@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ozma-agent"
+version = "1.1.0"
+description = "Ozma desktop agent — make any machine part of your ozma mesh"
+readme = "../README.md"
+license = {text = "AGPL-3.0-only WITH OzmaPluginException"}
+requires-python = ">=3.11"
+authors = [{name = "Ozma Labs", email = "dev@ozmalabs.com"}]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Systems Administration",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+]
+dependencies = [
+    "aiohttp>=3.9",
+    "zeroconf>=0.80",
+    "Pillow>=10.0",
+]
+
+[project.optional-dependencies]
+tray = ["pystray>=0.19"]
+capture = ["numpy>=1.24"]
+all = ["ozma-agent[tray,capture]"]
+
+[project.scripts]
+ozma-agent = "cli:main"
+
+[project.urls]
+Homepage = "https://ozma.dev"
+Repository = "https://github.com/ozmalabs/ozma"

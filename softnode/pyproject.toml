@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ozma-softnode"
+version = "1.1.0"
+description = "Ozma soft node — QEMU/KVM VM management with D-Bus display + Looking Glass"
+license = {text = "AGPL-3.0-only WITH OzmaPluginException"}
+requires-python = ">=3.11"
+authors = [{name = "Ozma Labs", email = "dev@ozmalabs.com"}]
+dependencies = [
+    "aiohttp>=3.9",
+    "zeroconf>=0.80",
+    "Pillow>=10.0",
+]
+
+[project.optional-dependencies]
+evdev = ["evdev>=1.6"]
+
+[project.scripts]
+ozma-softnode = "soft_node:main"
+ozma-virtual-node = "virtual_node:main"
+
+[project.urls]
+Homepage = "https://ozma.dev"
+Repository = "https://github.com/ozmalabs/ozma"
