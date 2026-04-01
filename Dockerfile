@@ -33,10 +33,6 @@ RUN pip install --no-cache-dir -r requirements.txt pynacl
 # Copy application code
 COPY controller/ /opt/ozma/controller/
 COPY softnode/ /opt/ozma/softnode/
-COPY static/ /opt/ozma/controller/static/ 2>/dev/null || true
-
-# Default scenarios
-COPY demo/scenarios.json /opt/ozma/controller/scenarios.json 2>/dev/null || true
 
 # Working directory for the controller
 WORKDIR /opt/ozma/controller
@@ -48,7 +44,7 @@ EXPOSE 7380/tcp
 
 # Health check
 HEALTHCHECK --interval=10s --timeout=3s --start-period=15s \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:7380/api/v1/status', timeout=2)" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:7380/health', timeout=2)" || exit 1
 
 # Run the controller
 CMD ["python", "main.py", "--virtual-only"]
