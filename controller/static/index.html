@@ -1,0 +1,1075 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ozma</title>
+  <link rel="icon" href="/static/favicon.ico" sizes="any">
+  <link rel="icon" href="/static/logo.svg" type="image/svg+xml">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0a0a0f;
+      color: #e0e0e0;
+      font-family: 'Inter', system-ui, sans-serif;
+      overflow: hidden;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    #status-bar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 18px;
+      background: rgba(255,255,255,0.04);
+      border-bottom: 1px solid rgba(255,255,255,0.07);
+      flex-shrink: 0;
+      z-index: 10;
+    }
+    #scenario-dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      background: #888;
+      flex-shrink: 0;
+      transition: background 0.3s;
+    }
+    #scenario-name {
+      font-size: 14px; font-weight: 600;
+      letter-spacing: 0.04em; text-transform: uppercase;
+      color: #fff; min-width: 80px;
+    }
+    #node-status { font-size: 12px; color: #666; }
+    #audio-status {
+      font-size: 12px; color: #555;
+      display: flex; align-items: center; gap: 4px;
+      margin-left: auto;
+      transition: color 0.3s;
+    }
+    #audio-status.active { color: #f0b94a; }
+    #audio-status.inactive { color: #444; }
+    #dashboard-link {
+      font-size: 11px; font-weight: 600;
+      letter-spacing: 0.06em; text-transform: uppercase;
+      color: #444; text-decoration: none;
+      padding: 4px 10px;
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 5px;
+      transition: color 0.15s, border-color 0.15s;
+    }
+    #dashboard-link:hover { color: #fff; border-color: rgba(255,255,255,0.22); }
+    #node-status.online  { color: #4caf50; }
+    #node-status.offline { color: #666; }
+    #transition-label { font-size: 12px; color: #aaa; opacity: 0; transition: opacity 0.15s; }
+    #transition-label.visible { opacity: 1; }
+    #progress-track {
+      width: 120px; height: 2px;
+      background: rgba(255,255,255,0.1);
+      border-radius: 1px; overflow: hidden;
+      opacity: 0; transition: opacity 0.15s;
+    }
+    #progress-track.visible { opacity: 1; }
+    #progress-fill {
+      height: 100%; width: 0%;
+      background: #fff; border-radius: 1px;
+      transition: width 0.05s linear;
+    }
+    #canvas-wrap { flex: 1; position: relative; }
+    canvas { display: block; width: 100% !important; height: 100% !important; }
+    #ws-indicator {
+      position: absolute; bottom: 12px; right: 14px;
+      font-size: 11px; color: #444;
+    }
+    #ws-indicator.connected { color: #2d6a2d; }
+    #ws-indicator.error     { color: #6a2d2d; }
+
+    /* Scenario switcher */
+    #switcher {
+      position: absolute; bottom: 22px; left: 50%;
+      transform: translateX(-50%);
+      display: flex; gap: 10px; z-index: 20;
+      pointer-events: auto;
+    }
+    .sc-btn {
+      display: flex; align-items: center; gap: 7px;
+      padding: 7px 15px;
+      background: rgba(0,0,0,0.55);
+      border: 1px solid rgba(255,255,255,0.13);
+      border-radius: 20px;
+      color: #ccc; font-size: 12px; font-weight: 600;
+      letter-spacing: 0.06em; text-transform: uppercase;
+      cursor: pointer; user-select: none;
+      transition: background 0.15s, border-color 0.15s, color 0.15s;
+    }
+    .sc-btn:hover { background: rgba(255,255,255,0.09); color: #fff; }
+    .sc-btn.active {
+      border-color: var(--sc-color, #888);
+      box-shadow: 0 0 10px -2px var(--sc-color, #888);
+      color: #fff;
+    }
+    .sc-btn .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  </style>
+
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+  <script type="importmap">
+  {
+    "imports": {
+      "three":         "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+
+<div id="status-bar">
+  <div id="scenario-dot"></div>
+  <div id="scenario-name">—</div>
+  <div id="transition-label">Switching…</div>
+  <div id="progress-track"><div id="progress-fill"></div></div>
+  <div id="node-status" class="offline">No node</div>
+  <div id="audio-status" class="inactive" title="Audio routing">♪ —</div>
+  <a id="dashboard-link" href="/dashboard.html">Dashboard</a>
+  <a id="dashboard-link" href="/desk3d.html" style="margin-left:8px">3D Desk</a>
+</div>
+<div id="canvas-wrap">
+  <canvas id="c"></canvas>
+  <div id="ws-indicator">connecting…</div>
+  <div id="switcher"></div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls }   from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer }  from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass }      from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass }      from 'three/addons/postprocessing/OutputPass.js';
+
+// ─── Layout data (keysim / keyboardsimulator.xyz, MIT license) ───────────────
+// layout_80_default.json + keymap_80_default.json
+
+const LAYOUT = [
+  // F-row  (y=0)
+  {x:0,y:0},{x:2,y:0},{x:3,y:0},{x:4,y:0},{x:5,y:0},
+  {x:6.5,y:0},{x:7.5,y:0},{x:8.5,y:0},{x:9.5,y:0},
+  {x:11,y:0},{x:12,y:0},{x:13,y:0},{x:14,y:0},
+  // Number row  (y=1.25)
+  {x:0,y:1.25},{x:1,y:1.25},{x:2,y:1.25},{x:3,y:1.25},{x:4,y:1.25},
+  {x:5,y:1.25},{x:6,y:1.25},{x:7,y:1.25},{x:8,y:1.25},{x:9,y:1.25},
+  {x:10,y:1.25},{x:11,y:1.25},{x:12,y:1.25},{x:13,y:1.25,w:2},
+  // Nav row 1
+  {x:15.25,y:1.25},{x:16.25,y:1.25},{x:17.25,y:1.25},
+  // Tab row  (y=2.25)
+  {x:0,y:2.25,w:1.5},{x:1.5,y:2.25},{x:2.5,y:2.25},{x:3.5,y:2.25},
+  {x:4.5,y:2.25},{x:5.5,y:2.25},{x:6.5,y:2.25},{x:7.5,y:2.25},
+  {x:8.5,y:2.25},{x:9.5,y:2.25},{x:10.5,y:2.25},{x:11.5,y:2.25},
+  {x:12.5,y:2.25},{x:13.5,y:2.25,w:1.5},
+  // Nav row 2
+  {x:15.25,y:2.25},{x:16.25,y:2.25},{x:17.25,y:2.25},
+  // Caps row  (y=3.25)
+  {x:0,y:3.25,w:1.75},{x:1.75,y:3.25},{x:2.75,y:3.25},{x:3.75,y:3.25},
+  {x:4.75,y:3.25},{x:5.75,y:3.25},{x:6.75,y:3.25},{x:7.75,y:3.25},
+  {x:8.75,y:3.25},{x:9.75,y:3.25},{x:10.75,y:3.25},{x:11.75,y:3.25},
+  {x:12.75,y:3.25,w:2.25},
+  // Shift row  (y=4.25)
+  {x:0,y:4.25,w:2.25},{x:2.25,y:4.25},{x:3.25,y:4.25},{x:4.25,y:4.25},
+  {x:5.25,y:4.25},{x:6.25,y:4.25},{x:7.25,y:4.25},{x:8.25,y:4.25},
+  {x:9.25,y:4.25},{x:10.25,y:4.25},{x:11.25,y:4.25},{x:12.25,y:4.25,w:2.75},
+  // Up arrow
+  {x:16.25,y:4.25},
+  // Bottom row  (y=5.25)
+  {x:0,y:5.25,w:1.25},{x:1.25,y:5.25,w:1.25},{x:2.5,y:5.25,w:1.25},
+  {x:3.75,y:5.25,w:6.25},
+  {x:10,y:5.25,w:1.25},{x:11.25,y:5.25,w:1.25},
+  {x:12.5,y:5.25,w:1.25},{x:13.75,y:5.25,w:1.25},
+  // Arrow cluster
+  {x:15.25,y:5.25},{x:16.25,y:5.25},{x:17.25,y:5.25},
+];
+
+const KEYMAP = [
+  'KC_ESC','KC_F1','KC_F2','KC_F3','KC_F4','KC_F5','KC_F6','KC_F7','KC_F8',
+  'KC_F9','KC_F10','KC_F11','KC_F12',
+  'KC_GRV','KC_1','KC_2','KC_3','KC_4','KC_5','KC_6','KC_7','KC_8','KC_9',
+  'KC_0','KC_MINS','KC_EQL','KC_BSPC',
+  'KC_INS','KC_HOME','KC_PGUP',
+  'KC_TAB','KC_Q','KC_W','KC_E','KC_R','KC_T','KC_Y','KC_U','KC_I','KC_O',
+  'KC_P','KC_LBRC','KC_RBRC','KC_BSLS',
+  'KC_DEL','KC_END','KC_PGDN',
+  'KC_CAPS','KC_A','KC_S','KC_D','KC_F','KC_G','KC_H','KC_J','KC_K','KC_L',
+  'KC_SCLN','KC_QUOT','KC_ENT',
+  'KC_LSFT','KC_Z','KC_X','KC_C','KC_V','KC_B','KC_N','KC_M','KC_COMM',
+  'KC_DOT','KC_SLSH','KC_RSFT',
+  'KC_UP',
+  'KC_LCTL','KC_LGUI','KC_LALT','KC_SPC','KC_RALT','KC_RGUI','KC_APP','KC_RCTL',
+  'KC_LEFT','KC_DOWN','KC_RGHT',
+];
+
+// browser KeyboardEvent.code → QMK code
+const QMK_CODES = {
+  'Escape':'KC_ESC','Tab':'KC_TAB','CapsLock':'KC_CAPS','Enter':'KC_ENT',
+  'Backspace':'KC_BSPC','Space':'KC_SPC',
+  'ShiftLeft':'KC_LSFT','ShiftRight':'KC_RSFT',
+  'ControlLeft':'KC_LCTL','ControlRight':'KC_RCTL',
+  'AltLeft':'KC_LALT','AltRight':'KC_RALT',
+  'MetaLeft':'KC_LGUI','MetaRight':'KC_RGUI',
+  'OSLeft':'KC_LGUI','OSRight':'KC_RGUI','Menu':'KC_APP',
+  'Backquote':'KC_GRV','Minus':'KC_MINS','Equal':'KC_EQL',
+  'BracketLeft':'KC_LBRC','BracketRight':'KC_RBRC','Backslash':'KC_BSLS',
+  'Semicolon':'KC_SCLN','Quote':'KC_QUOT',
+  'Comma':'KC_COMM','Period':'KC_DOT','Slash':'KC_SLSH',
+  'Insert':'KC_INS','Delete':'KC_DEL','Home':'KC_HOME','End':'KC_END',
+  'PageUp':'KC_PGUP','PageDown':'KC_PGDN',
+  'ArrowUp':'KC_UP','ArrowDown':'KC_DOWN',
+  'ArrowLeft':'KC_LEFT','ArrowRight':'KC_RGHT',
+  'F1':'KC_F1','F2':'KC_F2','F3':'KC_F3','F4':'KC_F4',
+  'F5':'KC_F5','F6':'KC_F6','F7':'KC_F7','F8':'KC_F8',
+  'F9':'KC_F9','F10':'KC_F10','F11':'KC_F11','F12':'KC_F12',
+};
+for (const c of 'ABCDEFGHIJKLMNOPQRSTUVWXYZ') QMK_CODES[`Key${c}`] = `KC_${c}`;
+for (let n = 0; n <= 9; n++) QMK_CODES[`Digit${n}`] = `KC_${n}`;
+
+// QMK → browser reverse map (rgb.frame events are keyed by browser code)
+const QMK_TO_BROWSER = Object.fromEntries(
+  Object.entries(QMK_CODES).map(([b, q]) => [q, b])
+);
+
+// Legend text keyed by QMK code
+const LEGENDS = {
+  'KC_ESC':'ESC','KC_TAB':'TAB','KC_CAPS':'CAPS','KC_ENT':'ENTER',
+  'KC_LSFT':'SHIFT','KC_RSFT':'SHIFT',
+  'KC_LCTL':'CTRL','KC_RCTL':'CTRL',
+  'KC_LALT':'ALT','KC_RALT':'ALT',
+  'KC_LGUI':'WIN','KC_RGUI':'WIN',
+  'KC_BSPC':'BKSP','KC_SPC':'','KC_APP':'≡',
+  'KC_INS':'INS','KC_DEL':'DEL','KC_HOME':'HOME','KC_END':'END',
+  'KC_PGUP':'PGUP','KC_PGDN':'PGDN',
+  'KC_UP':'↑','KC_DOWN':'↓','KC_LEFT':'←','KC_RGHT':'→',
+  'KC_GRV':'`','KC_MINS':'-','KC_EQL':'=',
+  'KC_LBRC':'[','KC_RBRC':']','KC_BSLS':'\\',
+  'KC_SCLN':';','KC_QUOT':"'",'KC_COMM':',','KC_DOT':'.','KC_SLSH':'/',
+};
+for (const c of 'ABCDEFGHIJKLMNOPQRSTUVWXYZ') LEGENDS[`KC_${c}`] = c;
+for (let n = 0; n <= 9; n++) LEGENDS[`KC_${n}`] = String(n);
+for (let n = 1; n <= 12; n++) LEGENDS[`KC_F${n}`] = `F${n}`;
+
+// Build KEYS array
+const KBD_W = 18.25, KBD_H = 6.25;
+const KBD_CX = KBD_W / 2, KBD_CY = KBD_H / 2;
+
+const KEYS = LAYOUT.map((pos, i) => ({
+  qmk:     KEYMAP[i],
+  browser: QMK_TO_BROWSER[KEYMAP[i]] ?? null,
+  x: pos.x, y: pos.y,
+  w: pos.w ?? 1, h: pos.h ?? 1,
+  row: Math.min(4, Math.floor(pos.y) + 1),
+}));
+
+// ─── Scene ────────────────────────────────────────────────────────────────────
+
+const canvas = document.getElementById('c');
+const wrap   = document.getElementById('canvas-wrap');
+
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x080810);
+scene.fog = new THREE.Fog(0x080810, 30, 60);
+
+const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+camera.position.set(0, 6, 18);
+camera.lookAt(0, 3, -5);
+
+const controls = new OrbitControls(camera, canvas);
+controls.target.set(0, 3, -5);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.minDistance = 5;
+controls.maxDistance = 35;
+controls.maxPolarAngle = Math.PI / 2.1;
+
+// Lighting
+scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+const sun = new THREE.DirectionalLight(0xffffff, 0.8);
+sun.position.set(4, 12, 8);
+scene.add(sun);
+const overhead = new THREE.DirectionalLight(0xffffff, 0.35);
+overhead.position.set(0, 1, 0);
+scene.add(overhead);
+const fill = new THREE.DirectionalLight(0x8899ff, 0.12);
+fill.position.set(0, 3, 10);
+scene.add(fill);
+
+// ─── Bloom ────────────────────────────────────────────────────────────────────
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.28, 0.6, 0.28);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
+// ─── Keyboard group (everything tilted together) ──────────────────────────────
+
+const kbdGroup = new THREE.Group();
+kbdGroup.rotation.x = THREE.MathUtils.degToRad(7);
+scene.add(kbdGroup);
+
+// ─── Case ─────────────────────────────────────────────────────────────────────
+// ExtrudeGeometry rounded-rect outline with a single rectangular key-area cutout.
+// After rotation.x = PI/2 the shape lies flat: extrusion becomes -Y (downward).
+
+{
+  const BEZEL  = 0.5;
+  const CASE_D = 0.55;
+  const CR     = 0.35;   // corner radius
+  const HG     = 0.05;   // hole gutter
+  const W = KBD_W + BEZEL * 2;
+  const D = KBD_H + BEZEL * 2;
+
+  const outline = new THREE.Shape();
+  outline.moveTo(CR, 0);
+  outline.lineTo(W - CR, 0);  outline.quadraticCurveTo(W, 0, W, CR);
+  outline.lineTo(W, D - CR);  outline.quadraticCurveTo(W, D, W - CR, D);
+  outline.lineTo(CR, D);      outline.quadraticCurveTo(0, D, 0, D - CR);
+  outline.lineTo(0, CR);      outline.quadraticCurveTo(0, 0, CR, 0);
+
+  const hole = new THREE.Path();
+  hole.moveTo(BEZEL - HG,        BEZEL - HG);
+  hole.lineTo(BEZEL + KBD_W + HG, BEZEL - HG);
+  hole.lineTo(BEZEL + KBD_W + HG, BEZEL + KBD_H + HG);
+  hole.lineTo(BEZEL - HG,        BEZEL + KBD_H + HG);
+  hole.lineTo(BEZEL - HG,        BEZEL - HG);
+  outline.holes = [hole];
+
+  const geo = new THREE.ExtrudeGeometry(outline, {
+    depth: CASE_D,
+    bevelEnabled: true,
+    bevelThickness: 0.06,
+    bevelSize: 0.05,
+    bevelSegments: 3,
+  });
+  const mat = new THREE.MeshStandardMaterial({
+    color: 0x18181f, roughness: 0.75, metalness: 0.25,
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.rotation.x = Math.PI / 2;
+  mesh.position.set(-BEZEL - KBD_CX, 0, -BEZEL - KBD_CY);
+  kbdGroup.add(mesh);
+}
+
+// ─── Keycap geometry (ported from keysim, MIT) ────────────────────────────────
+//
+// Each keycap is a 12-vertex shape: 4 base corners + 8 top-face vertices that
+// form a chamfered inset — the shelf visible between the key sides and the top
+// face.  Profile sculpting (row 1-4) tilts the top face front-to-back like SA
+// or Cherry profile.
+
+const GG   = 0.05;    // gutter between adjacent caps
+const CI   = 0.15;    // top-face inset from sides
+const CC   = 0.05;    // top corner chamfer
+const CIT  = 0.05;    // top back-edge inset
+const CAP_H    = 0.14;
+const CAP_BASE = 0.07;   // Y where keycap bottom rests (above case surface)
+
+const capGeoCache = new Map();
+
+function buildKeycapGeo(w, h, row) {
+  const cacheKey = `${w.toFixed(2)}_${h.toFixed(2)}_${row}`;
+  if (capGeoCache.has(cacheKey)) return capGeoCache.get(cacheKey);
+
+  const wg = w - GG;
+  const dg = h - GG;
+  const H  = CAP_H;
+
+  // 12 vertices
+  const v = [
+    [0,          0, 0          ],  // 0 base back-left
+    [wg,         0, 0          ],  // 1 base back-right
+    [wg,         0, dg         ],  // 2 base front-right
+    [0,          0, dg         ],  // 3 base front-left
+    [CI,         H, CIT + CC   ],  // 4 top back-left outer
+    [CI + CC,    H, CIT        ],  // 5 top back-left inner
+    [wg-CI-CC,   H, CIT        ],  // 6 top back-right inner
+    [wg-CI,      H, CIT + CC   ],  // 7 top back-right outer
+    [wg-CI,      H, dg-CI-CC   ],  // 8 top front-right outer
+    [wg-CI-CC,   H, dg-CI      ],  // 9 top front-right inner
+    [CI+CC,      H, dg-CI      ],  // 10 top front-left inner
+    [CI,         H, dg-CI-CC   ],  // 11 top front-left outer
+  ];
+
+  // Row profile: shift top vertices down (front-to-back tilt)
+  const lowerTop = (amt) => { for (let j = 4; j <= 11; j++) v[j][1] -= amt; };
+  if      (row === 1) lowerTop(-0.012);
+  else if (row === 2) lowerTop(0.025);
+  else if (row === 3) lowerTop(0.030);
+  else if (row === 4) lowerTop(0.040);
+
+  // Non-indexed geometry — duplicate vertices per triangle → flat shading
+  const faces = [
+    [4,7,5],[7,6,5],[9,11,10],[9,8,11],[4,11,7],[8,7,11],  // top face (8 tris)
+    [0,4,5],[1,6,7],[2,8,9],[3,10,11],                      // corner tris
+    [0,5,1],[1,5,6],                                         // back side
+    [2,7,8],[2,1,7],                                         // right side
+    [0,3,11],[0,11,4],                                       // left side
+    [3,2,9],[3,9,10],                                        // front side
+  ];
+
+  const pos = new Float32Array(faces.length * 9);
+  let pi = 0;
+  for (const [a, b, c] of faces)
+    for (const vi of [a, b, c]) { pos[pi++]=v[vi][0]; pos[pi++]=v[vi][1]; pos[pi++]=v[vi][2]; }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.computeVertexNormals();
+  capGeoCache.set(cacheKey, geo);
+  return geo;
+}
+
+// LED geometry — flat plane LARGER than the keycap footprint.
+// The outer ring (beyond the keycap edge) is not blocked by the opaque
+// keycap, so it's visible from any camera angle and gives bloom something
+// to work with.  The keycap itself masks the centre, so each key reads
+// as a clean halo rather than a filled disc.
+const ledGeoCache = new Map();
+function getLedGeo(w, h) {
+  const k = `${w.toFixed(2)}_${h.toFixed(2)}`;
+  if (!ledGeoCache.has(k))
+    ledGeoCache.set(k, new THREE.PlaneGeometry(w - GG + 0.10, h - GG + 0.10));
+  return ledGeoCache.get(k);
+}
+
+// ─── Legend texture ────────────────────────────────────────────────────────────
+
+const PX_PER_U = 128;
+function makeLegendTexture(label, wU) {
+  const cw = Math.max(4, Math.round(PX_PER_U * wU));
+  const ch = PX_PER_U;
+  const cv = document.createElement('canvas');
+  cv.width = cw; cv.height = ch;
+  const ctx = cv.getContext('2d');
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, cw, ch);
+  if (label) {
+    const fsize = Math.round(ch * (label.length > 3 ? 0.22 : 0.30));
+    ctx.font = `600 ${fsize}px 'Inter', system-ui, monospace`;
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, cw / 2, ch / 2);
+  }
+  const tex = new THREE.CanvasTexture(cv);
+  tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  return tex;
+}
+
+// ─── Build keys ───────────────────────────────────────────────────────────────
+
+const capMat = new THREE.MeshStandardMaterial({
+  color: 0x1c1c26, roughness: 0.58, metalness: 0.06,
+});
+
+const ledMaterials = new Map();   // browser code → MeshStandardMaterial
+const keyStates    = [];          // { mesh, restY, targetY, qmk }
+
+for (const key of KEYS) {
+  // Key left edge and top edge in world (centered)
+  const kx = key.x - KBD_CX;
+  const kz = key.y - KBD_CY;
+
+  // Keycap — geometry origin is bottom-left of key
+  const cap = new THREE.Mesh(buildKeycapGeo(key.w, key.h, key.row), capMat);
+  const restY = CAP_BASE;
+  cap.position.set(kx, restY, kz);
+  kbdGroup.add(cap);
+  keyStates.push({ mesh: cap, restY, targetY: restY, qmk: key.qmk });
+
+  // Legend plane — transparent plane above keycap top, centered on key
+  const label = LEGENDS[key.qmk] ?? '';
+  if (label) {
+    const lm = new THREE.MeshBasicMaterial({
+      transparent: true,
+      alphaMap:    makeLegendTexture(label, key.w),
+      color:       0x707080,  // dim enough not to trigger bloom (luminance ~0.19)
+      depthWrite:  false,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+    });
+    const lmesh = new THREE.Mesh(
+      new THREE.PlaneGeometry(key.w - GG - 0.04, key.h - GG - 0.04),
+      lm,
+    );
+    lmesh.rotation.x = -Math.PI / 2;
+    lmesh.renderOrder = 1;
+    // Offset must exceed the row-1 profile raise (+0.012) with margin
+    lmesh.position.set(kx + key.w / 2, CAP_BASE + CAP_H + 0.025, kz + key.h / 2);
+    kbdGroup.add(lmesh);
+  }
+
+  // LED slab — centered under keycap
+  const ledMat = new THREE.MeshBasicMaterial({
+    color: new THREE.Color(0.05, 0.05, 0.2),  // idle: dim blue
+  });
+  const led = new THREE.Mesh(getLedGeo(key.w, key.h), ledMat);
+  led.rotation.x = -Math.PI / 2;
+  led.position.set(kx + key.w / 2, CAP_BASE - 0.008, kz + key.h / 2);
+  kbdGroup.add(led);
+
+  if (key.browser) ledMaterials.set(key.browser, ledMat);
+}
+
+// ─── Monitor mesh ─────────────────────────────────────────────────────────────
+//
+// A flat-screen monitor sits behind the keyboard in the scene.
+// Its screen face uses a ShaderMaterial that blends two VideoTextures with
+// a wipe/fade/ripple effect driven by scenario.transitioning events.
+
+const MON_SW = 13.5;   // screen width  (16:9)
+const MON_SH = 7.594;  // screen height
+const MON_BEZ = 0.55;  // bezel thickness
+const MON_W = MON_SW + MON_BEZ * 2;
+const MON_H = MON_SH + MON_BEZ * 2;
+
+// Vertex shader for the screen blend
+const screenVert = /* glsl */`
+  varying vec2 vUv;
+  void main() {
+    vUv = uv;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  }
+`;
+
+// Fragment shader: blend texA → texB with a wipe + glowing edge
+// style 1=wave_right, 2=wave_left, 3=ripple, 0=fade
+const screenFrag = /* glsl */`
+  uniform sampler2D texA;
+  uniform sampler2D texB;
+  uniform float progress;
+  uniform int   style;
+  uniform vec3  tintA;
+  uniform vec3  tintB;
+  varying vec2 vUv;
+  void main() {
+    float blend;
+    float edgeDist = 1.0;   // distance from wipe boundary (normalised)
+
+    if (style == 1) {
+      blend = 1.0 - smoothstep(progress - 0.004, progress + 0.004, vUv.x);
+      edgeDist = abs(vUv.x - progress) / 0.006;
+    } else if (style == 2) {
+      blend = smoothstep(1.0 - progress - 0.004, 1.0 - progress + 0.004, vUv.x);
+      edgeDist = abs(vUv.x - (1.0 - progress)) / 0.006;
+    } else if (style == 3) {
+      float d = length(vUv - vec2(0.5));
+      blend = 1.0 - smoothstep(progress * 0.85 - 0.015, progress * 0.85 + 0.015, d);
+      edgeDist = abs(d - progress * 0.85) / 0.025;
+    } else {
+      blend = progress;
+      edgeDist = 1.0;
+    }
+
+    vec4 colA = texture2D(texA, vUv) * vec4(tintA, 1.0);
+    vec4 colB = texture2D(texB, vUv) * vec4(tintB, 1.0);
+    gl_FragColor = mix(colA, colB, step(0.5, blend));
+
+    // Bright white glow at the wipe boundary
+    float inTransit = step(0.01, progress) * (1.0 - step(0.99, progress));
+    float glow      = (1.0 - clamp(edgeDist, 0.0, 1.0)) * inTransit * 1.8;
+    gl_FragColor.rgb = min(gl_FragColor.rgb + glow, 1.0);
+    gl_FragColor.a   = 1.0;
+  }
+`;
+
+// Placeholder standby texture — shown while no stream is buffered
+const blackCanvas = document.createElement('canvas');
+blackCanvas.width = 1920; blackCanvas.height = 1080;
+{ const ctx = blackCanvas.getContext('2d');
+  ctx.fillStyle = '#07111f';
+  ctx.fillRect(0, 0, 1920, 1080);
+  // Subtle scanline feel
+  for (let y = 0; y < 1080; y += 4) {
+    ctx.fillStyle = 'rgba(0,0,0,0.18)';
+    ctx.fillRect(0, y, 1920, 2);
+  }
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#1e4976';
+  ctx.font = 'bold 72px monospace';
+  ctx.fillText('NO SIGNAL', 960, 510);
+  ctx.font = '32px monospace';
+  ctx.fillStyle = '#0f2d4a';
+  ctx.fillText('waiting for stream…', 960, 580); }
+const blackTex = new THREE.CanvasTexture(blackCanvas);
+
+const screenUniforms = {
+  texA:     { value: blackTex },
+  texB:     { value: blackTex },
+  progress: { value: 1.0 },
+  style:    { value: 0 },
+  tintA:    { value: new THREE.Vector3(1, 1, 1) },
+  tintB:    { value: new THREE.Vector3(1, 1, 1) },
+};
+
+// Scenario color → subtle tint multiplier so two sources are distinguishable
+function scenarioTint(hexColor) {
+  const c = new THREE.Color(hexColor ?? '#888888');
+  // Boost the dominant channel slightly, pull others down a touch
+  return new THREE.Vector3(
+    0.82 + c.r * 0.22,
+    0.82 + c.g * 0.22,
+    0.82 + c.b * 0.22,
+  );
+}
+
+const screenMat = new THREE.ShaderMaterial({
+  uniforms:       screenUniforms,
+  vertexShader:   screenVert,
+  fragmentShader: screenFrag,
+  side: THREE.FrontSide,
+});
+
+const monitorGroup = new THREE.Group();
+monitorGroup.position.set(0, 9, -8);
+monitorGroup.rotation.x = THREE.MathUtils.degToRad(-10);
+scene.add(monitorGroup);
+
+// Bezel body
+const bezelMat = new THREE.MeshStandardMaterial({
+  color: 0x141418, roughness: 0.7, metalness: 0.3,
+});
+const bezelGeo = new THREE.BoxGeometry(MON_W, MON_H, 0.28);
+monitorGroup.add(new THREE.Mesh(bezelGeo, bezelMat));
+
+// Thin stand
+const standGeo = new THREE.BoxGeometry(1.2, 2.2, 0.18);
+const standMesh = new THREE.Mesh(standGeo, bezelMat);
+standMesh.position.set(0, -(MON_H / 2 + 1.1), 0);
+monitorGroup.add(standMesh);
+const baseGeo = new THREE.BoxGeometry(4.0, 0.18, 1.6);
+const baseMesh = new THREE.Mesh(baseGeo, bezelMat);
+baseMesh.position.set(0, -(MON_H / 2 + 2.09), 0.7);
+monitorGroup.add(baseMesh);
+
+// Screen face (slightly proud of bezel)
+const screenGeo = new THREE.PlaneGeometry(MON_SW, MON_SH);
+const screenMesh = new THREE.Mesh(screenGeo, screenMat);
+screenMesh.position.z = 0.145;
+monitorGroup.add(screenMesh);
+
+// Screen ambient point light — colour matches active scenario
+const screenLight = new THREE.PointLight(0x4a90d9, 0.6, 25);
+screenLight.position.set(0, 0, 2.5);
+monitorGroup.add(screenLight);
+
+// ─── Video stream setup ────────────────────────────────────────────────────────
+//
+// slotA = texture currently displayed full-screen.
+// slotB = texture transitioning in.
+// pendingTransition = { nodeId, msg, timeoutId } while waiting for a stream to
+//   buffer before we can start the wipe animation.
+
+const streamTextures = new Map();   // node_id → THREE.VideoTexture | null
+let slotA = blackTex;
+let slotB = blackTex;
+
+let transitionActive = false;
+let transitionStart  = 0;
+let transitionDurMs  = 600;
+
+let pendingTransition = null;   // waiting for stream to buffer
+
+// Execute the wipe animation immediately with a ready texture.
+function _execTransition(msg, newTex) {
+  const t = msg.transition ?? {};
+  const styleMap = { wave_right: 1, wave_left: 2, ripple: 3, fade: 0, cut: 0 };
+  slotB = newTex;
+  screenUniforms.texA.value     = slotA;
+  screenUniforms.texB.value     = slotB;
+  screenUniforms.progress.value = 0;
+  screenUniforms.style.value    = styleMap[t.style] ?? 0;
+  // Tint B with the incoming scenario colour; A keeps its previous tint
+  screenUniforms.tintB.value    = scenarioTint(msg.scenario?.color);
+  transitionDurMs  = t.duration_ms ?? 600;
+  transitionStart  = performance.now();
+  transitionActive = true;
+  pendingTransition = null;
+}
+
+// node_id → { img, canvas, ctx, tex }
+const mjpegSources = new Map();
+
+// Attach a stream. type='mjpeg' uses MJPEG canvas texture (low latency, VNC nodes).
+// type='hls-remote' uses hls.js VideoTexture (hardware nodes with onboard encoder).
+function attachStream(nodeId, url, type = 'mjpeg') {
+  if (streamTextures.has(nodeId)) return streamTextures.get(nodeId);
+  streamTextures.set(nodeId, null);   // mark as loading
+
+  function _onTexReady(tex) {
+    streamTextures.set(nodeId, tex);
+    if (slotA === blackTex) {
+      slotA = tex; screenUniforms.texA.value = slotA; screenUniforms.texB.value = slotA;
+    }
+    if (pendingTransition?.nodeId === nodeId) {
+      const { msg, timeoutId } = pendingTransition;
+      clearTimeout(timeoutId);
+      _execTransition(msg, tex);
+    }
+  }
+
+  if (type === 'hls-remote' && url) {
+    // Hardware node: use hls.js VideoTexture (already encoded H.264/H.265)
+    const vid = document.createElement('video');
+    vid.muted = true; vid.playsInline = true; vid.style.display = 'none';
+    document.body.appendChild(vid);
+    const tex = new THREE.VideoTexture(vid);
+    tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter;
+    const onCanPlay = () => { if (streamTextures.get(nodeId) === null) _onTexReady(tex); };
+    vid.addEventListener('canplay', onCanPlay);
+    if (typeof Hls !== 'undefined' && Hls.isSupported()) {
+      const hls = new Hls({ lowLatencyMode: true, backBufferLength: 2 });
+      hls.loadSource(url);
+      hls.attachMedia(vid);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => vid.play().catch(() => {}));
+      hls.on(Hls.Events.ERROR, (_, d) => { if (d.fatal) hls.destroy(); });
+    } else if (vid.canPlayType('application/vnd.apple.mpegurl')) {
+      vid.src = url; vid.play().catch(() => {});
+    }
+    // Update VideoTexture in animate loop
+    mjpegSources.set(nodeId, { vid, tex, type: 'hls' });
+  } else {
+    // VNC node: MJPEG → canvas texture (low latency)
+    const canvas = document.createElement('canvas');
+    canvas.width = 1024; canvas.height = 640;
+    const ctx = canvas.getContext('2d');
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter;
+    const img = new Image();
+    img.style.display = 'none';
+    document.body.appendChild(img);
+    mjpegSources.set(nodeId, { img, canvas, ctx, tex, type: 'mjpeg' });
+    img.onload = () => {
+      if (canvas.width !== img.naturalWidth && img.naturalWidth > 0) {
+        canvas.width = img.naturalWidth; canvas.height = img.naturalHeight;
+      }
+      if (streamTextures.get(nodeId) === null) _onTexReady(tex);
+    };
+    img.src = `/api/v1/streams/${encodeURIComponent(nodeId)}/mjpeg`;
+  }
+  return null;
+}
+
+// Eagerly load all active streams so they're buffered before the first switch.
+async function preloadStreams() {
+  try {
+    const { streams = [] } = await fetch('/api/v1/streams').then(r => r.json());
+    for (const s of streams) attachStream(s.node_id, s.url, s.type ?? 'mjpeg');
+  } catch (_) {}
+}
+preloadStreams();
+
+// Called on scenario.transitioning — preload incoming stream; wipe as soon as
+// it has buffered (or after a 4 s fallback timeout).
+function startMonitorTransition(msg) {
+  const newNodeId = msg.scenario?.node_id;
+
+  // Cancel any still-pending transition
+  if (pendingTransition) { clearTimeout(pendingTransition.timeoutId); pendingTransition = null; }
+
+  // Ensure the incoming stream is loading
+  if (newNodeId && !streamTextures.has(newNodeId)) {
+    fetch(`/api/v1/streams/${encodeURIComponent(newNodeId)}`)
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (d?.url) attachStream(newNodeId, d.url, d.type ?? 'mjpeg'); })
+      .catch(() => {});
+  }
+
+  // If texture already buffered, wipe immediately
+  const readyTex = newNodeId ? streamTextures.get(newNodeId) : null;
+  if (readyTex) { _execTransition(msg, readyTex); return; }
+
+  // Otherwise wait; fall back to black after 4 s so we never get stuck
+  const timeoutId = setTimeout(() => {
+    if (pendingTransition?.nodeId === newNodeId) _execTransition(msg, blackTex);
+  }, 4000);
+  pendingTransition = { nodeId: newNodeId, msg, timeoutId };
+}
+
+// Called on scenario.activated — confirm slotA and update the screen light.
+function endMonitorTransition(msg) {
+  const nodeId = msg.scenario?.node_id;
+  const tex = (nodeId && streamTextures.get(nodeId)) ?? null;
+
+  // Update slotA to the now-active stream (animate loop propagates to uniforms)
+  if (tex) slotA = tex;
+
+  // If no wipe is running, snap uniforms to the final state
+  if (!transitionActive) {
+    screenUniforms.texA.value     = slotA;
+    screenUniforms.texB.value     = slotA;
+    screenUniforms.progress.value = 1;
+  }
+
+  screenLight.color.setStyle(msg.scenario?.color ?? '#888888');
+}
+
+// ─── Key press animation ──────────────────────────────────────────────────────
+
+const PRESS_DIST = 0.04;
+const qmkStateMap = new Map(keyStates.map(ks => [ks.qmk, ks]));
+
+document.addEventListener('keydown', (e) => {
+  if (e.repeat) return;
+  const ks = qmkStateMap.get(QMK_CODES[e.code]);
+  if (ks) ks.targetY = ks.restY - PRESS_DIST;
+});
+document.addEventListener('keyup', (e) => {
+  const ks = qmkStateMap.get(QMK_CODES[e.code]);
+  if (ks) ks.targetY = ks.restY;
+});
+
+// ─── RGB update ───────────────────────────────────────────────────────────────
+
+function applyFrame(keys) {
+  for (const [id, rgb] of Object.entries(keys)) {
+    const mat = ledMaterials.get(id);
+    if (!mat) continue;
+    mat.color.setRGB(rgb[0] / 255, rgb[1] / 255, rgb[2] / 255);
+  }
+}
+
+function applySolid(color) {
+  const frame = {};
+  for (const key of KEYS) { if (key.browser) frame[key.browser] = color; }
+  applyFrame(frame);
+}
+
+// ─── Status bar ───────────────────────────────────────────────────────────────
+
+const elDot        = document.getElementById('scenario-dot');
+const elName       = document.getElementById('scenario-name');
+const elNodeStatus = document.getElementById('node-status');
+const elAudio      = document.getElementById('audio-status');
+const elTransLabel = document.getElementById('transition-label');
+const elTrack      = document.getElementById('progress-track');
+const elFill       = document.getElementById('progress-fill');
+const elWS         = document.getElementById('ws-indicator');
+let progressTimer  = null;
+
+// Cache of node info for audio status display
+const _nodes = {};
+
+function updateAudioStatus(activeNodeId) {
+  const node = activeNodeId ? _nodes[activeNodeId] : null;
+  if (node?.audio_type === 'pipewire' && node.audio_sink) {
+    elAudio.textContent = '♪ ' + node.audio_sink.replace(/^ozma-/, '');
+    elAudio.className = 'active';
+    elAudio.title = `Audio: ${node.audio_sink} (PipeWire)`;
+  } else if (node?.audio_type === 'vban') {
+    elAudio.textContent = '♪ ' + (activeNodeId?.split('.')[0] ?? '—');
+    elAudio.className = 'active';
+    elAudio.title = `Audio: VBAN port ${node.audio_vban_port}`;
+  } else if (activeNodeId) {
+    elAudio.textContent = '♪ —';
+    elAudio.className = 'inactive';
+    elAudio.title = 'Audio: no audio type configured';
+  } else {
+    elAudio.textContent = '♪ —';
+    elAudio.className = 'inactive';
+    elAudio.title = 'Audio: no active node';
+  }
+}
+
+function setScenario(s) {
+  elName.textContent = s.name ?? s.id;
+  elDot.style.background = s.color ?? '#888';
+}
+function startTransition(t) {
+  elTransLabel.classList.add('visible');
+  elTrack.classList.add('visible');
+  elFill.style.width = '0%';
+  if (progressTimer) clearInterval(progressTimer);
+  const start = performance.now();
+  progressTimer = setInterval(() => {
+    const pct = Math.min(100, (performance.now() - start) / t.duration_ms * 100);
+    elFill.style.width = pct + '%';
+    if (pct >= 100) clearInterval(progressTimer);
+  }, 16);
+}
+function endTransition() {
+  elTransLabel.classList.remove('visible');
+  elTrack.classList.remove('visible');
+  if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
+}
+
+// ─── Scenario switcher ────────────────────────────────────────────────────────
+
+const elSwitcher = document.getElementById('switcher');
+let switcherScenarios = [];
+
+function buildSwitcher(scenarios, activeId) {
+  switcherScenarios = scenarios;
+  elSwitcher.innerHTML = '';
+  for (const s of scenarios) {
+    const btn = document.createElement('button');
+    btn.className = 'sc-btn' + (s.id === activeId ? ' active' : '');
+    btn.style.setProperty('--sc-color', s.color ?? '#888');
+    btn.innerHTML = `<span class="dot" style="background:${s.color ?? '#888'}"></span>${s.name ?? s.id}`;
+    btn.addEventListener('click', () => {
+      fetch(`/api/v1/scenarios/${encodeURIComponent(s.id)}/activate`, { method: 'POST' })
+        .catch(() => {});
+    });
+    elSwitcher.appendChild(btn);
+  }
+}
+
+function updateSwitcherActive(activeId) {
+  elSwitcher.querySelectorAll('.sc-btn').forEach((btn, i) => {
+    btn.classList.toggle('active', switcherScenarios[i]?.id === activeId);
+  });
+}
+
+// Load scenarios on startup
+fetch('/api/v1/scenarios')
+  .then(r => r.json())
+  .then(data => buildSwitcher(data.scenarios ?? [], data.active_id ?? null))
+  .catch(() => {});
+
+// ─── WebSocket ────────────────────────────────────────────────────────────────
+
+let ws = null, wsDelay = 1000;
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/api/v1/events`);
+  ws.addEventListener('open', () => {
+    elWS.textContent = '● connected'; elWS.className = 'connected'; wsDelay = 1000;
+  });
+  ws.addEventListener('close', () => {
+    elWS.textContent = '○ disconnected'; elWS.className = 'error';
+    setTimeout(connect, wsDelay); wsDelay = Math.min(wsDelay * 2, 10000);
+  });
+  ws.addEventListener('message', ({ data }) => {
+    let msg; try { msg = JSON.parse(data); } catch { return; }
+    switch (msg.type) {
+      case 'snapshot': {
+        const n = Object.keys(msg.data?.nodes ?? {}).length;
+        elNodeStatus.textContent = n ? `${n} node${n > 1 ? 's' : ''} online` : 'No nodes';
+        elNodeStatus.className   = n ? 'online' : 'offline';
+        // Cache node audio info for status display
+        for (const nd of Object.values(msg.data?.nodes ?? {})) _nodes[nd.id] = nd;
+        updateAudioStatus(msg.data?.active_node_id);
+        // Set initial screen colour from active scenario
+        if (msg.data?.active_scenario_id) {
+          fetch('/api/v1/scenarios')
+            .then(r => r.json())
+            .then(d => {
+              buildSwitcher(d.scenarios ?? [], d.active_id);
+              const active = d.scenarios?.find(s => s.id === d.active_id);
+              if (active) {
+                screenLight.color.setStyle(active.color ?? '#888');
+                // Preload active scenario's stream so it shows immediately
+                if (active.node_id) {
+                  fetch(`/api/v1/streams/${encodeURIComponent(active.node_id)}`)
+                    .then(r => r.ok ? r.json() : null)
+                    .then(dd => { if (dd?.url) attachStream(active.node_id, dd.url, dd.type ?? 'mjpeg'); })
+                    .catch(() => {});
+                }
+              }
+            }).catch(() => {});
+        }
+        break;
+      }
+      case 'node.online':
+      case 'node.offline': {
+        const on = msg.type === 'node.online';
+        elNodeStatus.textContent = on ? `${msg.node?.hw ?? 'node'} online` : 'Node offline';
+        elNodeStatus.className   = on ? 'online' : 'offline';
+        if (on && msg.node) _nodes[msg.node.id] = msg.node;
+        else if (!on && msg.node_id) delete _nodes[msg.node_id];
+        break;
+      }
+      case 'node.switched':
+        updateAudioStatus(msg.node_id);
+        break;
+      case 'scenario.transitioning':
+        if (msg.scenario)  setScenario(msg.scenario);
+        if (msg.transition) startTransition(msg.transition);
+        startMonitorTransition(msg);   // handles preloading internally
+        updateSwitcherActive(msg.scenario?.id);
+        break;
+      case 'scenario.activated':
+        if (msg.scenario) setScenario(msg.scenario);
+        endTransition();
+        endMonitorTransition(msg);
+        updateSwitcherActive(msg.scenario?.id);
+        break;
+      case 'scenario.updated':
+        if (msg.scenario) setScenario(msg.scenario);
+        break;
+      case 'rgb.frame':
+        if (msg.keys) applyFrame(msg.keys);
+        break;
+    }
+  });
+}
+connect();
+
+// ─── Resize ───────────────────────────────────────────────────────────────────
+
+function resize() {
+  const w = wrap.clientWidth, h = wrap.clientHeight;
+  const dpr = renderer.getPixelRatio();
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  renderer.setSize(w, h, false);
+  composer.setSize(w * dpr, h * dpr);
+  bloom.resolution.set(w * dpr, h * dpr);
+}
+new ResizeObserver(resize).observe(wrap);
+resize();
+
+// ─── Animate ──────────────────────────────────────────────────────────────────
+
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+
+  // Key press spring
+  for (const ks of keyStates) {
+    const diff = ks.targetY - ks.mesh.position.y;
+    if (Math.abs(diff) > 0.0004) ks.mesh.position.y += diff * 0.25;
+  }
+
+  // Monitor transition progress
+  if (transitionActive) {
+    const elapsed = performance.now() - transitionStart;
+    const t = Math.min(1, elapsed / transitionDurMs);
+    screenUniforms.progress.value = t;
+    if (t >= 1) {
+      transitionActive = false;
+      slotA = slotB;
+      screenUniforms.texA.value    = slotA;
+      screenUniforms.texB.value    = slotA;
+      screenUniforms.tintA.value   = screenUniforms.tintB.value;
+    }
+  }
+
+  // Draw latest MJPEG frame into each canvas texture; mark HLS VideoTextures dirty
+  for (const entry of mjpegSources.values()) {
+    if (entry.type === 'hls') {
+      entry.tex.needsUpdate = true;
+    } else {
+      const { img, canvas, ctx, tex } = entry;
+      if (img.naturalWidth > 0) {
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        tex.needsUpdate = true;
+      }
+    }
+  }
+
+  composer.render();
+}
+animate();
+</script>
+</body>
+</html>

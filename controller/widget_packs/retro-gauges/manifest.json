@@ -1,0 +1,22 @@
+{
+  "id": "retro-gauges",
+  "name": "Retro Analog Gauges",
+  "version": "1.0.0",
+  "author": "ozmalabs",
+  "description": "Skeuomorphic analog gauge widgets with needle animation, inspired by classic instrumentation panels",
+  "widget_types": ["retro_gauge", "retro_meter", "retro_dial", "retro_vu"],
+  "options": [
+    {"key": "bezel_color", "label": "Bezel Colour", "type": "color", "default": "#8B7355"},
+    {"key": "face_color", "label": "Face Colour", "type": "color", "default": "#1a1a1a"},
+    {"key": "needle_color", "label": "Needle Colour", "type": "color", "default": "#ff3333"},
+    {"key": "needle_style", "label": "Needle Style", "type": "select", "default": "classic", "choices": ["classic", "modern", "minimal", "sword"]},
+    {"key": "glow_enabled", "label": "Glow Effect", "type": "boolean", "default": true},
+    {"key": "tick_marks", "label": "Tick Mark Count", "type": "number", "default": 10, "min": 5, "max": 20},
+    {"key": "damping", "label": "Needle Damping", "type": "number", "default": 0.3, "min": 0, "max": 1}
+  ],
+  "themes": ["dark", "light", "amber", "green-phosphor", "military"],
+  "tags": ["retro", "analog", "skeuomorphic", "gauges", "instrumentation"],
+  "ozma_connect_url": "https://connect.ozma.io/packs/retro-gauges",
+  "preview": "preview.png",
+  "min_ozma_version": "1.0.0"
+}

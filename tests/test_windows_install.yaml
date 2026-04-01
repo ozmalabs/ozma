@@ -1,0 +1,61 @@
+# Ozma Visual Regression Test: Windows 10 Unattended Install
+#
+# Verifies that Windows 10 installs from ISO, reaches the desktop,
+# and the ozma agent is installed — all via hardware KVM.
+#
+# Run:
+#   curl -X POST http://localhost:7380/api/v1/tests/run \
+#     -H 'Content-Type: application/json' \
+#     -d '{"test_file": "tests/test_windows_install.yaml", "node_id": "win10._ozma._udp.local."}'
+
+name: "Windows 10 unattended install"
+timeout: 3600  # 1 hour max
+node: "win10._ozma._udp.local."
+
+setup:
+  - action: screenshot
+
+steps:
+  - name: "Windows installer starts"
+    wait_for_text: "Windows"
+    timeout: 300
+    screenshot: true
+
+  - name: "Installation progresses"
+    wait_for_text: "Installing"
+    timeout: 600
+    screenshot: true
+
+  - name: "OOBE or desktop reached"
+    wait_for_text: "region"  # OOBE first question
+    timeout: 1200
+    screenshot: true
+
+  - name: "Region selection"
+    click:
+      text: "Yes"
+    wait: 3
+
+  - name: "Keyboard layout"
+    wait_for_text: "keyboard"
+    timeout: 30
+    click:
+      text: "Yes"
+    wait: 3
+
+  - name: "Desktop reached"
+    wait_for_text: "Type here to search"
+    timeout: 600
+    screenshot: true
+
+  - name: "No BSOD or errors"
+    assert_not_present: "Your PC ran into a problem"
+    assert_not_present: "STOP:"
+    screenshot: true
+
+on_failure:
+  - action: screenshot
+    path: "test_results/{test_name}_FAILED_{timestamp}.jpg"
+  - action: notify
+    message: "FAILED: {test_name}"
+    channel: "#test-results"

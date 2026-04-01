@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "ozma": {
+      "command": "python3",
+      "args": ["controller/mcp_server.py", "--stdio"],
+      "env": {
+        "OZMA_CONTROLLER_URL": "http://localhost:7380"
+      }
+    }
+  }
+}

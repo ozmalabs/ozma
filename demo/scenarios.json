@@ -1,0 +1,25 @@
+{
+  "scenarios": [
+    {
+      "id": "vm1",
+      "name": "VM 1",
+      "node_id": "vm1._ozma._udp.local.",
+      "color": "#4A90D9",
+      "transition_in": {
+        "style": "wave_right",
+        "duration_ms": 180
+      }
+    },
+    {
+      "id": "vm2",
+      "name": "VM 2",
+      "node_id": "vm2._ozma._udp.local.",
+      "color": "#50C878",
+      "transition_in": {
+        "style": "wave_left",
+        "duration_ms": 180
+      }
+    }
+  ],
+  "default": "vm1"
+}

@@ -1,0 +1,8 @@
+# Ozma Node — Python dependencies
+# Install: pip install -r node/requirements.txt
+
+# HTTP API
+aiohttp>=3.8
+
+# mDNS announcement
+zeroconf>=0.132

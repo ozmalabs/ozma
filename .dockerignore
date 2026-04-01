@@ -1,0 +1,13 @@
+.git
+.github
+.venv
+__pycache__
+*.pyc
+docs
+dev
+demo/cache
+demo/logs
+images
+tests
+*.md
+!controller/requirements.txt

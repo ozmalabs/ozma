@@ -1,0 +1,70 @@
+# Ozma RPA script: Bootstrap Windows agent — fully air-gapped
+#
+# NO NETWORK in the VM. Everything comes from the USB drive (E:\).
+# The soft node delivers the drive via USB mass storage.
+#
+# Prerequisites:
+#   - bash dev/windows-vm/prepare-media.sh  (downloads everything to host)
+#   - bash dev/windows-vm/provision.sh create  (starts VM, no network)
+#   - Windows booted and at desktop (autounattend.xml handles this)
+#
+# What's on the USB drive (E:\):
+#   python/         Python 3.12 installer
+#   wheels/         All pip wheels (offline)
+#   ozma/           Agent source + offline install script
+#   viostor/        Virtio drivers (used during Windows install)
+
+log === Ozma Windows Agent Bootstrap (Air-Gapped) ===
+
+# Wait for Windows desktop
+log Waiting for Windows desktop...
+wait_for_text taskbar
+sleep 10
+
+# Open PowerShell as administrator
+log Opening PowerShell as admin...
+key win+x
+sleep 1
+key a
+sleep 3
+# Accept UAC if it appears
+key left
+key enter
+sleep 3
+
+# Wait for PowerShell prompt
+wait_for_text PS C:\
+sleep 1
+
+# Run the offline install script from the USB drive
+log Running offline installer from USB drive...
+type Set-ExecutionPolicy Bypass -Scope Process -Force\n
+sleep 2
+type E:\ozma\install-offline.ps1\n
+
+# This takes a while — Python install + pip from wheels + pyinstaller build
+# Wait for each major step
+
+# Python install (~30s)
+log Waiting for Python install...
+sleep 60
+
+# Pip wheels install (~30s)
+log Waiting for pip packages...
+sleep 60
+
+# PyInstaller build (~2-3 min)
+log Waiting for PyInstaller build (this is the slow part)...
+sleep 180
+
+# Wait for completion
+wait_for_text === Complete ===
+sleep 5
+
+# Verify the exe was copied to the USB drive
+type dir E:\ozma\ozma-agent.exe\n
+sleep 3
+
+log === Air-gapped bootstrap complete ===
+log No network was used. Everything came from the USB drive.
+log Built .exe is on the USB drive at E:\ozma\ozma-agent.exe

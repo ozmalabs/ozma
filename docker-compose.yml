@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
+# Ozma Controller — Docker Compose
+#
+# Quick start:
+#   docker compose up
+#
+# Then open http://localhost:7380 in your browser.
+#
+# Install soft nodes on target machines:
+#   pip install ozma-softnode
+#   ozma-softnode --name my-desktop --controller http://<this-machine>:7380
+
+services:
+  controller:
+    image: ghcr.io/ozmalabs/ozma:main
+    build: .  # falls back to local build if image not available
+    container_name: ozma-controller
+    restart: unless-stopped
+
+    # Host networking required for:
+    #   - mDNS multicast (node discovery)
+    #   - UDP HID packets to nodes on the LAN
+    #   - PipeWire audio (host socket)
+    network_mode: host
+
+    volumes:
+      # Persist scenarios, mesh registry, and configuration across restarts
+      - ozma-data:/opt/ozma/controller/data
+      # PipeWire socket for audio routing (Linux only)
+      - /run/user/${UID:-1000}/pipewire-0:/run/user/1000/pipewire-0:ro
+      # Optional: mount your own scenarios.json
+      # - ./my-scenarios.json:/opt/ozma/controller/scenarios.json
+
+    environment:
+      - OZMA_API_HOST=0.0.0.0
+      - OZMA_API_PORT=7380
+      # Set to 1 to enable WirePlumber-based audio (faster switching)
+      - OZMA_AUDIO_WIREPLUMBER=0
+      # Set to 1 for debug logging
+      - OZMA_DEBUG=0
+      # PipeWire runtime directory
+      - XDG_RUNTIME_DIR=/run/user/1000
+
+volumes:
+  ozma-data:

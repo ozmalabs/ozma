@@ -1,0 +1,2939 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ozma — Dashboard</title>
+<link rel="icon" href="/static/favicon.ico" sizes="any">
+<link rel="icon" href="/static/logo.svg" type="image/svg+xml">
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+<style>
+/* ── Reset & base ──────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:       #0a0a0f;
+  --surface:  #111118;
+  --surface2: #18181f;
+  --border:   rgba(255,255,255,0.08);
+  --border2:  rgba(255,255,255,0.14);
+  --text:     #d0d0d8;
+  --muted:    #555560;
+  --accent:   #5b6fff;
+  --green:    #3ecf8e;
+  --red:      #f26464;
+  --yellow:   #f0b94a;
+  --radius:   8px;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  font-size: 13px;
+  line-height: 1.5;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── Top bar ───────────────────────────────────────────────────────────────── */
+#topbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 0 20px;
+  height: 48px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  z-index: 100;
+}
+#topbar .logo {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: #fff;
+}
+#topbar .logo span { color: var(--accent); }
+#topbar .spacer { flex: 1; }
+#conn-badge {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  transition: color 0.2s;
+}
+#conn-badge .dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+  transition: background 0.2s;
+}
+#conn-badge.connected { color: var(--green); }
+#conn-badge.connected .dot { background: var(--green); box-shadow: 0 0 6px var(--green); }
+#conn-badge.error { color: var(--red); }
+#conn-badge.error .dot { background: var(--red); }
+
+.mode-btn {
+  font-size: 11px; font-weight: 600; letter-spacing: 0.03em;
+  padding: 3px 10px; border: none; border-radius: 4px;
+  background: transparent; color: var(--muted); cursor: pointer;
+  transition: all 0.15s;
+}
+.mode-btn:hover { color: var(--text); }
+.mode-btn.active { background: var(--accent); color: #000; }
+
+/* Mode visibility — panels declare their minimum mode */
+[data-mode="advanced"] { display: none; }
+[data-mode="amazing"] { display: none; }
+body.mode-advanced [data-mode="advanced"] { display: block; }
+body.mode-advanced [data-mode="amazing"] { display: none; }
+body.mode-amazing [data-mode="advanced"] { display: block; }
+body.mode-amazing [data-mode="amazing"] { display: block; }
+/* Panels use flex by default in the grid */
+#main [data-mode="advanced"].panel { display: none; }
+#main [data-mode="amazing"].panel { display: none; }
+body.mode-advanced #main [data-mode="advanced"].panel { display: flex; }
+body.mode-amazing #main [data-mode="advanced"].panel { display: flex; }
+body.mode-amazing #main [data-mode="amazing"].panel { display: flex; }
+/* full-width panels */
+#main [data-mode="advanced"].panel.full-width { display: none; }
+#main [data-mode="amazing"].panel.full-width { display: none; }
+body.mode-advanced #main [data-mode="advanced"].panel.full-width { display: flex; }
+body.mode-amazing #main [data-mode="advanced"].panel.full-width { display: flex; }
+body.mode-amazing #main [data-mode="amazing"].panel.full-width { display: flex; }
+
+.topbar-link {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+  text-decoration: none;
+  padding: 5px 10px;
+  border-radius: 5px;
+  transition: color 0.15s, background 0.15s;
+}
+.topbar-link:hover { color: #fff; background: rgba(255,255,255,0.06); }
+
+/* ── Main layout ───────────────────────────────────────────────────────────── */
+#main {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: auto auto 1fr;
+  gap: 1px;
+  background: var(--border);
+  overflow: auto;
+}
+
+/* ── Panel ─────────────────────────────────────────────────────────────────── */
+.panel {
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.panel.full-width {
+  grid-column: 1 / -1;
+}
+.panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px 10px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.panel-head h2 {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.panel-head .count {
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--surface2);
+  border-radius: 10px;
+  padding: 1px 7px;
+}
+.panel-head .panel-actions { margin-left: auto; display: flex; gap: 6px; }
+.panel-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+}
+
+/* ── Scrollbar ─────────────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
+
+/* ── Empty state ───────────────────────────────────────────────────────────── */
+.empty {
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+  padding: 28px 0;
+}
+
+/* ── Buttons ───────────────────────────────────────────────────────────────── */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 11px;
+  border-radius: 5px;
+  border: 1px solid var(--border2);
+  background: var(--surface2);
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+  white-space: nowrap;
+}
+.btn:hover { background: rgba(255,255,255,0.08); color: #fff; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.primary:hover { filter: brightness(1.15); }
+.btn.danger { color: var(--red); border-color: rgba(242,100,100,0.25); }
+.btn.danger:hover { background: rgba(242,100,100,0.12); }
+.btn.sm { padding: 3px 8px; font-size: 10px; }
+.btn:disabled { opacity: 0.4; pointer-events: none; }
+
+/* ── Node cards ────────────────────────────────────────────────────────────── */
+#nodes-list { display: flex; flex-direction: column; gap: 8px; }
+.node-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 11px 13px;
+  transition: border-color 0.15s;
+}
+.node-card.active-node { border-color: var(--accent); }
+.node-card:hover { border-color: var(--border2); }
+
+.node-card-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 7px;
+}
+.node-status-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex-shrink: 0;
+}
+.node-status-dot.online { background: var(--green); box-shadow: 0 0 5px var(--green); }
+.node-status-dot.offline { background: var(--muted); }
+
+.node-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: #fff;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.node-active-badge {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent);
+  background: rgba(91,111,255,0.12);
+  border: 1px solid rgba(91,111,255,0.25);
+  border-radius: 4px;
+  padding: 1px 6px;
+}
+
+.node-meta {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.node-meta .kv { display: flex; gap: 4px; align-items: center; }
+.node-meta .kv .k { color: var(--muted); font-size: 11px; }
+.node-meta .kv .v { color: var(--text); font-size: 11px; font-family: 'JetBrains Mono', 'Fira Code', monospace; }
+
+.caps { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 9px; }
+.cap {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  text-transform: uppercase;
+}
+.cap.hid     { color: #a78bfa; border-color: rgba(167,139,250,0.2); background: rgba(167,139,250,0.06); }
+.cap.video   { color: #38bdf8; border-color: rgba(56,189,248,0.2);  background: rgba(56,189,248,0.06); }
+.cap.audio   { color: var(--yellow); border-color: rgba(240,185,74,0.2); background: rgba(240,185,74,0.06); }
+.cap.uac2-audio { color: var(--yellow); border-color: rgba(240,185,74,0.2); background: rgba(240,185,74,0.06); }
+
+/* ── Audio routing row ─────────────────────────────────────────────────────── */
+.audio-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+  font-size: 11px;
+}
+.audio-type-badge {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.audio-type-badge.pipewire {
+  color: #7dd3fc;
+  border: 1px solid rgba(125,211,252,0.25);
+  background: rgba(125,211,252,0.06);
+}
+.audio-type-badge.vban {
+  color: #86efac;
+  border: 1px solid rgba(134,239,172,0.25);
+  background: rgba(134,239,172,0.06);
+}
+.audio-sink-name {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  color: var(--text);
+  font-size: 11px;
+}
+.audio-linked-badge {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--yellow);
+  border: 1px solid rgba(240,185,74,0.25);
+  background: rgba(240,185,74,0.06);
+  border-radius: 4px;
+}
+/* ── Volume slider ──────────────────────────────────────────────────────────── */
+.vol-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+.vol-slider {
+  flex: 1;
+  height: 4px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: var(--border2);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+.vol-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 12px; height: 12px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: none;
+  cursor: pointer;
+}
+.vol-label {
+  font-size: 10px;
+  font-family: monospace;
+  color: var(--muted);
+  min-width: 36px;
+  text-align: right;
+}
+.mute-btn {
+  background: none;
+  border: 1px solid var(--border2);
+  border-radius: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 2px 6px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.mute-btn:hover { border-color: var(--accent); color: var(--accent); }
+.mute-btn.muted { border-color: var(--red); color: var(--red); background: rgba(242,100,100,0.08);
+  padding: 1px 6px;
+  letter-spacing: 0.03em;
+}
+
+.node-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+
+/* ── USB panel ─────────────────────────────────────────────────────────────── */
+.usb-panel {
+  display: none;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.usb-panel.open { display: block; }
+
+.usb-section-title {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 6px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.usb-section-title .udc-badge {
+  font-size: 9px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+.udc-badge.active   { background: rgba(62,207,142,0.12); color: var(--green); border: 1px solid rgba(62,207,142,0.25); }
+.udc-badge.inactive { background: rgba(255,255,255,0.04); color: var(--muted); border: 1px solid var(--border); }
+
+.usb-func-list, .usb-device-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-bottom: 10px;
+}
+.usb-func-row, .usb-device-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  padding: 4px 7px;
+  border-radius: 5px;
+  background: var(--surface2);
+}
+.usb-func-icon { font-size: 13px; flex-shrink: 0; }
+.usb-func-name { flex: 1; color: var(--text); }
+.usb-func-sub  { color: var(--muted); font-size: 10px; }
+
+.usb-vid-pid { color: var(--muted); font-size: 10px; font-family: monospace; flex-shrink: 0; }
+.usb-product { flex: 1; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.usb-speed   { font-size: 10px; color: var(--muted); flex-shrink: 0; }
+
+.usb-loading { color: var(--muted); font-size: 11px; padding: 6px 0; }
+.usb-error   { color: var(--red);   font-size: 11px; padding: 6px 0; }
+.usb-none    { color: var(--muted); font-size: 11px; padding: 2px 0; font-style: italic; }
+
+/* ── Stream tiles ──────────────────────────────────────────────────────────── */
+#streams-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; }
+.stream-tile {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.stream-preview {
+  aspect-ratio: 16/9;
+  background: #000;
+  position: relative;
+  overflow: hidden;
+}
+.stream-preview img {
+  width: 100%; height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.stream-preview canvas {
+  width: 100%; height: 100%;
+  display: block;
+}
+.stream-preview .stream-badge {
+  position: absolute;
+  top: 6px; right: 6px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 2px 5px;
+  border-radius: 3px;
+  background: rgba(0,0,0,0.6);
+  color: #fff;
+}
+.stream-preview .stream-badge.live { color: var(--red); }
+.stream-preview .stream-badge.hls  { color: var(--yellow); }
+.stream-info {
+  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.stream-node { font-size: 11px; color: var(--text); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stream-type { font-size: 10px; color: var(--muted); }
+
+/* ── Scenarios ─────────────────────────────────────────────────────────────── */
+#scenarios-list { display: flex; flex-direction: column; gap: 8px; }
+.scenario-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 13px;
+}
+.scenario-card.active-scenario { border-color: #3ecf8e; }
+.scenario-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.scenario-color { width: 10px; height: 10px; border-radius: 3px; flex-shrink: 0; }
+.scenario-name { font-size: 13px; font-weight: 600; color: #fff; flex: 1; }
+.scenario-active-badge {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--green);
+  text-transform: uppercase;
+}
+.scenario-meta { font-size: 11px; color: var(--muted); margin-bottom: 8px; }
+.scenario-meta .bound-node { color: var(--text); font-family: monospace; }
+.scenario-actions { display: flex; gap: 6px; align-items: center; }
+
+/* ── Create scenario form ──────────────────────────────────────────────────── */
+#create-scenario-form {
+  background: var(--surface);
+  border: 1px solid var(--border2);
+  border-radius: var(--radius);
+  padding: 11px 13px;
+  display: none;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+#create-scenario-form.open { display: flex; }
+.form-row { display: flex; gap: 8px; align-items: center; }
+.form-row label { font-size: 11px; color: var(--muted); min-width: 40px; }
+input[type="text"], select {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--border2);
+  border-radius: 5px;
+  color: var(--text);
+  font-size: 12px;
+  padding: 5px 9px;
+  outline: none;
+  font-family: inherit;
+  min-width: 0;
+}
+input[type="text"]:focus, select:focus { border-color: var(--accent); }
+select option { background: var(--surface); }
+
+/* ── Bind node dropdown (inline) ───────────────────────────────────────────── */
+.bind-select {
+  background: var(--bg);
+  border: 1px solid var(--border2);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 10px;
+  padding: 3px 6px;
+  cursor: pointer;
+  max-width: 130px;
+}
+
+/* ── Events feed ───────────────────────────────────────────────────────────── */
+#events-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
+}
+.event-row {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 3px 4px;
+  border-radius: 4px;
+  font-size: 11px;
+}
+.event-row:hover { background: var(--surface); }
+.event-time { color: var(--muted); flex-shrink: 0; font-size: 10px; }
+.event-type {
+  font-weight: 700;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+  min-width: 120px;
+}
+.event-type.online    { color: var(--green); }
+.event-type.offline   { color: var(--red); }
+.event-type.switched  { color: var(--accent); }
+.event-type.rgb       { color: var(--yellow); }
+.event-type.other     { color: var(--muted); }
+.event-detail { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+
+/* ── Modal ─────────────────────────────────────────────────────────────────── */
+#modal-overlay {
+  display: none;
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,0.7);
+  z-index: 200;
+  align-items: center;
+  justify-content: center;
+}
+#modal-overlay.open { display: flex; }
+#modal {
+  background: var(--surface);
+  border: 1px solid var(--border2);
+  border-radius: 10px;
+  overflow: hidden;
+  max-width: 90vw;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+}
+#modal-title {
+  padding: 12px 16px;
+  font-size: 12px;
+  font-weight: 700;
+  color: #fff;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+#modal-title button {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 16px;
+  cursor: pointer;
+  line-height: 1;
+}
+#modal-title button:hover { color: #fff; }
+#modal-body { flex: 1; overflow: auto; background: #000; }
+#modal-img { width: 100%; height: 100%; display: block; object-fit: contain; max-height: 70vh; }
+#modal-video { width: 100%; max-height: 70vh; display: block; background: #000; }
+
+/* ── Responsive ────────────────────────────────────────────────────────────── */
+@media (max-width: 700px) {
+  #main { grid-template-columns: 1fr; }
+  .panel.full-width { grid-column: 1; }
+}
+</style>
+</head>
+<body>
+
+<!-- ── Top bar ──────────────────────────────────────────────────────────────── -->
+<div id="topbar">
+  <div class="logo">Oz<span>ma</span></div>
+  <a class="topbar-link" href="/">Keyboard</a>
+  <a class="topbar-link" href="/desk3d.html">3D Desk</a>
+  <div class="spacer"></div>
+  <div id="mode-switcher" style="display:flex;gap:2px;background:var(--surface);border-radius:6px;padding:2px;margin-right:12px">
+    <button class="mode-btn active" onclick="setMode('simple')">Simple</button>
+    <button class="mode-btn" onclick="setMode('advanced')">Advanced</button>
+    <button class="mode-btn" onclick="setMode('amazing')">Amazing</button>
+  </div>
+  <div id="conn-badge"><div class="dot"></div><span>connecting</span></div>
+</div>
+
+<!-- ── Main grid ────────────────────────────────────────────────────────────── -->
+<div id="main">
+
+  <!-- Nodes -->
+  <div class="panel" id="panel-nodes">
+    <div class="panel-head">
+      <h2>Nodes</h2><span class="count" id="node-count">0</span>
+      <div class="panel-actions">
+        <button class="btn sm" id="btn-refresh" title="Refresh nodes">↺</button>
+      </div>
+    </div>
+    <div class="panel-body">
+      <div id="nodes-list"><div class="empty">No nodes discovered</div></div>
+    </div>
+  </div>
+
+  <!-- Streams -->
+  <div class="panel" id="panel-streams" data-mode="advanced">
+    <div class="panel-head">
+      <h2>Streams</h2><span class="count" id="stream-count">0</span>
+    </div>
+    <div class="panel-body">
+      <div id="streams-grid"><div class="empty">No active streams</div></div>
+    </div>
+  </div>
+
+  <!-- Audio -->
+  <div class="panel full-width" id="panel-audio">
+    <div class="panel-head">
+      <h2>Audio</h2>
+      <div class="panel-actions">
+        <span id="audio-mode-badge" style="font-size:10px;color:var(--muted);font-weight:600;letter-spacing:0.04em;text-transform:uppercase"></span>
+      </div>
+    </div>
+    <div class="panel-body" style="padding:10px 12px">
+
+      <!-- Simple mode: just volume + mute for active node -->
+      <div id="audio-simple" data-mode-show="simple" style="margin-bottom:12px">
+        <div id="audio-simple-content" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+        </div>
+      </div>
+
+      <!-- Device graph (amazing only) -->
+      <div data-mode="amazing" style="margin-bottom:12px">
+        <div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px">Device Graph</div>
+        <div id="audio-graph" style="background:var(--surface);border-radius:var(--radius);border:1px solid var(--border);min-height:120px;padding:12px;overflow-x:auto">
+          <svg id="audio-graph-svg" width="100%" height="200" style="display:block"></svg>
+        </div>
+      </div>
+
+      <!-- Devices by node (amazing only) -->
+      <div data-mode="amazing" style="margin-bottom:12px">
+        <div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px">Devices</div>
+        <div id="audio-devices-grid" style="display:flex;gap:10px;flex-wrap:wrap">
+          <div class="empty" style="padding:12px 0">No audio devices</div>
+        </div>
+      </div>
+
+      <!-- Scenario routing (advanced+) -->
+      <div data-mode="advanced" style="margin-bottom:12px;padding-top:10px;border-top:1px solid var(--border)">
+        <div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px">Scenario Routing</div>
+        <div id="audio-routing-grid" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+          <div class="empty" style="padding:12px 0">No audio nodes discovered</div>
+        </div>
+      </div>
+
+      <!-- Output targets (advanced+) -->
+      <div data-mode="advanced" style="margin-bottom:12px;padding-top:10px;border-top:1px solid var(--border)">
+        <div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px">Output Targets</div>
+        <div id="audio-outputs-grid" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <div class="empty" style="padding:8px 0;font-size:11px">No outputs discovered</div>
+        </div>
+      </div>
+
+      <!-- Room correction (advanced+ for full controls, simple gets one button) -->
+      <div style="margin-bottom:12px;padding-top:10px;border-top:1px solid var(--border)">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+          <div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em">Room Correction</div>
+          <span id="rc-status" style="font-size:10px;color:var(--muted)"></span>
+        </div>
+        <div id="rc-panel">
+          <!-- Simple mode: mic selector + one button -->
+          <div id="rc-simple" data-mode-show="simple">
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+              <div style="display:flex;flex-direction:column;gap:2px">
+                <label style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em">Microphone</label>
+                <select id="rc-simple-mic" style="font-size:13px;padding:5px 10px;border-radius:8px;background:var(--bg-secondary);border:1px solid var(--border);color:var(--text);min-width:200px">
+                  <option value="">Loading...</option>
+                </select>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:2px">
+                <label style="font-size:10px;color:var(--muted)">&nbsp;</label>
+                <button class="btn sm accent" style="font-size:14px;padding:8px 20px" onclick="startRoomCorrectionSimple()">Correct Room</button>
+              </div>
+            </div>
+            <span id="rc-simple-status" style="font-size:12px;color:var(--muted)"></span>
+          </div>
+          <!-- Advanced+ mode: full controls -->
+          <div id="rc-idle" data-mode="advanced">
+            <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-bottom:8px">
+              <div style="display:flex;flex-direction:column;gap:2px">
+                <label style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em">Node</label>
+                <select id="rc-node" onchange="rcNodeChanged()" style="font-size:12px;padding:4px 8px;border-radius:6px;background:var(--bg-secondary);border:1px solid var(--border);color:var(--text);max-width:200px">
+                  <option value="">Select node...</option>
+                </select>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:2px">
+                <label style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em">Mic</label>
+                <select id="rc-source" style="font-size:12px;padding:4px 8px;border-radius:6px;background:var(--bg-secondary);border:1px solid var(--border);color:var(--text);max-width:220px">
+                  <option value="">Select node first</option>
+                </select>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:2px">
+                <label style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em">Speakers</label>
+                <select id="rc-sink" style="font-size:12px;padding:4px 8px;border-radius:6px;background:var(--bg-secondary);border:1px solid var(--border);color:var(--text);max-width:220px">
+                  <option value="">Select node first</option>
+                </select>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:2px">
+                <label style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em">Compensation</label>
+                <select id="rc-phone" style="font-size:12px;padding:4px 8px;border-radius:6px;background:var(--bg-secondary);border:1px solid var(--border);color:var(--text)">
+                  <option value="generic">generic</option>
+                </select>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:2px">
+                <label style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em">Target</label>
+                <select id="rc-target" style="font-size:12px;padding:4px 8px;border-radius:6px;background:var(--bg-secondary);border:1px solid var(--border);color:var(--text)">
+                  <option value="harman">Harman</option>
+                  <option value="flat">Flat</option>
+                  <option value="bbc">BBC dip</option>
+                </select>
+              </div>
+              <button class="btn sm accent" onclick="startRoomCorrection()">Sweep</button>
+            </div>
+          </div>
+          <div id="rc-measuring" style="display:none">
+            <div style="display:flex;align-items:center;gap:10px">
+              <div id="rc-spinner" style="width:16px;height:16px;border:2px solid var(--accent);border-top-color:transparent;border-radius:50%;animation:spin 0.8s linear infinite"></div>
+              <span id="rc-progress" style="font-size:13px">Playing sweep...</span>
+            </div>
+          </div>
+          <div id="rc-result" style="display:none">
+            <div style="display:flex;gap:10px;align-items:center;margin-bottom:6px">
+              <span style="font-size:13px;font-weight:600;color:var(--accent)">Correction calculated</span>
+              <button class="btn sm accent" onclick="applyCorrection()">Apply</button>
+              <button class="btn sm" onclick="dismissCorrection()">Dismiss</button>
+            </div>
+            <canvas id="rc-result-canvas" width="400" height="80" style="width:100%;height:60px;border-radius:6px;background:var(--bg-secondary)"></canvas>
+            <div id="rc-bands" style="font-size:11px;color:var(--muted);margin-top:4px"></div>
+          </div>
+          <div id="rc-active-profiles" style="margin-top:6px"></div>
+        </div>
+      </div>
+
+      <!-- Reference tracks + A/B -->
+      <div style="padding-top:10px;border-top:1px solid var(--border)">
+        <div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:6px">Reference Tracks</div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <select id="rc-demo-track" style="font-size:12px;padding:4px 8px;border-radius:6px;background:var(--bg-secondary);border:1px solid var(--border);color:var(--text)">
+            <option value="classical_grieg_mountain_king">Grieg — Hall of the Mountain King</option>
+            <option value="classical_beethoven_coriolan">Beethoven — Coriolan Overture</option>
+            <option value="classical_grieg_morning">Grieg — Morning Mood</option>
+            <option value="thunderstorm">Thunderstorm (4ch)</option>
+          </select>
+          <button class="btn sm" id="rc-demo-play" onclick="rcDemoPlay()">Play</button>
+          <button class="btn sm" id="rc-demo-stop" onclick="rcDemoStop()" style="display:none">Stop</button>
+          <button class="btn sm" id="rc-eq-toggle" onclick="rcToggleEQ()" style="display:none">EQ: ON</button>
+          <span id="rc-demo-status" style="font-size:11px;color:var(--muted)"></span>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Primary Display (active scenario's capture — fullscreen switching) -->
+  <div class="panel full-width" id="panel-primary-display" style="display:none">
+    <div class="panel-head">
+      <h2 id="primary-display-title">Display</h2>
+      <div class="panel-actions">
+        <button class="btn sm" id="btn-ocr" onclick="runOCR()" title="OCR — read text from screen">OCR</button>
+        <button class="btn sm" id="btn-record" onclick="toggleRecording()" title="Record session">● Rec</button>
+      </div>
+    </div>
+    <div class="panel-body" style="padding:0;background:#000">
+      <div id="primary-display-container" style="position:relative;width:100%;max-height:60vh;display:flex;justify-content:center">
+        <video id="primary-video" autoplay muted playsinline style="width:100%;max-height:60vh;object-fit:contain;background:#000"></video>
+        <div id="primary-no-signal" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#333;font-size:14px">No capture source</div>
+      </div>
+      <div id="ocr-output" style="display:none;padding:8px 12px;background:var(--surface);border-top:1px solid var(--border);max-height:150px;overflow:auto">
+        <pre id="ocr-text" style="font-size:11px;color:var(--text);font-family:monospace;white-space:pre-wrap;margin:0"></pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- Display Captures (thumbnails) -->
+  <div class="panel full-width" id="panel-captures" data-mode="advanced">
+    <div class="panel-head">
+      <h2>Display Captures</h2><span class="count" id="capture-count">0</span>
+    </div>
+    <div class="panel-body" style="padding:10px 12px">
+      <div id="captures-grid" style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-start">
+        <div class="empty" style="padding:12px 0">No capture cards detected</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- RGB Zones -->
+  <div class="panel" id="panel-rgb" data-mode="advanced">
+    <div class="panel-head">
+      <h2>RGB Zones</h2><span class="count" id="rgb-count">0</span>
+    </div>
+    <div class="panel-body" style="padding:10px 12px">
+      <div id="rgb-zones-grid" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <div class="empty" style="padding:8px 0;font-size:11px">No RGB zones</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Control Surfaces -->
+  <div class="panel" id="panel-controls" data-mode="advanced">
+    <div class="panel-head">
+      <h2>Control Surfaces</h2><span class="count" id="ctrl-count">0</span>
+    </div>
+    <div class="panel-body">
+      <div id="controls-list"><div class="empty">No control surfaces</div></div>
+    </div>
+  </div>
+
+  <!-- RGB Compositor -->
+  <div class="panel" id="panel-compositor" data-mode="amazing">
+    <div class="panel-head">
+      <h2>RGB Effects</h2>
+    </div>
+    <div class="panel-body" style="padding:10px 12px">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px">
+        <label style="font-size:11px;color:var(--muted);min-width:50px">Ambient</label>
+        <select id="ambient-effect" onchange="setAmbient()" style="background:var(--surface2);color:var(--text);border:1px solid var(--border2);border-radius:4px;padding:3px 6px;font-size:11px">
+          <option value="solid">Solid</option>
+          <option value="rainbow">Rainbow</option>
+          <option value="breathe">Breathe</option>
+          <option value="chase">Chase</option>
+          <option value="fire">Fire</option>
+          <option value="colour_cycle">Colour Cycle</option>
+        </select>
+        <input type="color" id="ambient-color" value="#140f28" onchange="setAmbient()" style="width:28px;height:22px;border:none;cursor:pointer" title="Base colour">
+        <label style="font-size:10px;color:var(--muted)">Bri</label>
+        <input type="range" class="vol-slider" id="ambient-bri" min="5" max="100" value="30" oninput="setAmbient()" style="width:80px" title="Brightness">
+        <label style="font-size:10px;color:var(--muted)">Speed</label>
+        <input type="range" class="vol-slider" id="ambient-speed" min="10" max="300" value="100" oninput="setAmbient()" style="width:60px" title="Speed">
+      </div>
+      <div id="compositor-layers" style="font-size:11px;color:var(--muted)">No active layers</div>
+    </div>
+  </div>
+
+  <!-- Motion Devices -->
+  <div class="panel" id="panel-motion" data-mode="advanced">
+    <div class="panel-head">
+      <h2>Motion</h2><span class="count" id="motion-count">0</span>
+    </div>
+    <div class="panel-body">
+      <div id="motion-list"><div class="empty">No motion devices</div></div>
+    </div>
+  </div>
+
+  <!-- Bluetooth & Phone -->
+  <div class="panel full-width" id="panel-bt" data-mode="advanced">
+    <div class="panel-head">
+      <h2>Bluetooth & Phone</h2>
+      <div class="panel-actions">
+        <button class="btn sm" onclick="btDiscover()" title="Scan for BT devices">Scan</button>
+      </div>
+    </div>
+    <div class="panel-body" style="padding:10px 12px">
+      <div style="display:flex;gap:12px;flex-wrap:wrap">
+        <div style="flex:1;min-width:200px">
+          <div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:6px">Bluetooth Devices</div>
+          <div id="bt-devices-list"><div class="empty" style="font-size:11px">No devices</div></div>
+        </div>
+        <div style="flex:1;min-width:200px">
+          <div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:6px">Phone / KDE Connect</div>
+          <div id="phone-list"><div class="empty" style="font-size:11px">No phones connected</div></div>
+        </div>
+        <div style="flex:1;min-width:200px">
+          <div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:6px">Wi-Fi Audio</div>
+          <div id="wifi-audio-list"><div class="empty" style="font-size:11px">—</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Scenarios -->
+  <div class="panel" id="panel-scenarios">
+    <div class="panel-head">
+      <h2>Scenarios</h2><span class="count" id="scenario-count">0</span>
+      <div class="panel-actions">
+        <button class="btn sm primary" id="btn-new-scenario">+ New</button>
+      </div>
+    </div>
+    <div class="panel-body">
+      <div id="create-scenario-form">
+        <div class="form-row">
+          <label>ID</label>
+          <input type="text" id="new-sc-id" placeholder="my-scenario">
+        </div>
+        <div class="form-row">
+          <label>Name</label>
+          <input type="text" id="new-sc-name" placeholder="My Scenario">
+        </div>
+        <div class="form-row">
+          <label>Node</label>
+          <select id="new-sc-node"><option value="">— none —</option></select>
+        </div>
+        <div class="form-row" style="justify-content:flex-end; gap:6px">
+          <button class="btn sm" id="btn-cancel-scenario">Cancel</button>
+          <button class="btn sm primary" id="btn-submit-scenario">Create</button>
+        </div>
+      </div>
+      <div id="scenarios-list"><div class="empty">No scenarios</div></div>
+    </div>
+  </div>
+
+  <!-- Automation & Macros -->
+  <div class="panel" id="panel-automation" data-mode="amazing">
+    <div class="panel-head">
+      <h2>Automation</h2>
+      <div class="panel-actions">
+        <button class="btn sm primary" onclick="runAutomationScript()">Run</button>
+      </div>
+    </div>
+    <div class="panel-body" style="padding:10px 12px">
+      <textarea id="automation-script" rows="6" style="width:100%;background:var(--surface2);color:var(--text);border:1px solid var(--border2);border-radius:4px;padding:6px;font-family:monospace;font-size:11px;resize:vertical" placeholder="# Automation script&#10;wait_for_text &quot;login:&quot; timeout=30&#10;type &quot;root\n&quot;"></textarea>
+      <div id="automation-result" style="font-size:11px;color:var(--muted);margin-top:4px"></div>
+    </div>
+  </div>
+
+  <!-- Macros & Schedule -->
+  <div class="panel" id="panel-macros" data-mode="advanced">
+    <div class="panel-head">
+      <h2>Macros & Schedule</h2>
+    </div>
+    <div class="panel-body" style="padding:10px 12px">
+      <div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:4px">Macros</div>
+      <div id="macros-list" style="margin-bottom:10px"><div class="empty" style="font-size:11px">No macros</div></div>
+      <div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:4px">Schedule</div>
+      <div id="schedule-list"><div class="empty" style="font-size:11px">No rules</div></div>
+      <div style="display:flex;gap:4px;margin-top:6px;align-items:center;flex-wrap:wrap">
+        <input id="sched-time" type="time" value="09:00" style="background:var(--surface2);color:var(--text);border:1px solid var(--border2);border-radius:3px;padding:2px 4px;font-size:11px">
+        <input id="sched-days" type="text" value="mon-fri" placeholder="days" style="width:80px;background:var(--surface2);color:var(--text);border:1px solid var(--border2);border-radius:3px;padding:2px 4px;font-size:11px">
+        <input id="sched-scenario" type="text" placeholder="scenario" style="width:70px;background:var(--surface2);color:var(--text);border:1px solid var(--border2);border-radius:3px;padding:2px 4px;font-size:11px">
+        <button class="btn sm primary" onclick="addScheduleRule()" style="font-size:10px">+ Add</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- OCR Triggers & Network Health -->
+  <div class="panel full-width" id="panel-ocr-health" data-mode="amazing">
+    <div class="panel-head">
+      <h2>Screen Watch & Network</h2>
+    </div>
+    <div class="panel-body" style="padding:10px 12px;display:flex;gap:16px;flex-wrap:wrap">
+      <div style="flex:1;min-width:250px">
+        <div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:4px">OCR Triggers <span id="ocr-trigger-count" style="color:var(--text)">0</span></div>
+        <div id="ocr-triggers-list" style="font-size:11px;max-height:150px;overflow:auto"><div class="empty">Loading...</div></div>
+      </div>
+      <div style="flex:1;min-width:250px">
+        <div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:4px">Network Health</div>
+        <div id="net-health-list" style="font-size:11px"><div class="empty">Loading...</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Events -->
+  <div class="panel" id="panel-events" data-mode="advanced">
+    <div class="panel-head">
+      <h2>Events</h2><span class="count" id="event-count">0</span>
+      <div class="panel-actions">
+        <button class="btn sm" id="btn-clear-events">Clear</button>
+      </div>
+    </div>
+    <div class="panel-body" id="events-body">
+      <div id="events-list"><div class="empty">Waiting for events…</div></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ── Stream modal ──────────────────────────────────────────────────────────── -->
+<div id="modal-overlay">
+  <div id="modal">
+    <div id="modal-title">
+      <span id="modal-title-text">Stream</span>
+      <button id="modal-close">✕</button>
+    </div>
+    <div id="modal-body">
+      <img id="modal-img" src="" alt="" style="display:none">
+      <video id="modal-video" autoplay muted playsinline controls style="display:none"></video>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── State ─────────────────────────────────────────────────────────────────────
+let nodes     = {};   // id → NodeInfo
+let scenarios = {};   // id → Scenario
+let streams   = {};   // node_id → stream info
+let activeNodeId     = null;
+let activeScenarioId = null;
+let eventCount = 0;
+const MAX_EVENTS = 100;
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+const fmt = t => new Date(t).toLocaleTimeString('en', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+const now = () => fmt(Date.now());
+
+function shortId(id) {
+  // "mynode._ozma._udp.local." → "mynode"
+  return id.replace(/\._ozma\._udp\.local\.$/, '').replace(/\._ozma\._tcp\.local\.$/, '');
+}
+
+// ── API helpers ───────────────────────────────────────────────────────────────
+async function api(method, path, body) {
+  const opts = { method, headers: {} };
+  if (body) { opts.body = JSON.stringify(body); opts.headers['Content-Type'] = 'application/json'; }
+  const r = await fetch('/api/v1' + path, opts);
+  if (!r.ok) throw new Error(`${method} ${path} → ${r.status}`);
+  return r.json();
+}
+
+// ── Initial data load ─────────────────────────────────────────────────────────
+async function loadAll() {
+  try {
+    const [status, scenarioData, streamData, audioData] = await Promise.all([
+      api('GET', '/status'),
+      api('GET', '/scenarios'),
+      api('GET', '/streams'),
+      api('GET', '/audio/nodes').catch(() => ({ nodes: {}, links: [] })),
+    ]);
+
+    activeNodeId = status.active_node_id;
+    activeScenarioId = status.active_scenario_id;
+
+    nodes = {};
+    for (const n of Object.values(status.nodes)) nodes[n.id] = n;
+
+    scenarios = {};
+    for (const s of scenarioData.scenarios) scenarios[s.id] = s;
+
+    streams = {};
+    for (const s of streamData.streams) streams[s.node_id] = s;
+
+    pwAudioState = audioData;
+
+    renderNodes();
+    renderScenarios();
+    renderStreams();
+    renderAudio();
+    renderAudioSimple();
+    initSimpleMicSelector();
+    fetchAllAudioDevices();
+    fetchCaptures();
+    setTimeout(updatePrimaryDisplay, 500); // after captures load
+    fetchAudioOutputs();
+    fetchRGBZones();
+    fetchCompositor();
+    fetchMacros();
+    fetchSchedule();
+    fetchOCRTriggers();
+    fetchNetHealth();
+    fetchMotion();
+    fetchBluetooth();
+    fetchKDEConnect();
+    fetchWifiAudio();
+    fetchControls();
+  } catch (e) {
+    console.error('loadAll:', e);
+  }
+}
+
+// ── Render: nodes ─────────────────────────────────────────────────────────────
+function renderNodes() {
+  const list = $('nodes-list');
+  const ns = Object.values(nodes);
+  $('node-count').textContent = ns.length;
+
+  if (!ns.length) {
+    list.innerHTML = '<div class="empty">No nodes discovered</div>';
+    return;
+  }
+
+  if (currentMode === 'simple') {
+    list.innerHTML = ns.map(n => {
+      const isActive = n.id === activeNodeId;
+      const name = shortId(n.id);
+      const eid = esc(n.id);
+      return `<div class="node-card ${isActive ? 'active-node' : ''}" style="padding:14px 18px" data-id="${eid}">
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <div>
+            <div style="font-size:16px;font-weight:700;color:#fff">${esc(name)}</div>
+            <div style="font-size:11px;color:${isActive ? 'var(--accent)' : 'var(--muted)'};font-weight:600;margin-top:2px">${isActive ? 'Active' : 'Ready'}</div>
+          </div>
+          ${!isActive ? `<button class="btn sm primary" style="font-size:13px;padding:6px 16px" onclick="activateNode('${eid}')">Switch</button>` : ''}
+        </div>
+      </div>`;
+    }).join('');
+    return;
+  }
+
+  list.innerHTML = ns.map(n => {
+    const isActive = n.id === activeNodeId;
+    const caps = (n.capabilities || []).map(c =>
+      `<span class="cap ${c}">${c}</span>`
+    ).join('');
+    const hasStream = !!streams[n.id];
+    const hasUsb = !!n.api_port;
+    const hasVnc = n.vnc_host && n.vnc_port;
+    const hasPower = (n.capabilities || []).includes('power');
+    const eid = esc(n.id);
+
+    // Audio routing row
+    let audioHtml = '';
+    if (n.audio_type === 'pipewire' && n.audio_sink) {
+      audioHtml = `<div class="audio-row">
+        <span class="audio-type-badge pipewire">PipeWire</span>
+        <span class="audio-sink-name">${esc(n.audio_sink)}</span>
+        ${isActive ? '<span class="audio-linked-badge">♪ linked</span>' : ''}
+      </div>`;
+    } else if (n.audio_type === 'vban' && n.audio_vban_port) {
+      audioHtml = `<div class="audio-row">
+        <span class="audio-type-badge vban">VBAN</span>
+        <span class="audio-sink-name">port ${n.audio_vban_port}</span>
+        ${isActive ? '<span class="audio-linked-badge">♪ linked</span>' : ''}
+      </div>`;
+    }
+
+    return `<div class="node-card ${isActive ? 'active-node' : ''}" data-id="${eid}">
+      <div class="node-card-top">
+        <div class="node-status-dot online"></div>
+        <div class="node-name" title="${esc(n.id)}">${esc(shortId(n.id))}</div>
+        ${isActive ? '<span class="node-active-badge">Active</span>' : ''}
+      </div>
+      <div class="node-meta">
+        <div class="kv"><span class="k">host</span><span class="v">${esc(n.host)}</span></div>
+        <div class="kv"><span class="k">hw</span><span class="v">${esc(n.hw)}</span></div>
+        <div class="kv"><span class="k">role</span><span class="v">${esc(n.role)}</span></div>
+        <div class="kv"><span class="k">fw</span><span class="v">${esc(n.fw_version)}</span></div>
+      </div>
+      ${caps ? `<div class="caps">${caps}</div>` : ''}
+      ${audioHtml}
+      ${hasPower ? `<div style="display:flex;gap:4px;margin:6px 0;flex-wrap:wrap">
+        <button class="btn sm" onclick="nodePower('${eid}','on')" title="Power On">&#x23FB; On</button>
+        <button class="btn sm" onclick="nodePower('${eid}','off')" title="Graceful Off">Off</button>
+        <button class="btn sm" onclick="nodePower('${eid}','reset')" title="Reset">Reset</button>
+        <button class="btn sm" onclick="nodePower('${eid}','force-off')" title="Force Off (hold 5s)" style="color:var(--red)">Force</button>
+        <button class="btn sm" onclick="nodePower('${eid}','cycle')" title="Power Cycle">Cycle</button>
+        <span id="pwr-${eid}" style="font-size:10px;color:var(--muted);align-self:center;margin-left:4px"></span>
+      </div>` : ''}
+      <div class="node-actions">
+        ${!isActive ? `<button class="btn sm primary" onclick="activateNode('${eid}')">Activate</button>` : ''}
+        ${hasStream ? `<button class="btn sm" onclick="openStream('${eid}')">▶ Stream</button>` : ''}
+        ${hasVnc ? `<a class="btn sm" href="vnc://${esc(n.vnc_host)}:${n.vnc_port}" target="_blank" title="Open VNC">⬚ VNC</a>` : ''}
+        ${hasUsb ? `<button class="btn sm" id="usb-btn-${eid}" onclick="toggleUsb('${eid}')">⬡ USB</button>` : ''}
+      </div>
+      ${hasUsb ? `<div class="usb-panel" id="usb-panel-${eid}"><div class="usb-loading">Loading…</div></div>` : ''}
+    </div>`;
+  }).join('');
+
+  // Populate node dropdowns
+  populateNodeSelects();
+}
+
+// ── Audio state from PipeWire watcher ─────────────────────────────────────────
+let pwAudioState = { nodes: {}, links: [] };
+
+function fetchAudioState() {
+  api('GET', '/audio/nodes').then(d => {
+    pwAudioState = d;
+    renderAudio();
+  }).catch(() => {});
+}
+
+function setVolume(nodeName, vol) {
+  api('POST', '/audio/volume', { node_name: nodeName, volume: vol }).catch(() => {});
+}
+
+function setMute(nodeName, muted) {
+  api('POST', '/audio/mute', { node_name: nodeName, mute: muted }).catch(() => {});
+}
+
+// ── Audio outputs (AirPlay, RTP, etc.) ───────────────────────────────────────
+let audioOutputs = [];
+
+function fetchAudioOutputs() {
+  api('GET', '/audio/outputs').then(d => {
+    audioOutputs = d.outputs || [];
+    renderAudioOutputs();
+  }).catch(() => {});
+}
+
+function toggleAudioOutput(outputId, currentlyEnabled) {
+  const endpoint = currentlyEnabled ? '/audio/outputs/disable' : '/audio/outputs/enable';
+  api('POST', endpoint, { output_id: outputId }).then(() => {
+    fetchAudioOutputs();
+  }).catch(() => {});
+}
+
+function setOutputDelay(outputId, delayMs) {
+  api('POST', '/audio/outputs/delay', { output_id: outputId, delay_ms: delayMs }).catch(() => {});
+}
+
+function renderAudioOutputs() {
+  const container = $('audio-outputs-grid');
+  if (!container) return;
+
+  if (!audioOutputs.length) {
+    container.innerHTML = '<div class="empty" style="padding:8px 0;font-size:11px">No outputs discovered</div>';
+    return;
+  }
+
+  const protocolColors = {
+    local: '#a78bfa', raop: '#f472b6', rtp: '#38bdf8',
+    roc: '#34d399', pulse: '#fb923c', snapcast: '#a3e635',
+    vban: '#86efac', bluetooth: '#60a5fa',
+  };
+
+  container.innerHTML = audioOutputs.map(o => {
+    const color = protocolColors[o.protocol] || '#888';
+    const border = o.enabled ? color : 'var(--border)';
+    const delayVal = Math.round(o.delay_ms || 0);
+    return `<div style="
+      background:var(--surface);border:1px solid ${border};border-radius:var(--radius);
+      padding:8px 12px;min-width:180px;flex:1;max-width:260px;transition:all 0.15s;
+    ">
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+        <button class="mute-btn ${o.enabled ? '' : 'muted'}" style="font-size:10px;padding:1px 5px"
+                onclick="toggleAudioOutput('${esc(o.id)}', ${o.enabled})"
+                title="${o.enabled ? 'Disable' : 'Enable'}">${o.enabled ? 'ON' : 'OFF'}</button>
+        <span style="font-size:12px;font-weight:600;color:#fff">${esc(o.name)}</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">
+        <span style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.04em;
+          padding:1px 5px;border-radius:3px;background:${color}20;color:${color};
+          border:1px solid ${color}33">${esc(o.protocol)}</span>
+        ${o.host ? `<span style="font-size:10px;color:var(--muted)">${esc(o.host)}</span>` : ''}
+      </div>
+      <div class="vol-row" style="margin-top:4px" title="Time-alignment delay">
+        <span style="font-size:10px;color:var(--muted);min-width:32px">Delay</span>
+        <input type="range" class="vol-slider" min="0" max="500" step="5" value="${delayVal}"
+               oninput="setOutputDelay('${esc(o.id)}', Number(this.value)); this.nextElementSibling.textContent=this.value+'ms'"
+               title="Delay: ${delayVal}ms">
+        <span class="vol-label">${delayVal}ms</span>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// ── Audio: fetch all node devices and render graph ───────────────────────────
+let allAudioDevices = {};  // nodeId → [{name, description, media_class, id}]
+
+async function fetchAllAudioDevices() {
+  allAudioDevices = {};
+  const nodeList = Object.values(nodes);
+  for (const n of nodeList) {
+    if (!n.api_port) continue;
+    try {
+      const d = await api('GET', `/audio/room-correction/node-audio?node_id=${encodeURIComponent(n.id)}`);
+      if (d && d.nodes) allAudioDevices[n.id] = d.nodes;
+    } catch(e) {}
+  }
+  renderAudioGraph();
+  renderAudioDevices();
+}
+
+function renderAudioGraph() {
+  const svg = document.getElementById('audio-graph-svg');
+  if (!svg) return;
+  const allNodes = Object.entries(allAudioDevices);
+  if (!allNodes.length) { svg.innerHTML = '<text x="10" y="20" fill="#666" font-size="12">No audio devices</text>'; return; }
+
+  const W = svg.clientWidth || 800;
+  let y = 10;
+  const nodeH = 24;
+  const groupGap = 16;
+  const sourceX = 10;
+  const sinkX = W - 10;
+  const midX = W / 2;
+  let lines = [];
+  let rects = [];
+
+  for (const [nodeId, devices] of allNodes) {
+    const nodeName = nodeId.replace('._ozma._udp.local.', '');
+    rects.push(`<text x="${midX}" y="${y + 12}" fill="var(--muted)" font-size="10" text-anchor="middle" font-weight="600">${esc(nodeName)}</text>`);
+    y += 18;
+    const sources = devices.filter(d => d.media_class && (d.media_class.includes('Source') || d.media_class.includes('Input')));
+    const sinks = devices.filter(d => d.media_class && d.media_class.includes('Sink'));
+    const maxRows = Math.max(sources.length, sinks.length, 1);
+
+    for (let i = 0; i < maxRows; i++) {
+      const cy = y + i * nodeH + nodeH / 2;
+      if (i < sources.length) {
+        const s = sources[i];
+        const label = (s.description || s.name).slice(0, 30);
+        const isInput = s.media_class.includes('Source');
+        const color = isInput ? '#38bdf8' : '#a78bfa';
+        rects.push(`<rect x="${sourceX}" y="${cy - 9}" width="200" height="18" rx="4" fill="${color}15" stroke="${color}40" />`);
+        rects.push(`<text x="${sourceX + 6}" y="${cy + 4}" fill="${color}" font-size="10">${esc(label)}</text>`);
+        rects.push(`<circle cx="${sourceX + 206}" cy="${cy}" r="3" fill="${color}" />`);
+      }
+      if (i < sinks.length) {
+        const s = sinks[i];
+        const label = (s.description || s.name).slice(0, 30);
+        const color = '#4ae0a4';
+        const rx = sinkX - 206;
+        rects.push(`<rect x="${rx}" y="${cy - 9}" width="200" height="18" rx="4" fill="${color}15" stroke="${color}40" />`);
+        rects.push(`<text x="${rx + 6}" y="${cy + 4}" fill="${color}" font-size="10">${esc(label)}</text>`);
+        rects.push(`<circle cx="${rx - 6}" cy="${cy}" r="3" fill="${color}" />`);
+      }
+      // Draw a routing line from source to sink (simplified — all sources can reach all sinks)
+      if (i < sources.length && i < sinks.length) {
+        const x1 = sourceX + 209;
+        const x2 = sinkX - 212;
+        lines.push(`<path d="M${x1},${cy} C${midX},${cy} ${midX},${cy} ${x2},${cy}" stroke="var(--border2)" fill="none" stroke-width="1" stroke-dasharray="4,3" />`);
+      }
+    }
+    y += maxRows * nodeH + groupGap;
+  }
+
+  svg.setAttribute('height', y);
+  svg.innerHTML = lines.join('') + rects.join('');
+}
+
+function renderAudioDevices() {
+  const grid = document.getElementById('audio-devices-grid');
+  if (!grid) return;
+  const allNodes = Object.entries(allAudioDevices);
+  if (!allNodes.length) { grid.innerHTML = '<div class="empty" style="padding:12px 0">No audio devices</div>'; return; }
+
+  let html = '';
+  for (const [nodeId, devices] of allNodes) {
+    const nodeName = nodeId.replace('._ozma._udp.local.', '');
+    const sinks = devices.filter(d => d.media_class && d.media_class.includes('Sink') && !d.name.includes('.monitor'));
+    const sources = devices.filter(d => d.media_class && (d.media_class.includes('Source') || d.media_class.includes('Input')));
+
+    for (const dev of [...sinks, ...sources]) {
+      const isSink = dev.media_class.includes('Sink');
+      const color = isSink ? '#4ae0a4' : '#38bdf8';
+      const typeLabel = isSink ? 'Output' : 'Input';
+      const desc = dev.description || dev.name;
+
+      html += `<div style="
+        background:var(--surface);border:1px solid ${color}30;border-radius:var(--radius);
+        padding:10px 14px;min-width:200px;flex:1;max-width:300px;
+      ">
+        <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+          <span style="font-size:12px;font-weight:600;color:#fff">${esc(desc)}</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+          <span style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.04em;
+            padding:1px 5px;border-radius:3px;background:${color}15;color:${color};
+            border:1px solid ${color}30">${typeLabel}</span>
+          <span style="font-size:10px;color:var(--muted)">${esc(nodeName)}</span>
+        </div>
+        <div style="font-family:monospace;font-size:10px;color:var(--muted);word-break:break-all">${esc(dev.name)}</div>
+      </div>`;
+    }
+  }
+  grid.innerHTML = html;
+}
+
+// ── Render: audio routing (scenario routing) ─────────────────────────────────
+function renderAudio() {
+  const grid = $('audio-routing-grid');
+  const badge = $('audio-mode-badge');
+
+  const audioNodes = Object.values(nodes).filter(n => n.audio_type);
+  if (!audioNodes.length) {
+    grid.innerHTML = '<div class="empty" style="padding:12px 0">No audio nodes discovered</div>';
+    badge.textContent = '';
+    return;
+  }
+
+  badge.textContent = 'pw-link';
+
+  grid.innerHTML = audioNodes.map(n => {
+    const isActive = n.id === activeNodeId;
+    const shortName = shortId(n.id);
+    const sinkName = n.audio_sink || '';
+
+    let details = '';
+    if (n.audio_type === 'pipewire') {
+      details = `<span style="font-family:monospace;font-size:11px;color:var(--text)">${esc(sinkName || '—')}</span>`;
+    } else if (n.audio_type === 'vban') {
+      details = `<span style="font-size:11px;color:var(--muted)">UDP :${n.audio_vban_port}</span>`;
+    }
+
+    const statusColor = isActive ? 'var(--yellow)' : 'var(--border)';
+    const statusText  = isActive ? '♪ routed' : 'idle';
+    const statusClass = isActive ? 'color:var(--yellow)' : 'color:var(--muted)';
+
+    // Look up PW node state for volume/mute (keyed by sink name)
+    const pwNode = sinkName ? pwAudioState.nodes[sinkName] : null;
+    const volume = pwNode ? pwNode.volume : 1.0;
+    const muted = pwNode ? pwNode.mute : false;
+    const volPct = Math.round(volume * 100);
+
+    // Volume slider + mute button
+    const volHtml = sinkName ? `
+      <div class="vol-row">
+        <button class="mute-btn ${muted ? 'muted' : ''}"
+                onclick="setMute('${esc(sinkName)}', ${!muted})"
+                title="${muted ? 'Unmute' : 'Mute'}">${muted ? 'MUTED' : 'VOL'}</button>
+        <input type="range" class="vol-slider" min="0" max="150" value="${volPct}"
+               oninput="setVolume('${esc(sinkName)}', this.value/100)"
+               title="Volume: ${volPct}%">
+        <span class="vol-label">${volPct}%</span>
+      </div>` : '';
+
+    return `<div style="
+      background:var(--surface);
+      border:1px solid ${statusColor};
+      border-radius:var(--radius);
+      padding:10px 14px;
+      min-width:180px;
+      flex:1;
+      max-width:280px;
+      transition:border-color 0.2s;
+    ">
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">
+        <span style="font-size:13px;font-weight:600;color:#fff">${esc(shortName)}</span>
+        <span style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.04em;
+          padding:1px 5px;border-radius:3px;
+          background:${n.audio_type === 'pipewire' ? 'rgba(125,211,252,0.08)' : 'rgba(134,239,172,0.08)'};
+          color:${n.audio_type === 'pipewire' ? '#7dd3fc' : '#86efac'};
+          border:1px solid ${n.audio_type === 'pipewire' ? 'rgba(125,211,252,0.2)' : 'rgba(134,239,172,0.2)'}
+        ">${esc(n.audio_type)}</span>
+      </div>
+      <div style="margin-bottom:4px">${details}</div>
+      <div style="font-size:11px;${statusClass};margin-bottom:4px">${statusText}</div>
+      ${volHtml}
+    </div>`;
+  }).join('');
+}
+
+// ── Render: control surfaces ──────────────────────────────────────────────────
+let controlSurfaces = [];
+
+function fetchControls() {
+  api('GET', '/controls').then(d => {
+    controlSurfaces = d.surfaces || [];
+    renderControls();
+  }).catch(() => {});
+}
+
+// ── Render: RGB zones ─────────────────────────────────────────────────────────
+let rgbZones = [];
+
+function fetchRGBZones() {
+  api('GET', '/rgb/zones').then(d => {
+    rgbZones = d.zones || [];
+    renderRGBZones();
+  }).catch(() => {});
+}
+
+function renderRGBZones() {
+  const grid = $('rgb-zones-grid');
+  $('rgb-count').textContent = rgbZones.length;
+
+  if (!rgbZones.length) {
+    grid.innerHTML = '<div class="empty" style="padding:8px 0;font-size:11px">No RGB zones</div>';
+    return;
+  }
+
+  const typeColors = { node: '#a78bfa', wled: '#34d399', artnet: '#f472b6' };
+
+  grid.innerHTML = rgbZones.map(z => {
+    const tc = typeColors[z.zone_type] || '#888';
+    const [r, g, b] = z.color || [0, 0, 0];
+    const colorStr = `rgb(${r},${g},${b})`;
+    return `<div style="
+      background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+      padding:8px 12px;min-width:140px;
+    ">
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+        <div style="width:12px;height:12px;border-radius:50%;background:${colorStr};border:1px solid rgba(255,255,255,0.2)"></div>
+        <span style="font-size:12px;font-weight:600;color:#fff">${esc(z.name)}</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:6px">
+        <span style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.04em;
+          padding:1px 5px;border-radius:3px;background:${tc}20;color:${tc};
+          border:1px solid ${tc}33">${esc(z.zone_type)}</span>
+        ${z.led_count ? `<span style="font-size:10px;color:var(--muted)">${z.led_count} LEDs</span>` : ''}
+        ${z.host ? `<span style="font-size:10px;color:var(--muted)">${esc(z.host)}</span>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function renderControls() {
+  const list = $('controls-list');
+  $('ctrl-count').textContent = controlSurfaces.length;
+
+  if (!controlSurfaces.length) {
+    list.innerHTML = '<div class="empty">No control surfaces</div>';
+    return;
+  }
+
+  list.innerHTML = controlSurfaces.map(s => {
+    const ctrlNames = Object.keys(s.controls || {});
+    const dispNames = Object.keys(s.displays || {});
+
+    const ctrlHtml = ctrlNames.map(name => {
+      const c = s.controls[name];
+      return `<div style="display:flex;gap:6px;align-items:center;font-size:11px">
+        <span style="color:var(--text);font-weight:500">${esc(name)}</span>
+        <span style="color:var(--muted)">${esc(c.binding || '—')}</span>
+        ${c.target ? `<span style="color:var(--muted);font-size:10px">${esc(c.target)}</span>` : ''}
+      </div>`;
+    }).join('');
+
+    return `<div class="node-card" style="border-color:var(--border)">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+        <span style="font-size:13px;font-weight:600;color:#fff">${esc(s.id)}</span>
+        <span style="font-size:10px;color:var(--muted)">${ctrlNames.length} controls, ${dispNames.length} displays</span>
+      </div>
+      ${ctrlHtml}
+    </div>`;
+  }).join('');
+}
+
+// ── RGB Compositor controls ───────────────────────────────────────────────────
+let compositorState = {};
+
+function fetchCompositor() {
+  api('GET', '/rgb/compositor').then(d => {
+    compositorState = d;
+    renderCompositor();
+  }).catch(() => {});
+}
+
+function setAmbient() {
+  const effect = $('ambient-effect').value;
+  const hex = $('ambient-color').value;
+  const r = parseInt(hex.substr(1,2),16), g = parseInt(hex.substr(3,2),16), b = parseInt(hex.substr(5,2),16);
+  const bri = $('ambient-bri').value / 100;
+  const speed = $('ambient-speed').value / 100;
+  api('POST', '/rgb/ambient', { effect, color: [r,g,b], brightness: bri, speed }).catch(() => {});
+}
+
+function renderCompositor() {
+  const el = $('compositor-layers');
+  if (!compositorState.layers || !compositorState.layers.length) {
+    el.innerHTML = '<span style="color:var(--muted)">No active layers</span>';
+    return;
+  }
+  // Update ambient controls to match server state
+  if (compositorState.ambient) {
+    $('ambient-effect').value = compositorState.ambient.effect || 'solid';
+    $('ambient-bri').value = Math.round((compositorState.ambient.brightness || 0.3) * 100);
+    $('ambient-speed').value = Math.round((compositorState.ambient.speed || 1.0) * 100);
+  }
+
+  const priorityColors = { AMBIENT: 'var(--muted)', SCENARIO: 'var(--accent)', NOTE: 'var(--yellow)', SYSTEM: 'var(--red)' };
+  el.innerHTML = compositorState.layers.map(l => {
+    const pc = priorityColors[l.priority] || 'var(--muted)';
+    const [r,g,b] = l.color || [0,0,0];
+    const ttl = l.ttl ? ` (${l.ttl}s)` : '';
+    return `<div style="display:flex;align-items:center;gap:6px;padding:2px 0">
+      <span style="font-size:10px;font-weight:700;text-transform:uppercase;color:${pc};min-width:60px">${esc(l.priority)}</span>
+      <div style="width:10px;height:10px;border-radius:50%;background:rgb(${r},${g},${b});border:1px solid rgba(255,255,255,0.2)"></div>
+      <span style="color:var(--text)">${esc(l.name)}</span>
+      <span style="color:var(--muted)">${esc(l.effect)}${ttl}</span>
+    </div>`;
+  }).join('');
+}
+
+// ── Motion devices ───────────────────────────────────────────────────────────
+let motionDevices = [];
+
+function fetchMotion() {
+  api('GET', '/motion/devices').then(d => {
+    motionDevices = d.devices || [];
+    renderMotion();
+  }).catch(() => {});
+}
+
+function motionPreset(deviceId, presetName) {
+  api('POST', `/motion/${encodeURIComponent(deviceId)}/preset`, { name: presetName }).catch(() => {});
+}
+
+function motionStop(deviceId) {
+  api('POST', `/motion/${encodeURIComponent(deviceId)}/stop`, {}).catch(() => {});
+}
+
+function renderMotion() {
+  const list = $('motion-list');
+  $('motion-count').textContent = motionDevices.length;
+
+  if (!motionDevices.length) {
+    list.innerHTML = '<div class="empty">No motion devices</div>';
+    return;
+  }
+
+  list.innerHTML = motionDevices.map(d => {
+    const axesHtml = Object.entries(d.axes || {}).map(([name, a]) => {
+      const pct = Math.round(a.position * 100);
+      const movingDot = a.moving ? '<span style="color:var(--green)">●</span>' : '';
+      return `<div style="display:flex;align-items:center;gap:6px;font-size:11px;padding:2px 0">
+        <span style="min-width:50px;color:var(--text)">${esc(name)}</span>
+        <div style="flex:1;height:4px;background:var(--border2);border-radius:2px;position:relative">
+          <div style="width:${pct}%;height:100%;background:var(--accent);border-radius:2px"></div>
+        </div>
+        <span class="vol-label">${pct}%</span>
+        ${movingDot}
+      </div>`;
+    }).join('');
+
+    const presetBtns = Object.keys(d.presets || {}).map(p =>
+      `<button class="btn sm" onclick="motionPreset('${esc(d.id)}','${esc(p)}')">${esc(p)}</button>`
+    ).join('');
+
+    const connDot = d.connected ? 'var(--green)' : 'var(--red)';
+    return `<div class="node-card" style="border-color:var(--border)">
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+        <div style="width:7px;height:7px;border-radius:50%;background:${connDot}"></div>
+        <span style="font-size:13px;font-weight:600;color:#fff">${esc(d.name)}</span>
+        <span style="font-size:10px;color:var(--muted)">${esc(d.device_type)}</span>
+      </div>
+      ${axesHtml}
+      ${presetBtns ? `<div style="display:flex;gap:4px;margin-top:6px">${presetBtns}
+        <button class="btn sm" onclick="motionStop('${esc(d.id)}')" style="color:var(--red)">Stop</button>
+      </div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+// ── Bluetooth & Phone ────────────────────────────────────────────────────────
+let btDevices = [], kdeDevices = [], wifiAudioState = {};
+
+function fetchBluetooth() {
+  api('GET', '/bluetooth/devices').then(d => {
+    btDevices = d.devices || [];
+    renderBluetooth();
+  }).catch(() => {});
+}
+
+function fetchKDEConnect() {
+  api('GET', '/kdeconnect/devices').then(d => {
+    kdeDevices = d.devices || [];
+    renderKDEConnect();
+  }).catch(() => {});
+}
+
+function fetchWifiAudio() {
+  api('GET', '/wifi-audio').then(d => {
+    wifiAudioState = d;
+    renderWifiAudio();
+  }).catch(() => {});
+}
+
+function btDiscover() {
+  const btn = event.target;
+  btn.textContent = 'Scanning...';
+  btn.disabled = true;
+  api('POST', '/bluetooth/discover', { timeout: 8 }).then(d => {
+    btDevices = d.devices || [];
+    renderBluetooth();
+  }).finally(() => { btn.textContent = 'Scan'; btn.disabled = false; });
+}
+
+function btConnect(addr) { api('POST', '/bluetooth/connect', { address: addr }).then(() => fetchBluetooth()); }
+function btDisconnect(addr) { api('POST', '/bluetooth/disconnect', { address: addr }).then(() => fetchBluetooth()); }
+function btPair(addr) { api('POST', '/bluetooth/pair', { address: addr }).then(() => fetchBluetooth()); }
+
+function renderBluetooth() {
+  const el = $('bt-devices-list');
+  if (!btDevices.length) {
+    el.innerHTML = '<div class="empty" style="font-size:11px">No devices — tap Scan</div>';
+    return;
+  }
+
+  const typeIcons = { headset: '🎧', phone: '📱', controller: '🎮', keyboard: '⌨', mouse: '🖱', audio: '🔊', unknown: '📟' };
+
+  el.innerHTML = btDevices.map(d => {
+    const icon = typeIcons[d.device_type] || '📟';
+    const connColor = d.connected ? 'var(--green)' : d.paired ? 'var(--yellow)' : 'var(--muted)';
+    const statusText = d.connected ? 'connected' : d.paired ? 'paired' : 'found';
+    const actions = d.connected
+      ? `<button class="btn sm" onclick="btDisconnect('${esc(d.address)}')" style="font-size:10px">Disconnect</button>`
+      : d.paired
+        ? `<button class="btn sm" onclick="btConnect('${esc(d.address)}')" style="font-size:10px">Connect</button>`
+        : `<button class="btn sm primary" onclick="btPair('${esc(d.address)}')" style="font-size:10px">Pair</button>`;
+
+    return `<div style="display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid var(--border)">
+      <span style="font-size:14px">${icon}</span>
+      <div style="flex:1;min-width:0">
+        <div style="font-size:12px;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(d.name || d.address)}</div>
+        <div style="font-size:10px;color:${connColor}">${statusText}</div>
+      </div>
+      ${actions}
+    </div>`;
+  }).join('');
+}
+
+function renderKDEConnect() {
+  const el = $('phone-list');
+  if (!kdeDevices.length) {
+    el.innerHTML = '<div class="empty" style="font-size:11px">No KDE Connect devices</div>';
+    return;
+  }
+
+  el.innerHTML = kdeDevices.map(d => {
+    const connDot = d.connected ? 'var(--green)' : 'var(--muted)';
+    const battHtml = d.battery_level >= 0
+      ? `<span style="font-size:10px;color:${d.battery_level < 20 ? 'var(--red)' : 'var(--muted)'}">🔋 ${d.battery_level}%${d.battery_charging ? ' ⚡' : ''}</span>`
+      : '';
+
+    return `<div style="display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid var(--border)">
+      <div style="width:7px;height:7px;border-radius:50%;background:${connDot}"></div>
+      <div style="flex:1">
+        <div style="font-size:12px;color:#fff">${esc(d.name)}</div>
+        <div style="font-size:10px;color:var(--muted)">${esc(d.device_type)}</div>
+      </div>
+      ${battHtml}
+      ${d.connected ? `<button class="btn sm" onclick="api('POST','/kdeconnect/${esc(d.device_id)}/ping')" style="font-size:10px">Ping</button>` : ''}
+    </div>`;
+  }).join('');
+}
+
+function renderWifiAudio() {
+  const el = $('wifi-audio-list');
+  const parts = [];
+  if (wifiAudioState.airplay) {
+    const a = wifiAudioState.airplay;
+    parts.push(`<div style="display:flex;align-items:center;gap:6px;padding:3px 0">
+      <span style="font-size:10px;font-weight:700;padding:1px 5px;border-radius:3px;background:rgba(244,114,182,0.1);color:#f472b6;border:1px solid rgba(244,114,182,0.2)">AirPlay</span>
+      <span style="font-size:11px;color:${a.running ? 'var(--green)' : 'var(--muted)'}">${a.running ? '● running' : 'stopped'}</span>
+      ${a.name ? `<span style="font-size:10px;color:var(--muted)">"${esc(a.name)}"</span>` : ''}
+    </div>`);
+  }
+  if (wifiAudioState.spotify) {
+    const s = wifiAudioState.spotify;
+    parts.push(`<div style="display:flex;align-items:center;gap:6px;padding:3px 0">
+      <span style="font-size:10px;font-weight:700;padding:1px 5px;border-radius:3px;background:rgba(52,211,153,0.1);color:#34d399;border:1px solid rgba(52,211,153,0.2)">Spotify</span>
+      <span style="font-size:11px;color:${s.running ? 'var(--green)' : 'var(--muted)'}">${s.running ? '● running' : 'stopped'}</span>
+      ${s.bitrate ? `<span style="font-size:10px;color:var(--muted)">${s.bitrate}kbps</span>` : ''}
+    </div>`);
+  }
+  el.innerHTML = parts.join('') || '<div class="empty" style="font-size:11px">—</div>';
+}
+
+// ── Automation, Macros, Schedule, OCR Triggers, Network Health ────────────────
+
+function runAutomationScript() {
+  const script = $('automation-script').value;
+  if (!script.trim()) return;
+  const el = $('automation-result');
+  el.textContent = 'Running...';
+  el.style.color = 'var(--yellow)';
+  api('POST', '/automation/run', { script }).then(d => {
+    el.textContent = d.ok
+      ? `Done: ${d.lines_executed} lines executed`
+      : `Errors: ${d.errors?.join('; ')}`;
+    el.style.color = d.ok ? 'var(--green)' : 'var(--red)';
+  }).catch(e => { el.textContent = 'Failed: ' + e.message; el.style.color = 'var(--red)'; });
+}
+
+function fetchMacros() {
+  api('GET', '/macros').then(d => {
+    const list = $('macros-list');
+    const macros = d.macros || [];
+    if (!macros.length) { list.innerHTML = '<div class="empty" style="font-size:11px">No macros</div>'; return; }
+    list.innerHTML = macros.map(m =>
+      `<div style="display:flex;gap:6px;align-items:center;padding:2px 0">
+        <span style="color:var(--text);font-size:11px">${esc(m.name)}</span>
+        <span style="color:var(--muted);font-size:10px">${m.steps} steps</span>
+        <button class="btn sm" onclick="api('POST','/macros/${esc(m.id)}/play')" style="font-size:10px">Play</button>
+        <button class="btn sm" onclick="api('DELETE','/macros/${esc(m.id)}').then(fetchMacros)" style="font-size:10px;color:var(--red)">Del</button>
+      </div>`
+    ).join('');
+  }).catch(() => {});
+}
+
+function fetchSchedule() {
+  api('GET', '/schedule').then(d => {
+    const list = $('schedule-list');
+    const rules = d.rules || [];
+    if (!rules.length) { list.innerHTML = '<div class="empty" style="font-size:11px">No rules</div>'; return; }
+    list.innerHTML = rules.map((r, i) =>
+      `<div style="display:flex;gap:6px;align-items:center;padding:2px 0;font-size:11px">
+        <span style="color:var(--text);font-weight:600">${esc(r.time)}</span>
+        <span style="color:var(--muted)">${esc(r.days)}</span>
+        <span style="color:var(--accent)">→ ${esc(r.scenario)}</span>
+        <button class="btn sm" onclick="api('DELETE','/schedule/${i}').then(fetchSchedule)" style="font-size:10px;color:var(--red)">×</button>
+      </div>`
+    ).join('');
+  }).catch(() => {});
+}
+
+function addScheduleRule() {
+  const time = $('sched-time').value;
+  const days = $('sched-days').value;
+  const scenario = $('sched-scenario').value;
+  if (!time || !scenario) return;
+  api('POST', '/schedule', { time, days, scenario }).then(fetchSchedule);
+}
+
+function fetchOCRTriggers() {
+  api('GET', '/ocr/triggers').then(d => {
+    const list = $('ocr-triggers-list');
+    const patterns = d.patterns || [];
+    $('ocr-trigger-count').textContent = patterns.length;
+    const sevColors = { critical: 'var(--red)', error: '#f97316', warning: 'var(--yellow)', info: 'var(--muted)' };
+    list.innerHTML = patterns.slice(0, 30).map(p =>
+      `<div style="display:flex;gap:6px;align-items:center;padding:1px 0">
+        <span style="font-size:9px;font-weight:700;min-width:50px;color:${sevColors[p.severity] || 'var(--muted)'}">${esc(p.severity)}</span>
+        <span style="color:var(--text)">${esc(p.id)}</span>
+        <span style="color:var(--muted);font-size:10px">${esc(p.category)}</span>
+      </div>`
+    ).join('') + (patterns.length > 30 ? `<div style="color:var(--muted)">+ ${patterns.length - 30} more</div>` : '');
+  }).catch(() => {});
+}
+
+function fetchNetHealth() {
+  api('GET', '/network/health').then(d => {
+    const list = $('net-health-list');
+    const nodes = d.nodes || [];
+    if (!nodes.length) { list.innerHTML = '<div class="empty">No nodes</div>'; return; }
+    list.innerHTML = nodes.map(n => {
+      const dot = n.online ? 'var(--green)' : 'var(--red)';
+      const latency = n.online ? `${n.latency_ms.toFixed(1)}ms` : 'offline';
+      const loss = n.packet_loss > 0 ? ` loss:${n.packet_loss.toFixed(0)}%` : '';
+      return `<div style="display:flex;gap:6px;align-items:center;padding:2px 0">
+        <div style="width:6px;height:6px;border-radius:50%;background:${dot}"></div>
+        <span style="color:var(--text);min-width:60px">${esc(n.node_id.split('.')[0])}</span>
+        <span style="color:var(--muted)">${latency}${loss}</span>
+      </div>`;
+    }).join('');
+  }).catch(() => {});
+}
+
+// ── Display captures ──────────────────────────────────────────────────────────
+let captureSources = [];
+
+function fetchCaptures() {
+  api('GET', '/captures').then(d => {
+    captureSources = d.sources || [];
+    renderCaptures();
+    updatePrimaryDisplay();
+  }).catch(() => {});
+}
+
+// ── Primary display (fullscreen HLS switching) ───────────────────────────────
+let primaryHls = null;
+let primarySourceId = null;
+
+function updatePrimaryDisplay() {
+  // Find the active scenario's capture source
+  const activeScenario = scenarios[activeScenarioId];
+  const sourceId = activeScenario?.capture_source || activeScenario?.capture_sources?.[0] || null;
+  const source = sourceId ? captureSources.find(s => s.id === sourceId) : null;
+
+  const panel = $('panel-primary-display');
+  const video = $('primary-video');
+  const noSignal = $('primary-no-signal');
+  const title = $('primary-display-title');
+
+  if (!source || !source.stream_path) {
+    // No capture source — try first available capture
+    const firstActive = captureSources.find(s => s.active && s.stream_path);
+    if (firstActive) {
+      switchPrimarySource(firstActive.id, firstActive.stream_path);
+      panel.style.display = '';
+      title.textContent = `Display — ${firstActive.id}`;
+    } else {
+      panel.style.display = 'none';
+    }
+    return;
+  }
+
+  panel.style.display = '';
+  title.textContent = `Display — ${esc(activeScenario?.name || sourceId)}`;
+  switchPrimarySource(sourceId, source.stream_path);
+}
+
+function switchPrimarySource(sourceId, streamPath) {
+  if (sourceId === primarySourceId) return;
+  primarySourceId = sourceId;
+
+  const video = $('primary-video');
+  const noSignal = $('primary-no-signal');
+  const hlsUrl = streamPath;
+
+  // Destroy old HLS instance
+  if (primaryHls) {
+    primaryHls.destroy();
+    primaryHls = null;
+  }
+
+  if (typeof Hls !== 'undefined' && Hls.isSupported()) {
+    primaryHls = new Hls({ enableWorker: true, lowLatencyMode: true });
+    primaryHls.loadSource(hlsUrl);
+    primaryHls.attachMedia(video);
+    primaryHls.on(Hls.Events.MANIFEST_PARSED, () => {
+      video.play().catch(() => {});
+      noSignal.style.display = 'none';
+    });
+    primaryHls.on(Hls.Events.ERROR, () => {
+      noSignal.style.display = 'flex';
+      noSignal.textContent = 'Stream error — waiting for signal';
+    });
+  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    // Safari native HLS
+    video.src = hlsUrl;
+    video.addEventListener('loadedmetadata', () => {
+      video.play().catch(() => {});
+      noSignal.style.display = 'none';
+    });
+  } else {
+    // Fallback to MJPEG
+    noSignal.textContent = 'HLS not supported — use MJPEG preview below';
+  }
+}
+
+function runOCR() {
+  if (!primarySourceId) return;
+  const btn = $('btn-ocr');
+  btn.textContent = 'Reading...';
+  api('POST', `/captures/${encodeURIComponent(primarySourceId)}/ocr`)
+    .then(d => {
+      $('ocr-text').textContent = d.text || '(no text detected)';
+      $('ocr-output').style.display = '';
+      btn.textContent = 'OCR';
+    })
+    .catch(() => { btn.textContent = 'OCR'; });
+}
+
+function toggleRecording() {
+  const btn = $('btn-record');
+  api('GET', '/recording/status').then(d => {
+    if (d.recording) {
+      api('POST', '/recording/stop').then(() => { btn.textContent = '● Rec'; btn.style.color = ''; });
+    } else {
+      api('POST', '/recording/start', { source_id: primarySourceId || 'hdmi-0' })
+        .then(() => { btn.textContent = '■ Stop'; btn.style.color = 'var(--red)'; });
+    }
+  });
+}
+
+function setEdid(sourceId, preset) {
+  if (!preset) return;
+  api('POST', `/captures/${encodeURIComponent(sourceId)}/edid`, { resolution: preset })
+    .then(() => { setTimeout(fetchCaptures, 3000); })
+    .catch(e => alert('EDID failed: ' + e.message));
+}
+
+function renderCaptures() {
+  const grid = $('captures-grid');
+  $('capture-count').textContent = captureSources.length;
+
+  if (!captureSources.length) {
+    grid.innerHTML = '<div class="empty" style="padding:12px 0">No capture cards detected</div>';
+    return;
+  }
+
+  grid.innerHTML = captureSources.map(s => {
+    const c = s.card || {};
+    const activeDot = s.active ? 'var(--green)' : 'var(--red)';
+    const hdmiBadge = c.is_hdmi
+      ? '<span style="font-size:10px;font-weight:700;padding:1px 5px;border-radius:3px;background:rgba(125,211,252,0.08);color:#7dd3fc;border:1px solid rgba(125,211,252,0.2)">HDMI</span>'
+      : '';
+
+    // MJPEG preview thumbnail
+    const previewSrc = `/api/v1/captures/${encodeURIComponent(s.id)}/mjpeg`;
+
+    // Compute actual aspect ratio for preview container
+    const curRes = c.current_resolution;
+    const aspectW = curRes ? curRes.width : c.max_width;
+    const aspectH = curRes ? curRes.height : c.max_height;
+    const aspectPct = ((aspectH / aspectW) * 100).toFixed(2);
+    const aspectLabel = s.aspect_ratio || c.aspect_ratio || '16:9';
+    const resLabel = curRes ? `${curRes.width}x${curRes.height}@${curRes.fps}fps` : `${c.max_width}x${c.max_height}@${c.max_fps}fps`;
+
+    return `<div style="
+      background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+      padding:0;min-width:280px;max-width:480px;flex:1;overflow:hidden;
+    ">
+      <div style="position:relative;width:100%;padding-top:${aspectPct}%;background:#000">
+        <img src="${previewSrc}" style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain"
+             onerror="this.style.display='none'" loading="lazy">
+        <div style="position:absolute;top:6px;right:6px;display:flex;gap:4px;align-items:center">
+          <span style="font-size:9px;background:rgba(0,0,0,0.7);color:#fff;padding:1px 4px;border-radius:3px">${esc(aspectLabel)}</span>
+          <div style="width:8px;height:8px;border-radius:50%;background:${activeDot}"></div>
+        </div>
+      </div>
+      <div style="padding:8px 10px">
+        <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+          <span style="font-size:13px;font-weight:600;color:#fff">${esc(s.id)}</span>
+          ${hdmiBadge}
+          <span style="font-size:10px;color:var(--muted)">${esc(resLabel)}</span>
+        </div>
+        <div style="font-size:11px;color:var(--muted)">${esc(c.name || 'Unknown')}</div>
+        <div style="font-size:10px;color:var(--muted)">Formats: ${(c.formats||[]).join(', ')}</div>
+        <div style="display:flex;gap:4px;margin-top:6px;flex-wrap:wrap;align-items:center">
+          ${s.stream_path ? `<a href="${esc(s.stream_path)}" target="_blank" class="btn sm" style="font-size:10px">HLS</a>` : ''}
+          ${c.edid_available ? `<select onchange="setEdid('${esc(s.id)}',this.value)" style="font-size:10px;background:var(--surface2);color:var(--text);border:1px solid var(--border2);border-radius:3px;padding:2px 4px">
+            <option value="">EDID: default</option>
+            <option value="1080p">1080p</option><option value="1440p">1440p</option><option value="4k">4K</option>
+            <option value="2560x1080">21:9 2560</option><option value="3440x1440">21:9 3440</option>
+            <option value="5120x1440">32:9 5120</option>
+            <option value="1920x1200">16:10 1920</option><option value="1600x1200">4:3 1600</option>
+          </select>` : ''}
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// ── Render: streams ───────────────────────────────────────────────────────────
+function renderStreams() {
+  const grid = $('streams-grid');
+  const ss = Object.values(streams).filter(s => s.active !== false);
+  $('stream-count').textContent = ss.length;
+
+  if (!ss.length) {
+    grid.innerHTML = '<div class="empty">No active streams</div>';
+    return;
+  }
+
+  grid.innerHTML = ss.map(s => {
+    const isHls = s.type === 'hls-remote';
+    const nodeShort = esc(shortId(s.node_id));
+    const typeLabel = isHls ? 'HLS' : 'MJPEG';
+    const badgeClass = isHls ? 'hls' : 'live';
+
+    // Use a thumbnail img for MJPEG; placeholder for HLS
+    const previewHtml = isHls
+      ? `<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#444;font-size:11px">HLS</div>`
+      : `<img src="/api/v1/streams/${encodeURIComponent(s.node_id)}/mjpeg"
+             style="width:100%;height:100%;object-fit:cover"
+             onerror="this.style.display='none'"
+             loading="lazy">`;
+
+    return `<div class="stream-tile">
+      <div class="stream-preview" style="cursor:pointer" onclick="openStream('${esc(s.node_id)}')">
+        ${previewHtml}
+        <span class="stream-badge ${badgeClass}">${typeLabel}</span>
+      </div>
+      <div class="stream-info">
+        <span class="stream-node" title="${esc(s.node_id)}">${nodeShort}</span>
+        <span class="stream-type">${typeLabel}</span>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// ── Render: scenarios ─────────────────────────────────────────────────────────
+const SCENARIO_COLORS = ['#5b6fff','#3ecf8e','#f0b94a','#f26464','#a78bfa','#38bdf8'];
+
+function renderScenarios() {
+  const list = $('scenarios-list');
+  const ss = Object.values(scenarios);
+  $('scenario-count').textContent = ss.length;
+
+  if (!ss.length) {
+    list.innerHTML = '<div class="empty">No scenarios — click + New to create one</div>';
+    return;
+  }
+
+  if (currentMode === 'simple') {
+    list.innerHTML = ss.map((s, i) => {
+      const color = s.color || SCENARIO_COLORS[i % SCENARIO_COLORS.length];
+      const isActive = s.id === activeScenarioId;
+      return `<div class="scenario-card ${isActive ? 'active-scenario' : ''}" style="cursor:pointer" onclick="${isActive ? '' : `activateScenario('${esc(s.id)}')`}">
+        <div style="display:flex;align-items:center;gap:10px;padding:4px 0">
+          <div class="scenario-color" style="background:${color};width:14px;height:14px;border-radius:50%"></div>
+          <span style="font-size:15px;font-weight:600;color:#fff;flex:1">${esc(s.name)}</span>
+          ${isActive ? '<span style="font-size:11px;color:var(--accent);font-weight:600">Active</span>' : ''}
+        </div>
+      </div>`;
+    }).join('');
+    return;
+  }
+
+  list.innerHTML = ss.map((s, i) => {
+    const color = s.color || SCENARIO_COLORS[i % SCENARIO_COLORS.length];
+    const isActive = s.id === activeScenarioId;
+    const boundNode = s.node_id ? shortId(s.node_id) : '—';
+    const allNodes = Object.values(nodes);
+
+    const bindOpts = allNodes.map(n =>
+      `<option value="${esc(n.id)}" ${n.id === s.node_id ? 'selected' : ''}>${esc(shortId(n.id))}</option>`
+    ).join('');
+
+    return `<div class="scenario-card ${isActive ? 'active-scenario' : ''}" data-id="${esc(s.id)}">
+      <div class="scenario-top">
+        <div class="scenario-color" style="background:${color}"></div>
+        <div class="scenario-name">${esc(s.name)}</div>
+        ${isActive ? '<span class="scenario-active-badge">● Active</span>' : ''}
+      </div>
+      <div class="scenario-meta">
+        <span>ID: <code>${esc(s.id)}</code></span>
+        &nbsp;·&nbsp;Node: <span class="bound-node">${esc(boundNode)}</span>
+      </div>
+      <div class="scenario-actions">
+        ${!isActive ? `<button class="btn sm primary" onclick="activateScenario('${esc(s.id)}')">Activate</button>` : ''}
+        <select class="bind-select" onchange="bindNode('${esc(s.id)}', this.value)">
+          <option value="">Bind node…</option>
+          ${bindOpts}
+        </select>
+        <button class="btn sm danger" onclick="deleteScenario('${esc(s.id)}')">Delete</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// ── Render: events ────────────────────────────────────────────────────────────
+function pushEvent(evt) {
+  const list = $('events-list');
+  // Remove empty placeholder
+  const emp = list.querySelector('.empty');
+  if (emp) emp.remove();
+
+  eventCount++;
+  $('event-count').textContent = eventCount;
+
+  const typeClass = evt.type.includes('online') ? 'online'
+    : evt.type.includes('offline') ? 'offline'
+    : evt.type.includes('switch') ? 'switched'
+    : evt.type.startsWith('rgb') ? 'rgb'
+    : 'other';
+
+  const detail = evt.node_id ? shortId(evt.node_id)
+    : evt.node ? shortId(evt.node.id || '')
+    : evt.scenario_id ? evt.scenario_id
+    : '';
+
+  const row = document.createElement('div');
+  row.className = 'event-row';
+  row.innerHTML = `<span class="event-time">${now()}</span>
+    <span class="event-type ${typeClass}">${esc(evt.type)}</span>
+    <span class="event-detail">${esc(detail)}</span>`;
+
+  // Prepend (newest first)
+  list.insertBefore(row, list.firstChild);
+
+  // Trim to MAX_EVENTS
+  while (list.children.length > MAX_EVENTS) list.removeChild(list.lastChild);
+}
+
+// ── Actions ───────────────────────────────────────────────────────────────────
+async function nodePower(id, action) {
+  const el = $('pwr-' + id);
+  try {
+    if (el) el.textContent = action + '...';
+    await api('POST', `/nodes/${encodeURIComponent(id)}/power/${action}`);
+    if (el) el.textContent = action + ' OK';
+    setTimeout(() => { if (el) el.textContent = ''; }, 3000);
+  } catch (e) {
+    if (el) el.textContent = 'failed';
+    alert('Power ' + action + ' failed: ' + e.message);
+  }
+}
+
+async function activateNode(id) {
+  try {
+    await api('POST', `/nodes/${encodeURIComponent(id)}/activate`);
+    activeNodeId = id;
+    renderNodes();
+    renderScenarios();
+    renderAudio();
+  } catch (e) { alert('Failed: ' + e.message); }
+}
+
+async function activateScenario(id) {
+  try {
+    const result = await api('POST', `/scenarios/${encodeURIComponent(id)}/activate`);
+    activeScenarioId = id;
+    if (result?.scenario?.node_id) activeNodeId = result.scenario.node_id;
+    renderScenarios();
+    renderNodes();
+    renderAudio();
+  } catch (e) { alert('Failed: ' + e.message); }
+}
+
+async function bindNode(scenarioId, nodeId) {
+  try {
+    const s = await api('POST', `/scenarios/${encodeURIComponent(scenarioId)}/bind`,
+      { node_id: nodeId || null });
+    scenarios[s.id] = s;
+    renderScenarios();
+  } catch (e) { alert('Failed: ' + e.message); }
+}
+
+async function deleteScenario(id) {
+  if (!confirm(`Delete scenario "${id}"?`)) return;
+  try {
+    await api('DELETE', `/scenarios/${encodeURIComponent(id)}`);
+    delete scenarios[id];
+    renderScenarios();
+  } catch (e) { alert('Failed: ' + e.message); }
+}
+
+// ── USB panel ─────────────────────────────────────────────────────────────────
+const USB_SPEED = { '1.5': 'LS', '12': 'FS', '480': 'HS', '5000': 'SS', '10000': 'SS+' };
+
+const FUNC_ICON = {
+  'keyboard':    '⌨',
+  'mouse':       '🖱',
+  'audio-uac2':  '🔊',
+  'mass-storage':'💾',
+};
+
+function toggleUsb(nodeId) {
+  const panel = document.getElementById(`usb-panel-${nodeId}`);
+  const btn   = document.getElementById(`usb-btn-${nodeId}`);
+  if (!panel) return;
+  const opening = !panel.classList.contains('open');
+  panel.classList.toggle('open', opening);
+  if (btn) btn.style.color = opening ? 'var(--accent)' : '';
+  if (opening) fetchUsb(nodeId);
+}
+
+async function fetchUsb(nodeId) {
+  const panel = document.getElementById(`usb-panel-${nodeId}`);
+  if (!panel) return;
+  panel.innerHTML = '<div class="usb-loading">Loading…</div>';
+  try {
+    const data = await api('GET', `/nodes/${encodeURIComponent(nodeId)}/usb`);
+    panel.innerHTML = renderUsbHtml(data);
+  } catch (e) {
+    panel.innerHTML = `<div class="usb-error">Failed: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderUsbHtml(data) {
+  const { gadget = {}, attached = [] } = data;
+  let html = '';
+
+  // ── Gadget section ──
+  const udc = gadget.udc || '—';
+  const active = gadget.active;
+  const badge = `<span class="udc-badge ${active ? 'active' : 'inactive'}">${active ? 'CONNECTED' : 'DISCONNECTED'}</span>`;
+  html += `<div class="usb-section-title">Presented (Gadget) ${badge}</div>`;
+
+  const funcs = gadget.functions || [];
+  if (funcs.length) {
+    html += '<div class="usb-func-list">';
+    for (const fn of funcs) {
+      const icon = FUNC_ICON[fn.subtype] || '⬡';
+      let sub = fn.subtype || fn.name;
+      if (fn.rate) sub += ` ${fn.rate / 1000}kHz/${fn.channels}ch`;
+      html += `<div class="usb-func-row">
+        <span class="usb-func-icon">${icon}</span>
+        <span class="usb-func-name">${esc(fn.name)}</span>
+        <span class="usb-func-sub">${esc(sub)}</span>
+      </div>`;
+    }
+    html += '</div>';
+    if (active) {
+      html += `<div class="usb-func-sub" style="margin-bottom:8px;font-size:10px;color:var(--muted)">UDC: ${esc(udc)}</div>`;
+    }
+  } else {
+    html += '<div class="usb-none">No gadget configured</div>';
+  }
+
+  // ── Attached section ──
+  html += '<div class="usb-section-title" style="margin-top:4px">Attached (Host ports)</div>';
+  if (attached.length) {
+    html += '<div class="usb-device-list">';
+    for (const d of attached) {
+      const product = d.product || d.manufacturer || 'Unknown Device';
+      const speed   = USB_SPEED[d.speed] || (d.speed ? `${d.speed}M` : '');
+      html += `<div class="usb-device-row">
+        <span class="usb-vid-pid">${esc(d.vid)}:${esc(d.pid)}</span>
+        <span class="usb-product" title="${esc(d.manufacturer || '')} ${esc(d.product || '')}">${esc(product)}</span>
+        ${speed ? `<span class="usb-speed">${esc(speed)}</span>` : ''}
+      </div>`;
+    }
+    html += '</div>';
+  } else {
+    html += '<div class="usb-none">No devices attached</div>';
+  }
+
+  return html;
+}
+
+function populateNodeSelects() {
+  const ns = Object.values(nodes);
+  const opts = ns.map(n => `<option value="${esc(n.id)}">${esc(shortId(n.id))}</option>`).join('');
+  $('new-sc-node').innerHTML = '<option value="">— none —</option>' + opts;
+}
+
+// ── Create scenario form ──────────────────────────────────────────────────────
+$('btn-new-scenario').addEventListener('click', () => {
+  $('create-scenario-form').classList.add('open');
+  $('new-sc-id').focus();
+  populateNodeSelects();
+});
+$('btn-cancel-scenario').addEventListener('click', () => {
+  $('create-scenario-form').classList.remove('open');
+});
+$('btn-submit-scenario').addEventListener('click', async () => {
+  const id   = $('new-sc-id').value.trim();
+  const name = $('new-sc-name').value.trim();
+  const nodeId = $('new-sc-node').value || null;
+  if (!id || !name) { alert('ID and Name are required.'); return; }
+  try {
+    const s = await api('POST', `/scenarios?scenario_id=${encodeURIComponent(id)}`,
+      { name, node_id: nodeId });
+    scenarios[s.id] = s;
+    $('create-scenario-form').classList.remove('open');
+    $('new-sc-id').value = '';
+    $('new-sc-name').value = '';
+    renderScenarios();
+  } catch (e) { alert('Failed: ' + e.message); }
+});
+
+// ── Stream modal ──────────────────────────────────────────────────────────────
+let hlsInstance = null;
+
+function openStream(nodeId) {
+  const s = streams[nodeId];
+  if (!s) return;
+
+  $('modal-title-text').textContent = shortId(nodeId);
+  $('modal-overlay').classList.add('open');
+
+  const img   = $('modal-img');
+  const video = $('modal-video');
+  img.style.display = 'none';
+  video.style.display = 'none';
+
+  if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
+
+  if (s.type === 'hls-remote') {
+    video.style.display = 'block';
+    if (window.Hls && Hls.isSupported()) {
+      hlsInstance = new Hls();
+      hlsInstance.loadSource(s.url);
+      hlsInstance.attachMedia(video);
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = s.url;
+    }
+    video.play().catch(() => {});
+  } else {
+    img.style.display = 'block';
+    img.src = `/api/v1/streams/${encodeURIComponent(nodeId)}/mjpeg?t=${Date.now()}`;
+  }
+}
+
+$('modal-close').addEventListener('click', () => {
+  $('modal-overlay').classList.remove('open');
+  if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
+  $('modal-img').src = '';
+  $('modal-video').src = '';
+});
+$('modal-overlay').addEventListener('click', e => {
+  if (e.target === $('modal-overlay')) $('modal-close').click();
+});
+
+// ── Refresh button ────────────────────────────────────────────────────────────
+$('btn-refresh').addEventListener('click', loadAll);
+$('btn-clear-events').addEventListener('click', () => {
+  $('events-list').innerHTML = '<div class="empty">Cleared</div>';
+  eventCount = 0;
+  $('event-count').textContent = 0;
+});
+
+// ── WebSocket ─────────────────────────────────────────────────────────────────
+let ws, wsDelay = 1000;
+
+function connect() {
+  const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${wsProto}//${location.host}/api/v1/events`);
+
+  ws.onopen = () => {
+    const b = $('conn-badge');
+    b.className = 'connected';
+    b.querySelector('span').textContent = 'connected';
+    wsDelay = 1000;
+    loadAll();
+  };
+
+  ws.onclose = () => {
+    const b = $('conn-badge');
+    b.className = 'error';
+    b.querySelector('span').textContent = 'disconnected';
+    setTimeout(connect, wsDelay = Math.min(wsDelay * 2, 15000));
+  };
+
+  ws.onerror = () => ws.close();
+
+  ws.onmessage = ({ data }) => {
+    let msg;
+    try { msg = JSON.parse(data); } catch { return; }
+    pushEvent(msg);
+    handleEvent(msg);
+  };
+}
+
+function handleEvent(msg) {
+  switch (msg.type) {
+    case 'node.online':
+      nodes[msg.node.id] = msg.node;
+      // Refresh stream list — new node may have a stream
+      api('GET', '/streams').then(d => {
+        streams = {};
+        for (const s of d.streams) streams[s.node_id] = s;
+        renderStreams();
+      }).catch(() => {});
+      renderNodes();
+      renderScenarios();
+      renderAudio();
+      break;
+    case 'node.offline':
+      delete nodes[msg.node_id];
+      delete streams[msg.node_id];
+      if (activeNodeId === msg.node_id) activeNodeId = null;
+      renderNodes();
+      renderStreams();
+      renderScenarios();
+      renderAudio();
+      break;
+    case 'node.switched':
+      activeNodeId = msg.node_id;
+      renderNodes();
+      renderAudio();
+      break;
+    case 'scenario.activated':
+    case 'scenario.transitioning':
+      if (msg.scenario) {
+        activeScenarioId = msg.scenario.id;
+        scenarios[msg.scenario.id] = msg.scenario;
+        // Update active node from scenario
+        if (msg.scenario.node_id) {
+          activeNodeId = msg.scenario.node_id;
+        }
+      }
+      renderScenarios();
+      renderNodes();
+      renderAudio();
+      fetchRGBZones();
+      fetchCompositor();
+      updatePrimaryDisplay();
+      break;
+    // PipeWire watcher events
+    case 'audio.node_online':
+    case 'audio.node_offline':
+    case 'audio.link_changed':
+      fetchAudioState();
+      break;
+    case 'audio.volume_changed':
+      // Update in-memory PW state without full refetch
+      if (msg.name && pwAudioState.nodes[msg.name]) {
+        pwAudioState.nodes[msg.name].volume = msg.volume;
+        pwAudioState.nodes[msg.name].mute = msg.mute;
+      }
+      renderAudio();
+      break;
+    case 'audio.output_discovered':
+    case 'audio.output_changed':
+      fetchAudioOutputs();
+      break;
+    case 'kdeconnect.device_connected':
+    case 'kdeconnect.device_disconnected':
+    case 'kdeconnect.battery':
+      fetchKDEConnect();
+      break;
+    case 'kdeconnect.notification':
+      fetchKDEConnect();
+      pushEvent({type: 'kdeconnect.notification', app: msg.app, title: msg.title, text: msg.text});
+      break;
+    case 'kdeconnect.telephony':
+      fetchKDEConnect();
+      break;
+  }
+}
+
+// ── XSS guard ─────────────────────────────────────────────────────────────────
+function esc(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// ── Room Correction ──────────────────────────────────────────────────────────
+
+let rcProfile = null;
+const RC_IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+                  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+async function initRoomCorrection() {
+  // iOS warning (still relevant if using browser mic as a source)
+  if (RC_IS_IOS) {
+    document.getElementById('rc-ios-warning').style.display = 'block';
+  }
+
+  // Populate node dropdown from controller's registered nodes
+  try {
+    const d = await api('GET', '/nodes');
+    if (d && d.nodes) {
+      const nodeSel = document.getElementById('rc-node');
+      nodeSel.innerHTML = d.nodes.map(n => {
+        const name = n.id.replace('._ozma._udp.local.', '');
+        return `<option value="${n.id}">${name} (${n.hw})</option>`;
+      }).join('');
+      if (d.nodes.length > 0) rcNodeChanged();
+    }
+  } catch(e) {}
+
+  // Load mic compensation models
+  try {
+    const d = await api('GET', '/audio/room-correction/phone-models');
+    const sel = document.getElementById('rc-phone');
+    if (d && d.models) {
+      sel.innerHTML = d.models.map(m =>
+        `<option value="${m}">${m.replace(/_/g, ' ')}</option>`
+      ).join('');
+    }
+  } catch(e) {}
+
+  // Load active profiles
+  try {
+    const d = await api('GET', '/audio/room-correction/profiles');
+    if (d && d.profiles && d.profiles.length > 0) {
+      const el = document.getElementById('rc-active-profiles');
+      el.innerHTML = d.profiles.map(p => {
+        const badge = p.active ? '<span style="color:var(--accent);font-weight:600"> Active</span>' : '';
+        return `<div style="font-size:11px;color:var(--muted);padding:2px 0">${p.name}${badge} — ${p.band_count} bands</div>`;
+      }).join('');
+      if (d.profiles.some(p => p.active)) {
+        document.getElementById('rc-status').textContent = 'EQ active';
+        document.getElementById('rc-status').style.color = 'var(--accent)';
+      }
+    }
+  } catch(e) {}
+
+}
+
+
+let rcSelectedNodeId = '';
+
+// Simple mode: cached node audio info for mic selector
+let rcSimpleNodeId = '';
+let rcSimpleDefaultSink = '';
+
+async function initSimpleMicSelector() {
+  const sel = document.getElementById('rc-simple-mic');
+  if (!sel) return;
+
+  const nodeList = Object.values(nodes).filter(n => n.api_port);
+  if (!nodeList.length) { sel.innerHTML = '<option value="">No nodes</option>'; return; }
+
+  // Use the first node with audio
+  for (const n of nodeList) {
+    try {
+      const d = await api('GET', `/audio/room-correction/node-audio?node_id=${encodeURIComponent(n.id)}`);
+      if (!d || !d.nodes) continue;
+      const sources = d.nodes.filter(x => x.media_class && (x.media_class.includes('Source') || x.media_class.includes('Input')));
+      if (!sources.length && !d.default_source) continue;
+
+      rcSimpleNodeId = n.id;
+      rcSimpleDefaultSink = d.default_sink || '';
+
+      let opts = sources.map(s =>
+        `<option value="node:${s.name}" ${s.default ? 'selected' : ''}>${s.description || s.name}${s.default ? ' (default)' : ''}</option>`
+      ).join('');
+      // Add browser mic option (for phone-based correction)
+      opts += '<option value="browser:">This device\'s mic (browser)</option>';
+      sel.innerHTML = opts;
+      return;
+    } catch(e) {}
+  }
+  sel.innerHTML = '<option value="">No audio devices found</option>';
+}
+
+async function startRoomCorrectionSimple() {
+  const statusEl = document.getElementById('rc-simple-status');
+  const micSel = document.getElementById('rc-simple-mic');
+  const micVal = micSel ? micSel.value : '';
+
+  if (!rcSimpleNodeId) { statusEl.textContent = 'No node available'; return; }
+  if (!rcSimpleDefaultSink) { statusEl.textContent = 'No speakers found'; return; }
+  if (!micVal) { statusEl.textContent = 'Select a microphone'; return; }
+
+  if (micVal.startsWith('browser:')) {
+    // Browser mic — do the sweep server-side but record via browser getUserMedia
+    // For now, fall back to a node source
+    statusEl.textContent = 'Browser mic not yet supported in simple mode — select a node mic';
+    return;
+  }
+
+  const source = micVal.replace('node:', '');
+  statusEl.textContent = 'Sweeping...';
+
+  const result = await api('POST', '/audio/room-correction/sweep', {
+    node_id: rcSimpleNodeId,
+    source: source,
+    sink: rcSimpleDefaultSink,
+    phone_model: 'generic',
+    target_curve: 'harman',
+  });
+
+  if (result && result.ok && result.profile) {
+    const applyResult = await api('POST', '/audio/room-correction/apply', {
+      node_id: rcSimpleNodeId,
+      profile_id: result.profile.id,
+    });
+    if (applyResult && applyResult.ok) {
+      rcProfile = result.profile;
+      rcEqOn = true;
+      const eqBtn = document.getElementById('rc-eq-toggle');
+      if (eqBtn) { eqBtn.style.display = 'inline-block'; eqBtn.textContent = 'EQ: ON'; eqBtn.style.opacity = '1'; }
+      statusEl.innerHTML = `<span style="color:var(--accent);font-weight:600">Corrected</span> — ${result.profile.band_count} bands applied`;
+      document.getElementById('rc-status').textContent = 'EQ active';
+      document.getElementById('rc-status').style.color = 'var(--accent)';
+    } else {
+      statusEl.textContent = 'Correction calculated but apply failed';
+    }
+  } else {
+    statusEl.textContent = result?.error || 'Sweep failed';
+  }
+}
+
+async function rcNodeChanged() {
+  const sel = document.getElementById('rc-node');
+  rcSelectedNodeId = sel.value;
+  const srcSel = document.getElementById('rc-source');
+  const sinkSel = document.getElementById('rc-sink');
+
+  if (!rcSelectedNodeId) {
+    srcSel.innerHTML = '<option value="">Select node first</option>';
+    sinkSel.innerHTML = '<option value="">Select node first</option>';
+    return;
+  }
+
+  srcSel.innerHTML = '<option value="">Loading...</option>';
+  sinkSel.innerHTML = '<option value="">Loading...</option>';
+
+  // Ask the CONTROLLER to fetch audio devices from the node
+  const d = await api('GET', `/audio/room-correction/node-audio?node_id=${encodeURIComponent(rcSelectedNodeId)}`);
+  if (d && d.nodes) {
+    const sources = d.nodes.filter(n => n.media_class && (n.media_class.includes('Source') || n.media_class.includes('Input')));
+    const sinks = d.nodes.filter(n => n.media_class && n.media_class.includes('Sink') && !n.name.includes('.monitor'));
+    srcSel.innerHTML = sources.length
+      ? sources.map(n => `<option value="${n.name}" ${n.default ? 'selected' : ''}>${n.description || n.name}${n.default ? ' (default)' : ''}</option>`).join('')
+      : '<option value="">No sources found</option>';
+    sinkSel.innerHTML = sinks.length
+      ? sinks.map(n => `<option value="${n.name}" ${n.default ? 'selected' : ''}>${n.description || n.name}${n.default ? ' (default)' : ''}</option>`).join('')
+      : '<option value="">No sinks found</option>';
+  } else {
+    srcSel.innerHTML = '<option value="">Failed to load</option>';
+    sinkSel.innerHTML = '<option value="">Failed to load</option>';
+  }
+}
+
+async function startRoomCorrection() {
+  const source = document.getElementById('rc-source').value;
+  const sink = document.getElementById('rc-sink').value;
+  const phoneModel = document.getElementById('rc-phone').value;
+  const targetCurve = document.getElementById('rc-target').value;
+
+  if (!rcSelectedNodeId) { alert('Select a node'); return; }
+  if (!source) { alert('Select a microphone / source'); return; }
+  if (!sink) { alert('Select speakers / sink'); return; }
+
+  document.getElementById('rc-idle').style.display = 'none';
+  document.getElementById('rc-measuring').style.display = 'block';
+  document.getElementById('rc-result').style.display = 'none';
+  document.getElementById('rc-progress').textContent = 'Running sweep on node...';
+
+  try {
+    // Everything goes through the controller. Controller proxies to the node.
+    const result = await api('POST', '/audio/room-correction/sweep', {
+      node_id: rcSelectedNodeId,
+      source, sink,
+      phone_model: phoneModel,
+      target_curve: targetCurve,
+    });
+
+    if (result && result.ok && result.profile) {
+      rcProfile = result.profile;
+      showCorrectionResult(result.profile);
+    } else {
+      document.getElementById('rc-progress').textContent = result?.error || 'Measurement failed';
+      setTimeout(() => resetRoomCorrection(), 3000);
+    }
+  } catch (err) {
+    document.getElementById('rc-progress').textContent = 'Error: ' + (err.message || err);
+    setTimeout(() => resetRoomCorrection(), 3000);
+  }
+}
+
+
+function showCorrectionResult(profile) {
+  document.getElementById('rc-measuring').style.display = 'none';
+  document.getElementById('rc-result').style.display = 'block';
+
+  const canvas = document.getElementById('rc-result-canvas');
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const bands = profile.bands || [];
+  const accent = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#4ae0a4';
+
+  const midY = canvas.height / 2;
+  ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+  ctx.beginPath(); ctx.moveTo(0, midY); ctx.lineTo(canvas.width, midY); ctx.stroke();
+
+  ctx.fillStyle = accent;
+  for (const band of bands) {
+    const x = freqToX(band.freq, canvas.width);
+    const y = midY - (band.gain / 12) * (canvas.height / 2);
+    ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = accent + '80';
+    ctx.beginPath(); ctx.moveTo(x, midY); ctx.lineTo(x, y); ctx.stroke();
+  }
+
+  document.getElementById('rc-bands').textContent = bands.map(b =>
+    `${b.freq >= 1000 ? (b.freq/1000).toFixed(1)+'k' : Math.round(b.freq)}Hz ${b.gain > 0 ? '+' : ''}${b.gain}dB Q${b.q}`
+  ).join(' · ');
+}
+
+function freqToX(freq, width) {
+  return ((Math.log10(freq) - Math.log10(20)) / (Math.log10(20000) - Math.log10(20))) * width;
+}
+
+async function applyCorrection() {
+  if (!rcProfile) return;
+  const r = await api('POST', '/audio/room-correction/apply', {
+    profile_id: rcProfile.id,
+    node_id: rcSelectedNodeId,
+  });
+  if (r && r.ok) {
+    document.getElementById('rc-status').textContent = 'EQ active';
+    document.getElementById('rc-status').style.color = 'var(--accent)';
+    rcEqOn = true;
+    const eqBtn = document.getElementById('rc-eq-toggle');
+    eqBtn.style.display = 'inline-block';
+    eqBtn.textContent = 'EQ: ON';
+    eqBtn.style.opacity = '1';
+  }
+  resetRoomCorrection();
+  initRoomCorrection();
+}
+
+function dismissCorrection() { rcProfile = null; resetRoomCorrection(); }
+
+function resetRoomCorrection() {
+  document.getElementById('rc-idle').style.display = 'block';
+  document.getElementById('rc-measuring').style.display = 'none';
+  document.getElementById('rc-result').style.display = 'none';
+}
+
+// ── Demo A/B playback (bundled reference tracks) ────────────────────────────
+// Multiple high-quality FLAC clips served as static files. Pre-decoded into
+// Playback happens on the node via pw-play (controller proxies the request).
+
+let rcPlaying = false;
+let rcEqOn = false;
+
+async function rcDemoPlay() {
+  const trackId = document.getElementById('rc-demo-track').value;
+  const sink = document.getElementById('rc-sink').value;
+  if (!rcSelectedNodeId) {
+    document.getElementById('rc-demo-status').textContent = 'Select a node first';
+    return;
+  }
+  if (!sink) {
+    document.getElementById('rc-demo-status').textContent = 'Select speakers first';
+    return;
+  }
+
+  rcPlaying = true;
+  document.getElementById('rc-demo-play').style.display = 'none';
+  document.getElementById('rc-demo-stop').style.display = 'inline-block';
+  document.getElementById('rc-demo-status').textContent = `Playing...`;
+
+  const r = await api('POST', '/audio/room-correction/play', {
+    node_id: rcSelectedNodeId,
+    track: trackId,
+    sink: sink,
+  });
+
+  rcPlaying = false;
+  document.getElementById('rc-demo-play').style.display = 'inline-block';
+  document.getElementById('rc-demo-stop').style.display = 'none';
+  document.getElementById('rc-demo-status').textContent = '';
+}
+
+async function rcDemoStop() {
+  if (!rcSelectedNodeId) return;
+  await api('POST', '/audio/room-correction/stop', { node_id: rcSelectedNodeId });
+  document.getElementById('rc-demo-status').textContent = 'Stopped';
+}
+
+async function rcToggleEQ() {
+  if (!rcSelectedNodeId || !rcProfile) return;
+  const btn = document.getElementById('rc-eq-toggle');
+  if (rcEqOn) {
+    await api('POST', '/audio/room-correction/remove', { node_id: rcSelectedNodeId });
+    rcEqOn = false;
+    btn.textContent = 'EQ: OFF';
+    btn.style.opacity = '0.5';
+  } else {
+    await api('POST', '/audio/room-correction/apply', { node_id: rcSelectedNodeId, profile_id: rcProfile.id });
+    rcEqOn = true;
+    btn.textContent = 'EQ: ON';
+    btn.style.opacity = '1';
+  }
+}
+
+setTimeout(initRoomCorrection, 1000);
+
+// ── UI Modes ─────────────────────────────────────────────────────────────────
+let currentMode = localStorage.getItem('ozma-ui-mode') || 'simple';
+
+function setMode(mode) {
+  currentMode = mode;
+  localStorage.setItem('ozma-ui-mode', mode);
+  document.body.className = `mode-${mode}`;
+
+  // Update mode buttons
+  document.querySelectorAll('.mode-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.textContent.toLowerCase() === mode);
+  });
+
+  // Hide simple-only elements in advanced/amazing
+  document.querySelectorAll('[data-mode-show="simple"]').forEach(el => {
+    el.style.display = mode === 'simple' ? '' : 'none';
+  });
+
+  // Re-render everything in the new mode
+  renderNodes();
+  renderAudio();
+  renderAudioSimple();
+  renderScenarios();
+  if (Object.keys(allAudioDevices).length) {
+    renderAudioGraph();
+    renderAudioDevices();
+  }
+}
+
+function renderAudioSimple() {
+  const el = document.getElementById('audio-simple-content');
+  if (!el || currentMode !== 'simple') return;
+
+  // In simple mode: show each node's main output with a friendly name,
+  // big volume slider, mute button, and correction status
+  const audioNodes = Object.values(nodes).filter(n => n.audio_type);
+  if (!audioNodes.length) {
+    el.innerHTML = '<div style="color:var(--muted);font-size:13px;padding:8px 0">No audio connected</div>';
+    return;
+  }
+
+  el.innerHTML = audioNodes.map(n => {
+    const isActive = n.id === activeNodeId;
+    const name = shortId(n.id);
+    const sinkName = n.audio_sink || '';
+    const pwNode = sinkName ? pwAudioState.nodes[sinkName] : null;
+    const volume = pwNode ? pwNode.volume : 1.0;
+    const muted = pwNode ? pwNode.mute : false;
+    const volPct = Math.round(volume * 100);
+    const border = isActive ? 'var(--accent)' : 'var(--border)';
+    const label = isActive ? 'Playing' : 'Ready';
+
+    return `<div style="
+      background:var(--surface);border:2px solid ${border};border-radius:12px;
+      padding:14px 18px;min-width:220px;flex:1;max-width:350px;
+    ">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+        <span style="font-size:16px;font-weight:700;color:#fff">${esc(name)}</span>
+        <span style="font-size:11px;color:${isActive ? 'var(--accent)' : 'var(--muted)'};font-weight:600">${label}</span>
+      </div>
+      ${sinkName ? `
+      <div style="display:flex;align-items:center;gap:10px">
+        <button class="mute-btn ${muted ? 'muted' : ''}" style="font-size:14px;padding:4px 10px;border-radius:6px"
+                onclick="setMute('${esc(sinkName)}', ${!muted})">${muted ? '🔇' : '🔊'}</button>
+        <input type="range" class="vol-slider" style="flex:1;height:8px" min="0" max="150" value="${volPct}"
+               oninput="setVolume('${esc(sinkName)}', this.value/100); this.nextElementSibling.textContent=this.value+'%'">
+        <span style="font-size:13px;color:var(--text);min-width:36px;text-align:right">${volPct}%</span>
+      </div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+setMode(currentMode);
+connect();
+</script>
+</body>
+</html>

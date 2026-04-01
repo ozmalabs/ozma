@@ -1,0 +1,343 @@
+# Ozma Control Surfaces Configuration
+#
+# Copy to controls.yaml and set OZMA_CONTROLS_CONFIG=controller/controls.yaml
+# (or pass an absolute path).
+#
+# Surfaces are physical or virtual devices that can control ozma.
+# Each surface has controls (faders, buttons, rotaries) and displays.
+# Controls are bound to actions that ozma executes.
+#
+# Built-in hotkeys (ScrollLock/Pause for scenario cycling) are always
+# active and do not need to be configured here.
+
+surfaces:
+
+  # ── Behringer X-Touch One ────────────────────────────────────────────────
+  # A compact MIDI control surface with a motorised fader, rotary encoder,
+  # buttons, jog wheel, and an LCD scribble strip.
+  xtouch:
+    type: midi
+    device: "X-Touch One"    # Substring match against MIDI device names
+
+    controls:
+      # Motorised fader — controls volume of the active node's audio
+      fader:
+        type: fader
+        control: 70          # MIDI CC number for fader position
+        note: 110            # MIDI note for touch detection (lockout)
+        binding:
+          action: audio.volume
+          target: "@active"  # Follows whichever node is currently active
+          to_target: midi_to_float    # 0-127 → 0.0-1.0
+          from_target: float_to_midi  # 0.0-1.0 → 0-127
+
+      # Rotary encoder — also volume (or rebind to anything)
+      rotary:
+        type: rotary
+        control: 80
+        binding:
+          action: audio.volume
+          target: "@active"
+          to_target: midi_to_float
+          from_target: float_to_midi
+
+      # Select button — cycle to next scenario
+      select:
+        type: button
+        note: 24
+        style: momentary
+        light: state
+        binding:
+          action: scenario.next
+          value: 1
+
+      # Mute button — mute the active node's audio
+      mute:
+        type: button
+        note: 29
+        style: toggle
+        light: state
+        binding:
+          action: audio.mute
+          target: "@active"
+
+      # Bank left/right — prev/next scenario
+      bank_left:
+        type: button
+        note: 25
+        style: momentary
+        light: false
+        binding:
+          action: scenario.next
+          value: -1
+
+      bank_right:
+        type: button
+        note: 26
+        style: momentary
+        light: false
+        binding:
+          action: scenario.next
+          value: 1
+
+      # Jog wheel — cycle scenarios
+      jog:
+        type: jogwheel
+        control: 60
+        binding:
+          action: scenario.next
+
+    displays:
+      # Scribble strip top half — shows active scenario name
+      scribble_top:
+        type: scribble_top
+        binding: "@active.name"
+
+      # Scribble strip bottom half — shows active node short name
+      scribble_bottom:
+        type: scribble_bottom
+        binding: "@active.node"
+
+
+  # ── Example: generic MIDI faderbox ───────────────────────────────────────
+  # faderbox:
+  #   type: midi
+  #   device: "nanoKONTROL"
+  #   controls:
+  #     fader1:
+  #       type: fader
+  #       control: 0
+  #       binding:
+  #         action: audio.volume
+  #         target: "ozma-vm1"       # Specific node (not @active)
+  #         to_target: midi_to_float
+  #         from_target: float_to_midi
+  #     fader2:
+  #       type: fader
+  #       control: 1
+  #       binding:
+  #         action: audio.volume
+  #         target: "ozma-vm2"
+  #         to_target: midi_to_float
+  #         from_target: float_to_midi
+
+
+  # ── Example: interpolated value mapping ──────────────────────────────────
+  # For non-linear fader curves, use scipy interpolation:
+  #
+  #   fader:
+  #     type: fader
+  #     control: 70
+  #     note: 110
+  #     binding:
+  #       action: audio.volume
+  #       target: "@active"
+  #       to_target:
+  #         map:
+  #           from: [0, 13, 21, 29, 46, 62, 79, 96, 111, 127]
+  #           to:   [0, 0.1, 0.15, 0.2, 0.3, 0.45, 0.6, 0.75, 0.9, 1.0]
+
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # OSC (Open Sound Control)
+  # ══════════════════════════════════════════════════════════════════════════
+  # Works with TouchOSC, Lemur, Open Stage Control, custom ESP32, etc.
+  # Any OSC app can control ozma by sending to the configured port.
+  #
+  # Inbound addresses:
+  #   /ozma/scenario/next            cycle scenario
+  #   /ozma/scenario/prev            cycle scenario
+  #   /ozma/scenario/activate <id>   activate by ID
+  #   /ozma/volume <float>           set active node volume (0.0-1.0)
+  #   /ozma/volume/<node> <float>    set specific node volume
+  #   /ozma/mute                     toggle mute on active node
+  #   /ozma/mute/<node> <bool>       set mute on specific node
+  #
+  # Outbound feedback (if feedback_host is set):
+  #   /ozma/state/scenario <id> <name> <color>
+  #   /ozma/state/volume <node> <float>
+  #   /ozma/state/mute <node> <bool>
+
+  # osc:
+  #   type: osc
+  #   listen_host: "0.0.0.0"
+  #   listen_port: 9000
+  #   feedback_host: "192.168.1.50"   # IP of your tablet/phone running TouchOSC
+  #   feedback_port: 9001
+
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # Generic evdev (ShuttlePRO, foot pedals, macro pads, button boxes)
+  # ══════════════════════════════════════════════════════════════════════════
+  # Any /dev/input device with buttons or axes.  Matched by device name.
+  # Use `evtest` or `cat /proc/bus/input/devices` to find button codes.
+
+  # ── Contour ShuttlePRO v2 ───────────────────────────────────────────────
+  # shuttle:
+  #   type: evdev
+  #   device: "ShuttlePRO"     # Substring match on device name
+  #   grab: true               # Exclusive grab (compositor won't see events)
+  #   buttons:
+  #     # Button codes from evtest (KEY_* or BTN_* numeric codes)
+  #     260: { action: scenario.next, value: -1 }     # Button 1 → prev scenario
+  #     261: { action: scenario.next, value: 1 }      # Button 2 → next scenario
+  #     262: { action: audio.mute, target: "@active" } # Button 3 → toggle mute
+  #     263: { action: scenario.activate, value: "work" }
+  #     264: { action: scenario.activate, value: "gaming" }
+  #   axes:
+  #     # Shuttle ring (absolute axis)
+  #     8: { action: audio.volume, target: "@active" }
+  #   rel_axes:
+  #     # Jog wheel (relative axis) — each click = +1 or -1
+  #     7: { action: scenario.next }
+
+  # ── USB foot pedal (single or multi) ─────────────────────────────────────
+  # foot_pedal:
+  #   type: evdev
+  #   device: "Foot"           # Most USB foot pedals have "Foot" in the name
+  #   grab: true
+  #   buttons:
+  #     256: { action: scenario.next, value: 1 }      # Single pedal
+  #     # Multi-pedal:
+  #     # 256: { action: scenario.next, value: -1 }   # Left pedal
+  #     # 257: { action: audio.mute, target: "@active" } # Middle pedal
+  #     # 258: { action: scenario.next, value: 1 }    # Right pedal
+
+  # ── Razer Tartarus / macro keypad ────────────────────────────────────────
+  # tartarus:
+  #   type: evdev
+  #   device: "Razer Tartarus"
+  #   grab: true
+  #   buttons:
+  #     # Map specific keys to ozma actions (use evtest to find codes)
+  #     2: { action: scenario.activate, value: "scenario1" }  # Key 1
+  #     3: { action: scenario.activate, value: "scenario2" }  # Key 2
+  #     4: { action: scenario.activate, value: "scenario3" }  # Key 3
+
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # NOTE: Gamepads and Stream Decks are auto-detected
+  # ══════════════════════════════════════════════════════════════════════════
+  #
+  # GAMEPADS (Xbox, PlayStation, generic):
+  #   Auto-detected from /dev/input. No config needed.
+  #   Default mapping:
+  #     D-pad left/right  → Scenario prev/next
+  #     LB / RB           → Scenario prev/next
+  #     A / Cross         → Activate scenario
+  #     Guide / PS        → Toggle mute
+  #     RT (analog)       → Volume
+  #     D-pad up/down     → Volume step +/-5%
+  #
+  #   Supported controllers:
+  #     Xbox 360, Xbox One, Xbox Series X|S
+  #     PlayStation 3 (DualShock 3)
+  #     PlayStation 4 (DualShock 4)
+  #     PlayStation 5 (DualSense)
+  #     8BitDo controllers
+  #     Nintendo Switch Pro Controller
+  #     Any generic gamepad recognised by Linux
+  #
+  # STREAM DECK:
+  #   Auto-detected via USB. No config needed.
+  #   Each key maps to a scenario (by order).
+  #   Key images show scenario name + colour, active key highlighted.
+  #   Stream Deck Pedal: left=prev, middle=mute, right=next.
+  #
+  #   Supported models:
+  #     Stream Deck Mini (6 keys)
+  #     Stream Deck Original / V2 (15 keys)
+  #     Stream Deck XL (32 keys)
+  #     Stream Deck Pedal (3 foot switches)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MOTION DEVICES
+# ══════════════════════════════════════════════════════════════════════════════
+# Motorised physical devices: monitor stands, sit/stand desks, cranes,
+# pan/tilt heads, linear actuators.
+#
+# Each device has named axes and optional presets.  Axes can be velocity
+# mode (joystick: -1.0 to +1.0) or position mode (go to 0.0-1.0).
+#
+# Bind control surface axes to motion axes:
+#   joystick X → crane pan (velocity)
+#   gamepad trigger → monitor height (position)
+#   scenario switch → desk preset "standing"
+
+motion:
+
+  # ── Workshop crane (serial/USB) ──────────────────────────────────────────
+  # crane:
+  #   type: serial
+  #   name: "Workshop Crane"
+  #   port: /dev/ttyUSB0
+  #   baudrate: 115200
+  #   axes:
+  #     height:  { mode: velocity }   # Hoist up/down
+  #     pan:     { mode: velocity }   # Swing left/right
+  #     extend:  { mode: velocity }   # Boom extend/retract
+  #
+  #   # Bind joystick to crane:
+  #   # In surfaces section, add:
+  #   #   joystick:
+  #   #     type: evdev
+  #   #     device: "Logitech Extreme"
+  #   #     axes:
+  #   #       0: { action: motion.move, target: "crane:pan" }
+  #   #       1: { action: motion.move, target: "crane:height" }
+  #   #       2: { action: motion.move, target: "crane:extend" }
+
+  # ── Monitor stand (serial/USB) ──────────────────────────────────────────
+  # monitor:
+  #   type: serial
+  #   name: "Monitor Stand"
+  #   port: /dev/ttyACM0
+  #   baudrate: 9600
+  #   axes:
+  #     height:  { mode: position }   # 0.0 = lowest, 1.0 = highest
+  #   presets:
+  #     low:     { height: 0.0 }
+  #     mid:     { height: 0.5 }
+  #     high:    { height: 1.0 }
+
+  # ── Sit/stand desk (HTTP/ESP32) ──────────────────────────────────────────
+  # desk:
+  #   type: http
+  #   name: "Standing Desk"
+  #   host: 10.0.0.50
+  #   port: 80
+  #   axes:
+  #     height:  { mode: position }
+  #   presets:
+  #     seated:    { height: 0.3 }
+  #     standing:  { height: 0.75 }
+
+  # ── Pan/tilt camera head (MQTT) ──────────────────────────────────────────
+  # camera_head:
+  #   type: mqtt
+  #   name: "Camera PTZ"
+  #   broker: localhost
+  #   port: 1883
+  #   axes:
+  #     pan:   { mode: velocity }
+  #     tilt:  { mode: velocity }
+
+# ── Scenario motion presets ────────────────────────────────────────────────
+# Add "motion" to scenarios.json to move devices on scenario switch:
+#
+#   {
+#     "id": "work",
+#     "name": "Work",
+#     "node_id": "work-pc._ozma._udp.local.",
+#     "color": "#4A90D9",
+#     "motion": {
+#       "desk": {"height": 0.75},
+#       "monitor": {"height": 0.6}
+#     }
+#   }
+#
+# When "Work" scenario activates:
+#   - Desk moves to 75% height (standing)
+#   - Monitor adjusts to 60% height
+#   - HID, audio, RGB all switch as usual

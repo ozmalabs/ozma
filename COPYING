@@ -1,0 +1,28 @@
+Ozma — Software-Defined KVM Fabric
+Copyright (C) 2024-2026 Ozma Labs Pty Ltd
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, version 3 of the License.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program (LICENSE.txt). If not, see
+https://www.gnu.org/licenses/agpl-3.0.html
+
+Additional permission under GNU AGPL version 3 section 7 — Plugin Exception:
+
+If you modify this Program, or any covered work, by linking or combining
+it with plugins loaded via the ozma plugin API (as defined in
+controller/plugin_api.py), the license of the combined work does not
+extend to those plugins, provided they communicate solely through the
+documented plugin API. This additional permission does not affect any
+other requirements of the GNU Affero General Public License.
+
+This exception exists so that third-party plugins — both open-source
+and proprietary — can extend the ozma platform without being required
+to adopt the AGPL. The ozma platform itself remains AGPL-3.0.

@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ozma — 3D Desk</title>
+<link rel="icon" href="/static/favicon.ico" sizes="any">
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160/examples/jsm/"}}</script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;overflow:hidden;font-family:system-ui}
+canvas{display:block}
+#hud{position:fixed;top:12px;left:12px;color:#888;font-size:11px;pointer-events:none;z-index:10}
+#hud .scenario{font-size:18px;font-weight:700;color:#fff;margin-bottom:4px}
+#hud .status{opacity:0.6}
+#nav{position:fixed;bottom:12px;left:50%;transform:translateX(-50%);display:flex;gap:8px;z-index:10}
+#nav button{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);color:#aaa;padding:6px 16px;border-radius:6px;cursor:pointer;font-size:12px;transition:all 0.2s}
+#nav button:hover{background:rgba(255,255,255,0.1);color:#fff}
+#nav button.active{border-color:var(--color);color:#fff;box-shadow:0 0 12px var(--color)}
+</style>
+</head>
+<body>
+<div id="hud">
+  <div class="scenario" id="hud-scenario">Connecting...</div>
+  <div class="status" id="hud-status"></div>
+</div>
+<div id="nav"></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ── State ────────────────────────────────────────────────────────────────────
+let scenarioColor = new THREE.Color(0x4A90D9);
+let scenarioName = '';
+let ws;
+
+// ── Scene setup ──────────────────────────────────────────────────────────────
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0a0f);
+scene.fog = new THREE.Fog(0x0a0a0f, 8, 25);
+
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 100);
+camera.position.set(0, 2.5, 4.5);
+camera.lookAt(0, 1.0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.2;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 1.0, 0);
+controls.enableDamping = true;
+controls.dampingFactor = 0.05;
+controls.minDistance = 2;
+controls.maxDistance = 12;
+
+// ── Lighting ─────────────────────────────────────────────────────────────────
+const ambient = new THREE.AmbientLight(0x222233, 0.3);
+scene.add(ambient);
+
+const keyLight = new THREE.DirectionalLight(0xffffff, 0.6);
+keyLight.position.set(3, 5, 2);
+keyLight.castShadow = true;
+keyLight.shadow.mapSize.set(1024, 1024);
+scene.add(keyLight);
+
+const fillLight = new THREE.PointLight(0x4466aa, 0.3, 10);
+fillLight.position.set(-2, 3, 1);
+scene.add(fillLight);
+
+// ── Materials ────────────────────────────────────────────────────────────────
+const darkMetal = new THREE.MeshStandardMaterial({ color: 0x1a1a22, metalness: 0.8, roughness: 0.3 });
+const glass = new THREE.MeshPhysicalMaterial({ color: 0x111118, metalness: 0, roughness: 0.05, transmission: 0.6, thickness: 0.02 });
+const screenMat = new THREE.MeshBasicMaterial({ color: 0x111122 });
+const ledMat = new THREE.MeshBasicMaterial({ color: scenarioColor });
+
+// ── Desk (frosted glass) ─────────────────────────────────────────────────────
+const deskGeo = new THREE.BoxGeometry(3.2, 0.04, 1.2);
+const desk = new THREE.Mesh(deskGeo, glass);
+desk.position.set(0, 0.75, 0);
+desk.receiveShadow = true;
+scene.add(desk);
+
+// Desk legs
+for (const [x, z] of [[-1.5, -0.5], [1.5, -0.5], [-1.5, 0.5], [1.5, 0.5]]) {
+  const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.02, 0.02, 0.75), darkMetal);
+  leg.position.set(x, 0.375, z);
+  scene.add(leg);
+}
+
+// ── LED strip under desk (underglow) ─────────────────────────────────────────
+const underglow = new THREE.Mesh(
+  new THREE.BoxGeometry(3.0, 0.01, 1.0),
+  new THREE.MeshBasicMaterial({ color: scenarioColor, transparent: true, opacity: 0.4 })
+);
+underglow.position.set(0, 0.73, 0);
+scene.add(underglow);
+
+// Ground plane to catch underglow
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(8, 8),
+  new THREE.MeshStandardMaterial({ color: 0x0a0a0f, roughness: 0.9 })
+);
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// ── Monitors (PLP: 27" portrait | 48" landscape | 27" portrait) ──────────────
+function makeMonitor(w, h, x, rotY = 0) {
+  const group = new THREE.Group();
+  // Bezel
+  const bezel = new THREE.Mesh(new THREE.BoxGeometry(w + 0.02, h + 0.02, 0.03), darkMetal);
+  group.add(bezel);
+  // Screen
+  const screen = new THREE.Mesh(new THREE.PlaneGeometry(w, h), screenMat);
+  screen.position.z = 0.016;
+  group.add(screen);
+  // LED strip behind
+  const led = new THREE.Mesh(
+    new THREE.BoxGeometry(w + 0.1, h + 0.1, 0.005),
+    new THREE.MeshBasicMaterial({ color: scenarioColor, transparent: true, opacity: 0.3 })
+  );
+  led.position.z = -0.02;
+  group.add(led);
+  group.position.set(x, 1.55, -0.45);
+  group.rotation.y = rotY;
+  group.userData = { led, screen };
+  return group;
+}
+
+const monL = makeMonitor(0.35, 0.62, -0.95, 0.15);   // 27" portrait (left)
+const monC = makeMonitor(1.1, 0.5, 0, 0);             // 48" landscape (centre)
+const monR = makeMonitor(0.35, 0.62, 0.95, -0.15);    // 27" portrait (right)
+scene.add(monL, monC, monR);
+
+// Monitor bar
+const bar = new THREE.Mesh(new THREE.BoxGeometry(2.2, 0.03, 0.03), darkMetal);
+bar.position.set(0, 1.9, -0.45);
+scene.add(bar);
+
+// LED strips on bar sides
+const barLedL = new THREE.Mesh(
+  new THREE.BoxGeometry(0.01, 0.4, 0.01),
+  new THREE.MeshBasicMaterial({ color: scenarioColor })
+);
+barLedL.position.set(-1.15, 1.7, -0.45);
+const barLedR = barLedL.clone();
+barLedR.position.x = 1.15;
+scene.add(barLedL, barLedR);
+
+// ── Devices on desk ──────────────────────────────────────────────────────────
+// Stream Deck
+const streamdeck = new THREE.Mesh(new THREE.BoxGeometry(0.15, 0.02, 0.1), darkMetal);
+streamdeck.position.set(-0.8, 0.78, 0.25);
+scene.add(streamdeck);
+// Keys (3x5 grid of tiny coloured squares)
+for (let r = 0; r < 3; r++) for (let c = 0; c < 5; c++) {
+  const key = new THREE.Mesh(
+    new THREE.PlaneGeometry(0.02, 0.02),
+    new THREE.MeshBasicMaterial({ color: r === 0 && c === 0 ? scenarioColor : 0x333344 })
+  );
+  key.position.set(-0.86 + c * 0.03, 0.791, 0.22 + r * 0.03);
+  key.rotation.x = -Math.PI / 2;
+  scene.add(key);
+}
+
+// X-Touch One (on a stand to the right)
+const xtouch = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.25, 0.06), darkMetal);
+xtouch.position.set(1.3, 0.88, 0.2);
+scene.add(xtouch);
+// Fader slot
+const faderSlot = new THREE.Mesh(
+  new THREE.BoxGeometry(0.01, 0.18, 0.005),
+  new THREE.MeshBasicMaterial({ color: 0x333344 })
+);
+faderSlot.position.set(1.3, 0.88, 0.231);
+scene.add(faderSlot);
+
+// Phone
+const phone = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.005, 0.16), darkMetal);
+phone.position.set(0.6, 0.775, 0.35);
+scene.add(phone);
+
+// Microphone
+const micStand = new THREE.Mesh(new THREE.CylinderGeometry(0.01, 0.01, 0.4), darkMetal);
+micStand.position.set(-0.5, 0.97, 0.3);
+scene.add(micStand);
+const micHead = new THREE.Mesh(new THREE.SphereGeometry(0.025), darkMetal);
+micHead.position.set(-0.5, 1.18, 0.3);
+scene.add(micHead);
+
+// Controller box (OLED)
+const ctrlBox = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.04, 0.08), darkMetal);
+ctrlBox.position.set(-0.3, 0.78, 0.35);
+scene.add(ctrlBox);
+const oled = new THREE.Mesh(
+  new THREE.PlaneGeometry(0.08, 0.02),
+  new THREE.MeshBasicMaterial({ color: scenarioColor, transparent: true, opacity: 0.8 })
+);
+oled.position.set(-0.3, 0.801, 0.35);
+oled.rotation.x = -Math.PI / 2;
+scene.add(oled);
+
+// Node LEDs (two small boxes with glowing strips)
+function makeNode(x, z, active) {
+  const box = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.03, 0.04), darkMetal);
+  box.position.set(x, 0.78, z);
+  scene.add(box);
+  const led = new THREE.Mesh(
+    new THREE.BoxGeometry(0.058, 0.005, 0.038),
+    new THREE.MeshBasicMaterial({ color: scenarioColor, transparent: true, opacity: active ? 1.0 : 0.1 })
+  );
+  led.position.set(x, 0.796, z);
+  scene.add(led);
+  return { box, led };
+}
+const node1 = makeNode(0.2, 0.4, true);
+const node2 = makeNode(0.35, 0.4, false);
+
+// ── Collect all LED elements for colour updates ──────────────────────────────
+const leds = [
+  underglow.material, barLedL.material, barLedR.material, oled.material,
+  monL.userData.led.material, monC.userData.led.material, monR.userData.led.material,
+  node1.led.material,
+];
+const dimLeds = [node2.led.material];
+
+// ── WebSocket ────────────────────────────────────────────────────────────────
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/api/v1/events`);
+  ws.onmessage = ({ data }) => {
+    const msg = JSON.parse(data);
+    if (msg.type === 'scenario.activated' || msg.type === 'scenario.transitioning') {
+      if (msg.scenario) {
+        const c = msg.scenario.color || '#4A90D9';
+        scenarioColor.set(c);
+        scenarioName = msg.scenario.name || msg.scenario.id;
+        document.getElementById('hud-scenario').textContent = scenarioName;
+        updateColors();
+      }
+    } else if (msg.type === 'snapshot' && msg.data) {
+      // Load scenarios for nav buttons
+      fetch('/api/v1/scenarios').then(r => r.json()).then(d => buildNav(d.scenarios, d.active_id));
+      if (msg.data.active_node_id) {
+        document.getElementById('hud-status').textContent = msg.data.active_node_id.split('.')[0];
+      }
+    }
+  };
+  ws.onclose = () => setTimeout(connect, 2000);
+}
+
+function updateColors() {
+  for (const mat of leds) mat.color.copy(scenarioColor);
+  for (const mat of dimLeds) {
+    mat.color.copy(scenarioColor);
+    mat.opacity = 0.08;
+  }
+}
+
+function buildNav(scenarios, activeId) {
+  const nav = document.getElementById('nav');
+  nav.innerHTML = scenarios.map(s => {
+    const active = s.id === activeId ? 'active' : '';
+    return `<button class="${active}" style="--color:${s.color}" onclick="fetch('/api/v1/scenarios/${s.id}/activate',{method:'POST'})">${s.name}</button>`;
+  }).join('');
+  if (activeId) {
+    const sc = scenarios.find(s => s.id === activeId);
+    if (sc) {
+      scenarioColor.set(sc.color);
+      scenarioName = sc.name;
+      document.getElementById('hud-scenario').textContent = scenarioName;
+      updateColors();
+    }
+  }
+}
+
+connect();
+
+// ── Animation ────────────────────────────────────────────────────────────────
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+
+  // Gentle breathe on underglow
+  const t = performance.now() / 1000;
+  underglow.material.opacity = 0.25 + Math.sin(t * 1.5) * 0.1;
+
+  renderer.render(scene, camera);
+}
+animate();
+
+window.addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>

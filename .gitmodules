@@ -1,0 +1,9 @@
+[submodule "tinynode"]
+	path = tinynode
+	url = https://github.com/ozmalabs/tinynode.git
+[submodule "protocol"]
+	path = protocol
+	url = https://github.com/ozmalabs/protocol.git
+[submodule "site"]
+	path = site
+	url = https://github.com/ozmalabs/website.git

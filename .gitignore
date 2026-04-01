@@ -1,0 +1,60 @@
+# Claude Code context (internal, never public)
+CLAUDE.md
+.claude/
+
+# Internal architecture docs (moved to ozmalabs/internal)
+system/
+
+# Controller runtime state (generated locally)
+controller/scenarios.json
+controller/macros.json
+controller/cameras.json
+controller/connect_cache.json
+controller/mesh_registry.json
+controller/obs_scenes.json
+controller/provisioning.json
+controller/stream_routes.json
+
+# Generated files
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+
+# Logs
+*.log
+demo/logs/
+
+# VM images and runtime state (built locally, not versioned)
+images/
+
+# HLS stream segment cache
+controller/static/streams/
+
+# Site dependencies (install with npm install)
+site/node_modules/
+site/package-lock.json
+
+# Dev secrets / local overrides
+.env
+.dev.vars
+
+# Kernel build artifacts (cross-compiled modules, source tree)
+dev/kernel-build/linux-*/
+dev/kernel-build/*.tar.xz
+dev/kernel-build/*.tar.gz
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+*.swp
+
+# Demo binary assets (downloaded/generated locally)
+demo/cache/
+demo/recordings/

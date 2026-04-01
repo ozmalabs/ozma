@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install ruff
+        run: pip install ruff
+      - name: Lint
+        run: ruff check controller/ node/ softnode/ agent/
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install dependencies
+        run: |
+          pip install mypy
+          pip install -r controller/requirements.txt 2>/dev/null || true
+      - name: Type check
+        run: mypy controller/ --ignore-missing-imports --no-error-summary || true
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install dependencies
+        run: |
+          pip install pytest pytest-timeout pytest-asyncio
+          pip install -r controller/requirements.txt 2>/dev/null || true
+      - name: Run tests
+        run: python -m pytest tests/ -x --timeout 30 -v
+
+  compile-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Compile all Python files
+        run: python -m py_compile controller/*.py node/*.py softnode/*.py
+
+  dco-check:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check DCO sign-off
+        run: |
+          commits=$(git log --format='%H %s' origin/${{ github.base_ref }}..HEAD)
+          failed=0
+          while IFS= read -r line; do
+            hash=$(echo "$line" | cut -d' ' -f1)
+            if ! git log -1 --format='%B' "$hash" | grep -q "^Signed-off-by:"; then
+              echo "Missing DCO sign-off: $line"
+              failed=1
+            fi
+          done <<< "$commits"
+          if [ "$failed" -eq 1 ]; then
+            echo ""
+            echo "All commits must include: Signed-off-by: Your Name <email>"
+            echo "Use: git commit -s"
+            exit 1
+          fi
