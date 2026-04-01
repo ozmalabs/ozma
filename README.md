@@ -31,13 +31,16 @@ No signal interruption on switch. No host software on the target. Works with any
 controller/     Python FastAPI controller daemon
 node/           Python node listener (runs on the node device)
 softnode/       QEMU-based soft node (node emulated as a VM)
+agent/          Host agent (runs inside the target machine's OS)
 tinynode/       Embedded platform support (Milk-V Duo S, RPi, Teensy) [submodule]
 protocol/       Wire protocol specifications [submodule]
-system/         Architecture and design documentation
+site/           Cloudflare Pages static web UI [submodule]
+docs/           Architecture, protocols, security, getting started
 dev/            Development harness: QEMU VMs, build scripts, Makefile
-site/           Cloudflare Pages static web UI
 demo/           Demo orchestration scripts
-docs/           Additional documentation
+tests/          Automated tests (E2E, unit, integration)
+firmware/       ESP32 screen firmware
+renderer/       Node.js screen rendering service
 ```
 
 ## Quick start (dev harness)
@@ -159,6 +162,13 @@ See [`dev/README.md`](dev/README.md) for the full setup guide.
 | 2222 | TCP | RISC-V VM SSH (SLIRP forward) |
 
 See [`protocol/specs/00-ports.md`](protocol/specs/00-ports.md) for the full port registry.
+
+## Documentation
+
+- [Architecture](docs/architecture.md) — system overview, three-layer model, data paths
+- [Protocols](docs/protocols.md) — wire protocol specs, packet formats, REST API
+- [Security](docs/security.md) — device identity, WireGuard mesh, enrollment, OTA signing
+- [Getting Started](docs/getting-started.md) — dev harness setup guide
 
 ## License
 
