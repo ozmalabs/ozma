@@ -1,0 +1,49 @@
+#!/bin/bash
+# Ozma Proxmox VM lifecycle hook
+# Called by Proxmox on VM start/stop/migrate
+#
+# Usage (in /etc/pve/qemu-server/hookscript):
+#   hookscript: local:snippets/ozma-vm-hook
+#
+# Arguments: $1 = vmid, $2 = phase (pre-start, post-start, pre-stop, post-stop, pre-migrate, post-migrate)
+
+VMID=$1
+PHASE=$2
+
+case "$PHASE" in
+    post-start)
+        # Create shared memory for KVMFR
+        SHM_PATH="/dev/shm/ozma-vm${VMID}"
+        SHM_SIZE=$((64 * 1024 * 1024))  # 64MB default
+        if [ ! -f "$SHM_PATH" ]; then
+            truncate -s $SHM_SIZE "$SHM_PATH"
+            chmod 666 "$SHM_PATH"
+        fi
+
+        # Create run directory
+        mkdir -p /var/run/ozma
+
+        # Start display service
+        systemctl start "ozma-display@${VMID}.service"
+
+        logger -t ozma "VM $VMID: ozma display started"
+        ;;
+
+    pre-stop)
+        systemctl stop "ozma-display@${VMID}.service"
+        rm -f "/dev/shm/ozma-vm${VMID}"
+        logger -t ozma "VM $VMID: ozma display stopped"
+        ;;
+
+    pre-migrate)
+        systemctl stop "ozma-display@${VMID}.service"
+        logger -t ozma "VM $VMID: ozma display stopped for migration"
+        ;;
+
+    post-migrate)
+        # Display will restart on the destination node via its own hook
+        logger -t ozma "VM $VMID: migration complete"
+        ;;
+esac
+
+exit 0

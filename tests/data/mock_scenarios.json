@@ -1,0 +1,1 @@
+{"scenarios": [{"id": "vm1", "name": "VM 1", "node_id": "vm1._ozma._udp.local.", "color": "#4A90D9"}, {"id": "vm2", "name": "VM 2", "node_id": "vm2._ozma._udp.local.", "color": "#50C878"}], "default": "vm1"}

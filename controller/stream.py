@@ -332,16 +332,22 @@ class StreamManager:
         entry = self._captures.get(node_id)
         if isinstance(entry, StreamCapture):
             return entry.mjpeg_frames()
+        if isinstance(entry, _SoftNodeStream):
+            return entry.mjpeg_frames()
         return None
 
     async def send_pointer(self, node_id: str, x: int, y: int, buttons: int) -> None:
         entry = self._captures.get(node_id)
-        if isinstance(entry, StreamCapture):
+        if isinstance(entry, _SoftNodeStream):
+            await entry.send_pointer(x, y, buttons)
+        elif isinstance(entry, StreamCapture):
             await entry.send_pointer(x, y, buttons)
 
     async def send_key(self, node_id: str, key: str, down: bool) -> None:
         entry = self._captures.get(node_id)
-        if isinstance(entry, StreamCapture):
+        if isinstance(entry, _SoftNodeStream):
+            await entry.send_key(key, down)
+        elif isinstance(entry, StreamCapture):
             await entry.send_key(key, down)
 
     # ── internal ─────────────────────────────────────────────────────────────
@@ -365,7 +371,16 @@ class StreamManager:
             self._captures[node.id] = _RemoteStream(node.id, node.stream_url)
             log.info("Remote stream registered for %s → %s", node.id, node.stream_url)
             return
-        # VNC node — local capture + MJPEG
+        # Soft node with D-Bus display — pull MJPEG from soft node API
+        api_port = node.api_port or 0
+        if api_port and node.hw == "soft":
+            cap = _SoftNodeStream(node.id, node.host, api_port)
+            self._captures[node.id] = cap
+            cap.start()
+            log.info("Soft node display stream for %s (D-Bus via %s:%d)",
+                     node.id, node.host, api_port)
+            return
+        # VNC node — local capture + MJPEG (fallback)
         if node.vnc_host and node.vnc_port:
             out_dir = self._static_dir / safe_id(node.id)
             cap = StreamCapture(node.id, node.vnc_host, node.vnc_port, out_dir, self._codec)
@@ -388,13 +403,129 @@ class StreamManager:
                 log.info("Stream capture stopped for offline node %s", nid)
 
 
+class _SoftNodeStream:
+    """
+    Stream from a soft node's D-Bus display via its HTTP API.
+
+    The soft node captures QEMU's framebuffer via D-Bus and serves
+    MJPEG at /display/mjpeg. This class proxies that stream and
+    forwards keyboard/mouse input to the soft node's D-Bus display.
+    """
+
+    def __init__(self, node_id: str, host: str, api_port: int) -> None:
+        self.node_id = node_id
+        self._host = host
+        self._api_port = api_port
+        self.active = False
+        self._latest_jpeg: bytes | None = None
+        self._task: asyncio.Task | None = None
+        self._vnc_w = 1024
+        self._vnc_h = 768
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._pull_loop(), name=f"softnode-stream-{self.node_id}")
+        self.active = True
+
+    def stop(self) -> None:
+        self.active = False
+        if self._task:
+            self._task.cancel()
+
+    @property
+    def stream_path(self) -> str:
+        return f"api/v1/streams/{self.node_id}/mjpeg"
+
+    async def _pull_loop(self) -> None:
+        """Pull JPEG frames from the soft node's snapshot endpoint."""
+        import aiohttp
+        url = f"http://{self._host}:{self._api_port}/display/snapshot"
+        while self.active:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                        if resp.status == 200:
+                            self._latest_jpeg = await resp.read()
+                            # Parse dimensions
+                            try:
+                                from PIL import Image
+                                import io
+                                img = Image.open(io.BytesIO(self._latest_jpeg))
+                                self._vnc_w = img.width
+                                self._vnc_h = img.height
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+            await asyncio.sleep(1.0 / 15)
+
+    async def mjpeg_frames(self):
+        """Yield JPEG frames for MJPEG streaming."""
+        while self.active:
+            if self._latest_jpeg:
+                yield self._latest_jpeg
+            await asyncio.sleep(1.0 / 15)
+
+    async def send_pointer(self, x: int, y: int, buttons: int) -> None:
+        """Forward mouse to soft node D-Bus display."""
+        import aiohttp
+        action = "click" if buttons else "move"
+        try:
+            async with aiohttp.ClientSession() as session:
+                await session.post(
+                    f"http://{self._host}:{self._api_port}/input/mouse",
+                    json={"x": x, "y": y, "button": 0, "action": action},
+                    timeout=aiohttp.ClientTimeout(total=1),
+                )
+        except Exception:
+            pass
+
+    async def send_key(self, key: str, down: bool) -> None:
+        """Forward keyboard to soft node D-Bus display."""
+        # Map VNC keysym name to evdev keycode
+        VNC_TO_EVDEV = {
+            'Return': 28, 'BackSpace': 14, 'Tab': 15, 'Escape': 1,
+            'Delete': 111, 'Insert': 110, 'Home': 102, 'End': 107,
+            'Prior': 104, 'Next': 109,
+            'Up': 103, 'Down': 108, 'Left': 105, 'Right': 106,
+            'F1': 59, 'F2': 60, 'F3': 61, 'F4': 62, 'F5': 63, 'F6': 64,
+            'F7': 65, 'F8': 66, 'F9': 67, 'F10': 68, 'F11': 87, 'F12': 88,
+            'Control_L': 29, 'Shift_L': 42, 'Alt_L': 56, 'Super_L': 125,
+            'Control_R': 97, 'Shift_R': 54, 'Alt_R': 100, 'Super_R': 126,
+            'space': 57, 'Caps_Lock': 58, 'Num_Lock': 69, 'Scroll_Lock': 70,
+        }
+        # Single character → evdev
+        CHAR_EVDEV = {c: 30 + i for i, c in enumerate('asdfghjkl')}
+        CHAR_EVDEV.update({c: 16 + i for i, c in enumerate('qwertyuiop')})
+        CHAR_EVDEV.update({c: 44 + i for i, c in enumerate('zxcvbnm')})
+        CHAR_EVDEV.update({str(i): 2 + i if i > 0 else 11 for i in range(10)})
+        CHAR_EVDEV.update({'.': 52, '-': 12, '=': 13, ',': 51, '/': 53, ';': 39,
+                           "'": 40, '\\': 43, '[': 26, ']': 27, '`': 41})
+
+        keycode = VNC_TO_EVDEV.get(key)
+        if not keycode and len(key) == 1:
+            keycode = CHAR_EVDEV.get(key.lower())
+        if not keycode:
+            return
+
+        import aiohttp
+        try:
+            async with aiohttp.ClientSession() as session:
+                await session.post(
+                    f"http://{self._host}:{self._api_port}/input/key",
+                    json={"keycode": keycode, "down": down},
+                    timeout=aiohttp.ClientTimeout(total=1),
+                )
+        except Exception:
+            pass
+
+
 class _RemoteStream:
     """Placeholder for a hardware node that serves its own HLS stream."""
 
     def __init__(self, node_id: str, remote_url: str) -> None:
         self.node_id = node_id
         self.remote_url = remote_url
-        self.active = True  # assumed active; node health is tracked by discovery
+        self.active = True
 
     def stop(self) -> None:
         self.active = False

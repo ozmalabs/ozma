@@ -27,7 +27,12 @@ class NodeInfo:
     capabilities: list[str] = field(default_factory=list)
     machine_class: str = "workstation"  # workstation | server | kiosk
     last_seen: float = field(default_factory=time.monotonic)
+    # Multi-display outputs (one entry per display head)
+    # Each: {"index": 0, "source_type": "dbus"|"vnc"|"ivshmem"|"agent",
+    #        "capture_source_id": "vm1-display-0", "width": 1920, "height": 1080}
+    display_outputs: list[dict] = field(default_factory=list)
     # Optional display/stream metadata (published via mDNS TXT)
+    # Single-display fields kept for backward compatibility
     vnc_host: str | None = None
     vnc_port: int | None = None
     # Hardware node: serves its own HLS stream
@@ -63,6 +68,7 @@ class NodeInfo:
             "proto_version": self.proto_version,
             "capabilities": self.capabilities,
             "machine_class": self.machine_class,
+            "display_outputs": self.display_outputs,
             "last_seen": self.last_seen,
         }
         if self.vnc_host:
@@ -119,6 +125,7 @@ class AppState:
                 # Preserve machine_class if the incoming registration doesn't set one
                 if node.machine_class == "workstation" and existing.machine_class != "workstation":
                     node.machine_class = existing.machine_class
+                node.display_outputs = node.display_outputs or existing.display_outputs
                 if existing.capabilities and not node.capabilities:
                     node.capabilities = existing.capabilities
                 elif node.capabilities and existing.capabilities:

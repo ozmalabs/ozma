@@ -78,8 +78,9 @@ class PhysicalDisplay:
     orientation: str = "landscape"   # landscape, portrait
 
     # Source
-    source_type: str = ""           # "capture", "agent", "vnc", "manual"
+    source_type: str = ""           # "capture", "agent", "vnc", "dbus", "ivshmem", "manual"
     node_id: str = ""
+    display_index: int = 0          # Which display head on this node (for multi-monitor)
 
     def __post_init__(self) -> None:
         self._compute_physical_size()

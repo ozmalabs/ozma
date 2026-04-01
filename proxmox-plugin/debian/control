@@ -1,0 +1,39 @@
+Source: ozma-proxmox
+Section: admin
+Priority: optional
+Maintainer: Ozma Labs <dev@ozmalabs.com>
+Build-Depends: debhelper-compat (= 13), dh-python, python3-all
+Standards-Version: 4.6.2
+Homepage: https://ozma.dev
+
+Package: ozma-proxmox-plugin
+Architecture: amd64
+Depends: ${misc:Depends},
+         qemu-system-x86,
+         python3,
+         python3-pil,
+         python3-aiohttp,
+         python3-gi,
+         gir1.2-spiceclientglib-2.0,
+         pve-qemu-kvm (>= 8.0),
+         libpve-access-control,
+         proxmox-ve (>= 8.0)
+Recommends: looking-glass-client
+Description: Ozma KVM integration for Proxmox VE
+ Install once on each Proxmox node. Every VM becomes an ozma node
+ automatically — display capture, input injection, audio routing,
+ agent install, all managed from the Proxmox UI or the ozma dashboard.
+ .
+ Includes:
+  - Ozma soft node (auto-created per VM, no manual setup)
+  - QEMU KVMFR display backend (direct framebuffer, no VNC/SPICE)
+  - D-Bus keyboard + mouse input injection
+  - Looking Glass shared memory capture
+  - Multi-head virtio-gpu (multiple monitors per VM)
+  - Multi-channel PipeWire audio (5.1/7.1 surround)
+  - GPU passthrough with IddCx virtual display
+  - VM profiles (gaming/workstation/server/media) with auto-tuning
+  - One-click Windows/Linux agent install into VMs
+  - Proxmox web UI extension (Ozma tab per VM)
+  - VM lifecycle hooks (start/stop/migrate/backup)
+  - Auto-registration with ozma controller

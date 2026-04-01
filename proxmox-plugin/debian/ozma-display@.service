@@ -1,0 +1,16 @@
+[Unit]
+Description=Ozma Display Listener for VM %i
+After=pve-guests.service
+BindsTo=qemu-server@%i.service
+After=qemu-server@%i.service
+
+[Service]
+Type=simple
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus
+ExecStart=/usr/lib/ozma-proxmox/display-service.py %i
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

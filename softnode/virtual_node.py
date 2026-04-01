@@ -50,6 +50,33 @@ sys.path.insert(0, str(Path(__file__).parent))
 from soft_node import SoftNode
 
 
+# ── VM display output ──────────────────────────────────────────────────────
+
+class VMDisplayOutput:
+    """A single display output on a VM."""
+    def __init__(self, index: int = 0, source_type: str = "dbus",
+                 vnc_port: int = 0, dbus_console: int = 0,
+                 ivshmem_path: str = "",
+                 resolution: tuple[int, int] = (1920, 1080),
+                 capture_source_id: str = "") -> None:
+        self.index = index
+        self.source_type = source_type    # "dbus", "vnc", "ivshmem", "agent"
+        self.vnc_port = vnc_port
+        self.dbus_console = dbus_console  # D-Bus Console_N index
+        self.ivshmem_path = ivshmem_path
+        self.resolution = resolution
+        self.capture_source_id = capture_source_id
+
+    def to_dict(self) -> dict:
+        return {
+            "index": self.index,
+            "source_type": self.source_type,
+            "capture_source_id": self.capture_source_id,
+            "width": self.resolution[0],
+            "height": self.resolution[1],
+        }
+
+
 # ── VM discovery backends ───────────────────────────────────────────────────
 
 class VMInfo:
@@ -64,9 +91,10 @@ class VMInfo:
         self.vnc_host = vnc_host
         self.state = state
         self.pid = pid
+        self.displays: list[VMDisplayOutput] = []
 
     def __repr__(self) -> str:
-        return f"VM({self.name}, qmp={self.qmp_path}, vnc=:{self.vnc_port})"
+        return f"VM({self.name}, qmp={self.qmp_path}, vnc=:{self.vnc_port}, displays={len(self.displays)})"
 
 
 def discover_proxmox_vms() -> list[VMInfo]:

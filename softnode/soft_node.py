@@ -35,6 +35,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from hid_to_qmp import KeyboardReportState, MouseReportState
 from qmp_client import QMPClient
+from qemu_display import QEMUDBusConsole
+from looking_glass import LookingGlassCapture
 from virtual_capture import VirtualCapture
 from connect_client import NodeConnectClient
 from prometheus_metrics import collect_soft
@@ -73,6 +75,8 @@ class SoftNode:
         self._kbd = KeyboardReportState()
         self._mouse = MouseReportState()
         self._stop_event = asyncio.Event()
+        self._display: QEMUDBusConsole | None = None
+        self._displays: list[QEMUDBusConsole] = []  # multi-monitor: all consoles
         self._virtual_capture: VirtualCapture | None = None
         if capture_device:
             # External capture device (v4l2loopback fed by the display bridge)
@@ -90,6 +94,22 @@ class SoftNode:
 
     async def run(self) -> None:
         await self._qmp.start()
+
+        # Connect to QEMU D-Bus display (keyboard + mouse + framebuffer)
+        console_indices = await QEMUDBusConsole.enumerate_consoles()
+        if not console_indices:
+            console_indices = [0]  # try Console_0 even if enumeration fails
+        for idx in console_indices:
+            console = QEMUDBusConsole(idx)
+            if await console.connect():
+                self._displays.append(console)
+                log.info("D-Bus console %d: %dx%d (%s)",
+                         idx, console.width, console.height, console.label)
+        if self._displays:
+            self._display = self._displays[0]  # primary for backward compat
+            log.info("QEMU D-Bus display: %d console(s) ready", len(self._displays))
+        else:
+            log.warning("QEMU D-Bus display not available — falling back to QMP/VNC")
 
         # Start capture — pick the best available source
         self._hls_dir = Path(f"/tmp/ozma-stream-{self._name}")
@@ -187,6 +207,180 @@ class SoftNode:
                 )
             ok = await fn()
             return web.json_response({"ok": ok, "action": action})
+
+        # ── Display + Input via QEMU D-Bus ──────────────────────────────
+
+        _self = self  # capture self for closures — display may connect after API starts
+        import os as _os
+
+        async def display_snapshot(_: web.Request) -> web.Response:
+            """JPEG snapshot of the VM display."""
+            if _self._display and _self._display.connected:
+                frame = await _self._display.get_frame()
+                if frame:
+                    return web.Response(body=frame, content_type="image/jpeg")
+            # QMP screendump via the control client
+            ctrl = _self._qmp._ctrl if hasattr(_self._qmp, '_ctrl') else _self._qmp
+            if hasattr(ctrl, 'screendump') and ctrl.connected:
+                import io as _io
+                tmp = f"/dev/shm/ozma-snap-{_os.getpid()}.png"
+                ok = await ctrl.screendump(tmp)
+                if ok and _os.path.exists(tmp):
+                    try:
+                        from PIL import Image
+                        img = Image.open(tmp)
+                        buf = _io.BytesIO()
+                        img.convert("RGB").save(buf, format="JPEG", quality=75)
+                        return web.Response(body=buf.getvalue(), content_type="image/jpeg")
+                    finally:
+                        try:
+                            _os.unlink(tmp)
+                        except OSError:
+                            pass
+            return web.json_response({"error": "no display"}, status=503)
+
+        async def display_mjpeg(_: web.Request) -> web.StreamResponse:
+            """MJPEG stream of the VM display."""
+            response = web.StreamResponse(
+                status=200,
+                headers={"Content-Type": "multipart/x-mixed-replace; boundary=frame"},
+            )
+            await response.prepare(_)
+            ctrl = _self._qmp._ctrl if hasattr(_self._qmp, '_ctrl') else _self._qmp
+            while True:
+                if hasattr(ctrl, 'screendump') and ctrl.connected:
+                    import io as _io
+                    tmp = f"/dev/shm/ozma-mjpeg-{_os.getpid()}.png"
+                    ok = await ctrl.screendump(tmp)
+                    if ok and _os.path.exists(tmp):
+                        try:
+                            from PIL import Image
+                            img = Image.open(tmp)
+                            buf = _io.BytesIO()
+                            img.convert("RGB").save(buf, format="JPEG", quality=70)
+                            frame = buf.getvalue()
+                        finally:
+                            try: _os.unlink(tmp)
+                            except OSError: pass
+                    else:
+                        frame = None
+                    if frame:
+                        await response.write(
+                            b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+                        )
+                await asyncio.sleep(1.0 / 15)  # 15 fps
+
+        async def display_info(_: web.Request) -> web.Response:
+            """Display resolution and status."""
+            return web.json_response({
+                "width": _self._display.width if _self._display else 0,
+                "height": _self._display.height if _self._display else 0,
+                "connected": _display.connected if _self._display else False,
+                "type": "dbus" if _self._display and _self._display.connected else "none",
+            })
+
+        async def input_key(request: web.Request) -> web.Response:
+            """Send keyboard input. Body: {"keycode": 30, "down": true}"""
+            if not _self._display or not _self._display.connected:
+                return web.json_response({"error": "no display"}, status=503)
+            body = await request.json()
+            keycode = body.get("keycode", 0)
+            down = body.get("down", True)
+            if down:
+                _self._display.key_press(keycode)
+            else:
+                _self._display.key_release(keycode)
+            return web.json_response({"ok": True})
+
+        async def input_mouse(request: web.Request) -> web.Response:
+            """Send mouse input. Body: {"x": 500, "y": 300, "button": 0, "action": "click"}"""
+            if not _self._display or not _self._display.connected:
+                return web.json_response({"error": "no display"}, status=503)
+            body = await request.json()
+            x = body.get("x", 0)
+            y = body.get("y", 0)
+            action = body.get("action", "move")
+            button = body.get("button", 0)
+            if action == "move":
+                _self._display.mouse_move(x, y)
+            elif action == "press":
+                _self._display.mouse_move(x, y)
+                _self._display.mouse_press(button)
+            elif action == "release":
+                _self._display.mouse_release(button)
+            elif action == "click":
+                _self._display.mouse_click(x, y, button)
+            return web.json_response({"ok": True})
+
+        async def input_type(request: web.Request) -> web.Response:
+            """Type text. Body: {"text": "hello"}"""
+            if not _self._display or not _self._display.connected:
+                return web.json_response({"error": "no display"}, status=503)
+            body = await request.json()
+            text = body.get("text", "")
+            import time as _time
+            # Map characters to evdev keycodes
+            CHAR_TO_EVDEV = {
+                **{c: (30 + i, False) for i, c in enumerate('asdfghjkl')},
+                **{c: (16 + i, False) for i, c in enumerate('qwertyuiop')},
+                **{c: (44 + i, False) for i, c in enumerate('zxcvbnm')},
+                **{str(i): (2 + i if i > 0 else 11, False) for i in range(10)},
+                ' ': (57, False), '.': (52, False), '-': (12, False), '=': (13, False),
+                ',': (51, False), '/': (53, False), ';': (39, False), "'": (40, False),
+                '\\': (43, False), '[': (26, False), ']': (27, False), '`': (41, False),
+                ':': (39, True), '_': (12, True), '+': (13, True), '"': (40, True),
+                '<': (51, True), '>': (52, True), '?': (53, True),
+                '\n': (28, False), '\t': (15, False),
+            }
+            for ch in text:
+                lc = ch.lower()
+                shift = ch.isupper() or ch in CHAR_TO_EVDEV and CHAR_TO_EVDEV.get(ch, (0, False))[1]
+                keycode, need_shift = CHAR_TO_EVDEV.get(lc, CHAR_TO_EVDEV.get(ch, (0, False)))
+                if keycode:
+                    if shift or need_shift:
+                        _self._display.key_press(42)  # shift
+                    _self._display.key_tap(keycode)
+                    if shift or need_shift:
+                        _self._display.key_release(42)
+                    _time.sleep(0.02)
+            return web.json_response({"ok": True})
+
+        async def input_ws(request: web.Request) -> web.WebSocketResponse:
+            """WebSocket for real-time input from dashboard."""
+            ws = web.WebSocketResponse()
+            await ws.prepare(request)
+            import json as _json
+            async for msg in ws:
+                if msg.type != web.WSMsgType.TEXT:
+                    continue
+                data = _json.loads(msg.data)
+                if not _self._display or not _self._display.connected:
+                    continue
+                t = data.get("type", "")
+                if t == "key":
+                    kc = data.get("keycode", 0)
+                    if data.get("down", True):
+                        _self._display.key_press(kc)
+                    else:
+                        _self._display.key_release(kc)
+                elif t == "pointer":
+                    _self._display.mouse_move(data.get("x", 0), data.get("y", 0))
+                    btn = data.get("buttons", -1)
+                    if btn == 1:
+                        _self._display.mouse_press(0)
+                    elif btn == 0 and data.get("was_pressed"):
+                        _self._display.mouse_release(0)
+                elif t == "click":
+                    _self._display.mouse_click(data.get("x", 0), data.get("y", 0), data.get("button", 0))
+            return ws
+
+        app.router.add_get("/display/snapshot", display_snapshot)
+        app.router.add_get("/display/mjpeg", display_mjpeg)
+        app.router.add_get("/display/info", display_info)
+        app.router.add_post("/input/key", input_key)
+        app.router.add_post("/input/mouse", input_mouse)
+        app.router.add_post("/input/type", input_type)
+        app.router.add_get("/input/ws", input_ws)
 
         app.router.add_get("/health", health)
         app.router.add_get("/metrics", metrics)
@@ -300,6 +494,14 @@ class SoftNode:
                                    if self._virtual_capture and self._virtual_capture.device_path
                                    else "")),
         }
+        # Multi-display outputs
+        if self._displays:
+            body["display_outputs"] = json.dumps([
+                {"index": d.console_index, "source_type": "dbus",
+                 "capture_source_id": f"{self._name}-display-{d.console_index}",
+                 "width": d.width, "height": d.height}
+                for d in self._displays
+            ])
 
         await asyncio.sleep(3)  # give the controller time to start
         for attempt in range(10):

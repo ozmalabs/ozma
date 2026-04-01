@@ -58,3 +58,4 @@ dev/kernel-build/*.tar.gz
 # Demo binary assets (downloaded/generated locally)
 demo/cache/
 demo/recordings/
+test_results/

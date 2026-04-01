@@ -120,6 +120,7 @@ class DirectRegisterRequest(BaseModel):
     mic_vban_port: str = ""
     capture_device: str = ""
     machine_class: str = "workstation"  # workstation | server | kiosk
+    display_outputs: str = ""  # JSON-encoded list of display output dicts
 
 
 def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None) -> FastAPI:
@@ -152,10 +153,19 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
+        # Auth disabled — pass everything through (default until dashboard has login flow)
+        if not _auth.enabled:
+            request.state.auth = AuthContext(
+                authenticated=True, scopes=ALL_SCOPES,
+                source_ip=request.client.host if request.client else "127.0.0.1",
+                auth_method="none",
+            )
+            return await call_next(request)
+
         path = request.url.path
 
         # Skip auth for exempt paths and static files
-        if not _auth.enabled or path in _AUTH_EXEMPT or path.startswith("/static") or path == "/":
+        if path in _AUTH_EXEMPT or path.startswith("/static") or path == "/":
             request.state.auth = AuthContext(
                 authenticated=True, scopes=ALL_SCOPES,
                 source_ip=request.client.host if request.client else "127.0.0.1",
@@ -309,6 +319,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         mic_vban_port=int(req.mic_vban_port) if req.mic_vban_port.isdigit() else None,
         capture_device=req.capture_device or None,
         machine_class=req.machine_class if req.machine_class in ("workstation", "server", "kiosk") else "workstation",
+        display_outputs=json.loads(req.display_outputs) if req.display_outputs else [],
         direct_registered=True,
         )
         await state.add_node(node)
@@ -2760,7 +2771,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     # --- TCP tunnel endpoints ---
 
     from mesh_network import MeshNetworkManager, PortForward
-    mesh_net = MeshNetworkManager(state)
+    mesh_net = MeshNetworkManager()
 
     @app.get("/api/v1/tunnels")
     async def list_tunnels(request: Request) -> dict[str, Any]:

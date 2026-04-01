@@ -1,0 +1,15 @@
+ozma-proxmox (1.0.0-1) bookworm; urgency=medium
+
+  * Initial release
+  * QEMU D-Bus display integration (Scanout framebuffer)
+  * KVMFR/Looking Glass shared memory capture
+  * D-Bus keyboard + mouse input injection
+  * VM lifecycle hooks (start/stop/migrate)
+  * VM profiles: gaming, workstation, server, media
+  * Auto CPU pinning, hugepages, ReBAR detection
+  * Multi-channel PipeWire audio
+  * Per-VM display service (systemd template)
+  * REST API extension (/api2/json/ozma/)
+  * Auto-registration with ozma controller
+
+ -- Ozma Labs <dev@ozmalabs.com>  Tue, 01 Apr 2026 00:00:00 +1100
