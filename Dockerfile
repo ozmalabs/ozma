@@ -22,6 +22,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     avahi-utils \
     v4l-utils \
     libevdev2 \
+    libevdev-dev \
+    gcc \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/ozma
