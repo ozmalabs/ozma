@@ -49,7 +49,7 @@ class TriggerPattern:
     category: str = ""        # "kernel", "bios", "windows", "application", "custom"
     description: str = ""
     cooldown_s: float = 60.0  # Don't re-trigger within this window
-    _last_fired: float = 0.0
+    _last_fired: float = -1e9  # Sentinel: always allow first fire regardless of uptime
     _compiled: re.Pattern | None = field(default=None, repr=False)
 
     def matches(self, text: str) -> re.Match | bool:
