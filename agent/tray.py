@@ -1,24 +1,18 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
 """
-Ozma Agent system tray icon — cross-platform GUI management.
+Ozma Agent system tray — notification area icon with full management UI.
 
-Sits in the system tray (Windows/macOS) or indicator area (Linux).
-Shows agent status, active machine, quick-switch menu, and settings.
+Sits in the Windows notification area (system tray), macOS menu bar, or
+Linux indicator area. Provides:
 
-Features:
-  - Status indicator: green (connected), yellow (connecting), red (offline)
-  - Active machine name shown in tooltip
-  - Quick-switch: right-click → list of scenarios → click to switch
-  - Volume slider in the menu (if supported by the platform)
+  - Status indicator with colour-coded icon (green/yellow/red)
+  - Active scenario display + quick-switch menu
+  - Settings dialog (controller URL, machine name, autostart, capture)
+  - Connection status + uptime
+  - Log viewer (last 100 lines)
   - Open dashboard in browser
-  - Settings: controller URL, machine name, autostart
-  - Logs viewer (last 50 lines)
-  - Quit (stops the agent but doesn't uninstall the service)
-
-Cross-platform:
-  Windows:  pystray (pip install pystray Pillow)
-  macOS:    rumps (pip install rumps) — native menu bar
-  Linux:    pystray with appindicator backend, or falls back to no tray
+  - Start/stop/restart agent
+  - System info (hostname, IP, OS, Python version)
 
 The tray runs in the main thread. The agent runs in a background thread.
 """
@@ -30,6 +24,8 @@ import json
 import logging
 import os
 import platform
+import socket
+import subprocess
 import sys
 import threading
 import time
@@ -39,28 +35,72 @@ from typing import Any
 
 log = logging.getLogger("ozma.agent.tray")
 
+# Config file location
+if platform.system() == "Windows":
+    _CONFIG_DIR = Path(os.environ.get("APPDATA", "~")) / "ozma"
+else:
+    _CONFIG_DIR = Path.home() / ".config" / "ozma"
+
+_CONFIG_FILE = _CONFIG_DIR / "agent.json"
+_LOG_FILE = _CONFIG_DIR / "agent.log"
+
+
+def _load_config() -> dict:
+    try:
+        return json.loads(_CONFIG_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def _save_config(config: dict) -> None:
+    _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    _CONFIG_FILE.write_text(json.dumps(config, indent=2))
+
+
+def _get_log_tail(lines: int = 100) -> str:
+    try:
+        if _LOG_FILE.exists():
+            all_lines = _LOG_FILE.read_text(errors="replace").splitlines()
+            return "\n".join(all_lines[-lines:])
+    except Exception:
+        pass
+    return "(no logs)"
+
+
+def _local_ip() -> str:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "unknown"
+
 
 class AgentTray:
-    """
-    System tray icon for the ozma agent.
-
-    Manages the agent lifecycle and provides a GUI for quick actions.
-    """
+    """System tray icon for the ozma agent."""
 
     def __init__(self, agent: Any, controller_url: str = "", name: str = "") -> None:
         self._agent = agent
         self._controller_url = controller_url
-        self._name = name
+        self._name = name or socket.gethostname()
         self._connected = False
         self._active_scenario = ""
         self._scenarios: list[dict] = []
         self._icon = None
-        self._poll_task: asyncio.Task | None = None
+        self._start_time = time.time()
+        self._config = _load_config()
+
+        # Apply saved config
+        if not self._controller_url and self._config.get("controller_url"):
+            self._controller_url = self._config["controller_url"]
+        if self._config.get("name"):
+            self._name = self._config["name"]
 
     def run(self) -> None:
         """Start the tray icon. Blocks the main thread."""
-        system = platform.system()
-        if system == "Darwin":
+        if platform.system() == "Darwin":
             self._run_macos()
         else:
             self._run_pystray()
@@ -70,128 +110,130 @@ class AgentTray:
     def _run_pystray(self) -> None:
         try:
             import pystray
-            from PIL import Image, ImageDraw
+            from PIL import Image
         except ImportError:
-            log.warning("Tray icon requires: pip install pystray Pillow")
-            log.info("Running agent without tray icon")
+            log.warning("Tray requires: pip install pystray Pillow")
             self._run_headless()
             return
 
-        # Create the icon image
-        icon_image = self._create_icon_image()
-
-        def on_open_dashboard(_):
-            url = self._controller_url or "http://localhost:7380"
-            webbrowser.open(url)
-
-        def on_quit(_):
-            if self._icon:
-                self._icon.stop()
-
-        def build_menu():
-            import pystray
-            items = []
-
-            # Status
-            status = "Connected" if self._connected else "Disconnected"
-            items.append(pystray.MenuItem(f"Status: {status}", None, enabled=False))
-            items.append(pystray.MenuItem(f"Machine: {self._name}", None, enabled=False))
-
-            if self._active_scenario:
-                items.append(pystray.MenuItem(f"Active: {self._active_scenario}", None, enabled=False))
-
-            items.append(pystray.Menu.SEPARATOR)
-
-            # Scenarios (quick-switch)
-            if self._scenarios:
-                for s in self._scenarios:
-                    scenario_name = s.get("name", s.get("id", ""))
-                    is_active = s.get("id") == self._active_scenario
-
-                    def make_switch(sid):
-                        def do_switch(_):
-                            self._switch_scenario(sid)
-                        return do_switch
-
-                    items.append(pystray.MenuItem(
-                        f"{'● ' if is_active else '  '}{scenario_name}",
-                        make_switch(s["id"]),
-                        enabled=not is_active,
-                    ))
-                items.append(pystray.Menu.SEPARATOR)
-
-            # Actions
-            items.append(pystray.MenuItem("Open Dashboard", on_open_dashboard))
-            items.append(pystray.Menu.SEPARATOR)
-            items.append(pystray.MenuItem("Quit", on_quit))
-
-            return pystray.Menu(*items)
+        icon_image = self._create_icon("green")
 
         self._icon = pystray.Icon(
             "ozma-agent",
             icon_image,
             f"Ozma Agent — {self._name}",
-            menu=build_menu(),
+            menu=self._build_menu(),
         )
 
-        # Start agent in background thread
-        agent_thread = threading.Thread(target=self._run_agent_thread, daemon=True)
-        agent_thread.start()
+        # Agent in background thread
+        threading.Thread(target=self._run_agent_thread, daemon=True).start()
+        # Status polling
+        threading.Thread(target=self._poll_status_thread, daemon=True).start()
 
-        # Start polling for status updates
-        poll_thread = threading.Thread(target=self._poll_status_thread, daemon=True)
-        poll_thread.start()
-
-        # Run tray icon (blocks main thread)
         self._icon.run()
 
-    # ── rumps (macOS) ──────────────────────────────────────────────────
+    def _build_menu(self):
+        import pystray
+
+        items = []
+        status_colour = "🟢" if self._connected else "🔴"
+        uptime = self._format_uptime()
+
+        # ── Header ──
+        items.append(pystray.MenuItem(
+            f"{status_colour} {'Connected' if self._connected else 'Disconnected'}",
+            None, enabled=False,
+        ))
+        items.append(pystray.MenuItem(f"  {self._name}", None, enabled=False))
+        if self._controller_url:
+            items.append(pystray.MenuItem(f"  → {self._controller_url}", None, enabled=False))
+        items.append(pystray.MenuItem(f"  Uptime: {uptime}", None, enabled=False))
+
+        items.append(pystray.Menu.SEPARATOR)
+
+        # ── Scenarios (quick-switch) ──
+        if self._scenarios:
+            items.append(pystray.MenuItem("Switch Machine", pystray.Menu(
+                *[pystray.MenuItem(
+                    f"{'● ' if s.get('id') == self._active_scenario else '  '}{s.get('name', s.get('id', ''))}",
+                    self._make_switch(s["id"]),
+                    enabled=s.get("id") != self._active_scenario,
+                ) for s in self._scenarios]
+            )))
+            items.append(pystray.Menu.SEPARATOR)
+
+        # ── Actions ──
+        items.append(pystray.MenuItem("Open Dashboard", self._on_open_dashboard))
+        items.append(pystray.MenuItem("Copy IP Address", self._on_copy_ip))
+
+        items.append(pystray.Menu.SEPARATOR)
+
+        # ── Settings submenu ──
+        items.append(pystray.MenuItem("Settings", pystray.Menu(
+            pystray.MenuItem(f"Controller: {self._controller_url or '(not set)'}",
+                             self._on_set_controller),
+            pystray.MenuItem(f"Machine name: {self._name}",
+                             self._on_set_name),
+            pystray.MenuItem("Autostart on login",
+                             self._on_toggle_autostart,
+                             checked=lambda _: self._config.get("autostart", False)),
+            pystray.MenuItem("Screen capture",
+                             self._on_toggle_capture,
+                             checked=lambda _: self._config.get("capture", True)),
+        )))
+
+        # ── Info submenu ──
+        items.append(pystray.MenuItem("System Info", pystray.Menu(
+            pystray.MenuItem(f"Host: {socket.gethostname()}", None, enabled=False),
+            pystray.MenuItem(f"IP: {_local_ip()}", None, enabled=False),
+            pystray.MenuItem(f"OS: {platform.system()} {platform.release()}", None, enabled=False),
+            pystray.MenuItem(f"Python: {platform.python_version()}", None, enabled=False),
+            pystray.MenuItem(f"Agent: ozma-agent 1.0.0", None, enabled=False),
+        )))
+
+        items.append(pystray.MenuItem("View Logs", self._on_view_logs))
+
+        items.append(pystray.Menu.SEPARATOR)
+
+        # ── Quit ──
+        items.append(pystray.MenuItem("Restart Agent", self._on_restart))
+        items.append(pystray.MenuItem("Quit", self._on_quit))
+
+        return pystray.Menu(*items)
+
+    # ── macOS (rumps) ──────────────────────────────────────────────────
 
     def _run_macos(self) -> None:
         try:
             import rumps
         except ImportError:
-            log.warning("macOS tray icon requires: pip install rumps")
             self._run_pystray()
             return
 
-        agent = self._agent
-        controller_url = self._controller_url
-        name = self._name
         tray = self
 
-        class OzmaAgentApp(rumps.App):
+        class OzmaApp(rumps.App):
             def __init__(self):
-                super().__init__("Ozma", icon=None, quit_button=None)
-                self.menu = [
-                    rumps.MenuItem(f"Machine: {name}", callback=None),
-                    rumps.MenuItem("Status: Connecting...", callback=None),
-                    None,  # separator
-                    rumps.MenuItem("Open Dashboard", callback=self.open_dashboard),
+                super().__init__("Ozma", quit_button=None)
+                self.menu = self._build()
+
+            def _build(self):
+                status = "Connected" if tray._connected else "Disconnected"
+                return [
+                    rumps.MenuItem(f"{status} — {tray._name}"),
                     None,
-                    rumps.MenuItem("Quit", callback=self.quit_app),
+                    rumps.MenuItem("Open Dashboard", callback=lambda _: webbrowser.open(
+                        tray._controller_url or "http://localhost:7380")),
+                    None,
+                    rumps.MenuItem("Quit", callback=lambda _: rumps.quit_application()),
                 ]
 
-            @rumps.clicked("Open Dashboard")
-            def open_dashboard(self, _):
-                url = controller_url or "http://localhost:7380"
-                webbrowser.open(url)
+        threading.Thread(target=self._run_agent_thread, daemon=True).start()
+        OzmaApp().run()
 
-            @rumps.clicked("Quit")
-            def quit_app(self, _):
-                rumps.quit_application()
-
-        # Start agent in background
-        agent_thread = threading.Thread(target=self._run_agent_thread, daemon=True)
-        agent_thread.start()
-
-        app = OzmaAgentApp()
-        app.run()
-
-    # ── Headless fallback ──────────────────────────────────────────────
+    # ── Headless ──────────────────────────────────────────────────────
 
     def _run_headless(self) -> None:
-        """No tray icon — just run the agent directly."""
         loop = asyncio.new_event_loop()
         try:
             loop.run_until_complete(self._agent.run())
@@ -200,10 +242,9 @@ class AgentTray:
         finally:
             loop.close()
 
-    # ── Agent thread ───────────────────────────────────────────────────
+    # ── Agent thread ──────────────────────────────────────────────────
 
     def _run_agent_thread(self) -> None:
-        """Run the agent in a background thread with its own event loop."""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -213,14 +254,15 @@ class AgentTray:
         finally:
             loop.close()
 
-    # ── Status polling ─────────────────────────────────────────────────
+    # ── Status polling ────────────────────────────────────────────────
 
     def _poll_status_thread(self) -> None:
-        """Poll the controller for status updates to refresh the menu."""
         import urllib.request
         while True:
             time.sleep(5)
             if not self._controller_url:
+                self._connected = False
+                self._update_icon()
                 continue
             try:
                 url = f"{self._controller_url.rstrip('/')}/api/v1/scenarios"
@@ -231,48 +273,31 @@ class AgentTray:
                     self._connected = True
             except Exception:
                 self._connected = False
+                self._scenarios = []
+                self._active_scenario = ""
 
-            # Update tray icon tooltip
-            if self._icon:
-                status = "Connected" if self._connected else "Disconnected"
-                self._icon.title = f"Ozma Agent — {self._name} ({status})"
-                # Rebuild menu with updated scenarios
-                try:
-                    self._icon.menu = self._build_pystray_menu()
-                except Exception:
-                    pass
+            self._update_icon()
 
-    def _build_pystray_menu(self):
-        """Rebuild the pystray menu with current state."""
-        import pystray
-        items = []
-        status = "Connected" if self._connected else "Disconnected"
-        items.append(pystray.MenuItem(f"Status: {status}", None, enabled=False))
-        items.append(pystray.MenuItem(f"Machine: {self._name}", None, enabled=False))
-        if self._active_scenario:
-            items.append(pystray.MenuItem(f"Active: {self._active_scenario}", None, enabled=False))
-        items.append(pystray.Menu.SEPARATOR)
-        if self._scenarios:
-            for s in self._scenarios:
-                sname = s.get("name", s.get("id", ""))
-                is_active = s.get("id") == self._active_scenario
-                def make_switch(sid):
-                    def do_switch(_): self._switch_scenario(sid)
-                    return do_switch
-                items.append(pystray.MenuItem(
-                    f"{'● ' if is_active else '  '}{sname}",
-                    make_switch(s["id"]), enabled=not is_active,
-                ))
-            items.append(pystray.Menu.SEPARATOR)
-        items.append(pystray.MenuItem("Open Dashboard", lambda _: webbrowser.open(self._controller_url or "http://localhost:7380")))
-        items.append(pystray.Menu.SEPARATOR)
-        items.append(pystray.MenuItem("Quit", lambda _: self._icon.stop() if self._icon else None))
-        return pystray.Menu(*items)
+    def _update_icon(self) -> None:
+        if not self._icon:
+            return
+        try:
+            colour = "green" if self._connected else "red"
+            self._icon.icon = self._create_icon(colour)
+            status = "Connected" if self._connected else "Disconnected"
+            self._icon.title = f"Ozma Agent — {self._name} ({status})"
+            self._icon.menu = self._build_menu()
+        except Exception:
+            pass
 
-    # ── Actions ────────────────────────────────────────────────────────
+    # ── Event handlers ────────────────────────────────────────────────
+
+    def _make_switch(self, scenario_id: str):
+        def do_switch(_):
+            self._switch_scenario(scenario_id)
+        return do_switch
 
     def _switch_scenario(self, scenario_id: str) -> None:
-        """Switch scenario via the controller API."""
         import urllib.request
         if not self._controller_url:
             return
@@ -283,21 +308,212 @@ class AgentTray:
                                          method="POST")
             urllib.request.urlopen(req, timeout=5)
         except Exception as e:
-            log.debug("Scenario switch failed: %s", e)
+            log.debug("Switch failed: %s", e)
 
-    # ── Icon image ─────────────────────────────────────────────────────
+    def _on_open_dashboard(self, _) -> None:
+        url = self._controller_url or "http://localhost:7380"
+        webbrowser.open(url)
 
-    def _create_icon_image(self):
-        """Create a simple tray icon image (green circle on transparent)."""
-        from PIL import Image, ImageDraw
+    def _on_copy_ip(self, _) -> None:
+        ip = _local_ip()
+        if platform.system() == "Windows":
+            subprocess.run(["clip"], input=ip.encode(), check=False)
+        elif platform.system() == "Darwin":
+            subprocess.run(["pbcopy"], input=ip.encode(), check=False)
+        else:
+            try:
+                subprocess.run(["xclip", "-selection", "clipboard"],
+                               input=ip.encode(), check=False)
+            except FileNotFoundError:
+                pass
+
+    def _on_set_controller(self, _) -> None:
+        url = self._input_dialog("Controller URL",
+                                  "Enter the ozma controller URL:",
+                                  self._controller_url or "http://localhost:7380")
+        if url:
+            self._controller_url = url
+            self._config["controller_url"] = url
+            _save_config(self._config)
+            self._update_icon()
+
+    def _on_set_name(self, _) -> None:
+        name = self._input_dialog("Machine Name",
+                                   "Enter a name for this machine:",
+                                   self._name)
+        if name:
+            self._name = name
+            self._config["name"] = name
+            _save_config(self._config)
+            self._update_icon()
+
+    def _on_toggle_autostart(self, _) -> None:
+        current = self._config.get("autostart", False)
+        self._config["autostart"] = not current
+        _save_config(self._config)
+        if not current:
+            self._install_autostart()
+        else:
+            self._remove_autostart()
+
+    def _on_toggle_capture(self, _) -> None:
+        current = self._config.get("capture", True)
+        self._config["capture"] = not current
+        _save_config(self._config)
+
+    def _on_view_logs(self, _) -> None:
+        logs = _get_log_tail(100)
+        if platform.system() == "Windows":
+            # Write to temp file and open in notepad
+            tmp = Path(os.environ.get("TEMP", "/tmp")) / "ozma-agent-log.txt"
+            tmp.write_text(logs)
+            subprocess.Popen(["notepad", str(tmp)])
+        elif platform.system() == "Darwin":
+            tmp = Path("/tmp/ozma-agent-log.txt")
+            tmp.write_text(logs)
+            subprocess.Popen(["open", "-e", str(tmp)])
+        else:
+            tmp = Path("/tmp/ozma-agent-log.txt")
+            tmp.write_text(logs)
+            subprocess.Popen(["xdg-open", str(tmp)])
+
+    def _on_restart(self, _) -> None:
+        """Restart the agent process."""
+        exe = sys.executable
+        args = sys.argv[:]
+        if platform.system() == "Windows":
+            subprocess.Popen([exe] + args)
+        else:
+            os.execv(exe, [exe] + args)
+        if self._icon:
+            self._icon.stop()
+
+    def _on_quit(self, _) -> None:
+        if self._icon:
+            self._icon.stop()
+
+    # ── Input dialog (platform-specific) ──────────────────────────────
+
+    def _input_dialog(self, title: str, prompt: str, default: str = "") -> str | None:
+        if platform.system() == "Windows":
+            return self._input_dialog_windows(title, prompt, default)
+        else:
+            return self._input_dialog_tkinter(title, prompt, default)
+
+    def _input_dialog_windows(self, title: str, prompt: str, default: str) -> str | None:
+        """Use PowerShell for a simple input dialog on Windows."""
+        try:
+            ps = f'''
+            Add-Type -AssemblyName Microsoft.VisualBasic
+            [Microsoft.VisualBasic.Interaction]::InputBox("{prompt}", "{title}", "{default}")
+            '''
+            result = subprocess.run(
+                ["powershell", "-Command", ps],
+                capture_output=True, text=True, timeout=60,
+            )
+            value = result.stdout.strip()
+            return value if value else None
+        except Exception:
+            return None
+
+    def _input_dialog_tkinter(self, title: str, prompt: str, default: str) -> str | None:
+        """Use tkinter for input dialog on Linux/macOS."""
+        try:
+            import tkinter as tk
+            from tkinter import simpledialog
+            root = tk.Tk()
+            root.withdraw()
+            result = simpledialog.askstring(title, prompt, initialvalue=default, parent=root)
+            root.destroy()
+            return result
+        except Exception:
+            return None
+
+    # ── Autostart ─────────────────────────────────────────────────────
+
+    def _install_autostart(self) -> None:
+        if platform.system() == "Windows":
+            # Add to Windows startup via registry
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                 r"Software\Microsoft\Windows\CurrentVersion\Run",
+                                 0, winreg.KEY_SET_VALUE)
+            exe = sys.executable
+            cmd = f'"{exe}" -m ozma_desktop_agent --name {self._name}'
+            if self._controller_url:
+                cmd += f' --controller {self._controller_url}'
+            winreg.SetValueEx(key, "OzmaAgent", 0, winreg.REG_SZ, cmd)
+            winreg.CloseKey(key)
+        elif platform.system() == "Linux":
+            # XDG autostart
+            autostart_dir = Path.home() / ".config" / "autostart"
+            autostart_dir.mkdir(parents=True, exist_ok=True)
+            desktop = autostart_dir / "ozma-agent.desktop"
+            desktop.write_text(f"""[Desktop Entry]
+Type=Application
+Name=Ozma Agent
+Exec={sys.executable} -m ozma_desktop_agent --name {self._name}
+Hidden=false
+X-GNOME-Autostart-enabled=true
+""")
+
+    def _remove_autostart(self) -> None:
+        if platform.system() == "Windows":
+            import winreg
+            try:
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                     r"Software\Microsoft\Windows\CurrentVersion\Run",
+                                     0, winreg.KEY_SET_VALUE)
+                winreg.DeleteValue(key, "OzmaAgent")
+                winreg.CloseKey(key)
+            except FileNotFoundError:
+                pass
+        elif platform.system() == "Linux":
+            desktop = Path.home() / ".config" / "autostart" / "ozma-agent.desktop"
+            desktop.unlink(missing_ok=True)
+
+    # ── Helpers ───────────────────────────────────────────────────────
+
+    def _format_uptime(self) -> str:
+        secs = int(time.time() - self._start_time)
+        if secs < 60:
+            return f"{secs}s"
+        mins = secs // 60
+        if mins < 60:
+            return f"{mins}m"
+        hours = mins // 60
+        return f"{hours}h {mins % 60}m"
+
+    def _create_icon(self, colour: str = "green"):
+        """Create the tray icon — ozma 'O' with status colour."""
+        from PIL import Image, ImageDraw, ImageFont
+
         size = 64
         img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
-        # Emerald circle (ozma brand colour)
-        draw.ellipse([8, 8, size - 8, size - 8], fill=(74, 224, 164, 255))
-        # "O" in the centre
+
+        # Colour map
+        colours = {
+            "green": (74, 224, 164),   # Connected — ozma emerald
+            "yellow": (255, 193, 7),    # Connecting
+            "red": (220, 53, 69),       # Disconnected
+        }
+        fill = colours.get(colour, colours["green"])
+
+        # Rounded square background
+        r = 12
+        draw.rounded_rectangle([2, 2, size - 2, size - 2], radius=r, fill=fill)
+
+        # "O" letter in the centre (ozma logo)
         try:
-            draw.text((size // 2 - 6, size // 2 - 8), "O", fill=(0, 0, 0, 255))
+            font = ImageFont.truetype("arial.ttf", 36)
         except Exception:
-            pass
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
+            except Exception:
+                font = ImageFont.load_default()
+
+        draw.text((size // 2, size // 2), "O", fill=(255, 255, 255, 255),
+                  font=font, anchor="mm")
+
         return img

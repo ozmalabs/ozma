@@ -139,6 +139,45 @@ Requests from browsers and tools require a **bearer token** (JWT signed with the
 - Default expiry: 24 hours. Configurable.
 - Tokens are scoped: `read`, `write`, `admin`.
 - All REST endpoints except `/api/v1/enroll` and `/api/v1/auth/token` require a valid token when accessed from outside the WireGuard network.
+- WebSocket connections authenticate via `?token=<jwt>` query parameter.
+
+### Node Machine Class
+
+Each node has a `machine_class` that determines its security behaviour:
+
+| Class | Description | Agent default | Consent | Privacy mode |
+|-------|-------------|--------------|---------|--------------|
+| `workstation` | Someone may be sitting here | mutating = notify, read = auto | Available (opt-in) | Available |
+| `server` | Headless / unattended | all = auto | Never | No-op |
+| `kiosk` | Has display, no operator | all = auto | Never | No-op |
+
+Set via `PUT /api/v1/nodes/{id}/machine_class` or during node registration.
+
+### AI Agent Action Approval
+
+AI agents interact with machines via the `ozma_control` MCP tool. Each action has a configurable approval mode:
+
+- **auto**: execute immediately (default for read-only actions; default for all actions on server/kiosk nodes)
+- **notify**: execute immediately, fire a WebSocket event and notification (default for mutating actions on workstation nodes)
+- **approve**: queue the action and wait for human approval via `POST /api/v1/agent/{action_id}/approve` before executing
+
+Per-action overrides via `PUT /api/v1/agent/config` take precedence over machine class defaults.
+
+### Remote Desktop Consent
+
+Remote desktop sessions (`/api/v1/remote/{node_id}/ws`) are protected by JWT auth. For workstation nodes in multi-user or helpdesk deployments, an additional consent flow can be enabled:
+
+- Session enters `PENDING` state, fires a `remote_desktop.consent_request` event
+- Local operator approves or rejects via `POST /api/v1/remote/{session_id}/approve`
+- If no response within 60 seconds, the session is denied
+
+Server and kiosk nodes **never** require consent — there's no one to ask. Workstation consent is off by default and must be explicitly enabled.
+
+**Privacy mode**: when enabled, blanks the target machine's physical display via DDC/CI during the remote session. Only meaningful for workstation nodes.
+
+### Audit Logging
+
+All control plane actions are recorded in a tamper-evident hashchained audit log (enabled by default). Events include: authentication attempts, remote desktop sessions, agent actions, scenario switches, power operations.
 
 ---
 

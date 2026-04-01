@@ -34,13 +34,24 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 import socket
 import time
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 from fastapi import WebSocket as FastAPIWebSocket
 
 log = logging.getLogger("ozma.remote_desktop")
+
+
+class SessionState(str, Enum):
+    PENDING = "pending"
+    ACTIVE = "active"
+    REJECTED = "rejected"
+    TIMED_OUT = "timed_out"
+    ENDED = "ended"
 
 # HID usage IDs for common keys (browser KeyboardEvent.code → HID)
 _KEY_TO_HID: dict[str, int] = {
@@ -80,7 +91,9 @@ class RemoteDesktopSession:
     forwards them as HID packets to the node.
     """
 
-    def __init__(self, node_id: str, host: str, port: int) -> None:
+    def __init__(self, node_id: str, host: str, port: int,
+                 session_id: str = "") -> None:
+        self.session_id = session_id or secrets.token_urlsafe(12)
         self.node_id = node_id
         self._host = host
         self._port = port
@@ -88,15 +101,59 @@ class RemoteDesktopSession:
         self._modifiers = 0
         self._pressed_keys: list[int] = []
         self._mouse_buttons = 0
+        # Session lifecycle
+        self.state = SessionState.PENDING
+        self.created_at = time.time()
+        self.last_activity = time.time()
+        self.requester: str = ""
+        self.privacy_mode: bool = False
+        self._approval_event = asyncio.Event()
+        self._approved = False
+
+    def approve(self) -> None:
+        self._approved = True
+        self._approval_event.set()
+
+    def reject(self) -> None:
+        self._approved = False
+        self._approval_event.set()
+
+    async def wait_for_approval(self, timeout: float = 60.0) -> bool:
+        """Wait for human approval. Returns True if approved."""
+        try:
+            await asyncio.wait_for(self._approval_event.wait(), timeout)
+        except asyncio.TimeoutError:
+            self.state = SessionState.TIMED_OUT
+            return False
+        if self._approved:
+            self.state = SessionState.ACTIVE
+            return True
+        self.state = SessionState.REJECTED
+        return False
+
+    def to_dict(self) -> dict:
+        return {
+            "session_id": self.session_id,
+            "node_id": self.node_id,
+            "state": self.state.value,
+            "created_at": self.created_at,
+            "last_activity": self.last_activity,
+            "requester": self.requester,
+            "privacy_mode": self.privacy_mode,
+        }
 
     async def handle_ws(self, ws: FastAPIWebSocket) -> None:
         """Handle a WebSocket connection from the browser."""
         await ws.accept()
-        log.info("Remote desktop session started: %s", self.node_id)
+        self.state = SessionState.ACTIVE
+        self.last_activity = time.time()
+        log.info("Remote desktop session started: %s (session %s)",
+                 self.node_id, self.session_id)
 
         try:
             while True:
                 data = await ws.receive_text()
+                self.last_activity = time.time()
                 msg = json.loads(data)
                 event_type = msg.get("type", "")
 
@@ -193,19 +250,130 @@ class RemoteDesktopSession:
 
 
 class RemoteDesktopManager:
-    """Manages remote desktop sessions."""
+    """Manages remote desktop sessions with consent and privacy controls."""
 
-    def __init__(self, state: Any) -> None:
+    def __init__(self, state: Any, event_queue: asyncio.Queue | None = None,
+                 notifier: Any = None, idle_timeout: float = 1800.0) -> None:
         self._state = state
-        self._sessions: dict[str, RemoteDesktopSession] = {}
+        self._event_queue = event_queue
+        self._notifier = notifier
+        self._idle_timeout = idle_timeout  # 30 min default
+        self._sessions: dict[str, RemoteDesktopSession] = {}  # session_id → session
+        # When True, workstation nodes require consent before remote desktop.
+        # Server and kiosk nodes never require consent regardless of this flag.
+        self._consent_for_workstations = False
+        self._idle_task: asyncio.Task | None = None
 
-    def create_session(self, node_id: str) -> RemoteDesktopSession | None:
+    def create_session(self, node_id: str, requester: str = "") -> RemoteDesktopSession | None:
+        """Create a new session in PENDING state."""
         node = self._state.nodes.get(node_id)
         if not node:
             return None
         session = RemoteDesktopSession(node_id, node.host, node.port)
-        self._sessions[node_id] = session
+        session.requester = requester
+        self._sessions[session.session_id] = session
         return session
 
-    def list_sessions(self) -> list[str]:
-        return list(self._sessions.keys())
+    def get_session(self, session_id: str) -> RemoteDesktopSession | None:
+        return self._sessions.get(session_id)
+
+    def approve_session(self, session_id: str) -> bool:
+        session = self._sessions.get(session_id)
+        if not session or session.state != SessionState.PENDING:
+            return False
+        session.approve()
+        return True
+
+    def reject_session(self, session_id: str) -> bool:
+        session = self._sessions.get(session_id)
+        if not session or session.state != SessionState.PENDING:
+            return False
+        session.reject()
+        return True
+
+    def end_session(self, session_id: str) -> bool:
+        session = self._sessions.pop(session_id, None)
+        if not session:
+            return False
+        session.state = SessionState.ENDED
+        return True
+
+    def list_sessions(self) -> list[dict]:
+        return [s.to_dict() for s in self._sessions.values()]
+
+    async def fire_event(self, event: dict) -> None:
+        if self._event_queue:
+            await self._event_queue.put(event)
+
+    def _needs_consent(self, node_id: str) -> bool:
+        """Check if a node requires consent for remote desktop access."""
+        node = self._state.nodes.get(node_id)
+        if not node:
+            return False
+        # Servers and kiosks never need consent — they're unattended.
+        if node.machine_class in ("server", "kiosk"):
+            return False
+        # Workstations only need consent if the flag is enabled.
+        return self._consent_for_workstations
+
+    async def start_session_with_consent(self, session: RemoteDesktopSession) -> bool:
+        """
+        Run the consent flow for a session.
+
+        Consent depends on the node's machine_class:
+          - server/kiosk: always auto-approve (no one to consent)
+          - workstation: requires approval only if _consent_for_workstations is True
+        """
+        if not self._needs_consent(session.node_id):
+            session.state = SessionState.ACTIVE
+            await self.fire_event({
+                "type": "remote_desktop.active",
+                "session_id": session.session_id,
+                "node_id": session.node_id,
+            })
+            return True
+
+        await self.fire_event({
+            "type": "remote_desktop.consent_request",
+            "session_id": session.session_id,
+            "node_id": session.node_id,
+            "requester": session.requester,
+        })
+        if self._notifier:
+            try:
+                await self._notifier.send(
+                    f"Remote desktop access requested for {session.node_id} by {session.requester or 'unknown'}")
+            except Exception:
+                pass
+
+        approved = await session.wait_for_approval(timeout=60.0)
+        if approved:
+            await self.fire_event({
+                "type": "remote_desktop.active",
+                "session_id": session.session_id,
+                "node_id": session.node_id,
+            })
+        return approved
+
+    async def start_idle_monitor(self) -> None:
+        """Background task that terminates idle sessions."""
+        while True:
+            await asyncio.sleep(30)
+            now = time.time()
+            expired = [
+                sid for sid, s in self._sessions.items()
+                if s.state == SessionState.ACTIVE
+                and (now - s.last_activity) > self._idle_timeout
+            ]
+            for sid in expired:
+                session = self._sessions.get(sid)
+                if session:
+                    log.info("Idle timeout: ending session %s for %s", sid, session.node_id)
+                    session.state = SessionState.TIMED_OUT
+                    await self.fire_event({
+                        "type": "remote_desktop.ended",
+                        "session_id": sid,
+                        "node_id": session.node_id,
+                        "reason": "idle_timeout",
+                    })
+                    self._sessions.pop(sid, None)

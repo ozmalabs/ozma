@@ -79,7 +79,7 @@ class AuditLogger:
     All ozma events funnel through here when audit mode is enabled.
     """
 
-    def __init__(self, enabled: bool = False, retention_days: int = 90) -> None:
+    def __init__(self, enabled: bool = True, retention_days: int = 90) -> None:
         self._enabled = enabled
         self._retention_days = retention_days
         self._prev_hash = "genesis"

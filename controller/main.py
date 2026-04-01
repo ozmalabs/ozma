@@ -76,6 +76,7 @@ from obs_studio import OBSStudioManager
 from stream_router import StreamRouter
 from guacamole import GuacamoleManager
 from provisioning import ProvisioningManager
+from auth import AuthConfig, setup_auth_password
 from api import build_app
 
 
@@ -308,13 +309,28 @@ async def run(config: Config) -> None:
     # AI Agent Engine
     from screen_reader import ScreenReader
     agent_screen_reader = ScreenReader(vision_manager=vision_mgr)
-    agent_engine = AgentEngine(state, agent_screen_reader, text_ocr)
+    agent_engine = AgentEngine(state, agent_screen_reader, text_ocr,
+                               notifier=notifier, event_queue=state.events)
 
     # Visual regression test runner
     test_runner = TestRunner(agent_engine, notifier)
 
+    # Authentication setup
+    auth_cfg = AuthConfig(enabled=config.auth_enabled)
+    if config.auth_password_hash:
+        auth_cfg.password_hash = config.auth_password_hash
+    elif config.auth_enabled:
+        env_pw = os.environ.get("OZMA_AUTH_PASSWORD")
+        pw_hash, pw_plain = setup_auth_password(env_pw)
+        auth_cfg.password_hash = pw_hash
+        if not env_pw:
+            log.warning("=" * 60)
+            log.warning("  GENERATED ADMIN PASSWORD: %s", pw_plain)
+            log.warning("  Set OZMA_AUTH_PASSWORD env var to use your own.")
+            log.warning("=" * 60)
+
     # Build the FastAPI app — all managers must be created before this point
-    app = build_app(state, scenarios, streams, audio, controls, rgb_out, motion, bt, kdeconnect, wifi_audio, captures, paste_typer, kbd_mgr, macro_mgr, sched, notifier, recorder, net_health, ocr_triggers, auto_engine, metrics_collector, screen_mgr, codec_mgr=codec_mgr, camera_mgr=camera_mgr, obs_studio=obs_studio, stream_router=stream_router, guac_mgr=guac_mgr, provision_mgr=provision_mgr, connect=connect, mesh_ca=mesh_ca, sess_mgr=sess_mgr, room_correction=room_corr, testbench=testbench, agent_engine=agent_engine, test_runner=test_runner)
+    app = build_app(state, scenarios, streams, audio, controls, rgb_out, motion, bt, kdeconnect, wifi_audio, captures, paste_typer, kbd_mgr, macro_mgr, sched, notifier, recorder, net_health, ocr_triggers, auto_engine, metrics_collector, screen_mgr, codec_mgr=codec_mgr, camera_mgr=camera_mgr, obs_studio=obs_studio, stream_router=stream_router, guac_mgr=guac_mgr, provision_mgr=provision_mgr, connect=connect, mesh_ca=mesh_ca, sess_mgr=sess_mgr, room_correction=room_corr, testbench=testbench, agent_engine=agent_engine, test_runner=test_runner, auth_config=auth_cfg)
 
     uv_config = uvicorn.Config(
         app,

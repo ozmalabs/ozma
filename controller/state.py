@@ -5,6 +5,16 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+# Machine class — what kind of machine is this node plugged into?
+# Determines security behaviour for remote access and agent control.
+#   workstation — someone may be sitting here. Consent can be required,
+#                 agent mutating actions default to "notify".
+#   server      — headless / unattended. No consent, agent actions auto,
+#                 privacy mode is a no-op (no physical display to blank).
+#   kiosk       — has a display but no operator. No consent, no privacy.
+MACHINE_CLASSES = ("workstation", "server", "kiosk")
+
+
 @dataclass
 class NodeInfo:
     id: str           # mDNS instance name, used as stable identifier
@@ -15,6 +25,7 @@ class NodeInfo:
     fw_version: str   # firmware version string
     proto_version: int  # protocol version from TXT record
     capabilities: list[str] = field(default_factory=list)
+    machine_class: str = "workstation"  # workstation | server | kiosk
     last_seen: float = field(default_factory=time.monotonic)
     # Optional display/stream metadata (published via mDNS TXT)
     vnc_host: str | None = None
@@ -51,6 +62,7 @@ class NodeInfo:
             "fw_version": self.fw_version,
             "proto_version": self.proto_version,
             "capabilities": self.capabilities,
+            "machine_class": self.machine_class,
             "last_seen": self.last_seen,
         }
         if self.vnc_host:
@@ -104,6 +116,9 @@ class AppState:
                 node.stream_port = node.stream_port or existing.stream_port
                 node.stream_path = node.stream_path or existing.stream_path
                 node.api_port = node.api_port or existing.api_port
+                # Preserve machine_class if the incoming registration doesn't set one
+                if node.machine_class == "workstation" and existing.machine_class != "workstation":
+                    node.machine_class = existing.machine_class
                 if existing.capabilities and not node.capabilities:
                     node.capabilities = existing.capabilities
                 elif node.capabilities and existing.capabilities:

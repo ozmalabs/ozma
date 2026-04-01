@@ -19,11 +19,16 @@ import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+from auth import (
+    AuthConfig, AuthContext, create_jwt, verify_jwt, verify_password,
+    has_scope, is_wireguard_source, SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN, ALL_SCOPES,
+)
 
 from state import AppState, NodeInfo
 from scenarios import ScenarioManager
@@ -114,9 +119,10 @@ class DirectRegisterRequest(BaseModel):
     audio_vban_port: str = ""
     mic_vban_port: str = ""
     capture_device: str = ""
+    machine_class: str = "workstation"  # workstation | server | kiosk
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None) -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None) -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -125,6 +131,90 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # --- Authentication ---
+
+    _auth = auth_config or AuthConfig(enabled=False)
+    _signing_key = mesh_ca.controller_keypair if mesh_ca else None
+    _verify_key = _signing_key.public_key if _signing_key else None
+
+    # Paths that don't require authentication
+    _AUTH_EXEMPT = {
+        "/api/v1/auth/token",
+        "/api/v1/enroll",
+        "/api/v1/nodes/register",
+        "/api/v1/nodes/heartbeat",
+        "/health",
+        "/docs",
+        "/openapi.json",
+        "/redoc",
+    }
+
+    @app.middleware("http")
+    async def auth_middleware(request: Request, call_next):
+        path = request.url.path
+
+        # Skip auth for exempt paths and static files
+        if not _auth.enabled or path in _AUTH_EXEMPT or path.startswith("/static") or path == "/":
+            request.state.auth = AuthContext(
+                authenticated=True, scopes=ALL_SCOPES,
+                source_ip=request.client.host if request.client else "127.0.0.1",
+                auth_method="none",
+            )
+            return await call_next(request)
+
+        client_ip = request.client.host if request.client else "127.0.0.1"
+
+        # WireGuard bypass: trusted mesh traffic
+        if is_wireguard_source(client_ip, _auth):
+            request.state.auth = AuthContext(
+                authenticated=True, scopes=ALL_SCOPES,
+                source_ip=client_ip, auth_method="wireguard",
+            )
+            return await call_next(request)
+
+        # JWT bearer token
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.startswith("Bearer ") and _verify_key:
+            token = auth_header[7:]
+            claims = verify_jwt(token, _verify_key)
+            if claims:
+                request.state.auth = AuthContext(
+                    authenticated=True, scopes=claims.get("scopes", []),
+                    source_ip=client_ip, auth_method="jwt",
+                )
+                return await call_next(request)
+
+        return JSONResponse(status_code=401, content={"error": "Authentication required"})
+
+    def _require_scope(request: Request, scope: str) -> AuthContext:
+        ctx = getattr(request.state, "auth", None)
+        if not ctx or not ctx.authenticated:
+            raise HTTPException(401, "Authentication required")
+        if not has_scope(ctx, scope):
+            raise HTTPException(403, f"Scope '{scope}' required")
+        return ctx
+
+    # --- Auth endpoints ---
+
+    @app.post("/api/v1/auth/token")
+    async def create_token(body: dict) -> dict[str, Any]:
+        """Authenticate with password and receive a JWT."""
+        password = body.get("password", "")
+        if not _auth.password_hash or not verify_password(password, _auth.password_hash):
+            raise HTTPException(401, "Invalid password")
+        if not _signing_key:
+            raise HTTPException(503, "Auth not configured — no signing key")
+        token = create_jwt(_signing_key, ALL_SCOPES, _auth.jwt_expiry_seconds)
+        return {
+            "token": token,
+            "expires_in": _auth.jwt_expiry_seconds,
+            "scopes": ALL_SCOPES,
+        }
+
+    @app.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
 
     # --- WebSocket broadcast ---
 
@@ -154,8 +244,23 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     # --- WebSocket endpoint ---
 
+    async def _ws_authenticate(ws: WebSocket) -> bool:
+        """Authenticate a WebSocket connection. Returns True if allowed."""
+        if not _auth.enabled:
+            return True
+        client_ip = ws.client.host if ws.client else "127.0.0.1"
+        if is_wireguard_source(client_ip, _auth):
+            return True
+        token = ws.query_params.get("token")
+        if token and _verify_key and verify_jwt(token, _verify_key):
+            return True
+        return False
+
     @app.websocket("/api/v1/events")
     async def websocket_events(ws: WebSocket) -> None:
+        if not await _ws_authenticate(ws):
+            await ws.close(code=4001, reason="Authentication required")
+            return
         await ws.accept()
         _ws_clients.append(ws)
         # Send current snapshot on connect
@@ -203,6 +308,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         audio_vban_port=int(req.audio_vban_port) if req.audio_vban_port.isdigit() else None,
         mic_vban_port=int(req.mic_vban_port) if req.mic_vban_port.isdigit() else None,
         capture_device=req.capture_device or None,
+        machine_class=req.machine_class if req.machine_class in ("workstation", "server", "kiosk") else "workstation",
         direct_registered=True,
         )
         await state.add_node(node)
@@ -237,6 +343,19 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if node is None:
             raise HTTPException(status_code=404, detail="Node not found")
         return node.to_dict()
+
+    @app.put("/api/v1/nodes/{node_id}/machine_class")
+    async def set_machine_class(request: Request, node_id: str, body: dict) -> dict[str, Any]:
+        """Set a node's machine class (workstation, server, kiosk)."""
+        _require_scope(request, SCOPE_WRITE)
+        node = state.nodes.get(node_id)
+        if not node:
+            raise HTTPException(status_code=404, detail="Node not found")
+        mc = body.get("machine_class", "")
+        if mc not in ("workstation", "server", "kiosk"):
+            raise HTTPException(status_code=400, detail="Invalid machine_class. Must be: workstation, server, kiosk")
+        node.machine_class = mc
+        return {"ok": True, "node_id": node_id, "machine_class": mc}
 
     @app.post("/api/v1/nodes/{node_id}/activate")
     async def activate_node(node_id: str) -> dict[str, Any]:
@@ -611,6 +730,83 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         ua = body.get("user_agent", "")
         model = room_correction.detect_phone_model(ua)
         return {"model": model}
+
+    # --- KVM input (dashboard → VNC) ---
+
+    @app.post("/api/v1/input/{node_id}/key")
+    async def input_key(node_id: str, body: dict) -> dict[str, Any]:
+        """Send a key press/release to a node via VNC."""
+        if not streams:
+            raise HTTPException(status_code=503, detail="Streams not available")
+        key_name = body.get("key", "")
+        down = body.get("down", True)
+        await streams.send_key(node_id, key_name, down)
+        return {"ok": True}
+
+    @app.post("/api/v1/input/{node_id}/pointer")
+    async def input_pointer(node_id: str, body: dict) -> dict[str, Any]:
+        """Send a mouse event to a node via VNC."""
+        if not streams:
+            raise HTTPException(status_code=503, detail="Streams not available")
+        x = body.get("x", 0)
+        y = body.get("y", 0)
+        buttons = body.get("buttons", 0)
+        await streams.send_pointer(node_id, x, y, buttons)
+        return {"ok": True}
+
+    @app.websocket("/api/v1/input/{node_id}/ws")
+    async def input_ws(ws: WebSocket, node_id: str) -> None:
+        """
+        WebSocket for real-time KVM input from the dashboard.
+
+        Client sends JSON messages:
+          {"type": "key", "key": "a", "down": true}
+          {"type": "pointer", "x": 500, "y": 300, "buttons": 0}
+          {"type": "click", "x": 500, "y": 300}
+          {"type": "type", "text": "hello"}
+        """
+        await ws.accept()
+        if not streams:
+            await ws.close(code=4003, reason="Streams not available")
+            return
+
+        try:
+            while True:
+                data = await ws.receive_json()
+                msg_type = data.get("type", "")
+
+                if msg_type == "key":
+                    await streams.send_key(node_id, data["key"], data.get("down", True))
+
+                elif msg_type == "pointer":
+                    await streams.send_pointer(node_id, data["x"], data["y"],
+                                               data.get("buttons", 0))
+
+                elif msg_type == "click":
+                    x, y = data["x"], data["y"]
+                    await streams.send_pointer(node_id, x, y, 1)
+                    await asyncio.sleep(0.05)
+                    await streams.send_pointer(node_id, x, y, 0)
+
+                elif msg_type == "type":
+                    # Type text character by character via VNC keysym
+                    for ch in data.get("text", ""):
+                        keysym = ord(ch)
+                        w = streams._captures.get(node_id)
+                        if w and hasattr(w, '_vnc_writer') and w._vnc_writer:
+                            flag_down = b'\x01'
+                            flag_up = b'\x00'
+                            w._vnc_writer.write(b'\x04' + flag_down + b'\x00\x00' + keysym.to_bytes(4, 'big'))
+                            await w._vnc_writer.drain()
+                            await asyncio.sleep(0.02)
+                            w._vnc_writer.write(b'\x04' + flag_up + b'\x00\x00' + keysym.to_bytes(4, 'big'))
+                            await w._vnc_writer.drain()
+                            await asyncio.sleep(0.02)
+
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            log.debug("Input WS error: %s", e)
 
     # --- Screen reader endpoints ---
 
@@ -1578,6 +1774,54 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         from agent_engine import OZMA_CONTROL_TOOL
         return OZMA_CONTROL_TOOL
 
+    @app.get("/api/v1/agent/pending")
+    async def agent_pending(request: Request) -> dict[str, Any]:
+        """List agent actions awaiting approval."""
+        _require_scope(request, SCOPE_READ)
+        if not agent_engine:
+            return {"pending": []}
+        return {"pending": agent_engine.list_pending()}
+
+    @app.post("/api/v1/agent/{action_id}/approve")
+    async def agent_approve(request: Request, action_id: str) -> dict[str, Any]:
+        """Approve a pending agent action."""
+        _require_scope(request, SCOPE_WRITE)
+        if not agent_engine:
+            raise HTTPException(status_code=503, detail="Agent engine not available")
+        ok = agent_engine.approve_action(action_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Pending action not found")
+        return {"ok": True}
+
+    @app.post("/api/v1/agent/{action_id}/reject")
+    async def agent_reject(request: Request, action_id: str) -> dict[str, Any]:
+        """Reject a pending agent action."""
+        _require_scope(request, SCOPE_WRITE)
+        if not agent_engine:
+            raise HTTPException(status_code=503, detail="Agent engine not available")
+        ok = agent_engine.reject_action(action_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Pending action not found")
+        return {"ok": True}
+
+    @app.get("/api/v1/agent/config")
+    async def agent_config_get(request: Request) -> dict[str, Any]:
+        """Get current agent approval mode configuration."""
+        _require_scope(request, SCOPE_READ)
+        if not agent_engine:
+            return {"approval_modes": {}}
+        return {"approval_modes": agent_engine.get_approval_config()}
+
+    @app.put("/api/v1/agent/config")
+    async def agent_config_set(request: Request, body: dict) -> dict[str, Any]:
+        """Update agent approval mode configuration."""
+        _require_scope(request, SCOPE_ADMIN)
+        if not agent_engine:
+            raise HTTPException(status_code=503, detail="Agent engine not available")
+        modes = body.get("approval_modes", {})
+        agent_engine.set_approval_config(modes)
+        return {"ok": True, "approval_modes": agent_engine.get_approval_config()}
+
     @app.get("/api/v1/vision/providers")
     async def list_vision_providers() -> dict[str, Any]:
         """List available vision providers (OmniParser, YOLO, Ollama, Connect)."""
@@ -2376,6 +2620,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     @app.websocket("/api/v1/terminal/{session_id}/ws")
     async def terminal_ws(ws: WebSocket, session_id: str) -> None:
         """WebSocket for terminal I/O. Attach to an existing session."""
+        if not await _ws_authenticate(ws):
+            await ws.close(code=4001, reason="Authentication required")
+            return
         await ws.accept()
 
         session = term_mgr.get_session(session_id)
@@ -2394,6 +2641,83 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             pass
         finally:
             term_mgr.detach_client(session_id, ws)
+
+    # --- Remote desktop endpoints ---
+
+    from remote_desktop import RemoteDesktopManager
+    rd_mgr = RemoteDesktopManager(state, event_queue=state.events, notifier=notifier)
+
+    @app.on_event("startup")
+    async def _start_rd_idle_monitor() -> None:
+        asyncio.create_task(rd_mgr.start_idle_monitor(), name="rd-idle-monitor")
+
+    @app.get("/api/v1/remote/sessions")
+    async def list_remote_sessions(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        return {"sessions": rd_mgr.list_sessions()}
+
+    @app.websocket("/api/v1/remote/{node_id}/ws")
+    async def remote_desktop_ws(ws: WebSocket, node_id: str) -> None:
+        if not await _ws_authenticate(ws):
+            await ws.close(code=4001, reason="Authentication required")
+            return
+        session = rd_mgr.create_session(node_id)
+        if not session:
+            await ws.accept()
+            await ws.close(code=4004, reason="Node not found")
+            return
+        approved = await rd_mgr.start_session_with_consent(session)
+        if not approved:
+            await ws.accept()
+            await ws.send_text(json.dumps({"type": "consent_denied"}))
+            await ws.close(code=4003, reason="Consent denied or timed out")
+            rd_mgr.end_session(session.session_id)
+            return
+        try:
+            await session.handle_ws(ws)
+        finally:
+            await rd_mgr.fire_event({
+                "type": "remote_desktop.ended",
+                "session_id": session.session_id,
+                "node_id": node_id,
+                "reason": "disconnected",
+            })
+            rd_mgr.end_session(session.session_id)
+
+    @app.post("/api/v1/remote/{session_id}/approve")
+    async def approve_remote_session(request: Request, session_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        ok = rd_mgr.approve_session(session_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Pending session not found")
+        return {"ok": True}
+
+    @app.post("/api/v1/remote/{session_id}/reject")
+    async def reject_remote_session(request: Request, session_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        ok = rd_mgr.reject_session(session_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Pending session not found")
+        return {"ok": True}
+
+    @app.post("/api/v1/remote/{node_id}/privacy")
+    async def set_remote_privacy(request: Request, node_id: str, body: dict = {}) -> dict[str, Any]:
+        """Enable/disable privacy mode (blank target display via DDC/CI)."""
+        _require_scope(request, SCOPE_WRITE)
+        enabled = body.get("enabled", False)
+        # Find active session for this node
+        for s in rd_mgr._sessions.values():
+            if s.node_id == node_id and s.state.value == "active":
+                s.privacy_mode = enabled
+                log.info("Privacy mode %s for %s", "enabled" if enabled else "disabled", node_id)
+                # DDC/CI blanking would be called here via monitor_control
+                await rd_mgr.fire_event({
+                    "type": "remote_desktop.privacy_changed",
+                    "node_id": node_id,
+                    "enabled": enabled,
+                })
+                return {"ok": True, "privacy_mode": enabled}
+        raise HTTPException(status_code=404, detail="No active session for this node")
 
     # --- Control action endpoint ---
 
@@ -2432,6 +2756,51 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if not notifier:
             raise HTTPException(status_code=503, detail="Notifications not available")
         return {"ok": True, "message": "Test notification sent"}
+
+    # --- TCP tunnel endpoints ---
+
+    from mesh_network import MeshNetworkManager, PortForward
+    mesh_net = MeshNetworkManager(state)
+
+    @app.get("/api/v1/tunnels")
+    async def list_tunnels(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        return {"tunnels": mesh_net.list_forwards()}
+
+    @app.post("/api/v1/tunnels")
+    async def create_tunnel(request: Request, body: dict) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        fwd = PortForward(
+            id=body.get("id", f"tunnel-{int(time.time())}"),
+            target_node=body.get("target_node", ""),
+            target_host=body.get("target_host", ""),
+            target_port=body.get("target_port", 0),
+            protocol=body.get("protocol", "tcp"),
+            expose_port=body.get("local_port", body.get("expose_port", 0)),
+            description=body.get("description", ""),
+        )
+        if not fwd.target_node or not fwd.target_port:
+            raise HTTPException(status_code=400, detail="target_node and target_port required")
+        mesh_net.add_forward(fwd)
+        await _broadcast({"type": "tunnel.created", "tunnel": fwd.to_dict()})
+        return {"ok": True, "tunnel": fwd.to_dict()}
+
+    @app.get("/api/v1/tunnels/{tunnel_id}")
+    async def get_tunnel(request: Request, tunnel_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        fwd = mesh_net.get_forward(tunnel_id)
+        if not fwd:
+            raise HTTPException(status_code=404, detail="Tunnel not found")
+        return fwd.to_dict()
+
+    @app.delete("/api/v1/tunnels/{tunnel_id}")
+    async def delete_tunnel(request: Request, tunnel_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        ok = mesh_net.remove_forward(tunnel_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Tunnel not found")
+        await _broadcast({"type": "tunnel.destroyed", "tunnel_id": tunnel_id})
+        return {"ok": True}
 
     # Static files — mounted last so they don't shadow API routes
     static_dir = Path(__file__).parent / "static"

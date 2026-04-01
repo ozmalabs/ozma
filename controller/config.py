@@ -32,6 +32,12 @@ class Config:
     # Control surfaces
     controls_config: str = ""        # Path to controls.yaml; empty = built-in defaults only
 
+    # Authentication
+    # Off by default — enable with OZMA_AUTH=1 once the dashboard has a login flow.
+    # When off, the API is open (same as before). When on, JWT required.
+    auth_enabled: bool = False
+    auth_password_hash: str = ""   # Argon2id hash; set via OZMA_AUTH_PASSWORD env
+
     # Logging
     debug: bool = False
 
@@ -50,4 +56,6 @@ class Config:
             audio_mic_source=os.environ.get("OZMA_AUDIO_MIC", ""),
             audio_wireplumber=os.environ.get("OZMA_AUDIO_WIREPLUMBER", "").lower() in ("1", "true", "yes"),
             controls_config=os.environ.get("OZMA_CONTROLS_CONFIG", ""),
+            auth_enabled=os.environ.get("OZMA_AUTH", "0").lower() in ("1", "true", "yes"),
+            auth_password_hash=os.environ.get("OZMA_AUTH_PASSWORD_HASH", ""),
         )

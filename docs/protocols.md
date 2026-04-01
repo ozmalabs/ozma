@@ -126,4 +126,62 @@ Events are JSON objects with a `type` field:
 {"type": "node.online", "node_id": "ozma-node-a3f2", "caps": ["hid", "audio"]}
 {"type": "scenario.activated", "scenario_id": "workstation"}
 {"type": "audio.volume_changed", "node_id": "vm1", "volume": 0.75}
+{"type": "remote_desktop.consent_request", "session_id": "...", "node_id": "..."}
+{"type": "agent.approval_required", "action_id": "...", "action": "click", "node_id": "..."}
 ```
+
+---
+
+## Encrypted Wire Format
+
+All node-to-controller traffic uses AEAD encryption after session establishment.
+
+```
+Byte 0:      Version (0x01)
+Byte 1:      Packet type (plaintext, in AAD)
+Bytes 2-9:   Nonce counter (8 bytes, big-endian, monotonic)
+Bytes 10-N:  Ciphertext + 16-byte Poly1305 MAC
+```
+
+- **AEAD cipher**: XChaCha20-Poly1305 (libsodium)
+- **Key derivation**: HKDF-SHA256 from X25519 DH shared secret
+- **Nonce**: 16-byte seed (from HKDF) + 8-byte counter = 24 bytes
+- **AAD**: version + packet_type + counter
+- **Overhead**: 26 bytes per packet (1 ver + 1 type + 8 counter + 16 MAC)
+- **Replay protection**: Sliding window (64 for HID, 512 for audio)
+
+### Packet Types
+
+| Type | Value | Payload |
+|------|-------|---------|
+| Keyboard | 0x01 | 8-byte HID boot protocol report |
+| Mouse | 0x02 | 6-byte absolute mouse report |
+| Audio | 0x03 | VBAN or Opus frame |
+| Control | 0x04 | JSON control message |
+| Keepalive | 0xFF | Empty |
+
+### Session Establishment
+
+1. Controller sends: version + ephemeral X25519 pubkey + Ed25519 signature + certificate + timestamp
+2. Node verifies certificate against mesh CA, verifies signature
+3. Node responds: version + ephemeral pubkey + signature + certificate + timestamp
+4. Both compute X25519 DH → HKDF-SHA256 → session keys (separate send/recv)
+5. Channel binding: both verify a session ID derived from the transcript hash
+
+### Message Versioning
+
+The version byte (`0x01`) allows future protocol evolution. Nodes and controllers negotiate the highest mutually-supported version during session establishment. The current version is `0x01` — breaking changes will increment this.
+
+### Future Evaluation
+
+The current wire format uses `struct.pack()` for binary encoding. This was chosen for:
+- Minimal overhead (26 bytes vs ~50+ for protobuf framing)
+- Direct portability to Rust (`sodiumoxide` crate, byte-level compatibility)
+- No external dependencies or code generation
+
+For V1.2 (native game streaming protocol), we may evaluate:
+- **Protobuf**: Better schema evolution, but adds codegen dependency and framing overhead
+- **FlatBuffers**: Zero-copy reads, good for streaming, but more complex API
+- **Current approach**: Sufficient for HID/audio/control; streaming may benefit from richer framing
+
+Decision deferred to V1.2 implementation.

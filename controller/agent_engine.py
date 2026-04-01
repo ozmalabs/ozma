@@ -26,6 +26,7 @@ import asyncio
 import base64
 import io
 import logging
+import secrets
 import socket
 import struct
 import time
@@ -33,6 +34,40 @@ from dataclasses import dataclass, field
 from typing import Any
 
 log = logging.getLogger("ozma.agent_engine")
+
+# ── Approval modes ────────────────────────────────────────────────────────────
+
+APPROVAL_AUTO = "auto"       # Execute immediately (current behaviour)
+APPROVAL_NOTIFY = "notify"   # Execute immediately, fire notification
+APPROVAL_APPROVE = "approve" # Queue for human approval before executing
+
+_READ_ONLY_ACTIONS = frozenset({
+    "screenshot", "read_screen", "find_elements", "assert_text",
+    "assert_element", "wait_for_text", "wait_for_element", "get_cursor_position",
+})
+
+_DEFAULT_APPROVAL: dict[str, str] = {}  # populated in AgentEngine.__init__
+
+
+@dataclass
+class PendingAction:
+    """An action awaiting human approval."""
+    action_id: str
+    action: str
+    node_id: str
+    kwargs: dict
+    created_at: float
+    event: asyncio.Event = field(default_factory=asyncio.Event)
+    approved: bool = False
+
+    def to_dict(self) -> dict:
+        return {
+            "action_id": self.action_id,
+            "action": self.action,
+            "node_id": self.node_id,
+            "kwargs": {k: v for k, v in self.kwargs.items() if k != "verify"},
+            "created_at": self.created_at,
+        }
 
 
 # ── HID keycodes ──────────────────────────────────────────────────────────────
@@ -123,7 +158,9 @@ class AgentEngine:
     """
 
     def __init__(self, state: Any, screen_reader: Any = None,
-                 text_capture: Any = None) -> None:
+                 text_capture: Any = None,
+                 evdev_kbd_path: str = "", evdev_mouse_path: str = "",
+                 notifier: Any = None, event_queue: asyncio.Queue | None = None) -> None:
         self._state = state
         self._screen_reader = screen_reader
         self._text_capture = text_capture
@@ -132,6 +169,74 @@ class AgentEngine:
         self._last_frames: dict[str, Any] = {}
         # SoM element registry: node_id → {element_id: element_dict}
         self._som_registry: dict[str, dict[int, dict]] = {}
+        # Evdev input (for QEMU input-linux — bypasses QMP entirely)
+        self._evdev_kbd_path = evdev_kbd_path
+        self._evdev_mouse_path = evdev_mouse_path
+        # Approval system
+        self._notifier = notifier
+        self._event_queue = event_queue
+        self._approval_config: dict[str, str] = {}  # action → mode
+        self._pending: dict[str, PendingAction] = {}
+        self._approval_timeout = 120.0  # seconds
+
+    # ── Approval management ───────────────────────────────────────────
+
+    def get_approval_config(self) -> dict[str, str]:
+        """Return current per-action approval modes."""
+        return dict(self._approval_config)
+
+    def set_approval_config(self, config: dict[str, str]) -> None:
+        """Update per-action approval modes."""
+        for action, mode in config.items():
+            if mode in (APPROVAL_AUTO, APPROVAL_NOTIFY, APPROVAL_APPROVE):
+                self._approval_config[action] = mode
+
+    def _get_approval_mode(self, action: str, node_id: str = "") -> str:
+        """Get the approval mode for an action, considering node machine_class."""
+        # Explicit per-action config always wins
+        if action in self._approval_config:
+            return self._approval_config[action]
+        # Servers and kiosks default to auto for everything — they're unattended
+        node = self._state.nodes.get(node_id) if node_id else None
+        if node and getattr(node, "machine_class", "workstation") in ("server", "kiosk"):
+            return APPROVAL_AUTO
+        # Workstations: read-only = auto, mutating = notify
+        return APPROVAL_AUTO if action in _READ_ONLY_ACTIONS else APPROVAL_NOTIFY
+
+    def list_pending(self) -> list[dict]:
+        """List actions awaiting approval."""
+        return [p.to_dict() for p in self._pending.values()]
+
+    def approve_action(self, action_id: str) -> bool:
+        """Approve a pending action."""
+        pending = self._pending.get(action_id)
+        if not pending:
+            return False
+        pending.approved = True
+        pending.event.set()
+        return True
+
+    def reject_action(self, action_id: str) -> bool:
+        """Reject a pending action."""
+        pending = self._pending.get(action_id)
+        if not pending:
+            return False
+        pending.approved = False
+        pending.event.set()
+        return True
+
+    async def _fire_event(self, event: dict) -> None:
+        """Fire an event to the WebSocket broadcast queue."""
+        if self._event_queue:
+            await self._event_queue.put(event)
+
+    async def _notify(self, message: str, **extra: Any) -> None:
+        """Send a notification if notifier is available."""
+        if self._notifier:
+            try:
+                await self._notifier.send(message, **extra)
+            except Exception:
+                pass
 
     # ── Main dispatch ──────────────────────────────────────────────────
 
@@ -140,6 +245,7 @@ class AgentEngine:
         Execute an agent action.
 
         This is the single entry point that maps to the `ozma_control` MCP tool.
+        Respects the approval mode configured for each action type.
         """
         result = ActionResult(action=action, timestamp=time.time())
 
@@ -149,7 +255,36 @@ class AgentEngine:
             result.success = False
             result.error = "No node found"
             return result
-        result.node_id = node.id if hasattr(node, 'id') else node_id
+        resolved_node_id = node.id if hasattr(node, 'id') else node_id
+        result.node_id = resolved_node_id
+
+        # Check approval mode (considers node machine_class)
+        mode = self._get_approval_mode(action, resolved_node_id)
+
+        if mode == APPROVAL_APPROVE:
+            action_id = secrets.token_urlsafe(12)
+            pending = PendingAction(
+                action_id=action_id, action=action, node_id=resolved_node_id,
+                kwargs=kwargs, created_at=time.time(),
+            )
+            self._pending[action_id] = pending
+            await self._fire_event({
+                "type": "agent.approval_required",
+                "action_id": action_id, "action": action,
+                "node_id": resolved_node_id,
+                "kwargs": {k: v for k, v in kwargs.items() if k != "verify"},
+            })
+            await self._notify(f"Agent action requires approval: {action} on {resolved_node_id}")
+            try:
+                await asyncio.wait_for(pending.event.wait(), self._approval_timeout)
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                self._pending.pop(action_id, None)
+            if not pending.approved:
+                result.success = False
+                result.error = "Action rejected or timed out"
+                return result
 
         verify = kwargs.get("verify", True)
         before_frame = None
@@ -210,6 +345,14 @@ class AgentEngine:
                 result.screen_changed, result.diff_regions = self._diff_frames(
                     before_frame, after_frame
                 )
+
+        # Post-execution notification for "notify" mode
+        if mode == APPROVAL_NOTIFY and result.success:
+            await self._fire_event({
+                "type": "agent.action_executed",
+                "action": action, "node_id": resolved_node_id,
+                "kwargs": {k: v for k, v in kwargs.items() if k != "verify"},
+            })
 
         return result
 
@@ -335,9 +478,60 @@ class AgentEngine:
 
     # ── Input injection ────────────────────────────────────────────────
 
+    # HID keycode → Linux evdev keycode mapping
+    _HID_TO_EVDEV: dict[int, int] = {
+        0x04: 30, 0x05: 48, 0x06: 46, 0x07: 32, 0x08: 18, 0x09: 33, 0x0A: 34, 0x0B: 35,
+        0x0C: 23, 0x0D: 36, 0x0E: 37, 0x0F: 38, 0x10: 50, 0x11: 49, 0x12: 24, 0x13: 25,
+        0x14: 16, 0x15: 19, 0x16: 31, 0x17: 20, 0x18: 22, 0x19: 47, 0x1A: 17, 0x1B: 45,
+        0x1C: 21, 0x1D: 44, 0x1E: 2, 0x1F: 3, 0x20: 4, 0x21: 5, 0x22: 6, 0x23: 7,
+        0x24: 8, 0x25: 9, 0x26: 10, 0x27: 11, 0x28: 28, 0x29: 1, 0x2A: 14, 0x2B: 15,
+        0x2C: 57, 0x2D: 12, 0x2E: 13, 0x2F: 26, 0x30: 27, 0x31: 43, 0x33: 39, 0x34: 40,
+        0x35: 41, 0x36: 51, 0x37: 52, 0x38: 53, 0x39: 58, 0x3A: 59, 0x3B: 60, 0x3C: 61,
+        0x3D: 62, 0x3E: 63, 0x3F: 64, 0x40: 65, 0x41: 66, 0x42: 67, 0x43: 68, 0x44: 87,
+        0x45: 88, 0x49: 110, 0x4A: 102, 0x4B: 104, 0x4C: 111, 0x4D: 107, 0x4E: 109,
+        0x4F: 106, 0x50: 105, 0x51: 108, 0x52: 103,
+    }
+    _HID_MOD_TO_EVDEV: dict[int, int] = {
+        0x01: 29, 0x02: 42, 0x04: 56, 0x08: 125,  # ctrl, shift, alt, meta
+        0x10: 97, 0x20: 54, 0x40: 100, 0x80: 126,  # right variants
+    }
+
+    def _evdev_write(self, fd: int, etype: int, code: int, value: int) -> None:
+        import os
+        t = time.time()
+        os.write(fd, struct.pack('llHHi', int(t), int((t % 1) * 1e6), etype, code, value))
+
+    def _evdev_syn(self, fd: int) -> None:
+        self._evdev_write(fd, 0, 0, 0)
+
+    def _evdev_key(self, fd: int, evcode: int, down: bool) -> None:
+        self._evdev_write(fd, 1, evcode, 1 if down else 0)
+        self._evdev_syn(fd)
+
     def _send_mouse(self, host: str, port: int, x: int, y: int,
                      width: int, height: int, buttons: int = 0, scroll: int = 0) -> None:
-        """Send a mouse HID packet."""
+        """Send mouse input — evdev if available, else UDP HID."""
+        if self._evdev_mouse_path:
+            import os
+            try:
+                fd = os.open(self._evdev_mouse_path, os.O_WRONLY)
+                ax = int(x * 32767 / max(width, 1))
+                ay = int(y * 32767 / max(height, 1))
+                self._evdev_write(fd, 3, 0, ax)   # ABS_X
+                self._evdev_write(fd, 3, 1, ay)   # ABS_Y
+                self._evdev_syn(fd)
+                if buttons:
+                    self._evdev_write(fd, 1, 0x110, 1 if (buttons & 1) else 0)  # BTN_LEFT
+                    self._evdev_syn(fd)
+                if scroll:
+                    val = scroll if scroll < 128 else scroll - 256
+                    self._evdev_write(fd, 2, 8, val)  # REL_WHEEL
+                    self._evdev_syn(fd)
+                os.close(fd)
+            except Exception as e:
+                log.debug("evdev mouse failed: %s", e)
+            return
+
         ax = int(x * 32767 / max(width, 1))
         ay = int(y * 32767 / max(height, 1))
         packet = bytes([0x02, buttons, ax & 0xFF, (ax >> 8) & 0xFF,
@@ -345,7 +539,30 @@ class AgentEngine:
         self._sock.sendto(packet, (host, port))
 
     def _send_key(self, host: str, port: int, keycode: int, modifier: int = 0) -> None:
-        """Send a keyboard HID packet (press + release)."""
+        """Send keyboard input — evdev if available, else UDP HID."""
+        if self._evdev_kbd_path:
+            import os
+            try:
+                fd = os.open(self._evdev_kbd_path, os.O_WRONLY)
+                # Modifiers
+                for bit, evcode in self._HID_MOD_TO_EVDEV.items():
+                    if modifier & bit:
+                        self._evdev_key(fd, evcode, True)
+                # Key
+                evcode = self._HID_TO_EVDEV.get(keycode)
+                if evcode:
+                    self._evdev_key(fd, evcode, True)
+                    time.sleep(0.02)
+                    self._evdev_key(fd, evcode, False)
+                # Release modifiers
+                for bit, evcode in self._HID_MOD_TO_EVDEV.items():
+                    if modifier & bit:
+                        self._evdev_key(fd, evcode, False)
+                os.close(fd)
+            except Exception as e:
+                log.debug("evdev key failed: %s", e)
+            return
+
         press = bytes([0x01, modifier, 0, keycode, 0, 0, 0, 0, 0])
         release = bytes([0x01, 0, 0, 0, 0, 0, 0, 0, 0])
         self._sock.sendto(press, (host, port))

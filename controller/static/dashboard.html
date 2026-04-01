@@ -1204,6 +1204,7 @@ function renderNodes() {
         ${!isActive ? `<button class="btn sm primary" onclick="activateNode('${eid}')">Activate</button>` : ''}
         ${hasStream ? `<button class="btn sm" onclick="openStream('${eid}')">▶ Stream</button>` : ''}
         ${hasVnc ? `<a class="btn sm" href="vnc://${esc(n.vnc_host)}:${n.vnc_port}" target="_blank" title="Open VNC">⬚ VNC</a>` : ''}
+        ${hasStream ? `<button class="btn sm" onclick="openRemoteControl('${eid}')" title="Interactive KVM control">🖥 Control</button>` : ''}
         ${hasUsb ? `<button class="btn sm" id="usb-btn-${eid}" onclick="toggleUsb('${eid}')">⬡ USB</button>` : ''}
       </div>
       ${hasUsb ? `<div class="usb-panel" id="usb-panel-${eid}"><div class="usb-loading">Loading…</div></div>` : ''}
@@ -2929,6 +2930,141 @@ function renderAudioSimple() {
       </div>` : ''}
     </div>`;
   }).join('');
+}
+
+// ── Remote Control (Interactive KVM) ──────────────────────────────────────────
+
+let rcNodeId = null;
+let rcWs = null;
+let rcActive = false;
+
+function openRemoteControl(nodeId) {
+  // Create fullscreen overlay with MJPEG stream + input capture
+  rcNodeId = nodeId;
+  let overlay = document.getElementById('rc-overlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'rc-overlay';
+    overlay.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;background:#000;z-index:10000;display:flex;flex-direction:column;align-items:center;justify-content:center;';
+    overlay.innerHTML = `
+      <div style="position:absolute;top:8px;right:8px;z-index:10001;display:flex;gap:8px;">
+        <span id="rc-status" style="color:#4ae0a4;font-size:12px;padding:6px 12px;background:rgba(0,0,0,0.7);border-radius:4px;">Connecting...</span>
+        <button onclick="sendCtrlAltDel()" style="padding:6px 12px;background:#333;color:#fff;border:1px solid #555;border-radius:4px;cursor:pointer;font-size:12px;">Ctrl+Alt+Del</button>
+        <button onclick="closeRemoteControl()" style="padding:6px 12px;background:#c0392b;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;">✕ Close (Esc)</button>
+      </div>
+      <img id="rc-screen" style="max-width:100%;max-height:100%;cursor:crosshair;image-rendering:pixelated;" />
+    `;
+    document.body.appendChild(overlay);
+  }
+
+  overlay.style.display = 'flex';
+  const img = document.getElementById('rc-screen');
+  img.src = apiBase + '/api/v1/streams/' + encodeURIComponent(nodeId) + '/mjpeg';
+
+  // Open input WebSocket
+  const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  rcWs = new WebSocket(wsProto + '//' + location.host + '/api/v1/input/' + encodeURIComponent(nodeId) + '/ws');
+  rcWs.onopen = () => {
+    document.getElementById('rc-status').textContent = '● Connected — click to focus, Esc to exit';
+    document.getElementById('rc-status').style.color = '#4ae0a4';
+    rcActive = true;
+  };
+  rcWs.onclose = () => {
+    document.getElementById('rc-status').textContent = '● Disconnected';
+    document.getElementById('rc-status').style.color = '#e74c3c';
+    rcActive = false;
+  };
+
+  // Mouse events on the image
+  img.onmousedown = (e) => { if (!rcActive) return; sendPointer(e, img, buttonMask(e, true)); };
+  img.onmouseup = (e) => { if (!rcActive) return; sendPointer(e, img, buttonMask(e, false)); };
+  img.onmousemove = (e) => { if (!rcActive || !e.buttons) return; sendPointer(e, img, e.buttons); };
+  img.oncontextmenu = (e) => e.preventDefault();
+  img.onwheel = (e) => {
+    if (!rcActive) return;
+    e.preventDefault();
+    const rect = img.getBoundingClientRect();
+    const scaleX = (img.naturalWidth || 1024) / rect.width;
+    const scaleY = (img.naturalHeight || 768) / rect.height;
+    const x = Math.round((e.clientX - rect.left) * scaleX);
+    const y = Math.round((e.clientY - rect.top) * scaleY);
+    // VNC scroll: button 4 = scroll up, button 5 = scroll down
+    const btn = e.deltaY < 0 ? 8 : 16;
+    rcWs.send(JSON.stringify({type:'pointer', x, y, buttons: btn}));
+    setTimeout(() => rcWs.send(JSON.stringify({type:'pointer', x, y, buttons: 0})), 50);
+  };
+
+  // Keyboard events
+  document.addEventListener('keydown', rcKeyDown);
+  document.addEventListener('keyup', rcKeyUp);
+}
+
+function closeRemoteControl() {
+  const overlay = document.getElementById('rc-overlay');
+  if (overlay) overlay.style.display = 'none';
+  if (rcWs) { rcWs.close(); rcWs = null; }
+  rcActive = false;
+  rcNodeId = null;
+  document.removeEventListener('keydown', rcKeyDown);
+  document.removeEventListener('keyup', rcKeyUp);
+}
+
+function sendPointer(e, img, buttons) {
+  if (!rcWs || rcWs.readyState !== 1) return;
+  const rect = img.getBoundingClientRect();
+  const scaleX = (img.naturalWidth || 1024) / rect.width;
+  const scaleY = (img.naturalHeight || 768) / rect.height;
+  const x = Math.round((e.clientX - rect.left) * scaleX);
+  const y = Math.round((e.clientY - rect.top) * scaleY);
+  rcWs.send(JSON.stringify({type:'pointer', x, y, buttons}));
+}
+
+function buttonMask(e, down) {
+  if (!down) return 0;
+  if (e.button === 0) return 1;
+  if (e.button === 1) return 2;
+  if (e.button === 2) return 4;
+  return 0;
+}
+
+// Map browser key events to VNC keysym names
+const KEY_MAP = {
+  'Enter':'Return','Backspace':'BackSpace','Tab':'Tab','Escape':'Escape',
+  'Delete':'Delete','Insert':'Insert','Home':'Home','End':'End',
+  'PageUp':'Prior','PageDown':'Next',
+  'ArrowUp':'Up','ArrowDown':'Down','ArrowLeft':'Left','ArrowRight':'Right',
+  'F1':'F1','F2':'F2','F3':'F3','F4':'F4','F5':'F5','F6':'F6',
+  'F7':'F7','F8':'F8','F9':'F9','F10':'F10','F11':'F11','F12':'F12',
+  'Control':'Control_L','Shift':'Shift_L','Alt':'Alt_L','Meta':'Super_L',
+  ' ':'space','CapsLock':'Caps_Lock','NumLock':'Num_Lock','ScrollLock':'Scroll_Lock',
+  'PrintScreen':'Print',
+};
+
+function rcKeyDown(e) {
+  if (!rcActive) return;
+  if (e.key === 'Escape') { closeRemoteControl(); return; }
+  e.preventDefault();
+  const key = KEY_MAP[e.key] || e.key;
+  rcWs.send(JSON.stringify({type:'key', key, down:true}));
+}
+
+function rcKeyUp(e) {
+  if (!rcActive) return;
+  e.preventDefault();
+  const key = KEY_MAP[e.key] || e.key;
+  rcWs.send(JSON.stringify({type:'key', key, down:false}));
+}
+
+function sendCtrlAltDel() {
+  if (!rcWs || !rcActive) return;
+  rcWs.send(JSON.stringify({type:'key', key:'Control_L', down:true}));
+  rcWs.send(JSON.stringify({type:'key', key:'Alt_L', down:true}));
+  rcWs.send(JSON.stringify({type:'key', key:'Delete', down:true}));
+  setTimeout(() => {
+    rcWs.send(JSON.stringify({type:'key', key:'Delete', down:false}));
+    rcWs.send(JSON.stringify({type:'key', key:'Alt_L', down:false}));
+    rcWs.send(JSON.stringify({type:'key', key:'Control_L', down:false}));
+  }, 100);
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────

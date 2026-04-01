@@ -17,6 +17,17 @@ Include:
 We will acknowledge receipt within 48 hours and provide an initial assessment
 within 7 days.
 
+## Security Architecture
+
+The controller implements:
+- **API authentication**: JWT bearer tokens signed with the controller's Ed25519 identity key. See [docs/security.md](docs/security.md).
+- **WireGuard mesh encryption**: All node traffic encrypted with ChaCha20-Poly1305 inside a WireGuard VPN overlay.
+- **Device enrollment**: X25519 key exchange with human approval required for new nodes.
+- **Agent action approval**: Configurable approval modes (auto/notify/approve) for AI agent actions.
+- **Audit logging**: Tamper-evident hashchained event log (enabled by default).
+
+See [TRUST.md](TRUST.md) for data collection policy and transparency details.
+
 ## Scope
 
 Security issues in the following components are in scope:
