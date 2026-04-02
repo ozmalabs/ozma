@@ -529,6 +529,51 @@ input[type=range]::-webkit-slider-thumb {
       </div>
     </div>
     <div class="panel-section">
+      <div class="panel-label">Encoder
+        <span id="enc-probe-status" style="font-weight:400;color:var(--muted);margin-left:6px"></span>
+      </div>
+      <div id="encoder-current" class="panel-info" style="margin-bottom:6px">—</div>
+      <div class="radio-group" id="encoder-list">
+        <div class="radio-btn active" id="enc-auto" onclick="setEncoder('auto')">Auto</div>
+      </div>
+      <div class="panel-row" style="margin-top:6px">
+        <button class="panel-btn" onclick="applyEncoder()">⚡ Apply encoder</button>
+        <button class="panel-btn" onclick="probeEncoders(true)">🔍 Probe</button>
+      </div>
+      <label style="display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer;margin-top:6px;">
+        <input type="checkbox" id="adaptive-toggle" onchange="setAdaptive(this.checked)">
+        Auto-switch on high CPU (adaptive)
+      </label>
+    </div>
+    <div class="panel-section">
+      <div class="panel-label">Codec family</div>
+      <div class="radio-group">
+        <div class="radio-btn active" id="codec-h264" onclick="setCodecFamily('h264')">H.264</div>
+        <div class="radio-btn" id="codec-h265"  onclick="setCodecFamily('h265')">H.265</div>
+        <div class="radio-btn" id="codec-av1"   onclick="setCodecFamily('av1')">AV1</div>
+        <div class="radio-btn" id="codec-vp9"   onclick="setCodecFamily('vp9')">VP9</div>
+      </div>
+    </div>
+    <div class="panel-section">
+      <div class="panel-label">Bitrate</div>
+      <div class="radio-group" id="bitrate-group">
+        <div class="radio-btn" onclick="setBitrate('512k')">512k</div>
+        <div class="radio-btn" onclick="setBitrate('2M')">2M</div>
+        <div class="radio-btn active" onclick="setBitrate('4M')">4M</div>
+        <div class="radio-btn" onclick="setBitrate('8M')">8M</div>
+        <div class="radio-btn" onclick="setBitrate('15M')">15M</div>
+        <div class="radio-btn" onclick="setBitrate('30M')">30M</div>
+      </div>
+    </div>
+    <div class="panel-section">
+      <div class="panel-label">Latency mode</div>
+      <div class="radio-group">
+        <div class="radio-btn active" id="lat-realtime" onclick="setLatencyMode('realtime')">Realtime</div>
+        <div class="radio-btn" id="lat-balanced" onclick="setLatencyMode('balanced')">Balanced</div>
+        <div class="radio-btn" id="lat-quality"  onclick="setLatencyMode('quality')">Quality</div>
+      </div>
+    </div>
+    <div class="panel-section">
       <div class="panel-label">Scaling</div>
       <div class="radio-group">
         <div class="radio-btn active" id="scale-fit"   onclick="setScaleMode('fit')">Fit</div>
@@ -1666,6 +1711,153 @@ function toast(msg, dur = 2200) {
   el.classList.add('show');
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => el.classList.remove('show'), dur);
+}
+
+// ── Codec / encoder controls ──────────────────────────────────
+const C = {
+  selectedEncoder: 'auto',  // 'auto' or encoder name e.g. 'h264_nvenc'
+  codecFamily: 'h264',
+  bitrate: '4M',
+  latencyMode: 'realtime',
+  probeCache: null,          // last probe result
+};
+
+async function probeEncoders(force = false) {
+  const status = $('enc-probe-status');
+  status.textContent = 'Probing…';
+  try {
+    const url = `/api/v1/codecs/probe${force ? '?force=1' : ''}`;
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(r.statusText);
+    const data = await r.json();
+    C.probeCache = data;
+    _populateEncoderList(data.encoders || []);
+    status.textContent = `${(data.encoders||[]).filter(e=>e.available).length} available`;
+  } catch (e) {
+    status.textContent = 'Probe failed';
+    console.error('probeEncoders:', e);
+  }
+}
+
+function _populateEncoderList(encoders) {
+  const list = $('encoder-list');
+  // Keep "Auto" button, remove dynamically added ones
+  [...list.querySelectorAll('.enc-dynamic')].forEach(el => el.remove());
+  const available = encoders.filter(e => e.available);
+  available.forEach(enc => {
+    const el = document.createElement('div');
+    el.className = 'radio-btn enc-dynamic';
+    el.id = `enc-${enc.encoder}`;
+    el.textContent = _encLabel(enc);
+    el.title = enc.hw_type ? `${enc.hw_type} · ${enc.probe_ms}ms probe` : `software · ${enc.probe_ms}ms probe`;
+    el.onclick = () => setEncoder(enc.encoder);
+    if (enc.encoder === C.selectedEncoder) el.classList.add('active');
+    list.appendChild(el);
+  });
+}
+
+function _encLabel(enc) {
+  const hw = { nvenc: '🟢 NVENC', vaapi: '🟡 VAAPI', qsv: '🔵 QSV', v4l2m2m: '📷 V4L2', amf: '🔴 AMF' };
+  const fam = enc.codec_family?.toUpperCase() || '';
+  if (enc.hw_type && hw[enc.hw_type]) return `${hw[enc.hw_type]} ${fam}`;
+  return `💻 ${fam} SW`;
+}
+
+function setEncoder(enc) {
+  C.selectedEncoder = enc;
+  // Update radio button states
+  const list = $('encoder-list');
+  list.querySelectorAll('.radio-btn').forEach(el => el.classList.remove('active'));
+  const target = $(`enc-${enc}`) || $('enc-auto');
+  if (target) target.classList.add('active');
+}
+
+async function applyEncoder() {
+  const body = {
+    encoder: C.selectedEncoder === 'auto' ? null : C.selectedEncoder,
+    codec_family: C.codecFamily,
+    bitrate: C.bitrate,
+    latency_mode: C.latencyMode,
+  };
+  try {
+    const r = await fetch(`/api/v1/streams/${encodeURIComponent(nodeId)}/codec`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    toast('Encoder applied — stream restarting…');
+    // Refresh current encoder display after a short delay
+    setTimeout(refreshCodecStatus, 2500);
+  } catch (e) {
+    toast(`Apply failed: ${e.message}`);
+  }
+}
+
+function setCodecFamily(family) {
+  C.codecFamily = family;
+  ['h264','h265','av1','vp9'].forEach(f => {
+    $(`codec-${f}`)?.classList.toggle('active', f === family);
+  });
+}
+
+function setBitrate(val) {
+  C.bitrate = val;
+  $('bitrate-group')?.querySelectorAll('.radio-btn').forEach(el => {
+    el.classList.toggle('active', el.textContent === val);
+  });
+}
+
+function setLatencyMode(mode) {
+  C.latencyMode = mode;
+  ['realtime','balanced','quality'].forEach(m => {
+    $(`lat-${m}`)?.classList.toggle('active', m === mode);
+  });
+}
+
+async function setAdaptive(on) {
+  try {
+    await fetch(`/api/v1/streams/${encodeURIComponent(nodeId)}/adaptive`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: on }),
+    });
+    toast(`Adaptive mode ${on ? 'enabled' : 'disabled'}`);
+  } catch (e) {
+    toast('Failed to set adaptive mode');
+  }
+}
+
+async function refreshCodecStatus() {
+  try {
+    const r = await fetch(`/api/v1/streams/${encodeURIComponent(nodeId)}/codec`);
+    if (!r.ok) return;
+    const data = await r.json();
+    const enc = data.current_encoder || '—';
+    $('encoder-current').textContent = enc;
+    $('stat-codec').textContent = enc;
+    $('stat-codec-card').textContent = enc;
+    if (data.adaptive_enabled !== undefined) {
+      $('adaptive-toggle').checked = data.adaptive_enabled;
+    }
+    // Populate encoder list if we don't have a probe yet
+    if (!C.probeCache && data.available_encoders?.length) {
+      _populateEncoderList(data.available_encoders.map(e =>
+        typeof e === 'string' ? { encoder: e, available: true, codec_family: 'h264', hw_type: null, probe_ms: 0 } : e
+      ));
+    }
+  } catch (_) { /* non-critical */ }
+}
+
+// Called when Performance panel opens
+const _origTogglePanel = togglePanel;
+function togglePanel(name) {
+  _origTogglePanel(name);
+  if (name === 'perf') {
+    refreshCodecStatus();
+    // Auto-probe if no cache
+    if (!C.probeCache) probeEncoders(false);
+  }
 }
 
 // ── Keyboard shortcuts hint (? key) ──────────────────────────

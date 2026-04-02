@@ -52,6 +52,72 @@ from evdev_input import VirtualKeyboard, VirtualMouse, EvdevHIDTranslator
 
 log = logging.getLogger("ozma.softnode")
 
+
+# ── Encoder helpers ───────────────────────────────────────────────────────────
+
+def _encoder_args_for(encoder: str, bitrate: str, quality: int, latency: str) -> list[str]:
+    """Build ffmpeg -c:v … args for the given encoder and parameters."""
+    if "nvenc" in encoder:
+        preset = "p1" if latency == "realtime" else "p5"
+        args = ["-c:v", encoder, "-preset", preset, "-tune", "ull", "-rc", "cbr",
+                "-b:v", bitrate or "3M"]
+    elif "vaapi" in encoder:
+        qp = str(quality) if quality > 0 else "24"
+        args = ["-c:v", encoder, "-qp", qp]
+        if bitrate and quality < 0:
+            args = ["-c:v", encoder, "-b:v", bitrate]
+    elif "qsv" in encoder:
+        preset = "veryfast" if latency == "realtime" else "medium"
+        args = ["-c:v", encoder, "-preset", preset]
+        if bitrate:
+            args += ["-b:v", bitrate]
+    elif "v4l2m2m" in encoder:
+        args = ["-c:v", encoder]
+        if bitrate:
+            args += ["-b:v", bitrate]
+    elif "libx265" in encoder:
+        args = ["-c:v", "libx265", "-preset", "ultrafast",
+                "-tune", "zerolatency", "-x265-params", "log-level=error"]
+        if quality > 0:
+            args += ["-crf", str(quality)]
+        elif bitrate:
+            args += ["-b:v", bitrate]
+    else:  # libx264 / default
+        args = ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency"]
+        if quality > 0:
+            args += ["-crf", str(quality)]
+        elif bitrate:
+            args += ["-b:v", bitrate]
+        else:
+            args += ["-crf", "23"]
+    return args
+
+
+async def _test_encoder_quick(encoder: str, vaapi_device: str | None = None) -> bool:
+    """Quick test encode to verify an encoder is functional."""
+    if vaapi_device and "vaapi" in encoder:
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+               "-init_hw_device", f"vaapi=hw:{vaapi_device}",
+               "-filter_hw_device", "hw",
+               "-f", "lavfi", "-i", "color=black:size=64x64:rate=1",
+               "-vf", "format=nv12,hwupload",
+               "-frames:v", "1", "-c:v", encoder, "-f", "null", "-"]
+    else:
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+               "-f", "lavfi", "-i", "color=black:size=64x64:rate=1",
+               "-frames:v", "1", "-c:v", encoder, "-f", "null", "-"]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return False
+        return proc.returncode == 0
+    except Exception:
+        return False
+
 PROTO_VERSION = 1
 MAX_PACKET = 64
 
@@ -97,6 +163,11 @@ class SoftNode:
         self._mouse = MouseReportState()
         self._use_evdev = False
         self._stop_event = asyncio.Event()
+        # Codec state — modified via /codec API to trigger ffmpeg restart
+        self._codec_override: dict | None = None   # None = auto-detect
+        self._ffmpeg_hls_proc: asyncio.subprocess.Process | None = None  # current HLS encoder
+        self._current_encoder: str = ""   # e.g. "h264_nvenc"
+        self._available_encoders: list[str] = []  # probed at startup
         self._display: QEMUDBusConsole | None = None
         self._displays: list[QEMUDBusConsole] = []  # multi-monitor: all consoles
         self._virtual_capture: VirtualCapture | None = None
@@ -706,6 +777,32 @@ class SoftNode:
         app.router.add_post("/webrtc/bitrate", webrtc_bitrate)
         app.router.add_post("/webrtc/offer", webrtc_offer)
 
+        # Dynamic codec switching
+        async def get_codec(request: web.Request) -> web.Response:
+            return web.json_response({
+                "current_encoder": self._current_encoder,
+                "override": self._codec_override,
+                "available": self._available_encoders,
+            })
+
+        async def set_codec(request: web.Request) -> web.Response:
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            self._codec_override = body if body else None
+            # Kill current ffmpeg; capture loop will restart with new config
+            if self._ffmpeg_hls_proc:
+                try:
+                    self._ffmpeg_hls_proc.kill()
+                except ProcessLookupError:
+                    pass
+            log.info("Codec override set: %s (ffmpeg restart requested)", body)
+            return web.json_response({"ok": True, "override": self._codec_override})
+
+        app.router.add_get("/codec", get_codec)
+        app.router.add_post("/codec", set_codec)
+
         app.router.add_get("/health", health)
         app.router.add_get("/metrics", metrics)
         app.router.add_get("/api/v1/connection", connection_state)
@@ -874,6 +971,60 @@ class SoftNode:
             except Exception:
                 pass
 
+    # --- Encoder selection ---
+
+    async def _build_encoder_args(
+        self, w: int, h: int, fps: int
+    ) -> tuple[list[str], list[str] | None]:
+        """
+        Return (encoder_args, vf_extra) for the current codec override or best auto-detected encoder.
+
+        Probe priority: NVENC → VAAPI → QSV → V4L2M2M → libx264.
+        Results are cached; override via POST /codec.
+        """
+        override = self._codec_override or {}
+        requested = override.get("codec", "")         # e.g. "h264_nvenc", "h264_vaapi", "h265"
+        bitrate = override.get("bitrate", "3M")
+        quality = override.get("quality", -1)
+        latency = override.get("latency_mode", "realtime")
+
+        # If explicit encoder name given (not family), use it directly
+        if requested and "_" in requested:
+            self._current_encoder = requested
+            return _encoder_args_for(requested, bitrate, quality, latency), None
+
+        # Map family → preferred encoder
+        family = requested or "h264"
+        candidates: list[tuple[str, str | None]] = [
+            # (ffmpeg_encoder, vaapi_device_or_None)
+            ("h264_nvenc",   None),
+            ("h264_vaapi",   "/dev/dri/renderD128"),
+            ("h264_qsv",     None),
+            ("h264_v4l2m2m", None),
+            ("libx264",      None),
+        ]
+        if family == "h265":
+            candidates = [
+                ("hevc_nvenc", None), ("hevc_vaapi", "/dev/dri/renderD128"),
+                ("hevc_qsv", None), ("hevc_v4l2m2m", None), ("libx265", None),
+            ]
+
+        # Use cached results if available
+        if not self._available_encoders or override:
+            self._available_encoders = []
+            for enc_name, vaapi_dev in candidates:
+                ok = await _test_encoder_quick(enc_name, vaapi_dev)
+                if ok:
+                    self._available_encoders.append(enc_name)
+
+        chosen = self._available_encoders[0] if self._available_encoders else "libx264"
+        self._current_encoder = chosen
+        vaapi_dev = dict(candidates).get(chosen)
+        vf_extra: list[str] | None = None
+        if vaapi_dev and "vaapi" in chosen:
+            vf_extra = ["-vf", f"scale={w}:{h},format=nv12,hwupload", "-pix_fmt", "nv12"]
+        return _encoder_args_for(chosen, bitrate, quality, latency), vf_extra
+
     # --- UDP server ---
 
     async def _capture_hls(self, device_or_socket: str) -> None:
@@ -956,28 +1107,15 @@ class SoftNode:
         w, h = dc.width, dc.height
         log.info("D-Bus capture: %dx%d @ %dfps target", w, h, target_fps)
 
-        # Detect NVENC
-        nvenc = False
-        try:
-            probe = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-hide_banner", "-encoders",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-            out, _ = await probe.communicate()
-            nvenc = b"h264_nvenc" in out
-        except Exception:
-            pass
-
-        if nvenc:
-            enc = ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ull", "-rc", "cbr", "-b:v", "3M"]
-        else:
-            enc = ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "23"]
+        # Detect available encoders (probe once per session; re-probe if override changes)
+        enc, vf_extra = await self._build_encoder_args(w, h, target_fps)
 
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
             "-f", "rawvideo", "-pix_fmt", "bgra", "-s", f"{w}x{h}",
             "-r", str(target_fps), "-i", "-",
             *enc,
-            "-pix_fmt", "yuv420p",
+            *(vf_extra or ["-pix_fmt", "yuv420p"]),
             "-g", str(target_fps),
             "-f", "hls",
             "-hls_time", "0.5",
@@ -994,8 +1132,9 @@ class SoftNode:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-        log.info("D-Bus → H.264 HLS started (pid=%d, %dx%d, %s, %dfps)",
-                 proc.pid, w, h, "NVENC" if nvenc else "x264", target_fps)
+        self._ffmpeg_hls_proc = proc
+        log.info("D-Bus → HLS started (pid=%d, %dx%d, enc=%s, %dfps)",
+                 proc.pid, w, h, self._current_encoder, target_fps)
 
         # Register with go2rtc
         try:
@@ -1070,26 +1209,8 @@ class SoftNode:
         tmp_path = str(frame_dir / f"{self._name}.ppm")
         target_fps = 15
 
-        # Detect NVENC availability
-        nvenc = False
-        try:
-            probe = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-hide_banner", "-encoders",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-            )
-            out, _ = await probe.communicate()
-            nvenc = b"h264_nvenc" in out
-        except Exception:
-            pass
-
-        if nvenc:
-            encoder_args = ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ull",
-                            "-rc", "cbr", "-b:v", "2M"]
-            log.info("Using NVENC hardware encoder")
-        else:
-            encoder_args = ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-                            "-crf", "28"]
-            log.info("Using libx264 software encoder")
+        # Detect / use encoder (shared with D-Bus path)
+        encoder_args, _vf = await self._build_encoder_args(1920, 1080, target_fps)
 
         # Check for PipeWire audio sink for this VM
         pw_sink = f"ozma-{self._name}"
@@ -1140,7 +1261,9 @@ class SoftNode:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-        log.info("QMP → H.264 HLS started for %s (pid=%d, %dfps)", self._name, proc.pid, target_fps)
+        self._ffmpeg_hls_proc = proc
+        log.info("QMP → HLS started for %s (pid=%d, enc=%s, %dfps)",
+                 self._name, proc.pid, self._current_encoder, target_fps)
 
         # Register with go2rtc for WebRTC output (if go2rtc is available)
         try:

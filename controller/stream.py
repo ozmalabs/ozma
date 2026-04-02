@@ -1,24 +1,26 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
 """
-VNC → H.265 HLS stream manager.
+VNC → HLS stream manager with dynamic codec switching.
 
 For each node that advertises vnc_host/vnc_port in its mDNS TXT record,
 StreamManager:
   1. Connects via asyncvnc and reads raw RGBA frames.
   2. Pipes frames to an ffmpeg subprocess as rawvideo.
-  3. ffmpeg encodes H.265 (or H.264 fallback) and outputs HLS .m3u8 + .ts
-     segments to static/streams/{safe_node_id}/.
+  3. ffmpeg encodes (H.264/H.265/hardware/software) and outputs HLS.
 
-The HLS manifest is served at /streams/{safe_node_id}/stream.m3u8 by the
-static file mount in api.py.
+The HLS manifest is served at /streams/{safe_node_id}/stream.m3u8.
 
-Browser side uses hls.js to play the stream and Three.js VideoTexture to
-display it on a monitor mesh in the 3D scene.
+Codec switching:
+  StreamCapture.set_codec(config)  — graceful restart with new encoder
+  StreamManager.switch_codec(node_id, config) — delegate to capture
+  StreamManager.enable_adaptive(True)  — background CPU-aware auto-switch
 """
 
 import asyncio
 import io
 import logging
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncIterator
 
@@ -27,20 +29,39 @@ import numpy as np
 from PIL import Image
 
 if TYPE_CHECKING:
+    from codec_manager import CodecConfig, CodecManager, ResolvedEncoder
     from state import AppState, NodeInfo
 
 log = logging.getLogger("ozma.stream")
 
-# H.265 segments for production use; H.264 for broader browser compat
-_CODEC_H265 = [
-    "libx265",
-    "-x265-params", "log-level=error:keyint=30:min-keyint=30",
-]
-_CODEC_H264 = [
-    "libx264",
-    "-profile:v", "baseline",
-    "-tune", "zerolatency",
-]
+# Fallback software encoders (used when no CodecManager is provided)
+_CODEC_H265 = ["libx265", "-x265-params", "log-level=error:keyint=30:min-keyint=30"]
+_CODEC_H264 = ["libx264", "-profile:v", "baseline", "-tune", "zerolatency"]
+
+
+@dataclass
+class StreamStats:
+    """Live statistics for a stream capture."""
+    node_id: str = ""
+    encoder: str = ""         # ffmpeg encoder name, e.g. "h264_nvenc"
+    hw_type: str = ""         # nvenc / vaapi / qsv / software
+    codec_family: str = ""    # h264 / h265 / av1
+    fps_actual: float = 0.0
+    bitrate_target: str = ""
+    frames_sent: int = 0
+    uptime_s: float = 0.0
+    restarts: int = 0
+    active: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "node_id": self.node_id, "encoder": self.encoder,
+            "hw_type": self.hw_type, "codec_family": self.codec_family,
+            "fps_actual": round(self.fps_actual, 1),
+            "bitrate_target": self.bitrate_target,
+            "frames_sent": self.frames_sent, "uptime_s": round(self.uptime_s, 1),
+            "restarts": self.restarts, "active": self.active,
+        }
 
 
 def safe_id(node_id: str) -> str:
@@ -49,7 +70,12 @@ def safe_id(node_id: str) -> str:
 
 
 class StreamCapture:
-    """Captures one node's VNC display and encodes it to HLS."""
+    """Captures one node's VNC display and encodes it to HLS.
+
+    Supports dynamic codec switching via ``set_codec()``. The current ffmpeg
+    process is cleanly terminated and restarted with the new encoder on the
+    next ``_run_with_backoff`` iteration.
+    """
 
     def __init__(
         self,
@@ -58,6 +84,8 @@ class StreamCapture:
         vnc_port: int,
         out_dir: Path,
         codec: str = "h265",
+        codec_config: "CodecConfig | None" = None,
+        codec_manager: "CodecManager | None" = None,
     ) -> None:
         self.node_id = node_id
         self.active = False
@@ -65,6 +93,10 @@ class StreamCapture:
         self._vnc_port = vnc_port
         self._out_dir = out_dir
         self._codec = codec
+        # Dynamic codec config; supersedes _codec when set
+        self._codec_config: CodecConfig | None = codec_config
+        self._codec_manager: CodecManager | None = codec_manager
+        self._codec_switch_event = asyncio.Event()  # set → restart with new encoder
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._vnc_writer: asyncio.StreamWriter | None = None
@@ -73,6 +105,12 @@ class StreamCapture:
         # Latest JPEG frame for MJPEG subscribers; maxsize=1 means no backlog
         self._jpeg_frame: bytes | None = None
         self._jpeg_event: asyncio.Event = asyncio.Event()
+        # Live stats
+        self.stats = StreamStats(node_id=node_id)
+        self._start_time: float = 0.0
+        self._frame_count: int = 0
+        self._fps_window_start: float = 0.0
+        self._fps_window_count: int = 0
 
     @property
     def stream_path(self) -> str:
@@ -92,6 +130,18 @@ class StreamCapture:
         if self._task:
             self._task.cancel()
         self.active = False
+
+    async def set_codec(self, config: "CodecConfig") -> None:
+        """Switch to a new codec config; restarts the encoding pipeline."""
+        self._codec_config = config
+        self._codec_switch_event.set()
+        # If the ffmpeg subprocess is piped, cancelling the task will cause
+        # _run_with_backoff to loop and restart with the new config.
+        if self._task and not self._task.done():
+            self._task.cancel()
+            # Re-start immediately
+            await asyncio.sleep(0)
+            self.start()
 
     async def mjpeg_frames(self) -> AsyncIterator[bytes]:
         """Yield JPEG bytes as each new frame is captured."""
@@ -132,12 +182,23 @@ class StreamCapture:
     async def _run_with_backoff(self) -> None:
         backoff = 1.0
         while not self._stop.is_set():
+            self._codec_switch_event.clear()
             try:
                 await self._capture_loop()
             except asyncio.CancelledError:
+                # If a codec switch triggered the cancel, don't return — restart
+                if self._codec_switch_event.is_set():
+                    self._codec_switch_event.clear()
+                    self.stats.restarts += 1
+                    continue
                 return
             except Exception as e:
                 log.warning("Stream %s error: %s — retry in %.0fs", self.node_id, e, backoff)
+                self.stats.restarts += 1
+            else:
+                # Clean exit (stop was set)
+                if self._stop.is_set():
+                    return
             try:
                 await asyncio.wait_for(
                     asyncio.shield(self._stop.wait()), timeout=backoff
@@ -146,15 +207,68 @@ class StreamCapture:
             except asyncio.TimeoutError:
                 backoff = min(backoff * 2, 15.0)
 
+    def _build_ffmpeg_cmd(
+        self, w: int, h: int, out_w: int, out_h: int, fps_target: int
+    ) -> tuple[list[str], str, str]:
+        """
+        Build the ffmpeg command for the current codec config.
+
+        Returns (cmd, encoder_name, hw_type).
+        """
+        pre_input: list[str] = []    # flags before -i (hwaccel device setup)
+        vf_parts: list[str] = []     # -vf filter chain components
+        enc_args: list[str] = []     # -c:v and encoder flags
+
+        encoder_name = ""
+        hw_type = "software"
+
+        if self._codec_manager and self._codec_config:
+            enc = self._codec_manager.resolve(self._codec_config)
+            encoder_name = enc.name
+            hw_type = enc.ffmpeg_codec.split("_")[1] if "_" in enc.ffmpeg_codec else "software"
+            if "software" in enc.name.lower():
+                hw_type = "software"
+
+            if enc.hw_device and "vaapi" in enc.ffmpeg_codec:
+                pre_input = [
+                    "-init_hw_device", f"vaapi=hw:{enc.hw_device}",
+                    "-filter_hw_device", "hw",
+                ]
+                vf_parts = [f"scale={out_w}:{out_h}", "format=nv12", "hwupload"]
+            else:
+                vf_parts = [f"scale={out_w}:{out_h}", "format=yuv420p"]
+                if enc.vf_prefix:
+                    vf_parts = [f"scale={out_w}:{out_h}"] + enc.vf_prefix.split(",")
+
+            enc_args = ["-c:v", enc.ffmpeg_codec] + enc.ffmpeg_flags
+
+        else:
+            # Fallback: software encoder (legacy path)
+            vcodec = _CODEC_H265 if self._codec == "h265" else _CODEC_H264
+            vf_parts = [f"scale={out_w}:{out_h}", "format=yuv420p"]
+            enc_args = ["-c:v"] + vcodec + ["-preset", "ultrafast"]
+            encoder_name = "Software H.265" if self._codec == "h265" else "Software H.264"
+
+        cmd = (
+            ["ffmpeg", "-y"]
+            + pre_input
+            + ["-f", "rawvideo", "-pixel_format", "rgba",
+               "-video_size", f"{w}x{h}", "-framerate", str(fps_target),
+               "-i", "pipe:0",
+               "-vf", ",".join(vf_parts)]
+            + enc_args
+            + ["-f", "hls", "-hls_time", "1", "-hls_list_size", "4",
+               "-hls_flags", "delete_segments+independent_segments",
+               "-hls_segment_filename", str(self._out_dir / "seg_%03d.ts"),
+               str(self._out_dir / "stream.m3u8")]
+        )
+        return cmd, encoder_name, hw_type
+
     async def _capture_loop(self) -> None:
         self._out_dir.mkdir(parents=True, exist_ok=True)
 
-        vcodec = _CODEC_H265 if self._codec == "h265" else _CODEC_H264
-
-        log.info(
-            "Connecting to VNC %s:%d for %s",
-            self._vnc_host, self._vnc_port, self.node_id,
-        )
+        log.info("Connecting to VNC %s:%d for %s",
+                 self._vnc_host, self._vnc_port, self.node_id)
 
         async with asyncvnc.connect(self._vnc_host, self._vnc_port) as client:
             self._vnc_writer = client.writer
@@ -163,32 +277,27 @@ class StreamCapture:
             self._vnc_h = h
             log.info("VNC connected: %s %dx%d", self.node_id, w, h)
 
-            # Cap width to 1024 to keep bitrate reasonable
-            out_w = min(w, 1024)
-            out_h = (out_w * h // w) & ~1   # keep even height
+            # Cap output width; let codec_config.max_width override
+            max_w = (self._codec_config.max_width
+                     if self._codec_config and self._codec_config.max_width > 0
+                     else 1920)
+            out_w = min(w, max_w)
+            out_h = (out_w * h // w) & ~1
 
-            fps_target = 20
-            cmd = [
-                "ffmpeg", "-y",
-                # Input: raw RGBA frames piped from asyncvnc
-                "-f", "rawvideo",
-                "-pixel_format", "rgba",
-                "-video_size", f"{w}x{h}",
-                "-framerate", str(fps_target),
-                "-i", "pipe:0",
-                # Scale + encode
-                # rgba → yuv420p (required; libx265 has no alpha support)
-                "-vf", f"scale={out_w}:{out_h},format=yuv420p",
-                "-c:v", *vcodec,
-                "-preset", "ultrafast",
-                # HLS output
-                "-f", "hls",
-                "-hls_time", "1",
-                "-hls_list_size", "4",
-                "-hls_flags", "delete_segments+independent_segments",
-                "-hls_segment_filename", str(self._out_dir / "seg_%03d.ts"),
-                str(self._out_dir / "stream.m3u8"),
-            ]
+            fps_target = (self._codec_config.max_fps
+                          if self._codec_config and self._codec_config.max_fps > 0
+                          else 20)
+
+            cmd, encoder_name, hw_type = self._build_ffmpeg_cmd(w, h, out_w, out_h, fps_target)
+
+            # Update stats
+            self.stats.encoder = encoder_name
+            self.stats.hw_type = hw_type
+            self.stats.codec_family = (self._codec_config.codec
+                                        if self._codec_config else self._codec)
+            self.stats.bitrate_target = (self._codec_config.bitrate
+                                          if self._codec_config else "auto")
+            log.info("Starting HLS encoder for %s: %s (hw=%s)", self.node_id, encoder_name, hw_type)
 
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -197,16 +306,19 @@ class StreamCapture:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             self.active = True
-            log.info("HLS encoding started for %s → %s", self.node_id, self._out_dir)
+            self.stats.active = True
+            self._start_time = time.monotonic()
+            self._frame_count = 0
+            self._fps_window_start = time.monotonic()
+            self._fps_window_count = 0
 
             try:
-                # First full frame
                 await client.screenshot()
 
                 fps_interval = 1.0 / fps_target
                 loop = asyncio.get_running_loop()
 
-                while not self._stop.is_set():
+                while not self._stop.is_set() and not self._codec_switch_event.is_set():
                     frame = client.video.as_rgba()
                     arr = np.ascontiguousarray(frame)
                     frame_bytes = arr.tobytes()
@@ -218,7 +330,20 @@ class StreamCapture:
                         log.warning("ffmpeg pipe closed for %s", self.node_id)
                         break
 
-                    # Publish JPEG for low-latency MJPEG subscribers
+                    # Update FPS stats (rolling 5-second window)
+                    self._frame_count += 1
+                    self._fps_window_count += 1
+                    now = time.monotonic()
+                    elapsed = now - self._fps_window_start
+                    if elapsed >= 5.0:
+                        self.stats.fps_actual = self._fps_window_count / elapsed
+                        self.stats.fps_actual = round(self.stats.fps_actual, 1)
+                        self._fps_window_count = 0
+                        self._fps_window_start = now
+                    self.stats.frames_sent = self._frame_count
+                    self.stats.uptime_s = now - self._start_time
+
+                    # MJPEG for low-latency subscribers
                     img = Image.fromarray(arr, 'RGBA').convert('RGB')
                     if out_w != w:
                         img = img.resize((out_w, out_h), Image.LANCZOS)
@@ -228,8 +353,6 @@ class StreamCapture:
                     self._jpeg_event.set()
                     self._jpeg_event.clear()
 
-                    # Drain all available VNC updates within the frame interval
-                    # so the next snapshot has as fresh a picture as possible.
                     client.video.refresh()
                     deadline = loop.time() + fps_interval
                     while True:
@@ -244,6 +367,7 @@ class StreamCapture:
             finally:
                 self._vnc_writer = None
                 self.active = False
+                self.stats.active = False
                 if proc.stdin and not proc.stdin.is_closing():
                     try:
                         proc.stdin.close()
@@ -253,6 +377,7 @@ class StreamCapture:
                     await asyncio.wait_for(proc.wait(), timeout=5.0)
                 except asyncio.TimeoutError:
                     proc.kill()
+                    await proc.wait()
 
 
 class StreamManager:
@@ -266,7 +391,7 @@ class StreamManager:
         state: "AppState",
         static_dir: Path | None = None,
         codec: str = "h264",   # h264=broad browser compat; h265=production via OZMA_STREAM_CODEC=h265
-        codec_manager: Any = None,
+        codec_manager: "CodecManager | None" = None,
     ) -> None:
         self._state = state
         self._static_dir = static_dir or (Path(__file__).parent / "static" / "streams")
@@ -274,6 +399,10 @@ class StreamManager:
         self._codec_manager = codec_manager
         self._captures: dict[str, StreamCapture] = {}
         self._poll_task: asyncio.Task | None = None
+        self._adaptive_task: asyncio.Task | None = None
+        self._adaptive_enabled: bool = False
+        # Per-node codec overrides (set via API)
+        self._codec_overrides: dict[str, "CodecConfig"] = {}
 
     async def start(self) -> None:
         self._static_dir.mkdir(parents=True, exist_ok=True)
@@ -395,11 +524,96 @@ class StreamManager:
         # VNC node — local capture + MJPEG (fallback)
         if node.vnc_host and node.vnc_port:
             out_dir = self._static_dir / safe_id(node.id)
-            cap = StreamCapture(node.id, node.vnc_host, node.vnc_port, out_dir, self._codec)
+            codec_cfg = self._codec_overrides.get(node.id)
+            cap = StreamCapture(
+                node.id, node.vnc_host, node.vnc_port, out_dir,
+                codec=self._codec,
+                codec_config=codec_cfg,
+                codec_manager=self._codec_manager,
+            )
             self._captures[node.id] = cap
             cap.start()
             log.info("Stream capture started for %s (vnc=%s:%d)",
                      node.id, node.vnc_host, node.vnc_port)
+
+    async def switch_codec(self, node_id: str, config: "CodecConfig") -> bool:
+        """Hot-switch the codec for a VNC stream capture.
+
+        Stores the override and triggers a graceful restart. Returns False if
+        the node isn't a local VNC capture (hardware nodes manage their own codec).
+        """
+        self._codec_overrides[node_id] = config
+        entry = self._captures.get(node_id)
+        if isinstance(entry, StreamCapture):
+            await entry.set_codec(config)
+            log.info("Codec switch requested for %s: %s (hw=%s)",
+                     node_id, config.codec, config.hw_accel)
+            return True
+        elif isinstance(entry, _SoftNodeStream):
+            # Forward to soft node API
+            import httpx
+            url = f"http://{entry._host}:{entry._api_port}/codec"
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    await client.post(url, json=config.to_dict())
+                return True
+            except Exception as e:
+                log.warning("Could not forward codec switch to soft node %s: %s", node_id, e)
+                return False
+        return False
+
+    def get_stream_stats(self, node_id: str) -> StreamStats | None:
+        """Return live stats for a stream capture."""
+        entry = self._captures.get(node_id)
+        if isinstance(entry, StreamCapture):
+            return entry.stats
+        return None
+
+    def get_all_stats(self) -> dict[str, dict]:
+        return {
+            nid: cap.stats.to_dict()
+            for nid, cap in self._captures.items()
+            if isinstance(cap, StreamCapture)
+        }
+
+    def enable_adaptive(self, enabled: bool) -> None:
+        """Enable or disable automatic codec switching based on CPU usage."""
+        self._adaptive_enabled = enabled
+        if enabled and self._adaptive_task is None:
+            self._adaptive_task = asyncio.create_task(
+                self._adaptive_loop(), name="stream-adaptive"
+            )
+            log.info("Adaptive codec switching enabled")
+        elif not enabled and self._adaptive_task:
+            self._adaptive_task.cancel()
+            self._adaptive_task = None
+            log.info("Adaptive codec switching disabled")
+
+    async def _adaptive_loop(self) -> None:
+        """Background task: monitor CPU and auto-switch codecs."""
+        while True:
+            await asyncio.sleep(30.0)
+            if not self._adaptive_enabled or not self._codec_manager:
+                continue
+            cpu_pct = _get_cpu_pct()
+            for node_id, cap in list(self._captures.items()):
+                if not isinstance(cap, StreamCapture) or not cap.active:
+                    continue
+                current = cap._codec_config
+                if current is None:
+                    continue
+                suggestion = self._codec_manager.adaptive_select(
+                    current,
+                    cpu_pct=cpu_pct,
+                    fps_actual=cap.stats.fps_actual,
+                )
+                if suggestion:
+                    log.info(
+                        "Adaptive: switching %s — CPU=%.0f%% fps=%.1f → hw_accel=%s bitrate=%s",
+                        node_id, cpu_pct, cap.stats.fps_actual,
+                        suggestion.hw_accel, suggestion.bitrate,
+                    )
+                    await self.switch_codec(node_id, suggestion)
 
     async def _poll_loop(self) -> None:
         while True:
@@ -413,6 +627,33 @@ class StreamManager:
                 if isinstance(entry, StreamCapture):
                     entry.stop()
                 log.info("Stream capture stopped for offline node %s", nid)
+
+
+def _get_cpu_pct() -> float:
+    """Return system CPU usage percentage (0–100)."""
+    try:
+        import psutil
+        return psutil.cpu_percent(interval=1)
+    except ImportError:
+        pass
+    # Fallback: read /proc/stat
+    try:
+        def _read_stat():
+            with open("/proc/stat") as f:
+                line = f.readline()
+            vals = [int(x) for x in line.split()[1:]]
+            idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+            total = sum(vals)
+            return idle, total
+        idle0, total0 = _read_stat()
+        import time as _time
+        _time.sleep(0.1)
+        idle1, total1 = _read_stat()
+        dtotal = total1 - total0
+        didle  = idle1  - idle0
+        return 100.0 * (1 - didle / dtotal) if dtotal else 0.0
+    except Exception:
+        return 0.0
 
 
 class _SoftNodeStream:

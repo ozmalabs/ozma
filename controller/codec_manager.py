@@ -82,9 +82,11 @@ Configuration:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -364,3 +366,195 @@ class CodecManager:
 
     def list_configs(self) -> dict[str, dict]:
         return {k: v.to_dict() for k, v in self._configs.items()}
+
+    # ── Async probe (runtime, cached) ────────────────────────────────────────
+
+    async def probe_encoders_async(
+        self,
+        families: list[str] | None = None,
+        force: bool = False,
+    ) -> list["EncoderProbeResult"]:
+        """
+        Probe available encoders using async test encodes.
+
+        Results are cached for 60 seconds. ``force=True`` bypasses the cache.
+        Runs all probes concurrently.
+        """
+        now = time.monotonic()
+        cache = getattr(self, "_probe_cache", None)
+        if not force and cache and (now - cache["ts"] < 60.0):
+            results = cache["results"]
+            if families:
+                results = [r for r in results if r.codec_family in families]
+            return results
+
+        targets = families or list(_CODEC_VARIANTS.keys())
+        tasks = []
+        for family in targets:
+            for v in _CODEC_VARIANTS.get(family, []):
+                tasks.append(_probe_encoder_async(v["codec"], v["hw"], family,
+                                                   v.get("hw_device", "")))
+        results: list[EncoderProbeResult] = await asyncio.gather(*tasks)
+
+        # Update in-memory available list too
+        for family in targets:
+            avail = [r.encoder for r in results
+                     if r.codec_family == family and r.available]
+            self._available[family] = avail
+
+        self._probe_cache = {"ts": now, "results": results}  # type: ignore[attr-defined]
+        return results
+
+    def get_probe_cache(self) -> list["EncoderProbeResult"]:
+        """Return cached probe results without re-probing."""
+        cache = getattr(self, "_probe_cache", None)
+        return cache["results"] if cache else []
+
+    # ── Adaptive selection ────────────────────────────────────────────────────
+
+    def adaptive_select(
+        self,
+        current: CodecConfig,
+        cpu_pct: float,
+        fps_actual: float = 0.0,
+        viewer_count: int = 1,
+    ) -> CodecConfig | None:
+        """
+        Suggest a codec config change based on system conditions.
+
+        Returns a new ``CodecConfig`` if a change is recommended, else ``None``.
+
+        Decision logic:
+        - CPU > 85% + software encoder → switch to hardware if available
+        - CPU > 95% → reduce bitrate 30%, lower resolution
+        - CPU < 30% + hardware encoder already → no change (stay efficient)
+        - FPS < 20 + using software → reduce bitrate or switch to hardware
+        - No viewers → drop to minimal bitrate (but keep streaming)
+        - Otherwise → no change
+        """
+        family = current.codec
+        available = self._available.get(family, [])
+        hw_available = [v for v in _CODEC_VARIANTS.get(family, [])
+                        if v["hw"] != "software" and v["codec"] in available]
+        is_software = current.hw_accel in ("software", "") or (
+            current.hw_accel == "auto" and not hw_available
+        )
+
+        cfg = CodecConfig(
+            codec=current.codec,
+            bitrate=current.bitrate,
+            quality=current.quality,
+            preset=current.preset,
+            latency_mode=current.latency_mode,
+            hw_accel=current.hw_accel,
+            max_width=current.max_width,
+            keyint=current.keyint,
+        )
+        changed = False
+
+        if viewer_count == 0:
+            # No one watching — minimal quality
+            cfg.bitrate = "512k"
+            cfg.max_width = 1280
+            changed = True
+
+        elif cpu_pct > 95.0:
+            # Emergency: reduce everything
+            if hw_available and is_software:
+                cfg.hw_accel = hw_available[0]["hw"]
+                changed = True
+            cfg.bitrate = _scale_bitrate(current.bitrate, 0.5)
+            cfg.max_width = 1280
+            cfg.latency_mode = "realtime"
+            changed = True
+
+        elif cpu_pct > 85.0 and is_software and hw_available:
+            # High CPU + software → switch to hardware
+            cfg.hw_accel = hw_available[0]["hw"]
+            cfg.latency_mode = "realtime"
+            changed = True
+
+        elif fps_actual > 0 and fps_actual < 20.0:
+            # FPS dropping → reduce bitrate
+            cfg.bitrate = _scale_bitrate(current.bitrate, 0.7)
+            if is_software and hw_available:
+                cfg.hw_accel = hw_available[0]["hw"]
+            changed = True
+
+        elif cpu_pct < 25.0 and not is_software and not hw_available:
+            # Light load, stuck on software (no HW found) → try upgrading quality
+            cfg.quality = max(18, current.quality - 2) if current.quality > 0 else current.quality
+            changed = True
+
+        return cfg if changed else None
+
+
+def _scale_bitrate(bitrate_str: str, factor: float) -> str:
+    """Scale a bitrate string like '8M' or '2000k' by a factor."""
+    s = bitrate_str.strip()
+    if s.endswith("M"):
+        val = float(s[:-1]) * factor
+        return f"{val:.1f}M" if val >= 1 else f"{int(val * 1000)}k"
+    elif s.endswith("k"):
+        return f"{int(float(s[:-1]) * factor)}k"
+    return bitrate_str  # can't parse, leave unchanged
+
+
+@dataclass
+class EncoderProbeResult:
+    """Result of a runtime encoder availability probe."""
+    encoder: str           # ffmpeg encoder name, e.g. "h264_nvenc"
+    codec_family: str      # "h264", "h265", "av1", "vp9", "mjpeg"
+    hw_type: str           # "nvenc", "vaapi", "qsv", "v4l2m2m", "software"
+    available: bool
+    probe_ms: float = 0.0
+    error: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "encoder": self.encoder, "codec_family": self.codec_family,
+            "hw_type": self.hw_type, "available": self.available,
+            "probe_ms": round(self.probe_ms, 1), "error": self.error,
+        }
+
+
+async def _probe_encoder_async(
+    codec: str, hw_type: str, family: str, hw_device: str = ""
+) -> EncoderProbeResult:
+    """Test-encode a tiny frame with the given encoder asynchronously."""
+    t0 = time.monotonic()
+    if "vaapi" in codec and hw_device:
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-init_hw_device", f"vaapi=hw:{hw_device}",
+            "-filter_hw_device", "hw",
+            "-f", "lavfi", "-i", "color=black:size=64x64:rate=1",
+            "-vf", "format=nv12,hwupload",
+            "-frames:v", "1", "-c:v", codec, "-f", "null", "-",
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "color=black:size=64x64:rate=1",
+            "-frames:v", "1", "-c:v", codec, "-f", "null", "-",
+        ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=12.0)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return EncoderProbeResult(codec, family, hw_type, False,
+                                      (time.monotonic() - t0) * 1000, "timeout")
+        ok = proc.returncode == 0
+        return EncoderProbeResult(codec, family, hw_type, ok,
+                                  (time.monotonic() - t0) * 1000,
+                                  "" if ok else f"returncode={proc.returncode}")
+    except Exception as e:
+        return EncoderProbeResult(codec, family, hw_type, False,
+                                  (time.monotonic() - t0) * 1000, str(e))

@@ -2676,6 +2676,93 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         resolved = codec_mgr.resolve(cfg)
         return {"resolved": resolved.to_dict(), "ffmpeg_args": codec_mgr.get_ffmpeg_args(cfg)}
 
+    @app.get("/api/v1/codecs/probe")
+    async def probe_codecs(request: Request, force: bool = False) -> dict[str, Any]:
+        """Probe all encoders with test encodes. Cached 60s. Use ?force=1 to bypass cache."""
+        _require_scope(request, SCOPE_READ)
+        if not codec_mgr:
+            raise HTTPException(status_code=503, detail="Codec manager not available")
+        from codec_manager import EncoderProbeResult
+        results = await codec_mgr.probe_encoders_async(force=force)
+        return {
+            "encoders": [r.to_dict() for r in results],
+            "available": {
+                family: [r.encoder for r in results if r.codec_family == family and r.available]
+                for family in ("h264", "h265", "av1", "vp9", "mjpeg")
+            },
+        }
+
+    @app.get("/api/v1/streams/{node_id}/codec")
+    async def get_stream_codec(request: Request, node_id: str) -> dict[str, Any]:
+        """Get current codec info and available encoders for a stream."""
+        _require_scope(request, SCOPE_READ)
+        if not streams:
+            raise HTTPException(status_code=503, detail="Streams not available")
+        stats = streams.get_stream_stats(node_id)
+        override = streams._codec_overrides.get(node_id)
+        # Get available encoders from cache (no blocking probe)
+        available: list[dict] = []
+        if codec_mgr:
+            cached = codec_mgr.get_probe_cache()
+            available = [r.to_dict() for r in cached if r.available]
+            if not available:
+                # Populate cache in background, return what we know right now
+                asyncio.create_task(codec_mgr.probe_encoders_async(), name="codec-probe-bg")
+                available = [{"encoder": e, "available": True}
+                             for family in codec_mgr._available.values() for e in family]
+        return {
+            "node_id": node_id,
+            "stats": stats.to_dict() if stats else {},
+            "config": override.to_dict() if override else {},
+            "adaptive": streams._adaptive_enabled,
+            "available_encoders": available,
+        }
+
+    @app.post("/api/v1/streams/{node_id}/codec")
+    async def set_stream_codec(request: Request, node_id: str, body: dict = {}) -> dict[str, Any]:
+        """Switch the codec for a running stream. Triggers graceful restart."""
+        _require_scope(request, SCOPE_WRITE)
+        if not streams:
+            raise HTTPException(status_code=503, detail="Streams not available")
+        if not codec_mgr:
+            raise HTTPException(status_code=503, detail="Codec manager not available")
+        cfg = CodecConfig.from_dict(body)
+        resolved = codec_mgr.resolve(cfg)
+        ok = await streams.switch_codec(node_id, cfg)
+        if not ok:
+            raise HTTPException(status_code=404,
+                detail="Node not found or codec switching not supported for this stream type")
+        await state.events.put({
+            "type": "stream.codec_changed",
+            "node_id": node_id,
+            "encoder": resolved.name,
+            "hw_type": resolved.hw_device and "vaapi" or
+                       ("nvenc" if "nvenc" in resolved.ffmpeg_codec else
+                        "qsv" if "qsv" in resolved.ffmpeg_codec else "software"),
+        })
+        return {"ok": True, "node_id": node_id, "resolved": resolved.to_dict()}
+
+    @app.post("/api/v1/streams/{node_id}/adaptive")
+    async def set_stream_adaptive(request: Request, node_id: str, body: dict = {}) -> dict[str, Any]:
+        """Enable or disable adaptive codec switching (CPU/FPS-aware auto-select)."""
+        _require_scope(request, SCOPE_WRITE)
+        if not streams:
+            raise HTTPException(status_code=503, detail="Streams not available")
+        enabled = body.get("enabled", True)
+        streams.enable_adaptive(enabled)
+        return {"ok": True, "adaptive": enabled}
+
+    @app.get("/api/v1/streams/{node_id}/stats")
+    async def get_stream_stats(request: Request, node_id: str) -> dict[str, Any]:
+        """Get live stream statistics (FPS, encoder, bitrate, uptime)."""
+        _require_scope(request, SCOPE_READ)
+        if not streams:
+            raise HTTPException(status_code=503, detail="Streams not available")
+        stats = streams.get_stream_stats(node_id)
+        if not stats:
+            return {"node_id": node_id, "active": False}
+        return stats.to_dict()
+
     # --- Camera endpoints ---
 
     @app.get("/api/v1/cameras")
