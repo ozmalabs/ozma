@@ -172,7 +172,7 @@ sudo cp /etc/resolv.conf "$MOUNT_ROOT/etc/resolv.conf"
 sudo chroot "$MOUNT_ROOT" apk update --quiet 2>/dev/null
 sudo chroot "$MOUNT_ROOT" apk add --quiet --no-progress \
     linux-lts linux-firmware-none mkinitfs syslinux \
-    python3 py3-pip \
+    python3 \
     ffmpeg avahi avahi-tools \
     pipewire pipewire-pulse wireplumber \
     v4l-utils openssh openrc e2fsprogs \
@@ -186,7 +186,7 @@ sudo cp -r "$REPO_ROOT/controller" "$MOUNT_ROOT/opt/ozma/"
 sudo cp -r "$REPO_ROOT/softnode" "$MOUNT_ROOT/opt/ozma/"
 
 # Install Python dependencies
-sudo chroot "$MOUNT_ROOT" pip3 install --quiet --break-system-packages \
+sudo chroot "$MOUNT_ROOT" uv pip install --system --quiet --break-system-packages \
     fastapi uvicorn zeroconf aiohttp asyncvnc numpy pillow mido pydantic websockets pynacl \
     2>/dev/null || true
 
@@ -307,7 +307,7 @@ sudo tee "$MOUNT_ROOT/etc/motd" > /dev/null << MOTDEOF
   ║  Dashboard: http://<this-ip>:7380                ║
   ║                                                  ║
   ║  Add machines:                                   ║
-  ║    pip install ozma-softnode                      ║
+  ║    uv pip install ozma-softnode                    ║
   ║    ozma-softnode --name my-desktop               ║
   ║                                                  ║
   ║  A/B partitions: automatic rollback on failure   ║

@@ -78,6 +78,11 @@ from stream_router import StreamRouter
 from guacamole import GuacamoleManager
 from provisioning import ProvisioningManager
 from auth import AuthConfig, setup_auth_password
+from users import UserManager
+from service_proxy import ServiceProxyManager
+from idp import IdentityProvider, IdPConfig
+from sharing import SharingManager
+from external_publish import ExternalPublishManager
 from api import build_app
 
 
@@ -330,8 +335,57 @@ async def run(config: Config) -> None:
             log.warning("  Set OZMA_AUTH_PASSWORD env var to use your own.")
             log.warning("=" * 60)
 
+    # User management
+    users_path = Path(__file__).parent / "users.json"
+    user_mgr = UserManager(users_path)
+
+    # Migrate single-admin password to a User on first run with auth enabled
+    if config.auth_enabled and not user_mgr.has_users() and auth_cfg.password_hash:
+        user_mgr.create_user_with_hash(
+            username="admin", display_name="Admin",
+            password_hash=auth_cfg.password_hash, role="owner",
+        )
+        log.info("Migrated admin password to user account")
+
+    state.user_manager = user_mgr
+
+    # Service proxy
+    services_path = Path(__file__).parent / "services.json"
+    svc_proxy = ServiceProxyManager(services_path)
+    await svc_proxy.start()
+
+    # Identity provider (OIDC)
+    idp_instance: IdentityProvider | None = None
+    if config.idp_enabled and config.auth_enabled:
+        idp_cfg = IdPConfig(enabled=True)
+        # Load IdP config from idp_config.json if it exists
+        idp_config_path = Path(__file__).parent / "idp_config.json"
+        if idp_config_path.exists():
+            try:
+                import json as _json
+                idp_cfg = IdPConfig.from_dict(_json.loads(idp_config_path.read_text()))
+                idp_cfg.enabled = True
+            except Exception as e:
+                log.warning("Failed to load IdP config: %s", e)
+        idp_instance = IdentityProvider(
+            config=idp_cfg,
+            user_manager=user_mgr,
+            signing_key=mesh_ca.controller_keypair if mesh_ca else None,
+        )
+        log.info("Identity Provider enabled (social providers: %d)",
+                 len(idp_cfg.social_providers))
+
+    # Sharing (cross-user resource grants + peer controllers)
+    shares_path = Path(__file__).parent / "shares.json"
+    sharing_mgr = SharingManager(shares_path)
+    await sharing_mgr.start()
+
+    # External publishing
+    publish_path = Path(__file__).parent / "publish.json"
+    ext_pub = ExternalPublishManager(publish_path)
+
     # Build the FastAPI app — all managers must be created before this point
-    app = build_app(state, scenarios, streams, audio, controls, rgb_out, motion, bt, kdeconnect, wifi_audio, captures, paste_typer, kbd_mgr, macro_mgr, sched, notifier, recorder, net_health, ocr_triggers, auto_engine, metrics_collector, screen_mgr, codec_mgr=codec_mgr, camera_mgr=camera_mgr, obs_studio=obs_studio, stream_router=stream_router, guac_mgr=guac_mgr, provision_mgr=provision_mgr, connect=connect, mesh_ca=mesh_ca, sess_mgr=sess_mgr, room_correction=room_corr, testbench=testbench, agent_engine=agent_engine, test_runner=test_runner, auth_config=auth_cfg)
+    app = build_app(state, scenarios, streams, audio, controls, rgb_out, motion, bt, kdeconnect, wifi_audio, captures, paste_typer, kbd_mgr, macro_mgr, sched, notifier, recorder, net_health, ocr_triggers, auto_engine, metrics_collector, screen_mgr, codec_mgr=codec_mgr, camera_mgr=camera_mgr, obs_studio=obs_studio, stream_router=stream_router, guac_mgr=guac_mgr, provision_mgr=provision_mgr, connect=connect, mesh_ca=mesh_ca, sess_mgr=sess_mgr, room_correction=room_corr, testbench=testbench, agent_engine=agent_engine, test_runner=test_runner, auth_config=auth_cfg, user_manager=user_mgr, service_proxy=svc_proxy, idp=idp_instance, sharing=sharing_mgr, ext_publish=ext_pub)
 
     uv_config = uvicorn.Config(
         app,
@@ -444,6 +498,8 @@ async def run(config: Config) -> None:
     await net_health.stop()
     await sched.stop()
     await kbd_mgr.stop()
+    await sharing_mgr.stop()
+    await svc_proxy.stop()
     await connect.stop()
     await provision_mgr.stop()
     await guac_mgr.stop()

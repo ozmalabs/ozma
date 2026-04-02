@@ -28,6 +28,7 @@ Port 51820 is the only port exposed on the physical network. All other ports are
 | 7380 | TCP | Any → Controller | REST API + WebSocket |
 | 7381 | TCP | Any → Controller | MCP server (AI agent interface) |
 | 7382 | TCP | Node → Controller | Node HTTP API |
+| 443 | TCP | Any → Controller | HTTPS (service proxy, when certs available) |
 
 ---
 
@@ -118,6 +119,65 @@ Base URL: `http://<controller>:7380/api/v1`
 | POST | `/scenarios/{id}/activate` | Activate scenario |
 | WS | `/events` | Real-time event stream |
 
+### User management endpoints
+
+| Method | Path | Scope | Description |
+|--------|------|-------|-------------|
+| GET | `/users` | read | List all users |
+| GET | `/users/me` | read | Current authenticated user |
+| GET | `/users/{id}` | read | Get user by ID |
+| POST | `/users` | admin | Create user |
+| PUT | `/users/{id}` | write | Update user (own profile) or admin (any) |
+| DELETE | `/users/{id}` | admin | Delete user |
+
+### Service proxy endpoints
+
+| Method | Path | Scope | Description |
+|--------|------|-------|-------------|
+| GET | `/services` | read | List registered services |
+| GET | `/services/{id}` | read | Get service details |
+| POST | `/services` | write | Register a service |
+| PUT | `/services/{id}` | write | Update service |
+| DELETE | `/services/{id}` | write | Remove service |
+| GET | `/services/{id}/health` | read | On-demand health check |
+
+### Sharing endpoints
+
+| Method | Path | Scope | Description |
+|--------|------|-------|-------------|
+| GET | `/shares` | read | List grants (given + received) |
+| GET | `/shares/{id}` | read | Get grant (grantor/grantee/admin only) |
+| POST | `/shares` | write | Create share grant |
+| DELETE | `/shares/{id}` | write | Revoke grant (grantor/admin only) |
+| GET | `/peers` | read | List linked peer controllers |
+| POST | `/peers` | admin | Link a peer controller |
+| DELETE | `/peers/{id}` | admin | Unlink peer |
+
+### External publishing endpoints
+
+| Method | Path | Scope | Description |
+|--------|------|-------|-------------|
+| GET | `/publish` | read | List published services |
+| POST | `/publish` | write | Publish a service externally |
+| PUT | `/publish/{id}` | write | Update (public mode requires admin + confirmation) |
+| DELETE | `/publish/{id}` | write | Unpublish |
+
+### Identity Provider endpoints
+
+These are mounted at the root, not under `/api/v1`:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/.well-known/openid-configuration` | OIDC discovery document |
+| GET | `/auth/jwks` | JSON Web Key Set |
+| GET | `/auth/login` | Login page |
+| POST | `/auth/login` | Password authentication |
+| GET | `/auth/login/{provider}` | Social login redirect |
+| GET | `/auth/callback/{provider}` | Social login callback |
+| POST | `/auth/logout` | End session |
+| POST | `/auth/token` | OIDC token endpoint |
+| GET | `/auth/userinfo` | OIDC userinfo endpoint |
+
 ### WebSocket Events
 
 Events are JSON objects with a `type` field:
@@ -128,6 +188,16 @@ Events are JSON objects with a `type` field:
 {"type": "audio.volume_changed", "node_id": "vm1", "volume": 0.75}
 {"type": "remote_desktop.consent_request", "session_id": "...", "node_id": "..."}
 {"type": "agent.approval_required", "action_id": "...", "action": "click", "node_id": "..."}
+{"type": "user.created", "user": {"id": "...", "username": "alice", ...}}
+{"type": "user.deleted", "user_id": "..."}
+{"type": "service.registered", "service": {"id": "...", "name": "Jellyfin", ...}}
+{"type": "service.removed", "service_id": "..."}
+{"type": "share.created", "grant": {"id": "...", "grantor_user_id": "...", ...}}
+{"type": "share.revoked", "grant_id": "..."}
+{"type": "peer.linked", "peer": {"id": "...", "name": "...", ...}}
+{"type": "peer.unlinked", "controller_id": "..."}
+{"type": "service.published", "entry": {"id": "...", "mode": "private", ...}}
+{"type": "service.unpublished", "entry_id": "..."}
 ```
 
 ---

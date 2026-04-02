@@ -89,7 +89,7 @@ class FrontPanel:
         """Initialise OLED and start render + button loops."""
         if not _HAS_OLED:
             log.info("Front panel: luma.oled not installed — display disabled "
-                     "(pip install luma.oled)")
+                     "(uv pip install luma.oled)")
             return
 
         try:

@@ -47,6 +47,8 @@ class NodeInfo:
     mic_vban_port: int | None = None     # UDP port node listens for mic VBAN (vban nodes)
     # Virtual capture device (soft nodes with v4l2loopback)
     capture_device: str | None = None    # /dev/videoN path on the controller host
+    # Ownership — which user owns this node (empty = controller default owner)
+    owner_user_id: str = ""
     # Registration source — direct HTTP nodes are not evicted by mDNS requery
     direct_registered: bool = False
 
@@ -71,6 +73,8 @@ class NodeInfo:
             "display_outputs": self.display_outputs,
             "last_seen": self.last_seen,
         }
+        if self.owner_user_id:
+            d["owner_user_id"] = self.owner_user_id
         if self.vnc_host:
             d["vnc_host"] = self.vnc_host
         if self.vnc_port:
@@ -101,6 +105,9 @@ class AppState:
         # Broadcast queue — api.py drains this for WebSocket clients
         self.events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
+        # User manager — set by main.py after UserManager is created
+        self.user_manager: Any | None = None
+
     async def add_node(self, node: NodeInfo) -> None:
         async with self._lock:
             is_new = node.id not in self.nodes
@@ -125,6 +132,7 @@ class AppState:
                 # Preserve machine_class if the incoming registration doesn't set one
                 if node.machine_class == "workstation" and existing.machine_class != "workstation":
                     node.machine_class = existing.machine_class
+                node.owner_user_id = node.owner_user_id or existing.owner_user_id
                 node.display_outputs = node.display_outputs or existing.display_outputs
                 if existing.capabilities and not node.capabilities:
                     node.capabilities = existing.capabilities

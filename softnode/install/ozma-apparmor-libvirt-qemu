@@ -1,0 +1,3 @@
+# Ozma: allow QEMU to read virtual evdev devices for input-linux.
+# Install to: /etc/apparmor.d/abstractions/libvirt-qemu.d/ozma
+/dev/input/event* rw,

@@ -138,7 +138,7 @@ fi
 if ! "$PYTHON" -c "import fastapi, uvicorn, zeroconf" 2>/dev/null; then
     echo "ERROR: Missing Python dependencies. Run:"
     echo "  python3 -m venv .venv && source .venv/bin/activate"
-    echo "  pip install fastapi uvicorn zeroconf asyncvnc numpy pillow aiohttp mido pydantic websockets"
+    echo "  uv pip install fastapi uvicorn zeroconf asyncvnc numpy pillow aiohttp mido pydantic websockets"
     exit 1
 fi
 

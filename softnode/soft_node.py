@@ -1,13 +1,17 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
 #!/usr/bin/env python3
 """
-Ozma Soft Node — QMP-backed virtual compute node.
+Ozma Soft Node — virtual compute node with evdev HID injection.
 
 Announces itself via mDNS (_ozma._udp.local.), listens for tinynode HID
-packets from the Controller, and forwards them to a QEMU VM via QMP.
+packets from the Controller, and injects them into a QEMU VM via evdev
+(input-linux). QMP is no longer required for HID — evdev devices are
+created via uinput and QEMU reads them directly.
+
+Power control uses libvirt API (preferred) or QMP (fallback).
 
 Usage:
-  python softnode/soft_node.py --name vm1 --port 7332 --qmp /tmp/ozma-vm1.qmp
+  python softnode/soft_node.py --name vm1 --port 7332
   python softnode/soft_node.py --name vm2 --port 7333 --qmp /tmp/ozma-vm2.qmp
 
 Each instance needs a distinct --port since both run on the same host.
@@ -20,8 +24,11 @@ The mDNS instance name becomes the node_id in the Controller:
 
 import argparse
 import asyncio
+import json
 import logging
+import os
 import signal
+import struct
 import socket
 import sys
 from pathlib import Path
@@ -36,10 +43,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 from hid_to_qmp import KeyboardReportState, MouseReportState
 from qmp_client import QMPClient
 from qemu_display import QEMUDBusConsole
+from dbus_display import DBusDisplayClient
 from looking_glass import LookingGlassCapture
 from virtual_capture import VirtualCapture
 from connect_client import NodeConnectClient
 from prometheus_metrics import collect_soft
+from evdev_input import VirtualKeyboard, VirtualMouse, EvdevHIDTranslator
 
 log = logging.getLogger("ozma.softnode")
 
@@ -53,7 +62,7 @@ class SoftNode:
         name: str,
         host: str,
         port: int,
-        qmp_path: str,
+        qmp_path: str = "",
         vnc_host: str | None = None,
         vnc_port: int | None = None,
         vnc_socket: str | None = None,    # VNC unix socket path (overrides host/port)
@@ -61,19 +70,32 @@ class SoftNode:
         audio_sink: str | None = None,    # PipeWire null sink name for this node
         api_port: int = 0,                # HTTP port for power/status API (0 = auto)
         qmp_input_path: str = "",         # Dedicated input QMP socket (recommended)
+        power_backend: "PowerBackend | None" = None,  # libvirt/qmp power control
     ) -> None:
         self._name = name
         self._host = host
         self._port = port
-        self._qmp = QMPClient(qmp_path, input_socket_path=qmp_input_path)
+        self._qmp: QMPClient | None = QMPClient(qmp_path, input_socket_path=qmp_input_path) if qmp_path else None
+        self._power = power_backend
         self._vnc_host = vnc_host
         self._vnc_port = vnc_port
         self._vnc_socket = vnc_socket
         self._capture_device = capture_device
         self._audio_sink = audio_sink
         self._api_port = api_port
+        # Async D-Bus display client (fast input + framebuffer)
+        self._dbus_client: DBusDisplayClient | None = None
+        # Direct evdev for input-linux (kernel-level input)
+        self._evdev_input_fd: int = -1   # keyboard device FD
+        self._evdev_mouse_fd: int = -1   # mouse device FD
+        # evdev input (primary HID path — no QMP needed)
+        self._evdev_kbd = VirtualKeyboard(name=f"ozma-kbd-{name}")
+        self._evdev_mouse = VirtualMouse(name=f"ozma-mouse-{name}")
+        self._evdev_translator: EvdevHIDTranslator | None = None
+        # QMP HID fallback (only if evdev unavailable)
         self._kbd = KeyboardReportState()
         self._mouse = MouseReportState()
+        self._use_evdev = False
         self._stop_event = asyncio.Event()
         self._display: QEMUDBusConsole | None = None
         self._displays: list[QEMUDBusConsole] = []  # multi-monitor: all consoles
@@ -93,23 +115,73 @@ class SoftNode:
         )
 
     async def run(self) -> None:
-        await self._qmp.start()
+        # Start evdev input devices (primary HID path)
+        kbd_path = self._evdev_kbd.start()
+        mouse_path = self._evdev_mouse.start()
+        if kbd_path and mouse_path:
+            self._evdev_translator = EvdevHIDTranslator(self._evdev_kbd, self._evdev_mouse)
+            self._use_evdev = True
+            log.info("evdev input: kbd=%s mouse=%s", kbd_path, mouse_path)
+        else:
+            log.warning("evdev input unavailable — falling back to QMP HID")
+
+        # QMP is optional — only start if configured
+        if self._qmp:
+            await self._qmp.start()
+        elif not self._use_evdev:
+            log.error("No HID path available: evdev failed and no QMP configured")
 
         # Connect to QEMU D-Bus display (keyboard + mouse + framebuffer)
-        console_indices = await QEMUDBusConsole.enumerate_consoles()
-        if not console_indices:
-            console_indices = [0]  # try Console_0 even if enumeration fails
-        for idx in console_indices:
-            console = QEMUDBusConsole(idx)
-            if await console.connect():
-                self._displays.append(console)
-                log.info("D-Bus console %d: %dx%d (%s)",
-                         idx, console.width, console.height, console.label)
+        # Check for ozma private D-Bus first (libvirt VMs provisioned by ozma)
+        dbus_bus_sock = f"/run/ozma/dbus/{self._name}-bus.sock"
+        # Try D-Bus p2p via QMP add_client (no bus daemon needed)
+        # Uses dedicated display QMP socket (separate from input/control)
+        qmp_display_sock = f"/run/ozma/qmp/{self._name}-display.sock"
+        if os.path.exists(qmp_display_sock):
+            # Retry a few times — VM may still be booting
+            for attempt in range(5):
+                self._dbus_client = DBusDisplayClient(qmp_display_sock)
+                if await self._dbus_client.connect():
+                    break
+                await asyncio.sleep(2)
+            if self._dbus_client and self._dbus_client.connected:
+                log.info("D-Bus p2p display: %dx%d via QMP add_client",
+                         self._dbus_client.width, self._dbus_client.height)
+            else:
+                self._dbus_client = None
+        else:
+            # Session bus — enumerate all consoles (demo VMs)
+            console_indices = await QEMUDBusConsole.enumerate_consoles()
+            if not console_indices:
+                console_indices = [0]
+            for idx in console_indices:
+                console = QEMUDBusConsole(idx)
+                if await console.connect():
+                    self._displays.append(console)
+                    log.info("D-Bus console %d: %dx%d (%s)",
+                             idx, console.width, console.height, console.label)
+            if self._displays:
+                self._display = self._displays[0]
+
         if self._displays:
-            self._display = self._displays[0]  # primary for backward compat
             log.info("QEMU D-Bus display: %d console(s) ready", len(self._displays))
         else:
-            log.warning("QEMU D-Bus display not available — falling back to QMP/VNC")
+            log.warning("QEMU D-Bus display not available — falling back to QMP")
+
+        # Open evdev service devices for input-linux (if available)
+        kbd_state = Path(f"/run/ozma/evdev/{self._name}.kbd")
+        if kbd_state.exists():
+            try:
+                kbd_path = kbd_state.read_text().strip()
+                mouse_state = Path(f"/run/ozma/evdev/{self._name}.mouse")
+                mouse_path = mouse_state.read_text().strip() if mouse_state.exists() else ""
+                self._evdev_input_fd = os.open(kbd_path, os.O_WRONLY | os.O_NONBLOCK)
+                if mouse_path:
+                    self._evdev_mouse_fd = os.open(mouse_path, os.O_WRONLY | os.O_NONBLOCK)
+                log.info("evdev FDs: kbd=%d mouse=%d", self._evdev_input_fd, self._evdev_mouse_fd)
+                log.info("evdev input-linux: kbd=%s mouse=%s", kbd_path, mouse_path)
+            except Exception as e:
+                log.debug("evdev input-linux unavailable: %s", e)
 
         # Start capture — pick the best available source
         self._hls_dir = Path(f"/tmp/ozma-stream-{self._name}")
@@ -126,6 +198,20 @@ class SoftNode:
                 name=f"capture-hls-{self._name}",
             )
             log.info("Capture: VNC socket %s → HLS", self._vnc_socket)
+        elif self._dbus_client and self._dbus_client.connected:
+            # D-Bus RegisterListener → ffmpeg → H.264 HLS (real-time, 30+ fps)
+            asyncio.create_task(
+                self._capture_dbus_hls(),
+                name=f"capture-dbus-hls-{self._name}",
+            )
+            log.info("Capture: D-Bus framebuffer → H.264 HLS for %s", self._name)
+        elif self._qmp:
+            # QMP screendump → ffmpeg → H.264 HLS (fallback, ~2fps)
+            asyncio.create_task(
+                self._capture_qmp_hls(),
+                name=f"capture-qmp-hls-{self._name}",
+            )
+            log.info("Capture: QMP screendump → H.264 HLS for %s (slow fallback)", self._name)
         elif self._virtual_capture:
             device_path = await self._virtual_capture.start()
             if device_path:
@@ -141,7 +227,7 @@ class SoftNode:
         # directly — the mesh is visible from Connect even if the
         # controller is offline.
         await self._connect.start(
-            capabilities="qmp,power",
+            capabilities=f"{'evdev' if self._use_evdev else 'qmp'},power",
             version="0.1.0",
             extra={
                 "audio_type": "pipewire" if self._audio_sink else "",
@@ -160,6 +246,8 @@ class SoftNode:
         await self._connect.stop()
         if self._virtual_capture:
             await self._virtual_capture.stop()
+        self._evdev_kbd.stop()
+        self._evdev_mouse.stop()
 
     # --- HTTP API for power control ---
 
@@ -174,31 +262,50 @@ class SoftNode:
             return web.json_response(self._connect.state.to_dict())
 
         async def metrics(_: web.Request) -> web.Response:
-            status = await self._qmp.query_status()
+            pw = self._power or self._qmp
+            if pw:
+                status = await pw.query_status()
+                vm_status = status.get("status", "unknown") if status else "unknown"
+                connected = pw.connected if hasattr(pw, "connected") else True
+            else:
+                vm_status = "unknown"
+                connected = False
             text = collect_soft(
                 node_name=self._name,
                 connect_client=self._connect,
-                qmp_connected=self._qmp.connected,
-                vm_status=status.get("status", "unknown") if status else "unknown",
+                qmp_connected=connected,
+                vm_status=vm_status,
             )
             return web.Response(text=text, content_type="text/plain; version=0.0.4")
 
         async def power_state(_: web.Request) -> web.Response:
-            status = await self._qmp.query_status()
-            running = status.get("status") == "running" if status else None
+            pw = self._power or self._qmp
+            if pw:
+                status = await pw.query_status()
+                running = status.get("status") == "running" if status else None
+                connected = pw.connected if hasattr(pw, "connected") else True
+            else:
+                status = None
+                running = None
+                connected = False
             return web.json_response({
-                "available": self._qmp.connected,
+                "available": connected,
                 "powered": running,
                 "vm_status": status.get("status") if status else "unknown",
             })
 
         async def power_action(request: web.Request) -> web.Response:
             action = request.match_info["action"]
+            pw = self._power or self._qmp
+            if not pw:
+                return web.json_response(
+                    {"ok": False, "error": "No power backend configured"}, status=503
+                )
             actions = {
-                "on": self._qmp.cont,             # resume paused VM
-                "off": self._qmp.system_powerdown, # ACPI power button
-                "reset": self._qmp.system_reset,
-                "force-off": self._qmp.stop,       # pause VM (closest to force-off)
+                "on": pw.cont,             # resume / start VM
+                "off": pw.system_powerdown, # ACPI power button
+                "reset": pw.system_reset,
+                "force-off": pw.stop if hasattr(pw, "stop") else pw.system_powerdown,
             }
             fn = actions.get(action)
             if not fn:
@@ -215,29 +322,65 @@ class SoftNode:
 
         async def display_snapshot(_: web.Request) -> web.Response:
             """JPEG snapshot of the VM display."""
+            # 1. Async D-Bus client (best — push-based framebuffer, zero I/O)
+            if _self._dbus_client and _self._dbus_client.connected and _self._dbus_client.latest_frame:
+                return web.Response(body=_self._dbus_client.latest_frame, content_type="image/jpeg")
+            # 2. Legacy D-Bus display
             if _self._display and _self._display.connected:
                 frame = await _self._display.get_frame()
                 if frame:
                     return web.Response(body=frame, content_type="image/jpeg")
-            # QMP screendump via the control client
-            ctrl = _self._qmp._ctrl if hasattr(_self._qmp, '_ctrl') else _self._qmp
-            if hasattr(ctrl, 'screendump') and ctrl.connected:
-                import io as _io
-                tmp = f"/dev/shm/ozma-snap-{_os.getpid()}.png"
+            # 3. QMP screendump (fallback)
+            if _self._qmp and _self._qmp.connected:
+                jpeg = await _screendump_jpeg(_self._qmp._ctrl)
+                if jpeg:
+                    return web.Response(body=jpeg, content_type="image/jpeg")
+            # 4. virsh screenshot (last resort)
+            jpeg = await _virsh_screenshot_jpeg(_self._name)
+            if jpeg:
+                return web.Response(body=jpeg, content_type="image/jpeg")
+            return web.json_response({"error": "no display"}, status=503)
+
+        async def _screendump_jpeg(ctrl) -> bytes | None:
+            import io as _io
+            tmp = f"/dev/shm/ozma-snap-{_os.getpid()}.png"
+            try:
                 ok = await ctrl.screendump(tmp)
                 if ok and _os.path.exists(tmp):
-                    try:
-                        from PIL import Image
-                        img = Image.open(tmp)
-                        buf = _io.BytesIO()
-                        img.convert("RGB").save(buf, format="JPEG", quality=75)
-                        return web.Response(body=buf.getvalue(), content_type="image/jpeg")
-                    finally:
-                        try:
-                            _os.unlink(tmp)
-                        except OSError:
-                            pass
-            return web.json_response({"error": "no display"}, status=503)
+                    from PIL import Image
+                    img = Image.open(tmp)
+                    buf = _io.BytesIO()
+                    img.convert("RGB").save(buf, format="JPEG", quality=75)
+                    return buf.getvalue()
+            except Exception:
+                pass
+            finally:
+                try: _os.unlink(tmp)
+                except OSError: pass
+            return None
+
+        async def _virsh_screenshot_jpeg(vm_name: str) -> bytes | None:
+            import io as _io
+            tmp = f"/dev/shm/ozma-virsh-{_os.getpid()}.png"
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "virsh", "screenshot", vm_name, tmp,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await proc.communicate()
+                if proc.returncode == 0 and _os.path.exists(tmp):
+                    from PIL import Image
+                    img = Image.open(tmp)
+                    buf = _io.BytesIO()
+                    img.convert("RGB").save(buf, format="JPEG", quality=75)
+                    return buf.getvalue()
+            except Exception:
+                pass
+            finally:
+                try: _os.unlink(tmp)
+                except OSError: pass
+            return None
 
         async def display_mjpeg(_: web.Request) -> web.StreamResponse:
             """MJPEG stream of the VM display."""
@@ -246,28 +389,21 @@ class SoftNode:
                 headers={"Content-Type": "multipart/x-mixed-replace; boundary=frame"},
             )
             await response.prepare(_)
-            ctrl = _self._qmp._ctrl if hasattr(_self._qmp, '_ctrl') else _self._qmp
             while True:
-                if hasattr(ctrl, 'screendump') and ctrl.connected:
-                    import io as _io
-                    tmp = f"/dev/shm/ozma-mjpeg-{_os.getpid()}.png"
-                    ok = await ctrl.screendump(tmp)
-                    if ok and _os.path.exists(tmp):
-                        try:
-                            from PIL import Image
-                            img = Image.open(tmp)
-                            buf = _io.BytesIO()
-                            img.convert("RGB").save(buf, format="JPEG", quality=70)
-                            frame = buf.getvalue()
-                        finally:
-                            try: _os.unlink(tmp)
-                            except OSError: pass
-                    else:
-                        frame = None
-                    if frame:
-                        await response.write(
-                            b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
-                        )
+                frame = None
+                # D-Bus display
+                if _self._display and _self._display.connected:
+                    frame = await _self._display.get_frame()
+                # QMP screendump (direct socket)
+                if not frame and _self._qmp and _self._qmp.connected:
+                    frame = await _screendump_jpeg(_self._qmp._ctrl)
+                # virsh screenshot (fallback)
+                if not frame:
+                    frame = await _virsh_screenshot_jpeg(_self._name)
+                if frame:
+                    await response.write(
+                        b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+                    )
                 await asyncio.sleep(1.0 / 15)  # 15 fps
 
         async def display_info(_: web.Request) -> web.Response:
@@ -279,43 +415,114 @@ class SoftNode:
                 "type": "dbus" if _self._display and _self._display.connected else "none",
             })
 
+        # ── evdev raw write (for input-linux) ─────────────────────────────
+        def _evdev_write_key(fd: int, keycode: int, down: bool):
+            """Write a key event directly to an evdev device FD."""
+            import time as _t
+            sec = int(_t.time())
+            usec = int((_t.time() % 1) * 1000000)
+            ev = struct.pack('llHHi', sec, usec, 1, keycode, 1 if down else 0)
+            syn = struct.pack('llHHi', sec, usec, 0, 0, 0)
+            os.write(fd, ev + syn)
+
+        # ── evdev keycode → QMP qcode mapping ───────────────────────────
+        # QMP input-send-event uses QEMU "qcode" names, not evdev numbers.
+        _EVDEV_TO_QCODE = {
+            1: "esc", 2: "1", 3: "2", 4: "3", 5: "4", 6: "5", 7: "6",
+            8: "7", 9: "8", 10: "9", 11: "0", 12: "minus", 13: "equal",
+            14: "backspace", 15: "tab", 16: "q", 17: "w", 18: "e", 19: "r",
+            20: "t", 21: "y", 22: "u", 23: "i", 24: "o", 25: "p",
+            26: "bracket_left", 27: "bracket_right", 28: "ret", 29: "ctrl",
+            30: "a", 31: "s", 32: "d", 33: "f", 34: "g", 35: "h",
+            36: "j", 37: "k", 38: "l", 39: "semicolon", 40: "apostrophe",
+            41: "grave_accent", 42: "shift", 43: "backslash",
+            44: "z", 45: "x", 46: "c", 47: "v", 48: "b", 49: "n",
+            50: "m", 51: "comma", 52: "dot", 53: "slash", 54: "shift_r",
+            56: "alt", 57: "spc", 58: "caps_lock",
+            59: "f1", 60: "f2", 61: "f3", 62: "f4", 63: "f5", 64: "f6",
+            65: "f7", 66: "f8", 67: "f9", 68: "f10", 87: "f11", 88: "f12",
+            97: "ctrl_r", 100: "alt_r", 102: "home", 103: "up",
+            104: "pgup", 105: "left", 106: "right", 107: "end",
+            108: "down", 109: "pgdn", 110: "insert", 111: "delete",
+            125: "meta_l", 126: "meta_r",
+        }
+
+        async def _qmp_input_key(vm_name: str, keycode: int, down: bool) -> bool:
+            """Send a key event via the direct QMP socket (1-2ms latency)."""
+            qcode = _EVDEV_TO_QCODE.get(keycode)
+            if not qcode or not _self._qmp or not _self._qmp.connected:
+                return False
+            resp = await _self._qmp._ctrl.send_command({
+                "execute": "input-send-event",
+                "arguments": {"events": [{
+                    "type": "key",
+                    "data": {"down": down, "key": {"type": "qcode", "data": qcode}},
+                }]},
+            })
+            return resp is not None and "return" in resp
+
+        async def _qmp_input_mouse(vm_name: str, x: int, y: int,
+                                    button: int = 0, down: bool | None = None) -> bool:
+            """Send mouse event via the direct QMP socket."""
+            if not _self._qmp or not _self._qmp.connected:
+                return False
+            events = [
+                {"type": "abs", "data": {"axis": "x", "value": x}},
+                {"type": "abs", "data": {"axis": "y", "value": y}},
+            ]
+            if down is not None and button >= 0:
+                btn_map = {0: "left", 1: "left", 2: "right", 4: "middle"}
+                events.append({
+                    "type": "btn",
+                    "data": {"down": down, "button": btn_map.get(button, "left")},
+                })
+            resp = await _self._qmp._ctrl.send_command({
+                "execute": "input-send-event",
+                "arguments": {"events": events},
+            })
+            return resp is not None and "return" in resp
+
         async def input_key(request: web.Request) -> web.Response:
             """Send keyboard input. Body: {"keycode": 30, "down": true}"""
-            if not _self._display or not _self._display.connected:
-                return web.json_response({"error": "no display"}, status=503)
             body = await request.json()
             keycode = body.get("keycode", 0)
             down = body.get("down", True)
-            if down:
-                _self._display.key_press(keycode)
-            else:
-                _self._display.key_release(keycode)
-            return web.json_response({"ok": True})
+            # evdev input-linux (kernel-level, zero overhead)
+            if _self._evdev_input_fd >= 0:
+                _evdev_write_key(_self._evdev_input_fd, keycode, down)
+                return web.json_response({"ok": True})
+            # QMP input-send-event (fallback — 1-2ms latency)
+            ok = await _qmp_input_key(_self._name, keycode, down)
+            if ok:
+                return web.json_response({"ok": True})
+            return web.json_response({"error": "no input method available"}, status=503)
 
         async def input_mouse(request: web.Request) -> web.Response:
             """Send mouse input. Body: {"x": 500, "y": 300, "button": 0, "action": "click"}"""
-            if not _self._display or not _self._display.connected:
-                return web.json_response({"error": "no display"}, status=503)
             body = await request.json()
             x = body.get("x", 0)
             y = body.get("y", 0)
             action = body.get("action", "move")
             button = body.get("button", 0)
+            # QMP input-send-event (direct socket)
             if action == "move":
-                _self._display.mouse_move(x, y)
+                await _qmp_input_mouse(_self._name, x, y)
             elif action == "press":
-                _self._display.mouse_move(x, y)
-                _self._display.mouse_press(button)
+                await _qmp_input_mouse(_self._name, x, y, button, down=True)
             elif action == "release":
-                _self._display.mouse_release(button)
+                await _qmp_input_mouse(_self._name, x, y, button, down=False)
             elif action == "click":
-                _self._display.mouse_click(x, y, button)
+                await _qmp_input_mouse(_self._name, x, y, button, down=True)
+                await asyncio.sleep(0.05)
+                await _qmp_input_mouse(_self._name, x, y, button, down=False)
             return web.json_response({"ok": True})
 
         async def input_type(request: web.Request) -> web.Response:
             """Type text. Body: {"text": "hello"}"""
-            if not _self._display or not _self._display.connected:
-                return web.json_response({"error": "no display"}, status=503)
+            has_input = ((_self._display and _self._display.connected)
+                        or (_self._use_evdev and _self._evdev_kbd))
+            if not has_input:
+                return web.json_response({"error": "no input method"}, status=503)
             body = await request.json()
             text = body.get("text", "")
             import time as _time
@@ -332,16 +539,26 @@ class SoftNode:
                 '<': (51, True), '>': (52, True), '?': (53, True),
                 '\n': (28, False), '\t': (15, False),
             }
+            use_dbus = _self._display and _self._display.connected
             for ch in text:
                 lc = ch.lower()
                 shift = ch.isupper() or ch in CHAR_TO_EVDEV and CHAR_TO_EVDEV.get(ch, (0, False))[1]
                 keycode, need_shift = CHAR_TO_EVDEV.get(lc, CHAR_TO_EVDEV.get(ch, (0, False)))
                 if keycode:
-                    if shift or need_shift:
-                        _self._display.key_press(42)  # shift
-                    _self._display.key_tap(keycode)
-                    if shift or need_shift:
-                        _self._display.key_release(42)
+                    if use_dbus:
+                        if shift or need_shift:
+                            _self._display.key_press(42)
+                        _self._display.key_tap(keycode)
+                        if shift or need_shift:
+                            _self._display.key_release(42)
+                    elif _self._use_evdev and _self._evdev_kbd:
+                        if shift or need_shift:
+                            _self._evdev_kbd.key_event(42, True)
+                        _self._evdev_kbd.key_event(keycode, True)
+                        _time.sleep(0.01)
+                        _self._evdev_kbd.key_event(keycode, False)
+                        if shift or need_shift:
+                            _self._evdev_kbd.key_event(42, False)
                     _time.sleep(0.02)
             return web.json_response({"ok": True})
 
@@ -381,6 +598,113 @@ class SoftNode:
         app.router.add_post("/input/mouse", input_mouse)
         app.router.add_post("/input/type", input_type)
         app.router.add_get("/input/ws", input_ws)
+
+        async def display_ws(request: web.Request) -> web.WebSocketResponse:
+            """WebSocket JPEG stream — real-time framebuffer, zero buffering."""
+            ws = web.WebSocketResponse()
+            await ws.prepare(request)
+            dc = _self._dbus_client
+            target_fps = 30
+            interval = 1.0 / target_fps
+            last_frame = None
+            try:
+                while not ws.closed:
+                    if dc and dc.connected and dc.latest_frame:
+                        frame = dc.latest_frame
+                        if frame is not last_frame:
+                            await ws.send_bytes(frame)
+                            last_frame = frame
+                    await asyncio.sleep(interval)
+            except (asyncio.CancelledError, ConnectionResetError):
+                pass
+            return ws
+
+        app.router.add_get("/display/ws", display_ws)
+
+        # WebRTC sessions
+        _gst_stream = None
+        _webrtc_pcs: set = set()
+
+        async def webrtc_offer(request: web.Request) -> web.Response:
+            """WebRTC signaling: H.264 via aiortc."""
+            nonlocal _gst_stream
+
+            body = await request.json()
+
+            if not _self._dbus_client or not _self._dbus_client.connected:
+                return web.json_response({"error": "no display"}, status=503)
+
+            import aiortc.codecs.h264 as _h264mod
+            _h264mod.DEFAULT_BITRATE = 4_000_000  # 4Mbps default
+            _h264mod.MAX_BITRATE = 50_000_000     # 50Mbps ceiling for 4K60
+            from aiortc import RTCPeerConnection, RTCSessionDescription
+            from webrtc_stream import FramebufferVideoTrack
+            from webrtc_audio import PulseAudioTrack
+
+            offer = RTCSessionDescription(sdp=body["sdp"], type=body["type"])
+            pc = RTCPeerConnection()
+            _webrtc_pcs.add(pc)
+
+            @pc.on("connectionstatechange")
+            async def on_state():
+                if pc.connectionState in ("failed", "closed"):
+                    _webrtc_pcs.discard(pc)
+                    await pc.close()
+
+            # Video track from D-Bus framebuffer
+            track = FramebufferVideoTrack(_self._dbus_client, fps=30)
+            sender = pc.addTrack(track)
+            # Store sender for bitrate control
+            _self._webrtc_sender = sender
+
+            # Audio track from PulseAudio monitor (VM audio output)
+            audio_sink = _self._audio_sink or f"ozma-{_self._name}"
+            # Find the monitor source for the sink the VM plays to
+            try:
+                import subprocess as _sp
+                result = _sp.run(["pactl", "list", "short", "sink-inputs"],
+                                capture_output=True, text=True, timeout=3)
+                # Default: capture from the default sink monitor
+                monitor = "default.monitor"
+                # If we can find the VM's specific sink, use its monitor
+                for line in result.stdout.splitlines():
+                    # sink-input lines don't easily map to sink names
+                    pass
+                audio_track = PulseAudioTrack(sink_monitor=monitor)
+                pc.addTrack(audio_track)
+            except Exception as e:
+                log.debug("Audio track unavailable: %s", e)
+
+            await pc.setRemoteDescription(offer)
+            answer = await pc.createAnswer()
+            await pc.setLocalDescription(answer)
+
+            answer_sdp = pc.localDescription.sdp
+
+            if answer_sdp:
+                return web.json_response({"sdp": answer_sdp, "type": "answer"})
+            return web.json_response({"error": "WebRTC negotiation failed"}, status=500)
+
+        async def webrtc_bitrate(request: web.Request) -> web.Response:
+            """Adjust WebRTC video bitrate. Body: {"bitrate": 4000000}"""
+            body = await request.json()
+            bitrate = body.get("bitrate", 4000000)
+            bitrate = max(500_000, min(bitrate, 50_000_000))  # up to 50Mbps for 4K60
+            # Find the H.264 encoder on the active sender
+            sender = getattr(_self, '_webrtc_sender', None)
+            if sender and hasattr(sender, '_encoder') and sender._encoder:
+                sender._encoder.target_bitrate = bitrate
+                return web.json_response({"ok": True, "bitrate": bitrate})
+            # Try via codec directly
+            for pc in _webrtc_pcs:
+                for s in pc.getSenders():
+                    if s.track and s.track.kind == "video" and hasattr(s, '_encoder'):
+                        s._encoder.target_bitrate = bitrate
+                        return web.json_response({"ok": True, "bitrate": bitrate})
+            return web.json_response({"ok": False, "error": "no active encoder"})
+
+        app.router.add_post("/webrtc/bitrate", webrtc_bitrate)
+        app.router.add_post("/webrtc/offer", webrtc_offer)
 
         app.router.add_get("/health", health)
         app.router.add_get("/metrics", metrics)
@@ -428,7 +752,7 @@ class SoftNode:
                 "role": "compute",
                 "hw": "soft",
                 "fw": "0.1.0",
-                "cap": "qmp,power",
+                "cap": f"{'evdev' if self._use_evdev else 'qmp'},power",
                 **({"api_port": str(self._api_port)} if self._api_port else {}),
                 **({"vnc_host": self._vnc_host} if self._vnc_host else {}),
                 **({"vnc_port": str(self._vnc_port)} if self._vnc_port else {}),
@@ -608,6 +932,270 @@ class SoftNode:
         except Exception as e:
             log.warning("HLS capture failed: %s", e)
 
+    async def _capture_dbus_hls(self) -> None:
+        """
+        Capture display via D-Bus RegisterListener → ffmpeg → H.264 HLS.
+
+        Reads raw BGRA pixels from the D-Bus framebuffer (pushed by QEMU
+        at display refresh rate) and pipes them to ffmpeg for H.264 encoding.
+        """
+        dc = self._dbus_client
+        hls_dir = self._hls_dir
+        target_fps = 30
+
+        # Wait for first frame to know dimensions
+        for _ in range(30):
+            if dc.width and dc.height and dc.latest_frame:
+                break
+            await asyncio.sleep(0.5)
+        if not dc.width or not dc.height:
+            log.warning("D-Bus display: no frames received, falling back to QMP")
+            await self._capture_qmp_hls()
+            return
+
+        w, h = dc.width, dc.height
+        log.info("D-Bus capture: %dx%d @ %dfps target", w, h, target_fps)
+
+        # Detect NVENC
+        nvenc = False
+        try:
+            probe = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-hide_banner", "-encoders",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            out, _ = await probe.communicate()
+            nvenc = b"h264_nvenc" in out
+        except Exception:
+            pass
+
+        if nvenc:
+            enc = ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ull", "-rc", "cbr", "-b:v", "3M"]
+        else:
+            enc = ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "23"]
+
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
+            "-f", "rawvideo", "-pix_fmt", "bgra", "-s", f"{w}x{h}",
+            "-r", str(target_fps), "-i", "-",
+            *enc,
+            "-pix_fmt", "yuv420p",
+            "-g", str(target_fps),
+            "-f", "hls",
+            "-hls_time", "0.5",
+            "-hls_list_size", "3",
+            "-hls_flags", "delete_segments+independent_segments+split_by_time",
+            "-hls_segment_type", "mpegts",
+            "-hls_segment_filename", str(hls_dir / "seg_%05d.ts"),
+            str(hls_dir / "stream.m3u8"),
+        ]
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        log.info("D-Bus → H.264 HLS started (pid=%d, %dx%d, %s, %dfps)",
+                 proc.pid, w, h, "NVENC" if nvenc else "x264", target_fps)
+
+        # Register with go2rtc
+        try:
+            import urllib.request
+            hls_url = f"http://127.0.0.1:{self._api_port}/stream/stream.m3u8"
+            go2rtc_url = f"http://localhost:1984/api/streams?dst={self._name}&src=ffmpeg:{hls_url}"
+            urllib.request.urlopen(urllib.request.Request(go2rtc_url, method="PUT"), timeout=3)
+            log.info("Registered with go2rtc: %s", self._name)
+        except Exception:
+            pass
+
+        frame_interval = 1.0 / target_fps
+        frames = 0
+        last_fb = None
+        loop = asyncio.get_event_loop()
+
+        try:
+            while not self._stop_event.is_set() and proc.returncode is None:
+                t0 = loop.time()
+
+                # Get raw framebuffer from D-Bus client
+                fb = dc._framebuffer
+                if fb and fb is not last_fb and len(fb) >= w * h * 4:
+                    try:
+                        proc.stdin.write(bytes(fb[:w * h * 4]))
+                        await proc.stdin.drain()
+                        frames += 1
+                        last_fb = fb
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+
+                elapsed = loop.time() - t0
+                if elapsed < frame_interval:
+                    await asyncio.sleep(frame_interval - elapsed)
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.warning("D-Bus HLS capture error: %s", e)
+        finally:
+            if proc.stdin and not proc.stdin.is_closing():
+                proc.stdin.close()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                proc.kill()
+            log.info("D-Bus HLS capture stopped (%d frames)", frames)
+
+    async def _capture_qmp_hls(self) -> None:
+        """
+        Capture display via QMP screendump → ffmpeg → H.264 HLS.
+
+        Grabs PPM frames from the QEMU display via the direct QMP socket,
+        pipes them to ffmpeg which encodes H.264 and outputs HLS segments.
+        """
+        ctrl = self._qmp._ctrl if self._qmp else None
+        if not ctrl:
+            return
+
+        # Wait for QMP to connect
+        for _ in range(60):
+            if ctrl.connected:
+                break
+            await asyncio.sleep(1)
+        if not ctrl.connected:
+            log.warning("QMP not connected — cannot start HLS capture")
+            return
+
+        hls_dir = self._hls_dir
+        frame_dir = Path("/run/ozma/frames")
+        frame_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = str(frame_dir / f"{self._name}.ppm")
+        target_fps = 15
+
+        # Detect NVENC availability
+        nvenc = False
+        try:
+            probe = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-hide_banner", "-encoders",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await probe.communicate()
+            nvenc = b"h264_nvenc" in out
+        except Exception:
+            pass
+
+        if nvenc:
+            encoder_args = ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ull",
+                            "-rc", "cbr", "-b:v", "2M"]
+            log.info("Using NVENC hardware encoder")
+        else:
+            encoder_args = ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+                            "-crf", "28"]
+            log.info("Using libx264 software encoder")
+
+        # Check for PipeWire audio sink for this VM
+        pw_sink = f"ozma-{self._name}"
+        has_audio = self._audio_sink or True  # Try PipeWire capture by default
+
+        # ffmpeg: PPM stdin (video) + PipeWire (audio) → H.264+AAC → HLS
+        # go2rtc reads the HLS for WebRTC output
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
+            "-f", "image2pipe", "-framerate", str(target_fps),
+            "-i", "-",
+        ]
+
+        # Add PipeWire audio capture if available
+        if has_audio:
+            cmd += [
+                "-f", "pulse",
+                "-i", f"{pw_sink}.monitor",
+            ]
+
+        cmd += [
+            # Video encoding
+            *encoder_args,
+            "-r", str(target_fps),
+            "-pix_fmt", "yuv420p",
+            "-g", str(target_fps),
+        ]
+
+        if has_audio:
+            cmd += [
+                # Audio encoding
+                "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+            ]
+
+        cmd += [
+            "-f", "hls",
+            "-hls_time", "0.5",
+            "-hls_list_size", "3",
+            "-hls_flags", "delete_segments+independent_segments+split_by_time",
+            "-hls_segment_type", "mpegts",
+            "-hls_segment_filename", str(hls_dir / "seg_%05d.ts"),
+            str(hls_dir / "stream.m3u8"),
+        ]
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        log.info("QMP → H.264 HLS started for %s (pid=%d, %dfps)", self._name, proc.pid, target_fps)
+
+        # Register with go2rtc for WebRTC output (if go2rtc is available)
+        try:
+            import urllib.request
+            hls_url = f"http://127.0.0.1:{self._api_port}/stream/stream.m3u8"
+            go2rtc_url = f"http://localhost:1984/api/streams?dst={self._name}&src=ffmpeg:{hls_url}"
+            urllib.request.urlopen(urllib.request.Request(go2rtc_url, method="PUT"), timeout=3)
+            log.info("Registered with go2rtc for WebRTC: %s", self._name)
+        except Exception as e:
+            log.debug("go2rtc registration failed (WebRTC unavailable): %s", e)
+
+        frame_interval = 1.0 / target_fps
+        frames = 0
+        loop = asyncio.get_event_loop()
+        try:
+            while not self._stop_event.is_set() and proc.returncode is None:
+                t0 = loop.time()
+
+                # QMP screendump writes PPM to /run/ozma/frames/
+                resp = await ctrl.send_command({
+                    "execute": "screendump",
+                    "arguments": {"filename": tmp_path, "format": "ppm"},
+                })
+                if resp and "return" in resp:
+                    try:
+                        data = await loop.run_in_executor(None, lambda: Path(tmp_path).read_bytes())
+                        proc.stdin.write(data)
+                        await proc.stdin.drain()
+                        frames += 1
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+                    except FileNotFoundError:
+                        pass
+
+                elapsed = loop.time() - t0
+                if elapsed < frame_interval:
+                    await asyncio.sleep(frame_interval - elapsed)
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.warning("QMP HLS capture error: %s", e)
+        finally:
+            if proc.stdin and not proc.stdin.is_closing():
+                proc.stdin.close()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                proc.kill()
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            log.info("QMP HLS capture stopped for %s (%d frames)", self._name, frames)
+
     async def _serve(self) -> None:
         loop = asyncio.get_running_loop()
 
@@ -623,7 +1211,8 @@ class SoftNode:
         finally:
             transport.close()
             await self._unannounce()
-            await self._qmp.stop()
+            if self._qmp:
+                await self._qmp.stop()
             if self._runner:
                 await self._runner.cleanup()
             log.info("Soft node '%s' stopped", self._name)
@@ -635,22 +1224,34 @@ class SoftNode:
         ptype = data[0]
         payload = data[1:]
 
-        if ptype == 0x01:  # keyboard
-            events = self._kbd.diff(payload)
-            if events:
-                asyncio.create_task(
-                    self._qmp.send_input_events(events),
-                    name="qmp-kbd",
-                )
-        elif ptype == 0x02:  # mouse
-            events = self._mouse.decode(payload)
-            if events:
-                asyncio.create_task(
-                    self._qmp.send_input_events(events),
-                    name="qmp-mouse",
-                )
-        else:
-            log.debug("Unknown packet type 0x%02X from %s", ptype, addr)
+        if self._use_evdev and self._evdev_translator:
+            # Primary path: evdev → QEMU input-linux (zero latency, no QMP)
+            if ptype == 0x01:  # keyboard
+                self._evdev_translator.handle_keyboard(payload)
+            elif ptype == 0x02:  # mouse (absolute)
+                self._evdev_translator.handle_mouse(payload)
+            elif ptype == 0x05:  # mouse (relative — gaming)
+                self._evdev_translator.handle_mouse_relative(payload)
+            else:
+                log.debug("Unknown packet type 0x%02X from %s", ptype, addr)
+        elif self._qmp:
+            # Fallback: QMP input events
+            if ptype == 0x01:
+                events = self._kbd.diff(payload)
+                if events:
+                    asyncio.create_task(
+                        self._qmp.send_input_events(events),
+                        name="qmp-kbd",
+                    )
+            elif ptype == 0x02:
+                events = self._mouse.decode(payload)
+                if events:
+                    asyncio.create_task(
+                        self._qmp.send_input_events(events),
+                        name="qmp-mouse",
+                    )
+            else:
+                log.debug("Unknown packet type 0x%02X from %s", ptype, addr)
 
     # --- Helpers ---
 
@@ -682,12 +1283,12 @@ class _UDPProtocol(asyncio.DatagramProtocol):
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Ozma Soft Node (QMP backend)")
+    p = argparse.ArgumentParser(description="Ozma Soft Node (evdev + libvirt)")
     p.add_argument("--name", required=True, help="Node name, e.g. 'vm1'")
-    p.add_argument("--qmp", required=True, metavar="SOCKET",
-                   help="QMP control socket, e.g. /tmp/ozma-vm1-ctrl.qmp")
+    p.add_argument("--qmp", default="", metavar="SOCKET",
+                   help="QMP control socket (optional — evdev is used for HID, libvirt for power)")
     p.add_argument("--qmp-input", default="", metavar="SOCKET",
-                   help="Dedicated QMP input socket (recommended). If omitted, shares --qmp.")
+                   help="Dedicated QMP input socket (legacy). If omitted, shares --qmp.")
     p.add_argument("--port", type=int, default=7332,
                    help="UDP port to listen on (default 7332; use distinct ports per instance)")
     p.add_argument("--host", default="0.0.0.0", help="UDP bind address")
@@ -712,7 +1313,8 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
-    node = SoftNode(args.name, args.host, args.port, args.qmp,
+    node = SoftNode(args.name, args.host, args.port,
+                    qmp_path=args.qmp,
                     vnc_host=args.vnc_host, vnc_port=args.vnc_port,
                     vnc_socket=args.vnc_socket,
                     capture_device=args.capture_device,

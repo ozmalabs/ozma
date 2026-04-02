@@ -112,7 +112,7 @@ class AgentTray:
             import pystray
             from PIL import Image
         except ImportError:
-            log.warning("Tray requires: pip install pystray Pillow")
+            log.warning("Tray requires: uv pip install pystray Pillow")
             self._run_headless()
             return
 

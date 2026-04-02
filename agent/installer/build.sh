@@ -13,7 +13,7 @@ cd "$(dirname "$0")/../.."
 echo "=== Ozma Agent Build ==="
 
 # Install build deps
-pip install --quiet pyinstaller aiohttp zeroconf numpy 2>/dev/null || true
+uv pip install --quiet pyinstaller aiohttp zeroconf numpy 2>/dev/null || true
 
 # Build
 echo "Building with PyInstaller..."

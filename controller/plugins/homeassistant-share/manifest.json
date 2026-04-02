@@ -1,0 +1,10 @@
+{
+  "id": "homeassistant-share",
+  "name": "Home Assistant Dashboard Sharing",
+  "version": "1.0.0",
+  "author": "Ozma Labs",
+  "description": "Share Home Assistant dashboards and device groups with other Ozma users. Grantees see only the shared dashboard — no access to automations, integrations, settings, or other dashboards.",
+  "entry_point": "plugin.py",
+  "capabilities": ["service_filter"],
+  "ozma_min_version": "1.1.0"
+}

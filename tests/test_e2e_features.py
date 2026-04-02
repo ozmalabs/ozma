@@ -299,7 +299,7 @@ def test_websocket_events():
         import websockets
         import websockets.sync.client
     except ImportError:
-        skip("websockets not installed — pip install websockets")
+        skip("websockets not installed — uv pip install websockets")
         return
 
     try:

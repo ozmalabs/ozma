@@ -1,0 +1,10 @@
+{
+  "id": "frigate-share",
+  "name": "Frigate NVR Sharing",
+  "version": "1.0.0",
+  "author": "Ozma Labs",
+  "description": "Share Frigate camera feeds, events, and recordings with other Ozma users. Grantees see only shared cameras — no access to NVR configuration, object detection settings, or other cameras.",
+  "entry_point": "plugin.py",
+  "capabilities": ["service_filter"],
+  "ozma_min_version": "1.1.0"
+}

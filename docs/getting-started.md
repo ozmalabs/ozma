@@ -11,13 +11,13 @@ make ssh-key       # generate SSH key for VM access
 make build-node-image   # build Alpine RISC-V disk image (requires sudo, ~5 min)
 ```
 
-You'll also need Python 3.11+ with pip.
+You'll also need Python 3.11+ with uv (`pip install uv`).
 
 ## Install controller dependencies
 
 ```bash
 cd controller
-pip install -r requirements.txt
+uv pip install -r requirements.txt
 ```
 
 ## Quick start (three terminals)

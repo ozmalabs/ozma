@@ -20,7 +20,7 @@
 #
 # After installation:
 #   Open http://localhost:7380 in your browser
-#   Install soft nodes: pip install ozma-softnode && ozma-softnode --name my-pc
+#   Install soft nodes: uv pip install ozma-softnode && ozma-softnode --name my-pc
 
 set -euo pipefail
 
@@ -105,9 +105,9 @@ if [[ ! -d "$VENV" ]]; then
 fi
 
 source "$VENV/bin/activate"
-pip install --quiet --upgrade pip
-pip install --quiet -r controller/requirements.txt
-pip install --quiet pynacl
+uv pip install --quiet --upgrade pip
+uv pip install --quiet -r controller/requirements.txt
+uv pip install --quiet pynacl
 
 ok "Python dependencies installed"
 
@@ -155,7 +155,7 @@ echo -e "  ${BLUE}API:${NC}        http://localhost:7380/api/v1/status"
 echo -e "  ${BLUE}Logs:${NC}       journalctl --user -u ozma-controller -f"
 echo ""
 echo -e "  ${BOLD}Add machines:${NC}"
-echo -e "    pip install ozma-softnode"
+echo -e "    uv pip install ozma-softnode"
 echo -e "    ozma-softnode --name my-desktop"
 echo ""
 echo -e "  ${BOLD}Manage:${NC}"

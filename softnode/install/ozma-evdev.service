@@ -1,0 +1,13 @@
+[Unit]
+Description=Ozma virtual evdev devices for VM input-linux
+Before=libvirtd.service
+After=systemd-udev-settle.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/ozma/softnode/evdev_service.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

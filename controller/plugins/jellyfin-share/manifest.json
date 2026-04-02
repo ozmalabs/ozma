@@ -1,0 +1,10 @@
+{
+  "id": "jellyfin-share",
+  "name": "Jellyfin Media Sharing",
+  "version": "1.0.0",
+  "author": "Ozma Labs",
+  "description": "Share Jellyfin libraries and items with other Ozma users. Automatically creates scoped guest users on the Jellyfin server — grantees see only what you share, with their own watch state.",
+  "entry_point": "plugin.py",
+  "capabilities": ["service_filter"],
+  "ozma_min_version": "1.1.0"
+}

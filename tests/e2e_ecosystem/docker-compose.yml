@@ -1,0 +1,180 @@
+## Ozma Ecosystem E2E Test Harness
+##
+## Spins up real instances of each service + the Ozma controller in
+## isolated containers with NAT internet access.  The test runner
+## validates each plugin's integration end-to-end.
+##
+## Usage:
+##   docker compose up -d
+##   docker compose run --rm test-runner
+##   docker compose down -v
+
+services:
+
+  ## ── Ozma Controller ────────────────────────────────────────────────
+  ozma-controller:
+    build:
+      context: ../../controller
+      dockerfile: ../tests/e2e_ecosystem/Dockerfile.controller
+    environment:
+      OZMA_API_HOST: "0.0.0.0"
+      OZMA_API_PORT: "7380"
+      OZMA_AUTH: "1"
+      OZMA_AUTH_PASSWORD: "testpassword123"
+      OZMA_IDP: "1"
+      OZMA_VIRTUAL_ONLY: "1"
+      OZMA_AUDIO: "0"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:7380/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks:
+      - ozma-test
+
+  ## ── Jellyfin ───────────────────────────────────────────────────────
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    environment:
+      JELLYFIN_DATA_DIR: /config
+      JELLYFIN_CACHE_DIR: /cache
+    volumes:
+      - jellyfin-config:/config
+      - jellyfin-cache:/cache
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8096/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks:
+      - ozma-test
+
+  ## ── Immich ─────────────────────────────────────────────────────────
+  immich-server:
+    image: ghcr.io/immich-app/immich-server:release
+    environment:
+      DB_HOSTNAME: immich-db
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+      DB_DATABASE_NAME: immich
+      REDIS_HOSTNAME: immich-redis
+      IMMICH_MACHINE_LEARNING_URL: "false"
+    depends_on:
+      immich-db:
+        condition: service_healthy
+      immich-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:2283/api/server/ping',r=>{process.exit(r.statusCode===200?0:1)}).on('error',()=>process.exit(1))\""]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+    networks:
+      - ozma-test
+
+  immich-db:
+    image: tensorchord/pgvecto-rs:pg16-v0.2.0
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: immich
+    volumes:
+      - immich-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      - ozma-test
+
+  immich-redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      - ozma-test
+
+  ## ── Audiobookshelf ─────────────────────────────────────────────────
+  audiobookshelf:
+    image: ghcr.io/advplyr/audiobookshelf:latest
+    environment:
+      PORT: "13378"
+    volumes:
+      - abs-config:/config
+      - abs-metadata:/metadata
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:13378/healthcheck',r=>{process.exit(r.statusCode===200?0:1)}).on('error',()=>process.exit(1))\""]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks:
+      - ozma-test
+
+  ## ── Frigate (mock mode — no cameras, just API) ────────────────────
+  ## Frigate needs a config file to start.  We use a minimal config
+  ## with no cameras to test the API surface.
+  frigate:
+    image: ghcr.io/blakeblackshear/frigate:stable
+    volumes:
+      - ./frigate-config.yml:/config/config.yml:ro
+      - frigate-media:/media
+    environment:
+      FRIGATE_MQTT_ENABLED: "false"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/version"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks:
+      - ozma-test
+
+  ## ── MQTT Broker (for Frigate events) ──────────────────────────────
+  mqtt:
+    image: eclipse-mosquitto:2
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    networks:
+      - ozma-test
+
+  ## ── Test Runner ────────────────────────────────────────────────────
+  test-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.test-runner
+    environment:
+      OZMA_URL: http://ozma-controller:7380
+      OZMA_PASSWORD: testpassword123
+      JELLYFIN_URL: http://jellyfin:8096
+      IMMICH_URL: http://immich-server:2283
+      ABS_URL: http://audiobookshelf:13378
+      FRIGATE_URL: http://frigate:5000
+      MQTT_HOST: mqtt
+    depends_on:
+      ozma-controller:
+        condition: service_healthy
+      jellyfin:
+        condition: service_healthy
+      immich-server:
+        condition: service_healthy
+      audiobookshelf:
+        condition: service_healthy
+      frigate:
+        condition: service_healthy
+    networks:
+      - ozma-test
+
+volumes:
+  jellyfin-config:
+  jellyfin-cache:
+  immich-db:
+  abs-config:
+  abs-metadata:
+  frigate-media:
+
+networks:
+  ozma-test:
+    driver: bridge

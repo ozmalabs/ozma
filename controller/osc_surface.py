@@ -24,7 +24,7 @@ Address convention:
 Default port: 9000 (receive), 9001 (send feedback).
 Configure in controls.yaml.
 
-Requires: pip install python-osc
+Requires: uv pip install python-osc
 """
 
 from __future__ import annotations

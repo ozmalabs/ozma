@@ -1,0 +1,23 @@
+FROM python:3.13-slim
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc curl linux-libc-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install deps in two steps — evdev may fail without kernel headers
+RUN uv pip install --system \
+    fastapi uvicorn httpx pynacl zeroconf pydantic \
+    pyyaml aiohttp asyncvnc numpy pillow mido websockets
+RUN uv pip install --system evdev-binary 2>/dev/null || \
+    uv pip install --system evdev 2>/dev/null || \
+    echo "evdev not available (ok for --virtual-only)"
+
+# Copy controller code
+COPY . /app/
+
+EXPOSE 7380
+CMD ["python3", "main.py", "--virtual-only"]

@@ -133,7 +133,7 @@ if [ "$SKIP_BUILD" = false ]; then
         echo "Build it on a Windows machine with: powershell agent/installer/build-windows.ps1"
         echo "Or copy the .exe to: $AGENT_SETUP"
         echo ""
-        echo "Continuing with pip-based install method (will install via PowerShell in VM)..."
+        echo "Continuing with uv-based install method (will install via PowerShell in VM)..."
         AGENT_EXE=""
     fi
 fi
@@ -175,9 +175,9 @@ if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
 
 # Install ozma-agent
 Write-Host "Installing ozma-agent..."
-python -m pip install --quiet ozma-agent 2>\$null
+uv pip install --quiet ozma-agent 2>\$null
 if (\$LASTEXITCODE -ne 0) {
-    python -m pip install --quiet "git+https://github.com/ozmalabs/ozma.git#subdirectory=agent"
+    uv pip install --quiet "git+https://github.com/ozmalabs/ozma.git#subdirectory=agent"
 }
 
 # Install as service

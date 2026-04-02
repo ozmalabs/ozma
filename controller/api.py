@@ -21,7 +21,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -63,6 +63,11 @@ from obs_studio import OBSStudioManager
 from stream_router import StreamRouter
 from guacamole import GuacamoleManager
 from provisioning import ProvisioningManager
+from users import UserManager
+from service_proxy import ServiceProxyManager
+from idp import IdentityProvider
+from sharing import SharingManager
+from external_publish import ExternalPublishManager
 
 log = logging.getLogger("ozma.api")
 
@@ -123,7 +128,7 @@ class DirectRegisterRequest(BaseModel):
     display_outputs: str = ""  # JSON-encoded list of display output dicts
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None) -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None) -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -149,7 +154,15 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         "/docs",
         "/openapi.json",
         "/redoc",
+        "/.well-known/openid-configuration",
+        "/auth/jwks",
+        "/auth/login",
+        "/auth/logout",
+        "/auth/token",
+        "/auth/userinfo",
     }
+
+    _AUTH_EXEMPT_PREFIXES = ("/auth/login/", "/auth/callback/")
 
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
@@ -164,8 +177,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
         path = request.url.path
 
-        # Skip auth for exempt paths and static files
-        if path in _AUTH_EXEMPT or path.startswith("/static") or path == "/":
+        # Skip auth for exempt paths, prefixes, and static files
+        if (path in _AUTH_EXEMPT or path.startswith("/static") or path == "/"
+                or any(path.startswith(p) for p in _AUTH_EXEMPT_PREFIXES)):
             request.state.auth = AuthContext(
                 authenticated=True, scopes=ALL_SCOPES,
                 source_ip=request.client.host if request.client else "127.0.0.1",
@@ -189,13 +203,37 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             token = auth_header[7:]
             claims = verify_jwt(token, _verify_key)
             if claims:
+                # sub is a user UUID for multi-user tokens, "admin" for legacy
+                sub = claims.get("sub", "")
+                user_id = sub if sub != "admin" else ""
                 request.state.auth = AuthContext(
                     authenticated=True, scopes=claims.get("scopes", []),
                     source_ip=client_ip, auth_method="jwt",
+                    user_id=user_id,
                 )
                 return await call_next(request)
 
         return JSONResponse(status_code=401, content={"error": "Authentication required"})
+
+    # --- Service proxy middleware (runs after auth middleware in the stack) ---
+
+    @app.middleware("http")
+    async def service_proxy_middleware(request: Request, call_next):
+        """Route requests to registered services based on Host header."""
+        if not service_proxy:
+            return await call_next(request)
+        host = request.headers.get("host", "")
+        matched = service_proxy.match_service(host)
+        if not matched:
+            return await call_next(request)
+        # Gate behind IdP session when auth_required
+        if matched.auth_required and idp and idp.enabled:
+            user_id = idp.validate_session_from_request(request)
+            if not user_id:
+                redirect = f"/auth/login?redirect_to={request.url}"
+                from fastapi.responses import RedirectResponse as RR
+                return RR(url=redirect, status_code=303)
+        return await service_proxy.proxy_request(request, matched)
 
     def _require_scope(request: Request, scope: str) -> AuthContext:
         ctx = getattr(request.state, "auth", None)
@@ -209,12 +247,31 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     @app.post("/api/v1/auth/token")
     async def create_token(body: dict) -> dict[str, Any]:
-        """Authenticate with password and receive a JWT."""
+        """Authenticate with username+password (or legacy password-only) and receive a JWT."""
         password = body.get("password", "")
-        if not _auth.password_hash or not verify_password(password, _auth.password_hash):
-            raise HTTPException(401, "Invalid password")
+        username = body.get("username", "")
         if not _signing_key:
             raise HTTPException(503, "Auth not configured — no signing key")
+
+        # Multi-user auth: if username provided and UserManager exists, authenticate via users
+        if username and user_manager:
+            user = user_manager.authenticate(username, password)
+            if not user:
+                raise HTTPException(401, "Invalid credentials")
+            scopes = ALL_SCOPES if user.role == "owner" else [SCOPE_READ, SCOPE_WRITE]
+            if user.role == "guest":
+                scopes = [SCOPE_READ]
+            token = create_jwt(_signing_key, scopes, _auth.jwt_expiry_seconds, subject=user.id)
+            return {
+                "token": token,
+                "expires_in": _auth.jwt_expiry_seconds,
+                "scopes": scopes,
+                "user": user.to_dict(),
+            }
+
+        # Legacy single-admin auth: password only (no username)
+        if not _auth.password_hash or not verify_password(password, _auth.password_hash):
+            raise HTTPException(401, "Invalid password")
         token = create_jwt(_signing_key, ALL_SCOPES, _auth.jwt_expiry_seconds)
         return {
             "token": token,
@@ -225,6 +282,400 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    # --- User management ---
+
+    @app.get("/api/v1/users")
+    async def list_users(request: Request) -> list[dict]:
+        _require_scope(request, SCOPE_READ)
+        if not user_manager:
+            return []
+        return [u.to_dict() for u in user_manager.list_users()]
+
+    @app.get("/api/v1/users/me")
+    async def get_current_user(request: Request) -> dict:
+        ctx = _require_scope(request, SCOPE_READ)
+        if not user_manager or not ctx.user_id:
+            raise HTTPException(404, "No user context")
+        user = user_manager.get_user(ctx.user_id)
+        if not user:
+            raise HTTPException(404, "User not found")
+        return user.to_dict()
+
+    @app.get("/api/v1/users/{user_id}")
+    async def get_user(user_id: str, request: Request) -> dict:
+        _require_scope(request, SCOPE_READ)
+        if not user_manager:
+            raise HTTPException(404, "User management not enabled")
+        user = user_manager.get_user(user_id)
+        if not user:
+            raise HTTPException(404, "User not found")
+        return user.to_dict()
+
+    @app.post("/api/v1/users")
+    async def create_user(body: dict, request: Request) -> dict:
+        _require_scope(request, SCOPE_ADMIN)
+        if not user_manager:
+            raise HTTPException(503, "User management not enabled")
+        username = body.get("username", "").strip()
+        display_name = body.get("display_name", username).strip()
+        password = body.get("password", "")
+        email = body.get("email", "")
+        role = body.get("role", "member")
+        if not username:
+            raise HTTPException(400, "Username is required")
+        if role not in ("owner", "member", "guest"):
+            raise HTTPException(400, "Invalid role")
+        try:
+            user = user_manager.create_user(
+                username=username, display_name=display_name,
+                password=password, email=email, role=role,
+            )
+        except ValueError as e:
+            raise HTTPException(409, str(e))
+        await state.events.put({"type": "user.created", "user": user.to_dict()})
+        return user.to_dict()
+
+    @app.put("/api/v1/users/{user_id}")
+    async def update_user(user_id: str, body: dict, request: Request) -> dict:
+        ctx = _require_scope(request, SCOPE_WRITE)
+        if not user_manager:
+            raise HTTPException(503, "User management not enabled")
+        # Users can update their own profile; admin can update anyone
+        if ctx.user_id != user_id and not has_scope(ctx, SCOPE_ADMIN):
+            raise HTTPException(403, "Cannot modify other users")
+        allowed = {}
+        for key in ("display_name", "email", "password"):
+            if key in body:
+                allowed[key] = body[key]
+        # Only admin can change roles
+        if "role" in body and has_scope(ctx, SCOPE_ADMIN):
+            allowed["role"] = body["role"]
+        user = user_manager.update_user(user_id, **allowed)
+        if not user:
+            raise HTTPException(404, "User not found")
+        return user.to_dict()
+
+    @app.delete("/api/v1/users/{user_id}")
+    async def delete_user(user_id: str, request: Request) -> dict:
+        _require_scope(request, SCOPE_ADMIN)
+        if not user_manager:
+            raise HTTPException(503, "User management not enabled")
+        if not user_manager.delete_user(user_id):
+            raise HTTPException(404, "User not found")
+        await state.events.put({"type": "user.deleted", "user_id": user_id})
+        return {"ok": True}
+
+    # --- Service proxy management ---
+
+    @app.get("/api/v1/services")
+    async def list_services(request: Request) -> list[dict]:
+        _require_scope(request, SCOPE_READ)
+        if not service_proxy:
+            return []
+        return [s.to_dict() for s in service_proxy.list_services()]
+
+    @app.get("/api/v1/services/{service_id}")
+    async def get_service(service_id: str, request: Request) -> dict:
+        _require_scope(request, SCOPE_READ)
+        if not service_proxy:
+            raise HTTPException(503, "Service proxy not enabled")
+        s = service_proxy.get_service(service_id)
+        if not s:
+            raise HTTPException(404, "Service not found")
+        return s.to_dict()
+
+    @app.post("/api/v1/services")
+    async def register_service(body: dict, request: Request) -> dict:
+        ctx = _require_scope(request, SCOPE_WRITE)
+        if not service_proxy:
+            raise HTTPException(503, "Service proxy not enabled")
+        name = body.get("name", "").strip()
+        target_host = body.get("target_host", "127.0.0.1")
+        target_port = int(body.get("target_port", 0))
+        if not name or not target_port:
+            raise HTTPException(400, "name and target_port are required")
+        try:
+            s = service_proxy.register_service(
+                name=name,
+                owner_user_id=ctx.user_id,
+                target_host=target_host,
+                target_port=target_port,
+                subdomain=body.get("subdomain", ""),
+                protocol=body.get("protocol", "http"),
+                service_type=body.get("service_type", ""),
+                auth_required=body.get("auth_required", True),
+                health_path=body.get("health_path", "/health"),
+                icon=body.get("icon", ""),
+            )
+        except ValueError as e:
+            raise HTTPException(409, str(e))
+        await state.events.put({"type": "service.registered", "service": s.to_dict()})
+        return s.to_dict()
+
+    @app.put("/api/v1/services/{service_id}")
+    async def update_service(service_id: str, body: dict, request: Request) -> dict:
+        _require_scope(request, SCOPE_WRITE)
+        if not service_proxy:
+            raise HTTPException(503, "Service proxy not enabled")
+        allowed = {}
+        for key in ("name", "target_host", "target_port", "protocol", "subdomain",
+                     "auth_required", "health_path", "icon", "enabled"):
+            if key in body:
+                allowed[key] = body[key]
+        s = service_proxy.update_service(service_id, **allowed)
+        if not s:
+            raise HTTPException(404, "Service not found")
+        return s.to_dict()
+
+    @app.delete("/api/v1/services/{service_id}")
+    async def delete_service(service_id: str, request: Request) -> dict:
+        _require_scope(request, SCOPE_WRITE)
+        if not service_proxy:
+            raise HTTPException(503, "Service proxy not enabled")
+        if not service_proxy.remove_service(service_id):
+            raise HTTPException(404, "Service not found")
+        await state.events.put({"type": "service.removed", "service_id": service_id})
+        return {"ok": True}
+
+    @app.get("/api/v1/services/{service_id}/health")
+    async def check_service_health(service_id: str, request: Request) -> dict:
+        _require_scope(request, SCOPE_READ)
+        if not service_proxy:
+            raise HTTPException(503, "Service proxy not enabled")
+        return await service_proxy.check_health(service_id)
+
+    # --- Identity Provider routes ---
+
+    @app.get("/.well-known/openid-configuration")
+    async def oidc_discovery() -> dict:
+        if not idp or not idp.enabled:
+            raise HTTPException(404, "IdP not enabled")
+        return idp.oidc_discovery()
+
+    @app.get("/auth/jwks")
+    async def oidc_jwks() -> dict:
+        if not idp or not idp.enabled:
+            raise HTTPException(404, "IdP not enabled")
+        return idp.jwks()
+
+    @app.get("/auth/login")
+    async def login_page(request: Request):
+        if not idp or not idp.enabled:
+            raise HTTPException(404, "IdP not enabled")
+        redirect_to = request.query_params.get("redirect_to", "/")
+        error = request.query_params.get("error", "")
+        return idp.login_page(error=error, redirect_to=redirect_to)
+
+    @app.post("/auth/login")
+    async def handle_login(request: Request):
+        if not idp or not idp.enabled:
+            raise HTTPException(404, "IdP not enabled")
+        return await idp.handle_login(request)
+
+    @app.get("/auth/login/{provider}")
+    async def social_login(provider: str, request: Request):
+        if not idp or not idp.enabled:
+            raise HTTPException(404, "IdP not enabled")
+        redirect_to = request.query_params.get("redirect_to", "/")
+        return idp.social_redirect(provider, redirect_to=redirect_to)
+
+    @app.get("/auth/callback/{provider}")
+    async def social_callback(provider: str, request: Request):
+        if not idp or not idp.enabled:
+            raise HTTPException(404, "IdP not enabled")
+        return await idp.social_callback(provider, request)
+
+    @app.post("/auth/logout")
+    async def handle_logout(request: Request):
+        if not idp or not idp.enabled:
+            raise HTTPException(404, "IdP not enabled")
+        return idp.handle_logout(request)
+
+    @app.post("/auth/token")
+    async def oidc_token(request: Request):
+        if not idp or not idp.enabled:
+            raise HTTPException(404, "IdP not enabled")
+        return await idp.token_endpoint(request)
+
+    @app.get("/auth/userinfo")
+    async def oidc_userinfo(request: Request):
+        if not idp or not idp.enabled:
+            raise HTTPException(404, "IdP not enabled")
+        return await idp.userinfo_endpoint(request)
+
+    # --- Sharing ---
+
+    @app.get("/api/v1/shares")
+    async def list_shares(request: Request) -> dict:
+        ctx = _require_scope(request, SCOPE_READ)
+        if not sharing:
+            return {"given": [], "received": []}
+        if ctx.user_id:
+            return {
+                "given": [g.to_dict() for g in sharing.list_grants_from_user(ctx.user_id)],
+                "received": [g.to_dict() for g in sharing.list_grants_for_user(ctx.user_id)],
+            }
+        return {"given": [], "received": [],
+                "all": [g.to_dict() for g in sharing.list_all_grants()]}
+
+    @app.post("/api/v1/shares")
+    async def create_share(body: dict, request: Request) -> dict:
+        ctx = _require_scope(request, SCOPE_WRITE)
+        if not sharing:
+            raise HTTPException(503, "Sharing not enabled")
+        # Security: grantor must be the authenticated user (no impersonation)
+        grantor = ctx.user_id
+        if not grantor:
+            raise HTTPException(403, "User identity required to create shares")
+        grantee = body.get("grantee_user_id", "")
+        resource_type = body.get("resource_type", "service")
+        resource_id = body.get("resource_id", "")
+        if not grantee or not resource_id:
+            raise HTTPException(400, "grantee_user_id and resource_id required")
+        grant = sharing.create_grant(
+            grantor_user_id=grantor,
+            grantee_user_id=grantee,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            permissions=body.get("permissions", ["read"]),
+            alias=body.get("alias", ""),
+            expires_at=body.get("expires_at", 0.0),
+        )
+        await state.events.put({"type": "share.created", "grant": grant.to_dict()})
+        return grant.to_dict()
+
+    @app.get("/api/v1/shares/{grant_id}")
+    async def get_share(grant_id: str, request: Request) -> dict:
+        ctx = _require_scope(request, SCOPE_READ)
+        if not sharing:
+            raise HTTPException(503, "Sharing not enabled")
+        grant = sharing.get_grant(grant_id)
+        if not grant:
+            raise HTTPException(404, "Grant not found")
+        # Security: only grantor, grantee, or admin can view a specific grant
+        if ctx.user_id and ctx.user_id not in (grant.grantor_user_id, grant.grantee_user_id):
+            if not has_scope(ctx, SCOPE_ADMIN):
+                raise HTTPException(403, "Not authorized to view this grant")
+        return grant.to_dict()
+
+    @app.delete("/api/v1/shares/{grant_id}")
+    async def revoke_share(grant_id: str, request: Request) -> dict:
+        ctx = _require_scope(request, SCOPE_WRITE)
+        if not sharing:
+            raise HTTPException(503, "Sharing not enabled")
+        grant = sharing.get_grant(grant_id)
+        if not grant:
+            raise HTTPException(404, "Grant not found")
+        # Security: only grantor or admin can revoke a grant
+        if ctx.user_id and ctx.user_id != grant.grantor_user_id:
+            if not has_scope(ctx, SCOPE_ADMIN):
+                raise HTTPException(403, "Only the grantor or admin can revoke shares")
+        if not sharing.revoke_grant(grant_id):
+            raise HTTPException(404, "Grant not found")
+        await state.events.put({"type": "share.revoked", "grant_id": grant_id})
+        return {"ok": True}
+
+    # --- Peer controllers ---
+
+    @app.get("/api/v1/peers")
+    async def list_peers(request: Request) -> list[dict]:
+        _require_scope(request, SCOPE_READ)
+        if not sharing:
+            return []
+        return [p.to_dict() for p in sharing.list_peers()]
+
+    @app.post("/api/v1/peers")
+    async def link_peer(body: dict, request: Request) -> dict:
+        _require_scope(request, SCOPE_ADMIN)
+        if not sharing:
+            raise HTTPException(503, "Sharing not enabled")
+        controller_id = body.get("controller_id", "")
+        owner_user_id = body.get("owner_user_id", "")
+        name = body.get("name", "")
+        host = body.get("host", "")
+        port = body.get("port", 7380)
+        transport = body.get("transport", "lan")
+        if not controller_id or not host:
+            raise HTTPException(400, "controller_id and host required")
+        peer = sharing.add_peer(
+            controller_id=controller_id, owner_user_id=owner_user_id,
+            name=name, host=host, port=port, transport=transport,
+        )
+        await state.events.put({"type": "peer.linked", "peer": peer.to_dict()})
+        return peer.to_dict()
+
+    @app.delete("/api/v1/peers/{controller_id}")
+    async def unlink_peer(controller_id: str, request: Request) -> dict:
+        _require_scope(request, SCOPE_ADMIN)
+        if not sharing:
+            raise HTTPException(503, "Sharing not enabled")
+        if not sharing.remove_peer(controller_id):
+            raise HTTPException(404, "Peer not found")
+        await state.events.put({"type": "peer.unlinked", "controller_id": controller_id})
+        return {"ok": True}
+
+    # --- External publishing ---
+
+    @app.get("/api/v1/publish")
+    async def list_published(request: Request) -> list[dict]:
+        _require_scope(request, SCOPE_READ)
+        if not ext_publish:
+            return []
+        return [e.to_dict() for e in ext_publish.list_entries()]
+
+    @app.post("/api/v1/publish")
+    async def publish_service(body: dict, request: Request) -> dict:
+        ctx = _require_scope(request, SCOPE_WRITE)
+        if not ext_publish:
+            raise HTTPException(503, "External publishing not enabled")
+        service_id = body.get("service_id", "")
+        external_subdomain = body.get("external_subdomain", "")
+        mode = body.get("mode", "private")
+        if not service_id or not external_subdomain:
+            raise HTTPException(400, "service_id and external_subdomain required")
+        entry = await ext_publish.publish(
+            service_id=service_id,
+            owner_user_id=ctx.user_id,
+            external_subdomain=external_subdomain,
+            mode=mode,
+            rate_limit=body.get("rate_limit", 0),
+            allowed_domains=body.get("allowed_domains"),
+            connect_client=connect,
+            username=body.get("username", ""),
+        )
+        await state.events.put({"type": "service.published", "entry": entry.to_dict()})
+        return entry.to_dict()
+
+    @app.put("/api/v1/publish/{entry_id}")
+    async def update_published(entry_id: str, body: dict, request: Request) -> dict:
+        ctx = _require_scope(request, SCOPE_WRITE)
+        if not ext_publish:
+            raise HTTPException(503, "External publishing not enabled")
+        # Security: changing to public mode requires admin scope
+        if body.get("mode") == "public":
+            if not has_scope(ctx, SCOPE_ADMIN):
+                raise HTTPException(403, "Admin scope required to set public mode")
+            if not body.get("confirm_public"):
+                raise HTTPException(400, "Set confirm_public: true to confirm public exposure")
+        allowed = {}
+        for key in ("mode", "rate_limit", "allowed_domains", "enabled"):
+            if key in body:
+                allowed[key] = body[key]
+        entry = ext_publish.update_entry(entry_id, **allowed)
+        if not entry:
+            raise HTTPException(404, "Published entry not found")
+        return entry.to_dict()
+
+    @app.delete("/api/v1/publish/{entry_id}")
+    async def unpublish_service(entry_id: str, request: Request) -> dict:
+        _require_scope(request, SCOPE_WRITE)
+        if not ext_publish:
+            raise HTTPException(503, "External publishing not enabled")
+        if not await ext_publish.unpublish(entry_id):
+            raise HTTPException(404, "Published entry not found")
+        await state.events.put({"type": "service.unpublished", "entry_id": entry_id})
+        return {"ok": True}
 
     # --- WebSocket broadcast ---
 
@@ -742,7 +1193,51 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         model = room_correction.detect_phone_model(ua)
         return {"model": model}
 
-    # --- KVM input (dashboard → VNC) ---
+    # --- KVM input proxy (dashboard → soft node API) ---
+
+    async def _proxy_to_node(node_id: str, path: str, body: dict) -> dict:
+        """Proxy a POST request to a node's soft node API."""
+        node = state.nodes.get(node_id)
+        if not node:
+            raise HTTPException(status_code=404, detail="Node not found")
+        api_port = getattr(node, "api_port", 0)
+        if not api_port:
+            raise HTTPException(status_code=503, detail="Node has no API port")
+        # Use localhost for nodes on the same host (container --net=host)
+        host = "127.0.0.1"
+        import aiohttp as _aiohttp
+        try:
+            async with _aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"http://{host}:{api_port}{path}",
+                    json=body,
+                    timeout=_aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    return await resp.json()
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=str(e))
+
+    @app.post("/api/v1/nodes/{node_id:path}/proxy/input/key")
+    async def proxy_input_key(node_id: str, body: dict) -> dict[str, Any]:
+        """Proxy key input to a node's soft node API."""
+        return await _proxy_to_node(node_id, "/input/key", body)
+
+    @app.post("/api/v1/nodes/{node_id:path}/proxy/input/mouse")
+    async def proxy_input_mouse(node_id: str, body: dict) -> dict[str, Any]:
+        """Proxy mouse input to a node's soft node API."""
+        return await _proxy_to_node(node_id, "/input/mouse", body)
+
+    @app.post("/api/v1/nodes/{node_id:path}/proxy/webrtc/bitrate")
+    async def proxy_webrtc_bitrate(node_id: str, body: dict) -> dict[str, Any]:
+        """Adjust WebRTC video bitrate."""
+        return await _proxy_to_node(node_id, "/webrtc/bitrate", body)
+
+    @app.post("/api/v1/nodes/{node_id:path}/proxy/input/type")
+    async def proxy_input_type(node_id: str, body: dict) -> dict[str, Any]:
+        """Proxy text typing to a node's soft node API."""
+        return await _proxy_to_node(node_id, "/input/type", body)
+
+    # --- KVM input (dashboard → VNC, legacy) ---
 
     @app.post("/api/v1/input/{node_id}/key")
     async def input_key(node_id: str, body: dict) -> dict[str, Any]:
@@ -1419,6 +1914,79 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             generate(),
             media_type="multipart/x-mixed-replace; boundary=frame",
         )
+
+    @app.get("/api/v1/streams/{node_id:path}/hls/{filename}")
+    async def stream_hls_proxy(node_id: str, filename: str) -> Response:
+        """Proxy HLS files (m3u8 + .ts segments) from a node's soft node."""
+        node = state.nodes.get(node_id)
+        if not node:
+            raise HTTPException(status_code=404, detail="Node not found")
+        api_port = getattr(node, "api_port", 0)
+        if not api_port:
+            raise HTTPException(status_code=404, detail="Node has no API port")
+        import aiohttp as _aiohttp
+        content_type = "application/vnd.apple.mpegurl" if filename.endswith(".m3u8") else "video/mp2t"
+        try:
+            async with _aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"http://127.0.0.1:{api_port}/stream/{filename}",
+                    timeout=_aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.read()
+                        return Response(content=data, media_type=content_type)
+        except Exception:
+            pass
+        raise HTTPException(status_code=503, detail="HLS not available")
+
+    @app.post("/api/v1/streams/{node_id:path}/webrtc")
+    async def stream_webrtc(node_id: str, body: dict) -> Response:
+        """WebRTC signaling — proxy to soft node's aiortc endpoint."""
+        return await _proxy_to_node_raw(node_id, "/webrtc/offer", body)
+
+    async def _proxy_to_node_raw(node_id: str, path: str, body: dict) -> Response:
+        node = state.nodes.get(node_id)
+        if not node:
+            raise HTTPException(status_code=404, detail="Node not found")
+        api_port = getattr(node, "api_port", 0)
+        if not api_port:
+            raise HTTPException(status_code=503, detail="Node has no API port")
+        import aiohttp as _aiohttp
+        try:
+            async with _aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"http://127.0.0.1:{api_port}{path}",
+                    json=body,
+                    timeout=_aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    data = await resp.read()
+                    return Response(content=data, media_type=resp.content_type,
+                                    status_code=resp.status)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=str(e))
+
+    @app.get("/api/v1/streams/{node_id:path}/snapshot")
+    async def stream_snapshot(node_id: str) -> Response:
+        """Single JPEG frame from a node's display (proxy to soft node API)."""
+        node = state.nodes.get(node_id)
+        if not node:
+            raise HTTPException(status_code=404, detail="Node not found")
+        api_port = getattr(node, "api_port", 0)
+        if not api_port:
+            raise HTTPException(status_code=404, detail="Node has no API port")
+        import aiohttp as _aiohttp
+        try:
+            async with _aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"http://127.0.0.1:{api_port}/display/snapshot",
+                    timeout=_aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status == 200 and resp.content_type.startswith("image/"):
+                        data = await resp.read()
+                        return Response(content=data, media_type="image/jpeg")
+        except Exception:
+            pass
+        raise HTTPException(status_code=503, detail="Snapshot unavailable")
 
     @app.get("/api/v1/streams/{node_id:path}")
     async def get_stream(node_id: str) -> dict[str, Any]:

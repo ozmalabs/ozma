@@ -133,7 +133,7 @@ apk add -q alpine-base openssh util-linux-misc e2fsprogs-extra ca-certificates
 apk add -q linux-lts
 
 echo "  Installing Python runtime..."
-apk add -q python3 py3-pip py3-aiohttp
+apk add -q python3 py3-aiohttp
 
 # usbip for exporting the USB gadget via USB/IP
 echo "  Installing USB/IP tools..."
@@ -145,9 +145,10 @@ echo "  Installing ffmpeg (optional)..."
 apk add -q ffmpeg 2>/dev/null || echo "    ffmpeg not available"
 
 # zeroconf for mDNS announcement from node.py
-echo "  Installing zeroconf via pip..."
-pip3 install --quiet --break-system-packages zeroconf 2>/dev/null \
-    || pip3 install --quiet zeroconf
+echo "  Installing zeroconf via uv..."
+pip3 install --quiet --break-system-packages uv 2>/dev/null || true
+uv pip install --system --quiet --break-system-packages zeroconf 2>/dev/null \
+    || uv pip install --system --quiet zeroconf
 
 # SSH config — key-only access (authorized_keys installed outside chroot)
 sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config

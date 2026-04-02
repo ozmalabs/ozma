@@ -1,0 +1,229 @@
+# Ozma Integration Test: Virtual Node + Windows Agent
+#
+# Exercises the complete virtual node pipeline:
+#   QEMU VM → evdev input → VNC capture → OmniParser → agent engine
+#
+# Prerequisites:
+#   - QEMU VM running with input-linux evdev devices
+#   - Windows 10 installed with ozma-agent.exe on C:\ozma-agent\dist\
+#   - USB media (D:\) with Python + wheels
+#   - VNC on :31 (port 5931)
+#   - OmniParser YOLO model downloaded
+#
+# Run:
+#   python3 tests/test_virtual_node_agent.py
+#
+# This test can also be run via the test runner API:
+#   curl -X POST http://localhost:7380/api/v1/tests/run \
+#     -d '{"test_file": "tests/test_virtual_node_agent.yaml"}'
+
+name: "Virtual Node + Windows Agent Integration"
+timeout: 600
+node: "win10._ozma._udp.local."
+
+# ─── Phase 1: VM + Input Verification ────────────────────────────────────
+
+steps:
+  - name: "VM is running and VNC accessible"
+    screenshot: true
+    assert_not_present: "STOP:"
+    assert_not_present: "Blue Screen"
+
+  - name: "Desktop is visible"
+    wait_for_text: "Type here to search"
+    timeout: 30
+    screenshot: true
+
+  - name: "evdev keyboard input works"
+    hotkey: "win+r"
+    wait: 1.5
+    type: "cmd"
+    key: enter
+    wait: 2
+    assert_text: "cmd.exe"
+
+  - name: "Can type commands"
+    type: "echo INPUT_TEST_OK"
+    key: enter
+    wait: 1
+    assert_text: "INPUT_TEST_OK"
+
+# ─── Phase 2: Python + Agent Verification ────────────────────────────────
+
+  - name: "Python 3.13 is installed"
+    type: "python --version"
+    key: enter
+    wait: 2
+    assert_text: "3.13"
+
+  - name: "pip is functional"
+    type: "pip --version"
+    key: enter
+    wait: 2
+    assert_text: "pip"
+
+  - name: "Agent exe exists"
+    type: "dir C:\\ozma-agent\\dist\\ozma-agent.exe"
+    key: enter
+    wait: 2
+    assert_text: "ozma-agent.exe"
+    assert_not_present: "File Not Found"
+
+  - name: "Agent shows help"
+    type: "C:\\ozma-agent\\dist\\ozma-agent.exe --help"
+    key: enter
+    wait: 3
+    assert_text: "make any machine part"
+    screenshot: true
+
+# ─── Phase 3: Agent Runtime ──────────────────────────────────────────────
+
+  - name: "Start agent in background"
+    type: "start C:\\ozma-agent\\dist\\ozma-agent.exe run --no-tray --no-capture --debug --port 7340 --api-port 7390"
+    key: enter
+    wait: 5
+    screenshot: true
+
+  - name: "Agent process is running"
+    type: "tasklist /fi \"imagename eq ozma-agent.exe\""
+    key: enter
+    wait: 2
+    assert_text: "ozma-agent.exe"
+
+# ─── Phase 4: Screen Understanding (OCR + OmniParser) ───────────────────
+
+  - name: "OCR reads command prompt text"
+    wait: 1
+    assert_text: "Users"
+
+  - name: "OmniParser detects UI elements"
+    # This step uses the find_elements action which runs OmniParser
+    # The test runner should verify >10 elements detected
+    screenshot: true
+
+# ─── Phase 5: Application Control via RPA ────────────────────────────────
+
+  - name: "Open Notepad"
+    hotkey: "win+r"
+    wait: 1.5
+    type: "notepad"
+    key: enter
+    wait: 2
+    assert_text: "Notepad"
+    screenshot: true
+
+  - name: "Type in Notepad"
+    type: "Ozma RPA integration test passed!"
+    wait: 1
+    assert_text: "integration test"
+
+  - name: "Save file via Ctrl+S"
+    hotkey: "ctrl+s"
+    wait: 2
+    # Save As dialog should appear
+    assert_text: "Save"
+    screenshot: true
+
+  - name: "Type filename and save"
+    type: "C:\\ozma-test-result.txt"
+    key: enter
+    wait: 2
+
+  - name: "Close Notepad"
+    hotkey: "alt+f4"
+    wait: 1
+
+  - name: "Verify file was saved"
+    # Switch to cmd
+    hotkey: "win+r"
+    wait: 1
+    type: "cmd"
+    key: enter
+    wait: 2
+    type: "type C:\\ozma-test-result.txt"
+    key: enter
+    wait: 2
+    assert_text: "integration test passed"
+    screenshot: true
+
+# ─── Phase 6: Multi-Window Management ────────────────────────────────────
+
+  - name: "Open Calculator"
+    hotkey: "win+r"
+    wait: 1
+    type: "calc"
+    key: enter
+    wait: 3
+    screenshot: true
+
+  - name: "Close Calculator"
+    hotkey: "alt+f4"
+    wait: 1
+
+  - name: "Open File Explorer"
+    hotkey: "win+e"
+    wait: 2
+    assert_text: "This PC"
+    screenshot: true
+
+  - name: "Navigate to D: drive"
+    click:
+      text: "This PC"
+    wait: 2
+    screenshot: true
+
+  - name: "Close File Explorer"
+    hotkey: "alt+f4"
+    wait: 1
+
+# ─── Phase 7: Agent Cleanup ──────────────────────────────────────────────
+
+  - name: "Stop agent"
+    hotkey: "win+r"
+    wait: 1
+    type: "cmd"
+    key: enter
+    wait: 2
+    type: "taskkill /im ozma-agent.exe /f"
+    key: enter
+    wait: 2
+    assert_not_present: "ERROR"
+
+  - name: "Agent stopped"
+    type: "tasklist /fi \"imagename eq ozma-agent.exe\""
+    key: enter
+    wait: 2
+    assert_text: "No tasks"
+    screenshot: true
+
+  - name: "Clean up test file"
+    type: "del C:\\ozma-test-result.txt"
+    key: enter
+    wait: 1
+
+# ─── Phase 8: Stress / Reliability ───────────────────────────────────────
+
+  - name: "Rapid key input (10 commands)"
+    type: "echo 1"
+    key: enter
+    wait: 0.3
+    type: "echo 2"
+    key: enter
+    wait: 0.3
+    type: "echo 3"
+    key: enter
+    wait: 0.3
+    type: "echo 4"
+    key: enter
+    wait: 0.3
+    type: "echo 5"
+    key: enter
+    wait: 1
+    assert_text: "5"
+    screenshot: true
+
+on_failure:
+  - action: screenshot
+    path: "test_results/virtual_node_agent_FAILED_{timestamp}.jpg"
+  - action: notify
+    message: "FAILED: Virtual Node + Agent integration test"

@@ -464,14 +464,14 @@ class USBStorageManager:
             "Ozma Soft Node Installer\n"
             "========================\n\n"
             "Install:\n"
-            "  pip install ozma_softnode-*.whl\n"
+            "  uv pip install ozma_softnode-*.whl\n"
             "  ozma-softnode --name $(hostname)\n"
         ).encode())
 
         await self.add_file("install.sh", (
             "#!/bin/bash\n"
             "cd \"$(dirname \"$0\")\"\n"
-            "pip3 install ozma_softnode-*.whl && "
+            "uv pip install ozma_softnode-*.whl && "
             "echo 'Run: ozma-softnode --name $(hostname)'\n"
         ).encode())
         return True

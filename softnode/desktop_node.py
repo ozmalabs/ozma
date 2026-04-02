@@ -23,7 +23,7 @@ This is the "Ozma Soft Node" product — free tier allows 1 device,
 Pro tier allows 5, Team/Business unlimited.
 
 Usage:
-  pip install ozma-softnode
+  uv pip install ozma-softnode
   ozma-softnode --name my-desktop
   ozma-softnode --name my-desktop --controller http://10.0.0.1:7380
 """

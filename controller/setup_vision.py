@@ -11,10 +11,10 @@ Usage:
 
 Models downloaded to ~/.cache/ozma/omniparser/ (~2GB total):
   - icon_detect/best.pt        — YOLOv8 fine-tuned for UI elements (~6MB)
-  - icon_caption_florence/      — Florence-2 for element description (~500MB)
+  - icon_caption/               — Florence-2 for element description (~500MB)
 
-Requires: pip install ultralytics torch huggingface_hub
-Optional: pip install transformers (for Florence-2 icon captioning)
+Requires: uv pip install ultralytics torch huggingface_hub
+Optional: uv pip install transformers (for Florence-2 icon captioning)
 """
 
 import argparse
@@ -69,7 +69,10 @@ def check_models() -> dict[str, bool]:
         (CACHE_DIR / "icon_detect" / "model.pt").exists() or
         (CACHE_DIR / "icon_detect" / "best.pt").exists()
     )
-    models["florence2"] = (CACHE_DIR / "icon_caption_florence" / "config.json").exists()
+    models["florence2"] = (
+        (CACHE_DIR / "icon_caption" / "config.json").exists() or
+        (CACHE_DIR / "icon_caption_florence" / "config.json").exists()
+    )
     return models
 
 
@@ -78,7 +81,7 @@ def download_omniparser():
     try:
         from huggingface_hub import snapshot_download
     except ImportError:
-        print("ERROR: pip install huggingface_hub first")
+        print("ERROR: uv pip install huggingface_hub first")
         sys.exit(1)
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -99,7 +102,7 @@ def download_omniparser():
         snapshot_download(
             repo_id="microsoft/OmniParser-v2.0",
             local_dir=str(CACHE_DIR),
-            allow_patterns=["icon_caption_florence/*"],
+            allow_patterns=["icon_caption/*"],
         )
         print("  ✓ Florence-2 model ready")
     except Exception as e:
@@ -116,7 +119,7 @@ def pull_ollama_vision():
         print("ERROR: Ollama not installed. Install from https://ollama.ai")
         sys.exit(1)
 
-    model = "qwen2.5-vl:7b"
+    model = "qwen2.5vl:7b"
     print(f"Pulling Ollama model: {model}")
     subprocess.run([ollama, "pull", model], check=True)
     print(f"✓ {model} ready")

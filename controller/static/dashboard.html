@@ -19,7 +19,7 @@
   --border2:  rgba(255,255,255,0.14);
   --text:     #d0d0d8;
   --muted:    #555560;
-  --accent:   #5b6fff;
+  --accent:   #4ae0a4;
   --green:    #3ecf8e;
   --red:      #f26464;
   --yellow:   #f0b94a;
@@ -50,10 +50,9 @@ body {
   z-index: 100;
 }
 #topbar .logo {
-  font-size: 15px;
-  font-weight: 700;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
+  font-size: 16px;
+  font-weight: 800;
+  letter-spacing: -0.03em;
   color: #fff;
 }
 #topbar .logo span { color: var(--accent); }
@@ -87,7 +86,7 @@ body {
   transition: all 0.15s;
 }
 .mode-btn:hover { color: var(--text); }
-.mode-btn.active { background: var(--accent); color: #000; }
+.mode-btn.active { background: var(--accent); color: #050505; }
 
 /* Mode visibility — panels declare their minimum mode */
 [data-mode="advanced"] { display: none; }
@@ -201,7 +200,7 @@ body.mode-amazing #main [data-mode="amazing"].panel.full-width { display: flex; 
   white-space: nowrap;
 }
 .btn:hover { background: rgba(255,255,255,0.08); color: #fff; }
-.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #050505; }
 .btn.primary:hover { filter: brightness(1.15); }
 .btn.danger { color: var(--red); border-color: rgba(242,100,100,0.25); }
 .btn.danger:hover { background: rgba(242,100,100,0.12); }
@@ -250,8 +249,8 @@ body.mode-amazing #main [data-mode="amazing"].panel.full-width { display: flex; 
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--accent);
-  background: rgba(91,111,255,0.12);
-  border: 1px solid rgba(91,111,255,0.25);
+  background: rgba(74,224,164,0.12);
+  border: 1px solid rgba(74,224,164,0.25);
   border-radius: 4px;
   padding: 1px 6px;
 }
@@ -442,11 +441,15 @@ body.mode-amazing #main [data-mode="amazing"].panel.full-width { display: flex; 
   aspect-ratio: 16/9;
   background: #000;
   position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   overflow: hidden;
 }
 .stream-preview img {
-  width: 100%; height: 100%;
-  object-fit: cover;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
   display: block;
 }
 .stream-preview canvas {
@@ -576,11 +579,11 @@ select option { background: var(--surface); }
 .event-type.other     { color: var(--muted); }
 .event-detail { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
 
-/* ── Modal ─────────────────────────────────────────────────────────────────── */
+/* ── KVM Modal ─────────────────────────────────────────────────────────────── */
 #modal-overlay {
   display: none;
   position: fixed; inset: 0;
-  background: rgba(0,0,0,0.7);
+  background: rgba(0,0,0,0.85);
   z-index: 200;
   align-items: center;
   justify-content: center;
@@ -591,13 +594,29 @@ select option { background: var(--surface); }
   border: 1px solid var(--border2);
   border-radius: 10px;
   overflow: hidden;
-  max-width: 90vw;
-  max-height: 90vh;
+  max-width: 95vw;
+  max-height: 95vh;
   display: flex;
   flex-direction: column;
 }
+#modal:fullscreen {
+  max-width: 100%;
+  max-height: 100%;
+  width: 100%;
+  height: 100%;
+  border-radius: 0;
+  border: none;
+}
+#modal:fullscreen #modal-body {
+  flex: 1;
+}
+#modal:fullscreen #modal-video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
 #modal-title {
-  padding: 12px 16px;
+  padding: 8px 16px;
   font-size: 12px;
   font-weight: 700;
   color: #fff;
@@ -607,7 +626,6 @@ select option { background: var(--surface); }
   gap: 8px;
 }
 #modal-title button {
-  margin-left: auto;
   background: none;
   border: none;
   color: var(--muted);
@@ -616,9 +634,29 @@ select option { background: var(--surface); }
   line-height: 1;
 }
 #modal-title button:hover { color: #fff; }
-#modal-body { flex: 1; overflow: auto; background: #000; }
-#modal-img { width: 100%; height: 100%; display: block; object-fit: contain; max-height: 70vh; }
-#modal-video { width: 100%; max-height: 70vh; display: block; background: #000; }
+#kvm-toolbar {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+  align-items: center;
+}
+#kvm-toolbar button {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 3px 10px;
+  border-radius: 4px;
+  font-size: 11px;
+  cursor: pointer;
+  margin: 0;
+}
+#kvm-toolbar button:hover { background: var(--border2); }
+#kvm-toolbar button.active { background: var(--accent); color: #050505; border-color: var(--accent); }
+#kvm-status { font-size: 10px; color: var(--muted); font-weight: 400; }
+#modal-body { flex: 1; overflow: hidden; background: #000; position: relative; display: flex; align-items: center; justify-content: center; }
+#modal-img { max-width: 100%; max-height: 85vh; display: block; object-fit: contain; cursor: default; }
+#modal-img.kvm-active { cursor: none; }
+#modal-video { width: 100%; height: 100%; display: block; background: #000; object-fit: contain; }
 
 /* ── Responsive ────────────────────────────────────────────────────────────── */
 @media (max-width: 700px) {
@@ -631,7 +669,7 @@ select option { background: var(--surface); }
 
 <!-- ── Top bar ──────────────────────────────────────────────────────────────── -->
 <div id="topbar">
-  <div class="logo">Oz<span>ma</span></div>
+  <div class="logo">ozma<span>labs</span></div>
   <a class="topbar-link" href="/">Keyboard</a>
   <a class="topbar-link" href="/desk3d.html">3D Desk</a>
   <div class="spacer"></div>
@@ -1034,11 +1072,21 @@ select option { background: var(--surface); }
   <div id="modal">
     <div id="modal-title">
       <span id="modal-title-text">Stream</span>
+      <div id="kvm-toolbar">
+        <span id="kvm-status"></span>
+        <button id="kvm-kbd-btn" title="Capture keyboard (Tab to release)">Keyboard</button>
+        <button id="kvm-mouse-btn" title="Capture mouse (Esc to release)">Mouse</button>
+        <button id="kvm-audio-btn" title="Unmute audio">Audio Off</button>
+        <input id="kvm-bitrate" type="range" min="0" max="50000" value="0" step="500"
+               style="width:80px;vertical-align:middle" title="Video bitrate (0=Auto)">
+        <span id="kvm-bitrate-label" style="font-size:10px;min-width:40px">Auto</span>
+        <button id="kvm-fullscreen-btn" title="Fullscreen">Fullscreen</button>
+      </div>
       <button id="modal-close">✕</button>
     </div>
-    <div id="modal-body">
+    <div id="modal-body" tabindex="0">
       <img id="modal-img" src="" alt="" style="display:none">
-      <video id="modal-video" autoplay muted playsinline controls style="display:none"></video>
+      <video id="modal-video" autoplay muted playsinline style="display:none"></video>
     </div>
   </div>
 </div>
@@ -2078,13 +2126,11 @@ function renderStreams() {
     const typeLabel = isHls ? 'HLS' : 'MJPEG';
     const badgeClass = isHls ? 'hls' : 'live';
 
-    // Use a thumbnail img for MJPEG; placeholder for HLS
-    const previewHtml = isHls
-      ? `<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#444;font-size:11px">HLS</div>`
-      : `<img src="/api/v1/streams/${encodeURIComponent(s.node_id)}/mjpeg"
-             style="width:100%;height:100%;object-fit:cover"
-             onerror="this.style.display='none'"
-             loading="lazy">`;
+    // Snapshot preview — polls single JPEG frames (works in all browsers)
+    const snapUrl = `/api/v1/streams/${encodeURIComponent(s.node_id)}/snapshot`;
+    const previewHtml = `<img data-snap-url="${snapUrl}" data-node-id="${esc(s.node_id)}"
+             src="${snapUrl}?t=${Date.now()}"
+             onerror="this.style.opacity='0.3'">`;
 
     return `<div class="stream-tile">
       <div class="stream-preview" style="cursor:pointer" onclick="openStream('${esc(s.node_id)}')">
@@ -2099,8 +2145,17 @@ function renderStreams() {
   }).join('');
 }
 
+// ── Snapshot preview polling ──────────────────────────────────────────────────
+// Refresh all preview snapshots every 2 seconds
+setInterval(() => {
+  document.querySelectorAll('img[data-snap-url]').forEach(img => {
+    const url = img.dataset.snapUrl;
+    if (url) img.src = url + '?t=' + Date.now();
+  });
+}, 2000);
+
 // ── Render: scenarios ─────────────────────────────────────────────────────────
-const SCENARIO_COLORS = ['#5b6fff','#3ecf8e','#f0b94a','#f26464','#a78bfa','#38bdf8'];
+const SCENARIO_COLORS = ['#4ae0a4','#3ecf8e','#f0b94a','#f26464','#a78bfa','#38bdf8'];
 
 function renderScenarios() {
   const list = $('scenarios-list');
@@ -2361,43 +2416,378 @@ $('btn-submit-scenario').addEventListener('click', async () => {
   } catch (e) { alert('Failed: ' + e.message); }
 });
 
-// ── Stream modal ──────────────────────────────────────────────────────────────
+// ── KVM Viewer ───────────────────────────────────────────────────────────────
 let hlsInstance = null;
+let kvmNodeId = null;
+let kvmKbdActive = false;
+let kvmMouseActive = false;
+let kvmSnapInterval = null;
+
+// evdev keycode mapping (browser KeyboardEvent.code → evdev code)
+const KVM_KEYMAP = {
+  Escape:1, Digit1:2, Digit2:3, Digit3:4, Digit4:5, Digit5:6, Digit6:7,
+  Digit7:8, Digit8:9, Digit9:10, Digit0:11, Minus:12, Equal:13,
+  Backspace:14, Tab:15, KeyQ:16, KeyW:17, KeyE:18, KeyR:19, KeyT:20,
+  KeyY:21, KeyU:22, KeyI:23, KeyO:24, KeyP:25, BracketLeft:26, BracketRight:27,
+  Enter:28, ControlLeft:29, KeyA:30, KeyS:31, KeyD:32, KeyF:33, KeyG:34,
+  KeyH:35, KeyJ:36, KeyK:37, KeyL:38, Semicolon:39, Quote:40, Backquote:41,
+  ShiftLeft:42, Backslash:43, KeyZ:44, KeyX:45, KeyC:46, KeyV:47, KeyB:48,
+  KeyN:49, KeyM:50, Comma:51, Period:52, Slash:53, ShiftRight:54,
+  AltLeft:56, Space:57, CapsLock:58,
+  F1:59, F2:60, F3:61, F4:62, F5:63, F6:64, F7:65, F8:66, F9:67, F10:68,
+  F11:87, F12:88, NumLock:69, ScrollLock:70, Home:102, ArrowUp:103,
+  PageUp:104, ArrowLeft:105, ArrowRight:106, End:107, ArrowDown:108,
+  PageDown:109, Insert:110, Delete:111, ControlRight:97, AltRight:100,
+  MetaLeft:125, MetaRight:126,
+};
 
 function openStream(nodeId) {
   const s = streams[nodeId];
   if (!s) return;
 
+  kvmNodeId = nodeId;
   $('modal-title-text').textContent = shortId(nodeId);
   $('modal-overlay').classList.add('open');
+  $('kvm-status').textContent = '';
 
-  const img   = $('modal-img');
+  const img = $('modal-img');
   const video = $('modal-video');
   img.style.display = 'none';
   video.style.display = 'none';
-
   if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
 
-  if (s.type === 'hls-remote') {
-    video.style.display = 'block';
-    if (window.Hls && Hls.isSupported()) {
-      hlsInstance = new Hls();
-      hlsInstance.loadSource(s.url);
-      hlsInstance.attachMedia(video);
-    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = s.url;
+  // Display: WebRTC via go2rtc (lowest latency), fallback to HLS then snapshots
+  video.style.display = 'block';
+  const webrtcUrl = `/api/v1/streams/${encodeURIComponent(nodeId)}/webrtc`;
+
+  async function startWebRTC() {
+    try {
+      const pc = new RTCPeerConnection({
+        iceServers: [],
+        encodings: [{maxBitrate: 4000000}],
+      });
+      window._kvmPeerConnection = pc;
+
+      // Prefer H.264 over VP8 (faster encoding)
+      const tcvr = pc.addTransceiver('video', {direction: 'recvonly'});
+      pc.addTransceiver('audio', {direction: 'recvonly'});
+      const codecs = RTCRtpReceiver.getCapabilities('video')?.codecs || [];
+      const h264 = codecs.filter(c => c.mimeType === 'video/H264');
+      const rest = codecs.filter(c => c.mimeType !== 'video/H264');
+      if (h264.length) tcvr.setCodecPreferences([...h264, ...rest]);
+
+      pc.ontrack = (event) => {
+        if (event.streams && event.streams[0]) {
+          video.srcObject = event.streams[0];
+        } else {
+          // aiortc may not provide streams — create one from the track
+          const stream = new MediaStream([event.track]);
+          video.srcObject = stream;
+        }
+        video.play().catch(() => {});
+        $('kvm-status').textContent = 'WebRTC';
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        $('kvm-status').textContent = `ICE: ${pc.iceConnectionState}`;
+      };
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === 'connected') {
+          $('kvm-status').textContent = 'WebRTC live';
+          // Monitor video stats
+          setInterval(async () => {
+            if (!pc || pc.connectionState !== 'connected') return;
+            const stats = await pc.getStats();
+            stats.forEach(s => {
+              if (s.type === 'inbound-rtp' && s.kind === 'video') {
+                $('kvm-status').textContent = `WebRTC ${s.framesDecoded}f ${s.framesPerSecond||0}fps ${(s.bytesReceived/1024)|0}KB`;
+              }
+            });
+          }, 1000);
+        } else if (pc.connectionState === 'failed') {
+          $('kvm-status').textContent = 'WebRTC failed → HLS';
+          _startHLS(nodeId);
+        }
+      };
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      // Wait for ICE gathering
+      await new Promise(resolve => {
+        if (pc.iceGatheringState === 'complete') return resolve();
+        pc.onicecandidate = e => { if (!e.candidate) resolve(); };
+        setTimeout(resolve, 2000);
+      });
+
+      const resp = await fetch(webrtcUrl, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          type: 'offer',
+          sdp: pc.localDescription.sdp,
+        }),
+      });
+
+      if (!resp.ok) throw new Error(`WebRTC signaling: ${resp.status}`);
+
+      const answer = await resp.json();
+      await pc.setRemoteDescription(new RTCSessionDescription(answer));
+
+    } catch (err) {
+      console.warn('WebRTC failed, falling back to HLS:', err);
+      _startHLS(nodeId);
     }
-    video.play().catch(() => {});
-  } else {
-    img.style.display = 'block';
-    img.src = `/api/v1/streams/${encodeURIComponent(nodeId)}/mjpeg?t=${Date.now()}`;
   }
+
+  function _startHLS(nid) {
+    const hlsUrl = `/api/v1/streams/${encodeURIComponent(nid)}/hls/stream.m3u8`;
+    if (window.Hls && Hls.isSupported()) {
+      hlsInstance = new Hls({liveSyncDuration: 1, liveMaxLatencyDuration: 3, enableWorker: true});
+      hlsInstance.loadSource(hlsUrl);
+      hlsInstance.attachMedia(video);
+      hlsInstance.on(Hls.Events.ERROR, (_, d) => {
+        if (d.fatal) { video.style.display = 'none'; _startSnapshotPolling(nid); }
+      });
+      video.play().catch(() => {});
+      $('kvm-status').textContent = 'HLS';
+    } else {
+      _startSnapshotPolling(nid);
+    }
+  }
+
+  startWebRTC();
+  _startAutoBitrate();
+
+  // Enable keyboard capture by default
+  kvmKbdActive = true;
+  $('kvm-kbd-btn').classList.add('active');
+
+  // Prevent video element from stealing keyboard focus
+  video.tabIndex = -1;
+  video.addEventListener('keydown', e => e.stopPropagation(), true);
+  $('modal-body').focus();
+
+  $('modal-body').focus();
 }
 
+function _startSnapshotPolling(nodeId) {
+  const img = $('modal-img');
+  img.style.display = 'block';
+  const snapUrl = `/api/v1/streams/${encodeURIComponent(nodeId)}/snapshot`;
+  img.src = snapUrl + '?t=' + Date.now();
+  if (kvmSnapInterval) clearInterval(kvmSnapInterval);
+  kvmSnapInterval = setInterval(() => {
+    if ($('modal-overlay').classList.contains('open')) {
+      const next = new Image();
+      next.onload = () => { img.src = next.src; };
+      next.src = snapUrl + '?t=' + Date.now();
+    }
+  }, 500);
+  $('kvm-status').textContent = 'snapshot';
+}
+
+// Keyboard capture
+const _heldKeys = new Set();
+
+function kvmKeyHandler(e) {
+  if (!kvmKbdActive || !kvmNodeId) return;
+  e.preventDefault();
+  e.stopPropagation();
+
+  const keycode = KVM_KEYMAP[e.code];
+  if (!keycode) return;
+
+  const down = e.type === 'keydown';
+  if (down) _heldKeys.add(keycode);
+  else _heldKeys.delete(keycode);
+
+  const url = `/api/v1/nodes/${encodeURIComponent(kvmNodeId)}/proxy/input/key`;
+  fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ keycode, down }),
+  }).then(r => {
+    $('kvm-status').textContent = `${e.code}→${keycode} ${down?'↓':'↑'} ${r.status}`;
+  }).catch(() => {});
+}
+
+function kvmReleaseAllKeys() {
+  if (!kvmNodeId) return;
+  const url = `/api/v1/nodes/${encodeURIComponent(kvmNodeId)}/proxy/input/key`;
+  for (const keycode of _heldKeys) {
+    fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ keycode, down: false }),
+    }).catch(() => {});
+  }
+  _heldKeys.clear();
+}
+
+// Release all keys on blur/visibility change
+window.addEventListener('blur', kvmReleaseAllKeys);
+document.addEventListener('visibilitychange', () => { if (document.hidden) kvmReleaseAllKeys(); });
+
+// Mouse capture
+function kvmMouseHandler(e) {
+  if (!kvmMouseActive || !kvmNodeId) return;
+  e.preventDefault();
+
+  const img = $('modal-img');
+  const rect = img.getBoundingClientRect();
+  // Map click position to image coordinates (0-32767 absolute range)
+  const imgW = img.naturalWidth || 640;
+  const imgH = img.naturalHeight || 480;
+  const scaleX = imgW / rect.width;
+  const scaleY = imgH / rect.height;
+  const px = Math.round((e.clientX - rect.left) * scaleX);
+  const py = Math.round((e.clientY - rect.top) * scaleY);
+  // Scale to 0-32767 for QMP absolute coords
+  const ax = Math.round(px * 32767 / imgW);
+  const ay = Math.round(py * 32767 / imgH);
+
+  let action = 'move';
+  let button = 0;
+  if (e.type === 'mousedown') { action = 'press'; button = e.button === 0 ? 1 : e.button === 2 ? 2 : 4; }
+  if (e.type === 'mouseup') { action = 'release'; button = e.button === 0 ? 1 : e.button === 2 ? 2 : 4; }
+
+  fetch(`/api/v1/nodes/${encodeURIComponent(kvmNodeId)}/proxy/input/mouse`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ x: ax, y: ay, action, button }),
+  }).catch(() => {});
+}
+
+// Toolbar buttons
+$('kvm-kbd-btn').addEventListener('click', () => {
+  kvmKbdActive = !kvmKbdActive;
+  $('kvm-kbd-btn').classList.toggle('active', kvmKbdActive);
+  $('kvm-status').textContent = kvmKbdActive ? 'Keyboard captured (click close to release)' : '';
+  if (kvmKbdActive) $('modal-body').focus();
+});
+
+$('kvm-mouse-btn').addEventListener('click', () => {
+  kvmMouseActive = !kvmMouseActive;
+  $('kvm-mouse-btn').classList.toggle('active', kvmMouseActive);
+  $('modal-img').classList.toggle('kvm-active', kvmMouseActive);
+});
+
+let _kvmAutoBitrate = true;
+let _kvmBitrateInterval = null;
+
+function _formatBitrate(kbps) {
+  if (kbps === 0) return 'Auto';
+  return kbps >= 1000 ? `${(kbps/1000).toFixed(kbps%1000?1:0)}M` : `${kbps}k`;
+}
+
+function _setBitrate(kbps) {
+  if (!kvmNodeId) return;
+  fetch(`/api/v1/nodes/${encodeURIComponent(kvmNodeId)}/proxy/webrtc/bitrate`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ bitrate: kbps * 1000, auto: kbps === 0 }),
+  }).catch(() => {});
+}
+
+function _autoBitrateUpdate() {
+  if (!_kvmAutoBitrate || !window._kvmPeerConnection) return;
+  const pc = window._kvmPeerConnection;
+  pc.getStats().then(stats => {
+    let rtt = 0, bytesReceived = 0, framesDecoded = 0, fps = 0;
+    stats.forEach(s => {
+      if (s.type === 'candidate-pair' && s.currentRoundTripTime) rtt = s.currentRoundTripTime;
+      if (s.type === 'inbound-rtp' && s.kind === 'video') {
+        fps = s.framesPerSecond || 0;
+        framesDecoded = s.framesDecoded || 0;
+      }
+    });
+    // Adaptive: if RTT > 100ms or fps drops, reduce bitrate
+    // If RTT < 20ms and fps is good, increase
+    const video = $('modal-video');
+    const w = video?.videoWidth || 640;
+    const h = video?.videoHeight || 480;
+    const pixels = w * h;
+
+    // Base bitrate from resolution: ~8 bits per pixel at 30fps
+    let target = Math.round(pixels * 8 * 30 / 1000);  // kbps
+    target = Math.max(1000, Math.min(target, 50000));
+
+    // Adjust for RTT
+    if (rtt > 0.1) target = Math.round(target * 0.6);
+    else if (rtt > 0.05) target = Math.round(target * 0.8);
+    else if (rtt < 0.02) target = Math.round(target * 1.2);
+
+    // Adjust for fps drops
+    if (fps > 0 && fps < 20) target = Math.round(target * 0.7);
+
+    target = Math.max(500, Math.min(target, 50000));
+    $('kvm-bitrate-label').textContent = `Auto ${_formatBitrate(target)}`;
+    _setBitrate(target);
+  }).catch(() => {});
+}
+
+$('kvm-bitrate').addEventListener('input', (e) => {
+  const kbps = parseInt(e.target.value);
+  _kvmAutoBitrate = (kbps === 0);
+  $('kvm-bitrate-label').textContent = _formatBitrate(kbps);
+  if (kbps > 0) {
+    _setBitrate(kbps);
+  }
+});
+
+// Start auto-bitrate when KVM opens
+function _startAutoBitrate() {
+  _kvmAutoBitrate = true;
+  $('kvm-bitrate').value = 0;
+  $('kvm-bitrate-label').textContent = 'Auto';
+  if (_kvmBitrateInterval) clearInterval(_kvmBitrateInterval);
+  _kvmBitrateInterval = setInterval(_autoBitrateUpdate, 2000);
+}
+
+function _stopAutoBitrate() {
+  if (_kvmBitrateInterval) { clearInterval(_kvmBitrateInterval); _kvmBitrateInterval = null; }
+}
+
+$('kvm-audio-btn').addEventListener('click', () => {
+  const video = $('modal-video');
+  video.muted = !video.muted;
+  $('kvm-audio-btn').textContent = video.muted ? 'Audio Off' : 'Audio On';
+  $('kvm-audio-btn').classList.toggle('active', !video.muted);
+});
+
+$('kvm-fullscreen-btn').addEventListener('click', () => {
+  const modal = $('modal');
+  if (document.fullscreenElement) {
+    document.exitFullscreen();
+  } else {
+    modal.requestFullscreen().catch(() => {});
+  }
+});
+
+// Attach keyboard handlers at document level (modal-body focus is unreliable)
+document.addEventListener('keydown', kvmKeyHandler, {capture: true});
+document.addEventListener('keyup', kvmKeyHandler, {capture: true});
+$('modal-body').addEventListener('mousemove', kvmMouseHandler);
+$('modal-body').addEventListener('mousedown', kvmMouseHandler);
+$('modal-body').addEventListener('mouseup', kvmMouseHandler);
+$('modal-body').addEventListener('contextmenu', e => { if (kvmMouseActive) e.preventDefault(); });
+
+// Close
 $('modal-close').addEventListener('click', () => {
+  kvmReleaseAllKeys();
+  _stopAutoBitrate();
   $('modal-overlay').classList.remove('open');
+  kvmKbdActive = false;
+  kvmMouseActive = false;
+  kvmNodeId = null;
+  $('kvm-kbd-btn').classList.remove('active');
+  $('kvm-mouse-btn').classList.remove('active');
+  $('modal-img').classList.remove('kvm-active');
+  if (window._kvmPeerConnection) { window._kvmPeerConnection.close(); window._kvmPeerConnection = null; }
   if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
+  if (kvmSnapInterval) { clearInterval(kvmSnapInterval); kvmSnapInterval = null; }
   $('modal-img').src = '';
+  $('modal-video').srcObject = null;
   $('modal-video').src = '';
 });
 $('modal-overlay').addEventListener('click', e => {
@@ -3064,7 +3454,7 @@ function sendCtrlAltDel() {
     rcWs.send(JSON.stringify({type:'key', key:'Delete', down:false}));
     rcWs.send(JSON.stringify({type:'key', key:'Alt_L', down:false}));
     rcWs.send(JSON.stringify({type:'key', key:'Control_L', down:false}));
-  }, 100);
+  }, 500);
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────

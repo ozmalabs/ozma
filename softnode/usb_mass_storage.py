@@ -22,7 +22,7 @@ Architecture:
       ↑
   Target sees a real USB mass storage device
 
-Uses python-functionfs (pip install functionfs) for the USB plumbing.
+Uses python-functionfs (uv pip install functionfs) for the USB plumbing.
 We handle the SCSI layer on top.
 
 USB Mass Storage Bulk-Only Transport (BBB):
@@ -256,7 +256,7 @@ class MassStorageGadget:
                  product_name: str = "Ozma Virtual Drive",
                  serial: str = "OZMA0001") -> None:
         if not _HAS_FUNCTIONFS:
-            raise RuntimeError("pip install functionfs")
+            raise RuntimeError("uv pip install functionfs")
         self._synth = synth
         self._scsi = SCSIHandler(synth)
         self._udc = udc

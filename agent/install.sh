@@ -8,7 +8,7 @@
 #
 # What it does:
 #   1. Checks for Python 3.11+
-#   2. pip installs ozma-agent
+#   2. uv pip installs ozma-agent
 #   3. Runs ozma-agent install (registers as background service)
 #   4. The machine appears in your dashboard
 #
@@ -82,10 +82,10 @@ echo -e "Python: ${GREEN}$($PYTHON --version)${NC}"
 # Install ozma-agent
 echo ""
 echo -e "${BOLD}Installing ozma-agent...${NC}"
-$PYTHON -m pip install --quiet --upgrade ozma-agent 2>/dev/null || \
-    $PYTHON -m pip install --quiet --upgrade --user ozma-agent || {
-        echo -e "${YELLOW}pip install failed. Trying from source...${NC}"
-        $PYTHON -m pip install --quiet --upgrade --user "git+https://github.com/ozmalabs/ozma.git#subdirectory=agent"
+uv pip install --quiet --upgrade ozma-agent 2>/dev/null || \
+    uv pip install --quiet --upgrade --user ozma-agent || {
+        echo -e "${YELLOW}uv pip install failed. Trying from source...${NC}"
+        uv pip install --quiet --upgrade --user "git+https://github.com/ozmalabs/ozma.git#subdirectory=agent"
     }
 
 # Find the installed binary

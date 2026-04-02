@@ -13,6 +13,8 @@
 
 FROM python:3.13-slim
 
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
 # System deps for evdev, PipeWire tools, ffmpeg, avahi
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
@@ -31,7 +33,7 @@ WORKDIR /opt/ozma
 
 # Install Python deps
 COPY controller/requirements.txt /opt/ozma/requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt pynacl
+RUN uv pip install --system --no-cache-dir -r requirements.txt pynacl
 
 # Copy application code
 COPY controller/ /opt/ozma/controller/

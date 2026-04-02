@@ -6,7 +6,7 @@
 #
 # What it does:
 #   1. Checks for Python 3.11+
-#   2. pip installs ozma-agent
+#   2. uv pip installs ozma-agent
 #   3. Registers as background service (Task Scheduler)
 #   4. The machine appears in your dashboard
 
@@ -45,10 +45,10 @@ Write-Host "Python: $pyVer" -ForegroundColor Green
 # Install
 Write-Host ""
 Write-Host "Installing ozma-agent..." -ForegroundColor White
-& $python.Split()[0] @($python.Split() | Select-Object -Skip 1) -m pip install --quiet --upgrade ozma-agent 2>$null
+uv pip install --quiet --upgrade ozma-agent 2>$null
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "pip install failed. Trying from source..." -ForegroundColor Yellow
-    & $python.Split()[0] @($python.Split() | Select-Object -Skip 1) -m pip install --quiet --upgrade "git+https://github.com/ozmalabs/ozma.git#subdirectory=agent"
+    Write-Host "uv pip install failed. Trying from source..." -ForegroundColor Yellow
+    uv pip install --quiet --upgrade "git+https://github.com/ozmalabs/ozma.git#subdirectory=agent"
 }
 
 # Find the binary

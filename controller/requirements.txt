@@ -1,5 +1,5 @@
 # Ozma Controller — Python dependencies
-# Install: pip install -r controller/requirements.txt
+# Install: uv pip install -r controller/requirements.txt
 
 # Core framework
 fastapi>=0.111

@@ -7,7 +7,7 @@
 # Then open http://localhost:7380 in your browser.
 #
 # Install soft nodes on target machines:
-#   pip install ozma-softnode
+#   uv pip install ozma-softnode
 #   ozma-softnode --name my-desktop --controller http://<this-machine>:7380
 
 services:

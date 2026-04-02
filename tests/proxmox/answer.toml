@@ -1,0 +1,16 @@
+[global]
+keyboard = "en-us"
+country = "us"
+fqdn = "pve-test.ozma.local"
+mailto = "test@ozma.local"
+timezone = "UTC"
+root-password = "ozmatest123"
+
+[network]
+source = "from-dhcp"
+
+[disk-setup]
+filesystem = "ext4"
+disk-list = ["vda"]
+lvm.swapsize = 4
+lvm.maxvz = 0

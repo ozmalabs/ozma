@@ -1,5 +1,5 @@
 # Ozma Node — Python dependencies
-# Install: pip install -r node/requirements.txt
+# Install: uv pip install -r node/requirements.txt
 
 # HTTP API
 aiohttp>=3.8

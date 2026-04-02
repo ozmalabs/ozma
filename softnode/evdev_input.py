@@ -118,8 +118,15 @@ class VirtualKeyboard:
 
 class VirtualMouse:
     """
-    Virtual absolute-position mouse via uinput. QEMU reads directly.
-    Uses absolute coordinates (like a tablet) for pixel-perfect positioning.
+    Virtual mouse via uinput with both absolute and relative modes.
+
+    Supports:
+    - Absolute coordinates (ABS_X/ABS_Y) for desktop use and AI agent clicks
+    - Relative movement (REL_X/REL_Y) for gaming (FPS, mouselook, raw input)
+
+    Both modes are available simultaneously — the HID report format determines
+    which is used. Games that capture the mouse via raw input will see REL events.
+    Desktop use and AI agent control use ABS events for pixel-perfect positioning.
     """
 
     def __init__(self, name: str = "ozma-mouse",
@@ -138,13 +145,17 @@ class VirtualMouse:
             cap = {
                 ecodes.EV_KEY: [
                     ecodes.BTN_LEFT, ecodes.BTN_RIGHT, ecodes.BTN_MIDDLE,
+                    ecodes.BTN_SIDE, ecodes.BTN_EXTRA,  # mouse4/mouse5
                 ],
                 ecodes.EV_ABS: [
                     (ecodes.ABS_X, AbsInfo(0, 0, self._width - 1, 0, 0, 0)),
                     (ecodes.ABS_Y, AbsInfo(0, 0, self._height - 1, 0, 0, 0)),
                 ],
                 ecodes.EV_REL: [
+                    ecodes.REL_X,
+                    ecodes.REL_Y,
                     ecodes.REL_WHEEL,
+                    ecodes.REL_HWHEEL,  # horizontal scroll
                 ],
             }
 
@@ -156,7 +167,7 @@ class VirtualMouse:
                 version=1,
             )
             self._path = self._device.device.path
-            log.info("Virtual mouse created: %s → %s", self._name, self._path)
+            log.info("Virtual mouse created: %s → %s (abs+rel)", self._name, self._path)
 
             self._create_symlink()
             return self._path
@@ -183,7 +194,7 @@ class VirtualMouse:
         return self._path
 
     def move(self, x: int, y: int) -> None:
-        """Move to absolute coordinates (0-32767 range)."""
+        """Move to absolute coordinates (0-32767 range). Desktop / AI agent mode."""
         if not self._device:
             return
         try:
@@ -193,19 +204,36 @@ class VirtualMouse:
         except Exception as e:
             log.debug("Mouse move failed: %s", e)
 
-    def button(self, button: int, down: bool) -> None:
-        """Press/release a mouse button. button: BTN_LEFT=0x110, etc."""
+    def move_relative(self, dx: int, dy: int) -> None:
+        """Move by relative delta. Gaming / raw input mode."""
         if not self._device:
             return
         try:
-            btn = {1: ecodes.BTN_LEFT, 2: ecodes.BTN_RIGHT, 4: ecodes.BTN_MIDDLE}.get(button, ecodes.BTN_LEFT)
+            if dx:
+                self._device.write(ecodes.EV_REL, ecodes.REL_X, dx)
+            if dy:
+                self._device.write(ecodes.EV_REL, ecodes.REL_Y, dy)
+            if dx or dy:
+                self._device.syn()
+        except Exception as e:
+            log.debug("Mouse move_relative failed: %s", e)
+
+    def button(self, button: int, down: bool) -> None:
+        """Press/release a mouse button. button: bitmask (1=L, 2=R, 4=M, 8=side, 16=extra)."""
+        if not self._device:
+            return
+        try:
+            btn = {
+                1: ecodes.BTN_LEFT, 2: ecodes.BTN_RIGHT, 4: ecodes.BTN_MIDDLE,
+                8: ecodes.BTN_SIDE, 16: ecodes.BTN_EXTRA,
+            }.get(button, ecodes.BTN_LEFT)
             self._device.write(ecodes.EV_KEY, btn, 1 if down else 0)
             self._device.syn()
         except Exception as e:
             log.debug("Mouse button failed: %s", e)
 
     def scroll(self, amount: int) -> None:
-        """Scroll. Positive = up, negative = down."""
+        """Vertical scroll. Positive = up, negative = down."""
         if not self._device:
             return
         try:
@@ -214,8 +242,18 @@ class VirtualMouse:
         except Exception as e:
             log.debug("Mouse scroll failed: %s", e)
 
+    def scroll_horizontal(self, amount: int) -> None:
+        """Horizontal scroll. Positive = right, negative = left."""
+        if not self._device:
+            return
+        try:
+            self._device.write(ecodes.EV_REL, ecodes.REL_HWHEEL, amount)
+            self._device.syn()
+        except Exception as e:
+            log.debug("Mouse hscroll failed: %s", e)
+
     def click(self, x: int, y: int, button: int = 1) -> None:
-        """Move + click in one operation."""
+        """Move + click in one operation (absolute mode)."""
         self.move(x, y)
         self.button(button, True)
         self.button(button, False)
@@ -369,6 +407,7 @@ class EvdevHIDTranslator:
         self._mouse = mouse
         self._prev_modifier = 0
         self._prev_keys: set[int] = set()
+        self._prev_buttons: int = 0
 
     def handle_keyboard(self, report: bytes) -> None:
         """Process an 8-byte HID keyboard boot report."""
@@ -406,7 +445,7 @@ class EvdevHIDTranslator:
 
     def handle_mouse(self, report: bytes) -> None:
         """Process a 6-byte HID mouse report (absolute coords)."""
-        if len(report) < 6:
+        if len(report) < 5:
             return
 
         buttons = report[0]
@@ -414,15 +453,50 @@ class EvdevHIDTranslator:
         y = report[3] | (report[4] << 8)
         scroll = report[5] if len(report) > 5 else 0
 
-        # Move
+        # Move (absolute)
         self._mouse.move(x, y)
 
-        # Buttons (we'd need state tracking for proper press/release)
-        # For now, just set button state
-        for bit, btn in [(1, 1), (2, 2), (4, 4)]:
-            self._mouse.button(btn, bool(buttons & bit))
+        # Buttons
+        self._update_buttons(buttons)
 
         # Scroll
         if scroll:
             val = scroll if scroll < 128 else scroll - 256
             self._mouse.scroll(val)
+
+    def handle_mouse_relative(self, report: bytes) -> None:
+        """Process a relative mouse report (gaming mode).
+
+        Format: [buttons, dx_lo, dx_hi, dy_lo, dy_hi, scroll]
+        dx/dy are signed 16-bit little-endian deltas.
+        """
+        if len(report) < 5:
+            return
+
+        buttons = report[0]
+        dx = struct.unpack_from("<h", report, 1)[0]
+        dy = struct.unpack_from("<h", report, 3)[0]
+        scroll = report[5] if len(report) > 5 else 0
+
+        # Move (relative)
+        self._mouse.move_relative(dx, dy)
+
+        # Buttons
+        self._update_buttons(buttons)
+
+        # Scroll
+        if scroll:
+            val = scroll if scroll < 128 else scroll - 256
+            self._mouse.scroll(val)
+
+    def _update_buttons(self, buttons: int) -> None:
+        """Diff button state and emit press/release events."""
+        prev = self._prev_buttons
+        for bit in (1, 2, 4, 8, 16):
+            was = bool(prev & bit)
+            now = bool(buttons & bit)
+            if now and not was:
+                self._mouse.button(bit, True)
+            elif was and not now:
+                self._mouse.button(bit, False)
+        self._prev_buttons = buttons

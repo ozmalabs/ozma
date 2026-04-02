@@ -1,0 +1,9 @@
+# Minimal Frigate config for E2E testing — no cameras, just API
+mqtt:
+  enabled: false
+
+detectors:
+  cpu:
+    type: cpu
+
+cameras: {}

@@ -49,9 +49,10 @@ OVERHEAD = HEADER_LEN + MAC_LEN  # 26 bytes
 
 # Packet types
 PKT_KEYBOARD = 0x01
-PKT_MOUSE = 0x02
+PKT_MOUSE = 0x02       # Absolute mouse (x/y 0-32767)
 PKT_AUDIO = 0x03
 PKT_CONTROL = 0x04
+PKT_MOUSE_REL = 0x05   # Relative mouse (dx/dy signed 16-bit deltas) — gaming
 
 # Replay window sizes (per stream type)
 REPLAY_WINDOW_HID = 64

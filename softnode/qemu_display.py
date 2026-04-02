@@ -60,9 +60,12 @@ class QEMUDBusConsole:
     MOUSE_IFACE = "org.qemu.Display1.Mouse"
     CONSOLE_IFACE = "org.qemu.Display1.Console"
 
-    def __init__(self, console_index: int = 0) -> None:
+    def __init__(self, console_index: int = 0, p2p_socket: str = "",
+                 dbus_address: str = "") -> None:
         self.console_index = console_index
         self.console_path = f"{DBUS_DISPLAY_PATH}/Console_{console_index}"
+        self._p2p_socket = p2p_socket  # unix socket path for p2p D-Bus
+        self._dbus_address = dbus_address  # explicit DBUS_SESSION_BUS_ADDRESS
         self._connected = False
         self._width = 0
         self._height = 0
@@ -227,17 +230,29 @@ class QEMUDBusConsole:
 
     # ── gdbus helpers ─────────────────────────────────────────────────
 
+    def _gdbus_bus_args(self) -> list[str]:
+        """Return gdbus connection args — p2p socket or session bus."""
+        if self._p2p_socket:
+            return ["--address", f"unix:path={self._p2p_socket}"]
+        return ["--session", "--dest", DBUS_DEST]
+
     def _gdbus_fire(self, iface: str, method: str, args: str) -> None:
         """Fire-and-forget D-Bus call via gdbus CLI. Non-blocking."""
         import subprocess
         cmd = [
-            "gdbus", "call", "--session",
-            "--dest", DBUS_DEST,
+            "gdbus", "call",
+            *self._gdbus_bus_args(),
             "--object-path", self.console_path,
             "--method", f"{iface}.{method}",
-        ] + args.split()
+        ]
+        # gdbus expects each typed value as a single arg: "uint32 103"
+        import re
+        cmd += [m.group() for m in re.finditer(r'uint32\s+\d+', args)]
+        env = os.environ.copy()
+        if self._dbus_address:
+            env["DBUS_SESSION_BUS_ADDRESS"] = self._dbus_address
         try:
-            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
         except Exception as e:
             log.debug("gdbus fire failed: %s", e)
 
@@ -247,15 +262,18 @@ class QEMUDBusConsole:
         import subprocess
         actual_method = kw.get("method", f"{iface}.{method}")
         cmd = [
-            "gdbus", "call", "--session",
-            "--dest", DBUS_DEST,
+            "gdbus", "call",
+            *self._gdbus_bus_args(),
             "--object-path", self.console_path,
             "--method", actual_method,
         ]
         if args:
             cmd += args
+        env = os.environ.copy()
+        if self._dbus_address:
+            env["DBUS_SESSION_BUS_ADDRESS"] = self._dbus_address
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3, env=env)
             return result.stdout.strip()
         except Exception:
             return None

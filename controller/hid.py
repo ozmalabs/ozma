@@ -26,7 +26,7 @@ from evdev import InputDevice, categorize, ecodes
 from keycodes import KEYCODE_TO_HID, KEYCODE_TO_X11, MODIFIER_BITS
 from state import AppState
 from config import Config
-from transport import PKT_KEYBOARD, PKT_MOUSE
+from transport import PKT_KEYBOARD, PKT_MOUSE, PKT_MOUSE_REL
 
 if TYPE_CHECKING:
     from stream import StreamManager
@@ -111,6 +111,9 @@ class MouseState:
         self.y: int = ABSOLUTE_MAX // 2
         self.buttons: int = 0
         self.scroll: int = 0
+        # Raw relative deltas for gaming (consumed per report)
+        self._rel_dx: int = 0
+        self._rel_dy: int = 0
         # Screen dimensions for normalization (updated by caller if known)
         self._screen_w: int = 1920
         self._screen_h: int = 1080
@@ -127,6 +130,9 @@ class MouseState:
     def move_rel(self, dx: int, dy: int) -> None:
         self.x = max(0, min(ABSOLUTE_MAX, self.x + int(dx * self._scale_x)))
         self.y = max(0, min(ABSOLUTE_MAX, self.y + int(dy * self._scale_y)))
+        # Accumulate raw deltas for relative report (gaming)
+        self._rel_dx += dx
+        self._rel_dy += dy
 
     def move_abs(self, raw_x: int, raw_y: int, max_x: int, max_y: int) -> None:
         self.x = int(raw_x * ABSOLUTE_MAX / max(max_x, 1))
@@ -160,6 +166,20 @@ class MouseState:
         scroll = self.scroll & 0xFF
         self.scroll = 0  # consume scroll after sending
         return bytes([self.buttons, x_lo, x_hi, y_lo, y_hi, scroll])
+
+    def build_relative_report(self) -> bytes | None:
+        """Build a relative mouse report with raw deltas. Returns None if no movement."""
+        dx, dy = self._rel_dx, self._rel_dy
+        if dx == 0 and dy == 0 and self.scroll == 0:
+            return None
+        # Clamp to signed 16-bit
+        dx = max(-32768, min(32767, dx))
+        dy = max(-32768, min(32767, dy))
+        self._rel_dx = 0
+        self._rel_dy = 0
+        scroll = self.scroll & 0xFF
+        self.scroll = 0
+        return struct.pack("<BhhB", self.buttons, dx, dy, scroll)
 
 
 class HIDForwarder:
@@ -390,7 +410,12 @@ class HIDForwarder:
                         await self._streams.send_pointer(vnc_node, px, py, self._mouse_state.buttons)
                     else:
                         report = self._mouse_state.build_report()
-                        self._send_udp(0x02, report)
+                        self._send_udp(PKT_MOUSE, report)
+                        # Also send relative report for gaming — node uses
+                        # whichever matches its current input mode
+                        rel_report = self._mouse_state.build_relative_report()
+                        if rel_report:
+                            self._send_udp(PKT_MOUSE_REL, rel_report)
                         if self._config.debug:
                             log.debug("MOUSE report: %s", report.hex())
         except asyncio.CancelledError:

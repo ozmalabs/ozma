@@ -14,8 +14,8 @@ Supports:
   - Behringer X-Touch scribble strip LCD displays
   - Behringer 7-segment displays
 
-Requires: pip install mido python-rtmidi
-Optional: pip install unidecode (for LCD Unicode→ASCII fallback)
+Requires: uv pip install mido python-rtmidi
+Optional: uv pip install unidecode (for LCD Unicode→ASCII fallback)
 """
 
 from __future__ import annotations

@@ -242,7 +242,7 @@ def _find_agent_command() -> str:
     if getattr(sys, 'frozen', False):
         return sys.executable
 
-    # If installed via pip
+    # If installed via uv/pip
     agent_bin = shutil.which("ozma-agent")
     if agent_bin:
         return agent_bin

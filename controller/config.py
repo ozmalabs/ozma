@@ -38,6 +38,9 @@ class Config:
     auth_enabled: bool = False
     auth_password_hash: str = ""   # Argon2id hash; set via OZMA_AUTH_PASSWORD env
 
+    # Identity Provider — built-in OIDC/social login.  Requires auth_enabled.
+    idp_enabled: bool = False
+
     # Logging
     debug: bool = False
 
@@ -58,4 +61,5 @@ class Config:
             controls_config=os.environ.get("OZMA_CONTROLS_CONFIG", ""),
             auth_enabled=os.environ.get("OZMA_AUTH", "0").lower() in ("1", "true", "yes"),
             auth_password_hash=os.environ.get("OZMA_AUTH_PASSWORD_HASH", ""),
+            idp_enabled=os.environ.get("OZMA_IDP", "0").lower() in ("1", "true", "yes"),
         )

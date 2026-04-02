@@ -1,0 +1,10 @@
+{
+  "id": "audiobookshelf-share",
+  "name": "Audiobookshelf Library Sharing",
+  "version": "1.0.0",
+  "author": "Ozma Labs",
+  "description": "Share Audiobookshelf libraries with other Ozma users. Grantees can browse and listen to audiobooks and podcasts in shared libraries with their own listening progress.",
+  "entry_point": "plugin.py",
+  "capabilities": ["service_filter"],
+  "ozma_min_version": "1.1.0"
+}

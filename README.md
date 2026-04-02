@@ -60,7 +60,7 @@ make build-node-image   # build Alpine RISC-V disk image (requires sudo, ~5 min)
 
 ```bash
 # Terminal 1: controller
-cd controller && pip install -r requirements.txt
+cd controller && uv pip install -r requirements.txt
 python -m uvicorn main:app --port 7380
 
 # Terminal 2: soft nodes (vm1, vm2)
@@ -91,7 +91,7 @@ FastAPI daemon that manages the node inventory, routes HID input to the active n
 
 ```bash
 cd controller
-pip install -r requirements.txt
+uv pip install -r requirements.txt
 python -m uvicorn main:app --port 7380 --reload
 ```
 

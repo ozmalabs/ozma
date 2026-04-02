@@ -1,0 +1,10 @@
+{
+  "id": "immich-share",
+  "name": "Immich Photo Sharing",
+  "version": "1.0.0",
+  "author": "Ozma Labs",
+  "description": "Share Immich albums and libraries with other Ozma users. Scoped access to shared photos and videos without exposing the full Immich instance.",
+  "entry_point": "plugin.py",
+  "capabilities": ["service_filter"],
+  "ozma_min_version": "1.1.0"
+}

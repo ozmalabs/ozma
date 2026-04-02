@@ -24,7 +24,7 @@ What it provides:
   - mDNS announcement + direct registration with controller
 
 Usage:
-  pip install ozma-agent
+  uv pip install ozma-agent
   ozma-agent --name my-desktop
   ozma-agent --name my-desktop --controller https://ozma.hrdwrbob.net
   ozma-agent install --controller https://ozma.hrdwrbob.net  # background service
@@ -297,7 +297,7 @@ class HIDInjectorMacOS:
             log.info("macOS HID injector ready (CGEvent)")
             return True
         except ImportError:
-            log.warning("macOS HID injector needs pyobjc-framework-Quartz: pip install pyobjc-framework-Quartz")
+            log.warning("macOS HID injector needs pyobjc-framework-Quartz: uv pip install pyobjc-framework-Quartz")
             return False
 
     def inject_keyboard(self, report: bytes) -> None:

@@ -45,7 +45,7 @@ fi
 # ── Pip wheels (all dependencies, Windows x86_64) ─────────────────────────────
 
 echo ""
-echo "Downloading pip wheels for Windows (this may take a minute)..."
+echo "Downloading Python wheels for Windows (this may take a minute)..."
 
 # Create a temporary requirements file with everything the agent needs
 cat > /tmp/ozma-agent-requirements.txt << 'EOF'
@@ -134,14 +134,14 @@ if (Test-Path $pyInstaller) {
 # Step 2: Install wheels (offline — no network)
 Write-Host "`nInstalling pip packages (offline from wheels)..."
 $wheelsDir = Join-Path $root "wheels"
-python -m pip install --no-index --find-links $wheelsDir pip setuptools wheel 2>$null
-python -m pip install --no-index --find-links $wheelsDir `
+uv pip install --no-index --find-links $wheelsDir pip setuptools wheel 2>$null
+uv pip install --no-index --find-links $wheelsDir `
     aiohttp zeroconf numpy pystray Pillow pyinstaller pynacl 2>&1 | Select-String -NotMatch "already satisfied"
 
 # Step 3: Install ozma-agent from source on the drive
 Write-Host "`nInstalling ozma-agent from USB drive..."
 $agentDir = Join-Path $root "ozma"
-python -m pip install --no-index --find-links $wheelsDir $agentDir 2>$null
+uv pip install --no-index --find-links $wheelsDir $agentDir 2>$null
 # If that fails, just copy modules to site-packages
 if ($LASTEXITCODE -ne 0) {
     $sitePackages = python -c "import site; print(site.getsitepackages()[0])"
@@ -224,7 +224,7 @@ TOTAL=$(du -sh "$MEDIA_DIR" | cut -f1)
 echo "Total size: $TOTAL"
 echo "Contents:"
 echo "  python/     Python 3.12 installer"
-echo "  wheels/     $WHEEL_COUNT pip wheels (offline)"
+echo "  wheels/     $WHEEL_COUNT Python wheels (offline)"
 echo "  ozma/       Agent source + install scripts + controller URL"
 echo "  viostor/    Virtio storage driver"
 echo "  NetKVM/     Virtio network driver (not needed — air-gapped!)"

@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ozma Console</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; background: #1a1a2e; color: #e0e0e0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; overflow: hidden; }
+
+#toolbar {
+  display: flex; align-items: center; gap: 8px;
+  background: #16213e; padding: 4px 10px; height: 36px;
+  border-bottom: 1px solid #0f3460; z-index: 10; position: relative;
+}
+#toolbar .title { font-weight: 600; font-size: 13px; color: #e94560; margin-right: 8px; }
+#toolbar .vmname { font-size: 13px; color: #aaa; }
+#toolbar .sep { width: 1px; height: 20px; background: #333; margin: 0 4px; }
+#toolbar button {
+  background: #0f3460; border: 1px solid #1a1a4e; color: #ccc;
+  padding: 3px 10px; border-radius: 3px; cursor: pointer; font-size: 12px;
+}
+#toolbar button:hover { background: #1a4a7e; color: #fff; }
+#toolbar button.active { background: #e94560; color: #fff; border-color: #e94560; }
+#toolbar .status { margin-left: auto; font-size: 11px; color: #888; font-family: monospace; }
+
+#display {
+  position: absolute; top: 36px; left: 0; right: 0; bottom: 0;
+  display: flex; align-items: center; justify-content: center; background: #000;
+}
+#display video {
+  max-width: 100%; max-height: 100%; outline: none;
+}
+#display img {
+  max-width: 100%; max-height: 100%; display: none;
+}
+#display.kvm-mouse video, #display.kvm-mouse img { cursor: crosshair; }
+
+/* Fullscreen */
+:fullscreen #toolbar { display: none; }
+:fullscreen #display { top: 0; }
+
+/* Bitrate slider */
+#bitrate-panel {
+  display: none; position: absolute; top: 36px; right: 0; z-index: 20;
+  background: #16213e; border: 1px solid #0f3460; padding: 10px; width: 200px;
+}
+#bitrate-panel.open { display: block; }
+#bitrate-panel input { width: 100%; }
+#bitrate-panel .label { font-size: 11px; color: #888; text-align: center; margin-top: 4px; }
+
+/* Audio unmute banner */
+#audio-banner {
+  display: none; position: absolute; top: 40px; left: 50%; transform: translateX(-50%);
+  background: rgba(233,69,96,0.9); color: #fff; padding: 6px 16px; border-radius: 4px;
+  font-size: 12px; cursor: pointer; z-index: 15;
+}
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <span class="title">OZMA</span>
+  <span class="vmname" id="vmname">VM</span>
+  <span class="sep"></span>
+  <button id="btn-kbd" class="active" title="Keyboard capture">Keyboard</button>
+  <button id="btn-mouse" title="Mouse capture">Mouse</button>
+  <span class="sep"></span>
+  <button id="btn-audio" title="Unmute audio">Audio</button>
+  <button id="btn-bitrate" title="Bitrate control">Bitrate</button>
+  <button id="btn-fullscreen" title="Fullscreen">Fullscreen</button>
+  <span class="sep"></span>
+  <button id="btn-screenshot" title="Save screenshot">Screenshot</button>
+  <button id="btn-ctrlaltdel" title="Send Ctrl+Alt+Del">Ctrl+Alt+Del</button>
+  <span class="status" id="status">connecting...</span>
+</div>
+
+<div id="display">
+  <video id="screen-video" autoplay playsinline muted></video>
+  <img id="screen-img" />
+</div>
+
+<div id="bitrate-panel">
+  <input type="range" id="bitrate-slider" min="0" max="50000" step="500" value="0">
+  <div class="label" id="bitrate-label">Auto</div>
+</div>
+
+<div id="audio-banner" onclick="unmute()">Click to enable audio</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+// Parse URL params: ?vmid=100&host=192.168.x.x&port=7490
+const params = new URLSearchParams(location.search);
+const VMID = params.get('vmid') || '100';
+const HOST = params.get('host') || location.hostname;
+const API_PORT = parseInt(params.get('port') || (7390 + parseInt(VMID)));
+const VMNAME = params.get('name') || `VM ${VMID}`;
+
+// If accessed via /ozma/console/ (reverse proxy), use relative /ozma/ paths
+// If accessed directly on the display service port, use root /
+const isProxied = location.pathname.startsWith('/ozma/');
+const BASE = params.get('base') || (isProxied ? '/ozma' : '');
+const INPUT_BASE = BASE;
+
+$('vmname').textContent = `${VMNAME} (${VMID})`;
+document.title = `Ozma Console — ${VMNAME}`;
+
+// ── State ───────────────────────────────────────────────
+let kbdActive = true, mouseActive = false;
+let pc = null;
+const heldKeys = new Set();
+
+// ── Keycode mapping (evdev scancodes) ───────────────────
+const KEYMAP = {
+  Escape:1, Digit1:2, Digit2:3, Digit3:4, Digit4:5, Digit5:6, Digit6:7,
+  Digit7:8, Digit8:9, Digit9:10, Digit0:11, Minus:12, Equal:13, Backspace:14,
+  Tab:15, KeyQ:16, KeyW:17, KeyE:18, KeyR:19, KeyT:20, KeyY:21, KeyU:22,
+  KeyI:23, KeyO:24, KeyP:25, BracketLeft:26, BracketRight:27, Enter:28,
+  ControlLeft:29, KeyA:30, KeyS:31, KeyD:32, KeyF:33, KeyG:34, KeyH:35,
+  KeyJ:36, KeyK:37, KeyL:38, Semicolon:39, Quote:40, Backquote:41,
+  ShiftLeft:42, Backslash:43, KeyZ:44, KeyX:45, KeyC:46, KeyV:47, KeyB:48,
+  KeyN:49, KeyM:50, Comma:51, Period:52, Slash:53, ShiftRight:54,
+  NumpadMultiply:55, AltLeft:56, Space:57, CapsLock:58,
+  F1:59, F2:60, F3:61, F4:62, F5:63, F6:64, F7:65, F8:66, F9:67, F10:68,
+  NumLock:69, ScrollLock:70,
+  Numpad7:71, Numpad8:72, Numpad9:73, NumpadSubtract:74,
+  Numpad4:75, Numpad5:76, Numpad6:77, NumpadAdd:78,
+  Numpad1:79, Numpad2:80, Numpad3:81, Numpad0:82, NumpadDecimal:83,
+  F11:87, F12:88,
+  NumpadEnter:96, ControlRight:97, NumpadDivide:98, PrintScreen:99,
+  AltRight:100, Home:102, ArrowUp:103, PageUp:104, ArrowLeft:105,
+  ArrowRight:106, End:107, ArrowDown:108, PageDown:109,
+  Insert:110, Delete:111, MetaLeft:125, MetaRight:126,
+};
+
+// ── WebRTC ──────────────────────────────────────────────
+async function startWebRTC() {
+  try {
+    pc = new RTCPeerConnection({ iceServers: [] });
+
+    const tcvr = pc.addTransceiver('video', { direction: 'recvonly' });
+    pc.addTransceiver('audio', { direction: 'recvonly' });
+
+    // Prefer H.264
+    const codecs = RTCRtpReceiver.getCapabilities('video')?.codecs || [];
+    const h264 = codecs.filter(c => c.mimeType === 'video/H264');
+    const rest = codecs.filter(c => c.mimeType !== 'video/H264');
+    if (h264.length) tcvr.setCodecPreferences([...h264, ...rest]);
+
+    pc.ontrack = (ev) => {
+      const video = $('screen-video');
+      if (ev.streams?.[0]) {
+        video.srcObject = ev.streams[0];
+      } else {
+        video.srcObject = new MediaStream([ev.track]);
+      }
+      video.play().catch(() => {});
+      if (ev.track.kind === 'audio') {
+        $('audio-banner').style.display = 'block';
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected') {
+        $('status').textContent = 'WebRTC connected';
+        startStatsMonitor();
+      } else if (pc.connectionState === 'failed') {
+        $('status').textContent = 'WebRTC failed, falling back...';
+        startSnapshotFallback();
+      } else {
+        $('status').textContent = pc.connectionState;
+      }
+    };
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    // Wait for ICE gathering
+    await new Promise(resolve => {
+      if (pc.iceGatheringState === 'complete') return resolve();
+      pc.onicecandidate = e => { if (!e.candidate) resolve(); };
+      setTimeout(resolve, 2000);
+    });
+
+    const resp = await fetch(`${BASE}/webrtc/offer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'offer', sdp: pc.localDescription.sdp }),
+    });
+
+    if (!resp.ok) throw new Error(`Signaling ${resp.status}`);
+    const answer = await resp.json();
+    if (answer.error) throw new Error(answer.error);
+    await pc.setRemoteDescription(new RTCSessionDescription(answer));
+
+  } catch (err) {
+    console.warn('WebRTC failed:', err);
+    $('status').textContent = `WebRTC failed: ${err.message}`;
+    startSnapshotFallback();
+  }
+}
+
+function startStatsMonitor() {
+  setInterval(async () => {
+    if (!pc || pc.connectionState !== 'connected') return;
+    const stats = await pc.getStats();
+    stats.forEach(s => {
+      if (s.type === 'inbound-rtp' && s.kind === 'video') {
+        const kbps = Math.round((s.bytesReceived || 0) * 8 / 1000);
+        $('status').textContent = `${s.framesPerSecond || 0}fps ${(kbps / 1000).toFixed(1)}Mbps ${s.framesDecoded}f`;
+      }
+    });
+  }, 1000);
+}
+
+// ── Snapshot fallback ───────────────────────────────────
+let snapInterval = null;
+function startSnapshotFallback() {
+  $('screen-video').style.display = 'none';
+  const img = $('screen-img');
+  img.style.display = 'block';
+
+  function refresh() {
+    const next = new Image();
+    next.onload = () => { img.src = next.src; };
+    next.src = `${BASE}/display/snapshot?t=${Date.now()}`;
+  }
+  refresh();
+  snapInterval = setInterval(refresh, 200);
+  $('status').textContent = 'snapshot (5fps)';
+}
+
+// ── Keyboard ────────────────────────────────────────────
+function sendKey(keycode, down) {
+  fetch(`${INPUT_BASE}/input/key`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ keycode, down }),
+  }).catch(() => {});
+}
+
+function onKey(e) {
+  if (!kbdActive) return;
+  e.preventDefault();
+  e.stopPropagation();
+
+  const keycode = KEYMAP[e.code];
+  if (!keycode) return;
+
+  const down = e.type === 'keydown';
+  if (down) heldKeys.add(keycode); else heldKeys.delete(keycode);
+  sendKey(keycode, down);
+}
+
+function releaseAll() {
+  for (const k of heldKeys) sendKey(k, false);
+  heldKeys.clear();
+}
+
+document.addEventListener('keydown', onKey, true);
+document.addEventListener('keyup', onKey, true);
+window.addEventListener('blur', releaseAll);
+document.addEventListener('visibilitychange', () => { if (document.hidden) releaseAll(); });
+
+// ── Mouse ───────────────────────────────────────────────
+function onMouse(e) {
+  if (!mouseActive) return;
+  e.preventDefault();
+
+  const el = $('screen-video').style.display !== 'none' ? $('screen-video') : $('screen-img');
+  const rect = el.getBoundingClientRect();
+  const w = el.videoWidth || el.naturalWidth || 640;
+  const h = el.videoHeight || el.naturalHeight || 480;
+  const sx = w / rect.width;
+  const sy = h / rect.height;
+  const px = Math.round((e.clientX - rect.left) * sx);
+  const py = Math.round((e.clientY - rect.top) * sy);
+  const ax = Math.round(px * 32767 / w);
+  const ay = Math.round(py * 32767 / h);
+
+  let action = 'move', button = 0;
+  if (e.type === 'mousedown') { action = 'press'; button = e.button === 0 ? 1 : e.button === 2 ? 2 : 4; }
+  if (e.type === 'mouseup') { action = 'release'; button = e.button === 0 ? 1 : e.button === 2 ? 2 : 4; }
+
+  fetch(`${INPUT_BASE}/input/mouse`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ x: ax, y: ay, action, button }),
+  }).catch(() => {});
+}
+
+const display = $('display');
+display.addEventListener('mousemove', onMouse);
+display.addEventListener('mousedown', onMouse);
+display.addEventListener('mouseup', onMouse);
+display.addEventListener('contextmenu', e => { if (mouseActive) e.preventDefault(); });
+
+// ── Toolbar ─────────────────────────────────────────────
+$('btn-kbd').addEventListener('click', () => {
+  kbdActive = !kbdActive;
+  $('btn-kbd').classList.toggle('active', kbdActive);
+  if (!kbdActive) releaseAll();
+});
+
+$('btn-mouse').addEventListener('click', () => {
+  mouseActive = !mouseActive;
+  $('btn-mouse').classList.toggle('active', mouseActive);
+  display.classList.toggle('kvm-mouse', mouseActive);
+});
+
+$('btn-fullscreen').addEventListener('click', () => {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen();
+});
+
+$('btn-screenshot').addEventListener('click', () => {
+  const video = $('screen-video');
+  if (video.videoWidth) {
+    const c = document.createElement('canvas');
+    c.width = video.videoWidth; c.height = video.videoHeight;
+    c.getContext('2d').drawImage(video, 0, 0);
+    const a = document.createElement('a');
+    a.href = c.toDataURL('image/png');
+    a.download = `ozma-${VMID}-${Date.now()}.png`;
+    a.click();
+  } else {
+    window.open(`${BASE}/display/snapshot`, '_blank');
+  }
+});
+
+$('btn-ctrlaltdel').addEventListener('click', () => {
+  [29, 56, 111].forEach(k => sendKey(k, true));
+  setTimeout(() => [111, 56, 29].forEach(k => sendKey(k, false)), 100);
+});
+
+function unmute() {
+  $('screen-video').muted = false;
+  $('audio-banner').style.display = 'none';
+}
+$('btn-audio').addEventListener('click', unmute);
+
+// ── Bitrate ─────────────────────────────────────────────
+$('btn-bitrate').addEventListener('click', () => {
+  $('bitrate-panel').classList.toggle('open');
+});
+
+$('bitrate-slider').addEventListener('input', (e) => {
+  const v = parseInt(e.target.value);
+  $('bitrate-label').textContent = v === 0 ? 'Auto' : v >= 1000 ? `${(v/1000).toFixed(1)} Mbps` : `${v} kbps`;
+  fetch(`${INPUT_BASE}/webrtc/bitrate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ bitrate: v * 1000, auto: v === 0 }),
+  }).catch(() => {});
+});
+
+// ── Start ───────────────────────────────────────────────
+startWebRTC();
+</script>
+</body>
+</html>

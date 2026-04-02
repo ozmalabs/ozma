@@ -260,6 +260,78 @@ class OzmaConnect:
         })
         return result
 
+    # ── Subdomain & certificate management ─────────────────────────────────
+
+    async def claim_subdomain(self, username: str) -> str | None:
+        """Claim a Connect subdomain for the user (e.g. alice → alice.c.ozma.dev).
+
+        Returns the full domain on success, None on failure.
+        """
+        if not self._authenticated:
+            return None
+        result = await self._api_post("/domains/claim", {"username": username})
+        if result and result.get("domain"):
+            log.info("Claimed Connect subdomain: %s", result["domain"])
+            return result["domain"]
+        return None
+
+    async def request_dns_challenge(self, subdomain: str,
+                                     challenge_token: str,
+                                     challenge_value: str) -> bool:
+        """Ask Connect to set a DNS-01 challenge TXT record.
+
+        Connect controls the ozma.dev DNS zone and sets::
+
+            _acme-challenge.{subdomain}.c.ozma.dev  TXT  {challenge_value}
+
+        The controller then completes the ACME exchange with Let's Encrypt
+        directly.  The TLS private key never leaves the controller.
+        """
+        if not self._authenticated:
+            return False
+        result = await self._api_post("/domains/dns-challenge", {
+            "subdomain": subdomain,
+            "token": challenge_token,
+            "value": challenge_value,
+        })
+        return bool(result and result.get("ok"))
+
+    async def provision_external_subdomain(self, subdomain: str,
+                                            username: str) -> str | None:
+        """Provision an external subdomain (e.g. jellyfin.alice.e.ozma.dev).
+
+        Returns the full external domain on success, None on failure.
+        """
+        if not self._authenticated:
+            return None
+        result = await self._api_post("/domains/external", {
+            "subdomain": subdomain,
+            "username": username,
+        })
+        if result and result.get("domain"):
+            log.info("Provisioned external subdomain: %s", result["domain"])
+            return result["domain"]
+        return None
+
+    # ── Sharing grant sync ─────────────────────────────────────────────────
+
+    async def sync_grants(self, grants: list[dict]) -> list[dict]:
+        """Push local share grants to Connect, receive remote grants.
+
+        Returns a list of grants from other users sharing with us.
+        """
+        if not self._authenticated:
+            return []
+        result = await self._api_post("/shares/sync", {"grants": grants})
+        return result.get("remote_grants", []) if result else []
+
+    async def get_grant_token(self, grant_id: str) -> str | None:
+        """Get a Connect-signed JWT for a share grant (used in relay auth)."""
+        if not self._authenticated:
+            return None
+        result = await self._api_get(f"/shares/{grant_id}/token")
+        return result.get("token") if result else None
+
     # ── API helpers ─────────────────────────────────────────────────────────
 
     async def _api_get(self, path: str, token: str = "") -> dict | None:
@@ -325,7 +397,9 @@ class OzmaConnect:
             "valid_until": self._cache_valid_until,
         }
         try:
+            import os
             CACHE_PATH.write_text(json.dumps(data, indent=2))
+            os.chmod(CACHE_PATH, 0o600)
         except Exception:
             pass
 

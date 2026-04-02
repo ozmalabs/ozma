@@ -17,7 +17,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - run: pip install build
+      - uses: astral-sh/setup-uv@v4
+      - run: uv pip install --system build
       - name: Build wheel
         run: python -m build ${{ matrix.package }}/ --outdir dist/
       - uses: actions/upload-artifact@v4
@@ -53,7 +54,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - run: pip install pyinstaller aiohttp zeroconf Pillow pystray pynacl
+      - uses: astral-sh/setup-uv@v4
+      - run: uv pip install --system pyinstaller aiohttp zeroconf Pillow pystray pynacl
       - name: Build exe
         run: |
           cd agent

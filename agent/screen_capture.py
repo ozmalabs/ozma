@@ -171,7 +171,7 @@ class ScreenCaptureBackend:
         fullscreen D3D games, 240fps capable. Outputs frames which we
         pipe to ffmpeg for HLS encoding.
 
-        Requires: pip install dxcam
+        Requires: uv pip install dxcam
         """
         try:
             import dxcam  # noqa: F401

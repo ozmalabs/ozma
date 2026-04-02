@@ -128,10 +128,9 @@ sed -i 's/^#\(.*community\)/\1/' /etc/apk/repositories
 
 # Install dependencies
 apk update
-apk add python3 py3-pip avahi avahi-tools
-
-# Install Python deps
-pip3 install --break-system-packages aiohttp zeroconf
+apk add python3 avahi avahi-tools
+pip3 install uv
+uv pip install --system --break-system-packages aiohttp zeroconf
 
 # Enable services
 rc-update add avahi-daemon default

@@ -137,3 +137,96 @@ A **scenario** binds a name, colour, and node together. Switching scenarios chan
 ```
 
 Scenarios are stored in `controller/scenarios.json` and managed via the REST API.
+
+---
+
+## Users and Zones
+
+**Users** are the identity layer above Controllers. Each user owns a **zone** — a collection of controllers, nodes, and registered services.
+
+```
+User (alice)
+  └── Zone ("Alice's Home")
+       ├── Controller (home office)
+       │    ├── Node A → Workstation PC
+       │    └── Node B → Gaming PC
+       └── Controller (study)
+            └── Node C → Laptop dock
+```
+
+- One user can own multiple controllers (home, office, holiday house).
+- Multiple users can link controllers into a **local mesh** (housemates on the same LAN).
+- Each user has explicit ownership of their devices — "share everything" is a policy preset, not a special case.
+
+Users are managed via `controller/users.json` and the REST API (`/api/v1/users`).
+
+---
+
+## Service Proxy
+
+The Controller acts as a **reverse proxy** for internal services (Jellyfin, Gitea, Immich, etc.). Services are registered with a subdomain and the proxy routes requests based on the `Host` header.
+
+```
+jellyfin.alice.c.ozma.dev
+    → DNS (Connect)
+    → Controller (port 443, wildcard cert)
+    → Reverse proxy to 192.168.1.50:8096
+```
+
+- **Connect subdomain**: each user gets `*.username.c.ozma.dev` with a wildcard Let's Encrypt certificate.
+- **DNS-01 challenge**: coordinated via Connect (it controls the `ozma.dev` DNS zone). The TLS private key never leaves the controller.
+- **Without Connect**: works as a plain HTTP proxy on the LAN using `*.localhost` matching.
+- **Health monitoring**: background checks every 30 seconds per service.
+
+Registered services are stored in `controller/services.json`.
+
+---
+
+## Identity Provider
+
+The Controller runs a built-in **OIDC-compatible identity provider** that centralises authentication for the entire household or organisation.
+
+- **Password login** for local users
+- **Social login** (Google, Apple, GitHub) via OAuth2
+- **Enterprise federation** with AD/Entra/LDAP
+- **Session management** via httponly cookies
+- **OIDC provider for LAN services** — Gitea, Nextcloud, etc. can point at `/.well-known/openid-configuration` for SSO
+
+The IdP gates: the dashboard, proxied services (via session cookie), cross-user sharing, and API access (OIDC tokens alongside existing Ed25519 JWTs).
+
+---
+
+## Sharing
+
+Users on linked controllers can share resources with explicit grants:
+
+```
+Alice shares her Jellyfin with Bob:
+  bobsjellyfin.alice.c.ozma.dev
+      → Alice's controller (authenticated via IdP)
+      → WireGuard tunnel (LAN) or Connect relay (internet)
+      → Bob's controller
+      → Bob's Jellyfin
+```
+
+- **Share grants** specify grantor, grantee, resource type (service, node, audio, display), permissions, and optional expiry.
+- **Local mesh**: controllers discover each other via mDNS (`_ozma-ctrl._tcp.local.`) and pair via the existing mesh CA.
+- **Connect relay**: same mechanism but tunnelled through the Connect relay infrastructure for cross-internet sharing.
+- Entry point is always the grantee's own domain — the tunnel chain is transparent.
+
+---
+
+## External Publishing
+
+Services can be published to the internet under `.e.` subdomains:
+
+| Domain pattern | Meaning |
+|---|---|
+| `jellyfin.alice.c.ozma.dev` | Internal — Connect mesh only |
+| `jellyfin.alice.e.ozma.dev` | External — internet-accessible |
+
+Two modes:
+- **Private**: authenticated via the user's IdP — access your own services from outside.
+- **Public**: open to anyone (requires admin confirmation). For blogs, public media servers, etc.
+
+External publishing requires Ozma Connect for DNS and relay infrastructure.

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import ipaddress
 import json
 import logging
@@ -65,6 +66,7 @@ class AuthContext:
     scopes: list[str]
     source_ip: str
     auth_method: str   # "jwt", "wireguard", "none"
+    user_id: str = ""  # UUID of the authenticated user (empty for legacy/wireguard)
 
 
 # ── Password hashing ──────────────────────────────────────────────────────
@@ -93,7 +95,7 @@ def verify_password(password: str, stored_hash: str) -> bool:
         salt = base64.b64decode(salt_b64)
         expected = base64.b64decode(dk_b64)
         dk = hashlib.pbkdf2_hmac(algo, password.encode(), salt, int(iterations_str))
-        return dk == expected
+        return hmac.compare_digest(dk, expected)
     return False
 
 

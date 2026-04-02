@@ -125,7 +125,7 @@ class AgentInstaller:
     async def _install_linux_via_ga(self) -> dict:
         """Install agent on Linux via guest-exec."""
         try:
-            # One-liner: pip install ozma-agent from PyPI (or controller URL)
+            # One-liner: uv pip install ozma-agent from PyPI (or controller URL)
             script = self._linux_bootstrap_script()
             self._ga_write_file("/tmp/ozma-install.sh", script)
             self._ga_exec("bash", ["/tmp/ozma-install.sh"], timeout=300)
@@ -217,12 +217,12 @@ if (-not $py) {{
     $env:PATH = "C:\\ozma-python;$env:PATH"
 }}
 
-# Install pip
+# Install uv
 python -m ensurepip 2>$null
-python -m pip install --upgrade pip 2>$null
+python -m pip install uv 2>$null
 
 # Install ozma-agent
-python -m pip install ozma-agent
+uv pip install --system ozma-agent
 
 # Run agent install
 ozma-agent install --controller "{self.controller_url}" --name "$env:COMPUTERNAME"
@@ -235,15 +235,16 @@ Write-Host "=== Done ==="
 set -e
 echo "=== Ozma Agent Install ==="
 
-# Install pip if needed
-command -v pip3 >/dev/null 2>&1 || {{
-    apt-get update -qq && apt-get install -y -qq python3-pip 2>/dev/null || \
-    dnf install -y python3-pip 2>/dev/null || \
-    pacman -Sy --noconfirm python-pip 2>/dev/null
+# Install uv if needed
+command -v uv >/dev/null 2>&1 || {{
+    pip3 install uv 2>/dev/null || \
+    apt-get update -qq && apt-get install -y -qq python3-pip 2>/dev/null && pip3 install uv || \
+    dnf install -y python3-pip 2>/dev/null && pip3 install uv || \
+    pacman -Sy --noconfirm python-pip 2>/dev/null && pip3 install uv
 }}
 
 # Install ozma-agent
-pip3 install ozma-agent
+uv pip install --system ozma-agent
 
 # Install as systemd service
 ozma-agent install --controller "{self.controller_url}" --name "$(hostname)"

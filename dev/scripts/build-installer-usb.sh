@@ -410,7 +410,7 @@ echo "https://dl-cdn.alpinelinux.org/alpine/v3.21/community" >> /tmp/apk-repos
 apk -X "https://dl-cdn.alpinelinux.org/alpine/v3.21/main" \
     -U --allow-untrusted --root "$ROOT_MNT" --initdb \
     add alpine-base linux-lts linux-firmware-none mkinitfs syslinux \
-    python3 py3-pip \
+    python3 \
     ffmpeg avahi avahi-tools \
     pipewire pipewire-pulse wireplumber \
     v4l-utils openssh openrc e2fsprogs \
@@ -424,14 +424,14 @@ cp -r "$OZMA_SRC/softnode" "$ROOT_MNT/opt/ozma/"
 
 # Install Python deps from cache or network
 if [[ -d "$OZMA_SRC/pip-cache" ]]; then
-    chroot "$ROOT_MNT" pip3 install --quiet --break-system-packages \
+    chroot "$ROOT_MNT" uv pip install --system --quiet --break-system-packages \
         --no-index --find-links=/opt/ozma-install/pip-cache \
         fastapi uvicorn zeroconf aiohttp asyncvnc numpy pillow mido pydantic websockets pynacl \
         2>/dev/null || true
     # Copy pip cache to installed system for offline use
     cp -r "$OZMA_SRC/pip-cache" "$ROOT_MNT/opt/ozma/pip-cache"
 else
-    chroot "$ROOT_MNT" pip3 install --quiet --break-system-packages \
+    chroot "$ROOT_MNT" uv pip install --system --quiet --break-system-packages \
         fastapi uvicorn zeroconf aiohttp asyncvnc numpy pillow mido pydantic websockets pynacl \
         2>/dev/null || true
 fi
@@ -523,7 +523,7 @@ cat > "$ROOT_MNT/etc/motd" << 'MOTD'
   ║  Dashboard: http://<this-ip>:7380                ║
   ║                                                  ║
   ║  Add machines:                                   ║
-  ║    pip install ozma-softnode                      ║
+  ║    uv pip install ozma-softnode                    ║
   ║    ozma-softnode --name my-desktop               ║
   ╚══════════════════════════════════════════════════╝
 

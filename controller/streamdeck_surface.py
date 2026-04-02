@@ -12,7 +12,7 @@ Supports all Stream Deck models:
   - Stream Deck XL (32 keys)
   - Stream Deck Pedal (3 foot switches, no display)
 
-Requires: pip install elgato-streamdeck pillow
+Requires: uv pip install elgato-streamdeck pillow
 """
 
 from __future__ import annotations

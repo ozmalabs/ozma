@@ -34,7 +34,7 @@ ssh_node sudo apt-get install -y -qq \
     v4l2loopback-dkms \
     usbip \
     ffmpeg \
-    python3-pip \
+    python3-venv \
     python3-dev \
     avahi-daemon \
     avahi-utils \
@@ -47,7 +47,7 @@ ssh_node sudo modprobe dummy_hcd 2>/dev/null || \
     echo "  dummy_hcd: will be available after kernel module install"
 
 echo "=== Python dependencies ==="
-ssh_node pip3 install --quiet \
+ssh_node uv pip install --quiet \
     asyncvnc \
     numpy \
     Pillow \

@@ -1,0 +1,8 @@
+# Ozma: allow uinput device creation
+KERNEL=="uinput", GROUP="input", MODE="0660"
+
+# Ozma: virtual evdev devices created by ozma-virtual-node via uinput.
+# Match by device name prefix. Set group to kvm so libvirt-qemu (which is
+# in the kvm group) can read them for QEMU input-linux.
+SUBSYSTEM=="input", ATTRS{name}=="ozma-kbd-*", GROUP="kvm", MODE="0660"
+SUBSYSTEM=="input", ATTRS{name}=="ozma-mouse-*", GROUP="kvm", MODE="0660"

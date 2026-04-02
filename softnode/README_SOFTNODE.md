@@ -7,7 +7,7 @@ Make any PC appear as an ozma node. No hardware required.
 ## Install
 
 ```bash
-pip install ozma-softnode
+uv pip install ozma-softnode
 ```
 
 ## Run

@@ -7,35 +7,38 @@ One process per hypervisor host. Auto-discovers all running VMs via
 libvirt or QMP socket scanning, creates a soft node per VM, and manages
 the lifecycle (VM starts → node appears, VM stops → node disappears).
 
-Zero software inside the VMs. HID injection via QMP. Display capture
-via VNC or SPICE. Audio via QEMU audio device.
+Every new VM automatically gets:
+  1. A SoftNode (evdev HID, VNC/D-Bus capture, power control)
+  2. Controller registration (mDNS + direct HTTP)
+  3. Agent provisioning attempt (qemu-ga → install ozma-agent inside the VM)
+
+Zero config required. Just run `ozma-virtual-node` and every VM on the
+host becomes an ozma node.
+
+HID injection via evdev (uinput → QEMU input-linux). Power control via
+libvirt API. QMP is not required.
 
 Deployment:
   Proxmox:  apt install ozma-virtual-node && systemctl enable ozma-virtual-node
-  libvirt:  pip install ozma-virtual-node && ozma-virtual-node
+  libvirt:  uv pip install ozma-virtual-node && ozma-virtual-node
   Manual:   ozma-virtual-node --qmp-dir /tmp/ --vnc-base 5900
 
-Supported hypervisors:
-  - Proxmox VE (libvirt + QMP, auto-detected)
-  - QEMU/KVM via libvirt
-  - QEMU/KVM via QMP sockets (no libvirt needed)
-  - Potentially VMware/Hyper-V in the future (different HID path)
-
 Usage:
-  ozma-virtual-node                          # auto-detect everything
+  ozma-virtual-node                          # auto-detect + auto-manage everything
   ozma-virtual-node --controller http://10.0.0.1:7380
-  ozma-virtual-node --qmp-dir /var/run/qemu-server/  # Proxmox QMP sockets
-  ozma-virtual-node --libvirt qemu:///system
+  ozma-virtual-node --exclude 'template-*,infra-*'
+  ozma-virtual-node --no-auto-agent          # softnodes only, no agent provisioning
+  ozma-virtual-node --no-auto-manage         # discover only, don't create nodes
 """
 
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import glob
 import json
 import logging
 import os
-import platform
 import signal
 import socket
 import sys
@@ -48,6 +51,7 @@ log = logging.getLogger("ozma.virtual_node")
 sys.path.insert(0, str(Path(__file__).parent))
 
 from soft_node import SoftNode
+from libvirt_power import LibvirtPower
 
 
 # ── VM display output ──────────────────────────────────────────────────────
@@ -83,7 +87,9 @@ class VMInfo:
     """Discovered VM metadata."""
     def __init__(self, name: str, vm_id: str = "", qmp_path: str = "",
                  vnc_port: int = 0, vnc_host: str = "127.0.0.1",
-                 state: str = "running", pid: int = 0) -> None:
+                 state: str = "running", pid: int = 0,
+                 has_guest_agent: bool = False,
+                 guest_os: str = "") -> None:
         self.name = name
         self.vm_id = vm_id or name
         self.qmp_path = qmp_path
@@ -91,10 +97,14 @@ class VMInfo:
         self.vnc_host = vnc_host
         self.state = state
         self.pid = pid
+        self.has_guest_agent = has_guest_agent
+        self.guest_os = guest_os  # "windows", "linux", "" (unknown)
         self.displays: list[VMDisplayOutput] = []
 
     def __repr__(self) -> str:
-        return f"VM({self.name}, qmp={self.qmp_path}, vnc=:{self.vnc_port}, displays={len(self.displays)})"
+        return (f"VM({self.name}, vnc=:{self.vnc_port}, "
+                f"guest_agent={'yes' if self.has_guest_agent else 'no'}, "
+                f"os={self.guest_os or '?'})")
 
 
 def discover_proxmox_vms() -> list[VMInfo]:
@@ -111,12 +121,17 @@ def discover_proxmox_vms() -> list[VMInfo]:
         conf_path = Path(f"/etc/pve/qemu-server/{vmid}.conf")
         name = vmid
         vnc_port = 0
+        guest_os = ""
         if conf_path.exists():
             for line in conf_path.read_text().splitlines():
                 if line.startswith("name:"):
                     name = line.split(":", 1)[1].strip()
-                # Proxmox VNC port = 5900 + display number
-                # Display number is typically VMID for Proxmox
+                if line.startswith("ostype:"):
+                    ostype = line.split(":", 1)[1].strip()
+                    if ostype.startswith("win"):
+                        guest_os = "windows"
+                    elif ostype.startswith("l"):
+                        guest_os = "linux"
                 if line.startswith("args:") and "-vnc" in line:
                     pass  # complex parsing, fall back to default
             vnc_port = 5900 + int(vmid) if vmid.isdigit() else 0
@@ -126,6 +141,8 @@ def discover_proxmox_vms() -> list[VMInfo]:
             qmp_path=str(qmp_sock),
             vnc_port=vnc_port,
             state="running",
+            has_guest_agent=True,  # Proxmox always installs qemu-ga
+            guest_os=guest_os,
         ))
 
     log.info("Proxmox: discovered %d VMs", len(vms))
@@ -147,17 +164,18 @@ def discover_libvirt_vms() -> list[VMInfo]:
             name = domain.name()
             vm_id = str(domain.ID())
 
-            # Find QMP socket
             xml = domain.XMLDesc()
             qmp_path = ""
             vnc_port = 0
+            has_guest_agent = False
+            guest_os = ""
 
-            # Parse QMP path from domain XML
             import xml.etree.ElementTree as ET
             root = ET.fromstring(xml)
 
-            # QMP socket
-            for qmp in root.findall(".//qemu:commandline/qemu:arg", {"qemu": "http://libvirt.org/schemas/domain/qemu/1.0"}):
+            # QMP socket from qemu:commandline
+            for qmp in root.findall(".//qemu:commandline/qemu:arg",
+                                    {"qemu": "http://libvirt.org/schemas/domain/qemu/1.0"}):
                 val = qmp.get("value", "")
                 if val.startswith("unix:") and "qmp" in val.lower():
                     qmp_path = val.split("unix:")[1].split(",")[0]
@@ -179,11 +197,28 @@ def discover_libvirt_vms() -> list[VMInfo]:
                 if port and port != "-1":
                     vnc_port = int(port)
 
+            # Guest agent channel
+            for channel in root.findall(".//channel"):
+                target = channel.find("target")
+                if target is not None and target.get("name") == "org.qemu.guest_agent.0":
+                    has_guest_agent = True
+
+            # Guest OS detection from osinfo
+            os_elem = root.find(".//os/type")
+            for meta in root.findall(".//{http://libosinfo.org/xmlns/libvirt/domain/1.0}os"):
+                os_id = meta.get("id", "")
+                if "win" in os_id.lower():
+                    guest_os = "windows"
+                elif any(x in os_id.lower() for x in ("linux", "ubuntu", "fedora", "debian", "rhel")):
+                    guest_os = "linux"
+
             vms.append(VMInfo(
                 name=name, vm_id=vm_id,
                 qmp_path=qmp_path,
                 vnc_port=vnc_port,
                 state="running",
+                has_guest_agent=has_guest_agent,
+                guest_os=guest_os,
             ))
 
         conn.close()
@@ -200,9 +235,16 @@ def discover_qmp_sockets(qmp_dir: str = "/tmp") -> list[VMInfo]:
     """Discover VMs by scanning for QMP sockets in a directory."""
     vms = []
     for sock_path in sorted(glob.glob(f"{qmp_dir}/*qmp*") + glob.glob(f"{qmp_dir}/*.monitor")):
-        if not os.path.exists(sock_path):
+        # Only actual Unix sockets, not regular files
+        import stat
+        try:
+            if not stat.S_ISSOCK(os.stat(sock_path).st_mode):
+                continue
+        except OSError:
             continue
-        # Try to determine VM name from socket filename
+        # Skip ozma's own sockets and stream directories
+        if "/run/ozma/" in sock_path or "ozma-mon" in sock_path or "ozma-stream" in sock_path:
+            continue
         name = Path(sock_path).stem.replace("ozma-", "").replace(".qmp", "").replace(".monitor", "")
         vms.append(VMInfo(
             name=name, vm_id=name,
@@ -213,24 +255,206 @@ def discover_qmp_sockets(qmp_dir: str = "/tmp") -> list[VMInfo]:
     return vms
 
 
+# ── Agent provisioning ─────────────────────────────────────────────────────
+
+class AgentProvisioner:
+    """
+    Attempts to install and start the ozma agent inside a VM.
+
+    Strategy (tried in order):
+      1. qemu-ga: run commands via QEMU guest agent channel
+      2. SSH: if we can reach the VM's IP (libvirt network)
+      3. Virtual USB: present agent installer as a USB drive
+
+    The agent is a single-binary install:
+      - Windows: ozma-agent.exe (--install registers as a service)
+      - Linux:   uv pip install ozma-agent && systemctl enable ozma-agent
+    """
+
+    def __init__(self, controller_url: str = "") -> None:
+        self._controller_url = controller_url
+
+    async def provision(self, vm: VMInfo) -> bool:
+        """Try to provision the agent inside a VM. Returns True if successful."""
+        # Check if agent is already responding
+        if await self._agent_alive(vm):
+            log.info("Agent already running in %s", vm.name)
+            return True
+
+        if vm.has_guest_agent:
+            ok = await self._provision_via_guest_agent(vm)
+            if ok:
+                return True
+
+        log.debug("Agent provisioning not available for %s (no guest agent channel)", vm.name)
+        return False
+
+    async def _agent_alive(self, vm: VMInfo) -> bool:
+        """Check if the ozma agent is already responding inside the VM."""
+        # The agent listens on port 7382 inside the VM. If we can reach
+        # the VM's IP (via libvirt bridge or direct network), check it.
+        # For now, check via guest-agent ping.
+        if not vm.has_guest_agent:
+            return False
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "virsh", "qemu-agent-command", vm.name,
+                '{"execute":"guest-ping"}',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+            if proc.returncode == 0:
+                # Guest agent is alive — check if ozma agent process exists
+                return await self._check_agent_process(vm)
+        except (asyncio.TimeoutError, Exception):
+            pass
+        return False
+
+    async def _check_agent_process(self, vm: VMInfo) -> bool:
+        """Check if ozma-agent is running inside the VM via guest-exec."""
+        try:
+            if vm.guest_os == "windows":
+                cmd = '{"execute":"guest-exec","arguments":{"path":"tasklist","arg":["/FI","IMAGENAME eq ozma-agent.exe"],"capture-output":true}}'
+            else:
+                cmd = '{"execute":"guest-exec","arguments":{"path":"pgrep","arg":["-f","ozma"],"capture-output":true}}'
+
+            proc = await asyncio.create_subprocess_exec(
+                "virsh", "qemu-agent-command", vm.name, cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+            if proc.returncode == 0:
+                result = json.loads(stdout.decode())
+                pid = result.get("return", {}).get("pid", 0)
+                if pid:
+                    # Wait for the command to complete and check output
+                    await asyncio.sleep(1)
+                    status_cmd = f'{{"execute":"guest-exec-status","arguments":{{"pid":{pid}}}}}'
+                    proc2 = await asyncio.create_subprocess_exec(
+                        "virsh", "qemu-agent-command", vm.name, status_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    stdout2, _ = await asyncio.wait_for(proc2.communicate(), timeout=5)
+                    if proc2.returncode == 0:
+                        status = json.loads(stdout2.decode())
+                        exitcode = status.get("return", {}).get("exitcode", -1)
+                        return exitcode == 0
+        except (asyncio.TimeoutError, Exception) as e:
+            log.debug("Agent process check failed for %s: %s", vm.name, e)
+        return False
+
+    async def _provision_via_guest_agent(self, vm: VMInfo) -> bool:
+        """Install and start the ozma agent via QEMU guest agent."""
+        log.info("Provisioning agent in %s via guest agent...", vm.name)
+
+        controller = self._controller_url or "http://10.200.0.1:7380"
+
+        if vm.guest_os == "windows":
+            return await self._provision_windows(vm, controller)
+        elif vm.guest_os == "linux":
+            return await self._provision_linux(vm, controller)
+        else:
+            # Try Linux first (more common for VMs), fall back to Windows
+            if await self._provision_linux(vm, controller):
+                return True
+            return await self._provision_windows(vm, controller)
+
+    async def _provision_linux(self, vm: VMInfo, controller: str) -> bool:
+        """Install ozma-agent on a Linux VM."""
+        install_cmd = (
+            "uv pip install ozma-agent 2>/dev/null || pip3 install ozma-agent 2>/dev/null; "
+            f"ozma-agent --controller {controller} --daemon"
+        )
+        return await self._guest_exec(vm, "/bin/sh", ["-c", install_cmd])
+
+    async def _provision_windows(self, vm: VMInfo, controller: str) -> bool:
+        """Start ozma-agent on a Windows VM (assumes pre-installed)."""
+        # Try to start the service if it exists, or run the exe directly
+        start_cmd = (
+            f'net start ozma-agent 2>nul || '
+            f'start /B C:\\ozma-agent\\ozma-agent.exe --controller {controller}'
+        )
+        return await self._guest_exec(vm, "cmd.exe", ["/C", start_cmd])
+
+    async def _guest_exec(self, vm: VMInfo, path: str, args: list[str]) -> bool:
+        """Run a command inside the VM via qemu-ga."""
+        try:
+            cmd_json = json.dumps({
+                "execute": "guest-exec",
+                "arguments": {
+                    "path": path,
+                    "arg": args,
+                    "capture-output": True,
+                },
+            })
+            proc = await asyncio.create_subprocess_exec(
+                "virsh", "qemu-agent-command", vm.name, cmd_json,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+            if proc.returncode == 0:
+                log.info("Agent provisioning command sent to %s", vm.name)
+                return True
+            log.debug("guest-exec failed for %s: %s", vm.name, stderr.decode().strip())
+        except asyncio.TimeoutError:
+            log.debug("guest-exec timed out for %s", vm.name)
+        except Exception as e:
+            log.debug("guest-exec error for %s: %s", vm.name, e)
+        return False
+
+
+# ── Managed VM state ───────────────────────────────────────────────────────
+
+class ManagedVM:
+    """Tracks state for a VM being managed by the virtual node manager."""
+
+    def __init__(self, vm: VMInfo, node: SoftNode, power: LibvirtPower | None = None) -> None:
+        self.vm = vm
+        self.node = node
+        self.power = power
+        self.task: asyncio.Task | None = None
+        self.agent_provisioned = False
+        self.agent_check_failures = 0
+        self.evdev_attached = False
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.vm.name,
+            "port": self.node._port,
+            "guest_os": self.vm.guest_os,
+            "has_guest_agent": self.vm.has_guest_agent,
+            "agent_provisioned": self.agent_provisioned,
+            "evdev_attached": self.evdev_attached,
+        }
+
+
 # ── Virtual Node Manager ────────────────────────────────────────────────────
 
 class VirtualNodeManager:
     """
-    Manages one soft node per VM on the hypervisor.
+    Manages one soft node + agent per VM on the hypervisor.
 
-    Auto-discovers VMs, creates SoftNode instances for each,
-    and watches for VMs starting/stopping.
+    Auto-discovers VMs, creates SoftNode instances, registers with the
+    controller, and provisions agents inside the VMs. All on by default.
     """
 
     def __init__(self, controller_url: str = "", qmp_dir: str = "",
-                 base_port: int = 7332, audio_sink_prefix: str = "ozma-") -> None:
+                 base_port: int = 7332, audio_sink_prefix: str = "ozma-",
+                 auto_manage: bool = True, auto_agent: bool = True,
+                 exclude_patterns: list[str] | None = None) -> None:
         self._controller_url = controller_url
         self._qmp_dir = qmp_dir
         self._base_port = base_port
         self._audio_prefix = audio_sink_prefix
-        self._nodes: dict[str, SoftNode] = {}
-        self._node_tasks: dict[str, asyncio.Task] = {}
+        self._auto_manage = auto_manage
+        self._auto_agent = auto_agent
+        self._exclude = exclude_patterns or []
+        self._managed: dict[str, ManagedVM] = {}
+        self._provisioner = AgentProvisioner(controller_url)
         self._stop_event = asyncio.Event()
         self._next_port = base_port
 
@@ -238,6 +462,10 @@ class VirtualNodeManager:
         """Discover VMs and start managing them."""
         log.info("Virtual Node Manager starting...")
         log.info("  Controller: %s", self._controller_url or "(auto-discover)")
+        log.info("  Auto-manage: %s", "on" if self._auto_manage else "off")
+        log.info("  Auto-agent:  %s", "on" if self._auto_agent else "off")
+        if self._exclude:
+            log.info("  Exclude:     %s", ", ".join(self._exclude))
 
         # Initial discovery
         await self._discover_and_sync()
@@ -245,23 +473,34 @@ class VirtualNodeManager:
         # Watch for changes
         asyncio.create_task(self._watch_loop(), name="vm-watcher")
 
+        # Agent provisioning loop (separate cadence)
+        if self._auto_agent:
+            asyncio.create_task(self._agent_loop(), name="agent-provisioner")
+
         # Wait for stop
         await self._stop_event.wait()
 
     async def stop(self) -> None:
         self._stop_event.set()
-        for name, task in self._node_tasks.items():
-            task.cancel()
+        for managed in self._managed.values():
+            if managed.task:
+                managed.task.cancel()
+
+    def _is_excluded(self, name: str) -> bool:
+        return any(fnmatch.fnmatch(name, pat) for pat in self._exclude)
 
     async def _discover_and_sync(self) -> None:
         """Discover VMs and start/stop nodes as needed."""
+        if not self._auto_manage:
+            return
+
         vms = self._discover_vms()
         current_names = {vm.name for vm in vms}
-        managed_names = set(self._nodes.keys())
+        managed_names = set(self._managed.keys())
 
         # Start nodes for new VMs
         for vm in vms:
-            if vm.name not in managed_names:
+            if vm.name not in managed_names and not self._is_excluded(vm.name):
                 await self._start_node(vm)
 
         # Stop nodes for VMs that no longer exist
@@ -270,8 +509,6 @@ class VirtualNodeManager:
 
     def _discover_vms(self) -> list[VMInfo]:
         """Run all discovery backends and merge results."""
-        vms: list[VMInfo] = []
-
         # Try Proxmox first (most specific)
         proxmox = discover_proxmox_vms()
         if proxmox:
@@ -286,34 +523,185 @@ class VirtualNodeManager:
         qmp_dir = self._qmp_dir or "/tmp"
         return discover_qmp_sockets(qmp_dir)
 
+    def _is_proxmox(self) -> bool:
+        """Detect if running on a Proxmox VE host."""
+        return Path("/var/run/qemu-server").exists()
+
+    async def _provision_vm(self, vm: VMInfo) -> str:
+        """Ensure the VM has an ozma QMP socket. Returns QMP socket path or ''."""
+        # On Proxmox, the Perl hook handles QEMU args (D-Bus display, KVMFR, audio).
+        # The QMP socket is the Proxmox-native one at /var/run/qemu-server/VMID.qmp.
+        # We don't modify the VM config — just use what Proxmox provides.
+        if self._is_proxmox():
+            qmp = vm.qmp_path
+            if qmp and os.path.exists(qmp):
+                log.info("Proxmox VM %s: using native QMP %s", vm.name, qmp)
+                return qmp
+            return ""
+
+        # Libvirt VMs: provision our own QMP socket + D-Bus display
+        qmp_dir = "/run/ozma/qmp"
+        os.makedirs(qmp_dir, mode=0o775, exist_ok=True)
+        qmp_sock = f"{qmp_dir}/{vm.name}.sock"
+
+        # Check if already provisioned and running
+        if os.path.exists(qmp_sock):
+            return qmp_sock
+
+        # Check if the VM XML already has ozma config
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "virsh", "dumpxml", "--inactive", vm.name,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await proc.communicate()
+            if b"ozma-mon" in stdout:
+                return qmp_sock  # already provisioned
+        except Exception:
+            return ""
+
+        # Add ozma QMP socket + D-Bus p2p display to the VM's config.
+        # - QMP socket: direct control channel (input, screendump)
+        # - D-Bus p2p: QEMU serves display, we connect via QMP add_client
+        #   No bus daemon needed — everything goes through the QMP socket.
+        log.info("Provisioning ozma integration for %s", vm.name)
+        try:
+            xml = stdout.decode()
+
+            # PipeWire audio sink name for this VM
+            pw_sink = f"ozma-{vm.name}"
+
+            # Request evdev devices from the evdev service
+            kbd_path = ""
+            mouse_path = ""
+            try:
+                from evdev_service import create_devices
+                result = await create_devices(vm.name)
+                kbd_path = result.get("kbd", "")
+                mouse_path = result.get("mouse", "")
+                if kbd_path:
+                    log.info("evdev devices for %s: kbd=%s mouse=%s", vm.name, kbd_path, mouse_path)
+            except Exception as e:
+                log.debug("evdev service not available: %s", e)
+
+            # Second QMP socket for D-Bus display setup (add_client + getfd)
+            qmp_display_sock = f"{qmp_dir}/{vm.name}-display.sock"
+
+            qemu_block = (
+                "  <qemu:commandline>\n"
+                # QMP control socket (input, screendump, power)
+                "    <qemu:arg value='-chardev'/>\n"
+                f"    <qemu:arg value='socket,id=ozma-mon,path={qmp_sock},server=on,wait=off'/>\n"
+                "    <qemu:arg value='-mon'/>\n"
+                "    <qemu:arg value='chardev=ozma-mon,mode=control'/>\n"
+                # QMP display socket (D-Bus add_client)
+                "    <qemu:arg value='-chardev'/>\n"
+                f"    <qemu:arg value='socket,id=ozma-display,path={qmp_display_sock},server=on,wait=off'/>\n"
+                "    <qemu:arg value='-mon'/>\n"
+                "    <qemu:arg value='chardev=ozma-display,mode=control'/>\n"
+                # D-Bus p2p display
+                "    <qemu:arg value='-display'/>\n"
+                "    <qemu:arg value='dbus,p2p=yes'/>\n"
+            )
+            # evdev input-linux (if evdev service provided devices)
+            if kbd_path and mouse_path:
+                qemu_block += (
+                    f"    <qemu:arg value='-object'/>\n"
+                    f"    <qemu:arg value='input-linux,id=ozma-kbd,evdev={kbd_path}'/>\n"
+                    f"    <qemu:arg value='-object'/>\n"
+                    f"    <qemu:arg value='input-linux,id=ozma-mouse,evdev={mouse_path},grab_all=on'/>\n"
+                )
+            # Environment for audio + display
+            qemu_block += (
+                "    <qemu:env name='PULSE_SERVER' value='unix:/run/user/1000/pulse/native'/>\n"
+                "    <qemu:env name='XDG_RUNTIME_DIR' value='/run/user/1000'/>\n"
+            )
+            qemu_block += "  </qemu:commandline>"
+
+            ns_decl = "xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'"
+            if ns_decl not in xml:
+                xml = xml.replace("type='kvm'", f"type='kvm' {ns_decl}", 1)
+            # Replace audio none with PulseAudio (PipeWire serves this)
+            # PulseAudio works better than native PipeWire for cross-user access
+            xml = xml.replace(
+                "<audio id='1' type='none'/>",
+                "<audio id='1' type='pulseaudio'/>"
+            )
+            xml = xml.replace("</domain>", f"{qemu_block}\n</domain>")
+
+            proc = await asyncio.create_subprocess_exec(
+                "virsh", "define", "/dev/stdin",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate(input=xml.encode())
+            if proc.returncode != 0:
+                log.warning("Failed to provision QMP for %s: %s", vm.name, stderr.decode().strip())
+                return ""
+
+            log.info("QMP socket provisioned for %s — restart VM to activate", vm.name)
+            # Restart the VM to pick up the new config
+            proc = await asyncio.create_subprocess_exec(
+                "virsh", "destroy", vm.name,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.communicate()
+            await asyncio.sleep(1)
+            proc = await asyncio.create_subprocess_exec(
+                "virsh", "start", vm.name,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.communicate()
+            if proc.returncode == 0:
+                log.info("VM %s restarted with QMP socket", vm.name)
+                await asyncio.sleep(3)  # let it boot
+                return sock_path
+            return ""
+        except Exception as e:
+            log.warning("QMP provisioning failed for %s: %s", vm.name, e)
+            return ""
+
     async def _start_node(self, vm: VMInfo) -> None:
         """Create and start a SoftNode for a VM."""
-        if not vm.qmp_path:
-            log.warning("VM %s has no QMP socket — skipping", vm.name)
-            return
-
         port = self._next_port
         self._next_port += 1
+
+        # Ensure VM has ozma QMP socket + D-Bus display
+        qmp_sock = await self._provision_vm(vm)
+
+
+        # Libvirt power backend (preferred over QMP)
+        power = LibvirtPower(vm.name)
+        await power.start()
+
+        # Use the ozma QMP socket for input/display, libvirt for power
+        qmp = qmp_sock if qmp_sock else (vm.qmp_path if not power.connected else "")
 
         node = SoftNode(
             name=vm.name,
             host="0.0.0.0",
             port=port,
-            qmp_path=vm.qmp_path,
+            qmp_path=qmp,
             vnc_host=vm.vnc_host,
             vnc_port=vm.vnc_port if vm.vnc_port else None,
             audio_sink=f"{self._audio_prefix}{vm.name}",
             api_port=7380 + port - self._base_port + 2,
+            power_backend=power,
         )
 
-        self._nodes[vm.name] = node
-        task = asyncio.create_task(
+        managed = ManagedVM(vm, node, power)
+        managed.task = asyncio.create_task(
             self._run_node(vm.name, node),
             name=f"vnode-{vm.name}",
         )
-        self._node_tasks[vm.name] = task
-        log.info("Started virtual node: %s (QMP=%s, port=%d, VNC=:%s)",
-                 vm.name, vm.qmp_path, port, vm.vnc_port or "none")
+        self._managed[vm.name] = managed
+        log.info("Auto-managed VM: %s (qmp=%s, port=%d, VNC=:%s, os=%s)",
+                 vm.name, "direct" if qmp_sock else "libvirt",
+                 port, vm.vnc_port or "none", vm.guest_os or "unknown")
 
     async def _run_node(self, name: str, node: SoftNode) -> None:
         """Run a soft node with restart on failure."""
@@ -328,12 +716,13 @@ class VirtualNodeManager:
 
     async def _stop_node(self, name: str) -> None:
         """Stop a soft node for a VM that went away."""
-        task = self._node_tasks.pop(name, None)
-        if task:
-            task.cancel()
-        node = self._nodes.pop(name, None)
-        if node:
-            await node.stop()
+        managed = self._managed.pop(name, None)
+        if managed:
+            if managed.task:
+                managed.task.cancel()
+            await managed.node.stop()
+            if managed.power:
+                await managed.power.close()
         log.info("Stopped virtual node: %s", name)
 
     async def _watch_loop(self) -> None:
@@ -345,13 +734,36 @@ class VirtualNodeManager:
             except Exception as e:
                 log.debug("VM watch error: %s", e)
 
+    async def _agent_loop(self) -> None:
+        """Periodically attempt agent provisioning for VMs that don't have it."""
+        # Wait for nodes to stabilise before first attempt
+        await asyncio.sleep(15)
+
+        while not self._stop_event.is_set():
+            for managed in list(self._managed.values()):
+                if managed.agent_provisioned:
+                    continue
+                if managed.agent_check_failures > 5:
+                    continue  # stop retrying after 5 failures
+                try:
+                    ok = await self._provisioner.provision(managed.vm)
+                    if ok:
+                        managed.agent_provisioned = True
+                        log.info("Agent provisioned in %s", managed.vm.name)
+                    else:
+                        managed.agent_check_failures += 1
+                except Exception as e:
+                    log.debug("Agent provisioning error for %s: %s", managed.vm.name, e)
+                    managed.agent_check_failures += 1
+
+            await asyncio.sleep(30)
+
     def status(self) -> dict:
         return {
-            "managed_vms": len(self._nodes),
-            "vms": [
-                {"name": name, "port": node._port}
-                for name, node in self._nodes.items()
-            ],
+            "auto_manage": self._auto_manage,
+            "auto_agent": self._auto_agent,
+            "managed_vms": len(self._managed),
+            "vms": [m.to_dict() for m in self._managed.values()],
         }
 
 
@@ -361,18 +773,28 @@ def main() -> None:
     import argparse
 
     p = argparse.ArgumentParser(
-        description="Ozma Virtual Node — manage all VMs on a hypervisor",
+        description="Ozma Virtual Node — auto-manage all VMs on a hypervisor",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Every running VM automatically gets a soft node (HID + capture + power)
+and an agent provisioning attempt. This is on by default.
+
 Examples:
-  ozma-virtual-node                                    # auto-detect everything
+  ozma-virtual-node                                    # auto-detect + manage everything
   ozma-virtual-node --controller http://10.0.0.1:7380  # explicit controller
-  ozma-virtual-node --qmp-dir /var/run/qemu-server/    # Proxmox
-  ozma-virtual-node --qmp-dir /tmp/                    # dev/test QEMU VMs
+  ozma-virtual-node --exclude 'template-*,infra-*'     # skip matching VMs
+  ozma-virtual-node --no-auto-agent                    # softnodes only, skip agent
+  ozma-virtual-node --no-auto-manage                   # discover only, don't manage
 """)
     p.add_argument("--controller", default="", help="Controller URL")
     p.add_argument("--qmp-dir", default="", help="Directory to scan for QMP sockets")
     p.add_argument("--base-port", type=int, default=7332, help="Starting UDP port")
+    p.add_argument("--exclude", default="",
+                   help="Comma-separated VM name patterns to exclude (e.g. 'template-*,infra-*')")
+    p.add_argument("--no-auto-manage", action="store_true",
+                   help="Don't auto-create nodes for discovered VMs")
+    p.add_argument("--no-auto-agent", action="store_true",
+                   help="Don't attempt agent provisioning inside VMs")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args()
 
@@ -382,10 +804,15 @@ Examples:
         datefmt="%H:%M:%S",
     )
 
+    exclude = [p.strip() for p in args.exclude.split(",") if p.strip()] if args.exclude else []
+
     mgr = VirtualNodeManager(
         controller_url=args.controller,
         qmp_dir=args.qmp_dir,
         base_port=args.base_port,
+        auto_manage=not args.no_auto_manage,
+        auto_agent=not args.no_auto_agent,
+        exclude_patterns=exclude,
     )
 
     loop = asyncio.new_event_loop()

@@ -26,10 +26,10 @@ Write-Host "Python: $pyVer"
 
 # Install build dependencies
 Write-Host "`nInstalling build dependencies..."
-python -m pip install --quiet pyinstaller aiohttp zeroconf numpy
+uv pip install --quiet pyinstaller aiohttp zeroconf numpy
 
 # Optional: dxcam for DXGI capture (may fail on non-Windows or CI)
-python -m pip install --quiet dxcam 2>$null
+uv pip install --quiet dxcam 2>$null
 
 # Build with PyInstaller
 Write-Host "`nBuilding with PyInstaller..."

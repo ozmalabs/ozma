@@ -13,11 +13,12 @@ Plugins can add:
   - Description packs (new sensor personality)
   - Wallpaper sources (new background providers)
   - Export targets (new monitoring integrations)
+  - Service filters (scoped proxy plugins for content sharing)
 
 Plugin structure (controller/plugins/{plugin_id}/):
   manifest.json     — metadata, capabilities, entry point
   plugin.py         — Python module loaded at startup
-  requirements.txt  — pip dependencies (optional)
+  requirements.txt  — Python dependencies (optional)
   static/           — web assets (optional)
   README.md         — documentation
 
@@ -81,6 +82,51 @@ class PluginManifest:
         }
 
 
+class ServiceFilter:
+    """Base class for service proxy filters.
+
+    Service filters sit in the proxy pipeline and provide scoped access
+    to backend services.  A Jellyfin filter, for example, maps an Ozma
+    share grant to a Jellyfin user with access to only the granted libraries.
+
+    Subclass this and register via ``ozma.register_service_filter()``.
+    """
+
+    service_type: str = ""  # "jellyfin", "immich", "gitea", etc.
+
+    async def filter_request(self, request: Any, service: Any,
+                             grant: Any | None = None) -> Any:
+        """Modify or reject a request before it reaches the backend.
+
+        Return the (possibly modified) request to continue proxying,
+        or return a ``Response`` to short-circuit.
+        """
+        return request
+
+    async def filter_response(self, response: Any, service: Any,
+                              grant: Any | None = None) -> Any:
+        """Modify a response before it reaches the client."""
+        return response
+
+    async def setup_backend_access(self, service: Any, grant: Any) -> dict:
+        """Create or configure a scoped user/token on the backend for this grant.
+
+        Called when a new share grant is created.  Returns metadata that
+        the filter stores (e.g. backend user ID, auth token).
+
+        Override in subclasses.
+        """
+        return {}
+
+    async def teardown_backend_access(self, service: Any, grant: Any,
+                                       metadata: dict) -> None:
+        """Remove the backend user/token when a grant is revoked.
+
+        Override in subclasses.
+        """
+        pass
+
+
 class PluginContext:
     """
     Context object passed to plugins during registration.
@@ -95,6 +141,7 @@ class PluginContext:
         self._overlay_sources: list[Any] = []
         self._screen_drivers: list[Any] = []
         self._export_targets: list[Any] = []
+        self._service_filters: dict[str, ServiceFilter] = {}  # service_type → filter
 
     def register_control_surface(self, surface: Any) -> None:
         self._control_surfaces.append(surface)
@@ -113,6 +160,15 @@ class PluginContext:
 
     def register_export_target(self, target: Any) -> None:
         self._export_targets.append(target)
+
+    def register_service_filter(self, filter: ServiceFilter) -> None:
+        """Register a scoped proxy filter for a service type."""
+        self._service_filters[filter.service_type] = filter
+        log.info("Registered service filter: %s", filter.service_type)
+
+    def get_service_filter(self, service_type: str) -> ServiceFilter | None:
+        """Look up a service filter by type."""
+        return self._service_filters.get(service_type)
 
 
 class PluginManager:

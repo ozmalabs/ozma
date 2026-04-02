@@ -167,10 +167,14 @@ class OmniParserProvider(VisionProvider):
         # Load Florence-2 for icon description (optional, enhances descriptions)
         try:
             from transformers import AutoModelForCausalLM, AutoProcessor
-            florence_path = self._model_dir / "icon_caption_florence"
+            florence_path = self._model_dir / "icon_caption"
+            if not florence_path.exists():
+                florence_path = self._model_dir / "icon_caption_florence"  # legacy
             if florence_path.exists():
+                # Processor from base model (has preprocessor_config.json),
+                # weights from OmniParser fine-tune
                 self._florence_processor = AutoProcessor.from_pretrained(
-                    str(florence_path), trust_remote_code=True
+                    "microsoft/Florence-2-base-ft", trust_remote_code=True
                 )
                 self._florence = AutoModelForCausalLM.from_pretrained(
                     str(florence_path), trust_remote_code=True
@@ -195,7 +199,7 @@ class OmniParserProvider(VisionProvider):
         snapshot_download(
             repo_id="microsoft/OmniParser-v2.0",
             local_dir=str(self._model_dir),
-            allow_patterns=["icon_detect/*", "icon_caption_florence/*"],
+            allow_patterns=["icon_detect/*", "icon_caption/*"],
         )
         log.info("OmniParser models downloaded to %s", self._model_dir)
 
@@ -427,7 +431,7 @@ class OllamaVisionProvider(VisionProvider):
 
     name = "ollama"
 
-    def __init__(self, model: str = "qwen2.5-vl:7b",
+    def __init__(self, model: str = "qwen2.5vl:7b",
                  host: str = "http://localhost:11434") -> None:
         self._model = model
         self._host = host

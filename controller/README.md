@@ -5,7 +5,7 @@ FastAPI daemon that manages the node inventory, routes HID input to the active n
 ## Running
 
 ```bash
-pip install -r requirements.txt
+uv pip install -r requirements.txt
 python -m uvicorn main:app --host 0.0.0.0 --port 7380 --reload
 ```
 

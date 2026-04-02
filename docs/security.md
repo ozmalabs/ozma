@@ -181,6 +181,116 @@ All control plane actions are recorded in a tamper-evident hashchained audit log
 
 ---
 
+## Multi-User Authentication
+
+### User Model
+
+Users are the identity layer above controllers. The controller supports multiple local user accounts with role-based access:
+
+| Role | Scopes | Description |
+|------|--------|-------------|
+| `owner` | read, write, admin | Full access — creates/deletes users, manages sharing, configures IdP |
+| `member` | read, write | Can use the system, register services, create shares |
+| `guest` | read | View-only access |
+
+User passwords are hashed with Argon2id (primary) or PBKDF2-SHA256 with 600k iterations (fallback). Password comparison uses constant-time `hmac.compare_digest()`.
+
+### Identity Provider (IdP)
+
+The controller can run a built-in OIDC-compatible identity provider:
+
+- **Password + social login** (Google, Apple, GitHub via OAuth2)
+- **Enterprise federation** with AD/Entra/LDAP
+- **Session cookies**: httponly, SameSite=lax, secure flag when HTTPS
+- **Per-user session caps**: max 50 sessions per user, 10k globally, with LRU eviction
+- **Open redirect protection**: `redirect_to` parameters validated as relative paths only
+- **XSS protection**: all user-controlled values HTML-escaped in rendered pages
+
+The IdP coexists with the existing device auth model:
+- Auth disabled (default): open API, no sessions
+- Auth enabled, IdP disabled: single-admin password + JWT
+- Auth enabled, IdP enabled: full multi-user with social login; password + JWT still works for API clients
+
+### JWT Token Model
+
+JWTs are signed with the controller's Ed25519 identity key. Multi-user tokens include the user UUID as the `sub` claim. Legacy tokens use `sub: "admin"` for backward compatibility.
+
+---
+
+## Service Proxy Security
+
+### SSRF Protection
+
+The service proxy validates target hosts against a blocklist of dangerous IP ranges:
+
+- `169.254.0.0/16` (link-local — cloud metadata endpoints)
+- `0.0.0.0/8`, `240.0.0.0/4`, `255.255.255.255/32` (reserved/broadcast)
+- `224.0.0.0/4` (multicast)
+- IPv6 loopback, link-local, ULA
+
+Private RFC1918 ranges (`10.x`, `172.16-31.x`, `192.168.x`) are allowed because those are legitimate LAN services.
+
+Subdomains are validated against a strict regex (`^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]?$`) and a reserved name blocklist (`api`, `auth`, `admin`, `www`, etc.).
+
+### Header Isolation
+
+The reverse proxy strips sensitive headers before forwarding to backend services:
+
+- `Authorization` (prevents JWT leakage to backends)
+- `Cookie` (prevents IdP session leakage)
+- Existing `X-Forwarded-*` headers (prevents spoofing)
+
+Only safe headers are forwarded. `X-Forwarded-For/Proto/Host` are set from trusted request properties.
+
+### TLS Certificate Management
+
+- Controller generates TLS private key locally — it **never** leaves the controller
+- Wildcard certificate (`*.user.c.ozma.dev`) obtained via DNS-01 challenge
+- Connect provides DNS-01 coordination (sets `_acme-challenge` TXT record)
+- Controller completes ACME exchange with Let's Encrypt directly
+- Certificate and key stored at `controller/certs/` (backed up via Connect's encrypted backup)
+
+---
+
+## Sharing Security
+
+### Access Control
+
+- **Grant creation**: only the authenticated user can be the grantor (enforced server-side; body `grantor_user_id` is ignored)
+- **Grant viewing**: restricted to the grantor, grantee, or admin
+- **Grant revocation**: restricted to the grantor or admin
+- **Expiry**: grants can have an expiry timestamp; expired grants are inactive
+
+### Cross-Controller Trust
+
+Controllers link via the existing mesh CA trust model (mutual Ed25519 certificate signing). Cross-user proxy requests carry the grant ID for verification on both sides.
+
+For Connect relay sharing, grant tokens are JWTs signed by Connect, binding grantor, grantee, and service ID. Both controllers validate the token before proxying.
+
+---
+
+## External Publishing Security
+
+- **Private mode** (default): requests authenticated via the user's IdP session
+- **Public mode**: requires `admin` scope + explicit `confirm_public: true` to activate. Dashboard displays a warning.
+- **Rate limiting**: configurable per-published service
+- **Domain allowlisting**: optional email domain restrictions for private-mode access
+
+---
+
+## File Security
+
+Sensitive files are written with restrictive permissions:
+
+| File | Contains | Permissions |
+|------|----------|-------------|
+| `users.json` | Argon2id password hashes | `0600` |
+| `connect_cache.json` | Connect JWT token | `0600` |
+| `certs/` | TLS private keys | `0600` |
+| `mesh_registry.json` | Mesh CA private key (encrypted) | `0600` |
+
+---
+
 ## OTA Firmware Signing
 
 Firmware images are signed with Ed25519. Nodes verify the signature before writing to the inactive partition. An image that fails verification is rejected.
@@ -228,3 +338,11 @@ If the node fails to check in with the Controller within 5 minutes of rebooting 
 | Relay server compromise | Relay sees only encrypted WireGuard packets; cannot decrypt or inject traffic |
 | Enrollment abuse | Rate-limited; requests require admin approval |
 | Token theft (web UI) | JWTs are short-lived (24h); WireGuard-sourced requests do not use tokens |
+| SSRF via service proxy | Target host validated against blocklist; cloud metadata ranges blocked |
+| Open redirect via login | redirect_to validated as relative path only; absolute URLs rejected |
+| XSS in login page | All user-controlled values HTML-escaped before rendering |
+| Password brute force | Argon2id slows attempts; per-user session caps limit session accumulation |
+| Cross-user impersonation | Grantor always set from auth context; body parameters ignored |
+| Shared service token leakage | Proxy strips Authorization/Cookie headers before forwarding to backends |
+| IdP session hijack | Cookies: httponly + SameSite=lax + secure (HTTPS); sessions expire after 24h |
+| Public service exposure | Requires admin scope + explicit confirmation; dashboard warning displayed |
