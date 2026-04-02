@@ -162,7 +162,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         "/auth/userinfo",
     }
 
-    _AUTH_EXEMPT_PREFIXES = ("/auth/login/", "/auth/callback/", "/console/")
+    _AUTH_EXEMPT_PREFIXES = ("/auth/login/", "/auth/callback/", "/console/", "/terminal/")
 
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
@@ -3373,6 +3373,124 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if not console_path.exists():
             raise HTTPException(status_code=404, detail="Console not found")
         return Response(content=console_path.read_text(), media_type="text/html")
+
+    # --- Terminal bridge (VGA OCR → xterm.js) ---
+
+    from terminal_bridge import TerminalBridgeManager
+    tb_mgr = TerminalBridgeManager(state, streams=streams)
+
+    @app.on_event("startup")
+    async def _start_tb_manager() -> None:
+        tb_mgr.start()
+
+    @app.get("/terminal/{node_id:path}")
+    async def terminal_page(node_id: str) -> Response:
+        """Serve the VGA-OCR terminal bridge page for a node (no video stream required)."""
+        p = Path(__file__).parent / "static" / "terminal.html"
+        if not p.exists():
+            raise HTTPException(status_code=404, detail="Terminal page not found")
+        return Response(content=p.read_text(), media_type="text/html")
+
+    @app.websocket("/api/v1/remote/{node_id}/terminal/ws")
+    async def terminal_bridge_ws(ws: WebSocket, node_id: str) -> None:
+        """
+        Bidirectional WebSocket for the VGA OCR terminal bridge.
+
+        Server → client: ANSI escape sequence bytes (write directly to xterm.js)
+                         OR JSON text frames for control messages (resize, error)
+        Client → server: JSON text frames {type: keydown/keyup/paste/key_sequence, ...}
+        """
+        if not await _ws_authenticate(ws):
+            await ws.close(code=4001, reason="Authentication required")
+            return
+
+        bridge = tb_mgr.get_or_create(node_id)
+        if not bridge:
+            await ws.accept()
+            await ws.close(code=4004, reason="Node not found")
+            return
+
+        await ws.accept()
+        session = await bridge.add_session(ws)
+
+        from remote_desktop import _KEY_TO_HID, _MOD_BITS as _RD_MOD_BITS
+
+        # Per-session modifier state (sticky mods across messages)
+        _modifiers = 0
+        _pressed_keys: list[int] = []
+
+        try:
+            while True:
+                data = await ws.receive_text()
+                msg = json.loads(data)
+                t = msg.get("type", "")
+
+                if t == "keydown":
+                    code = msg.get("code", "")
+                    if code in _RD_MOD_BITS:
+                        _modifiers |= _RD_MOD_BITS[code]
+                    else:
+                        hid = _KEY_TO_HID.get(code, 0)
+                        if hid and hid not in _pressed_keys:
+                            _pressed_keys.append(hid)
+                            if len(_pressed_keys) > 6:
+                                _pressed_keys.pop(0)
+                    _flush_kbd(bridge, _modifiers, _pressed_keys)
+
+                elif t == "keyup":
+                    code = msg.get("code", "")
+                    if code in _RD_MOD_BITS:
+                        _modifiers &= ~_RD_MOD_BITS[code]
+                    else:
+                        hid = _KEY_TO_HID.get(code, 0)
+                        if hid in _pressed_keys:
+                            _pressed_keys.remove(hid)
+                    _flush_kbd(bridge, _modifiers, _pressed_keys)
+
+                elif t == "paste":
+                    text = msg.get("text", "")[:10000]
+                    await _tb_paste(bridge, text)
+
+                elif t == "key_sequence":
+                    seq = msg.get("sequence", "")
+                    await _tb_key_sequence(bridge, seq)
+
+        except Exception:
+            pass
+        finally:
+            bridge.remove_session(session)
+
+    def _flush_kbd(bridge: Any, mods: int, pressed: list[int]) -> None:
+        """Send current keyboard state as HID report to the node."""
+        keys = (pressed + [0] * 6)[:6]
+        report = bytes([mods, 0] + keys)
+        bridge.send_hid(0x01, report)
+
+    async def _tb_paste(bridge: Any, text: str) -> None:
+        """Type text into the node via HID."""
+        from paste_typing import LAYOUTS
+        layout = LAYOUTS.get("us", {})
+        for char in text:
+            stroke = layout.get(char)
+            if not stroke:
+                continue
+            bridge.send_hid(0x01, bytes([stroke.modifier, 0, stroke.key, 0, 0, 0, 0, 0]))
+            await asyncio.sleep(0.02)
+            bridge.send_hid(0x01, bytes(8))
+            await asyncio.sleep(0.015)
+
+    async def _tb_key_sequence(bridge: Any, sequence: str) -> None:
+        """Send a predefined key sequence (Ctrl+Alt+Del etc.) to the node."""
+        from remote_desktop import RemoteDesktopSession
+        import socket as _socket
+        node_id_ = getattr(bridge, "node_id", "")
+        node = state.nodes.get(node_id_)
+        if not node:
+            return
+        # Reuse the sequence table from a temporary RemoteDesktopSession
+        tmp = RemoteDesktopSession(node_id_, node.host, node.port)
+        await tmp._on_key_sequence(sequence)
+        tmp._sock.close()
 
     @app.get("/api/v1/remote/{node_id}/screenshot")
     async def remote_screenshot(request: Request, node_id: str) -> Response:

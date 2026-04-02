@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ozma terminal</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css">
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #0d0d0d;
+  --toolbar: #161616;
+  --border: #2a2a2a;
+  --accent: #3b82f6;
+  --text: #e2e8f0;
+  --muted: #64748b;
+  --good: #22c55e;
+  --warn: #f59e0b;
+  --bad:  #ef4444;
+}
+
+html, body { width: 100%; height: 100%; background: var(--bg); color: var(--text);
+             font-family: system-ui, sans-serif; overflow: hidden; }
+
+/* ── Toolbar ── */
+#toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  background: var(--toolbar);
+  border-bottom: 1px solid var(--border);
+  height: 36px;
+  user-select: none;
+}
+
+#node-name { font-size: 13px; font-weight: 600; color: var(--text); margin-right: 4px; }
+.tb-sep { width: 1px; height: 20px; background: var(--border); margin: 0 4px; }
+
+.tb-btn {
+  display: flex; align-items: center; gap: 4px;
+  padding: 3px 8px; border-radius: 5px; cursor: pointer;
+  font-size: 12px; color: var(--muted); border: 1px solid transparent;
+  background: transparent; transition: background .15s, color .15s;
+}
+.tb-btn:hover { background: rgba(255,255,255,.07); color: var(--text); }
+.tb-btn.active { background: rgba(59,130,246,.15); color: var(--accent);
+                 border-color: rgba(59,130,246,.3); }
+
+/* Status badges */
+.badge {
+  display: inline-flex; align-items: center; padding: 2px 7px;
+  border-radius: 10px; font-size: 11px; font-weight: 500;
+}
+.badge.good  { background: rgba(34,197,94,.15);  color: var(--good); }
+.badge.warn  { background: rgba(245,158,11,.15); color: var(--warn); }
+.badge.bad   { background: rgba(239,68,68,.15);  color: var(--bad); }
+.badge.idle  { background: rgba(100,116,139,.12); color: var(--muted); }
+
+#stat-size { font-size: 11px; color: var(--muted); margin-left: 4px; }
+#stat-fps  { font-size: 11px; color: var(--muted); }
+#tb-right  { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+
+/* ── Terminal wrapper ── */
+#term-wrap {
+  width: 100%;
+  height: calc(100% - 36px);
+  padding: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-start;
+  background: #000;
+}
+
+#terminal {
+  width: 100%;
+  height: 100%;
+}
+
+/* Fullscreen hides toolbar */
+body.fullscreen #toolbar { display: none; }
+body.fullscreen #term-wrap { height: 100%; }
+
+/* ── Special keys overlay ── */
+#keys-overlay {
+  position: fixed;
+  bottom: 0; left: 0; right: 0;
+  display: flex;
+  gap: 4px;
+  padding: 6px 8px;
+  background: rgba(13,13,13,.92);
+  backdrop-filter: blur(8px);
+  border-top: 1px solid var(--border);
+  flex-wrap: wrap;
+  z-index: 100;
+  transform: translateY(100%);
+  transition: transform .2s ease;
+}
+#keys-overlay.show { transform: none; }
+
+.key-btn {
+  padding: 4px 10px;
+  border-radius: 5px;
+  background: var(--toolbar);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+  transition: background .1s;
+}
+.key-btn:hover  { background: rgba(255,255,255,.08); }
+.key-btn:active { background: rgba(59,130,246,.2); }
+.key-btn.sticky-on { background: rgba(59,130,246,.2); color: var(--accent);
+                     border-color: rgba(59,130,246,.4); }
+
+/* ── Toast ── */
+#toast {
+  position: fixed;
+  bottom: 60px; left: 50%; transform: translateX(-50%) translateY(20px);
+  background: rgba(30,30,30,.95); color: var(--text);
+  padding: 8px 16px; border-radius: 8px;
+  font-size: 13px; pointer-events: none; opacity: 0;
+  transition: opacity .25s, transform .25s;
+  z-index: 999;
+}
+#toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* ── Disconnected overlay ── */
+#conn-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.8);
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  z-index: 500;
+  gap: 14px;
+}
+#conn-overlay.hidden { display: none; }
+#conn-status { font-size: 15px; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<!-- Toolbar -->
+<div id="toolbar">
+  <span id="node-name">terminal</span>
+  <span id="stat-badge" class="badge idle">—</span>
+  <span id="stat-size"></span>
+  <div class="tb-sep"></div>
+  <button class="tb-btn" id="btn-keys"   onclick="toggleKeys()"   title="Special keys (K)">⌨ Keys</button>
+  <button class="tb-btn" id="btn-cad"    onclick="sendSeq('ctrl_alt_del')"  title="Ctrl+Alt+Del">⛔ C-A-D</button>
+  <button class="tb-btn" id="btn-f2"     onclick="sendF(2)"  title="F2 (BIOS entry)">F2</button>
+  <button class="tb-btn" id="btn-f10"    onclick="sendF(10)" title="F10">F10</button>
+  <button class="tb-btn" id="btn-f12"    onclick="sendF(12)" title="F12 (boot menu)">F12</button>
+  <button class="tb-btn" id="btn-esc"    onclick="sendKey('Escape')"  title="Escape">Esc</button>
+  <button class="tb-btn" id="btn-paste"  onclick="pasteClipboard()"  title="Paste clipboard text">📋 Paste</button>
+  <div id="tb-right">
+    <span id="stat-fps"></span>
+    <button class="tb-btn" id="btn-fs" onclick="toggleFullscreen()" title="Fullscreen (F11)">⛶</button>
+    <button class="tb-btn" onclick="disconnect()" title="Close">✕</button>
+  </div>
+</div>
+
+<!-- Terminal -->
+<div id="term-wrap">
+  <div id="terminal"></div>
+</div>
+
+<!-- Special keys strip -->
+<div id="keys-overlay">
+  <!-- Sticky modifiers -->
+  <button class="key-btn" id="sk-ctrl"  onclick="toggleMod('ctrl')" >Ctrl</button>
+  <button class="key-btn" id="sk-alt"   onclick="toggleMod('alt')"  >Alt</button>
+  <button class="key-btn" id="sk-shift" onclick="toggleMod('shift')">Shift</button>
+  <button class="key-btn" id="sk-win"   onclick="toggleMod('win')"  >Win</button>
+  <!-- Navigation -->
+  <button class="key-btn" onclick="sendKey('Tab')">Tab</button>
+  <button class="key-btn" onclick="sendKey('ArrowUp')">↑</button>
+  <button class="key-btn" onclick="sendKey('ArrowDown')">↓</button>
+  <button class="key-btn" onclick="sendKey('ArrowLeft')">←</button>
+  <button class="key-btn" onclick="sendKey('ArrowRight')">→</button>
+  <button class="key-btn" onclick="sendKey('Enter')">↵ Enter</button>
+  <button class="key-btn" onclick="sendKey('Backspace')">⌫</button>
+  <button class="key-btn" onclick="sendKey('Delete')">Del</button>
+  <button class="key-btn" onclick="sendKey('Home')">Home</button>
+  <button class="key-btn" onclick="sendKey('End')">End</button>
+  <button class="key-btn" onclick="sendKey('PageUp')">PgUp</button>
+  <button class="key-btn" onclick="sendKey('PageDown')">PgDn</button>
+  <button class="key-btn" onclick="sendKey('Insert')">Ins</button>
+  <!-- Function keys -->
+  <button class="key-btn" onclick="sendF(1)">F1</button>
+  <button class="key-btn" onclick="sendF(2)">F2</button>
+  <button class="key-btn" onclick="sendF(3)">F3</button>
+  <button class="key-btn" onclick="sendF(4)">F4</button>
+  <button class="key-btn" onclick="sendF(5)">F5</button>
+  <button class="key-btn" onclick="sendF(6)">F6</button>
+  <button class="key-btn" onclick="sendF(7)">F7</button>
+  <button class="key-btn" onclick="sendF(8)">F8</button>
+  <button class="key-btn" onclick="sendF(9)">F9</button>
+  <button class="key-btn" onclick="sendF(10)">F10</button>
+  <button class="key-btn" onclick="sendF(11)">F11</button>
+  <button class="key-btn" onclick="sendF(12)">F12</button>
+</div>
+
+<!-- Connection overlay -->
+<div id="conn-overlay">
+  <div id="conn-status">Connecting…</div>
+</div>
+
+<!-- Toast -->
+<div id="toast"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+<script>
+// ── Config ────────────────────────────────────────────────────────────────────
+const params  = new URLSearchParams(location.search);
+const nodeId  = params.get('node') || '';
+const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+
+// ── xterm.js setup ────────────────────────────────────────────────────────────
+const term = new Terminal({
+  theme: {
+    background:  '#000000',
+    foreground:  '#cccccc',
+    cursor:      '#ffffff',
+    cursorAccent: '#000000',
+  },
+  fontFamily: 'Consolas, "Lucida Console", "Courier New", monospace',
+  fontSize: 14,
+  lineHeight: 1.1,
+  cursorBlink: true,
+  cursorStyle: 'block',
+  allowTransparency: false,
+  // We handle all keyboard input ourselves; xterm only renders
+  disableStdin: true,
+});
+
+const fitAddon = new FitAddon.FitAddon();
+term.loadAddon(fitAddon);
+term.open(document.getElementById('terminal'));
+fitAddon.fit();
+
+// ── State ─────────────────────────────────────────────────────────────────────
+const S = {
+  ws: null,
+  connected: false,
+  termCols: 80,
+  termRows: 25,
+  stickMods: { ctrl: false, alt: false, shift: false, win: false },
+  // Current modifier state for sticky keys
+  modBits: 0,
+  fpsCounter: 0,
+  fpsTs: performance.now(),
+  keysVisible: false,
+};
+
+const _MOD_BITS = {
+  ControlLeft: 0x01, ControlRight: 0x10,
+  ShiftLeft:   0x02, ShiftRight:   0x20,
+  AltLeft:     0x04, AltRight:     0x40,
+  MetaLeft:    0x08, MetaRight:    0x80,
+};
+
+// ── DOM ───────────────────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+const connOverlay = $('conn-overlay');
+const connStatus  = $('conn-status');
+const keysOverlay = $('keys-overlay');
+
+// ── WebSocket ─────────────────────────────────────────────────────────────────
+function connect() {
+  if (!nodeId) {
+    term.write('\r\n\x1b[31mError: no node specified — add ?node=<id> to the URL\x1b[0m\r\n');
+    connOverlay.classList.add('hidden');
+    return;
+  }
+
+  const url = `${wsProto}//${location.host}/api/v1/remote/${encodeURIComponent(nodeId)}/terminal/ws`;
+  S.ws = new WebSocket(url);
+  S.ws.binaryType = 'arraybuffer';
+
+  S.ws.onopen = () => {
+    S.connected = true;
+    connOverlay.classList.add('hidden');
+    updateBadge('good', 'connected');
+    document.title = `${nodeId} · ozma terminal`;
+    $('node-name').textContent = nodeId;
+  };
+
+  S.ws.onclose = () => {
+    S.connected = false;
+    updateBadge('bad', 'disconnected');
+    connStatus.textContent = 'Reconnecting…';
+    connOverlay.classList.remove('hidden');
+    setTimeout(connect, 2000);
+  };
+
+  S.ws.onerror = () => {};
+
+  S.ws.onmessage = (e) => {
+    if (e.data instanceof ArrayBuffer) {
+      // ANSI bytes → xterm
+      const bytes = new Uint8Array(e.data);
+      term.write(bytes);
+      // FPS counter
+      S.fpsCounter++;
+      const now = performance.now();
+      if (now - S.fpsTs >= 2000) {
+        const fps = Math.round(S.fpsCounter * 1000 / (now - S.fpsTs));
+        $('stat-fps').textContent = `${fps} fps`;
+        S.fpsCounter = 0;
+        S.fpsTs = now;
+      }
+    } else {
+      // JSON control message
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'resize') {
+          S.termCols = msg.cols;
+          S.termRows = msg.rows;
+          $('stat-size').textContent = `${msg.cols}×${msg.rows}`;
+          // Resize xterm to match the detected grid
+          if (msg.cols > 0 && msg.rows > 0) {
+            term.resize(msg.cols, msg.rows);
+          }
+        }
+      } catch (_) {}
+    }
+  };
+}
+
+// ── Keyboard input → HID ─────────────────────────────────────────────────────
+function sendWs(msg) {
+  if (S.ws && S.ws.readyState === 1) S.ws.send(JSON.stringify(msg));
+}
+
+function _keyCode(e) {
+  // Return the DOM KeyboardEvent.code for the pressed key
+  return e.code || e.key;
+}
+
+document.addEventListener('keydown', e => {
+  if (!S.connected) return;
+
+  // F11 = fullscreen (don't forward)
+  if (e.key === 'F11') { e.preventDefault(); toggleFullscreen(); return; }
+
+  // Apply sticky modifiers first
+  const extraMods = _stickyModCode();
+
+  e.preventDefault();
+  // Release any fired sticky mods after sending
+  sendWs({ type: 'keydown', code: _keyCode(e) });
+  if (extraMods.length) {
+    // Fire mod keys before the actual key
+    extraMods.forEach(code => sendWs({ type: 'keydown', code }));
+  }
+  // Clear sticky mods that are one-shot (all of them — next keydown clears them)
+  _clearStickyMods();
+}, { capture: true });
+
+document.addEventListener('keyup', e => {
+  if (!S.connected) return;
+  e.preventDefault();
+  sendWs({ type: 'keyup', code: _keyCode(e) });
+}, { capture: true });
+
+// ── Sticky modifier logic ─────────────────────────────────────────────────────
+function _stickyModCode() {
+  const codes = [];
+  if (S.stickMods.ctrl)  codes.push('ControlLeft');
+  if (S.stickMods.alt)   codes.push('AltLeft');
+  if (S.stickMods.shift) codes.push('ShiftLeft');
+  if (S.stickMods.win)   codes.push('MetaLeft');
+  return codes;
+}
+
+function _clearStickyMods() {
+  Object.keys(S.stickMods).forEach(k => {
+    S.stickMods[k] = false;
+    $(`sk-${k}`)?.classList.remove('sticky-on');
+  });
+}
+
+function toggleMod(mod) {
+  S.stickMods[mod] = !S.stickMods[mod];
+  $(`sk-${mod}`)?.classList.toggle('sticky-on', S.stickMods[mod]);
+}
+
+// ── Helper send functions ─────────────────────────────────────────────────────
+function sendKey(code) {
+  const extra = _stickyModCode();
+  extra.forEach(c => sendWs({ type: 'keydown', code: c }));
+  sendWs({ type: 'keydown', code });
+  sendWs({ type: 'keyup',   code });
+  extra.forEach(c => sendWs({ type: 'keyup', code: c }));
+  _clearStickyMods();
+}
+
+function sendF(n) {
+  sendKey(`F${n}`);
+}
+
+function sendSeq(sequence) {
+  sendWs({ type: 'key_sequence', sequence });
+}
+
+async function pasteClipboard() {
+  try {
+    const text = await navigator.clipboard.readText();
+    if (text) sendWs({ type: 'paste', text });
+  } catch (_) {
+    toast('Clipboard access denied — use browser permissions');
+  }
+}
+
+// ── UI helpers ────────────────────────────────────────────────────────────────
+function toggleKeys() {
+  S.keysVisible = !S.keysVisible;
+  keysOverlay.classList.toggle('show', S.keysVisible);
+  $('btn-keys').classList.toggle('active', S.keysVisible);
+}
+
+function toggleFullscreen() {
+  if (document.fullscreenElement) {
+    document.exitFullscreen();
+    document.body.classList.remove('fullscreen');
+  } else {
+    document.documentElement.requestFullscreen();
+    document.body.classList.add('fullscreen');
+  }
+}
+
+function disconnect() {
+  if (S.ws) S.ws.close();
+  window.close();
+  setTimeout(() => {
+    connStatus.textContent = 'Disconnected';
+    connOverlay.classList.remove('hidden');
+  }, 100);
+}
+
+function updateBadge(cls, msg) {
+  const el = $('stat-badge');
+  el.className = `badge ${cls}`;
+  el.textContent = msg;
+}
+
+let toastTimer;
+function toast(msg, dur = 2500) {
+  const el = $('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), dur);
+}
+
+// ── Resize ────────────────────────────────────────────────────────────────────
+window.addEventListener('resize', () => fitAddon.fit());
+document.addEventListener('fullscreenchange', () => {
+  document.body.classList.toggle('fullscreen', !!document.fullscreenElement);
+  setTimeout(() => fitAddon.fit(), 50);
+});
+
+// ── Start ─────────────────────────────────────────────────────────────────────
+connect();
+</script>
+</body>
+</html>
