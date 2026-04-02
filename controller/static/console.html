@@ -51,6 +51,14 @@ html, body {
 }
 #display-video { width: 100%; height: 100%; object-fit: contain; }
 #display-img   { width: 100%; height: 100%; object-fit: contain; }
+/* OCR canvas — rendered at VGA native resolution, scaled by parent transform */
+#ocr-canvas {
+  display: none;
+  image-rendering: pixelated;
+  image-rendering: -moz-crisp-edges;
+  image-rendering: crisp-edges;
+  cursor: default;
+}
 #display-offline {
   display: none; flex-direction: column; align-items: center; gap: 16px;
   color: var(--muted); font-size: 14px; text-align: center;
@@ -336,6 +344,7 @@ input[type=range]::-webkit-slider-thumb {
   <div id="display-inner">
     <video id="display-video" autoplay playsinline muted></video>
     <img  id="display-img" alt="">
+    <canvas id="ocr-canvas"></canvas>
   </div>
   <div id="display-offline">
     <span class="icon">🖥</span>
@@ -552,8 +561,16 @@ input[type=range]::-webkit-slider-thumb {
         <div class="radio-btn" id="codec-h265"  onclick="setCodecFamily('h265')">H.265</div>
         <div class="radio-btn" id="codec-av1"   onclick="setCodecFamily('av1')">AV1</div>
         <div class="radio-btn" id="codec-vp9"   onclick="setCodecFamily('vp9')">VP9</div>
+        <div class="radio-btn" id="codec-ocr"   onclick="setCodecFamily('ocr')" title="VGA bitmap OCR — pixel-perfect text, ~0 bandwidth">OCR</div>
       </div>
     </div>
+    <div id="ocr-info-box" style="display:none;padding:8px 10px;background:rgba(59,130,246,.08);border-radius:6px;font-size:11px;color:var(--accent);border:1px solid rgba(59,130,246,.2);line-height:1.5">
+      ◈ <strong>OCR Terminal mode</strong><br>
+      Pixel-perfect VGA bitmap rendering.<br>
+      No video stream — uses text OCR at ~30fps.<br>
+      Ideal for BIOS, console, installers.
+    </div>
+    <div id="video-codec-controls">
     <div class="panel-section">
       <div class="panel-label">Bitrate</div>
       <div class="radio-group" id="bitrate-group">
@@ -573,6 +590,7 @@ input[type=range]::-webkit-slider-thumb {
         <div class="radio-btn" id="lat-quality"  onclick="setLatencyMode('quality')">Quality</div>
       </div>
     </div>
+    </div><!-- /video-codec-controls -->
     <div class="panel-section">
       <div class="panel-label">Scaling</div>
       <div class="radio-group">
@@ -723,6 +741,7 @@ const S = {
   mediaRecorder: null,
   fileMode: 'usb',
   stats: { fps: 0, lat: 0, bw: 0, codec: '—' },
+  ocrMode: false,
   frameCount: 0,
   lastFpsSample: performance.now(),
   prevBytesIn: 0,
@@ -736,11 +755,12 @@ const S = {
 const $  = id => document.getElementById(id);
 const qs = sel => document.querySelector(sel);
 
-const displayWrap  = $('display-wrap');
-const displayInner = $('display-inner');
-const displayVideo = $('display-video');
-const displayImg   = $('display-img');
-const displayOff   = $('display-offline');
+const displayWrap    = $('display-wrap');
+const displayInner   = $('display-inner');
+const displayVideo   = $('display-video');
+const displayImg     = $('display-img');
+const displayOff     = $('display-offline');
+const displayOcrCvs  = $('ocr-canvas');
 const toolbar      = $('toolbar');
 const keysStrip    = $('keys-strip');
 const connOverlay  = $('conn-overlay');
@@ -1757,7 +1777,7 @@ function _populateEncoderList(encoders) {
 }
 
 function _encLabel(enc) {
-  const hw = { nvenc: '🟢 NVENC', vaapi: '🟡 VAAPI', qsv: '🔵 QSV', v4l2m2m: '📷 V4L2', amf: '🔴 AMF' };
+  const hw = { nvenc: '🟢 NVENC', vaapi: '🟡 VAAPI', qsv: '🔵 QSV', v4l2m2m: '📷 V4L2', amf: '🔴 AMF', text: '◈ OCR' };
   const fam = enc.codec_family?.toUpperCase() || '';
   if (enc.hw_type && hw[enc.hw_type]) return `${hw[enc.hw_type]} ${fam}`;
   return `💻 ${fam} SW`;
@@ -1773,9 +1793,24 @@ function setEncoder(enc) {
 }
 
 async function applyEncoder() {
+  if (C.codecFamily === 'ocr') {
+    // OCR mode: tell server to stop ffmpeg, then switch client to canvas rendering
+    try {
+      await fetch(`/api/v1/streams/${encodeURIComponent(nodeId)}/codec`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ codec: 'ocr' }),
+      });
+    } catch (_) {}
+    await _switchToOcrMode();
+    return;
+  }
+
+  // Switching back from OCR
+  if (S.ocrMode) _switchFromOcrMode();
+
   const body = {
+    codec: C.codecFamily,
     encoder: C.selectedEncoder === 'auto' ? null : C.selectedEncoder,
-    codec_family: C.codecFamily,
     bitrate: C.bitrate,
     latency_mode: C.latencyMode,
   };
@@ -1787,7 +1822,6 @@ async function applyEncoder() {
     });
     if (!r.ok) throw new Error(await r.text());
     toast('Encoder applied — stream restarting…');
-    // Refresh current encoder display after a short delay
     setTimeout(refreshCodecStatus, 2500);
   } catch (e) {
     toast(`Apply failed: ${e.message}`);
@@ -1796,9 +1830,14 @@ async function applyEncoder() {
 
 function setCodecFamily(family) {
   C.codecFamily = family;
-  ['h264','h265','av1','vp9'].forEach(f => {
+  ['h264','h265','av1','vp9','ocr'].forEach(f => {
     $(`codec-${f}`)?.classList.toggle('active', f === family);
   });
+  const isOcr = family === 'ocr';
+  $('video-codec-controls').style.display = isOcr ? 'none' : '';
+  $('ocr-info-box').style.display = isOcr ? 'block' : 'none';
+  // Hide encoder list irrelevant to OCR
+  $('encoder-list').style.opacity = isOcr ? '0.4' : '';
 }
 
 function setBitrate(val) {
@@ -1833,12 +1872,19 @@ async function refreshCodecStatus() {
     const r = await fetch(`/api/v1/streams/${encodeURIComponent(nodeId)}/codec`);
     if (!r.ok) return;
     const data = await r.json();
+
+    // Restore OCR mode if server says it's active (e.g. after panel refresh)
+    if (data.ocr_mode && !S.ocrMode) {
+      setCodecFamily('ocr');
+      await _switchToOcrMode();
+    }
+
     const enc = data.current_encoder || '—';
     $('encoder-current').textContent = enc;
     $('stat-codec').textContent = enc;
     $('stat-codec-card').textContent = enc;
-    if (data.adaptive_enabled !== undefined) {
-      $('adaptive-toggle').checked = data.adaptive_enabled;
+    if (data.adaptive !== undefined) {
+      $('adaptive-toggle').checked = data.adaptive;
     }
     // Populate encoder list if we don't have a probe yet
     if (!C.probeCache && data.available_encoders?.length) {
@@ -1858,6 +1904,286 @@ function togglePanel(name) {
     // Auto-probe if no cache
     if (!C.probeCache) probeEncoders(false);
   }
+}
+
+// ── OCR codec mode ────────────────────────────────────────────
+//
+// When the OCR codec is selected the video stream is stopped entirely.
+// Instead we connect to the terminal bridge WebSocket (read-only) and
+// render the ANSI output on a canvas using the actual VGA bitmap font.
+// This gives pixel-perfect text at zero video bandwidth.
+//
+// Architecture:
+//   S.ws      → remote_desktop WebSocket (keyboard/mouse input, unchanged)
+//   OCR.ws    → terminal bridge WebSocket (receive ANSI screen updates)
+//   #ocr-canvas → VGA-pixel canvas, replaces video/img in display-inner
+
+const OCR = {
+  ws: null,          // terminal bridge WS (read-only ANSI output)
+  canvas: displayOcrCvs,
+  ctx: null,
+  cells: [],         // cells[row][col] = {char, fg:[r,g,b], bg:[r,g,b]}
+  glyphs: null,      // {code_str: [row_bitmask, ...]} or null (fallback mode)
+  cellW: 8,
+  cellH: 16,
+  cols: 80,
+  rows: 25,
+  curRow: 0, curCol: 0,
+  curFg: [204, 204, 204], curBg: [0, 0, 0],
+  showCursor: true,
+  animId: null,
+  dirty: new Set(),  // row indices that need redraw
+  allDirty: false,
+  _cellCache: new Map(), // "char|fgHex|bgHex" → ImageData (avoids per-frame alloc)
+};
+
+// ── ANSI parser ───────────────────────────────────────────────────────────────
+const _ap = { st: 'n', buf: '', priv: false };
+
+function _ansiParse(text) {
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const cc = ch.charCodeAt(0);
+    switch (_ap.st) {
+      case 'n':
+        if (cc === 0x1b) { _ap.st = 'e'; }
+        else if (cc === 0x0d) { OCR.curCol = 0; }
+        else if (cc === 0x0a) { OCR.curRow = Math.min(OCR.curRow + 1, OCR.rows - 1); }
+        else if (cc >= 0x20) { _ocrPutChar(ch); }
+        break;
+      case 'e':
+        _ap.st = ch === '[' ? 'c' : 'n';
+        _ap.buf = ''; _ap.priv = false;
+        break;
+      case 'c':
+        if (ch === '?') { _ap.priv = true; }
+        else if (ch === ';' || (cc >= 0x30 && cc <= 0x39)) { _ap.buf += ch; }
+        else {
+          const ps = _ap.buf ? _ap.buf.split(';').map(s => parseInt(s) || 0) : [0];
+          _ansiExec(ch, ps, _ap.priv);
+          _ap.st = 'n';
+        }
+        break;
+    }
+  }
+  // Always mark cursor row dirty for cursor blink
+  if (OCR.curRow < OCR.rows) OCR.dirty.add(OCR.curRow);
+}
+
+function _ansiExec(cmd, ps, priv) {
+  switch (cmd) {
+    case 'H':  // cursor position
+      OCR.curRow = Math.max(0, Math.min((ps[0] || 1) - 1, OCR.rows - 1));
+      OCR.curCol = Math.max(0, Math.min((ps[1] || 1) - 1, OCR.cols - 1));
+      break;
+    case 'J':  // erase screen
+      if (ps[0] === 2) {
+        _ocrClear();
+        OCR.allDirty = true;
+      }
+      break;
+    case 'm': { // SGR — set graphics rendition
+      let i = 0;
+      while (i < ps.length) {
+        const p = ps[i];
+        if (p === 0)  { OCR.curFg = [204,204,204]; OCR.curBg = [0,0,0]; }
+        else if (p === 38 && ps[i+1] === 2) {
+          OCR.curFg = [ps[i+2]||0, ps[i+3]||0, ps[i+4]||0]; i += 4;
+        } else if (p === 48 && ps[i+1] === 2) {
+          OCR.curBg = [ps[i+2]||0, ps[i+3]||0, ps[i+4]||0]; i += 4;
+        }
+        i++;
+      }
+      break;
+    }
+    case 'h': if (priv && ps[0] === 25) OCR.showCursor = true;  break;
+    case 'l': if (priv && ps[0] === 25) OCR.showCursor = false; break;
+  }
+}
+
+function _ocrPutChar(ch) {
+  if (OCR.curRow >= OCR.rows || OCR.curCol >= OCR.cols) return;
+  const row = OCR.cells[OCR.curRow];
+  if (!row) return;
+  row[OCR.curCol] = { char: ch, fg: [...OCR.curFg], bg: [...OCR.curBg] };
+  OCR.dirty.add(OCR.curRow);
+  OCR.curCol++;
+  if (OCR.curCol >= OCR.cols) { OCR.curCol = 0; OCR.curRow = Math.min(OCR.curRow + 1, OCR.rows - 1); }
+}
+
+function _ocrClear() {
+  OCR.cells = Array.from({ length: OCR.rows }, () =>
+    Array.from({ length: OCR.cols }, () => ({ char: ' ', fg: [0,0,0], bg: [0,0,0] }))
+  );
+  OCR._cellCache.clear();
+}
+
+// ── Canvas renderer ───────────────────────────────────────────────────────────
+
+function _ocrRenderLoop() {
+  _ocrRenderFrame();
+  OCR.animId = requestAnimationFrame(_ocrRenderLoop);
+}
+
+function _ocrRenderFrame() {
+  if (!OCR.ctx) return;
+  const rows = OCR.allDirty
+    ? Array.from({ length: OCR.rows }, (_, i) => i)
+    : Array.from(OCR.dirty);
+  OCR.allDirty = false;
+  OCR.dirty.clear();
+  for (const r of rows) {
+    const row = OCR.cells[r];
+    if (!row) continue;
+    for (let c = 0; c < row.length; c++) _drawCell(r, c, row[c]);
+  }
+  // Draw cursor underline
+  if (OCR.showCursor && OCR.curRow < OCR.rows && OCR.curCol < OCR.cols) {
+    const x = OCR.curCol * OCR.cellW, y = OCR.curRow * OCR.cellH;
+    OCR.ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    OCR.ctx.fillRect(x, y + OCR.cellH - 2, OCR.cellW, 2);
+  }
+}
+
+function _drawCell(row, col, cell) {
+  const { char, fg, bg } = cell;
+  const ctx = OCR.ctx;
+  const x = col * OCR.cellW, y = row * OCR.cellH;
+  const cw = OCR.cellW, ch = OCR.cellH;
+  const code = char.charCodeAt(0);
+  const glyph = OCR.glyphs && OCR.glyphs[String(code)];
+
+  if (glyph) {
+    // VGA bitmap pixel-perfect rendering
+    const key = `${code}|${fg[0]},${fg[1]},${fg[2]}|${bg[0]},${bg[1]},${bg[2]}`;
+    let img = OCR._cellCache.get(key);
+    if (!img) {
+      img = ctx.createImageData(cw, ch);
+      const d = img.data;
+      // Fill background
+      for (let i = 0; i < cw * ch * 4; i += 4) {
+        d[i] = bg[0]; d[i+1] = bg[1]; d[i+2] = bg[2]; d[i+3] = 255;
+      }
+      // Draw foreground pixels from glyph bitmask (MSB = leftmost)
+      for (let gr = 0; gr < Math.min(ch, glyph.length); gr++) {
+        const bits = glyph[gr];
+        for (let gc = 0; gc < cw; gc++) {
+          if ((bits >>> (cw - 1 - gc)) & 1) {
+            const idx = (gr * cw + gc) * 4;
+            d[idx] = fg[0]; d[idx+1] = fg[1]; d[idx+2] = fg[2]; d[idx+3] = 255;
+          }
+        }
+      }
+      // Cache up to 4096 entries (bounded by unique char×color combos on screen)
+      if (OCR._cellCache.size < 4096) OCR._cellCache.set(key, img);
+    }
+    ctx.putImageData(img, x, y);
+  } else {
+    // Fallback: canvas text (when no VGA font loaded)
+    ctx.fillStyle = `rgb(${bg[0]},${bg[1]},${bg[2]})`;
+    ctx.fillRect(x, y, cw, ch);
+    if (char !== ' ') {
+      ctx.fillStyle = `rgb(${fg[0]},${fg[1]},${fg[2]})`;
+      ctx.font = `${ch - 2}px monospace`;
+      ctx.textBaseline = 'top';
+      ctx.fillText(char, x, y + 1);
+    }
+  }
+}
+
+// ── OCR mode lifecycle ────────────────────────────────────────────────────────
+
+async function _switchToOcrMode() {
+  S.ocrMode = true;
+
+  // Stop video stream but keep S.ws (remote_desktop) for keyboard/mouse input
+  if (S.pc)  { S.pc.close(); S.pc = null; }
+  if (S.hls) { S.hls.destroy(); S.hls = null; }
+  displayVideo.style.display = 'none';
+  displayImg.style.display = 'none';
+  hideConnOverlay();
+
+  // Load VGA font from server
+  await _loadOcrFont();
+
+  // Size and show canvas
+  _ocrResizeTo(OCR.cols, OCR.rows);
+  OCR.canvas.style.display = 'block';
+  OCR.ctx = OCR.canvas.getContext('2d');
+  _ocrClear();
+  OCR.allDirty = true;
+
+  // Connect to terminal bridge WebSocket (receive-only: no keystrokes sent here)
+  _startOcrWs();
+
+  // Start render loop
+  if (!OCR.animId) OCR.animId = requestAnimationFrame(_ocrRenderLoop);
+
+  S.stats.codec = 'OCR';
+  $('stat-codec').textContent = 'OCR';
+  $('stat-codec-card').textContent = 'OCR';
+  toast('OCR terminal mode · pixel-perfect · ~0 kbps');
+}
+
+function _switchFromOcrMode() {
+  if (!S.ocrMode) return;
+  S.ocrMode = false;
+
+  // Stop OCR WebSocket and render loop
+  if (OCR.ws)    { OCR.ws.close(); OCR.ws = null; }
+  if (OCR.animId){ cancelAnimationFrame(OCR.animId); OCR.animId = null; }
+
+  // Hide canvas, restart video
+  OCR.canvas.style.display = 'none';
+  startVideoChain();
+}
+
+async function _loadOcrFont() {
+  try {
+    const r = await fetch('/api/v1/text_capture/font');
+    if (!r.ok) return;
+    const d = await r.json();
+    OCR.glyphs  = d.glyphs  || null;
+    OCR.cellW   = d.cell_width  || 8;
+    OCR.cellH   = d.cell_height || 16;
+  } catch (_) {
+    OCR.glyphs = null; // will use canvas text fallback
+  }
+}
+
+function _ocrResizeTo(cols, rows) {
+  OCR.cols = cols; OCR.rows = rows;
+  OCR.canvas.width  = cols * OCR.cellW;
+  OCR.canvas.height = rows * OCR.cellH;
+  // Tell scaling system about new native size
+  applyScaling();
+  _ocrClear();
+  OCR._cellCache.clear();
+  OCR.allDirty = true;
+}
+
+function _startOcrWs() {
+  const url = `${wsProto}//${location.host}/api/v1/remote/${encodeURIComponent(nodeId)}/terminal/ws`;
+  OCR.ws = new WebSocket(url);
+  OCR.ws.binaryType = 'arraybuffer';
+  OCR.ws.onopen  = () => {};
+  OCR.ws.onerror = () => {};
+  OCR.ws.onclose = () => {
+    if (S.ocrMode) setTimeout(_startOcrWs, 2000);
+  };
+  OCR.ws.onmessage = (e) => {
+    if (e.data instanceof ArrayBuffer) {
+      // ANSI bytes → parser → dirty cell tracking
+      _ansiParse(new TextDecoder().decode(e.data));
+    } else {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
+          _ocrResizeTo(msg.cols, msg.rows);
+        }
+      } catch (_) {}
+    }
+  };
 }
 
 // ── Keyboard shortcuts hint (? key) ──────────────────────────

@@ -312,6 +312,33 @@ class TextCapture:
     def last_result(self) -> OCRResult | None:
         return self._last_result
 
+    def export_font_json(self) -> dict:
+        """Export loaded font glyphs for canvas bitmap rendering.
+
+        Each glyph row is encoded as an integer bitmask (MSB = leftmost pixel).
+        Returns {name, cell_width, cell_height, glyphs: {<code>: [row_int, ...]}}.
+        """
+        if not self._fonts:
+            return {"name": "none", "cell_width": 8, "cell_height": 16, "glyphs": {}}
+        font = self._fonts[0]
+        glyphs: dict[str, list[int]] = {}
+        for code, glyph in font.glyphs.items():
+            rows = []
+            for r in range(font.height):
+                row_bits = 0
+                for c in range(font.width):
+                    if r < glyph.shape[0] and c < glyph.shape[1]:
+                        if glyph[r, c] > 0.5:
+                            row_bits |= (1 << (font.width - 1 - c))
+                rows.append(row_bits)
+            glyphs[str(code)] = rows
+        return {
+            "name": font.name,
+            "cell_width": font.width,
+            "cell_height": font.height,
+            "glyphs": glyphs,
+        }
+
     def _detect_cell_size(self, gray: np.ndarray, font: FontTemplate) -> tuple[int, int]:
         """Detect character cell size from the image.
 

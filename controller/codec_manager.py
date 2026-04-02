@@ -258,6 +258,16 @@ class CodecManager:
         """Resolve a codec config to ffmpeg encoder arguments."""
         cfg = config or self._configs.get(source_id, self._configs["default"])
 
+        # OCR terminal mode — no ffmpeg encoder needed
+        if cfg.codec == "ocr":
+            return ResolvedEncoder(
+                name="OCR Terminal",
+                ffmpeg_codec="ocr",
+                ffmpeg_flags=[],
+                hw_device="",
+                vf_prefix="",
+            )
+
         # Find the best available variant for this codec family
         family = cfg.codec
         available = self._available.get(family, [])
@@ -401,6 +411,16 @@ class CodecManager:
             avail = [r.encoder for r in results
                      if r.codec_family == family and r.available]
             self._available[family] = avail
+
+        # Always include OCR terminal as a synthetic always-available encoder
+        ocr_result = EncoderProbeResult(
+            encoder="ocr-terminal",
+            codec_family="ocr",
+            hw_type="text",
+            available=True,
+            probe_ms=0,
+        )
+        results = list(results) + [ocr_result]
 
         self._probe_cache = {"ts": now, "results": results}  # type: ignore[attr-defined]
         return results

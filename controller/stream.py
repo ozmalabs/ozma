@@ -403,6 +403,8 @@ class StreamManager:
         self._adaptive_enabled: bool = False
         # Per-node codec overrides (set via API)
         self._codec_overrides: dict[str, "CodecConfig"] = {}
+        # Nodes in OCR terminal mode (no ffmpeg stream)
+        self._ocr_nodes: set[str] = set()
 
     async def start(self) -> None:
         self._static_dir.mkdir(parents=True, exist_ok=True)
@@ -494,6 +496,9 @@ class StreamManager:
     # ── internal ─────────────────────────────────────────────────────────────
 
     def _maybe_start(self, node: "NodeInfo") -> None:
+        # OCR terminal mode: no ffmpeg stream
+        if node.id in self._ocr_nodes:
+            return
         # If capture exists but VNC host changed, recreate it
         existing = self._captures.get(node.id)
         if isinstance(existing, StreamCapture):
@@ -541,8 +546,25 @@ class StreamManager:
 
         Stores the override and triggers a graceful restart. Returns False if
         the node isn't a local VNC capture (hardware nodes manage their own codec).
+
+        Special case: codec=="ocr" stops the ffmpeg stream entirely and enables
+        OCR terminal mode (zero bandwidth, pixel-perfect text rendering).
         """
         self._codec_overrides[node_id] = config
+
+        if config.codec == "ocr":
+            # Stop any running capture — terminal bridge takes over
+            entry = self._captures.pop(node_id, None)
+            if entry:
+                entry.stop()
+            self._ocr_nodes.add(node_id)
+            log.info("Stream %s: switched to OCR terminal mode (ffmpeg stopped)", node_id)
+            return True
+
+        # Switching away from OCR — clear the flag and let _maybe_start restart capture
+        was_ocr = node_id in self._ocr_nodes
+        self._ocr_nodes.discard(node_id)
+
         entry = self._captures.get(node_id)
         if isinstance(entry, StreamCapture):
             await entry.set_codec(config)
@@ -562,8 +584,11 @@ class StreamManager:
                 return False
         return False
 
-    def get_stream_stats(self, node_id: str) -> StreamStats | None:
+    def get_stream_stats(self, node_id: str) -> "StreamStats | None":
         """Return live stats for a stream capture."""
+        if node_id in self._ocr_nodes:
+            return StreamStats(node_id=node_id, encoder="ocr-terminal",
+                               codec_family="ocr", active=True)
         entry = self._captures.get(node_id)
         if isinstance(entry, StreamCapture):
             return entry.stats

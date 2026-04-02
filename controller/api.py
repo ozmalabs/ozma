@@ -2700,6 +2700,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(status_code=503, detail="Streams not available")
         stats = streams.get_stream_stats(node_id)
         override = streams._codec_overrides.get(node_id)
+        ocr_mode = node_id in streams._ocr_nodes
         # Get available encoders from cache (no blocking probe)
         available: list[dict] = []
         if codec_mgr:
@@ -2710,12 +2711,18 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
                 asyncio.create_task(codec_mgr.probe_encoders_async(), name="codec-probe-bg")
                 available = [{"encoder": e, "available": True}
                              for family in codec_mgr._available.values() for e in family]
+            # Always include OCR terminal as available
+            if not any(e.get("encoder") == "ocr-terminal" for e in available):
+                available.append({"encoder": "ocr-terminal", "codec_family": "ocr",
+                                   "hw_type": "text", "available": True, "probe_ms": 0})
         return {
             "node_id": node_id,
             "stats": stats.to_dict() if stats else {},
             "config": override.to_dict() if override else {},
             "adaptive": streams._adaptive_enabled,
             "available_encoders": available,
+            "ocr_mode": ocr_mode,
+            "current_encoder": "ocr-terminal" if ocr_mode else (stats.encoder if stats else ""),
         }
 
     @app.post("/api/v1/streams/{node_id}/codec")
@@ -3373,6 +3380,24 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if not console_path.exists():
             raise HTTPException(status_code=404, detail="Console not found")
         return Response(content=console_path.read_text(), media_type="text/html")
+
+    # --- VGA font endpoint (for OCR canvas renderer) ---
+
+    _tc_singleton: Any = None
+
+    @app.get("/api/v1/text_capture/font")
+    async def get_text_capture_font(request: Request) -> dict[str, Any]:
+        """Return VGA bitmap font data for pixel-perfect canvas rendering.
+
+        Each glyph is a list of integers (one per row), MSB = leftmost pixel.
+        Used by console.html's OCR codec mode to render exact VGA glyphs on canvas.
+        """
+        _require_scope(request, SCOPE_READ)
+        nonlocal _tc_singleton
+        if _tc_singleton is None:
+            from text_capture import TextCapture as _TC
+            _tc_singleton = _TC()
+        return _tc_singleton.export_font_json()
 
     # --- Terminal bridge (VGA OCR → xterm.js) ---
 
