@@ -336,6 +336,18 @@ class StreamManager:
             return entry.mjpeg_frames()
         return None
 
+    async def get_snapshot(self, node_id: str) -> bytes | None:
+        """Return a single JPEG frame from the node's stream, or None."""
+        frames = self.mjpeg_frames(node_id)
+        if frames is None:
+            return None
+        try:
+            async for frame in frames:
+                return frame  # return first frame
+        except Exception:
+            pass
+        return None
+
     async def send_pointer(self, node_id: str, x: int, y: int, buttons: int) -> None:
         entry = self._captures.get(node_id)
         if isinstance(entry, _SoftNodeStream):

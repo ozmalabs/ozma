@@ -162,7 +162,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         "/auth/userinfo",
     }
 
-    _AUTH_EXEMPT_PREFIXES = ("/auth/login/", "/auth/callback/")
+    _AUTH_EXEMPT_PREFIXES = ("/auth/login/", "/auth/callback/", "/console/")
 
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
@@ -3278,6 +3278,86 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if not ok:
             raise HTTPException(status_code=404, detail="Pending session not found")
         return {"ok": True}
+
+    @app.get("/console/{node_id:path}")
+    async def console_page(node_id: str) -> Response:
+        """Serve the full-featured KVM console for a node."""
+        console_path = Path(__file__).parent / "static" / "console.html"
+        if not console_path.exists():
+            raise HTTPException(status_code=404, detail="Console not found")
+        return Response(content=console_path.read_text(), media_type="text/html")
+
+    @app.get("/api/v1/remote/{node_id}/screenshot")
+    async def remote_screenshot(request: Request, node_id: str) -> Response:
+        """Capture current frame from the node's stream as JPEG."""
+        _require_scope(request, SCOPE_READ)
+        node = state.nodes.get(node_id)
+        if not node:
+            raise HTTPException(status_code=404, detail="Node not found")
+        # Try snapshot endpoint on the node
+        import httpx
+        snapshot_url = f"http://127.0.0.1:{node.api_port}/display/snapshot"
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(snapshot_url)
+                if resp.status_code == 200:
+                    return Response(content=resp.content, media_type="image/jpeg",
+                                    headers={"Content-Disposition": f"inline; filename=\"{node_id}.jpg\""})
+        except Exception:
+            pass
+        # Fall back to one MJPEG frame via the capture pipeline
+        if streams:
+            frame = await streams.get_snapshot(node_id)
+            if frame:
+                return Response(content=frame, media_type="image/jpeg",
+                                headers={"Content-Disposition": f"inline; filename=\"{node_id}.jpg\""})
+        raise HTTPException(status_code=503, detail="No stream available")
+
+    @app.get("/api/v1/remote/{node_id}/clipboard")
+    async def get_remote_clipboard(request: Request, node_id: str) -> dict[str, Any]:
+        """Read clipboard from guest — via agent if connected, else OCR the screen."""
+        _require_scope(request, SCOPE_READ)
+        node = state.nodes.get(node_id)
+        if not node:
+            raise HTTPException(status_code=404, detail="Node not found")
+        # Check if desktop agent is connected and can provide clipboard
+        agent_ws = getattr(state, "agent_connections", {}).get(node_id)
+        if agent_ws:
+            try:
+                result = await asyncio.wait_for(
+                    _request_agent_clipboard(agent_ws), timeout=3.0
+                )
+                if result:
+                    return {"text": result, "source": "agent"}
+            except (asyncio.TimeoutError, Exception):
+                pass
+        # Fallback: OCR the screen
+        if streams:
+            frame = await streams.get_snapshot(node_id)
+            if frame:
+                try:
+                    from screen_reader import ScreenReader
+                    reader = ScreenReader()
+                    text = await reader.extract_text_from_image(frame)
+                    return {"text": text, "source": "ocr"}
+                except Exception:
+                    pass
+        return {"text": "", "source": "none"}
+
+    async def _request_agent_clipboard(agent_ws: Any) -> str | None:
+        """Ask a connected desktop agent for its clipboard contents."""
+        # Agent protocol: send {"type":"clipboard_get"}, receive {"type":"clipboard","text":"..."}
+        try:
+            import asyncio
+            future: asyncio.Future[str] = asyncio.get_event_loop().create_future()
+            orig_handler = getattr(agent_ws, "_clipboard_future", None)
+            agent_ws._clipboard_future = future
+            await agent_ws.send_text('{"type":"clipboard_get"}')
+            result = await future
+            agent_ws._clipboard_future = orig_handler
+            return result
+        except Exception:
+            return None
 
     @app.post("/api/v1/remote/{node_id}/privacy")
     async def set_remote_privacy(request: Request, node_id: str, body: dict = {}) -> dict[str, Any]:

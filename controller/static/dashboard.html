@@ -1252,7 +1252,7 @@ function renderNodes() {
         ${!isActive ? `<button class="btn sm primary" onclick="activateNode('${eid}')">Activate</button>` : ''}
         ${hasStream ? `<button class="btn sm" onclick="openStream('${eid}')">▶ Stream</button>` : ''}
         ${hasVnc ? `<a class="btn sm" href="vnc://${esc(n.vnc_host)}:${n.vnc_port}" target="_blank" title="Open VNC">⬚ VNC</a>` : ''}
-        ${hasStream ? `<button class="btn sm" onclick="openRemoteControl('${eid}')" title="Interactive KVM control">🖥 Control</button>` : ''}
+        ${hasStream ? `<button class="btn sm" onclick="openConsole('${eid}')" title="Full KVM console">🖥 Console</button>` : ''}
         ${hasUsb ? `<button class="btn sm" id="usb-btn-${eid}" onclick="toggleUsb('${eid}')">⬡ USB</button>` : ''}
       </div>
       ${hasUsb ? `<div class="usb-panel" id="usb-panel-${eid}"><div class="usb-loading">Loading…</div></div>` : ''}
@@ -3322,7 +3322,14 @@ function renderAudioSimple() {
   }).join('');
 }
 
-// ── Remote Control (Interactive KVM) ──────────────────────────────────────────
+// ── Console launcher ──────────────────────────────────────────────────────────
+
+function openConsole(nodeId) {
+  // Open the full-featured KVM console in a new tab
+  window.open(`/console/${encodeURIComponent(nodeId)}`, `ozma-console-${nodeId}`);
+}
+
+// ── Remote Control (Interactive KVM — legacy inline overlay) ──────────────────
 
 let rcNodeId = null;
 let rcWs = null;
