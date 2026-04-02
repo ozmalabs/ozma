@@ -3608,6 +3608,66 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
                 return {"ok": True, "privacy_mode": enabled}
         raise HTTPException(status_code=404, detail="No active session for this node")
 
+    # --- Terminal renderer view endpoint ---
+
+    @app.get("/api/v1/remote/{node_id}/view")
+    async def remote_view(
+        request: Request,
+        node_id: str,
+        stream: int = 0,
+        mode: str = "auto",
+        cols: int = 80,
+        rows: int = 24,
+        fps: float = 10.0,
+        pixel_mode: str = "auto",
+    ) -> Response:
+        """
+        Render the node's display as ANSI terminal art.
+
+        Query params:
+          stream=1      — chunked streaming (keeps connection open, yields frames at fps)
+          mode          — "auto" | "ocr" | "pixel"
+          cols/rows     — terminal dimensions (default 80x24)
+          fps           — frames per second for streaming (default 10)
+          pixel_mode    — chafa pixel mode: "auto"|"sixel"|"kitty"|"half"|"braille"
+
+        Single-frame response: text/plain; charset=utf-8 ANSI bytes
+        Streaming response: application/octet-stream chunked ANSI bytes
+
+        Usable directly from curl:
+          curl -s http://localhost:7380/api/v1/remote/vm1/view
+          curl -s http://localhost:7380/api/v1/remote/vm1/view?stream=1
+        """
+        _require_scope(request, SCOPE_READ)
+        node = state.nodes.get(node_id)
+        if not node:
+            raise HTTPException(status_code=404, detail="Node not found")
+
+        from terminal_renderer import render_frame, stream_frames
+
+        async def _get_frame() -> bytes | None:
+            if streams:
+                return await streams.get_snapshot(node_id)
+            return None
+
+        if not stream:
+            jpeg = await _get_frame()
+            if not jpeg:
+                raise HTTPException(status_code=503, detail="No stream available")
+            loop = asyncio.get_event_loop()
+            data = await loop.run_in_executor(
+                None,
+                lambda: render_frame(jpeg, mode, cols, rows, home=False, pixel_mode=pixel_mode),
+            )
+            return Response(content=data, media_type="text/plain; charset=utf-8")
+
+        async def _gen():
+            async for chunk in stream_frames(_get_frame, mode=mode, fps=fps,
+                                             cols=cols, rows=rows, pixel_mode=pixel_mode):
+                yield chunk
+
+        return StreamingResponse(_gen(), media_type="application/octet-stream")
+
     # --- Control action endpoint ---
 
     @app.post("/api/v1/controls/action")
