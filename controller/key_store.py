@@ -655,6 +655,74 @@ class KeyStore:
             raise KeyLockedError("Must be unlocked to export words")
         return bip39_encode(self._current_master_bytes())
 
+    # ── Connect cloud backup ──────────────────────────────────────────────────
+
+    async def backup_to_connect(self, connect: Any) -> None:
+        """
+        Push the on-disk key blob to Ozma Connect for account-level backup.
+
+        The blob is already public-safe: the password method stores only an
+        Argon2id-protected ciphertext; the export method stores no secret at all
+        (the user holds the words); the none method stores no key material.
+
+        Connect stores the blob verbatim.  Even if Connect is compromised the
+        attacker still needs the user's password or word list to recover the key.
+
+        Raises:
+            KeyNotInitialisedError  — no blob to push
+            RuntimeError            — Connect client unavailable or RPC failed
+        """
+        blob = self._require_blob()
+        if connect is None:
+            raise RuntimeError("Connect client is not available")
+        blob_bytes = json.dumps(blob, indent=2).encode()
+        await connect.store_key_blob(
+            controller_id=self._controller_id,
+            blob=blob_bytes,
+        )
+        log.info("Key blob pushed to Connect (method=%s, size=%d bytes)",
+                 self._method.value, len(blob_bytes))
+
+    async def restore_from_connect(self, connect: Any) -> None:
+        """
+        Pull the key blob from Ozma Connect and write it locally.
+
+        Used for disaster recovery when the controller's local storage has been
+        lost (hardware failure, re-flash).  The blob must still be unlocked by
+        the user's password or word list before any subkeys can be derived.
+
+        After restore, call unlock_password() or unlock_export() as normal.
+
+        Raises:
+            RuntimeError  — Connect client unavailable, no blob stored, or RPC failed
+        """
+        if connect is None:
+            raise RuntimeError("Connect client is not available")
+        blob_bytes = await connect.fetch_key_blob(controller_id=self._controller_id)
+        if not blob_bytes:
+            raise RuntimeError("No key blob found in Connect for this controller")
+        try:
+            blob = json.loads(blob_bytes)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Key blob from Connect is corrupt: {exc}") from exc
+        if blob.get("controller_id") != self._controller_id:
+            raise RuntimeError(
+                "Key blob controller_id mismatch — this blob belongs to a different controller"
+            )
+        self._dir.mkdir(parents=True, exist_ok=True)
+        self._atomic_save(blob)
+        # Reload from freshly written file
+        self._blob      = blob
+        self._method    = BackupMethod(blob.get("method", "none"))
+        self._hkdf_salt = _unb64(blob["hkdf_salt"]) if "hkdf_salt" in blob else b""
+        self._state     = KeyState.LOCKED
+        log.info("Key blob restored from Connect (method=%s) — unlock to proceed",
+                 self._method.value)
+
+    def connect_backup_enabled(self) -> bool:
+        """True if the current blob supports Connect backup (not the none method)."""
+        return self._blob is not None and self._method != BackupMethod.NONE
+
     # ── Status ────────────────────────────────────────────────────────────────
 
     def get_status(self) -> dict[str, Any]:

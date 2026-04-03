@@ -624,5 +624,140 @@ class TestKeyStoreStatus(unittest.TestCase):
         self.assertTrue(ks.get_status()["has_blob"])
 
 
+# ── Connect backup integration ────────────────────────────────────────────────
+
+@patch("key_store._derive_kek_password", side_effect=_fake_argon2)
+@patch("key_store._HAS_ARGON2", True)
+@patch("key_store._calibrate_argon2", new_callable=AsyncMock, return_value=65536)
+class TestConnectBackup(unittest.TestCase):
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_backup_pushes_blob(self, mock_cal, mock_argon2):
+        ks = _store(self.tmp)
+        run(ks.init_password("test123"))
+
+        connect = AsyncMock()
+        run(ks.backup_to_connect(connect))
+
+        connect.store_key_blob.assert_called_once()
+        call_kwargs = connect.store_key_blob.call_args
+        assert call_kwargs.kwargs["controller_id"] == "test-ctrl"
+        blob_bytes = call_kwargs.kwargs["blob"]
+        blob = json.loads(blob_bytes)
+        assert blob["method"] == "password"
+
+    def test_backup_not_available_for_none_method(self, mock_cal, mock_argon2):
+        ks = _store(self.tmp)
+        run(ks.init_none(confirm=True))
+        self.assertFalse(ks.connect_backup_enabled())
+
+    def test_connect_backup_enabled_password(self, mock_cal, mock_argon2):
+        ks = _store(self.tmp)
+        run(ks.init_password("pw"))
+        self.assertTrue(ks.connect_backup_enabled())
+
+    def test_connect_backup_enabled_export(self, mock_cal, mock_argon2):
+        ks = _store(self.tmp)
+        run(ks.init_export())
+        self.assertTrue(ks.connect_backup_enabled())
+
+    def test_connect_backup_disabled_none(self, mock_cal, mock_argon2):
+        ks = _store(self.tmp)
+        run(ks.init_none(confirm=True))
+        self.assertFalse(ks.connect_backup_enabled())
+
+    def test_connect_backup_disabled_uninitialised(self, mock_cal, mock_argon2):
+        ks = _store(self.tmp)
+        self.assertFalse(ks.connect_backup_enabled())
+
+    def test_backup_without_connect_raises(self, mock_cal, mock_argon2):
+        ks = _store(self.tmp)
+        run(ks.init_password("pw"))
+        with self.assertRaises(RuntimeError):
+            run(ks.backup_to_connect(None))
+
+    def test_restore_writes_blob(self, mock_cal, mock_argon2):
+        """Restore from Connect writes the blob to disk and enters LOCKED state."""
+        ks1 = _store(self.tmp)
+        run(ks1.init_password("mypassword"))
+        original_blob = json.loads((self.tmp / "key.json").read_text())
+
+        # Remove local blob to simulate hardware loss
+        (self.tmp / "key.json").unlink()
+
+        # Fresh store — no blob
+        ks2 = _store(self.tmp)
+        self.assertEqual(ks2._state, KeyState.UNINITIALISED)
+
+        connect = AsyncMock()
+        connect.fetch_key_blob.return_value = json.dumps(original_blob).encode()
+
+        run(ks2.restore_from_connect(connect))
+
+        # After restore: should be LOCKED (blob present, but not yet unlocked)
+        self.assertEqual(ks2._state, KeyState.LOCKED)
+        self.assertEqual(ks2._method, BackupMethod.PASSWORD)
+        self.assertTrue((self.tmp / "key.json").exists())
+
+    def test_restore_without_connect_raises(self, mock_cal, mock_argon2):
+        ks = _store(self.tmp)
+        with self.assertRaises(RuntimeError):
+            run(ks.restore_from_connect(None))
+
+    def test_restore_controller_id_mismatch_raises(self, mock_cal, mock_argon2):
+        """Blob from a different controller must be rejected."""
+        ks1 = _store(self.tmp)
+        run(ks1.init_password("pw"))
+        original_blob = json.loads((self.tmp / "key.json").read_text())
+        (self.tmp / "key.json").unlink()
+
+        # Simulate blob from a different controller
+        original_blob["controller_id"] = "different-controller"
+
+        ks2 = _store(self.tmp)
+        connect = AsyncMock()
+        connect.fetch_key_blob.return_value = json.dumps(original_blob).encode()
+
+        with self.assertRaises(RuntimeError, msg="controller_id mismatch"):
+            run(ks2.restore_from_connect(connect))
+
+    def test_restore_no_blob_raises(self, mock_cal, mock_argon2):
+        ks = _store(self.tmp)
+        connect = AsyncMock()
+        connect.fetch_key_blob.return_value = None
+        with self.assertRaises(RuntimeError):
+            run(ks.restore_from_connect(connect))
+
+    def test_restore_then_unlock(self, mock_cal, mock_argon2):
+        """Full DR cycle: backup → local loss → restore → unlock → derive."""
+        ks1 = _store(self.tmp)
+        run(ks1.init_password("drpassword"))
+        subkey1 = ks1.derive_subkey("footage")
+        blob_bytes = json.dumps(json.loads((self.tmp / "key.json").read_text())).encode()
+
+        # Simulate disaster: lose local blob
+        (self.tmp / "key.json").unlink()
+
+        # Restore
+        ks2 = _store(self.tmp)
+        connect = AsyncMock()
+        connect.fetch_key_blob.return_value = blob_bytes
+        run(ks2.restore_from_connect(connect))
+
+        # Unlock with original password
+        ok = run(ks2.unlock_password("drpassword"))
+        self.assertTrue(ok)
+
+        # Subkey must match original
+        subkey2 = ks2.derive_subkey("footage")
+        self.assertEqual(subkey1, subkey2)
+
+
 if __name__ == "__main__":
     unittest.main()

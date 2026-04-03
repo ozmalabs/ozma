@@ -164,7 +164,7 @@ class DirectRegisterRequest(BaseModel):
     frigate_port: str = ""     # Frigate API port (default 5000)
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None) -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None) -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -6323,6 +6323,34 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         _ks().evict_injected()
         return {"ok": True}
 
+    @app.post("/api/v1/keys/backup")
+    async def keys_backup_to_connect(request: Request) -> dict[str, Any]:
+        """Push the key blob to Ozma Connect for account-level backup."""
+        _require_scope(request, SCOPE_ADMIN)
+        ks = _ks()
+        if not ks.connect_backup_enabled():
+            raise HTTPException(409, "Key backup not available for 'none' backup method — change method first")
+        try:
+            await ks.backup_to_connect(connect)
+        except RuntimeError as exc:
+            raise HTTPException(503, str(exc))
+        return {"ok": True, "method": ks.get_status()["method"]}
+
+    @app.post("/api/v1/keys/restore")
+    async def keys_restore_from_connect(request: Request) -> dict[str, Any]:
+        """
+        Pull key blob from Ozma Connect.
+
+        Used for disaster recovery when local key storage has been lost.
+        After restore, call /keys/unlock with the original password/words.
+        """
+        _require_scope(request, SCOPE_ADMIN)
+        try:
+            await _ks().restore_from_connect(connect)
+        except RuntimeError as exc:
+            raise HTTPException(503, str(exc))
+        return {"ok": True, "status": _ks().get_status()}
+
     # ── DLP ──────────────────────────────────────────────────────────────────────
 
     class DLPRuleRequest(BaseModel):
@@ -6982,6 +7010,202 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if not compliance:
             raise HTTPException(503, "Compliance engine not configured")
         return await compliance.generate_soa()
+
+    # ── Wi-Fi AP ─────────────────────────────────────────────────────────────
+
+    @app.get("/api/v1/wifi-ap/status")
+    async def wifi_ap_status(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not wifi_ap:
+            raise HTTPException(503, "Wi-Fi AP not configured")
+        return wifi_ap.get_status()
+
+    @app.get("/api/v1/wifi-ap/config")
+    async def wifi_ap_get_config(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not wifi_ap:
+            raise HTTPException(503, "Wi-Fi AP not configured")
+        return wifi_ap.get_config().to_dict()
+
+    @app.patch("/api/v1/wifi-ap/config")
+    async def wifi_ap_set_config(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not wifi_ap:
+            raise HTTPException(503, "Wi-Fi AP not configured")
+        body = await request.json()
+        cfg = await wifi_ap.set_config(**body)
+        return cfg.to_dict()
+
+    @app.get("/api/v1/wifi-ap/interfaces")
+    async def wifi_ap_interfaces(request: Request) -> list[dict[str, Any]]:
+        _require_scope(request, SCOPE_READ)
+        if not wifi_ap:
+            raise HTTPException(503, "Wi-Fi AP not configured")
+        return await wifi_ap.probe_interfaces()
+
+    # ── Router Mode ───────────────────────────────────────────────────────────
+
+    @app.get("/api/v1/router/status")
+    async def router_status(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not router:
+            raise HTTPException(503, "Router mode not configured")
+        return router.get_status()
+
+    @app.get("/api/v1/router/config")
+    async def router_get_config(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not router:
+            raise HTTPException(503, "Router mode not configured")
+        return router.get_config().to_dict()
+
+    @app.patch("/api/v1/router/config")
+    async def router_set_config(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not router:
+            raise HTTPException(503, "Router mode not configured")
+        body = await request.json()
+        cfg = await router.set_config(**body)
+        return cfg.to_dict()
+
+    @app.get("/api/v1/router/cloud-allow-rules")
+    async def router_cloud_allow_list(request: Request) -> list[dict[str, Any]]:
+        _require_scope(request, SCOPE_READ)
+        if not router:
+            raise HTTPException(503, "Router mode not configured")
+        return router.list_cloud_allow_rules()
+
+    @app.post("/api/v1/router/cloud-allow-rules")
+    async def router_cloud_allow_add(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not router:
+            raise HTTPException(503, "Router mode not configured")
+        body = await request.json()
+        try:
+            rule = await router.add_cloud_allow_rule(
+                device_ip=body["device_ip"],
+                destination=body["destination"],
+                comment=body.get("comment", ""),
+            )
+        except KeyError as exc:
+            raise HTTPException(400, f"Missing field: {exc}")
+        return rule
+
+    @app.delete("/api/v1/router/cloud-allow-rules")
+    async def router_cloud_allow_remove(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not router:
+            raise HTTPException(503, "Router mode not configured")
+        body = await request.json()
+        removed = await router.remove_cloud_allow_rule(
+            device_ip=body.get("device_ip", ""),
+            destination=body.get("destination", ""),
+        )
+        if not removed:
+            raise HTTPException(404, "Rule not found")
+        return {"deleted": True}
+
+    @app.post("/api/v1/router/camera-trust")
+    async def router_trust_camera(request: Request) -> dict[str, Any]:
+        """Add a camera node IP to the trusted set (VLAN exempt)."""
+        _require_scope(request, SCOPE_WRITE)
+        if not router:
+            raise HTTPException(503, "Router mode not configured")
+        body = await request.json()
+        ip = body.get("ip", "")
+        if not ip:
+            raise HTTPException(400, "ip is required")
+        await router.add_trusted_camera(ip)
+        return {"ok": True, "ip": ip}
+
+    @app.delete("/api/v1/router/camera-trust/{ip}")
+    async def router_untrust_camera(request: Request, ip: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not router:
+            raise HTTPException(503, "Router mode not configured")
+        await router.remove_trusted_camera(ip)
+        return {"ok": True, "ip": ip}
+
+    @app.post("/api/v1/router/frigate-autostart")
+    async def router_frigate_autostart(request: Request) -> dict[str, Any]:
+        """Probe hardware and auto-start Frigate if capable."""
+        _require_scope(request, SCOPE_WRITE)
+        if not router:
+            raise HTTPException(503, "Router mode not configured")
+        started = await router.start_frigate_if_capable()
+        return {"started": started}
+
+    # ── Camera Recording ─────────────────────────────────────────────────────
+
+    def _cr():
+        if not cam_rec:
+            raise HTTPException(503, "Camera recording not configured")
+        return cam_rec
+
+    @app.get("/api/v1/recording/status")
+    async def recording_status(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        return _cr().get_status()
+
+    @app.get("/api/v1/recording/jobs")
+    async def recording_jobs(request: Request) -> list[dict[str, Any]]:
+        _require_scope(request, SCOPE_READ)
+        return _cr().list_jobs()
+
+    @app.get("/api/v1/recording/policies")
+    async def recording_list_policies(request: Request) -> list[dict[str, Any]]:
+        _require_scope(request, SCOPE_READ)
+        return [p.to_dict() for p in _cr().list_policies()]
+
+    @app.post("/api/v1/recording/policies")
+    async def recording_create_policy(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        mgr = _cr()
+        from camera_recording import RecordingTrigger, StorageBackend
+        try:
+            policy = mgr.add_policy(
+                name=body["name"],
+                camera_node_id=body.get("camera_node_id"),
+                trigger=RecordingTrigger(body.get("trigger", "continuous")),
+                object_classes=body.get("object_classes", []),
+                event_types=body.get("event_types", []),
+                segment_seconds=int(body.get("segment_seconds", 60)),
+                pre_buffer_seconds=int(body.get("pre_buffer_seconds", 5)),
+                post_buffer_seconds=int(body.get("post_buffer_seconds", 30)),
+                backend=StorageBackend(body.get("backend", "local")),
+                backend_config=body.get("backend_config", {}),
+                encrypted=bool(body.get("encrypted", False)),
+                retention_days=int(body.get("retention_days", 30)),
+                enabled=bool(body.get("enabled", True)),
+            )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(400, str(exc))
+        return policy.to_dict()
+
+    @app.get("/api/v1/recording/policies/{policy_id}")
+    async def recording_get_policy(request: Request, policy_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        policy = _cr().get_policy(policy_id)
+        if not policy:
+            raise HTTPException(404, "Policy not found")
+        return policy.to_dict()
+
+    @app.patch("/api/v1/recording/policies/{policy_id}")
+    async def recording_update_policy(request: Request, policy_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        policy = _cr().update_policy(policy_id, **body)
+        if not policy:
+            raise HTTPException(404, "Policy not found")
+        return policy.to_dict()
+
+    @app.delete("/api/v1/recording/policies/{policy_id}")
+    async def recording_delete_policy(request: Request, policy_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not _cr().remove_policy(policy_id):
+            raise HTTPException(404, "Policy not found")
+        return {"deleted": policy_id}
 
     # Static files — mounted last so they don't shadow API routes
     static_dir = Path(__file__).parent / "static"
