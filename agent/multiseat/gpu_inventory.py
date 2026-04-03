@@ -571,7 +571,13 @@ class GPUInventory:
             self._discover_windows_fallback()
 
         # Probe encoders (async — uses ffmpeg subprocess calls)
-        await self._probe_windows_encoders()
+        print(f"[OZMA DEBUG] GPU discovery done, {len(self._gpus)} GPUs. Probing encoders...", flush=True)
+        try:
+            await self._probe_windows_encoders()
+            print(f"[OZMA DEBUG] Encoder probing complete", flush=True)
+        except Exception as e:
+            print(f"[OZMA DEBUG] Encoder probing failed: {e}", flush=True)
+            log.warning("Encoder probing failed: %s", e)
 
     def _enumerate_windows_dxgi(self) -> None:
         """Enumerate GPUs via DXGI COM (IDXGIFactory1::EnumAdapters1). Synchronous."""
