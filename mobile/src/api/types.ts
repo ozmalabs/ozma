@@ -222,3 +222,31 @@ export class OzmaApiError extends Error {
     this.name = 'OzmaApiError';
   }
 }
+
+// ── Mobile camera / WHIP ──────────────────────────────────────────────────────
+
+/**
+ * A WHIP ingest session on the controller.
+ * Mirrors MobileSession.to_dict() in controller/mobile_camera.py.
+ */
+export interface MobileSession {
+  session_id: string;
+  camera_id: string;
+  name: string;
+  created_at: number;
+  relay_rtmp_url: string;
+  bytes_received: number;
+  status: 'connecting' | 'active' | 'ended';
+}
+
+/**
+ * A saved stream destination on the mobile client.
+ * Matches the StreamTarget interface in mobile/src/webcam/StreamTargets.ts.
+ */
+export interface StreamTarget {
+  id: string;
+  name: string;
+  type: 'ozma' | 'whip_external' | 'rtmp_relay';
+  url: string;
+  relayWhipEndpoint?: string;
+}

@@ -164,7 +164,7 @@ class DirectRegisterRequest(BaseModel):
     frigate_port: str = ""     # Frigate API port (default 5000)
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None) -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None) -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -3441,6 +3441,113 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             "frigate_yaml": frigate_yaml,
             "profile": profile.to_dict(),
         }
+
+    # --- WHIP (mobile camera ingest) endpoints ---
+
+    @app.post("/api/v1/cameras/whip")
+    async def whip_offer(
+        request: Request,
+        name: str = "Mobile Camera",
+        relay_rtmp: str = "",
+    ) -> Any:
+        """
+        WHIP ingest endpoint.  Accepts an SDP offer from a mobile phone and
+        returns an SDP answer.  Responds 201 Created with Location header.
+
+        Content-Type: application/sdp
+        Body: SDP offer text
+
+        Returns:
+          201 Created
+          Content-Type: application/sdp
+          Location: /api/v1/cameras/whip/{session_id}
+          Body: SDP answer text
+        """
+        if not mobile_cam:
+            raise HTTPException(status_code=503, detail="Mobile camera ingest not available")
+
+        content_type = request.headers.get("content-type", "")
+        if "application/sdp" not in content_type:
+            raise HTTPException(status_code=415, detail="Content-Type must be application/sdp")
+
+        offer_sdp = (await request.body()).decode("utf-8", errors="replace")
+        if not offer_sdp.strip():
+            raise HTTPException(status_code=422, detail="Empty SDP offer")
+
+        try:
+            answer_sdp, session_id = await mobile_cam.start_session(
+                offer_sdp=offer_sdp,
+                name=name,
+                relay_rtmp=relay_rtmp,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+        except Exception as exc:
+            log.exception("WHIP offer failed: %s", exc)
+            raise HTTPException(status_code=500, detail=f"WHIP session error: {exc}")
+
+        from fastapi.responses import Response
+        return Response(
+            content=answer_sdp,
+            status_code=201,
+            media_type="application/sdp",
+            headers={"Location": f"/api/v1/cameras/whip/{session_id}"},
+        )
+
+    @app.patch("/api/v1/cameras/whip/{session_id}")
+    async def whip_trickle(session_id: str, request: Request) -> Any:
+        """
+        WHIP trickle ICE endpoint.  Accepts an ICE candidate SDP fragment and
+        adds it to the peer connection.
+
+        Content-Type: application/trickle-ice-sdpfrag
+        Body: SDP fragment (a=candidate:... lines)
+
+        Returns: 204 No Content
+        """
+        if not mobile_cam:
+            raise HTTPException(status_code=503, detail="Mobile camera ingest not available")
+
+        session = await mobile_cam.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="WHIP session not found")
+
+        body = (await request.body()).decode("utf-8", errors="replace")
+        try:
+            await mobile_cam.trickle(session_id, body)
+        except Exception as exc:
+            log.warning("WHIP trickle error: %s", exc)
+
+        from fastapi.responses import Response
+        return Response(status_code=204)
+
+    @app.delete("/api/v1/cameras/whip/{session_id}")
+    async def whip_delete(session_id: str) -> dict[str, Any]:
+        """Teardown a WHIP session."""
+        if not mobile_cam:
+            raise HTTPException(status_code=503, detail="Mobile camera ingest not available")
+        session = await mobile_cam.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="WHIP session not found")
+        await mobile_cam.end_session(session_id)
+        return {"ok": True}
+
+    @app.get("/api/v1/cameras/whip")
+    async def whip_list() -> dict[str, Any]:
+        """List active WHIP (mobile camera) sessions."""
+        if not mobile_cam:
+            return {"sessions": []}
+        return {"sessions": await mobile_cam.list_sessions()}
+
+    @app.get("/api/v1/cameras/whip/{session_id}")
+    async def whip_get(session_id: str) -> dict[str, Any]:
+        """Get stats/status for a WHIP session."""
+        if not mobile_cam:
+            raise HTTPException(status_code=503, detail="Mobile camera ingest not available")
+        session = await mobile_cam.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="WHIP session not found")
+        return session.to_dict()
 
     # --- OBS / Broadcast studio endpoints ---
 

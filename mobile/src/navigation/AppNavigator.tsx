@@ -32,6 +32,7 @@ import {GuestInviteScreen} from '../screens/GuestInviteScreen';
 import {SettingsScreen} from '../screens/SettingsScreen';
 import {LoginScreen} from '../screens/LoginScreen';
 import {OnboardingScreen} from '../screens/OnboardingScreen';
+import {WebcamScreen} from '../screens/WebcamScreen';
 
 // ── Route parameter types ─────────────────────────────────────────────────────
 
@@ -44,6 +45,7 @@ export type RootStackParamList = {
 
 export type TabParamList = {
   Cameras: undefined;
+  Webcam: undefined;
   Machines: undefined;
   Notifications: undefined;
   Guests: undefined;
@@ -75,6 +77,14 @@ function MainTabs() {
         options={{
           title: 'Cameras',
           tabBarIcon: ({color}) => <TabIcon emoji="📷" color={color} />,
+        }}
+      />
+      <Tab.Screen
+        name="Webcam"
+        component={WebcamScreen}
+        options={{
+          title: 'Webcam',
+          tabBarIcon: ({color}) => <TabIcon emoji="📹" color={color} />,
         }}
       />
       <Tab.Screen
