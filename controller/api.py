@@ -31,6 +31,10 @@ from auth import (
 )
 
 from state import AppState, NodeInfo
+from permissions import (
+    check_node_permission, check_destructive_warnings, warnings_to_dict,
+    get_user_seats, get_user_permission_level, PERMISSION_LEVELS,
+)
 from scenarios import ScenarioManager
 from stream import StreamManager
 from audio import AudioRouter
@@ -85,6 +89,8 @@ from itsm import (
     WorkingHours, OnCallWindow, AgentModelConfig,
     AGENT_L1, AGENT_L2, AGENT_HUMAN, _PRIORITIES,
 )
+from mdm_bridge import MDMBridgeManager, MDMConfig, ManagedDevice
+from job_queue import JobQueue, JobSpec, JobType, JobState, TargetScope
 
 log = logging.getLogger("ozma.api")
 
@@ -149,7 +155,7 @@ class DirectRegisterRequest(BaseModel):
     frigate_port: str = ""     # Frigate API port (default 5000)
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None) -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None) -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -883,43 +889,8 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             "seat_config": node.seat_config,
         }
 
-    @app.put("/api/v1/nodes/{node_id}/seats")
-    async def update_seat_config(request: Request, node_id: str, body: dict) -> dict[str, Any]:
-        """Update seat config for a node and push to the agent."""
-        _require_scope(request, SCOPE_WRITE)
-        node = state.nodes.get(node_id)
-        if not node:
-            raise HTTPException(status_code=404, detail="Node not found")
-
-        seats = body.get("seats")
-        if seats is None or not isinstance(seats, int) or seats < 1 or seats > 8:
-            raise HTTPException(status_code=400, detail="seats must be an integer 1-8")
-
-        profiles = body.get("profiles", [])
-        if profiles and len(profiles) != seats:
-            raise HTTPException(status_code=400, detail="profiles length must match seats count")
-
-        node.seat_count = seats
-        node.seat_config = {"seats": seats, "profiles": profiles}
-
-        # Push config to the agent's WebSocket if connected
-        msg = json.dumps({"type": "seat_config", "seats": seats, "profiles": profiles})
-        ws = _node_config_ws.get(node_id)
-        if ws:
-            try:
-                await ws.send_text(msg)
-                log.info("Pushed seat config to %s: %d seats", node_id, seats)
-            except Exception:
-                log.warning("Failed to push seat config to %s — agent disconnected", node_id)
-                _node_config_ws.pop(node_id, None)
-
-        await state.events.put({
-            "type": "node.seat_config",
-            "node_id": node_id,
-            "seat_count": seats,
-            "seat_config": node.seat_config,
-        })
-        return {"ok": True, "node_id": node_id, "seat_count": seats, "seat_config": node.seat_config}
+    # Note: PUT /api/v1/nodes/{node_id}/seats is defined below with destructive
+    # action warning support (update_seat_config_with_warnings)
 
     @app.websocket("/api/v1/nodes/{node_id}/config/ws")
     async def node_config_ws(ws: WebSocket, node_id: str) -> None:
@@ -952,7 +923,28 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
         log.info("Agent config WS connected: %s", node_id)
 
-        # Send current config immediately
+        # Wire job dispatch function into the queue on first use
+        if job_queue and not job_queue._dispatch_fn:
+            async def _jq_dispatch(target: str, msg: dict) -> bool:
+                _ws = _node_config_ws.get(target)
+                if not _ws:
+                    return False
+                try:
+                    await _ws.send_text(json.dumps(msg))
+                    return True
+                except Exception:
+                    _node_config_ws.pop(target, None)
+                    return False
+            job_queue.set_dispatch_fn(_jq_dispatch)
+
+        # Dispatch any pending jobs for this node
+        if job_queue:
+            asyncio.create_task(
+                job_queue.on_node_connected(node_id),
+                name=f"job-dispatch-{node_id}",
+            )
+
+        # Send current seat config immediately
         config_msg = {
             "type": "seat_config",
             "seats": node.seat_count,
@@ -966,14 +958,29 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
         try:
             while True:
-                # Agent can send messages (e.g. acks, status)
+                # Agent can send messages (e.g. acks, status, job results)
                 text = await ws.receive_text()
                 try:
                     msg = json.loads(text)
                     msg_type = msg.get("type", "")
                     if msg_type == "seat_status":
-                        # Agent reports current seat count for reconciliation
                         log.debug("Agent %s seat status: %s", node_id, msg)
+                    elif msg_type == "job_ack" and job_queue:
+                        await job_queue.handle_ack(msg.get("job_id", ""))
+                    elif msg_type == "job_progress" and job_queue:
+                        await job_queue.handle_progress(
+                            msg.get("job_id", ""),
+                            msg.get("progress", 0),
+                            msg.get("message", ""),
+                        )
+                    elif msg_type == "job_result" and job_queue:
+                        await job_queue.handle_result(
+                            msg.get("job_id", ""),
+                            msg.get("exit_code", -1),
+                            msg.get("stdout", ""),
+                            msg.get("stderr", ""),
+                            msg.get("error", ""),
+                        )
                 except json.JSONDecodeError:
                     pass
         except WebSocketDisconnect:
@@ -984,6 +991,253 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             if _node_config_ws.get(node_id) is ws:
                 _node_config_ws.pop(node_id, None)
             log.info("Agent config WS disconnected: %s", node_id)
+
+    # --- Seat ownership and sharing ---
+
+    @app.get("/api/v1/nodes/{node_id}/owner")
+    async def get_node_owner(node_id: str) -> dict[str, Any]:
+        """Get owner info for a node/seat."""
+        node = state.nodes.get(node_id)
+        if not node:
+            raise HTTPException(status_code=404, detail="Node not found")
+        return {
+            "node_id": node_id,
+            "owner_id": node.owner_id,
+            "parent_node_id": node.parent_node_id,
+        }
+
+    @app.put("/api/v1/nodes/{node_id}/owner")
+    async def set_node_owner(request: Request, node_id: str, body: dict) -> dict[str, Any]:
+        """Set owner of a node/seat."""
+        ctx = _require_scope(request, SCOPE_WRITE)
+        node = state.nodes.get(node_id)
+        if not node:
+            raise HTTPException(status_code=404, detail="Node not found")
+
+        user_id = body.get("user_id", "")
+        if not isinstance(user_id, str):
+            raise HTTPException(status_code=400, detail="user_id must be a string")
+
+        old_owner = node.owner_id
+        node.owner_id = user_id
+
+        log.info("Node %s owner changed: %s -> %s (by %s from %s)",
+                 node_id, old_owner or "(none)", user_id or "(none)",
+                 ctx.user_id or "admin", ctx.source_ip)
+
+        await state.events.put({
+            "type": "seat.owner_changed",
+            "node_id": node_id,
+            "old_owner": old_owner,
+            "new_owner": user_id,
+            "changed_by": ctx.user_id or "admin",
+            "timestamp": time.time(),
+        })
+        return {"ok": True, "node_id": node_id, "owner_id": user_id}
+
+    @app.get("/api/v1/nodes/{node_id}/sharing")
+    async def get_node_sharing(node_id: str) -> dict[str, Any]:
+        """Get share list with permissions for a node/seat."""
+        node = state.nodes.get(node_id)
+        if not node:
+            raise HTTPException(status_code=404, detail="Node not found")
+        shares = [
+            {"user_id": uid, "permission": node.share_permissions.get(uid, "use")}
+            for uid in node.shared_with
+        ]
+        return {"node_id": node_id, "owner_id": node.owner_id, "shares": shares}
+
+    @app.post("/api/v1/nodes/{node_id}/sharing")
+    async def add_node_sharing(request: Request, node_id: str, body: dict) -> dict[str, Any]:
+        """Share a node/seat with a user."""
+        ctx = _require_scope(request, SCOPE_WRITE)
+        node = state.nodes.get(node_id)
+        if not node:
+            raise HTTPException(status_code=404, detail="Node not found")
+
+        user_id = body.get("user_id", "")
+        permission = body.get("permission", "use")
+        if not user_id or not isinstance(user_id, str):
+            raise HTTPException(status_code=400, detail="user_id is required")
+        if permission not in ("use", "manage", "admin"):
+            raise HTTPException(status_code=400, detail="permission must be use, manage, or admin")
+
+        # Check that the requesting user has at least admin permission to share
+        if node.owner_id and ctx.user_id:
+            if not check_node_permission(node, ctx.user_id, "admin", state):
+                raise HTTPException(status_code=403, detail="Admin permission required to share")
+
+        if user_id not in node.shared_with:
+            node.shared_with.append(user_id)
+        node.share_permissions[user_id] = permission
+
+        log.info("Node %s shared with %s (%s) by %s from %s",
+                 node_id, user_id, permission,
+                 ctx.user_id or "admin", ctx.source_ip)
+
+        await state.events.put({
+            "type": "seat.shared",
+            "node_id": node_id,
+            "user_id": user_id,
+            "permission": permission,
+            "shared_by": ctx.user_id or "admin",
+            "timestamp": time.time(),
+        })
+        return {"ok": True, "node_id": node_id, "user_id": user_id, "permission": permission}
+
+    @app.delete("/api/v1/nodes/{node_id}/sharing/{user_id}")
+    async def revoke_node_sharing(request: Request, node_id: str, user_id: str) -> dict[str, Any]:
+        """Revoke a user's share on a node/seat."""
+        ctx = _require_scope(request, SCOPE_WRITE)
+        node = state.nodes.get(node_id)
+        if not node:
+            raise HTTPException(status_code=404, detail="Node not found")
+
+        if user_id not in node.shared_with:
+            raise HTTPException(status_code=404, detail="User not in share list")
+
+        # Check permission — owner or admin can revoke
+        if node.owner_id and ctx.user_id:
+            if not check_node_permission(node, ctx.user_id, "admin", state):
+                raise HTTPException(status_code=403, detail="Admin permission required to revoke share")
+
+        node.shared_with.remove(user_id)
+        node.share_permissions.pop(user_id, None)
+
+        log.info("Node %s share revoked for %s by %s from %s",
+                 node_id, user_id, ctx.user_id or "admin", ctx.source_ip)
+
+        await state.events.put({
+            "type": "seat.unshared",
+            "node_id": node_id,
+            "user_id": user_id,
+            "revoked_by": ctx.user_id or "admin",
+            "timestamp": time.time(),
+        })
+        return {"ok": True, "node_id": node_id, "user_id": user_id}
+
+    @app.put("/api/v1/nodes/{node_id}/sharing/{user_id}")
+    async def update_node_sharing(request: Request, node_id: str, user_id: str, body: dict) -> dict[str, Any]:
+        """Update a user's permission level on a shared node/seat."""
+        ctx = _require_scope(request, SCOPE_WRITE)
+        node = state.nodes.get(node_id)
+        if not node:
+            raise HTTPException(status_code=404, detail="Node not found")
+
+        if user_id not in node.shared_with:
+            raise HTTPException(status_code=404, detail="User not in share list")
+
+        permission = body.get("permission", "")
+        if permission not in ("use", "manage", "admin"):
+            raise HTTPException(status_code=400, detail="permission must be use, manage, or admin")
+
+        if node.owner_id and ctx.user_id:
+            if not check_node_permission(node, ctx.user_id, "admin", state):
+                raise HTTPException(status_code=403, detail="Admin permission required to update share")
+
+        old_perm = node.share_permissions.get(user_id, "use")
+        node.share_permissions[user_id] = permission
+
+        log.info("Node %s share for %s updated: %s -> %s by %s from %s",
+                 node_id, user_id, old_perm, permission,
+                 ctx.user_id or "admin", ctx.source_ip)
+
+        return {"ok": True, "node_id": node_id, "user_id": user_id, "permission": permission}
+
+    @app.get("/api/v1/my/seats")
+    async def get_my_seats(request: Request) -> dict[str, Any]:
+        """Get seats owned by or shared with the authenticated user."""
+        ctx = _require_scope(request, SCOPE_READ)
+        user_id = ctx.user_id
+        if not user_id:
+            raise HTTPException(status_code=400, detail="No user identity (legacy auth)")
+        return get_user_seats(state, user_id)
+
+    # --- Override seat config update with destructive warnings ---
+
+    @app.put("/api/v1/nodes/{node_id}/seats")
+    async def update_seat_config_with_warnings(request: Request, node_id: str, body: dict) -> Any:
+        """Update seat config with destructive action warnings.
+
+        If reducing seats would affect owned/shared seats, returns 409 with warnings
+        unless confirm:true is in the request body.
+        """
+        _require_scope(request, SCOPE_WRITE)
+        node = state.nodes.get(node_id)
+        if not node:
+            raise HTTPException(status_code=404, detail="Node not found")
+
+        seats = body.get("seats")
+        if seats is None or not isinstance(seats, int) or seats < 1 or seats > 8:
+            raise HTTPException(status_code=400, detail="seats must be an integer 1-8")
+
+        confirm = body.get("confirm", False)
+
+        # Check for destructive warnings when reducing seats
+        if seats < node.seat_count and not confirm:
+            warnings = check_destructive_warnings(state, node_id, "reduce_seats",
+                                                   target_seat_count=seats)
+            if warnings:
+                total_affected = sum(
+                    (1 if w.owner else 0) + len(w.shared_users) for w in warnings
+                )
+                removed = node.seat_count - seats
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "warnings": warnings_to_dict(warnings),
+                        "confirm_required": True,
+                        "confirm_message": (
+                            f"Reducing seats will remove {removed} seat(s) "
+                            f"affecting {total_affected} user(s). "
+                            f"Send confirm:true to proceed."
+                        ),
+                    },
+                )
+
+        if confirm and seats < node.seat_count:
+            ctx = getattr(request.state, "auth", None)
+            warnings = check_destructive_warnings(state, node_id, "reduce_seats",
+                                                   target_seat_count=seats)
+            if warnings:
+                log.info("Destructive seat reduction on %s confirmed by %s from %s: %d -> %d seats",
+                         node_id, ctx.user_id if ctx else "admin",
+                         ctx.source_ip if ctx else "unknown",
+                         node.seat_count, seats)
+                await state.events.put({
+                    "type": "seat.destroying_warning",
+                    "node_id": node_id,
+                    "warnings": warnings_to_dict(warnings),
+                    "confirmed_by": ctx.user_id if ctx else "admin",
+                    "timestamp": time.time(),
+                })
+
+        # Proceed with the actual seat config update
+        profiles = body.get("profiles", [])
+        if profiles and len(profiles) != seats:
+            raise HTTPException(status_code=400, detail="profiles length must match seats count")
+
+        node.seat_count = seats
+        node.seat_config = {"seats": seats, "profiles": profiles}
+
+        # Push config to the agent's WebSocket if connected
+        msg = json.dumps({"type": "seat_config", "seats": seats, "profiles": profiles})
+        ws = _node_config_ws.get(node_id)
+        if ws:
+            try:
+                await ws.send_text(msg)
+                log.info("Pushed seat config to %s: %d seats", node_id, seats)
+            except Exception:
+                log.warning("Failed to push seat config to %s — agent disconnected", node_id)
+                _node_config_ws.pop(node_id, None)
+
+        await state.events.put({
+            "type": "node.seat_config",
+            "node_id": node_id,
+            "seat_count": seats,
+            "seat_config": node.seat_config,
+        })
+        return {"ok": True, "node_id": node_id, "seat_count": seats, "seat_config": node.seat_config}
 
     @app.post("/api/v1/nodes/{node_id}/activate")
     async def activate_node(node_id: str) -> dict[str, Any]:
@@ -5370,6 +5624,341 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(503, "License manager not enabled")
         alerts = await license_mgr.run_renewal_check_now()
         return {"alerts": [a.to_dict() for a in alerts]}
+
+    # ── MDM Bridge ───────────────────────────────────────────────────────────────
+
+    class MDMConfigPatchRequest(BaseModel):
+        provider: str | None = None
+        google_admin_email: str | None = None
+        google_service_account_json_env: str | None = None
+        google_customer_id: str | None = None
+        intune_tenant_id: str | None = None
+        intune_client_id: str | None = None
+        intune_client_secret_env: str | None = None
+        jamf_base_url: str | None = None
+        jamf_client_id: str | None = None
+        jamf_client_secret_env: str | None = None
+        wg_endpoint: str | None = None
+        wg_server_public_key: str | None = None
+        wg_dns: str | None = None
+        wg_allowed_ips: str | None = None
+        wifi_ssid: str | None = None
+        wifi_security: str | None = None
+        wifi_password_env: str | None = None
+        sync_interval_seconds: int | None = None
+
+    @app.get("/api/v1/mdm/status")
+    async def mdm_status(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not mdm:
+            raise HTTPException(503, "MDM bridge not enabled")
+        return mdm.status()
+
+    @app.get("/api/v1/mdm/config")
+    async def mdm_get_config(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not mdm:
+            raise HTTPException(503, "MDM bridge not enabled")
+        return mdm.get_config().to_dict()
+
+    @app.patch("/api/v1/mdm/config")
+    async def mdm_patch_config(request: Request, body: MDMConfigPatchRequest) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not mdm:
+            raise HTTPException(503, "MDM bridge not enabled")
+        cfg = mdm.get_config()
+        patch = body.model_dump(exclude_none=True)
+        for k, v in patch.items():
+            if hasattr(cfg, k):
+                setattr(cfg, k, v)
+        mdm.set_config(cfg)
+        return cfg.to_dict()
+
+    @app.get("/api/v1/mdm/devices")
+    async def mdm_list_devices(
+        request: Request,
+        email: str | None = None,
+        platform: str | None = None,
+        compliant: bool | None = None,
+        vpn_pushed: bool | None = None,
+    ) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not mdm:
+            raise HTTPException(503, "MDM bridge not enabled")
+        devices = mdm.list_devices(
+            user_email=email,
+            platform=platform,
+            compliance_state="compliant" if compliant is True else ("noncompliant" if compliant is False else None),
+        )
+        if vpn_pushed is not None:
+            devices = [d for d in devices if d.vpn_profile_pushed == vpn_pushed]
+        return {"devices": [d.to_dict() for d in devices]}
+
+    @app.get("/api/v1/mdm/devices/{device_id}")
+    async def mdm_get_device(request: Request, device_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not mdm:
+            raise HTTPException(503, "MDM bridge not enabled")
+        d = mdm.get_device(device_id)
+        if not d:
+            raise HTTPException(404, "Device not found")
+        return d.to_dict()
+
+    @app.post("/api/v1/mdm/sync")
+    async def mdm_sync(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not mdm:
+            raise HTTPException(503, "MDM bridge not enabled")
+        return await mdm.sync()
+
+    @app.post("/api/v1/mdm/devices/{device_id}/push-vpn")
+    async def mdm_push_vpn(request: Request, device_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not mdm:
+            raise HTTPException(503, "MDM bridge not enabled")
+        d = mdm.get_device(device_id)
+        if not d:
+            raise HTTPException(404, "Device not found")
+        ok = await mdm.push_vpn_profile(device_id)
+        if not ok:
+            raise HTTPException(500, "VPN profile push failed")
+        return {"ok": True, "device_id": device_id}
+
+    @app.post("/api/v1/mdm/invite/{email:path}")
+    async def mdm_invite(request: Request, email: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not mdm:
+            raise HTTPException(503, "MDM bridge not enabled")
+        body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+        name = body.get("name", "") if isinstance(body, dict) else ""
+        ok = await mdm.invite_enrollment(email, name=name)
+        return {"ok": ok, "email": email}
+
+    @app.post("/api/v1/mdm/offboard/{email:path}")
+    async def mdm_offboard(request: Request, email: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not mdm:
+            raise HTTPException(503, "MDM bridge not enabled")
+        body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+        wipe = bool(body.get("wipe", False)) if isinstance(body, dict) else False
+        result = await mdm.offboard_user(email, wipe=wipe)
+        return result
+
+    @app.get("/api/v1/mdm/gaps")
+    async def mdm_compliance_gaps(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not mdm:
+            raise HTTPException(503, "MDM bridge not enabled")
+        return {"gaps": mdm.compliance_gaps()}
+
+    # ── Job queue ──────────────────────────────────────────────────────────────
+
+    def _jq() -> JobQueue:
+        if not job_queue:
+            raise HTTPException(503, "Job queue not enabled")
+        return job_queue
+
+    class CreateJobRequest(BaseModel):
+        name:             str
+        type:             str               = "command"
+        command:          str               = ""
+        args:             list[str]         = []
+        env:              dict[str, str]    = {}
+        working_dir:      str               = ""
+        timeout_seconds:  int               = 300
+        run_as:           str               = ""
+        packages:         list[str]         = []
+        package_manager:  str               = "auto"
+        dest_path:        str               = ""
+        content_b64:      str               = ""
+        file_mode:        str               = "0644"
+        recipe:           str               = ""
+        recipe_params:    dict[str, Any]    = {}
+        target_node_id:   str               = ""
+        deadline:         float | None      = None
+        tags:             dict[str, str]    = {}
+
+    class CreateCampaignRequest(BaseModel):
+        name:             str
+        type:             str               = "command"
+        command:          str               = ""
+        args:             list[str]         = []
+        env:              dict[str, str]    = {}
+        working_dir:      str               = ""
+        timeout_seconds:  int               = 300
+        run_as:           str               = ""
+        packages:         list[str]         = []
+        package_manager:  str               = "auto"
+        dest_path:        str               = ""
+        content_b64:      str               = ""
+        file_mode:        str               = "0644"
+        recipe:           str               = ""
+        recipe_params:    dict[str, Any]    = {}
+        target_scope:     str               = "all"
+        target_ids:       list[str]         = []
+        target_labels:    list[str]         = []
+        deadline:         float | None      = None
+        tags:             dict[str, str]    = {}
+
+    class JobResultRequest(BaseModel):
+        exit_code:  int
+        stdout:     str = ""
+        stderr:     str = ""
+        error:      str = ""
+
+    class JobProgressRequest(BaseModel):
+        progress:   int
+        message:    str = ""
+
+    def _spec_from_request(body: Any) -> JobSpec:
+        try:
+            jtype = JobType(body.type)
+        except ValueError:
+            raise HTTPException(400, f"Unknown job type: {body.type}")
+        return JobSpec(
+            type=jtype, command=body.command, args=body.args, env=body.env,
+            working_dir=body.working_dir, timeout_seconds=body.timeout_seconds,
+            run_as=body.run_as, packages=body.packages,
+            package_manager=body.package_manager, dest_path=body.dest_path,
+            content_b64=body.content_b64, file_mode=body.file_mode,
+            recipe=body.recipe, recipe_params=body.recipe_params,
+        )
+
+    @app.get("/api/v1/jobs")
+    async def jobs_list(request: Request,
+                        state_filter: str | None = None,
+                        node_id: str | None = None,
+                        campaign_id: str | None = None,
+                        limit: int = 200,
+                        offset: int = 0) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        q = _jq()
+        jobs = q.list_jobs(state=state_filter, node_id=node_id,
+                            campaign_id=campaign_id, limit=limit, offset=offset)
+        return {"jobs": [j.to_dict() for j in jobs]}
+
+    @app.post("/api/v1/jobs")
+    async def jobs_create(request: Request, body: CreateJobRequest) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        q = _jq()
+        if not body.target_node_id:
+            raise HTTPException(400, "target_node_id required for single-node job")
+        if body.target_node_id not in state.nodes:
+            raise HTTPException(404, "Node not found")
+        spec = _spec_from_request(body)
+        job = await q.create_job(
+            name=body.name, spec=spec, target_node_id=body.target_node_id,
+            deadline=body.deadline, tags=body.tags,
+            created_by=getattr(request.state, "user", "api"),
+        )
+        return job.to_dict()
+
+    @app.get("/api/v1/jobs/{job_id}")
+    async def jobs_get(request: Request, job_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        job = _jq().get_job(job_id)
+        if not job:
+            raise HTTPException(404, "Job not found")
+        return job.to_dict()
+
+    @app.post("/api/v1/jobs/{job_id}/cancel")
+    async def jobs_cancel(request: Request, job_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not _jq().cancel_job(job_id):
+            raise HTTPException(404, "Job not found or already terminal")
+        return {"ok": True}
+
+    @app.post("/api/v1/jobs/{job_id}/retry")
+    async def jobs_retry(request: Request, job_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        new_job = await _jq().retry_job(job_id)
+        if not new_job:
+            raise HTTPException(400, "Job not found or not in a retryable state")
+        return new_job.to_dict()
+
+    # Agent result reporting — WireGuard/mesh agents post without JWT
+
+    @app.post("/api/v1/jobs/{job_id}/ack")
+    async def jobs_ack(job_id: str) -> dict[str, Any]:
+        if not job_queue:
+            raise HTTPException(503, "Job queue not enabled")
+        await job_queue.handle_ack(job_id)
+        return {"ok": True}
+
+    @app.post("/api/v1/jobs/{job_id}/progress")
+    async def jobs_progress(job_id: str, body: JobProgressRequest) -> dict[str, Any]:
+        if not job_queue:
+            raise HTTPException(503, "Job queue not enabled")
+        await job_queue.handle_progress(job_id, body.progress, body.message)
+        return {"ok": True}
+
+    @app.post("/api/v1/jobs/{job_id}/result")
+    async def jobs_result(job_id: str, body: JobResultRequest) -> dict[str, Any]:
+        if not job_queue:
+            raise HTTPException(503, "Job queue not enabled")
+        await job_queue.handle_result(job_id, body.exit_code, body.stdout,
+                                       body.stderr, body.error)
+        return {"ok": True}
+
+    @app.get("/api/v1/campaigns")
+    async def campaigns_list(request: Request,
+                              limit: int = 100,
+                              offset: int = 0) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        campaigns = _jq().list_campaigns(limit=limit, offset=offset)
+        return {"campaigns": [c.to_dict() for c in campaigns]}
+
+    @app.post("/api/v1/campaigns")
+    async def campaigns_create(request: Request,
+                                body: CreateCampaignRequest) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        q = _jq()
+        try:
+            scope = TargetScope(body.target_scope)
+        except ValueError:
+            raise HTTPException(400, f"Unknown target_scope: {body.target_scope}")
+        if scope == TargetScope.NODE and not body.target_ids:
+            raise HTTPException(400, "target_ids required when target_scope=node")
+        spec = _spec_from_request(body)
+        campaign = await q.create_campaign(
+            name=body.name, spec=spec,
+            target_scope=scope,
+            target_ids=body.target_ids or None,
+            target_labels=body.target_labels or None,
+            deadline=body.deadline, tags=body.tags,
+            created_by=getattr(request.state, "user", "api"),
+        )
+        return {"campaign": campaign.to_dict(),
+                "summary": q.campaign_summary(campaign.id)}
+
+    @app.get("/api/v1/campaigns/{campaign_id}")
+    async def campaigns_get(request: Request, campaign_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        q = _jq()
+        campaign = q.get_campaign(campaign_id)
+        if not campaign:
+            raise HTTPException(404, "Campaign not found")
+        return {"campaign": campaign.to_dict(),
+                "summary": q.campaign_summary(campaign_id)}
+
+    @app.get("/api/v1/campaigns/{campaign_id}/jobs")
+    async def campaigns_jobs(request: Request, campaign_id: str,
+                              state_filter: str | None = None) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        q = _jq()
+        if not q.get_campaign(campaign_id):
+            raise HTTPException(404, "Campaign not found")
+        jobs = q.list_jobs(campaign_id=campaign_id, state=state_filter, limit=1000)
+        return {"jobs": [j.to_dict() for j in jobs]}
+
+    @app.post("/api/v1/campaigns/{campaign_id}/cancel")
+    async def campaigns_cancel(request: Request, campaign_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        q = _jq()
+        if not q.get_campaign(campaign_id):
+            raise HTTPException(404, "Campaign not found")
+        count = q.cancel_campaign(campaign_id)
+        return {"ok": True, "cancelled": count}
 
     # Static files — mounted last so they don't shadow API routes
     static_dir = Path(__file__).parent / "static"
