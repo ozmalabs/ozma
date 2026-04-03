@@ -215,22 +215,11 @@ class WindowsAudioBackend(SeatAudioBackend):
         if sys.platform != "win32":
             return None
 
-        # Lazy enumeration — defer to avoid COM crashes at startup
-        if not self._endpoints:
-            if self._enum_attempted:
-                return None
-            self._enum_attempted = True
-            # Run PowerShell in executor to avoid blocking and catch crashes
-            import asyncio
-            loop = asyncio.get_event_loop()
-            try:
-                self._endpoints = await loop.run_in_executor(
-                    None, self.enumerate_endpoints
-                )
-            except Exception as e:
-                log.warning("Audio endpoint enumeration failed: %s", e)
-                self._endpoints = []
-                return None
+        # Skip enumeration at startup — audio routing is configured
+        # per-seat later via the dashboard or seat config. Avoids COM
+        # crashes with complex audio setups (Voicemeeter, VB-Audio, etc.)
+        log.debug("Audio sink for %s: deferred (configure via dashboard)", seat_name)
+        return None
 
         # Check for VB-Audio Cable virtual sinks
         vb_sinks = [e for e in self._endpoints if "cable" in e.name.lower()
