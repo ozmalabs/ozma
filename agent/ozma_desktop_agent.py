@@ -1240,6 +1240,16 @@ def main() -> None:
         sp.add_argument("--fps", type=int, default=15, help="Screen capture FPS")
         sp.add_argument("--no-capture", action="store_true", help="Disable screen capture")
         sp.add_argument("--debug", action="store_true")
+        # Multi-seat options
+        sp.add_argument("--multi-seat", action="store_true",
+                        help="Enable multi-seat mode (one node per display)")
+        sp.add_argument("--seats", type=int, default=None,
+                        help="Number of seats (default: auto-detect from displays)")
+        sp.add_argument("--seat-config", default=None,
+                        help="Path to seat configuration JSON file")
+        sp.add_argument("--seat-profile", default="workstation",
+                        choices=["gaming", "workstation", "media", "kiosk"],
+                        help="Default seat profile (default: workstation)")
 
     # `ozma-agent install`
     inst_p = sub.add_parser("install", help="Install as background service (auto-start on boot)")
@@ -1281,28 +1291,61 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
-    node = DesktopSoftNode(
-        name=args.name, port=args.port,
-        api_port=args.api_port,
-        controller_url=args.controller,
-        capture_fps=0 if args.no_capture else args.fps,
-    )
+    multi_seat = getattr(args, "multi_seat", False)
 
-    loop = asyncio.new_event_loop()
+    if multi_seat:
+        # Multi-seat mode: one node per display
+        from multiseat import SeatManager
 
-    def _on_signal():
-        loop.call_soon_threadsafe(node._stop_event.set)
+        manager = SeatManager(
+            controller_url=args.controller,
+            base_udp_port=args.port,
+            base_api_port=args.api_port,
+            seat_count=getattr(args, "seats", None),
+            seat_config_path=getattr(args, "seat_config", None),
+            profile_name=getattr(args, "seat_profile", "workstation"),
+            machine_name=args.name,
+        )
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, _on_signal)
+        loop = asyncio.new_event_loop()
 
-    try:
-        loop.run_until_complete(node.run())
-    except KeyboardInterrupt:
-        pass
-    finally:
-        loop.run_until_complete(node.stop())
-        loop.close()
+        def _on_signal():
+            loop.call_soon_threadsafe(manager._stop_event.set)
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, _on_signal)
+
+        try:
+            loop.run_until_complete(manager.start())
+        except KeyboardInterrupt:
+            pass
+        finally:
+            loop.run_until_complete(manager.stop())
+            loop.close()
+    else:
+        # Single-node mode (original behaviour)
+        node = DesktopSoftNode(
+            name=args.name, port=args.port,
+            api_port=args.api_port,
+            controller_url=args.controller,
+            capture_fps=0 if args.no_capture else args.fps,
+        )
+
+        loop = asyncio.new_event_loop()
+
+        def _on_signal():
+            loop.call_soon_threadsafe(node._stop_event.set)
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, _on_signal)
+
+        try:
+            loop.run_until_complete(node.run())
+        except KeyboardInterrupt:
+            pass
+        finally:
+            loop.run_until_complete(node.stop())
+            loop.close()
 
 
 if __name__ == "__main__":
