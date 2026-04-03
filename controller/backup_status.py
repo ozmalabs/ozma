@@ -308,17 +308,64 @@ class BackupNudgeService:
             report = self._tracker.get_node_report(node_id)
             if report and report.health not in ("unconfigured", ""):
                 continue  # already configured
+            if report and getattr(report, "time_machine_enabled", False):
+                continue  # macOS TM already covers this node — don't nag
             # Check cooldown
             if now - self._last_nudge.get(node_id, 0) < self._NUDGE_COOLDOWN:
                 continue
             self._last_nudge[node_id] = now
             log.info("Nudging node %s: backup not configured", node_id)
             await self._fire_event({
-                "type":    "backup.not_configured",
-                "node_id": node_id,
+                "type":      "backup.not_configured",
+                "node_id":   node_id,
                 "node_name": getattr(node, "name", node_id),
-                "ts":      now,
+                "ts":        now,
             })
+
+    async def check_onboarding(self, node_id: str) -> None:
+        """
+        Called when a new node registers.  Queries the node's agent for backup
+        eligibility and fires a 'backup.onboarding_offer' event if the node
+        is eligible for default-on setup.
+
+        This drives the dashboard "~8 GB found — Back up now" one-click prompt.
+        """
+        # Short delay to let the agent stabilise after registration
+        import asyncio
+        await asyncio.sleep(5.0)
+
+        # Fetch eligibility from agent
+        eligibility = await self.proxy_get(node_id, "/api/v1/backup/onboarding")
+        if not eligibility:
+            return
+
+        if not eligibility.get("eligible"):
+            # Already configured, on battery, not enough disk, etc.
+            if eligibility.get("time_machine_enabled"):
+                log.info("Node %s: Time Machine detected — skipping backup onboarding", node_id)
+            return
+
+        size_bytes  = eligibility.get("estimated_size_bytes", 0)
+        size_gb     = round(size_bytes / (1024 ** 3), 1) if size_bytes else 0
+        platform    = eligibility.get("platform", "")
+        size_label  = f"~{size_gb} GB found" if size_gb else "Files found"
+
+        nodes = getattr(self._state, "nodes", {})
+        node  = nodes.get(node_id)
+        name  = getattr(node, "name", node_id) if node else node_id
+
+        log.info("Firing backup onboarding offer for node %s (%s, %s GB)",
+                 node_id, name, size_gb)
+        await self._fire_event({
+            "type":                  "backup.onboarding_offer",
+            "node_id":               node_id,
+            "node_name":             name,
+            "platform":              platform,
+            "size_label":            size_label,
+            "estimated_size_bytes":  size_bytes,
+            "suggested_config":      eligibility.get("suggested_config", {}),
+            "ts":                    time.time(),
+        })
 
     async def _fire_event(self, event: dict[str, Any]) -> None:
         if self._event_queue is not None:

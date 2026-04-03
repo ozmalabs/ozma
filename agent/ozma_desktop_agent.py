@@ -1076,6 +1076,84 @@ class DesktopSoftNode:
             asyncio.create_task(bm.verify(), name="backup-verify")
             return web.json_response({"ok": True, "message": "Verify started"})
 
+        async def backup_onboarding_handler(_: web.Request) -> web.Response:
+            """
+            Return backup onboarding eligibility for the default-on setup offer.
+
+            Response schema:
+              eligible           — bool: should the dashboard show the one-click prompt?
+              estimated_size_bytes — int
+              platform           — str  (linux/darwin/windows)
+              time_machine_enabled — bool (macOS only)
+              suggested_config   — dict: sane defaults for this machine
+            """
+            import platform as _platform
+            bm = _get_backup()
+
+            plat = _platform.system().lower()  # "linux" / "darwin" / "windows"
+
+            # Time Machine check (macOS only)
+            tm_enabled = False
+            if plat == "darwin":
+                try:
+                    import subprocess
+                    r = subprocess.run(
+                        ["tmutil", "destinationinfo"],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    tm_enabled = r.returncode == 0 and "MountPoint" in r.stdout
+                except Exception:
+                    pass
+
+            # Check if already configured
+            cfg = bm.get_config()
+            already_configured = getattr(cfg, "enabled", False)
+
+            if already_configured or tm_enabled:
+                return web.json_response({
+                    "eligible":             False,
+                    "estimated_size_bytes": 0,
+                    "platform":             plat,
+                    "time_machine_enabled": tm_enabled,
+                    "suggested_config":     {},
+                })
+
+            # Check we have at least one configured destination
+            destinations = getattr(cfg, "destinations", [])
+            if not destinations:
+                # No destination configured → not yet eligible for one-click
+                return web.json_response({
+                    "eligible":             False,
+                    "estimated_size_bytes": 0,
+                    "platform":             plat,
+                    "time_machine_enabled": False,
+                    "suggested_config":     {},
+                })
+
+            # Estimate backup size
+            try:
+                size_bytes = await bm.estimate_size()
+            except Exception:
+                size_bytes = 0
+
+            # Build a sensible suggested config
+            home = str(Path.home())
+            suggested: dict[str, Any] = {
+                "enabled":       True,
+                "mode":          "smart",
+                "sources":       [home],
+                "schedule_cron": "0 2 * * *",   # 02:00 daily
+                "retention_days": 30,
+            }
+
+            return web.json_response({
+                "eligible":             size_bytes > 0,
+                "estimated_size_bytes": size_bytes,
+                "platform":             plat,
+                "time_machine_enabled": False,
+                "suggested_config":     suggested,
+            })
+
         app.router.add_get("/backup/status",                backup_status_handler)
         app.router.add_post("/backup/run",                  backup_run_handler)
         app.router.add_get("/backup/config",                backup_config_get_handler)
@@ -1087,6 +1165,7 @@ class DesktopSoftNode:
         app.router.add_post("/backup/apps/restore",         backup_restore_apps_handler)
         app.router.add_get("/backup/estimate",              backup_estimate_handler)
         app.router.add_post("/backup/verify",               backup_verify_handler)
+        app.router.add_get("/backup/onboarding",            backup_onboarding_handler)
 
         # Serve HLS segments as static files
         capture_dir = Path(str(Path(os.environ.get('TEMP', '/tmp')) / f"ozma-agent-{self._name}"))

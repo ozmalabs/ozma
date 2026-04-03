@@ -8771,7 +8771,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         reachable at the registered api_port.
         """
         _require_scope(request, SCOPE_READ)
-        result = await _backup_nudge().proxy_get(node_id, "/api/v1/backup/snapshots")
+        result = await _backup_nudge().proxy_get(node_id, "/backup/snapshots")
         if result is None:
             raise HTTPException(503, f"Node {node_id!r} agent unreachable or backup not configured")
         return result if isinstance(result, list) else [result]
@@ -8785,7 +8785,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         path = request.query_params.get("path", "/")
         result = await _backup_nudge().proxy_get(
             node_id,
-            f"/api/v1/backup/snapshots/{snapshot_id}/files?path={path}",
+            f"/backup/snapshots/{snapshot_id}/files?path={path}",
         )
         if result is None:
             raise HTTPException(503, f"Node {node_id!r} agent unreachable")
@@ -8801,7 +8801,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         """
         _require_scope(request, SCOPE_WRITE)
         body = await request.json()
-        result = await _backup_nudge().proxy_post(node_id, "/api/v1/backup/restore", body)
+        result = await _backup_nudge().proxy_post(node_id, "/backup/restore", body)
         if result is None:
             raise HTTPException(503, f"Node {node_id!r} agent unreachable or restore failed")
         return result
@@ -8812,7 +8812,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         _require_scope(request, SCOPE_WRITE)
         body = await request.json()
         mode = body.get("mode", "smart")
-        result = await _backup_nudge().proxy_post(node_id, "/api/v1/backup/run", {"mode": mode})
+        result = await _backup_nudge().proxy_post(node_id, "/backup/run", {"mode": mode})
         if result is None:
             raise HTTPException(503, f"Node {node_id!r} agent unreachable")
         return result
@@ -8821,7 +8821,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     async def backup_node_apps(request: Request, node_id: str) -> list[dict]:
         """List installed apps on a node (for selective restore)."""
         _require_scope(request, SCOPE_READ)
-        result = await _backup_nudge().proxy_get(node_id, "/api/v1/backup/apps")
+        result = await _backup_nudge().proxy_get(node_id, "/backup/apps")
         if result is None:
             raise HTTPException(503, f"Node {node_id!r} agent unreachable")
         return result if isinstance(result, list) else [result]
@@ -8831,7 +8831,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         """Reinstall apps on a node from its inventory snapshot."""
         _require_scope(request, SCOPE_WRITE)
         body = await request.json()
-        result = await _backup_nudge().proxy_post(node_id, "/api/v1/backup/restore-apps", body)
+        result = await _backup_nudge().proxy_post(node_id, "/backup/apps/restore", body)
         if result is None:
             raise HTTPException(503, f"Node {node_id!r} agent unreachable")
         return result
