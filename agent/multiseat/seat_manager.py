@@ -299,29 +299,10 @@ class SeatManager:
             )
             self._seat_tasks.append(task)
 
-        # Monitoring, game launcher, and hotplug deferred until seat is stable
-        print("[OZMA DEBUG] Skipping optional services for now...", flush=True)
-
-        log.info("SeatManager running: %d seats on %s",
-                 len(self._seats), self._machine_name)
-        print(f"[OZMA DEBUG] SeatManager fully started — {len(self._seats)} seats", flush=True)
-
-        # Config WS disabled for initial testing
-        # if self._controller_url:
-        #     self._config_ws_task = asyncio.create_task(
-        #         self._connect_config_ws(), name="config-ws",
-        #     )
-
-        # Wait for stop signal
-        print("[OZMA DEBUG] About to await stop signal...", flush=True)
-        import sys as _sys
-        _sys.stdout.flush()
-        _sys.stderr.flush()
-        try:
-            await self._stop_event.wait()
-        except Exception as e:
-            print(f"[OZMA DEBUG] stop_event.wait failed: {e}", flush=True)
-        print("[OZMA DEBUG] Stop signal received", flush=True)
+        print("[OZMA] *** ALL SEATS CREATED — entering main loop ***", flush=True)
+        while True:
+            await asyncio.sleep(5)
+            print(f"[OZMA] alive — {len(self._seats)} seats", flush=True)
 
     async def stop(self) -> None:
         """Stop all seats and clean up resources."""

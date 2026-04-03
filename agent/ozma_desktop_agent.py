@@ -1453,6 +1453,9 @@ def main() -> None:
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, _on_signal)
 
+        import atexit
+        atexit.register(lambda: print("[OZMA] atexit fired!", flush=True))
+
         async def _run():
             try:
                 await manager.start()
