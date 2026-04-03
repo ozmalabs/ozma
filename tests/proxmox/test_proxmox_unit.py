@@ -17,6 +17,14 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
+from unittest.mock import MagicMock
+
+# Stub heavy optional deps that aren't installed in the dev/CI environment.
+# Must happen before any project imports that transitively pull these in.
+for _mod in ("aiohttp", "aiohttp.web", "zeroconf", "zeroconf.asyncio",
+             "zeroconf._utils.ipaddress", "zeroconf._dns", "zeroconf._services.browser",
+             "dbus_fast", "dbus_fast.aio"):
+    sys.modules.setdefault(_mod, MagicMock())
 
 # Add project paths
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "softnode"))

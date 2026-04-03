@@ -26,9 +26,19 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from unittest.mock import MagicMock
+
+for _mod in ("aiohttp", "aiohttp.web", "zeroconf", "zeroconf.asyncio",
+             "zeroconf._utils.ipaddress", "zeroconf._dns", "zeroconf._services.browser",
+             "dbus_fast", "dbus_fast.aio"):
+    sys.modules.setdefault(_mod, MagicMock())
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "softnode"))
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "proxmox-plugin" / "python"))
+
+# Ensure proxmox-plugin's dbus_display (proper async stub) takes priority over
+# the softnode version (which requires dbus_fast to be a real package).
+sys.modules.pop("dbus_display", None)
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────
@@ -131,6 +141,8 @@ class TestSimulatedDisplayService:
 
     def test_dbus_client_connects(self, simulated_proxmox):
         """D-Bus display client can connect via the QMP socket."""
+        # Clear any MagicMock stub set by other test modules so we get the real impl.
+        sys.modules.pop("dbus_display", None)
         from dbus_display import DBusDisplayClient
 
         qmp = simulated_proxmox["qmp_path"]

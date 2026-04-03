@@ -196,10 +196,13 @@ class VMDisplayService:
                 elif self._latest_frame:
                     frame = self._latest_frame
                 if frame:
-                    await response.write(
-                        b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
-                        + frame + b"\r\n"
-                    )
+                    try:
+                        await response.write(
+                            b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+                            + frame + b"\r\n"
+                        )
+                    except (ConnectionResetError, asyncio.CancelledError):
+                        break
                 await asyncio.sleep(1.0 / 15)
 
         async def input_key(request):
@@ -318,30 +321,43 @@ class VMDisplayService:
         async def api_adaptive(request):
             return web.json_response({"ok": True})
 
-        # WebSocket for HID input (keyboard + mouse)
-        # Console sends: {type:'keydown',code:N}, {type:'keyup',code:N},
-        #                {type:'mousemove',x:N,y:N}, {type:'mousedown',button:N,...}
-        #                {type:'ping',ts:N}
-        async def _qmp_send(cmd):
-            """Send a QMP command to the VM."""
-            import socket as _socket
+        # Persistent async QMP connection for low-latency input injection.
+        # Creates one connection that stays open for the lifetime of the WS session,
+        # re-connecting automatically if dropped.
+        _qmp_reader: asyncio.StreamReader | None = None
+        _qmp_writer: asyncio.StreamWriter | None = None
+
+        async def _qmp_connect() -> bool:
+            nonlocal _qmp_reader, _qmp_writer
             qmp = self.qmp_path if os.path.exists(self.qmp_path) else self.qmp_path_proxmox
             if not os.path.exists(qmp):
-                log.warning("QMP socket not found: %s / %s", self.qmp_path, self.qmp_path_proxmox)
-                return
+                return False
             try:
-                s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-                s.settimeout(2)
-                s.connect(qmp)
-                s.recv(4096)  # greeting
-                s.sendall(json.dumps({"execute": "qmp_capabilities"}).encode() + b"\n")
-                s.recv(4096)
-                s.sendall(json.dumps(cmd).encode() + b"\n")
-                resp = s.recv(4096)
-                s.close()
-                log.info("QMP input sent: %s → %s", cmd.get("execute"), resp[:80])
+                _qmp_reader, _qmp_writer = await asyncio.wait_for(
+                    asyncio.open_unix_connection(qmp), timeout=2.0
+                )
+                await asyncio.wait_for(_qmp_reader.readline(), timeout=2.0)  # greeting
+                _qmp_writer.write(json.dumps({"execute": "qmp_capabilities"}).encode() + b"\n")
+                await _qmp_writer.drain()
+                await asyncio.wait_for(_qmp_reader.readline(), timeout=2.0)  # {"return":{}}
+                return True
             except Exception as e:
-                log.warning("QMP send error: %s", e)
+                log.debug("QMP connect failed: %s", e)
+                _qmp_reader = _qmp_writer = None
+                return False
+
+        async def _qmp_send(cmd: dict) -> None:
+            nonlocal _qmp_reader, _qmp_writer
+            if _qmp_writer is None or _qmp_writer.is_closing():
+                if not await _qmp_connect():
+                    return
+            try:
+                assert _qmp_writer is not None
+                _qmp_writer.write(json.dumps(cmd).encode() + b"\n")
+                await _qmp_writer.drain()
+            except Exception as e:
+                log.debug("QMP send error: %s — will reconnect", e)
+                _qmp_reader = _qmp_writer = None
 
         async def api_ws(request):
             ws = web.WebSocketResponse()
@@ -353,7 +369,7 @@ class VMDisplayService:
                         data = json.loads(msg.data)
                         t = data.get("type", "")
 
-                        log.info("WS msg: %s", data)
+                        log.debug("WS msg: %s", data)
 
                         if t in ("keydown", "keyup"):
                             code = data.get("code", "")
@@ -370,11 +386,17 @@ class VMDisplayService:
                                 })
 
                         elif t in ("mousemove", "mousedown", "mouseup"):
-                            x = int(data.get("x", 0))
-                            y = int(data.get("y", 0))
+                            # Console sends normalized coords: x in [0,w], y in [0,h].
+                            # QMP absolute input uses 0-32767 per axis.
+                            rx = float(data.get("x", 0))
+                            ry = float(data.get("y", 0))
+                            rw = float(data.get("w", 1)) or 1
+                            rh = float(data.get("h", 1)) or 1
+                            qx = int(rx / rw * 32767)
+                            qy = int(ry / rh * 32767)
                             events = [
-                                {"type": "abs", "data": {"axis": "x", "value": x}},
-                                {"type": "abs", "data": {"axis": "y", "value": y}},
+                                {"type": "abs", "data": {"axis": "x", "value": qx}},
+                                {"type": "abs", "data": {"axis": "y", "value": qy}},
                             ]
                             if t == "mousedown":
                                 btn = {0: "left", 1: "middle", 2: "right"}.get(data.get("button", 0), "left")
