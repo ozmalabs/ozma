@@ -1099,6 +1099,20 @@ select option { background: var(--surface); }
     </div>
   </div>
 
+  <!-- Enrollment -->
+  <div class="panel" id="panel-enrollment" data-mode="advanced">
+    <div class="panel-head">
+      <h2>Enrollment</h2>
+      <span class="count" id="enroll-count">0</span>
+      <div class="panel-actions">
+        <button class="btn sm" onclick="fetchEnrollment()" title="Refresh">↺</button>
+      </div>
+    </div>
+    <div class="panel-body">
+      <div id="enroll-list"><div class="empty">No nodes awaiting approval</div></div>
+    </div>
+  </div>
+
   <!-- Users -->
   <div class="panel" id="panel-users" data-mode="advanced">
     <div class="panel-head">
@@ -1287,6 +1301,7 @@ async function loadAll() {
     fetchKDEConnect();
     fetchWifiAudio();
     fetchControls();
+    fetchEnrollment();
     fetchUsers();
     fetchServices();
     fetchSharing();
@@ -3000,6 +3015,7 @@ function handleEvent(msg) {
       renderNodes();
       renderScenarios();
       renderAudio();
+      fetchEnrollment();
       break;
     case 'node.offline':
       delete nodes[msg.node_id];
@@ -3620,6 +3636,46 @@ function sendCtrlAltDel() {
     rcWs.send(JSON.stringify({type:'key', key:'Alt_L', down:false}));
     rcWs.send(JSON.stringify({type:'key', key:'Control_L', down:false}));
   }, 500);
+}
+
+// ── Enrollment ────────────────────────────────────────────────────────────────
+let pendingNodes = [];
+
+function fetchEnrollment() {
+  api('GET', '/security/pending').then(d => {
+    pendingNodes = d.pending || [];
+    $('enroll-count').textContent = pendingNodes.length;
+    renderEnrollment();
+  }).catch(() => {});
+}
+
+function renderEnrollment() {
+  const el = $('enroll-list');
+  if (!pendingNodes.length) {
+    el.innerHTML = '<div class="empty">No nodes awaiting approval</div>';
+    return;
+  }
+  el.innerHTML = pendingNodes.map(n => `
+    <div style="display:flex;align-items:center;gap:8px;padding:8px;
+      background:var(--surface);border-radius:var(--radius);
+      border:1px solid rgba(240,185,74,0.3);margin-bottom:6px">
+      <div style="flex:1">
+        <div style="font-size:13px;font-weight:600;color:#fff">${esc(n.id)}</div>
+        <div style="font-size:11px;color:var(--muted)">${esc(n.host || '')} · ${esc(n.hw || 'unknown')}</div>
+      </div>
+      <button class="btn sm primary" onclick="approveNode('${esc(n.id)}')">Approve</button>
+    </div>
+  `).join('');
+}
+
+function approveNode(nodeId) {
+  api('POST', '/security/approve', { node_id: nodeId })
+    .then(d => {
+      fetchEnrollment();
+      loadAll();
+      alert('Node approved. Fingerprint: ' + (d.fingerprint || '—'));
+    })
+    .catch(e => alert('Approval failed: ' + e.message));
 }
 
 // ── Users ─────────────────────────────────────────────────────────────────────
