@@ -68,6 +68,9 @@ from service_proxy import ServiceProxyManager
 from idp import IdentityProvider
 from sharing import SharingManager
 from external_publish import ExternalPublishManager
+from vaultwarden import VaultwardenManager
+from email_security import EmailSecurityMonitor
+from cloud_backup import CloudBackupManager, BackupSource, CredentialRecord, Provider
 
 log = logging.getLogger("ozma.api")
 
@@ -132,7 +135,7 @@ class DirectRegisterRequest(BaseModel):
     frigate_port: str = ""     # Frigate API port (default 5000)
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None) -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None) -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -4166,6 +4169,270 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     @app.get("/api/v1/doorbell/{session_id}/snapshot")
     async def doorbell_snapshot(request: Request, session_id: str) -> Any:
         return await alert_snapshot(request, session_id)
+
+    # ── Vaultwarden ────────────────────────────────────────────────────────
+
+    class VaultOidcRequest(BaseModel):
+        client_id: str
+        client_secret: str
+        issuer_url: str
+
+    @app.get("/api/v1/vault/status")
+    async def vault_status(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not vaultwarden:
+            raise HTTPException(503, "Vaultwarden not enabled")
+        return vaultwarden.get_status()
+
+    @app.get("/api/v1/vault/backup-paths")
+    async def vault_backup_paths(request: Request) -> dict[str, Any]:
+        """Return the file paths that must be included in the backup schedule."""
+        _require_scope(request, SCOPE_READ)
+        if not vaultwarden:
+            raise HTTPException(503, "Vaultwarden not enabled")
+        return {"paths": vaultwarden.backup_paths()}
+
+    @app.post("/api/v1/vault/oidc")
+    async def vault_configure_oidc(request: Request, body: VaultOidcRequest) -> dict[str, Any]:
+        """Configure SSO: link Vaultwarden to the controller IdP."""
+        _require_scope(request, SCOPE_ADMIN)
+        if not vaultwarden:
+            raise HTTPException(503, "Vaultwarden not enabled")
+        vaultwarden.configure_oidc(
+            client_id=body.client_id,
+            client_secret=body.client_secret,
+            issuer_url=body.issuer_url,
+        )
+        return {"ok": True, "message": "OIDC config updated; restart container to apply"}
+
+    # ── Email security ─────────────────────────────────────────────────────
+
+    class AddDomainRequest(BaseModel):
+        domain: str
+        dkim_selectors: list[str] = []
+
+    @app.get("/api/v1/email-security/domains")
+    async def email_security_list(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not email_security:
+            raise HTTPException(503, "Email security monitor not available")
+        return {
+            "domains": email_security.list_domains(),
+            "results": email_security.get_all_results(),
+        }
+
+    @app.post("/api/v1/email-security/domains")
+    async def email_security_add_domain(request: Request,
+                                        body: AddDomainRequest) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not email_security:
+            raise HTTPException(503, "Email security monitor not available")
+        email_security.add_domain(body.domain, body.dkim_selectors)
+        return {"ok": True, "domain": body.domain}
+
+    @app.delete("/api/v1/email-security/domains/{domain:path}")
+    async def email_security_remove_domain(request: Request,
+                                           domain: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not email_security:
+            raise HTTPException(503, "Email security monitor not available")
+        email_security.remove_domain(domain)
+        return {"ok": True}
+
+    @app.get("/api/v1/email-security/domains/{domain:path}")
+    async def email_security_get_domain(request: Request, domain: str) -> dict[str, Any]:
+        """Return the latest posture for one domain, including full remediation guides."""
+        _require_scope(request, SCOPE_READ)
+        if not email_security:
+            raise HTTPException(503, "Email security monitor not available")
+        result = email_security.get_result(domain)
+        if not result:
+            raise HTTPException(404, f"No result for domain: {domain}")
+        return result.to_dict(include_remediation=True)
+
+    @app.post("/api/v1/email-security/domains/{domain:path}/check")
+    async def email_security_check_now(request: Request, domain: str) -> dict[str, Any]:
+        """Trigger an immediate re-check and return results with remediation guides."""
+        _require_scope(request, SCOPE_WRITE)
+        if not email_security:
+            raise HTTPException(503, "Email security monitor not available")
+        # Register the domain if not already tracked
+        if domain not in email_security.list_domains():
+            email_security.add_domain(domain)
+        posture = await email_security.check_now(domain)
+        return posture.to_dict(include_remediation=True)
+
+    # ── Cloud backup ────────────────────────────────────────────────────────
+
+    class AddBackupSourceRequest(BaseModel):
+        name: str
+        provider: str           # "m365" | "google"
+        tenant_id: str
+        backup_mail: bool = True
+        backup_files: bool = True
+        backup_sharepoint: bool = False
+        schedule_cron: str = "0 2 * * *"
+        retention_days: int = 90
+
+    class M365CredentialsRequest(BaseModel):
+        source_id: str
+        tenant_id: str
+        client_id: str
+        client_secret: str
+
+    class GoogleCredentialsRequest(BaseModel):
+        source_id: str
+        customer_id: str        # Google customer ID (tenant_id equivalent)
+        service_account_json: str   # full JSON key content
+        admin_email: str
+
+    @app.get("/api/v1/cloud-backup/status")
+    async def cloud_backup_status(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not cloud_backup:
+            raise HTTPException(503, "Cloud backup not available")
+        return cloud_backup.get_status()
+
+    @app.get("/api/v1/cloud-backup/sources")
+    async def cloud_backup_list_sources(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not cloud_backup:
+            raise HTTPException(503, "Cloud backup not available")
+        return {"sources": [s.to_dict() for s in cloud_backup.list_sources()]}
+
+    @app.post("/api/v1/cloud-backup/sources")
+    async def cloud_backup_add_source(request: Request,
+                                       body: AddBackupSourceRequest) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not cloud_backup:
+            raise HTTPException(503, "Cloud backup not available")
+        try:
+            provider = Provider(body.provider)
+        except ValueError:
+            raise HTTPException(400, f"Unknown provider: {body.provider}")
+        source = BackupSource(
+            name=body.name,
+            provider=provider,
+            tenant_id=body.tenant_id,
+            backup_mail=body.backup_mail,
+            backup_files=body.backup_files,
+            backup_sharepoint=body.backup_sharepoint,
+            schedule_cron=body.schedule_cron,
+            retention_days=body.retention_days,
+        )
+        cloud_backup.add_source(source)
+        return {"ok": True, "source_id": source.id}
+
+    @app.delete("/api/v1/cloud-backup/sources/{source_id}")
+    async def cloud_backup_remove_source(request: Request,
+                                          source_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not cloud_backup:
+            raise HTTPException(503, "Cloud backup not available")
+        if not cloud_backup.remove_source(source_id):
+            raise HTTPException(404, f"Source not found: {source_id}")
+        return {"ok": True}
+
+    @app.post("/api/v1/cloud-backup/sources/{source_id}/credentials/m365")
+    async def cloud_backup_set_m365_creds(request: Request, source_id: str,
+                                           body: M365CredentialsRequest) -> dict[str, Any]:
+        """Store M365 app credentials for a backup source (encrypted at rest)."""
+        _require_scope(request, SCOPE_ADMIN)
+        if not cloud_backup:
+            raise HTTPException(503, "Cloud backup not available")
+        if not cloud_backup.get_source(source_id):
+            raise HTTPException(404, f"Source not found: {source_id}")
+        rec = CredentialRecord(
+            id=source_id,
+            provider=Provider.M365,
+            tenant_id=body.tenant_id,
+            client_id=body.client_id,
+            client_secret=body.client_secret,
+        )
+        cloud_backup.store_credentials(rec)
+        return {"ok": True, "message": "M365 credentials stored (encrypted)"}
+
+    @app.post("/api/v1/cloud-backup/sources/{source_id}/credentials/google")
+    async def cloud_backup_set_google_creds(request: Request, source_id: str,
+                                             body: GoogleCredentialsRequest) -> dict[str, Any]:
+        """Store Google Workspace service account credentials (encrypted at rest)."""
+        _require_scope(request, SCOPE_ADMIN)
+        if not cloud_backup:
+            raise HTTPException(503, "Cloud backup not available")
+        if not cloud_backup.get_source(source_id):
+            raise HTTPException(404, f"Source not found: {source_id}")
+        rec = CredentialRecord(
+            id=source_id,
+            provider=Provider.GOOGLE,
+            tenant_id=body.customer_id,
+            service_account_json=body.service_account_json,
+            admin_email=body.admin_email,
+        )
+        cloud_backup.store_credentials(rec)
+        return {"ok": True, "message": "Google credentials stored (encrypted)"}
+
+    @app.post("/api/v1/cloud-backup/sources/{source_id}/trigger")
+    async def cloud_backup_trigger(request: Request, source_id: str) -> dict[str, Any]:
+        """Immediately enqueue all backup jobs for a source."""
+        _require_scope(request, SCOPE_WRITE)
+        if not cloud_backup:
+            raise HTTPException(503, "Cloud backup not available")
+        if not cloud_backup.get_source(source_id):
+            raise HTTPException(404, f"Source not found: {source_id}")
+        job_ids = await cloud_backup.trigger_backup(source_id, priority=0)
+        return {"ok": True, "jobs_enqueued": len(job_ids), "job_ids": job_ids}
+
+    # ── rclone remote management ───────────────────────────────────────────────
+
+    @app.get("/api/v1/cloud-backup/rclone/available")
+    async def cloud_backup_rclone_available(request: Request) -> dict[str, Any]:
+        """Check whether the rclone binary is installed on this controller."""
+        _require_scope(request, SCOPE_READ)
+        if not cloud_backup:
+            raise HTTPException(503, "Cloud backup not available")
+        available, version = await cloud_backup.rclone_available()
+        return {"available": available, "version": version}
+
+    @app.get("/api/v1/cloud-backup/rclone/remotes")
+    async def cloud_backup_rclone_list_remotes(request: Request) -> dict[str, Any]:
+        """List all configured rclone remotes."""
+        _require_scope(request, SCOPE_READ)
+        if not cloud_backup:
+            raise HTTPException(503, "Cloud backup not available")
+        remotes = await cloud_backup.rclone_list_remotes()
+        return {"remotes": remotes}
+
+    class RcloneConfigureRemoteRequest(BaseModel):
+        name: str
+        type: str                    # rclone provider type, e.g. "s3", "b2", "dropbox"
+        params: dict[str, str] = {}  # provider-specific config params
+
+    @app.post("/api/v1/cloud-backup/rclone/remotes")
+    async def cloud_backup_rclone_configure(
+        request: Request,
+        body: RcloneConfigureRemoteRequest,
+    ) -> dict[str, Any]:
+        """Configure a new rclone remote (or update an existing one)."""
+        _require_scope(request, SCOPE_ADMIN)
+        if not cloud_backup:
+            raise HTTPException(503, "Cloud backup not available")
+        ok = await cloud_backup.rclone_configure_remote(body.name, body.type, body.params)
+        if not ok:
+            raise HTTPException(500, "rclone config create failed — check controller logs")
+        return {"ok": True, "remote": body.name}
+
+    @app.delete("/api/v1/cloud-backup/rclone/remotes/{name}")
+    async def cloud_backup_rclone_delete_remote(
+        request: Request, name: str,
+    ) -> dict[str, Any]:
+        """Remove a configured rclone remote."""
+        _require_scope(request, SCOPE_ADMIN)
+        if not cloud_backup:
+            raise HTTPException(503, "Cloud backup not available")
+        ok = await cloud_backup.rclone_delete_remote(name)
+        if not ok:
+            raise HTTPException(500, f"Failed to delete rclone remote: {name}")
+        return {"ok": True}
 
     # Static files — mounted last so they don't shadow API routes
     static_dir = Path(__file__).parent / "static"

@@ -51,6 +51,12 @@ class Config:
     transcription_enabled: bool = False
     transcription_source: str = ""   # PipeWire source name; empty = default mic
 
+    # Vaultwarden — self-hosted password manager (requires Docker)
+    vaultwarden_enabled: bool = False
+    vaultwarden_data_dir: str = ""   # abs path; empty → ./vaultwarden-data
+    vaultwarden_port: int = 8222
+    vaultwarden_admin_token: str = ""  # auto-generated if empty
+
     # Logging
     debug: bool = False
 
@@ -76,4 +82,8 @@ class Config:
             update_manager_enabled=os.environ.get("OZMA_UPDATE_MANAGER", "0").lower() in ("1", "true", "yes"),
             transcription_enabled=os.environ.get("OZMA_TRANSCRIPTION", "0").lower() in ("1", "true", "yes"),
             transcription_source=os.environ.get("OZMA_TRANSCRIPTION_SOURCE", ""),
+            vaultwarden_enabled=os.environ.get("OZMA_VAULTWARDEN", "0").lower() in ("1", "true", "yes"),
+            vaultwarden_data_dir=os.environ.get("OZMA_VAULTWARDEN_DATA", ""),
+            vaultwarden_port=int(os.environ.get("OZMA_VAULTWARDEN_PORT", "8222")),
+            vaultwarden_admin_token=os.environ.get("OZMA_VAULTWARDEN_ADMIN_TOKEN", ""),
         )

@@ -122,6 +122,9 @@ class AppState:
         # User manager — set by main.py after UserManager is created
         self.user_manager: Any | None = None
 
+        # Vaultwarden manager — set by main.py if OZMA_VAULTWARDEN=1
+        self.vaultwarden_manager: Any | None = None
+
     async def add_node(self, node: NodeInfo) -> None:
         async with self._lock:
             is_new = node.id not in self.nodes
