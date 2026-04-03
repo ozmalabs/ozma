@@ -13,6 +13,10 @@ The previous threat model — "trust the LAN because it is physically isolated" 
 3. **Network topology is decoupled from trust.** The same node can be on the local LAN today and behind a 4G modem tomorrow; the security model does not change.
 4. **Operator approves enrollment; the system handles the rest.** A human grants a node permission to join once. After that, key rotation, reconnection, and OTA updates happen without operator involvement.
 
+> **Data privacy and government access commitments are in [Privacy Architecture](privacy.md).**
+> This document covers the cryptographic security model. Privacy.md covers what
+> Connect can see, what it cannot, and what happens when a government asks.
+
 ---
 
 ## Device Identity

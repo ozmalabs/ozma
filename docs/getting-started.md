@@ -91,4 +91,16 @@ bash demo/start_vms.sh stop    # stop VMs and soft nodes
 - Read the [Architecture](architecture.md) doc for system design
 - Read the [Protocols](protocols.md) doc for wire formats
 - Browse the REST API at `http://localhost:7380/docs` (FastAPI auto-generated)
-- Try connecting a physical node — see `tinynode/README.md` for SBC setup
+- Try connecting a physical node — see [Hardware Reference](hardware.md) for recommended SBCs and capture cards, then `tinynode/README.md` for gadget setup
+
+## Documentation index
+
+| Document | What it covers |
+|----------|---------------|
+| [Architecture](architecture.md) | System design, component overview, data flows |
+| [Protocols](protocols.md) | HID byte format, VBAN, scenarios.json schema, wire formats |
+| [Security](security.md) | WireGuard mesh, enrollment, JWT auth, OTA signing, threat model |
+| [Privacy](privacy.md) | Data categories, what Connect can see, government access policy, warrant canary |
+| [Hardware](hardware.md) | Controller hardware tiers, node SBCs, COTS options, Ozma Dock (custom PCB) |
+| [Network](network.md) | IoT VLAN, router mode, device onboarding workflow, homelab integrations |
+| [Cameras](cameras.md) | PoE camera recommendations, Ring replacement guide, Frigate setup |
