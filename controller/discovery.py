@@ -3,16 +3,21 @@
 mDNS listener for _ozma._udp.local. service announcements.
 
 Each node advertises itself with these TXT records:
-  proto=<int>       protocol version (must be 1)
-  role=<str>        node role: compute | presence | room-mic | display | ...
-  hw=<str>          hardware type: milkv-duos | rpi-zero2w | teensy41 | soft | ...
-  fw=<str>          firmware version string
-  cap=<csv>         comma-separated capability list (optional)
+  proto=<int>           protocol version (must be 1)
+  role=<str>            node role: compute | presence | room-mic | display | ...
+  hw=<str>              hardware type: milkv-duos | rpi-zero2w | teensy41 | soft | ...
+  fw=<str>              firmware version string
+  cap=<csv>             comma-separated capability list (optional)
+  machine_class=<str>   workstation | server | kiosk | camera (default: workstation)
+  frigate_host=<str>    Frigate HTTP host (camera nodes only)
+  frigate_port=<int>    Frigate HTTP port (camera nodes only, default: 5000)
+  camera_streams=<json> JSON array of stream dicts (camera nodes only)
 
 Re-queries every mdns_requery_interval seconds to detect node loss.
 """
 
 import asyncio
+import json
 import logging
 import socket
 import time
@@ -132,6 +137,17 @@ class DiscoveryService:
         mic_vban_port = int(mic_vban_str) if mic_vban_str.isdigit() else None
         capture_device = txt.get("capture_device") or None
 
+        machine_class = txt.get("machine_class") or "workstation"
+        frigate_host = txt.get("frigate_host") or None
+        frigate_port_str = txt.get("frigate_port", "")
+        frigate_port = int(frigate_port_str) if frigate_port_str.isdigit() else None
+        camera_streams_raw = txt.get("camera_streams", "")
+        try:
+            camera_streams = json.loads(camera_streams_raw) if camera_streams_raw else []
+        except json.JSONDecodeError:
+            log.warning("Node %s has malformed camera_streams TXT record", name)
+            camera_streams = []
+
         node = NodeInfo(
             id=name,
             host=host,
@@ -152,6 +168,10 @@ class DiscoveryService:
             audio_vban_port=audio_vban_port,
             mic_vban_port=mic_vban_port,
             capture_device=capture_device,
+            machine_class=machine_class,
+            frigate_host=frigate_host,
+            frigate_port=frigate_port,
+            camera_streams=camera_streams,
         )
         await self._state.add_node(node)
         log.info("Node online: %s @ %s:%d role=%s hw=%s", name, host, port, node.role, node.hw)
