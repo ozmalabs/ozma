@@ -168,7 +168,7 @@ class DirectRegisterRequest(BaseModel):
     frigate_port: str = ""     # Frigate API port (default 5000)
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None, sunshine: Any | None = None, msp_mgr: MSPDashboardManager | None = None, msp_portal: MSPPortalManager | None = None, auto_configure: Any | None = None, cam_connect: Any | None = None, grid: Any | None = None, parental: ParentalControlsManager | None = None, backup_nudge: BackupNudgeService | None = None, dns_filter: Any | None = None) -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None, sunshine: Any | None = None, msp_mgr: MSPDashboardManager | None = None, msp_portal: MSPPortalManager | None = None, auto_configure: Any | None = None, cam_connect: Any | None = None, grid: Any | None = None, parental: ParentalControlsManager | None = None, backup_nudge: BackupNudgeService | None = None, dns_filter: Any | None = None, local_proxy: Any | None = None, file_sharing: Any | None = None, ups_monitor: Any | None = None, ddns: Any | None = None, speedtest: Any | None = None) -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -9005,6 +9005,482 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(400, "domain required")
         blocked = _dns_filter().is_blocked(domain)
         return {"domain": domain, "blocked": blocked}
+
+    # ── Local DNS records ──────────────────────────────────────────────
+
+    @app.get("/api/v1/dns-filter/records")
+    async def dns_records_list(request: Request) -> list[dict]:
+        """List all local DNS records (A/AAAA/CNAME/PTR)."""
+        _require_scope(request, SCOPE_READ)
+        return _dns_filter().list_records()
+
+    @app.post("/api/v1/dns-filter/records")
+    async def dns_records_add(request: Request) -> dict[str, Any]:
+        """
+        Add a local DNS record.
+
+        Body: { "name": "NAS", "hostname": "nas.home", "rtype": "A",
+                "value": "192.168.1.10", "ttl": 0 }
+        """
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        mgr = _dns_filter()
+        rec = mgr.add_record(
+            name     = body["name"],
+            hostname = body["hostname"],
+            rtype    = body.get("rtype", "A"),
+            value    = body["value"],
+            ttl      = int(body.get("ttl", 0)),
+        )
+        await mgr.write_conf()
+        return rec.to_dict()
+
+    @app.patch("/api/v1/dns-filter/records/{record_id}")
+    async def dns_records_patch(request: Request, record_id: str) -> dict[str, Any]:
+        """Update fields on a local DNS record."""
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        mgr = _dns_filter()
+        rec = mgr.update_record(record_id, **body)
+        if rec is None:
+            raise HTTPException(404, f"Record {record_id!r} not found")
+        await mgr.write_conf()
+        return rec.to_dict()
+
+    @app.delete("/api/v1/dns-filter/records/{record_id}")
+    async def dns_records_delete(request: Request, record_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        mgr = _dns_filter()
+        ok = mgr.remove_record(record_id)
+        if not ok:
+            raise HTTPException(404, f"Record {record_id!r} not found")
+        await mgr.write_conf()
+        return {"ok": True}
+
+    # =========================================================================
+    # Connect — subdomain + HTTPS provisioning
+    # =========================================================================
+
+    @app.post("/api/v1/subdomain/claim")
+    async def subdomain_claim(request: Request) -> dict[str, Any]:
+        """
+        Claim a Connect subdomain for the authenticated user.
+
+        Returns { "domain": "alice.c.ozma.dev" } on success.
+        Requires an active Connect session.
+        """
+        _require_scope(request, SCOPE_WRITE)
+        if connect is None:
+            raise HTTPException(503, "Connect not configured")
+        body = await request.json()
+        username = body.get("username", "")
+        if not username:
+            raise HTTPException(400, "username required")
+        domain = await connect.claim_subdomain(username)
+        if not domain:
+            raise HTTPException(502, "Connect subdomain claim failed")
+        return {"domain": domain}
+
+    # =========================================================================
+    # Local reverse proxy (Caddy LAN HTTPS)
+    # =========================================================================
+
+    def _local_proxy():
+        if local_proxy is None:
+            raise HTTPException(503, "Local proxy not available")
+        return local_proxy
+
+    @app.get("/api/v1/proxy/status")
+    async def proxy_status(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        return _local_proxy().get_status()
+
+    @app.get("/api/v1/proxy/config")
+    async def proxy_config_get(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        return _local_proxy().get_config().to_dict()
+
+    @app.patch("/api/v1/proxy/config")
+    async def proxy_config_patch(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        cfg = await _local_proxy().set_config(**body)
+        return cfg.to_dict()
+
+    @app.get("/api/v1/proxy/routes")
+    async def proxy_routes_list(request: Request) -> list[dict]:
+        _require_scope(request, SCOPE_READ)
+        return _local_proxy().list_routes()
+
+    @app.post("/api/v1/proxy/routes")
+    async def proxy_routes_add(request: Request) -> dict[str, Any]:
+        """
+        Add a reverse proxy route.
+
+        Body: { "name": "Jellyfin", "match_domain": "jellyfin.home",
+                "upstream": "http://localhost:8096", "tls_mode": "internal" }
+        """
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        mgr   = _local_proxy()
+        route = mgr.add_route(
+            name         = body["name"],
+            match_domain = body["match_domain"],
+            upstream     = body["upstream"],
+            tls_mode     = body.get("tls_mode", "internal"),
+            strip_prefix = body.get("strip_prefix", ""),
+            extra_headers = body.get("extra_headers", {}),
+        )
+        await mgr.apply()
+        return route.to_dict()
+
+    @app.patch("/api/v1/proxy/routes/{route_id}")
+    async def proxy_routes_patch(request: Request, route_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        body  = await request.json()
+        mgr   = _local_proxy()
+        route = mgr.update_route(route_id, **body)
+        if route is None:
+            raise HTTPException(404, f"Route {route_id!r} not found")
+        await mgr.apply()
+        return route.to_dict()
+
+    @app.delete("/api/v1/proxy/routes/{route_id}")
+    async def proxy_routes_delete(request: Request, route_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        mgr = _local_proxy()
+        ok  = mgr.remove_route(route_id)
+        if not ok:
+            raise HTTPException(404, f"Route {route_id!r} not found")
+        await mgr.apply()
+        return {"ok": True}
+
+    @app.get("/api/v1/proxy/ca-cert")
+    async def proxy_ca_cert(request: Request):
+        """Download Caddy's internal CA cert for client-side trust installation."""
+        _require_scope(request, SCOPE_READ)
+        from fastapi.responses import Response
+        cert = _local_proxy().get_ca_cert()
+        if cert is None:
+            raise HTTPException(404, "CA cert not yet generated (start proxy with tls internal first)")
+        return Response(content=cert, media_type="application/x-pem-file",
+                        headers={"Content-Disposition": "attachment; filename=ozma-local-ca.crt"})
+
+    # =========================================================================
+    # File sharing (Samba + NFS)
+    # =========================================================================
+
+    def _file_sharing():
+        if file_sharing is None:
+            raise HTTPException(503, "File sharing not available")
+        return file_sharing
+
+    @app.get("/api/v1/file-sharing/status")
+    async def file_sharing_status(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        return _file_sharing().get_status()
+
+    @app.get("/api/v1/file-sharing/config")
+    async def file_sharing_config_get(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        return _file_sharing().get_config().to_dict()
+
+    @app.patch("/api/v1/file-sharing/config")
+    async def file_sharing_config_patch(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        cfg = await _file_sharing().set_config(**body)
+        return cfg.to_dict()
+
+    @app.get("/api/v1/file-sharing/shares")
+    async def file_sharing_shares_list(request: Request) -> list[dict]:
+        _require_scope(request, SCOPE_READ)
+        return _file_sharing().list_shares()
+
+    @app.post("/api/v1/file-sharing/shares")
+    async def file_sharing_shares_add(request: Request) -> dict[str, Any]:
+        """
+        Create a new file share.
+
+        Body: { "name": "Home Files", "path": "/home/matt/shared",
+                "protocols": ["smb"], "read_only": false, "guest_ok": false,
+                "valid_users": ["alice"] }
+        """
+        _require_scope(request, SCOPE_WRITE)
+        body  = await request.json()
+        mgr   = _file_sharing()
+        share = mgr.add_share(
+            name      = body["name"],
+            path      = body["path"],
+            protocols = body.get("protocols", ["smb"]),
+            **{k: v for k, v in body.items() if k not in ("name", "path", "protocols")},
+        )
+        await mgr._reload_smbd() if mgr._config.smb_enabled else None
+        return share.to_dict()
+
+    @app.patch("/api/v1/file-sharing/shares/{share_id}")
+    async def file_sharing_shares_patch(request: Request, share_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        body  = await request.json()
+        mgr   = _file_sharing()
+        share = mgr.update_share(share_id, **body)
+        if share is None:
+            raise HTTPException(404, f"Share {share_id!r} not found")
+        await mgr._reload_smbd() if mgr._config.smb_enabled else None
+        return share.to_dict()
+
+    @app.delete("/api/v1/file-sharing/shares/{share_id}")
+    async def file_sharing_shares_delete(request: Request, share_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        mgr = _file_sharing()
+        ok  = mgr.remove_share(share_id)
+        if not ok:
+            raise HTTPException(404, f"Share {share_id!r} not found")
+        return {"ok": True}
+
+    @app.get("/api/v1/file-sharing/users")
+    async def file_sharing_users_list(request: Request) -> list[dict]:
+        _require_scope(request, SCOPE_READ)
+        return _file_sharing().list_samba_users()
+
+    @app.post("/api/v1/file-sharing/users")
+    async def file_sharing_users_add(request: Request) -> dict[str, Any]:
+        """Add a Samba user: { "username": "alice", "password": "..." }"""
+        _require_scope(request, SCOPE_ADMIN)
+        body = await request.json()
+        ok   = await _file_sharing().add_samba_user(body["username"], body["password"])
+        if not ok:
+            raise HTTPException(500, "Failed to add Samba user")
+        return {"ok": True, "username": body["username"]}
+
+    @app.delete("/api/v1/file-sharing/users/{username}")
+    async def file_sharing_users_delete(request: Request, username: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        ok = await _file_sharing().remove_samba_user(username)
+        if not ok:
+            raise HTTPException(404, f"User {username!r} not found")
+        return {"ok": True}
+
+    # =========================================================================
+    # UPS / power management
+    # =========================================================================
+
+    def _ups():
+        if ups_monitor is None:
+            raise HTTPException(503, "UPS monitor not available")
+        return ups_monitor
+
+    @app.get("/api/v1/ups/status")
+    async def ups_status(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        return _ups().get_status()
+
+    @app.get("/api/v1/ups/config")
+    async def ups_config_get(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        return _ups().get_config().to_dict()
+
+    @app.patch("/api/v1/ups/config")
+    async def ups_config_patch(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        cfg  = await _ups().set_config(**body)
+        return cfg.to_dict()
+
+    @app.post("/api/v1/ups/poll")
+    async def ups_poll_now(request: Request) -> dict[str, Any]:
+        """Trigger an immediate UPS status poll."""
+        _require_scope(request, SCOPE_READ)
+        status = await _ups().poll_now()
+        if status is None:
+            raise HTTPException(503, "UPS unreachable")
+        return status.to_dict()
+
+    # =========================================================================
+    # Dynamic DNS
+    # =========================================================================
+
+    def _ddns():
+        if ddns is None:
+            raise HTTPException(503, "DDNS not available")
+        return ddns
+
+    @app.get("/api/v1/ddns/status")
+    async def ddns_status(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        return _ddns().get_status()
+
+    @app.get("/api/v1/ddns/config")
+    async def ddns_config_get(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        return _ddns().get_config().to_dict()
+
+    @app.patch("/api/v1/ddns/config")
+    async def ddns_config_patch(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        cfg  = _ddns().set_config(**body)
+        return cfg.to_dict()
+
+    @app.get("/api/v1/ddns/records")
+    async def ddns_records_list(request: Request) -> list[dict]:
+        _require_scope(request, SCOPE_READ)
+        return _ddns().list_records()
+
+    @app.post("/api/v1/ddns/records")
+    async def ddns_records_add(request: Request) -> dict[str, Any]:
+        """
+        Add a DDNS record.
+
+        Body: { "name": "Home", "provider": "cloudflare",
+                "credentials": {"zone_id": "...", "api_token": "..."},
+                "hostnames": ["home.example.com"] }
+        """
+        _require_scope(request, SCOPE_WRITE)
+        body   = await request.json()
+        record = _ddns().add_record(
+            name        = body["name"],
+            provider    = body["provider"],
+            credentials = body["credentials"],
+            hostnames   = body["hostnames"],
+            **{k: v for k, v in body.items()
+               if k not in ("name", "provider", "credentials", "hostnames")},
+        )
+        return record.to_dict()
+
+    @app.patch("/api/v1/ddns/records/{record_id}")
+    async def ddns_records_patch(request: Request, record_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        body   = await request.json()
+        record = _ddns().update_record(record_id, **body)
+        if record is None:
+            raise HTTPException(404, f"DDNS record {record_id!r} not found")
+        return record.to_dict()
+
+    @app.delete("/api/v1/ddns/records/{record_id}")
+    async def ddns_records_delete(request: Request, record_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        ok = _ddns().remove_record(record_id)
+        if not ok:
+            raise HTTPException(404, f"DDNS record {record_id!r} not found")
+        return {"ok": True}
+
+    @app.post("/api/v1/ddns/update")
+    async def ddns_update_now(request: Request) -> dict[str, Any]:
+        """Force an immediate DDNS update for all or one record."""
+        _require_scope(request, SCOPE_WRITE)
+        body      = await request.json()
+        record_id = body.get("record_id")
+        results   = await _ddns().update_now(record_id)
+        return results
+
+    # =========================================================================
+    # WAN speed monitoring
+    # =========================================================================
+
+    def _speedtest():
+        if speedtest is None:
+            raise HTTPException(503, "Speedtest monitor not available")
+        return speedtest
+
+    @app.get("/api/v1/speedtest/status")
+    async def speedtest_status(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        return _speedtest().get_status()
+
+    @app.get("/api/v1/speedtest/config")
+    async def speedtest_config_get(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        return _speedtest().get_config().to_dict()
+
+    @app.patch("/api/v1/speedtest/config")
+    async def speedtest_config_patch(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        cfg  = await _speedtest().set_config(**body)
+        return cfg.to_dict()
+
+    @app.get("/api/v1/speedtest/history")
+    async def speedtest_history(request: Request) -> list[dict]:
+        _require_scope(request, SCOPE_READ)
+        limit = int(request.query_params.get("limit", 48))
+        return _speedtest().get_history(limit=limit)
+
+    @app.post("/api/v1/speedtest/run")
+    async def speedtest_run_now(request: Request) -> dict[str, Any]:
+        """Trigger an immediate speed test (runs in background task)."""
+        _require_scope(request, SCOPE_WRITE)
+        result = await _speedtest().run_now()
+        if result is None:
+            raise HTTPException(503, "No speedtest tool available or test already running")
+        return result.to_dict()
+
+    @app.delete("/api/v1/subdomain/claim")
+    async def subdomain_release(request: Request) -> dict[str, Any]:
+        """Release the current subdomain claim (if supported by Connect)."""
+        _require_scope(request, SCOPE_WRITE)
+        if connect is None:
+            raise HTTPException(503, "Connect not configured")
+        # Connect server handles release; we just surface the call
+        ok = await connect._api_delete("/domains/claim") if hasattr(connect, "_api_delete") else None
+        return {"ok": True}
+
+    @app.post("/api/v1/dns/challenge")
+    async def dns_challenge_create(request: Request) -> dict[str, Any]:
+        """
+        Request an ACME DNS-01 TXT challenge record via Connect/Cloudflare.
+
+        Body: { "subdomain": "alice", "challenge_value": "_acme-challenge token" }
+        Returns: { "fqdn": "_acme-challenge.alice.c.ozma.dev", "value": "..." }
+        """
+        _require_scope(request, SCOPE_WRITE)
+        if connect is None:
+            raise HTTPException(503, "Connect not configured")
+        body = await request.json()
+        subdomain = body.get("subdomain", "")
+        challenge_value = body.get("challenge_value", "")
+        if not subdomain or not challenge_value:
+            raise HTTPException(400, "subdomain and challenge_value required")
+        result = await connect.request_dns_challenge(subdomain, challenge_value)
+        if not result:
+            raise HTTPException(502, "DNS challenge request failed")
+        return result
+
+    @app.delete("/api/v1/dns/challenge")
+    async def dns_challenge_delete(request: Request) -> dict[str, Any]:
+        """Remove an ACME DNS-01 TXT challenge record after cert issuance."""
+        _require_scope(request, SCOPE_WRITE)
+        if connect is None:
+            raise HTTPException(503, "Connect not configured")
+        body = await request.json()
+        subdomain = body.get("subdomain", "")
+        if not subdomain:
+            raise HTTPException(400, "subdomain required")
+        result = await connect._api_post("/domains/challenge/delete", {"subdomain": subdomain}) \
+            if hasattr(connect, "_api_post") else {"ok": True}
+        return result or {"ok": True}
+
+    @app.post("/api/v1/subdomain/external")
+    async def subdomain_external_provision(request: Request) -> dict[str, Any]:
+        """
+        Provision an external subdomain for a local service.
+
+        Body: { "subdomain": "jellyfin", "upstream_url": "http://192.168.1.10:8096" }
+        Returns: { "domain": "jellyfin.alice.e.ozma.dev" }
+        Connect will reverse-proxy the subdomain to upstream_url via the relay tunnel.
+        """
+        _require_scope(request, SCOPE_WRITE)
+        if connect is None:
+            raise HTTPException(503, "Connect not configured")
+        body = await request.json()
+        subdomain    = body.get("subdomain", "")
+        upstream_url = body.get("upstream_url", "")
+        if not subdomain or not upstream_url:
+            raise HTTPException(400, "subdomain and upstream_url required")
+        result = await connect.provision_external_subdomain(subdomain, upstream_url)
+        if not result:
+            raise HTTPException(502, "External subdomain provisioning failed")
+        return result
 
     # Static files — mounted last so they don't shadow API routes
     static_dir = Path(__file__).parent / "static"

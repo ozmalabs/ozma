@@ -193,6 +193,57 @@ class BlocklistSource:
 
 
 @dataclass
+class CustomDNSRecord:
+    """
+    A user-defined local DNS record written to dnsmasq.
+
+    Supported types:
+      A     — hostname → IPv4 address  (dnsmasq: address=/hostname/ip)
+      AAAA  — hostname → IPv6 address  (dnsmasq: address=/hostname/ipv6)
+      CNAME — alias → canonical name   (dnsmasq: cname=alias,target)
+      PTR   — reverse lookup           (dnsmasq: ptr-record=ptr-name,hostname)
+    """
+    id:       str
+    name:     str          # display name e.g. "NAS"
+    hostname: str          # e.g. "nas.home"
+    rtype:    str          # "A" | "AAAA" | "CNAME" | "PTR"
+    value:    str          # IP or target hostname
+    ttl:      int  = 0     # 0 = use dnsmasq default
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id":       self.id,
+            "name":     self.name,
+            "hostname": self.hostname,
+            "rtype":    self.rtype,
+            "value":    self.value,
+            "ttl":      self.ttl,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "CustomDNSRecord":
+        return cls(
+            id       = d["id"],
+            name     = d.get("name", d["id"]),
+            hostname = d["hostname"],
+            rtype    = d.get("rtype", "A").upper(),
+            value    = d["value"],
+            ttl      = d.get("ttl", 0),
+        )
+
+    def to_dnsmasq_line(self) -> str:
+        """Return the dnsmasq conf line for this record."""
+        rtype = self.rtype.upper()
+        if rtype in ("A", "AAAA"):
+            return f"address=/{self.hostname}/{self.value}"
+        if rtype == "CNAME":
+            return f"cname={self.hostname},{self.value}"
+        if rtype == "PTR":
+            return f"ptr-record={self.hostname},{self.value}"
+        return f"# unsupported record type {rtype}"
+
+
+@dataclass
 class DNSFilterConfig:
     enabled:               bool = False
     block_categories:      list[str] = field(
@@ -223,8 +274,7 @@ class DNSFilterConfig:
     def from_dict(cls, d: dict) -> "DNSFilterConfig":
         return cls(
             enabled               = d.get("enabled", False),
-            block_categories      = d.get("block_categories",
-                                          [FilterCategory.ADS, FilterCategory.MALWARE, FilterCategory.TRACKING]),
+            block_categories      = d.get("block_categories", ["ads", "malware", "tracking"]),
             allowlist             = d.get("allowlist", []),
             custom_blocklist      = d.get("custom_blocklist", []),
             safesearch_enabled    = d.get("safesearch_enabled", False),
@@ -380,8 +430,9 @@ class DNSFilterManager:
         self._state_path = state_path or Path("/var/lib/ozma/dns_filter_state.json")
         self._cache_dir  = cache_dir  or Path("/var/lib/ozma/dns_filter_cache")
         self._config     = DNSFilterConfig()
-        self._sources:   dict[str, BlocklistSource] = {}   # id → source
-        self._blocked:   set[str] = set()                  # compiled domain set
+        self._sources:   dict[str, BlocklistSource] = {}        # id → source
+        self._records:   dict[str, CustomDNSRecord] = {}        # id → local DNS record
+        self._blocked:   set[str] = set()                       # compiled domain set
         self._task:      asyncio.Task | None = None
         self._load()
         self._ensure_builtin_sources()
@@ -512,6 +563,56 @@ class DNSFilterManager:
             return True
         return False
 
+    # ------------------------------------------------------------------
+    # Local DNS records (A / AAAA / CNAME / PTR)
+    # ------------------------------------------------------------------
+
+    def list_records(self) -> list[dict]:
+        return [r.to_dict() for r in self._records.values()]
+
+    def get_record(self, record_id: str) -> CustomDNSRecord | None:
+        return self._records.get(record_id)
+
+    def add_record(
+        self,
+        name: str,
+        hostname: str,
+        rtype: str,
+        value: str,
+        ttl: int = 0,
+    ) -> CustomDNSRecord:
+        import re as _re
+        rec_id = _re.sub(r"[^a-z0-9\-]", "-", name.lower())[:40]
+        if rec_id in self._records:
+            rec_id = f"{rec_id}-{int(time.time())}"
+        rec = CustomDNSRecord(
+            id=rec_id, name=name,
+            hostname=hostname.lower().strip("."),
+            rtype=rtype.upper(),
+            value=value,
+            ttl=ttl,
+        )
+        self._records[rec_id] = rec
+        self._save()
+        return rec
+
+    def update_record(self, record_id: str, **kwargs: Any) -> CustomDNSRecord | None:
+        rec = self._records.get(record_id)
+        if not rec:
+            return None
+        for k, v in kwargs.items():
+            if hasattr(rec, k):
+                setattr(rec, k, v)
+        self._save()
+        return rec
+
+    def remove_record(self, record_id: str) -> bool:
+        if record_id not in self._records:
+            return False
+        del self._records[record_id]
+        self._save()
+        return True
+
     def is_blocked(self, domain: str) -> bool:
         """Check if a domain (or any of its parents) is in the compiled blocklist."""
         if not self._config.enabled:
@@ -616,10 +717,22 @@ class DNSFilterManager:
 
         allowset = set(self._config.allowlist)
         conf_content = build_blocklist_conf(self._blocked, allowset, safesearch_lines)
+
+        # Append local DNS records
+        if self._records:
+            record_lines = [
+                "",
+                "# Local DNS records",
+            ]
+            for rec in self._records.values():
+                record_lines.append(rec.to_dnsmasq_line())
+            conf_content += "\n".join(record_lines) + "\n"
+
         conf_file.write_text(conf_content)
         conf_file.chmod(0o644)  # readable by dnsmasq (runs as nobody)
-        log.info("DNS filter conf written: %d domains, safesearch=%s",
-                 len(self._blocked) - len(allowset), self._config.safesearch_enabled)
+        log.info("DNS filter conf written: %d domains, %d local records, safesearch=%s",
+                 len(self._blocked) - len(allowset), len(self._records),
+                 self._config.safesearch_enabled)
         await self._reload_dnsmasq()
         return conf_file
 
@@ -673,6 +786,7 @@ class DNSFilterManager:
         data = {
             "config":  self._config.to_dict(),
             "sources": {sid: s.to_dict() for sid, s in self._sources.items()},
+            "records": {rid: r.to_dict() for rid, r in self._records.items()},
         }
         tmp.write_text(json.dumps(data, indent=2))
         tmp.chmod(0o600)
@@ -686,6 +800,8 @@ class DNSFilterManager:
             self._config = DNSFilterConfig.from_dict(data.get("config", {}))
             for sid, sd in data.get("sources", {}).items():
                 self._sources[sid] = BlocklistSource.from_dict(sd)
+            for rid, rd in data.get("records", {}).items():
+                self._records[rid] = CustomDNSRecord.from_dict(rd)
             self._recompile()
         except Exception:
             log.exception("Failed to load DNS filter state")
