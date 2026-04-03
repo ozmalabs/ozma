@@ -156,6 +156,92 @@ class DiscoveryService:
         await self._state.add_node(node)
         log.info("Node online: %s @ %s:%d role=%s hw=%s", name, host, port, node.role, node.hw)
 
+    # ── Controller advertisement ──────────────────────────────────────────
+
+    def _get_local_ip(self) -> str:
+        """Return the primary local IP address."""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        except Exception:
+            return "127.0.0.1"
+        finally:
+            s.close()
+
+    async def announce_controller(self, controller_id: str, api_port: int) -> None:
+        """Advertise this controller as _ozma-ctrl._tcp.local."""
+        if self._azc is None:
+            return
+        from zeroconf.asyncio import AsyncServiceInfo as _ASI
+        info = _ASI(
+            "_ozma-ctrl._tcp.local.",
+            f"{controller_id}._ozma-ctrl._tcp.local.",
+            addresses=[socket.inet_aton(self._get_local_ip())],
+            port=api_port,
+            properties={
+                b"api_port": str(api_port).encode(),
+                b"controller_id": controller_id.encode(),
+                b"version": b"1",
+            },
+            server=f"{controller_id}.local.",
+        )
+        await self._azc.async_register_service(info)
+        self._ctrl_info = info
+        log.info("Controller advertised as %s._ozma-ctrl._tcp.local.", controller_id)
+
+    async def withdraw_controller(self) -> None:
+        """Withdraw the controller's mDNS advertisement."""
+        info = getattr(self, "_ctrl_info", None)
+        if info and self._azc:
+            try:
+                await self._azc.async_unregister_service(info)
+            except Exception as e:
+                log.debug("withdraw_controller: %s", e)
+            self._ctrl_info = None
+
+    async def discover_controllers(self, timeout: float = 5.0) -> list[dict]:
+        """Probe mDNS for _ozma-ctrl._tcp.local. peers on the LAN."""
+        if self._azc is None:
+            return []
+        from zeroconf import ServiceStateChange as SSC
+        from zeroconf.asyncio import AsyncServiceInfo as _ASI, AsyncServiceBrowser as _ASB
+        found: list[dict] = []
+        my_id = getattr(getattr(self, "_ctrl_info", None), "name", None)
+
+        async def _resolve(name: str) -> None:
+            info = _ASI("_ozma-ctrl._tcp.local.", name)
+            await info.async_request(self._azc.zeroconf, timeout=3000)  # type: ignore[union-attr]
+            if not info.addresses:
+                return
+            ip = socket.inet_ntoa(info.addresses[0])
+            props = {
+                k.decode(): v.decode() if isinstance(v, bytes) else (v or "")
+                for k, v in (info.properties or {}).items()
+            }
+            api_port = int(props.get("api_port", "7380"))
+            ctrl_id = props.get("controller_id", name.split(".")[0])
+            # Skip self
+            if my_id and name == my_id:
+                return
+            found.append({"id": ctrl_id, "host": ip, "api_port": api_port,
+                          "base_url": f"http://{ip}:{api_port}"})
+
+        tasks: list[asyncio.Task] = []
+
+        def _on_change(zc, stype, name, state_change):
+            if state_change == SSC.Added:
+                tasks.append(asyncio.get_event_loop().create_task(_resolve(name)))
+
+        browser = _ASB(self._azc.zeroconf, "_ozma-ctrl._tcp.local.", handlers=[_on_change])
+        await asyncio.sleep(timeout)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        browser.cancel()
+        return found
+
+    # ── Requery loop ──────────────────────────────────────────────────────
+
     async def _requery_loop(self) -> None:
         interval = self._config.mdns_requery_interval
         while True:

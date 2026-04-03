@@ -1144,7 +1144,8 @@ select option { background: var(--surface); }
     <div class="panel-head">
       <h2>Sharing</h2>
       <div class="panel-actions">
-        <button class="btn sm primary" onclick="showAddPeerModal()">+ Peer</button>
+        <button class="btn sm" onclick="discoverPeers()" id="btn-discover-peers">Discover</button>
+      <button class="btn sm primary" onclick="showAddPeerModal()">+ Peer</button>
         <button class="btn sm" onclick="showCreateShareModal()">+ Share Grant</button>
       </div>
     </div>
@@ -3832,6 +3833,26 @@ function renderShares() {
       <button class="btn sm danger" onclick="revokeShare('${esc(s.id)}')">Revoke</button>
     </div>
   `).join('');
+}
+
+function discoverPeers() {
+  const btn = $('btn-discover-peers');
+  btn.disabled = true;
+  btn.textContent = 'Scanning…';
+  api('GET', '/peers/discover').then(d => {
+    const found = d.controllers || [];
+    if (!found.length) { alert('No controllers found on LAN.'); return; }
+    const lines = found.map(c => `${c.id}\n  ${c.base_url}`).join('\n\n');
+    const pick = prompt(`Found ${found.length} controller(s):\n\n${lines}\n\nEnter controller ID to link (or cancel):`);
+    if (!pick) return;
+    const ctrl = found.find(c => c.id === pick.trim());
+    if (!ctrl) { alert('Controller ID not found in scan results.'); return; }
+    const name = prompt('Friendly name:', ctrl.id) || ctrl.id;
+    api('POST', '/peers', { controller_id: ctrl.id, host: ctrl.base_url.replace(/^https?:\/\//, ''), name, transport: 'lan' })
+      .then(() => fetchSharing())
+      .catch(e => alert('Failed: ' + e.message));
+  }).catch(e => alert('Discover failed: ' + e.message))
+    .finally(() => { btn.disabled = false; btn.textContent = 'Discover'; });
 }
 
 function showAddPeerModal() {
