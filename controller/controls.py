@@ -156,12 +156,14 @@ class ControlManager:
         audio: "AudioRouter | None" = None,
         motion: "MotionManager | None" = None,
         doorbell: "Any | None" = None,
+        alerts: "Any | None" = None,
     ) -> None:
         self._state = state
         self._scenarios = scenarios
         self._audio = audio
         self._motion = motion
         self._doorbell = doorbell
+        self._alerts = alerts
         self._surfaces: dict[str, ControlSurface] = {}
         self._action_lock = asyncio.Lock()
         self._trigger_rules: list[EventTriggerRule] = []
@@ -277,32 +279,34 @@ class ControlManager:
                 if node_name:
                     await self._proxy_power(node_name, power_action)
 
+            case "alert.acknowledge":
+                # Acknowledge an alert (primary action — Answer for doorbell, OK for timer).
+                # target or value = alert_id; empty = most recent active alert.
+                if self._alerts:
+                    await self._alerts.acknowledge(str(value or target or ""))
+                elif self._doorbell:
+                    # Compat: fall through to doorbell if no alert manager
+                    await self._doorbell.answer(str(value or target or ""))
+
+            case "alert.dismiss":
+                # Dismiss an alert (secondary action).
+                if self._alerts:
+                    await self._alerts.dismiss(str(value or target or ""))
+                elif self._doorbell:
+                    await self._doorbell.dismiss(str(value or target or ""))
+
+            # Kept for backwards compatibility with existing control bindings
             case "doorbell.answer":
-                # target or value = session_id
-                # Bindable to any control surface: Stream Deck button, MIDI note, hotkey
-                if not self._doorbell:
-                    return
-                session_id = str(value or target or "")
-                if not session_id:
-                    # No session specified — answer the most recent ringing session
-                    ringing = [s for s in self._doorbell.get_sessions()
-                               if s["state"] == "ringing"]
-                    if ringing:
-                        session_id = ringing[-1]["id"]
-                if session_id:
-                    await self._doorbell.answer(session_id)
+                if self._alerts:
+                    await self._alerts.acknowledge(str(value or target or ""))
+                elif self._doorbell:
+                    await self._doorbell.answer(str(value or target or ""))
 
             case "doorbell.dismiss":
-                if not self._doorbell:
-                    return
-                session_id = str(value or target or "")
-                if not session_id:
-                    ringing = [s for s in self._doorbell.get_sessions()
-                               if s["state"] == "ringing"]
-                    if ringing:
-                        session_id = ringing[-1]["id"]
-                if session_id:
-                    await self._doorbell.dismiss(session_id)
+                if self._alerts:
+                    await self._alerts.dismiss(str(value or target or ""))
+                elif self._doorbell:
+                    await self._doorbell.dismiss(str(value or target or ""))
 
             case _:
                 log.debug("Unknown action: %s", action)

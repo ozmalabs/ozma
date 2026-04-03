@@ -84,6 +84,7 @@ from idp import IdentityProvider, IdPConfig
 from sharing import SharingManager
 from external_publish import ExternalPublishManager
 from node_reconciler import NodeReconciler
+from alerts import AlertManager
 from doorbell import DoorbellManager
 from api import build_app
 
@@ -170,7 +171,7 @@ async def run(config: Config) -> None:
     stream_router = StreamRouter(codec_manager=codec_mgr)
     guac_mgr = GuacamoleManager(state=state)
     provision_mgr = ProvisioningManager(state=state)
-    controls = ControlManager(state, scenarios, audio, motion, doorbell=doorbell_mgr)
+    controls = ControlManager(state, scenarios, audio, motion, doorbell=doorbell_mgr, alerts=alert_mgr)
 
     # Built-in hotkey surface: ScrollLock = next scenario, Pause = prev
     hotkey_surface = ControlSurface("hotkeys")
@@ -274,11 +275,12 @@ async def run(config: Config) -> None:
     sched = Scheduler(scenarios)
     await sched.start()
     notifier = NotificationManager()
+    alert_mgr = AlertManager(state=state, kdeconnect=kdeconnect, notifier=notifier)
+    await alert_mgr.start()
     doorbell_mgr = DoorbellManager(
         state=state,
         frigate_url=os.environ.get("OZMA_FRIGATE_URL", "http://localhost:5000"),
-        kdeconnect=kdeconnect,
-        notifier=notifier,
+        alert_mgr=alert_mgr,
     )
     await doorbell_mgr.start()
     recorder = SessionRecorder()
@@ -437,7 +439,7 @@ async def run(config: Config) -> None:
         transcription_mgr = LiveTranscriptionManager(connect=connect)
 
     # Build the FastAPI app — all managers must be created before this point
-    app = build_app(state, scenarios, streams, audio, controls, rgb_out, motion, bt, kdeconnect, wifi_audio, captures, paste_typer, kbd_mgr, macro_mgr, sched, notifier, recorder, net_health, ocr_triggers, auto_engine, metrics_collector, screen_mgr, codec_mgr=codec_mgr, camera_mgr=camera_mgr, obs_studio=obs_studio, stream_router=stream_router, guac_mgr=guac_mgr, provision_mgr=provision_mgr, connect=connect, mesh_ca=mesh_ca, sess_mgr=sess_mgr, room_correction=room_corr, testbench=testbench, agent_engine=agent_engine, test_runner=test_runner, auth_config=auth_cfg, user_manager=user_mgr, service_proxy=svc_proxy, idp=idp_instance, sharing=sharing_mgr, ext_publish=ext_pub, node_reconciler=reconciler, update_mgr=update_mgr, transcription_mgr=transcription_mgr, discovery=discovery, doorbell_mgr=doorbell_mgr)
+    app = build_app(state, scenarios, streams, audio, controls, rgb_out, motion, bt, kdeconnect, wifi_audio, captures, paste_typer, kbd_mgr, macro_mgr, sched, notifier, recorder, net_health, ocr_triggers, auto_engine, metrics_collector, screen_mgr, codec_mgr=codec_mgr, camera_mgr=camera_mgr, obs_studio=obs_studio, stream_router=stream_router, guac_mgr=guac_mgr, provision_mgr=provision_mgr, connect=connect, mesh_ca=mesh_ca, sess_mgr=sess_mgr, room_correction=room_corr, testbench=testbench, agent_engine=agent_engine, test_runner=test_runner, auth_config=auth_cfg, user_manager=user_mgr, service_proxy=svc_proxy, idp=idp_instance, sharing=sharing_mgr, ext_publish=ext_pub, node_reconciler=reconciler, update_mgr=update_mgr, transcription_mgr=transcription_mgr, discovery=discovery, doorbell_mgr=doorbell_mgr, alert_mgr=alert_mgr)
 
     uv_config = uvicorn.Config(
         app,

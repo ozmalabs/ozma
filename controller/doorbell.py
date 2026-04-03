@@ -1,67 +1,46 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
 """
-Doorbell-to-X — routes doorbell events to wherever the user is.
+Doorbell adapter — translates Frigate camera events into AlertManager calls.
 
-  At desk    → OzmaConsole overlay + chime (WebSocket broadcast)
-  In lounge  → any other connected browser client receives the same broadcast
-  On phone   → KDE Connect ping notification (instant, no app required beyond KDE Connect)
-  Not home   → all of the above fire simultaneously; user gets whichever applies
+This module is responsible for doorbell-specific concerns only:
+  - Interpreting Frigate MQTT events (button press vs person detection)
+  - Two-way audio (CameraAudioBridge + VBANToBackchannelBridge, Phase 2)
+  - Debouncing rapid re-triggers from the same camera
 
-When Frigate's facial recognition identifies a visitor (sub_label), the person's
-name enriches the session and appears in the overlay.  This also works as a
-general event trigger: e.g. "when Matt is recognised at the front door, activate
-the matt-workstation scenario."
+All session lifecycle, delivery (KDE Connect, notifications), expiry, and
+WebSocket broadcasting is handled by AlertManager in alerts.py.
 
-When a Frigate-connected doorbell camera detects a button press or person,
-the controller:
-  1. Fires a doorbell.ringing WebSocket event to all connected clients
-  2. Connected web clients (OzmaConsole, dashboard) play a chime via Web
-     Audio API and show a notification overlay with a live camera snapshot
-  3. The user clicks Answer or Dismiss — no phone required
+Event taxonomy from Frigate:
+  frigate/<cam>/doorbell  payload=True   → button pressed → kind="doorbell"
+                                            urgent; plays chime; Answer + Dismiss
+  frigate/events  label=person            → person at door (no button press)
+                  + sub_label             → recognised person
+                                            passive; Dismiss only; no chime
 
-Two-way audio (answer path):
-  Phase 1 (current): stub — logs intent, answer state tracked
-  Phase 2: ffmpeg pulls RTSP audio from camera → VBAN → active node → headset
-            headset mic → VBAN → controller → camera RTSP backchannel (Reolink)
-  See _start_audio() below for the planned implementation.
-
-Event flow:
-  Frigate MQTT (frigate/<cam>/doorbell)
-    → ozma_bridge POSTs to POST /api/v1/frigate/webhook
-      → DoorbellManager.receive_event()
-        → state.events.put(doorbell.ringing)
-          → _broadcast() → WebSocket clients
-            → OzmaConsole.html / dashboard show overlay + play chime
+The webhook in api.py calls receive_button_press() / receive_person_detected()
+based on the MQTT-derived kind field.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import os
 import socket
 import time
-import uuid
-from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urlparse
+
+from alerts import AlertManager, AlertSession
 
 log = logging.getLogger("ozma.doorbell")
 
-RING_TIMEOUT_S = 30      # auto-expire if not answered/dismissed
-SESSION_TTL_S  = 300     # clean up old sessions after 5 minutes
-
 # Audio constants
-_CAM_SAMPLE_RATE  = 48_000   # inbound (camera → headset): full quality
-_CAM_CHANNELS     = 2
-_MIC_SAMPLE_RATE  = 8_000    # outbound (mic → camera backchannel): telephony
-_MIC_CHANNELS     = 1
-_VBAN_NODE_PORT   = 6980     # node VBAN receiver port (existing default)
-_SAMPLES_PER_FRAME = 256     # matches vban.py DEFAULT_SAMPLES_PER_FRAME
+_CAM_SAMPLE_RATE   = 48_000   # inbound (camera → headset): full quality
+_CAM_CHANNELS      = 2
+_VBAN_NODE_PORT    = 6980     # node VBAN receiver port (existing default)
+_SAMPLES_PER_FRAME = 256      # matches vban.py DEFAULT_SAMPLES_PER_FRAME
 
 
-# ── Audio bridges ──────────────────────────────────────────────────────────────
+# ── Doorbell-specific audio bridges ───────────────────────────────────────────
 
 class CameraAudioBridge:
     """
@@ -151,33 +130,37 @@ class CameraAudioBridge:
             sock.close()
 
 
-class BackchannelSink:
+class VBANToBackchannelBridge:
     """
-    Accepts raw PCM chunks (s16le, 8 kHz mono) from the dashboard mic
-    WebSocket and forwards them to the camera RTSP backchannel via ffmpeg.
+    Receives VBAN frames from the active node's PipeWire mic (VBANSender)
+    on a UDP port, strips the VBAN header, and forwards raw PCM to a
+    camera RTSP backchannel via ffmpeg.
 
     Outbound path:
-      Dashboard mic → Web Audio API → PCM/WebSocket → controller
-      → BackchannelSink.write() → queue → ffmpeg stdin
-      → G.711 µ-law RTSP ANNOUNCE/RECORD → camera speaker
+      Node PipeWire mic → VBANSender → UDP → controller:6982
+      → VBANToBackchannelBridge → ffmpeg (G.711 µ-law) → camera RTSP backchannel
 
-    write() is non-blocking — overflow drops frames rather than blocking.
+    The camera RTSP backchannel URL is camera-specific:
+      Reolink:  rtsp://user:pass@camera-ip/backchannel
+      Generic:  any RTSP ANNOUNCE/RECORD endpoint
     """
 
-    def __init__(self, backchannel_url: str) -> None:
+    PORT = 6982  # Controller listens here for mic VBAN from the active node
+
+    def __init__(self, backchannel_url: str, listen_port: int = PORT) -> None:
         self._url = backchannel_url
+        self._listen_port = listen_port
         self._proc: asyncio.subprocess.Process | None = None
         self._task: asyncio.Task | None = None
-        self._queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=64)
 
     async def start(self) -> None:
         cmd = [
             "ffmpeg", "-loglevel", "error",
             "-f", "s16le",
-            "-ar", str(_MIC_SAMPLE_RATE),
-            "-ac", str(_MIC_CHANNELS),
+            "-ar", str(_CAM_SAMPLE_RATE),
+            "-ac", str(_CAM_CHANNELS),
             "-i", "pipe:0",
-            "-acodec", "pcm_mulaw",    # G.711 µ-law — widely accepted by cameras
+            "-acodec", "pcm_mulaw",
             "-ar", "8000",
             "-ac", "1",
             "-f", "rtsp",
@@ -193,33 +176,38 @@ class BackchannelSink:
         except FileNotFoundError:
             log.error("ffmpeg not found — doorbell backchannel unavailable")
             return
-        self._task = asyncio.create_task(self._feed(), name="doorbell-backchannel")
-        log.info("Doorbell backchannel sink started → %s", self._url)
+        self._task = asyncio.create_task(
+            self._receive_loop(), name="doorbell-vban-backchannel"
+        )
+        log.info("Doorbell backchannel: VBAN :%d → ffmpeg → %s",
+                 self._listen_port, self._url)
 
-    async def _feed(self) -> None:
+    async def _receive_loop(self) -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("0.0.0.0", self._listen_port))
+        sock.setblocking(False)
+        loop = asyncio.get_event_loop()
         try:
             while self._proc and self._proc.returncode is None:
-                chunk = await self._queue.get()
-                if not chunk:
-                    break
+                try:
+                    data = await asyncio.wait_for(
+                        loop.sock_recv(sock, 65535), timeout=1.0
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                if len(data) <= 28:
+                    continue
+                pcm = data[28:]   # strip 28-byte VBAN header
                 if self._proc.stdin:
-                    self._proc.stdin.write(chunk)
+                    self._proc.stdin.write(pcm)
                     await self._proc.stdin.drain()
         except Exception as exc:
-            log.debug("Doorbell backchannel feed ended: %s", exc)
-
-    def write(self, pcm_chunk: bytes) -> None:
-        """Called by the WebSocket handler — non-blocking."""
-        try:
-            self._queue.put_nowait(pcm_chunk)
-        except asyncio.QueueFull:
-            pass  # drop if downstream can't keep up
+            log.debug("Doorbell VBAN receive loop ended: %s", exc)
+        finally:
+            sock.close()
 
     async def stop(self) -> None:
-        try:
-            self._queue.put_nowait(b"")  # sentinel
-        except asyncio.QueueFull:
-            pass
         if self._proc and self._proc.returncode is None:
             if self._proc.stdin:
                 try:
@@ -238,263 +226,142 @@ class BackchannelSink:
                 pass
 
 
-@dataclass
-class DoorbellSession:
-    id: str
-    camera: str
-    frigate_url: str
-    started_at: float
-    state: str = "ringing"           # ringing | answered | dismissed | expired
-    active_node_id: str | None = None
-    snapshot_url: str = ""           # Frigate latest snapshot URL
-    person: str = ""                 # Recognised person name (Frigate sub_label), if any
-    _audio_proc: Any = field(default=None, repr=False)
-    _cam_bridge: Any = field(default=None, repr=False)   # CameraAudioBridge | None
-    _backchannel: Any = field(default=None, repr=False)  # BackchannelSink | None
-
-    def to_dict(self) -> dict:
-        d = {
-            "id": self.id,
-            "camera": self.camera,
-            "started_at": self.started_at,
-            "state": self.state,
-            "active_node_id": self.active_node_id,
-            "snapshot_url": f"/api/v1/doorbell/{self.id}/snapshot",
-            "age_s": round(time.time() - self.started_at, 1),
-        }
-        if self.person:
-            d["person"] = self.person
-        return d
-
+# ── Doorbell adapter ──────────────────────────────────────────────────────────
 
 class DoorbellManager:
-    """Manages doorbell sessions and routes events to wherever the user is.
+    """Translates Frigate doorbell events into AlertManager alerts.
 
-    Doorbell-to-X delivery:
-      - All connected WebSocket clients receive doorbell.ringing (covers desk + lounge)
-      - KDE Connect ping fires to all paired phones (covers not-at-desk / not-home)
-      - NotificationManager.on_event fires webhooks / Slack / Discord if configured
-      Presence awareness is opportunistic: all channels fire simultaneously, so the
-      user is reached on whichever applies.  Deduplication is the client's job.
+    Doorbell button press → kind="doorbell" alert (urgent, chime, Answer + Dismiss)
+    Person detected       → kind="motion"   alert (passive, no chime, Dismiss only)
+
+    Audio bridges are managed here (doorbell-specific concern).
+    All session lifecycle, delivery, expiry handled by AlertManager.
     """
 
     def __init__(
         self,
         state: Any,
         frigate_url: str = "http://localhost:5000",
+        alert_mgr: AlertManager | None = None,
+        # Kept for call-site compatibility — forwarded to AlertManager if provided
         kdeconnect: Any = None,
         notifier: Any = None,
     ) -> None:
         self._state = state
         self._frigate_url = frigate_url
-        self._kdeconnect = kdeconnect
-        self._notifier = notifier
-        self._sessions: dict[str, DoorbellSession] = {}
-        self._expire_task: asyncio.Task | None = None
+        self._alert_mgr = alert_mgr
+        # Audio state per alert-id
+        self._audio: dict[str, tuple[CameraAudioBridge | None, VBANToBackchannelBridge | None]] = {}
 
     async def start(self) -> None:
-        self._expire_task = asyncio.create_task(
-            self._expire_loop(), name="doorbell-expire"
-        )
         log.info("DoorbellManager started (frigate=%s)", self._frigate_url)
 
     async def stop(self) -> None:
-        if self._expire_task:
-            self._expire_task.cancel()
+        for cam_bridge, backchannel in self._audio.values():
+            if cam_bridge:
+                await cam_bridge.stop()
+            if backchannel:
+                await backchannel.stop()
+        self._audio.clear()
 
-    # ── Public API ──────────────────────────────────────────────────────────
+    # ── Called from api.py webhook ────────────────────────────────────────────
 
-    async def receive_event(self, camera: str, event_type: str, payload: dict) -> DoorbellSession | None:
-        """Called when Frigate sends a doorbell event for a camera.
-
-        event_type is 'doorbell' (button press) or 'person' (detection).
-        Returns the new session, or None if the event was ignored.
-        """
-        # Debounce: ignore if a ringing session for this camera is < 5s old
-        for s in self._sessions.values():
-            if s.camera == camera and s.state == "ringing":
-                age = time.time() - s.started_at
-                if age < 5:
-                    log.debug("Doorbell debounce: ignoring %s event for %s (age=%.1fs)", event_type, camera, age)
-                    return None
-
-        session_id = uuid.uuid4().hex[:8]
-        session = DoorbellSession(
-            id=session_id,
+    async def receive_button_press(self, camera: str) -> AlertSession | None:
+        """Doorbell button pressed at camera. Creates an urgent doorbell alert."""
+        if not self._alert_mgr:
+            return None
+        snapshot = f"{self._frigate_url}/api/{camera}/latest.jpg"
+        return await self._alert_mgr.create(
+            kind="doorbell",
+            title="Doorbell",
+            body=f"Someone at your door ({camera})",
+            timeout_s=30,
+            node_id=getattr(self._state, "active_node_id", None),
+            snapshot_url=snapshot,
             camera=camera,
-            frigate_url=self._frigate_url,
-            started_at=time.time(),
-            active_node_id=getattr(self._state, "active_node_id", None),
-            snapshot_url=f"{self._frigate_url}/api/{camera}/latest.jpg",
+            primary_label="Answer",
+            secondary_label="Dismiss",
+            debounce_key=camera,
+            debounce_s=5,
         )
-        self._sessions[session_id] = session
 
-        log.info("Doorbell ringing: camera=%s session=%s active_node=%s",
-                 camera, session_id, session.active_node_id)
+    async def receive_person_detected(
+        self, camera: str, person: str = ""
+    ) -> AlertSession | None:
+        """Person detected at camera (with or without facial recognition).
 
-        await self._push_event("doorbell.ringing", session)
-        await self._notify_user(session)
-        return session
+        If a doorbell alert is already active on this camera, enrich it with
+        the person name rather than creating a separate alert.
+        """
+        if not self._alert_mgr:
+            return None
 
-    async def answer(self, session_id: str) -> bool:
-        """Answer a ringing doorbell. Returns True if state was changed."""
-        session = self._sessions.get(session_id)
-        if not session:
-            return False
-        if session.state != "ringing":
-            log.debug("Answer ignored: session %s is %s", session_id, session.state)
-            return False
+        # Enrich existing doorbell alert if present
+        if person:
+            existing = self._alert_mgr.get_most_recent_active(kind="doorbell")
+            if existing and existing.camera == camera and not existing.person:
+                await self._alert_mgr.update(existing.id, person=person,
+                                             body=f"{person} at your door ({camera})")
+                return existing
 
-        session.state = "answered"
-        log.info("Doorbell answered: session=%s camera=%s", session_id, session.camera)
-        await self._push_event("doorbell.answered", session)
-        await self._start_audio(session)
-        return True
+        snapshot = f"{self._frigate_url}/api/{camera}/latest.jpg"
+        title = f"{person} at {camera}" if person else f"Person at {camera}"
+        body = title
+        return await self._alert_mgr.create(
+            kind="motion",
+            title=title,
+            body=body,
+            timeout_s=60,
+            node_id=getattr(self._state, "active_node_id", None),
+            snapshot_url=snapshot,
+            camera=camera,
+            person=person,
+            primary_label="Dismiss",
+            secondary_label="",
+            debounce_key=camera,
+            debounce_s=30,
+        )
 
-    async def dismiss(self, session_id: str) -> bool:
-        """Dismiss a ringing doorbell. Returns True if state was changed."""
-        session = self._sessions.get(session_id)
-        if not session:
-            return False
-        if session.state != "ringing":
-            return False
+    # ── Called from ControlManager (alert.acknowledge → answer the door) ─────
 
-        session.state = "dismissed"
-        log.info("Doorbell dismissed: session=%s camera=%s", session_id, session.camera)
-        await self._push_event("doorbell.dismissed", session)
-        await self._stop_audio(session)
-        return True
+    async def start_audio(self, alert_id: str) -> None:
+        """Start two-way audio when the doorbell is answered.
 
-    def get_session(self, session_id: str) -> DoorbellSession | None:
-        return self._sessions.get(session_id)
+        Phase 2: requires RTSP URL from camera config.
+        Currently a stub — audio bridge classes are wired but not activated
+        until camera RTSP URLs are stored in the node/service registry.
+        """
+        log.info("Doorbell audio answer: alert=%s (two-way audio Phase 2)", alert_id)
 
-    def get_sessions(self) -> list[dict]:
-        return [s.to_dict() for s in self._sessions.values()]
+    async def stop_audio(self, alert_id: str) -> None:
+        bridges = self._audio.pop(alert_id, (None, None))
+        for b in bridges:
+            if b:
+                await b.stop()
 
-    def get_snapshot_url(self, session_id: str) -> str | None:
-        s = self._sessions.get(session_id)
-        return s.snapshot_url if s else None
+    # ── Backwards-compat: old call sites that use DoorbellManager directly ───
+
+    async def receive_event(self, camera: str, event_type: str, payload: Any) -> AlertSession | None:
+        """Compatibility shim — route to receive_button_press()."""
+        return await self.receive_button_press(camera)
 
     def enrich_person(self, camera: str, person: str) -> None:
-        """Update ringing sessions on this camera with the recognised person's name.
+        """Compatibility shim — enrich via AlertManager."""
+        if not self._alert_mgr:
+            return
+        existing = self._alert_mgr.get_most_recent_active(kind="doorbell")
+        if existing and existing.camera == camera and not existing.person:
+            asyncio.create_task(
+                self._alert_mgr.update(existing.id, person=person,
+                                       body=f"{person} at your door ({camera})"),
+                name=f"doorbell-enrich-{existing.id}",
+            )
 
-        Called when Frigate fires a person_recognized event near-simultaneously with
-        a doorbell button press.  The name enriches the session and is pushed to
-        WebSocket clients via a doorbell.person_identified event.
-        """
-        for session in self._sessions.values():
-            if session.camera == camera and session.state == "ringing" and not session.person:
-                session.person = person
-                log.info("Doorbell person identified: session=%s person=%s", session.id, person)
-                asyncio.create_task(
-                    self._push_event("doorbell.person_identified", session),
-                    name=f"doorbell-person-{session.id}",
-                )
+    def get_session(self, alert_id: str) -> Any:
+        return self._alert_mgr.get_alert(alert_id) if self._alert_mgr else None
 
-    # ── Internal ────────────────────────────────────────────────────────────
+    def get_sessions(self) -> list[dict]:
+        return self._alert_mgr.list_alerts(kind="doorbell") if self._alert_mgr else []
 
-    async def _push_event(self, event_type: str, session: DoorbellSession) -> None:
-        await self._state.events.put({
-            "type": event_type,
-            **session.to_dict(),
-        })
-
-    async def _notify_user(self, session: DoorbellSession) -> None:
-        """Push doorbell notification to the user's phone (doorbell-to-X).
-
-        All channels fire simultaneously — the user is reached on whichever applies:
-          - WebSocket broadcast (OzmaConsole overlay) reaches desk and lounge clients
-          - KDE Connect ping reaches the phone when away from desk
-        Both fire unconditionally; clients / devices handle deduplication/dismissal.
-        """
-        if session.person:
-            text = f"{session.person} at your door ({session.camera})"
-        else:
-            text = f"Someone at your door ({session.camera})"
-
-        # KDE Connect: ping all paired phones
-        if self._kdeconnect:
-            for device in self._kdeconnect._devices.values():
-                if device.connected:
-                    try:
-                        await self._kdeconnect.ping(device.id, message=text)
-                    except Exception as exc:
-                        log.debug("KDE Connect ping failed for %s: %s", device.id, exc)
-
-        # Webhook / Slack / Discord notifications
-        if self._notifier:
-            try:
-                await self._notifier.on_event("doorbell.ringing", {
-                    "title": "Doorbell",
-                    "message": text,
-                    "camera": session.camera,
-                    "person": session.person,
-                    "session_id": session.id,
-                    "snapshot_url": session.to_dict()["snapshot_url"],
-                })
-            except Exception as exc:
-                log.debug("Notifier send failed: %s", exc)
-
-    async def _start_audio(self, session: DoorbellSession) -> None:
-        """Start two-way audio between the camera and the active node's headset.
-
-        Phase 2 implementation plan:
-          Inbound (camera mic → headset):
-            ffmpeg -i <camera_rtsp> -vn -acodec pcm_s16le -ar 48000 -ac 2 \
-                   -f vban udp://<active_node_ip>:6980
-            The active node's VBAN input receives the stream and routes it
-            to PipeWire → headset output via the existing audio routing.
-
-          Outbound (headset mic → camera speaker):
-            Reolink supports RTSP backchannel (ANNOUNCE/RECORD) or a UDP
-            push endpoint. The active node captures the headset mic via VBAN
-            and streams it to the controller. The controller forwards it to
-            the camera via backchannel.
-
-            ffmpeg -f vban -i udp://0.0.0.0:6981 \
-                   -acodec pcm_s16le -ar 8000 -ac 1 \
-                   -f rtsp rtsp://<camera_ip>/backchannel
-
-          This requires:
-            - VBAN bidirectional session between controller and active node
-            - ffmpeg pipeline per doorbell session (managed as subprocess)
-            - Camera-specific backchannel URL (Reolink, Dahua differ)
-            - Cleanup on dismiss/expire
-
-        For now: log the intent so the answered state is tracked and audio
-        can be wired in Phase 2 without changing the session lifecycle.
-        """
-        log.info(
-            "Doorbell audio: session=%s camera=%s active_node=%s — "
-            "two-way audio not yet implemented (Phase 2)",
-            session.id, session.camera, session.active_node_id,
-        )
-
-    async def _stop_audio(self, session: DoorbellSession) -> None:
-        if session._audio_proc:
-            try:
-                session._audio_proc.terminate()
-            except ProcessLookupError:
-                pass
-            session._audio_proc = None
-
-    async def _expire_loop(self) -> None:
-        while True:
-            await asyncio.sleep(5)
-            await self._expire_loop_once()
-
-    async def _expire_loop_once(self) -> None:
-        """Single expiry sweep — separated for testability."""
-        now = time.time()
-        expired = []
-        for session in list(self._sessions.values()):
-            if session.state == "ringing" and now - session.started_at > RING_TIMEOUT_S:
-                session.state = "expired"
-                log.debug("Doorbell expired: session=%s camera=%s", session.id, session.camera)
-                await self._push_event("doorbell.expired", session)
-                await self._stop_audio(session)
-            if session.state in ("dismissed", "expired", "answered"):
-                if now - session.started_at > SESSION_TTL_S:
-                    expired.append(session.id)
-        for sid in expired:
-            self._sessions.pop(sid, None)
+    def get_snapshot_url(self, alert_id: str) -> str | None:
+        return self._alert_mgr.get_snapshot_url(alert_id) if self._alert_mgr else None

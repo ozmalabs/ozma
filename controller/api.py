@@ -128,7 +128,7 @@ class DirectRegisterRequest(BaseModel):
     display_outputs: str = ""  # JSON-encoded list of display output dicts
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None) -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None) -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -3913,15 +3913,16 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         person = body.get("person", "")
 
         if kind == "doorbell" and doorbell_mgr and camera:
-            session = await doorbell_mgr.receive_event(camera, "doorbell", payload)
-            return {"ok": True, "session_id": session.id if session else None}
+            # Button pressed → urgent doorbell alert
+            alert = await doorbell_mgr.receive_button_press(camera)
+            return {"ok": True, "alert_id": alert.id if alert else None}
 
-        if kind == "person_recognized" and camera and person:
-            # Enrich any active doorbell session on this camera with the person's name
+        if kind == "person_recognized" and camera:
+            # Person detected with facial recognition — enrich doorbell or create motion alert
             if doorbell_mgr:
-                doorbell_mgr.enrich_person(camera, person)
+                await doorbell_mgr.receive_person_detected(camera, person)
 
-        # Forward all Frigate events onto the event bus for overlays / notifications
+        # Forward all Frigate events onto the event bus for trigger rules / overlays
         event: dict[str, Any] = {
             "type": f"frigate.{kind}",
             "camera": camera,
@@ -3933,30 +3934,34 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         await state.events.put(event)
         return {"ok": True}
 
-    @app.get("/api/v1/doorbell/sessions")
-    async def list_doorbell_sessions(request: Request) -> dict[str, Any]:
-        """List active doorbell sessions. Answer/dismiss via POST /api/v1/controls/action
-        with action='doorbell.answer' or 'doorbell.dismiss' and value=session_id.
-        This routes through the control surface system so any bound surface can answer."""
-        _require_scope(request, SCOPE_READ)
-        sessions = doorbell_mgr.get_sessions() if doorbell_mgr else []
-        return {"sessions": sessions}
+    # --- Alert endpoints ---
 
-    @app.get("/api/v1/doorbell/{session_id}/snapshot")
-    async def doorbell_snapshot(request: Request, session_id: str) -> Any:
-        """Proxy the Frigate camera snapshot for this doorbell session."""
+    @app.get("/api/v1/alerts")
+    async def list_alerts(
+        request: Request,
+        kind: str | None = None,
+        state_filter: str | None = None,
+    ) -> dict[str, Any]:
+        """List alerts. Optional ?kind=doorbell&state_filter=active."""
         _require_scope(request, SCOPE_READ)
-        if not doorbell_mgr:
-            raise HTTPException(503, "Doorbell manager not available")
-        snapshot_url = doorbell_mgr.get_snapshot_url(session_id)
+        alerts = alert_mgr.list_alerts(kind=kind, state=state_filter) if alert_mgr else []
+        return {"alerts": alerts}
+
+    @app.get("/api/v1/alerts/{alert_id}/snapshot")
+    async def alert_snapshot(request: Request, alert_id: str) -> Any:
+        """Proxy a camera snapshot for the given alert."""
+        _require_scope(request, SCOPE_READ)
+        if not alert_mgr:
+            raise HTTPException(503, "Alert manager not available")
+        snapshot_url = alert_mgr.get_snapshot_url(alert_id)
         if not snapshot_url:
-            raise HTTPException(404, "Session not found")
+            raise HTTPException(404, "Alert not found or no snapshot")
         try:
             import httpx as _httpx
             async with _httpx.AsyncClient(timeout=5) as client:
                 resp = await client.get(snapshot_url)
                 if resp.status_code != 200:
-                    raise HTTPException(502, "Snapshot unavailable from Frigate")
+                    raise HTTPException(502, "Snapshot unavailable")
                 from fastapi.responses import Response as _Response
                 return _Response(
                     content=resp.content,
@@ -3964,6 +3969,17 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
                 )
         except Exception as exc:
             raise HTTPException(502, f"Snapshot fetch failed: {exc}") from exc
+
+    # Backwards-compat aliases — doorbell sessions are now alerts with kind="doorbell"
+    @app.get("/api/v1/doorbell/sessions")
+    async def list_doorbell_sessions(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        sessions = alert_mgr.list_alerts(kind="doorbell") if alert_mgr else []
+        return {"sessions": sessions}
+
+    @app.get("/api/v1/doorbell/{session_id}/snapshot")
+    async def doorbell_snapshot(request: Request, session_id: str) -> Any:
+        return await alert_snapshot(request, session_id)
 
     # Static files — mounted last so they don't shadow API routes
     static_dir = Path(__file__).parent / "static"
