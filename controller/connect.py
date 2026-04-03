@@ -412,6 +412,106 @@ class OzmaConnect:
 
         return curves
 
+    # ── Business continuity failover ────────────────────────────────────────
+
+    async def send_failover_heartbeat(self, mode: str, origin_controller_id: str | None = None) -> bool:
+        """Enhanced heartbeat that includes failover mode.
+
+        Connect uses this to detect outages (missed heartbeats) and to know
+        when a virtual controller is standing in for a local one.
+        """
+        if not self._authenticated:
+            return False
+        result = await self._api_post("/failover/heartbeat", {
+            "mode": mode,
+            "origin_controller_id": origin_controller_id,
+            "timestamp": time.time(),
+        })
+        return bool(result and result.get("ok"))
+
+    async def check_failover_status(self) -> dict | None:
+        """Poll Connect for current failover state.
+
+        Returns a dict with:
+          state: "normal" | "outage_detected" | "failover_pending" |
+                 "failover_active" | "recovery_ready" | "local_recovered"
+          backup_label: human-readable backup timestamp (e.g. "today at 14:32")
+          backup_timestamp: unix timestamp of the backup
+          free_days_remaining: float
+          accept_url: URL for user to accept the offer (deeplink into mobile app)
+          virtual_url: URL of the active virtual controller (if failover_active)
+        """
+        if not self._authenticated:
+            return None
+        return await self._api_get("/failover/status")
+
+    async def accept_failover(self) -> dict | None:
+        """User accepts the virtual controller offer.
+
+        Connect activates the pre-warmed virtual controller, updates DNS so
+        the existing subdomain points there, and notifies nodes via the relay
+        to reconnect to the virtual controller.
+
+        Returns: {ok, virtual_url, free_days, free_until}
+        """
+        if not self._authenticated:
+            return None
+        return await self._api_post("/failover/accept", {})
+
+    async def decline_failover(self) -> dict | None:
+        """User declines the offer. Connect marks it declined — no further nudges."""
+        if not self._authenticated:
+            return None
+        return await self._api_post("/failover/decline", {})
+
+    async def extend_failover(self, days: int) -> dict | None:
+        """Purchase additional days of virtual failover beyond the free tier.
+
+        Connect creates a Stripe payment intent. Returns:
+          {ok, checkout_url, paid_until}
+        """
+        if not self._authenticated:
+            return None
+        return await self._api_post("/failover/extend", {"days": days})
+
+    async def push_sync_delta(self, delta: dict) -> bool:
+        """Virtual controller pushes its state delta to Connect for local to pull.
+
+        The delta contains changes made while the local was offline:
+        scenarios, node configs, bindings. Stored transiently (48h TTL).
+        """
+        if not self._authenticated:
+            return False
+        result = await self._api_post("/failover/sync", {"delta": delta})
+        return bool(result and result.get("ok"))
+
+    async def pull_sync_delta(self) -> dict | None:
+        """Local controller pulls the state delta from Connect after coming back.
+
+        Returns the delta dict, or None if nothing available.
+        """
+        if not self._authenticated:
+            return None
+        return await self._api_get("/failover/sync")
+
+    async def signal_handoff_complete(self, origin_controller_id: str | None = None) -> bool:
+        """Signal Connect that the handoff is complete.
+
+        Called by both sides:
+        - Virtual: after pushing delta, signals it's ready to shut down
+        - Local: after applying delta, confirms it's primary again
+        """
+        if not self._authenticated:
+            return False
+        result = await self._api_post("/failover/handoff", {
+            "origin_controller_id": origin_controller_id,
+        })
+        return bool(result and result.get("ok"))
+
+    async def get_auth_token(self) -> str:
+        """Return the current Connect auth token for use in outgoing requests."""
+        return self._token
+
     # ── API helpers ─────────────────────────────────────────────────────────
 
     async def _api_get_public(self, path: str) -> dict | None:
