@@ -319,15 +319,17 @@ class SeatManager:
             print(f"[OZMA DEBUG] Game launcher init failed: {e}", flush=True)
             log.warning("Game launcher init failed: %s", e)
 
-        # Start USB hotplug monitor
-        print("[OZMA DEBUG] Starting hotplug monitor...", flush=True)
-        try:
-            self._hotplug = HotplugMonitor(self)
-            await self._hotplug.start()
-            print("[OZMA DEBUG] Hotplug monitor running", flush=True)
-        except Exception as e:
-            print(f"[OZMA DEBUG] Hotplug monitor failed: {e}", flush=True)
-            log.warning("Hotplug monitor failed: %s", e)
+        # Start USB hotplug monitor (deferred)
+        print("[OZMA DEBUG] Deferring hotplug monitor...", flush=True)
+        async def _start_hotplug():
+            try:
+                self._hotplug = HotplugMonitor(self)
+                await self._hotplug.start()
+                print("[OZMA DEBUG] Hotplug monitor running", flush=True)
+            except Exception as e:
+                print(f"[OZMA DEBUG] Hotplug monitor failed: {e}", flush=True)
+                log.warning("Hotplug monitor failed: %s", e)
+        asyncio.create_task(_start_hotplug(), name="hotplug")
 
         log.info("SeatManager running: %d seats on %s",
                  len(self._seats), self._machine_name)
