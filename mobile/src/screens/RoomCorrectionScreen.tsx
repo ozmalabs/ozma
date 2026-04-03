@@ -24,6 +24,7 @@ import {
   Platform,
   ScrollView,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   TouchableOpacity,
@@ -220,6 +221,7 @@ export function RoomCorrectionScreen() {
     setTargetCurve,
     setRoomName,
     setSink,
+    setContributeToDatabase,
   } = useRoomCorrection();
 
   // Result step state — must be at top level (Rules of Hooks)
@@ -354,6 +356,26 @@ export function RoomCorrectionScreen() {
           value={state.roomName}
           onChangeText={setRoomName}
         />
+
+        {/* Mic DB consent */}
+        <View style={styles.consentRow}>
+          <Switch
+            value={state.contributeToDatabase}
+            onValueChange={setContributeToDatabase}
+            trackColor={{false: '#374151', true: '#10B981'}}
+            thumbColor={state.contributeToDatabase ? '#fff' : '#9CA3AF'}
+          />
+          <View style={styles.consentText}>
+            <Text style={styles.consentTitle}>
+              Contribute to phone mic database
+            </Text>
+            <Text style={styles.consentDesc}>
+              {`Help improve corrections for all ${
+                state.phoneModel === 'generic' ? 'users' : state.phoneModel.replace(/_/g, ' ') + ' users'
+              }. Sends only your frequency response and phone model — no room info, no audio.`}
+            </Text>
+          </View>
+        </View>
 
         {state.error && <Text style={styles.errorText}>{state.error}</Text>}
 
@@ -683,6 +705,26 @@ const styles = StyleSheet.create({
     color: '#EF4444',
     fontSize: 13,
     marginTop: 12,
+  },
+  consentRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    marginTop: 20,
+    gap: 12,
+  },
+  consentText: {
+    flex: 1,
+  },
+  consentTitle: {
+    color: '#D1D5DB',
+    fontSize: 14,
+    fontWeight: '500',
+    marginBottom: 2,
+  },
+  consentDesc: {
+    color: '#6B7280',
+    fontSize: 12,
+    lineHeight: 17,
   },
   // Measuring step
   fullscreenStep: {

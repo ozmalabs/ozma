@@ -102,6 +102,7 @@ from key_store import (
 )
 from msp_dashboard import MSPDashboardManager, MSPClient, BulkOperation, BillingLine
 from msp_portal import MSPPortalManager, PortalConfig
+from parental_controls import ParentalControlsManager
 
 log = logging.getLogger("ozma.api")
 
@@ -166,7 +167,7 @@ class DirectRegisterRequest(BaseModel):
     frigate_port: str = ""     # Frigate API port (default 5000)
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None, sunshine: Any | None = None, msp_mgr: MSPDashboardManager | None = None, msp_portal: MSPPortalManager | None = None, auto_configure: Any | None = None, cam_connect: Any | None = None, grid: Any | None = None) -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None, sunshine: Any | None = None, msp_mgr: MSPDashboardManager | None = None, msp_portal: MSPPortalManager | None = None, auto_configure: Any | None = None, cam_connect: Any | None = None, grid: Any | None = None, parental: ParentalControlsManager | None = None) -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -1525,7 +1526,57 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             room_name=body.get("room_name", ""),
             node_id=body.get("node_id", ""),
         )
+
+        # Async fire-and-forget: submit to Connect if authenticated
+        if connect and connect.authenticated:
+            asyncio.create_task(
+                connect.submit_mic_measurement(
+                    phone_model=body.get("phone_model", "generic"),
+                    raw_response=freq_resp,
+                    correction_applied=[(b["freq"], b["gain"]) for b in profile.to_dict()["bands"]],
+                    target_curve=body.get("target_curve", "harman"),
+                ),
+                name="mic_telemetry",
+            )
+
         return {"ok": True, "profile": profile.to_dict()}
+
+    @app.post("/api/v1/audio/room-correction/contribute")
+    async def contribute_mic_measurement(body: dict) -> dict[str, Any]:
+        """
+        Forward a phone mic measurement from the mobile app to Connect.
+
+        The mobile app always talks to the controller (no Connect JWT needed
+        in the app). This endpoint proxies the submission to Connect as a
+        fire-and-forget task.
+
+        Body: {
+            phone_model: str,
+            raw_response: [[freq, db], ...],
+            correction_applied: [[freq, db], ...],
+            target_curve: str,
+            snr_estimate: float,   # optional
+        }
+        """
+        if not connect or not connect.authenticated:
+            return {"ok": True, "accepted": False, "reason": "connect_not_available"}
+
+        phone_model = body.get("phone_model", "generic")
+        raw_response = body.get("raw_response", [])
+        if not raw_response:
+            raise HTTPException(status_code=400, detail="raw_response required")
+
+        asyncio.create_task(
+            connect.submit_mic_measurement(
+                phone_model=phone_model,
+                raw_response=[(f, d) for f, d in raw_response],
+                correction_applied=[(f, d) for f, d in body.get("correction_applied", [])],
+                target_curve=body.get("target_curve", "harman"),
+                snr_estimate=float(body.get("snr_estimate", 0.0)),
+            ),
+            name="mic_telemetry_mobile",
+        )
+        return {"ok": True, "accepted": True}
 
     @app.post("/api/v1/audio/room-correction/apply")
     async def apply_room_correction(body: dict) -> dict[str, Any]:
@@ -8465,6 +8516,197 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if not ok:
             raise HTTPException(404, f"Feed {feed_id} not found")
         return {"ok": True, "feed_id": feed_id, "desk_id": desk_id}
+
+    # ------------------------------------------------------------------ #
+    # Parental controls
+    # ------------------------------------------------------------------ #
+
+    def _parental() -> ParentalControlsManager:
+        if parental is None:
+            raise HTTPException(503, "Parental controls not enabled")
+        return parental
+
+    @app.get("/api/v1/parental/profiles")
+    async def parental_list_profiles(request: Request) -> list[dict]:
+        _require_scope(request, SCOPE_READ)
+        return _parental().list_profiles()
+
+    @app.post("/api/v1/parental/profiles")
+    async def parental_create_profile(request: Request) -> dict:
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        profile = _parental().create_profile(
+            name           = body.get("name", ""),
+            policy_mode    = body.get("policy_mode", "blacklist"),
+            content_filter = body.get("content_filter", "off"),
+            rules          = body.get("rules", []),
+            timers         = body.get("timers", []),
+            schedule       = body.get("schedule", []),
+            break_policy   = body.get("break_policy", {}),
+            override_pin   = body.get("override_pin"),
+        )
+        return profile.to_dict()
+
+    @app.get("/api/v1/parental/profiles/{profile_id}")
+    async def parental_get_profile(request: Request, profile_id: str) -> dict:
+        _require_scope(request, SCOPE_READ)
+        profile = _parental().get_profile(profile_id)
+        if profile is None:
+            raise HTTPException(404, f"Profile {profile_id!r} not found")
+        return profile.to_dict()
+
+    @app.put("/api/v1/parental/profiles/{profile_id}")
+    async def parental_update_profile(request: Request, profile_id: str) -> dict:
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        profile = _parental().update_profile(profile_id, **body)
+        if profile is None:
+            raise HTTPException(404, f"Profile {profile_id!r} not found")
+        return profile.to_dict()
+
+    @app.delete("/api/v1/parental/profiles/{profile_id}")
+    async def parental_delete_profile(request: Request, profile_id: str) -> dict:
+        _require_scope(request, SCOPE_WRITE)
+        ok = _parental().delete_profile(profile_id)
+        if not ok:
+            raise HTTPException(404, f"Profile {profile_id!r} not found")
+        return {"ok": True, "profile_id": profile_id}
+
+    @app.post("/api/v1/parental/profiles/{profile_id}/rules")
+    async def parental_add_rule(request: Request, profile_id: str) -> dict:
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        rule = _parental().add_rule(profile_id, **body)
+        if rule is None:
+            raise HTTPException(404, f"Profile {profile_id!r} not found")
+        return rule.to_dict()
+
+    @app.delete("/api/v1/parental/profiles/{profile_id}/rules/{rule_id}")
+    async def parental_remove_rule(request: Request, profile_id: str, rule_id: str) -> dict:
+        _require_scope(request, SCOPE_WRITE)
+        ok = _parental().remove_rule(profile_id, rule_id)
+        if not ok:
+            raise HTTPException(404, "Profile or rule not found")
+        return {"ok": True}
+
+    @app.post("/api/v1/parental/profiles/{profile_id}/timers")
+    async def parental_add_timer(request: Request, profile_id: str) -> dict:
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        timer = _parental().add_timer(profile_id, **body)
+        if timer is None:
+            raise HTTPException(404, f"Profile {profile_id!r} not found")
+        return timer.to_dict()
+
+    @app.delete("/api/v1/parental/profiles/{profile_id}/timers/{timer_id}")
+    async def parental_remove_timer(request: Request, profile_id: str, timer_id: str) -> dict:
+        _require_scope(request, SCOPE_WRITE)
+        ok = _parental().remove_timer(profile_id, timer_id)
+        if not ok:
+            raise HTTPException(404, "Profile or timer not found")
+        return {"ok": True}
+
+    @app.get("/api/v1/parental/devices/{device_id}/profile")
+    async def parental_get_device_profile(request: Request, device_id: str) -> dict:
+        _require_scope(request, SCOPE_READ)
+        profile = _parental().get_profile_for_device(device_id)
+        if profile is None:
+            return {"profile": None}
+        return {"profile": profile.to_dict()}
+
+    @app.post("/api/v1/parental/devices/{device_id}/assign")
+    async def parental_assign_device(request: Request, device_id: str) -> dict:
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        profile_id = body.get("profile_id", "")
+        if not profile_id:
+            raise HTTPException(400, "profile_id is required")
+        ok = _parental().assign_device(device_id, profile_id)
+        if not ok:
+            raise HTTPException(404, f"Profile {profile_id!r} not found")
+        return {"ok": True, "device_id": device_id, "profile_id": profile_id}
+
+    @app.post("/api/v1/parental/devices/{device_id}/unassign")
+    async def parental_unassign_device(request: Request, device_id: str) -> dict:
+        _require_scope(request, SCOPE_WRITE)
+        _parental().unassign_device(device_id)
+        return {"ok": True, "device_id": device_id}
+
+    @app.get("/api/v1/parental/enforcement/{device_id}")
+    async def parental_get_enforcement(request: Request, device_id: str) -> dict:
+        """Return the LockdownConfig for a device (fetched by the agent)."""
+        _require_scope(request, SCOPE_READ)
+        cfg = _parental().get_enforcement_state(device_id)
+        return cfg.to_dict()
+
+    @app.post("/api/v1/parental/usage/report")
+    async def parental_usage_report(request: Request) -> dict:
+        """Agent reports per-app minute increments."""
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        profile_id  = body.get("profile_id", "")
+        increments  = body.get("increments", {})   # app_name → minutes
+        if profile_id and increments:
+            for app_name, minutes in increments.items():
+                _parental().record_usage(profile_id, app_name, int(minutes))
+        return {"ok": True}
+
+    @app.get("/api/v1/parental/profiles/{profile_id}/usage")
+    async def parental_get_usage(request: Request, profile_id: str) -> dict:
+        _require_scope(request, SCOPE_READ)
+        summary = _parental().get_usage_summary(profile_id)
+        return {"profile_id": profile_id, "summary": summary}
+
+    @app.post("/api/v1/parental/profiles/{profile_id}/timers/{timer_id}/reset")
+    async def parental_reset_timer(request: Request, profile_id: str, timer_id: str) -> dict:
+        _require_scope(request, SCOPE_WRITE)
+        ok = _parental().reset_timer(profile_id, timer_id)
+        if not ok:
+            raise HTTPException(404, "Profile or timer not found")
+        return {"ok": True}
+
+    @app.post("/api/v1/parental/overrides")
+    async def parental_grant_override(request: Request) -> dict:
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        profile_id = body.get("profile_id", "")
+        device_id  = body.get("device_id", "")
+        pin        = body.get("pin", "")
+        minutes    = int(body.get("minutes", 60))
+        reason     = body.get("reason", "")
+        if not profile_id or not pin:
+            raise HTTPException(400, "profile_id and pin are required")
+        ctx     = _require_scope(request, SCOPE_WRITE)
+        user_id = ctx.user_id if ctx else ""
+        session = _parental().grant_override(profile_id, device_id, minutes, pin, user_id, reason)
+        if session is None:
+            raise HTTPException(403, "Invalid PIN or profile not found")
+        return session.to_dict()
+
+    @app.delete("/api/v1/parental/overrides/{override_id}")
+    async def parental_revoke_override(request: Request, override_id: str) -> dict:
+        _require_scope(request, SCOPE_WRITE)
+        ok = _parental().revoke_override(override_id)
+        if not ok:
+            raise HTTPException(404, f"Override {override_id!r} not found")
+        return {"ok": True}
+
+    @app.get("/api/v1/parental/overrides")
+    async def parental_list_overrides(request: Request) -> list[dict]:
+        _require_scope(request, SCOPE_READ)
+        return _parental().list_overrides()
+
+    @app.post("/api/v1/parental/profiles/{profile_id}/check")
+    async def parental_check_permission(request: Request, profile_id: str) -> dict:
+        """Check whether an app is permitted under a profile (for testing)."""
+        _require_scope(request, SCOPE_READ)
+        body     = await request.json()
+        app_name = body.get("app_name", "")
+        if not app_name:
+            raise HTTPException(400, "app_name is required")
+        device_id = body.get("device_id", "")
+        result    = _parental().check_permission(profile_id, app_name, device_id)
+        return result.to_dict()
 
     # Static files — mounted last so they don't shadow API routes
     static_dir = Path(__file__).parent / "static"

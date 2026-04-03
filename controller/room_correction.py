@@ -248,6 +248,57 @@ class RoomCorrectionManager:
                  profile_id, len(bands), phone_model, target_curve)
         return profile
 
+    def update_mic_curves(self, connect_curves: dict) -> int:
+        """
+        Merge Connect-sourced crowdsourced curves into PHONE_MIC_CURVES.
+
+        Only updates models where:
+          - confidence > 0.6  (enough agreement across measurements)
+          - n >= 10           (enough measurements to be meaningful)
+
+        Models that don't meet the threshold keep their hardcoded values.
+        Returns the count of models updated/added.
+        """
+        updated = 0
+        for model, info in connect_curves.items():
+            confidence = info.get("confidence", 0.0)
+            n = info.get("n", 0)
+            curve_data = info.get("curve", [])
+
+            if confidence <= 0.6 or n < 10:
+                log.debug(
+                    "Skipping Connect curve for %s: confidence=%.2f n=%d "
+                    "(need confidence>0.6 and n>=10)",
+                    model, confidence, n,
+                )
+                continue
+
+            if not curve_data:
+                continue
+
+            try:
+                new_curve: list[tuple[float, float]] = [
+                    (float(freq), float(db)) for freq, db in curve_data
+                ]
+            except (TypeError, ValueError) as e:
+                log.warning("Invalid curve data for model %s: %s", model, e)
+                continue
+
+            existing = PHONE_MIC_CURVES.get(model)
+            PHONE_MIC_CURVES[model] = new_curve
+            updated += 1
+            log.info(
+                "Updated mic compensation curve for %s from Connect "
+                "(n=%d, confidence=%.2f)%s",
+                model, n, confidence,
+                " (new model)" if existing is None else "",
+            )
+
+        if updated:
+            log.info("Applied %d Connect mic compensation curve(s)", updated)
+
+        return updated
+
     def _apply_mic_compensation(self, measured: list[tuple[float, float]],
                                   mic_curve: list[tuple[float, float]]) -> list[tuple[float, float]]:
         """Subtract phone mic frequency response from measurement."""

@@ -13,8 +13,12 @@ import {useCallback, useReducer, useRef} from 'react';
 import {Platform, PermissionsAndroid} from 'react-native';
 import AudioRecorderPlayer from 'react-native-audio-recorder-player';
 import RNFS from 'react-native-fs';
+import {MMKV} from 'react-native-mmkv';
 import {useAuth} from '../auth/useAuth';
 import type {CorrectionProfile, AudioSink} from '../api/types';
+
+const _storage = new MMKV();
+const MIC_DB_CONSENT_KEY = 'mic_db_consent';
 
 // ── 1/3-octave centre frequencies (20 Hz – 20 kHz, 20 bands) ─────────────────
 const OCTAVE_CENTRES: number[] = [
@@ -41,6 +45,8 @@ export interface RoomCorrectionState {
   roomName: string;
   availableSinks: AudioSink[];
   availablePhoneModels: string[];
+  // Mic DB consent
+  contributeToDatabase: boolean;
   // Measuring
   isRecording: boolean;
   recordingProgress: number; // 0–1
@@ -64,6 +70,7 @@ type Action =
   | {type: 'SET_ROOM_NAME'; name: string}
   | {type: 'SET_SINKS'; sinks: AudioSink[]}
   | {type: 'SET_PHONE_MODELS'; models: string[]}
+  | {type: 'SET_CONTRIBUTE'; contribute: boolean}
   | {type: 'SET_RECORDING'; isRecording: boolean}
   | {type: 'SET_PROGRESS'; progress: number}
   | {type: 'SET_PROCESSING'; isProcessing: boolean}
@@ -82,6 +89,8 @@ const INITIAL_STATE: RoomCorrectionState = {
   roomName: '',
   availableSinks: [],
   availablePhoneModels: [],
+  // Default to true if previously consented, false on first use
+  contributeToDatabase: _storage.getBoolean(MIC_DB_CONSENT_KEY) ?? false,
   isRecording: false,
   recordingProgress: 0,
   isProcessing: false,
@@ -112,6 +121,8 @@ function reducer(
       return {...state, availableSinks: action.sinks};
     case 'SET_PHONE_MODELS':
       return {...state, availablePhoneModels: action.models};
+    case 'SET_CONTRIBUTE':
+      return {...state, contributeToDatabase: action.contribute};
     case 'SET_RECORDING':
       return {...state, isRecording: action.isRecording};
     case 'SET_PROGRESS':
@@ -132,6 +143,7 @@ function reducer(
         availablePhoneModels: state.availablePhoneModels,
         profiles: state.profiles,
         activeProfileId: state.activeProfileId,
+        contributeToDatabase: state.contributeToDatabase,
       };
     default:
       return state;
@@ -195,6 +207,40 @@ export function computeFFT(
     result.push([freq, db]);
   }
   return result;
+}
+
+// ── SNR estimate ──────────────────────────────────────────────────────────────
+
+/**
+ * Compute a simple SNR estimate (dB) from a recording.
+ *
+ * signal = mean RMS of the full recording (in dBFS)
+ * noise  = mean RMS of the first 0.3 s (before sweep starts)
+ * snr    = signal_db - noise_db
+ *
+ * Higher = better recording quality.
+ */
+export function estimateSnr(samples: Float32Array, sampleRate: number): number {
+  if (samples.length === 0) return 0;
+
+  // Full-signal RMS
+  let sumSq = 0;
+  for (let i = 0; i < samples.length; i++) {
+    sumSq += samples[i] * samples[i];
+  }
+  const rmsSignal = Math.sqrt(sumSq / samples.length);
+  const dbSignal = rmsSignal > 0 ? 20 * Math.log10(rmsSignal) : -120;
+
+  // Noise floor: first 0.3 s
+  const noiseSamples = Math.min(Math.round(sampleRate * 0.3), samples.length);
+  let noiseSumSq = 0;
+  for (let i = 0; i < noiseSamples; i++) {
+    noiseSumSq += samples[i] * samples[i];
+  }
+  const rmsNoise = noiseSamples > 0 ? Math.sqrt(noiseSumSq / noiseSamples) : 0;
+  const dbNoise = rmsNoise > 0 ? 20 * Math.log10(rmsNoise) : -120;
+
+  return dbSignal - dbNoise;
 }
 
 // ── WAV reader ────────────────────────────────────────────────────────────────
@@ -505,8 +551,9 @@ export function useRoomCorrection() {
       const base64 = await RNFS.readFile(recordingPathRef.current, 'base64');
       const {samples, sampleRate} = parseWav(base64);
 
-      // Compute frequency response
+      // Compute frequency response and SNR estimate
       const freqResponse = computeFFT(samples, sampleRate);
+      const snrEstimate = estimateSnr(samples, sampleRate);
 
       // POST to controller
       await submitMeasurement(
@@ -516,6 +563,21 @@ export function useRoomCorrection() {
         roomName,
         selectedNodeId,
       );
+
+      // Contribute to mic DB if user consented (fire-and-forget)
+      if (state.contributeToDatabase) {
+        // We don't have correction_applied at this point (returned in profile);
+        // profile is set by submitMeasurement via dispatch — read from state ref
+        // after it resolves. Use empty array as placeholder; the controller will
+        // fill in what it applied from the profile it just created.
+        contributeMeasurement(
+          freqResponse,
+          [],  // correction_applied filled server-side by the /measure handler
+          phoneModel,
+          targetCurve,
+          snrEstimate,
+        );
+      }
     } catch (e: any) {
       dispatch({
         type: 'SET_ERROR',
@@ -525,7 +587,7 @@ export function useRoomCorrection() {
     } finally {
       dispatch({type: 'SET_PROCESSING', isProcessing: false});
     }
-  }, [state, apiBase, headers, requestMicPermission, submitMeasurement]);
+  }, [state, apiBase, headers, requestMicPermission, submitMeasurement, contributeMeasurement]);
 
   // ── Cancel measurement ────────────────────────────────────────────────
 
@@ -633,6 +695,42 @@ export function useRoomCorrection() {
     (sink: string) => dispatch({type: 'SET_SINK', sink}),
     [],
   );
+  const setContributeToDatabase = useCallback((val: boolean) => {
+    _storage.set(MIC_DB_CONSENT_KEY, val);
+    dispatch({type: 'SET_CONTRIBUTE', contribute: val});
+  }, []);
+
+  // ── Contribute to mic DB via controller proxy ─────────────────────────
+
+  const contributeMeasurement = useCallback(
+    async (
+      freqResponse: [number, number][],
+      correctionApplied: [number, number][],
+      phoneModel: string,
+      targetCurve: string,
+      snrEstimate: number,
+    ) => {
+      try {
+        await fetch(
+          `${apiBase}/api/v1/audio/room-correction/contribute`,
+          {
+            method: 'POST',
+            headers: headers(),
+            body: JSON.stringify({
+              phone_model: phoneModel,
+              raw_response: freqResponse,
+              correction_applied: correctionApplied,
+              target_curve: targetCurve,
+              snr_estimate: snrEstimate,
+            }),
+          },
+        );
+      } catch (_) {
+        // Fire-and-forget — never surface errors to the user
+      }
+    },
+    [apiBase, headers],
+  );
 
   return {
     state,
@@ -650,5 +748,6 @@ export function useRoomCorrection() {
     setTargetCurve,
     setRoomName,
     setSink,
+    setContributeToDatabase,
   };
 }

@@ -338,6 +338,25 @@ async def run(config: Config) -> None:
     wifi_audio = WiFiAudioManager()
     room_corr = RoomCorrectionManager()
 
+    # Pull latest phone mic curves from Connect (non-blocking)
+    async def _refresh_mic_curves():
+        if connect and room_corr:
+            curves = await connect.get_mic_curves()
+            if curves:
+                n = room_corr.update_mic_curves(curves.get("curves", {}))
+                if n:
+                    log.info("Updated %d phone mic compensation curve(s) from Connect", n)
+
+    asyncio.create_task(_refresh_mic_curves(), name="mic_curves_refresh")
+
+    # Daily mic curve refresh loop
+    async def _mic_curves_refresh_loop():
+        while True:
+            await asyncio.sleep(86400)  # 24 hours
+            await _refresh_mic_curves()
+
+    asyncio.create_task(_mic_curves_refresh_loop(), name="mic_curves_refresh_loop")
+
     # TestBench
     testbench = TestBench(state, auto_engine, metrics_collector, captures, recorder)
 

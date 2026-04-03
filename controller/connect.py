@@ -332,7 +332,91 @@ class OzmaConnect:
         result = await self._api_get(f"/shares/{grant_id}/token")
         return result.get("token") if result else None
 
+    # ── Phone mic compensation database ─────────────────────────────────────
+
+    MIC_CURVES_CACHE_PATH = Path(__file__).parent / "mic_curves_cache.json"
+    MIC_CURVES_TTL = 86400.0  # 24 hours
+
+    async def submit_mic_measurement(
+        self,
+        phone_model: str,
+        raw_response: list[tuple[float, float]],
+        correction_applied: list[tuple[float, float]],
+        target_curve: str = "harman",
+        snr_estimate: float = 0.0,
+    ) -> dict | None:
+        """
+        Submit a phone mic frequency response measurement to Connect's
+        crowdsourced database.  Only called when telemetry is enabled
+        (caller's responsibility to check).
+
+        Fire-and-forget: silently returns None on failure.
+        """
+        if not self._authenticated:
+            return None
+        return await self._api_post("/mic-curves/submit", {
+            "controller_id": self._account_id or "unknown",
+            "phone_model": phone_model,
+            "raw_response": [list(p) for p in raw_response],
+            "correction_applied": [list(p) for p in correction_applied],
+            "target_curve": target_curve,
+            "snr_estimate": snr_estimate,
+        })
+
+    async def get_mic_curves(self) -> dict | None:
+        """
+        Pull the latest aggregated mic compensation curves from Connect.
+
+        Returns the full curves dict from Connect, or None on failure.
+        Caches locally in mic_curves_cache.json with 24h TTL.
+        """
+        cache_path = self.MIC_CURVES_CACHE_PATH
+        # Try local cache first
+        if cache_path.exists():
+            try:
+                cached = json.loads(cache_path.read_text())
+                if time.time() - cached.get("fetched_at", 0) < self.MIC_CURVES_TTL:
+                    return cached.get("curves")
+            except Exception:
+                pass
+
+        # Fetch from Connect (no auth required for GET /mic-curves)
+        result = await self._api_get_public("/mic-curves")
+        if not result:
+            # Return cached data even if stale rather than nothing
+            if cache_path.exists():
+                try:
+                    cached = json.loads(cache_path.read_text())
+                    return cached.get("curves")
+                except Exception:
+                    pass
+            return None
+
+        # Persist to local cache
+        try:
+            cache_path.write_text(json.dumps({
+                "fetched_at": time.time(),
+                "curves": result,
+            }, indent=2))
+        except Exception as e:
+            log.debug("Failed to cache mic curves: %s", e)
+
+        return result
+
     # ── API helpers ─────────────────────────────────────────────────────────
+
+    async def _api_get_public(self, path: str) -> dict | None:
+        """Unauthenticated GET — used for public endpoints like /mic-curves."""
+        import urllib.request
+        try:
+            loop = asyncio.get_running_loop()
+            def _fetch():
+                req = urllib.request.Request(f"{self._api_base}{path}")
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    return json.loads(r.read())
+            return await loop.run_in_executor(None, _fetch)
+        except Exception:
+            return None
 
     async def _api_get(self, path: str, token: str = "") -> dict | None:
         import urllib.request
