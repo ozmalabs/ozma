@@ -139,7 +139,13 @@ class Seat:
 
         print(f"[SEAT {self.name}] starting UDP listener on port {self.udp_port}...", flush=True)
         # Start UDP listener (blocks until stopped)
-        await self._serve()
+        try:
+            await self._serve()
+        except Exception as e:
+            print(f"[SEAT {self.name}] UDP listener failed: {e}", flush=True)
+            log.error("Seat %s: UDP listener failed: %s", self.name, e)
+            # Keep seat alive even without UDP
+            await self._stop_event.wait()
 
     async def stop(self) -> None:
         """Clean shutdown of this seat."""
