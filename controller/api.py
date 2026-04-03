@@ -76,6 +76,15 @@ from iot_network import (
     VLANConfig, OnboardingSession,
 )
 from wg_peering import WGPeeringManager, WGPeer
+from license_manager import (
+    LicenseManager, LicensedProduct, SaaSApplication, LicenseType, SaaSCategory,
+    DiscoverySource,
+)
+from itsm import (
+    ITSMManager, ITSMConfig, Ticket, OnCallUser, EscalationPolicy, EscalationTier,
+    WorkingHours, OnCallWindow, AgentModelConfig,
+    AGENT_L1, AGENT_L2, AGENT_HUMAN, _PRIORITIES,
+)
 
 log = logging.getLogger("ozma.api")
 
@@ -140,7 +149,7 @@ class DirectRegisterRequest(BaseModel):
     frigate_port: str = ""     # Frigate API port (default 5000)
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None) -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None) -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -857,6 +866,124 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(status_code=400, detail="Invalid machine_class. Must be: workstation, server, kiosk, camera")
         node.machine_class = mc
         return {"ok": True, "node_id": node_id, "machine_class": mc}
+
+    # --- Seat config push to agents ---
+
+    # Per-node WebSocket connections from agents (node_id -> WebSocket)
+    _node_config_ws: dict[str, WebSocket] = {}
+
+    @app.get("/api/v1/nodes/{node_id}/seats")
+    async def get_seat_config(node_id: str) -> dict[str, Any]:
+        node = state.nodes.get(node_id)
+        if not node:
+            raise HTTPException(status_code=404, detail="Node not found")
+        return {
+            "node_id": node_id,
+            "seat_count": node.seat_count,
+            "seat_config": node.seat_config,
+        }
+
+    @app.put("/api/v1/nodes/{node_id}/seats")
+    async def update_seat_config(request: Request, node_id: str, body: dict) -> dict[str, Any]:
+        """Update seat config for a node and push to the agent."""
+        _require_scope(request, SCOPE_WRITE)
+        node = state.nodes.get(node_id)
+        if not node:
+            raise HTTPException(status_code=404, detail="Node not found")
+
+        seats = body.get("seats")
+        if seats is None or not isinstance(seats, int) or seats < 1 or seats > 8:
+            raise HTTPException(status_code=400, detail="seats must be an integer 1-8")
+
+        profiles = body.get("profiles", [])
+        if profiles and len(profiles) != seats:
+            raise HTTPException(status_code=400, detail="profiles length must match seats count")
+
+        node.seat_count = seats
+        node.seat_config = {"seats": seats, "profiles": profiles}
+
+        # Push config to the agent's WebSocket if connected
+        msg = json.dumps({"type": "seat_config", "seats": seats, "profiles": profiles})
+        ws = _node_config_ws.get(node_id)
+        if ws:
+            try:
+                await ws.send_text(msg)
+                log.info("Pushed seat config to %s: %d seats", node_id, seats)
+            except Exception:
+                log.warning("Failed to push seat config to %s — agent disconnected", node_id)
+                _node_config_ws.pop(node_id, None)
+
+        await state.events.put({
+            "type": "node.seat_config",
+            "node_id": node_id,
+            "seat_count": seats,
+            "seat_config": node.seat_config,
+        })
+        return {"ok": True, "node_id": node_id, "seat_count": seats, "seat_config": node.seat_config}
+
+    @app.websocket("/api/v1/nodes/{node_id}/config/ws")
+    async def node_config_ws(ws: WebSocket, node_id: str) -> None:
+        """
+        WebSocket endpoint for agent config push.
+
+        The agent connects here and receives seat config updates.
+        On connect, the current config is sent immediately so agents
+        get authoritative state after restart/reconnect.
+        """
+        if not await _ws_authenticate(ws):
+            await ws.close(code=4001, reason="Authentication required")
+            return
+
+        node = state.nodes.get(node_id)
+        if not node:
+            await ws.close(code=4004, reason="Node not found")
+            return
+
+        await ws.accept()
+
+        # Replace any existing connection for this node
+        old_ws = _node_config_ws.pop(node_id, None)
+        if old_ws:
+            try:
+                await old_ws.close(code=1000, reason="Replaced by new connection")
+            except Exception:
+                pass
+        _node_config_ws[node_id] = ws
+
+        log.info("Agent config WS connected: %s", node_id)
+
+        # Send current config immediately
+        config_msg = {
+            "type": "seat_config",
+            "seats": node.seat_count,
+            "profiles": node.seat_config.get("profiles", []),
+        }
+        try:
+            await ws.send_text(json.dumps(config_msg))
+        except Exception:
+            _node_config_ws.pop(node_id, None)
+            return
+
+        try:
+            while True:
+                # Agent can send messages (e.g. acks, status)
+                text = await ws.receive_text()
+                try:
+                    msg = json.loads(text)
+                    msg_type = msg.get("type", "")
+                    if msg_type == "seat_status":
+                        # Agent reports current seat count for reconciliation
+                        log.debug("Agent %s seat status: %s", node_id, msg)
+                except json.JSONDecodeError:
+                    pass
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            pass
+        finally:
+            if _node_config_ws.get(node_id) is ws:
+                _node_config_ws.pop(node_id, None)
+            log.info("Agent config WS disconnected: %s", node_id)
 
     @app.post("/api/v1/nodes/{node_id}/activate")
     async def activate_node(node_id: str) -> dict[str, Any]:
@@ -4439,6 +4566,284 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(500, f"Failed to delete rclone remote: {name}")
         return {"ok": True}
 
+    # ── ITSM ───────────────────────────────────────────────────────────────────
+
+    class CreateTicketRequest(BaseModel):
+        source: str = "user"
+        category: str = "incident"
+        priority: str = "medium"
+        subject: str
+        description: str = ""
+        requester_user_id: str = "admin"
+        node_id: str | None = None
+        assignee_user_id: str | None = None
+
+    class ResolveTicketRequest(BaseModel):
+        resolution: str
+        actor: str = "admin"
+
+    class EscalateTicketRequest(BaseModel):
+        notes: str = ""
+        actor: str = "admin"
+
+    class CommentTicketRequest(BaseModel):
+        note: str
+        actor: str = "admin"
+
+    class OnCallUserRequest(BaseModel):
+        channels: list[str] = []
+        working_hours: list[dict] = []
+        oncall_windows: list[dict] = []
+        interrupt_critical: bool = True
+        interrupt_high: bool = False
+        interrupt_any: bool = False
+
+    class EscalationPolicyRequest(BaseModel):
+        name: str
+        tiers: list[dict] = []
+
+    class AgentModelConfigRequest(BaseModel):
+        provider: str
+        model: str
+        base_url: str = ""
+        api_key_env: str = ""
+        extra: dict = {}
+
+    class ITSMConfigPatchRequest(BaseModel):
+        default_policy_id: str | None = None
+        l1_max_attempts: int | None = None
+        l2_max_attempts: int | None = None
+        l1_timeout_seconds: int | None = None
+        l2_timeout_seconds: int | None = None
+        l1_model: AgentModelConfigRequest | None = None
+        l2_model: AgentModelConfigRequest | None = None
+        external_webhook_url: str | None = None
+        external_webhook_headers: dict | None = None
+
+    @app.get("/api/v1/itsm/status")
+    async def itsm_status() -> dict[str, Any]:
+        """ITSM summary stats."""
+        if not itsm:
+            return {"available": False}
+        return {"available": True, **itsm.status()}
+
+    @app.get("/api/v1/itsm/tickets")
+    async def itsm_list_tickets(
+        request: Request,
+        status: str | None = None,
+        priority: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not itsm:
+            raise HTTPException(503, "ITSM not available")
+        tickets = itsm.list_tickets(status=status, priority=priority, limit=limit)
+        return {"tickets": [t.to_dict() for t in tickets]}
+
+    @app.post("/api/v1/itsm/tickets")
+    async def itsm_create_ticket(
+        request: Request, body: CreateTicketRequest,
+    ) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not itsm:
+            raise HTTPException(503, "ITSM not available")
+        ticket = await itsm.create_ticket(
+            source=body.source,
+            category=body.category,
+            priority=body.priority,
+            subject=body.subject,
+            description=body.description,
+            requester_user_id=body.requester_user_id,
+            node_id=body.node_id,
+            assignee_user_id=body.assignee_user_id,
+        )
+        return {"ticket": ticket.to_dict()}
+
+    @app.get("/api/v1/itsm/tickets/{ticket_id}")
+    async def itsm_get_ticket(request: Request, ticket_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not itsm:
+            raise HTTPException(503, "ITSM not available")
+        ticket = itsm.get_ticket(ticket_id)
+        if not ticket:
+            raise HTTPException(404, f"Ticket {ticket_id} not found")
+        return {"ticket": ticket.to_dict()}
+
+    @app.post("/api/v1/itsm/tickets/{ticket_id}/resolve")
+    async def itsm_resolve_ticket(
+        request: Request, ticket_id: str, body: ResolveTicketRequest,
+    ) -> dict[str, Any]:
+        """Resolve a ticket — called by AI agent or human operator."""
+        _require_scope(request, SCOPE_WRITE)
+        if not itsm:
+            raise HTTPException(503, "ITSM not available")
+        ok = await itsm.resolve_ticket(ticket_id, actor=body.actor, resolution=body.resolution)
+        if not ok:
+            raise HTTPException(404, f"Ticket {ticket_id} not found or already closed")
+        ticket = itsm.get_ticket(ticket_id)
+        return {"ok": True, "ticket": ticket.to_dict() if ticket else {}}
+
+    @app.post("/api/v1/itsm/tickets/{ticket_id}/escalate")
+    async def itsm_escalate_ticket(
+        request: Request, ticket_id: str, body: EscalateTicketRequest,
+    ) -> dict[str, Any]:
+        """Escalate a ticket — called by AI agent when it cannot fix the issue."""
+        _require_scope(request, SCOPE_WRITE)
+        if not itsm:
+            raise HTTPException(503, "ITSM not available")
+        ok = await itsm.escalate_ticket(ticket_id, actor=body.actor, notes=body.notes)
+        if not ok:
+            raise HTTPException(404, f"Ticket {ticket_id} not found or already closed")
+        ticket = itsm.get_ticket(ticket_id)
+        return {"ok": True, "ticket": ticket.to_dict() if ticket else {}}
+
+    @app.post("/api/v1/itsm/tickets/{ticket_id}/acknowledge")
+    async def itsm_acknowledge_ticket(
+        request: Request, ticket_id: str, body: dict = {},
+    ) -> dict[str, Any]:
+        """Human acknowledges they are handling the ticket."""
+        _require_scope(request, SCOPE_WRITE)
+        if not itsm:
+            raise HTTPException(503, "ITSM not available")
+        user_id = body.get("user_id", "admin")
+        ok = await itsm.acknowledge_ticket(ticket_id, user_id=user_id)
+        if not ok:
+            raise HTTPException(404, f"Ticket {ticket_id} not found or not in pending state")
+        ticket = itsm.get_ticket(ticket_id)
+        return {"ok": True, "ticket": ticket.to_dict() if ticket else {}}
+
+    @app.post("/api/v1/itsm/tickets/{ticket_id}/close")
+    async def itsm_close_ticket(
+        request: Request, ticket_id: str, body: dict = {},
+    ) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not itsm:
+            raise HTTPException(503, "ITSM not available")
+        ok = await itsm.close_ticket(ticket_id, actor=body.get("actor", "admin"))
+        if not ok:
+            raise HTTPException(404, f"Ticket {ticket_id} not found")
+        return {"ok": True}
+
+    @app.post("/api/v1/itsm/tickets/{ticket_id}/comment")
+    async def itsm_comment_ticket(
+        request: Request, ticket_id: str, body: CommentTicketRequest,
+    ) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not itsm:
+            raise HTTPException(503, "ITSM not available")
+        ok = await itsm.comment_ticket(ticket_id, actor=body.actor, note=body.note)
+        if not ok:
+            raise HTTPException(404, f"Ticket {ticket_id} not found")
+        return {"ok": True}
+
+    @app.get("/api/v1/itsm/oncall")
+    async def itsm_get_oncall(request: Request) -> dict[str, Any]:
+        """Get on-call schedule and escalation policies."""
+        _require_scope(request, SCOPE_READ)
+        if not itsm:
+            raise HTTPException(503, "ITSM not available")
+        cfg = itsm.get_config()
+        return {
+            "oncall_users": [u.to_dict() for u in cfg.oncall_users.values()],
+            "escalation_policies": [p.to_dict() for p in cfg.escalation_policies.values()],
+            "default_policy_id": cfg.default_policy_id,
+        }
+
+    @app.put("/api/v1/itsm/oncall/users/{user_id}")
+    async def itsm_upsert_oncall_user(
+        request: Request, user_id: str, body: OnCallUserRequest,
+    ) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not itsm:
+            raise HTTPException(503, "ITSM not available")
+        user = OnCallUser(
+            user_id=user_id,
+            channels=body.channels,
+            working_hours=[WorkingHours.from_dict(w) for w in body.working_hours],
+            oncall_windows=[OnCallWindow.from_dict(w) for w in body.oncall_windows],
+            interrupt_critical=body.interrupt_critical,
+            interrupt_high=body.interrupt_high,
+            interrupt_any=body.interrupt_any,
+        )
+        itsm.upsert_oncall_user(user)
+        return {"ok": True, "user": user.to_dict()}
+
+    @app.delete("/api/v1/itsm/oncall/users/{user_id}")
+    async def itsm_remove_oncall_user(request: Request, user_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not itsm:
+            raise HTTPException(503, "ITSM not available")
+        ok = itsm.remove_oncall_user(user_id)
+        if not ok:
+            raise HTTPException(404, f"On-call user {user_id} not found")
+        return {"ok": True}
+
+    @app.put("/api/v1/itsm/oncall/policies/{policy_id}")
+    async def itsm_upsert_policy(
+        request: Request, policy_id: str, body: EscalationPolicyRequest,
+    ) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not itsm:
+            raise HTTPException(503, "ITSM not available")
+        policy = EscalationPolicy(
+            id=policy_id,
+            name=body.name,
+            tiers=[EscalationTier.from_dict(t) for t in body.tiers],
+        )
+        itsm.upsert_escalation_policy(policy)
+        return {"ok": True, "policy": policy.to_dict()}
+
+    @app.delete("/api/v1/itsm/oncall/policies/{policy_id}")
+    async def itsm_remove_policy(request: Request, policy_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not itsm:
+            raise HTTPException(503, "ITSM not available")
+        ok = itsm.remove_escalation_policy(policy_id)
+        if not ok:
+            raise HTTPException(404, f"Policy {policy_id} not found")
+        return {"ok": True}
+
+    @app.patch("/api/v1/itsm/config")
+    async def itsm_patch_config(
+        request: Request, body: ITSMConfigPatchRequest,
+    ) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not itsm:
+            raise HTTPException(503, "ITSM not available")
+        cfg = itsm.get_config()
+        if body.default_policy_id is not None:
+            cfg.default_policy_id = body.default_policy_id
+        if body.l1_max_attempts is not None:
+            cfg.l1_max_attempts = body.l1_max_attempts
+        if body.l2_max_attempts is not None:
+            cfg.l2_max_attempts = body.l2_max_attempts
+        if body.l1_timeout_seconds is not None:
+            cfg.l1_timeout_seconds = body.l1_timeout_seconds
+        if body.l2_timeout_seconds is not None:
+            cfg.l2_timeout_seconds = body.l2_timeout_seconds
+        if body.l1_model is not None:
+            cfg.l1_model = AgentModelConfig(
+                provider=body.l1_model.provider,
+                model=body.l1_model.model,
+                base_url=body.l1_model.base_url,
+                api_key_env=body.l1_model.api_key_env,
+                extra=body.l1_model.extra,
+            )
+        if body.l2_model is not None:
+            cfg.l2_model = AgentModelConfig(
+                provider=body.l2_model.provider,
+                model=body.l2_model.model,
+                base_url=body.l2_model.base_url,
+                api_key_env=body.l2_model.api_key_env,
+                extra=body.l2_model.extra,
+            )
+        if body.external_webhook_url is not None:
+            cfg.external_webhook_url = body.external_webhook_url
+        if body.external_webhook_headers is not None:
+            cfg.external_webhook_headers = body.external_webhook_headers
+        itsm.set_config(cfg)
+        return {"ok": True, "config": cfg.to_dict()}
+
     # ── IoT network ────────────────────────────────────────────────────────────
 
     class VLANConfigRequest(BaseModel):
@@ -4693,6 +5098,278 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if not wg_peer:
             raise HTTPException(502, "WG peering handshake failed")
         return wg_peer.to_dict()
+
+    # ── License & SaaS management ──────────────────────────────────────────────
+
+    class AddProductRequest(BaseModel):
+        name:         str
+        vendor:       str  = ""
+        license_type: str  = "perpetual"
+        seats:        int  = 1
+        annual_cost:  float = 0.0
+        renewal_date: float = 0.0
+        notes:        str  = ""
+
+    class UpdateProductRequest(BaseModel):
+        name:         str | None = None
+        vendor:       str | None = None
+        license_type: str | None = None
+        seats_licensed: int | None = None
+        annual_cost:  float | None = None
+        renewal_date: float | None = None
+        notes:        str | None = None
+
+    class AddSaaSRequest(BaseModel):
+        name:             str
+        vendor:           str  = ""
+        category:         str  = "other"
+        url:              str  = ""
+        discovery_source: str  = "manual"
+        monthly_cost:     float = 0.0
+        seats_licensed:   int  = 0
+        renewal_date:     float = 0.0
+        notes:            str  = ""
+        approved:         bool = False
+
+    class UpdateSaaSRequest(BaseModel):
+        name:           str | None = None
+        vendor:         str | None = None
+        category:       str | None = None
+        url:            str | None = None
+        monthly_cost:   float | None = None
+        seats_licensed: int | None = None
+        seats_active:   int | None = None
+        renewal_date:   float | None = None
+        vendor_soc2:    bool | None = None
+        vendor_gdpr:    bool | None = None
+        dpa_signed:     bool | None = None
+        sso_integrated: bool | None = None
+        mfa_enforced:   bool | None = None
+        notes:          str | None = None
+
+    class ReconcileRequest(BaseModel):
+        installed: list[dict[str, str]]
+
+    @app.get("/api/v1/licenses")
+    async def license_list(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not license_mgr:
+            raise HTTPException(503, "License manager not enabled")
+        return {"products": [p.to_dict() for p in license_mgr.list_products()]}
+
+    @app.post("/api/v1/licenses")
+    async def license_add(request: Request, body: AddProductRequest) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not license_mgr:
+            raise HTTPException(503, "License manager not enabled")
+        try:
+            lt = LicenseType(body.license_type)
+        except ValueError:
+            raise HTTPException(400, f"Unknown license_type: {body.license_type}")
+        if body.seats < 1:
+            raise HTTPException(400, "seats must be >= 1")
+        p = license_mgr.add_product(
+            name=body.name, vendor=body.vendor, license_type=lt,
+            seats=body.seats, annual_cost=body.annual_cost,
+            renewal_date=body.renewal_date, notes=body.notes,
+        )
+        return p.to_dict()
+
+    @app.get("/api/v1/licenses/{product_id}")
+    async def license_get(request: Request, product_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not license_mgr:
+            raise HTTPException(503, "License manager not enabled")
+        p = license_mgr.get_product(product_id)
+        if not p:
+            raise HTTPException(404, "Product not found")
+        return p.to_dict()
+
+    @app.patch("/api/v1/licenses/{product_id}")
+    async def license_update(request: Request, product_id: str,
+                             body: UpdateProductRequest) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not license_mgr:
+            raise HTTPException(503, "License manager not enabled")
+        updates = {k: v for k, v in body.model_dump().items() if v is not None}
+        if "license_type" in updates:
+            try:
+                updates["license_type"] = LicenseType(updates["license_type"])
+            except ValueError:
+                raise HTTPException(400, f"Unknown license_type: {updates['license_type']}")
+        p = license_mgr.update_product(product_id, **updates)
+        if not p:
+            raise HTTPException(404, "Product not found")
+        return p.to_dict()
+
+    @app.delete("/api/v1/licenses/{product_id}")
+    async def license_delete(request: Request, product_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not license_mgr:
+            raise HTTPException(503, "License manager not enabled")
+        if not license_mgr.remove_product(product_id):
+            raise HTTPException(404, "Product not found")
+        return {"ok": True}
+
+    @app.post("/api/v1/licenses/{product_id}/reconcile")
+    async def license_reconcile(request: Request, product_id: str,
+                                body: ReconcileRequest) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not license_mgr:
+            raise HTTPException(503, "License manager not enabled")
+        node_id = product_id   # product_id param re-used as node_id here; real
+        # reconcile is per-node, not per-product — use /nodes/{id}/reconcile instead
+        raise HTTPException(400, "Use POST /api/v1/nodes/{node_id}/reconcile-licenses")
+
+    @app.post("/api/v1/nodes/{node_id}/reconcile-licenses")
+    async def node_reconcile_licenses(request: Request, node_id: str,
+                                      body: ReconcileRequest) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not license_mgr:
+            raise HTTPException(503, "License manager not enabled")
+        if node_id not in state.nodes:
+            raise HTTPException(404, "Node not found")
+        report = license_mgr.reconcile_node(node_id, body.installed)
+        return report
+
+    # SaaS endpoints
+
+    @app.get("/api/v1/saas")
+    async def saas_list(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not license_mgr:
+            raise HTTPException(503, "License manager not enabled")
+        return {"apps": [a.to_dict() for a in license_mgr.list_saas()]}
+
+    @app.post("/api/v1/saas")
+    async def saas_add(request: Request, body: AddSaaSRequest) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not license_mgr:
+            raise HTTPException(503, "License manager not enabled")
+        try:
+            cat = SaaSCategory(body.category)
+        except ValueError:
+            raise HTTPException(400, f"Unknown category: {body.category}")
+        try:
+            src = DiscoverySource(body.discovery_source)
+        except ValueError:
+            raise HTTPException(400, f"Unknown discovery_source: {body.discovery_source}")
+        app_obj = license_mgr.add_saas(
+            name=body.name, vendor=body.vendor, category=cat, url=body.url,
+            discovery_sources=[src], monthly_cost=body.monthly_cost,
+            seats_licensed=body.seats_licensed, renewal_date=body.renewal_date,
+            notes=body.notes, approved=body.approved,
+        )
+        return app_obj.to_dict()
+
+    @app.get("/api/v1/saas/{app_id}")
+    async def saas_get(request: Request, app_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not license_mgr:
+            raise HTTPException(503, "License manager not enabled")
+        app_obj = license_mgr.get_saas(app_id)
+        if not app_obj:
+            raise HTTPException(404, "SaaS app not found")
+        return app_obj.to_dict()
+
+    @app.patch("/api/v1/saas/{app_id}")
+    async def saas_update(request: Request, app_id: str,
+                          body: UpdateSaaSRequest) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not license_mgr:
+            raise HTTPException(503, "License manager not enabled")
+        updates = {k: v for k, v in body.model_dump().items() if v is not None}
+        if "category" in updates:
+            try:
+                updates["category"] = SaaSCategory(updates["category"])
+            except ValueError:
+                raise HTTPException(400, f"Unknown category: {updates['category']}")
+        app_obj = license_mgr.update_saas(app_id, **updates)
+        if not app_obj:
+            raise HTTPException(404, "SaaS app not found")
+        return app_obj.to_dict()
+
+    @app.delete("/api/v1/saas/{app_id}")
+    async def saas_delete(request: Request, app_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not license_mgr:
+            raise HTTPException(503, "License manager not enabled")
+        if not license_mgr.remove_saas(app_id):
+            raise HTTPException(404, "SaaS app not found")
+        return {"ok": True}
+
+    @app.post("/api/v1/saas/{app_id}/approve")
+    async def saas_approve(request: Request, app_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not license_mgr:
+            raise HTTPException(503, "License manager not enabled")
+        body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+        app_obj = license_mgr.approve_saas(app_id, owner_user_id=body.get("owner_user_id", ""))
+        if not app_obj:
+            raise HTTPException(404, "SaaS app not found")
+        return app_obj.to_dict()
+
+    # Analytics endpoints
+
+    @app.get("/api/v1/licenses/analytics/summary")
+    async def license_cost_summary(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not license_mgr:
+            raise HTTPException(503, "License manager not enabled")
+        return license_mgr.cost_summary()
+
+    @app.get("/api/v1/licenses/analytics/renewals")
+    async def license_upcoming_renewals(request: Request,
+                                        days: int = 90) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not license_mgr:
+            raise HTTPException(503, "License manager not enabled")
+        return {"renewals": license_mgr.find_upcoming_renewals(days)}
+
+    @app.get("/api/v1/licenses/analytics/wasted-seats")
+    async def license_wasted_seats(request: Request,
+                                   threshold: float = 50.0) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not license_mgr:
+            raise HTTPException(503, "License manager not enabled")
+        return {"items": license_mgr.find_wasted_seats(threshold)}
+
+    @app.get("/api/v1/saas/analytics/shadow-it")
+    async def saas_shadow_it(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not license_mgr:
+            raise HTTPException(503, "License manager not enabled")
+        return {"apps": [a.to_dict() for a in license_mgr.find_shadow_it()]}
+
+    @app.get("/api/v1/saas/analytics/no-dpa")
+    async def saas_no_dpa(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not license_mgr:
+            raise HTTPException(503, "License manager not enabled")
+        return {"apps": [a.to_dict() for a in license_mgr.find_no_dpa()]}
+
+    @app.get("/api/v1/saas/analytics/duplicate-categories")
+    async def saas_duplicate_categories(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not license_mgr:
+            raise HTTPException(503, "License manager not enabled")
+        dups = license_mgr.find_duplicate_categories()
+        return {cat: [a.to_dict() for a in apps] for cat, apps in dups.items()}
+
+    @app.get("/api/v1/saas/offboarding/{user_id}")
+    async def saas_offboarding_checklist(request: Request, user_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not license_mgr:
+            raise HTTPException(503, "License manager not enabled")
+        return {"checklist": license_mgr.offboarding_checklist(user_id)}
+
+    @app.post("/api/v1/licenses/analytics/check-renewals")
+    async def license_check_renewals_now(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not license_mgr:
+            raise HTTPException(503, "License manager not enabled")
+        alerts = await license_mgr.run_renewal_check_now()
+        return {"alerts": [a.to_dict() for a in alerts]}
 
     # Static files — mounted last so they don't shadow API routes
     static_dir = Path(__file__).parent / "static"

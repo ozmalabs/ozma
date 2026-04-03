@@ -82,6 +82,8 @@ from users import UserManager
 from vaultwarden import VaultwardenManager, VaultwardenConfig
 from email_security import EmailSecurityMonitor
 from cloud_backup import CloudBackupManager
+from itsm import ITSMManager
+from license_manager import LicenseManager
 from service_proxy import ServiceProxyManager
 from idp import IdentityProvider, IdPConfig
 from sharing import SharingManager
@@ -411,6 +413,17 @@ async def run(config: Config) -> None:
     cloud_backup = CloudBackupManager(cloud_backup_dir, mesh_key_bytes)
     await cloud_backup.start()
 
+    # ITSM — ticket triage, on-call scheduling, agent escalation
+    itsm_data_dir = Path(__file__).parent / "itsm_data"
+    itsm_mgr = ITSMManager(itsm_data_dir, notifier=notifier, event_queue=state.events)
+    await itsm_mgr.start()
+
+    # License & SaaS management
+    license_mgr = LicenseManager(
+        on_alert=notifier.send_event if notifier else None,
+    )
+    await license_mgr.start()
+
     # IoT VLAN management
     from iot_network import IoTNetworkManager
     iot_mgr = IoTNetworkManager()
@@ -492,7 +505,7 @@ async def run(config: Config) -> None:
         transcription_mgr = LiveTranscriptionManager(connect=connect)
 
     # Build the FastAPI app — all managers must be created before this point
-    app = build_app(state, scenarios, streams, audio, controls, rgb_out, motion, bt, kdeconnect, wifi_audio, captures, paste_typer, kbd_mgr, macro_mgr, sched, notifier, recorder, net_health, ocr_triggers, auto_engine, metrics_collector, screen_mgr, codec_mgr=codec_mgr, camera_mgr=camera_mgr, obs_studio=obs_studio, stream_router=stream_router, guac_mgr=guac_mgr, provision_mgr=provision_mgr, connect=connect, mesh_ca=mesh_ca, sess_mgr=sess_mgr, room_correction=room_corr, testbench=testbench, agent_engine=agent_engine, test_runner=test_runner, auth_config=auth_cfg, user_manager=user_mgr, service_proxy=svc_proxy, idp=idp_instance, sharing=sharing_mgr, ext_publish=ext_pub, node_reconciler=reconciler, update_mgr=update_mgr, transcription_mgr=transcription_mgr, discovery=discovery, doorbell_mgr=doorbell_mgr, alert_mgr=alert_mgr, vaultwarden=vault_mgr, email_security=email_sec, cloud_backup=cloud_backup, iot=iot_mgr, wg=wg_mgr)
+    app = build_app(state, scenarios, streams, audio, controls, rgb_out, motion, bt, kdeconnect, wifi_audio, captures, paste_typer, kbd_mgr, macro_mgr, sched, notifier, recorder, net_health, ocr_triggers, auto_engine, metrics_collector, screen_mgr, codec_mgr=codec_mgr, camera_mgr=camera_mgr, obs_studio=obs_studio, stream_router=stream_router, guac_mgr=guac_mgr, provision_mgr=provision_mgr, connect=connect, mesh_ca=mesh_ca, sess_mgr=sess_mgr, room_correction=room_corr, testbench=testbench, agent_engine=agent_engine, test_runner=test_runner, auth_config=auth_cfg, user_manager=user_mgr, service_proxy=svc_proxy, idp=idp_instance, sharing=sharing_mgr, ext_publish=ext_pub, node_reconciler=reconciler, update_mgr=update_mgr, transcription_mgr=transcription_mgr, discovery=discovery, doorbell_mgr=doorbell_mgr, alert_mgr=alert_mgr, vaultwarden=vault_mgr, email_security=email_sec, cloud_backup=cloud_backup, iot=iot_mgr, wg=wg_mgr, itsm=itsm_mgr, license_mgr=license_mgr)
 
     uv_config = uvicorn.Config(
         app,
@@ -671,6 +684,7 @@ async def run(config: Config) -> None:
     await vault_mgr.stop()
     await email_sec.stop()
     await cloud_backup.stop()
+    await license_mgr.stop()
     if front_panel:
         await front_panel.stop()
 
