@@ -36,6 +36,10 @@ class FileShare:
     browseable: bool = True
     create_mask: str = "0664"
     directory_mask: str = "0775"
+    # ZFS dataset backing this share (e.g. "tank/shares/homes").
+    # When set, Samba enables shadow_copy2 so Windows sees snapshots
+    # as "Previous Versions" with zero extra client configuration.
+    zfs_dataset: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -50,6 +54,7 @@ class FileShare:
             "browseable": self.browseable,
             "create_mask": self.create_mask,
             "directory_mask": self.directory_mask,
+            "zfs_dataset": self.zfs_dataset,
         }
 
     @classmethod
@@ -66,6 +71,7 @@ class FileShare:
             browseable=d.get("browseable", True),
             create_mask=d.get("create_mask", "0664"),
             directory_mask=d.get("directory_mask", "0775"),
+            zfs_dataset=d.get("zfs_dataset"),
         )
 
 
@@ -395,6 +401,17 @@ class FileSharingManager:
                 lines.append(f"   valid users = {' '.join(share.valid_users)}")
             lines.append(f"   create mask = {share.create_mask}")
             lines.append(f"   directory mask = {share.directory_mask}")
+            # ZFS-backed share: enable shadow_copy2 so Windows "Previous Versions"
+            # tab shows ZFS snapshots automatically. Snapshots must be named with
+            # the @GMT-YYYY.MM.DD-HH.MM.SS format (which ZFSManager uses).
+            if share.zfs_dataset:
+                lines.append("   vfs objects = shadow_copy2")
+                lines.append("   shadow:snapdir = .zfs/snapshot")
+                lines.append("   shadow:sort = desc")
+                # ZFSManager names snapshots GMT-YYYY.MM.DD-HH.MM.SS (no leading @)
+                # so they appear in .zfs/snapshot/ without @ prefix.
+                lines.append("   shadow:format = GMT-%Y.%m.%d-%H.%M.%S")
+                lines.append("   shadow:localtime = no")
 
         return "\n".join(lines) + "\n"
 

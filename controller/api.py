@@ -168,7 +168,7 @@ class DirectRegisterRequest(BaseModel):
     frigate_port: str = ""     # Frigate API port (default 5000)
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None, sunshine: Any | None = None, msp_mgr: MSPDashboardManager | None = None, msp_portal: MSPPortalManager | None = None, auto_configure: Any | None = None, cam_connect: Any | None = None, grid: Any | None = None, parental: ParentalControlsManager | None = None, backup_nudge: BackupNudgeService | None = None, dns_filter: Any | None = None, local_proxy: Any | None = None, file_sharing: Any | None = None, ups_monitor: Any | None = None, ddns: Any | None = None, speedtest: Any | None = None) -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None, sunshine: Any | None = None, msp_mgr: MSPDashboardManager | None = None, msp_portal: MSPPortalManager | None = None, auto_configure: Any | None = None, cam_connect: Any | None = None, grid: Any | None = None, parental: ParentalControlsManager | None = None, backup_nudge: BackupNudgeService | None = None, dns_filter: Any | None = None, local_proxy: Any | None = None, file_sharing: Any | None = None, zfs: Any | None = None, ups_monitor: Any | None = None, ddns: Any | None = None, speedtest: Any | None = None) -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -9414,6 +9414,160 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if result is None:
             raise HTTPException(503, "No speedtest tool available or test already running")
         return result.to_dict()
+
+    # =========================================================================
+    # ZFS pool / dataset / snapshot management
+    # =========================================================================
+
+    def _zfs():
+        if zfs is None:
+            raise HTTPException(503, "ZFS manager not available")
+        return zfs
+
+    @app.get("/api/v1/zfs/status")
+    async def zfs_status(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        return _zfs().get_status()
+
+    @app.get("/api/v1/zfs/config")
+    async def zfs_config_get(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        return _zfs().get_config().to_dict()
+
+    @app.patch("/api/v1/zfs/config")
+    async def zfs_config_patch(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        return _zfs().set_config(**body).to_dict()
+
+    @app.get("/api/v1/zfs/pools")
+    async def zfs_pools(request: Request) -> list[dict]:
+        _require_scope(request, SCOPE_READ)
+        return await _zfs().list_pools()
+
+    @app.get("/api/v1/zfs/datasets")
+    async def zfs_datasets(request: Request) -> list[dict]:
+        _require_scope(request, SCOPE_READ)
+        pool = request.query_params.get("pool")
+        datasets = await _zfs().list_datasets(pool=pool)
+        return [d.to_dict() for d in datasets]
+
+    @app.post("/api/v1/zfs/datasets")
+    async def zfs_dataset_create(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        dataset = body.get("dataset") or body.get("name")
+        if not dataset:
+            raise HTTPException(400, "dataset required")
+        ok = await _zfs().create_dataset(
+            dataset=dataset,
+            mountpoint=body.get("mountpoint"),
+            encrypted=body.get("encrypted"),
+            quota_bytes=body.get("quota_bytes", 0),
+            compression=body.get("compression", "lz4"),
+        )
+        if not ok:
+            raise HTTPException(500, "zfs create failed — check controller logs")
+        return {"dataset": dataset, "created": True}
+
+    @app.delete("/api/v1/zfs/datasets/{dataset:path}")
+    async def zfs_dataset_destroy(request: Request, dataset: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        recursive = request.query_params.get("recursive", "false").lower() == "true"
+        ok = await _zfs().destroy_dataset(dataset, recursive=recursive)
+        if not ok:
+            raise HTTPException(500, "zfs destroy failed")
+        return {"dataset": dataset, "destroyed": True}
+
+    @app.get("/api/v1/zfs/snapshots")
+    async def zfs_snapshots(request: Request) -> list[dict]:
+        _require_scope(request, SCOPE_READ)
+        dataset = request.query_params.get("dataset")
+        snaps = await _zfs().list_snapshots(dataset=dataset)
+        return [s.to_dict() for s in snaps]
+
+    @app.post("/api/v1/zfs/snapshots")
+    async def zfs_snapshot_take(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        dataset = body.get("dataset")
+        if not dataset:
+            raise HTTPException(400, "dataset required")
+        snap = await _zfs().take_snapshot(dataset=dataset, label=body.get("label"))
+        if snap is None:
+            raise HTTPException(500, "zfs snapshot failed")
+        return {"snapshot": snap}
+
+    @app.delete("/api/v1/zfs/snapshots/{snapshot:path}")
+    async def zfs_snapshot_destroy(request: Request, snapshot: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        ok = await _zfs().destroy_snapshot(snapshot)
+        if not ok:
+            raise HTTPException(500, "zfs destroy snapshot failed")
+        return {"snapshot": snapshot, "destroyed": True}
+
+    # Managed dataset registry (Ozma-tracked — auto-snapshot + cloud backup)
+
+    @app.get("/api/v1/zfs/managed")
+    async def zfs_managed_list(request: Request) -> list[dict]:
+        _require_scope(request, SCOPE_READ)
+        return _zfs().list_managed()
+
+    @app.post("/api/v1/zfs/managed")
+    async def zfs_managed_register(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        dataset = body.get("dataset")
+        if not dataset:
+            raise HTTPException(400, "dataset required")
+        md = _zfs().register_dataset(
+            dataset=dataset,
+            auto_snapshot=body.get("auto_snapshot", True),
+            cloud_backup=body.get("cloud_backup", False),
+        )
+        if "policy" in body:
+            _zfs().update_managed(dataset, policy=body["policy"])
+        return md.to_dict()
+
+    @app.patch("/api/v1/zfs/managed/{dataset:path}")
+    async def zfs_managed_update(request: Request, dataset: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        md = _zfs().update_managed(dataset, **body)
+        if md is None:
+            raise HTTPException(404, "dataset not managed by Ozma")
+        return md.to_dict()
+
+    @app.delete("/api/v1/zfs/managed/{dataset:path}")
+    async def zfs_managed_unregister(request: Request, dataset: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not _zfs().unregister_dataset(dataset):
+            raise HTTPException(404, "dataset not managed by Ozma")
+        return {"dataset": dataset, "unregistered": True}
+
+    @app.post("/api/v1/zfs/managed/{dataset:path}/backup")
+    async def zfs_backup_now(request: Request, dataset: str) -> dict[str, Any]:
+        """Trigger an immediate zfs send to Connect for this dataset."""
+        _require_scope(request, SCOPE_WRITE)
+        z = _zfs()
+        cfg = z.get_config()
+        if not cfg.connect_backup_url:
+            raise HTTPException(503, "Connect backup URL not configured")
+        if connect is None:
+            raise HTTPException(503, "Connect not available")
+        auth_header = f"Bearer {await connect.get_auth_token()}"
+        ok = await z.send_to_connect(dataset, cfg.connect_backup_url, auth_header)
+        return {"dataset": dataset, "ok": ok}
+
+    @app.post("/api/v1/zfs/managed/{dataset:path}/prune")
+    async def zfs_prune(request: Request, dataset: str) -> dict[str, Any]:
+        """Manually run retention policy pruning for a dataset."""
+        _require_scope(request, SCOPE_WRITE)
+        md = _zfs().get_managed(dataset)
+        if md is None:
+            raise HTTPException(404, "dataset not managed by Ozma")
+        destroyed = await _zfs().prune_snapshots(dataset, md.policy)
+        return {"dataset": dataset, "pruned": destroyed}
 
     @app.delete("/api/v1/subdomain/claim")
     async def subdomain_release(request: Request) -> dict[str, Any]:
