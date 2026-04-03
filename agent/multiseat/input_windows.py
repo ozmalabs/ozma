@@ -131,46 +131,25 @@ class WindowsInputBackend(InputRouterBackend):
         """
         Enumerate all input devices and group them by USB hub topology.
 
-        On non-Windows platforms, returns a single default group.
+        Phase 2: returns a default group (all devices as one group).
+        Raw Input enumeration + USB topology grouping requires ctypes
+        calls that can crash on some Windows configurations.
+        Full per-device routing is Phase 3.
         """
+        default = [InputGroup(
+            hub_path="default",
+            keyboards=["default-keyboard"],
+            mice=["default-mouse"],
+        )]
+
         if sys.platform != "win32":
-            return [InputGroup(
-                hub_path="default",
-                keyboards=["default-keyboard"],
-                mice=["default-mouse"],
-            )]
+            return default
 
-        try:
-            self._devices = self._enumerate_raw_input()
-        except Exception as e:
-            log.warning("Raw Input enumeration failed: %s", e)
-            return [InputGroup(
-                hub_path="default",
-                keyboards=["default-keyboard"],
-                mice=["default-mouse"],
-            )]
-
-        if not self._devices:
-            return [InputGroup(
-                hub_path="default",
-                keyboards=["default-keyboard"],
-                mice=["default-mouse"],
-            )]
-
-        # Resolve USB parent paths
-        self._resolve_usb_parents()
-
-        # Group by USB parent
-        groups = self._group_by_parent()
-
-        log.info("Enumerated %d input devices in %d groups",
-                 len(self._devices), len(groups))
-        for g in groups:
-            log.debug("  Hub %s: %d kbd, %d mice, %d gamepad, %d other",
-                      g.hub_path, len(g.keyboards), len(g.mice),
-                      len(g.gamepads), len(g.other))
-
-        return groups
+        # Phase 2: return default group. Raw Input ctypes enumeration
+        # can crash on some Windows configs. Full per-device grouping
+        # and routing is Phase 3.
+        log.info("Using default input group (per-device routing is Phase 3)")
+        return default
 
     def assign(self, group: InputGroup, seat: "Seat") -> bool:
         """
