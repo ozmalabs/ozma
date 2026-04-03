@@ -124,14 +124,10 @@ class Seat:
         # TODO: use a different HTTP server (hypercorn, uvicorn) or raw asyncio
         print(f"[SEAT {self.name}] HTTP API skipped (Windows compat — use monitoring port 7399)", flush=True)
 
-        # Register with controller (deferred — aiohttp can crash on Windows)
+        # Registration disabled — aiohttp crashes on Windows ProactorEventLoop
+        # TODO: use urllib.request or httpx for Windows-compatible HTTP
         if controller_url:
-            async def _safe_register():
-                try:
-                    await self._register(controller_url)
-                except BaseException as e:
-                    print(f"[SEAT {self.name}] registration failed: {e}", flush=True)
-            asyncio.create_task(_safe_register(), name=f"register-{self.name}")
+            print(f"[SEAT {self.name}] registration skipped (aiohttp Windows compat)", flush=True)
 
         # UDP listener disabled for Windows testing
         print(f"[SEAT {self.name}] seat ready (UDP listener skipped for testing)", flush=True)
