@@ -207,16 +207,20 @@ class DoorbellManager:
     async def _expire_loop(self) -> None:
         while True:
             await asyncio.sleep(5)
-            now = time.time()
-            expired = []
-            for session in list(self._sessions.values()):
-                if session.state == "ringing" and now - session.started_at > RING_TIMEOUT_S:
-                    session.state = "expired"
-                    log.debug("Doorbell expired: session=%s camera=%s", session.id, session.camera)
-                    await self._push_event("doorbell.expired", session)
-                    await self._stop_audio(session)
-                if session.state in ("dismissed", "expired", "answered"):
-                    if now - session.started_at > SESSION_TTL_S:
-                        expired.append(session.id)
-            for sid in expired:
-                self._sessions.pop(sid, None)
+            await self._expire_loop_once()
+
+    async def _expire_loop_once(self) -> None:
+        """Single expiry sweep — separated for testability."""
+        now = time.time()
+        expired = []
+        for session in list(self._sessions.values()):
+            if session.state == "ringing" and now - session.started_at > RING_TIMEOUT_S:
+                session.state = "expired"
+                log.debug("Doorbell expired: session=%s camera=%s", session.id, session.camera)
+                await self._push_event("doorbell.expired", session)
+                await self._stop_audio(session)
+            if session.state in ("dismissed", "expired", "answered"):
+                if now - session.started_at > SESSION_TTL_S:
+                    expired.append(session.id)
+        for sid in expired:
+            self._sessions.pop(sid, None)
