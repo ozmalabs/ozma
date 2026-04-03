@@ -235,6 +235,7 @@ class SeatManager:
                     encoder_hints.codec = seat_configs[i]["codec"]
 
             encoder_session = self._encoder_allocator.allocate(name, encoder_hints)
+            print(f"[OZMA DEBUG] Creating seat {name} (index={i})", flush=True)
 
             seat = Seat(
                 name=name,
@@ -249,13 +250,17 @@ class SeatManager:
             )
             seat.display = display
             self._seats.append(seat)
+            print(f"[OZMA DEBUG] Seat {name} created", flush=True)
 
+        print(f"[OZMA DEBUG] {len(self._seats)} seats created, setting up audio...", flush=True)
         # Create audio sinks for each seat
         for seat in self._seats:
             try:
                 sink = await self._audio_backend.create_sink(seat.name)
                 seat.audio_sink = sink
+                print(f"[OZMA DEBUG] Audio sink for {seat.name}: {sink}", flush=True)
             except Exception as e:
+                print(f"[OZMA DEBUG] Audio sink failed for {seat.name}: {e}", flush=True)
                 log.warning("Seat %s: audio sink creation failed: %s", seat.name, e)
 
         # Set up per-seat isolation based on profile
