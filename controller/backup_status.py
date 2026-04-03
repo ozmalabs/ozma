@@ -32,6 +32,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+try:
+    import aiohttp
+except ImportError:
+    aiohttp = None  # type: ignore
+
 log = logging.getLogger("ozma.controller.backup_status")
 
 # Health severity order (ascending)
@@ -242,3 +247,142 @@ class BackupStatusTracker:
             self._reports.pop(nid)
         if stale:
             self._save()
+
+
+# ---------------------------------------------------------------------------
+# Default-on nudge service
+# ---------------------------------------------------------------------------
+
+class BackupNudgeService:
+    """
+    Fires 'backup.not_configured' events for nodes that have never sent a
+    backup report, prompting the dashboard to show the one-click setup offer.
+
+    Also proxies snapshot browse and restore commands from the controller to
+    node agents (controller → agent HTTP API on port api_port).
+    """
+
+    _NUDGE_INTERVAL  = 3600.0   # check once per hour
+    _NUDGE_COOLDOWN  = 86400.0  # don't re-nudge the same node within 24 h
+    _PROXY_TIMEOUT   = 15.0     # seconds for proxied HTTP calls
+
+    def __init__(
+        self,
+        state: Any,                      # AppState — provides node list
+        tracker: BackupStatusTracker,
+        event_queue: Any | None = None,  # asyncio.Queue for WebSocket events
+    ) -> None:
+        self._state       = state
+        self._tracker     = tracker
+        self._event_queue = event_queue
+        self._last_nudge:  dict[str, float] = {}   # node_id → last nudge ts
+        self._task:        Any | None = None
+
+    async def start(self) -> None:
+        import asyncio
+        self._task = asyncio.create_task(self._nudge_loop(), name="backup.nudge")
+
+    async def stop(self) -> None:
+        if self._task:
+            self._task.cancel()
+            import asyncio
+            await asyncio.gather(self._task, return_exceptions=True)
+
+    async def _nudge_loop(self) -> None:
+        import asyncio
+        while True:
+            await asyncio.sleep(self._NUDGE_INTERVAL)
+            try:
+                await self._check_unconfigured()
+            except Exception:
+                log.exception("nudge_loop error")
+
+    async def _check_unconfigured(self) -> None:
+        """Fire events for nodes with no or unconfigured backup reports."""
+        now = time.time()
+        nodes = list(getattr(self._state, "nodes", {}).values())
+        for node in nodes:
+            node_id = getattr(node, "id", None) or getattr(node, "node_id", None)
+            if not node_id:
+                continue
+            report = self._tracker.get_node_report(node_id)
+            if report and report.health not in ("unconfigured", ""):
+                continue  # already configured
+            # Check cooldown
+            if now - self._last_nudge.get(node_id, 0) < self._NUDGE_COOLDOWN:
+                continue
+            self._last_nudge[node_id] = now
+            log.info("Nudging node %s: backup not configured", node_id)
+            await self._fire_event({
+                "type":    "backup.not_configured",
+                "node_id": node_id,
+                "node_name": getattr(node, "name", node_id),
+                "ts":      now,
+            })
+
+    async def _fire_event(self, event: dict[str, Any]) -> None:
+        if self._event_queue is not None:
+            await self._event_queue.put(event)
+
+    # ------------------------------------------------------------------
+    # Proxy helpers
+    # ------------------------------------------------------------------
+
+    async def proxy_get(self, node_id: str, path: str) -> dict[str, Any] | list | None:
+        """
+        GET a path from a node agent's HTTP API.
+
+        Returns the parsed JSON response, or None if unreachable.
+        """
+        url = self._agent_url(node_id, path)
+        if not url:
+            return None
+        if aiohttp is None:
+            return None
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=self._PROXY_TIMEOUT)
+                ) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    log.debug("agent proxy GET %s → %d", url, resp.status)
+                    return None
+        except Exception as exc:
+            log.debug("proxy_get %s: %s", url, exc)
+            return None
+
+    async def proxy_post(
+        self, node_id: str, path: str, body: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """POST to a node agent's HTTP API and return the JSON response."""
+        url = self._agent_url(node_id, path)
+        if not url:
+            return None
+        if aiohttp is None:
+            return None
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url, json=body,
+                    timeout=aiohttp.ClientTimeout(total=self._PROXY_TIMEOUT),
+                ) as resp:
+                    if resp.status in (200, 201, 202):
+                        return await resp.json()
+                    log.debug("agent proxy POST %s → %d", url, resp.status)
+                    return None
+        except Exception as exc:
+            log.debug("proxy_post %s: %s", url, exc)
+            return None
+
+    def _agent_url(self, node_id: str, path: str) -> str | None:
+        """Build the base URL for a node's agent API."""
+        nodes = getattr(self._state, "nodes", {})
+        node  = nodes.get(node_id)
+        if not node:
+            return None
+        host     = getattr(node, "host", None)
+        api_port = getattr(node, "api_port", None)
+        if not host or not api_port:
+            return None
+        return f"http://{host}:{api_port}{path}"

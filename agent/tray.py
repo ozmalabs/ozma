@@ -81,16 +81,24 @@ def _local_ip() -> str:
 class AgentTray:
     """System tray icon for the ozma agent."""
 
-    def __init__(self, agent: Any, controller_url: str = "", name: str = "") -> None:
+    def __init__(self, agent: Any, controller_url: str = "", name: str = "",
+                 agent_api_port: int = 7382) -> None:
         self._agent = agent
         self._controller_url = controller_url
         self._name = name or socket.gethostname()
+        self._agent_api_port = agent_api_port
         self._connected = False
         self._active_scenario = ""
         self._scenarios: list[dict] = []
         self._icon = None
         self._start_time = time.time()
         self._config = _load_config()
+
+        # Backup state
+        self._backup_health: str = ""         # "green" | "yellow" | "orange" | "red" | "unconfigured"
+        self._backup_last_at: str = ""        # ISO timestamp of last successful backup
+        self._backup_running: bool = False    # True if a backup is in progress
+        self._backup_alert: bool = False      # True when health is orange/red (show badge)
 
         # Apply saved config
         if not self._controller_url and self._config.get("controller_url"):
@@ -165,6 +173,35 @@ class AgentTray:
         # ── Actions ──
         items.append(pystray.MenuItem("Open Dashboard", self._on_open_dashboard))
         items.append(pystray.MenuItem("Copy IP Address", self._on_copy_ip))
+
+        # ── Backup status ──
+        items.append(pystray.Menu.SEPARATOR)
+        backup_icon = self._backup_health_icon()
+        backup_label = f"{backup_icon} Backup"
+        if self._backup_running:
+            backup_label += " (running…)"
+        elif self._backup_last_at:
+            backup_label += f" — last: {self._backup_last_at}"
+        elif self._backup_health == "unconfigured":
+            backup_label += " — not configured"
+        backup_submenu_items = []
+        if self._backup_health:
+            health_text = self._backup_health.capitalize() if self._backup_health else "Unknown"
+            backup_submenu_items.append(pystray.MenuItem(
+                f"Status: {health_text}", None, enabled=False,
+            ))
+        if self._backup_last_at:
+            backup_submenu_items.append(pystray.MenuItem(
+                f"Last: {self._backup_last_at}", None, enabled=False,
+            ))
+        backup_submenu_items.append(pystray.MenuItem("Back Up Now", self._on_backup_now))
+        backup_submenu_items.append(pystray.MenuItem(
+            "Open Backup Settings",
+            lambda _: webbrowser.open(
+                (self._controller_url or "http://localhost:7380") + "/#backup"
+            ),
+        ))
+        items.append(pystray.MenuItem(backup_label, pystray.Menu(*backup_submenu_items)))
 
         items.append(pystray.Menu.SEPARATOR)
 
@@ -258,6 +295,7 @@ class AgentTray:
 
     def _poll_status_thread(self) -> None:
         import urllib.request
+        _backup_poll_counter = 0
         while True:
             time.sleep(5)
             if not self._controller_url:
@@ -276,19 +314,71 @@ class AgentTray:
                 self._scenarios = []
                 self._active_scenario = ""
 
+            # Poll backup status every 60s (every 12 × 5s iterations)
+            _backup_poll_counter += 1
+            if _backup_poll_counter >= 12:
+                _backup_poll_counter = 0
+                self._poll_backup_status()
+
             self._update_icon()
+
+    def _poll_backup_status(self) -> None:
+        """Fetch backup status from the local agent API."""
+        import urllib.request
+        url = f"http://localhost:{self._agent_api_port}/api/v1/backup/status"
+        try:
+            with urllib.request.urlopen(url, timeout=3) as r:
+                data = json.loads(r.read())
+                self._backup_health  = data.get("health", "unconfigured")
+                self._backup_running = bool(data.get("running", False))
+                last_ts = data.get("last_backup_at") or data.get("last_success_at", "")
+                if last_ts:
+                    # Format to friendly "YYYY-MM-DD HH:MM"
+                    try:
+                        import datetime
+                        dt = datetime.datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+                        self._backup_last_at = dt.strftime("%Y-%m-%d %H:%M")
+                    except Exception:
+                        self._backup_last_at = str(last_ts)[:16]
+                else:
+                    self._backup_last_at = ""
+                self._backup_alert = self._backup_health in ("orange", "red")
+        except Exception:
+            # Agent API not reachable — don't clear existing state
+            pass
 
     def _update_icon(self) -> None:
         if not self._icon:
             return
         try:
-            colour = "green" if self._connected else "red"
+            if not self._connected:
+                colour = "red"
+            elif self._backup_health == "red":
+                colour = "red"
+            elif self._backup_health in ("orange", "yellow"):
+                colour = "orange"
+            else:
+                colour = "green"
             self._icon.icon = self._create_icon(colour)
             status = "Connected" if self._connected else "Disconnected"
-            self._icon.title = f"Ozma Agent — {self._name} ({status})"
+            backup_suffix = ""
+            if self._backup_alert:
+                backup_suffix = " ⚠ Backup needs attention"
+            elif self._backup_health == "unconfigured":
+                backup_suffix = " · Backup not configured"
+            self._icon.title = f"Ozma Agent — {self._name} ({status}){backup_suffix}"
             self._icon.menu = self._build_menu()
         except Exception:
             pass
+
+    def _backup_health_icon(self) -> str:
+        return {
+            "green":        "🟢",
+            "yellow":       "🟡",
+            "orange":       "🟠",
+            "red":          "🔴",
+            "unconfigured": "⚪",
+        }.get(self._backup_health, "⚪")
 
     # ── Event handlers ────────────────────────────────────────────────
 
@@ -360,6 +450,22 @@ class AgentTray:
         current = self._config.get("capture", True)
         self._config["capture"] = not current
         _save_config(self._config)
+
+    def _on_backup_now(self, _) -> None:
+        """Trigger an on-demand backup via the local agent API."""
+        import urllib.request
+        url = f"http://localhost:{self._agent_api_port}/api/v1/backup/run"
+        try:
+            req = urllib.request.Request(
+                url, data=b'{}',
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=5)
+            self._backup_running = True
+            self._update_icon()
+        except Exception as e:
+            log.debug("Backup now failed: %s", e)
 
     def _on_view_logs(self, _) -> None:
         logs = _get_log_tail(100)
@@ -494,9 +600,10 @@ X-GNOME-Autostart-enabled=true
 
         # Colour map
         colours = {
-            "green": (74, 224, 164),   # Connected — ozma emerald
-            "yellow": (255, 193, 7),    # Connecting
-            "red": (220, 53, 69),       # Disconnected
+            "green":  (74, 224, 164),   # Connected — ozma emerald
+            "yellow": (255, 193, 7),    # Connecting / warning
+            "orange": (255, 128, 0),    # Backup degraded
+            "red":    (220, 53, 69),    # Disconnected / backup failure
         }
         fill = colours.get(colour, colours["green"])
 

@@ -103,6 +103,7 @@ from key_store import (
 from msp_dashboard import MSPDashboardManager, MSPClient, BulkOperation, BillingLine
 from msp_portal import MSPPortalManager, PortalConfig
 from parental_controls import ParentalControlsManager
+from backup_status import BackupNudgeService
 
 log = logging.getLogger("ozma.api")
 
@@ -167,7 +168,7 @@ class DirectRegisterRequest(BaseModel):
     frigate_port: str = ""     # Frigate API port (default 5000)
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None, sunshine: Any | None = None, msp_mgr: MSPDashboardManager | None = None, msp_portal: MSPPortalManager | None = None, auto_configure: Any | None = None, cam_connect: Any | None = None, grid: Any | None = None, parental: ParentalControlsManager | None = None) -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None, sunshine: Any | None = None, msp_mgr: MSPDashboardManager | None = None, msp_portal: MSPPortalManager | None = None, auto_configure: Any | None = None, cam_connect: Any | None = None, grid: Any | None = None, parental: ParentalControlsManager | None = None, backup_nudge: BackupNudgeService | None = None) -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -1447,6 +1448,30 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         except Exception as e:
             return {"nodes": [], "error": str(e)}
 
+    @app.get("/api/v1/audio/room-correction/usb-mics")
+    async def list_usb_mics(q: str = "") -> dict[str, Any]:
+        """
+        Autocomplete for USB/XLR mic models.
+
+        Query params:
+          q — case-insensitive substring filter (optional)
+
+        Returns: {mics: [{name, key, has_curve}, ...]}
+        Filtered by q if provided. The list includes all known models from the
+        hardcoded seed list.
+        """
+        from room_correction import KNOWN_USB_MICS, USB_MIC_CURVES, normalise_mic_name
+        results = []
+        for name in KNOWN_USB_MICS:
+            if not q or q.lower() in name.lower():
+                key = normalise_mic_name(name)
+                results.append({
+                    "name": name,
+                    "key": key,
+                    "has_curve": key in USB_MIC_CURVES,
+                })
+        return {"mics": results}
+
     @app.post("/api/v1/audio/room-correction/sweep")
     async def run_room_sweep(body: dict) -> dict[str, Any]:
         """
@@ -1473,6 +1498,8 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
                     "phone_model": body.get("phone_model", "generic"),
                     "target_curve": body.get("target_curve", "harman"),
                     "room_name": body.get("room_name", ""),
+                    "mic_type": body.get("mic_type", "phone"),
+                    "mic_model": body.get("mic_model", ""),
                 }).encode()
                 def _proxy():
                     req = urllib.request.Request(
@@ -1496,6 +1523,8 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             target_curve=body.get("target_curve", "harman"),
             room_name=body.get("room_name", ""),
             node_id=node_id,
+            mic_type=body.get("mic_type", "phone"),
+            mic_model=body.get("mic_model", ""),
         )
         if not profile:
             return {"ok": False, "error": "Sweep failed — check source/sink names and PipeWire state"}
@@ -1504,14 +1533,16 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     @app.post("/api/v1/audio/room-correction/measure")
     async def process_room_measurement(body: dict) -> dict[str, Any]:
         """
-        Process a room measurement from the phone sweep UI.
+        Process a room measurement from the phone/USB mic sweep UI.
 
         Body: {
             frequency_response: [[freq, db], ...],  // from browser FFT
             phone_model: "iphone_15" | "pixel_8" | "generic" | ...,
             target_curve: "harman" | "flat" | "bbc",
             room_name: "Living Room",
-            node_id: "vm1._ozma._udp.local."
+            node_id: "vm1._ozma._udp.local.",
+            mic_type: "phone" | "usb" | "xlr",   // default: "phone"
+            mic_model: "Blue Yeti",               // display name for USB/XLR mics
         }
         """
         if not room_correction:
@@ -1519,22 +1550,30 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         freq_resp = [(f, db) for f, db in body.get("frequency_response", [])]
         if not freq_resp:
             raise HTTPException(status_code=400, detail="frequency_response required")
+
+        mic_type = body.get("mic_type", "phone")
+        mic_model = body.get("mic_model", "")
+
         profile = room_correction.process_measurement(
             frequency_response=freq_resp,
             phone_model=body.get("phone_model", "generic"),
             target_curve=body.get("target_curve", "harman"),
             room_name=body.get("room_name", ""),
             node_id=body.get("node_id", ""),
+            mic_type=mic_type,
+            mic_model=mic_model,
         )
 
         # Async fire-and-forget: submit to Connect if authenticated
         if connect and connect.authenticated:
             asyncio.create_task(
                 connect.submit_mic_measurement(
-                    phone_model=body.get("phone_model", "generic"),
+                    phone_model=body.get("phone_model", "generic") if mic_type == "phone" else mic_model,
                     raw_response=freq_resp,
                     correction_applied=[(b["freq"], b["gain"]) for b in profile.to_dict()["bands"]],
                     target_curve=body.get("target_curve", "harman"),
+                    mic_type=mic_type,
+                    mic_model=mic_model,
                 ),
                 name="mic_telemetry",
             )
@@ -1544,23 +1583,27 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     @app.post("/api/v1/audio/room-correction/contribute")
     async def contribute_mic_measurement(body: dict) -> dict[str, Any]:
         """
-        Forward a phone mic measurement from the mobile app to Connect.
+        Forward a phone or USB mic measurement from the mobile app to Connect.
 
         The mobile app always talks to the controller (no Connect JWT needed
         in the app). This endpoint proxies the submission to Connect as a
         fire-and-forget task.
 
         Body: {
-            phone_model: str,
+            phone_model: str,           // for phone mics (mic_type="phone")
+            mic_type: str,              // "phone" | "usb" | "xlr" (default: "phone")
+            mic_model: str,             // display name for USB/XLR (e.g. "Blue Yeti")
             raw_response: [[freq, db], ...],
             correction_applied: [[freq, db], ...],
             target_curve: str,
-            snr_estimate: float,   # optional
+            snr_estimate: float,        // optional
         }
         """
         if not connect or not connect.authenticated:
             return {"ok": True, "accepted": False, "reason": "connect_not_available"}
 
+        mic_type = body.get("mic_type", "phone")
+        mic_model = body.get("mic_model", "")
         phone_model = body.get("phone_model", "generic")
         raw_response = body.get("raw_response", [])
         if not raw_response:
@@ -1568,11 +1611,13 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
         asyncio.create_task(
             connect.submit_mic_measurement(
-                phone_model=phone_model,
+                phone_model=phone_model if mic_type == "phone" else mic_model,
                 raw_response=[(f, d) for f, d in raw_response],
                 correction_applied=[(f, d) for f, d in body.get("correction_applied", [])],
                 target_curve=body.get("target_curve", "harman"),
                 snr_estimate=float(body.get("snr_estimate", 0.0)),
+                mic_type=mic_type,
+                mic_model=mic_model,
             ),
             name="mic_telemetry_mobile",
         )
@@ -8707,6 +8752,89 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         device_id = body.get("device_id", "")
         result    = _parental().check_permission(profile_id, app_name, device_id)
         return result.to_dict()
+
+    # ------------------------------------------------------------------ #
+    # Backup proxy — forward snapshot browse / restore to node agents
+    # ------------------------------------------------------------------ #
+
+    def _backup_nudge() -> BackupNudgeService:
+        if backup_nudge is None:
+            raise HTTPException(503, "Backup proxy not configured")
+        return backup_nudge
+
+    @app.get("/api/v1/backup/nodes/{node_id}/snapshots")
+    async def backup_node_snapshots(request: Request, node_id: str) -> list[dict]:
+        """
+        List Restic snapshots for a node.
+
+        Proxied to the node's agent API.  Requires the agent to be running and
+        reachable at the registered api_port.
+        """
+        _require_scope(request, SCOPE_READ)
+        result = await _backup_nudge().proxy_get(node_id, "/api/v1/backup/snapshots")
+        if result is None:
+            raise HTTPException(503, f"Node {node_id!r} agent unreachable or backup not configured")
+        return result if isinstance(result, list) else [result]
+
+    @app.get("/api/v1/backup/nodes/{node_id}/snapshots/{snapshot_id}/files")
+    async def backup_node_snapshot_files(
+        request: Request, node_id: str, snapshot_id: str,
+    ) -> list[dict]:
+        """Browse the file tree within a specific snapshot."""
+        _require_scope(request, SCOPE_READ)
+        path = request.query_params.get("path", "/")
+        result = await _backup_nudge().proxy_get(
+            node_id,
+            f"/api/v1/backup/snapshots/{snapshot_id}/files?path={path}",
+        )
+        if result is None:
+            raise HTTPException(503, f"Node {node_id!r} agent unreachable")
+        return result if isinstance(result, list) else [result]
+
+    @app.post("/api/v1/backup/nodes/{node_id}/restore")
+    async def backup_node_restore(request: Request, node_id: str) -> dict[str, Any]:
+        """
+        Trigger a selective restore on a node.
+
+        Body: { "snapshot_id": "...", "source_path": "/home/alice/docs",
+                "target_path": "/home/alice/restore" }
+        """
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        result = await _backup_nudge().proxy_post(node_id, "/api/v1/backup/restore", body)
+        if result is None:
+            raise HTTPException(503, f"Node {node_id!r} agent unreachable or restore failed")
+        return result
+
+    @app.post("/api/v1/backup/nodes/{node_id}/run")
+    async def backup_node_run(request: Request, node_id: str) -> dict[str, Any]:
+        """Trigger an on-demand backup on a node."""
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        mode = body.get("mode", "smart")
+        result = await _backup_nudge().proxy_post(node_id, "/api/v1/backup/run", {"mode": mode})
+        if result is None:
+            raise HTTPException(503, f"Node {node_id!r} agent unreachable")
+        return result
+
+    @app.get("/api/v1/backup/nodes/{node_id}/apps")
+    async def backup_node_apps(request: Request, node_id: str) -> list[dict]:
+        """List installed apps on a node (for selective restore)."""
+        _require_scope(request, SCOPE_READ)
+        result = await _backup_nudge().proxy_get(node_id, "/api/v1/backup/apps")
+        if result is None:
+            raise HTTPException(503, f"Node {node_id!r} agent unreachable")
+        return result if isinstance(result, list) else [result]
+
+    @app.post("/api/v1/backup/nodes/{node_id}/restore-apps")
+    async def backup_node_restore_apps(request: Request, node_id: str) -> dict[str, Any]:
+        """Reinstall apps on a node from its inventory snapshot."""
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        result = await _backup_nudge().proxy_post(node_id, "/api/v1/backup/restore-apps", body)
+        if result is None:
+            raise HTTPException(503, f"Node {node_id!r} agent unreachable")
+        return result
 
     # Static files — mounted last so they don't shadow API routes
     static_dir = Path(__file__).parent / "static"

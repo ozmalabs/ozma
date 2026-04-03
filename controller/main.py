@@ -95,7 +95,7 @@ from threat_intelligence import ThreatIntelligenceEngine
 from camera_recording import CameraRecordingManager
 from wifi_ap import WiFiAPManager
 from router_mode import RouterModeManager
-from backup_status import BackupStatusTracker
+from backup_status import BackupStatusTracker, BackupNudgeService
 from game_streaming import SunshineManager
 from auto_configure import AutoConfigureManager
 from camera_connect import CameraConnectManager
@@ -339,14 +339,15 @@ async def run(config: Config) -> None:
     wifi_audio = WiFiAudioManager()
     room_corr = RoomCorrectionManager()
 
-    # Pull latest phone mic curves from Connect (non-blocking)
+    # Pull latest mic curves (phone + USB) from Connect (non-blocking)
     async def _refresh_mic_curves():
         if connect and room_corr:
             curves = await connect.get_mic_curves()
             if curves:
-                n = room_corr.update_mic_curves(curves.get("curves", {}))
+                # curves is already the curves dict (may be nested phone/usb or flat)
+                n = room_corr.update_mic_curves(curves)
                 if n:
-                    log.info("Updated %d phone mic compensation curve(s) from Connect", n)
+                    log.info("Updated %d mic compensation curve(s) from Connect", n)
 
     asyncio.create_task(_refresh_mic_curves(), name="mic_curves_refresh")
 
@@ -537,6 +538,11 @@ async def run(config: Config) -> None:
     backup_state = Path(__file__).parent / "backup_fleet_status.json"
     backup_tracker = BackupStatusTracker(state_path=backup_state)
 
+    # Backup default-on nudge — fires backup.not_configured events for unconfigured nodes
+    backup_nudge = BackupNudgeService(state=state, tracker=backup_tracker,
+                                      event_queue=state.events)
+    await backup_nudge.start()
+
     # Game streaming (V1.2) — Sunshine/Moonlight manager
     sunshine_data = Path(__file__).parent / "sunshine_data"
     sunshine_mgr = SunshineManager(data_dir=sunshine_data, state=state)
@@ -657,7 +663,7 @@ async def run(config: Config) -> None:
         transcription_mgr = LiveTranscriptionManager(connect=connect)
 
     # Build the FastAPI app — all managers must be created before this point
-    app = build_app(state, scenarios, streams, audio, controls, rgb_out, motion, bt, kdeconnect, wifi_audio, captures, paste_typer, kbd_mgr, macro_mgr, sched, notifier, recorder, net_health, ocr_triggers, auto_engine, metrics_collector, screen_mgr, codec_mgr=codec_mgr, camera_mgr=camera_mgr, obs_studio=obs_studio, stream_router=stream_router, guac_mgr=guac_mgr, provision_mgr=provision_mgr, connect=connect, mesh_ca=mesh_ca, sess_mgr=sess_mgr, room_correction=room_corr, testbench=testbench, agent_engine=agent_engine, test_runner=test_runner, auth_config=auth_cfg, user_manager=user_mgr, service_proxy=svc_proxy, idp=idp_instance, sharing=sharing_mgr, ext_publish=ext_pub, node_reconciler=reconciler, update_mgr=update_mgr, transcription_mgr=transcription_mgr, discovery=discovery, doorbell_mgr=doorbell_mgr, alert_mgr=alert_mgr, vaultwarden=vault_mgr, email_security=email_sec, cloud_backup=cloud_backup, iot=iot_mgr, wg=wg_mgr, itsm=itsm_mgr, license_mgr=license_mgr, mdm=mdm_mgr, job_queue=job_queue, net_scan=net_scan_mgr, key_store=key_store, dlp=dlp_mgr, saas_mgr=saas_mgr, threat_intel=threat_intel, compliance=compliance_engine, cam_rec=cam_rec_mgr, wifi_ap=wifi_ap_mgr, router=router_mgr, backup_tracker=backup_tracker, mobile_cam=mob_cam, sunshine=sunshine_mgr, msp_mgr=msp_mgr, msp_portal=msp_portal_mgr, auto_configure=auto_configure_mgr, cam_connect=cam_connect_mgr, grid=grid_svc, parental=parental_mgr)
+    app = build_app(state, scenarios, streams, audio, controls, rgb_out, motion, bt, kdeconnect, wifi_audio, captures, paste_typer, kbd_mgr, macro_mgr, sched, notifier, recorder, net_health, ocr_triggers, auto_engine, metrics_collector, screen_mgr, codec_mgr=codec_mgr, camera_mgr=camera_mgr, obs_studio=obs_studio, stream_router=stream_router, guac_mgr=guac_mgr, provision_mgr=provision_mgr, connect=connect, mesh_ca=mesh_ca, sess_mgr=sess_mgr, room_correction=room_corr, testbench=testbench, agent_engine=agent_engine, test_runner=test_runner, auth_config=auth_cfg, user_manager=user_mgr, service_proxy=svc_proxy, idp=idp_instance, sharing=sharing_mgr, ext_publish=ext_pub, node_reconciler=reconciler, update_mgr=update_mgr, transcription_mgr=transcription_mgr, discovery=discovery, doorbell_mgr=doorbell_mgr, alert_mgr=alert_mgr, vaultwarden=vault_mgr, email_security=email_sec, cloud_backup=cloud_backup, iot=iot_mgr, wg=wg_mgr, itsm=itsm_mgr, license_mgr=license_mgr, mdm=mdm_mgr, job_queue=job_queue, net_scan=net_scan_mgr, key_store=key_store, dlp=dlp_mgr, saas_mgr=saas_mgr, threat_intel=threat_intel, compliance=compliance_engine, cam_rec=cam_rec_mgr, wifi_ap=wifi_ap_mgr, router=router_mgr, backup_tracker=backup_tracker, mobile_cam=mob_cam, sunshine=sunshine_mgr, msp_mgr=msp_mgr, msp_portal=msp_portal_mgr, auto_configure=auto_configure_mgr, cam_connect=cam_connect_mgr, grid=grid_svc, parental=parental_mgr, backup_nudge=backup_nudge)
 
     uv_config = uvicorn.Config(
         app,
@@ -854,6 +860,7 @@ async def run(config: Config) -> None:
     await cam_connect_mgr.stop()
     await grid_svc.stop()
     await parental_mgr.stop()
+    await backup_nudge.stop()
     if front_panel:
         await front_panel.stop()
 
