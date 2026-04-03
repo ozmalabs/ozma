@@ -1307,8 +1307,9 @@ def main() -> None:
         def _on_signal():
             loop.call_soon_threadsafe(node._stop_event.set)
 
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, _on_signal)
+        if sys.platform != "win32":
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, _on_signal)
 
         try:
             loop.run_until_complete(node.run())
@@ -1346,8 +1347,9 @@ def main() -> None:
         def _on_signal():
             loop.call_soon_threadsafe(manager._stop_event.set)
 
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, _on_signal)
+        if sys.platform != "win32":
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, _on_signal)
 
         try:
             loop.run_until_complete(manager.start())
