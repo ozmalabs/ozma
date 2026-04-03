@@ -1441,6 +1441,14 @@ def main() -> None:
         def _on_signal():
             loop.call_soon_threadsafe(manager._stop_event.set)
 
+        def _on_exception(loop, context):
+            msg = context.get("message", "")
+            exc = context.get("exception")
+            print(f"[OZMA] Unhandled async exception: {msg} {exc}", flush=True)
+            log.error("Unhandled async exception: %s %s", msg, exc)
+
+        loop.set_exception_handler(_on_exception)
+
         if sys.platform != "win32":
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, _on_signal)
