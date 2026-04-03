@@ -119,16 +119,9 @@ class Seat:
                 print(f"[SEAT {self.name}] screen capture failed: {e}", flush=True)
                 log.warning("Seat %s: screen capture failed: %s", self.name, e)
 
-        # Start HTTP API (deferred to background to prevent crash blocking startup)
-        print(f"[SEAT {self.name}] deferring HTTP API on port {self.api_port}...", flush=True)
-        async def _safe_http():
-            try:
-                await self._start_http()
-                print(f"[SEAT {self.name}] HTTP API running on port {self.api_port}", flush=True)
-            except Exception as e:
-                print(f"[SEAT {self.name}] HTTP API failed: {e}", flush=True)
-                log.warning("Seat %s: HTTP API failed: %s", self.name, e)
-        asyncio.create_task(_safe_http(), name=f"http-{self.name}")
+        # HTTP API disabled — aiohttp crashes on Windows ProactorEventLoop
+        # TODO: use a different HTTP server (hypercorn, uvicorn) or raw asyncio
+        print(f"[SEAT {self.name}] HTTP API skipped (Windows compat — use monitoring port 7399)", flush=True)
 
         # Register with controller
         if controller_url:
