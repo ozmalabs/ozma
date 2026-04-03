@@ -90,7 +90,13 @@ from itsm import (
     AGENT_L1, AGENT_L2, AGENT_HUMAN, _PRIORITIES,
 )
 from mdm_bridge import MDMBridgeManager, MDMConfig, ManagedDevice
+from network_scan import NetworkScanManager, NetworkScanConfig, OpenVASConfig, NessusConfig
+from dlp import DLPManager, DLPConfig, DLPPolicy, DLPRule, DLPIncident
 from job_queue import JobQueue, JobSpec, JobType, JobState, TargetScope
+from key_store import (
+    KeyStore, BackupMethod, KeyLockedError, KeyNotInitialisedError,
+    UnlockRateLimitedError,
+)
 
 log = logging.getLogger("ozma.api")
 
@@ -155,7 +161,7 @@ class DirectRegisterRequest(BaseModel):
     frigate_port: str = ""     # Frigate API port (default 5000)
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None) -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None) -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -5959,6 +5965,598 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(404, "Campaign not found")
         count = q.cancel_campaign(campaign_id)
         return {"ok": True, "cancelled": count}
+
+    # ── Network Scanning ─────────────────────────────────────────────────────────
+
+    class NetworkScanConfigPatchRequest(BaseModel):
+        targets: list[str] | None = None
+        discovery_interval: int | None = None
+        vuln_scan_interval: int | None = None
+        rogue_device_alert: bool | None = None
+        rogue_device_itsm_ticket: bool | None = None
+        rogue_device_itsm_priority: str | None = None
+        nmap_args: str | None = None
+        nuclei_enabled: bool | None = None
+        nuclei_severity: str | None = None
+        nuclei_templates: str | None = None
+        openvas_enabled: bool | None = None
+        openvas_host: str | None = None
+        openvas_port: int | None = None
+        openvas_username: str | None = None
+        openvas_password_env: str | None = None
+        openvas_scan_config: str | None = None
+        nessus_enabled: bool | None = None
+        nessus_url: str | None = None
+        nessus_access_key_env: str | None = None
+        nessus_secret_key_env: str | None = None
+        nessus_policy_id: str | None = None
+        ticket_severity_threshold: str | None = None
+
+    @app.get("/api/v1/network-scan/status")
+    async def net_scan_status(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not net_scan:
+            raise HTTPException(503, "Network scan not enabled")
+        return net_scan.status()
+
+    @app.get("/api/v1/network-scan/config")
+    async def net_scan_get_config(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not net_scan:
+            raise HTTPException(503, "Network scan not enabled")
+        return net_scan.get_config().to_dict()
+
+    @app.patch("/api/v1/network-scan/config")
+    async def net_scan_patch_config(request: Request,
+                                     body: NetworkScanConfigPatchRequest) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not net_scan:
+            raise HTTPException(503, "Network scan not enabled")
+        cfg = net_scan.get_config()
+        if body.targets is not None:
+            cfg.targets = body.targets
+        if body.discovery_interval is not None:
+            cfg.discovery_interval = body.discovery_interval
+        if body.vuln_scan_interval is not None:
+            cfg.vuln_scan_interval = body.vuln_scan_interval
+        if body.rogue_device_alert is not None:
+            cfg.rogue_device_alert = body.rogue_device_alert
+        if body.rogue_device_itsm_ticket is not None:
+            cfg.rogue_device_itsm_ticket = body.rogue_device_itsm_ticket
+        if body.rogue_device_itsm_priority is not None:
+            cfg.rogue_device_itsm_priority = body.rogue_device_itsm_priority
+        if body.nmap_args is not None:
+            cfg.nmap_args = body.nmap_args
+        if body.nuclei_enabled is not None:
+            cfg.nuclei_enabled = body.nuclei_enabled
+        if body.nuclei_severity is not None:
+            cfg.nuclei_severity = body.nuclei_severity
+        if body.nuclei_templates is not None:
+            cfg.nuclei_templates = body.nuclei_templates
+        if body.openvas_enabled is not None:
+            cfg.openvas_enabled = body.openvas_enabled
+        if body.openvas_host is not None:
+            cfg.openvas.host = body.openvas_host
+        if body.openvas_port is not None:
+            cfg.openvas.port = body.openvas_port
+        if body.openvas_username is not None:
+            cfg.openvas.username = body.openvas_username
+        if body.openvas_password_env is not None:
+            cfg.openvas.password_env = body.openvas_password_env
+        if body.openvas_scan_config is not None:
+            cfg.openvas.scan_config = body.openvas_scan_config
+        if body.nessus_enabled is not None:
+            cfg.nessus_enabled = body.nessus_enabled
+        if body.nessus_url is not None:
+            cfg.nessus.url = body.nessus_url
+        if body.nessus_access_key_env is not None:
+            cfg.nessus.access_key_env = body.nessus_access_key_env
+        if body.nessus_secret_key_env is not None:
+            cfg.nessus.secret_key_env = body.nessus_secret_key_env
+        if body.nessus_policy_id is not None:
+            cfg.nessus.policy_id = body.nessus_policy_id
+        if body.ticket_severity_threshold is not None:
+            cfg.ticket_severity_threshold = body.ticket_severity_threshold
+        net_scan.set_config(cfg)
+        return cfg.to_dict()
+
+    @app.post("/api/v1/network-scan/discovery")
+    async def net_scan_run_discovery(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not net_scan:
+            raise HTTPException(503, "Network scan not enabled")
+        return await net_scan.run_discovery()
+
+    @app.post("/api/v1/network-scan/vuln-scan")
+    async def net_scan_run_vuln(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not net_scan:
+            raise HTTPException(503, "Network scan not enabled")
+        return await net_scan.run_vuln_scan()
+
+    @app.get("/api/v1/network-scan/hosts")
+    async def net_scan_list_hosts(
+        request: Request,
+        os_filter: str | None = None,
+        rogue_only: bool = False,
+    ) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not net_scan:
+            raise HTTPException(503, "Network scan not enabled")
+        hosts = net_scan.list_hosts(os_filter=os_filter, rogue_only=rogue_only)
+        return {"hosts": [h.to_dict() for h in hosts]}
+
+    @app.get("/api/v1/network-scan/hosts/{ip}")
+    async def net_scan_get_host(request: Request, ip: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not net_scan:
+            raise HTTPException(503, "Network scan not enabled")
+        hosts = net_scan.list_hosts(ip=ip)
+        if not hosts:
+            raise HTTPException(404, "Host not found")
+        return hosts[0].to_dict()
+
+    @app.post("/api/v1/network-scan/hosts/{ip}/mark-known")
+    async def net_scan_mark_host_known(request: Request, ip: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not net_scan:
+            raise HTTPException(503, "Network scan not enabled")
+        body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+        node_id = body.get("node_id", "") if isinstance(body, dict) else ""
+        ok = net_scan.mark_host_in_itam(ip, node_id=node_id)
+        if not ok:
+            raise HTTPException(404, "Host not found")
+        return {"ok": True, "ip": ip}
+
+    @app.get("/api/v1/network-scan/findings")
+    async def net_scan_list_findings(
+        request: Request,
+        severity: str | None = None,
+        host: str | None = None,
+        scanner: str | None = None,
+        suppressed: bool | None = None,
+    ) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not net_scan:
+            raise HTTPException(503, "Network scan not enabled")
+        findings = net_scan.list_findings(
+            severity=severity, host=host, scanner=scanner, suppressed=suppressed
+        )
+        return {"findings": [f.to_dict() for f in findings]}
+
+    @app.post("/api/v1/network-scan/findings/{finding_id}/suppress")
+    async def net_scan_suppress_finding(request: Request, finding_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not net_scan:
+            raise HTTPException(503, "Network scan not enabled")
+        ok = net_scan.suppress_finding(finding_id)
+        if not ok:
+            raise HTTPException(404, "Finding not found")
+        return {"ok": True, "finding_id": finding_id}
+
+    @app.delete("/api/v1/network-scan/findings/{finding_id}/suppress")
+    async def net_scan_unsuppress_finding(request: Request, finding_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not net_scan:
+            raise HTTPException(503, "Network scan not enabled")
+        ok = net_scan.unsuppress_finding(finding_id)
+        if not ok:
+            raise HTTPException(404, "Finding not found")
+        return {"ok": True, "finding_id": finding_id}
+
+    @app.get("/api/v1/network-scan/results")
+    async def net_scan_list_results(request: Request,
+                                     limit: int = 20) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not net_scan:
+            raise HTTPException(503, "Network scan not enabled")
+        return {"results": [r.to_dict() for r in net_scan.list_results(limit=limit)]}
+
+    # ── Master key store ───────────────────────────────────────────────────────
+
+    def _ks() -> KeyStore:
+        if not key_store:
+            raise HTTPException(503, "Key store not enabled")
+        return key_store
+
+    class KeyInitRequest(BaseModel):
+        method:       str  = "password"
+        password:     str  = ""
+        confirm_none: bool = False
+
+    class KeyUnlockRequest(BaseModel):
+        method:   str        = "password"
+        password: str        = ""
+        words:    list[str]  = []
+
+    class KeyChangeMethodRequest(BaseModel):
+        method:       str  = "password"
+        password:     str  = ""
+        confirm_none: bool = False
+
+    class KeyInjectRequest(BaseModel):
+        key_b64: str
+        ttl:     int = 3600
+
+    @app.get("/api/v1/keys/status")
+    async def keys_status(request: Request) -> dict[str, Any]:
+        """Key store state — no sensitive material returned."""
+        _require_scope(request, SCOPE_READ)
+        return _ks().get_status()
+
+    @app.post("/api/v1/keys/init")
+    async def keys_init(request: Request, body: KeyInitRequest) -> dict[str, Any]:
+        """
+        First-time key setup.  Idempotent only if called before any blob exists.
+        Returns BIP39 words if method=export (display once, store securely).
+        """
+        _require_scope(request, SCOPE_ADMIN)
+        ks = _ks()
+        if ks.get_status()["has_blob"]:
+            raise HTTPException(409, "Key already initialised — use change-method to rotate")
+        try:
+            method = BackupMethod(body.method)
+        except ValueError:
+            raise HTTPException(400, f"Unknown method: {body.method}")
+
+        if method == BackupMethod.PASSWORD:
+            if not body.password:
+                raise HTTPException(400, "password required for method=password")
+            await ks.init_password(body.password)
+            return {"ok": True, "method": "password", "words": None}
+
+        elif method == BackupMethod.EXPORT:
+            words = await ks.init_export()
+            return {"ok": True, "method": "export", "words": words,
+                    "warning": "These 24 words ARE your master key. Store them like cash — they cannot be recovered if lost."}
+
+        elif method == BackupMethod.NONE:
+            if not body.confirm_none:
+                raise HTTPException(400, "Set confirm_none=true to acknowledge key loss on restart")
+            await ks.init_none(confirm=True)
+            return {"ok": True, "method": "none", "words": None,
+                    "warning": "Ephemeral key — all encrypted data is lost on controller restart."}
+
+        raise HTTPException(400, f"Unsupported method: {body.method}")
+
+    @app.post("/api/v1/keys/unlock")
+    async def keys_unlock(request: Request, body: KeyUnlockRequest) -> dict[str, Any]:
+        """Unlock master key from password or BIP39 words."""
+        _require_scope(request, SCOPE_ADMIN)
+        ks = _ks()
+        try:
+            if body.method == "password":
+                ok = await ks.unlock_password(body.password)
+            elif body.method == "export":
+                ok = await ks.unlock_export(body.words)
+            else:
+                raise HTTPException(400, f"Unknown unlock method: {body.method}")
+        except UnlockRateLimitedError as exc:
+            raise HTTPException(429, f"Too many failed attempts — retry in {int(exc.retry_after - __import__('time').monotonic())}s")
+        except KeyNotInitialisedError:
+            raise HTTPException(409, "Key store not initialised — call /keys/init first")
+
+        if not ok:
+            status = ks.get_status()
+            remaining = ks.MAX_ATTEMPTS - status["failed_attempts"]
+            raise HTTPException(401, f"Wrong credentials — {max(0, remaining)} attempts remaining")
+
+        return {"ok": True, "state": ks.get_status()["state"]}
+
+    @app.post("/api/v1/keys/lock")
+    async def keys_lock(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        _ks().lock()
+        return {"ok": True, "state": "locked"}
+
+    @app.post("/api/v1/keys/export")
+    async def keys_export_words(request: Request) -> dict[str, Any]:
+        """
+        Return the 24 BIP39 recovery words for the current master key.
+        Requires unlocked state.  ADMIN scope.
+        """
+        _require_scope(request, SCOPE_ADMIN)
+        ks = _ks()
+        try:
+            words = ks.export_words()
+        except KeyLockedError as exc:
+            raise HTTPException(423, str(exc))
+        return {"words": words,
+                "warning": "These words give full access to all encrypted data. Never share them."}
+
+    @app.post("/api/v1/keys/change-method")
+    async def keys_change_method(request: Request,
+                                  body: KeyChangeMethodRequest) -> dict[str, Any]:
+        """
+        Change backup method.  Requires unlocked state.
+        Returns BIP39 words if switching to export method.
+        """
+        _require_scope(request, SCOPE_ADMIN)
+        ks = _ks()
+        try:
+            method = BackupMethod(body.method)
+        except ValueError:
+            raise HTTPException(400, f"Unknown method: {body.method}")
+        try:
+            words = await ks.change_method(method, password=body.password,
+                                            confirm_none=body.confirm_none)
+        except KeyLockedError as exc:
+            raise HTTPException(423, str(exc))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+
+        result: dict[str, Any] = {"ok": True, "method": method.value}
+        if words:
+            result["words"] = words
+            result["warning"] = "These 24 words ARE your master key. Store them now — they cannot be shown again."
+        return result
+
+    @app.post("/api/v1/keys/inject")
+    async def keys_inject(request: Request, body: KeyInjectRequest) -> dict[str, Any]:
+        """
+        BYOK session injection (cloud controller Pro).
+        Injects a master key for a bounded session.  Memory-only — never persisted.
+        Requires ADMIN scope.
+        """
+        _require_scope(request, SCOPE_ADMIN)
+        ks = _ks()
+        try:
+            key_bytes = __import__("base64").b64decode(body.key_b64)
+        except Exception:
+            raise HTTPException(400, "key_b64 must be valid base64")
+        if len(key_bytes) != 32:
+            raise HTTPException(400, "Injected key must decode to exactly 32 bytes")
+
+        actor = getattr(request.state, "user", "unknown")
+        source_ip = request.client.host if request.client else "unknown"
+        session = await ks.inject(key_bytes, ttl=body.ttl,
+                                   actor=actor, source_ip=source_ip)
+        return {"ok": True, "session": session.to_dict()}
+
+    @app.post("/api/v1/keys/evict")
+    async def keys_evict(request: Request) -> dict[str, Any]:
+        """Evict BYOK injected session."""
+        _require_scope(request, SCOPE_ADMIN)
+        _ks().evict_injected()
+        return {"ok": True}
+
+    # ── DLP ──────────────────────────────────────────────────────────────────────
+
+    class DLPRuleRequest(BaseModel):
+        name: str
+        pattern_type: str
+        custom_pattern: str = ""
+        action: str = "alert"
+        severity: str = "high"
+        scopes: list[str] = list(("file", "email", "cloud", "clipboard", "usb"))
+        enabled: bool = True
+        min_matches: int = 1
+        validate_matches: bool = True
+
+    class DLPConfigPatchRequest(BaseModel):
+        file_scan_interval: int | None = None
+        itsm_ticket_severity: str | None = None
+        email_scan_enabled: bool | None = None
+        cloud_scan_enabled: bool | None = None
+        cloud_scan_interval: int | None = None
+        usb_alert_enabled: bool | None = None
+        quarantine_path: str | None = None
+
+    @app.get("/api/v1/dlp/status")
+    async def dlp_status(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not dlp:
+            raise HTTPException(503, "DLP not enabled")
+        return dlp.status()
+
+    @app.get("/api/v1/dlp/config")
+    async def dlp_get_config(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not dlp:
+            raise HTTPException(503, "DLP not enabled")
+        return dlp.get_config().to_dict()
+
+    @app.patch("/api/v1/dlp/config")
+    async def dlp_patch_config(request: Request,
+                                body: DLPConfigPatchRequest) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not dlp:
+            raise HTTPException(503, "DLP not enabled")
+        cfg = dlp.get_config()
+        for field_name, val in body.model_dump(exclude_none=True).items():
+            actual = "validate" if field_name == "validate_matches" else field_name
+            if hasattr(cfg, actual):
+                setattr(cfg, actual, val)
+        dlp.set_config(cfg)
+        return cfg.to_dict()
+
+    @app.get("/api/v1/dlp/policies")
+    async def dlp_list_policies(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not dlp:
+            raise HTTPException(503, "DLP not enabled")
+        return {"policies": [p.to_dict() for p in dlp.list_policies()]}
+
+    @app.post("/api/v1/dlp/policies")
+    async def dlp_create_policy(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not dlp:
+            raise HTTPException(503, "DLP not enabled")
+        body = await request.json()
+        policy = dlp.create_policy(
+            name=body.get("name", "New Policy"),
+            description=body.get("description", ""),
+        )
+        return policy.to_dict()
+
+    @app.post("/api/v1/dlp/policies/default")
+    async def dlp_create_default_policy(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not dlp:
+            raise HTTPException(503, "DLP not enabled")
+        policy = dlp.create_default_policy()
+        return policy.to_dict()
+
+    @app.get("/api/v1/dlp/policies/{policy_id}")
+    async def dlp_get_policy(request: Request, policy_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not dlp:
+            raise HTTPException(503, "DLP not enabled")
+        p = dlp.get_policy(policy_id)
+        if not p:
+            raise HTTPException(404, "Policy not found")
+        return p.to_dict()
+
+    @app.patch("/api/v1/dlp/policies/{policy_id}")
+    async def dlp_update_policy(request: Request, policy_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not dlp:
+            raise HTTPException(503, "DLP not enabled")
+        body = await request.json()
+        p = dlp.update_policy(policy_id, **{k: v for k, v in body.items()
+                                             if k not in ("id", "rules")})
+        if not p:
+            raise HTTPException(404, "Policy not found")
+        return p.to_dict()
+
+    @app.delete("/api/v1/dlp/policies/{policy_id}")
+    async def dlp_delete_policy(request: Request, policy_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not dlp:
+            raise HTTPException(503, "DLP not enabled")
+        if not dlp.delete_policy(policy_id):
+            raise HTTPException(404, "Policy not found")
+        return {"ok": True}
+
+    @app.post("/api/v1/dlp/policies/{policy_id}/rules")
+    async def dlp_add_rule(request: Request, policy_id: str,
+                            body: DLPRuleRequest) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not dlp:
+            raise HTTPException(503, "DLP not enabled")
+        import uuid as _uuid
+        rule = DLPRule(
+            id=str(_uuid.uuid4()), name=body.name,
+            pattern_type=body.pattern_type,
+            custom_pattern=body.custom_pattern,
+            action=body.action, severity=body.severity,
+            scopes=body.scopes, enabled=body.enabled,
+            min_matches=body.min_matches, validate=body.validate_matches,
+        )
+        p = dlp.add_rule(policy_id, rule)
+        if not p:
+            raise HTTPException(404, "Policy not found")
+        return p.to_dict()
+
+    @app.patch("/api/v1/dlp/policies/{policy_id}/rules/{rule_id}")
+    async def dlp_update_rule(request: Request, policy_id: str,
+                               rule_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not dlp:
+            raise HTTPException(503, "DLP not enabled")
+        body = await request.json()
+        rule = dlp.update_rule(policy_id, rule_id,
+                                **{k: v for k, v in body.items() if k != "id"})
+        if not rule:
+            raise HTTPException(404, "Policy or rule not found")
+        return rule.to_dict()
+
+    @app.delete("/api/v1/dlp/policies/{policy_id}/rules/{rule_id}")
+    async def dlp_remove_rule(request: Request, policy_id: str,
+                               rule_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not dlp:
+            raise HTTPException(503, "DLP not enabled")
+        if not dlp.remove_rule(policy_id, rule_id):
+            raise HTTPException(404, "Policy or rule not found")
+        return {"ok": True}
+
+    @app.get("/api/v1/dlp/incidents")
+    async def dlp_list_incidents(
+        request: Request,
+        scope: str | None = None,
+        severity: str | None = None,
+        resolved: bool | None = None,
+        node_id: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not dlp:
+            raise HTTPException(503, "DLP not enabled")
+        incidents = dlp.list_incidents(
+            scope=scope, severity=severity, resolved=resolved,
+            node_id=node_id, limit=limit,
+        )
+        return {"incidents": [i.to_dict() for i in incidents]}
+
+    @app.get("/api/v1/dlp/incidents/{incident_id}")
+    async def dlp_get_incident(request: Request, incident_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not dlp:
+            raise HTTPException(503, "DLP not enabled")
+        i = dlp.get_incident(incident_id)
+        if not i:
+            raise HTTPException(404, "Incident not found")
+        return i.to_dict()
+
+    @app.post("/api/v1/dlp/incidents/{incident_id}/acknowledge")
+    async def dlp_ack_incident(request: Request, incident_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not dlp:
+            raise HTTPException(503, "DLP not enabled")
+        if not dlp.acknowledge_incident(incident_id):
+            raise HTTPException(404, "Incident not found")
+        return {"ok": True}
+
+    @app.post("/api/v1/dlp/incidents/{incident_id}/resolve")
+    async def dlp_resolve_incident(request: Request, incident_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not dlp:
+            raise HTTPException(503, "DLP not enabled")
+        if not dlp.resolve_incident(incident_id):
+            raise HTTPException(404, "Incident not found")
+        return {"ok": True}
+
+    @app.post("/api/v1/dlp/scan/file")
+    async def dlp_file_scan(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not dlp:
+            raise HTTPException(503, "DLP not enabled")
+        body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+        paths = body.get("paths") if isinstance(body, dict) else None
+        node_id = body.get("node_id", "") if isinstance(body, dict) else ""
+        return await dlp.run_file_scan(paths=paths, node_id=node_id)
+
+    @app.post("/api/v1/dlp/scan/content")
+    async def dlp_scan_content(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not dlp:
+            raise HTTPException(503, "DLP not enabled")
+        body = await request.json()
+        text = body.get("text", "")
+        scope = body.get("scope", "file")
+        source = body.get("source", "manual")
+        node_id = body.get("node_id", "")
+        user_email = body.get("user_email", "")
+        incidents = await dlp.scan_content(
+            text, scope=scope, source=source,
+            node_id=node_id, user_email=user_email,
+        )
+        return {"incidents": [i.to_dict() for i in incidents]}
+
+    @app.post("/api/v1/dlp/usb-event")
+    async def dlp_usb_event(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_ADMIN)
+        if not dlp:
+            raise HTTPException(503, "DLP not enabled")
+        body = await request.json()
+        node_id = body.get("node_id", "")
+        device_name = body.get("device_name", "unknown")
+        user_email = body.get("user_email", "")
+        incidents = await dlp.handle_usb_event(
+            node_id=node_id, device_name=device_name, user_email=user_email
+        )
+        return {"incidents": [i.to_dict() for i in incidents]}
 
     # Static files — mounted last so they don't shadow API routes
     static_dir = Path(__file__).parent / "static"

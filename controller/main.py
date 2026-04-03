@@ -85,7 +85,10 @@ from cloud_backup import CloudBackupManager
 from itsm import ITSMManager
 from license_manager import LicenseManager
 from job_queue import JobQueue
+from key_store import KeyStore
 from mdm_bridge import MDMBridgeManager, MDMConfig
+from network_scan import NetworkScanManager, NetworkScanConfig
+from dlp import DLPManager, DLPConfig
 from service_proxy import ServiceProxyManager
 from idp import IdentityProvider, IdPConfig
 from sharing import SharingManager
@@ -431,6 +434,18 @@ async def run(config: Config) -> None:
     mdm_mgr = MDMBridgeManager(mdm_data_dir, event_queue=state.events)
     await mdm_mgr.start()
 
+    # Network scanning (nmap + nuclei + OpenVAS + Nessus)
+    scan_data_dir = Path(__file__).parent / "scan_data"
+    net_scan_mgr = NetworkScanManager(scan_data_dir, event_queue=state.events)
+    net_scan_mgr.itsm = itsm_mgr
+    await net_scan_mgr.start()
+
+    # DLP — data loss prevention
+    dlp_data_dir = Path(__file__).parent / "dlp_data"
+    dlp_mgr = DLPManager(dlp_data_dir, event_queue=state.events)
+    dlp_mgr.itsm = itsm_mgr
+    await dlp_mgr.start()
+
     # IoT VLAN management
     from iot_network import IoTNetworkManager
     iot_mgr = IoTNetworkManager()
@@ -439,6 +454,10 @@ async def run(config: Config) -> None:
     # Job queue — persistent async task queue for agent/node operations
     job_queue = JobQueue(state_ref=state)
     await job_queue.start()
+
+    # Master key store — memory-only after unlock; wraps all ZK subkeys
+    key_store = KeyStore(controller_id=config.controller_id if hasattr(config, "controller_id") else "")
+    await key_store.start()
 
     # Service proxy
     services_path = Path(__file__).parent / "services.json"
@@ -516,7 +535,7 @@ async def run(config: Config) -> None:
         transcription_mgr = LiveTranscriptionManager(connect=connect)
 
     # Build the FastAPI app — all managers must be created before this point
-    app = build_app(state, scenarios, streams, audio, controls, rgb_out, motion, bt, kdeconnect, wifi_audio, captures, paste_typer, kbd_mgr, macro_mgr, sched, notifier, recorder, net_health, ocr_triggers, auto_engine, metrics_collector, screen_mgr, codec_mgr=codec_mgr, camera_mgr=camera_mgr, obs_studio=obs_studio, stream_router=stream_router, guac_mgr=guac_mgr, provision_mgr=provision_mgr, connect=connect, mesh_ca=mesh_ca, sess_mgr=sess_mgr, room_correction=room_corr, testbench=testbench, agent_engine=agent_engine, test_runner=test_runner, auth_config=auth_cfg, user_manager=user_mgr, service_proxy=svc_proxy, idp=idp_instance, sharing=sharing_mgr, ext_publish=ext_pub, node_reconciler=reconciler, update_mgr=update_mgr, transcription_mgr=transcription_mgr, discovery=discovery, doorbell_mgr=doorbell_mgr, alert_mgr=alert_mgr, vaultwarden=vault_mgr, email_security=email_sec, cloud_backup=cloud_backup, iot=iot_mgr, wg=wg_mgr, itsm=itsm_mgr, license_mgr=license_mgr, mdm=mdm_mgr, job_queue=job_queue)
+    app = build_app(state, scenarios, streams, audio, controls, rgb_out, motion, bt, kdeconnect, wifi_audio, captures, paste_typer, kbd_mgr, macro_mgr, sched, notifier, recorder, net_health, ocr_triggers, auto_engine, metrics_collector, screen_mgr, codec_mgr=codec_mgr, camera_mgr=camera_mgr, obs_studio=obs_studio, stream_router=stream_router, guac_mgr=guac_mgr, provision_mgr=provision_mgr, connect=connect, mesh_ca=mesh_ca, sess_mgr=sess_mgr, room_correction=room_corr, testbench=testbench, agent_engine=agent_engine, test_runner=test_runner, auth_config=auth_cfg, user_manager=user_mgr, service_proxy=svc_proxy, idp=idp_instance, sharing=sharing_mgr, ext_publish=ext_pub, node_reconciler=reconciler, update_mgr=update_mgr, transcription_mgr=transcription_mgr, discovery=discovery, doorbell_mgr=doorbell_mgr, alert_mgr=alert_mgr, vaultwarden=vault_mgr, email_security=email_sec, cloud_backup=cloud_backup, iot=iot_mgr, wg=wg_mgr, itsm=itsm_mgr, license_mgr=license_mgr, mdm=mdm_mgr, job_queue=job_queue, net_scan=net_scan_mgr, key_store=key_store, dlp=dlp_mgr)
 
     uv_config = uvicorn.Config(
         app,
@@ -697,7 +716,10 @@ async def run(config: Config) -> None:
     await cloud_backup.stop()
     await license_mgr.stop()
     await job_queue.stop()
+    await key_store.stop()
     await mdm_mgr.stop()
+    await net_scan_mgr.stop()
+    await dlp_mgr.stop()
     if front_panel:
         await front_panel.stop()
 
