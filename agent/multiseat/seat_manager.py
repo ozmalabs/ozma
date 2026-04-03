@@ -293,22 +293,36 @@ class SeatManager:
             self._seat_tasks.append(task)
 
         # Start monitoring server
-        self._monitoring = MonitoringServer(self)
-        await self._monitoring.start()
+        print("[OZMA DEBUG] Starting monitoring server...", flush=True)
+        try:
+            self._monitoring = MonitoringServer(self)
+            await self._monitoring.start()
+            print("[OZMA DEBUG] Monitoring server running on port 7399", flush=True)
+        except Exception as e:
+            print(f"[OZMA DEBUG] Monitoring server failed: {e}", flush=True)
+            log.warning("Monitoring server failed: %s", e)
 
         # Start game launcher (discovers game libraries in background)
-        self._game_launcher = GameLauncher(self)
-        asyncio.create_task(
-            self._game_launcher.discover_games(),
-            name="game-discovery",
-        )
+        print("[OZMA DEBUG] Starting game launcher...", flush=True)
+        try:
+            self._game_launcher = GameLauncher(self)
+        except Exception as e:
+            print(f"[OZMA DEBUG] Game launcher init failed: {e}", flush=True)
+            log.warning("Game launcher init failed: %s", e)
 
         # Start USB hotplug monitor
-        self._hotplug = HotplugMonitor(self)
-        await self._hotplug.start()
+        print("[OZMA DEBUG] Starting hotplug monitor...", flush=True)
+        try:
+            self._hotplug = HotplugMonitor(self)
+            await self._hotplug.start()
+            print("[OZMA DEBUG] Hotplug monitor running", flush=True)
+        except Exception as e:
+            print(f"[OZMA DEBUG] Hotplug monitor failed: {e}", flush=True)
+            log.warning("Hotplug monitor failed: %s", e)
 
         log.info("SeatManager running: %d seats on %s",
                  len(self._seats), self._machine_name)
+        print(f"[OZMA DEBUG] SeatManager fully started — {len(self._seats)} seats", flush=True)
 
         # Start config WebSocket listener for dynamic seat changes from controller
         if self._controller_url:
