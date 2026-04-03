@@ -86,6 +86,7 @@ from service_proxy import ServiceProxyManager
 from idp import IdentityProvider, IdPConfig
 from sharing import SharingManager
 from external_publish import ExternalPublishManager
+from wg_peering import WGPeeringManager
 from node_reconciler import NodeReconciler
 from alerts import AlertManager
 from doorbell import DoorbellManager
@@ -410,6 +411,11 @@ async def run(config: Config) -> None:
     cloud_backup = CloudBackupManager(cloud_backup_dir, mesh_key_bytes)
     await cloud_backup.start()
 
+    # IoT VLAN management
+    from iot_network import IoTNetworkManager
+    iot_mgr = IoTNetworkManager()
+    await iot_mgr.start()
+
     # Service proxy
     services_path = Path(__file__).parent / "services.json"
     svc_proxy = ServiceProxyManager(services_path)
@@ -486,7 +492,7 @@ async def run(config: Config) -> None:
         transcription_mgr = LiveTranscriptionManager(connect=connect)
 
     # Build the FastAPI app — all managers must be created before this point
-    app = build_app(state, scenarios, streams, audio, controls, rgb_out, motion, bt, kdeconnect, wifi_audio, captures, paste_typer, kbd_mgr, macro_mgr, sched, notifier, recorder, net_health, ocr_triggers, auto_engine, metrics_collector, screen_mgr, codec_mgr=codec_mgr, camera_mgr=camera_mgr, obs_studio=obs_studio, stream_router=stream_router, guac_mgr=guac_mgr, provision_mgr=provision_mgr, connect=connect, mesh_ca=mesh_ca, sess_mgr=sess_mgr, room_correction=room_corr, testbench=testbench, agent_engine=agent_engine, test_runner=test_runner, auth_config=auth_cfg, user_manager=user_mgr, service_proxy=svc_proxy, idp=idp_instance, sharing=sharing_mgr, ext_publish=ext_pub, node_reconciler=reconciler, update_mgr=update_mgr, transcription_mgr=transcription_mgr, discovery=discovery, doorbell_mgr=doorbell_mgr, alert_mgr=alert_mgr, vaultwarden=vault_mgr, email_security=email_sec, cloud_backup=cloud_backup)
+    app = build_app(state, scenarios, streams, audio, controls, rgb_out, motion, bt, kdeconnect, wifi_audio, captures, paste_typer, kbd_mgr, macro_mgr, sched, notifier, recorder, net_health, ocr_triggers, auto_engine, metrics_collector, screen_mgr, codec_mgr=codec_mgr, camera_mgr=camera_mgr, obs_studio=obs_studio, stream_router=stream_router, guac_mgr=guac_mgr, provision_mgr=provision_mgr, connect=connect, mesh_ca=mesh_ca, sess_mgr=sess_mgr, room_correction=room_corr, testbench=testbench, agent_engine=agent_engine, test_runner=test_runner, auth_config=auth_cfg, user_manager=user_mgr, service_proxy=svc_proxy, idp=idp_instance, sharing=sharing_mgr, ext_publish=ext_pub, node_reconciler=reconciler, update_mgr=update_mgr, transcription_mgr=transcription_mgr, discovery=discovery, doorbell_mgr=doorbell_mgr, alert_mgr=alert_mgr, vaultwarden=vault_mgr, email_security=email_sec, cloud_backup=cloud_backup, iot=iot_mgr, wg=wg_mgr)
 
     uv_config = uvicorn.Config(
         app,
@@ -526,6 +532,10 @@ async def run(config: Config) -> None:
     )
     await discovery.announce_controller(ctrl_id, api_port=config.api_port)
 
+    # WireGuard inter-controller peering
+    wg_mgr = WGPeeringManager(controller_id=ctrl_id, api_port=config.api_port)
+    await wg_mgr.start()
+
     # Auto-link LAN peer controllers discovered via mDNS
     async def _on_peer_found(info: dict) -> None:
         if not sharing:
@@ -549,6 +559,11 @@ async def run(config: Config) -> None:
             peer.auto_discovered = True
             await state.events.put({"type": "peer.discovered", "peer": peer.to_dict()})
             log.info("Auto-linked LAN peer: %s @ %s:%d", info["id"], info["host"], info["api_port"])
+            # Initiate WireGuard peering with the newly discovered controller
+            asyncio.create_task(
+                wg_mgr.peer_with(info["host"], info["api_port"]),
+                name=f"wg-peer-{info['id'][:8]}",
+            )
 
     async def _on_peer_lost(ctrl_id: str) -> None:
         if not sharing:

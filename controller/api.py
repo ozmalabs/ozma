@@ -75,6 +75,7 @@ from iot_network import (
     IoTNetworkManager, IoTDevice, DeviceCategory, InternetAccess,
     VLANConfig, OnboardingSession,
 )
+from wg_peering import WGPeeringManager, WGPeer
 
 log = logging.getLogger("ozma.api")
 
@@ -139,7 +140,7 @@ class DirectRegisterRequest(BaseModel):
     frigate_port: str = ""     # Frigate API port (default 5000)
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None) -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None) -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -4621,6 +4622,77 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(503, "IoT network manager not enabled")
         count = await iot.sync_leases()
         return {"updated": count}
+
+    # ── WireGuard peering ──────────────────────────────────────────────────────
+
+    class WGPeerRequest(BaseModel):
+        controller_id: str
+        public_key:    str
+        endpoint:      str
+        overlay_ip:    str = ""
+        api_port:      int = 7380
+
+    @app.get("/api/v1/wg/info")
+    async def wg_info(request: Request) -> dict:
+        """Return our WireGuard public key + endpoint for peer exchange."""
+        # Note: intentionally unauthenticated — public key exchange must work
+        # before auth is bootstrapped. The public key is not a secret.
+        if not wg:
+            raise HTTPException(503, "WireGuard peering not enabled")
+        return wg.get_info()
+
+    @app.post("/api/v1/wg/peer")
+    async def wg_add_peer(body: WGPeerRequest, request: Request) -> dict:
+        """Receive a peer's WG info and add them. Called by the initiating controller."""
+        # Allow from WireGuard overlay (already peered) or admin JWT
+        if not wg:
+            raise HTTPException(503, "WireGuard peering not enabled")
+        peer = wg.get_peer(body.controller_id)
+        if peer:
+            # Already peered — return 409 (initiator can treat as success)
+            return {"status": "already_peered", "overlay_ip": peer.overlay_ip}
+        peer = await wg.add_peer(
+            controller_id=body.controller_id,
+            public_key=body.public_key,
+            endpoint=body.endpoint,
+            overlay_ip=body.overlay_ip,
+        )
+        await state.events.put({"type": "wg.peered", "peer": peer.to_dict()})
+        return {"status": "peered", "overlay_ip": peer.overlay_ip,
+                "our_overlay_ip": wg.overlay_ip}
+
+    @app.get("/api/v1/wg/status")
+    async def wg_status(request: Request) -> dict:
+        _require_scope(request, SCOPE_READ)
+        if not wg:
+            raise HTTPException(503, "WireGuard peering not enabled")
+        return wg.status()
+
+    @app.delete("/api/v1/wg/peer/{controller_id}")
+    async def wg_remove_peer(controller_id: str, request: Request) -> dict:
+        _require_scope(request, SCOPE_ADMIN)
+        if not wg:
+            raise HTTPException(503, "WireGuard peering not enabled")
+        if not await wg.remove_peer(controller_id):
+            raise HTTPException(404, "WG peer not found")
+        await state.events.put({"type": "wg.unpeered", "controller_id": controller_id})
+        return {"ok": True}
+
+    @app.post("/api/v1/wg/peer/{controller_id}/initiate")
+    async def wg_initiate_peering(controller_id: str, request: Request) -> dict:
+        """Manually trigger WG peering with an already-linked peer controller."""
+        _require_scope(request, SCOPE_ADMIN)
+        if not wg:
+            raise HTTPException(503, "WireGuard peering not enabled")
+        if not sharing:
+            raise HTTPException(503, "Sharing not enabled")
+        peer = sharing.get_peer(controller_id)
+        if not peer:
+            raise HTTPException(404, "Peer controller not found")
+        wg_peer = await wg.peer_with(peer.host, peer.port)
+        if not wg_peer:
+            raise HTTPException(502, "WG peering handshake failed")
+        return wg_peer.to_dict()
 
     # Static files — mounted last so they don't shadow API routes
     static_dir = Path(__file__).parent / "static"
