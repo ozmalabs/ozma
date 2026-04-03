@@ -164,12 +164,14 @@ class MeshCA:
         """Load registry from disk."""
         data = json.loads(self._registry_path.read_text())
 
-        ca_priv_hex = data.get("mesh_ca", {}).get("private_key_encrypted", "")
-        ca_pub_hex = data.get("mesh_ca", {}).get("public_key", "")
+        ca_data = data.get("mesh_ca", {})
+        ca_priv_hex = ca_data.get("private_key_encrypted", "")
+        ca_priv_plain = ca_data.get("private_key", "")
+        ca_pub_hex = ca_data.get("public_key", "")
 
-        if ca_priv_hex and ca_pub_hex:
+        if ca_pub_hex and (ca_priv_hex or ca_priv_plain):
             ca_pub = bytes.fromhex(ca_pub_hex)
-            if passphrase and _HAS_NACL:
+            if ca_priv_hex and passphrase and _HAS_NACL:
                 # Decrypt CA private key
                 encrypted = bytes.fromhex(ca_priv_hex)
                 key = nacl.pwhash.argon2id.kdf(
@@ -181,14 +183,12 @@ class MeshCA:
                 box = nacl.secret.SecretBox(key)
                 ca_priv = box.decrypt(encrypted[16:])
                 self._ca_keypair = IdentityKeyPair(public_key=ca_pub, private_key=ca_priv)
-            else:
+            elif ca_priv_plain:
                 # No passphrase — load plaintext (development only)
-                ca_priv_plain = data.get("mesh_ca", {}).get("private_key", "")
-                if ca_priv_plain:
-                    self._ca_keypair = IdentityKeyPair(
-                        public_key=ca_pub,
-                        private_key=bytes.fromhex(ca_priv_plain),
-                    )
+                self._ca_keypair = IdentityKeyPair(
+                    public_key=ca_pub,
+                    private_key=bytes.fromhex(ca_priv_plain),
+                )
 
         # Controller identity
         ctrl = data.get("controller", {})
