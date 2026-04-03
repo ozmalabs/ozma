@@ -127,6 +127,13 @@ class SeatManager:
         """
         log.info("SeatManager starting on %s (%s)", self._machine_name, platform.system())
 
+        try:
+            await self._start_inner()
+        except Exception as e:
+            log.error("SeatManager startup failed: %s", e, exc_info=True)
+            raise
+
+    async def _start_inner(self) -> None:
         # Initialize platform-specific backends
         self._init_backends()
 
@@ -138,15 +145,27 @@ class SeatManager:
             log.info("No virtual display driver — extra seats need physical displays or dummy plugs")
 
         # Discover GPUs and create encoder allocator
-        await self._gpu_inventory.discover()
+        try:
+            await self._gpu_inventory.discover()
+        except Exception as e:
+            log.warning("GPU discovery failed: %s — continuing without encoder optimization", e)
         self._encoder_allocator = EncoderAllocator(self._gpu_inventory)
 
         # Enumerate displays
-        self._displays = self._display_backend.enumerate()
-        log.info("Found %d displays", len(self._displays))
+        try:
+            self._displays = self._display_backend.enumerate()
+        except Exception as e:
+            log.warning("Display enumeration failed: %s — creating default display", e)
+            self._displays = [DisplayInfo(index=0, name="default", width=1920, height=1080)]
+        log.info("Found %d displays: %s", len(self._displays),
+                 ", ".join(d.name for d in self._displays))
 
         # Enumerate input groups
-        self._input_groups = self._input_backend.enumerate_groups()
+        try:
+            self._input_groups = self._input_backend.enumerate_groups()
+        except Exception as e:
+            log.warning("Input enumeration failed: %s", e)
+            self._input_groups = []
         log.info("Found %d input groups", len(self._input_groups))
 
         # Determine seat count
@@ -219,8 +238,11 @@ class SeatManager:
 
         # Create audio sinks for each seat
         for seat in self._seats:
-            sink = await self._audio_backend.create_sink(seat.name)
-            seat.audio_sink = sink
+            try:
+                sink = await self._audio_backend.create_sink(seat.name)
+                seat.audio_sink = sink
+            except Exception as e:
+                log.warning("Seat %s: audio sink creation failed: %s", seat.name, e)
 
         # Set up per-seat isolation based on profile
         for seat in self._seats:
