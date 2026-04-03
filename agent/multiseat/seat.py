@@ -119,15 +119,16 @@ class Seat:
                 print(f"[SEAT {self.name}] screen capture failed: {e}", flush=True)
                 log.warning("Seat %s: screen capture failed: %s", self.name, e)
 
-        # Start HTTP API
-        print(f"[SEAT {self.name}] start HTTP API on port {self.api_port}...", flush=True)
-        try:
-            await self._start_http()
-        except Exception as e:
-            print(f"[SEAT {self.name}] HTTP API failed: {e}", flush=True)
-            log.warning("Seat %s: HTTP API failed: %s", self.name, e)
-
-        print(f"[SEAT {self.name}] HTTP API running", flush=True)
+        # Start HTTP API (deferred to background to prevent crash blocking startup)
+        print(f"[SEAT {self.name}] deferring HTTP API on port {self.api_port}...", flush=True)
+        async def _safe_http():
+            try:
+                await self._start_http()
+                print(f"[SEAT {self.name}] HTTP API running on port {self.api_port}", flush=True)
+            except Exception as e:
+                print(f"[SEAT {self.name}] HTTP API failed: {e}", flush=True)
+                log.warning("Seat %s: HTTP API failed: %s", self.name, e)
+        asyncio.create_task(_safe_http(), name=f"http-{self.name}")
 
         # Register with controller
         if controller_url:
