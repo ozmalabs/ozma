@@ -17,6 +17,7 @@ Endpoints:
   POST /api/v1/seats/{seat}/stop-game  Stop game on a seat
   GET  /api/v1/seats/{seat}/game   What's running on a seat
   GET  /api/v1/hotplug             Hotplug monitor state
+  GET  /api/v1/isolation            Available backends + per-seat status
   GET  /metrics                    Prometheus text format
   GET  /health                     Health check
 """
@@ -58,6 +59,7 @@ class MonitoringServer:
         app.router.add_post("/api/v1/seats/{seat}/stop-game", self._handle_stop_game)
         app.router.add_get("/api/v1/seats/{seat}/game", self._handle_seat_game)
         app.router.add_get("/api/v1/hotplug", self._handle_hotplug)
+        app.router.add_get("/api/v1/isolation", self._handle_isolation)
         app.router.add_get("/metrics", self._handle_metrics)
         app.router.add_get("/health", self._handle_health)
 
@@ -207,6 +209,10 @@ class MonitoringServer:
                 and seat._screen_proc.returncode is None
             )
 
+            # Isolation context for this seat
+            iso_ctx = self._manager.isolation_manager.get_context(seat.name)
+            isolation_info = iso_ctx.to_dict() if iso_ctx else {"backend": "none"}
+
             seats.append({
                 "name": seat.name,
                 "index": seat.seat_index,
@@ -216,6 +222,7 @@ class MonitoringServer:
                 "encoder": encoder_info,
                 "audio_sink": seat.audio_sink,
                 "input_devices": seat.input_devices,
+                "isolation": isolation_info,
                 "status": "running" if capture_active else "idle",
             })
 
@@ -329,6 +336,10 @@ class MonitoringServer:
         result = hotplug.to_dict()
         result["enabled"] = True
         return web.json_response(result)
+
+    async def _handle_isolation(self, _request: web.Request) -> web.Response:
+        """GET /api/v1/isolation -- available backends and per-seat status."""
+        return web.json_response(self._manager.isolation_manager.to_dict())
 
     async def _handle_metrics(self, _request: web.Request) -> web.Response:
         """GET /metrics -- Prometheus text exposition format."""

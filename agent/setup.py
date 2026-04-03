@@ -12,6 +12,7 @@ setup(
     packages=find_packages(),
     py_modules=["cli", "ozma_desktop_agent", "ozma_agent", "screen_capture",
                 "connect_client", "prometheus_metrics", "service", "tray"],
+    packages=find_packages(),
     install_requires=[
         "aiohttp>=3.8",
         "zeroconf>=0.132",
@@ -21,7 +22,9 @@ setup(
         "gui": ["pystray>=0.19", "Pillow>=9.0"],
         "macos": ["rumps>=0.4", "pyobjc-framework-Quartz>=9.0"],
         "windows": ["pystray>=0.19", "Pillow>=9.0", "dxcam>=0.0.5"],
-        "full": ["numpy>=1.24", "pynacl>=1.5", "pystray>=0.19", "Pillow>=9.0"],
+        "multiseat": ["numpy>=1.24", "aiortc>=1.6", "Pillow>=9.0"],
+        "full": ["numpy>=1.24", "pynacl>=1.5", "pystray>=0.19", "Pillow>=9.0",
+                 "aiortc>=1.6", "dxcam>=0.0.5"],
     },
     entry_points={
         "console_scripts": [

@@ -26,6 +26,7 @@ from .encoder_allocator import EncoderAllocator, EncoderHints
 from .virtual_display import VirtualDisplayManager
 from .game_launcher import GameLauncher
 from .gpu_inventory import GPUInventory
+from .isolation import IsolationManager
 from .hotplug import HotplugMonitor
 from .input_router import InputGroup, InputRouterBackend
 from .audio_backend import SeatAudioBackend
@@ -34,6 +35,11 @@ from .seat import Seat
 from .seat_profiles import SeatProfile, get_profile, WORKSTATION
 
 log = logging.getLogger("ozma.agent.multiseat.seat_manager")
+log_config = logging.getLogger("ozma.agent.multiseat.config")
+
+# Default path for persisted seat config
+_DEFAULT_CONFIG_DIR = Path.home() / ".config" / "ozma"
+_DEFAULT_CONFIG_FILE = _DEFAULT_CONFIG_DIR / "seat_config.json"
 
 
 class SeatManager:
@@ -71,12 +77,15 @@ class SeatManager:
         self._gpu_inventory: GPUInventory = GPUInventory()
         self._encoder_allocator: EncoderAllocator | None = None
         self._game_launcher: GameLauncher | None = None
+        self._isolation_manager: IsolationManager = IsolationManager()
         self._hotplug: HotplugMonitor | None = None
         self._monitoring: MonitoringServer | None = None
         self._vdm: VirtualDisplayManager | None = None
         self._displays: list[DisplayInfo] = []
         self._input_groups: list[InputGroup] = []
         self._stop_event = asyncio.Event()
+        self._config_ws_task: asyncio.Task | None = None
+        self._scaling_lock = asyncio.Lock()  # serialize scale-up/down
 
     @property
     def seats(self) -> list[Seat]:
@@ -93,6 +102,10 @@ class SeatManager:
     @property
     def game_launcher(self) -> GameLauncher | None:
         return self._game_launcher
+
+    @property
+    def isolation_manager(self) -> IsolationManager:
+        return self._isolation_manager
 
     @property
     def hotplug(self) -> HotplugMonitor | None:
@@ -209,6 +222,23 @@ class SeatManager:
             sink = await self._audio_backend.create_sink(seat.name)
             seat.audio_sink = sink
 
+        # Set up per-seat isolation based on profile
+        for seat in self._seats:
+            isolation_name = self._profile.isolation
+            if seat_configs and seat.seat_index < len(seat_configs):
+                isolation_name = seat_configs[seat.seat_index].get(
+                    "isolation", isolation_name,
+                )
+            if isolation_name != "none":
+                try:
+                    ctx = await self._isolation_manager.setup_seat(
+                        seat.name, isolation_name, seat.seat_index,
+                    )
+                    log.info("Seat %s: isolation=%s", seat.name, isolation_name)
+                except (ValueError, RuntimeError) as e:
+                    log.warning("Seat %s: isolation setup failed (%s), using none",
+                                seat.name, e)
+
         # Assign input groups to seats
         self._assign_inputs()
 
@@ -239,6 +269,13 @@ class SeatManager:
         log.info("SeatManager running: %d seats on %s",
                  len(self._seats), self._machine_name)
 
+        # Start config WebSocket listener for dynamic seat changes from controller
+        if self._controller_url:
+            self._config_ws_task = asyncio.create_task(
+                self._connect_config_ws(),
+                name="config-ws",
+            )
+
         # Wait for stop signal
         await self._stop_event.wait()
 
@@ -246,6 +283,15 @@ class SeatManager:
         """Stop all seats and clean up resources."""
         log.info("SeatManager stopping")
         self._stop_event.set()
+
+        # Cancel config WS task
+        if self._config_ws_task:
+            self._config_ws_task.cancel()
+            try:
+                await self._config_ws_task
+            except asyncio.CancelledError:
+                pass
+            self._config_ws_task = None
 
         # Stop hotplug monitor
         if self._hotplug:
@@ -262,6 +308,10 @@ class SeatManager:
         if self._monitoring:
             await self._monitoring.stop()
             self._monitoring = None
+
+        # Tear down per-seat isolation
+        for seat in self._seats:
+            await self._isolation_manager.teardown_seat(seat.name)
 
         # Stop all seats and release encoder sessions
         for seat in self._seats:
@@ -301,6 +351,258 @@ class SeatManager:
         self._seats.clear()
         self._seat_tasks.clear()
         log.info("SeatManager stopped")
+
+    # ── Config WebSocket (controller push) ──────────────────────────────────
+
+    def _node_id(self) -> str:
+        """Build node ID for WebSocket path (matches registration ID)."""
+        return f"{self._machine_name}-seat-0._ozma._udp.local."
+
+    async def _connect_config_ws(self) -> None:
+        """
+        Connect to controller WebSocket for seat config push.
+
+        Reconnects with exponential backoff. On each connect the controller
+        sends current authoritative config, which we apply if different from
+        local state.
+        """
+        try:
+            import aiohttp
+        except ImportError:
+            log_config.warning("aiohttp not available — config push disabled")
+            return
+
+        base = self._controller_url.rstrip("/")
+        # Convert http(s) to ws(s)
+        ws_base = base.replace("https://", "wss://").replace("http://", "ws://")
+        node_id = self._node_id()
+        url = f"{ws_base}/api/v1/nodes/{node_id}/config/ws"
+
+        backoff = 1.0
+        max_backoff = 30.0
+
+        while not self._stop_event.is_set():
+            try:
+                async with aiohttp.ClientSession() as session:
+                    log_config.info("Connecting to config WS: %s", url)
+                    async with session.ws_connect(url, heartbeat=30) as ws:
+                        backoff = 1.0  # reset on successful connect
+                        log_config.info("Config WS connected")
+
+                        async for msg in ws:
+                            if self._stop_event.is_set():
+                                break
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                await self._handle_config_message(msg.data)
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED,
+                                              aiohttp.WSMsgType.ERROR):
+                                break
+
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                log_config.debug("Config WS error: %s", e)
+
+            if self._stop_event.is_set():
+                return
+            log_config.info("Config WS reconnecting in %.0fs", backoff)
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=backoff)
+                return  # stop_event was set
+            except asyncio.TimeoutError:
+                pass
+            backoff = min(backoff * 2, max_backoff)
+
+    async def _handle_config_message(self, raw: str) -> None:
+        """Handle a config message from the controller."""
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            log_config.warning("Invalid config message: %s", raw[:200])
+            return
+
+        msg_type = msg.get("type", "")
+
+        if msg_type == "seat_config":
+            target_seats = msg.get("seats", 1)
+            profiles = msg.get("profiles", [])
+            log_config.info("Received seat config: seats=%d profiles=%s",
+                            target_seats, profiles)
+            await self._apply_seat_config(target_seats, profiles)
+            self._persist_config({"seats": target_seats, "profiles": profiles})
+
+        elif msg_type == "encoder_hint":
+            seat_name = msg.get("seat")
+            gaming_gpu = msg.get("gaming_gpu")
+            if seat_name and gaming_gpu is not None:
+                await self.rebalance_encoders(seat_name, int(gaming_gpu))
+
+        else:
+            log_config.debug("Unknown config message type: %s", msg_type)
+
+    async def _apply_seat_config(self, target_seats: int, profiles: list[str]) -> None:
+        """
+        Scale seats up or down to match target_seats.
+
+        Scaling up creates new seats with virtual displays.
+        Scaling down destroys excess seats gracefully (highest index first).
+        """
+        target_seats = max(1, min(8, target_seats))
+        current = len(self._seats)
+
+        if target_seats == current:
+            log_config.info("Seat count unchanged at %d", current)
+            return
+
+        async with self._scaling_lock:
+            if target_seats > current:
+                await self._scale_up(current, target_seats, profiles)
+            else:
+                await self._scale_down(current, target_seats)
+
+    async def _scale_up(self, current: int, target: int, profiles: list[str]) -> None:
+        """Create additional seats to reach target count."""
+        for i in range(current, target):
+            name = f"{self._machine_name}-seat-{i}"
+            profile_name = profiles[i] if i < len(profiles) else self._profile.name
+            profile = get_profile(profile_name)
+
+            # Create virtual display
+            display: DisplayInfo | None = None
+            if self._display_backend:
+                # Check for unused physical displays first
+                used_indices = {s.display_index for s in self._seats}
+                for d in self._displays:
+                    if d.index not in used_indices:
+                        display = d
+                        break
+                if not display:
+                    display = self._display_backend.create_virtual(
+                        profile.capture_width, profile.capture_height,
+                    )
+                    if display:
+                        self._displays.append(display)
+
+            # Allocate encoder
+            encoder_hints = EncoderHints(
+                resolution=(profile.capture_width, profile.capture_height),
+                fps=profile.capture_fps,
+            )
+            encoder_session = (
+                self._encoder_allocator.allocate(name, encoder_hints)
+                if self._encoder_allocator else None
+            )
+
+            seat = Seat(
+                name=name,
+                seat_index=i,
+                display_index=display.index if display else i,
+                udp_port=self._base_udp_port + i,
+                api_port=self._base_api_port + i,
+                capture_fps=profile.capture_fps,
+                capture_width=profile.capture_width,
+                capture_height=profile.capture_height,
+                encoder_args=encoder_session.ffmpeg_args if encoder_session else [],
+            )
+            seat.display = display
+
+            # Audio sink
+            if self._audio_backend:
+                sink = await self._audio_backend.create_sink(name)
+                seat.audio_sink = sink
+
+            # Set up isolation if profile requests it
+            if profile.isolation != "none":
+                try:
+                    await self._isolation_manager.setup_seat(
+                        name, profile.isolation, i,
+                    )
+                except (ValueError, RuntimeError) as e:
+                    log.warning("Seat %s: isolation setup failed (%s)", name, e)
+
+            self._seats.append(seat)
+
+            # Start seat
+            task = asyncio.create_task(
+                seat.start(self._controller_url),
+                name=f"seat-{name}",
+            )
+            self._seat_tasks.append(task)
+
+            log.info("Scaled up: created seat %s (index=%d)", name, i)
+
+    async def _scale_down(self, current: int, target: int) -> None:
+        """Destroy excess seats (highest index first) to reach target count."""
+        for i in range(current - 1, target - 1, -1):
+            seat = self._seats[i]
+            seat_name = seat.name
+            log.info("Scaling down: destroying seat %s (index=%d)", seat_name, i)
+
+            # Stop game if running
+            if self._game_launcher:
+                await self._game_launcher.stop(seat)
+
+            # Tear down isolation
+            await self._isolation_manager.teardown_seat(seat_name)
+
+            # Stop the seat
+            await seat.stop()
+
+            # Release encoder
+            if self._encoder_allocator:
+                self._encoder_allocator.release(seat_name)
+
+            # Destroy audio sink
+            if self._audio_backend:
+                await self._audio_backend.destroy_sink(seat_name)
+
+            # Destroy virtual display
+            if seat.display and seat.display.virtual and self._display_backend:
+                self._display_backend.destroy_virtual(seat.display)
+                if seat.display in self._displays:
+                    self._displays.remove(seat.display)
+
+            # Cancel task
+            for task in self._seat_tasks:
+                if task.get_name() == f"seat-{seat_name}":
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    self._seat_tasks.remove(task)
+                    break
+
+            self._seats.pop(i)
+            log.info("Scaled down: destroyed seat %s", seat_name)
+
+    # ── Config persistence ───────────────────────────────────────────────────
+
+    def _persist_config(self, config: dict) -> None:
+        """Save seat config to disk for offline restarts."""
+        try:
+            _DEFAULT_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            with open(_DEFAULT_CONFIG_FILE, "w") as f:
+                json.dump(config, f, indent=2)
+            log_config.debug("Persisted seat config to %s", _DEFAULT_CONFIG_FILE)
+        except Exception as e:
+            log_config.warning("Failed to persist seat config: %s", e)
+
+    @staticmethod
+    def load_persisted_config() -> dict | None:
+        """Load persisted seat config from disk. Returns None if not found."""
+        if not _DEFAULT_CONFIG_FILE.exists():
+            return None
+        try:
+            with open(_DEFAULT_CONFIG_FILE) as f:
+                config = json.load(f)
+            if isinstance(config, dict) and "seats" in config:
+                log_config.info("Loaded persisted config: %s", config)
+                return config
+            return None
+        except Exception as e:
+            log_config.warning("Failed to load persisted config: %s", e)
+            return None
 
     def _init_backends(self) -> None:
         """Initialize platform-specific backends."""
@@ -594,6 +896,8 @@ class SeatManager:
             result["hotplug"] = self._hotplug.to_dict()
         if self._vdm:
             result["virtual_display"] = self._vdm.to_dict()
+        if self._isolation_manager:
+            result["isolation"] = self._isolation_manager.to_dict()
         return result
 
 

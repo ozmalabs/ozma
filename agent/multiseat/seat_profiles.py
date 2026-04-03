@@ -2,102 +2,161 @@
 """
 Seat profiles for multi-seat.
 
-Profiles define capture quality, audio, and latency settings per seat
-based on intended usage.
+A profile defines what runs on a seat (launcher), how it's captured
+(quality/latency), and audio settings. The launcher determines what
+the user sees — a full desktop, a game library, a single app, or
+a custom command.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
 class SeatProfile:
     """Configuration profile for a seat."""
     name: str
-    capture_fps: int
-    capture_width: int
-    capture_height: int
-    capture_crf: int          # x264 CRF (lower = better quality)
-    capture_preset: str       # x264 preset
-    audio_channels: int       # 2 = stereo, 6 = 5.1, 8 = 7.1
-    audio_sample_rate: int
-    low_latency: bool         # tune=zerolatency for x264
     description: str
 
+    # ── Launcher ──────────────────────────────────────────────
+    # What runs on this seat's display.
+    launcher: str             # "desktop", "playnite", "lutris", "steam", "app", "custom"
+    launcher_command: str = ""  # for "app"/"custom": the command to run
+    launcher_args: list[str] = field(default_factory=list)
+    launcher_fullscreen: bool = True
+    launcher_env: dict[str, str] = field(default_factory=dict)  # extra env vars
+
+    # ── Capture ───────────────────────────────────────────────
+    capture_fps: int = 30
+    capture_width: int = 1920
+    capture_height: int = 1080
+    capture_crf: int = 25           # x264 CRF (lower = better quality)
+    capture_preset: str = "ultrafast"
+    low_latency: bool = True        # tune=zerolatency
+
+    # ── Audio ─────────────────────────────────────────────────
+    audio_channels: int = 2         # 2 = stereo, 6 = 5.1, 8 = 7.1
+    audio_sample_rate: int = 48000
+
+    # ── Isolation ────────────────────────────────────────────
+    # Per-seat process isolation backend.
+    # "none"         No isolation (display/input separation only)
+    # "user"         Separate Windows user per seat (best, solves single-instance)
+    # "sandboxie"    Sandboxie-Plus sandbox per seat (good, no user accounts)
+    # "appcontainer" Windows AppContainer (lightest, built-in, some games fail)
+    # "namespace"    Linux PID/mount namespaces (unshare)
+    isolation: str = "none"
+
     def to_dict(self) -> dict:
-        return {
+        d = {
             "name": self.name,
+            "description": self.description,
+            "launcher": self.launcher,
             "capture_fps": self.capture_fps,
             "capture_resolution": f"{self.capture_width}x{self.capture_height}",
-            "capture_crf": self.capture_crf,
-            "audio_channels": self.audio_channels,
-            "audio_sample_rate": self.audio_sample_rate,
             "low_latency": self.low_latency,
-            "description": self.description,
+            "audio_channels": self.audio_channels,
         }
+        if self.launcher_command:
+            d["launcher_command"] = self.launcher_command
+        if self.launcher_args:
+            d["launcher_args"] = self.launcher_args
+        if self.launcher_env:
+            d["launcher_env"] = self.launcher_env
+        if self.isolation != "none":
+            d["isolation"] = self.isolation
+        return d
 
+
+# ── Built-in profiles ────────────────────────────────────────────────────
+
+DESKTOP = SeatProfile(
+    name="desktop",
+    description="Full desktop session — user gets a complete desktop environment",
+    launcher="desktop",
+    capture_fps=30,
+    capture_crf=25,
+    low_latency=True,
+)
 
 GAMING = SeatProfile(
     name="gaming",
+    description="Game library (Playnite/Lutris/Steam) — low-latency, 60fps",
+    launcher="playnite",  # auto-detects: playnite → lutris → steam
     capture_fps=60,
-    capture_width=1920,
-    capture_height=1080,
     capture_crf=23,
     capture_preset="ultrafast",
-    audio_channels=2,
-    audio_sample_rate=48000,
     low_latency=True,
-    description="Low-latency gaming: 60fps, fast encode, stereo audio",
 )
 
 WORKSTATION = SeatProfile(
     name="workstation",
+    description="Standard workstation — balanced quality, lower bandwidth",
+    launcher="desktop",
     capture_fps=15,
-    capture_width=1920,
-    capture_height=1080,
     capture_crf=28,
-    capture_preset="ultrafast",
-    audio_channels=2,
-    audio_sample_rate=48000,
     low_latency=False,
-    description="Standard workstation: 15fps, balanced quality",
 )
 
 MEDIA = SeatProfile(
     name="media",
+    description="Media player (Kodi/Jellyfin/Plex) — 30fps, surround audio",
+    launcher="app",
+    launcher_command="kodi",
     capture_fps=30,
-    capture_width=1920,
-    capture_height=1080,
     capture_crf=25,
     capture_preset="fast",
     audio_channels=6,
-    audio_sample_rate=48000,
     low_latency=False,
-    description="Media consumption: 30fps, surround audio",
 )
 
 KIOSK = SeatProfile(
     name="kiosk",
+    description="Single app in fullscreen — locked-down, minimal resources",
+    launcher="app",
+    launcher_command="",  # set via seat config
     capture_fps=10,
     capture_width=1280,
     capture_height=720,
     capture_crf=30,
-    capture_preset="ultrafast",
-    audio_channels=2,
-    audio_sample_rate=44100,
     low_latency=False,
-    description="Kiosk/signage: low bandwidth, minimal resources",
+)
+
+SIGNAGE = SeatProfile(
+    name="signage",
+    description="Digital signage — browser fullscreen to a URL, minimal interaction",
+    launcher="app",
+    launcher_command="chromium",
+    launcher_args=["--kiosk", "--noerrdialogs", "--disable-infobars"],
+    launcher_fullscreen=True,
+    capture_fps=10,
+    capture_width=1920,
+    capture_height=1080,
+    capture_crf=30,
+    low_latency=False,
+)
+
+CUSTOM = SeatProfile(
+    name="custom",
+    description="Custom command — you specify what runs",
+    launcher="custom",
+    capture_fps=30,
+    capture_crf=25,
+    low_latency=True,
 )
 
 PROFILES: dict[str, SeatProfile] = {
+    "desktop": DESKTOP,
     "gaming": GAMING,
     "workstation": WORKSTATION,
     "media": MEDIA,
     "kiosk": KIOSK,
+    "signage": SIGNAGE,
+    "custom": CUSTOM,
 }
 
 
 def get_profile(name: str) -> SeatProfile:
-    """Get a profile by name. Falls back to workstation if not found."""
-    return PROFILES.get(name, WORKSTATION)
+    """Get a profile by name. Falls back to desktop if not found."""
+    return PROFILES.get(name, DESKTOP)

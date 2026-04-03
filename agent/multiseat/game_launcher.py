@@ -1,15 +1,20 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
 """
-Game launcher integration for multi-seat.
+Seat session launcher for multi-seat.
 
-Discovers installed games from Playnite (Windows), Lutris (Linux), and
-Steam (both), and launches them on specific seats with correct
-display/audio/input environment variables.
+Launches sessions on seats based on their profile: full desktop, game
+library (Playnite/Lutris/Steam), single app, kiosk browser, media
+player, or a custom command. Also discovers installed games for the
+game library profiles.
+
+A seat is just an isolated display with input — what runs on it is
+determined by its profile's launcher type.
 
 Usage:
     launcher = GameLauncher(seat_manager)
-    games = await launcher.discover_games()
-    proc = await launcher.launch(games[0], seat)
+    await launcher.launch_seat_session(seat)  # uses seat's profile
+    games = await launcher.discover_games()   # for game library profiles
+    await launcher.launch(games[0], seat)     # launch specific game
     await launcher.stop(seat)
 """
 
@@ -21,6 +26,7 @@ import logging
 import os
 import platform
 import re
+import shutil
 import signal
 import sqlite3
 from dataclasses import dataclass, field
@@ -33,6 +39,8 @@ if TYPE_CHECKING:
     from .seat_manager import SeatManager
 
 log = logging.getLogger("ozma.agent.multiseat.launcher")
+
+_which = shutil.which
 
 
 # ── Data model ────────────────────────────────────────────────────────────────
@@ -506,6 +514,210 @@ class GameLauncher:
 
         all_games.sort(key=lambda g: g.name.lower())
         return all_games
+
+    # ── Seat session launcher ─────────────────────────────────────────────
+    # Launches the appropriate session based on the seat's profile.
+    # A seat profile's `launcher` field determines what runs:
+    #   desktop  → full desktop environment (no-op on existing DE, or start one)
+    #   playnite → Playnite in fullscreen (auto-detects: playnite → lutris → steam)
+    #   lutris   → Lutris
+    #   steam    → Steam Big Picture
+    #   app      → single application from launcher_command
+    #   custom   → arbitrary command from launcher_command
+
+    async def launch_seat_session(self, seat: "Seat") -> asyncio.subprocess.Process | None:
+        """Start the seat's session based on its profile launcher type."""
+        from .seat_profiles import SeatProfile
+        profile: SeatProfile = seat.profile if hasattr(seat, "profile") else None
+        if not profile:
+            log.debug("Seat %s has no profile, skipping session launch", seat.name)
+            return None
+
+        launcher = profile.launcher
+        log.info("Seat %s: starting %s session (profile=%s)", seat.name, launcher, profile.name)
+
+        match launcher:
+            case "desktop":
+                return await self._launch_desktop(seat, profile)
+            case "playnite":
+                return await self._launch_game_library(seat, profile, "playnite")
+            case "lutris":
+                return await self._launch_game_library(seat, profile, "lutris")
+            case "steam":
+                return await self._launch_game_library(seat, profile, "steam")
+            case "app":
+                return await self._launch_app(seat, profile)
+            case "custom":
+                return await self._launch_custom(seat, profile)
+            case _:
+                log.warning("Unknown launcher type: %s", launcher)
+                return None
+
+    async def _launch_desktop(self, seat: "Seat", profile: "SeatProfile") -> asyncio.subprocess.Process | None:
+        """Launch a desktop environment on the seat's display.
+
+        On Linux: if an X/Wayland session is already running on this screen,
+        do nothing. Otherwise start a lightweight session (openbox/xfce).
+        On Windows: desktop is always present — nothing to launch.
+        """
+        system = platform.system()
+        if system == "Windows":
+            log.info("Seat %s: Windows desktop already present", seat.name)
+            return None
+
+        # Linux: check if a window manager is already running on this display
+        display = seat.display.x_screen if seat.display else ":0"
+        env = self._build_launch_env(
+            GameInfo(id="desktop", name="Desktop", platform="", install_path="", source=""),
+            seat,
+        )
+
+        # Try common lightweight WMs/DEs in order
+        for wm in ["openbox-session", "xfce4-session", "startplasma-x11", "gnome-session", "i3"]:
+            if _which(wm):
+                log.info("Seat %s: launching %s on %s", seat.name, wm, display)
+                return await self._spawn_session(wm, [], env, seat)
+
+        log.warning("Seat %s: no desktop environment found", seat.name)
+        return None
+
+    async def _launch_game_library(self, seat: "Seat", profile: "SeatProfile",
+                                    preferred: str) -> asyncio.subprocess.Process | None:
+        """Launch a game library manager on the seat."""
+        system = platform.system()
+        env = self._build_launch_env(
+            GameInfo(id="library", name="Game Library", platform="", install_path="", source=""),
+            seat,
+        )
+
+        if preferred == "playnite" and system == "Windows":
+            for path in [Path(os.environ.get("LOCALAPPDATA", "")) / "Playnite" / "Playnite.FullscreenApp.exe",
+                         Path("C:/Program Files/Playnite/Playnite.FullscreenApp.exe"),
+                         Path("C:/Program Files (x86)/Playnite/Playnite.FullscreenApp.exe")]:
+                if path.exists():
+                    return await self._spawn_session(str(path), [], env, seat)
+            log.warning("Playnite not found, falling back to Steam")
+            preferred = "steam"
+
+        if preferred == "lutris" and system == "Linux":
+            if _which("lutris"):
+                return await self._spawn_session("lutris", [], env, seat)
+            log.warning("Lutris not found, falling back to Steam")
+            preferred = "steam"
+
+        if preferred == "steam" or preferred == "playnite":
+            # Steam Big Picture mode
+            if system == "Linux" and _which("steam"):
+                return await self._spawn_session("steam", ["-bigpicture"], env, seat)
+            elif system == "Windows":
+                steam_dir = _find_steam_dir()
+                if steam_dir:
+                    exe = steam_dir / "steam.exe"
+                    if exe.exists():
+                        return await self._spawn_session(str(exe), ["-bigpicture"], env, seat)
+
+        log.warning("Seat %s: no game library found", seat.name)
+        return None
+
+    async def _launch_app(self, seat: "Seat", profile: "SeatProfile") -> asyncio.subprocess.Process | None:
+        """Launch a single application on the seat."""
+        cmd = profile.launcher_command
+        if not cmd:
+            log.error("Seat %s: app profile but no launcher_command set", seat.name)
+            return None
+
+        env = self._build_launch_env(
+            GameInfo(id="app", name=cmd, platform="", install_path="", source=""),
+            seat,
+        )
+        # Merge profile's extra env vars
+        env.update(profile.launcher_env)
+
+        args = list(profile.launcher_args)
+        return await self._spawn_session(cmd, args, env, seat)
+
+    async def _launch_custom(self, seat: "Seat", profile: "SeatProfile") -> asyncio.subprocess.Process | None:
+        """Launch a custom command on the seat."""
+        cmd = profile.launcher_command
+        if not cmd:
+            log.error("Seat %s: custom profile but no launcher_command set", seat.name)
+            return None
+
+        env = self._build_launch_env(
+            GameInfo(id="custom", name=cmd, platform="", install_path="", source=""),
+            seat,
+        )
+        env.update(profile.launcher_env)
+
+        # Custom command may contain shell syntax
+        log.info("Seat %s: launching custom: %s %s", seat.name, cmd, profile.launcher_args)
+        try:
+            if profile.launcher_args:
+                proc = await asyncio.create_subprocess_exec(
+                    cmd, *profile.launcher_args,
+                    env=env,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                    preexec_fn=os.setsid if platform.system() == "Linux" else None,
+                )
+            else:
+                # Allow shell expansion for custom commands
+                proc = await asyncio.create_subprocess_shell(
+                    cmd,
+                    env=env,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                    preexec_fn=os.setsid if platform.system() == "Linux" else None,
+                )
+            self._running[seat.name] = _SeatGameState(
+                game=GameInfo(id="custom", name=cmd, platform="custom",
+                              install_path="", source="custom"),
+                process=proc, pid=proc.pid,
+                launched_at=__import__("time").time(),
+            )
+            asyncio.create_task(
+                self._monitor_game(seat.name, proc),
+                name=f"session-monitor-{seat.name}",
+            )
+            return proc
+        except Exception as e:
+            log.error("Failed to launch custom command on seat %s: %s", seat.name, e)
+            return None
+
+    async def _spawn_session(self, cmd: str, args: list[str], env: dict,
+                              seat: "Seat") -> asyncio.subprocess.Process | None:
+        """Common session spawn helper.  Uses seat isolation if configured."""
+        full_cmd = [cmd] + args
+        log.info("Seat %s: spawning %s", seat.name, " ".join(full_cmd))
+        try:
+            # Use isolation manager if the seat has an isolation context
+            iso_mgr = self._seat_manager.isolation_manager
+            iso_ctx = iso_mgr.get_context(seat.name)
+            if iso_ctx and iso_ctx.backend_name != "none":
+                proc = await iso_mgr.launch(seat.name, full_cmd, env)
+            else:
+                proc = await asyncio.create_subprocess_exec(
+                    *full_cmd,
+                    env=env,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                    preexec_fn=os.setsid if platform.system() == "Linux" else None,
+                )
+            import time
+            self._running[seat.name] = _SeatGameState(
+                game=GameInfo(id=cmd, name=cmd, platform="session",
+                              install_path="", source="session"),
+                process=proc, pid=proc.pid,
+                launched_at=time.time(),
+            )
+            asyncio.create_task(
+                self._monitor_game(seat.name, proc),
+                name=f"session-monitor-{seat.name}",
+            )
+            return proc
+        except Exception as e:
+            log.error("Failed to spawn %s on seat %s: %s", cmd, seat.name, e)
+            return None
 
     async def launch(self, game: GameInfo, seat: "Seat") -> asyncio.subprocess.Process | None:
         """

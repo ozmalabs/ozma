@@ -59,6 +59,14 @@ class NodeInfo:
     owner_user_id: str = ""
     # Registration source — direct HTTP nodes are not evicted by mDNS requery
     direct_registered: bool = False
+    # Seat configuration — pushed to agents via config WebSocket
+    seat_count: int = 1
+    seat_config: dict = field(default_factory=dict)  # {seats: N, profiles: [...], ...}
+    # Seat ownership and sharing
+    owner_id: str = ""                                 # user ID who owns this node/seat
+    shared_with: list[str] = field(default_factory=list)  # user IDs who have access
+    share_permissions: dict[str, str] = field(default_factory=dict)  # user_id -> "use"|"manage"|"admin"
+    parent_node_id: str = ""                           # if this is a seat, the machine it belongs to
 
     @property
     def stream_url(self) -> str | None:
@@ -107,6 +115,16 @@ class NodeInfo:
             d["frigate_host"] = self.frigate_host
         if self.frigate_port:
             d["frigate_port"] = self.frigate_port
+        if self.seat_count != 1 or self.seat_config:
+            d["seat_count"] = self.seat_count
+            d["seat_config"] = self.seat_config
+        if self.owner_id:
+            d["owner_id"] = self.owner_id
+        if self.shared_with:
+            d["shared_with"] = self.shared_with
+            d["share_permissions"] = self.share_permissions
+        if self.parent_node_id:
+            d["parent_node_id"] = self.parent_node_id
         return d
 
 
@@ -154,6 +172,14 @@ class AppState:
                 node.camera_streams = node.camera_streams or existing.camera_streams
                 node.frigate_host = node.frigate_host or existing.frigate_host
                 node.frigate_port = node.frigate_port or existing.frigate_port
+                # Preserve seat config from existing node (controller-owned)
+                node.seat_count = existing.seat_count
+                node.seat_config = existing.seat_config or node.seat_config
+                # Preserve ownership/sharing (controller-owned, survives re-registration)
+                node.owner_id = existing.owner_id or node.owner_id
+                node.shared_with = existing.shared_with or node.shared_with
+                node.share_permissions = existing.share_permissions or node.share_permissions
+                node.parent_node_id = existing.parent_node_id or node.parent_node_id
                 if existing.capabilities and not node.capabilities:
                     node.capabilities = existing.capabilities
                 elif node.capabilities and existing.capabilities:

@@ -107,7 +107,8 @@ class TestBasicAllocation:
 
         session = alloc.allocate("seat-0")
         assert session.encoder.name == "h264_nvenc"
-        assert session.gpu_index == 1 if inv._gpus[0].is_igpu else 0
+        nvidia_gpu = [g for g in inv._gpus if g.vendor == "nvidia"][0]
+        assert session.gpu_index == nvidia_gpu.index
 
     def test_allocate_no_encoders_raises(self):
         """With no encoders at all, should raise RuntimeError."""
