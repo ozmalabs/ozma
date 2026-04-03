@@ -1099,6 +1099,84 @@ select option { background: var(--surface); }
     </div>
   </div>
 
+  <!-- Users -->
+  <div class="panel" id="panel-users" data-mode="advanced">
+    <div class="panel-head">
+      <h2>Users</h2><span class="count" id="users-count">0</span>
+      <div class="panel-actions">
+        <button class="btn sm primary" onclick="showCreateUserModal()">+ User</button>
+      </div>
+    </div>
+    <div class="panel-body">
+      <div id="users-list"><div class="empty">No users</div></div>
+    </div>
+  </div>
+
+  <!-- Services -->
+  <div class="panel" id="panel-services" data-mode="advanced">
+    <div class="panel-head">
+      <h2>Services</h2><span class="count" id="svc-count">0</span>
+      <div class="panel-actions">
+        <button class="btn sm primary" onclick="showAddServiceModal()">+ Service</button>
+      </div>
+    </div>
+    <div class="panel-body">
+      <div id="svc-list"><div class="empty">No services registered</div></div>
+    </div>
+  </div>
+
+  <!-- Sharing & Peers (full-width, advanced) -->
+  <div class="panel full-width" id="panel-sharing" data-mode="advanced">
+    <div class="panel-head">
+      <h2>Sharing</h2>
+      <div class="panel-actions">
+        <button class="btn sm primary" onclick="showAddPeerModal()">+ Peer</button>
+        <button class="btn sm" onclick="showCreateShareModal()">+ Share Grant</button>
+      </div>
+    </div>
+    <div class="panel-body" style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+      <div>
+        <div style="font-size:11px;font-weight:700;letter-spacing:0.08em;
+          text-transform:uppercase;color:var(--muted);margin-bottom:8px">
+          Peer Controllers
+        </div>
+        <div id="peers-list"><div class="empty">No peers linked</div></div>
+      </div>
+      <div>
+        <div style="font-size:11px;font-weight:700;letter-spacing:0.08em;
+          text-transform:uppercase;color:var(--muted);margin-bottom:8px">
+          Share Grants
+        </div>
+        <div id="shares-list"><div class="empty">No active shares</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- IdP Config (amazing only) -->
+  <div class="panel" id="panel-idp" data-mode="amazing">
+    <div class="panel-head">
+      <h2>Identity Provider</h2>
+      <span id="idp-status-badge" style="font-size:10px;padding:1px 7px;
+        border-radius:10px;background:var(--surface2);color:var(--muted)">disabled</span>
+    </div>
+    <div class="panel-body">
+      <div id="idp-content"><div class="empty">Loading…</div></div>
+    </div>
+  </div>
+
+  <!-- External Publishing (amazing only) -->
+  <div class="panel" id="panel-publish" data-mode="amazing">
+    <div class="panel-head">
+      <h2>External Publishing</h2><span class="count" id="pub-count">0</span>
+      <div class="panel-actions">
+        <button class="btn sm primary" onclick="showAddPublishModal()">+ Publish</button>
+      </div>
+    </div>
+    <div class="panel-body">
+      <div id="pub-list"><div class="empty">No published entries</div></div>
+    </div>
+  </div>
+
 </div>
 
 <!-- ── Stream modal ──────────────────────────────────────────────────────────── -->
@@ -1209,6 +1287,11 @@ async function loadAll() {
     fetchKDEConnect();
     fetchWifiAudio();
     fetchControls();
+    fetchUsers();
+    fetchServices();
+    fetchSharing();
+    fetchIdpStatus();
+    fetchPublish();
     probeAuthState();
   } catch (e) {
     console.error('loadAll:', e);
@@ -3539,9 +3622,293 @@ function sendCtrlAltDel() {
   }, 500);
 }
 
+// ── Users ─────────────────────────────────────────────────────────────────────
+let users = [];
+
+function fetchUsers() {
+  api('GET', '/users').then(d => {
+    users = Array.isArray(d) ? d : [];
+    $('users-count').textContent = users.length;
+    renderUsers();
+  }).catch(() => {});
+}
+
+function renderUsers() {
+  const list = $('users-list');
+  if (!users.length) { list.innerHTML = '<div class="empty">No users</div>'; return; }
+  list.innerHTML = users.map(u => `
+    <div style="display:flex;align-items:center;gap:8px;padding:8px;
+      background:var(--surface);border-radius:var(--radius);
+      border:1px solid var(--border);margin-bottom:6px">
+      <div style="flex:1">
+        <div style="font-size:13px;font-weight:600;color:#fff">${esc(u.display_name)}</div>
+        <div style="font-size:11px;color:var(--muted)">@${esc(u.username)} · ${esc(u.role)}</div>
+      </div>
+      <button class="btn sm danger" onclick="deleteUser('${esc(u.id)}')">Delete</button>
+    </div>
+  `).join('');
+}
+
+function showCreateUserModal() {
+  const username = prompt('Username:');
+  if (!username) return;
+  const password = prompt('Password:');
+  if (!password) return;
+  const display_name = prompt('Display name:', username) || username;
+  api('POST', '/users', { username, password, display_name, role: 'member' })
+    .then(() => fetchUsers())
+    .catch(e => alert('Failed: ' + e.message));
+}
+
+function deleteUser(userId) {
+  if (!confirm('Delete this user?')) return;
+  api('DELETE', `/users/${userId}`).then(() => fetchUsers()).catch(e => alert('Failed: ' + e.message));
+}
+
+// ── Services ──────────────────────────────────────────────────────────────────
+let services = [];
+
+function fetchServices() {
+  api('GET', '/services').then(d => {
+    services = Array.isArray(d) ? d : [];
+    $('svc-count').textContent = services.length;
+    renderServices();
+  }).catch(() => {});
+}
+
+function renderServices() {
+  const list = $('svc-list');
+  if (!services.length) { list.innerHTML = '<div class="empty">No services registered</div>'; return; }
+  list.innerHTML = services.map(s => {
+    const healthColor = s.healthy ? 'var(--green)' : 'var(--red)';
+    const healthText = s.healthy !== false ? 'healthy' : 'unhealthy';
+    const targetUrl = `${esc(s.protocol)}://${esc(s.target_host)}:${s.target_port}`;
+    return `
+      <div style="padding:8px;background:var(--surface);border-radius:var(--radius);
+        border:1px solid var(--border);margin-bottom:6px">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+          <span style="font-size:13px;font-weight:600;color:#fff">${esc(s.name)}</span>
+          <span style="font-size:10px;color:${healthColor}">${healthText}</span>
+          <span style="flex:1"></span>
+          <button class="btn sm danger" onclick="deleteService('${esc(s.id)}')">Remove</button>
+        </div>
+        <div style="font-size:11px;color:var(--muted)">
+          ${targetUrl}${s.subdomain ? ` → <code>${esc(s.subdomain)}.…</code>` : ''}
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+function showAddServiceModal() {
+  const name = prompt('Service name (e.g. Jellyfin):');
+  if (!name) return;
+  const target_host = prompt('Target host (e.g. 192.168.1.10):');
+  if (!target_host) return;
+  const target_port = parseInt(prompt('Target port (e.g. 8096):') || '80', 10);
+  const subdomain = (prompt('Subdomain (e.g. jellyfin — leave blank to skip):') || '').trim();
+  api('POST', '/services', { name, target_host, target_port, subdomain: subdomain || undefined,
+    protocol: 'http', auth_required: false })
+    .then(() => fetchServices())
+    .catch(e => alert('Failed: ' + e.message));
+}
+
+function deleteService(id) {
+  if (!confirm('Remove this service?')) return;
+  api('DELETE', `/services/${id}`).then(() => fetchServices()).catch(e => alert('Failed: ' + e.message));
+}
+
+// ── Sharing & Peers ───────────────────────────────────────────────────────────
+let peers = [], shares = [];
+
+function fetchSharing() {
+  Promise.all([
+    api('GET', '/peers').catch(() => []),
+    api('GET', '/shares').catch(() => ({ given: [], received: [] })),
+  ]).then(([pd, sd]) => {
+    peers = Array.isArray(pd) ? pd : [];
+    // Combine given + received; deduplicate by id
+    const allGrants = [...(sd.given || []), ...(sd.received || []), ...(sd.all || [])];
+    const seen = new Set();
+    shares = allGrants.filter(g => { if (seen.has(g.id)) return false; seen.add(g.id); return true; });
+    renderPeers();
+    renderShares();
+  });
+}
+
+function renderPeers() {
+  const el = $('peers-list');
+  if (!peers.length) { el.innerHTML = '<div class="empty">No peers linked</div>'; return; }
+  el.innerHTML = peers.map(p => `
+    <div style="display:flex;align-items:center;gap:8px;padding:8px;
+      background:var(--surface);border-radius:var(--radius);
+      border:1px solid var(--border);margin-bottom:6px">
+      <div style="flex:1">
+        <div style="font-size:13px;font-weight:600;color:#fff">${esc(p.name || p.id)}</div>
+        <div style="font-size:11px;color:var(--muted)">
+          ${esc(p.host || '')} · ${esc(p.transport || 'lan')}
+          ${p.online ? '<span style="color:var(--green)"> ● online</span>'
+                     : '<span style="color:var(--muted)"> ● offline</span>'}
+        </div>
+      </div>
+      <button class="btn sm danger" onclick="removePeer('${esc(p.id)}')">Unlink</button>
+    </div>
+  `).join('');
+}
+
+function renderShares() {
+  const el = $('shares-list');
+  const active = shares.filter(s => s.active !== false && !s.revoked);
+  if (!active.length) { el.innerHTML = '<div class="empty">No active shares</div>'; return; }
+  el.innerHTML = active.map(s => `
+    <div style="display:flex;align-items:center;gap:8px;padding:8px;
+      background:var(--surface);border-radius:var(--radius);
+      border:1px solid var(--border);margin-bottom:6px">
+      <div style="flex:1">
+        <div style="font-size:13px;font-weight:600;color:#fff">
+          ${esc(s.resource_type)}/${esc(s.resource_id)}
+        </div>
+        <div style="font-size:11px;color:var(--muted)">
+          ${esc((s.permissions || []).join(', ') || 'read')}
+          ${s.alias ? ` · alias: ${esc(s.alias)}` : ''}
+        </div>
+      </div>
+      <button class="btn sm danger" onclick="revokeShare('${esc(s.id)}')">Revoke</button>
+    </div>
+  `).join('');
+}
+
+function showAddPeerModal() {
+  const controller_id = prompt('Peer controller ID (public key fingerprint):');
+  if (!controller_id) return;
+  const host = prompt('Peer host (e.g. 192.168.1.5:7380):');
+  if (!host) return;
+  const name = prompt('Friendly name:') || host;
+  api('POST', '/peers', { controller_id, host, name, transport: 'lan' })
+    .then(() => fetchSharing())
+    .catch(e => alert('Failed: ' + e.message));
+}
+
+function removePeer(id) {
+  if (!confirm('Unlink this peer controller?')) return;
+  api('DELETE', `/peers/${id}`).then(() => fetchSharing()).catch(e => alert('Failed: ' + e.message));
+}
+
+function showCreateShareModal() {
+  const resource_type = (prompt('Resource type (service / node / display):') || '').trim();
+  if (!resource_type) return;
+  const resource_id = prompt('Resource ID:');
+  if (!resource_id) return;
+  const grantee_user_id = prompt('Grantee user ID (UUID):');
+  if (!grantee_user_id) return;
+  api('POST', '/shares', { resource_type, resource_id, grantee_user_id, permissions: ['read'] })
+    .then(() => fetchSharing())
+    .catch(e => alert('Failed: ' + e.message));
+}
+
+function revokeShare(id) {
+  if (!confirm('Revoke this share?')) return;
+  api('DELETE', `/shares/${id}`).then(() => fetchSharing()).catch(e => alert('Failed: ' + e.message));
+}
+
+// ── IdP ───────────────────────────────────────────────────────────────────────
+function fetchIdpStatus() {
+  fetch('/.well-known/openid-configuration')
+    .then(r => r.ok ? r.json() : null)
+    .then(cfg => renderIdpStatus(cfg))
+    .catch(() => renderIdpStatus(null));
+}
+
+function renderIdpStatus(cfg) {
+  const badge = $('idp-status-badge');
+  const content = $('idp-content');
+  if (!cfg) {
+    badge.textContent = 'disabled';
+    badge.style.background = 'var(--surface2)';
+    badge.style.color = 'var(--muted)';
+    content.innerHTML = `
+      <div style="color:var(--muted);font-size:12px">
+        IdP is disabled. Set <code>OZMA_IDP=1</code> and <code>OZMA_AUTH=1</code> to enable.
+      </div>`;
+    return;
+  }
+  badge.textContent = 'enabled';
+  badge.style.background = 'rgba(91,111,255,0.12)';
+  badge.style.color = 'var(--accent)';
+  content.innerHTML = `
+    <div style="font-size:12px;color:var(--muted);margin-bottom:10px">
+      Issuer: <code style="color:var(--text)">${esc(cfg.issuer)}</code>
+    </div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap">
+      <a href="${esc(cfg.authorization_endpoint)}" target="_blank" class="btn sm">Auth ↗</a>
+      <a href="${esc(cfg.jwks_uri)}" target="_blank" class="btn sm">JWKS ↗</a>
+      <a href="/auth/login" target="_blank" class="btn sm primary">Login page ↗</a>
+    </div>
+    <div style="margin-top:10px;font-size:11px;color:var(--muted)">
+      OIDC issuer for LAN services — point Gitea, Nextcloud, Jellyfin SSO here.
+    </div>`;
+}
+
+// ── External Publishing ───────────────────────────────────────────────────────
+let publishEntries = [];
+
+function fetchPublish() {
+  api('GET', '/publish').then(d => {
+    publishEntries = Array.isArray(d) ? d : [];
+    $('pub-count').textContent = publishEntries.length;
+    renderPublish();
+  }).catch(() => {});
+}
+
+function renderPublish() {
+  const el = $('pub-list');
+  if (!publishEntries.length) { el.innerHTML = '<div class="empty">No published entries</div>'; return; }
+  el.innerHTML = publishEntries.map(e => {
+    const displayUrl = e.external_domain ? `https://${esc(e.external_domain)}` : '';
+    const modeColor = e.mode === 'public' ? 'rgba(91,111,255,0.12)' : 'var(--surface2)';
+    const modeText = e.mode === 'public' ? 'var(--accent)' : 'var(--muted)';
+    return `
+      <div style="padding:8px;background:var(--surface);border-radius:var(--radius);
+        border:1px solid var(--border);margin-bottom:6px">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+          <span style="font-size:13px;font-weight:600;color:#fff">${esc(e.external_subdomain || e.id)}</span>
+          <span style="font-size:10px;padding:1px 5px;border-radius:3px;
+            background:${modeColor};color:${modeText}">${esc(e.mode || 'private')}</span>
+          ${e.provisioned ? '<span style="font-size:10px;color:var(--green)">● provisioned</span>'
+                          : '<span style="font-size:10px;color:var(--muted)">○ pending</span>'}
+          <span style="flex:1"></span>
+          <button class="btn sm danger" onclick="removePublish('${esc(e.id)}')">Remove</button>
+        </div>
+        ${displayUrl ? `<a href="${displayUrl}" target="_blank"
+          style="font-size:11px;color:var(--accent)">${esc(e.external_domain)}</a>` : ''}
+      </div>
+    `;
+  }).join('');
+}
+
+function showAddPublishModal() {
+  const service_id = prompt('Service ID to publish (from Services panel):');
+  if (!service_id) return;
+  const external_subdomain = (prompt('External subdomain (e.g. myapp):') || '').trim();
+  if (!external_subdomain) return;
+  const modeInput = (prompt('Mode: public or private (default: private):') || 'private').trim();
+  const mode = modeInput === 'public' ? 'public' : 'private';
+  const body = { service_id, external_subdomain, mode };
+  if (mode === 'public') body.confirm_public = true;
+  api('POST', '/publish', body)
+    .then(() => fetchPublish())
+    .catch(e => alert('Failed: ' + e.message));
+}
+
+function removePublish(id) {
+  if (!confirm('Remove this published entry?')) return;
+  api('DELETE', `/publish/${id}`).then(() => fetchPublish()).catch(e => alert('Failed: ' + e.message));
+}
+
 // ── Boot ──────────────────────────────────────────────────────────────────────
 setMode(currentMode);
 connect();
+setInterval(fetchServices, 30000);
 </script>
 </body>
 </html>
