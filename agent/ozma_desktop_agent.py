@@ -1455,11 +1455,14 @@ def main() -> None:
 
         try:
             loop.run_until_complete(manager.start())
+            print("[OZMA] manager.start() returned unexpectedly!", flush=True)
         except KeyboardInterrupt:
-            pass
-        except Exception:
+            print("[OZMA] KeyboardInterrupt", flush=True)
+        except Exception as e:
+            print(f"[OZMA] Exception: {e}", flush=True)
             log.exception("Agent failed")
         finally:
+            print("[OZMA] Shutting down...", flush=True)
             try:
                 loop.run_until_complete(manager.stop())
             except Exception:
