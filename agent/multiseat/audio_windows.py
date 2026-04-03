@@ -59,17 +59,19 @@ class WindowsAudioBackend(SeatAudioBackend):
         if sys.platform != "win32":
             return []
 
+        # Try PowerShell first (safe, no COM/ctypes crashes)
         try:
-            endpoints = self._enumerate_pycaw()
+            endpoints = self._enumerate_powershell()
             if endpoints:
                 return endpoints
         except Exception as e:
-            log.debug("pycaw enumeration failed: %s — trying PowerShell", e)
+            log.debug("PowerShell audio enumeration failed: %s", e)
 
+        # Try pycaw as fallback (uses COM — can conflict with DXGI)
         try:
-            return self._enumerate_powershell()
+            return self._enumerate_pycaw()
         except Exception as e:
-            log.warning("Audio enumeration failed: %s", e)
+            log.debug("pycaw audio enumeration failed: %s", e)
             return []
 
     def _enumerate_pycaw(self) -> list[AudioEndpoint]:
@@ -218,7 +220,12 @@ class WindowsAudioBackend(SeatAudioBackend):
 
         # Ensure endpoints are enumerated
         if not self._endpoints:
-            self._endpoints = self.enumerate_endpoints()
+            try:
+                self._endpoints = self.enumerate_endpoints()
+            except Exception as e:
+                log.warning("Audio endpoint enumeration failed: %s", e)
+                self._endpoints = []
+                return None
 
         # Check for VB-Audio Cable virtual sinks
         vb_sinks = [e for e in self._endpoints if "cable" in e.name.lower()
