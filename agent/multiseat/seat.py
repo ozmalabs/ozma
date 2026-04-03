@@ -439,6 +439,34 @@ class Seat:
 
     async def _serve(self) -> None:
         """UDP datagram listener for HID packets from the controller."""
+        import socket
+        import sys
+
+        if sys.platform == "win32":
+            # ProactorEventLoop on Windows doesn't support create_datagram_endpoint.
+            # Use a plain socket in a thread instead.
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("0.0.0.0", self.udp_port))
+            sock.settimeout(1.0)
+            log.info("Seat %s: listening on UDP port %d (threaded)", self.name, self.udp_port)
+
+            loop = asyncio.get_running_loop()
+
+            def _udp_reader():
+                while not self._stop_event.is_set():
+                    try:
+                        data, addr = sock.recvfrom(4096)
+                        self._on_packet(data, addr)
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                sock.close()
+
+            await loop.run_in_executor(None, _udp_reader)
+            return
+
         loop = asyncio.get_running_loop()
         self._transport, _ = await loop.create_datagram_endpoint(
             lambda: _UDPProtocol(self._on_packet),
