@@ -236,6 +236,10 @@ class BackupStatus:
     health:              BackupHealth       = BackupHealth.UNCONFIGURED
     health_message:      str               = "Backup not configured"
     estimated_size_bytes: int | None       = None
+    # macOS Time Machine integration
+    time_machine_enabled:        bool        = False
+    time_machine_last_backup_at: float | None = None
+    time_machine_destination:    str          = ""
 
     def to_dict(self) -> dict:
         return {
@@ -252,6 +256,9 @@ class BackupStatus:
             "health": self.health,
             "health_message": self.health_message,
             "estimated_size_bytes": self.estimated_size_bytes,
+            "time_machine_enabled": self.time_machine_enabled,
+            "time_machine_last_backup_at": self.time_machine_last_backup_at,
+            "time_machine_destination": self.time_machine_destination,
         }
 
 
@@ -517,6 +524,90 @@ async def _run_db_hooks(dump_dir: Path) -> list[str]:
 # Idle detection
 # ---------------------------------------------------------------------------
 
+async def detect_time_machine() -> dict:
+    """
+    Detect macOS Time Machine configuration via tmutil.
+
+    Returns a dict with:
+      enabled          bool   — whether TM is configured with a destination
+      running          bool   — whether a backup is currently in progress
+      last_backup_at   float | None — unix timestamp of last completed backup
+      destination      str    — destination volume name / URL
+      phase            str    — current phase from tmutil status (or "")
+
+    On non-macOS systems always returns {"enabled": False}.
+    """
+    if platform.system() != "Darwin":
+        return {"enabled": False, "running": False, "last_backup_at": None,
+                "destination": "", "phase": ""}
+
+    result: dict = {
+        "enabled": False, "running": False,
+        "last_backup_at": None, "destination": "", "phase": "",
+    }
+
+    import shutil as _sh
+    if not _sh.which("tmutil"):
+        return result
+
+    async def _tmutil(*args: str) -> str:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "tmutil", *args,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+            return out.decode(errors="replace").strip()
+        except Exception:
+            return ""
+
+    # Check if a destination is configured
+    dest_out = await _tmutil("destinationinfo")
+    if dest_out and "Name" in dest_out:
+        result["enabled"] = True
+        for line in dest_out.splitlines():
+            if line.strip().startswith("Name"):
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    result["destination"] = parts[1].strip()
+                    break
+
+    if not result["enabled"]:
+        return result
+
+    # Current status
+    status_out = await _tmutil("status")
+    if status_out:
+        if "Running = 1" in status_out:
+            result["running"] = True
+        for line in status_out.splitlines():
+            if "BackupPhase" in line:
+                parts = line.split("=", 1)
+                if len(parts) == 2:
+                    result["phase"] = parts[1].strip().strip('";')
+
+    # Last completed backup timestamp
+    latest_out = await _tmutil("latestbackup")
+    if latest_out:
+        # tmutil latestbackup returns a path like /Volumes/TM/Backups.backupdb/MacBook/2024-01-15-120000
+        tail = latest_out.rstrip("/").split("/")[-1]
+        # Try to parse YYYY-MM-DD-HHmmss format
+        import re as _re
+        m = _re.match(r"(\d{4})-(\d{2})-(\d{2})-(\d{2})(\d{2})(\d{2})", tail)
+        if m:
+            import datetime as _dt
+            try:
+                dt = _dt.datetime(
+                    int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                    int(m.group(4)), int(m.group(5)), int(m.group(6)),
+                )
+                result["last_backup_at"] = dt.timestamp()
+            except ValueError:
+                pass
+
+    return result
+
+
 async def _idle_seconds() -> float:
     """Return number of seconds since last user input (best effort)."""
     sys_name = platform.system()
@@ -665,6 +756,11 @@ class BackupManager:
         self._load()
         self._status.enabled = self._config.enabled
         self._update_health()
+        if platform.system() == "Darwin":
+            try:
+                await self.refresh_time_machine_status()
+            except Exception:
+                pass
         self._tasks = [
             asyncio.create_task(self._schedule_loop(), name="backup:scheduler"),
             asyncio.create_task(self._verify_loop(), name="backup:verify"),
@@ -707,6 +803,61 @@ class BackupManager:
     # ------------------------------------------------------------------
     # Manual operations
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Onboarding / default-on
+    # ------------------------------------------------------------------
+
+    def get_onboarding_config(self) -> BackupConfig:
+        """
+        Return a sensible default BackupConfig for first-run onboarding.
+
+        The config is not enabled — the user must explicitly opt in via
+        the dashboard. It defaults to smart mode with local destination
+        so the user can preview what would be backed up before committing.
+        """
+        return BackupConfig(
+            enabled=False,
+            mode=BackupMode.SMART,
+            destination=BackupDestination.LOCAL,
+            destination_config={
+                "path": str(Path.home() / ".ozma" / "backup_store"),
+            },
+            encrypt=True,
+            schedule="adaptive",
+        )
+
+    async def is_default_on_eligible(self) -> bool:
+        """
+        Return True if this machine is a good candidate for auto-enabling
+        backup on first start.
+
+        Criteria:
+          - Not already configured
+          - Has at least 10 GB free on the home directory filesystem
+          - Not on battery (laptops — avoid kicking off a large backup on
+            battery at first install)
+        """
+        if self._config.enabled:
+            return False
+        try:
+            import shutil as _sh
+            usage = _sh.disk_usage(str(Path.home()))
+            if usage.free < 10 * 1024 ** 3:
+                return False
+        except Exception:
+            return False
+        if await _is_on_battery():
+            return False
+        return True
+
+    async def refresh_time_machine_status(self) -> None:
+        """Update Time Machine fields in _status (macOS only, no-op elsewhere)."""
+        tm = await detect_time_machine()
+        self._status.time_machine_enabled = tm.get("enabled", False)
+        self._status.time_machine_destination = tm.get("destination", "")
+        ts = tm.get("last_backup_at")
+        self._status.time_machine_last_backup_at = ts
 
     async def run_backup(self, mode: BackupMode | None = None) -> BackupStatus:
         """
@@ -1048,18 +1199,52 @@ class BackupManager:
         image_dir.mkdir(parents=True, exist_ok=True)
 
         sys_name = platform.system()
-        if sys_name == "FreeBSD":
-            # ZFS send
+
+        # ZFS send — FreeBSD and Linux (OpenZFS)
+        if sys_name in ("FreeBSD", "Linux"):
             zpool = await self._detect_zpool()
             if zpool:
                 image_path = image_dir / f"zfs_send_{int(time.time())}.zfs"
-                proc = await asyncio.create_subprocess_exec(
-                    "zfs", "send", "-R", zpool,
-                    stdout=open(image_path, "wb"),
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
+                with open(image_path, "wb") as fp:
+                    proc = await asyncio.create_subprocess_exec(
+                        "zfs", "send", "-R", zpool,
+                        stdout=fp,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
                 await proc.wait()
-                return [str(image_path), "--tag", "disk_image:zfs_send"]
+                if proc.returncode == 0 and image_path.stat().st_size > 0:
+                    return [str(image_path), "--tag", "disk_image:zfs_send"]
+                image_path.unlink(missing_ok=True)
+
+        # BTRFS send — Linux only
+        if sys_name == "Linux":
+            subvol = await self._detect_btrfs_subvol()
+            if subvol:
+                # Create a read-only snapshot then stream it
+                snap_path = f"{subvol}/.ozma_snap_{int(time.time())}"
+                snap_proc = await asyncio.create_subprocess_exec(
+                    "btrfs", "subvolume", "snapshot", "-r", subvol, snap_path,
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                )
+                await snap_proc.wait()
+                if snap_proc.returncode == 0:
+                    image_path = image_dir / f"btrfs_send_{int(time.time())}.btrfs"
+                    with open(image_path, "wb") as fp:
+                        send_proc = await asyncio.create_subprocess_exec(
+                            "btrfs", "send", snap_path,
+                            stdout=fp,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                    await send_proc.wait()
+                    # Clean up the snapshot regardless of outcome
+                    del_proc = await asyncio.create_subprocess_exec(
+                        "btrfs", "subvolume", "delete", snap_path,
+                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await del_proc.wait()
+                    if send_proc.returncode == 0 and image_path.stat().st_size > 0:
+                        return [str(image_path), "--tag", "disk_image:btrfs_send"]
+                    image_path.unlink(missing_ok=True)
 
         # Linux/generic: partclone of root
         try:
@@ -1117,6 +1302,25 @@ class BackupManager:
             return out.decode().strip() or None
         except FileNotFoundError:
             return None
+
+    async def _detect_btrfs_subvol(self) -> str | None:
+        """Return the BTRFS root subvolume path if the root FS is BTRFS, else None."""
+        import shutil as _sh
+        if not _sh.which("btrfs"):
+            return None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "findmnt", "-n", "-o", "FSTYPE,SOURCE,TARGET", "/",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await proc.communicate()
+            line = out.decode().strip()
+            if line.startswith("btrfs"):
+                parts = line.split()
+                return parts[2] if len(parts) >= 3 else "/"
+        except FileNotFoundError:
+            pass
+        return None
 
     async def _detect_zpool(self) -> str | None:
         try:
