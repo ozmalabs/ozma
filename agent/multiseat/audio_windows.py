@@ -49,6 +49,7 @@ class WindowsAudioBackend(SeatAudioBackend):
     def __init__(self) -> None:
         self._managed_sinks: dict[str, str] = {}  # seat_name -> endpoint_id
         self._endpoints: list[AudioEndpoint] = []
+        self._enum_attempted: bool = False
 
     def enumerate_endpoints(self) -> list[AudioEndpoint]:
         """
@@ -208,20 +209,24 @@ class WindowsAudioBackend(SeatAudioBackend):
         """
         Create or assign a virtual audio sink for a seat.
 
-        Strategy:
-        1. If VB-Audio Cable is installed, assign a CABLE output
-        2. Otherwise, assign a physical endpoint (round-robin)
-        3. If nothing available, return None
-
-        Returns the endpoint ID or sink name.
+        Returns the endpoint ID or sink name, or None if unavailable.
+        Audio endpoint enumeration is deferred to avoid startup crashes.
         """
         if sys.platform != "win32":
             return None
 
-        # Ensure endpoints are enumerated
+        # Lazy enumeration — defer to avoid COM crashes at startup
         if not self._endpoints:
+            if self._enum_attempted:
+                return None
+            self._enum_attempted = True
+            # Run PowerShell in executor to avoid blocking and catch crashes
+            import asyncio
+            loop = asyncio.get_event_loop()
             try:
-                self._endpoints = self.enumerate_endpoints()
+                self._endpoints = await loop.run_in_executor(
+                    None, self.enumerate_endpoints
+                )
             except Exception as e:
                 log.warning("Audio endpoint enumeration failed: %s", e)
                 self._endpoints = []
