@@ -172,11 +172,14 @@ class SeatManager:
                  ", ".join(d.name for d in self._displays))
 
         # Enumerate input groups
+        print("[OZMA DEBUG] Enumerating input groups...", flush=True)
         try:
             self._input_groups = self._input_backend.enumerate_groups()
         except Exception as e:
+            print(f"[OZMA DEBUG] Input enum failed: {e}", flush=True)
             log.warning("Input enumeration failed: %s", e)
             self._input_groups = []
+        print(f"[OZMA DEBUG] Found {len(self._input_groups)} input groups", flush=True)
         log.info("Found %d input groups", len(self._input_groups))
 
         # Determine seat count
