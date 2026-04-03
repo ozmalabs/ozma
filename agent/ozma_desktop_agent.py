@@ -1453,21 +1453,23 @@ def main() -> None:
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, _on_signal)
 
+        async def _run():
+            try:
+                await manager.start()
+                print("[OZMA] manager.start() returned — this shouldn't happen", flush=True)
+            except asyncio.CancelledError:
+                print("[OZMA] Cancelled", flush=True)
+            except Exception as e:
+                print(f"[OZMA] Exception: {e}", flush=True)
+                log.exception("Agent failed")
+            finally:
+                print("[OZMA] Shutting down...", flush=True)
+                await manager.stop()
+
         try:
-            loop.run_until_complete(manager.start())
-            print("[OZMA] manager.start() returned unexpectedly!", flush=True)
+            asyncio.run(_run())
         except KeyboardInterrupt:
             print("[OZMA] KeyboardInterrupt", flush=True)
-        except Exception as e:
-            print(f"[OZMA] Exception: {e}", flush=True)
-            log.exception("Agent failed")
-        finally:
-            print("[OZMA] Shutting down...", flush=True)
-            try:
-                loop.run_until_complete(manager.stop())
-            except Exception:
-                pass
-            loop.close()
 
 
 if __name__ == "__main__":
