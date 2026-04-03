@@ -1453,26 +1453,26 @@ def main() -> None:
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, _on_signal)
 
-        import atexit
+        import atexit, traceback
         atexit.register(lambda: print("[OZMA] atexit fired!", flush=True))
 
         async def _run():
-            try:
-                await manager.start()
-                print("[OZMA] manager.start() returned — this shouldn't happen", flush=True)
-            except asyncio.CancelledError:
-                print("[OZMA] Cancelled", flush=True)
-            except Exception as e:
-                print(f"[OZMA] Exception: {e}", flush=True)
-                log.exception("Agent failed")
-            finally:
-                print("[OZMA] Shutting down...", flush=True)
-                await manager.stop()
+            print("[OZMA] _run() starting", flush=True)
+            await manager.start()
+            print("[OZMA] _run() manager.start() returned!", flush=True)
 
         try:
+            print("[OZMA] calling asyncio.run()...", flush=True)
             asyncio.run(_run())
+            print("[OZMA] asyncio.run() returned normally", flush=True)
         except KeyboardInterrupt:
             print("[OZMA] KeyboardInterrupt", flush=True)
+        except SystemExit as e:
+            print(f"[OZMA] SystemExit: {e}", flush=True)
+        except BaseException as e:
+            print(f"[OZMA] BaseException: {type(e).__name__}: {e}", flush=True)
+            traceback.print_exc()
+        print("[OZMA] main() returning", flush=True)
 
 
 if __name__ == "__main__":
