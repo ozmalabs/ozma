@@ -21,6 +21,7 @@ import json
 import logging
 import socket
 import time
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
 from zeroconf import ServiceBrowser, ServiceStateChange, Zeroconf
@@ -54,6 +55,9 @@ class DiscoveryService:
         self._browser: ServiceBrowser | None = None
         self._requery_task: asyncio.Task | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._peer_browser: object | None = None  # AsyncServiceBrowser for ctrl peers
+        self._on_peer_found: Callable[[dict], Awaitable[None]] | None = None
+        self._on_peer_lost: Callable[[str], Awaitable[None]] | None = None
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -219,6 +223,88 @@ class DiscoveryService:
             except Exception as e:
                 log.debug("withdraw_controller: %s", e)
             self._ctrl_info = None
+
+    async def start_peer_browser(
+        self,
+        on_found: Callable[[dict], Awaitable[None]],
+        on_lost: Callable[[str], Awaitable[None]],
+    ) -> None:
+        """Start a persistent background browser for _ozma-ctrl._tcp.local. peers.
+
+        ``on_found`` is called with a dict: {id, host, api_port, base_url}
+        when a peer is first seen or its address changes.
+
+        ``on_lost`` is called with controller_id when a peer goes away.
+        """
+        if self._azc is None:
+            return
+        from zeroconf import ServiceStateChange as SSC
+        from zeroconf.asyncio import AsyncServiceBrowser as _ASB
+
+        self._on_peer_found = on_found
+        self._on_peer_lost = on_lost
+        assert self._loop is not None
+
+        def _on_ctrl_state_change(
+            zeroconf: Zeroconf,
+            service_type: str,
+            name: str,
+            state_change: SSC,
+        ) -> None:
+            if state_change in (SSC.Added, SSC.Updated):
+                self._loop.call_soon_threadsafe(  # type: ignore[union-attr]
+                    self._loop.create_task,  # type: ignore[union-attr]
+                    self._resolve_peer(zeroconf, name),
+                )
+            elif state_change == SSC.Removed:
+                ctrl_id = name.split(".")[0]
+                self._loop.call_soon_threadsafe(  # type: ignore[union-attr]
+                    self._loop.create_task,  # type: ignore[union-attr]
+                    self._peer_lost(ctrl_id),
+                )
+
+        self._peer_browser = _ASB(
+            self._azc.zeroconf,
+            "_ozma-ctrl._tcp.local.",
+            handlers=[_on_ctrl_state_change],
+        )
+        log.info("Peer controller browser started")
+
+    async def _resolve_peer(self, zeroconf: Zeroconf, name: str) -> None:
+        """Resolve a peer controller service record and fire on_found."""
+        from zeroconf.asyncio import AsyncServiceInfo as _ASI
+        info = _ASI("_ozma-ctrl._tcp.local.", name)
+        await info.async_request(zeroconf, timeout=3000)
+        if not info.addresses:
+            log.warning("Could not resolve address for peer %s", name)
+            return
+        ip = socket.inet_ntoa(info.addresses[0])
+        props = {
+            k.decode(): (v.decode() if isinstance(v, bytes) else (v or ""))
+            for k, v in (info.properties or {}).items()
+        }
+        api_port = int(props.get("api_port", "7380"))
+        ctrl_id = props.get("controller_id", name.split(".")[0])
+
+        # Skip self
+        my_info = getattr(self, "_ctrl_info", None)
+        if my_info and name == my_info.name:
+            return
+
+        log.info("Peer controller seen: %s @ %s:%d", ctrl_id, ip, api_port)
+        if self._on_peer_found:
+            await self._on_peer_found({
+                "id": ctrl_id,
+                "host": ip,
+                "api_port": api_port,
+                "base_url": f"http://{ip}:{api_port}",
+            })
+
+    async def _peer_lost(self, ctrl_id: str) -> None:
+        """Fire on_lost for a peer that has gone offline."""
+        log.info("Peer controller lost: %s", ctrl_id)
+        if self._on_peer_lost:
+            await self._on_peer_lost(ctrl_id)
 
     async def discover_controllers(self, timeout: float = 5.0) -> list[dict]:
         """Probe mDNS for _ozma-ctrl._tcp.local. peers on the LAN."""

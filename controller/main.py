@@ -79,6 +79,9 @@ from guacamole import GuacamoleManager
 from provisioning import ProvisioningManager
 from auth import AuthConfig, setup_auth_password
 from users import UserManager
+from vaultwarden import VaultwardenManager, VaultwardenConfig
+from email_security import EmailSecurityMonitor
+from cloud_backup import CloudBackupManager
 from service_proxy import ServiceProxyManager
 from idp import IdentityProvider, IdPConfig
 from sharing import SharingManager
@@ -363,6 +366,50 @@ async def run(config: Config) -> None:
 
     state.user_manager = user_mgr
 
+    # Vaultwarden — self-hosted password manager
+    vw_cfg = VaultwardenConfig(
+        enabled=config.vaultwarden_enabled,
+        data_dir=config.vaultwarden_data_dir,
+        port=config.vaultwarden_port,
+        admin_token=config.vaultwarden_admin_token,
+    )
+    vault_mgr = VaultwardenManager(vw_cfg, controller_dir=Path(__file__).parent)
+    await vault_mgr.start()
+    state.vaultwarden_manager = vault_mgr
+
+    # Email security monitor
+    async def _email_alert(domain: str, posture) -> None:
+        high = [i for i in posture.issues if i.severity in ("critical", "high")]
+        if high:
+            await state.events.put({
+                "type": "email_security.alert",
+                "domain": domain,
+                "grade": posture.grade,
+                "score": posture.score,
+                "issues": [i.to_dict() for i in high],
+            })
+            if notifier:
+                await notifier.on_event("email_security.alert", {
+                    "domain": domain, "grade": posture.grade,
+                    "issues": [i.to_dict() for i in high],
+                })
+
+    email_sec = EmailSecurityMonitor(on_alert=_email_alert)
+    await email_sec.start()
+
+    # Cloud backup (M365 + Google Workspace)
+    cloud_backup_dir = Path(__file__).parent / "cloud_backup"
+    mesh_key_bytes: bytes | None = None
+    if mesh_ca and mesh_ca.controller_keypair:
+        try:
+            mesh_key_bytes = bytes.fromhex(
+                mesh_ca.controller_keypair.private_key_hex()
+            )
+        except Exception:
+            pass
+    cloud_backup = CloudBackupManager(cloud_backup_dir, mesh_key_bytes)
+    await cloud_backup.start()
+
     # Service proxy
     services_path = Path(__file__).parent / "services.json"
     svc_proxy = ServiceProxyManager(services_path)
@@ -439,7 +486,7 @@ async def run(config: Config) -> None:
         transcription_mgr = LiveTranscriptionManager(connect=connect)
 
     # Build the FastAPI app — all managers must be created before this point
-    app = build_app(state, scenarios, streams, audio, controls, rgb_out, motion, bt, kdeconnect, wifi_audio, captures, paste_typer, kbd_mgr, macro_mgr, sched, notifier, recorder, net_health, ocr_triggers, auto_engine, metrics_collector, screen_mgr, codec_mgr=codec_mgr, camera_mgr=camera_mgr, obs_studio=obs_studio, stream_router=stream_router, guac_mgr=guac_mgr, provision_mgr=provision_mgr, connect=connect, mesh_ca=mesh_ca, sess_mgr=sess_mgr, room_correction=room_corr, testbench=testbench, agent_engine=agent_engine, test_runner=test_runner, auth_config=auth_cfg, user_manager=user_mgr, service_proxy=svc_proxy, idp=idp_instance, sharing=sharing_mgr, ext_publish=ext_pub, node_reconciler=reconciler, update_mgr=update_mgr, transcription_mgr=transcription_mgr, discovery=discovery, doorbell_mgr=doorbell_mgr, alert_mgr=alert_mgr)
+    app = build_app(state, scenarios, streams, audio, controls, rgb_out, motion, bt, kdeconnect, wifi_audio, captures, paste_typer, kbd_mgr, macro_mgr, sched, notifier, recorder, net_health, ocr_triggers, auto_engine, metrics_collector, screen_mgr, codec_mgr=codec_mgr, camera_mgr=camera_mgr, obs_studio=obs_studio, stream_router=stream_router, guac_mgr=guac_mgr, provision_mgr=provision_mgr, connect=connect, mesh_ca=mesh_ca, sess_mgr=sess_mgr, room_correction=room_corr, testbench=testbench, agent_engine=agent_engine, test_runner=test_runner, auth_config=auth_cfg, user_manager=user_mgr, service_proxy=svc_proxy, idp=idp_instance, sharing=sharing_mgr, ext_publish=ext_pub, node_reconciler=reconciler, update_mgr=update_mgr, transcription_mgr=transcription_mgr, discovery=discovery, doorbell_mgr=doorbell_mgr, alert_mgr=alert_mgr, vaultwarden=vault_mgr, email_security=email_sec, cloud_backup=cloud_backup)
 
     uv_config = uvicorn.Config(
         app,
@@ -478,6 +525,40 @@ async def run(config: Config) -> None:
         else "ozma-controller"
     )
     await discovery.announce_controller(ctrl_id, api_port=config.api_port)
+
+    # Auto-link LAN peer controllers discovered via mDNS
+    async def _on_peer_found(info: dict) -> None:
+        if not sharing:
+            return
+        existing = sharing.get_peer(info["id"])
+        if existing:
+            # Update address in case it changed; mark online
+            was_online = existing.online
+            updated = sharing.mark_peer_online(info["id"], info["host"], info["api_port"])
+            if updated and not was_online:
+                await state.events.put({"type": "peer.online", "controller_id": info["id"]})
+        else:
+            peer = sharing.add_peer(
+                controller_id=info["id"],
+                owner_user_id="",
+                name=info["id"],
+                host=info["host"],
+                port=info["api_port"],
+                transport="lan",
+            )
+            peer.auto_discovered = True
+            await state.events.put({"type": "peer.discovered", "peer": peer.to_dict()})
+            log.info("Auto-linked LAN peer: %s @ %s:%d", info["id"], info["host"], info["api_port"])
+
+    async def _on_peer_lost(ctrl_id: str) -> None:
+        if not sharing:
+            return
+        peer = sharing.mark_peer_offline(ctrl_id)
+        if peer:
+            await state.events.put({"type": "peer.offline", "controller_id": ctrl_id})
+
+    await discovery.start_peer_browser(_on_peer_found, _on_peer_lost)
+
     await hid.start()
 
     # Monitor for virtual capture devices from soft nodes
@@ -572,6 +653,9 @@ async def run(config: Config) -> None:
     await streams.stop()
     await scenarios.stop()
     await reconciler.stop()
+    await vault_mgr.stop()
+    await email_sec.stop()
+    await cloud_backup.stop()
     if front_panel:
         await front_panel.stop()
 

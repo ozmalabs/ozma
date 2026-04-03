@@ -92,6 +92,7 @@ class PeerController:
     last_seen: float = 0.0
     online: bool = False
     transport: str = "lan"           # "lan" | "relay"
+    auto_discovered: bool = False    # True = linked automatically via mDNS
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -103,6 +104,7 @@ class PeerController:
             "last_seen": self.last_seen,
             "online": self.online,
             "transport": self.transport,
+            "auto_discovered": self.auto_discovered,
         }
 
     @classmethod
@@ -116,6 +118,7 @@ class PeerController:
             last_seen=d.get("last_seen", 0.0),
             online=d.get("online", False),
             transport=d.get("transport", "lan"),
+            auto_discovered=d.get("auto_discovered", False),
         )
 
 
@@ -267,6 +270,27 @@ class SharingManager:
             if p.owner_user_id == user_id:
                 return p
         return None
+
+    def mark_peer_online(self, controller_id: str, host: str, port: int) -> PeerController | None:
+        """Update a peer's address and mark it online. Returns the peer if found."""
+        peer = self._peers.get(controller_id)
+        if not peer:
+            return None
+        peer.host = host
+        peer.port = port
+        peer.online = True
+        peer.last_seen = time.time()
+        return peer
+
+    def mark_peer_offline(self, controller_id: str) -> PeerController | None:
+        """Mark a peer as offline without removing it. Returns the peer if found."""
+        peer = self._peers.get(controller_id)
+        if not peer:
+            return None
+        if peer.online:
+            peer.online = False
+            log.info("Peer %s (%s) went offline", peer.name or peer.id, controller_id)
+        return peer
 
     # ── Cross-user proxy ─────────────────────────────────────────────
 
