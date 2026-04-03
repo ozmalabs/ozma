@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 260 100" width="260" height="100" fill="none" overflow="visible">
+  <defs>
+    <linearGradient id="f1" gradientUnits="userSpaceOnUse" x1="68.5" y1="32" x2="82.5" y2="56"><stop offset="0%" stop-color="#d1fae5"/><stop offset="100%" stop-color="#a7f3d0"/></linearGradient>
+    <linearGradient id="f2" gradientUnits="userSpaceOnUse" x1="131.5" y1="32" x2="117.5" y2="56"><stop offset="0%" stop-color="#a7f3d0"/><stop offset="100%" stop-color="#6ee7b7"/></linearGradient>
+    <linearGradient id="f3" gradientUnits="userSpaceOnUse" x1="163" y1="86" x2="135" y2="86"><stop offset="0%" stop-color="#34d399"/><stop offset="100%" stop-color="#059669"/></linearGradient>
+    <linearGradient id="f4" gradientUnits="userSpaceOnUse" x1="131.5" y1="140" x2="117.5" y2="116"><stop offset="0%" stop-color="#10b981"/><stop offset="100%" stop-color="#047857"/></linearGradient>
+    <linearGradient id="f5" gradientUnits="userSpaceOnUse" x1="68.5" y1="140" x2="82.5" y2="116"><stop offset="0%" stop-color="#059669"/><stop offset="100%" stop-color="#065f46"/></linearGradient>
+    <linearGradient id="f6" gradientUnits="userSpaceOnUse" x1="37" y1="86" x2="65" y2="86"><stop offset="0%" stop-color="#065f46"/><stop offset="100%" stop-color="#022c22"/></linearGradient>
+    <linearGradient id="gold" gradientUnits="userSpaceOnUse" x1="54" y1="20" x2="260" y2="72"><stop offset="0%" stop-color="#fcd34d"/><stop offset="48%" stop-color="#fffbeb"/><stop offset="100%" stop-color="#d97706"/></linearGradient>
+  </defs>
+  <svg x="0" y="8" width="56" height="64" viewBox="37 14 126 144">
+    <polygon points="37,50  100,14  100,46  65,66"    fill="url(#f1)"/>
+    <polygon points="100,14 163,50  135,66  100,46"   fill="url(#f2)"/>
+    <polygon points="163,50 163,122 135,106 135,66"   fill="url(#f3)"/>
+    <polygon points="163,122 100,158 100,126 135,106" fill="url(#f4)"/>
+    <polygon points="100,158 37,122  65,106  100,126" fill="url(#f5)"/>
+    <polygon points="37,122  37,50   65,66   65,106"  fill="url(#f6)"/>
+    <polygon points="100,14 163,50 163,122 100,158 37,122 37,50" stroke="#6ee7b7" stroke-width="2.5" fill="none"/>
+  </svg>
+  <text x="60" y="72" font-family="Inter,-apple-system,sans-serif" font-size="72" font-weight="800" letter-spacing="-3" fill="url(#gold)">zma</text>
+  <text x="61" y="94" font-family="Inter,-apple-system,sans-serif" font-size="15" font-weight="700" letter-spacing="7" fill="#4ae0a4" opacity="0.85">LABS</text>
+</svg>
