@@ -166,7 +166,7 @@ class DirectRegisterRequest(BaseModel):
     frigate_port: str = ""     # Frigate API port (default 5000)
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None, sunshine: Any | None = None, msp_mgr: MSPDashboardManager | None = None, msp_portal: MSPPortalManager | None = None) -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None, sunshine: Any | None = None, msp_mgr: MSPDashboardManager | None = None, msp_portal: MSPPortalManager | None = None, auto_configure: Any | None = None) -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -7965,6 +7965,69 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         portal = _msp_portal()
         html = portal.get_portal_html(client, health)
         return Response(content=html, media_type="text/html")
+
+    # ── Auto-configure (V1.7) — PoE subnet camera discovery ──────────────────
+
+    def _ac() -> Any:
+        if auto_configure is None:
+            raise HTTPException(503, "Auto-configure not available")
+        return auto_configure
+
+    @app.get("/api/v1/auto-configure/devices")
+    async def ac_list_devices(request: Request) -> list[dict[str, Any]]:
+        """List all discovered devices on the PoE subnet."""
+        _require_scope(request, SCOPE_READ)
+        return _ac().list_devices()
+
+    @app.get("/api/v1/auto-configure/devices/{ip}")
+    async def ac_get_device(request: Request, ip: str) -> dict[str, Any]:
+        """Get a single discovered device by IP."""
+        _require_scope(request, SCOPE_READ)
+        dev = _ac().get_device(ip)
+        if dev is None:
+            raise HTTPException(404, f"No device at {ip}")
+        return dev.to_dict()
+
+    @app.post("/api/v1/auto-configure/devices/{ip}/register")
+    async def ac_register_device(request: Request, ip: str) -> dict[str, Any]:
+        """Register a discovered device as an Ozma node."""
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        name = body.get("name", "")
+        if not name:
+            raise HTTPException(400, "name is required")
+        machine_class = body.get("machine_class", "camera")
+        result = await _ac().register_device(ip, name, machine_class=machine_class)
+        if not result.get("ok"):
+            raise HTTPException(404, result.get("error", f"No device at {ip}"))
+        return result
+
+    @app.post("/api/v1/auto-configure/devices/{ip}/ignore")
+    async def ac_ignore_device(request: Request, ip: str) -> dict[str, Any]:
+        """Suppress future notifications for this device."""
+        _require_scope(request, SCOPE_WRITE)
+        dev = _ac().get_device(ip)
+        if dev is None:
+            raise HTTPException(404, f"No device at {ip}")
+        _ac().ignore_device(ip)
+        return {"ok": True, "ip": ip}
+
+    @app.post("/api/v1/auto-configure/devices/{ip}/unignore")
+    async def ac_unignore_device(request: Request, ip: str) -> dict[str, Any]:
+        """Re-enable notifications for a previously ignored device."""
+        _require_scope(request, SCOPE_WRITE)
+        dev = _ac().get_device(ip)
+        if dev is None:
+            raise HTTPException(404, f"No device at {ip}")
+        _ac().unignore_device(ip)
+        return {"ok": True, "ip": ip}
+
+    @app.post("/api/v1/auto-configure/scan")
+    async def ac_scan_now(request: Request) -> dict[str, Any]:
+        """Trigger an immediate PoE subnet scan."""
+        _require_scope(request, SCOPE_WRITE)
+        await _ac().scan_now()
+        return {"ok": True}
 
     # Static files — mounted last so they don't shadow API routes
     static_dir = Path(__file__).parent / "static"
