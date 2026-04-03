@@ -141,6 +141,7 @@ class ScenarioManager:
         self._watch_task: asyncio.Task | None = None
         self._transition_task: asyncio.Task | None = None
         self._mtime: float = 0.0
+        self._active_path: Path = config_path  # updated by _load() to whichever file was read
 
     # --- Lifecycle ---
 
@@ -320,42 +321,59 @@ class ScenarioManager:
         return s
 
     def _load(self) -> None:
-        if not self._path.exists():
-            log.info("No scenarios file at %s — starting empty", self._path)
-            return
+        # Support both .json and .yaml — try the alternate extension if primary missing
+        path = self._path
+        if not path.exists():
+            alt = path.with_suffix('.yaml') if path.suffix == '.json' else path.with_suffix('.json')
+            if alt.exists():
+                path = alt
+            else:
+                log.info("No scenarios file at %s — starting empty", self._path)
+                return
         try:
-            data = json.loads(self._path.read_text())
+            text = path.read_text()
+            if path.suffix in ('.yaml', '.yml'):
+                import yaml
+                data = yaml.safe_load(text) or {}
+            else:
+                data = json.loads(text)
             self._scenarios = {
                 d["id"]: Scenario.from_dict(d)
                 for d in data.get("scenarios", [])
             }
             self._default_id = data.get("default")
-            self._mtime = self._path.stat().st_mtime
-            log.info("Loaded %d scenario(s) from %s", len(self._scenarios), self._path)
+            self._mtime = path.stat().st_mtime
+            self._active_path = path  # remember which file is live
+            log.info("Loaded %d scenario(s) from %s", len(self._scenarios), path)
         except Exception as e:
-            log.error("Failed to load scenarios from %s: %s", self._path, e)
+            log.error("Failed to load scenarios from %s: %s", path, e)
 
     def _save(self) -> None:
+        """Save scenarios. Input may be .yaml or .json; saves always write .json."""
         data = {
             "scenarios": [s.to_dict() for s in self._scenarios.values()],
         }
         if self._default_id:
             data["default"] = self._default_id
+        # Always save to the .json path regardless of which file was loaded
+        save_path = self._path.with_suffix('.json')
         try:
-            self._path.write_text(json.dumps(data, indent=2))
-            self._mtime = self._path.stat().st_mtime
+            save_path.write_text(json.dumps(data, indent=2))
+            self._mtime = save_path.stat().st_mtime
+            self._active_path = save_path
         except Exception as e:
-            log.error("Failed to save scenarios to %s: %s", self._path, e)
+            log.error("Failed to save scenarios to %s: %s", save_path, e)
 
     async def _watch_loop(self) -> None:
-        """Reload scenarios.json if it changes on disk."""
+        """Reload scenarios file if it changes on disk."""
         while True:
             await asyncio.sleep(2.0)
             try:
-                if self._path.exists():
-                    mtime = self._path.stat().st_mtime
+                watch_path = getattr(self, '_active_path', self._path)
+                if watch_path.exists():
+                    mtime = watch_path.stat().st_mtime
                     if mtime != self._mtime:
-                        log.info("scenarios.json changed, reloading")
+                        log.info("%s changed, reloading", watch_path.name)
                         self._load()
             except Exception as e:
                 log.debug("Scenario watch error: %s", e)

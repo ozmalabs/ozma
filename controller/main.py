@@ -115,6 +115,9 @@ async def run(config: Config) -> None:
     state = AppState()
 
     scenarios_path = Path(__file__).parent / "scenarios.json"
+    _yaml_path = Path(__file__).parent / "scenarios.yaml"
+    if not scenarios_path.exists() and _yaml_path.exists():
+        scenarios_path = _yaml_path
     rgb_engine = RGBEngine()
     audio = AudioRouter(
         state,
