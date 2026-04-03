@@ -5,7 +5,7 @@ Camera advisor — snapshot + AI analysis → name/zone/trigger suggestions.
 
 Workflow:
   1. Fetch a JPEG snapshot from the camera (Frigate /latest.jpg or CameraManager)
-  2. Send to Claude claude-sonnet-4-6 with a structured vision prompt
+  2. Send to a vision-capable LLM with a structured prompt
   3. Parse the JSON response (scene, detected objects, suggested zones)
   4. Build three ready-to-use Frigate config profiles:
        default   — sensible defaults for a home/office camera
@@ -15,8 +15,26 @@ Workflow:
 
 The caller chooses a profile and can apply it (rename camera, push Frigate config).
 
-Requires ANTHROPIC_API_KEY env var.  Falls back to a heuristic profile if the
-API key is absent or the call fails — so the advisor always returns something useful.
+Backend configuration (environment variables):
+
+  OZMA_CAMERA_ADVISOR_BACKEND   anthropic (default) | ollama | openai
+  OZMA_CAMERA_ADVISOR_MODEL     model name; defaults per backend:
+                                  anthropic → claude-sonnet-4-6
+                                  ollama    → llava
+                                  openai    → gpt-4o
+  OZMA_CAMERA_ADVISOR_URL       base URL for ollama/openai backends
+                                  ollama    → http://localhost:11434
+                                  openai    → https://api.openai.com
+                                  (any OpenAI-compatible server works here —
+                                   LM Studio, vLLM, llama.cpp, etc.)
+  ANTHROPIC_API_KEY             required for anthropic backend
+  OPENAI_API_KEY                required for openai backend (not ollama)
+
+The advisor always returns something — if the LLM call fails it falls back to a
+safe heuristic profile so camera setup is never blocked.
+
+Speed note: local models (ollama) are slower but free and fully private.
+Camera advice is a one-time setup step, so latency is not a concern.
 """
 
 from __future__ import annotations
@@ -196,36 +214,70 @@ Rules:
 _USER_PROMPT = "Analyse this camera snapshot and return the JSON configuration advice."
 
 
-# ── AI call ───────────────────────────────────────────────────────────────────
+# ── Backend configuration ─────────────────────────────────────────────────────
 
-async def _call_claude(jpeg_bytes: bytes) -> dict:
-    """Send snapshot to Claude claude-sonnet-4-6, return parsed JSON dict."""
+_DEFAULT_MODELS = {
+    "anthropic": "claude-sonnet-4-6",
+    "ollama":    "llava",
+    "openai":    "gpt-4o",
+}
+
+_DEFAULT_URLS = {
+    "ollama": "http://localhost:11434",
+    "openai": "https://api.openai.com",
+}
+
+
+def _advisor_config() -> tuple[str, str, str]:
+    """Return (backend, model, base_url) from environment."""
+    backend = os.environ.get("OZMA_CAMERA_ADVISOR_BACKEND", "anthropic").lower()
+    if backend not in _DEFAULT_MODELS:
+        raise RuntimeError(
+            f"Unknown OZMA_CAMERA_ADVISOR_BACKEND={backend!r}. "
+            f"Choose: {', '.join(_DEFAULT_MODELS)}"
+        )
+    model = os.environ.get("OZMA_CAMERA_ADVISOR_MODEL") or _DEFAULT_MODELS[backend]
+    url   = os.environ.get("OZMA_CAMERA_ADVISOR_URL")   or _DEFAULT_URLS.get(backend, "")
+    return backend, model, url
+
+
+# ── JSON extraction ───────────────────────────────────────────────────────────
+
+def _extract_json(text: str) -> dict:
+    """Parse JSON from LLM output, stripping any markdown fences."""
+    text = text.strip()
+    if text.startswith("```"):
+        # ```json ... ``` or ``` ... ```
+        inner = text.split("```", 2)
+        text = inner[1]
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.strip()
+    return json.loads(text)
+
+
+# ── Backend implementations ───────────────────────────────────────────────────
+
+async def _call_anthropic(jpeg_bytes: bytes, model: str) -> dict:
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY not set")
 
     b64 = base64.standard_b64encode(jpeg_bytes).decode()
-
     payload = {
-        "model": "claude-sonnet-4-6",
+        "model": model,
         "max_tokens": 1024,
         "system": _SYSTEM_PROMPT,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": b64,
-                        },
-                    },
-                    {"type": "text", "text": _USER_PROMPT},
-                ],
-            }
-        ],
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
+                },
+                {"type": "text", "text": _USER_PROMPT},
+            ],
+        }],
     }
 
     import aiohttp
@@ -238,20 +290,116 @@ async def _call_claude(jpeg_bytes: bytes) -> dict:
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
             },
-            timeout=aiohttp.ClientTimeout(total=30),
+            timeout=aiohttp.ClientTimeout(total=60),
         ) as resp:
             if resp.status != 200:
-                text = await resp.text()
-                raise RuntimeError(f"Anthropic API error {resp.status}: {text[:200]}")
+                raise RuntimeError(f"Anthropic API {resp.status}: {(await resp.text())[:200]}")
             data = await resp.json()
 
-    text = data["content"][0]["text"].strip()
-    # Strip accidental markdown fences
-    if text.startswith("```"):
-        text = text.split("```")[1]
-        if text.startswith("json"):
-            text = text[4:]
-    return json.loads(text)
+    return _extract_json(data["content"][0]["text"])
+
+
+async def _call_ollama(jpeg_bytes: bytes, model: str, base_url: str) -> dict:
+    """
+    Ollama native chat API with vision support.
+
+    Uses POST {base_url}/api/chat with the `images` field (base64 JPEG list).
+    Compatible with any Ollama-hosted vision model: llava, llava:13b,
+    llava:34b, bakllava, moondream, minicpm-v, etc.
+
+    Ollama has no timeout by default — we use 300s since local models
+    can be slow on CPU but the analysis is a one-time setup step.
+    """
+    b64 = base64.standard_b64encode(jpeg_bytes).decode()
+
+    # Combine system + user prompt: Ollama supports system role in messages
+    payload = {
+        "model": model,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": _USER_PROMPT,
+                "images": [b64],
+            },
+        ],
+    }
+
+    import aiohttp
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{base_url.rstrip('/')}/api/chat",
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=300),
+        ) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"Ollama API {resp.status}: {(await resp.text())[:200]}")
+            data = await resp.json()
+
+    text = data["message"]["content"]
+    return _extract_json(text)
+
+
+async def _call_openai_compat(jpeg_bytes: bytes, model: str, base_url: str) -> dict:
+    """
+    OpenAI-compatible chat/completions endpoint with vision.
+
+    Works with:
+      - OpenAI (gpt-4o, gpt-4-turbo-vision)
+      - LM Studio  (http://localhost:1234)
+      - vLLM       (http://localhost:8000)
+      - llama.cpp  (http://localhost:8080)
+      - any server implementing POST /v1/chat/completions with image_url support
+    """
+    api_key = os.environ.get("OPENAI_API_KEY", "none")  # some local servers ignore the key
+    b64 = base64.standard_b64encode(jpeg_bytes).decode()
+    data_url = f"data:image/jpeg;base64,{b64}"
+
+    payload = {
+        "model": model,
+        "max_tokens": 1024,
+        "messages": [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                    {"type": "text",      "text": _USER_PROMPT},
+                ],
+            },
+        ],
+    }
+
+    import aiohttp
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{base_url.rstrip('/')}/v1/chat/completions",
+            json=payload,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=aiohttp.ClientTimeout(total=300),
+        ) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"OpenAI-compat API {resp.status}: {(await resp.text())[:200]}")
+            data = await resp.json()
+
+    text = data["choices"][0]["message"]["content"]
+    return _extract_json(text)
+
+
+# ── Dispatcher ────────────────────────────────────────────────────────────────
+
+async def _call_llm(jpeg_bytes: bytes) -> dict:
+    """Route to the configured backend and return the parsed JSON dict."""
+    backend, model, url = _advisor_config()
+    log.info("Camera advisor: backend=%s model=%s", backend, model)
+    match backend:
+        case "anthropic":
+            return await _call_anthropic(jpeg_bytes, model)
+        case "ollama":
+            return await _call_ollama(jpeg_bytes, model, url)
+        case "openai":
+            return await _call_openai_compat(jpeg_bytes, model, url)
 
 
 # ── Heuristic fallback ────────────────────────────────────────────────────────
@@ -273,7 +421,10 @@ def _heuristic_advice(camera_id: str) -> dict:
                 "objects": ["person", "car"],
             }
         ],
-        "reasoning": "Heuristic defaults — set ANTHROPIC_API_KEY for AI-powered advice.",
+        "reasoning": (
+            "Heuristic defaults — configure OZMA_CAMERA_ADVISOR_BACKEND "
+            "(anthropic/ollama/openai) for AI-powered advice."
+        ),
     }
 
 
@@ -375,7 +526,7 @@ async def advise_camera(
     error = ""
 
     try:
-        ai = await _call_claude(jpeg_bytes)
+        ai = await _call_llm(jpeg_bytes)
         log.info("Camera advisor: AI analysis succeeded for %s", camera_id)
     except Exception as exc:
         log.warning("Camera advisor: AI call failed for %s: %s — using heuristic", camera_id, exc)
