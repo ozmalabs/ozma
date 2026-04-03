@@ -337,13 +337,21 @@ class SeatManager:
 
         # Start config WebSocket listener for dynamic seat changes from controller
         if self._controller_url:
+            async def _safe_config_ws():
+                try:
+                    await self._connect_config_ws()
+                except Exception as e:
+                    print(f"[OZMA DEBUG] Config WS failed: {e}", flush=True)
+                    log.warning("Config WebSocket failed: %s", e)
             self._config_ws_task = asyncio.create_task(
-                self._connect_config_ws(),
+                _safe_config_ws(),
                 name="config-ws",
             )
 
         # Wait for stop signal
+        print("[OZMA DEBUG] Waiting for stop signal (Ctrl+C)...", flush=True)
         await self._stop_event.wait()
+        print("[OZMA DEBUG] Stop signal received", flush=True)
 
     async def stop(self) -> None:
         """Stop all seats and clean up resources."""
