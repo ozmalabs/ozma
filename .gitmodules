@@ -7,3 +7,6 @@
 [submodule "site"]
 	path = site
 	url = https://github.com/ozmalabs/website.git
+[submodule "ecosystem/ha-ozma"]
+	path = ecosystem/ha-ozma
+	url = https://github.com/ozmalabs/ha-ozma.git
