@@ -299,15 +299,17 @@ class SeatManager:
             )
             self._seat_tasks.append(task)
 
-        # Start monitoring server
-        print("[OZMA DEBUG] Starting monitoring server...", flush=True)
-        try:
-            self._monitoring = MonitoringServer(self)
-            await self._monitoring.start()
-            print("[OZMA DEBUG] Monitoring server running on port 7399", flush=True)
-        except Exception as e:
-            print(f"[OZMA DEBUG] Monitoring server failed: {e}", flush=True)
-            log.warning("Monitoring server failed: %s", e)
+        # Start monitoring server (deferred — don't block seat startup)
+        print("[OZMA DEBUG] Deferring monitoring server...", flush=True)
+        async def _start_monitoring():
+            try:
+                self._monitoring = MonitoringServer(self)
+                await self._monitoring.start()
+                print("[OZMA DEBUG] Monitoring server running on port 7399", flush=True)
+            except Exception as e:
+                print(f"[OZMA DEBUG] Monitoring server failed: {e}", flush=True)
+                log.warning("Monitoring server failed: %s", e)
+        asyncio.create_task(_start_monitoring(), name="monitoring")
 
         # Start game launcher (discovers game libraries in background)
         print("[OZMA DEBUG] Starting game launcher...", flush=True)
