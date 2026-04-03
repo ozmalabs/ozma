@@ -286,8 +286,15 @@ class SeatManager:
         # Start all seats concurrently
         log.info("Starting %d seats", len(self._seats))
         for seat in self._seats:
+            async def _safe_start(s=seat):
+                try:
+                    await s.start(self._controller_url)
+                except Exception as e:
+                    print(f"[OZMA DEBUG] Seat {s.name} crashed: {e}", flush=True)
+                    log.error("Seat %s crashed: %s", s.name, e, exc_info=True)
+
             task = asyncio.create_task(
-                seat.start(self._controller_url),
+                _safe_start(),
                 name=f"seat-{seat.name}",
             )
             self._seat_tasks.append(task)
