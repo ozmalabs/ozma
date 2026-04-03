@@ -184,8 +184,9 @@ class Seat:
             else:
                 log.debug("Seat %s: WebRTC unavailable (aiortc not installed)",
                           self.name)
-        except ImportError:
-            log.debug("Seat %s: WebRTC module not available", self.name)
+        except Exception:
+            # aiortc/av/PyAV can crash on import if ffmpeg libs are missing
+            log.debug("Seat %s: WebRTC not available", self.name)
 
     async def _start_hid_injector(self) -> None:
         """Create per-seat virtual input devices via uinput."""

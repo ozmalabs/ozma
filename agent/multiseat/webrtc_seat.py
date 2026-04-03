@@ -53,14 +53,22 @@ def _check_aiortc() -> bool:
     if _AIORTC_AVAILABLE is not None:
         return _AIORTC_AVAILABLE
     try:
+        # Test av import in a subprocess to avoid DLL load crashes
+        import subprocess, sys as _sys
+        result = subprocess.run(
+            [_sys.executable, "-c", "import av; import aiortc; import numpy"],
+            capture_output=True, timeout=10,
+        )
+        if result.returncode != 0:
+            raise ImportError(f"av/aiortc probe failed: {result.stderr.decode()[:200]}")
         import aiortc  # noqa: F401
         import av  # noqa: F401
         import numpy  # noqa: F401
         _AIORTC_AVAILABLE = True
-    except ImportError:
+    except Exception as e:
         _AIORTC_AVAILABLE = False
-        log.info("aiortc/av/numpy not installed — WebRTC disabled, "
-                 "MJPEG/HLS fallback active")
+        log.info("WebRTC disabled (aiortc/av probe failed: %s) — MJPEG/HLS fallback active",
+                 str(e)[:100])
     return _AIORTC_AVAILABLE
 
 
