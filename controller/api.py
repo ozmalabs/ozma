@@ -3551,6 +3551,139 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(status_code=404, detail="WHIP session not found")
         return session.to_dict()
 
+    # ── V1.6 consumer camera: clip browsing, guest tokens, push webhooks ─────
+
+    # Clip browsing
+    @app.get("/api/v1/cameras/{camera_id}/clips")
+    async def camera_list_clips(
+        request: Request,
+        camera_id: str,
+        limit: int = 50,
+        before: float | None = None,
+        event_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List recorded clips for a camera, newest first."""
+        _require_scope(request, SCOPE_READ)
+        if mobile_cam is None:
+            raise HTTPException(503, "Mobile camera service not available")
+        from mobile_camera import ClipBrowser
+        recordings_dir = getattr(mobile_cam, "_hls_dir", Path(".")).parent / "recordings"
+        browser = ClipBrowser(recordings_dir)
+        clips = browser.list_clips(camera_id, limit=limit, before=before, event_type=event_type)
+        return [c.to_dict() for c in clips]
+
+    @app.get("/api/v1/cameras/{camera_id}/clips/{clip_id}")
+    async def camera_get_clip(request: Request, camera_id: str, clip_id: str) -> dict[str, Any]:
+        """Get metadata for a specific recorded clip."""
+        _require_scope(request, SCOPE_READ)
+        if mobile_cam is None:
+            raise HTTPException(503, "Mobile camera service not available")
+        from mobile_camera import ClipBrowser
+        recordings_dir = getattr(mobile_cam, "_hls_dir", Path(".")).parent / "recordings"
+        browser = ClipBrowser(recordings_dir)
+        clip = browser.get_clip(camera_id, clip_id)
+        if not clip:
+            raise HTTPException(404, f"Clip {clip_id} not found")
+        return clip.to_dict()
+
+    # Guest tokens
+    @app.post("/api/v1/cameras/guest-tokens")
+    async def create_guest_token(request: Request) -> dict[str, Any]:
+        """Create a camera-view-only guest token for sharing with non-technical users."""
+        _require_scope(request, SCOPE_WRITE)
+        if mobile_cam is None:
+            raise HTTPException(503, "Mobile camera service not available")
+        body = await request.json()
+        from mobile_camera import GuestTokenManager
+        gtm_dir = getattr(mobile_cam, "_hls_dir", Path(".")).parent / "guest_tokens"
+        gtm = GuestTokenManager(data_dir=gtm_dir)
+        gt = gtm.create_token(
+            label=body.get("label", ""),
+            camera_ids=body.get("camera_ids", []),
+            ttl_days=int(body.get("ttl_days", 365)),
+        )
+        return gt.to_dict()
+
+    @app.get("/api/v1/cameras/guest-tokens")
+    async def list_guest_tokens(request: Request) -> list[dict[str, Any]]:
+        """List active guest tokens."""
+        _require_scope(request, SCOPE_READ)
+        if mobile_cam is None:
+            raise HTTPException(503, "Mobile camera service not available")
+        from mobile_camera import GuestTokenManager
+        gtm_dir = getattr(mobile_cam, "_hls_dir", Path(".")).parent / "guest_tokens"
+        gtm = GuestTokenManager(data_dir=gtm_dir)
+        return gtm.list_tokens()
+
+    @app.delete("/api/v1/cameras/guest-tokens/{token}")
+    async def revoke_guest_token(request: Request, token: str) -> dict[str, Any]:
+        """Revoke a guest token."""
+        _require_scope(request, SCOPE_WRITE)
+        if mobile_cam is None:
+            raise HTTPException(503, "Mobile camera service not available")
+        from mobile_camera import GuestTokenManager
+        gtm_dir = getattr(mobile_cam, "_hls_dir", Path(".")).parent / "guest_tokens"
+        gtm = GuestTokenManager(data_dir=gtm_dir)
+        ok = gtm.revoke(token)
+        if not ok:
+            raise HTTPException(404, "Token not found")
+        return {"ok": True}
+
+    # Push webhooks (motion notifications)
+    def _get_push_mgr() -> Any:
+        if mobile_cam is None:
+            raise HTTPException(503, "Mobile camera service not available")
+        from mobile_camera import MotionPushManager
+        push_dir = getattr(mobile_cam, "_hls_dir", Path(".")).parent / "push_webhooks"
+        return MotionPushManager(data_dir=push_dir)
+
+    @app.get("/api/v1/cameras/push-webhooks")
+    async def list_push_webhooks(request: Request) -> list[dict[str, Any]]:
+        """List registered motion push webhooks."""
+        _require_scope(request, SCOPE_READ)
+        return _get_push_mgr().list_webhooks()
+
+    @app.post("/api/v1/cameras/push-webhooks")
+    async def register_push_webhook(request: Request) -> dict[str, Any]:
+        """Register a webhook URL to receive motion/object alert notifications."""
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        url = body.get("url", "")
+        if not url:
+            raise HTTPException(400, "url is required")
+        wh = _get_push_mgr().register(
+            url=url,
+            camera_ids=body.get("camera_ids", []),
+            events=body.get("events", []),
+            label=body.get("label", ""),
+        )
+        return wh.to_dict()
+
+    @app.delete("/api/v1/cameras/push-webhooks/{webhook_id}")
+    async def unregister_push_webhook(request: Request, webhook_id: str) -> dict[str, Any]:
+        """Remove a push webhook."""
+        _require_scope(request, SCOPE_WRITE)
+        ok = _get_push_mgr().unregister(webhook_id)
+        if not ok:
+            raise HTTPException(404, f"Webhook {webhook_id} not found")
+        return {"ok": True}
+
+    @app.post("/api/v1/cameras/{camera_id}/notify")
+    async def trigger_camera_notify(request: Request, camera_id: str) -> dict[str, Any]:
+        """Manually trigger a push notification for a camera event (for testing)."""
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        mgr = _get_push_mgr()
+        count = await mgr.notify(
+            camera_id=camera_id,
+            event_type=body.get("event_type", "motion"),
+            camera_name=body.get("camera_name", ""),
+            label=body.get("label", ""),
+            confidence=float(body.get("confidence", 0.0)),
+            snapshot_url=body.get("snapshot_url", ""),
+        )
+        return {"ok": True, "delivered": count}
+
     # --- OBS / Broadcast studio endpoints ---
 
     @app.get("/api/v1/broadcast/status")

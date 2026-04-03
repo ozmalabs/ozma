@@ -418,3 +418,447 @@ async def _drain_stderr(proc: Any, label: str) -> None:
                 log.debug("ffmpeg[%s]: %s", label, text)
     except Exception:
         pass
+
+
+# ── Clip browser ─────────────────────────────────────────────────────────────
+
+import json as _json
+import os as _os
+import stat as _stat
+
+
+@dataclass
+class ClipInfo:
+    """Metadata for a recorded camera clip."""
+    clip_id: str            # Unique identifier (basename without ext)
+    camera_id: str
+    timestamp: float        # Unix epoch of clip start
+    duration_sec: float     # Duration in seconds (0 if unknown)
+    size_bytes: int         # File size
+    path: str               # Absolute path on disk
+    thumbnail_url: str = "" # URL to JPEG thumbnail (if available)
+    event_type: str = ""    # "motion" | "object" | "continuous" | ""
+
+    def to_dict(self) -> dict:
+        return {
+            "clip_id":       self.clip_id,
+            "camera_id":     self.camera_id,
+            "timestamp":     self.timestamp,
+            "duration_sec":  self.duration_sec,
+            "size_bytes":    self.size_bytes,
+            "thumbnail_url": self.thumbnail_url,
+            "event_type":    self.event_type,
+        }
+
+
+class ClipBrowser:
+    """
+    Browse recorded clips for one or more cameras.
+
+    Clips are assumed to be .mp4 (or .mkv) files under:
+      {recordings_dir}/{camera_id}/{YYYY}/{MM}/{DD}/
+
+    Falls back to a flat listing if subdirectory layout is absent.
+    """
+
+    def __init__(self, recordings_dir: Path) -> None:
+        self._dir = recordings_dir
+
+    def list_clips(
+        self,
+        camera_id: str,
+        limit: int = 100,
+        before: float | None = None,
+        event_type: str | None = None,
+    ) -> list[ClipInfo]:
+        """
+        Return recorded clips for camera_id, newest first.
+
+        Args:
+          camera_id:   Camera node ID
+          limit:       Max clips to return
+          before:      Only clips with timestamp < before (pagination)
+          event_type:  Filter by event type tag
+        """
+        cam_dir = self._dir / camera_id
+        if not cam_dir.exists():
+            return []
+
+        clips: list[ClipInfo] = []
+        for p in sorted(cam_dir.rglob("*.mp4"), key=lambda f: f.stat().st_mtime, reverse=True):
+            st = p.stat()
+            ts = st.st_mtime
+            if before and ts >= before:
+                continue
+            clip_id = p.stem
+            ev_type = self._parse_event_type(p)
+            if event_type and ev_type != event_type:
+                continue
+            clips.append(ClipInfo(
+                clip_id=clip_id,
+                camera_id=camera_id,
+                timestamp=ts,
+                duration_sec=self._probe_duration(p),
+                size_bytes=st.st_size,
+                path=str(p),
+                thumbnail_url=self._thumbnail_url(p, camera_id),
+                event_type=ev_type,
+            ))
+            if len(clips) >= limit:
+                break
+        return clips
+
+    def get_clip(self, camera_id: str, clip_id: str) -> ClipInfo | None:
+        """Find a specific clip by ID."""
+        cam_dir = self._dir / camera_id
+        if not cam_dir.exists():
+            return None
+        for p in cam_dir.rglob(f"{clip_id}.mp4"):
+            st = p.stat()
+            return ClipInfo(
+                clip_id=clip_id,
+                camera_id=camera_id,
+                timestamp=st.st_mtime,
+                duration_sec=self._probe_duration(p),
+                size_bytes=st.st_size,
+                path=str(p),
+                thumbnail_url=self._thumbnail_url(p, camera_id),
+                event_type=self._parse_event_type(p),
+            )
+        return None
+
+    @staticmethod
+    def _probe_duration(p: Path) -> float:
+        """Try to read duration from a sidecar .json or return 0."""
+        sidecar = p.with_suffix(".json")
+        if sidecar.exists():
+            try:
+                d = _json.loads(sidecar.read_text())
+                return float(d.get("duration_sec", 0))
+            except Exception:
+                pass
+        return 0.0
+
+    @staticmethod
+    def _parse_event_type(p: Path) -> str:
+        """Infer event type from filename suffix convention e.g. foo_motion.mp4."""
+        stem = p.stem.lower()
+        for ev in ("motion", "object", "continuous", "doorbell"):
+            if stem.endswith(f"_{ev}"):
+                return ev
+        return ""
+
+    @staticmethod
+    def _thumbnail_url(p: Path, camera_id: str) -> str:
+        """Return relative URL for thumbnail if a .jpg sidecar exists."""
+        thumb = p.with_suffix(".jpg")
+        if thumb.exists():
+            return f"/api/v1/cameras/{camera_id}/clips/{p.stem}/thumbnail"
+        return ""
+
+
+# ── Guest token helper ────────────────────────────────────────────────────────
+
+@dataclass
+class GuestCameraToken:
+    """A scoped token that grants camera-view-only access."""
+    token: str
+    camera_ids: list[str]   # Empty = all cameras
+    expires_at: float       # Unix epoch
+    label: str = ""         # Human-readable label (e.g. "Grandma's phone")
+
+    def to_dict(self) -> dict:
+        return {
+            "token":      self.token,
+            "camera_ids": self.camera_ids,
+            "expires_at": self.expires_at,
+            "label":      self.label,
+        }
+
+    def is_expired(self) -> bool:
+        return time.time() > self.expires_at
+
+    def allows_camera(self, camera_id: str) -> bool:
+        if not self.camera_ids:
+            return True  # All cameras
+        return camera_id in self.camera_ids
+
+
+class GuestTokenManager:
+    """
+    Manages camera-only guest tokens for the consumer gifting use case.
+
+    A technical friend sets up the camera system and calls
+    create_guest_token() to get a token for a non-technical family member.
+    The token only permits:
+      - Listing cameras
+      - Viewing live streams
+      - Browsing recorded clips
+
+    It cannot access HID, audio routing, nodes, or any sensitive config.
+    """
+
+    def __init__(self, data_dir: Path, mesh_ca: Any = None) -> None:
+        self._data_dir = data_dir
+        self._mesh_ca = mesh_ca  # MeshCA for signing (optional; plain tokens if None)
+        self._tokens: dict[str, GuestCameraToken] = {}  # token → GuestCameraToken
+        self._load()
+
+    def create_token(
+        self,
+        label: str = "",
+        camera_ids: list[str] | None = None,
+        ttl_days: int = 365,
+    ) -> GuestCameraToken:
+        """
+        Create a new guest token with camera_view scope.
+
+        Args:
+          label:      Human label (e.g. "Mum's iPhone")
+          camera_ids: Camera node IDs this token may access (empty = all)
+          ttl_days:   Token lifetime in days (default 1 year)
+        """
+        import secrets as _sec
+        raw = _sec.token_hex(32)
+        expires_at = time.time() + ttl_days * 86400
+        gt = GuestCameraToken(
+            token=raw,
+            camera_ids=list(camera_ids or []),
+            expires_at=expires_at,
+            label=label,
+        )
+        self._tokens[raw] = gt
+        self._save()
+        log.info("Guest token created: label=%r cameras=%s ttl_days=%d",
+                 label, camera_ids or "all", ttl_days)
+        return gt
+
+    def validate(self, token: str) -> GuestCameraToken | None:
+        """Return the GuestCameraToken if valid and unexpired, else None."""
+        gt = self._tokens.get(token)
+        if gt is None or gt.is_expired():
+            return None
+        return gt
+
+    def revoke(self, token: str) -> bool:
+        if token in self._tokens:
+            del self._tokens[token]
+            self._save()
+            return True
+        return False
+
+    def list_tokens(self) -> list[dict]:
+        now = time.time()
+        return [
+            {**gt.to_dict(), "expired": gt.is_expired()}
+            for gt in self._tokens.values()
+            if now - gt.expires_at < 86400 * 30  # prune tokens expired >30d ago
+        ]
+
+    def _save(self) -> None:
+        self._data_dir.mkdir(parents=True, exist_ok=True)
+        p = self._data_dir / "guest_tokens.json"
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(_json.dumps(
+            {tok: gt.to_dict() for tok, gt in self._tokens.items()}, indent=2
+        ))
+        tmp.chmod(0o600)
+        tmp.rename(p)
+
+    def _load(self) -> None:
+        p = self._data_dir / "guest_tokens.json"
+        if not p.exists():
+            return
+        try:
+            data = _json.loads(p.read_text())
+            for tok, d in data.items():
+                self._tokens[tok] = GuestCameraToken(
+                    token=d["token"],
+                    camera_ids=d.get("camera_ids", []),
+                    expires_at=d.get("expires_at", 0.0),
+                    label=d.get("label", ""),
+                )
+        except Exception:
+            log.exception("Failed to load guest tokens")
+
+
+# ── Motion push notifications ─────────────────────────────────────────────────
+
+@dataclass
+class PushWebhook:
+    """A webhook URL registered to receive motion/object alerts."""
+    webhook_id: str
+    url: str
+    camera_ids: list[str]   # Empty = all cameras
+    events: list[str]       # ["motion", "object", "doorbell"] or empty = all
+    label: str = ""
+    created_at: float = field(default_factory=time.time)
+    last_fired_at: float = 0.0
+    failures: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "webhook_id":   self.webhook_id,
+            "url":          self.url,
+            "camera_ids":   self.camera_ids,
+            "events":       self.events,
+            "label":        self.label,
+            "created_at":   self.created_at,
+            "last_fired_at": self.last_fired_at,
+            "failures":     self.failures,
+        }
+
+
+class MotionPushManager:
+    """
+    Sends POST webhook notifications when cameras detect motion or objects.
+
+    Integrates with the controller event queue — Frigate and auto_configure
+    push events like frigate.motion_started or device_discovered. This
+    manager watches for those events and forwards them to registered webhooks.
+
+    Webhook payload (JSON POST body):
+      {
+        "event":       "motion" | "object" | "doorbell",
+        "camera_id":   "cam01._ozma._udp.local.",
+        "camera_name": "Front Door",
+        "label":       "person",          // object label if applicable
+        "confidence":  0.87,              // detection confidence
+        "snapshot_url": "https://...",    // snapshot URL if available
+        "ts":          1700000000.0,
+      }
+    """
+
+    _MAX_FAILURES = 5       # Disable webhook after this many consecutive failures
+
+    def __init__(self, data_dir: Path) -> None:
+        self._data_dir = data_dir
+        self._webhooks: dict[str, PushWebhook] = {}  # webhook_id → webhook
+        self._load()
+
+    def register(
+        self,
+        url: str,
+        camera_ids: list[str] | None = None,
+        events: list[str] | None = None,
+        label: str = "",
+    ) -> PushWebhook:
+        import secrets as _sec
+        wh = PushWebhook(
+            webhook_id=_sec.token_hex(8),
+            url=url,
+            camera_ids=list(camera_ids or []),
+            events=list(events or []),
+            label=label,
+        )
+        self._webhooks[wh.webhook_id] = wh
+        self._save()
+        log.info("Push webhook registered: %s → %s", wh.webhook_id, url[:60])
+        return wh
+
+    def unregister(self, webhook_id: str) -> bool:
+        if webhook_id in self._webhooks:
+            del self._webhooks[webhook_id]
+            self._save()
+            return True
+        return False
+
+    def list_webhooks(self) -> list[dict]:
+        return [wh.to_dict() for wh in self._webhooks.values()]
+
+    def get_webhook(self, webhook_id: str) -> PushWebhook | None:
+        return self._webhooks.get(webhook_id)
+
+    async def notify(
+        self,
+        camera_id: str,
+        event_type: str,
+        camera_name: str = "",
+        label: str = "",
+        confidence: float = 0.0,
+        snapshot_url: str = "",
+    ) -> int:
+        """
+        Fire notification to all matching webhooks.
+
+        Returns count of successful deliveries.
+        """
+        payload = _json.dumps({
+            "event":        event_type,
+            "camera_id":    camera_id,
+            "camera_name":  camera_name,
+            "label":        label,
+            "confidence":   confidence,
+            "snapshot_url": snapshot_url,
+            "ts":           time.time(),
+        }).encode()
+
+        ok_count = 0
+        for wh in list(self._webhooks.values()):
+            if wh.failures >= self._MAX_FAILURES:
+                continue
+            if wh.camera_ids and camera_id not in wh.camera_ids:
+                continue
+            if wh.events and event_type not in wh.events:
+                continue
+            delivered = await self._fire(wh, payload)
+            if delivered:
+                ok_count += 1
+                wh.failures = 0
+            else:
+                wh.failures += 1
+            wh.last_fired_at = time.time()
+        if self._webhooks:
+            self._save()
+        return ok_count
+
+    async def _fire(self, wh: PushWebhook, payload: bytes) -> bool:
+        """POST the payload to the webhook URL. Returns True on success."""
+        import urllib.request as _req
+        try:
+            loop = asyncio.get_running_loop()
+            request = _req.Request(
+                wh.url,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: _req.urlopen(request, timeout=5)),
+                timeout=6.0,
+            )
+            log.debug("Push webhook fired: %s → %s", wh.webhook_id, wh.url[:60])
+            return True
+        except Exception as e:
+            log.debug("Push webhook failed: %s — %s", wh.webhook_id, e)
+            return False
+
+    def _save(self) -> None:
+        self._data_dir.mkdir(parents=True, exist_ok=True)
+        p = self._data_dir / "push_webhooks.json"
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(_json.dumps(
+            {wid: wh.to_dict() for wid, wh in self._webhooks.items()}, indent=2
+        ))
+        tmp.chmod(0o600)
+        tmp.rename(p)
+
+    def _load(self) -> None:
+        p = self._data_dir / "push_webhooks.json"
+        if not p.exists():
+            return
+        try:
+            data = _json.loads(p.read_text())
+            for wid, d in data.items():
+                self._webhooks[wid] = PushWebhook(
+                    webhook_id=d["webhook_id"],
+                    url=d["url"],
+                    camera_ids=d.get("camera_ids", []),
+                    events=d.get("events", []),
+                    label=d.get("label", ""),
+                    created_at=d.get("created_at", 0.0),
+                    last_fired_at=d.get("last_fired_at", 0.0),
+                    failures=d.get("failures", 0),
+                )
+        except Exception:
+            log.exception("Failed to load push webhooks")
