@@ -3936,6 +3936,65 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     # --- Alert endpoints ---
 
+    @app.post("/api/v1/alerts")
+    async def create_alert(request: Request, body: dict = {}) -> dict[str, Any]:
+        """Create an alert from an external source (Home Assistant timer/alarm, etc.).
+
+        Body fields (all optional except kind, title, body):
+          kind          — "timer" | "alarm" | "reminder" | "doorbell" | "motion" | "alarm"
+          title         — short header
+          body          — one-line description
+          timeout_s     — auto-expire seconds (0 = never)
+          primary_label — label for primary action button
+          secondary_label
+          camera, person, snapshot_url  — optional media
+          source        — free-form source identifier (e.g. "ha:timer.pasta")
+        """
+        _require_scope(request, SCOPE_WRITE)
+        if not alert_mgr:
+            raise HTTPException(503, "Alert manager not available")
+        kind = body.get("kind", "reminder")
+        title = body.get("title", "")
+        body_text = body.get("body", body.get("message", ""))
+        if not title or not body_text:
+            raise HTTPException(400, "title and body are required")
+        alert = await alert_mgr.create(
+            kind=kind,
+            title=title,
+            body=body_text,
+            timeout_s=int(body.get("timeout_s", 0)),
+            primary_label=body.get("primary_label", "OK"),
+            secondary_label=body.get("secondary_label", "Dismiss"),
+            camera=body.get("camera", ""),
+            person=body.get("person", ""),
+            snapshot_url=body.get("snapshot_url", ""),
+        )
+        if not alert:
+            return {"ok": False, "reason": "debounced"}
+        return {"ok": True, "alert_id": alert.id}
+
+    @app.post("/api/v1/alerts/{alert_id}/acknowledge")
+    async def acknowledge_alert(request: Request, alert_id: str) -> dict[str, Any]:
+        """Acknowledge an active alert (primary action)."""
+        _require_scope(request, SCOPE_WRITE)
+        if not alert_mgr:
+            raise HTTPException(503, "Alert manager not available")
+        ok = await alert_mgr.acknowledge(alert_id)
+        if not ok:
+            raise HTTPException(404, "Alert not found or not active")
+        return {"ok": True}
+
+    @app.post("/api/v1/alerts/{alert_id}/dismiss")
+    async def dismiss_alert(request: Request, alert_id: str) -> dict[str, Any]:
+        """Dismiss an active alert (secondary action)."""
+        _require_scope(request, SCOPE_WRITE)
+        if not alert_mgr:
+            raise HTTPException(503, "Alert manager not available")
+        ok = await alert_mgr.dismiss(alert_id)
+        if not ok:
+            raise HTTPException(404, "Alert not found or not active")
+        return {"ok": True}
+
     @app.get("/api/v1/alerts")
     async def list_alerts(
         request: Request,
