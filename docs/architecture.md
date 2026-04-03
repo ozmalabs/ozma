@@ -2,14 +2,14 @@
 
 ## Overview
 
-Ozma is a software-defined USB and AV fabric. A **Controller** (any Linux machine on the local network) manages a set of **Nodes** (small SBCs, MCUs, or software agents) that each attach to a target PC via USB. The target PC sees the node as ordinary USB peripherals — keyboard, mouse, audio device, and camera — while all routing decisions live in the Controller.
+Ozma is a **KVMA router** — a software-defined network fabric that routes Keyboard, Video, Mouse, and Audio signals between a Controller and any number of target machines. A **Controller** (any Linux machine on the local network) manages a set of **Nodes** (small SBCs, MCUs, or software agents) that each attach to a target PC via USB. The target PC sees the node as ordinary USB peripherals — keyboard, mouse, audio device, and camera — while all routing decisions live in the Controller.
 
-This inversion of the traditional KVM model (hardware switch in the signal path) means:
+Traditional KVM products are *switches*: hardware in the signal path that physically moves a connection. Ozma is a *router*: the connections are permanent and the signals travel over the network. This distinction matters:
 
 - No signal interruption when switching — the display stays connected and the monitor never resyncs.
 - No host software required on the target — the node looks like a standard USB device class.
-- Audio, camera, and video routes are first-class, not afterthoughts.
-- The same hardware platform can run entirely different behaviors via software profiles (KVM, conference room, digital signage, lecture capture, live production, etc.).
+- Audio is a first-class signal, not an afterthought — routed with the same precision as keyboard and video.
+- The same platform runs across every use case: KVM, conference room, NVR, home server, digital signage, lecture capture, live production.
 
 ---
 
