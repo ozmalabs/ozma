@@ -1453,26 +1453,22 @@ def main() -> None:
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, _on_signal)
 
-        import atexit, traceback
-        atexit.register(lambda: print("[OZMA] atexit fired!", flush=True))
-
         async def _run():
-            print("[OZMA] _run() starting", flush=True)
+            print("[OZMA] Starting manager...", flush=True)
             await manager.start()
-            print("[OZMA] _run() manager.start() returned!", flush=True)
 
+        async def _test_loop():
+            print("[OZMA] Testing bare asyncio.sleep loop...", flush=True)
+            for i in range(100):
+                await asyncio.sleep(1)
+                print(f"[OZMA] tick {i}", flush=True)
+
+        # First test: does asyncio.run even stay alive?
+        print("[OZMA] Testing event loop...", flush=True)
         try:
-            print("[OZMA] calling asyncio.run()...", flush=True)
-            asyncio.run(_run())
-            print("[OZMA] asyncio.run() returned normally", flush=True)
+            asyncio.run(_test_loop())
         except KeyboardInterrupt:
-            print("[OZMA] KeyboardInterrupt", flush=True)
-        except SystemExit as e:
-            print(f"[OZMA] SystemExit: {e}", flush=True)
-        except BaseException as e:
-            print(f"[OZMA] BaseException: {type(e).__name__}: {e}", flush=True)
-            traceback.print_exc()
-        print("[OZMA] main() returning", flush=True)
+            print("[OZMA] Stopped by Ctrl+C", flush=True)
 
 
 if __name__ == "__main__":
