@@ -92,6 +92,9 @@ from itsm import (
 from mdm_bridge import MDMBridgeManager, MDMConfig, ManagedDevice
 from network_scan import NetworkScanManager, NetworkScanConfig, OpenVASConfig, NessusConfig
 from dlp import DLPManager, DLPConfig, DLPPolicy, DLPRule, DLPIncident
+from saas_management import SaaSManager, ManagedSaaSApp, SaaSConfig as SaaSMgmtConfig
+from threat_intelligence import ThreatIntelligenceEngine, ThreatConfig
+from compliance_reports import ComplianceReportEngine, ComplianceConfig
 from job_queue import JobQueue, JobSpec, JobType, JobState, TargetScope
 from key_store import (
     KeyStore, BackupMethod, KeyLockedError, KeyNotInitialisedError,
@@ -161,7 +164,7 @@ class DirectRegisterRequest(BaseModel):
     frigate_port: str = ""     # Frigate API port (default 5000)
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None) -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None) -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -6557,6 +6560,428 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             node_id=node_id, device_name=device_name, user_email=user_email
         )
         return {"incidents": [i.to_dict() for i in incidents]}
+
+    # ── SaaS Management ───────────────────────────────────────────────────────
+
+    @app.get("/api/v1/saas/status")
+    async def saas_status(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not saas_mgr:
+            raise HTTPException(503, "SaaS management not configured")
+        return saas_mgr.status()
+
+    @app.get("/api/v1/saas/config")
+    async def saas_get_config(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not saas_mgr:
+            raise HTTPException(503, "SaaS management not configured")
+        return saas_mgr.get_config().to_dict()
+
+    @app.patch("/api/v1/saas/config")
+    async def saas_update_config(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not saas_mgr:
+            raise HTTPException(503, "SaaS management not configured")
+        body = await request.json()
+        return saas_mgr.set_config(body).to_dict()
+
+    @app.get("/api/v1/saas/apps")
+    async def saas_list_apps(request: Request) -> list[dict[str, Any]]:
+        _require_scope(request, SCOPE_READ)
+        if not saas_mgr:
+            raise HTTPException(503, "SaaS management not configured")
+        params = dict(request.query_params)
+        shadow_it = None
+        if "shadow_it" in params:
+            shadow_it = params["shadow_it"].lower() == "true"
+        return [a.to_dict() for a in saas_mgr.list_apps(
+            shadow_it=shadow_it,
+            category=params.get("category"),
+            renewal_risk=params.get("renewal_risk"),
+            source=params.get("source"),
+        )]
+
+    @app.post("/api/v1/saas/apps")
+    async def saas_register_app(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not saas_mgr:
+            raise HTTPException(503, "SaaS management not configured")
+        body = await request.json()
+        name = body.get("name", "")
+        if not name:
+            raise HTTPException(400, "name is required")
+        app = saas_mgr.register_app(
+            name=name,
+            vendor=body.get("vendor", ""),
+            domain=body.get("domain", ""),
+            source=body.get("source", "manual"),
+            **{k: v for k, v in body.items()
+               if k not in ("name", "vendor", "domain", "source")},
+        )
+        return app.to_dict()
+
+    @app.get("/api/v1/saas/apps/{app_id}")
+    async def saas_get_app(request: Request, app_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not saas_mgr:
+            raise HTTPException(503, "SaaS management not configured")
+        app = saas_mgr.get_app(app_id)
+        if not app:
+            raise HTTPException(404, "App not found")
+        return app.to_dict()
+
+    @app.patch("/api/v1/saas/apps/{app_id}")
+    async def saas_update_app(request: Request, app_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not saas_mgr:
+            raise HTTPException(503, "SaaS management not configured")
+        body = await request.json()
+        app = saas_mgr.update_app(app_id, body)
+        if not app:
+            raise HTTPException(404, "App not found")
+        return app.to_dict()
+
+    @app.delete("/api/v1/saas/apps/{app_id}")
+    async def saas_delete_app(request: Request, app_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not saas_mgr:
+            raise HTTPException(503, "SaaS management not configured")
+        if not saas_mgr.delete_app(app_id):
+            raise HTTPException(404, "App not found")
+        return {"ok": True}
+
+    @app.post("/api/v1/saas/apps/{app_id}/approve")
+    async def saas_approve_app(request: Request, app_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not saas_mgr:
+            raise HTTPException(503, "SaaS management not configured")
+        app = saas_mgr.update_app(app_id, {"approved": True})
+        if not app:
+            raise HTTPException(404, "App not found")
+        return app.to_dict()
+
+    @app.get("/api/v1/saas/shadow-it")
+    async def saas_shadow_it(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not saas_mgr:
+            raise HTTPException(503, "SaaS management not configured")
+        return saas_mgr.shadow_it_summary()
+
+    @app.get("/api/v1/saas/cost")
+    async def saas_cost_summary(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not saas_mgr:
+            raise HTTPException(503, "SaaS management not configured")
+        return saas_mgr.cost_summary()
+
+    @app.get("/api/v1/saas/renewals")
+    async def saas_renewals(request: Request) -> list[dict[str, Any]]:
+        _require_scope(request, SCOPE_READ)
+        if not saas_mgr:
+            raise HTTPException(503, "SaaS management not configured")
+        days = int(request.query_params.get("days", "90"))
+        return saas_mgr.upcoming_renewals(days=days)
+
+    @app.get("/api/v1/saas/duplicates")
+    async def saas_duplicates(request: Request) -> list[dict[str, Any]]:
+        _require_scope(request, SCOPE_READ)
+        if not saas_mgr:
+            raise HTTPException(503, "SaaS management not configured")
+        return saas_mgr.duplicate_categories()
+
+    @app.get("/api/v1/saas/vendor-risk")
+    async def saas_vendor_risk(request: Request) -> list[dict[str, Any]]:
+        _require_scope(request, SCOPE_READ)
+        if not saas_mgr:
+            raise HTTPException(503, "SaaS management not configured")
+        return saas_mgr.vendor_risk_summary()
+
+    @app.get("/api/v1/saas/offboarding/{user_email}")
+    async def saas_offboarding_checklist(request: Request, user_email: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not saas_mgr:
+            raise HTTPException(503, "SaaS management not configured")
+        return saas_mgr.create_offboarding_checklist(user_email)
+
+    @app.post("/api/v1/saas/discover/chrome-extensions")
+    async def saas_ingest_chrome_extensions(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not saas_mgr:
+            raise HTTPException(503, "SaaS management not configured")
+        body = await request.json()
+        node_id = body.get("node_id", "")
+        extensions = body.get("extensions", [])
+        count = saas_mgr.ingest_chrome_extensions(node_id, extensions)
+        return {"ok": True, "new_apps": count}
+
+    @app.post("/api/v1/saas/discover/dns-domains")
+    async def saas_ingest_dns(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not saas_mgr:
+            raise HTTPException(503, "SaaS management not configured")
+        body = await request.json()
+        domains = body.get("domains", [])
+        count = saas_mgr.ingest_dns_domains(domains)
+        return {"ok": True, "new_apps": count}
+
+    @app.post("/api/v1/saas/discover/invoices")
+    async def saas_ingest_invoices(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not saas_mgr:
+            raise HTTPException(503, "SaaS management not configured")
+        body = await request.json()
+        invoices = body.get("invoices", [])
+        count = saas_mgr.ingest_invoice_data(invoices)
+        return {"ok": True, "apps_updated": count}
+
+    # ── Threat Intelligence ───────────────────────────────────────────────────
+
+    @app.get("/api/v1/threat/status")
+    async def threat_status(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not threat_intel:
+            raise HTTPException(503, "Threat intelligence not configured")
+        return threat_intel.status()
+
+    @app.get("/api/v1/threat/config")
+    async def threat_get_config(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not threat_intel:
+            raise HTTPException(503, "Threat intelligence not configured")
+        return threat_intel.get_config().to_dict()
+
+    @app.patch("/api/v1/threat/config")
+    async def threat_update_config(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not threat_intel:
+            raise HTTPException(503, "Threat intelligence not configured")
+        body = await request.json()
+        return threat_intel.set_config(body).to_dict()
+
+    @app.post("/api/v1/threat/poll/kev")
+    async def threat_poll_kev(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not threat_intel:
+            raise HTTPException(503, "Threat intelligence not configured")
+        new_entries = await threat_intel.poll_cisa_kev()
+        return {"ok": True, "new_entries": len(new_entries)}
+
+    @app.get("/api/v1/threat/kev")
+    async def threat_list_kev(request: Request) -> list[dict[str, Any]]:
+        _require_scope(request, SCOPE_READ)
+        if not threat_intel:
+            raise HTTPException(503, "Threat intelligence not configured")
+        params = dict(request.query_params)
+        matched_sbom = None
+        if "matched_sbom" in params:
+            matched_sbom = params["matched_sbom"].lower() == "true"
+        return [e.to_dict() for e in threat_intel.list_kev(matched_sbom=matched_sbom)]
+
+    @app.post("/api/v1/threat/poll/advisories")
+    async def threat_poll_advisories(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not threat_intel:
+            raise HTTPException(503, "Threat intelligence not configured")
+        new_adv = await threat_intel.poll_acsc_advisories()
+        return {"ok": True, "new_advisories": len(new_adv)}
+
+    @app.post("/api/v1/threat/advisories")
+    async def threat_ingest_advisory(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not threat_intel:
+            raise HTTPException(503, "Threat intelligence not configured")
+        body = await request.json()
+        adv = threat_intel.ingest_advisory(body)
+        return adv.to_dict()
+
+    @app.get("/api/v1/threat/advisories")
+    async def threat_list_advisories(request: Request) -> list[dict[str, Any]]:
+        _require_scope(request, SCOPE_READ)
+        if not threat_intel:
+            raise HTTPException(503, "Threat intelligence not configured")
+        params = dict(request.query_params)
+        ack = None
+        if "acknowledged" in params:
+            ack = params["acknowledged"].lower() == "true"
+        return [a.to_dict() for a in threat_intel.list_advisories(
+            source=params.get("source"),
+            severity=params.get("severity"),
+            acknowledged=ack,
+        )]
+
+    @app.post("/api/v1/threat/advisories/{advisory_id}/acknowledge")
+    async def threat_ack_advisory(request: Request, advisory_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not threat_intel:
+            raise HTTPException(503, "Threat intelligence not configured")
+        adv = threat_intel.acknowledge_advisory(advisory_id)
+        if not adv:
+            raise HTTPException(404, "Advisory not found")
+        return adv.to_dict()
+
+    @app.post("/api/v1/threat/poll/exposure")
+    async def threat_poll_exposure(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not threat_intel:
+            raise HTTPException(503, "Threat intelligence not configured")
+        body = await request.json()
+        domains = body.get("domains")
+        new_exp = await threat_intel.check_credential_exposure(domains=domains)
+        return {"ok": True, "new_exposures": len(new_exp)}
+
+    @app.get("/api/v1/threat/exposures")
+    async def threat_list_exposures(request: Request) -> list[dict[str, Any]]:
+        _require_scope(request, SCOPE_READ)
+        if not threat_intel:
+            raise HTTPException(503, "Threat intelligence not configured")
+        params = dict(request.query_params)
+        resolved = None
+        if "resolved" in params:
+            resolved = params["resolved"].lower() == "true"
+        return [e.to_dict() for e in threat_intel.list_exposures(resolved=resolved)]
+
+    @app.post("/api/v1/threat/exposures/{exposure_id}/resolve")
+    async def threat_resolve_exposure(request: Request, exposure_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not threat_intel:
+            raise HTTPException(503, "Threat intelligence not configured")
+        exp = threat_intel.resolve_exposure(exposure_id)
+        if not exp:
+            raise HTTPException(404, "Exposure record not found")
+        return exp.to_dict()
+
+    @app.post("/api/v1/threat/typosquat")
+    async def threat_check_typosquat(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not threat_intel:
+            raise HTTPException(503, "Threat intelligence not configured")
+        body = await request.json()
+        domain = body.get("domain", "")
+        if not domain:
+            raise HTTPException(400, "domain is required")
+        results = await threat_intel.check_typosquat(domain)
+        return {"domain": domain, "suspicious": results, "count": len(results)}
+
+    @app.get("/api/v1/threat/attack-coverage")
+    async def threat_attack_coverage(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not threat_intel:
+            raise HTTPException(503, "Threat intelligence not configured")
+        controls_param = request.query_params.get("controls", "")
+        active_controls = [c.strip() for c in controls_param.split(",") if c.strip()]
+        return threat_intel.compute_attack_coverage(active_controls)
+
+    @app.post("/api/v1/threat/sbom-cves")
+    async def threat_update_sbom(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not threat_intel:
+            raise HTTPException(503, "Threat intelligence not configured")
+        body = await request.json()
+        cves = set(body.get("cve_ids", []))
+        matches = threat_intel.update_sbom_cves(cves)
+        return {"ok": True, "new_kev_matches": matches}
+
+    @app.get("/api/v1/threat/briefing")
+    async def threat_briefing(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not threat_intel:
+            raise HTTPException(503, "Threat intelligence not configured")
+        controls_param = request.query_params.get("controls", "")
+        active_controls = [c.strip() for c in controls_param.split(",") if c.strip()]
+        return threat_intel.generate_threat_briefing(active_controls)
+
+    @app.get("/api/v1/threat/posture-changes")
+    async def threat_posture_changes(request: Request) -> list[dict[str, Any]]:
+        _require_scope(request, SCOPE_READ)
+        if not threat_intel:
+            raise HTTPException(503, "Threat intelligence not configured")
+        return [p.to_dict() for p in threat_intel.list_posture_changes()]
+
+    # ── Compliance Reports ────────────────────────────────────────────────────
+
+    @app.get("/api/v1/compliance/status")
+    async def compliance_status(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not compliance:
+            raise HTTPException(503, "Compliance engine not configured")
+        return compliance.status()
+
+    @app.get("/api/v1/compliance/config")
+    async def compliance_get_config(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not compliance:
+            raise HTTPException(503, "Compliance engine not configured")
+        return compliance.get_config().to_dict()
+
+    @app.patch("/api/v1/compliance/config")
+    async def compliance_update_config(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not compliance:
+            raise HTTPException(503, "Compliance engine not configured")
+        body = await request.json()
+        return compliance.set_config(body).to_dict()
+
+    @app.post("/api/v1/compliance/report")
+    async def compliance_generate_report(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not compliance:
+            raise HTTPException(503, "Compliance engine not configured")
+        body = await request.json()
+        framework = body.get("framework", "")
+        if not framework:
+            raise HTTPException(400, "framework is required")
+        scope = body.get("scope", "all")
+        report = await compliance.generate_report(framework, scope=scope)
+        return report.to_dict()
+
+    @app.get("/api/v1/compliance/reports")
+    async def compliance_list_reports(request: Request) -> list[dict[str, Any]]:
+        _require_scope(request, SCOPE_READ)
+        if not compliance:
+            raise HTTPException(503, "Compliance engine not configured")
+        return compliance.list_reports()
+
+    @app.get("/api/v1/compliance/reports/{report_id}")
+    async def compliance_get_report(request: Request, report_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not compliance:
+            raise HTTPException(503, "Compliance engine not configured")
+        report = compliance.get_report(report_id)
+        if not report:
+            raise HTTPException(404, "Report not found")
+        return report.to_dict()
+
+    @app.get("/api/v1/compliance/gaps")
+    async def compliance_list_gaps(request: Request) -> list[dict[str, Any]]:
+        _require_scope(request, SCOPE_READ)
+        if not compliance:
+            raise HTTPException(503, "Compliance engine not configured")
+        params = dict(request.query_params)
+        resolved = None
+        if "resolved" in params:
+            resolved = params["resolved"].lower() == "true"
+        return [g.to_dict() for g in compliance.list_gaps(
+            framework=params.get("framework"),
+            resolved=resolved,
+            severity=params.get("severity"),
+        )]
+
+    @app.post("/api/v1/compliance/gaps/{gap_id}/resolve")
+    async def compliance_resolve_gap(request: Request, gap_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        if not compliance:
+            raise HTTPException(503, "Compliance engine not configured")
+        gap = compliance.resolve_gap(gap_id)
+        if not gap:
+            raise HTTPException(404, "Gap not found")
+        return gap.to_dict()
+
+    @app.get("/api/v1/compliance/soa")
+    async def compliance_soa(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not compliance:
+            raise HTTPException(503, "Compliance engine not configured")
+        return await compliance.generate_soa()
 
     # Static files — mounted last so they don't shadow API routes
     static_dir = Path(__file__).parent / "static"
