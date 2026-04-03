@@ -42,6 +42,7 @@ import socket
 import struct
 import sys
 from pathlib import Path
+from typing import Any
 
 from aiohttp import web
 from screen_capture import ScreenCaptureBackend
@@ -993,6 +994,99 @@ class DesktopSoftNode:
         app.router.add_post("/audio/remove", remove_handler)
         app.router.add_post("/audio/stop", stop_handler)
         app.router.add_post("/audio/play", play_handler)
+
+        # ── Backup routes ───────────────────────────────────────────────
+        _backup_mgr: Any | None = None
+
+        def _get_backup() -> Any:
+            nonlocal _backup_mgr
+            if _backup_mgr is None:
+                from backup import BackupManager
+                data_dir = Path(os.environ.get("OZMA_DATA_DIR", "~/.local/share/ozma")).expanduser() / "backup"
+                _backup_mgr = BackupManager(data_dir=data_dir)
+            return _backup_mgr
+
+        async def backup_status_handler(_: web.Request) -> web.Response:
+            bm = _get_backup()
+            return web.json_response(bm.get_status().__dict__)
+
+        async def backup_run_handler(request: web.Request) -> web.Response:
+            body = {}
+            try:
+                body = await request.json()
+            except Exception:
+                pass
+            mode = body.get("mode")
+            bm = _get_backup()
+            asyncio.create_task(bm.run_backup(mode), name="backup-on-demand")
+            return web.json_response({"ok": True, "message": "Backup started"})
+
+        async def backup_config_get_handler(_: web.Request) -> web.Response:
+            bm = _get_backup()
+            return web.json_response(bm.get_config().to_dict())
+
+        async def backup_config_patch_handler(request: web.Request) -> web.Response:
+            body = await request.json()
+            bm = _get_backup()
+            bm.set_config(**body)
+            return web.json_response({"ok": True})
+
+        async def backup_snapshots_handler(_: web.Request) -> web.Response:
+            bm = _get_backup()
+            snaps = await bm.list_snapshots()
+            return web.json_response({"snapshots": snaps})
+
+        async def backup_snapshot_files_handler(request: web.Request) -> web.Response:
+            snapshot_id = request.match_info["snapshot_id"]
+            path = request.query.get("path", "/")
+            bm = _get_backup()
+            files = await bm.list_snapshot_files(snapshot_id, path)
+            return web.json_response({"files": files})
+
+        async def backup_restore_handler(request: web.Request) -> web.Response:
+            body = await request.json()
+            snapshot_id = body.get("snapshot_id", "latest")
+            source_path = body.get("source_path", "")
+            target_path = body.get("target_path", "")
+            if not target_path:
+                return web.json_response({"ok": False, "error": "target_path required"}, status=400)
+            bm = _get_backup()
+            ok = await bm.restore(snapshot_id, source_path, target_path)
+            return web.json_response({"ok": ok})
+
+        async def backup_apps_handler(_: web.Request) -> web.Response:
+            bm = _get_backup()
+            apps = await bm.get_app_inventory()
+            return web.json_response({"apps": [a.__dict__ for a in apps]})
+
+        async def backup_restore_apps_handler(request: web.Request) -> web.Response:
+            body = await request.json()
+            names = body.get("names", [])
+            bm = _get_backup()
+            await bm.restore_apps(names)
+            return web.json_response({"ok": True})
+
+        async def backup_estimate_handler(_: web.Request) -> web.Response:
+            bm = _get_backup()
+            size = await bm.estimate_size()
+            return web.json_response({"estimated_bytes": size})
+
+        async def backup_verify_handler(_: web.Request) -> web.Response:
+            bm = _get_backup()
+            asyncio.create_task(bm.verify(), name="backup-verify")
+            return web.json_response({"ok": True, "message": "Verify started"})
+
+        app.router.add_get("/backup/status",                backup_status_handler)
+        app.router.add_post("/backup/run",                  backup_run_handler)
+        app.router.add_get("/backup/config",                backup_config_get_handler)
+        app.router.add_patch("/backup/config",              backup_config_patch_handler)
+        app.router.add_get("/backup/snapshots",             backup_snapshots_handler)
+        app.router.add_get("/backup/snapshots/{snapshot_id}/files", backup_snapshot_files_handler)
+        app.router.add_post("/backup/restore",              backup_restore_handler)
+        app.router.add_get("/backup/apps",                  backup_apps_handler)
+        app.router.add_post("/backup/apps/restore",         backup_restore_apps_handler)
+        app.router.add_get("/backup/estimate",              backup_estimate_handler)
+        app.router.add_post("/backup/verify",               backup_verify_handler)
 
         # Serve HLS segments as static files
         capture_dir = Path(str(Path(os.environ.get('TEMP', '/tmp')) / f"ozma-agent-{self._name}"))
