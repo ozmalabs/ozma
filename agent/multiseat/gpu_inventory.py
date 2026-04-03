@@ -678,6 +678,19 @@ class GPUInventory:
 
     async def _probe_windows_encoders(self) -> None:
         """Probe hardware encoders on Windows GPUs."""
+        if not shutil.which("ffmpeg"):
+            log.warning("ffmpeg not found — skipping encoder probing. "
+                        "Install ffmpeg for hardware encoding support.")
+            # Add assumed NVENC for NVIDIA GPUs (very likely to work)
+            for gpu in self._gpus:
+                if gpu.vendor == "nvidia":
+                    limit = self._nvenc_session_limit(gpu.name)
+                    gpu.encoders.append(EncoderInfo(
+                        name="h264_nvenc", codec="h264", gpu_index=gpu.index,
+                        max_sessions=limit, quality=8, latency=2,
+                    ))
+            return
+
         for gpu in self._gpus:
             if gpu.vendor == "nvidia":
                 await self._probe_nvenc(gpu)
