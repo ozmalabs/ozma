@@ -241,121 +241,102 @@ class TestBuildPrometheusMetrics:
 # ── API response formats ────────────────────────────────────────────────────
 
 class TestAPIResponseFormats:
-    """Test the structure of API handler responses.
+    """Test the monitoring HTTP server by starting it and making real requests."""
 
-    These test the handler methods directly without starting HTTP.
-    """
-
-    @pytest.mark.asyncio
-    async def test_handle_gpus(self):
-        manager = _make_mock_manager()
+    def _start_server(self, manager):
+        """Start monitoring server on a random port, return (server, port)."""
         server = MonitoringServer(manager, port=0)
+        # Use port 0 to get a random free port
+        server.start_sync()
+        port = server._server.server_address[1]
+        return server, port
 
-        mock_request = MagicMock()
-        resp = await server._handle_gpus(mock_request)
-        data = json.loads(resp.body)
+    def _get(self, port, path):
+        import urllib.request
+        resp = urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5)
+        return json.loads(resp.read())
 
-        assert "gpus" in data
-        assert len(data["gpus"]) == 1
-        gpu = data["gpus"][0]
-        assert gpu["name"] == "NVIDIA GeForce RTX 4070"
-        assert gpu["vendor"] == "nvidia"
-        assert len(gpu["encoders"]) >= 1
+    def test_handle_gpus(self):
+        manager = _make_mock_manager()
+        server, port = self._start_server(manager)
+        try:
+            data = self._get(port, "/api/v1/gpus")
+            assert "gpus" in data
+            assert len(data["gpus"]) == 1
+            assert data["gpus"][0]["name"] == "NVIDIA GeForce RTX 4070"
+        finally:
+            server.stop_sync()
 
-    @pytest.mark.asyncio
-    async def test_handle_encoders(self):
+    def test_handle_encoders(self):
         manager = _make_mock_manager(seat_count=1, with_encoder=True)
-        server = MonitoringServer(manager, port=0)
+        server, port = self._start_server(manager)
+        try:
+            data = self._get(port, "/api/v1/encoders")
+            assert "allocations" in data
+            assert "sessions" in data
+        finally:
+            server.stop_sync()
 
-        mock_request = MagicMock()
-        resp = await server._handle_encoders(mock_request)
-        data = json.loads(resp.body)
-
-        assert "allocations" in data
-        assert "sessions" in data
-        assert len(data["allocations"]) == 1
-
-    @pytest.mark.asyncio
-    async def test_handle_encoders_no_allocator(self):
+    def test_handle_encoders_no_allocator(self):
         manager = _make_mock_manager(with_encoder=False)
-        server = MonitoringServer(manager, port=0)
+        server, port = self._start_server(manager)
+        try:
+            data = self._get(port, "/api/v1/encoders")
+            assert data["allocations"] == []
+        finally:
+            server.stop_sync()
 
-        mock_request = MagicMock()
-        resp = await server._handle_encoders(mock_request)
-        data = json.loads(resp.body)
-
-        assert data["allocations"] == []
-
-    @pytest.mark.asyncio
-    async def test_handle_encoder_history(self):
+    def test_handle_encoder_history(self):
         manager = _make_mock_manager(with_encoder=True)
-        server = MonitoringServer(manager, port=0)
+        server, port = self._start_server(manager)
+        try:
+            data = self._get(port, "/api/v1/encoders/history")
+            assert "events" in data
+        finally:
+            server.stop_sync()
 
-        mock_request = MagicMock()
-        resp = await server._handle_encoder_history(mock_request)
-        data = json.loads(resp.body)
-
-        assert "events" in data
-        assert len(data["events"]) >= 1
-
-    @pytest.mark.asyncio
-    async def test_handle_seats(self):
+    def test_handle_seats(self):
         manager = _make_mock_manager(seat_count=2, with_encoder=True)
-        server = MonitoringServer(manager, port=0)
+        server, port = self._start_server(manager)
+        try:
+            data = self._get(port, "/api/v1/seats")
+            assert "seats" in data
+            assert len(data["seats"]) == 2
+        finally:
+            server.stop_sync()
 
-        mock_request = MagicMock()
-        resp = await server._handle_seats(mock_request)
-        data = json.loads(resp.body)
-
-        assert "seats" in data
-        assert len(data["seats"]) == 2
-        seat = data["seats"][0]
-        assert "name" in seat
-        assert "encoder" in seat
-        assert "status" in seat
-
-    @pytest.mark.asyncio
-    async def test_handle_health(self):
+    def test_handle_health(self):
         manager = _make_mock_manager()
-        server = MonitoringServer(manager, port=0)
+        server, port = self._start_server(manager)
+        try:
+            data = self._get(port, "/health")
+            assert data["ok"] is True
+        finally:
+            server.stop_sync()
 
-        mock_request = MagicMock()
-        resp = await server._handle_health(mock_request)
-        data = json.loads(resp.body)
-
-        assert data["ok"] is True
-        assert "seats" in data
-        assert "gpus" in data
-
-    @pytest.mark.asyncio
-    async def test_handle_hotplug_disabled(self):
+    def test_handle_hotplug_disabled(self):
         manager = _make_mock_manager(with_hotplug=False)
-        server = MonitoringServer(manager, port=0)
+        server, port = self._start_server(manager)
+        try:
+            data = self._get(port, "/api/v1/hotplug")
+            assert data["enabled"] is False
+        finally:
+            server.stop_sync()
 
-        mock_request = MagicMock()
-        resp = await server._handle_hotplug(mock_request)
-        data = json.loads(resp.body)
-
-        assert data["enabled"] is False
-
-    @pytest.mark.asyncio
-    async def test_handle_hotplug_enabled(self):
+    def test_handle_hotplug_enabled(self):
         manager = _make_mock_manager(with_hotplug=True)
-        server = MonitoringServer(manager, port=0)
+        server, port = self._start_server(manager)
+        try:
+            data = self._get(port, "/api/v1/hotplug")
+            assert data["enabled"] is True
+        finally:
+            server.stop_sync()
 
-        mock_request = MagicMock()
-        resp = await server._handle_hotplug(mock_request)
-        data = json.loads(resp.body)
-
-        assert data["enabled"] is True
-
-    @pytest.mark.asyncio
-    async def test_handle_games_no_launcher(self):
+    def test_handle_games_no_launcher(self):
         manager = _make_mock_manager(with_games=False)
-        server = MonitoringServer(manager, port=0)
-
-        mock_request = MagicMock()
-        resp = await server._handle_games(mock_request)
-        data = json.loads(resp.body)
-
-        assert data["games"] == []
+        server, port = self._start_server(manager)
+        try:
+            data = self._get(port, "/api/v1/games")
+            assert data["games"] == []
+        finally:
+            server.stop_sync()

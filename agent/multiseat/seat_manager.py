@@ -134,10 +134,8 @@ class SeatManager:
             raise
 
     async def _start_inner(self) -> None:
-        print("[OZMA DEBUG] _start_inner begin", flush=True)
         # Initialize platform-specific backends
         self._init_backends()
-        print("[OZMA DEBUG] backends initialized", flush=True)
 
         # Initialize virtual display manager (auto-detects driver)
         self._vdm = VirtualDisplayManager()
@@ -151,35 +149,24 @@ class SeatManager:
             await self._gpu_inventory.discover()
         except Exception as e:
             log.warning("GPU discovery failed: %s — continuing without encoder optimization", e)
-        print(f"[OZMA DEBUG] GPU discovery returned, {len(self._gpu_inventory.gpus)} GPUs", flush=True)
         log.info("GPU discovery complete: %d GPUs", len(self._gpu_inventory.gpus))
-        try:
-            self._encoder_allocator = EncoderAllocator(self._gpu_inventory)
-        except Exception as e:
-            print(f"[OZMA DEBUG] EncoderAllocator init failed: {e}", flush=True)
-            raise
-        print("[OZMA DEBUG] Encoder allocator ready", flush=True)
+        self._encoder_allocator = EncoderAllocator(self._gpu_inventory)
 
         # Enumerate displays
-        print("[OZMA DEBUG] Enumerating displays...", flush=True)
         try:
             self._displays = self._display_backend.enumerate()
         except Exception as e:
-            print(f"[OZMA DEBUG] Display enum failed: {e}", flush=True)
             log.warning("Display enumeration failed: %s — creating default display", e)
             self._displays = [DisplayInfo(index=0, name="default", width=1920, height=1080)]
         log.info("Found %d displays: %s", len(self._displays),
                  ", ".join(d.name for d in self._displays))
 
         # Enumerate input groups
-        print("[OZMA DEBUG] Enumerating input groups...", flush=True)
         try:
             self._input_groups = self._input_backend.enumerate_groups()
         except Exception as e:
-            print(f"[OZMA DEBUG] Input enum failed: {e}", flush=True)
             log.warning("Input enumeration failed: %s", e)
             self._input_groups = []
-        print(f"[OZMA DEBUG] Found {len(self._input_groups)} input groups", flush=True)
         log.info("Found %d input groups", len(self._input_groups))
 
         # Determine seat count
@@ -235,7 +222,6 @@ class SeatManager:
                     encoder_hints.codec = seat_configs[i]["codec"]
 
             encoder_session = self._encoder_allocator.allocate(name, encoder_hints)
-            print(f"[OZMA DEBUG] Creating seat {name} (index={i})", flush=True)
 
             seat = Seat(
                 name=name,
@@ -250,17 +236,14 @@ class SeatManager:
             )
             seat.display = display
             self._seats.append(seat)
-            print(f"[OZMA DEBUG] Seat {name} created", flush=True)
 
-        print(f"[OZMA DEBUG] {len(self._seats)} seats created, setting up audio...", flush=True)
+        log.info("Created %d seats, setting up audio", len(self._seats))
         # Create audio sinks for each seat
         for seat in self._seats:
             try:
                 sink = await self._audio_backend.create_sink(seat.name)
                 seat.audio_sink = sink
-                print(f"[OZMA DEBUG] Audio sink for {seat.name}: {sink}", flush=True)
             except Exception as e:
-                print(f"[OZMA DEBUG] Audio sink failed for {seat.name}: {e}", flush=True)
                 log.warning("Seat %s: audio sink creation failed: %s", seat.name, e)
 
         # Set up per-seat isolation based on profile
@@ -283,27 +266,48 @@ class SeatManager:
         # Assign input groups to seats
         self._assign_inputs()
 
-        # Start seats with minimal functionality
+        # Start all seats concurrently
         log.info("Starting %d seats", len(self._seats))
         for seat in self._seats:
-            async def _minimal_seat(s=seat):
-                print(f"[SEAT-TASK {s.name}] task started", flush=True)
-                try:
-                    await s.start(self._controller_url)
-                except BaseException as e:
-                    print(f"[SEAT-TASK {s.name}] crashed: {type(e).__name__}: {e}", flush=True)
-                    import traceback; traceback.print_exc()
-                print(f"[SEAT-TASK {s.name}] task ended", flush=True)
+            task = asyncio.create_task(
+                seat.start(self._controller_url),
+                name=f"seat-{seat.name}",
+            )
+            self._seat_tasks.append(task)
 
-            asyncio.create_task(_minimal_seat(), name=f"seat-{seat.name}")
+        # Start monitoring server
+        self._monitoring = MonitoringServer(self)
+        try:
+            await self._monitoring.start()
+        except Exception as e:
+            log.warning("Monitoring server failed to start: %s", e)
+            self._monitoring = None
 
-        print("[OZMA] Seats launched, entering keepalive...", flush=True)
-        i = 0
-        while True:
-            await asyncio.sleep(1)
-            i += 1
-            if i % 5 == 0:
-                print(f"[OZMA] alive {i}s", flush=True)
+        # Start game launcher
+        try:
+            self._game_launcher = GameLauncher()
+            await self._game_launcher.discover_games()
+        except Exception as e:
+            log.warning("Game launcher init failed: %s", e)
+            self._game_launcher = None
+
+        # Start hotplug monitor
+        try:
+            self._hotplug = HotplugMonitor(self)
+            await self._hotplug.start()
+        except Exception as e:
+            log.warning("Hotplug monitor failed: %s", e)
+            self._hotplug = None
+
+        # Start config polling (replaces WebSocket push)
+        if self._controller_url:
+            self._config_ws_task = asyncio.create_task(
+                self._connect_config_ws(),
+                name="config-poll",
+            )
+
+        log.info("SeatManager ready: %d seats", len(self._seats))
+        await self._stop_event.wait()
 
     async def stop(self) -> None:
         """Stop all seats and clean up resources."""
@@ -386,58 +390,63 @@ class SeatManager:
 
     async def _connect_config_ws(self) -> None:
         """
-        Connect to controller WebSocket for seat config push.
+        Poll the controller for seat config updates.
 
-        Reconnects with exponential backoff. On each connect the controller
-        sends current authoritative config, which we apply if different from
-        local state.
+        Replaces the previous aiohttp WebSocket approach with simple HTTP
+        polling using ``urllib.request`` (run in an executor to avoid blocking
+        the event loop).  This works on all platforms including Windows with
+        ProactorEventLoop.
+
+        Polls every 30 seconds with exponential backoff on errors.
         """
-        try:
-            import aiohttp
-        except ImportError:
-            log_config.warning("aiohttp not available — config push disabled")
-            return
+        import urllib.request as _urlreq
 
         base = self._controller_url.rstrip("/")
-        # Convert http(s) to ws(s)
-        ws_base = base.replace("https://", "wss://").replace("http://", "ws://")
         node_id = self._node_id()
-        url = f"{ws_base}/api/v1/nodes/{node_id}/config/ws"
+        url = f"{base}/api/v1/nodes/{node_id}/config"
 
         backoff = 1.0
-        max_backoff = 30.0
+        max_backoff = 60.0
+        poll_interval = 30.0
+        loop = asyncio.get_running_loop()
 
         while not self._stop_event.is_set():
             try:
-                async with aiohttp.ClientSession() as session:
-                    log_config.info("Connecting to config WS: %s", url)
-                    async with session.ws_connect(url, heartbeat=30) as ws:
-                        backoff = 1.0  # reset on successful connect
-                        log_config.info("Config WS connected")
+                req = _urlreq.Request(url, headers={"Accept": "application/json"})
+                resp_bytes: bytes = await loop.run_in_executor(
+                    None,
+                    lambda: _urlreq.urlopen(req, timeout=10).read(),
+                )
+                data = json.loads(resp_bytes)
+                backoff = 1.0  # reset on success
 
-                        async for msg in ws:
-                            if self._stop_event.is_set():
-                                break
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                await self._handle_config_message(msg.data)
-                            elif msg.type in (aiohttp.WSMsgType.CLOSED,
-                                              aiohttp.WSMsgType.ERROR):
-                                break
+                # The config endpoint returns the same shape as a WS message
+                if isinstance(data, dict) and data.get("type"):
+                    await self._handle_config_message(json.dumps(data))
 
             except asyncio.CancelledError:
                 return
             except Exception as e:
-                log_config.debug("Config WS error: %s", e)
+                log_config.debug("Config poll error: %s", e)
+                # Wait with backoff before retrying
+                try:
+                    await asyncio.wait_for(
+                        self._stop_event.wait(), timeout=backoff,
+                    )
+                    return  # stop_event was set
+                except asyncio.TimeoutError:
+                    pass
+                backoff = min(backoff * 2, max_backoff)
+                continue
 
-            if self._stop_event.is_set():
-                return
-            log_config.info("Config WS reconnecting in %.0fs", backoff)
+            # Normal poll interval
             try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=backoff)
+                await asyncio.wait_for(
+                    self._stop_event.wait(), timeout=poll_interval,
+                )
                 return  # stop_event was set
             except asyncio.TimeoutError:
                 pass
-            backoff = min(backoff * 2, max_backoff)
 
     async def _handle_config_message(self, raw: str) -> None:
         """Handle a config message from the controller."""

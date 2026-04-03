@@ -24,10 +24,11 @@ import platform
 import shutil
 import socket
 import struct
+import threading
+import urllib.request
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
-
-from aiohttp import web
 
 log = logging.getLogger("ozma.agent.multiseat.seat")
 
@@ -75,7 +76,7 @@ class Seat:
         self._screen_proc: asyncio.subprocess.Process | None = None
         self._transport: asyncio.DatagramTransport | None = None
         self._output_dir = Path(f"/tmp/ozma-seat-{seat_index}")
-        self._runner: web.AppRunner | None = None
+        self._http_server: HTTPServer | None = None
         self._webrtc: Any = None  # SeatWebRTCHandler, set if aiortc available
 
         # HID state tracking
@@ -99,44 +100,47 @@ class Seat:
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
         # Initialize WebRTC handler (graceful if aiortc not installed)
-        # WebRTC init deferred — av/aiortc DLL crashes on Windows without ffmpeg
-        # Will be enabled when ffmpeg is installed
-        print(f"[SEAT {self.name}] skipping webrtc (requires ffmpeg)...", flush=True)
+        self._init_webrtc()
 
         # Start HID injector (per-seat uinput devices)
-        print(f"[SEAT {self.name}] start HID injector...", flush=True)
         try:
             await self._start_hid_injector()
         except Exception as e:
-            print(f"[SEAT {self.name}] HID injector failed: {e}", flush=True)
             log.warning("Seat %s: HID injector failed: %s", self.name, e)
 
         # Start screen capture
         if self.capture_fps > 0:
-            print(f"[SEAT {self.name}] start screen capture...", flush=True)
             try:
                 await self._start_screen_capture()
             except Exception as e:
-                print(f"[SEAT {self.name}] screen capture failed: {e}", flush=True)
                 log.warning("Seat %s: screen capture failed: %s", self.name, e)
 
-        # HTTP API disabled — aiohttp crashes on Windows ProactorEventLoop
-        # TODO: use a different HTTP server (hypercorn, uvicorn) or raw asyncio
-        print(f"[SEAT {self.name}] HTTP API skipped (Windows compat — use monitoring port 7399)", flush=True)
+        # Start HTTP API (stdlib http.server in a daemon thread)
+        try:
+            self._start_http()
+        except Exception as e:
+            log.warning("Seat %s: HTTP API failed: %s", self.name, e)
 
-        # Registration disabled — aiohttp crashes on Windows ProactorEventLoop
-        # TODO: use urllib.request or httpx for Windows-compatible HTTP
+        # Register with controller
         if controller_url:
-            print(f"[SEAT {self.name}] registration skipped (aiohttp Windows compat)", flush=True)
+            asyncio.create_task(
+                self._register(controller_url),
+                name=f"register-{self.name}",
+            )
 
-        # UDP listener disabled for Windows testing
-        print(f"[SEAT {self.name}] seat ready (UDP listener skipped for testing)", flush=True)
+        # UDP listener (threaded on Windows, asyncio on Linux)
+        asyncio.create_task(
+            self._serve(), name=f"udp-{self.name}",
+        )
+
+        log.info("Seat %s: ready", self.name)
         await self._stop_event.wait()
 
     async def stop(self) -> None:
         """Clean shutdown of this seat."""
         log.info("Stopping seat %s", self.name)
-        self._stop_event.set()
+        if self._stop_event:
+            self._stop_event.set()
 
         # Stop WebRTC peer connections
         if self._webrtc:
@@ -158,9 +162,9 @@ class Seat:
             self._hid_injector = None
 
         # Stop HTTP server
-        if self._runner:
-            await self._runner.cleanup()
-            self._runner = None
+        if self._http_server:
+            self._http_server.shutdown()
+            self._http_server = None
 
         # Close UDP transport
         if self._transport:
@@ -286,38 +290,109 @@ class Seat:
         except Exception:
             pass
 
-    async def _start_http(self) -> None:
-        """Start HTTP API for this seat: /status, /snapshot, /stream/."""
-        app = web.Application()
+    def _start_http(self) -> None:
+        """Start HTTP API for this seat in a daemon thread.
 
-        async def status_handler(_: web.Request) -> web.Response:
-            return web.json_response(self.to_dict())
+        Uses stdlib ``http.server`` so it works on every platform including
+        Windows with ProactorEventLoop.
 
-        async def snapshot_handler(_: web.Request) -> web.Response:
-            data = await self._take_snapshot()
-            if data:
-                return web.Response(body=data, content_type="image/jpeg")
-            return web.json_response({"error": "capture failed"}, status=503)
+        Endpoints:
+          GET /status   — seat state JSON
+          GET /health   — ``{"ok": true}``
+          GET /snapshot — single JPEG frame (synchronous ffmpeg capture)
+          GET /stream/* — HLS segments served as static files
+        """
+        seat = self
+        output_dir = self._output_dir
 
-        async def health_handler(_: web.Request) -> web.Response:
-            return web.json_response({"ok": True})
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                path = self.path.split("?")[0]
 
-        app.router.add_get("/status", status_handler)
-        app.router.add_get("/snapshot", snapshot_handler)
-        app.router.add_get("/health", health_handler)
+                if path == "/status":
+                    self._json_response(200, seat.to_dict())
+                elif path == "/health":
+                    self._json_response(200, {"ok": True})
+                elif path == "/snapshot":
+                    self._handle_snapshot()
+                elif path.startswith("/stream/"):
+                    self._handle_stream(path)
+                else:
+                    self.send_error(404)
 
-        # WebRTC routes (if aiortc is available)
-        if self._webrtc:
-            self._webrtc.add_routes(app)
+            # ── helpers ────────────────────────────────────────────
 
-        # Serve HLS segments
-        if self._output_dir.exists():
-            app.router.add_static("/stream/", self._output_dir)
+            def _json_response(self, status: int, data: Any) -> None:
+                body = json.dumps(data).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
 
-        self._runner = web.AppRunner(app)
-        await self._runner.setup()
-        site = web.TCPSite(self._runner, "0.0.0.0", self.api_port)
-        await site.start()
+            def _handle_snapshot(self) -> None:
+                """Synchronous single-frame capture via ffmpeg."""
+                import subprocess as _sp
+
+                display_env = os.environ.get("DISPLAY", ":0")
+                grab_x = seat.display.x_offset if seat.display else 0
+                grab_y = seat.display.y_offset if seat.display else 0
+                width = seat.display.width if seat.display else seat.capture_width
+                height = seat.display.height if seat.display else seat.capture_height
+
+                cmd = [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error",
+                    "-f", "x11grab", "-framerate", "1",
+                    "-video_size", f"{width}x{height}",
+                    "-i", f"{display_env}+{grab_x},{grab_y}",
+                    "-frames:v", "1", "-f", "image2pipe",
+                    "-vcodec", "mjpeg", "pipe:1",
+                ]
+                try:
+                    result = _sp.run(
+                        cmd, capture_output=True, timeout=10,
+                    )
+                    if result.stdout:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "image/jpeg")
+                        self.send_header("Content-Length", str(len(result.stdout)))
+                        self.end_headers()
+                        self.wfile.write(result.stdout)
+                        return
+                except Exception:
+                    pass
+                self._json_response(503, {"error": "capture failed"})
+
+            def _handle_stream(self, path: str) -> None:
+                """Serve HLS segments from the output directory."""
+                # Sanitise: only allow simple filenames under /stream/
+                rel = path[len("/stream/"):]
+                if not rel or ".." in rel or "/" in rel:
+                    self.send_error(404)
+                    return
+                fpath = output_dir / rel
+                if not fpath.is_file():
+                    self.send_error(404)
+                    return
+
+                data = fpath.read_bytes()
+                ctype = "application/vnd.apple.mpegurl" if rel.endswith(".m3u8") else "video/mp2t"
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                pass  # suppress default stderr logging
+
+        server = HTTPServer(("0.0.0.0", self.api_port), _Handler)
+        self._http_server = server
+        thread = threading.Thread(
+            target=server.serve_forever, daemon=True,
+            name=f"seat-http-{self.name}",
+        )
+        thread.start()
         log.info("Seat %s: HTTP API on port %d", self.name, self.api_port)
 
     async def _take_snapshot(self) -> bytes | None:

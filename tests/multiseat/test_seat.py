@@ -250,7 +250,7 @@ class TestSeatLifecycle:
         assert seat._transport is None
 
     @pytest.mark.asyncio
-    async def test_stop_cleans_up_runner(self):
+    async def test_stop_cleans_up_http_server(self):
         seat = Seat(
             name="test-seat-0",
             seat_index=0,
@@ -258,12 +258,12 @@ class TestSeatLifecycle:
             udp_port=7331,
             api_port=7382,
         )
-        mock_runner = AsyncMock()
-        seat._runner = mock_runner
+        mock_server = MagicMock()
+        seat._http_server = mock_server
 
         await seat.stop()
-        mock_runner.cleanup.assert_called_once()
-        assert seat._runner is None
+        mock_server.shutdown.assert_called_once()
+        assert seat._http_server is None
 
     @pytest.mark.asyncio
     async def test_stop_stops_hid_injector(self):

@@ -25,10 +25,12 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import TYPE_CHECKING, Any
-
-from aiohttp import web
 
 if TYPE_CHECKING:
     from .seat_manager import SeatManager
@@ -39,323 +41,331 @@ DEFAULT_PORT = 7399
 
 
 class MonitoringServer:
-    """Management HTTP server for multi-seat monitoring and diagnostics."""
+    """Management HTTP server for multi-seat monitoring and diagnostics.
+
+    Uses stdlib ``http.server`` in a daemon thread instead of aiohttp,
+    so it works on Windows with ProactorEventLoop.
+    """
 
     def __init__(self, seat_manager: SeatManager, port: int = DEFAULT_PORT) -> None:
         self._manager = seat_manager
         self._port = port
-        self._runner: web.AppRunner | None = None
+        self._server: HTTPServer | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     async def start(self) -> None:
-        """Start the monitoring HTTP server."""
-        app = web.Application()
-        app.router.add_get("/api/v1/gpus", self._handle_gpus)
-        app.router.add_get("/api/v1/encoders", self._handle_encoders)
-        app.router.add_get("/api/v1/encoders/history", self._handle_encoder_history)
-        app.router.add_post("/api/v1/encoders/rebalance", self._handle_rebalance)
-        app.router.add_get("/api/v1/seats", self._handle_seats)
-        app.router.add_get("/api/v1/games", self._handle_games)
-        app.router.add_post("/api/v1/seats/{seat}/launch", self._handle_launch)
-        app.router.add_post("/api/v1/seats/{seat}/stop-game", self._handle_stop_game)
-        app.router.add_get("/api/v1/seats/{seat}/game", self._handle_seat_game)
-        app.router.add_get("/api/v1/hotplug", self._handle_hotplug)
-        app.router.add_get("/api/v1/isolation", self._handle_isolation)
-        app.router.add_get("/metrics", self._handle_metrics)
-        app.router.add_get("/health", self._handle_health)
+        """Start the monitoring HTTP server in a daemon thread."""
+        self._loop = asyncio.get_running_loop()
+        manager = self._manager
+        loop = self._loop
 
-        self._runner = web.AppRunner(app)
-        await self._runner.setup()
-        site = web.TCPSite(self._runner, "0.0.0.0", self._port)
-        await site.start()
+        # Regex patterns for seat-specific routes
+        _SEAT_LAUNCH = re.compile(r"^/api/v1/seats/([^/]+)/launch$")
+        _SEAT_STOP = re.compile(r"^/api/v1/seats/([^/]+)/stop-game$")
+        _SEAT_GAME = re.compile(r"^/api/v1/seats/([^/]+)/game$")
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                path = self.path.split("?")[0]
+                query = self.path.split("?", 1)[1] if "?" in self.path else ""
+
+                if path == "/api/v1/gpus":
+                    self._json(200, _get_gpus(manager))
+                elif path == "/api/v1/encoders":
+                    self._json(200, _get_encoders(manager))
+                elif path == "/api/v1/encoders/history":
+                    self._json(200, _get_encoder_history(manager))
+                elif path == "/api/v1/seats":
+                    self._json(200, _get_seats(manager))
+                elif path == "/api/v1/games":
+                    refresh = "refresh=1" in query
+                    if refresh and manager.game_launcher:
+                        _run_coro(loop, manager.game_launcher.discover_games())
+                    self._json(200, _get_games(manager))
+                elif path == "/api/v1/hotplug":
+                    self._json(200, _get_hotplug(manager))
+                elif path == "/api/v1/isolation":
+                    self._json(200, manager.isolation_manager.to_dict())
+                elif path == "/metrics":
+                    self._text(200, "".join(_build_prometheus_metrics(manager)),
+                               "text/plain; version=0.0.4; charset=utf-8")
+                elif path == "/health":
+                    self._json(200, {
+                        "ok": True,
+                        "seats": manager.seat_count,
+                        "gpus": len(manager._gpu_inventory.gpus),
+                    })
+                else:
+                    # Seat-specific GET routes
+                    m = _SEAT_GAME.match(path)
+                    if m:
+                        self._json(200, _get_seat_game(manager, m.group(1)))
+                        return
+                    self.send_error(404)
+
+            def do_POST(self) -> None:  # noqa: N802
+                path = self.path.split("?")[0]
+
+                if path == "/api/v1/encoders/rebalance":
+                    result = _run_coro(loop, manager.rebalance_encoders())
+                    self._json(200, _get_rebalance_result(manager, result))
+                    return
+
+                m = _SEAT_LAUNCH.match(path)
+                if m:
+                    self._handle_launch(m.group(1))
+                    return
+
+                m = _SEAT_STOP.match(path)
+                if m:
+                    self._handle_stop_game(m.group(1))
+                    return
+
+                self.send_error(404)
+
+            # ── helpers ────────────────────────────────────────
+
+            def _json(self, status: int, data: Any) -> None:
+                body = json.dumps(data).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _text(self, status: int, text: str, ctype: str) -> None:
+                body = text.encode()
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _read_body(self) -> bytes:
+                length = int(self.headers.get("Content-Length", 0))
+                return self.rfile.read(length) if length else b""
+
+            def _handle_launch(self, seat_name: str) -> None:
+                seat = manager.get_seat(seat_name)
+                if not seat:
+                    self._json(404, {"error": f"seat not found: {seat_name}"})
+                    return
+                launcher = manager.game_launcher
+                if not launcher:
+                    self._json(503, {"error": "game launcher not initialized"})
+                    return
+                try:
+                    body = json.loads(self._read_body())
+                except Exception:
+                    self._json(400, {"error": "invalid JSON body"})
+                    return
+                game_id = body.get("game_id")
+                if not game_id:
+                    self._json(400, {"error": "game_id required"})
+                    return
+                game = next((g for g in launcher.games if g.id == game_id), None)
+                if not game:
+                    self._json(404, {"error": f"game not found: {game_id}"})
+                    return
+                proc = _run_coro(loop, launcher.launch(game, seat))
+                if proc:
+                    self._json(200, {
+                        "ok": True, "game": game.to_dict(),
+                        "pid": proc.pid, "seat": seat_name,
+                    })
+                else:
+                    self._json(500, {"error": "failed to launch game"})
+
+            def _handle_stop_game(self, seat_name: str) -> None:
+                seat = manager.get_seat(seat_name)
+                if not seat:
+                    self._json(404, {"error": f"seat not found: {seat_name}"})
+                    return
+                launcher = manager.game_launcher
+                if not launcher:
+                    self._json(503, {"error": "game launcher not initialized"})
+                    return
+                stopped = _run_coro(loop, launcher.stop(seat))
+                self._json(200, {"ok": stopped, "seat": seat_name})
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                pass  # suppress default stderr logging
+
+        server = HTTPServer(("0.0.0.0", self._port), _Handler)
+        self._server = server
+        thread = threading.Thread(
+            target=server.serve_forever, daemon=True,
+            name="monitoring-http",
+        )
+        thread.start()
         log.info("Monitoring server listening on port %d", self._port)
+
+    def start_sync(self) -> None:
+        """Start server synchronously (for tests). No event loop needed."""
+        # We need to run the async start without an event loop by inlining the logic
+        asyncio.run(self.start())
+
+    def stop_sync(self) -> None:
+        """Stop server synchronously (for tests)."""
+        if self._server:
+            self._server.shutdown()
+            self._server = None
 
     async def stop(self) -> None:
         """Stop the monitoring HTTP server."""
-        if self._runner:
-            await self._runner.cleanup()
-            self._runner = None
+        if self._server:
+            self._server.shutdown()
+            self._server = None
         log.info("Monitoring server stopped")
 
-    # ── Handlers ────────────────────────────────────────────────────────────
 
-    async def _handle_gpus(self, _request: web.Request) -> web.Response:
-        """GET /api/v1/gpus -- GPU inventory with active session counts."""
-        inventory = self._manager._gpu_inventory
-        allocator = self._manager._encoder_allocator
+def _run_coro(loop: asyncio.AbstractEventLoop, coro: Any) -> Any:
+    """Run an asyncio coroutine from a synchronous thread, blocking until done."""
+    import concurrent.futures
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    return future.result(timeout=30)
 
-        gpus = []
-        for gpu in inventory.gpus:
-            encoders = []
-            for enc in gpu.encoders:
-                active = allocator.active_sessions_on(gpu.index, enc.name) if allocator else 0
-                encoders.append({
-                    "name": enc.name,
-                    "codec": enc.codec,
-                    "max_sessions": enc.max_sessions,
-                    "active_sessions": active,
-                    "quality": enc.quality,
-                    "latency": enc.latency,
-                })
-            gpus.append({
-                "index": gpu.index,
-                "name": gpu.name,
-                "vendor": gpu.vendor,
-                "is_igpu": gpu.is_igpu,
-                "pci_slot": gpu.pci_slot,
-                "vram_mb": gpu.vram_mb,
-                "render_device": gpu.render_device,
-                "encoders": encoders,
+
+# ── Data‐gathering helpers (called from handler thread) ─────────────────────
+
+def _get_gpus(manager: SeatManager) -> dict:
+    inventory = manager._gpu_inventory
+    allocator = manager._encoder_allocator
+    gpus = []
+    for gpu in inventory.gpus:
+        encoders = []
+        for enc in gpu.encoders:
+            active = allocator.active_sessions_on(gpu.index, enc.name) if allocator else 0
+            encoders.append({
+                "name": enc.name, "codec": enc.codec,
+                "max_sessions": enc.max_sessions, "active_sessions": active,
+                "quality": enc.quality, "latency": enc.latency,
             })
+        gpus.append({
+            "index": gpu.index, "name": gpu.name, "vendor": gpu.vendor,
+            "is_igpu": gpu.is_igpu, "pci_slot": gpu.pci_slot,
+            "vram_mb": gpu.vram_mb, "render_device": gpu.render_device,
+            "encoders": encoders,
+        })
+    return {"gpus": gpus}
 
-        return web.json_response({"gpus": gpus})
 
-    async def _handle_encoders(self, _request: web.Request) -> web.Response:
-        """GET /api/v1/encoders -- current encoder allocations."""
-        allocator = self._manager._encoder_allocator
-        if not allocator:
-            return web.json_response({"allocations": [], "sessions": {}})
+def _get_encoders(manager: SeatManager) -> dict:
+    allocator = manager._encoder_allocator
+    if not allocator:
+        return {"allocations": [], "sessions": {}}
+    inventory = manager._gpu_inventory
+    allocations = []
+    for seat_name, session in allocator.sessions.items():
+        gpu = inventory.gpu_by_index(session.gpu_index)
+        gpu_name = gpu.name if gpu else "software"
+        allocations.append({
+            "seat": seat_name, "encoder": session.encoder.name,
+            "gpu_index": session.gpu_index, "gpu_name": gpu_name,
+            "score": session.score, "reason": session.reason,
+            "ffmpeg_args": session.ffmpeg_args,
+        })
+    sessions: dict[str, dict[str, int]] = {}
+    for gpu in inventory.gpus:
+        for enc in gpu.encoders:
+            key = f"{enc.name}:{gpu.index}"
+            active = allocator.active_sessions_on(gpu.index, enc.name)
+            sessions[key] = {"active": active, "max": enc.max_sessions}
+    return {"allocations": allocations, "sessions": sessions}
 
-        inventory = self._manager._gpu_inventory
-        allocations = []
+
+def _get_encoder_history(manager: SeatManager) -> dict:
+    allocator = manager._encoder_allocator
+    if not allocator:
+        return {"events": []}
+    return {"events": allocator.get_history()}
+
+
+def _get_rebalance_result(manager: SeatManager, reassigned: list[str]) -> dict:
+    allocator = manager._encoder_allocator
+    inventory = manager._gpu_inventory
+    allocations = []
+    if allocator:
         for seat_name, session in allocator.sessions.items():
             gpu = inventory.gpu_by_index(session.gpu_index)
             gpu_name = gpu.name if gpu else "software"
             allocations.append({
-                "seat": seat_name,
-                "encoder": session.encoder.name,
-                "gpu_index": session.gpu_index,
-                "gpu_name": gpu_name,
-                "score": session.score,
-                "reason": session.reason,
-                "ffmpeg_args": session.ffmpeg_args,
+                "seat": seat_name, "encoder": session.encoder.name,
+                "gpu_index": session.gpu_index, "gpu_name": gpu_name,
+                "score": session.score, "reason": session.reason,
             })
+    return {"reassigned": reassigned, "allocations": allocations}
 
-        # Session counts keyed by "encoder_name:gpu_index"
-        sessions: dict[str, dict[str, int]] = {}
-        for gpu in inventory.gpus:
-            for enc in gpu.encoders:
-                key = f"{enc.name}:{gpu.index}"
-                active = allocator.active_sessions_on(gpu.index, enc.name)
-                sessions[key] = {"active": active, "max": enc.max_sessions}
 
-        return web.json_response({"allocations": allocations, "sessions": sessions})
-
-    async def _handle_encoder_history(self, _request: web.Request) -> web.Response:
-        """GET /api/v1/encoders/history -- recent allocation decisions."""
-        allocator = self._manager._encoder_allocator
-        if not allocator:
-            return web.json_response({"events": []})
-
-        return web.json_response({"events": allocator.get_history()})
-
-    async def _handle_rebalance(self, _request: web.Request) -> web.Response:
-        """POST /api/v1/encoders/rebalance -- force rebalance."""
-        reassigned = await self._manager.rebalance_encoders()
-        # Return the current allocations after rebalance
-        allocator = self._manager._encoder_allocator
-        inventory = self._manager._gpu_inventory
-        allocations = []
+def _get_seats(manager: SeatManager) -> dict:
+    allocator = manager._encoder_allocator
+    inventory = manager._gpu_inventory
+    seats = []
+    for seat in manager.seats:
+        encoder_info: dict[str, Any] | None = None
         if allocator:
-            for seat_name, session in allocator.sessions.items():
+            session = allocator.sessions.get(seat.name)
+            if session:
                 gpu = inventory.gpu_by_index(session.gpu_index)
                 gpu_name = gpu.name if gpu else "software"
-                allocations.append({
-                    "seat": seat_name,
-                    "encoder": session.encoder.name,
-                    "gpu_index": session.gpu_index,
-                    "gpu_name": gpu_name,
-                    "score": session.score,
-                    "reason": session.reason,
-                })
-
-        return web.json_response({
-            "reassigned": reassigned,
-            "allocations": allocations,
-        })
-
-    async def _handle_seats(self, _request: web.Request) -> web.Response:
-        """GET /api/v1/seats -- all seats with encoder info."""
-        allocator = self._manager._encoder_allocator
-        inventory = self._manager._gpu_inventory
-        seats = []
-
-        for seat in self._manager.seats:
-            encoder_info: dict[str, Any] | None = None
-            if allocator:
-                session = allocator.sessions.get(seat.name)
-                if session:
-                    gpu = inventory.gpu_by_index(session.gpu_index)
-                    gpu_name = gpu.name if gpu else "software"
-                    max_s = session.encoder.max_sessions
-                    active_s = allocator.active_sessions_on(
-                        session.gpu_index, session.encoder.name,
-                    )
-                    sessions_str = (
-                        f"{active_s}/unlimited" if max_s < 0
-                        else f"{active_s}/{max_s}"
-                    )
-                    encoder_info = {
-                        "name": session.encoder.name,
-                        "gpu": gpu_name,
-                        "gpu_index": session.gpu_index,
-                        "sessions": sessions_str,
-                        "score": session.score,
-                        "reason": session.reason,
-                    }
-
-            display_name = seat.display.name if seat.display else None
-            capture_active = (
-                seat._screen_proc is not None
-                and seat._screen_proc.returncode is None
-            )
-
-            # Isolation context for this seat
-            iso_ctx = self._manager.isolation_manager.get_context(seat.name)
-            isolation_info = iso_ctx.to_dict() if iso_ctx else {"backend": "none"}
-
-            seats.append({
-                "name": seat.name,
-                "index": seat.seat_index,
-                "display": display_name,
-                "udp_port": seat.udp_port,
-                "api_port": seat.api_port,
-                "encoder": encoder_info,
-                "audio_sink": seat.audio_sink,
-                "input_devices": seat.input_devices,
-                "isolation": isolation_info,
-                "status": "running" if capture_active else "idle",
-            })
-
-        return web.json_response({"seats": seats})
-
-    async def _handle_games(self, request: web.Request) -> web.Response:
-        """GET /api/v1/games -- discovered game library."""
-        launcher = self._manager.game_launcher
-        if not launcher:
-            return web.json_response({"games": []})
-
-        # Allow ?refresh=1 to force rescan
-        if request.query.get("refresh") == "1":
-            await launcher.discover_games()
-
-        games = [g.to_dict() for g in launcher.games]
-        return web.json_response({"games": games, "count": len(games)})
-
-    async def _handle_launch(self, request: web.Request) -> web.Response:
-        """POST /api/v1/seats/{seat}/launch -- launch a game on a seat."""
-        seat_name = request.match_info["seat"]
-        seat = self._manager.get_seat(seat_name)
-        if not seat:
-            return web.json_response(
-                {"error": f"seat not found: {seat_name}"}, status=404,
-            )
-
-        launcher = self._manager.game_launcher
-        if not launcher:
-            return web.json_response(
-                {"error": "game launcher not initialized"}, status=503,
-            )
-
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response(
-                {"error": "invalid JSON body"}, status=400,
-            )
-
-        game_id = body.get("game_id")
-        if not game_id:
-            return web.json_response(
-                {"error": "game_id required"}, status=400,
-            )
-
-        # Find the game
-        game = None
-        for g in launcher.games:
-            if g.id == game_id:
-                game = g
-                break
-
-        if not game:
-            return web.json_response(
-                {"error": f"game not found: {game_id}"}, status=404,
-            )
-
-        proc = await launcher.launch(game, seat)
-        if proc:
-            return web.json_response({
-                "ok": True,
-                "game": game.to_dict(),
-                "pid": proc.pid,
-                "seat": seat_name,
-            })
-        return web.json_response(
-            {"error": "failed to launch game"}, status=500,
+                max_s = session.encoder.max_sessions
+                active_s = allocator.active_sessions_on(
+                    session.gpu_index, session.encoder.name,
+                )
+                sessions_str = (
+                    f"{active_s}/unlimited" if max_s < 0
+                    else f"{active_s}/{max_s}"
+                )
+                encoder_info = {
+                    "name": session.encoder.name, "gpu": gpu_name,
+                    "gpu_index": session.gpu_index, "sessions": sessions_str,
+                    "score": session.score, "reason": session.reason,
+                }
+        display_name = seat.display.name if seat.display else None
+        capture_active = (
+            seat._screen_proc is not None
+            and seat._screen_proc.returncode is None
         )
-
-    async def _handle_stop_game(self, request: web.Request) -> web.Response:
-        """POST /api/v1/seats/{seat}/stop-game -- stop game on a seat."""
-        seat_name = request.match_info["seat"]
-        seat = self._manager.get_seat(seat_name)
-        if not seat:
-            return web.json_response(
-                {"error": f"seat not found: {seat_name}"}, status=404,
-            )
-
-        launcher = self._manager.game_launcher
-        if not launcher:
-            return web.json_response(
-                {"error": "game launcher not initialized"}, status=503,
-            )
-
-        stopped = await launcher.stop(seat)
-        return web.json_response({"ok": stopped, "seat": seat_name})
-
-    async def _handle_seat_game(self, request: web.Request) -> web.Response:
-        """GET /api/v1/seats/{seat}/game -- what's running on a seat."""
-        seat_name = request.match_info["seat"]
-        seat = self._manager.get_seat(seat_name)
-        if not seat:
-            return web.json_response(
-                {"error": f"seat not found: {seat_name}"}, status=404,
-            )
-
-        launcher = self._manager.game_launcher
-        if not launcher:
-            return web.json_response({"game": None})
-
-        state = launcher.running_state(seat_name)
-        return web.json_response({"game": state})
-
-    async def _handle_hotplug(self, _request: web.Request) -> web.Response:
-        """GET /api/v1/hotplug -- hotplug monitor state."""
-        hotplug = self._manager.hotplug
-        if not hotplug:
-            return web.json_response({"enabled": False})
-
-        result = hotplug.to_dict()
-        result["enabled"] = True
-        return web.json_response(result)
-
-    async def _handle_isolation(self, _request: web.Request) -> web.Response:
-        """GET /api/v1/isolation -- available backends and per-seat status."""
-        return web.json_response(self._manager.isolation_manager.to_dict())
-
-    async def _handle_metrics(self, _request: web.Request) -> web.Response:
-        """GET /metrics -- Prometheus text exposition format."""
-        lines = _build_prometheus_metrics(self._manager)
-        return web.Response(
-            text="".join(lines),
-            content_type="text/plain; version=0.0.4; charset=utf-8",
-        )
-
-    async def _handle_health(self, _request: web.Request) -> web.Response:
-        """GET /health -- simple health check."""
-        return web.json_response({
-            "ok": True,
-            "seats": self._manager.seat_count,
-            "gpus": len(self._manager._gpu_inventory.gpus),
+        iso_ctx = manager.isolation_manager.get_context(seat.name)
+        isolation_info = iso_ctx.to_dict() if iso_ctx else {"backend": "none"}
+        seats.append({
+            "name": seat.name, "index": seat.seat_index,
+            "display": display_name, "udp_port": seat.udp_port,
+            "api_port": seat.api_port, "encoder": encoder_info,
+            "audio_sink": seat.audio_sink,
+            "input_devices": seat.input_devices,
+            "isolation": isolation_info,
+            "status": "running" if capture_active else "idle",
         })
+    return {"seats": seats}
+
+
+def _get_games(manager: SeatManager) -> dict:
+    launcher = manager.game_launcher
+    if not launcher:
+        return {"games": []}
+    games = [g.to_dict() for g in launcher.games]
+    return {"games": games, "count": len(games)}
+
+
+def _get_seat_game(manager: SeatManager, seat_name: str) -> dict:
+    seat = manager.get_seat(seat_name)
+    if not seat:
+        return {"error": f"seat not found: {seat_name}"}
+    launcher = manager.game_launcher
+    if not launcher:
+        return {"game": None}
+    state = launcher.running_state(seat_name)
+    return {"game": state}
+
+
+def _get_hotplug(manager: SeatManager) -> dict:
+    hotplug = manager.hotplug
+    if not hotplug:
+        return {"enabled": False}
+    result = hotplug.to_dict()
+    result["enabled"] = True
+    return result
 
 
 # ── Prometheus metric formatting ──────────────────────────────────────────────
