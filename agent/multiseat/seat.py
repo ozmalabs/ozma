@@ -98,17 +98,35 @@ class Seat:
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
         # Initialize WebRTC handler (graceful if aiortc not installed)
+        print(f"[SEAT {self.name}] init webrtc...", flush=True)
         self._init_webrtc()
 
         # Start HID injector (per-seat uinput devices)
-        await self._start_hid_injector()
+        print(f"[SEAT {self.name}] start HID injector...", flush=True)
+        try:
+            await self._start_hid_injector()
+        except Exception as e:
+            print(f"[SEAT {self.name}] HID injector failed: {e}", flush=True)
+            log.warning("Seat %s: HID injector failed: %s", self.name, e)
 
         # Start screen capture
         if self.capture_fps > 0:
-            await self._start_screen_capture()
+            print(f"[SEAT {self.name}] start screen capture...", flush=True)
+            try:
+                await self._start_screen_capture()
+            except Exception as e:
+                print(f"[SEAT {self.name}] screen capture failed: {e}", flush=True)
+                log.warning("Seat %s: screen capture failed: %s", self.name, e)
 
         # Start HTTP API
-        await self._start_http()
+        print(f"[SEAT {self.name}] start HTTP API on port {self.api_port}...", flush=True)
+        try:
+            await self._start_http()
+        except Exception as e:
+            print(f"[SEAT {self.name}] HTTP API failed: {e}", flush=True)
+            log.warning("Seat %s: HTTP API failed: %s", self.name, e)
+
+        print(f"[SEAT {self.name}] HTTP API running", flush=True)
 
         # Register with controller
         if controller_url:
@@ -117,6 +135,7 @@ class Seat:
                 name=f"register-{self.name}",
             )
 
+        print(f"[SEAT {self.name}] starting UDP listener on port {self.udp_port}...", flush=True)
         # Start UDP listener (blocks until stopped)
         await self._serve()
 
