@@ -100,6 +100,7 @@ from game_streaming import SunshineManager
 from auto_configure import AutoConfigureManager
 from camera_connect import CameraConnectManager
 from grid import GridService
+from parental_controls import ParentalControlsManager
 from compliance_reports import ComplianceReportEngine
 from msp_dashboard import MSPDashboardManager
 from msp_portal import MSPPortalManager, PortalConfig
@@ -555,6 +556,11 @@ async def run(config: Config) -> None:
     )
     await grid_svc.start()
 
+    # Parental controls (V1.8) — child profiles, app whitelists, timers, schedules
+    parental_data = Path(__file__).parent / "parental_data"
+    parental_mgr = ParentalControlsManager(data_dir=parental_data)
+    await parental_mgr.start()
+
     # Camera Connect (V1.7) — proxy camera nodes to Connect cloud for remote access
     cc_data = Path(__file__).parent / "camera_connect_data"
     cam_connect_mgr = CameraConnectManager(
@@ -651,7 +657,7 @@ async def run(config: Config) -> None:
         transcription_mgr = LiveTranscriptionManager(connect=connect)
 
     # Build the FastAPI app — all managers must be created before this point
-    app = build_app(state, scenarios, streams, audio, controls, rgb_out, motion, bt, kdeconnect, wifi_audio, captures, paste_typer, kbd_mgr, macro_mgr, sched, notifier, recorder, net_health, ocr_triggers, auto_engine, metrics_collector, screen_mgr, codec_mgr=codec_mgr, camera_mgr=camera_mgr, obs_studio=obs_studio, stream_router=stream_router, guac_mgr=guac_mgr, provision_mgr=provision_mgr, connect=connect, mesh_ca=mesh_ca, sess_mgr=sess_mgr, room_correction=room_corr, testbench=testbench, agent_engine=agent_engine, test_runner=test_runner, auth_config=auth_cfg, user_manager=user_mgr, service_proxy=svc_proxy, idp=idp_instance, sharing=sharing_mgr, ext_publish=ext_pub, node_reconciler=reconciler, update_mgr=update_mgr, transcription_mgr=transcription_mgr, discovery=discovery, doorbell_mgr=doorbell_mgr, alert_mgr=alert_mgr, vaultwarden=vault_mgr, email_security=email_sec, cloud_backup=cloud_backup, iot=iot_mgr, wg=wg_mgr, itsm=itsm_mgr, license_mgr=license_mgr, mdm=mdm_mgr, job_queue=job_queue, net_scan=net_scan_mgr, key_store=key_store, dlp=dlp_mgr, saas_mgr=saas_mgr, threat_intel=threat_intel, compliance=compliance_engine, cam_rec=cam_rec_mgr, wifi_ap=wifi_ap_mgr, router=router_mgr, backup_tracker=backup_tracker, mobile_cam=mob_cam, sunshine=sunshine_mgr, msp_mgr=msp_mgr, msp_portal=msp_portal_mgr, auto_configure=auto_configure_mgr, cam_connect=cam_connect_mgr, grid=grid_svc)
+    app = build_app(state, scenarios, streams, audio, controls, rgb_out, motion, bt, kdeconnect, wifi_audio, captures, paste_typer, kbd_mgr, macro_mgr, sched, notifier, recorder, net_health, ocr_triggers, auto_engine, metrics_collector, screen_mgr, codec_mgr=codec_mgr, camera_mgr=camera_mgr, obs_studio=obs_studio, stream_router=stream_router, guac_mgr=guac_mgr, provision_mgr=provision_mgr, connect=connect, mesh_ca=mesh_ca, sess_mgr=sess_mgr, room_correction=room_corr, testbench=testbench, agent_engine=agent_engine, test_runner=test_runner, auth_config=auth_cfg, user_manager=user_mgr, service_proxy=svc_proxy, idp=idp_instance, sharing=sharing_mgr, ext_publish=ext_pub, node_reconciler=reconciler, update_mgr=update_mgr, transcription_mgr=transcription_mgr, discovery=discovery, doorbell_mgr=doorbell_mgr, alert_mgr=alert_mgr, vaultwarden=vault_mgr, email_security=email_sec, cloud_backup=cloud_backup, iot=iot_mgr, wg=wg_mgr, itsm=itsm_mgr, license_mgr=license_mgr, mdm=mdm_mgr, job_queue=job_queue, net_scan=net_scan_mgr, key_store=key_store, dlp=dlp_mgr, saas_mgr=saas_mgr, threat_intel=threat_intel, compliance=compliance_engine, cam_rec=cam_rec_mgr, wifi_ap=wifi_ap_mgr, router=router_mgr, backup_tracker=backup_tracker, mobile_cam=mob_cam, sunshine=sunshine_mgr, msp_mgr=msp_mgr, msp_portal=msp_portal_mgr, auto_configure=auto_configure_mgr, cam_connect=cam_connect_mgr, grid=grid_svc, parental=parental_mgr)
 
     uv_config = uvicorn.Config(
         app,
@@ -847,6 +853,7 @@ async def run(config: Config) -> None:
     await auto_configure_mgr.stop()
     await cam_connect_mgr.stop()
     await grid_svc.stop()
+    await parental_mgr.stop()
     if front_panel:
         await front_panel.stop()
 

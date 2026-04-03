@@ -8621,7 +8621,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         profile_id = body.get("profile_id", "")
         if not profile_id:
             raise HTTPException(400, "profile_id is required")
-        ok = _parental().assign_device(device_id, profile_id)
+        ok = _parental().assign_device(profile_id, device_id)
         if not ok:
             raise HTTPException(404, f"Profile {profile_id!r} not found")
         return {"ok": True, "device_id": device_id, "profile_id": profile_id}
