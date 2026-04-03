@@ -134,8 +134,10 @@ class SeatManager:
             raise
 
     async def _start_inner(self) -> None:
+        print("[OZMA DEBUG] _start_inner begin", flush=True)
         # Initialize platform-specific backends
         self._init_backends()
+        print("[OZMA DEBUG] backends initialized", flush=True)
 
         # Initialize virtual display manager (auto-detects driver)
         self._vdm = VirtualDisplayManager()
@@ -151,13 +153,19 @@ class SeatManager:
             log.warning("GPU discovery failed: %s — continuing without encoder optimization", e)
         print(f"[OZMA DEBUG] GPU discovery returned, {len(self._gpu_inventory.gpus)} GPUs", flush=True)
         log.info("GPU discovery complete: %d GPUs", len(self._gpu_inventory.gpus))
-        self._encoder_allocator = EncoderAllocator(self._gpu_inventory)
-        log.info("Encoder allocator ready")
+        try:
+            self._encoder_allocator = EncoderAllocator(self._gpu_inventory)
+        except Exception as e:
+            print(f"[OZMA DEBUG] EncoderAllocator init failed: {e}", flush=True)
+            raise
+        print("[OZMA DEBUG] Encoder allocator ready", flush=True)
 
         # Enumerate displays
+        print("[OZMA DEBUG] Enumerating displays...", flush=True)
         try:
             self._displays = self._display_backend.enumerate()
         except Exception as e:
+            print(f"[OZMA DEBUG] Display enum failed: {e}", flush=True)
             log.warning("Display enumeration failed: %s — creating default display", e)
             self._displays = [DisplayInfo(index=0, name="default", width=1920, height=1080)]
         log.info("Found %d displays: %s", len(self._displays),
