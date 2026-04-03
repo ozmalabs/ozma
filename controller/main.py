@@ -408,8 +408,18 @@ async def run(config: Config) -> None:
     update_mgr = None
     if config.update_manager_enabled:
         from update_manager import UpdateManager
-        ca_pubkey = mesh_ca.controller_keypair.public_key if mesh_ca and mesh_ca.controller_keypair else None
-        update_mgr = UpdateManager(firmware_ca_pubkey=ca_pubkey)
+        ota_pub_path = Path(__file__).parent / "ota_signing.pub"
+        ota_pubkey: bytes | None = None
+        if ota_pub_path.exists():
+            try:
+                ota_pubkey = bytes.fromhex(ota_pub_path.read_text().strip())
+            except ValueError:
+                log.warning("Invalid OTA public key in %s — signature verification disabled",
+                            ota_pub_path)
+        else:
+            log.warning("OTA signing public key not found (%s) — signature verification disabled",
+                        ota_pub_path)
+        update_mgr = UpdateManager(firmware_ca_pubkey=ota_pubkey)
         asyncio.create_task(update_mgr.check_loop(), name="update-checker")
 
     # Live transcription — optional; requires whisper.cpp on PATH

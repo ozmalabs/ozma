@@ -74,6 +74,17 @@ class IdentityKeyPair:
             return IdentityKeyPair(public_key=pk, private_key=sk)
         raise RuntimeError("PyNaCl required for key generation")
 
+    @classmethod
+    def from_private_bytes(cls, private_bytes: bytes) -> "IdentityKeyPair":
+        """Reconstruct a keypair from stored private key bytes (64-byte libsodium format)."""
+        if not _HAS_NACL:
+            raise RuntimeError("PyNaCl required")
+        if len(private_bytes) != 64:
+            raise ValueError(f"Expected 64 private key bytes, got {len(private_bytes)}")
+        # The last 32 bytes of libsodium's 64-byte sk are the public key
+        public_key = private_bytes[32:]
+        return cls(public_key=public_key, private_key=private_bytes)
+
     def sign(self, message: bytes) -> bytes:
         """Sign a message. Returns 64-byte Ed25519 signature."""
         if _HAS_NACL:

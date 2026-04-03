@@ -96,9 +96,56 @@ jobs:
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
 
+  # ── OTA image signing ───────────────────────────────────────────────────
+  sign-ota:
+    needs: [wheels]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: astral-sh/setup-uv@v4
+      - run: uv pip install --system pynacl
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-controller
+          merge-multiple: true
+          path: /tmp/ota-artifacts/
+      - name: Sign OTA artifacts
+        env:
+          OTA_SIGNING_KEY: ${{ secrets.OTA_SIGNING_KEY }}
+        run: |
+          python - <<'EOF'
+          import base64, os, sys
+          from pathlib import Path
+          sys.path.insert(0, "controller")
+          from transport import IdentityKeyPair
+
+          priv_b64 = os.environ.get("OTA_SIGNING_KEY", "")
+          if not priv_b64:
+              print("WARNING: OTA_SIGNING_KEY not set — skipping signing")
+              sys.exit(0)
+          priv_bytes = base64.b64decode(priv_b64.strip())
+          kp = IdentityKeyPair.from_private_bytes(priv_bytes)
+
+          for artifact in Path("/tmp/ota-artifacts").iterdir():
+              if artifact.suffix in (".whl", ".img", ".tar", ".gz"):
+                  data = artifact.read_bytes()
+                  sig = kp.sign(data)
+                  sig_path = artifact.with_suffix(artifact.suffix + ".sig")
+                  sig_path.write_bytes(sig)
+                  print(f"Signed {artifact.name} → {sig_path.name}")
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ota-artifacts-signed
+          path: /tmp/ota-artifacts/
+
   # ── GitHub Release ──────────────────────────────────────────────────────
   release:
-    needs: [wheels, container, windows-agent, deb]
+    needs: [wheels, container, windows-agent, deb, sign-ota]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -113,4 +160,5 @@ jobs:
             artifacts/ozma-agent-windows/ozma-agent.exe
             artifacts/wheel-*/*.whl
             artifacts/deb-packages/*.deb
+            artifacts/ota-artifacts-signed/*.sig
           generate_release_notes: true
