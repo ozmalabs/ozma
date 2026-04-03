@@ -29,19 +29,19 @@ This inversion of the traditional KVM model (hardware switch in the signal path)
 │                    Internal routing bus                      │
 └──────────────────────────────┬───────────────────────────────┘
                                │
-         ┌─────────────────────┼─────────────────────┐
-         │                     │                     │
-┌────────┴───────┐   ┌─────────┴──────┐   ┌─────────┴──────┐
-│  Compute Node  │   │  Compute Node  │   │   Room Mic     │
-│  (SBC / MCU)   │   │   (Soft Node)  │   │                │
-└────────┬───────┘   └─────────┬──────┘   └────────────────┘
-         │  USB-C               │  TCP/IP
-         │                      │
-┌────────┴───────┐   ┌─────────┴──────┐
-│  Target PC A   │   │  Target PC B   │
-│  (sees: HID,   │   │  (any desktop) │
-│   UAC, UVC)    │   │                │
-└────────────────┘   └────────────────┘
+         ┌─────────────────────┼──────────────────────────┐
+         │                     │                          │
+┌────────┴───────┐   ┌─────────┴──────┐   ┌──────────────┴─────┐
+│  Compute Node  │   │  Compute Node  │   │   Camera Node       │
+│  (SBC / MCU)   │   │   (Soft Node)  │   │  (Ozma Camera /     │
+└────────┬───────┘   └─────────┬──────┘   │   NVR / DIY OPi5)  │
+         │  USB-C               │  TCP/IP  └──────────┬──────────┘
+         │                      │                     │  TCP/IP
+┌────────┴───────┐   ┌─────────┴──────┐   ┌──────────┴──────────┐
+│  Target PC A   │   │  Target PC B   │   │  IP Cameras (PoE)   │
+│  (sees: HID,   │   │  (any desktop) │   │  (Frigate runs      │
+│   UAC, UVC)    │   │                │   │   on the node)      │
+└────────────────┘   └────────────────┘   └─────────────────────┘
 ```
 
 ---
@@ -91,6 +91,84 @@ Agents run **inside** the target machine's OS (not on the node). They provide:
 - Metrics collection (CPU, GPU, RAM, temps)
 
 Agents are optional. The node works without one.
+
+### Camera Nodes
+
+Camera nodes are a distinct node type (`machine_class: "camera"`) that produce video and handle local inference rather than consuming HID. The KVMA fabric treats them as first-class nodes — they register via mDNS, authenticate with the mesh CA, and appear in the controller's node inventory alongside compute nodes.
+
+**What camera nodes do:**
+- Run Frigate locally — all decode and ML inference happen on the node, not the controller
+- Expose camera streams (RTSP, HLS/MJPEG) via their registration metadata
+- Forward Frigate events (doorbell press, person detected, face recognised) to the controller's AlertManager
+- Participate in two-way audio (camera mic → node headset; node mic → camera RTSP backchannel)
+
+**What camera nodes do not do:**
+- No USB gadget (no HID, no UAC — `capabilities: []` for keyboard and mouse)
+- No target PC — they produce video output rather than serving a workstation
+
+**Controller CPU impact is flat.** The controller only receives event metadata, snapshot JPEGs on demand, and stream URLs. No raw video is decoded on the controller regardless of camera count. Adding cameras means adding camera node hardware; the controller's load does not grow.
+
+**Zero-config camera auto-detection.** When a camera is plugged into an Ozma NVR's PoE port, the NVR's auto-configuration pipeline handles everything:
+
+1. Camera powers up and gets an IP from the NVR's built-in DHCP server (dedicated PoE subnet)
+2. ONVIF probe — `WS-Discovery` confirms it's a camera; `GetProfiles` and `GetStreamUri` retrieve all stream URLs and their resolution/codec/framerate; `GetCapabilities` detects audio, PTZ, and doorbell button support
+3. Frigate config is generated automatically: record stream set to the highest quality profile, detect stream set to a low-resolution sub-stream for efficient inference, RK3588 NPU detector pre-configured
+4. If the camera has a doorbell button or two-way audio, those are wired to the Ozma alert system automatically
+5. The camera appears in the controller dashboard — typically within 30 seconds of being plugged in
+
+For cameras that do not support ONVIF, the pipeline falls back to known manufacturer RTSP URL patterns and `ffprobe` stream detection. No YAML editing is ever required.
+
+**DoorbellManager auto-discovery:** When camera nodes are registered, `DoorbellManager` reads `camera_streams` from `NodeInfo` to resolve RTSP and backchannel URLs automatically. Manual `OZMA_DOORBELL_CAMERAS` configuration is only needed for third-party cameras that are not managed by Ozma.
+
+**Deploy anywhere — including remote locations.** Camera nodes register with Ozma Connect independently, the same way compute nodes do. This means a camera node establishes its own WireGuard relay tunnel and appears in the controller's node inventory regardless of whether it is on the same LAN. A camera at a holiday home, a parent's house, a rental property, or a workshop with its own 4G router shows up in your controller exactly like a camera in the next room — same node inventory, same dashboard, same scenario switching, same two-way audio. No VPN to configure, no port forwarding, no manual network plumbing. Plug in, enroll with Connect, it's in the mesh.
+
+**Network placement — normal LAN, not IoT VLAN.** Third-party IP cameras are untrusted firmware and should be isolated on an IoT VLAN where only Frigate can reach them. Ozma Camera nodes are different: they hold a mesh CA certificate, authenticate mutually with the controller, and carry all traffic over XChaCha20-Poly1305 encrypted transport. They belong on the normal network (or the mesh overlay) — no VLAN configuration needed. Third-party cameras plugged into an Ozma NVR's PoE ports are isolated by the NVR's own firewall; only the local Frigate instance reaches them.
+
+**Hardware options:**
+
+| Option | Hardware | Approx cost | Notes |
+|--------|----------|-------------|-------|
+| Ozma Camera | OPi5 + PoE out port, Hailo-8L or RK3588 NPU, designed enclosure | TBD | Single camera, Frigate on-device |
+| Ozma NVR 4 | OPi5 + 4-port PoE switch, single enclosure | TBD | 4 cameras, 6 TOPS RK3588 NPU handles all inference |
+| Ozma NVR 8 | OPi5 + 8-port PoE switch, single enclosure | TBD | 8 cameras, same compute |
+| DIY (single cam) | RPi 5 + PoE HAT (~$85) | ~$85 | Add Hailo-8L M.2 HAT (~$70) for full NPU inference |
+| DIY (NVR 4) | Orange Pi 5 + TP-Link TL-SG1005P + 3D-printed enclosure | ~$115 | OPi5 plugged into switch uplink; 6 TOPS NPU, PoE+ (802.3at) |
+| Existing machine | Any Linux machine + Frigate in Docker | ~$0 | `pip install ozma-agent`, set `machine_class: camera` |
+
+The OPi5 + TP-Link TL-SG1005P DIY NVR 4 is the reference design the product hardware is built from. 4× 1440p at 5–10fps detection is comfortably within the RK3588S VPU and 6 TOPS NPU budget.
+
+### Camera Recording Storage
+
+Recording trigger and storage destination are independent choices.
+
+**When to record** (configured per camera):
+- Motion-triggered — Frigate's default; efficient, covers most use cases
+- Object detection — only record when a specific class is detected (person, car, vehicle, animal)
+- Event-triggered — doorbell press, recognised face, alarm zone crossing
+- Continuous — full-time recording to local storage
+
+**Where to store** (multiple destinations can be active simultaneously):
+
+| Destination | How it works |
+|-------------|-------------|
+| **Connect cloud** | NVR encrypts footage with the user's own key before upload. Connect stores only ciphertext — it cannot view, process, or hand over footage even under legal compulsion. Connect manages storage cycling. This is the easiest option and requires no local infrastructure. |
+| **Local NVR storage** | Frigate records directly to an attached SSD or NVMe drive on the NVR. Works fully offline. |
+| **NAS / network storage** | Frigate mounts an NFS or SMB share. For cameras on the local network this is direct. For remote cameras (holiday home, etc.) the footage travels over the Connect relay tunnel to the home NAS — the camera's remote location is transparent. |
+| **S3-compatible storage** | Frigate's S3 recording backend supports Backblaze B2, Wasabi, Minio, or AWS S3. Optional client-side encryption before upload for non-Connect destinations. |
+| **Connect cache/backup** | An encrypted backup copy stored in Connect alongside any primary storage. Provides redundancy against local storage loss — including the scenario where an intruder takes the NVR, in which case the footage of the intrusion is still in Connect. |
+
+**Zero-knowledge encryption.** The encryption key for Connect cloud recording is generated on the user's controller and never leaves their devices. Connect receives ciphertext and a nonce. There is no server-side decrypt path — this is architecturally enforced, not a policy statement.
+
+### Bridge Nodes
+
+Bridge nodes (`machine_class: "bridge"`) are satellite WiFi access points for larger houses where a single controller AP doesn't provide full coverage. They register with the controller as managed nodes and are configured from the dashboard like any other hardware.
+
+**What a bridge node provides:**
+- **IoT SSID** — default-deny, per-device firewall rules, onboarding workflow (device joins onboarding SSID → profiled → moved to IoT SSID with appropriate outbound rules)
+- **Client SSID extension** — optional second radio for normal client traffic, extending the main network's reach
+- **Mesh backhaul** — 802.11s or WDS back to the controller, single uplink Ethernet, or PoE-powered wall mount
+
+For smaller deployments the controller's built-in hostapd AP (via USB WiFi dongle) is sufficient. The Ozma Bridge is for houses where you need managed IoT coverage in a garage, garden, utility room, or second floor that the controller can't reach.
 
 ---
 

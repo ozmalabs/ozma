@@ -24,7 +24,9 @@ based on the MQTT-derived kind field.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import socket
 import time
 from typing import Any
@@ -252,6 +254,55 @@ class DoorbellManager:
         self._alert_mgr = alert_mgr
         # Audio state per alert-id
         self._audio: dict[str, tuple[CameraAudioBridge | None, VBANToBackchannelBridge | None]] = {}
+        # Camera RTSP config from OZMA_DOORBELL_CAMERAS env var.
+        # JSON dict: {"front_door": {"rtsp_inbound": "rtsp://...", "backchannel": "rtsp://..."}}
+        self._camera_configs: dict[str, dict[str, str]] = self._load_camera_configs()
+
+    @staticmethod
+    def _load_camera_configs() -> dict[str, dict[str, str]]:
+        """Load static camera configs from OZMA_DOORBELL_CAMERAS env var (fallback/override)."""
+        raw = os.environ.get("OZMA_DOORBELL_CAMERAS", "")
+        if not raw:
+            return {}
+        try:
+            cfg = json.loads(raw)
+            if isinstance(cfg, dict):
+                return cfg
+        except json.JSONDecodeError as exc:
+            log.warning("OZMA_DOORBELL_CAMERAS parse error: %s", exc)
+        return {}
+
+    def _get_camera_configs(self) -> dict[str, dict[str, str]]:
+        """Return merged camera configs: registered camera nodes take priority, env var fills gaps.
+
+        Camera nodes registered with machine_class='camera' publish their streams
+        in camera_streams. Each stream entry with a 'name' field becomes a camera
+        config entry. The env var OZMA_DOORBELL_CAMERAS provides a static fallback
+        for cameras not registered as nodes (e.g. third-party cameras).
+        """
+        configs: dict[str, dict[str, str]] = dict(self._camera_configs)  # start from env var
+        nodes = getattr(self._state, "nodes", {})
+        for node in nodes.values():
+            if getattr(node, "machine_class", "") != "camera":
+                continue
+            frigate_host = getattr(node, "frigate_host", None) or node.host
+            frigate_port = getattr(node, "frigate_port", None) or 5000
+            for stream in getattr(node, "camera_streams", []):
+                name = stream.get("name")
+                if not name:
+                    continue
+                entry: dict[str, str] = {}
+                if stream.get("rtsp_inbound"):
+                    entry["rtsp_inbound"] = stream["rtsp_inbound"]
+                if stream.get("backchannel"):
+                    entry["backchannel"] = stream["backchannel"]
+                if stream.get("hls"):
+                    entry["hls"] = stream["hls"]
+                # Derive snapshot URL from co-located Frigate if not explicitly provided
+                if "snapshot_url" not in entry:
+                    entry["snapshot_url"] = f"http://{frigate_host}:{frigate_port}/api/{name}/latest.jpg"
+                configs[name] = entry
+        return configs
 
     async def start(self) -> None:
         log.info("DoorbellManager started (frigate=%s)", self._frigate_url)
@@ -266,12 +317,19 @@ class DoorbellManager:
 
     # ── Called from api.py webhook ────────────────────────────────────────────
 
+    def _snapshot_url(self, camera: str) -> str:
+        """Get the snapshot URL for a camera — from its node config or the fallback Frigate URL."""
+        cam_cfg = self._get_camera_configs().get(camera, {})
+        if cam_cfg.get("snapshot_url"):
+            return cam_cfg["snapshot_url"]
+        return f"{self._frigate_url}/api/{camera}/latest.jpg"
+
     async def receive_button_press(self, camera: str) -> AlertSession | None:
         """Doorbell button pressed at camera. Creates an urgent doorbell alert."""
         if not self._alert_mgr:
             return None
-        snapshot = f"{self._frigate_url}/api/{camera}/latest.jpg"
-        return await self._alert_mgr.create(
+        snapshot = self._snapshot_url(camera)
+        session = await self._alert_mgr.create(
             kind="doorbell",
             title="Doorbell",
             body=f"Someone at your door ({camera})",
@@ -284,6 +342,9 @@ class DoorbellManager:
             debounce_key=camera,
             debounce_s=5,
         )
+        if session and camera in self._get_camera_configs():
+            self._alert_mgr.register_acknowledge_callback(session.id, self.start_audio)
+        return session
 
     async def receive_person_detected(
         self, camera: str, person: str = ""
@@ -304,7 +365,7 @@ class DoorbellManager:
                                              body=f"{person} at your door ({camera})")
                 return existing
 
-        snapshot = f"{self._frigate_url}/api/{camera}/latest.jpg"
+        snapshot = self._snapshot_url(camera)
         title = f"{person} at {camera}" if person else f"Person at {camera}"
         body = title
         return await self._alert_mgr.create(
@@ -327,11 +388,63 @@ class DoorbellManager:
     async def start_audio(self, alert_id: str) -> None:
         """Start two-way audio when the doorbell is answered.
 
-        Phase 2: requires RTSP URL from camera config.
-        Currently a stub — audio bridge classes are wired but not activated
-        until camera RTSP URLs are stored in the node/service registry.
+        Inbound:  camera RTSP → ffmpeg → VBAN → active node:6980
+                  (node's existing VBANReceiver routes it to the headset)
+        Outbound: active node PipeWire mic → VBANSender → controller:6982
+                  → VBANToBackchannelBridge → ffmpeg G.711 → camera RTSP backchannel
+                  (the agent on the active node runs the VBANSender side)
+
+        Requires OZMA_DOORBELL_CAMERAS to be configured with RTSP URLs.
+        If the camera has no config entry, audio is skipped silently.
         """
-        log.info("Doorbell audio answer: alert=%s (two-way audio Phase 2)", alert_id)
+        alert = self._alert_mgr.get_alert(alert_id) if self._alert_mgr else None
+        if not alert:
+            return
+
+        cam_cfg = self._get_camera_configs().get(alert.camera, {})
+        if not cam_cfg:
+            log.debug("Doorbell audio: no camera config for %r — skipping", alert.camera)
+            return
+
+        rtsp_inbound = cam_cfg.get("rtsp_inbound", "")
+        backchannel_url = cam_cfg.get("backchannel", "")
+
+        active_node = getattr(self._state, "active_node_id", None)
+        node_host = self._resolve_node_host(active_node)
+
+        cam_bridge: CameraAudioBridge | None = None
+        backchannel: VBANToBackchannelBridge | None = None
+
+        if rtsp_inbound and node_host:
+            cam_bridge = CameraAudioBridge(
+                rtsp_url=rtsp_inbound,
+                node_host=node_host,
+            )
+            await cam_bridge.start()
+
+        if backchannel_url:
+            backchannel = VBANToBackchannelBridge(backchannel_url=backchannel_url)
+            await backchannel.start()
+
+        self._audio[alert_id] = (cam_bridge, backchannel)
+        log.info(
+            "Doorbell audio started: alert=%s camera=%s node=%s inbound=%s backchannel=%s",
+            alert_id, alert.camera, node_host,
+            "yes" if cam_bridge else "no",
+            "yes" if backchannel else "no",
+        )
+
+    def _resolve_node_host(self, node_id: str | None) -> str | None:
+        """Look up the hostname/IP of the active node from AppState."""
+        if not node_id:
+            return None
+        nodes = getattr(self._state, "nodes", {})
+        node = nodes.get(node_id)
+        if node is None:
+            return None
+        # NodeInfo has host and/or address attributes
+        host = getattr(node, "host", None) or getattr(node, "address", None)
+        return host if host else None
 
     async def stop_audio(self, alert_id: str) -> None:
         bridges = self._audio.pop(alert_id, (None, None))

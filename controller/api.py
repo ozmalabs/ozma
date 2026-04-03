@@ -124,8 +124,12 @@ class DirectRegisterRequest(BaseModel):
     audio_vban_port: str = ""
     mic_vban_port: str = ""
     capture_device: str = ""
-    machine_class: str = "workstation"  # workstation | server | kiosk
+    machine_class: str = "workstation"  # workstation | server | kiosk | camera
     display_outputs: str = ""  # JSON-encoded list of display output dicts
+    # Camera node fields (machine_class="camera")
+    camera_streams: str = ""   # JSON-encoded list of stream dicts
+    frigate_host: str = ""     # Frigate API host (hostname or IP)
+    frigate_port: str = ""     # Frigate API port (default 5000)
 
 
 def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None) -> FastAPI:
@@ -793,8 +797,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         audio_vban_port=int(req.audio_vban_port) if req.audio_vban_port.isdigit() else None,
         mic_vban_port=int(req.mic_vban_port) if req.mic_vban_port.isdigit() else None,
         capture_device=req.capture_device or None,
-        machine_class=req.machine_class if req.machine_class in ("workstation", "server", "kiosk") else "workstation",
+        machine_class=req.machine_class if req.machine_class in ("workstation", "server", "kiosk", "camera") else "workstation",
         display_outputs=json.loads(req.display_outputs) if req.display_outputs else [],
+        camera_streams=json.loads(req.camera_streams) if req.camera_streams else [],
+        frigate_host=req.frigate_host or None,
+        frigate_port=int(req.frigate_port) if req.frigate_port.isdigit() else None,
         direct_registered=True,
         )
         await state.add_node(node)
@@ -838,8 +845,8 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if not node:
             raise HTTPException(status_code=404, detail="Node not found")
         mc = body.get("machine_class", "")
-        if mc not in ("workstation", "server", "kiosk"):
-            raise HTTPException(status_code=400, detail="Invalid machine_class. Must be: workstation, server, kiosk")
+        if mc not in ("workstation", "server", "kiosk", "camera"):
+            raise HTTPException(status_code=400, detail="Invalid machine_class. Must be: workstation, server, kiosk, camera")
         node.machine_class = mc
         return {"ok": True, "node_id": node_id, "machine_class": mc}
 

@@ -12,7 +12,7 @@ from typing import Any
 #   server      — headless / unattended. No consent, agent actions auto,
 #                 privacy mode is a no-op (no physical display to blank).
 #   kiosk       — has a display but no operator. No consent, no privacy.
-MACHINE_CLASSES = ("workstation", "server", "kiosk")
+MACHINE_CLASSES = ("workstation", "server", "kiosk", "camera")
 
 
 @dataclass
@@ -47,6 +47,14 @@ class NodeInfo:
     mic_vban_port: int | None = None     # UDP port node listens for mic VBAN (vban nodes)
     # Virtual capture device (soft nodes with v4l2loopback)
     capture_device: str | None = None    # /dev/videoN path on the controller host
+    # Camera node fields (machine_class="camera")
+    # camera_streams: list of RTSP/HLS streams this camera node provides.
+    # Each entry: {"name": "front_door", "rtsp_inbound": "rtsp://...",
+    #              "backchannel": "rtsp://...", "hls": "http://..."}
+    camera_streams: list[dict] = field(default_factory=list)
+    # Frigate instance running on (or paired with) this camera node.
+    frigate_host: str | None = None   # hostname/IP of the Frigate API
+    frigate_port: int | None = None   # Frigate API port (default 5000)
     # Ownership — which user owns this node (empty = controller default owner)
     owner_user_id: str = ""
     # Registration source — direct HTTP nodes are not evicted by mDNS requery
@@ -93,6 +101,12 @@ class NodeInfo:
             d["mic_vban_port"] = self.mic_vban_port
         if self.capture_device:
             d["capture_device"] = self.capture_device
+        if self.camera_streams:
+            d["camera_streams"] = self.camera_streams
+        if self.frigate_host:
+            d["frigate_host"] = self.frigate_host
+        if self.frigate_port:
+            d["frigate_port"] = self.frigate_port
         return d
 
 
@@ -134,6 +148,9 @@ class AppState:
                     node.machine_class = existing.machine_class
                 node.owner_user_id = node.owner_user_id or existing.owner_user_id
                 node.display_outputs = node.display_outputs or existing.display_outputs
+                node.camera_streams = node.camera_streams or existing.camera_streams
+                node.frigate_host = node.frigate_host or existing.frigate_host
+                node.frigate_port = node.frigate_port or existing.frigate_port
                 if existing.capabilities and not node.capabilities:
                     node.capabilities = existing.capabilities
                 elif node.capabilities and existing.capabilities:

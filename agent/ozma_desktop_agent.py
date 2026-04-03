@@ -531,6 +531,212 @@ class AudioBackendLinux:
                 pass
 
 
+# ── Doorbell event handler ───────────────────────────────────────────────────
+
+def _parse_host(url: str) -> str:
+    """Extract hostname from a URL string."""
+    try:
+        from urllib.parse import urlparse as _up
+        return _up(url).hostname or "localhost"
+    except Exception:
+        return "localhost"
+
+
+# VBAN frame header: 4-byte magic + 24 bytes of fields = 28 bytes total
+_VBAN_MAGIC = b"VBAN"
+_VBAN_HEADER_SIZE = 28
+_VBAN_SAMPLE_RATES = [6000, 12000, 24000, 48000, 96000, 192000, 384000,
+                      8000, 16000, 32000, 64000, 128000, 256000, 512000,
+                      11025, 22050, 44100, 88200, 176400, 352800,
+                      44100 * 8, 0, 0, 0, 0]
+_DOORBELL_MIC_PORT = 6982    # controller listens here for mic VBAN from the agent
+
+
+def _vban_encode_header(
+    stream_name: str, counter: int,
+    sample_rate: int = 48000, channels: int = 2, samples: int = 256,
+) -> bytes:
+    """Pack a 28-byte VBAN frame header."""
+    try:
+        sr_idx = _VBAN_SAMPLE_RATES.index(sample_rate)
+    except ValueError:
+        sr_idx = 3  # default 48000
+    name = stream_name.encode("ascii", errors="replace")[:16].ljust(16, b"\x00")
+    return (
+        _VBAN_MAGIC
+        + bytes([sr_idx, samples - 1, channels - 1, 0x01])
+        + name
+        + counter.to_bytes(4, "little")
+    )
+
+
+class DoorbellEventHandler:
+    """
+    Subscribes to the controller's WebSocket event stream and handles
+    doorbell events directly on the machine where the user is sitting.
+
+    doorbell.ringing:  show native OS notification (notify-send / osascript / toast)
+    doorbell.answered: start VBANSender (PipeWire mic → UDP → controller:6982)
+                       The controller's VBANToBackchannelBridge receives it and
+                       forwards it to the camera RTSP backchannel.
+    doorbell.dismissed / doorbell.expired: stop VBANSender
+
+    Overlay: the browser overlay (dashboard/OzmaConsole) handles the visual.
+    For compositing-capable displays (Wayland/X11 managed by screen_manager),
+    the doorbell.ringing event in the controller's event queue is picked up by
+    screen_manager and rendered as an overlay widget on connected display devices.
+    A native on-screen overlay (wlr-layer-shell / X11 override-redirect) is a
+    future enhancement.
+    """
+
+    def __init__(self, controller_url: str, controller_host: str) -> None:
+        self._ctrl_url = controller_url.rstrip("/")
+        self._ctrl_host = controller_host
+        self._vban_task: asyncio.Task | None = None
+        self._vban_stop = asyncio.Event()
+
+    async def run(self) -> None:
+        """Reconnecting WebSocket subscriber loop."""
+        ws_proto = "wss" if self._ctrl_url.startswith("https") else "ws"
+        base = self._ctrl_url.replace("http://", "").replace("https://", "")
+        ws_url = f"{ws_proto}://{base}/api/v1/events"
+        while True:
+            try:
+                import aiohttp
+                async with aiohttp.ClientSession() as session:
+                    async with session.ws_connect(ws_url, heartbeat=30) as ws:
+                        log.info("Doorbell: subscribed to %s", ws_url)
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                try:
+                                    evt = json.loads(msg.data)
+                                    await self._handle(evt)
+                                except Exception as exc:
+                                    log.debug("Doorbell event error: %s", exc)
+            except Exception as exc:
+                log.debug("Doorbell WS disconnected (%s), retrying in 10s", exc)
+            await asyncio.sleep(10)
+
+    async def _handle(self, evt: dict) -> None:
+        t = evt.get("type", "")
+        if t == "doorbell.ringing":
+            camera = evt.get("camera", "camera")
+            person = evt.get("person", "")
+            msg = f"{person} at your door" if person else f"Doorbell — {camera}"
+            await self._notify(msg)
+        elif t == "doorbell.answered":
+            session_id = evt.get("id", "")
+            await self._start_mic_vban(session_id)
+        elif t in ("doorbell.dismissed", "doorbell.expired"):
+            await self._stop_mic_vban()
+
+    async def _notify(self, message: str) -> None:
+        """Show a native notification. Best-effort — never raises."""
+        system = platform.system()
+        try:
+            if system == "Linux":
+                await asyncio.create_subprocess_exec(
+                    "notify-send", "--urgency=critical",
+                    "--icon=camera", "Doorbell", message,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+            elif system == "Darwin":
+                script = f'display notification "{message}" with title "Doorbell" sound name "Funk"'
+                await asyncio.create_subprocess_exec(
+                    "osascript", "-e", script,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+            elif system == "Windows":
+                # Windows 10+: use PowerShell toast notification
+                ps = (
+                    f"[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null;"
+                    f"$t = [Windows.UI.Notifications.ToastTemplateType]::ToastText02;"
+                    f"$x = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent($t);"
+                    f"$x.GetElementsByTagName('text')[0].AppendChild($x.CreateTextNode('Doorbell')) | Out-Null;"
+                    f"$x.GetElementsByTagName('text')[1].AppendChild($x.CreateTextNode('{message}')) | Out-Null;"
+                    f"[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Ozma').Show([Windows.UI.Notifications.ToastNotification]::new($x))"
+                )
+                await asyncio.create_subprocess_exec(
+                    "powershell", "-WindowStyle", "Hidden", "-Command", ps,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+        except Exception as exc:
+            log.debug("Doorbell notify failed: %s", exc)
+
+    async def _start_mic_vban(self, session_id: str) -> None:
+        """Start sending PipeWire mic audio as VBAN to the controller."""
+        await self._stop_mic_vban()
+        self._vban_stop.clear()
+        self._vban_task = asyncio.create_task(
+            self._vban_sender_loop(), name=f"doorbell-mic-{session_id}"
+        )
+        log.info("Doorbell mic VBAN started → %s:%d",
+                 self._ctrl_host, _DOORBELL_MIC_PORT)
+
+    async def _stop_mic_vban(self) -> None:
+        self._vban_stop.set()
+        if self._vban_task:
+            self._vban_task.cancel()
+            try:
+                await self._vban_task
+            except asyncio.CancelledError:
+                pass
+            self._vban_task = None
+
+    async def _vban_sender_loop(self) -> None:
+        """
+        Capture from PipeWire default mic via pw-cat and send as VBAN UDP
+        frames to the controller for forwarding to the camera backchannel.
+        """
+        cmd = [
+            "pw-cat", "--capture",
+            "--format", "s16",
+            "--rate", "48000",
+            "--channels", "2",
+            "-",
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            log.warning("pw-cat not found — doorbell mic VBAN unavailable "
+                        "(is PipeWire installed?)")
+            return
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        frame_bytes = 256 * 2 * 2   # 256 samples * 2 channels * 2 bytes (s16)
+        counter = 0
+        try:
+            while not self._vban_stop.is_set():
+                assert proc.stdout is not None
+                chunk = await proc.stdout.read(frame_bytes)
+                if not chunk:
+                    break
+                if len(chunk) < frame_bytes:
+                    chunk = chunk + b"\x00" * (frame_bytes - len(chunk))
+                header = _vban_encode_header(
+                    "doorbell-mic", counter,
+                    sample_rate=48000, channels=2, samples=256,
+                )
+                sock.sendto(header + chunk, (self._ctrl_host, _DOORBELL_MIC_PORT))
+                counter = (counter + 1) & 0xFFFF_FFFF
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            log.debug("Doorbell mic VBAN loop ended: %s", exc)
+        finally:
+            sock.close()
+            if proc.returncode is None:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    proc.kill()
+
+
 # ── Desktop Soft Node ───────────────────────────────────────────────────────
 
 class DesktopSoftNode:
@@ -608,6 +814,16 @@ class DesktopSoftNode:
         # Direct registration with controller (if URL provided)
         if self._controller_url:
             asyncio.create_task(self._direct_register(), name=f"register-{self._name}")
+
+        # Doorbell event handler (overlay + two-way audio)
+        if self._controller_url:
+            self._doorbell = DoorbellEventHandler(
+                controller_url=self._controller_url,
+                controller_host=_parse_host(self._controller_url),
+            )
+            asyncio.create_task(
+                self._doorbell.run(), name="doorbell-events"
+            )
 
         # UDP server for HID packets
         await self._serve()

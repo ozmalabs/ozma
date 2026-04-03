@@ -448,7 +448,7 @@ class ControlManager:
         for rule in self._trigger_rules:
             if rule.event_type != event_type:
                 continue
-            if not all(data.get(k) == v for k, v in rule.filters.items()):
+            if not all(str(data.get(k, "")) == str(v) for k, v in rule.filters.items()):
                 continue
             action_value = rule.value if rule.value is not None else data
             log.debug("Trigger rule %s fired: %s → %s", rule.rule_id, event_type, rule.action)

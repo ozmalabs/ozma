@@ -43,6 +43,18 @@ log = logging.getLogger("ozma.alerts")
 
 ALERT_TTL_S = 300   # clean up resolved alerts after 5 minutes
 
+# Backwards-compat / kind-specific event aliases.
+# When an alert of the given kind transitions, we also fire the aliased event
+# so that pre-existing dashboard and agent code that listens for
+# "doorbell.ringing" / "doorbell.answered" etc. continues to work.
+_KIND_EVENT_ALIAS: dict[tuple[str, str], str] = {
+    ("doorbell", "alert.created"):      "doorbell.ringing",
+    ("doorbell", "alert.acknowledged"): "doorbell.answered",
+    ("doorbell", "alert.dismissed"):    "doorbell.dismissed",
+    ("doorbell", "alert.expired"):      "doorbell.expired",
+    ("doorbell", "alert.updated"):      "doorbell.updated",
+}
+
 
 @dataclass
 class AlertSession:
@@ -118,6 +130,9 @@ class AlertManager:
         self._notifier = notifier
         self._alerts: dict[str, AlertSession] = {}
         self._expire_task: asyncio.Task | None = None
+        # Optional callbacks fired (as Tasks) when an alert is acknowledged.
+        # Key: alert_id, Value: async callable(alert_id: str)
+        self._ack_callbacks: dict[str, Any] = {}
 
     async def start(self) -> None:
         self._expire_task = asyncio.create_task(
@@ -153,11 +168,13 @@ class AlertManager:
         """
         if debounce_key:
             for a in self._alerts.values():
+                # Debounce on kind + camera so doorbell and motion on the same
+                # camera don't suppress each other — they're independent events.
                 if (a.state == "active"
-                        and a.camera == camera
                         and a.kind == kind
+                        and a.camera == camera
                         and time.time() - a.started_at < debounce_s):
-                    log.debug("Alert debounced: kind=%s key=%s", kind, debounce_key)
+                    log.debug("Alert debounced: kind=%s camera=%s", kind, camera)
                     return None
 
         alert = AlertSession(
@@ -181,6 +198,14 @@ class AlertManager:
         await self._notify(alert)
         return alert
 
+    def register_acknowledge_callback(self, alert_id: str, coro_fn: Any) -> None:
+        """Register a coroutine function to call when alert_id is acknowledged.
+
+        Called with the alert_id as the sole argument.  Used by DoorbellManager
+        to start audio bridges on answer without polling the event queue.
+        """
+        self._ack_callbacks[alert_id] = coro_fn
+
     async def acknowledge(self, alert_id: str) -> bool:
         """Primary action (Answer / OK). Returns True if state changed."""
         alert = self._resolve(alert_id)
@@ -189,6 +214,9 @@ class AlertManager:
         alert.state = "acknowledged"
         log.info("Alert acknowledged: id=%s kind=%s", alert.id, alert.kind)
         await self._push("alert.acknowledged", alert)
+        cb = self._ack_callbacks.pop(alert.id, None)
+        if cb:
+            asyncio.create_task(cb(alert.id), name=f"alert-ack-cb-{alert.id}")
         return True
 
     async def dismiss(self, alert_id: str) -> bool:
@@ -251,7 +279,11 @@ class AlertManager:
         return self._alerts.get(alert_id)
 
     async def _push(self, event_type: str, alert: AlertSession) -> None:
-        await self._state.events.put({"type": event_type, **alert.to_dict()})
+        payload = {"type": event_type, **alert.to_dict()}
+        await self._state.events.put(payload)
+        alias = _KIND_EVENT_ALIAS.get((alert.kind, event_type))
+        if alias:
+            await self._state.events.put({**payload, "type": alias})
 
     async def _notify(self, alert: AlertSession) -> None:
         """Push to phone and configured notification channels."""
