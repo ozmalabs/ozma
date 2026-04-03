@@ -172,6 +172,91 @@ For smaller deployments the controller's built-in hostapd AP (via USB WiFi dongl
 
 ---
 
+## Backup
+
+### Default On, Opt-Out
+
+When a node is added, the agent analyses its profile directory and immediately offers a backup plan with a concrete estimate:
+
+> "We found ~8 GB of documents, photos, and settings (apps and caches excluded — reinstallable).
+> With the default backup plan: 7 daily snapshots, 4 weekly, 12 monthly.
+> Your files change ~40 MB/day. Estimated total storage: ~11 GB. Cost on Connect: ~$0.07/month."
+
+One click to start. "Not now" resurfaces after 30 days. The estimate is computed from file modification timestamps before the first backup — no guessing.
+
+### Backup Stack
+
+- **Restic** — primary engine. Single Go binary, Linux/macOS/Windows/FreeBSD/OpenBSD, content-addressed deduplication, AES-256 encrypted repos, native S3/SFTP/local/Azure/GCS/REST support. Repository password derived from the controller master key — zero-knowledge on Connect.
+- **ZFS/BTRFS snapshots** (via Snapper) — filesystem-consistent snapshots before backup when available.
+- **partclone** — sector-aware disk imaging for full disk backup mode (only used blocks).
+
+### Four Backup Modes
+
+**"Backup my files"** (default) — profile directory tree, files modified in the last 90 days, preview before start.
+
+**"Smart backup"** — same, plus aggressive exclusions of reinstallable content: `node_modules/`, `.cargo/`, `__pycache__/`, Steam game caches, `/Applications`, `C:\Program Files`, build directories, `.venv/`, Docker cache, VM images, files >500 MB, `.Trash`.
+
+**"Backup the disk"** — `partclone` image stored in a Restic repo. Supports no-touch restore: the node presents a bootable USB (via `virtual_media.py` + USB mass storage gadget), the BIOS boots from it, and a recovery OS restores the image over the network with zero user interaction.
+
+**"Advanced"** — arbitrary includes/excludes, Restic tags, custom schedule, custom retention policy. Full Restic surface.
+
+### Adaptive Scheduling
+
+Backup runs automatically when conditions are right — CPU low, home network, bandwidth available, not in a meeting, plugged in. It backs off when CPU spikes, a meeting starts, bandwidth is saturated, or the battery is low. The `--limit-upload` flag is set dynamically from available bandwidth. No configuration required; advanced users can override.
+
+### Selective Restore
+
+The restore path you want 99% of the time:
+
+1. Select node → "Restore files"
+2. Calendar timeline of snapshots
+3. Browse directory tree at that point in time
+4. Select files/folders → restore to original or new location
+
+Full disk restore is a separate "Disaster Recovery" path. Ransomware recovery (restore to a pre-infection snapshot) is explicitly supported and called out in the UI.
+
+### Retention
+
+Default: `--keep-daily 7 --keep-weekly 4 --keep-monthly 12`. Runs automatically after each backup. Configurable per profile. Business plans use fixed, unalterable retention (see below).
+
+### Application Inventory
+
+An `apps_snapshot.json` is stored with every backup, capturing all installed applications via osquery and native package managers (apt/dnf/brew/winget/pkg, flatpak, snap, pip/cargo/npm globals). On restore: batch auto-install for package-manager apps + download links + manual list for the rest. Steam games are restored by App ID.
+
+### Backup Destinations
+
+Restic supports any destination — local disk, NAS (NFS/SMB), S3-compatible storage (B2, Wasabi, Minio, AWS), or Connect cloud. Multiple destinations can be active simultaneously. Connect is the default for new users: zero configuration, storage cycling managed automatically, footage encrypted with the user's own key before upload.
+
+### Business Plans: Immutable Backups
+
+Business backups use Restic append-only mode combined with S3 Object Lock (Compliance mode). Clients cannot delete history; not even Connect admins can alter snapshots within the retention window. A secondary admin domain owns the GFS rotation schedule; the user's account has write and read-only access.
+
+| Actor | Can do | Cannot do |
+|-------|--------|-----------|
+| User | Add snapshots, restore | Delete snapshots, change retention |
+| Connect support | Nothing | Alter retention, delete (Object Lock) |
+| Connect backup service | GFS rotation on fixed schedule | Anything outside schedule |
+| Attacker with machine access | Add new snapshots | Erase existing history |
+
+This satisfies Essential Eight Maturity Level 3 for backup and recovery, and covers SOC 2, ISO 27001 A.12.3, PCI DSS 9.5/10, and HIPAA §164.308(a)(7). Legal holds can suspend GFS rotation for specific snapshots pending litigation.
+
+### Platform Support
+
+| Platform | Filesystem-aware | Disk restore | No-touch? |
+|----------|-----------------|--------------|-----------|
+| Linux | ZFS/BTRFS/LVM snapshot | partclone | ✅ Full |
+| macOS (Intel) | APFS tmutil snapshot | asr from image | ✅ Full |
+| macOS (Apple Silicon) | APFS tmutil snapshot | Limited (secure boot) | ⚠️ Partial |
+| Windows | VSS `--use-fs-snapshot` | WinPE + `dism /Apply-Image` | ✅ Full |
+| FreeBSD | ZFS first-class, UFS dump/restore | mfsBSD + zfs receive | ✅ Full |
+| OpenBSD | FFS dump/restore | Install media + restore script | ✅ Full |
+
+### Controller Self-Backup
+
+The controller is a managed backup target like any other node. It backs up to any configured destination (ideally offsite). Controller config backup — mesh CA keypair, scenarios, scenarios — is part of the Connect encrypted backup and is recovered automatically when the controller master key is restored.
+
+---
+
 ## Data Paths
 
 ### HID (keyboard + mouse)
