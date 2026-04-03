@@ -3,15 +3,17 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>Console · ozma</title>
+<title>Ozma Remote</title>
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
 <style>
 :root {
-  --bg: #0a0c0f;
-  --surface: #11151c;
-  --border: #1e2530;
-  --accent: #4ae0a4;
-  --accent-dim: rgba(74,224,164,0.15);
+  --bg: #0a0a0f;
+  --surface: #111118;
+  --border: #1e2030;
+  --accent: #5b6fff;
+  --accent-dim: rgba(91,111,255,0.15);
+  --emerald: #4ae0a4;
+  --emerald-dim: rgba(74,224,164,0.12);
   --text: #e2e8f0;
   --muted: #64748b;
   --red: #ef4444;
@@ -83,6 +85,15 @@ html, body {
 .tb-left  { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0; }
 .tb-right { display: flex; align-items: center; gap: 2px; }
 .tb-divider { width: 1px; height: 20px; background: var(--border); margin: 0 4px; }
+/* Brand mark */
+.brand-mark {
+  display: flex; align-items: center; gap: 5px; flex-shrink: 0; text-decoration: none;
+}
+.brand-mark img { height: 18px; width: auto; display: block; }
+.brand-product {
+  font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--emerald); line-height: 1;
+}
 #node-name {
   font-weight: 600; font-size: 13px; color: var(--text);
   max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -93,13 +104,13 @@ html, body {
   background: rgba(255,255,255,0.07); color: var(--muted);
   transition: color var(--trans);
 }
-.stat-badge.good { color: var(--accent); }
+.stat-badge.good { color: var(--emerald); }
 .stat-badge.warn { color: var(--yellow); }
 .stat-badge.bad  { color: var(--red); }
 .codec-badge {
   font-size: 10px; font-weight: 700; letter-spacing: 0.04em;
   padding: 2px 6px; border-radius: 3px; text-transform: uppercase;
-  background: var(--accent-dim); color: var(--accent);
+  background: var(--emerald-dim); color: var(--emerald);
 }
 
 .tb-btn {
@@ -149,7 +160,7 @@ html, body {
 .key-btn.mod-active {
   background: var(--accent-dim); border-color: var(--accent); color: var(--accent);
 }
-.key-btn.combo { background: rgba(74,224,164,0.07); }
+.key-btn.combo { background: rgba(91,111,255,0.07); }
 .key-btn.combo:hover { background: var(--accent-dim); }
 
 /* ── Side panel ───────────────────────────────────────────── */
@@ -193,7 +204,7 @@ html, body {
 }
 .panel-btn:hover { background: rgba(255,255,255,0.1); }
 .panel-btn.primary { background: var(--accent-dim); border-color: var(--accent); color: var(--accent); }
-.panel-btn.primary:hover { background: rgba(74,224,164,0.25); }
+.panel-btn.primary:hover { background: rgba(91,111,255,0.25); }
 .panel-row { display: flex; gap: 6px; }
 .panel-row .panel-btn { flex: 1; }
 .panel-info { font-size: 11px; color: var(--muted); line-height: 1.5; }
@@ -255,7 +266,7 @@ input[type=range]::-webkit-slider-thumb {
   font-size: 12px;
 }
 .gamepad-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
-.gamepad-dot.connected { background: var(--accent); }
+.gamepad-dot.connected { background: var(--emerald); }
 
 /* Volume indicator */
 .volume-row { display: flex; align-items: center; gap: 8px; }
@@ -281,7 +292,7 @@ input[type=range]::-webkit-slider-thumb {
 #conn-overlay.hidden { opacity: 0; pointer-events: none; }
 .spinner {
   width: 32px; height: 32px; border-radius: 50%;
-  border: 3px solid var(--border); border-top-color: var(--accent);
+  border: 3px solid var(--border); border-top-color: var(--emerald);
   animation: spin 0.8s linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -347,7 +358,7 @@ input[type=range]::-webkit-slider-thumb {
     <canvas id="ocr-canvas"></canvas>
   </div>
   <div id="display-offline">
-    <span class="icon">🖥</span>
+    <img src="/logo.svg" alt="Ozma" style="height:44px;opacity:0.3;margin-bottom:4px">
     <span id="offline-msg">No stream available</span>
     <button class="panel-btn" onclick="reconnect()" style="margin-top:4px">Reconnect</button>
   </div>
@@ -355,6 +366,7 @@ input[type=range]::-webkit-slider-thumb {
 
 <!-- Connection overlay -->
 <div id="conn-overlay">
+  <img src="/logo.svg" alt="Ozma" style="height:36px;opacity:0.6;margin-bottom:4px">
   <div class="spinner"></div>
   <span id="conn-status">Connecting…</span>
 </div>
@@ -362,6 +374,11 @@ input[type=range]::-webkit-slider-thumb {
 <!-- Toolbar -->
 <div id="toolbar">
   <div class="tb-left">
+    <a class="brand-mark" href="/" title="Ozma dashboard">
+      <img src="/logo.svg" alt="Ozma">
+      <span class="brand-product">Remote</span>
+    </a>
+    <span class="tb-divider"></span>
     <span id="node-name">—</span>
     <span class="tb-divider"></span>
     <span id="stat-fps"   class="stat-badge">— fps</span>
@@ -769,7 +786,7 @@ const connStatus   = $('conn-status');
 // ── Init ──────────────────────────────────────────────────────
 function init() {
   if (!nodeId) { showOffline('No node specified — add ?node=<id> to the URL'); return; }
-  document.title = `${nodeId} · ozma console`;
+  document.title = `${nodeId} · Ozma Remote`;
   $('node-name').textContent = nodeId;
   if (viewOnly) {
     $('viewonly-banner').style.display = 'block';
