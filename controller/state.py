@@ -67,6 +67,9 @@ class NodeInfo:
     shared_with: list[str] = field(default_factory=list)  # user IDs who have access
     share_permissions: dict[str, str] = field(default_factory=dict)  # user_id -> "use"|"manage"|"admin"
     parent_node_id: str = ""                           # if this is a seat, the machine it belongs to
+    # Game streaming (V1.2) — Sunshine/Moonlight
+    # Set by agent mDNS TXT record ("sunshine_port") or by SunshineManager on enable.
+    sunshine_port: int | None = None   # Sunshine stream base port on this node's host
 
     @property
     def stream_url(self) -> str | None:
@@ -125,6 +128,8 @@ class NodeInfo:
             d["share_permissions"] = self.share_permissions
         if self.parent_node_id:
             d["parent_node_id"] = self.parent_node_id
+        if self.sunshine_port:
+            d["sunshine_port"] = self.sunshine_port
         return d
 
 

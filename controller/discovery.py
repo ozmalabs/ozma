@@ -141,6 +141,9 @@ class DiscoveryService:
         mic_vban_port = int(mic_vban_str) if mic_vban_str.isdigit() else None
         capture_device = txt.get("capture_device") or None
 
+        sunshine_port_str = txt.get("sunshine_port", "")
+        sunshine_port = int(sunshine_port_str) if sunshine_port_str.isdigit() else None
+
         machine_class = txt.get("machine_class") or "workstation"
         frigate_host = txt.get("frigate_host") or None
         frigate_port_str = txt.get("frigate_port", "")
@@ -176,6 +179,7 @@ class DiscoveryService:
             frigate_host=frigate_host,
             frigate_port=frigate_port,
             camera_streams=camera_streams,
+            sunshine_port=sunshine_port,
         )
         await self._state.add_node(node)
         log.info("Node online: %s @ %s:%d role=%s hw=%s", name, host, port, node.role, node.hw)
