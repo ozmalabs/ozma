@@ -166,7 +166,7 @@ class DirectRegisterRequest(BaseModel):
     frigate_port: str = ""     # Frigate API port (default 5000)
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None, sunshine: Any | None = None, msp_mgr: MSPDashboardManager | None = None, msp_portal: MSPPortalManager | None = None, auto_configure: Any | None = None) -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None, sunshine: Any | None = None, msp_mgr: MSPDashboardManager | None = None, msp_portal: MSPPortalManager | None = None, auto_configure: Any | None = None, cam_connect: Any | None = None) -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -8028,6 +8028,58 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         _require_scope(request, SCOPE_WRITE)
         await _ac().scan_now()
         return {"ok": True}
+
+    # ── Camera Connect (V1.7) — cloud registration proxy for camera nodes ────
+
+    def _cc() -> Any:
+        if cam_connect is None:
+            raise HTTPException(503, "Camera Connect not available")
+        return cam_connect
+
+    @app.get("/api/v1/camera-connect/registrations")
+    async def cc_list_registrations(request: Request) -> list[dict[str, Any]]:
+        """List Connect registration records for all camera nodes."""
+        _require_scope(request, SCOPE_READ)
+        return _cc().list_registrations()
+
+    @app.get("/api/v1/camera-connect/registrations/{node_id:path}")
+    async def cc_get_registration(request: Request, node_id: str) -> dict[str, Any]:
+        """Get the Connect registration record for a specific camera node."""
+        _require_scope(request, SCOPE_READ)
+        reg = _cc().get_registration(node_id)
+        if reg is None:
+            raise HTTPException(404, f"No Connect registration for {node_id}")
+        return reg.to_dict()
+
+    @app.post("/api/v1/camera-connect/registrations/{node_id:path}/register")
+    async def cc_force_register(request: Request, node_id: str) -> dict[str, Any]:
+        """Force immediate (re-)registration of a camera node with Connect."""
+        _require_scope(request, SCOPE_WRITE)
+        result = await _cc().force_register(node_id)
+        if not result.get("ok"):
+            raise HTTPException(400, result.get("error", "Registration failed"))
+        return result
+
+    @app.delete("/api/v1/camera-connect/registrations/{node_id:path}")
+    async def cc_deregister(request: Request, node_id: str) -> dict[str, Any]:
+        """Remove a camera node from Connect and clear its registration record."""
+        _require_scope(request, SCOPE_WRITE)
+        result = await _cc().deregister(node_id)
+        if not result.get("ok"):
+            raise HTTPException(404, result.get("error", "Not found"))
+        return result
+
+    @app.get("/api/v1/camera-connect/registrations/{node_id:path}/relay-url")
+    async def cc_relay_rtsp_url(
+        request: Request, node_id: str,
+        stream_path: str = "/",
+    ) -> dict[str, Any]:
+        """Return the Connect relay RTSP URL for a camera node."""
+        _require_scope(request, SCOPE_READ)
+        url = _cc().relay_rtsp_url(node_id, stream_path)
+        if url is None:
+            raise HTTPException(404, "No relay configured for this camera")
+        return {"node_id": node_id, "relay_rtsp_url": url}
 
     # Static files — mounted last so they don't shadow API routes
     static_dir = Path(__file__).parent / "static"
