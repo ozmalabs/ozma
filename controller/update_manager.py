@@ -416,6 +416,17 @@ class UpdateManager:
             "applying": self._applying,
         }
 
+    async def check_loop(self) -> None:
+        """Poll for updates every hour."""
+        while True:
+            await asyncio.sleep(3600)
+            try:
+                info = await self.check_for_update()
+                if info:
+                    log.info("Update available: %s", info.get("version"))
+            except Exception as e:
+                log.debug("Update check failed: %s", e)
+
     def set_channel(self, channel: str) -> None:
         if channel in ("stable", "beta", "nightly"):
             self._config.update_channel = channel

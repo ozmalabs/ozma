@@ -41,6 +41,16 @@ class Config:
     # Identity Provider — built-in OIDC/social login.  Requires auth_enabled.
     idp_enabled: bool = False
 
+    # Hardware front panel — I2C OLED + GPIO buttons on appliance builds
+    front_panel_enabled: bool = False
+
+    # A/B partition update manager — only meaningful on bare-metal appliances
+    update_manager_enabled: bool = False
+
+    # Live transcription via Whisper.cpp
+    transcription_enabled: bool = False
+    transcription_source: str = ""   # PipeWire source name; empty = default mic
+
     # Logging
     debug: bool = False
 
@@ -62,4 +72,8 @@ class Config:
             auth_enabled=os.environ.get("OZMA_AUTH", "0").lower() in ("1", "true", "yes"),
             auth_password_hash=os.environ.get("OZMA_AUTH_PASSWORD_HASH", ""),
             idp_enabled=os.environ.get("OZMA_IDP", "0").lower() in ("1", "true", "yes"),
+            front_panel_enabled=os.environ.get("OZMA_FRONT_PANEL", "0").lower() in ("1", "true", "yes"),
+            update_manager_enabled=os.environ.get("OZMA_UPDATE_MANAGER", "0").lower() in ("1", "true", "yes"),
+            transcription_enabled=os.environ.get("OZMA_TRANSCRIPTION", "0").lower() in ("1", "true", "yes"),
+            transcription_source=os.environ.get("OZMA_TRANSCRIPTION_SOURCE", ""),
         )

@@ -128,7 +128,7 @@ class DirectRegisterRequest(BaseModel):
     display_outputs: str = ""  # JSON-encoded list of display output dicts
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None) -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None) -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -3760,6 +3760,76 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(status_code=404, detail="Tunnel not found")
         await _broadcast({"type": "tunnel.destroyed", "tunnel_id": tunnel_id})
         return {"ok": True}
+
+    # --- Node reconciler ---
+
+    if node_reconciler:
+        @app.get("/api/v1/reconciled_nodes")
+        async def list_reconciled(request: Request) -> dict:
+            _require_scope(request, SCOPE_READ)
+            return {"nodes": node_reconciler.list_reconciled()}
+
+        @app.post("/api/v1/reconciled_nodes/bind")
+        async def bind_nodes(body: dict, request: Request) -> dict:
+            _require_scope(request, SCOPE_WRITE)
+            node_reconciler.bind(body["hardware_node_id"], body["software_node_id"])
+            return {"ok": True}
+
+    # --- Update manager ---
+
+    if update_mgr:
+        @app.get("/api/v1/update/status")
+        async def update_status(request: Request) -> dict:
+            _require_scope(request, SCOPE_READ)
+            return update_mgr.status()
+
+        @app.post("/api/v1/update/check")
+        async def update_check(request: Request) -> dict:
+            _require_scope(request, SCOPE_READ)
+            info = await update_mgr.check_for_update()
+            return {"available": info is not None, "update": info}
+
+        @app.post("/api/v1/update/apply")
+        async def update_apply(body: dict, request: Request) -> dict:
+            _require_scope(request, SCOPE_ADMIN)
+            ok = await update_mgr.apply_update(body)
+            return {"ok": ok}
+
+    # --- Live transcription ---
+
+    if transcription_mgr:
+        import uuid as _uuid
+
+        @app.get("/api/v1/transcription/sessions")
+        async def list_transcription_sessions(request: Request) -> dict:
+            _require_scope(request, SCOPE_READ)
+            return {"sessions": transcription_mgr.list_sessions()}
+
+        @app.post("/api/v1/transcription/start")
+        async def start_transcription(body: dict, request: Request) -> dict:
+            _require_scope(request, SCOPE_WRITE)
+            session_id = body.get("session_id") or str(_uuid.uuid4())
+            session = await transcription_mgr.start_session(
+                session_id=session_id,
+                source=body.get("source", "default"),
+                language=body.get("language", "en"),
+            )
+            if session is None:
+                raise HTTPException(status_code=503, detail="Failed to start transcription session")
+            return {"session_id": session.id}
+
+        @app.post("/api/v1/transcription/stop")
+        async def stop_transcription(body: dict, request: Request) -> dict:
+            _require_scope(request, SCOPE_WRITE)
+            await transcription_mgr.stop_session(body.get("session_id", ""))
+            return {"ok": True}
+
+        @app.get("/api/v1/transcription/{session_id}")
+        async def get_transcription(request: Request, session_id: str) -> dict:
+            _require_scope(request, SCOPE_READ)
+            since = float(request.query_params.get("since", "0"))
+            segments = transcription_mgr.get_segments(session_id, since=since)
+            return {"session_id": session_id, "segments": segments}
 
     # Static files — mounted last so they don't shadow API routes
     static_dir = Path(__file__).parent / "static"
