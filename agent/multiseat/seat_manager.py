@@ -299,54 +299,18 @@ class SeatManager:
             )
             self._seat_tasks.append(task)
 
-        # Start monitoring server (deferred — don't block seat startup)
-        print("[OZMA DEBUG] Deferring monitoring server...", flush=True)
-        async def _start_monitoring():
-            try:
-                self._monitoring = MonitoringServer(self)
-                await self._monitoring.start()
-                print("[OZMA DEBUG] Monitoring server running on port 7399", flush=True)
-            except Exception as e:
-                print(f"[OZMA DEBUG] Monitoring server failed: {e}", flush=True)
-                log.warning("Monitoring server failed: %s", e)
-        asyncio.create_task(_start_monitoring(), name="monitoring")
-
-        # Start game launcher (discovers game libraries in background)
-        print("[OZMA DEBUG] Starting game launcher...", flush=True)
-        try:
-            self._game_launcher = GameLauncher(self)
-        except Exception as e:
-            print(f"[OZMA DEBUG] Game launcher init failed: {e}", flush=True)
-            log.warning("Game launcher init failed: %s", e)
-
-        # Start USB hotplug monitor (deferred)
-        print("[OZMA DEBUG] Deferring hotplug monitor...", flush=True)
-        async def _start_hotplug():
-            try:
-                self._hotplug = HotplugMonitor(self)
-                await self._hotplug.start()
-                print("[OZMA DEBUG] Hotplug monitor running", flush=True)
-            except Exception as e:
-                print(f"[OZMA DEBUG] Hotplug monitor failed: {e}", flush=True)
-                log.warning("Hotplug monitor failed: %s", e)
-        asyncio.create_task(_start_hotplug(), name="hotplug")
+        # Monitoring, game launcher, and hotplug deferred until seat is stable
+        print("[OZMA DEBUG] Skipping optional services for now...", flush=True)
 
         log.info("SeatManager running: %d seats on %s",
                  len(self._seats), self._machine_name)
         print(f"[OZMA DEBUG] SeatManager fully started — {len(self._seats)} seats", flush=True)
 
-        # Start config WebSocket listener for dynamic seat changes from controller
-        if self._controller_url:
-            async def _safe_config_ws():
-                try:
-                    await self._connect_config_ws()
-                except Exception as e:
-                    print(f"[OZMA DEBUG] Config WS failed: {e}", flush=True)
-                    log.warning("Config WebSocket failed: %s", e)
-            self._config_ws_task = asyncio.create_task(
-                _safe_config_ws(),
-                name="config-ws",
-            )
+        # Config WS disabled for initial testing
+        # if self._controller_url:
+        #     self._config_ws_task = asyncio.create_task(
+        #         self._connect_config_ws(), name="config-ws",
+        #     )
 
         # Wait for stop signal
         print("[OZMA DEBUG] Waiting for stop signal (Ctrl+C)...", flush=True)
