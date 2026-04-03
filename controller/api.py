@@ -2924,6 +2924,126 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             return {"entries": []}
         return {"entries": camera_mgr.get_access_log(camera_id or None, limit)}
 
+    @app.post("/api/v1/cameras/{camera_id}/advise")
+    async def advise_camera(camera_id: str, body: dict = {}) -> dict[str, Any]:
+        """
+        Snapshot the camera and return AI-generated name/zone/trigger advice.
+
+        Optional body fields:
+          snapshot_url: str  — fetch JPEG from this URL instead of CameraManager
+          profile: str       — if provided, also return the Frigate YAML for that profile
+                               ("default" | "paranoid" | "lax")
+        """
+        if not camera_mgr:
+            raise HTTPException(status_code=503, detail="Cameras not available")
+
+        from camera_advisor import advise_camera as _advise
+
+        snapshot_url = body.get("snapshot_url", "")
+        jpeg: bytes | None = None
+
+        if snapshot_url:
+            try:
+                import aiohttp
+                async with aiohttp.ClientSession() as _s:
+                    async with _s.get(snapshot_url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                        if r.status == 200:
+                            jpeg = await r.read()
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail=f"Failed to fetch snapshot_url: {exc}")
+        else:
+            jpeg = await camera_mgr.snapshot(camera_id)
+
+        if not jpeg:
+            raise HTTPException(status_code=400, detail="Cannot capture snapshot — check privacy settings or provide snapshot_url")
+
+        advice = await _advise(camera_id, jpeg)
+        result = advice.to_dict()
+
+        # Optionally include Frigate YAML for the requested profile
+        profile_key = body.get("profile", "")
+        if profile_key and profile_key in advice.profiles:
+            result["frigate_yaml"] = advice.profiles[profile_key].to_frigate_yaml(camera_id)
+
+        return result
+
+    @app.post("/api/v1/cameras/{camera_id}/apply-advice")
+    async def apply_camera_advice(camera_id: str, body: dict = {}) -> dict[str, Any]:
+        """
+        Apply a chosen advice profile to the camera.
+
+        Body:
+          profile: str          — "default" | "paranoid" | "lax"  (required)
+          suggested_name: str   — rename the camera to this (optional)
+          advice: dict          — the full CameraAdvice dict from /advise (optional;
+                                  if omitted, a new snapshot + AI call is made)
+
+        Returns:
+          ok: bool
+          name: str             — the name that was applied
+          frigate_yaml: str     — ready-to-paste Frigate config block
+          profile: dict         — the applied FrigateProfile
+        """
+        if not camera_mgr:
+            raise HTTPException(status_code=503, detail="Cameras not available")
+
+        from camera_advisor import advise_camera as _advise, CameraAdvice
+
+        profile_key = body.get("profile", "default")
+        if profile_key not in ("default", "paranoid", "lax"):
+            raise HTTPException(status_code=400, detail="profile must be 'default', 'paranoid', or 'lax'")
+
+        # Use pre-computed advice if provided, otherwise compute fresh
+        advice_dict = body.get("advice")
+        if advice_dict:
+            # Reconstruct from the dict the client sent back — we only need the profile
+            from camera_advisor import _build_profiles
+            ai_fragment = {
+                "name": advice_dict.get("suggested_name", camera_id),
+                "scene": advice_dict.get("scene_description", ""),
+                "objects": advice_dict.get("detected_objects", ["person", "car"]),
+                "zones": [
+                    {
+                        "name": z["name"],
+                        "description": z.get("description", ""),
+                        "coordinates": z.get("coordinates", [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]),
+                        "objects": z.get("objects", []),
+                    }
+                    for p in advice_dict.get("profiles", {}).values()
+                    for z in p.get("zones", [])
+                    # zones are the same across all profiles — take from the first
+                ][:len(next(iter(advice_dict.get("profiles", {}).values()), {}).get("zones", []))],
+                "reasoning": advice_dict.get("ai_reasoning", ""),
+            }
+            # Simpler: just use the zones from the default profile (same in all three)
+            default_profile_dict = advice_dict.get("profiles", {}).get("default", {})
+            ai_fragment["zones"] = default_profile_dict.get("zones", [])
+            profiles = _build_profiles(ai_fragment)
+            suggested_name = advice_dict.get("suggested_name", camera_id)
+        else:
+            jpeg = await camera_mgr.snapshot(camera_id)
+            if not jpeg:
+                raise HTTPException(status_code=400, detail="Cannot capture snapshot")
+            advice = await _advise(camera_id, jpeg)
+            profiles = advice.profiles
+            suggested_name = advice.suggested_name
+
+        profile = profiles[profile_key]
+
+        # Apply the name if provided or suggested
+        new_name = body.get("suggested_name") or suggested_name
+        if new_name and new_name != camera_id:
+            camera_mgr.update_camera(camera_id, {"name": new_name})
+
+        frigate_yaml = profile.to_frigate_yaml(camera_id)
+
+        return {
+            "ok": True,
+            "name": new_name,
+            "frigate_yaml": frigate_yaml,
+            "profile": profile.to_dict(),
+        }
+
     # --- OBS / Broadcast studio endpoints ---
 
     @app.get("/api/v1/broadcast/status")
