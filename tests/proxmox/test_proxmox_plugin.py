@@ -21,7 +21,11 @@ import time
 from pathlib import Path
 
 import pytest
-import requests
+
+# Skip the entire module at collection time if requests isn't installed.
+# All tests here require a live PVE host anyway (PVE_HOST env var), so this
+# module is always skipped in unit/CI runs regardless.
+requests = pytest.importorskip("requests")
 
 # Add project paths
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "controller"))
@@ -200,7 +204,7 @@ class TestDisplayService:
         assert data["vmid"] == TEST_VMID
         assert data["width"] > 0
         assert data["height"] > 0
-        assert data["type"] in ("kvmfr", "dbus", "none")
+        assert data["type"] in ("kvmfr", "dbus", "dbus-p2p", "qmp-screendump", "none")
 
     def test_snapshot(self):
         """Snapshot returns a JPEG image."""
