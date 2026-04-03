@@ -149,7 +149,9 @@ class SeatManager:
             await self._gpu_inventory.discover()
         except Exception as e:
             log.warning("GPU discovery failed: %s — continuing without encoder optimization", e)
+        log.info("GPU discovery complete: %d GPUs", len(self._gpu_inventory.gpus))
         self._encoder_allocator = EncoderAllocator(self._gpu_inventory)
+        log.info("Encoder allocator ready")
 
         # Enumerate displays
         try:

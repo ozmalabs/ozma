@@ -1355,8 +1355,13 @@ def main() -> None:
             loop.run_until_complete(manager.start())
         except KeyboardInterrupt:
             pass
+        except Exception:
+            log.exception("Agent failed")
         finally:
-            loop.run_until_complete(manager.stop())
+            try:
+                loop.run_until_complete(manager.stop())
+            except Exception:
+                pass
             loop.close()
 
 
