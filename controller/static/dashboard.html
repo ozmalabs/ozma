@@ -79,6 +79,36 @@ body {
 #conn-badge.error { color: var(--red); }
 #conn-badge.error .dot { background: var(--red); }
 
+#user-pill {
+  display: none;
+  align-items: center;
+  gap: 8px;
+  margin-left: 10px;
+  font-size: 11px;
+  color: var(--muted);
+}
+#user-pill-name {
+  font-weight: 600;
+  color: var(--text);
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.user-pill-logout {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  text-decoration: none;
+  padding: 2px 7px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  transition: color 0.15s, border-color 0.15s;
+}
+.user-pill-logout:hover { color: var(--red); border-color: var(--red); }
+
 .mode-btn {
   font-size: 11px; font-weight: 600; letter-spacing: 0.03em;
   padding: 3px 10px; border: none; border-radius: 4px;
@@ -679,6 +709,10 @@ select option { background: var(--surface); }
     <button class="mode-btn" onclick="setMode('amazing')">Amazing</button>
   </div>
   <div id="conn-badge"><div class="dot"></div><span>connecting</span></div>
+  <div id="user-pill">
+    <span id="user-pill-name"></span>
+    <a href="/auth/logout" class="user-pill-logout" onclick="return confirmLogout()">Logout</a>
+  </div>
 </div>
 
 <!-- ── Main grid ────────────────────────────────────────────────────────────── -->
@@ -1115,7 +1149,17 @@ function shortId(id) {
 async function api(method, path, body) {
   const opts = { method, headers: {} };
   if (body) { opts.body = JSON.stringify(body); opts.headers['Content-Type'] = 'application/json'; }
+  const jwt = sessionStorage.getItem('ozma_jwt');
+  if (jwt) opts.headers['Authorization'] = 'Bearer ' + jwt;
   const r = await fetch('/api/v1' + path, opts);
+  if (r.status === 401) {
+    sessionStorage.removeItem('ozma_jwt');
+    const data = await r.json().catch(() => ({}));
+    if (data.auth_enabled) {
+      location.href = '/auth/login?redirect_to=' + encodeURIComponent(location.pathname);
+    }
+    throw new Error('Unauthorized');
+  }
   if (!r.ok) throw new Error(`${method} ${path} → ${r.status}`);
   return r.json();
 }
@@ -1165,9 +1209,34 @@ async function loadAll() {
     fetchKDEConnect();
     fetchWifiAudio();
     fetchControls();
+    probeAuthState();
   } catch (e) {
     console.error('loadAll:', e);
   }
+}
+
+async function probeAuthState() {
+  try {
+    const u = await api('GET', '/users/me');
+    showUserPill(u);
+  } catch (_) {
+    // 401 is handled inside api() — redirect already triggered if auth_enabled
+  }
+}
+
+function showUserPill(user) {
+  if (!user || !user.auth_enabled) return; // auth off — no pill needed
+  const pill = document.getElementById('user-pill');
+  document.getElementById('user-pill-name').textContent = user.display_name || user.username;
+  pill.style.display = 'flex';
+}
+
+function confirmLogout() {
+  fetch('/auth/logout', { method: 'POST' }).finally(() => {
+    sessionStorage.removeItem('ozma_jwt');
+    location.href = '/auth/login';
+  });
+  return false;
 }
 
 // ── Render: nodes ─────────────────────────────────────────────────────────────

@@ -213,7 +213,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
                 )
                 return await call_next(request)
 
-        return JSONResponse(status_code=401, content={"error": "Authentication required"})
+        return JSONResponse(status_code=401, content={"error": "Authentication required", "auth_enabled": True})
 
     # --- Service proxy middleware (runs after auth middleware in the stack) ---
 
@@ -294,13 +294,23 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     @app.get("/api/v1/users/me")
     async def get_current_user(request: Request) -> dict:
-        ctx = _require_scope(request, SCOPE_READ)
+        ctx = getattr(request.state, "auth", None)
+        # Auth disabled — return anonymous context so dashboard can detect the mode
+        if not _auth.enabled:
+            return {"id": "", "username": "admin", "display_name": "Admin",
+                    "role": "owner", "auth_enabled": False}
+        if not ctx or not ctx.authenticated:
+            raise HTTPException(401, detail={"error": "Authentication required", "auth_enabled": True})
         if not user_manager or not ctx.user_id:
-            raise HTTPException(404, "No user context")
+            # Auth on but no user model (legacy JWT with sub="admin")
+            return {"id": "", "username": "admin", "display_name": "Admin",
+                    "role": "owner", "auth_enabled": True}
         user = user_manager.get_user(ctx.user_id)
         if not user:
             raise HTTPException(404, "User not found")
-        return user.to_dict()
+        d = user.to_dict()
+        d["auth_enabled"] = True
+        return d
 
     @app.get("/api/v1/users/{user_id}")
     async def get_user(user_id: str, request: Request) -> dict:
