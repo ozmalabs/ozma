@@ -313,8 +313,14 @@ class SeatManager:
         #     )
 
         # Wait for stop signal
-        print("[OZMA DEBUG] Waiting for stop signal (Ctrl+C)...", flush=True)
-        await self._stop_event.wait()
+        print("[OZMA DEBUG] About to await stop signal...", flush=True)
+        import sys as _sys
+        _sys.stdout.flush()
+        _sys.stderr.flush()
+        try:
+            await self._stop_event.wait()
+        except Exception as e:
+            print(f"[OZMA DEBUG] stop_event.wait failed: {e}", flush=True)
         print("[OZMA DEBUG] Stop signal received", flush=True)
 
     async def stop(self) -> None:
