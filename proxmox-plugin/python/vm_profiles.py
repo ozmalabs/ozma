@@ -288,7 +288,11 @@ class VMProfile:
         if self.display_type == "dbus":
             args += ["-display", "dbus"]
         elif self.display_type == "kvmfr":
-            args += ["-display", "none"]
+            # Secondary virtio-vga driven via D-Bus for management console.
+            # The passed-through GPU owns the real monitors; this virtual display
+            # gives the ozma display service a separate management console path
+            # (BIOS, OS install, agent control) without touching the gaming GPU.
+            args += ["-display", "dbus,p2p=yes"]
         else:
             args += ["-display", "none"]
 
@@ -298,6 +302,10 @@ class VMProfile:
                 args += ["-device", f"virtio-gpu-pci,id=vga0,max_outputs={self.display_heads}"]
             else:
                 args += ["-device", "virtio-vga"]
+        elif self.display_type == "kvmfr":
+            # Secondary virtio-vga alongside passed-through GPU.
+            # Proxmox needs vga: virtio in the conf to keep this alive.
+            args += ["-device", "virtio-vga,id=vga0"]
 
         # GPU passthrough
         if self.gpu_passthrough and self.gpu_pci:
@@ -381,6 +389,9 @@ class VMProfile:
 
         if self.gpu_passthrough and self.gpu_pci:
             lines.append(f"hostpci0: {self.gpu_pci},pcie=1,x-vga=1")
+            # Keep secondary virtio-vga alive alongside the passed-through GPU.
+            # Without this Proxmox removes the virtual display entirely.
+            lines.append("vga: virtio")
             if self.gpu_audio_pci:
                 lines.append(f"hostpci1: {self.gpu_audio_pci},pcie=1")
 

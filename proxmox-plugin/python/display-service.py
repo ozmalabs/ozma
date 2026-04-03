@@ -68,12 +68,29 @@ class VMDisplayService:
         self._display_type = "none"
         self._dbus_client = None
 
+        # KVMFR (Looking Glass) — game capture from passed-through GPU.
+        # Runs concurrently with D-Bus; each serves a separate endpoint.
+        self._lg = None
+        self._lg_frame: bytes | None = None
+        self._lg_frame_count = 0
+        self._lg_width = 0
+        self._lg_height = 0
+
     async def start(self) -> None:
-        """Start display capture and HTTP API."""
-        # Try D-Bus p2p via QMP add_client (real-time framebuffer push)
+        """Start display capture and HTTP API.
+
+        For GPU passthrough VMs both sources run concurrently:
+          - D-Bus p2p → virtio-vga secondary display (management console, BIOS, agents)
+          - KVMFR → passed-through GPU framebuffer (game capture, full framerate)
+
+        For normal VMs only D-Bus (or QMP screendump fallback) is used.
+        """
         qmp = self.qmp_path if os.path.exists(self.qmp_path) else self.qmp_path_proxmox
         if os.path.exists(qmp):
-            self.qmp_path = qmp  # use whichever exists
+            self.qmp_path = qmp
+
+        # D-Bus p2p — management console (virtio-vga secondary)
+        if os.path.exists(self.qmp_path):
             try:
                 from dbus_display import DBusDisplayClient
                 self._dbus_client = DBusDisplayClient(self.qmp_path)
@@ -81,7 +98,7 @@ class VMDisplayService:
                     self._display_type = "dbus-p2p"
                     self._width = self._dbus_client.width
                     self._height = self._dbus_client.height
-                    log.info("VM %d: D-Bus p2p display %dx%d (RegisterListener)",
+                    log.info("VM %d: D-Bus p2p display %dx%d (management console)",
                              self.vmid, self._width, self._height)
                 else:
                     self._dbus_client = None
@@ -89,19 +106,26 @@ class VMDisplayService:
                 log.warning("D-Bus p2p failed: %s", e, exc_info=True)
                 self._dbus_client = None
 
-        # Fallback: KVMFR shared memory
-        if self._display_type == "none" and os.path.exists(self.shm_path):
+        # KVMFR — game capture from passed-through GPU.
+        # Runs independently of D-Bus; both can be active at once.
+        if os.path.exists(self.shm_path):
             try:
                 from looking_glass import LookingGlassCapture
                 self._lg = LookingGlassCapture(self.name, shm_path=self.shm_path)
                 if await self._lg.start():
-                    self._display_type = "kvmfr"
-                    log.info("VM %d: KVMFR display from %s", self.vmid, self.shm_path)
+                    log.info("VM %d: KVMFR game capture active from %s", self.vmid, self.shm_path)
                     asyncio.create_task(self._kvmfr_capture_loop(), name=f"kvmfr-{self.vmid}")
+                    # If no D-Bus, promote KVMFR as the primary display type
+                    if self._display_type == "none":
+                        self._display_type = "kvmfr"
+                        self._lg_width = getattr(self._lg, "width", 0)
+                        self._lg_height = getattr(self._lg, "height", 0)
+                else:
+                    self._lg = None
             except ImportError:
                 log.debug("looking_glass module not available")
 
-        # Fallback: QMP screendump
+        # QMP screendump — last resort when nothing else is available
         if self._display_type == "none" and os.path.exists(self.qmp_path):
             self._display_type = "qmp-screendump"
             log.info("VM %d: QMP screendump fallback", self.vmid)
@@ -118,11 +142,17 @@ class VMDisplayService:
             try:
                 frame = await self._lg.get_frame_jpeg()
                 if frame:
-                    self._latest_frame = frame
-                    self._frame_count += 1
+                    self._lg_frame = frame
+                    self._lg_frame_count += 1
+                    self._lg_width = getattr(self._lg, "width", self._lg_width)
+                    self._lg_height = getattr(self._lg, "height", self._lg_height)
+                    # Mirror to _latest_frame when KVMFR is the primary source
+                    if self._display_type == "kvmfr":
+                        self._latest_frame = frame
+                        self._frame_count = self._lg_frame_count
             except Exception as e:
                 log.debug("KVMFR read error: %s", e)
-            await asyncio.sleep(1.0 / 30)
+            await asyncio.sleep(1.0 / 60)  # KVMFR supports up to 60fps
 
     async def _qmp_screendump(self) -> bytes | None:
         """Capture via QMP screendump (slow fallback)."""
@@ -163,38 +193,70 @@ class VMDisplayService:
 
         async def display_info(_):
             dc = self._dbus_client
-            return web.json_response({
+            info: dict = {
                 "vmid": self.vmid,
-                "width": dc.width if dc else self._width,
-                "height": dc.height if dc else self._height,
                 "type": self._display_type,
-                "frame_count": dc.frame_count if dc else self._frame_count,
-            })
+                "console": {
+                    "available": dc is not None and dc.connected,
+                    "width": dc.width if dc else self._width,
+                    "height": dc.height if dc else self._height,
+                    "frame_count": dc.frame_count if dc else self._frame_count,
+                },
+                "game": {
+                    "available": self._lg_frame is not None,
+                    "width": self._lg_width,
+                    "height": self._lg_height,
+                    "frame_count": self._lg_frame_count,
+                },
+            }
+            # Top-level width/height = best available source
+            if self._lg_frame is not None:
+                info["width"] = self._lg_width
+                info["height"] = self._lg_height
+                info["frame_count"] = self._lg_frame_count
+            else:
+                info["width"] = dc.width if dc else self._width
+                info["height"] = dc.height if dc else self._height
+                info["frame_count"] = dc.frame_count if dc else self._frame_count
+            return web.json_response(info)
 
         async def snapshot(_):
-            # D-Bus p2p (real-time)
+            # KVMFR game capture (highest quality — passed-through GPU)
+            if self._lg_frame:
+                return web.Response(body=self._lg_frame, content_type="image/jpeg")
+            # D-Bus p2p management console
             if self._dbus_client and self._dbus_client.connected and self._dbus_client.latest_frame:
                 return web.Response(body=self._dbus_client.latest_frame, content_type="image/jpeg")
-            # KVMFR
-            if self._latest_frame:
-                return web.Response(body=self._latest_frame, content_type="image/jpeg")
-            # QMP screendump
+            # QMP screendump last resort
             frame = await self._qmp_screendump()
             if frame:
                 return web.Response(body=frame, content_type="image/jpeg")
             return web.json_response({"error": "no frame"}, status=503)
 
-        async def mjpeg(request):
+        async def game_snapshot(_):
+            """KVMFR frame from the passed-through GPU (full framerate game capture)."""
+            if self._lg_frame:
+                return web.Response(body=self._lg_frame, content_type="image/jpeg")
+            return web.json_response({"error": "no KVMFR frame — is the VM running with GPU passthrough?"}, status=503)
+
+        async def console_snapshot(_):
+            """D-Bus management console frame (virtio-vga secondary display)."""
+            if self._dbus_client and self._dbus_client.connected and self._dbus_client.latest_frame:
+                return web.Response(body=self._dbus_client.latest_frame, content_type="image/jpeg")
+            # Fall back to QMP screendump if D-Bus isn't up yet
+            frame = await self._qmp_screendump()
+            if frame:
+                return web.Response(body=frame, content_type="image/jpeg")
+            return web.json_response({"error": "no console frame"}, status=503)
+
+        async def _mjpeg_stream(request, frame_fn):
+            """Generic MJPEG streaming helper."""
             response = web.StreamResponse(headers={
                 "Content-Type": "multipart/x-mixed-replace; boundary=frame",
             })
             await response.prepare(request)
             while True:
-                frame = None
-                if self._dbus_client and self._dbus_client.connected:
-                    frame = self._dbus_client.latest_frame
-                elif self._latest_frame:
-                    frame = self._latest_frame
+                frame = frame_fn()
                 if frame:
                     try:
                         await response.write(
@@ -203,7 +265,29 @@ class VMDisplayService:
                         )
                     except (ConnectionResetError, asyncio.CancelledError):
                         break
-                await asyncio.sleep(1.0 / 15)
+                await asyncio.sleep(1.0 / 30)
+
+        async def mjpeg(request):
+            """Best available stream — KVMFR game capture, then D-Bus console."""
+            def _best():
+                if self._lg_frame:
+                    return self._lg_frame
+                if self._dbus_client and self._dbus_client.connected:
+                    return self._dbus_client.latest_frame
+                return self._latest_frame
+            return await _mjpeg_stream(request, _best)
+
+        async def game_mjpeg(request):
+            """KVMFR MJPEG stream — passed-through GPU at up to 60fps."""
+            return await _mjpeg_stream(request, lambda: self._lg_frame)
+
+        async def console_mjpeg(request):
+            """D-Bus management console MJPEG stream."""
+            def _console():
+                if self._dbus_client and self._dbus_client.connected:
+                    return self._dbus_client.latest_frame
+                return self._latest_frame
+            return await _mjpeg_stream(request, _console)
 
         async def input_key(request):
             body = await request.json()
@@ -316,7 +400,10 @@ class VMDisplayService:
             codecs = ["mjpeg"]
             if self._dbus_client and self._dbus_client.connected:
                 codecs.append("webrtc")
-            return web.json_response({"codecs": codecs})
+            sources = ["console"] if self._dbus_client else []
+            if self._lg is not None:
+                sources.append("game")
+            return web.json_response({"codecs": codecs, "sources": sources})
 
         async def api_adaptive(request):
             return web.json_response({"ok": True})
@@ -424,6 +511,11 @@ class VMDisplayService:
         app.router.add_get("/display/info", display_info)
         app.router.add_get("/display/snapshot", snapshot)
         app.router.add_get("/display/mjpeg", mjpeg)
+        # GPU passthrough: separate game (KVMFR) and console (D-Bus virtio-vga) streams
+        app.router.add_get("/display/game/snapshot", game_snapshot)
+        app.router.add_get("/display/game/mjpeg", game_mjpeg)
+        app.router.add_get("/display/console/snapshot", console_snapshot)
+        app.router.add_get("/display/console/mjpeg", console_mjpeg)
         app.router.add_post("/input/key", input_key)
         app.router.add_post("/input/mouse", input_mouse)
         app.router.add_post("/webrtc/offer", webrtc_offer)
