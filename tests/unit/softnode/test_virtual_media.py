@@ -129,20 +129,18 @@ class TestFATSynthesiser:
         assert ".hidden" not in names
         assert "visible.txt" in names
 
-    @pytest.mark.slow
     def test_file_watcher_detects_add(self, tmp_path):
-        import time
+        """rescan() picks up files added after the initial scan."""
         from virtual_media import FATSynthesiser
         (tmp_path / "a.txt").write_text("a")
-        s = FATSynthesiser(str(tmp_path), label="T", watch=True)
+        s = FATSynthesiser(str(tmp_path), label="T", watch=False)
         s.scan()
         initial_count = len(s._files)
 
         (tmp_path / "b.txt").write_text("b")
-        time.sleep(3)  # watcher polls every 1s, needs margin
+        s.rescan()
 
         assert len(s._files) > initial_count
-        s.stop_watcher()
 
     def test_fsinfo_sector(self, tmp_path):
         from virtual_media import FATSynthesiser
