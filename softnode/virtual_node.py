@@ -99,6 +99,7 @@ class VMInfo:
         self.pid = pid
         self.has_guest_agent = has_guest_agent
         self.guest_os = guest_os  # "windows", "linux", "" (unknown)
+        self.has_gpu_passthrough = False  # True if a GPU is bound to vfio-pci in this VM
         self.displays: list[VMDisplayOutput] = []
 
     def __repr__(self) -> str:
@@ -122,6 +123,7 @@ def discover_proxmox_vms() -> list[VMInfo]:
         name = vmid
         vnc_port = 0
         guest_os = ""
+        has_gpu_passthrough = False
         if conf_path.exists():
             for line in conf_path.read_text().splitlines():
                 if line.startswith("name:"):
@@ -134,16 +136,21 @@ def discover_proxmox_vms() -> list[VMInfo]:
                         guest_os = "linux"
                 if line.startswith("args:") and "-vnc" in line:
                     pass  # complex parsing, fall back to default
+                # hostpciN: 0000:29:00,x-vga=1 → GPU passthrough
+                if line.startswith("hostpci") and "x-vga=1" in line:
+                    has_gpu_passthrough = True
             vnc_port = 5900 + int(vmid) if vmid.isdigit() else 0
 
-        vms.append(VMInfo(
+        vm = VMInfo(
             name=name, vm_id=vmid,
             qmp_path=str(qmp_sock),
             vnc_port=vnc_port,
             state="running",
             has_guest_agent=True,  # Proxmox always installs qemu-ga
             guest_os=guest_os,
-        ))
+        )
+        vm.has_gpu_passthrough = has_gpu_passthrough
+        vms.append(vm)
 
     log.info("Proxmox: discovered %d VMs", len(vms))
     return vms
@@ -203,6 +210,27 @@ def discover_libvirt_vms() -> list[VMInfo]:
                 if target is not None and target.get("name") == "org.qemu.guest_agent.0":
                     has_guest_agent = True
 
+            # GPU passthrough: <hostdev type='pci'> with vfio driver
+            has_gpu_passthrough = False
+            for hostdev in root.findall(".//hostdev[@type='pci']"):
+                driver = hostdev.find("driver")
+                if driver is not None and driver.get("name") == "vfio":
+                    has_gpu_passthrough = True
+                    break
+                # Also catch passthrough without explicit driver element —
+                # check if the PCI address is bound to vfio-pci on the host
+                addr = hostdev.find("source/address")
+                if addr is not None:
+                    domain = addr.get("domain", "0x0000").replace("0x", "").zfill(4)
+                    bus    = addr.get("bus",    "0x00").replace("0x", "").zfill(2)
+                    slot   = addr.get("slot",   "0x00").replace("0x", "").zfill(2)
+                    func   = addr.get("function", "0x0").replace("0x", "")
+                    pci    = f"{domain}:{bus}:{slot}.{func}"
+                    driver_link = Path(f"/sys/bus/pci/devices/{pci}/driver")
+                    if driver_link.is_symlink() and "vfio" in str(driver_link.resolve()):
+                        has_gpu_passthrough = True
+                        break
+
             # Guest OS detection from osinfo
             os_elem = root.find(".//os/type")
             for meta in root.findall(".//{http://libosinfo.org/xmlns/libvirt/domain/1.0}os"):
@@ -212,14 +240,16 @@ def discover_libvirt_vms() -> list[VMInfo]:
                 elif any(x in os_id.lower() for x in ("linux", "ubuntu", "fedora", "debian", "rhel")):
                     guest_os = "linux"
 
-            vms.append(VMInfo(
+            vm = VMInfo(
                 name=name, vm_id=vm_id,
                 qmp_path=qmp_path,
                 vnc_port=vnc_port,
                 state="running",
                 has_guest_agent=has_guest_agent,
                 guest_os=guest_os,
-            ))
+            )
+            vm.has_gpu_passthrough = has_gpu_passthrough
+            vms.append(vm)
 
         conn.close()
         log.info("libvirt: discovered %d VMs", len(vms))
@@ -678,6 +708,15 @@ class VirtualNodeManager:
         power = LibvirtPower(vm.name)
         await power.start()
 
+        # GPU passthrough VMs have no virtual display (no VNC, no D-Bus).
+        # The ozma agent inside the VM captures the real GPU framebuffer and
+        # pushes frames directly — VNC port is meaningless, don't pass it.
+        if vm.has_gpu_passthrough:
+            vnc_port = None
+            log.info("VM %s has GPU passthrough — skipping VNC, using agent display", vm.name)
+        else:
+            vnc_port = vm.vnc_port if vm.vnc_port else None
+
         # Use the ozma QMP socket for input/display, libvirt for power
         qmp = qmp_sock if qmp_sock else (vm.qmp_path if not power.connected else "")
 
@@ -687,7 +726,7 @@ class VirtualNodeManager:
             port=port,
             qmp_path=qmp,
             vnc_host=vm.vnc_host,
-            vnc_port=vm.vnc_port if vm.vnc_port else None,
+            vnc_port=vnc_port,
             audio_sink=f"{self._audio_prefix}{vm.name}",
             api_port=7380 + port - self._base_port + 2,
             power_backend=power,
@@ -699,9 +738,10 @@ class VirtualNodeManager:
             name=f"vnode-{vm.name}",
         )
         self._managed[vm.name] = managed
-        log.info("Auto-managed VM: %s (qmp=%s, port=%d, VNC=:%s, os=%s)",
-                 vm.name, "direct" if qmp_sock else "libvirt",
-                 port, vm.vnc_port or "none", vm.guest_os or "unknown")
+        log.info("Auto-managed VM: %s (qmp=%s, port=%d, display=%s, os=%s)",
+                 vm.name, "direct" if qmp_sock else "libvirt", port,
+                 "agent-capture" if vm.has_gpu_passthrough else f"vnc:{vnc_port or 'none'}",
+                 vm.guest_os or "unknown")
 
     async def _run_node(self, name: str, node: SoftNode) -> None:
         """Run a soft node with restart on failure."""
@@ -743,8 +783,11 @@ class VirtualNodeManager:
             for managed in list(self._managed.values()):
                 if managed.agent_provisioned:
                     continue
-                if managed.agent_check_failures > 5:
-                    continue  # stop retrying after 5 failures
+                # GPU passthrough VMs: agent is the ONLY display path, never give up.
+                # Other VMs: stop retrying after 5 failures (VNC/D-Bus will cover them).
+                max_failures = None if managed.vm.has_gpu_passthrough else 5
+                if max_failures is not None and managed.agent_check_failures > max_failures:
+                    continue
                 try:
                     ok = await self._provisioner.provision(managed.vm)
                     if ok:
@@ -752,6 +795,12 @@ class VirtualNodeManager:
                         log.info("Agent provisioned in %s", managed.vm.name)
                     else:
                         managed.agent_check_failures += 1
+                        if managed.vm.has_gpu_passthrough:
+                            log.debug(
+                                "GPU passthrough VM %s: agent not yet installed "
+                                "(attempt %d) — will keep retrying",
+                                managed.vm.name, managed.agent_check_failures,
+                            )
                 except Exception as e:
                     log.debug("Agent provisioning error for %s: %s", managed.vm.name, e)
                     managed.agent_check_failures += 1
