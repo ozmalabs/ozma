@@ -166,7 +166,7 @@ class DirectRegisterRequest(BaseModel):
     frigate_port: str = ""     # Frigate API port (default 5000)
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None, sunshine: Any | None = None, msp_mgr: MSPDashboardManager | None = None, msp_portal: MSPPortalManager | None = None, auto_configure: Any | None = None, cam_connect: Any | None = None) -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None, sunshine: Any | None = None, msp_mgr: MSPDashboardManager | None = None, msp_portal: MSPPortalManager | None = None, auto_configure: Any | None = None, cam_connect: Any | None = None, grid: Any | None = None) -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -8080,6 +8080,167 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if url is None:
             raise HTTPException(404, "No relay configured for this camera")
         return {"node_id": node_id, "relay_rtsp_url": url}
+
+    # ── Grid federation (V1.4) — multi-Desk KVM federation ───────────────────
+
+    def _grid() -> Any:
+        if grid is None:
+            raise HTTPException(503, "Grid service not available")
+        return grid
+
+    @app.get("/api/v1/grid/state")
+    async def grid_show_state(request: Request) -> dict[str, Any]:
+        """Full Grid Show state: desks, claims, feeds."""
+        _require_scope(request, SCOPE_READ)
+        return _grid().show_state()
+
+    # Desks
+    @app.get("/api/v1/grid/desks")
+    async def grid_list_desks(request: Request) -> list[dict[str, Any]]:
+        _require_scope(request, SCOPE_READ)
+        return _grid().list_desks()
+
+    @app.get("/api/v1/grid/desks/{desk_id}")
+    async def grid_get_desk(request: Request, desk_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        desk = _grid().get_desk(desk_id)
+        if not desk:
+            raise HTTPException(404, f"Desk {desk_id} not found")
+        return desk.to_dict()
+
+    @app.post("/api/v1/grid/desks")
+    async def grid_register_desk(request: Request) -> dict[str, Any]:
+        """Register a Desk with the Grid."""
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        from grid import DeskInfo
+        desk = DeskInfo(
+            id=body["id"],
+            name=body.get("name", body["id"]),
+            host=body["host"],
+            port=body.get("port", 7380),
+            marks=body.get("marks", []),
+            failover_group=body.get("failover_group", ""),
+            priority=body.get("priority", 0),
+        )
+        _grid().register_desk(desk)
+        return {"ok": True, "desk_id": desk.id}
+
+    @app.put("/api/v1/grid/desks/{desk_id}")
+    async def grid_update_desk(request: Request, desk_id: str) -> dict[str, Any]:
+        """Update mutable fields on a Desk."""
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        desk = _grid().update_desk(desk_id, **body)
+        if not desk:
+            raise HTTPException(404, f"Desk {desk_id} not found")
+        return desk.to_dict()
+
+    @app.delete("/api/v1/grid/desks/{desk_id}")
+    async def grid_unregister_desk(request: Request, desk_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        _grid().unregister_desk(desk_id)
+        return {"ok": True, "desk_id": desk_id}
+
+    # Claims
+    @app.get("/api/v1/grid/claims")
+    async def grid_list_claims(request: Request) -> list[dict[str, Any]]:
+        _require_scope(request, SCOPE_READ)
+        return _grid().list_claims()
+
+    @app.post("/api/v1/grid/claims")
+    async def grid_claim_mark(request: Request) -> dict[str, Any]:
+        """Claim a Mark for a Desk."""
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        mark_id = body.get("mark_id", "")
+        desk_id = body.get("desk_id", "")
+        if not mark_id or not desk_id:
+            raise HTTPException(400, "mark_id and desk_id are required")
+        shared = body.get("shared", False)
+        ok = _grid().claim_mark(mark_id, desk_id, shared=shared)
+        return {"ok": ok, "mark_id": mark_id, "desk_id": desk_id}
+
+    @app.delete("/api/v1/grid/claims/{mark_id}")
+    async def grid_release_mark(
+        request: Request, mark_id: str, desk_id: str = ""
+    ) -> dict[str, Any]:
+        """Release a Mark claim."""
+        _require_scope(request, SCOPE_WRITE)
+        if not desk_id:
+            body = await request.json() if request.headers.get("content-type") == "application/json" else {}
+            desk_id = body.get("desk_id", "")
+        ok = _grid().release_mark(mark_id, desk_id)
+        return {"ok": ok, "mark_id": mark_id}
+
+    @app.get("/api/v1/grid/desks/{desk_id}/failover-candidates")
+    async def grid_failover_candidates(request: Request, desk_id: str) -> list[dict[str, Any]]:
+        """Return online failover candidates for a Desk."""
+        _require_scope(request, SCOPE_READ)
+        return [d.to_dict() for d in _grid().failover_candidates(desk_id)]
+
+    # Feeds
+    @app.get("/api/v1/grid/feeds")
+    async def grid_list_feeds(request: Request) -> list[dict[str, Any]]:
+        _require_scope(request, SCOPE_READ)
+        return _grid().list_feeds()
+
+    @app.get("/api/v1/grid/feeds/{feed_id}")
+    async def grid_get_feed(request: Request, feed_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        feed = _grid().get_feed(feed_id)
+        if not feed:
+            raise HTTPException(404, f"Feed {feed_id} not found")
+        return feed.to_dict()
+
+    @app.post("/api/v1/grid/feeds")
+    async def grid_register_feed(request: Request) -> dict[str, Any]:
+        """Publish a Desk as a Feed source."""
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        from grid import FeedSource
+        feed = FeedSource(
+            feed_id=body["feed_id"],
+            desk_id=body["desk_id"],
+            name=body.get("name", body["feed_id"]),
+            hls_url=body.get("hls_url", ""),
+            rtsp_url=body.get("rtsp_url", ""),
+            audio=body.get("audio", False),
+        )
+        _grid().register_feed(feed)
+        return {"ok": True, "feed_id": feed.feed_id}
+
+    @app.delete("/api/v1/grid/feeds/{feed_id}")
+    async def grid_unregister_feed(request: Request, feed_id: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        ok = _grid().unregister_feed(feed_id)
+        if not ok:
+            raise HTTPException(404, f"Feed {feed_id} not found")
+        return {"ok": True, "feed_id": feed_id}
+
+    @app.post("/api/v1/grid/feeds/{feed_id}/subscribe")
+    async def grid_subscribe_feed(request: Request, feed_id: str) -> dict[str, Any]:
+        """Subscribe the caller's Desk to a Feed."""
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        desk_id = body.get("desk_id", "")
+        if not desk_id:
+            raise HTTPException(400, "desk_id is required")
+        ok = _grid().subscribe_feed(feed_id, desk_id)
+        if not ok:
+            raise HTTPException(404, f"Feed {feed_id} not found")
+        return {"ok": True, "feed_id": feed_id, "desk_id": desk_id}
+
+    @app.post("/api/v1/grid/feeds/{feed_id}/unsubscribe")
+    async def grid_unsubscribe_feed(request: Request, feed_id: str) -> dict[str, Any]:
+        """Unsubscribe a Desk from a Feed."""
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        desk_id = body.get("desk_id", "")
+        ok = _grid().unsubscribe_feed(feed_id, desk_id)
+        if not ok:
+            raise HTTPException(404, f"Feed {feed_id} not found")
+        return {"ok": True, "feed_id": feed_id, "desk_id": desk_id}
 
     # Static files — mounted last so they don't shadow API routes
     static_dir = Path(__file__).parent / "static"
