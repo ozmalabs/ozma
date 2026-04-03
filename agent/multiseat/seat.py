@@ -70,7 +70,7 @@ class Seat:
 
         # Set during start()
         self.display: Any = None  # DisplayInfo, set by SeatManager
-        self._stop_event = asyncio.Event()
+        self._stop_event: asyncio.Event | None = None  # created in start()
         self._hid_injector: Any = None
         self._screen_proc: asyncio.subprocess.Process | None = None
         self._transport: asyncio.DatagramTransport | None = None
@@ -90,6 +90,7 @@ class Seat:
         Args:
             controller_url: Controller URL for registration (empty = mDNS only)
         """
+        self._stop_event = asyncio.Event()  # must be created inside running loop
         log.info("Starting seat %s (index=%d, display=%d, udp=%d, http=%d)",
                  self.name, self.seat_index, self.display_index,
                  self.udp_port, self.api_port)
