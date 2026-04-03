@@ -71,6 +71,10 @@ from external_publish import ExternalPublishManager
 from vaultwarden import VaultwardenManager
 from email_security import EmailSecurityMonitor
 from cloud_backup import CloudBackupManager, BackupSource, CredentialRecord, Provider
+from iot_network import (
+    IoTNetworkManager, IoTDevice, DeviceCategory, InternetAccess,
+    VLANConfig, OnboardingSession,
+)
 
 log = logging.getLogger("ozma.api")
 
@@ -135,7 +139,7 @@ class DirectRegisterRequest(BaseModel):
     frigate_port: str = ""     # Frigate API port (default 5000)
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None) -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None) -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -4433,6 +4437,190 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if not ok:
             raise HTTPException(500, f"Failed to delete rclone remote: {name}")
         return {"ok": True}
+
+    # ── IoT network ────────────────────────────────────────────────────────────
+
+    class VLANConfigRequest(BaseModel):
+        vlan_id:    int  = 20
+        subnet:     str  = "192.168.20"
+        gateway:    str  = "192.168.20.1"
+        dhcp_start: str  = "192.168.20.100"
+        dhcp_end:   str  = "192.168.20.200"
+        dns:        str  = "192.168.20.1"
+        iface:      str  = ""
+
+    class AddDeviceRequest(BaseModel):
+        mac:             str
+        name:            str  = ""
+        category:        str  = "unknown"
+        internet_access: str  = "deny"
+
+    class UpdateDeviceRequest(BaseModel):
+        name:            str | None = None
+        category:        str | None = None
+        internet_access: str | None = None
+        notes:           str | None = None
+        blocked:         bool | None = None
+
+    class StartOnboardingRequest(BaseModel):
+        device_name:    str  = ""
+        category:       str  = "unknown"
+        phone_ip:       str  = ""
+        allow_internet: bool = False
+        ttl:            int  = 1800
+
+    class CompleteOnboardingRequest(BaseModel):
+        mac:             str
+        name:            str  = ""
+        internet_access: str  = "deny"
+
+    @app.get("/api/v1/iot/status")
+    async def iot_status(request: Request) -> dict:
+        _require_scope(request, SCOPE_READ)
+        if not iot:
+            raise HTTPException(503, "IoT network manager not enabled")
+        return iot.status()
+
+    @app.post("/api/v1/iot/provision")
+    async def iot_provision(request: Request, body: VLANConfigRequest) -> dict:
+        """Provision the IoT VLAN on the configured backend."""
+        _require_scope(request, SCOPE_ADMIN)
+        if not iot:
+            raise HTTPException(503, "IoT network manager not enabled")
+        cfg = VLANConfig(
+            vlan_id=body.vlan_id, subnet=body.subnet, gateway=body.gateway,
+            dhcp_start=body.dhcp_start, dhcp_end=body.dhcp_end,
+            dns=body.dns, iface=body.iface,
+        )
+        ok = await iot.provision(cfg)
+        if not ok:
+            raise HTTPException(500, "VLAN provisioning failed — check controller logs")
+        return {"ok": True, "vlan": cfg.to_dict()}
+
+    @app.get("/api/v1/iot/nftables")
+    async def iot_nftables(request: Request) -> dict:
+        """Export current nftables ruleset for review."""
+        _require_scope(request, SCOPE_ADMIN)
+        if not iot:
+            raise HTTPException(503, "IoT network manager not enabled")
+        return {"rules": iot.export_nftables()}
+
+    # ── Devices ────────────────────────────────────────────────────────
+
+    @app.get("/api/v1/iot/devices")
+    async def iot_list_devices(request: Request) -> list[dict]:
+        _require_scope(request, SCOPE_READ)
+        if not iot:
+            raise HTTPException(503, "IoT network manager not enabled")
+        return [d.to_dict() for d in iot.list_devices()]
+
+    @app.post("/api/v1/iot/devices")
+    async def iot_add_device(request: Request, body: AddDeviceRequest) -> dict:
+        _require_scope(request, SCOPE_WRITE)
+        if not iot:
+            raise HTTPException(503, "IoT network manager not enabled")
+        dev = iot.add_device(
+            mac=body.mac, name=body.name,
+            category=DeviceCategory(body.category),
+            internet_access=InternetAccess(body.internet_access),
+        )
+        await state.events.put({"type": "iot.device_added", "device": dev.to_dict()})
+        return dev.to_dict()
+
+    @app.get("/api/v1/iot/devices/{device_id}")
+    async def iot_get_device(device_id: str, request: Request) -> dict:
+        _require_scope(request, SCOPE_READ)
+        if not iot:
+            raise HTTPException(503, "IoT network manager not enabled")
+        dev = iot.get_device(device_id)
+        if not dev:
+            raise HTTPException(404, "Device not found")
+        return dev.to_dict()
+
+    @app.put("/api/v1/iot/devices/{device_id}")
+    async def iot_update_device(device_id: str, request: Request,
+                                 body: UpdateDeviceRequest) -> dict:
+        _require_scope(request, SCOPE_WRITE)
+        if not iot:
+            raise HTTPException(503, "IoT network manager not enabled")
+        updates: dict = {k: v for k, v in body.model_dump().items() if v is not None}
+        if "category" in updates:
+            updates["category"] = DeviceCategory(updates["category"])
+        if "internet_access" in updates:
+            updates["internet_access"] = InternetAccess(updates["internet_access"])
+        dev = iot.update_device(device_id, **updates)
+        if not dev:
+            raise HTTPException(404, "Device not found")
+        return dev.to_dict()
+
+    @app.delete("/api/v1/iot/devices/{device_id}")
+    async def iot_remove_device(device_id: str, request: Request) -> dict:
+        _require_scope(request, SCOPE_WRITE)
+        if not iot:
+            raise HTTPException(503, "IoT network manager not enabled")
+        if not iot.remove_device(device_id):
+            raise HTTPException(404, "Device not found")
+        return {"ok": True}
+
+    # ── Onboarding ─────────────────────────────────────────────────────
+
+    @app.post("/api/v1/iot/onboard")
+    async def iot_start_onboarding(request: Request,
+                                    body: StartOnboardingRequest) -> dict:
+        """Start an onboarding session — creates exception rule for device setup."""
+        _require_scope(request, SCOPE_WRITE)
+        if not iot:
+            raise HTTPException(503, "IoT network manager not enabled")
+        sess = await iot.start_onboarding(
+            device_name=body.device_name,
+            category=DeviceCategory(body.category),
+            phone_ip=body.phone_ip,
+            allow_internet=body.allow_internet,
+            ttl=body.ttl,
+        )
+        await state.events.put({"type": "iot.onboarding_started", "session": sess.to_dict()})
+        return sess.to_dict()
+
+    @app.post("/api/v1/iot/onboard/{session_id}/complete")
+    async def iot_complete_onboarding(session_id: str, request: Request,
+                                       body: CompleteOnboardingRequest) -> dict:
+        """Complete onboarding — removes exception, adds device to inventory."""
+        _require_scope(request, SCOPE_WRITE)
+        if not iot:
+            raise HTTPException(503, "IoT network manager not enabled")
+        dev = await iot.complete_onboarding(
+            session_id=session_id, mac=body.mac, name=body.name,
+            internet_access=InternetAccess(body.internet_access),
+        )
+        if not dev:
+            raise HTTPException(404, "Session not found or not in pending state")
+        await state.events.put({"type": "iot.onboarding_complete", "device": dev.to_dict()})
+        return dev.to_dict()
+
+    @app.post("/api/v1/iot/onboard/{session_id}/cancel")
+    async def iot_cancel_onboarding(session_id: str, request: Request) -> dict:
+        _require_scope(request, SCOPE_WRITE)
+        if not iot:
+            raise HTTPException(503, "IoT network manager not enabled")
+        if not await iot.cancel_onboarding(session_id):
+            raise HTTPException(404, "Session not found or not in pending state")
+        return {"ok": True}
+
+    @app.get("/api/v1/iot/onboard")
+    async def iot_list_sessions(request: Request, active: bool = False) -> list[dict]:
+        _require_scope(request, SCOPE_READ)
+        if not iot:
+            raise HTTPException(503, "IoT network manager not enabled")
+        return [s.to_dict() for s in iot.list_sessions(active_only=active)]
+
+    @app.post("/api/v1/iot/sync-leases")
+    async def iot_sync_leases(request: Request) -> dict:
+        """Pull DHCP leases from backend and update device IPs."""
+        _require_scope(request, SCOPE_WRITE)
+        if not iot:
+            raise HTTPException(503, "IoT network manager not enabled")
+        count = await iot.sync_leases()
+        return {"updated": count}
 
     # Static files — mounted last so they don't shadow API routes
     static_dir = Path(__file__).parent / "static"
