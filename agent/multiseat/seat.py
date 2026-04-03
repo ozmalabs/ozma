@@ -98,8 +98,9 @@ class Seat:
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
         # Initialize WebRTC handler (graceful if aiortc not installed)
-        print(f"[SEAT {self.name}] init webrtc...", flush=True)
-        self._init_webrtc()
+        # WebRTC init deferred — av/aiortc DLL crashes on Windows without ffmpeg
+        # Will be enabled when ffmpeg is installed
+        print(f"[SEAT {self.name}] skipping webrtc (requires ffmpeg)...", flush=True)
 
         # Start HID injector (per-seat uinput devices)
         print(f"[SEAT {self.name}] start HID injector...", flush=True)
