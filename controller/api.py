@@ -164,7 +164,7 @@ class DirectRegisterRequest(BaseModel):
     frigate_port: str = ""     # Frigate API port (default 5000)
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None) -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None) -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -4293,17 +4293,284 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     # --- Notification endpoints ---
 
     @app.get("/api/v1/notifications")
-    async def notification_list() -> dict[str, Any]:
+    async def notification_list(request: Request) -> dict[str, Any]:
+        """Return notification list.
+
+        Supports two response shapes selected by Accept / query param:
+          - Default / ?format=channels : legacy {channels, recent} for dashboard
+          - ?format=mobile              : {notifications, unread_count} for the mobile app
+
+        The mobile app sends ?limit=N&offset=N&unread_only=true.
+        """
+        fmt = request.query_params.get("format", "channels")
+        limit = int(request.query_params.get("limit", "50"))
+        offset = int(request.query_params.get("offset", "0"))
+        unread_only = request.query_params.get("unread_only", "false").lower() in ("1", "true")
+
+        if fmt == "mobile":
+            # Return mobile-friendly notification history.
+            # In a full implementation this would read from a persistent store.
+            # For now return an empty list with the correct shape.
+            return {"notifications": [], "unread_count": 0, "limit": limit, "offset": offset}
+
         if not notifier:
             return {"channels": [], "recent": []}
         return {"channels": notifier.list_channels() if hasattr(notifier, 'list_channels') else [],
                 "recent": []}
+
+    @app.post("/api/v1/notifications/{notification_id}/read")
+    async def notification_mark_read(request: Request, notification_id: str) -> dict[str, Any]:
+        """Mark a notification as read (mobile app endpoint)."""
+        _require_scope(request, SCOPE_WRITE)
+        # In a full implementation this would update a persistent store.
+        return {"ok": True, "notification_id": notification_id}
 
     @app.post("/api/v1/notifications/test")
     async def notification_test(body: dict = {}) -> dict[str, Any]:
         if not notifier:
             raise HTTPException(status_code=503, detail="Notifications not available")
         return {"ok": True, "message": "Test notification sent"}
+
+    # --- Mobile push device token endpoints ---
+
+    import uuid as _uuid
+
+    # In-memory store for push registrations.  A real deployment would
+    # persist these to the config/DB layer, but for the controller process
+    # lifetime this is sufficient and consistent with how other transient
+    # registrations (e.g. connected agents) are handled.
+    _push_registrations: dict[str, dict[str, Any]] = {}
+
+    @app.post("/api/v1/push/register")
+    async def push_register(request: Request, body: dict = {}) -> dict[str, Any]:
+        """Register a mobile device token for push notifications.
+
+        Body: {device_token: str, platform: "ios"|"android", device_name?: str}
+        Returns: {ok: bool, registration_id: str}
+        """
+        _require_scope(request, SCOPE_WRITE)
+        device_token = body.get("device_token", "").strip()
+        platform = body.get("platform", "")
+        device_name = body.get("device_name", None)
+
+        if not device_token:
+            raise HTTPException(status_code=400, detail="device_token is required")
+        if platform not in ("ios", "android"):
+            raise HTTPException(status_code=400, detail="platform must be 'ios' or 'android'")
+
+        # De-duplicate: if this token is already registered, update it.
+        for reg_id, reg in _push_registrations.items():
+            if reg["device_token"] == device_token:
+                reg["platform"] = platform
+                reg["device_name"] = device_name
+                reg["last_used"] = None
+                log.info("push.register: updated existing registration %s (platform=%s)", reg_id, platform)
+                return {"ok": True, "registration_id": reg_id}
+
+        reg_id = str(_uuid.uuid4())
+        _push_registrations[reg_id] = {
+            "id": reg_id,
+            "device_token": device_token,
+            "platform": platform,
+            "device_name": device_name,
+            "registered_at": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+            "last_used": None,
+        }
+        log.info("push.register: new registration %s (platform=%s)", reg_id, platform)
+        await _broadcast({"type": "push.registered", "registration_id": reg_id, "platform": platform})
+        return {"ok": True, "registration_id": reg_id}
+
+    @app.delete("/api/v1/push/unregister")
+    async def push_unregister(request: Request, body: dict = {}) -> dict[str, Any]:
+        """Remove a device token registration.
+
+        Body: {device_token: str}
+        Returns: {ok: bool}
+        """
+        _require_scope(request, SCOPE_WRITE)
+        device_token = body.get("device_token", "").strip()
+        if not device_token:
+            raise HTTPException(status_code=400, detail="device_token is required")
+
+        to_remove = [
+            reg_id for reg_id, reg in _push_registrations.items()
+            if reg["device_token"] == device_token
+        ]
+        for reg_id in to_remove:
+            del _push_registrations[reg_id]
+            log.info("push.unregister: removed registration %s", reg_id)
+
+        if not to_remove:
+            raise HTTPException(status_code=404, detail="Device token not found")
+
+        await _broadcast({"type": "push.unregistered", "device_token": device_token})
+        return {"ok": True}
+
+    @app.get("/api/v1/push/registrations")
+    async def push_list_registrations(request: Request) -> dict[str, Any]:
+        """List all registered device tokens (admin view)."""
+        _require_scope(request, SCOPE_READ)
+        return {"registrations": list(_push_registrations.values())}
+
+    @app.post("/api/v1/push/test")
+    async def push_test(request: Request, body: dict = {}) -> dict[str, Any]:
+        """Send a test push notification to all registered devices (or a specific token).
+
+        Optional body: {device_token: str}
+        Returns: {ok: bool, message: str, sent_to: int}
+        """
+        _require_scope(request, SCOPE_WRITE)
+        target_token = body.get("device_token", None)
+
+        targets = [
+            reg for reg in _push_registrations.values()
+            if target_token is None or reg["device_token"] == target_token
+        ]
+        if not targets:
+            raise HTTPException(status_code=404, detail="No matching device registrations found")
+
+        # In a full deployment the controller would call APNs / FCM here.
+        # For now we broadcast the test event on the WebSocket so the mobile
+        # app receives it via its event stream if connected over the relay.
+        for reg in targets:
+            reg["last_used"] = __import__("datetime").datetime.utcnow().isoformat() + "Z"
+            await _broadcast({
+                "type": "push.test",
+                "registration_id": reg["id"],
+                "platform": reg["platform"],
+                "notification": {
+                    "title": "Ozma Test Notification",
+                    "body": "Push notifications are working correctly.",
+                    "event_type": "test",
+                },
+            })
+
+        log.info("push.test: sent test notification to %d device(s)", len(targets))
+        return {
+            "ok": True,
+            "message": f"Test notification sent to {len(targets)} device(s)",
+            "sent_to": len(targets),
+        }
+
+    # --- Guest invite endpoints ---
+    # Camera-only, time-limited access links for non-account holders.
+    # Tokens are kept in memory; a production deployment would persist them.
+
+    import secrets as _secrets
+    import datetime as _datetime
+
+    _guest_invites: dict[str, dict[str, Any]] = {}
+
+    def _make_invite_url(request: Request, invite_id: str, token: str) -> str:
+        """Build the invite URL using the request's base URL."""
+        base = str(request.base_url).rstrip("/")
+        return f"{base}/invite/{invite_id}?token={token}"
+
+    @app.get("/api/v1/guests")
+    async def guest_list(request: Request) -> dict[str, Any]:
+        """List all guest invites (active + expired, not revoked unless ?include_revoked=1)."""
+        _require_scope(request, SCOPE_READ)
+        include_revoked = request.query_params.get("include_revoked", "0") == "1"
+        invites = [
+            inv for inv in _guest_invites.values()
+            if include_revoked or not inv["revoked"]
+        ]
+        return {"invites": invites}
+
+    @app.post("/api/v1/guests/invite")
+    async def guest_create_invite(request: Request, body: dict = {}) -> dict[str, Any]:
+        """Create a new guest camera-only invite link.
+
+        Body:
+          label?: str            — display name for the invite
+          camera_ids?: list[str] — restrict to these cameras; [] = all
+          ttl?: int              — lifetime in seconds (default 604800 = 7 days)
+
+        Returns: {ok: bool, invite: GuestInvite}
+        """
+        _require_scope(request, SCOPE_WRITE)
+        label = body.get("label", None)
+        camera_ids: list[str] = body.get("camera_ids", [])
+        ttl: int = int(body.get("ttl", 604800))
+        if ttl < 60 or ttl > 86400 * 365:
+            raise HTTPException(status_code=400, detail="ttl must be between 60 seconds and 365 days")
+
+        invite_id = str(_uuid.uuid4())
+        token = _secrets.token_urlsafe(32)
+        now = _datetime.datetime.utcnow()
+        expires_at = (now + _datetime.timedelta(seconds=ttl)).isoformat() + "Z"
+
+        invite = {
+            "id": invite_id,
+            "invite_url": _make_invite_url(request, invite_id, token),
+            "token": token,  # kept server-side; not exposed in list endpoint
+            "expires_at": expires_at,
+            "camera_ids": camera_ids,
+            "label": label,
+            "created_by": getattr(getattr(request.state, "auth_ctx", None), "user_id", "api"),
+            "created_at": now.isoformat() + "Z",
+            "accepted_at": None,
+            "accepted_by_email": None,
+            "revoked": False,
+        }
+        _guest_invites[invite_id] = invite
+
+        # Expose invite without the server-side token.
+        public_invite = {k: v for k, v in invite.items() if k != "token"}
+        log.info("guest.invite: created invite %s (ttl=%ds label=%s)", invite_id, ttl, label)
+        await _broadcast({"type": "guest.invite.created", "invite_id": invite_id, "label": label})
+        return {"ok": True, "invite": public_invite}
+
+    @app.get("/api/v1/guests/invite/{invite_id}")
+    async def guest_get_invite(request: Request, invite_id: str) -> dict[str, Any]:
+        """Get a single invite by ID."""
+        _require_scope(request, SCOPE_READ)
+        invite = _guest_invites.get(invite_id)
+        if not invite:
+            raise HTTPException(status_code=404, detail="Invite not found")
+        return {k: v for k, v in invite.items() if k != "token"}
+
+    @app.delete("/api/v1/guests/invite/{invite_id}")
+    async def guest_revoke_invite(request: Request, invite_id: str) -> dict[str, Any]:
+        """Revoke a guest invite. The link stops working immediately."""
+        _require_scope(request, SCOPE_WRITE)
+        invite = _guest_invites.get(invite_id)
+        if not invite:
+            raise HTTPException(status_code=404, detail="Invite not found")
+        invite["revoked"] = True
+        log.info("guest.invite: revoked invite %s", invite_id)
+        await _broadcast({"type": "guest.invite.revoked", "invite_id": invite_id})
+        return {"ok": True}
+
+    @app.get("/invite/{invite_id}")
+    async def guest_invite_landing(invite_id: str, token: str = "") -> Any:
+        """Public invite landing page — validates token and marks invite accepted.
+
+        This endpoint is unauthenticated; it is accessed by recipients of the
+        invite link.  Returns 200 with redirect instructions on success, 403 on
+        invalid/expired/revoked token.
+        """
+        from fastapi.responses import JSONResponse
+        invite = _guest_invites.get(invite_id)
+        if not invite or invite["revoked"]:
+            return JSONResponse({"error": "Invite not found or revoked"}, status_code=403)
+        if invite["token"] != token:
+            return JSONResponse({"error": "Invalid token"}, status_code=403)
+        if _datetime.datetime.utcnow().isoformat() + "Z" > invite["expires_at"]:
+            return JSONResponse({"error": "Invite has expired"}, status_code=403)
+
+        if not invite["accepted_at"]:
+            invite["accepted_at"] = _datetime.datetime.utcnow().isoformat() + "Z"
+            await _broadcast({"type": "guest.invite.accepted", "invite_id": invite_id})
+
+        # Return enough info for the mobile app or browser to bootstrap.
+        return {
+            "ok": True,
+            "invite_id": invite_id,
+            "camera_ids": invite["camera_ids"],
+            "expires_at": invite["expires_at"],
+            "message": "Invite accepted. Open the Ozma app to view cameras.",
+        }
 
     # --- TCP tunnel endpoints ---
 
@@ -7206,6 +7473,45 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if not _cr().remove_policy(policy_id):
             raise HTTPException(404, "Policy not found")
         return {"deleted": policy_id}
+
+    # ── Node Backup Status ───────────────────────────────────────────────────
+
+    @app.post("/api/v1/nodes/{node_id}/backup-status")
+    async def node_backup_status_ingest(request: Request, node_id: str) -> dict[str, Any]:
+        """Accept a backup status report pushed by an agent running on the node."""
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        if backup_tracker:
+            backup_tracker.ingest(node_id, body)
+        return {"ok": True}
+
+    @app.get("/api/v1/backup/fleet")
+    async def backup_fleet_summary(request: Request) -> dict[str, Any]:
+        """Fleet-level backup health summary."""
+        _require_scope(request, SCOPE_READ)
+        if not backup_tracker:
+            raise HTTPException(503, "Backup tracking not configured")
+        return backup_tracker.get_fleet_summary().to_dict()
+
+    @app.get("/api/v1/backup/nodes/{node_id}")
+    async def backup_node_report(request: Request, node_id: str) -> dict[str, Any]:
+        """Per-node backup status."""
+        _require_scope(request, SCOPE_READ)
+        if not backup_tracker:
+            raise HTTPException(503, "Backup tracking not configured")
+        report = backup_tracker.get_node_report(node_id)
+        if not report:
+            raise HTTPException(404, "No backup report for this node")
+        return report.to_dict()
+
+    @app.delete("/api/v1/backup/nodes/{node_id}")
+    async def backup_node_remove(request: Request, node_id: str) -> dict[str, Any]:
+        """Remove a decommissioned node's backup records."""
+        _require_scope(request, SCOPE_WRITE)
+        if not backup_tracker:
+            raise HTTPException(503, "Backup tracking not configured")
+        backup_tracker.remove_node(node_id)
+        return {"deleted": node_id}
 
     # Static files — mounted last so they don't shadow API routes
     static_dir = Path(__file__).parent / "static"

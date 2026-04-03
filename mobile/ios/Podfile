@@ -1,0 +1,80 @@
+# Ozma iOS — CocoaPods configuration
+# React Native 0.73 + Firebase + react-native-video
+
+require_relative '../node_modules/react-native/scripts/react_native_pods'
+require_relative '../node_modules/@react-native-community/cli-platform-ios/native_modules'
+
+platform :ios, min_ios_version_supported
+prepare_react_native_project!
+
+# Flipper is disabled — uncomment if you need it during development
+# flipper_config = FlipperConfiguration.disabled
+
+linkage = ENV['USE_FRAMEWORKS']
+if linkage != nil
+  Pod::UI.puts "Enabled Frameworks Based Linking"
+  use_frameworks! :linkage => linkage.to_sym
+end
+
+target 'ozma' do
+  config = use_native_modules!
+
+  use_react_native!(
+    :path => config[:reactNativePath],
+    # Hermes is the default JS engine for RN 0.70+
+    :hermes_enabled => true,
+    :fabric_enabled => false,
+    # :flipper_configuration => flipper_config,
+    :app_path => "#{Pod::Config.instance.installation_root}/.."
+  )
+
+  # ── Firebase (FCM) ──────────────────────────────────────────────────────────
+  pod 'Firebase', :modular_headers => true
+  pod 'FirebaseCoreInternal', :modular_headers => true
+  pod 'GoogleUtilities', :modular_headers => true
+  pod 'FirebaseCore', :modular_headers => true
+  pod 'FirebaseMessaging', :modular_headers => true
+
+  # ── react-native-app-auth ───────────────────────────────────────────────────
+  # AppAuth is pulled in automatically via its podspec.
+
+  # ── react-native-video ──────────────────────────────────────────────────────
+  # Uses AVFoundation; HLS is natively supported on iOS.
+
+  # ── notifee ──────────────────────────────────────────────────────────────────
+  # @notifee/react-native auto-links via CocoaPods.
+
+  # ── react-native-mmkv ────────────────────────────────────────────────────────
+  # MMKV requires Swift — ensure the target has Swift enabled in Xcode.
+
+  target 'ozmaTests' do
+    inherit! :complete
+    # Add test pods here
+  end
+
+  post_install do |installer|
+    # Apply minimum iOS version to all pods
+    react_native_post_install(
+      installer,
+      config[:reactNativePath],
+      :mac_catalyst_enabled => false
+    )
+
+    installer.pods_project.targets.each do |target|
+      target.build_configurations.each do |config|
+        config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '13.4'
+        # Required for Xcode 15 / Swift interop
+        config.build_settings['GCC_PREPROCESSOR_DEFINITIONS'] ||= ['$(inherited)']
+      end
+    end
+
+    # Workaround for Xcode 14+ signing on simulator
+    installer.pods_project.targets.each do |target|
+      if target.respond_to?(:product_type) && target.product_type == 'com.apple.product-type.bundle'
+        target.build_configurations.each do |config|
+          config.build_settings['CODE_SIGNING_ALLOWED'] = 'NO'
+        end
+      end
+    end
+  end
+end
