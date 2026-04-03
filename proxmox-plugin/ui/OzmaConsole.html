@@ -1,362 +1,2248 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Ozma Console</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Ozma Remote</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
 <style>
-* { margin: 0; padding: 0; box-sizing: border-box; }
-html, body { height: 100%; background: #1a1a2e; color: #e0e0e0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; overflow: hidden; }
+:root {
+  --bg: #0a0a0f;
+  --surface: #111118;
+  --border: #1e2030;
+  --accent: #5b6fff;
+  --accent-dim: rgba(91,111,255,0.15);
+  --emerald: #4ae0a4;
+  --emerald-dim: rgba(74,224,164,0.12);
+  --text: #e2e8f0;
+  --muted: #64748b;
+  --red: #ef4444;
+  --yellow: #f59e0b;
+  --toolbar-h: 44px;
+  --strip-h: 72px;
+  --panel-w: 340px;
+  --radius: 6px;
+  --trans: 0.18s ease;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body {
+  width: 100%; height: 100%; overflow: hidden;
+  background: var(--bg); color: var(--text);
+  font: 13px/1.4 'Inter', system-ui, sans-serif;
+  -webkit-user-select: none; user-select: none;
+}
 
+/* ── Display area ──────────────────────────────────────────── */
+#display-wrap {
+  position: fixed; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: #000; overflow: hidden;
+  cursor: crosshair;
+}
+#display-inner {
+  position: relative;
+  transform-origin: center center;
+  line-height: 0;
+  transition: none;
+  flex-shrink: 0;
+}
+#display-inner.panning { cursor: grabbing !important; }
+#display-video, #display-img {
+  display: block;
+  image-rendering: auto;
+}
+#display-video { width: 100%; height: 100%; object-fit: contain; }
+#display-img   { display: block; width: auto; height: auto; }
+/* OCR canvas — rendered at VGA native resolution, scaled by parent transform */
+#ocr-canvas {
+  display: none;
+  image-rendering: pixelated;
+  image-rendering: -moz-crisp-edges;
+  image-rendering: crisp-edges;
+  cursor: default;
+}
+#display-offline {
+  display: none; flex-direction: column; align-items: center; gap: 16px;
+  color: var(--muted); font-size: 14px; text-align: center;
+  padding: 40px;
+}
+#display-offline .icon { font-size: 48px; opacity: 0.4; }
+#display-offline.show { display: flex; }
+
+/* ── Toolbar ───────────────────────────────────────────────── */
 #toolbar {
+  position: fixed; top: 0; left: 0; right: 0;
+  height: var(--toolbar-h);
+  background: linear-gradient(to bottom, rgba(0,0,0,0.85) 0%, transparent 100%);
+  display: flex; align-items: center; gap: 4px; padding: 0 10px;
+  z-index: 100;
+  transition: opacity var(--trans), transform var(--trans);
+}
+#toolbar.hidden {
+  opacity: 0; pointer-events: none;
+  transform: translateY(-6px);
+}
+.tb-left  { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0; }
+.tb-right { display: flex; align-items: center; gap: 2px; }
+.tb-divider { width: 1px; height: 20px; background: var(--border); margin: 0 4px; }
+/* Brand mark */
+.brand-mark {
+  display: flex; align-items: center; gap: 5px; flex-shrink: 0; text-decoration: none;
+}
+.brand-mark img { height: 18px; width: auto; display: block; }
+.brand-product {
+  font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--emerald); line-height: 1;
+}
+#node-name {
+  font-weight: 600; font-size: 13px; color: var(--text);
+  max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.stat-badge {
+  font-size: 11px; font-variant-numeric: tabular-nums;
+  padding: 2px 6px; border-radius: 3px;
+  background: rgba(255,255,255,0.07); color: var(--muted);
+  transition: color var(--trans);
+}
+.stat-badge.good { color: var(--emerald); }
+.stat-badge.warn { color: var(--yellow); }
+.stat-badge.bad  { color: var(--red); }
+.codec-badge {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.04em;
+  padding: 2px 6px; border-radius: 3px; text-transform: uppercase;
+  background: var(--emerald-dim); color: var(--emerald);
+}
+
+.tb-btn {
+  display: flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px; border-radius: var(--radius);
+  background: transparent; border: none; cursor: pointer;
+  color: var(--muted); font-size: 15px;
+  transition: background var(--trans), color var(--trans);
+  position: relative;
+}
+.tb-btn:hover { background: rgba(255,255,255,0.08); color: var(--text); }
+.tb-btn.active { background: var(--accent-dim); color: var(--accent); }
+.tb-btn.danger:hover { background: rgba(239,68,68,0.15); color: var(--red); }
+.tb-btn[title]:hover::after {
+  content: attr(title);
+  position: absolute; top: calc(100% + 6px); left: 50%;
+  transform: translateX(-50%);
+  background: #0a0c0f; color: var(--text); font-size: 11px;
+  padding: 3px 7px; border-radius: 4px; white-space: nowrap;
+  border: 1px solid var(--border); pointer-events: none; z-index: 200;
+}
+.tb-btn.recording { color: var(--red); animation: pulse-rec 1.2s infinite; }
+@keyframes pulse-rec { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+/* ── Special keys strip ────────────────────────────────────── */
+#keys-strip {
+  position: fixed; bottom: 0; left: 0; right: 0;
+  height: var(--strip-h); z-index: 100; overflow: hidden;
+  background: linear-gradient(to top, rgba(0,0,0,0.9) 0%, transparent 100%);
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 8px 10px 10px;
+  transition: opacity var(--trans), transform var(--trans);
+}
+#keys-strip.hidden { opacity: 0; pointer-events: none; transform: translateY(8px); }
+.keys-row { display: flex; gap: 3px; flex-wrap: nowrap; overflow-x: auto; }
+.keys-row::-webkit-scrollbar { display: none; }
+.key-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  height: 26px; min-width: 26px; padding: 0 7px;
+  font-size: 11px; font-weight: 600; white-space: nowrap;
+  background: rgba(255,255,255,0.07); border: 1px solid var(--border);
+  border-radius: 4px; cursor: pointer; color: var(--text);
+  transition: background var(--trans), border-color var(--trans), color var(--trans);
+  flex-shrink: 0;
+}
+.key-btn:hover { background: rgba(255,255,255,0.13); border-color: var(--accent); }
+.key-btn.mod-active {
+  background: var(--accent-dim); border-color: var(--accent); color: var(--accent);
+}
+.key-btn.combo { background: rgba(91,111,255,0.07); }
+.key-btn.combo:hover { background: var(--accent-dim); }
+
+/* ── Side panel ───────────────────────────────────────────── */
+.side-panel {
+  position: fixed; top: var(--toolbar-h); right: 0; bottom: 0;
+  width: var(--panel-w); z-index: 90;
+  background: var(--surface); border-left: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  transform: translateX(100%);
+  transition: transform 0.2s ease;
+  overflow: hidden;
+}
+.side-panel.open { transform: translateX(0); }
+.panel-header {
+  display: flex; align-items: center; padding: 12px 14px;
+  border-bottom: 1px solid var(--border); gap: 8px;
+  font-weight: 600; font-size: 13px; flex-shrink: 0;
+}
+.panel-header .panel-title { flex: 1; }
+.panel-close {
+  background: none; border: none; cursor: pointer;
+  color: var(--muted); font-size: 16px; padding: 2px 6px; border-radius: 3px;
+}
+.panel-close:hover { color: var(--text); background: rgba(255,255,255,0.07); }
+.panel-body { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 12px; }
+.panel-section { display: flex; flex-direction: column; gap: 6px; }
+.panel-label { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.panel-textarea {
+  width: 100%; resize: none; height: 120px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+  color: var(--text); font: 12px/1.5 monospace; padding: 8px;
+  outline: none;
+}
+.panel-textarea:focus { border-color: var(--accent); }
+.panel-btn {
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+  padding: 7px 12px; border-radius: var(--radius);
+  background: rgba(255,255,255,0.06); border: 1px solid var(--border);
+  color: var(--text); font-size: 12px; cursor: pointer;
+  transition: background var(--trans);
+}
+.panel-btn:hover { background: rgba(255,255,255,0.1); }
+.panel-btn.primary { background: var(--accent-dim); border-color: var(--accent); color: var(--accent); }
+.panel-btn.primary:hover { background: rgba(91,111,255,0.25); }
+.panel-row { display: flex; gap: 6px; }
+.panel-row .panel-btn { flex: 1; }
+.panel-info { font-size: 11px; color: var(--muted); line-height: 1.5; }
+.panel-info a { color: var(--accent); }
+
+/* File drop zone */
+#drop-zone {
+  border: 2px dashed var(--border); border-radius: var(--radius);
+  padding: 24px 16px; text-align: center; color: var(--muted); font-size: 12px;
+  cursor: pointer; transition: border-color var(--trans), background var(--trans);
+}
+#drop-zone.drag-over { border-color: var(--accent); background: var(--accent-dim); }
+#drop-zone .drop-icon { font-size: 28px; margin-bottom: 6px; display: block; }
+#file-list { display: flex; flex-direction: column; gap: 4px; }
+.file-item {
   display: flex; align-items: center; gap: 8px;
-  background: #16213e; padding: 4px 10px; height: 36px;
-  border-bottom: 1px solid #0f3460; z-index: 10; position: relative;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+  padding: 6px 10px; font-size: 11px;
 }
-#toolbar .title { font-weight: 600; font-size: 13px; color: #e94560; margin-right: 8px; }
-#toolbar .vmname { font-size: 13px; color: #aaa; }
-#toolbar .sep { width: 1px; height: 20px; background: #333; margin: 0 4px; }
-#toolbar button {
-  background: #0f3460; border: 1px solid #1a1a4e; color: #ccc;
-  padding: 3px 10px; border-radius: 3px; cursor: pointer; font-size: 12px;
-}
-#toolbar button:hover { background: #1a4a7e; color: #fff; }
-#toolbar button.active { background: #e94560; color: #fff; border-color: #e94560; }
-#toolbar .status { margin-left: auto; font-size: 11px; color: #888; font-family: monospace; }
+.file-item .file-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-progress { width: 100%; height: 3px; background: var(--border); border-radius: 2px; margin-top: 3px; }
+.file-progress-bar { height: 100%; background: var(--accent); border-radius: 2px; transition: width 0.3s; }
 
-#display {
-  position: absolute; top: 36px; left: 0; right: 0; bottom: 0;
-  display: flex; align-items: center; justify-content: center; background: #000;
+/* Sliders */
+.slider-row { display: flex; align-items: center; gap: 8px; }
+.slider-row label { min-width: 70px; font-size: 11px; color: var(--muted); }
+.slider-row span { min-width: 30px; text-align: right; font-size: 11px; font-variant-numeric: tabular-nums; }
+input[type=range] {
+  flex: 1; -webkit-appearance: none; height: 4px;
+  background: var(--border); border-radius: 2px; outline: none; cursor: pointer;
 }
-#display video {
-  max-width: 100%; max-height: 100%; outline: none;
+input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%;
+  background: var(--accent); cursor: pointer;
 }
-#display img {
-  max-width: 100%; max-height: 100%; display: none;
+.radio-group { display: flex; gap: 4px; flex-wrap: wrap; }
+.radio-btn {
+  padding: 4px 10px; border-radius: 4px; font-size: 11px; font-weight: 600;
+  background: rgba(255,255,255,0.05); border: 1px solid var(--border);
+  cursor: pointer; color: var(--muted);
+  transition: background var(--trans), color var(--trans), border-color var(--trans);
 }
-#display.kvm-mouse video, #display.kvm-mouse img { cursor: crosshair; }
+.radio-btn.active { background: var(--accent-dim); border-color: var(--accent); color: var(--accent); }
 
-/* Fullscreen */
-:fullscreen #toolbar { display: none; }
-:fullscreen #display { top: 0; }
-
-/* Bitrate slider */
-#bitrate-panel {
-  display: none; position: absolute; top: 36px; right: 0; z-index: 20;
-  background: #16213e; border: 1px solid #0f3460; padding: 10px; width: 200px;
+/* Stats table */
+.stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.stat-card {
+  background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 8px 10px;
 }
-#bitrate-panel.open { display: block; }
-#bitrate-panel input { width: 100%; }
-#bitrate-panel .label { font-size: 11px; color: #888; text-align: center; margin-top: 4px; }
+.stat-card .stat-val { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--accent); }
+.stat-card .stat-lbl { font-size: 10px; color: var(--muted); margin-top: 1px; }
 
-/* Audio unmute banner */
-#audio-banner {
-  display: none; position: absolute; top: 40px; left: 50%; transform: translateX(-50%);
-  background: rgba(233,69,96,0.9); color: #fff; padding: 6px 16px; border-radius: 4px;
-  font-size: 12px; cursor: pointer; z-index: 15;
+/* Gamepad indicators */
+.gamepad-list { display: flex; flex-direction: column; gap: 6px; }
+.gamepad-item {
+  display: flex; align-items: center; gap: 8px; padding: 8px 10px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+  font-size: 12px;
+}
+.gamepad-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+.gamepad-dot.connected { background: var(--emerald); }
+
+/* Volume indicator */
+.volume-row { display: flex; align-items: center; gap: 8px; }
+.vol-icon { font-size: 16px; cursor: pointer; min-width: 20px; }
+
+/* Pointer lock indicator */
+#pointer-lock-indicator {
+  position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  background: rgba(0,0,0,0.8); color: var(--text); font-size: 13px;
+  padding: 12px 20px; border-radius: 8px; border: 1px solid var(--border);
+  pointer-events: none; z-index: 200; opacity: 0;
+  transition: opacity 0.3s;
+}
+#pointer-lock-indicator.show { opacity: 1; }
+
+/* Connection overlay */
+#conn-overlay {
+  position: fixed; inset: 0; z-index: 50;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  background: rgba(0,0,0,0.6); gap: 12px; font-size: 14px; color: var(--muted);
+  transition: opacity 0.3s;
+}
+#conn-overlay.hidden { opacity: 0; pointer-events: none; }
+.spinner {
+  width: 32px; height: 32px; border-radius: 50%;
+  border: 3px solid var(--border); border-top-color: var(--emerald);
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Toast */
+#toast {
+  position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%) translateY(10px);
+  background: var(--surface); border: 1px solid var(--border);
+  color: var(--text); font-size: 12px; padding: 8px 16px; border-radius: 6px;
+  opacity: 0; pointer-events: none; z-index: 300;
+  transition: opacity 0.2s, transform 0.2s;
+  max-width: 300px; text-align: center;
+}
+#toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* Zoom indicator */
+#zoom-display {
+  position: fixed; bottom: 85px; right: 16px;
+  background: rgba(0,0,0,0.7); color: var(--text); font-size: 12px; font-weight: 600;
+  padding: 4px 10px; border-radius: 4px; opacity: 0;
+  transition: opacity 0.3s; pointer-events: none; z-index: 200;
+}
+#zoom-display.show { opacity: 1; }
+
+/* View-only banner */
+#viewonly-banner {
+  position: fixed; top: var(--toolbar-h); left: 50%; transform: translateX(-50%);
+  background: rgba(245,158,11,0.15); border: 1px solid rgba(245,158,11,0.4);
+  color: var(--yellow); font-size: 11px; font-weight: 600; letter-spacing: 0.04em;
+  padding: 3px 12px; border-radius: 0 0 6px 6px; z-index: 80;
+  display: none;
+}
+
+/* Mobile virtual keyboard input */
+#vkbd-input {
+  position: fixed; left: -9999px; top: -9999px;
+  width: 1px; height: 1px; opacity: 0; font-size: 16px;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+/* Mobile tweaks */
+@media (max-width: 600px) {
+  :root { --panel-w: 100vw; --toolbar-h: 48px; }
+  .tb-btn { width: 34px; height: 34px; font-size: 16px; }
+  #node-name { max-width: 80px; }
 }
 </style>
 </head>
 <body>
 
+<!-- Hidden input for mobile virtual keyboard -->
+<input id="vkbd-input" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+
+<!-- Display -->
+<div id="display-wrap">
+  <div id="display-inner">
+    <video id="display-video" autoplay playsinline muted></video>
+    <img  id="display-img" alt="">
+    <canvas id="ocr-canvas"></canvas>
+  </div>
+  <div id="display-offline">
+    <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 0.5L14.5 4.25V11.75L8 15.5L1.5 11.75V4.25Z' fill='none' stroke='%234ae0a4' stroke-width='3' stroke-linejoin='round'/%3E%3C/svg%3E" alt="Ozma" style="height:44px;opacity:0.3;margin-bottom:4px">
+    <span id="offline-msg">No stream available</span>
+    <button class="panel-btn" onclick="reconnect()" style="margin-top:4px">Reconnect</button>
+  </div>
+</div>
+
+<!-- Connection overlay -->
+<div id="conn-overlay">
+  <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 0.5L14.5 4.25V11.75L8 15.5L1.5 11.75V4.25Z' fill='none' stroke='%234ae0a4' stroke-width='3' stroke-linejoin='round'/%3E%3C/svg%3E" alt="Ozma" style="height:36px;opacity:0.6;margin-bottom:4px">
+  <div class="spinner"></div>
+  <span id="conn-status">Connecting…</span>
+</div>
+
+<!-- Toolbar -->
 <div id="toolbar">
-  <span class="title">OZMA</span>
-  <span class="vmname" id="vmname">VM</span>
-  <span class="sep"></span>
-  <button id="btn-kbd" class="active" title="Keyboard capture">Keyboard</button>
-  <button id="btn-mouse" title="Mouse capture">Mouse</button>
-  <span class="sep"></span>
-  <button id="btn-audio" title="Unmute audio">Audio</button>
-  <button id="btn-bitrate" title="Bitrate control">Bitrate</button>
-  <button id="btn-fullscreen" title="Fullscreen">Fullscreen</button>
-  <span class="sep"></span>
-  <button id="btn-screenshot" title="Save screenshot">Screenshot</button>
-  <button id="btn-ctrlaltdel" title="Send Ctrl+Alt+Del">Ctrl+Alt+Del</button>
-  <span class="status" id="status">connecting...</span>
+  <div class="tb-left">
+    <a class="brand-mark" href="#" title="Ozma">
+      <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 0.5L14.5 4.25V11.75L8 15.5L1.5 11.75V4.25Z' fill='none' stroke='%234ae0a4' stroke-width='3' stroke-linejoin='round'/%3E%3C/svg%3E" alt="Ozma">
+      <span class="brand-product">Remote</span>
+    </a>
+    <span class="tb-divider"></span>
+    <span id="node-name">—</span>
+    <span class="tb-divider"></span>
+    <span id="stat-fps"   class="stat-badge">— fps</span>
+    <span id="stat-lat"   class="stat-badge">— ms</span>
+    <span id="stat-bw"    class="stat-badge" style="display:none">— kb/s</span>
+    <span id="stat-codec" class="codec-badge">—</span>
+  </div>
+  <div class="tb-right">
+    <!-- Key sequences -->
+    <button class="tb-btn" id="btn-cad"   title="Ctrl+Alt+Del" onclick="sendSequence('ctrl_alt_del')">⌫</button>
+    <button class="tb-btn" id="btn-win"   title="Win key"       onclick="sendSequence('win')">⊞</button>
+    <button class="tb-btn" id="btn-keys"  title="Special keys (K)" onclick="toggleStrip()">⌨</button>
+    <span class="tb-divider"></span>
+    <!-- Panels -->
+    <button class="tb-btn" id="btn-audio"     title="Audio"           onclick="togglePanel('audio')">🔇</button>
+    <button class="tb-btn" id="btn-clipboard" title="Clipboard (C)"   onclick="togglePanel('clipboard')">📋</button>
+    <button class="tb-btn" id="btn-file"      title="File transfer"   onclick="togglePanel('file')">📁</button>
+    <button class="tb-btn" id="btn-perf"      title="Performance"     onclick="togglePanel('perf')">⚡</button>
+    <button class="tb-btn" id="btn-gamepad"   title="Gamepad"         onclick="togglePanel('gamepad')">🎮</button>
+    <span class="tb-divider"></span>
+    <!-- Actions -->
+    <button class="tb-btn" id="btn-screenshot" title="Screenshot"          onclick="takeScreenshot()">📷</button>
+    <button class="tb-btn" id="btn-record"     title="Record session"       onclick="toggleRecord()">●</button>
+    <button class="tb-btn" id="btn-share"      title="Copy view-only link"  onclick="copyShareLink()">🔗</button>
+    <button class="tb-btn" id="btn-zoom-out"   title="Zoom out (-)"         onclick="adjustZoom(-0.25)">−</button>
+    <button class="tb-btn" id="btn-zoom-fit"   title="Fit to window (F)"    onclick="setScaleMode('fit')">⊡</button>
+    <button class="tb-btn" id="btn-zoom-in"    title="Zoom in (+)"          onclick="adjustZoom(0.25)">+</button>
+    <button class="tb-btn" id="btn-fullscreen" title="Fullscreen (F11)"     onclick="toggleFullscreen()">⛶</button>
+    <span class="tb-divider"></span>
+    <button class="tb-btn danger" id="btn-disc" title="Disconnect" onclick="disconnect()">✕</button>
+  </div>
 </div>
 
-<div id="display">
-  <video id="screen-video" autoplay playsinline muted></video>
-  <img id="screen-img" />
+<!-- Special keys strip -->
+<div id="keys-strip" class="hidden">
+  <div class="keys-row" id="keys-row-fn">
+    <button class="key-btn" onclick="sendKey('Escape')">Esc</button>
+    <button class="key-btn" onclick="sendKey('Tab')">Tab</button>
+    <button class="key-btn" onclick="sendKey('CapsLock')">Caps</button>
+    <button class="key-btn" onclick="sendKey('F1')">F1</button>
+    <button class="key-btn" onclick="sendKey('F2')">F2</button>
+    <button class="key-btn" onclick="sendKey('F3')">F3</button>
+    <button class="key-btn" onclick="sendKey('F4')">F4</button>
+    <button class="key-btn" onclick="sendKey('F5')">F5</button>
+    <button class="key-btn" onclick="sendKey('F6')">F6</button>
+    <button class="key-btn" onclick="sendKey('F7')">F7</button>
+    <button class="key-btn" onclick="sendKey('F8')">F8</button>
+    <button class="key-btn" onclick="sendKey('F9')">F9</button>
+    <button class="key-btn" onclick="sendKey('F10')">F10</button>
+    <button class="key-btn" onclick="sendKey('F11')">F11</button>
+    <button class="key-btn" onclick="sendKey('F12')">F12</button>
+    <button class="key-btn" onclick="sendKey('PrintScreen')">PrtSc</button>
+    <button class="key-btn" onclick="sendKey('ScrollLock')">ScrlLk</button>
+    <button class="key-btn" onclick="sendKey('Pause')">Pause</button>
+    <button class="key-btn" onclick="sendKey('Insert')">Ins</button>
+    <button class="key-btn" onclick="sendKey('Delete')">Del</button>
+    <button class="key-btn" onclick="sendKey('Home')">Home</button>
+    <button class="key-btn" onclick="sendKey('End')">End</button>
+    <button class="key-btn" onclick="sendKey('PageUp')">PgUp</button>
+    <button class="key-btn" onclick="sendKey('PageDown')">PgDn</button>
+  </div>
+  <div class="keys-row" id="keys-row-mods">
+    <button class="key-btn" id="mod-ctrl"  onclick="toggleStickyMod('ctrl',  'ControlLeft')">Ctrl</button>
+    <button class="key-btn" id="mod-alt"   onclick="toggleStickyMod('alt',   'AltLeft')">Alt</button>
+    <button class="key-btn" id="mod-shift" onclick="toggleStickyMod('shift', 'ShiftLeft')">Shift</button>
+    <button class="key-btn" id="mod-win"   onclick="toggleStickyMod('win',   'MetaLeft')">⊞ Win</button>
+    <span style="flex:1"></span>
+    <button class="key-btn combo" onclick="sendSequence('ctrl_alt_del')">Ctrl+Alt+Del</button>
+    <button class="key-btn combo" onclick="sendSequence('alt_f4')">Alt+F4</button>
+    <button class="key-btn combo" onclick="sendSequence('alt_tab')">Alt+Tab</button>
+    <button class="key-btn combo" onclick="sendCombo(['ControlLeft'], 'KeyA')">Ctrl+A</button>
+    <button class="key-btn combo" onclick="sendCombo(['ControlLeft'], 'KeyC')">Ctrl+C</button>
+    <button class="key-btn combo" onclick="sendCombo(['ControlLeft'], 'KeyV')">Ctrl+V</button>
+    <button class="key-btn combo" onclick="sendCombo(['ControlLeft'], 'KeyX')">Ctrl+X</button>
+    <button class="key-btn combo" onclick="sendCombo(['ControlLeft'], 'KeyZ')">Ctrl+Z</button>
+    <button class="key-btn combo" onclick="sendCombo(['ControlLeft', 'ShiftLeft'], 'KeyT')">Ctrl+Shift+T</button>
+  </div>
 </div>
 
-<div id="bitrate-panel">
-  <input type="range" id="bitrate-slider" min="0" max="50000" step="500" value="0">
-  <div class="label" id="bitrate-label">Auto</div>
+<!-- View-only banner -->
+<div id="viewonly-banner">👁 VIEW ONLY</div>
+
+<!-- Pointer lock indicator -->
+<div id="pointer-lock-indicator">Pointer locked · ESC to release</div>
+
+<!-- Zoom indicator -->
+<div id="zoom-display">100%</div>
+
+<!-- Toast -->
+<div id="toast"></div>
+
+<!-- ── Clipboard panel ───────────────────────────────────────── -->
+<div class="side-panel" id="panel-clipboard">
+  <div class="panel-header">
+    <span>📋</span>
+    <span class="panel-title">Clipboard</span>
+    <button class="panel-close" onclick="closePanel()">✕</button>
+  </div>
+  <div class="panel-body">
+    <div class="panel-section">
+      <div class="panel-label">Paste to guest</div>
+      <textarea class="panel-textarea" id="paste-text" placeholder="Type or paste text here, then click Send…"></textarea>
+      <div class="panel-row">
+        <button class="panel-btn primary" onclick="sendPasteText()">⌨ Send as typing</button>
+        <button class="panel-btn" onclick="document.getElementById('paste-text').value=''">Clear</button>
+      </div>
+      <div class="panel-info">Sends text character by character via HID keystroke injection. Works at BIOS level — no clipboard protocol needed. Up to 10,000 characters.</div>
+    </div>
+    <div class="panel-section">
+      <div class="panel-label">Read from guest</div>
+      <textarea class="panel-textarea" id="read-text" placeholder="Guest clipboard will appear here…" readonly></textarea>
+      <div class="panel-row">
+        <button class="panel-btn" onclick="readGuestClipboard()">🔍 Read from agent</button>
+        <button class="panel-btn" onclick="readScreenOcr()">👁 OCR screen</button>
+      </div>
+      <div class="panel-info" id="clipboard-source"></div>
+    </div>
+  </div>
 </div>
 
-<div id="audio-banner" onclick="unmute()">Click to enable audio</div>
+<!-- ── File transfer panel ──────────────────────────────────── -->
+<div class="side-panel" id="panel-file">
+  <div class="panel-header">
+    <span>📁</span>
+    <span class="panel-title">File Transfer</span>
+    <button class="panel-close" onclick="closePanel()">✕</button>
+  </div>
+  <div class="panel-body">
+    <div class="panel-section">
+      <div class="panel-label">Send to guest</div>
+      <div id="drop-zone" onclick="document.getElementById('file-input').click()"
+           ondragover="dropZoneDragOver(event)" ondragleave="dropZoneDragLeave(event)"
+           ondrop="dropZoneDrop(event)">
+        <span class="drop-icon">📂</span>
+        Drag files here or click to browse
+      </div>
+      <input type="file" id="file-input" multiple style="display:none" onchange="fileInputChange(event)">
+      <div id="file-list"></div>
+    </div>
+    <div class="panel-section">
+      <div class="panel-label">Transfer mode</div>
+      <div class="radio-group">
+        <div class="radio-btn active" id="fmode-usb" onclick="setFileMode('usb')">USB storage</div>
+        <div class="radio-btn" id="fmode-type" onclick="setFileMode('type')">Type content</div>
+      </div>
+      <div class="panel-info" id="fmode-info">Files are injected as a virtual USB mass storage device. The guest will see a USB drive appear with your files.</div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Performance panel ────────────────────────────────────── -->
+<div class="side-panel" id="panel-perf">
+  <div class="panel-header">
+    <span>⚡</span>
+    <span class="panel-title">Performance</span>
+    <button class="panel-close" onclick="closePanel()">✕</button>
+  </div>
+  <div class="panel-body">
+    <div class="panel-section">
+      <div class="panel-label">Live stats</div>
+      <div class="stats-grid">
+        <div class="stat-card"><div class="stat-val" id="stat-fps-card">—</div><div class="stat-lbl">Frames/sec</div></div>
+        <div class="stat-card"><div class="stat-val" id="stat-lat-card">—</div><div class="stat-lbl">Latency ms</div></div>
+        <div class="stat-card"><div class="stat-val" id="stat-bw-card">—</div><div class="stat-lbl">kb/s in</div></div>
+        <div class="stat-card"><div class="stat-val" id="stat-codec-card">—</div><div class="stat-lbl">Codec</div></div>
+      </div>
+    </div>
+    <div class="panel-section">
+      <div class="panel-label">Video source</div>
+      <div class="radio-group">
+        <div class="radio-btn" id="vsrc-webrtc" onclick="switchSource('webrtc')">WebRTC</div>
+        <div class="radio-btn" id="vsrc-hls"    onclick="switchSource('hls')">HLS</div>
+        <div class="radio-btn" id="vsrc-mjpeg"  onclick="switchSource('mjpeg')">MJPEG</div>
+      </div>
+    </div>
+    <div class="panel-section">
+      <div class="panel-label">Encoder
+        <span id="enc-probe-status" style="font-weight:400;color:var(--muted);margin-left:6px"></span>
+      </div>
+      <div id="encoder-current" class="panel-info" style="margin-bottom:6px">—</div>
+      <div class="radio-group" id="encoder-list">
+        <div class="radio-btn active" id="enc-auto" onclick="setEncoder('auto')">Auto</div>
+      </div>
+      <div class="panel-row" style="margin-top:6px">
+        <button class="panel-btn" onclick="applyEncoder()">⚡ Apply encoder</button>
+        <button class="panel-btn" onclick="probeEncoders(true)">🔍 Probe</button>
+      </div>
+      <label style="display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer;margin-top:6px;">
+        <input type="checkbox" id="adaptive-toggle" onchange="setAdaptive(this.checked)">
+        Auto-switch on high CPU (adaptive)
+      </label>
+    </div>
+    <div class="panel-section">
+      <div class="panel-label">Codec family</div>
+      <div class="radio-group">
+        <div class="radio-btn active" id="codec-h264" onclick="setCodecFamily('h264')">H.264</div>
+        <div class="radio-btn" id="codec-h265"  onclick="setCodecFamily('h265')">H.265</div>
+        <div class="radio-btn" id="codec-av1"   onclick="setCodecFamily('av1')">AV1</div>
+        <div class="radio-btn" id="codec-vp9"   onclick="setCodecFamily('vp9')">VP9</div>
+        <div class="radio-btn" id="codec-ocr"   onclick="setCodecFamily('ocr')" title="VGA bitmap OCR — pixel-perfect text, ~0 bandwidth">OCR</div>
+      </div>
+    </div>
+    <div id="ocr-info-box" style="display:none;padding:8px 10px;background:rgba(59,130,246,.08);border-radius:6px;font-size:11px;color:var(--accent);border:1px solid rgba(59,130,246,.2);line-height:1.5">
+      ◈ <strong>OCR Terminal mode</strong><br>
+      Pixel-perfect VGA bitmap rendering.<br>
+      No video stream — uses text OCR at ~30fps.<br>
+      Ideal for BIOS, console, installers.
+    </div>
+    <div id="video-codec-controls">
+    <div class="panel-section">
+      <div class="panel-label">Bitrate</div>
+      <div class="radio-group" id="bitrate-group">
+        <div class="radio-btn" onclick="setBitrate('512k')">512k</div>
+        <div class="radio-btn" onclick="setBitrate('2M')">2M</div>
+        <div class="radio-btn active" onclick="setBitrate('4M')">4M</div>
+        <div class="radio-btn" onclick="setBitrate('8M')">8M</div>
+        <div class="radio-btn" onclick="setBitrate('15M')">15M</div>
+        <div class="radio-btn" onclick="setBitrate('30M')">30M</div>
+      </div>
+    </div>
+    <div class="panel-section">
+      <div class="panel-label">Latency mode</div>
+      <div class="radio-group">
+        <div class="radio-btn active" id="lat-realtime" onclick="setLatencyMode('realtime')">Realtime</div>
+        <div class="radio-btn" id="lat-balanced" onclick="setLatencyMode('balanced')">Balanced</div>
+        <div class="radio-btn" id="lat-quality"  onclick="setLatencyMode('quality')">Quality</div>
+      </div>
+    </div>
+    </div><!-- /video-codec-controls -->
+    <div class="panel-section">
+      <div class="panel-label">Scaling</div>
+      <div class="radio-group">
+        <div class="radio-btn active" id="scale-fit"   onclick="setScaleMode('fit')">Fit</div>
+        <div class="radio-btn" id="scale-fill"  onclick="setScaleMode('fill')">Fill</div>
+        <div class="radio-btn" id="scale-100"   onclick="setScaleMode('100')">100%</div>
+      </div>
+    </div>
+    <div class="panel-section">
+      <div class="panel-label">Zoom level</div>
+      <div class="slider-row">
+        <label>Zoom</label>
+        <input type="range" id="zoom-slider" min="25" max="400" value="100" step="25"
+               oninput="setZoomSlider(this.value)">
+        <span id="zoom-val">100%</span>
+      </div>
+    </div>
+    <div class="panel-section">
+      <div class="panel-label">Image quality</div>
+      <div class="slider-row">
+        <label>Quality</label>
+        <input type="range" id="quality-slider" min="1" max="10" value="7" step="1"
+               oninput="setQuality(this.value)">
+        <span id="quality-val">7</span>
+      </div>
+      <div class="panel-info">Affects MJPEG/HLS quality. Lower = faster, higher = sharper.</div>
+    </div>
+    <div class="panel-section">
+      <div class="panel-label">Options</div>
+      <label style="display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer;">
+        <input type="checkbox" id="rel-mouse" onchange="toggleRelMouse(this.checked)">
+        Relative mouse mode (for games/FPS)
+      </label>
+      <label style="display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer;margin-top:4px;">
+        <input type="checkbox" id="pixel-perfect" onchange="togglePixelPerfect(this.checked)">
+        Pixel-perfect rendering (disable smoothing)
+      </label>
+    </div>
+  </div>
+</div>
+
+<!-- ── Gamepad panel ─────────────────────────────────────────── -->
+<div class="side-panel" id="panel-gamepad">
+  <div class="panel-header">
+    <span>🎮</span>
+    <span class="panel-title">Gamepad</span>
+    <button class="panel-close" onclick="closePanel()">✕</button>
+  </div>
+  <div class="panel-body">
+    <div class="panel-section">
+      <div class="panel-label">Connected gamepads</div>
+      <div class="gamepad-list" id="gamepad-list">
+        <div style="color:var(--muted);font-size:12px;">No gamepads detected. Connect a gamepad and press a button.</div>
+      </div>
+    </div>
+    <div class="panel-section">
+      <div class="panel-label">Mapping</div>
+      <div class="panel-info">
+        <b>Left stick</b> → mouse movement<br>
+        <b>Right stick Y</b> → scroll<br>
+        <b>D-pad</b> → arrow keys<br>
+        <b>A/B/X/Y</b> → left/right/middle/back click<br>
+        <b>LB/RB</b> → browser back/forward<br>
+        <b>Start</b> → Enter · <b>Select</b> → Escape
+      </div>
+    </div>
+    <div class="panel-section">
+      <label style="display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer;">
+        <input type="checkbox" id="gamepad-enabled" checked onchange="setGamepadEnabled(this.checked)">
+        Enable gamepad passthrough
+      </label>
+      <div class="slider-row" style="margin-top:8px">
+        <label>Mouse speed</label>
+        <input type="range" id="gpad-speed" min="1" max="50" value="20" step="1"
+               oninput="document.getElementById('gpad-speed-val').textContent=this.value">
+        <span id="gpad-speed-val">20</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Audio panel ───────────────────────────────────────────── -->
+<div class="side-panel" id="panel-audio">
+  <div class="panel-header">
+    <span>🔊</span>
+    <span class="panel-title">Audio</span>
+    <button class="panel-close" onclick="closePanel()">✕</button>
+  </div>
+  <div class="panel-body">
+    <div class="panel-section">
+      <div class="panel-label">Playback</div>
+      <div class="volume-row">
+        <span class="vol-icon" onclick="toggleMute()" id="vol-icon">🔊</span>
+        <input type="range" id="vol-slider" min="0" max="100" value="100"
+               oninput="setVolume(this.value)">
+        <span id="vol-val">100%</span>
+      </div>
+      <div id="audio-status" class="panel-info" style="margin-top:4px">
+        Audio is carried by the WebRTC stream. If you're on HLS/MJPEG fallback, audio is not available.
+      </div>
+    </div>
+    <div class="panel-section">
+      <div class="panel-label">Status</div>
+      <div id="audio-codec-info" class="panel-info">—</div>
+    </div>
+  </div>
+</div>
 
 <script>
-const $ = id => document.getElementById(id);
+'use strict';
 
-// Parse URL params: ?vmid=100&host=192.168.x.x&port=7490
-const params = new URLSearchParams(location.search);
-const VMID = params.get('vmid') || '100';
-const HOST = params.get('host') || location.hostname;
-const API_PORT = parseInt(params.get('port') || (7390 + parseInt(VMID)));
-const VMNAME = params.get('name') || `VM ${VMID}`;
+// ── Config from URL ───────────────────────────────────────────
+const params   = new URLSearchParams(location.search);
+const nodeId   = params.get('node') || location.pathname.replace(/.*\/console\//,'').replace(/\//g,'') || '';
+const viewOnly = params.has('view_only');
+const apiBase  = params.get('api') || '';  // same origin, or explicit controller URL
+const wsProto  = location.protocol === 'https:' ? 'wss:' : 'ws:';
 
-// If accessed via /ozma/console/ (reverse proxy), use relative /ozma/ paths
-// If accessed directly on the display service port, use root /
-const isProxied = location.pathname.startsWith('/ozma/');
-const BASE = params.get('base') || (isProxied ? '/ozma' : '');
-const INPUT_BASE = BASE;
-
-$('vmname').textContent = `${VMNAME} (${VMID})`;
-document.title = `Ozma Console — ${VMNAME}`;
-
-// ── State ───────────────────────────────────────────────
-let kbdActive = true, mouseActive = false;
-let pc = null;
-const heldKeys = new Set();
-
-// ── Keycode mapping (evdev scancodes) ───────────────────
-const KEYMAP = {
-  Escape:1, Digit1:2, Digit2:3, Digit3:4, Digit4:5, Digit5:6, Digit6:7,
-  Digit7:8, Digit8:9, Digit9:10, Digit0:11, Minus:12, Equal:13, Backspace:14,
-  Tab:15, KeyQ:16, KeyW:17, KeyE:18, KeyR:19, KeyT:20, KeyY:21, KeyU:22,
-  KeyI:23, KeyO:24, KeyP:25, BracketLeft:26, BracketRight:27, Enter:28,
-  ControlLeft:29, KeyA:30, KeyS:31, KeyD:32, KeyF:33, KeyG:34, KeyH:35,
-  KeyJ:36, KeyK:37, KeyL:38, Semicolon:39, Quote:40, Backquote:41,
-  ShiftLeft:42, Backslash:43, KeyZ:44, KeyX:45, KeyC:46, KeyV:47, KeyB:48,
-  KeyN:49, KeyM:50, Comma:51, Period:52, Slash:53, ShiftRight:54,
-  NumpadMultiply:55, AltLeft:56, Space:57, CapsLock:58,
-  F1:59, F2:60, F3:61, F4:62, F5:63, F6:64, F7:65, F8:66, F9:67, F10:68,
-  NumLock:69, ScrollLock:70,
-  Numpad7:71, Numpad8:72, Numpad9:73, NumpadSubtract:74,
-  Numpad4:75, Numpad5:76, Numpad6:77, NumpadAdd:78,
-  Numpad1:79, Numpad2:80, Numpad3:81, Numpad0:82, NumpadDecimal:83,
-  F11:87, F12:88,
-  NumpadEnter:96, ControlRight:97, NumpadDivide:98, PrintScreen:99,
-  AltRight:100, Home:102, ArrowUp:103, PageUp:104, ArrowLeft:105,
-  ArrowRight:106, End:107, ArrowDown:108, PageDown:109,
-  Insert:110, Delete:111, MetaLeft:125, MetaRight:126,
+// ── State ─────────────────────────────────────────────────────
+const S = {
+  ws: null,
+  pc: null,          // RTCPeerConnection
+  hls: null,         // Hls instance
+  videoMode: 'none', // 'webrtc'|'hls'|'mjpeg'
+  audioEnabled: true,
+  muted: false,
+  volume: 1.0,
+  audioCtx: null,
+  gainNode: null,
+  scaleMode: 'fit',  // 'fit'|'fill'|'100'|'zoom'
+  zoom: 1.0,
+  panX: 0, panY: 0,
+  isPanning: false, panStartX: 0, panStartY: 0,
+  relMouse: false,
+  mouseAbsX: 16383, mouseAbsY: 16383,
+  mouseButtons: 0,
+  modifiers: 0,
+  pressedKeys: [],
+  stickyMods: {},    // {code: bool}
+  stripVisible: false,
+  activePanel: null,
+  gamepadEnabled: true,
+  gamepadRAF: null,
+  prevGamepadState: {},
+  recording: false,
+  recordChunks: [],
+  recordStream: null,
+  mediaRecorder: null,
+  fileMode: 'usb',
+  stats: { fps: 0, lat: 0, bw: 0, codec: '—' },
+  ocrMode: false,
+  frameCount: 0,
+  lastFpsSample: performance.now(),
+  prevBytesIn: 0,
+  latencyTs: 0,
+  connected: false,
+  toolbarTimer: null,
+  pixelPerfect: false,
 };
 
-// ── WebRTC ──────────────────────────────────────────────
+// ── DOM shortcuts ─────────────────────────────────────────────
+const $  = id => document.getElementById(id);
+const qs = sel => document.querySelector(sel);
+
+const displayWrap    = $('display-wrap');
+const displayInner   = $('display-inner');
+const displayVideo   = $('display-video');
+const displayImg     = $('display-img');
+const displayOff     = $('display-offline');
+const displayOcrCvs  = $('ocr-canvas');
+const toolbar      = $('toolbar');
+const keysStrip    = $('keys-strip');
+const connOverlay  = $('conn-overlay');
+const connStatus   = $('conn-status');
+
+// ── Init ──────────────────────────────────────────────────────
+function init() {
+  if (!nodeId) { showOffline('No node specified — add ?node=<id> to the URL'); return; }
+  document.title = `${nodeId} · Ozma Remote`;
+  $('node-name').textContent = nodeId;
+  if (viewOnly) {
+    $('viewonly-banner').style.display = 'block';
+    toolbar.querySelectorAll('.tb-btn:not(#btn-fullscreen):not(#btn-disc)').forEach(b => {
+      if (!['btn-perf','btn-screenshot','btn-share'].includes(b.id)) b.style.display = 'none';
+    });
+  }
+  showConnOverlay('Connecting…');
+  startInputWs();
+  startVideoChain();
+  startToolbarAutoHide();
+  startGamepadPoll();
+  startStatsLoop();
+  startFpsCounter();
+  setupKeyboard();
+  setupMouse();
+  setupTouch();
+  setupPointerLock();
+  setupDragDrop();
+  window.addEventListener('resize', applyScaling);
+  window.addEventListener('gamepadconnected', onGamepadConnected);
+  window.addEventListener('gamepaddisconnected', onGamepadDisconnected);
+  document.addEventListener('fullscreenchange', onFullscreenChange);
+  document.addEventListener('pointerlockchange', onPointerLockChange);
+  // Keyboard shortcut hints
+  document.addEventListener('keydown', globalKeyDown, true);
+
+  // Ensure this window/frame captures keyboard focus (critical when embedded in PVE iframe)
+  window.focus();
+  displayWrap.addEventListener('click', () => { window.focus(); });
+  // Re-grab focus when the parent iframe receives focus
+  window.addEventListener('focus', () => { window.focus(); });
+}
+
+// ── Input WebSocket ───────────────────────────────────────────
+function startInputWs() {
+  if (viewOnly) return;
+  const url = `${wsProto}//${location.host}${apiBase}/api/v1/remote/${encodeURIComponent(nodeId)}/ws`;
+  S.ws = new WebSocket(url);
+  S.ws.onopen  = () => { S.connected = true; hideConnOverlay(); startLatencyProbe(); };
+  S.ws.onclose = () => {
+    S.connected = false;
+    showConnOverlay('Reconnecting…');
+    setTimeout(startInputWs, 2000);
+  };
+  S.ws.onerror = () => {};
+  S.ws.onmessage = onWsMessage;
+}
+
+function onWsMessage(ev) {
+  try {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === 'pong' && S.latencyTs) {
+      const lat = Math.round(performance.now() - S.latencyTs);
+      S.stats.lat = lat;
+      updateStatBadge($('stat-lat'), `${lat}ms`,
+        lat < 50 ? 'good' : lat < 150 ? 'warn' : 'bad');
+      $('stat-lat-card').textContent = lat;
+    } else if (msg.type === 'consent_denied') {
+      showOffline('Access denied — consent required');
+    }
+  } catch (_) {}
+}
+
+function send(obj) {
+  if (S.ws && S.ws.readyState === WebSocket.OPEN && !viewOnly) {
+    S.ws.send(JSON.stringify(obj));
+  }
+}
+
+function startLatencyProbe() {
+  setInterval(() => {
+    S.latencyTs = performance.now();
+    send({ type: 'ping', ts: S.latencyTs });
+  }, 2000);
+}
+
+// ── Video chain: WebRTC → HLS → MJPEG ────────────────────────
+async function startVideoChain(force) {
+  if (force === 'webrtc') {
+    displayVideo.style.display = 'block';
+    displayImg.style.display = 'none';
+    await startWebRTC();
+  } else if (!force) {
+    // Default: try MJPEG first (instant), WebRTC can be selected manually
+    displayVideo.style.display = 'none';
+    displayImg.style.display = 'block';
+    startMJPEG();
+    return;
+  } else if (force === 'hls') {
+    displayVideo.style.display = 'block';
+    displayImg.style.display = 'none';
+    startHLS();
+  } else if (force === 'mjpeg') {
+    displayVideo.style.display = 'none';
+    displayImg.style.display = 'block';
+    startMJPEG();
+  }
+}
+
 async function startWebRTC() {
   try {
-    pc = new RTCPeerConnection({ iceServers: [] });
-
-    const tcvr = pc.addTransceiver('video', { direction: 'recvonly' });
+    const pc = new RTCPeerConnection({ iceServers: [] });
+    S.pc = pc;
+    const vcvr = pc.addTransceiver('video', { direction: 'recvonly' });
     pc.addTransceiver('audio', { direction: 'recvonly' });
-
     // Prefer H.264
-    const codecs = RTCRtpReceiver.getCapabilities('video')?.codecs || [];
-    const h264 = codecs.filter(c => c.mimeType === 'video/H264');
-    const rest = codecs.filter(c => c.mimeType !== 'video/H264');
-    if (h264.length) tcvr.setCodecPreferences([...h264, ...rest]);
+    const caps = RTCRtpReceiver.getCapabilities?.('video')?.codecs || [];
+    const h264 = caps.filter(c => c.mimeType === 'video/H264');
+    if (h264.length) vcvr.setCodecPreferences([...h264, ...caps.filter(c => c.mimeType !== 'video/H264')]);
 
-    pc.ontrack = (ev) => {
-      const video = $('screen-video');
-      if (ev.streams?.[0]) {
-        video.srcObject = ev.streams[0];
-      } else {
-        video.srcObject = new MediaStream([ev.track]);
-      }
-      video.play().catch(() => {});
-      if (ev.track.kind === 'audio') {
-        $('audio-banner').style.display = 'block';
-      }
+    pc.ontrack = e => {
+      const stream = e.streams?.[0] || new MediaStream([e.track]);
+      displayVideo.srcObject = stream;
+      displayVideo.muted = S.muted;
+      displayVideo.volume = S.volume;
+      displayVideo.play().catch(() => {});
+      applyScaling();
+      if (e.track.kind === 'audio') updateAudioStatus('WebRTC audio active');
     };
-
+    let webrtcTimeout = setTimeout(() => {
+      if (pc.connectionState !== 'connected') {
+        console.warn('WebRTC timeout — falling back to MJPEG');
+        pc.close(); S.pc = null;
+        startMJPEG();
+      }
+    }, 5000);
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === 'connected') {
-        $('status').textContent = 'WebRTC connected';
-        startStatsMonitor();
-      } else if (pc.connectionState === 'failed') {
-        $('status').textContent = 'WebRTC failed, falling back...';
-        startSnapshotFallback();
-      } else {
-        $('status').textContent = pc.connectionState;
+        clearTimeout(webrtcTimeout);
+        setCodec('WebRTC');
+        hideConnOverlay();
+        setSourceActive('vsrc-webrtc');
+      } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+        clearTimeout(webrtcTimeout);
+        if (S.videoMode !== 'hls' && S.videoMode !== 'mjpeg') startMJPEG();
       }
+    };
+    pc.oniceconnectionstatechange = () => {
+      if (pc.iceConnectionState === 'checking') showConnOverlay('Connecting (ICE)…');
     };
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-
-    // Wait for ICE gathering
-    await new Promise(resolve => {
-      if (pc.iceGatheringState === 'complete') return resolve();
-      pc.onicecandidate = e => { if (!e.candidate) resolve(); };
-      setTimeout(resolve, 2000);
+    await new Promise(r => {
+      if (pc.iceGatheringState === 'complete') return r();
+      pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') r(); };
+      setTimeout(r, 2500);
     });
 
-    const resp = await fetch(`${BASE}/webrtc/offer`, {
+    const resp = await fetch(`${apiBase}/api/v1/streams/${encodeURIComponent(nodeId)}/webrtc`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ type: 'offer', sdp: pc.localDescription.sdp }),
     });
-
-    if (!resp.ok) throw new Error(`Signaling ${resp.status}`);
+    if (!resp.ok) throw new Error(`WebRTC ${resp.status}`);
     const answer = await resp.json();
-    if (answer.error) throw new Error(answer.error);
     await pc.setRemoteDescription(new RTCSessionDescription(answer));
+    S.videoMode = 'webrtc';
 
   } catch (err) {
     console.warn('WebRTC failed:', err);
-    $('status').textContent = `WebRTC failed: ${err.message}`;
-    startSnapshotFallback();
+    startMJPEG();
   }
 }
 
-function startStatsMonitor() {
-  setInterval(async () => {
-    if (!pc || pc.connectionState !== 'connected') return;
-    const stats = await pc.getStats();
-    stats.forEach(s => {
-      if (s.type === 'inbound-rtp' && s.kind === 'video') {
-        const kbps = Math.round((s.bytesReceived || 0) * 8 / 1000);
-        $('status').textContent = `${s.framesPerSecond || 0}fps ${(kbps / 1000).toFixed(1)}Mbps ${s.framesDecoded}f`;
-      }
+function startHLS() {
+  if (S.pc) { S.pc.close(); S.pc = null; }
+  if (S.hls) { S.hls.destroy(); S.hls = null; }
+  const url = `${apiBase}/api/v1/streams/${encodeURIComponent(nodeId)}/hls/stream.m3u8`;
+  if (window.Hls && Hls.isSupported()) {
+    S.hls = new Hls({ liveSyncDuration: 1, liveMaxLatencyDuration: 3, enableWorker: true });
+    S.hls.loadSource(url);
+    S.hls.attachMedia(displayVideo);
+    S.hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      displayVideo.play().catch(() => {});
+      setCodec('HLS');
+      S.videoMode = 'hls';
+      setSourceActive('vsrc-hls');
+      hideConnOverlay();
+      applyScaling();
     });
+    S.hls.on(Hls.Events.ERROR, (_, d) => {
+      if (d.fatal) { S.hls.destroy(); S.hls = null; startMJPEG(); }
+    });
+  } else if (displayVideo.canPlayType('application/vnd.apple.mpegurl')) {
+    displayVideo.src = url;
+    displayVideo.play().catch(() => startMJPEG());
+    setCodec('HLS'); S.videoMode = 'hls';
+    hideConnOverlay();
+  } else {
+    startMJPEG();
+  }
+  updateAudioStatus('Audio requires WebRTC connection');
+}
+
+function startMJPEG() {
+  if (S.hls) { S.hls.destroy(); S.hls = null; }
+  displayVideo.style.display = 'none';
+  displayImg.style.display = 'block';
+  const url = `${apiBase}/api/v1/streams/${encodeURIComponent(nodeId)}/mjpeg`;
+  displayImg.src = url;
+  displayImg.onload = () => {
+    applyScaling(); hideConnOverlay(); setCodec('MJPEG'); S.videoMode = 'mjpeg'; setSourceActive('vsrc-mjpeg');
+    // Multipart MJPEG: naturalWidth may not be ready on first onload — retry scaling
+    let retries = 0;
+    const fixScale = setInterval(() => {
+      if (displayImg.naturalWidth > 32 && displayImg.naturalHeight > 32) {
+        applyScaling(); clearInterval(fixScale);
+      }
+      if (++retries > 20) clearInterval(fixScale);
+    }, 200);
+  };
+  displayImg.onerror = () => showOffline('No video stream available');
+  updateAudioStatus('Audio requires WebRTC connection');
+}
+
+function switchSource(src) {
+  if (S.hls) { S.hls.destroy(); S.hls = null; }
+  if (S.pc)  { S.pc.close(); S.pc = null; }
+  displayVideo.srcObject = null;
+  displayImg.src = '';
+  startVideoChain(src);
+}
+
+function setCodec(name) {
+  S.stats.codec = name;
+  $('stat-codec').textContent = name;
+  $('stat-codec-card').textContent = name;
+}
+function setSourceActive(id) {
+  ['vsrc-webrtc','vsrc-hls','vsrc-mjpeg'].forEach(i => $(`${i}`)?.classList.remove('active'));
+  $(id)?.classList.add('active');
+}
+
+// ── Scaling / zoom / pan ──────────────────────────────────────
+function applyScaling() {
+  const wrap = displayWrap;
+  const inner = displayInner;
+  const vid = S.videoMode === 'mjpeg' ? displayImg : displayVideo;
+  const vw = wrap.clientWidth;
+  const vh = wrap.clientHeight - (S.stripVisible ? parseInt(getComputedStyle(document.documentElement).getPropertyValue('--strip-h')) : 0);
+  const nw = vid.videoWidth || vid.naturalWidth || 1920;
+  const nh = vid.videoHeight || vid.naturalHeight || 1080;
+  if (nw < 32 || nh < 32) return;  // wait for real frame
+
+  let scale = 1;
+  if (S.scaleMode === 'fit') {
+    scale = Math.min(vw / nw, vh / nh);
+  } else if (S.scaleMode === 'fill') {
+    scale = Math.max(vw / nw, vh / nh);
+  } else if (S.scaleMode === '100') {
+    scale = 1;
+  } else {
+    scale = S.zoom;
+  }
+  S.zoom = scale;
+  inner.style.width  = `${nw}px`;
+  inner.style.height = `${nh}px`;
+  inner.style.transform = `translate(${S.panX}px, ${S.panY}px) scale(${scale})`;
+  inner.style.imageRendering = S.pixelPerfect ? 'pixelated' : 'auto';
+  if (vid.style) vid.style.imageRendering = S.pixelPerfect ? 'pixelated' : 'auto';
+
+  $('zoom-val').value = Math.round(scale * 100);
+  $('zoom-slider').value = Math.round(scale * 100);
+  showZoomIndicator(Math.round(scale * 100));
+}
+
+function setScaleMode(mode) {
+  S.scaleMode = mode;
+  S.panX = 0; S.panY = 0;
+  ['scale-fit','scale-fill','scale-100'].forEach(id => $(id)?.classList.remove('active'));
+  $(`scale-${mode}`)?.classList.add('active');
+  applyScaling();
+}
+
+function adjustZoom(delta) {
+  S.scaleMode = 'zoom';
+  S.zoom = Math.max(0.25, Math.min(4.0, S.zoom + delta));
+  applyScaling();
+}
+
+function setZoomSlider(val) {
+  S.scaleMode = 'zoom';
+  S.zoom = val / 100;
+  $('zoom-val').textContent = `${val}%`;
+  applyScaling();
+}
+
+let zoomIndicatorTimer;
+function showZoomIndicator(pct) {
+  const el = $('zoom-display');
+  el.textContent = `${pct}%`;
+  el.classList.add('show');
+  clearTimeout(zoomIndicatorTimer);
+  zoomIndicatorTimer = setTimeout(() => el.classList.remove('show'), 1200);
+}
+
+// ── Keyboard ──────────────────────────────────────────────────
+const MOD_BITS = {
+  ControlLeft:0x01, ShiftLeft:0x02, AltLeft:0x04, MetaLeft:0x08,
+  ControlRight:0x10, ShiftRight:0x20, AltRight:0x40, MetaRight:0x80,
+};
+
+function isPanelFocused() {
+  const el = document.activeElement;
+  return el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT' || el.isContentEditable);
+}
+
+function setupKeyboard() {
+  document.addEventListener('keydown', onKeyDown);
+  document.addEventListener('keyup', onKeyUp);
+  // Release all keys on window blur (prevent stuck keys)
+  window.addEventListener('blur', releaseAllKeys);
+}
+
+function onKeyDown(e) {
+  if (isPanelFocused()) return;
+  // Global shortcuts that don't go to guest
+  if (e.key === 'F11' && !e.ctrlKey && !e.altKey) { e.preventDefault(); toggleFullscreen(); return; }
+  if (e.key === 'k' && e.ctrlKey && e.shiftKey)   { e.preventDefault(); toggleStrip(); return; }
+
+  e.preventDefault();
+  const code = e.code;
+  if (code in MOD_BITS) {
+    S.modifiers |= MOD_BITS[code];
+  }
+  send({ type: 'keydown', code });
+  updateModIndicators();
+}
+
+function onKeyUp(e) {
+  if (isPanelFocused()) return;
+  e.preventDefault();
+  const code = e.code;
+  if (code in MOD_BITS) {
+    S.modifiers &= ~MOD_BITS[code];
+    // Clear sticky mod if it was active
+    if (S.stickyMods[code]) {
+      S.stickyMods[code] = false;
+      updateStickyModUI();
+    }
+  }
+  send({ type: 'keyup', code });
+  updateModIndicators();
+}
+
+function globalKeyDown(e) {
+  // Handle even while panel focused: F11
+  if (e.key === 'F11') { e.preventDefault(); toggleFullscreen(); }
+}
+
+function releaseAllKeys() {
+  send({ type: 'release_all' });
+  S.modifiers = 0;
+  Object.keys(S.stickyMods).forEach(k => S.stickyMods[k] = false);
+  updateModIndicators();
+  updateStickyModUI();
+}
+
+// Send a single key tap (down + up)
+function sendKey(code, delay = 50) {
+  send({ type: 'keydown', code });
+  setTimeout(() => send({ type: 'keyup', code }), delay);
+}
+
+// Send modifier+key combo
+function sendCombo(modCodes, keyCode) {
+  modCodes.forEach(m => send({ type: 'keydown', code: m }));
+  send({ type: 'keydown', code: keyCode });
+  setTimeout(() => {
+    send({ type: 'keyup', code: keyCode });
+    modCodes.forEach(m => send({ type: 'keyup', code: m }));
+  }, 60);
+}
+
+// Pre-defined sequences
+function sendSequence(name) {
+  send({ type: 'key_sequence', sequence: name });
+}
+
+// Sticky modifiers (toggle on/off from special keys strip)
+function toggleStickyMod(name, code) {
+  const current = S.stickyMods[code] || false;
+  S.stickyMods[code] = !current;
+  if (!current) {
+    send({ type: 'keydown', code });
+    S.modifiers |= (MOD_BITS[code] || 0);
+  } else {
+    send({ type: 'keyup', code });
+    S.modifiers &= ~(MOD_BITS[code] || 0);
+  }
+  updateStickyModUI();
+  updateModIndicators();
+}
+
+function updateStickyModUI() {
+  const map = { ctrl: 'ControlLeft', alt: 'AltLeft', shift: 'ShiftLeft', win: 'MetaLeft' };
+  for (const [name, code] of Object.entries(map)) {
+    $(`mod-${name}`)?.classList.toggle('mod-active', !!S.stickyMods[code]);
+  }
+}
+
+function updateModIndicators() {
+  // Could show Caps/Num/Scroll state if we track it
+}
+
+// Virtual keyboard (mobile)
+$('vkbd-input').addEventListener('input', e => {
+  const text = e.target.value;
+  if (text) {
+    send({ type: 'paste', text });
+    e.target.value = '';
+  }
+});
+
+// ── Mouse ─────────────────────────────────────────────────────
+function setupMouse() {
+  displayWrap.addEventListener('mousemove',  onMouseMove);
+  displayWrap.addEventListener('mousedown',  onMouseDown);
+  displayWrap.addEventListener('mouseup',    onMouseUp);
+  displayWrap.addEventListener('wheel',      onWheel, { passive: false });
+  displayWrap.addEventListener('contextmenu', e => e.preventDefault());
+  // Middle click paste shortcut (Linux-style)
+  displayWrap.addEventListener('auxclick', e => { if (e.button === 1) e.preventDefault(); });
+}
+
+function screenToNative(clientX, clientY) {
+  const rect = displayInner.getBoundingClientRect();
+  const vid  = S.videoMode === 'mjpeg' ? displayImg : displayVideo;
+  const nw   = vid.videoWidth || vid.naturalWidth || 1920;
+  const nh   = vid.videoHeight || vid.naturalHeight || 1080;
+  const scale = S.zoom;
+  // Compensate for pan
+  const x = (clientX - rect.left) / scale;
+  const y = (clientY - rect.top)  / scale;
+  return {
+    x: Math.max(0, Math.min(nw, x)),
+    y: Math.max(0, Math.min(nh, y)),
+    w: nw, h: nh,
+  };
+}
+
+function onMouseMove(e) {
+  if (isPanelFocused()) return;
+  if (S.relMouse && document.pointerLockElement === displayWrap) {
+    // Relative mode: accumulate
+    S.mouseAbsX = Math.max(0, Math.min(32767, S.mouseAbsX + e.movementX * 10));
+    S.mouseAbsY = Math.max(0, Math.min(32767, S.mouseAbsY + e.movementY * 10));
+    send({ type: 'mousemove', x: S.mouseAbsX / 32767, y: S.mouseAbsY / 32767, w: 1, h: 1 });
+  } else {
+    // Pan mode when zoom > 1 and no button pressed
+    if (S.isPanning) {
+      const dx = e.clientX - S.panStartX;
+      const dy = e.clientY - S.panStartY;
+      S.panX = S.panStartPanX + dx;
+      S.panY = S.panStartPanY + dy;
+      applyScaling();
+      return;
+    }
+    const { x, y, w, h } = screenToNative(e.clientX, e.clientY);
+    send({ type: 'mousemove', x, y, w, h });
+  }
+}
+
+function onMouseDown(e) {
+  if (isPanelFocused()) return;
+  e.preventDefault();
+  // Alt+drag = pan
+  if (e.altKey && S.zoom > 1) {
+    S.isPanning = true;
+    S.panStartX = e.clientX; S.panStartY = e.clientY;
+    S.panStartPanX = S.panX; S.panStartPanY = S.panY;
+    displayInner.classList.add('panning');
+    return;
+  }
+  if (S.relMouse && document.pointerLockElement !== displayWrap) {
+    displayWrap.requestPointerLock();
+    return;
+  }
+  const { x, y, w, h } = screenToNative(e.clientX, e.clientY);
+  send({ type: 'mousemove', x, y, w, h });
+  send({ type: 'mousedown', button: e.button });
+}
+
+function onMouseUp(e) {
+  if (S.isPanning) {
+    S.isPanning = false;
+    displayInner.classList.remove('panning');
+    return;
+  }
+  if (isPanelFocused()) return;
+  send({ type: 'mouseup', button: e.button });
+}
+
+function onWheel(e) {
+  if (isPanelFocused()) return;
+  e.preventDefault();
+  // Ctrl+wheel = zoom
+  if (e.ctrlKey) {
+    adjustZoom(e.deltaY < 0 ? 0.1 : -0.1);
+    return;
+  }
+  send({ type: 'wheel', deltaY: e.deltaY, deltaX: e.deltaX });
+}
+
+// ── Touch ─────────────────────────────────────────────────────
+function setupTouch() {
+  let touches = {};
+  let lastTap = 0;
+  let pinchDist0 = 0;
+  let pinch0Zoom = 1;
+
+  displayWrap.addEventListener('touchstart', e => {
+    e.preventDefault();
+    if (e.touches.length === 1) {
+      const t = e.touches[0];
+      touches = { id: t.identifier, x: t.clientX, y: t.clientY };
+      const now = Date.now();
+      if (now - lastTap < 300) {
+        // Double-tap = double-click
+        const { x, y, w, h } = screenToNative(t.clientX, t.clientY);
+        send({ type: 'mousemove', x, y, w, h });
+        send({ type: 'mousedown', button: 0 });
+        send({ type: 'mouseup', button: 0 });
+        send({ type: 'mousedown', button: 0 });
+        send({ type: 'mouseup', button: 0 });
+      }
+      lastTap = now;
+    } else if (e.touches.length === 2) {
+      // Two-finger touch = right-click on first touch, or pinch-to-zoom
+      const dx = e.touches[1].clientX - e.touches[0].clientX;
+      const dy = e.touches[1].clientY - e.touches[0].clientY;
+      pinchDist0 = Math.hypot(dx, dy);
+      pinch0Zoom = S.zoom;
+    }
+  }, { passive: false });
+
+  displayWrap.addEventListener('touchmove', e => {
+    e.preventDefault();
+    if (e.touches.length === 1) {
+      const t = e.touches[0];
+      const { x, y, w, h } = screenToNative(t.clientX, t.clientY);
+      send({ type: 'mousemove', x, y, w, h });
+    } else if (e.touches.length === 2) {
+      const dx = e.touches[1].clientX - e.touches[0].clientX;
+      const dy = e.touches[1].clientY - e.touches[0].clientY;
+      const dist = Math.hypot(dx, dy);
+      const newZoom = Math.max(0.5, Math.min(4.0, pinch0Zoom * (dist / pinchDist0)));
+      S.zoom = newZoom;
+      S.scaleMode = 'zoom';
+      applyScaling();
+    }
+  }, { passive: false });
+
+  displayWrap.addEventListener('touchend', e => {
+    e.preventDefault();
+    if (e.changedTouches.length === 1 && e.touches.length === 0) {
+      const t = e.changedTouches[0];
+      const moved = Math.hypot(t.clientX - (touches.x||0), t.clientY - (touches.y||0));
+      if (moved < 5) {
+        // Tap = click
+        const { x, y, w, h } = screenToNative(t.clientX, t.clientY);
+        send({ type: 'mousemove', x, y, w, h });
+        send({ type: 'mousedown', button: 0 });
+        setTimeout(() => send({ type: 'mouseup', button: 0 }), 60);
+      }
+    } else if (e.changedTouches.length === 1 && e.touches.length === 1) {
+      // One finger released from two-finger touch = right click
+      const t = e.changedTouches[0];
+      const { x, y, w, h } = screenToNative(t.clientX, t.clientY);
+      send({ type: 'mousemove', x, y, w, h });
+      send({ type: 'mousedown', button: 2 });
+      setTimeout(() => send({ type: 'mouseup', button: 2 }), 60);
+    }
+  }, { passive: false });
+}
+
+// ── Pointer lock (for relative/FPS mode) ─────────────────────
+function setupPointerLock() {
+  displayWrap.addEventListener('click', () => {
+    if (S.relMouse && document.pointerLockElement !== displayWrap) {
+      displayWrap.requestPointerLock();
+    }
+  });
+}
+
+function onPointerLockChange() {
+  const locked = document.pointerLockElement === displayWrap;
+  $('pointer-lock-indicator').classList.toggle('show', locked);
+  if (locked) setTimeout(() => $('pointer-lock-indicator').classList.remove('show'), 2500);
+}
+
+function toggleRelMouse(on) {
+  S.relMouse = on;
+  if (!on && document.pointerLockElement === displayWrap) document.exitPointerLock();
+}
+
+// ── Gamepad ───────────────────────────────────────────────────
+function startGamepadPoll() {
+  const poll = () => {
+    if (!S.gamepadEnabled) { S.gamepadRAF = requestAnimationFrame(poll); return; }
+    const pads = navigator.getGamepads?.() || [];
+    for (const gp of pads) {
+      if (!gp) continue;
+      const axes    = Array.from(gp.axes);
+      const buttons = gp.buttons.map(b => b.pressed ? 1 : 0);
+      const speed   = parseInt($('gpad-speed')?.value || 20);
+      // Scale axes by speed
+      const scaledAxes = axes.map((a, i) => i < 2 ? a * speed : a);
+      send({ type: 'gamepad', index: gp.index, axes: scaledAxes, buttons });
+    }
+    S.gamepadRAF = requestAnimationFrame(poll);
+  };
+  S.gamepadRAF = requestAnimationFrame(poll);
+}
+
+function setGamepadEnabled(on) { S.gamepadEnabled = on; }
+
+function onGamepadConnected(e) {
+  toast(`Gamepad connected: ${e.gamepad.id}`);
+  updateGamepadList();
+}
+function onGamepadDisconnected(e) {
+  toast(`Gamepad disconnected: ${e.gamepad.id}`);
+  updateGamepadList();
+}
+function updateGamepadList() {
+  const list = $('gamepad-list');
+  const pads = Array.from(navigator.getGamepads?.() || []).filter(Boolean);
+  if (!pads.length) {
+    list.innerHTML = '<div style="color:var(--muted);font-size:12px;">No gamepads detected.</div>';
+    return;
+  }
+  list.innerHTML = pads.map(gp => `
+    <div class="gamepad-item">
+      <div class="gamepad-dot connected"></div>
+      <span>${gp.id.slice(0, 50)}</span>
+    </div>`).join('');
+}
+
+// ── Audio ─────────────────────────────────────────────────────
+function toggleMute() {
+  S.muted = !S.muted;
+  displayVideo.muted = S.muted;
+  $('btn-audio').textContent = S.muted ? '🔇' : '🔊';
+  $('vol-icon').textContent  = S.muted ? '🔇' : '🔊';
+}
+
+function setVolume(val) {
+  S.volume = val / 100;
+  displayVideo.volume = S.volume;
+  $('vol-val').textContent = `${val}%`;
+  $('btn-audio').textContent = S.volume === 0 ? '🔇' : S.volume < 0.5 ? '🔉' : '🔊';
+}
+
+function updateAudioStatus(msg) {
+  $('audio-status').textContent = msg;
+}
+
+// ── Clipboard ─────────────────────────────────────────────────
+async function sendPasteText() {
+  const text = $('paste-text').value;
+  if (!text) return;
+  send({ type: 'paste', text: text.slice(0, 10000) });
+  toast('Sending text…');
+  // Auto-clear after a delay proportional to length
+  setTimeout(() => $('paste-text').value = '', Math.min(text.length * 25, 5000));
+}
+
+async function readGuestClipboard() {
+  $('clipboard-source').textContent = 'Reading…';
+  try {
+    const r = await fetch(`${apiBase}/api/v1/remote/${encodeURIComponent(nodeId)}/clipboard`);
+    const j = await r.json();
+    $('read-text').value = j.text || '';
+    $('clipboard-source').textContent = j.source === 'agent' ? '✓ From agent clipboard' :
+                                         j.source === 'ocr'   ? '✓ OCR result' : '— No content found';
+  } catch {
+    $('clipboard-source').textContent = '✗ Failed';
+  }
+}
+
+async function readScreenOcr() {
+  $('clipboard-source').textContent = 'Running OCR…';
+  try {
+    const r = await fetch(`${apiBase}/api/v1/remote/${encodeURIComponent(nodeId)}/clipboard?source=ocr`);
+    const j = await r.json();
+    $('read-text').value = j.text || '';
+    $('clipboard-source').textContent = j.text ? `✓ OCR — ${j.text.length} chars` : '— No text found';
+  } catch {
+    $('clipboard-source').textContent = '✗ Failed';
+  }
+}
+
+// Copy read text to browser clipboard
+$('read-text').addEventListener('click', async () => {
+  const text = $('read-text').value;
+  if (text) {
+    await navigator.clipboard.writeText(text).catch(() => {});
+    toast('Copied to clipboard');
+  }
+});
+
+// ── File transfer ─────────────────────────────────────────────
+function setupDragDrop() {
+  displayWrap.addEventListener('dragover', e => {
+    e.preventDefault();
+    $('drop-zone').classList.add('drag-over');
+    if (S.activePanel !== 'file') togglePanel('file');
+  });
+  displayWrap.addEventListener('dragleave', () => $('drop-zone').classList.remove('drag-over'));
+  displayWrap.addEventListener('drop', e => {
+    e.preventDefault();
+    $('drop-zone').classList.remove('drag-over');
+    handleFiles(Array.from(e.dataTransfer.files));
+  });
+}
+
+function dropZoneDragOver(e) { e.preventDefault(); $('drop-zone').classList.add('drag-over'); }
+function dropZoneDragLeave() { $('drop-zone').classList.remove('drag-over'); }
+function dropZoneDrop(e) { e.preventDefault(); $('drop-zone').classList.remove('drag-over'); handleFiles(Array.from(e.dataTransfer.files)); }
+function fileInputChange(e) { handleFiles(Array.from(e.target.files)); }
+
+function setFileMode(mode) {
+  S.fileMode = mode;
+  $('fmode-usb').classList.toggle('active', mode === 'usb');
+  $('fmode-type').classList.toggle('active', mode === 'type');
+  $('fmode-info').textContent = mode === 'usb'
+    ? 'Files are injected as a virtual USB mass storage device. The guest sees a USB drive with your files.'
+    : 'Text file content will be typed character by character. Only suitable for small text files (<8KB).';
+}
+
+async function handleFiles(files) {
+  const list = $('file-list');
+  for (const file of files) {
+    const item = document.createElement('div');
+    item.className = 'file-item';
+    item.innerHTML = `
+      <span>📄</span>
+      <span class="file-name">${file.name}</span>
+      <span style="color:var(--muted);font-size:10px">${formatBytes(file.size)}</span>
+      <div class="file-progress"><div class="file-progress-bar" style="width:0%"></div></div>`;
+    list.appendChild(item);
+    const bar = item.querySelector('.file-progress-bar');
+
+    if (S.fileMode === 'type' && file.size < 8192 && file.type.startsWith('text')) {
+      const text = await file.text();
+      bar.style.width = '50%';
+      send({ type: 'paste', text });
+      bar.style.width = '100%';
+      bar.style.background = 'var(--accent)';
+      toast(`Typed: ${file.name}`);
+    } else {
+      // Upload via REST API
+      const fd = new FormData();
+      fd.append('file', file);
+      const xhr = new XMLHttpRequest();
+      xhr.upload.onprogress = e => { bar.style.width = `${Math.round(e.loaded/e.total*100)}%`; };
+      xhr.onload = () => {
+        bar.style.width = '100%';
+        bar.style.background = xhr.status === 200 ? 'var(--accent)' : 'var(--red)';
+        toast(xhr.status === 200 ? `Sent: ${file.name}` : `Failed: ${file.name}`);
+      };
+      xhr.open('POST', `${apiBase}/api/v1/remote/${encodeURIComponent(nodeId)}/file`);
+      xhr.send(fd);
+    }
+  }
+}
+
+function formatBytes(n) {
+  if (n < 1024) return `${n}B`;
+  if (n < 1048576) return `${(n/1024).toFixed(1)}KB`;
+  return `${(n/1048576).toFixed(1)}MB`;
+}
+
+// ── Screenshot ────────────────────────────────────────────────
+async function takeScreenshot() {
+  // Try capturing from the video element directly
+  const vid = S.videoMode === 'mjpeg' ? displayImg : displayVideo;
+  const canvas = document.createElement('canvas');
+  canvas.width  = vid.videoWidth || vid.naturalWidth || 1920;
+  canvas.height = vid.videoHeight || vid.naturalHeight || 1080;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(vid, 0, 0);
+  const a = document.createElement('a');
+  a.href = canvas.toDataURL('image/png');
+  a.download = `${nodeId}-${new Date().toISOString().slice(0,19).replace(/:/g,'-')}.png`;
+  a.click();
+  toast('Screenshot saved');
+}
+
+// ── Recording ─────────────────────────────────────────────────
+async function toggleRecord() {
+  if (!S.recording) {
+    try {
+      const stream = displayVideo.captureStream?.() || displayVideo.mozCaptureStream?.();
+      if (!stream) { toast('Recording not supported in this browser'); return; }
+      S.recordChunks = [];
+      S.mediaRecorder = new MediaRecorder(stream, { mimeType: 'video/webm;codecs=vp8' });
+      S.mediaRecorder.ondataavailable = e => { if (e.data.size > 0) S.recordChunks.push(e.data); };
+      S.mediaRecorder.start(1000);
+      S.recording = true;
+      $('btn-record').classList.add('recording');
+      $('btn-record').title = 'Stop recording';
+      toast('Recording started');
+    } catch (e) { toast('Recording failed: ' + e.message); }
+  } else {
+    S.mediaRecorder.stop();
+    S.mediaRecorder.onstop = () => {
+      const blob = new Blob(S.recordChunks, { type: 'video/webm' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `${nodeId}-${new Date().toISOString().slice(0,19).replace(/:/g,'-')}.webm`;
+      a.click();
+      toast('Recording saved');
+    };
+    S.recording = false;
+    $('btn-record').classList.remove('recording');
+    $('btn-record').title = 'Record session';
+  }
+}
+
+// ── Share / view-only link ────────────────────────────────────
+async function copyShareLink() {
+  const url = `${location.origin}/console/${encodeURIComponent(nodeId)}?view_only=1`;
+  await navigator.clipboard.writeText(url).catch(() => prompt('Share this link:', url));
+  toast('View-only link copied');
+}
+
+// ── Fullscreen ────────────────────────────────────────────────
+function toggleFullscreen() {
+  if (!document.fullscreenElement) {
+    document.documentElement.requestFullscreen().catch(() => {});
+  } else {
+    document.exitFullscreen();
+  }
+}
+
+function onFullscreenChange() {
+  const fs = !!document.fullscreenElement;
+  $('btn-fullscreen').title = fs ? 'Exit fullscreen' : 'Fullscreen (F11)';
+  $('btn-fullscreen').textContent = fs ? '⊠' : '⛶';
+  applyScaling();
+}
+
+// ── Toolbar auto-hide ─────────────────────────────────────────
+function startToolbarAutoHide() {
+  const show = () => {
+    toolbar.classList.remove('hidden');
+    clearTimeout(S.toolbarTimer);
+    S.toolbarTimer = setTimeout(() => {
+      if (!S.activePanel) toolbar.classList.add('hidden');
+    }, 3000);
+  };
+  displayWrap.addEventListener('mousemove', show);
+  toolbar.addEventListener('mouseenter', () => { clearTimeout(S.toolbarTimer); toolbar.classList.remove('hidden'); });
+  toolbar.addEventListener('mouseleave', show);
+  displayWrap.addEventListener('touchstart', () => { toolbar.classList.remove('hidden'); clearTimeout(S.toolbarTimer); S.toolbarTimer = setTimeout(() => toolbar.classList.add('hidden'), 4000); }, { passive: true });
+  show();
+}
+
+// ── Panels ────────────────────────────────────────────────────
+function togglePanel(name) {
+  if (S.activePanel === name) { closePanel(); return; }
+  closePanel(false);
+  S.activePanel = name;
+  $(`panel-${name}`)?.classList.add('open');
+  $(`btn-${name}`)?.classList.add('active');
+  // Keep toolbar visible while panel open
+  clearTimeout(S.toolbarTimer);
+  toolbar.classList.remove('hidden');
+  if (name === 'gamepad') updateGamepadList();
+}
+
+function closePanel(restore = true) {
+  if (S.activePanel) {
+    $(`panel-${S.activePanel}`)?.classList.remove('open');
+    $(`btn-${S.activePanel}`)?.classList.remove('active');
+    S.activePanel = null;
+  }
+  if (restore) startToolbarAutoHide();
+}
+
+// ── Special keys strip ────────────────────────────────────────
+function toggleStrip() {
+  S.stripVisible = !S.stripVisible;
+  keysStrip.classList.toggle('hidden', !S.stripVisible);
+  $('btn-keys').classList.toggle('active', S.stripVisible);
+  applyScaling();
+}
+
+// ── Stats loop ────────────────────────────────────────────────
+function startStatsLoop() {
+  setInterval(async () => {
+    if (S.pc && S.pc.connectionState === 'connected') {
+      const stats = await S.pc.getStats();
+      stats.forEach(s => {
+        if (s.type === 'inbound-rtp' && s.kind === 'video') {
+          const fps = s.framesPerSecond || 0;
+          const bw  = s.bytesReceived ? Math.round((s.bytesReceived - (S.prevBytesIn||0)) / 1024) : 0;
+          S.prevBytesIn = s.bytesReceived;
+          S.stats.fps = fps;
+          S.stats.bw  = bw * 8; // kbps
+          updateStatBadge($('stat-fps'), `${fps} fps`, fps >= 25 ? 'good' : fps >= 15 ? 'warn' : 'bad');
+          $('stat-fps-card').textContent = fps;
+          $('stat-bw-card').textContent = S.stats.bw;
+          if (bw > 0) { $('stat-bw').style.display = ''; $('stat-bw').textContent = `${S.stats.bw} kbps`; }
+        }
+      });
+    }
+    // Update perf panel stats
+    $('stat-lat-card').textContent = S.stats.lat || '—';
   }, 1000);
 }
 
-// ── Snapshot fallback ───────────────────────────────────
-let snapInterval = null;
-function startSnapshotFallback() {
-  $('screen-video').style.display = 'none';
-  const img = $('screen-img');
-  img.style.display = 'block';
+function startFpsCounter() {
+  // For MJPEG/HLS: count img load events
+  displayImg.addEventListener('load', () => {
+    S.frameCount++;
+    const now = performance.now();
+    if (now - S.lastFpsSample >= 1000) {
+      const fps = Math.round(S.frameCount * 1000 / (now - S.lastFpsSample));
+      S.stats.fps = fps;
+      S.frameCount = 0;
+      S.lastFpsSample = now;
+      if (S.videoMode === 'mjpeg') {
+        updateStatBadge($('stat-fps'), `${fps} fps`, fps >= 25 ? 'good' : fps >= 15 ? 'warn' : 'bad');
+        $('stat-fps-card').textContent = fps;
+      }
+    }
+  });
+}
 
-  function refresh() {
-    const next = new Image();
-    next.onload = () => { img.src = next.src; };
-    next.src = `${BASE}/display/snapshot?t=${Date.now()}`;
+function updateStatBadge(el, text, cls) {
+  el.textContent = text;
+  el.className = `stat-badge ${cls}`;
+}
+
+// ── Performance options ───────────────────────────────────────
+function togglePixelPerfect(on) {
+  S.pixelPerfect = on;
+  applyScaling();
+}
+
+function setQuality(val) {
+  $('quality-val').textContent = val;
+  // Quality affects MJPEG stream — append param when switching
+  if (S.videoMode === 'mjpeg') {
+    displayImg.src = `${apiBase}/api/v1/streams/${encodeURIComponent(nodeId)}/mjpeg?quality=${val}`;
   }
-  refresh();
-  snapInterval = setInterval(refresh, 200);
-  $('status').textContent = 'snapshot (5fps)';
 }
 
-// ── Keyboard ────────────────────────────────────────────
-function sendKey(keycode, down) {
-  fetch(`${INPUT_BASE}/input/key`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ keycode, down }),
-  }).catch(() => {});
+// ── Connection helpers ────────────────────────────────────────
+function showConnOverlay(msg) {
+  connOverlay.classList.remove('hidden');
+  connStatus.textContent = msg;
+}
+function hideConnOverlay() {
+  connOverlay.classList.add('hidden');
+}
+function showOffline(msg) {
+  hideConnOverlay();
+  displayOff.classList.add('show');
+  $('offline-msg').textContent = msg || 'No stream available';
 }
 
-function onKey(e) {
-  if (!kbdActive) return;
-  e.preventDefault();
-  e.stopPropagation();
-
-  const keycode = KEYMAP[e.code];
-  if (!keycode) return;
-
-  const down = e.type === 'keydown';
-  if (down) heldKeys.add(keycode); else heldKeys.delete(keycode);
-  sendKey(keycode, down);
+function reconnect() {
+  displayOff.classList.remove('show');
+  showConnOverlay('Reconnecting…');
+  startVideoChain();
+  if (!S.connected) startInputWs();
 }
 
-function releaseAll() {
-  for (const k of heldKeys) sendKey(k, false);
-  heldKeys.clear();
+function disconnect() {
+  if (S.ws)  { S.ws.close(); S.ws = null; }
+  if (S.pc)  { S.pc.close(); S.pc = null; }
+  if (S.hls) { S.hls.destroy(); S.hls = null; }
+  if (S.recording) toggleRecord();
+  window.close();
+  // If can't close (not opened by script), show offline
+  setTimeout(() => showOffline('Disconnected'), 100);
 }
 
-document.addEventListener('keydown', onKey, true);
-document.addEventListener('keyup', onKey, true);
-window.addEventListener('blur', releaseAll);
-document.addEventListener('visibilitychange', () => { if (document.hidden) releaseAll(); });
-
-// ── Mouse ───────────────────────────────────────────────
-function onMouse(e) {
-  if (!mouseActive) return;
-  e.preventDefault();
-
-  const el = $('screen-video').style.display !== 'none' ? $('screen-video') : $('screen-img');
-  const rect = el.getBoundingClientRect();
-  const w = el.videoWidth || el.naturalWidth || 640;
-  const h = el.videoHeight || el.naturalHeight || 480;
-  const sx = w / rect.width;
-  const sy = h / rect.height;
-  const px = Math.round((e.clientX - rect.left) * sx);
-  const py = Math.round((e.clientY - rect.top) * sy);
-  const ax = Math.round(px * 32767 / w);
-  const ay = Math.round(py * 32767 / h);
-
-  let action = 'move', button = 0;
-  if (e.type === 'mousedown') { action = 'press'; button = e.button === 0 ? 1 : e.button === 2 ? 2 : 4; }
-  if (e.type === 'mouseup') { action = 'release'; button = e.button === 0 ? 1 : e.button === 2 ? 2 : 4; }
-
-  fetch(`${INPUT_BASE}/input/mouse`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ x: ax, y: ay, action, button }),
-  }).catch(() => {});
+// ── Toast ─────────────────────────────────────────────────────
+let toastTimer;
+function toast(msg, dur = 2200) {
+  const el = $('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), dur);
 }
 
-const display = $('display');
-display.addEventListener('mousemove', onMouse);
-display.addEventListener('mousedown', onMouse);
-display.addEventListener('mouseup', onMouse);
-display.addEventListener('contextmenu', e => { if (mouseActive) e.preventDefault(); });
+// ── Codec / encoder controls ──────────────────────────────────
+const C = {
+  selectedEncoder: 'auto',  // 'auto' or encoder name e.g. 'h264_nvenc'
+  codecFamily: 'h264',
+  bitrate: '4M',
+  latencyMode: 'realtime',
+  probeCache: null,          // last probe result
+};
 
-// ── Toolbar ─────────────────────────────────────────────
-$('btn-kbd').addEventListener('click', () => {
-  kbdActive = !kbdActive;
-  $('btn-kbd').classList.toggle('active', kbdActive);
-  if (!kbdActive) releaseAll();
-});
+async function probeEncoders(force = false) {
+  const status = $('enc-probe-status');
+  status.textContent = 'Probing…';
+  try {
+    const url = `${apiBase}/api/v1/codecs/probe${force ? '?force=1' : ''}`;
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(r.statusText);
+    const data = await r.json();
+    C.probeCache = data;
+    _populateEncoderList(data.encoders || []);
+    status.textContent = `${(data.encoders||[]).filter(e=>e.available).length} available`;
+  } catch (e) {
+    status.textContent = 'Probe failed';
+    console.error('probeEncoders:', e);
+  }
+}
 
-$('btn-mouse').addEventListener('click', () => {
-  mouseActive = !mouseActive;
-  $('btn-mouse').classList.toggle('active', mouseActive);
-  display.classList.toggle('kvm-mouse', mouseActive);
-});
+function _populateEncoderList(encoders) {
+  const list = $('encoder-list');
+  // Keep "Auto" button, remove dynamically added ones
+  [...list.querySelectorAll('.enc-dynamic')].forEach(el => el.remove());
+  const available = encoders.filter(e => e.available);
+  available.forEach(enc => {
+    const el = document.createElement('div');
+    el.className = 'radio-btn enc-dynamic';
+    el.id = `enc-${enc.encoder}`;
+    el.textContent = _encLabel(enc);
+    el.title = enc.hw_type ? `${enc.hw_type} · ${enc.probe_ms}ms probe` : `software · ${enc.probe_ms}ms probe`;
+    el.onclick = () => setEncoder(enc.encoder);
+    if (enc.encoder === C.selectedEncoder) el.classList.add('active');
+    list.appendChild(el);
+  });
+}
 
-$('btn-fullscreen').addEventListener('click', () => {
-  if (document.fullscreenElement) document.exitFullscreen();
-  else document.documentElement.requestFullscreen();
-});
+function _encLabel(enc) {
+  const hw = { nvenc: '🟢 NVENC', vaapi: '🟡 VAAPI', qsv: '🔵 QSV', v4l2m2m: '📷 V4L2', amf: '🔴 AMF', text: '◈ OCR' };
+  const fam = enc.codec_family?.toUpperCase() || '';
+  if (enc.hw_type && hw[enc.hw_type]) return `${hw[enc.hw_type]} ${fam}`;
+  return `💻 ${fam} SW`;
+}
 
-$('btn-screenshot').addEventListener('click', () => {
-  const video = $('screen-video');
-  if (video.videoWidth) {
-    const c = document.createElement('canvas');
-    c.width = video.videoWidth; c.height = video.videoHeight;
-    c.getContext('2d').drawImage(video, 0, 0);
-    const a = document.createElement('a');
-    a.href = c.toDataURL('image/png');
-    a.download = `ozma-${VMID}-${Date.now()}.png`;
-    a.click();
+function setEncoder(enc) {
+  C.selectedEncoder = enc;
+  // Update radio button states
+  const list = $('encoder-list');
+  list.querySelectorAll('.radio-btn').forEach(el => el.classList.remove('active'));
+  const target = $(`enc-${enc}`) || $('enc-auto');
+  if (target) target.classList.add('active');
+}
+
+async function applyEncoder() {
+  if (C.codecFamily === 'ocr') {
+    // OCR mode: tell server to stop ffmpeg, then switch client to canvas rendering
+    try {
+      await fetch(`${apiBase}/api/v1/streams/${encodeURIComponent(nodeId)}/codec`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ codec: 'ocr' }),
+      });
+    } catch (_) {}
+    await _switchToOcrMode();
+    return;
+  }
+
+  // Switching back from OCR
+  if (S.ocrMode) _switchFromOcrMode();
+
+  const body = {
+    codec: C.codecFamily,
+    encoder: C.selectedEncoder === 'auto' ? null : C.selectedEncoder,
+    bitrate: C.bitrate,
+    latency_mode: C.latencyMode,
+  };
+  try {
+    const r = await fetch(`${apiBase}/api/v1/streams/${encodeURIComponent(nodeId)}/codec`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    toast('Encoder applied — stream restarting…');
+    setTimeout(refreshCodecStatus, 2500);
+  } catch (e) {
+    toast(`Apply failed: ${e.message}`);
+  }
+}
+
+function setCodecFamily(family) {
+  C.codecFamily = family;
+  ['h264','h265','av1','vp9','ocr'].forEach(f => {
+    $(`codec-${f}`)?.classList.toggle('active', f === family);
+  });
+  const isOcr = family === 'ocr';
+  $('video-codec-controls').style.display = isOcr ? 'none' : '';
+  $('ocr-info-box').style.display = isOcr ? 'block' : 'none';
+  // Hide encoder list irrelevant to OCR
+  $('encoder-list').style.opacity = isOcr ? '0.4' : '';
+}
+
+function setBitrate(val) {
+  C.bitrate = val;
+  $('bitrate-group')?.querySelectorAll('.radio-btn').forEach(el => {
+    el.classList.toggle('active', el.textContent === val);
+  });
+}
+
+function setLatencyMode(mode) {
+  C.latencyMode = mode;
+  ['realtime','balanced','quality'].forEach(m => {
+    $(`lat-${m}`)?.classList.toggle('active', m === mode);
+  });
+}
+
+async function setAdaptive(on) {
+  try {
+    await fetch(`${apiBase}/api/v1/streams/${encodeURIComponent(nodeId)}/adaptive`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: on }),
+    });
+    toast(`Adaptive mode ${on ? 'enabled' : 'disabled'}`);
+  } catch (e) {
+    toast('Failed to set adaptive mode');
+  }
+}
+
+async function refreshCodecStatus() {
+  try {
+    const r = await fetch(`${apiBase}/api/v1/streams/${encodeURIComponent(nodeId)}/codec`);
+    if (!r.ok) return;
+    const data = await r.json();
+
+    // Restore OCR mode if server says it's active (e.g. after panel refresh)
+    if (data.ocr_mode && !S.ocrMode) {
+      setCodecFamily('ocr');
+      await _switchToOcrMode();
+    }
+
+    const enc = data.current_encoder || '—';
+    $('encoder-current').textContent = enc;
+    $('stat-codec').textContent = enc;
+    $('stat-codec-card').textContent = enc;
+    if (data.adaptive !== undefined) {
+      $('adaptive-toggle').checked = data.adaptive;
+    }
+    // Populate encoder list if we don't have a probe yet
+    if (!C.probeCache && data.available_encoders?.length) {
+      _populateEncoderList(data.available_encoders.map(e =>
+        typeof e === 'string' ? { encoder: e, available: true, codec_family: 'h264', hw_type: null, probe_ms: 0 } : e
+      ));
+    }
+  } catch (_) { /* non-critical */ }
+}
+
+// Called when Performance panel opens
+const _origTogglePanel = togglePanel;
+function togglePanel(name) {
+  _origTogglePanel(name);
+  if (name === 'perf') {
+    refreshCodecStatus();
+    // Auto-probe if no cache
+    if (!C.probeCache) probeEncoders(false);
+  }
+}
+
+// ── OCR codec mode ────────────────────────────────────────────
+//
+// When the OCR codec is selected the video stream is stopped entirely.
+// Instead we connect to the terminal bridge WebSocket (read-only) and
+// render the ANSI output on a canvas using the actual VGA bitmap font.
+// This gives pixel-perfect text at zero video bandwidth.
+//
+// Architecture:
+//   S.ws      → remote_desktop WebSocket (keyboard/mouse input, unchanged)
+//   OCR.ws    → terminal bridge WebSocket (receive ANSI screen updates)
+//   #ocr-canvas → VGA-pixel canvas, replaces video/img in display-inner
+
+const OCR = {
+  ws: null,          // terminal bridge WS (read-only ANSI output)
+  canvas: displayOcrCvs,
+  ctx: null,
+  cells: [],         // cells[row][col] = {char, fg:[r,g,b], bg:[r,g,b]}
+  glyphs: null,      // {code_str: [row_bitmask, ...]} or null (fallback mode)
+  cellW: 8,
+  cellH: 16,
+  cols: 80,
+  rows: 25,
+  curRow: 0, curCol: 0,
+  curFg: [204, 204, 204], curBg: [0, 0, 0],
+  showCursor: true,
+  animId: null,
+  dirty: new Set(),  // row indices that need redraw
+  allDirty: false,
+  _cellCache: new Map(), // "char|fgHex|bgHex" → ImageData (avoids per-frame alloc)
+};
+
+// ── ANSI parser ───────────────────────────────────────────────────────────────
+const _ap = { st: 'n', buf: '', priv: false };
+
+function _ansiParse(text) {
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const cc = ch.charCodeAt(0);
+    switch (_ap.st) {
+      case 'n':
+        if (cc === 0x1b) { _ap.st = 'e'; }
+        else if (cc === 0x0d) { OCR.curCol = 0; }
+        else if (cc === 0x0a) { OCR.curRow = Math.min(OCR.curRow + 1, OCR.rows - 1); }
+        else if (cc >= 0x20) { _ocrPutChar(ch); }
+        break;
+      case 'e':
+        _ap.st = ch === '[' ? 'c' : 'n';
+        _ap.buf = ''; _ap.priv = false;
+        break;
+      case 'c':
+        if (ch === '?') { _ap.priv = true; }
+        else if (ch === ';' || (cc >= 0x30 && cc <= 0x39)) { _ap.buf += ch; }
+        else {
+          const ps = _ap.buf ? _ap.buf.split(';').map(s => parseInt(s) || 0) : [0];
+          _ansiExec(ch, ps, _ap.priv);
+          _ap.st = 'n';
+        }
+        break;
+    }
+  }
+  // Always mark cursor row dirty for cursor blink
+  if (OCR.curRow < OCR.rows) OCR.dirty.add(OCR.curRow);
+}
+
+function _ansiExec(cmd, ps, priv) {
+  switch (cmd) {
+    case 'H':  // cursor position
+      OCR.curRow = Math.max(0, Math.min((ps[0] || 1) - 1, OCR.rows - 1));
+      OCR.curCol = Math.max(0, Math.min((ps[1] || 1) - 1, OCR.cols - 1));
+      break;
+    case 'J':  // erase screen
+      if (ps[0] === 2) {
+        _ocrClear();
+        OCR.allDirty = true;
+      }
+      break;
+    case 'm': { // SGR — set graphics rendition
+      let i = 0;
+      while (i < ps.length) {
+        const p = ps[i];
+        if (p === 0)  { OCR.curFg = [204,204,204]; OCR.curBg = [0,0,0]; }
+        else if (p === 38 && ps[i+1] === 2) {
+          OCR.curFg = [ps[i+2]||0, ps[i+3]||0, ps[i+4]||0]; i += 4;
+        } else if (p === 48 && ps[i+1] === 2) {
+          OCR.curBg = [ps[i+2]||0, ps[i+3]||0, ps[i+4]||0]; i += 4;
+        }
+        i++;
+      }
+      break;
+    }
+    case 'h': if (priv && ps[0] === 25) OCR.showCursor = true;  break;
+    case 'l': if (priv && ps[0] === 25) OCR.showCursor = false; break;
+  }
+}
+
+function _ocrPutChar(ch) {
+  if (OCR.curRow >= OCR.rows || OCR.curCol >= OCR.cols) return;
+  const row = OCR.cells[OCR.curRow];
+  if (!row) return;
+  row[OCR.curCol] = { char: ch, fg: [...OCR.curFg], bg: [...OCR.curBg] };
+  OCR.dirty.add(OCR.curRow);
+  OCR.curCol++;
+  if (OCR.curCol >= OCR.cols) { OCR.curCol = 0; OCR.curRow = Math.min(OCR.curRow + 1, OCR.rows - 1); }
+}
+
+function _ocrClear() {
+  OCR.cells = Array.from({ length: OCR.rows }, () =>
+    Array.from({ length: OCR.cols }, () => ({ char: ' ', fg: [0,0,0], bg: [0,0,0] }))
+  );
+  OCR._cellCache.clear();
+}
+
+// ── Canvas renderer ───────────────────────────────────────────────────────────
+
+function _ocrRenderLoop() {
+  _ocrRenderFrame();
+  OCR.animId = requestAnimationFrame(_ocrRenderLoop);
+}
+
+function _ocrRenderFrame() {
+  if (!OCR.ctx) return;
+  const rows = OCR.allDirty
+    ? Array.from({ length: OCR.rows }, (_, i) => i)
+    : Array.from(OCR.dirty);
+  OCR.allDirty = false;
+  OCR.dirty.clear();
+  for (const r of rows) {
+    const row = OCR.cells[r];
+    if (!row) continue;
+    for (let c = 0; c < row.length; c++) _drawCell(r, c, row[c]);
+  }
+  // Draw cursor underline
+  if (OCR.showCursor && OCR.curRow < OCR.rows && OCR.curCol < OCR.cols) {
+    const x = OCR.curCol * OCR.cellW, y = OCR.curRow * OCR.cellH;
+    OCR.ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    OCR.ctx.fillRect(x, y + OCR.cellH - 2, OCR.cellW, 2);
+  }
+}
+
+function _drawCell(row, col, cell) {
+  const { char, fg, bg } = cell;
+  const ctx = OCR.ctx;
+  const x = col * OCR.cellW, y = row * OCR.cellH;
+  const cw = OCR.cellW, ch = OCR.cellH;
+  const code = char.charCodeAt(0);
+  const glyph = OCR.glyphs && OCR.glyphs[String(code)];
+
+  if (glyph) {
+    // VGA bitmap pixel-perfect rendering
+    const key = `${code}|${fg[0]},${fg[1]},${fg[2]}|${bg[0]},${bg[1]},${bg[2]}`;
+    let img = OCR._cellCache.get(key);
+    if (!img) {
+      img = ctx.createImageData(cw, ch);
+      const d = img.data;
+      // Fill background
+      for (let i = 0; i < cw * ch * 4; i += 4) {
+        d[i] = bg[0]; d[i+1] = bg[1]; d[i+2] = bg[2]; d[i+3] = 255;
+      }
+      // Draw foreground pixels from glyph bitmask (MSB = leftmost)
+      for (let gr = 0; gr < Math.min(ch, glyph.length); gr++) {
+        const bits = glyph[gr];
+        for (let gc = 0; gc < cw; gc++) {
+          if ((bits >>> (cw - 1 - gc)) & 1) {
+            const idx = (gr * cw + gc) * 4;
+            d[idx] = fg[0]; d[idx+1] = fg[1]; d[idx+2] = fg[2]; d[idx+3] = 255;
+          }
+        }
+      }
+      // Cache up to 4096 entries (bounded by unique char×color combos on screen)
+      if (OCR._cellCache.size < 4096) OCR._cellCache.set(key, img);
+    }
+    ctx.putImageData(img, x, y);
   } else {
-    window.open(`${BASE}/display/snapshot`, '_blank');
+    // Fallback: canvas text (when no VGA font loaded)
+    ctx.fillStyle = `rgb(${bg[0]},${bg[1]},${bg[2]})`;
+    ctx.fillRect(x, y, cw, ch);
+    if (char !== ' ') {
+      ctx.fillStyle = `rgb(${fg[0]},${fg[1]},${fg[2]})`;
+      ctx.font = `${ch - 2}px monospace`;
+      ctx.textBaseline = 'top';
+      ctx.fillText(char, x, y + 1);
+    }
+  }
+}
+
+// ── OCR mode lifecycle ────────────────────────────────────────────────────────
+
+async function _switchToOcrMode() {
+  S.ocrMode = true;
+
+  // Stop video stream but keep S.ws (remote_desktop) for keyboard/mouse input
+  if (S.pc)  { S.pc.close(); S.pc = null; }
+  if (S.hls) { S.hls.destroy(); S.hls = null; }
+  displayVideo.style.display = 'none';
+  displayImg.style.display = 'none';
+  hideConnOverlay();
+
+  // Load VGA font from server
+  await _loadOcrFont();
+
+  // Size and show canvas
+  _ocrResizeTo(OCR.cols, OCR.rows);
+  OCR.canvas.style.display = 'block';
+  OCR.ctx = OCR.canvas.getContext('2d');
+  _ocrClear();
+  OCR.allDirty = true;
+
+  // Connect to terminal bridge WebSocket (receive-only: no keystrokes sent here)
+  _startOcrWs();
+
+  // Start render loop
+  if (!OCR.animId) OCR.animId = requestAnimationFrame(_ocrRenderLoop);
+
+  S.stats.codec = 'OCR';
+  $('stat-codec').textContent = 'OCR';
+  $('stat-codec-card').textContent = 'OCR';
+  toast('OCR terminal mode · pixel-perfect · ~0 kbps');
+}
+
+function _switchFromOcrMode() {
+  if (!S.ocrMode) return;
+  S.ocrMode = false;
+
+  // Stop OCR WebSocket and render loop
+  if (OCR.ws)    { OCR.ws.close(); OCR.ws = null; }
+  if (OCR.animId){ cancelAnimationFrame(OCR.animId); OCR.animId = null; }
+
+  // Hide canvas, restart video
+  OCR.canvas.style.display = 'none';
+  startVideoChain();
+}
+
+async function _loadOcrFont() {
+  try {
+    const r = await fetch(`${apiBase}/api/v1/text_capture/font`);
+    if (!r.ok) return;
+    const d = await r.json();
+    OCR.glyphs  = d.glyphs  || null;
+    OCR.cellW   = d.cell_width  || 8;
+    OCR.cellH   = d.cell_height || 16;
+  } catch (_) {
+    OCR.glyphs = null; // will use canvas text fallback
+  }
+}
+
+function _ocrResizeTo(cols, rows) {
+  OCR.cols = cols; OCR.rows = rows;
+  OCR.canvas.width  = cols * OCR.cellW;
+  OCR.canvas.height = rows * OCR.cellH;
+  // Tell scaling system about new native size
+  applyScaling();
+  _ocrClear();
+  OCR._cellCache.clear();
+  OCR.allDirty = true;
+}
+
+function _startOcrWs() {
+  const url = `${wsProto}//${location.host}${apiBase}/api/v1/remote/${encodeURIComponent(nodeId)}/terminal/ws`;
+  OCR.ws = new WebSocket(url);
+  OCR.ws.binaryType = 'arraybuffer';
+  OCR.ws.onopen  = () => {};
+  OCR.ws.onerror = () => {};
+  OCR.ws.onclose = () => {
+    if (S.ocrMode) setTimeout(_startOcrWs, 2000);
+  };
+  OCR.ws.onmessage = (e) => {
+    if (e.data instanceof ArrayBuffer) {
+      // ANSI bytes → parser → dirty cell tracking
+      _ansiParse(new TextDecoder().decode(e.data));
+    } else {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
+          _ocrResizeTo(msg.cols, msg.rows);
+        }
+      } catch (_) {}
+    }
+  };
+}
+
+// ── Keyboard shortcuts hint (? key) ──────────────────────────
+document.addEventListener('keydown', e => {
+  if (e.key === '?' && !isPanelFocused()) {
+    toast('F11=Fullscreen · K=Keys strip · C=Clipboard · ESC=forwarded to guest · Alt+drag=pan');
   }
 });
 
-$('btn-ctrlaltdel').addEventListener('click', () => {
-  [29, 56, 111].forEach(k => sendKey(k, true));
-  setTimeout(() => [111, 56, 29].forEach(k => sendKey(k, false)), 100);
-});
-
-function unmute() {
-  $('screen-video').muted = false;
-  $('audio-banner').style.display = 'none';
-}
-$('btn-audio').addEventListener('click', unmute);
-
-// ── Bitrate ─────────────────────────────────────────────
-$('btn-bitrate').addEventListener('click', () => {
-  $('bitrate-panel').classList.toggle('open');
-});
-
-$('bitrate-slider').addEventListener('input', (e) => {
-  const v = parseInt(e.target.value);
-  $('bitrate-label').textContent = v === 0 ? 'Auto' : v >= 1000 ? `${(v/1000).toFixed(1)} Mbps` : `${v} kbps`;
-  fetch(`${INPUT_BASE}/webrtc/bitrate`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ bitrate: v * 1000, auto: v === 0 }),
-  }).catch(() => {});
-});
-
-// ── Start ───────────────────────────────────────────────
-startWebRTC();
+// ── Start ─────────────────────────────────────────────────────
+init();
 </script>
 </body>
 </html>

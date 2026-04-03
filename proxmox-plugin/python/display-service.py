@@ -32,6 +32,9 @@ from pathlib import Path
 _lib_dir = Path(__file__).parent.parent / "lib" / "ozma-proxmox"
 if _lib_dir.exists():
     sys.path.insert(0, str(_lib_dir))
+_softnode_dir = Path(__file__).parent / "softnode"
+if _softnode_dir.exists():
+    sys.path.insert(0, str(_softnode_dir))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from aiohttp import web
@@ -83,7 +86,7 @@ class VMDisplayService:
                 else:
                     self._dbus_client = None
             except Exception as e:
-                log.debug("D-Bus p2p failed: %s", e)
+                log.warning("D-Bus p2p failed: %s", e, exc_info=True)
                 self._dbus_client = None
 
         # Fallback: KVMFR shared memory
@@ -285,6 +288,116 @@ class VMDisplayService:
                 return web.FileResponse(html)
             return web.Response(text="Console not installed", status=404)
 
+        # Controller-compatible API routes (so console.html works unmodified)
+        # The {node} segment is ignored — this service handles one VM only.
+        async def api_webrtc(request):
+            return await webrtc_offer(request)
+
+        async def api_snapshot(request):
+            return await snapshot(request)
+
+        async def api_mjpeg(request):
+            return await mjpeg(request)
+
+        async def api_codec(request):
+            if request.method == 'POST':
+                return web.json_response({"ok": True})
+            return web.json_response({
+                "codec": "mjpeg",
+                "active": "mjpeg",
+                "width": self._dbus_client.width if self._dbus_client else self._width,
+                "height": self._dbus_client.height if self._dbus_client else self._height,
+            })
+
+        async def api_codecs_probe(request):
+            codecs = ["mjpeg"]
+            if self._dbus_client and self._dbus_client.connected:
+                codecs.append("webrtc")
+            return web.json_response({"codecs": codecs})
+
+        async def api_adaptive(request):
+            return web.json_response({"ok": True})
+
+        # WebSocket for HID input (keyboard + mouse)
+        # Console sends: {type:'keydown',code:N}, {type:'keyup',code:N},
+        #                {type:'mousemove',x:N,y:N}, {type:'mousedown',button:N,...}
+        #                {type:'ping',ts:N}
+        async def _qmp_send(cmd):
+            """Send a QMP command to the VM."""
+            import socket as _socket
+            qmp = self.qmp_path if os.path.exists(self.qmp_path) else self.qmp_path_proxmox
+            if not os.path.exists(qmp):
+                log.warning("QMP socket not found: %s / %s", self.qmp_path, self.qmp_path_proxmox)
+                return
+            try:
+                s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+                s.settimeout(2)
+                s.connect(qmp)
+                s.recv(4096)  # greeting
+                s.sendall(json.dumps({"execute": "qmp_capabilities"}).encode() + b"\n")
+                s.recv(4096)
+                s.sendall(json.dumps(cmd).encode() + b"\n")
+                resp = s.recv(4096)
+                s.close()
+                log.info("QMP input sent: %s → %s", cmd.get("execute"), resp[:80])
+            except Exception as e:
+                log.warning("QMP send error: %s", e)
+
+        async def api_ws(request):
+            ws = web.WebSocketResponse()
+            await ws.prepare(request)
+            log.info("WS connected from %s", request.remote)
+            async for msg in ws:
+                if msg.type == web.WSMsgType.TEXT:
+                    try:
+                        data = json.loads(msg.data)
+                        t = data.get("type", "")
+
+                        log.info("WS msg: %s", data)
+
+                        if t in ("keydown", "keyup"):
+                            code = data.get("code", "")
+                            down = t == "keydown"
+                            # Console sends DOM KeyboardEvent.code strings
+                            qcode = _DOM_TO_QCODE.get(code) or _EVDEV_TO_QCODE.get(code)
+                            if qcode:
+                                await _qmp_send({
+                                    "execute": "input-send-event",
+                                    "arguments": {"events": [{
+                                        "type": "key",
+                                        "data": {"down": down, "key": {"type": "qcode", "data": qcode}},
+                                    }]},
+                                })
+
+                        elif t in ("mousemove", "mousedown", "mouseup"):
+                            x = int(data.get("x", 0))
+                            y = int(data.get("y", 0))
+                            events = [
+                                {"type": "abs", "data": {"axis": "x", "value": x}},
+                                {"type": "abs", "data": {"axis": "y", "value": y}},
+                            ]
+                            if t == "mousedown":
+                                btn = {0: "left", 1: "middle", 2: "right"}.get(data.get("button", 0), "left")
+                                events.append({"type": "btn", "data": {"down": True, "button": btn}})
+                            elif t == "mouseup":
+                                btn = {0: "left", 1: "middle", 2: "right"}.get(data.get("button", 0), "left")
+                                events.append({"type": "btn", "data": {"down": False, "button": btn}})
+                            await _qmp_send({
+                                "execute": "input-send-event",
+                                "arguments": {"events": events},
+                            })
+
+                        elif t == "ping":
+                            await ws.send_json({"type": "pong", "ts": data.get("ts", 0)})
+
+                    except Exception as e:
+                        log.debug("WS input error: %s", e)
+            return ws
+
+        async def api_text_capture_font(request):
+            return web.json_response({"error": "not available"}, status=404)
+
+        # Native flat routes
         app.router.add_get("/health", health)
         app.router.add_get("/display/info", display_info)
         app.router.add_get("/display/snapshot", snapshot)
@@ -294,6 +407,20 @@ class VMDisplayService:
         app.router.add_post("/webrtc/offer", webrtc_offer)
         app.router.add_get("/console/", console_page)
         app.router.add_get("/console", console_page)
+
+        # Controller-compatible routes (for console.html)
+        app.router.add_post("/api/v1/streams/{node}/webrtc", api_webrtc)
+        app.router.add_get("/api/v1/streams/{node}/snapshot", api_snapshot)
+        app.router.add_get("/api/v1/streams/{node}/mjpeg", api_mjpeg)
+        app.router.add_get("/api/v1/streams/{node}/codec", api_codec)
+        app.router.add_post("/api/v1/streams/{node}/codec", api_codec)
+        app.router.add_post("/api/v1/streams/{node}/adaptive", api_adaptive)
+        async def api_hls_unavailable(request):
+            return web.json_response({"error": "HLS not available"}, status=404)
+        app.router.add_get("/api/v1/streams/{node}/hls/{filename}", api_hls_unavailable)
+        app.router.add_get("/api/v1/remote/{node}/ws", api_ws)
+        app.router.add_get("/api/v1/codecs/probe", api_codecs_probe)
+        app.router.add_get("/api/v1/text_capture/font", api_text_capture_font)
 
         # CORS headers for cross-origin console access
         try:
@@ -329,6 +456,36 @@ _EVDEV_TO_QCODE = {
     42: "shift", 44: "z", 45: "x", 46: "c", 47: "v", 48: "b", 49: "n",
     50: "m", 54: "shift_r", 56: "alt", 57: "spc",
     97: "ctrl_r", 100: "alt_r", 103: "up", 105: "left", 106: "right", 108: "down",
+}
+
+# DOM KeyboardEvent.code → QMP qcode
+_DOM_TO_QCODE = {
+    "Escape": "esc", "Digit1": "1", "Digit2": "2", "Digit3": "3", "Digit4": "4",
+    "Digit5": "5", "Digit6": "6", "Digit7": "7", "Digit8": "8", "Digit9": "9",
+    "Digit0": "0", "Minus": "minus", "Equal": "equal", "Backspace": "backspace",
+    "Tab": "tab", "KeyQ": "q", "KeyW": "w", "KeyE": "e", "KeyR": "r", "KeyT": "t",
+    "KeyY": "y", "KeyU": "u", "KeyI": "i", "KeyO": "o", "KeyP": "p",
+    "BracketLeft": "bracket_left", "BracketRight": "bracket_right",
+    "Enter": "ret", "ControlLeft": "ctrl", "KeyA": "a", "KeyS": "s", "KeyD": "d",
+    "KeyF": "f", "KeyG": "g", "KeyH": "h", "KeyJ": "j", "KeyK": "k", "KeyL": "l",
+    "Semicolon": "semicolon", "Quote": "apostrophe", "Backquote": "grave_accent",
+    "ShiftLeft": "shift", "Backslash": "backslash",
+    "KeyZ": "z", "KeyX": "x", "KeyC": "c", "KeyV": "v", "KeyB": "b", "KeyN": "n",
+    "KeyM": "m", "Comma": "comma", "Period": "dot", "Slash": "slash",
+    "ShiftRight": "shift_r", "NumpadMultiply": "kp_multiply",
+    "AltLeft": "alt", "Space": "spc", "CapsLock": "caps_lock",
+    "F1": "f1", "F2": "f2", "F3": "f3", "F4": "f4", "F5": "f5", "F6": "f6",
+    "F7": "f7", "F8": "f8", "F9": "f9", "F10": "f10", "F11": "f11", "F12": "f12",
+    "NumLock": "num_lock", "ScrollLock": "scroll_lock",
+    "Numpad7": "kp_7", "Numpad8": "kp_8", "Numpad9": "kp_9",
+    "NumpadSubtract": "kp_subtract", "Numpad4": "kp_4", "Numpad5": "kp_5",
+    "Numpad6": "kp_6", "NumpadAdd": "kp_add", "Numpad1": "kp_1", "Numpad2": "kp_2",
+    "Numpad3": "kp_3", "Numpad0": "kp_0", "NumpadDecimal": "kp_decimal",
+    "NumpadEnter": "kp_enter", "ControlRight": "ctrl_r", "NumpadDivide": "kp_divide",
+    "PrintScreen": "print", "AltRight": "alt_r",
+    "Home": "home", "ArrowUp": "up", "PageUp": "pgup", "ArrowLeft": "left",
+    "ArrowRight": "right", "End": "end", "ArrowDown": "down", "PageDown": "pgdn",
+    "Insert": "insert", "Delete": "delete", "MetaLeft": "meta_l", "MetaRight": "meta_r",
 }
 
 

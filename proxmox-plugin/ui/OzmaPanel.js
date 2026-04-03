@@ -1,177 +1,66 @@
 /*
  * Ozma Proxmox Plugin — Web UI Extension
  *
- * Adds to each VM's management page:
- *   1. "Ozma Console" button in the VM toolbar (WebRTC, <5ms latency)
- *   2. "Ozma" tab with live preview, status, profiles
+ * Adds "Ozma Console" tab to each VM's sidebar — one click opens a
+ * WebRTC console with <5ms latency, replacing PVE's noVNC.
  */
 
-// ── Inject Ozma Console button into VM toolbar ──────────────────────────
-Ext.define('PVE.qemu.OzmaInjector', {
+// Inject ozma icon CSS — simple hexagonal O
+(function() {
+    var style = document.createElement('style');
+    style.textContent =
+        ".fa.fa-ozma:before{content:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' width='14' height='14'%3E" +
+        "%3Cpath d='M8 0.5L14.5 4.25V11.75L8 15.5L1.5 11.75V4.25Z' fill='none' stroke='white' stroke-width='3' stroke-linejoin='round'/%3E" +
+        '%3C/svg%3E")}';
+    document.head.appendChild(style);
+})();
+
+Ext.define('PVE.qemu.OzmaConsoleTab', {
     override: 'PVE.qemu.Config',
 
     initComponent: function() {
         var me = this;
         me.callParent();
 
-        var vmid = me.pveSelNode.data.vmid;
-        var vmname = me.pveSelNode.data.text || me.pveSelNode.data.name || ('VM ' + vmid);
+        var vm = me.pveSelNode.data;
+        var vmid = vm.vmid;
+        var vmname = vm.name || vm.text || ('VM ' + vmid);
+        var frameId = 'ozma-frame-' + vmid;
 
-        // Add Ozma Console button to the top toolbar
-        var tbar = me.down('toolbar');
-        if (tbar) {
-            // Insert after the first few buttons (Start, Shutdown, etc.)
-            tbar.add('-');
-            tbar.add({
-                xtype: 'button',
-                text: 'Ozma Console',
-                iconCls: 'fa fa-bolt',
-                tooltip: 'Open Ozma WebRTC Console (low latency)',
-                handler: function() {
-                    var w = Math.min(screen.width - 100, 1920);
-                    var h = Math.min(screen.height - 100, 1080);
-                    var l = Math.round((screen.width - w) / 2);
-                    var t = Math.round((screen.height - h) / 2);
-                    window.open(
-                        '/ozma/console/?vmid=' + vmid +
-                        '&name=' + encodeURIComponent(vmname),
-                        'ozma-console-' + vmid,
-                        'width=' + w + ',height=' + h + ',left=' + l + ',top=' + t +
-                        ',menubar=no,toolbar=no,location=no,status=no'
-                    );
-                }
-            });
-        }
-
-        // Add Ozma tab to the VM panel
-        me.addDocked({
-            // nothing — we insert as a tab below
-        });
-
-        // Insert Ozma tab before the last item
-        var tabIdx = me.items.length > 1 ? me.items.length - 1 : me.items.length;
-        me.insert(tabIdx, {
+        me.insertNodes([{
             xtype: 'panel',
-            title: 'Ozma',
-            iconCls: 'fa fa-desktop',
-            itemId: 'ozma',
-            layout: 'border',
-            items: [{
-                // Display preview (center)
-                region: 'center',
-                xtype: 'panel',
-                title: 'Live Display',
-                bodyStyle: 'background:#111;display:flex;align-items:center;justify-content:center;cursor:pointer',
-                html: '<img id="ozma-preview-' + vmid + '" style="max-width:100%;max-height:100%" />' +
-                      '<div style="position:absolute;bottom:8px;left:8px;background:rgba(0,0,0,0.7);' +
-                      'color:#e94560;padding:2px 8px;border-radius:3px;font-size:11px">' +
-                      'Click to open Ozma Console</div>',
-                listeners: {
-                    afterrender: function(p) {
-                        // Click to open console
-                        p.getEl().on('click', function() {
-                            var w = Math.min(screen.width - 100, 1920);
-                            var h = Math.min(screen.height - 100, 1080);
-                            window.open(
-                                '/ozma/console/?vmid=' + vmid + '&name=' + encodeURIComponent(vmname),
-                                'ozma-console-' + vmid,
-                                'width=' + w + ',height=' + h + ',menubar=no,toolbar=no'
-                            );
+            title: 'Ozma Console',
+            iconCls: 'fa fa-ozma',
+            itemId: 'ozma-console',
+            layout: 'fit',
+            html: '<iframe id="' + frameId + '" ' +
+                  'tabindex="0" ' +
+                  'style="width:100%;height:100%;border:none" ' +
+                  'src="/ozma/console/?node=' + encodeURIComponent(vmname) + '&api=/ozma&_=' + Date.now() +
+                  '" allow="autoplay; clipboard-write; fullscreen" allowfullscreen></iframe>',
+            listeners: {
+                // Focus the iframe when the Ozma Console tab is activated
+                activate: function() {
+                    var frame = document.getElementById(frameId);
+                    if (frame) {
+                        // Short delay to let ExtJS finish layout
+                        setTimeout(function() {
+                            frame.focus();
+                            // Also tell the iframe content to grab focus
+                            try { frame.contentWindow.focus(); } catch(e) {}
+                        }, 100);
+                    }
+                },
+                afterrender: function() {
+                    var frame = document.getElementById(frameId);
+                    if (frame) {
+                        // Focus iframe when clicked
+                        frame.addEventListener('mouseenter', function() {
+                            frame.focus();
                         });
-
-                        // Start snapshot preview polling
-                        var img = document.getElementById('ozma-preview-' + vmid);
-                        if (img) {
-                            var refresh = function() {
-                                var next = new Image();
-                                next.onload = function() { img.src = next.src; };
-                                next.src = '/ozma/display/snapshot?t=' + Date.now();
-                            };
-                            refresh();
-                            var timer = setInterval(refresh, 2000);
-                            p.on('destroy', function() { clearInterval(timer); });
-                        }
                     }
-                }
-            }, {
-                // Status panel (right)
-                region: 'east',
-                width: 260,
-                split: true,
-                xtype: 'panel',
-                title: 'Status',
-                bodyPadding: 8,
-                defaults: { margin: '4 0' },
-                items: [{
-                    xtype: 'displayfield',
-                    fieldLabel: 'Display',
-                    itemId: 'ozma-display-type',
-                    value: '<i>detecting...</i>'
-                }, {
-                    xtype: 'displayfield',
-                    fieldLabel: 'Resolution',
-                    itemId: 'ozma-resolution',
-                    value: '-'
-                }, {
-                    xtype: 'displayfield',
-                    fieldLabel: 'Frames',
-                    itemId: 'ozma-frames',
-                    value: '0'
-                }, {
-                    xtype: 'displayfield',
-                    fieldLabel: 'Port',
-                    value: String(7390 + parseInt(vmid))
-                }, {
-                    xtype: 'component',
-                    html: '<hr style="border-color:#444">'
-                }, {
-                    xtype: 'button',
-                    text: 'Open Ozma Console',
-                    iconCls: 'fa fa-bolt',
-                    width: '100%',
-                    scale: 'medium',
-                    handler: function() {
-                        var w = Math.min(screen.width - 100, 1920);
-                        var h = Math.min(screen.height - 100, 1080);
-                        window.open(
-                            '/ozma/console/?vmid=' + vmid + '&name=' + encodeURIComponent(vmname),
-                            'ozma-console-' + vmid,
-                            'width=' + w + ',height=' + h + ',menubar=no,toolbar=no'
-                        );
-                    }
-                }, {
-                    xtype: 'button',
-                    text: 'Screenshot',
-                    iconCls: 'fa fa-camera',
-                    width: '100%',
-                    margin: '4 0',
-                    handler: function() {
-                        window.open('/ozma/display/snapshot', '_blank');
-                    }
-                }],
-                listeners: {
-                    afterrender: function(p) {
-                        // Poll display status
-                        var timer = setInterval(function() {
-                            fetch('/ozma/display/info')
-                                .then(function(r) { return r.json(); })
-                                .then(function(d) {
-                                    var dt = p.down('[itemId=ozma-display-type]');
-                                    if (dt) dt.setValue(d.type || 'unknown');
-                                    var res = p.down('[itemId=ozma-resolution]');
-                                    if (res && d.width) res.setValue(d.width + ' x ' + d.height);
-                                    var fc = p.down('[itemId=ozma-frames]');
-                                    if (fc) fc.setValue(String(d.frame_count || 0));
-                                })
-                                .catch(function() {
-                                    var dt = p.down('[itemId=ozma-display-type]');
-                                    if (dt) dt.setValue('<span style="color:red">offline</span>');
-                                });
-                        }, 3000);
-                        p.on('destroy', function() { clearInterval(timer); });
-                    }
-                }
-            }]
-        });
-    }
+                },
+            },
+        }]);
+    },
 });

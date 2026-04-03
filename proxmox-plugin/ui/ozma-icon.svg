@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!--
+    Ozma "O" mark for Proxmox UI sidebar.
+    Matches PVE's flat icon style — clean strokes, no gradients at this size.
+    Brand green (#4ae0a4) on transparent, with the curtain gap motif.
+  -->
+  <defs>
+    <linearGradient id="og" x1="0" y1="0" x2="16" y2="16" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#4ae0a4"/>
+      <stop offset="100%" stop-color="#35b87e"/>
+    </linearGradient>
+  </defs>
+  <!-- Outer O ring -->
+  <path d="M8 1C4.134 1 1 4.134 1 8s3.134 7 7 7 7-3.134 7-7S11.866 1 8 1zm0 2c2.761 0 5 2.239 5 5s-2.239 5-5 5-5-2.239-5-5 2.239-5 5-5z" fill="url(#og)"/>
+  <!-- Curtain gap — vertical S-curve cut through the O -->
+  <path d="M7.2 3.2C7 4.8 6.2 6 6 8c-.2 2 .6 3.2.8 4.8h1.6C8.2 11.2 9.4 10 9.6 8c.2-2-.6-3.2-.8-4.8z" fill="url(#og)" opacity="0.6"/>
+</svg>
