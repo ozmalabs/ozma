@@ -283,15 +283,27 @@ class SeatManager:
         # Assign input groups to seats
         self._assign_inputs()
 
-        # Don't start seats yet — just test the main loop
-        log.info("Skipping seat start — testing main loop only")
-        print(f"[OZMA] {len(self._seats)} seats created but NOT started", flush=True)
-        print("[OZMA] Entering sleep loop...", flush=True)
+        # Start seats with minimal functionality
+        log.info("Starting %d seats", len(self._seats))
+        for seat in self._seats:
+            async def _minimal_seat(s=seat):
+                print(f"[SEAT-TASK {s.name}] task started", flush=True)
+                try:
+                    await s.start(self._controller_url)
+                except BaseException as e:
+                    print(f"[SEAT-TASK {s.name}] crashed: {type(e).__name__}: {e}", flush=True)
+                    import traceback; traceback.print_exc()
+                print(f"[SEAT-TASK {s.name}] task ended", flush=True)
+
+            asyncio.create_task(_minimal_seat(), name=f"seat-{seat.name}")
+
+        print("[OZMA] Seats launched, entering keepalive...", flush=True)
         i = 0
         while True:
             await asyncio.sleep(1)
             i += 1
-            print(f"[OZMA] alive {i}", flush=True)
+            if i % 5 == 0:
+                print(f"[OZMA] alive {i}s", flush=True)
 
     async def stop(self) -> None:
         """Stop all seats and clean up resources."""
