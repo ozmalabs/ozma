@@ -1414,7 +1414,7 @@ def main() -> None:
             loop.close()
     else:
         # Default: always use SeatManager (supports dynamic seat config from controller)
-        from multiseat import SeatManager
+        from multiseat.seat_manager import SeatManager
 
         # Determine initial seat count: CLI flag > persisted config > 1
         seat_count = getattr(args, "seats", None)
