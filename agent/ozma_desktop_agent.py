@@ -1455,18 +1455,20 @@ def main() -> None:
 
         async def _run():
             print("[OZMA] Starting manager...", flush=True)
-            await manager.start()
+            try:
+                await manager.start()
+            except Exception as e:
+                print(f"[OZMA] manager.start() raised: {e}", flush=True)
+                import traceback; traceback.print_exc()
 
-        async def _test_loop():
-            print("[OZMA] Testing bare asyncio.sleep loop...", flush=True)
-            for i in range(100):
-                await asyncio.sleep(1)
-                print(f"[OZMA] tick {i}", flush=True)
+            # manager.start() returned — keep alive with sleep loop
+            print("[OZMA] Entering keepalive loop...", flush=True)
+            while True:
+                await asyncio.sleep(5)
+                print("[OZMA] alive", flush=True)
 
-        # First test: does asyncio.run even stay alive?
-        print("[OZMA] Testing event loop...", flush=True)
         try:
-            asyncio.run(_test_loop())
+            asyncio.run(_run())
         except KeyboardInterrupt:
             print("[OZMA] Stopped by Ctrl+C", flush=True)
 
