@@ -223,6 +223,41 @@ export class OzmaApiError extends Error {
   }
 }
 
+// ── Room correction ───────────────────────────────────────────────────────────
+
+export interface EQBand {
+  type: 'peak' | 'low_shelf' | 'high_shelf';
+  freq: number;
+  gain: number;
+  q: number;
+}
+
+export interface CorrectionProfile {
+  id: string;
+  name: string;
+  created_at: number;
+  bands: EQBand[];
+  mic_type: string;
+  phone_model: string;
+  target_curve: string;
+  room_name: string;
+  node_id: string;
+  active: boolean;
+  band_count: number;
+}
+
+export interface RoomCorrectionStatus {
+  available: boolean;
+  phone_models: string[];
+  target_curves: string[];
+  active_profile_id?: string;
+}
+
+export interface AudioSink {
+  name: string;
+  description: string;
+}
+
 // ── Mobile camera / WHIP ──────────────────────────────────────────────────────
 
 /**

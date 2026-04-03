@@ -1624,6 +1624,97 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         model = room_correction.detect_phone_model(ua)
         return {"model": model}
 
+    # Active sweep processes keyed by node_id (or "" for local).
+    _sweep_processes: dict[str, Any] = {}
+
+    @app.post("/api/v1/audio/room-correction/play-sweep")
+    async def play_sweep_for_phone(body: dict) -> dict[str, Any]:
+        """
+        Play a log sweep through a speaker sink without recording.
+        The phone IS the microphone — it calls this endpoint then starts
+        recording locally at the same time.
+
+        Non-blocking: returns immediately after spawning pw-play so the
+        phone can begin its MediaStream capture in parallel.
+
+        Body: {node_id?, sink, duration?: 5}
+        Returns: {ok, duration}
+        """
+        if not room_correction:
+            raise HTTPException(status_code=503, detail="Room correction not available")
+
+        sink = body.get("sink", "")
+        if not sink:
+            raise HTTPException(status_code=400, detail="sink required")
+
+        duration = float(body.get("duration", 5))
+        node_id = body.get("node_id", "")
+
+        import tempfile, pathlib as _pl
+
+        sweep_dir = _pl.Path(tempfile.mkdtemp(prefix="ozma-sweep-phone-"))
+        sweep_path = sweep_dir / "sweep.wav"
+
+        try:
+            room_correction._generate_sweep_wav(sweep_path, 48000, duration)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Sweep generation failed: {e}")
+
+        # Kill any existing sweep for this node
+        existing = _sweep_processes.pop(node_id, None)
+        if existing is not None:
+            try:
+                existing.terminate()
+            except Exception:
+                pass
+
+        play_proc = await asyncio.create_subprocess_exec(
+            "pw-play", "--target", sink, str(sweep_path),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        _sweep_processes[node_id] = play_proc
+
+        # Clean up temp dir + process entry after sweep finishes (non-blocking)
+        async def _cleanup():
+            try:
+                await asyncio.wait_for(play_proc.wait(), timeout=duration + 5)
+            except Exception:
+                pass
+            _sweep_processes.pop(node_id, None)
+            import shutil as _sh
+            _sh.rmtree(sweep_dir, ignore_errors=True)
+
+        asyncio.create_task(_cleanup(), name=f"sweep-cleanup-{node_id or 'local'}")
+
+        return {"ok": True, "duration": duration}
+
+    @app.post("/api/v1/audio/room-correction/stop-sweep")
+    async def stop_sweep_playback(body: dict = {}) -> dict[str, Any]:
+        """
+        Cancel an in-progress sweep playback started by play-sweep.
+
+        Body: {node_id?}
+        """
+        node_id = (body or {}).get("node_id", "")
+        proc = _sweep_processes.pop(node_id, None)
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        return {"ok": True}
+
+    @app.delete("/api/v1/audio/room-correction/profiles/{profile_id}")
+    async def delete_correction_profile(profile_id: str) -> dict[str, Any]:
+        """Delete a saved correction profile by ID."""
+        if not room_correction:
+            raise HTTPException(status_code=503, detail="Room correction not available")
+        ok = room_correction.delete_profile(profile_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        return {"ok": True}
+
     # --- KVM input proxy (dashboard → soft node API) ---
 
     async def _proxy_to_node(node_id: str, path: str, body: dict) -> dict:

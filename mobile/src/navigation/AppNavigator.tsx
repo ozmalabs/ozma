@@ -33,6 +33,7 @@ import {SettingsScreen} from '../screens/SettingsScreen';
 import {LoginScreen} from '../screens/LoginScreen';
 import {OnboardingScreen} from '../screens/OnboardingScreen';
 import {WebcamScreen} from '../screens/WebcamScreen';
+import {RoomCorrectionScreen} from '../screens/RoomCorrectionScreen';
 
 // ── Route parameter types ─────────────────────────────────────────────────────
 
@@ -47,6 +48,7 @@ export type TabParamList = {
   Cameras: undefined;
   Webcam: undefined;
   Machines: undefined;
+  Room: undefined;
   Notifications: undefined;
   Guests: undefined;
   Settings: undefined;
@@ -93,6 +95,14 @@ function MainTabs() {
         options={{
           title: 'Machines',
           tabBarIcon: ({color}) => <TabIcon emoji="🖥" color={color} />,
+        }}
+      />
+      <Tab.Screen
+        name="Room"
+        component={RoomCorrectionScreen}
+        options={{
+          title: 'Room EQ',
+          tabBarIcon: ({color}) => <TabIcon emoji="🎚" color={color} />,
         }}
       />
       <Tab.Screen
