@@ -128,7 +128,7 @@ class DirectRegisterRequest(BaseModel):
     display_outputs: str = ""  # JSON-encoded list of display output dicts
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None) -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None) -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -3839,6 +3839,66 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             since = float(request.query_params.get("since", "0"))
             segments = transcription_mgr.get_segments(session_id, since=since)
             return {"session_id": session_id, "segments": segments}
+
+    # ── Doorbell ────────────────────────────────────────────────────────────
+
+    @app.post("/api/v1/frigate/webhook")
+    async def frigate_webhook(request: Request) -> dict[str, Any]:
+        """Receive events from the Frigate-Ozma bridge (MQTT → HTTP).
+
+        Called by frigate_tools.ozma_bridge for every MQTT message from Frigate.
+        Doorbell button events are routed to DoorbellManager. Other events are
+        put onto state.events for general consumption (overlays, notifications).
+        """
+        body = await request.json()
+        kind = body.get("kind", "event")
+        camera = body.get("camera", "")
+        payload = body.get("payload", {})
+
+        if kind == "doorbell" and doorbell_mgr and camera:
+            session = await doorbell_mgr.receive_event(camera, "doorbell", payload)
+            return {"ok": True, "session_id": session.id if session else None}
+
+        # Forward all Frigate events onto the event bus for overlays / notifications
+        await state.events.put({
+            "type": f"frigate.{kind}",
+            "camera": camera,
+            "topic": body.get("topic", ""),
+            "payload": payload,
+        })
+        return {"ok": True}
+
+    @app.get("/api/v1/doorbell/sessions")
+    async def list_doorbell_sessions(request: Request) -> dict[str, Any]:
+        """List active doorbell sessions. Answer/dismiss via POST /api/v1/controls/action
+        with action='doorbell.answer' or 'doorbell.dismiss' and value=session_id.
+        This routes through the control surface system so any bound surface can answer."""
+        _require_scope(request, SCOPE_READ)
+        sessions = doorbell_mgr.get_sessions() if doorbell_mgr else []
+        return {"sessions": sessions}
+
+    @app.get("/api/v1/doorbell/{session_id}/snapshot")
+    async def doorbell_snapshot(request: Request, session_id: str) -> Any:
+        """Proxy the Frigate camera snapshot for this doorbell session."""
+        _require_scope(request, SCOPE_READ)
+        if not doorbell_mgr:
+            raise HTTPException(503, "Doorbell manager not available")
+        snapshot_url = doorbell_mgr.get_snapshot_url(session_id)
+        if not snapshot_url:
+            raise HTTPException(404, "Session not found")
+        try:
+            import httpx as _httpx
+            async with _httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(snapshot_url)
+                if resp.status_code != 200:
+                    raise HTTPException(502, "Snapshot unavailable from Frigate")
+                from fastapi.responses import Response as _Response
+                return _Response(
+                    content=resp.content,
+                    media_type=resp.headers.get("content-type", "image/jpeg"),
+                )
+        except Exception as exc:
+            raise HTTPException(502, f"Snapshot fetch failed: {exc}") from exc
 
     # Static files — mounted last so they don't shadow API routes
     static_dir = Path(__file__).parent / "static"

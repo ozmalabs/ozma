@@ -130,11 +130,13 @@ class ControlManager:
         scenarios: "ScenarioManager",
         audio: "AudioRouter | None" = None,
         motion: "MotionManager | None" = None,
+        doorbell: "Any | None" = None,
     ) -> None:
         self._state = state
         self._scenarios = scenarios
         self._audio = audio
         self._motion = motion
+        self._doorbell = doorbell
         self._surfaces: dict[str, ControlSurface] = {}
         self._action_lock = asyncio.Lock()
 
@@ -248,6 +250,33 @@ class ControlManager:
                 node_name = self._resolve_target(target)
                 if node_name:
                     await self._proxy_power(node_name, power_action)
+
+            case "doorbell.answer":
+                # target or value = session_id
+                # Bindable to any control surface: Stream Deck button, MIDI note, hotkey
+                if not self._doorbell:
+                    return
+                session_id = str(value or target or "")
+                if not session_id:
+                    # No session specified — answer the most recent ringing session
+                    ringing = [s for s in self._doorbell.get_sessions()
+                               if s["state"] == "ringing"]
+                    if ringing:
+                        session_id = ringing[-1]["id"]
+                if session_id:
+                    await self._doorbell.answer(session_id)
+
+            case "doorbell.dismiss":
+                if not self._doorbell:
+                    return
+                session_id = str(value or target or "")
+                if not session_id:
+                    ringing = [s for s in self._doorbell.get_sessions()
+                               if s["state"] == "ringing"]
+                    if ringing:
+                        session_id = ringing[-1]["id"]
+                if session_id:
+                    await self._doorbell.dismiss(session_id)
 
             case _:
                 log.debug("Unknown action: %s", action)

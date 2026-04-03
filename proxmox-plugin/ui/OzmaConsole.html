@@ -297,6 +297,38 @@ input[type=range]::-webkit-slider-thumb {
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* Doorbell notification */
+#doorbell-notify {
+  position: fixed; top: 56px; right: 16px; width: 280px;
+  background: var(--surface); border: 1px solid var(--emerald);
+  border-radius: 10px; box-shadow: 0 4px 24px rgba(0,0,0,0.5);
+  z-index: 400; overflow: hidden;
+  transform: translateX(320px); opacity: 0;
+  transition: transform 0.25s cubic-bezier(0.34,1.56,0.64,1), opacity 0.2s;
+  pointer-events: none;
+}
+#doorbell-notify.show { transform: translateX(0); opacity: 1; pointer-events: all; }
+#doorbell-img {
+  width: 100%; height: 158px; object-fit: cover; display: block;
+  background: var(--bg);
+}
+#doorbell-img-placeholder {
+  width: 100%; height: 158px; display: flex; align-items: center; justify-content: center;
+  background: var(--bg); color: var(--muted); font-size: 28px;
+}
+#doorbell-body { padding: 10px 12px 12px; }
+#doorbell-title { font-size: 11px; font-weight: 700; color: var(--emerald); text-transform: uppercase; letter-spacing: 0.05em; }
+#doorbell-camera { font-size: 13px; font-weight: 600; color: var(--text); margin: 2px 0 8px; }
+#doorbell-timer { font-size: 11px; color: var(--muted); margin-bottom: 10px; }
+#doorbell-actions { display: flex; gap: 8px; }
+#doorbell-actions button {
+  flex: 1; padding: 7px 0; border-radius: 6px; border: none;
+  font-size: 12px; font-weight: 600; cursor: pointer; transition: opacity 0.15s;
+}
+#doorbell-actions button:hover { opacity: 0.85; }
+#btn-doorbell-answer { background: var(--emerald); color: #000; }
+#btn-doorbell-dismiss { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
+
 /* Toast */
 #toast {
   position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%) translateY(10px);
@@ -469,6 +501,20 @@ input[type=range]::-webkit-slider-thumb {
 
 <!-- Toast -->
 <div id="toast"></div>
+
+<div id="doorbell-notify" role="dialog" aria-label="Doorbell">
+  <img id="doorbell-img" style="display:none" alt="Camera snapshot">
+  <div id="doorbell-img-placeholder">📷</div>
+  <div id="doorbell-body">
+    <div id="doorbell-title">🔔 Doorbell</div>
+    <div id="doorbell-camera">Front door</div>
+    <div id="doorbell-timer">Ringing…</div>
+    <div id="doorbell-actions">
+      <button id="btn-doorbell-answer" onclick="doorbellAnswer()">Answer</button>
+      <button id="btn-doorbell-dismiss" onclick="doorbellDismiss()">Dismiss</button>
+    </div>
+  </div>
+</div>
 
 <!-- ── Clipboard panel ───────────────────────────────────────── -->
 <div class="side-panel" id="panel-clipboard">
@@ -847,7 +893,85 @@ function onWsMessage(ev) {
       $('stat-lat-card').textContent = lat;
     } else if (msg.type === 'consent_denied') {
       showOffline('Access denied — consent required');
+    } else if (msg.type === 'doorbell.ringing') {
+      doorbellShow(msg);
+    } else if (msg.type === 'doorbell.answered' || msg.type === 'doorbell.dismissed' || msg.type === 'doorbell.expired') {
+      if (S.doorbellSession === msg.session_id) doorbellHide();
     }
+  } catch (_) {}
+}
+
+// ── Doorbell notification ─────────────────────────────────────────────────
+
+S.doorbellSession = null;
+let _doorbellTimer = null;
+
+function doorbellShow(msg) {
+  S.doorbellSession = msg.session_id;
+  $('doorbell-camera').textContent = msg.camera || 'Camera';
+  const notify = $('doorbell-notify');
+  const img = $('doorbell-img');
+  const placeholder = $('doorbell-img-placeholder');
+
+  // Load snapshot
+  img.style.display = 'none';
+  placeholder.style.display = 'flex';
+  if (msg.snapshot_url) {
+    img.onload = () => { img.style.display = 'block'; placeholder.style.display = 'none'; };
+    img.onerror = () => {};
+    img.src = msg.snapshot_url + '?t=' + Date.now();
+  }
+
+  // Countdown timer
+  let remaining = 30;
+  $('doorbell-timer').textContent = `Ringing… ${remaining}s`;
+  clearInterval(_doorbellTimer);
+  _doorbellTimer = setInterval(() => {
+    remaining--;
+    if (remaining <= 0) { clearInterval(_doorbellTimer); doorbellHide(); return; }
+    $('doorbell-timer').textContent = `Ringing… ${remaining}s`;
+  }, 1000);
+
+  notify.classList.add('show');
+  doorbellChime();
+}
+
+function doorbellHide() {
+  clearInterval(_doorbellTimer);
+  $('doorbell-notify').classList.remove('show');
+  S.doorbellSession = null;
+}
+
+function doorbellAction(action) {
+  const sid = S.doorbellSession;
+  if (!sid) return;
+  // Route through the control surface action system — same path as a Stream Deck button
+  api('POST', '/api/v1/controls/action', { action, target: sid, value: sid })
+    .then(() => doorbellHide())
+    .catch(e => console.warn('doorbell action failed', e));
+}
+
+function doorbellAnswer()  { doorbellAction('doorbell.answer'); }
+function doorbellDismiss() { doorbellAction('doorbell.dismiss'); }
+
+function doorbellChime() {
+  // Two-tone ding-dong via Web Audio API — no audio file needed
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    [[784, 0], [587, 0.35]].forEach(([freq, delay]) => {
+      const osc  = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      const t = ctx.currentTime + delay;
+      gain.gain.setValueAtTime(0.0, t);
+      gain.gain.linearRampToValueAtTime(0.25, t + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.55);
+      osc.start(t);
+      osc.stop(t + 0.6);
+    });
   } catch (_) {}
 }
 
