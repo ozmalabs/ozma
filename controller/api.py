@@ -100,6 +100,8 @@ from key_store import (
     KeyStore, BackupMethod, KeyLockedError, KeyNotInitialisedError,
     UnlockRateLimitedError,
 )
+from msp_dashboard import MSPDashboardManager, MSPClient, BulkOperation, BillingLine
+from msp_portal import MSPPortalManager, PortalConfig
 
 log = logging.getLogger("ozma.api")
 
@@ -164,7 +166,7 @@ class DirectRegisterRequest(BaseModel):
     frigate_port: str = ""     # Frigate API port (default 5000)
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None) -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None, sunshine: Any | None = None, msp_mgr: MSPDashboardManager | None = None, msp_portal: MSPPortalManager | None = None) -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -7619,6 +7621,350 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(503, "Backup tracking not configured")
         backup_tracker.remove_node(node_id)
         return {"deleted": node_id}
+
+    # ── Game Streaming (V1.2) — Sunshine / Moonlight ────────────────────────
+
+    def _ss():
+        if not sunshine:
+            raise HTTPException(503, "Game streaming not configured")
+        return sunshine
+
+    @app.get("/api/v1/streaming/status")
+    async def streaming_status(request: Request) -> dict[str, Any]:
+        """Fleet-level streaming status: all nodes + binary availability."""
+        _require_scope(request, SCOPE_READ)
+        mgr = _ss()
+        return {
+            "available": mgr.is_available(),
+            "instances": mgr.get_all_status(),
+        }
+
+    @app.get("/api/v1/streaming/nodes/{node_id}")
+    async def streaming_node_status(request: Request, node_id: str) -> dict[str, Any]:
+        """Per-node Sunshine status, config, and paired clients."""
+        _require_scope(request, SCOPE_READ)
+        status = _ss().get_status(node_id)
+        if not status:
+            raise HTTPException(404, "No Sunshine instance for this node")
+        return status
+
+    @app.post("/api/v1/streaming/nodes/{node_id}/enable")
+    async def streaming_enable_node(request: Request, node_id: str) -> dict[str, Any]:
+        """
+        Enable Sunshine streaming for a node.
+
+        Body (all optional):
+          capture       — kms | wlroots | x11 | v4l2 | auto
+          encoder       — nvenc | vaapi | qsv | v4l2m2m | software | auto
+          codec         — h264 | h265 | av1
+          fps           — 30 | 60
+          bitrate_kbps  — target bitrate in kbps (default 10000)
+          resolutions   — ["1920x1080", ...]
+          v4l2_device   — /dev/videoN (soft nodes with v4l2loopback)
+          audio_sink    — PipeWire sink name
+        """
+        _require_scope(request, SCOPE_WRITE)
+        body: dict = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+        result = await _ss().enable_node(
+            node_id      = node_id,
+            capture      = body.get("capture", "auto"),
+            encoder      = body.get("encoder", "auto"),
+            codec        = body.get("codec", "h264"),
+            fps          = int(body.get("fps", 60)),
+            bitrate_kbps = int(body.get("bitrate_kbps", 10_000)),
+            resolutions  = body.get("resolutions"),
+            v4l2_device  = body.get("v4l2_device", ""),
+            audio_sink   = body.get("audio_sink", ""),
+        )
+        return result
+
+    @app.post("/api/v1/streaming/nodes/{node_id}/disable")
+    async def streaming_disable_node(request: Request, node_id: str) -> dict[str, Any]:
+        """Stop Sunshine for a node."""
+        _require_scope(request, SCOPE_WRITE)
+        await _ss().disable_node(node_id)
+        return {"ok": True, "node_id": node_id}
+
+    @app.post("/api/v1/streaming/nodes/{node_id}/pair")
+    async def streaming_pair(request: Request, node_id: str) -> dict[str, Any]:
+        """
+        Submit a Moonlight pairing PIN to Sunshine.
+
+        Moonlight shows a 4-digit PIN; the user enters it in the dashboard
+        and POSTs it here.  Body: {"pin": "1234"}
+        """
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        pin = str(body.get("pin", "")).strip()
+        if not pin or not pin.isdigit() or len(pin) != 4:
+            raise HTTPException(400, "pin must be a 4-digit string")
+        return await _ss().pair(node_id, pin)
+
+    @app.get("/api/v1/streaming/nodes/{node_id}/clients")
+    async def streaming_list_clients(request: Request, node_id: str) -> list[dict[str, Any]]:
+        """List paired Moonlight clients for a node."""
+        _require_scope(request, SCOPE_READ)
+        return await _ss().list_clients(node_id)
+
+    @app.delete("/api/v1/streaming/nodes/{node_id}/clients/{cert}")
+    async def streaming_unpair_client(
+        request: Request, node_id: str, cert: str
+    ) -> dict[str, Any]:
+        """Unpair a Moonlight client by certificate fingerprint."""
+        _require_scope(request, SCOPE_WRITE)
+        ok = await _ss().unpair_client(node_id, cert)
+        if not ok:
+            raise HTTPException(404, "Client not found or unpair failed")
+        return {"ok": True, "cert": cert}
+
+    @app.get("/api/v1/streaming/nodes/{node_id}/moonlight-address")
+    async def streaming_moonlight_address(
+        request: Request, node_id: str
+    ) -> dict[str, Any]:
+        """Return the host:port address to enter in Moonlight's 'Add Computer' dialog."""
+        _require_scope(request, SCOPE_READ)
+        addr = _ss().moonlight_address(node_id)
+        if not addr:
+            raise HTTPException(503, "Streaming not active for this node")
+        return {"address": addr, "node_id": node_id}
+
+    @app.post("/api/v1/streaming/nodes/{node_id}/register-remote")
+    async def streaming_register_remote(
+        request: Request, node_id: str
+    ) -> dict[str, Any]:
+        """
+        Register a node that manages its own Sunshine instance (desktop agent).
+
+        Called automatically by the agent when it starts Sunshine.
+        Body: {"host": "192.168.1.50", "api_port": 47990}
+        """
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        host = body.get("host", "")
+        api_port = int(body.get("api_port", 47990))
+        if not host:
+            raise HTTPException(400, "host is required")
+        _ss().register_remote(node_id, host, api_port)
+        return {"ok": True, "node_id": node_id, "host": host, "api_port": api_port}
+
+    # ── MSP Multi-tenant Dashboard ────────────────────────────────────────────
+
+    def _msp() -> MSPDashboardManager:
+        if msp_mgr is None:
+            raise HTTPException(503, "MSP dashboard not available")
+        return msp_mgr
+
+    def _msp_portal() -> MSPPortalManager:
+        if msp_portal is None:
+            raise HTTPException(503, "MSP portal not configured")
+        return msp_portal
+
+    # Clients
+    @app.get("/api/v1/msp/clients")
+    async def msp_list_clients(request: Request) -> list[dict]:
+        _require_scope(request, SCOPE_ADMIN)
+        clients = await _msp().list_clients()
+        return [c.to_dict() for c in clients]
+
+    @app.post("/api/v1/msp/clients")
+    async def msp_add_client(request: Request) -> dict:
+        _require_scope(request, SCOPE_ADMIN)
+        body = await request.json()
+        required = ("name", "slug", "controller_url", "api_token")
+        for f in required:
+            if not body.get(f):
+                raise HTTPException(400, f"Field '{f}' is required")
+        optional = {k: body[k] for k in (
+            "tier", "seat_count", "tags", "notes", "monthly_rate", "wholesale_cost"
+        ) if k in body}
+        client = await _msp().add_client(
+            name=body["name"],
+            slug=body["slug"],
+            controller_url=body["controller_url"],
+            api_token=body["api_token"],
+            **optional,
+        )
+        return client.to_dict()
+
+    @app.get("/api/v1/msp/clients/{client_id}")
+    async def msp_get_client(request: Request, client_id: str) -> dict:
+        _require_scope(request, SCOPE_ADMIN)
+        client = await _msp().get_client(client_id)
+        if not client:
+            raise HTTPException(404, "Client not found")
+        return client.to_dict()
+
+    @app.put("/api/v1/msp/clients/{client_id}")
+    async def msp_update_client(request: Request, client_id: str) -> dict:
+        _require_scope(request, SCOPE_ADMIN)
+        body = await request.json()
+        try:
+            client = await _msp().update_client(client_id, **body)
+        except KeyError:
+            raise HTTPException(404, "Client not found")
+        return client.to_dict()
+
+    @app.delete("/api/v1/msp/clients/{client_id}")
+    async def msp_delete_client(request: Request, client_id: str) -> dict:
+        _require_scope(request, SCOPE_ADMIN)
+        client = await _msp().get_client(client_id)
+        if not client:
+            raise HTTPException(404, "Client not found")
+        await _msp().remove_client(client_id)
+        return {"ok": True}
+
+    # Health
+    @app.get("/api/v1/msp/health")
+    async def msp_list_health(request: Request) -> list[dict]:
+        _require_scope(request, SCOPE_ADMIN)
+        healths = await _msp().get_all_health()
+        return [h.to_dict() for h in healths]
+
+    @app.post("/api/v1/msp/health/refresh")
+    async def msp_refresh_all_health(request: Request) -> list[dict]:
+        _require_scope(request, SCOPE_ADMIN)
+        healths = await _msp().refresh_all_health()
+        return [h.to_dict() for h in healths]
+
+    @app.get("/api/v1/msp/health/{client_id}")
+    async def msp_get_health(request: Request, client_id: str) -> dict:
+        _require_scope(request, SCOPE_ADMIN)
+        h = await _msp().get_health(client_id)
+        if not h:
+            raise HTTPException(404, "No health data for this client")
+        return h.to_dict()
+
+    @app.post("/api/v1/msp/health/{client_id}/refresh")
+    async def msp_refresh_client_health(request: Request, client_id: str) -> dict:
+        _require_scope(request, SCOPE_ADMIN)
+        try:
+            h = await _msp().refresh_client_health(client_id)
+        except KeyError:
+            raise HTTPException(404, "Client not found")
+        return h.to_dict()
+
+    # Bulk operations
+    @app.post("/api/v1/msp/bulk/patch")
+    async def msp_bulk_patch(request: Request) -> dict:
+        _require_scope(request, SCOPE_ADMIN)
+        body = await request.json()
+        client_ids = body.get("client_ids", [])
+        if not client_ids:
+            raise HTTPException(400, "client_ids is required")
+        ring = body.get("ring", "emergency")
+        op = await _msp().bulk_patch_deploy(client_ids, ring=ring)
+        return op.to_dict()
+
+    @app.post("/api/v1/msp/bulk/compliance")
+    async def msp_bulk_compliance(request: Request) -> dict:
+        _require_scope(request, SCOPE_ADMIN)
+        body = await request.json()
+        client_ids = body.get("client_ids", [])
+        if not client_ids:
+            raise HTTPException(400, "client_ids is required")
+        framework = body.get("framework", "e8")
+        op = await _msp().bulk_compliance_reports(client_ids, framework=framework)
+        return op.to_dict()
+
+    @app.post("/api/v1/msp/bulk/policy")
+    async def msp_bulk_policy(request: Request) -> dict:
+        _require_scope(request, SCOPE_ADMIN)
+        body = await request.json()
+        client_ids = body.get("client_ids", [])
+        if not client_ids:
+            raise HTTPException(400, "client_ids is required")
+        policy = body.get("policy", {})
+        op = await _msp().bulk_policy_push(client_ids, policy=policy)
+        return op.to_dict()
+
+    @app.get("/api/v1/msp/bulk")
+    async def msp_list_operations(request: Request) -> list[dict]:
+        _require_scope(request, SCOPE_ADMIN)
+        ops = await _msp().list_operations()
+        return [op.to_dict() for op in ops]
+
+    @app.get("/api/v1/msp/bulk/{op_id}")
+    async def msp_get_operation(request: Request, op_id: str) -> dict:
+        _require_scope(request, SCOPE_ADMIN)
+        op = await _msp().get_operation(op_id)
+        if not op:
+            raise HTTPException(404, "Operation not found")
+        return op.to_dict()
+
+    # Alerts
+    @app.get("/api/v1/msp/alerts")
+    async def msp_alerts(request: Request) -> list[dict]:
+        _require_scope(request, SCOPE_ADMIN)
+        severity = request.query_params.get("severity", "")
+        client_id = request.query_params.get("client_id", "")
+        return await _msp().aggregate_alerts(severity=severity, client_id=client_id)
+
+    # Billing
+    @app.get("/api/v1/msp/billing/{year}/{month}")
+    async def msp_billing(request: Request, year: int, month: int) -> list[dict]:
+        _require_scope(request, SCOPE_ADMIN)
+        lines = await _msp().monthly_billing_export(year, month)
+        return [line.to_dict() for line in lines]
+
+    @app.get("/api/v1/msp/billing/{year}/{month}/csv")
+    async def msp_billing_csv(request: Request, year: int, month: int):
+        _require_scope(request, SCOPE_ADMIN)
+        csv_data = await _msp().billing_csv(year, month)
+        filename = f"msp_billing_{year}_{month:02d}.csv"
+        return Response(
+            content=csv_data,
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    # Portal config
+    @app.get("/api/v1/msp/portal/config")
+    async def msp_portal_get_config(request: Request) -> dict:
+        _require_scope(request, SCOPE_ADMIN)
+        return _msp_portal().get_portal_config().to_dict()
+
+    @app.patch("/api/v1/msp/portal/config")
+    async def msp_portal_update_config(request: Request) -> dict:
+        _require_scope(request, SCOPE_ADMIN)
+        body = await request.json()
+        config = await _msp_portal().update_portal_config(**body)
+        return config.to_dict()
+
+    # Client portal page — no auth on the URL itself; MSP gates access externally.
+    # In production: put OIDC token validation here.
+    @app.get("/portal/{client_id}", response_class=Response)
+    async def msp_portal_page(client_id: str) -> Response:
+        mgr = _msp()
+        client = await mgr.get_client(client_id)
+        if not client:
+            return Response(content="<h1>Not found</h1>", media_type="text/html",
+                            status_code=404)
+        health = await mgr.get_health(client_id)
+        if health is None:
+            # Return a minimal "loading" page
+            from msp_dashboard import MSPClientHealth
+            health = MSPClientHealth(
+                client_id=client_id,
+                fetched_at=0.0,
+                machines_online=0,
+                machines_total=0,
+                critical_alerts=0,
+                compliance_score=0.0,
+                e8_score=0.0,
+                iso27001_score=0.0,
+                last_backup_ok=False,
+                pending_approvals=0,
+                upcoming_renewals=0,
+                health="amber",
+                error="Health data not yet available",
+            )
+        portal = _msp_portal()
+        html = portal.get_portal_html(client, health)
+        return Response(content=html, media_type="text/html")
 
     # Static files — mounted last so they don't shadow API routes
     static_dir = Path(__file__).parent / "static"
