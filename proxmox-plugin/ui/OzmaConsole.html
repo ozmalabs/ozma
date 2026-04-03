@@ -318,7 +318,8 @@ input[type=range]::-webkit-slider-thumb {
 }
 #doorbell-body { padding: 10px 12px 12px; }
 #doorbell-title { font-size: 11px; font-weight: 700; color: var(--emerald); text-transform: uppercase; letter-spacing: 0.05em; }
-#doorbell-camera { font-size: 13px; font-weight: 600; color: var(--text); margin: 2px 0 8px; }
+#doorbell-person { font-size: 14px; font-weight: 700; color: var(--text); margin: 3px 0 1px; }
+#doorbell-camera { font-size: 11px; font-weight: 500; color: var(--muted); margin: 0 0 8px; }
 #doorbell-timer { font-size: 11px; color: var(--muted); margin-bottom: 10px; }
 #doorbell-actions { display: flex; gap: 8px; }
 #doorbell-actions button {
@@ -507,6 +508,7 @@ input[type=range]::-webkit-slider-thumb {
   <div id="doorbell-img-placeholder">📷</div>
   <div id="doorbell-body">
     <div id="doorbell-title">🔔 Doorbell</div>
+    <div id="doorbell-person" style="display:none"></div>
     <div id="doorbell-camera">Front door</div>
     <div id="doorbell-timer">Ringing…</div>
     <div id="doorbell-actions">
@@ -895,6 +897,8 @@ function onWsMessage(ev) {
       showOffline('Access denied — consent required');
     } else if (msg.type === 'doorbell.ringing') {
       doorbellShow(msg);
+    } else if (msg.type === 'doorbell.person_identified') {
+      if (S.doorbellSession === msg.session_id && msg.person) doorbellSetPerson(msg.person);
     } else if (msg.type === 'doorbell.answered' || msg.type === 'doorbell.dismissed' || msg.type === 'doorbell.expired') {
       if (S.doorbellSession === msg.session_id) doorbellHide();
     }
@@ -906,9 +910,22 @@ function onWsMessage(ev) {
 S.doorbellSession = null;
 let _doorbellTimer = null;
 
+function doorbellSetPerson(name) {
+  const el = $('doorbell-person');
+  el.textContent = name;
+  el.style.display = 'block';
+}
+
 function doorbellShow(msg) {
   S.doorbellSession = msg.session_id;
   $('doorbell-camera').textContent = msg.camera || 'Camera';
+  // Show recognised person name if available (Frigate facial recognition)
+  if (msg.person) {
+    doorbellSetPerson(msg.person);
+  } else {
+    $('doorbell-person').style.display = 'none';
+    $('doorbell-person').textContent = '';
+  }
   const notify = $('doorbell-notify');
   const img = $('doorbell-img');
   const placeholder = $('doorbell-img-placeholder');
@@ -988,18 +1005,12 @@ function startLatencyProbe() {
   }, 2000);
 }
 
-// ── Video chain: WebRTC → HLS → MJPEG ────────────────────────
+// ── Video chain: instant MJPEG + background WebRTC upgrade ───
 async function startVideoChain(force) {
   if (force === 'webrtc') {
     displayVideo.style.display = 'block';
     displayImg.style.display = 'none';
     await startWebRTC();
-  } else if (!force) {
-    // Default: try MJPEG first (instant), WebRTC can be selected manually
-    displayVideo.style.display = 'none';
-    displayImg.style.display = 'block';
-    startMJPEG();
-    return;
   } else if (force === 'hls') {
     displayVideo.style.display = 'block';
     displayImg.style.display = 'none';
@@ -1008,6 +1019,76 @@ async function startVideoChain(force) {
     displayVideo.style.display = 'none';
     displayImg.style.display = 'block';
     startMJPEG();
+  } else {
+    // Default: show MJPEG immediately, attempt WebRTC upgrade in background
+    displayVideo.style.display = 'none';
+    displayImg.style.display = 'block';
+    startMJPEG();
+    _tryWebRTCUpgrade();
+  }
+}
+
+// Attempt WebRTC in background — if it connects, seamlessly swap from MJPEG
+async function _tryWebRTCUpgrade() {
+  try {
+    const pc = new RTCPeerConnection({ iceServers: [] });
+    const vcvr = pc.addTransceiver('video', { direction: 'recvonly' });
+    pc.addTransceiver('audio', { direction: 'recvonly' });
+    const caps = RTCRtpReceiver.getCapabilities?.('video')?.codecs || [];
+    const h264 = caps.filter(c => c.mimeType === 'video/H264');
+    if (h264.length) vcvr.setCodecPreferences([...h264, ...caps.filter(c => c.mimeType !== 'video/H264')]);
+
+    // If it doesn't connect within 5s, silently give up — MJPEG is already working
+    const timeout = setTimeout(() => { pc.close(); }, 5000);
+
+    pc.ontrack = e => {
+      // WebRTC track arrived — prepare video element but don't show yet
+      const stream = e.streams?.[0] || new MediaStream([e.track]);
+      displayVideo.srcObject = stream;
+      displayVideo.muted = S.muted;
+      displayVideo.volume = S.volume;
+      displayVideo.play().catch(() => {});
+      if (e.track.kind === 'audio') updateAudioStatus('WebRTC audio active');
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected') {
+        clearTimeout(timeout);
+        // Seamless swap: hide MJPEG img, show WebRTC video
+        S.pc = pc;
+        S.videoMode = 'webrtc';
+        displayImg.style.display = 'none';
+        displayImg.src = '';  // stop MJPEG stream
+        displayVideo.style.display = 'block';
+        applyScaling();
+        setCodec('WebRTC');
+        setSourceActive('vsrc-webrtc');
+      } else if (pc.connectionState === 'failed') {
+        clearTimeout(timeout);
+        pc.close();
+        // MJPEG already running — nothing to do
+      }
+    };
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await new Promise(r => {
+      if (pc.iceGatheringState === 'complete') return r();
+      pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') r(); };
+      setTimeout(r, 2500);
+    });
+
+    const resp = await fetch(`${apiBase}/api/v1/streams/${encodeURIComponent(nodeId)}/webrtc`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'offer', sdp: pc.localDescription.sdp }),
+    });
+    if (!resp.ok) { pc.close(); return; }
+    const answer = await resp.json();
+    if (answer.error) { pc.close(); return; }
+    await pc.setRemoteDescription(new RTCSessionDescription(answer));
+  } catch {
+    // WebRTC not available — MJPEG continues silently
   }
 }
 

@@ -277,6 +277,8 @@ async def run(config: Config) -> None:
     doorbell_mgr = DoorbellManager(
         state=state,
         frigate_url=os.environ.get("OZMA_FRIGATE_URL", "http://localhost:5000"),
+        kdeconnect=kdeconnect,
+        notifier=notifier,
     )
     await doorbell_mgr.start()
     recorder = SessionRecorder()

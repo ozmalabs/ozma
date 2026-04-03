@@ -717,6 +717,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         while True:
             event = await state.events.get()
             await _broadcast(event)
+            # Route events to control surface trigger rules
+            if controls:
+                event_type = event.get("type", "")
+                if event_type:
+                    await controls.on_event(event_type, event)
 
     @app.on_event("startup")
     async def _startup() -> None:
@@ -3700,6 +3705,56 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         await controls._execute_action(action, target, value)
         return {"ok": True, "action": action}
 
+    @app.get("/api/v1/controls/triggers")
+    async def list_trigger_rules(request: Request) -> dict[str, Any]:
+        """List event trigger rules (fire actions when events match)."""
+        _require_scope(request, SCOPE_READ)
+        rules = controls.list_trigger_rules() if controls else []
+        return {"rules": rules}
+
+    @app.post("/api/v1/controls/triggers")
+    async def add_trigger_rule(request: Request, body: dict = {}) -> dict[str, Any]:
+        """Add an event trigger rule.
+
+        Body:
+          event_type  — e.g. "frigate.person_recognized"
+          action      — e.g. "scenario.activate"
+          target      — optional (for audio/motion actions)
+          value       — fixed action value; omit to pass event data
+          filters     — dict of key/value filters applied to the event
+
+        Example — switch to Matt's workstation when recognised at front door:
+          {"event_type": "frigate.person_recognized",
+           "filters": {"person": "Matt", "camera": "front_door"},
+           "action": "scenario.activate", "value": "matt-workstation"}
+        """
+        _require_scope(request, SCOPE_WRITE)
+        if not controls:
+            raise HTTPException(status_code=503, detail="Controls not available")
+        from controls import EventTriggerRule
+        rule = EventTriggerRule(
+            event_type=body.get("event_type", ""),
+            action=body.get("action", ""),
+            target=body.get("target", ""),
+            value=body.get("value"),
+            filters=body.get("filters", {}),
+        )
+        if not rule.event_type or not rule.action:
+            raise HTTPException(status_code=400, detail="event_type and action are required")
+        rule_id = controls.add_trigger_rule(rule)
+        return {"ok": True, "rule_id": rule_id}
+
+    @app.delete("/api/v1/controls/triggers/{rule_id}")
+    async def delete_trigger_rule(request: Request, rule_id: str) -> dict[str, Any]:
+        """Remove an event trigger rule."""
+        _require_scope(request, SCOPE_WRITE)
+        if not controls:
+            raise HTTPException(status_code=503, detail="Controls not available")
+        removed = controls.remove_trigger_rule(rule_id)
+        if not removed:
+            raise HTTPException(status_code=404, detail="Rule not found")
+        return {"ok": True}
+
     # --- Replay buffer endpoints ---
 
     @app.get("/api/v1/replay/status")
@@ -3855,17 +3910,27 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         camera = body.get("camera", "")
         payload = body.get("payload", {})
 
+        person = body.get("person", "")
+
         if kind == "doorbell" and doorbell_mgr and camera:
             session = await doorbell_mgr.receive_event(camera, "doorbell", payload)
             return {"ok": True, "session_id": session.id if session else None}
 
+        if kind == "person_recognized" and camera and person:
+            # Enrich any active doorbell session on this camera with the person's name
+            if doorbell_mgr:
+                doorbell_mgr.enrich_person(camera, person)
+
         # Forward all Frigate events onto the event bus for overlays / notifications
-        await state.events.put({
+        event: dict[str, Any] = {
             "type": f"frigate.{kind}",
             "camera": camera,
             "topic": body.get("topic", ""),
             "payload": payload,
-        })
+        }
+        if person:
+            event["person"] = person
+        await state.events.put(event)
         return {"ok": True}
 
     @app.get("/api/v1/doorbell/sessions")

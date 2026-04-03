@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, TYPE_CHECKING
 
@@ -78,6 +79,30 @@ class DisplayControl:
 
     # Called when display content should update.
     on_update: Callable[[str, str | None], None] | None = None  # (text, color)
+
+
+@dataclass
+class EventTriggerRule:
+    """Fires an ozma action when a broadcast event matches type and optional filters.
+
+    Example — switch to Matt's workstation when face recognised at front door:
+        EventTriggerRule(
+            event_type="frigate.person_recognized",
+            filters={"person": "Matt", "camera": "front_door"},
+            action="scenario.activate",
+            value="matt-workstation",
+        )
+
+    Filters are AND-matched: every key in ``filters`` must equal the corresponding
+    value in the event dict.  Omit ``filters`` to match all events of that type.
+    """
+
+    event_type: str                                  # e.g. "frigate.person_recognized"
+    action: str                                      # e.g. "scenario.activate"
+    rule_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+    filters: dict[str, Any] = field(default_factory=dict)
+    target: str = ""
+    value: Any = None                                # fixed value; None → pass event data
 
 
 class ControlSurface:
@@ -139,6 +164,7 @@ class ControlManager:
         self._doorbell = doorbell
         self._surfaces: dict[str, ControlSurface] = {}
         self._action_lock = asyncio.Lock()
+        self._trigger_rules: list[EventTriggerRule] = []
 
     def register_surface(self, surface: ControlSurface) -> None:
         self._surfaces[surface.id] = surface
@@ -386,6 +412,44 @@ class ControlManager:
                 display.value = text
                 if display.on_update:
                     display.on_update(text, color)
+
+    # ── Event trigger rules ──────────────────────────────────────────────────
+
+    def add_trigger_rule(self, rule: EventTriggerRule) -> str:
+        """Register a trigger rule. Returns the rule_id."""
+        self._trigger_rules.append(rule)
+        log.info("Trigger rule added: %s → %s (filters=%s)", rule.event_type, rule.action, rule.filters)
+        return rule.rule_id
+
+    def remove_trigger_rule(self, rule_id: str) -> bool:
+        before = len(self._trigger_rules)
+        self._trigger_rules = [r for r in self._trigger_rules if r.rule_id != rule_id]
+        return len(self._trigger_rules) < before
+
+    def list_trigger_rules(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "rule_id": r.rule_id,
+                "event_type": r.event_type,
+                "filters": r.filters,
+                "action": r.action,
+                "target": r.target,
+                "value": r.value,
+            }
+            for r in self._trigger_rules
+        ]
+
+    async def on_event(self, event_type: str, data: dict) -> None:
+        """Called for every event broadcast; fires matching trigger rules."""
+        for rule in self._trigger_rules:
+            if rule.event_type != event_type:
+                continue
+            if not all(data.get(k) == v for k, v in rule.filters.items()):
+                continue
+            action_value = rule.value if rule.value is not None else data
+            log.debug("Trigger rule %s fired: %s → %s", rule.rule_id, event_type, rule.action)
+            async with self._action_lock:
+                await self._execute_action(rule.action, rule.target, action_value)
 
     # ── Surface enumeration for API ──────────────────────────────────────────
 
