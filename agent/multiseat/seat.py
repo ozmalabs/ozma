@@ -440,7 +440,8 @@ class Seat:
             # Use a plain socket in a thread instead.
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(("0.0.0.0", self.udp_port))
+            # Bind to localhost to avoid Windows Firewall blocking
+            sock.bind(("127.0.0.1", self.udp_port))
             sock.settimeout(1.0)
             log.info("Seat %s: listening on UDP port %d (threaded)", self.name, self.udp_port)
 
