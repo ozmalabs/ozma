@@ -217,16 +217,18 @@ table inet {NFT_TABLE_NAME} {{
 # dnsmasq config generation
 # ---------------------------------------------------------------------------
 
-def _build_dnsmasq_conf(cfg: RouterConfig) -> str:
+def _build_dnsmasq_conf(cfg: RouterConfig, dns_filter_conf_dir: str | None = None) -> str:
     iot_iface = f"{cfg.lan_interface}.{cfg.iot_vlan_id}"
-    upstream = ",".join(cfg.upstream_dns)
+    conf_dir_line = ""
+    if dns_filter_conf_dir:
+        conf_dir_line = f"\n# DNS filter blocklist (written by DNSFilterManager)\nconf-dir={dns_filter_conf_dir},*.conf\n"
     return f"""# Ozma router mode — dnsmasq configuration
 pid-file={DNSMASQ_PID_PATH}
 no-resolv
 server={",".join(cfg.upstream_dns)}
 interface={cfg.lan_interface}
 interface={iot_iface}
-
+{conf_dir_line}
 # LAN DHCP
 dhcp-range={cfg.lan_interface},{cfg.lan_dhcp_start},{cfg.lan_dhcp_end},{cfg.lan_dhcp_lease}
 
@@ -242,11 +244,13 @@ dhcp-range={iot_iface},{cfg.iot_dhcp_start},{cfg.iot_dhcp_end},{cfg.iot_dhcp_lea
 class RouterModeManager:
     """Manages router mode: NAT + DHCP + DNS + IoT firewall."""
 
-    def __init__(self, state_path: Path = ROUTER_STATE_PATH) -> None:
+    def __init__(self, state_path: Path = ROUTER_STATE_PATH,
+                 dns_filter_conf_dir: str | None = None) -> None:
         self._state_path = state_path
         self._config = RouterConfig()
         self._dnsmasq_proc: asyncio.subprocess.Process | None = None
         self._active = False
+        self._dns_filter_conf_dir = dns_filter_conf_dir  # injected by main.py
         self._load()
 
     # ------------------------------------------------------------------
@@ -330,7 +334,7 @@ class RouterModeManager:
             pass  # table may not exist
 
     async def _start_dnsmasq(self) -> None:
-        conf = _build_dnsmasq_conf(self._config)
+        conf = _build_dnsmasq_conf(self._config, self._dns_filter_conf_dir)
         DNSMASQ_CONF_PATH.write_text(conf)
         DNSMASQ_CONF_PATH.chmod(0o600)
         try:

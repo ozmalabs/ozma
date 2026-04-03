@@ -168,7 +168,7 @@ class DirectRegisterRequest(BaseModel):
     frigate_port: str = ""     # Frigate API port (default 5000)
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None, sunshine: Any | None = None, msp_mgr: MSPDashboardManager | None = None, msp_portal: MSPPortalManager | None = None, auto_configure: Any | None = None, cam_connect: Any | None = None, grid: Any | None = None, parental: ParentalControlsManager | None = None, backup_nudge: BackupNudgeService | None = None) -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None, sunshine: Any | None = None, msp_mgr: MSPDashboardManager | None = None, msp_portal: MSPPortalManager | None = None, auto_configure: Any | None = None, cam_connect: Any | None = None, grid: Any | None = None, parental: ParentalControlsManager | None = None, backup_nudge: BackupNudgeService | None = None, dns_filter: Any | None = None) -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -8835,6 +8835,176 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if result is None:
             raise HTTPException(503, f"Node {node_id!r} agent unreachable")
         return result
+
+    # =========================================================================
+    # DNS / Ad Filter endpoints
+    # =========================================================================
+
+    def _dns_filter():
+        if dns_filter is None:
+            raise HTTPException(503, "DNS filter not available")
+        return dns_filter
+
+    @app.get("/api/v1/dns-filter/status")
+    async def dns_filter_status(request: Request) -> dict[str, Any]:
+        """Current DNS filter state: enabled, domain count, source stats."""
+        _require_scope(request, SCOPE_READ)
+        return _dns_filter().get_status()
+
+    @app.get("/api/v1/dns-filter/config")
+    async def dns_filter_config_get(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        return _dns_filter().get_config().to_dict()
+
+    @app.patch("/api/v1/dns-filter/config")
+    async def dns_filter_config_patch(request: Request) -> dict[str, Any]:
+        """
+        Update DNS filter config.
+
+        Patchable fields: enabled, block_categories, safesearch_enabled,
+        safesearch_providers, update_interval_hours.
+        Changes are persisted and the dnsmasq conf is rewritten immediately.
+        """
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        mgr = _dns_filter()
+        mgr.set_config(**body)
+        mgr._recompile()
+        await mgr.write_conf()
+        return mgr.get_config().to_dict()
+
+    @app.get("/api/v1/dns-filter/sources")
+    async def dns_filter_sources(request: Request) -> list[dict]:
+        """List all blocklist sources (built-in + custom)."""
+        _require_scope(request, SCOPE_READ)
+        return _dns_filter().list_sources()
+
+    @app.post("/api/v1/dns-filter/sources")
+    async def dns_filter_sources_add(request: Request) -> dict[str, Any]:
+        """
+        Add a custom blocklist source.
+
+        Body: { "name": "...", "url": "...", "format": "hosts|domains|adblock",
+                "categories": ["ads", "malware"] }
+        """
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        src = _dns_filter().add_source(
+            name       = body["name"],
+            url        = body["url"],
+            fmt        = body.get("format", "domains"),
+            categories = body.get("categories", []),
+        )
+        return src.to_dict()
+
+    @app.patch("/api/v1/dns-filter/sources/{source_id}")
+    async def dns_filter_sources_patch(request: Request, source_id: str) -> dict[str, Any]:
+        """Enable or disable a source: { "enabled": true }"""
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        mgr = _dns_filter()
+        if "enabled" in body:
+            ok = mgr.set_source_enabled(source_id, bool(body["enabled"]))
+            if not ok:
+                raise HTTPException(404, f"Source {source_id!r} not found")
+            mgr._recompile()
+            await mgr.write_conf()
+        src = mgr.get_source(source_id)
+        if src is None:
+            raise HTTPException(404, f"Source {source_id!r} not found")
+        return src.to_dict()
+
+    @app.delete("/api/v1/dns-filter/sources/{source_id}")
+    async def dns_filter_sources_delete(request: Request, source_id: str) -> dict[str, Any]:
+        """Remove a custom source (built-in sources are disabled instead)."""
+        _require_scope(request, SCOPE_WRITE)
+        ok = _dns_filter().remove_source(source_id)
+        if not ok:
+            raise HTTPException(404, f"Source {source_id!r} not found")
+        return {"ok": True}
+
+    @app.post("/api/v1/dns-filter/sources/{source_id}/update")
+    async def dns_filter_sources_update(request: Request, source_id: str) -> dict[str, Any]:
+        """Trigger an immediate download + refresh of one or all sources."""
+        _require_scope(request, SCOPE_WRITE)
+        results = await _dns_filter().update_sources(source_ids=[source_id])
+        return results
+
+    @app.post("/api/v1/dns-filter/update")
+    async def dns_filter_update_all(request: Request) -> dict[str, Any]:
+        """Trigger a full blocklist refresh across all enabled sources."""
+        _require_scope(request, SCOPE_WRITE)
+        results = await _dns_filter().update_sources()
+        return results
+
+    @app.get("/api/v1/dns-filter/allowlist")
+    async def dns_filter_allowlist_get(request: Request) -> list[str]:
+        _require_scope(request, SCOPE_READ)
+        return list(_dns_filter().get_config().allowlist)
+
+    @app.post("/api/v1/dns-filter/allowlist")
+    async def dns_filter_allowlist_add(request: Request) -> dict[str, Any]:
+        """Add a domain to the global allowlist: { "domain": "example.com" }"""
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        domain = body.get("domain", "").strip().lower()
+        if not domain:
+            raise HTTPException(400, "domain required")
+        mgr = _dns_filter()
+        mgr.add_allowlist(domain)
+        await mgr.write_conf()
+        return {"ok": True, "domain": domain}
+
+    @app.delete("/api/v1/dns-filter/allowlist/{domain}")
+    async def dns_filter_allowlist_remove(request: Request, domain: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        mgr = _dns_filter()
+        ok = mgr.remove_allowlist(domain.lower())
+        if not ok:
+            raise HTTPException(404, f"{domain!r} not in allowlist")
+        await mgr.write_conf()
+        return {"ok": True}
+
+    @app.get("/api/v1/dns-filter/custom-blocklist")
+    async def dns_filter_custom_block_get(request: Request) -> list[str]:
+        _require_scope(request, SCOPE_READ)
+        return list(_dns_filter().get_config().custom_blocklist)
+
+    @app.post("/api/v1/dns-filter/custom-blocklist")
+    async def dns_filter_custom_block_add(request: Request) -> dict[str, Any]:
+        """Add a domain to the custom blocklist: { "domain": "badsite.com" }"""
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        domain = body.get("domain", "").strip().lower()
+        if not domain:
+            raise HTTPException(400, "domain required")
+        mgr = _dns_filter()
+        mgr.add_custom_block(domain)
+        mgr._recompile()
+        await mgr.write_conf()
+        return {"ok": True, "domain": domain}
+
+    @app.delete("/api/v1/dns-filter/custom-blocklist/{domain}")
+    async def dns_filter_custom_block_remove(request: Request, domain: str) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
+        mgr = _dns_filter()
+        ok = mgr.remove_custom_block(domain.lower())
+        if not ok:
+            raise HTTPException(404, f"{domain!r} not in custom blocklist")
+        mgr._recompile()
+        await mgr.write_conf()
+        return {"ok": True}
+
+    @app.post("/api/v1/dns-filter/check")
+    async def dns_filter_check(request: Request) -> dict[str, Any]:
+        """Check if a domain is blocked: { "domain": "example.com" }"""
+        _require_scope(request, SCOPE_READ)
+        body = await request.json()
+        domain = body.get("domain", "").strip().lower()
+        if not domain:
+            raise HTTPException(400, "domain required")
+        blocked = _dns_filter().is_blocked(domain)
+        return {"domain": domain, "blocked": blocked}
 
     # Static files — mounted last so they don't shadow API routes
     static_dir = Path(__file__).parent / "static"
