@@ -222,6 +222,9 @@ export function RoomCorrectionScreen() {
     setRoomName,
     setSink,
     setContributeToDatabase,
+    setMicSource,
+    searchUsbMics,
+    selectUsbMic,
   } = useRoomCorrection();
 
   // Result step state — must be at top level (Rules of Hooks)
@@ -306,28 +309,134 @@ export function RoomCorrectionScreen() {
 
         <Text style={styles.sectionTitle}>Calibration settings</Text>
 
-        {/* Phone model picker */}
-        <Text style={styles.label}>Phone model</Text>
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chipRow}>
-          {phoneModelOptions.map(m => {
-            const effectiveModel = m === 'auto' ? detectedPhone : m;
-            const label = m === 'auto' ? `Auto (${detectedPhone})` : m.replace(/_/g, ' ');
-            const selected =
-              m === 'auto'
-                ? state.phoneModel === detectedPhone
-                : state.phoneModel === m;
-            return (
-              <TouchableOpacity
-                key={m}
-                style={[styles.chip, selected && styles.chipSelected]}
-                onPress={() => setPhoneModel(effectiveModel)}>
-                <Text style={[styles.chipText, selected && styles.chipTextSelected]}>
-                  {label}
-                </Text>
-              </TouchableOpacity>
-            );
-          })}
-        </ScrollView>
+        {/* Mic source selector */}
+        <Text style={styles.label}>Mic source</Text>
+        <View style={styles.segmentedControl}>
+          <TouchableOpacity
+            style={[
+              styles.segmentBtn,
+              state.micSource === 'phone' && styles.segmentBtnActive,
+            ]}
+            onPress={() => setMicSource('phone')}>
+            <Text style={[
+              styles.segmentBtnText,
+              state.micSource === 'phone' && styles.segmentBtnTextActive,
+            ]}>
+              Phone Mic
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[
+              styles.segmentBtn,
+              state.micSource === 'usb' && styles.segmentBtnActive,
+            ]}
+            onPress={() => setMicSource('usb')}>
+            <Text style={[
+              styles.segmentBtnText,
+              state.micSource === 'usb' && styles.segmentBtnTextActive,
+            ]}>
+              USB Mic
+            </Text>
+          </TouchableOpacity>
+        </View>
+
+        {state.micSource === 'phone' ? (
+          <>
+            {/* Phone model picker */}
+            <Text style={styles.label}>Phone model</Text>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chipRow}>
+              {phoneModelOptions.map(m => {
+                const effectiveModel = m === 'auto' ? detectedPhone : m;
+                const label = m === 'auto' ? `Auto (${detectedPhone})` : m.replace(/_/g, ' ');
+                const selected =
+                  m === 'auto'
+                    ? state.phoneModel === detectedPhone
+                    : state.phoneModel === m;
+                return (
+                  <TouchableOpacity
+                    key={m}
+                    style={[styles.chip, selected && styles.chipSelected]}
+                    onPress={() => setPhoneModel(effectiveModel)}>
+                    <Text style={[styles.chipText, selected && styles.chipTextSelected]}>
+                      {label}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </ScrollView>
+          </>
+        ) : (
+          <>
+            {/* USB mic autocomplete */}
+            <Text style={styles.label}>Mic model</Text>
+            <View style={styles.usbMicInputRow}>
+              <TextInput
+                style={[styles.textInput, styles.usbMicInput]}
+                placeholder="Type to search..."
+                placeholderTextColor="#6B7280"
+                value={state.usbMicQuery}
+                onChangeText={searchUsbMics}
+                autoCorrect={false}
+                autoCapitalize="none"
+              />
+              {state.usbMicQuery.length > 0 && (
+                <TouchableOpacity
+                  style={styles.usbMicClear}
+                  onPress={() => {
+                    searchUsbMics('');
+                    selectUsbMic('', '');
+                  }}>
+                  <Text style={styles.usbMicClearText}>✕</Text>
+                </TouchableOpacity>
+              )}
+            </View>
+
+            {/* Autocomplete dropdown */}
+            {state.usbMicResults.length > 0 && (
+              <View style={styles.usbMicDropdown}>
+                {state.usbMicResults.slice(0, 8).map(mic => (
+                  <TouchableOpacity
+                    key={mic.key}
+                    style={styles.usbMicOption}
+                    onPress={() => selectUsbMic(mic.name, mic.key)}>
+                    <Text style={styles.usbMicOptionText}>{mic.name}</Text>
+                    {mic.has_curve ? (
+                      <Text style={styles.usbMicBadgeCalibrated}>✓ calibrated</Text>
+                    ) : mic.community ? (
+                      <Text style={styles.usbMicBadgeCommunity}>~ community</Text>
+                    ) : null}
+                  </TouchableOpacity>
+                ))}
+                <TouchableOpacity
+                  style={[styles.usbMicOption, styles.usbMicOptionGeneric]}
+                  onPress={() => selectUsbMic('Generic USB', 'generic_usb')}>
+                  <Text style={styles.usbMicOptionTextMuted}>
+                    Don't know / Generic USB
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            )}
+
+            {/* Selected mic or no-curve hint */}
+            {state.usbMicKey && state.usbMicResults.length === 0 && (
+              <Text style={styles.usbMicSelected}>{state.usbMicName || 'Generic USB'}</Text>
+            )}
+            {state.usbMicKey && !state.usbMicResults.length && (
+              (() => {
+                // Only show the hint if no calibration curve is available
+                // We can't easily check has_curve here without the results list,
+                // so show a general note for unrecognised keys
+                const isKnown = state.usbMicKey.length > 0 &&
+                  state.usbMicKey !== 'generic_usb';
+                return isKnown ? null : (
+                  <Text style={styles.usbMicNoCurveHint}>
+                    No calibration curve yet — your measurement helps build one.
+                  </Text>
+                );
+              })()
+            )}
+          </>
+        )}
 
         {/* Target curve picker */}
         <Text style={styles.label}>Target curve</Text>
@@ -367,12 +476,16 @@ export function RoomCorrectionScreen() {
           />
           <View style={styles.consentText}>
             <Text style={styles.consentTitle}>
-              Contribute to phone mic database
+              {state.micSource === 'usb' && state.usbMicName
+                ? `Help calibrate ${state.usbMicName} for all users`
+                : 'Contribute to phone mic database'}
             </Text>
             <Text style={styles.consentDesc}>
-              {`Help improve corrections for all ${
-                state.phoneModel === 'generic' ? 'users' : state.phoneModel.replace(/_/g, ' ') + ' users'
-              }. Sends only your frequency response and phone model — no room info, no audio.`}
+              {state.micSource === 'usb'
+                ? `Sends only your frequency response and mic model — no room info, no audio.`
+                : `Help improve corrections for all ${
+                    state.phoneModel === 'generic' ? 'users' : state.phoneModel.replace(/_/g, ' ') + ' users'
+                  }. Sends only your frequency response and phone model — no room info, no audio.`}
             </Text>
           </View>
         </View>
@@ -931,5 +1044,102 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 14,
     fontWeight: '600',
+  },
+  // Mic source segmented control
+  segmentedControl: {
+    flexDirection: 'row',
+    backgroundColor: '#1F2937',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#374151',
+    overflow: 'hidden',
+    marginBottom: 4,
+  },
+  segmentBtn: {
+    flex: 1,
+    paddingVertical: 10,
+    alignItems: 'center',
+  },
+  segmentBtnActive: {
+    backgroundColor: '#064E3B',
+    borderColor: '#10B981',
+  },
+  segmentBtnText: {
+    color: '#9CA3AF',
+    fontSize: 13,
+    fontWeight: '500',
+  },
+  segmentBtnTextActive: {
+    color: '#10B981',
+  },
+  // USB mic autocomplete
+  usbMicInputRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  usbMicInput: {
+    flex: 1,
+  },
+  usbMicClear: {
+    position: 'absolute',
+    right: 12,
+    paddingHorizontal: 6,
+    paddingVertical: 4,
+  },
+  usbMicClearText: {
+    color: '#6B7280',
+    fontSize: 14,
+  },
+  usbMicDropdown: {
+    backgroundColor: '#1F2937',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#374151',
+    marginTop: 4,
+    overflow: 'hidden',
+  },
+  usbMicOption: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: '#374151',
+  },
+  usbMicOptionGeneric: {
+    borderBottomWidth: 0,
+  },
+  usbMicOptionText: {
+    color: '#F9FAFB',
+    fontSize: 14,
+  },
+  usbMicOptionTextMuted: {
+    color: '#6B7280',
+    fontSize: 13,
+    fontStyle: 'italic',
+  },
+  usbMicBadgeCalibrated: {
+    color: '#34D399',
+    fontSize: 11,
+    fontWeight: '500',
+  },
+  usbMicBadgeCommunity: {
+    color: '#60A5FA',
+    fontSize: 11,
+    fontWeight: '500',
+  },
+  usbMicSelected: {
+    color: '#10B981',
+    fontSize: 13,
+    marginTop: 6,
+    marginLeft: 2,
+  },
+  usbMicNoCurveHint: {
+    color: '#9CA3AF',
+    fontSize: 12,
+    marginTop: 6,
+    marginLeft: 2,
+    fontStyle: 'italic',
   },
 });

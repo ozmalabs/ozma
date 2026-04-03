@@ -45,6 +45,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -88,6 +89,7 @@ class CorrectionProfile:
     bands: list[EQBand] = field(default_factory=list)
     mic_type: str = "phone"        # phone, usb, calibration
     phone_model: str = ""          # "iPhone 15 Pro", "Pixel 8", etc.
+    mic_model: str = ""            # USB/XLR mic display name e.g. "Blue Yeti"
     target_curve: str = "harman"   # harman, flat, bbc, custom
     room_name: str = ""
     node_id: str = ""              # which node/output this was measured for
@@ -104,6 +106,7 @@ class CorrectionProfile:
             "bands": [b.to_dict() for b in self.bands],
             "mic_type": self.mic_type,
             "phone_model": self.phone_model,
+            "mic_model": self.mic_model,
             "target_curve": self.target_curve,
             "room_name": self.room_name,
             "node_id": self.node_id,
@@ -163,6 +166,120 @@ PHONE_MIC_CURVES: dict[str, list[tuple[float, float]]] = {
     ],
 }
 
+# ── USB / XLR mic known model list ────────────────────────────────────────
+# Used for autocomplete in the setup step. Models without curve data are still
+# accepted for contribution — submissions accumulate until n >= 5.
+
+KNOWN_USB_MICS: list[str] = [
+    "Blue Yeti",
+    "Blue Yeti X",
+    "Blue Yeti Nano",
+    "Blue Snowball",
+    "Blue Snowball iCE",
+    "HyperX QuadCast",
+    "HyperX QuadCast S",
+    "HyperX SoloCast",
+    "Rode NT-USB",
+    "Rode NT-USB Mini",
+    "Rode Podcaster",
+    "Audio-Technica AT2020USB+",
+    "Audio-Technica ATR2500x-USB",
+    "Audio-Technica AT2035",
+    "Shure MV7",
+    "Shure MV88+",
+    "Shure SM7B (via interface)",
+    "Elgato Wave 3",
+    "Elgato Wave 1",
+    "Razer Seiren Elite",
+    "Razer Seiren Mini",
+    "Razer Seiren V2 Pro",
+    "SteelSeries Alias",
+    "SteelSeries Alias Pro",
+    "Samson Q2U",
+    "Samson C01U Pro",
+    "AKG Lyra",
+    "AKG P120",
+    "FIFINE K669B",
+    "FIFINE AM8",
+    "Tonor TC-777",
+    "Tonor TC-30",
+    "Focusrite Scarlett Solo (with SM58)",
+    "Focusrite Scarlett 2i2 (with SM7B)",
+    "Sennheiser MK4 (via interface)",
+    "Sennheiser Profile",
+    "NEAT Bumblebee II",
+    "JLab Talk Pro",
+    "JLab Talk Go",
+    "Logitech Blue Sona",
+    "Movo UM700",
+    "NZXT Capsule",
+]
+
+# ── USB mic compensation curves ────────────────────────────────────────────
+# Same format as PHONE_MIC_CURVES: (freq_hz, deviation_db) where positive
+# means the mic is hot at that frequency (we subtract from raw measurement).
+# Keys are normalised: lowercase, non-alnum replaced with underscores.
+# Based on published measurements and manufacturer specs.
+
+USB_MIC_CURVES: dict[str, list[tuple[float, float]]] = {
+    "blue_yeti": [
+        # Slight low-end rolloff, modest bump at 200Hz, presence peak 5–8kHz
+        (20, -5), (31.5, -3), (63, -1), (125, 0), (200, 1.5), (250, 1),
+        (500, 0), (1000, 0), (2000, 0.5), (4000, 1.5), (5000, 2.5),
+        (6000, 2.5), (8000, 2), (10000, 1), (12000, 0), (16000, -2),
+        (20000, -5),
+    ],
+    "blue_snowball": [
+        # More aggressive presence peak 6–10kHz, slight mud at 200–400Hz
+        (20, -6), (31.5, -4), (63, -1.5), (125, 0), (200, 1), (250, 1),
+        (400, 1), (500, 0.5), (1000, 0), (2000, 0.5), (4000, 2),
+        (6000, 3.5), (8000, 4), (10000, 3), (12000, 1.5), (16000, -2),
+        (20000, -6),
+    ],
+    "hyperx_quadcast": [
+        # Smooth, warmth at 125–250Hz, mild presence lift at 3–5kHz
+        (20, -4), (31.5, -2), (63, -1), (125, 1), (250, 1), (500, 0),
+        (1000, 0), (2000, 0.5), (3000, 1.5), (4000, 1.5), (5000, 1),
+        (6000, 0.5), (8000, 0), (10000, -0.5), (12000, -1), (16000, -3),
+        (20000, -6),
+    ],
+    "rode_nt_usb": [
+        # Fairly flat, gentle HF rolloff above 10kHz, mild warmth at 100–200Hz
+        (20, -3), (31.5, -2), (63, -1), (100, 1), (125, 1), (200, 0.5),
+        (250, 0), (500, 0), (1000, 0), (2000, 0), (4000, 0), (6000, 0),
+        (8000, -0.5), (10000, -1), (12000, -2), (16000, -4), (20000, -8),
+    ],
+    "shure_mv7": [
+        # Presence peak at 3–5kHz (+2dB), low-mid warmth at 150–250Hz (+1dB)
+        (20, -2), (31.5, -1), (63, 0), (125, 0.5), (150, 1), (200, 1),
+        (250, 1), (500, 0), (1000, 0), (2000, 1), (3000, 2), (4000, 2),
+        (5000, 1.5), (6000, 1), (8000, 0.5), (10000, 0), (12000, -1),
+        (16000, -3), (20000, -6),
+    ],
+    "elgato_wave_3": [
+        # Marketed as flat; subtle presence lift at 8–12kHz, clean low end
+        (20, -3), (31.5, -2), (63, -0.5), (125, 0), (250, 0), (500, 0),
+        (1000, 0), (2000, 0), (4000, 0.5), (6000, 1), (8000, 1.5),
+        (10000, 1.5), (12000, 1), (16000, -1), (20000, -4),
+    ],
+    "audio_technica_at2020usb": [
+        # Slightly forward mids at 2–4kHz, mild presence peak at 6–8kHz
+        (20, -4), (31.5, -2), (63, -1), (125, 0), (250, 0), (500, 0),
+        (1000, 0), (2000, 1.5), (3000, 1.5), (4000, 1.5), (6000, 2),
+        (8000, 2), (10000, 1), (12000, 0), (16000, -2), (20000, -5),
+    ],
+}
+
+
+def normalise_mic_name(name: str) -> str:
+    """Normalise a mic display name to a dict key.
+
+    e.g. "Blue Yeti" -> "blue_yeti"
+         "Audio-Technica AT2020USB+" -> "audio_technica_at2020usb"
+    """
+    return re.sub(r'[^a-z0-9]+', '_', name.lower()).strip('_')
+
+
 # ── Target curves ──────────────────────────────────────────────────────────
 
 TARGET_CURVES: dict[str, list[tuple[float, float]]] = {
@@ -201,22 +318,34 @@ class RoomCorrectionManager:
                              phone_model: str = "generic",
                              target_curve: str = "harman",
                              room_name: str = "",
-                             node_id: str = "") -> CorrectionProfile:
+                             node_id: str = "",
+                             mic_type: str = "phone",
+                             mic_model: str = "") -> CorrectionProfile:
         """
         Process a raw frequency response measurement into an EQ correction.
 
         Args:
             frequency_response: [(freq_hz, magnitude_db), ...] from the browser FFT
-            phone_model: phone model for mic compensation
+            phone_model: phone model key for mic compensation (when mic_type="phone")
             target_curve: desired target curve name
             room_name: user label for this room
             node_id: which node/output this correction is for
+            mic_type: "phone" | "usb" | "xlr" — determines which curve dict to use
+            mic_model: USB/XLR mic display name (e.g. "Blue Yeti"), used when
+                       mic_type is "usb" or "xlr"
 
         Returns:
             CorrectionProfile with calculated EQ bands
         """
-        # 1. Apply phone mic compensation
-        mic_curve = PHONE_MIC_CURVES.get(phone_model, PHONE_MIC_CURVES["generic"])
+        # 1. Apply mic compensation
+        if mic_type in ("usb", "xlr"):
+            key = normalise_mic_name(mic_model) if mic_model else "generic"
+            mic_curve = USB_MIC_CURVES.get(key, PHONE_MIC_CURVES["generic"])
+            resolved_mic_type = mic_type
+        else:
+            mic_curve = PHONE_MIC_CURVES.get(phone_model, PHONE_MIC_CURVES["generic"])
+            resolved_mic_type = "phone"
+
         compensated = self._apply_mic_compensation(frequency_response, mic_curve)
 
         # 2. Calculate correction: target - measured
@@ -233,8 +362,9 @@ class RoomCorrectionManager:
             name=f"{room_name or 'Room'} ({time.strftime('%Y-%m-%d %H:%M')})",
             created_at=time.time(),
             bands=bands,
-            mic_type="phone",
+            mic_type=resolved_mic_type,
             phone_model=phone_model,
+            mic_model=mic_model if resolved_mic_type != "phone" else "",
             target_curve=target_curve,
             room_name=room_name,
             node_id=node_id,
@@ -244,13 +374,22 @@ class RoomCorrectionManager:
         self._profiles[profile_id] = profile
         self._save_profiles()
 
-        log.info("Room correction calculated: %s — %d bands, phone=%s, target=%s",
-                 profile_id, len(bands), phone_model, target_curve)
+        log.info(
+            "Room correction calculated: %s — %d bands, mic_type=%s "
+            "phone=%s mic_model=%s target=%s",
+            profile_id, len(bands), resolved_mic_type, phone_model,
+            mic_model or "(none)", target_curve,
+        )
         return profile
 
     def update_mic_curves(self, connect_curves: dict) -> int:
         """
-        Merge Connect-sourced crowdsourced curves into PHONE_MIC_CURVES.
+        Merge Connect-sourced crowdsourced curves into PHONE_MIC_CURVES and
+        USB_MIC_CURVES.
+
+        Accepts either the old flat format {"model": {...}} (all treated as
+        phone curves) or the new nested format:
+            {"phone": {"iphone_15": {...}}, "usb": {"blue_yeti": {...}}}
 
         Only updates models where:
           - confidence > 0.6  (enough agreement across measurements)
@@ -260,39 +399,51 @@ class RoomCorrectionManager:
         Returns the count of models updated/added.
         """
         updated = 0
-        for model, info in connect_curves.items():
-            confidence = info.get("confidence", 0.0)
-            n = info.get("n", 0)
-            curve_data = info.get("curve", [])
 
-            if confidence <= 0.6 or n < 10:
-                log.debug(
-                    "Skipping Connect curve for %s: confidence=%.2f n=%d "
-                    "(need confidence>0.6 and n>=10)",
-                    model, confidence, n,
+        # Support both legacy flat dict and new nested dict
+        if "phone" in connect_curves or "usb" in connect_curves:
+            batches: list[tuple[dict, dict]] = [
+                (connect_curves.get("phone", {}), PHONE_MIC_CURVES),
+                (connect_curves.get("usb", {}),   USB_MIC_CURVES),
+            ]
+        else:
+            # Legacy: all entries treated as phone curves
+            batches = [(connect_curves, PHONE_MIC_CURVES)]
+
+        for source, target_dict in batches:
+            for model, info in source.items():
+                confidence = info.get("confidence", 0.0)
+                n = info.get("n", 0)
+                curve_data = info.get("curve", [])
+
+                if confidence <= 0.6 or n < 10:
+                    log.debug(
+                        "Skipping Connect curve for %s: confidence=%.2f n=%d "
+                        "(need confidence>0.6 and n>=10)",
+                        model, confidence, n,
+                    )
+                    continue
+
+                if not curve_data:
+                    continue
+
+                try:
+                    new_curve: list[tuple[float, float]] = [
+                        (float(freq), float(db)) for freq, db in curve_data
+                    ]
+                except (TypeError, ValueError) as e:
+                    log.warning("Invalid curve data for model %s: %s", model, e)
+                    continue
+
+                existing = target_dict.get(model)
+                target_dict[model] = new_curve
+                updated += 1
+                log.info(
+                    "Updated mic compensation curve for %s from Connect "
+                    "(n=%d, confidence=%.2f)%s",
+                    model, n, confidence,
+                    " (new model)" if existing is None else "",
                 )
-                continue
-
-            if not curve_data:
-                continue
-
-            try:
-                new_curve: list[tuple[float, float]] = [
-                    (float(freq), float(db)) for freq, db in curve_data
-                ]
-            except (TypeError, ValueError) as e:
-                log.warning("Invalid curve data for model %s: %s", model, e)
-                continue
-
-            existing = PHONE_MIC_CURVES.get(model)
-            PHONE_MIC_CURVES[model] = new_curve
-            updated += 1
-            log.info(
-                "Updated mic compensation curve for %s from Connect "
-                "(n=%d, confidence=%.2f)%s",
-                model, n, confidence,
-                " (new model)" if existing is None else "",
-            )
 
         if updated:
             log.info("Applied %d Connect mic compensation curve(s)", updated)
@@ -381,7 +532,9 @@ class RoomCorrectionManager:
                           phone_model: str = "generic",
                           target_curve: str = "harman",
                           room_name: str = "",
-                          node_id: str = "") -> CorrectionProfile | None:
+                          node_id: str = "",
+                          mic_type: str = "phone",
+                          mic_model: str = "") -> CorrectionProfile | None:
         """
         Run a complete sweep + record + analyse cycle on the controller.
 
@@ -450,6 +603,8 @@ class RoomCorrectionManager:
                 target_curve=target_curve,
                 room_name=room_name,
                 node_id=node_id,
+                mic_type=mic_type,
+                mic_model=mic_model,
             )
             return profile
 

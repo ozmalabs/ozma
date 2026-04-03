@@ -344,12 +344,14 @@ class OzmaConnect:
         correction_applied: list[tuple[float, float]],
         target_curve: str = "harman",
         snr_estimate: float = 0.0,
+        mic_type: str = "phone",
+        mic_model: str = "",
     ) -> dict | None:
         """
-        Submit a phone mic frequency response measurement to Connect's
-        crowdsourced database.  Only called when telemetry is enabled
-        (caller's responsibility to check).
+        Submit a mic frequency response measurement to Connect's crowdsourced
+        database.  Supports phone, USB, and XLR-via-interface mics.
 
+        Only called when telemetry is enabled (caller's responsibility to check).
         Fire-and-forget: silently returns None on failure.
         """
         if not self._authenticated:
@@ -361,13 +363,16 @@ class OzmaConnect:
             "correction_applied": [list(p) for p in correction_applied],
             "target_curve": target_curve,
             "snr_estimate": snr_estimate,
+            "mic_type": mic_type,
+            "mic_model": mic_model,
         })
 
     async def get_mic_curves(self) -> dict | None:
         """
         Pull the latest aggregated mic compensation curves from Connect.
 
-        Returns the full curves dict from Connect, or None on failure.
+        Returns the full response dict from Connect (may contain nested
+        "phone" and "usb" sections), or None on failure.
         Caches locally in mic_curves_cache.json with 24h TTL.
         """
         cache_path = self.MIC_CURVES_CACHE_PATH
@@ -392,16 +397,20 @@ class OzmaConnect:
                     pass
             return None
 
+        # The response has a "curves" key which may be nested {"phone": ..., "usb": ...}
+        # or legacy flat {"model": ...}. Return as-is; update_mic_curves handles both.
+        curves = result.get("curves", result)
+
         # Persist to local cache
         try:
             cache_path.write_text(json.dumps({
                 "fetched_at": time.time(),
-                "curves": result,
+                "curves": curves,
             }, indent=2))
         except Exception as e:
             log.debug("Failed to cache mic curves: %s", e)
 
-        return result
+        return curves
 
     # ── API helpers ─────────────────────────────────────────────────────────
 

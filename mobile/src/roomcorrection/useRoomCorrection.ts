@@ -20,6 +20,15 @@ import type {CorrectionProfile, AudioSink} from '../api/types';
 const _storage = new MMKV();
 const MIC_DB_CONSENT_KEY = 'mic_db_consent';
 
+// ── USB mic autocomplete result type ─────────────────────────────────────────
+
+export interface UsbMicResult {
+  name: string;
+  key: string;
+  has_curve: boolean;
+  community?: boolean;
+}
+
 // ── 1/3-octave centre frequencies (20 Hz – 20 kHz, 20 bands) ─────────────────
 const OCTAVE_CENTRES: number[] = [
   20, 31.5, 63, 125, 250, 500, 1000, 2000, 4000, 6000, 8000, 10000, 12000,
@@ -45,6 +54,12 @@ export interface RoomCorrectionState {
   roomName: string;
   availableSinks: AudioSink[];
   availablePhoneModels: string[];
+  // Mic source
+  micSource: 'phone' | 'usb';
+  usbMicQuery: string;        // current text in the autocomplete field
+  usbMicResults: UsbMicResult[];
+  usbMicName: string;         // selected USB mic display name
+  usbMicKey: string;          // normalised key (e.g. "blue_yeti")
   // Mic DB consent
   contributeToDatabase: boolean;
   // Measuring
@@ -70,6 +85,10 @@ type Action =
   | {type: 'SET_ROOM_NAME'; name: string}
   | {type: 'SET_SINKS'; sinks: AudioSink[]}
   | {type: 'SET_PHONE_MODELS'; models: string[]}
+  | {type: 'SET_MIC_SOURCE'; src: 'phone' | 'usb'}
+  | {type: 'SET_USB_MIC_QUERY'; query: string}
+  | {type: 'SET_USB_MIC_RESULTS'; results: UsbMicResult[]}
+  | {type: 'SET_USB_MIC'; name: string; key: string}
   | {type: 'SET_CONTRIBUTE'; contribute: boolean}
   | {type: 'SET_RECORDING'; isRecording: boolean}
   | {type: 'SET_PROGRESS'; progress: number}
@@ -89,6 +108,11 @@ const INITIAL_STATE: RoomCorrectionState = {
   roomName: '',
   availableSinks: [],
   availablePhoneModels: [],
+  micSource: 'phone',
+  usbMicQuery: '',
+  usbMicResults: [],
+  usbMicName: '',
+  usbMicKey: '',
   // Default to true if previously consented, false on first use
   contributeToDatabase: _storage.getBoolean(MIC_DB_CONSENT_KEY) ?? false,
   isRecording: false,
@@ -121,6 +145,27 @@ function reducer(
       return {...state, availableSinks: action.sinks};
     case 'SET_PHONE_MODELS':
       return {...state, availablePhoneModels: action.models};
+    case 'SET_MIC_SOURCE':
+      // Reset USB selection when switching back to phone
+      return {
+        ...state,
+        micSource: action.src,
+        usbMicQuery: '',
+        usbMicResults: [],
+        ...(action.src === 'phone' ? {usbMicName: '', usbMicKey: ''} : {}),
+      };
+    case 'SET_USB_MIC_QUERY':
+      return {...state, usbMicQuery: action.query};
+    case 'SET_USB_MIC_RESULTS':
+      return {...state, usbMicResults: action.results};
+    case 'SET_USB_MIC':
+      return {
+        ...state,
+        usbMicName: action.name,
+        usbMicKey: action.key,
+        usbMicQuery: action.name,
+        usbMicResults: [],
+      };
     case 'SET_CONTRIBUTE':
       return {...state, contributeToDatabase: action.contribute};
     case 'SET_RECORDING':
@@ -433,6 +478,8 @@ export function useRoomCorrection() {
       targetCurve: string,
       roomName: string,
       nodeId: string,
+      micType: 'phone' | 'usb' = 'phone',
+      micModel: string = '',
     ) => {
       const resp = await fetch(
         `${apiBase}/api/v1/audio/room-correction/measure`,
@@ -445,6 +492,8 @@ export function useRoomCorrection() {
             target_curve: targetCurve,
             room_name: roomName,
             node_id: nodeId,
+            mic_type: micType,
+            mic_model: micModel,
           }),
         },
       );
@@ -459,8 +508,10 @@ export function useRoomCorrection() {
   );
 
   const startMeasurement = useCallback(async () => {
-    const {selectedNodeId, selectedSink, targetCurve, phoneModel, roomName} =
-      state;
+    const {
+      selectedNodeId, selectedSink, targetCurve, phoneModel, roomName,
+      micSource, usbMicName, usbMicKey,
+    } = state;
 
     dispatch({type: 'SET_STEP', step: 'measuring'});
     dispatch({type: 'SET_ERROR', error: null});
@@ -555,6 +606,9 @@ export function useRoomCorrection() {
       const freqResponse = computeFFT(samples, sampleRate);
       const snrEstimate = estimateSnr(samples, sampleRate);
 
+      const effectiveMicType: 'phone' | 'usb' = micSource === 'usb' ? 'usb' : 'phone';
+      const effectiveMicModel = micSource === 'usb' ? (usbMicName || 'Generic USB') : '';
+
       // POST to controller
       await submitMeasurement(
         freqResponse,
@@ -562,20 +616,20 @@ export function useRoomCorrection() {
         targetCurve,
         roomName,
         selectedNodeId,
+        effectiveMicType,
+        effectiveMicModel,
       );
 
       // Contribute to mic DB if user consented (fire-and-forget)
       if (state.contributeToDatabase) {
-        // We don't have correction_applied at this point (returned in profile);
-        // profile is set by submitMeasurement via dispatch — read from state ref
-        // after it resolves. Use empty array as placeholder; the controller will
-        // fill in what it applied from the profile it just created.
         contributeMeasurement(
           freqResponse,
           [],  // correction_applied filled server-side by the /measure handler
           phoneModel,
           targetCurve,
           snrEstimate,
+          effectiveMicType,
+          effectiveMicModel,
         );
       }
     } catch (e: any) {
@@ -700,6 +754,44 @@ export function useRoomCorrection() {
     dispatch({type: 'SET_CONTRIBUTE', contribute: val});
   }, []);
 
+  const setMicSource = useCallback(
+    (src: 'phone' | 'usb') => dispatch({type: 'SET_MIC_SOURCE', src}),
+    [],
+  );
+
+  // USB mic autocomplete — debounced 200ms fetch
+  const _usbSearchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const searchUsbMics = useCallback(
+    (q: string) => {
+      dispatch({type: 'SET_USB_MIC_QUERY', query: q});
+      if (_usbSearchTimer.current) {
+        clearTimeout(_usbSearchTimer.current);
+      }
+      if (!q.trim()) {
+        dispatch({type: 'SET_USB_MIC_RESULTS', results: []});
+        return;
+      }
+      _usbSearchTimer.current = setTimeout(async () => {
+        try {
+          const resp = await fetch(
+            `${apiBase}/api/v1/audio/room-correction/usb-mics?q=${encodeURIComponent(q)}`,
+            {headers: headers()},
+          );
+          const data = await resp.json();
+          dispatch({type: 'SET_USB_MIC_RESULTS', results: data.mics ?? []});
+        } catch (_) {
+          // Non-fatal — autocomplete failures are silent
+        }
+      }, 200);
+    },
+    [apiBase, headers],
+  );
+
+  const selectUsbMic = useCallback(
+    (name: string, key: string) => dispatch({type: 'SET_USB_MIC', name, key}),
+    [],
+  );
+
   // ── Contribute to mic DB via controller proxy ─────────────────────────
 
   const contributeMeasurement = useCallback(
@@ -709,6 +801,8 @@ export function useRoomCorrection() {
       phoneModel: string,
       targetCurve: string,
       snrEstimate: number,
+      micType: 'phone' | 'usb' = 'phone',
+      micModel: string = '',
     ) => {
       try {
         await fetch(
@@ -718,6 +812,8 @@ export function useRoomCorrection() {
             headers: headers(),
             body: JSON.stringify({
               phone_model: phoneModel,
+              mic_type: micType,
+              mic_model: micModel,
               raw_response: freqResponse,
               correction_applied: correctionApplied,
               target_curve: targetCurve,
@@ -749,5 +845,8 @@ export function useRoomCorrection() {
     setRoomName,
     setSink,
     setContributeToDatabase,
+    setMicSource,
+    searchUsbMics,
+    selectUsbMic,
   };
 }
