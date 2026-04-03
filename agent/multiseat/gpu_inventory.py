@@ -541,6 +541,14 @@ class GPUInventory:
 
     async def _probe_software_encoders(self) -> None:
         """Probe software encoders (always available as fallback)."""
+        if not shutil.which("ffmpeg"):
+            # Assume libx264 will be available when ffmpeg is installed
+            self._software_encoders.append(EncoderInfo(
+                name="libx264", codec="h264", gpu_index=-1,
+                max_sessions=-1, quality=9, latency=8,
+            ))
+            return
+
         for codec, encoder_name in [("h264", "libx264"), ("h265", "libx265")]:
             if await self._test_encoder(encoder_name):
                 self._software_encoders.append(EncoderInfo(
@@ -548,8 +556,8 @@ class GPUInventory:
                     codec=codec,
                     gpu_index=-1,
                     max_sessions=-1,
-                    quality=9 if codec == "h264" else 9,
-                    latency=8,  # software is high latency
+                    quality=9,
+                    latency=8,
                 ))
 
     # ── Windows GPU discovery ───────────────────────────────────────────────
