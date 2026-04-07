@@ -3670,7 +3670,146 @@ The router uses quality levels in two ways:
 ## 6. Plugin Contracts
 
 Everything that is not a core graph primitive is a plugin. Transports, devices,
-codecs, and converters are all plugin types with defined interfaces.
+codecs, converters, and switches are all plugin types with defined interfaces.
+
+### 6.0 Plugin registration and lifecycle
+
+Plugins are the extension mechanism for the entire routing system. The built-in
+transports, device plugins, and codecs that ship with Ozma are themselves
+plugins — they use the same registration and lifecycle as third-party plugins.
+There is no distinction between "core" and "external" at the interface level.
+
+**Plugin registration**:
+
+```yaml
+PluginManifest:
+  id: string                    # globally unique plugin ID ("com.example.lora-transport")
+  name: string                  # human-readable name ("LoRa Transport Plugin")
+  version: string               # semver
+  type: PluginType              # what kind of plugin this is
+  description: string?
+  author: string?
+  license: string?
+  url: string?                  # project/documentation URL
+  min_ozma_version: string?     # minimum Ozma version required
+  max_ozma_version: string?     # maximum Ozma version tested with
+  dependencies: string[]?       # other plugins this depends on
+  platforms: string[]?          # supported platforms (null = all)
+  python_package: string?       # PyPI package name (for pip install)
+  entry_point: string           # Python module:class path
+
+PluginType: enum
+  transport                     # moves data between ports (§6.1)
+  device                        # discovers hardware/software devices (§6.2)
+  codec                         # encodes/decodes media (§6.3)
+  converter                     # transforms data between formats (§6.4)
+  switch                        # controls external switching devices (§6.5)
+  composite                     # provides multiple of the above (e.g., a plugin
+                                # that discovers LoRa devices AND provides LoRa transport)
+```
+
+**Plugin lifecycle**:
+
+```
+discover → load manifest → check compatibility → instantiate → register → start
+  │                                                                         │
+  │  On shutdown or unload:                                                │
+  └── stop → deregister → unload                                          │
+                                                                           │
+  Running:                                                                 │
+  ├── graph queries (discover_links, capabilities, etc.)                   │
+  ├── active operations (open, close, measure)                            │
+  └── events (on_link_change, on_hotplug, on_state_change)               │
+```
+
+**Registration methods**:
+
+1. **Built-in**: Ship with Ozma. Loaded automatically on startup. Cannot be
+   unloaded. These are the default transports, device plugins, and codecs.
+
+2. **Installed**: Installed via `pip install` or placed in the plugins
+   directory. Loaded on startup if present. Can be disabled via config.
+   ```
+   pip install ozma-plugin-lora
+   # or
+   cp lora_transport.py ~/.config/ozma/plugins/
+   ```
+
+3. **Dynamic**: Loaded at runtime via the API. Useful for development and
+   testing. Can be loaded and unloaded without restart.
+   ```
+   POST /api/v1/plugins/load    { "entry_point": "my_plugin:MyTransport" }
+   DELETE /api/v1/plugins/{id}   # unload
+   ```
+
+**Plugin isolation**: Plugins run in the controller's process but are
+sandboxed by convention — they must only interact with the system through
+the plugin interface methods. A misbehaving plugin (crash, hang, excessive
+resource use) is caught by the plugin host, logged, and disabled. The
+controller continues operating without it.
+
+**Plugin API**:
+
+```
+GET /api/v1/plugins                     # list all registered plugins
+GET /api/v1/plugins/{id}                # plugin detail (manifest, status, metrics)
+POST /api/v1/plugins/load               # load a dynamic plugin
+DELETE /api/v1/plugins/{id}             # unload a dynamic plugin
+PUT /api/v1/plugins/{id}/config         # update plugin configuration
+GET /api/v1/plugins/{id}/config         # get plugin configuration
+POST /api/v1/plugins/{id}/enable        # enable a disabled plugin
+POST /api/v1/plugins/{id}/disable       # disable without unloading
+```
+
+**What a plugin can do**:
+
+- Add new device types to the graph (via device plugin interface)
+- Add new transport types (via transport plugin interface)
+- Add new codec/converter types (via codec/converter plugin interface)
+- Add new switch controller types (via switch plugin interface)
+- Define new `TransportCharacteristics` baselines for its transport
+- Contribute to the device database (add entries for devices it discovers)
+- Emit events on the WebSocket stream (namespaced: `plugin.{id}.{event}`)
+- Register API endpoints (namespaced: `/api/v1/plugins/{id}/{path}`)
+- Read the routing graph (query devices, ports, links, pipelines)
+- Receive graph change notifications (device added/removed, link state change)
+
+**What a plugin cannot do**:
+
+- Modify other plugins' state
+- Bypass the transport encryption model (§10)
+- Access the filesystem outside its data directory
+- Register core API endpoints (only namespaced under `/api/v1/plugins/{id}/`)
+- Override built-in plugin behaviour (but can provide alternatives)
+
+**Example — a LoRa transport plugin**:
+
+```python
+# ozma_plugin_lora/transport.py
+from ozma.plugins import TransportPlugin, PluginManifest
+
+class LoRaTransport(TransportPlugin):
+    manifest = PluginManifest(
+        id="community.lora-transport",
+        name="LoRa Transport",
+        version="0.1.0",
+        type="transport",
+        entry_point="ozma_plugin_lora.transport:LoRaTransport",
+    )
+
+    # TransportPlugin interface methods:
+    async def discover_links(self): ...
+    async def capabilities(self, link): ...
+    async def measure(self, link): ...
+    async def open(self, link, format): ...
+    async def close(self, stream): ...
+    def on_link_change(self, callback): ...
+```
+
+Once loaded, the LoRa transport appears in the graph like any other transport.
+Links discovered by the LoRa plugin have the LoRa transport type, LoRa-specific
+characteristics, and participate in routing decisions. The router doesn't know
+or care that it came from a plugin — it's just another transport with a cost.
 
 ### 6.1 Transport plugin
 
