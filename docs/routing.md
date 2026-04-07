@@ -6815,10 +6815,13 @@ GpuSpec:
   architecture: string?         # "ada_lovelace", "rdna3", "arc_alchemist", "m3"
   vram_mb: uint?
   vram_type: string?            # "gddr6x", "gddr6", "hbm3"
+  vram_bus_width: uint?         # memory bus width (128, 192, 256, 384 bit)
   display_outputs: DisplayOutput[]?  # physical display connectors
+  display_engine: DisplayEngineSpec?  # internal display pipeline constraints
   encode: GpuCodecCapability?   # hardware encoder (NVENC, VCN, QSV, VideoToolbox)
   decode: GpuCodecCapability?   # hardware decoder
   compute_units: uint?          # shader cores / compute units
+  ray_tracing: bool?            # hardware ray tracing cores
   tdp_w: float?
   driver_version: string?       # currently installed driver
 
@@ -6842,6 +6845,162 @@ This is how the router knows that an RTX 4080 has 3 NVENC sessions available
 and can encode H.265 4K60 with ~3ms latency, while an Intel Arc A380 has 2
 QSV sessions with different codec support. The `gpu` block on a device database
 entry feeds directly into the codec plugin's capability enumeration (§6.3).
+
+**DisplayEngineSpec** — the internal display pipeline that determines which
+combinations of outputs actually work simultaneously:
+
+```yaml
+DisplayEngineSpec:
+  heads: uint                   # display heads (independent framebuffers/CRTCs)
+  clock_sources: uint?          # independent pixel clock generators (PLLs)
+  max_total_pixel_clock_mhz: float?  # aggregate pixel clock budget across all outputs
+  max_per_head_pixel_clock_mhz: float?  # maximum pixel clock per individual head
+  max_total_bandwidth_gbps: float?  # total display output bandwidth (all links combined)
+  output_links: GpuOutputLink[]  # internal link from head/clock to physical connector
+  constraints: DisplayConstraint[]?  # combinations that don't work
+
+GpuOutputLink:
+  output_id: string             # physical output ("dp_1", "hdmi_1", "usb_c_1")
+  connector: string             # "dp", "hdmi", "usb_c", "vga", "dvi"
+  link_type: string             # "dp_mst", "dp_sst", "hdmi_tmds", "hdmi_frl"
+  max_link_bandwidth_gbps: float?  # max bandwidth of this specific output link
+  head_assignment: string?      # which head(s) can drive this output ("any", "head_0", "head_0_or_1")
+  clock_source: string?         # which PLL drives this output ("pll_0", "pll_1", "shared")
+  mst_capable: bool?            # can this output daisy-chain via MST
+  mst_max_streams: uint?        # max MST streams from this output (DP MST hub)
+  dsc: bool?                    # Display Stream Compression available on this link
+  dsc_max_bpp: float?           # maximum compressed bits per pixel (e.g., 12 bpp)
+
+DisplayConstraint:
+  type: string                  # constraint type (see table below)
+  description: string           # human-readable explanation
+  outputs_affected: string[]    # which outputs are involved
+  condition: string?            # when this constraint applies
+```
+
+**Why this matters — real-world GPU display constraints**:
+
+GPUs don't simply have "4 outputs = 4 displays". The internal architecture
+has heads (CRTCs), clock sources (PLLs), and link bandwidth that are shared
+and limited in non-obvious ways:
+
+**NVIDIA (Ada Lovelace / RTX 40 series)**:
+```yaml
+display_engine:
+  heads: 4                      # 4 independent CRTCs
+  clock_sources: 4              # 4 PLLs
+  max_total_pixel_clock_mhz: 2380  # ~2.4 GHz total across all outputs
+  output_links:
+    - { output_id: dp_1, link_type: dp_sst, max_link_bandwidth_gbps: 32.4, dsc: true }
+    - { output_id: dp_2, link_type: dp_sst, max_link_bandwidth_gbps: 32.4, dsc: true }
+    - { output_id: dp_3, link_type: dp_sst, max_link_bandwidth_gbps: 32.4, dsc: true }
+    - { output_id: hdmi_1, link_type: hdmi_frl, max_link_bandwidth_gbps: 48 }
+  constraints:
+    - type: max_simultaneous
+      description: "Maximum 4 displays simultaneously"
+      outputs_affected: ["dp_1", "dp_2", "dp_3", "hdmi_1"]
+    - type: pixel_clock_shared
+      description: "4K 144Hz on HDMI uses significant pixel clock budget — may limit other outputs to lower refresh"
+      outputs_affected: ["hdmi_1"]
+      condition: "hdmi_1 resolution > 4K60"
+```
+
+**NVIDIA (Turing / RTX 20 series)**:
+```yaml
+display_engine:
+  heads: 4
+  clock_sources: 2              # only 2 PLLs! This is the key constraint.
+  output_links:
+    - { output_id: dp_1, link_type: dp_sst, max_link_bandwidth_gbps: 25.92 }
+    - { output_id: dp_2, link_type: dp_sst, max_link_bandwidth_gbps: 25.92 }
+    - { output_id: dp_3, link_type: dp_sst, max_link_bandwidth_gbps: 25.92 }
+    - { output_id: hdmi_1, link_type: hdmi_tmds, max_link_bandwidth_gbps: 18 }
+  constraints:
+    - type: clock_sharing
+      description: "2 PLLs shared across 4 outputs — displays sharing a PLL must use compatible pixel clocks"
+      outputs_affected: ["dp_1", "dp_2", "dp_3", "hdmi_1"]
+      # Two 4K 60Hz displays at different refresh rates (e.g., 60Hz + 144Hz)
+      # need different pixel clocks. If they land on the same PLL, one must
+      # downclock. The driver handles this silently — the user just sees
+      # their 144Hz monitor running at 120Hz and doesn't know why.
+    - type: hdmi_bandwidth
+      description: "HDMI 2.0b — max 4K60 4:2:0 or 4K30 4:4:4"
+      outputs_affected: ["hdmi_1"]
+```
+
+**AMD (RDNA 3 / RX 7000 series)**:
+```yaml
+display_engine:
+  heads: 4
+  clock_sources: 4              # 4 PLLs — more flexible than Turing
+  max_total_bandwidth_gbps: 80  # but total DP bandwidth is shared
+  output_links:
+    - { output_id: dp_1, link_type: dp_sst, max_link_bandwidth_gbps: 40, dsc: true }
+    - { output_id: dp_2, link_type: dp_sst, max_link_bandwidth_gbps: 40, dsc: true }
+    - { output_id: hdmi_1, link_type: hdmi_frl, max_link_bandwidth_gbps: 48 }
+    - { output_id: usb_c_1, link_type: dp_sst, max_link_bandwidth_gbps: 40, dsc: true }
+  constraints:
+    - type: bandwidth_shared
+      description: "DP outputs share total bandwidth pool — two 4K 144Hz outputs may exceed aggregate limit without DSC"
+      outputs_affected: ["dp_1", "dp_2", "usb_c_1"]
+    - type: usb_c_mode
+      description: "USB-C port operates in DP Alt Mode — disables USB data when active as display output"
+      outputs_affected: ["usb_c_1"]
+```
+
+**Intel (Alder/Raptor Lake iGPU)**:
+```yaml
+display_engine:
+  heads: 4
+  clock_sources: 3              # 3 PLLs (DPLL0, DPLL1, DPLL4)
+  output_links:
+    - { output_id: dp_1, link_type: dp_sst, max_link_bandwidth_gbps: 32.4 }
+    - { output_id: hdmi_1, link_type: hdmi_tmds, max_link_bandwidth_gbps: 18 }
+    - { output_id: dp_2, link_type: dp_sst, max_link_bandwidth_gbps: 32.4 }
+  constraints:
+    - type: max_simultaneous
+      description: "iGPU supports max 3 simultaneous displays (even though 4 heads exist)"
+      outputs_affected: ["dp_1", "hdmi_1", "dp_2"]
+    - type: shared_pll
+      description: "HDMI and DP1 share DPLL0 — incompatible pixel clocks force one to lower refresh"
+      outputs_affected: ["dp_1", "hdmi_1"]
+```
+
+**How the router uses display engine constraints**:
+
+1. **Validating display configurations**: Before recommending a multi-monitor
+   setup, the router checks whether the GPU can actually drive it. "3× 4K
+   144Hz" may require DSC to fit within bandwidth limits. "4K 144Hz HDMI +
+   4K 60Hz DP" may conflict on a shared PLL.
+
+2. **Recommending which output to use**: "Connect your 144Hz monitor to DP 1,
+   not HDMI — HDMI 2.0 can't carry 4K 144Hz without chroma subsampling."
+
+3. **Explaining why a display isn't at full refresh**: "Your monitor is
+   running at 120Hz instead of 144Hz because it shares a PLL with your
+   other display. Move one monitor to a different output to use independent
+   PLLs."
+
+4. **DSC awareness**: "Your GPU can drive 3× 4K 144Hz but only with Display
+   Stream Compression enabled. Your monitor supports DSC — this is handled
+   automatically."
+
+5. **MST hub detection**: If a DP output is feeding an MST hub (daisy-chain
+   or external DP hub), the total bandwidth of the MST group comes from one
+   output link. Two 4K60 displays on one DP MST hub need 2× the bandwidth
+   of one — the router checks whether the link can carry it.
+
+6. **GPU passthrough planning**: For VFIO GPU passthrough, the router knows
+   the GPU's display capabilities and can recommend which outputs to pass
+   through vs keep for the host. "Pass HDMI to the VM; keep DP 1 for the
+   host's management console."
+
+**Discovery**: Display engine capabilities can come from:
+- Device database entry (`spec` quality) — known constraints per GPU model
+- Driver query (`reported` quality) — `nvidia-smi`, `xrandr --verbose`,
+  DRM/KMS `drmModeGetResources` for head/CRTC count
+- Measured (`measured` quality) — attempt a configuration, observe if it
+  succeeds or the driver downclocks
 
 **NetworkCardSpec** (NICs, WiFi, Bluetooth — beyond the physical port):
 
