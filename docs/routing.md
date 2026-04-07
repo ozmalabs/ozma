@@ -4118,6 +4118,108 @@ multiple bands, the link's expected characteristics depend on which band
 is active. A device on 5 GHz channel 36 at 80 MHz width has very different
 properties than the same device on 2.4 GHz channel 1 at 20 MHz.
 
+#### Serial connection model
+
+Serial links (RS-232, RS-485, USB-serial, UART) are the primary transport
+for switch control, actuator commands, serial consoles, sensor buses, and
+legacy industrial equipment. Serial links have fixed parameters that
+determine bandwidth and behaviour:
+
+**Serial link state**:
+
+```yaml
+SerialLinkState:
+  port: string                  # OS device path ("/dev/ttyUSB0", "/dev/ttyS0", "COM3")
+  interface_type: string        # "rs232", "rs485", "uart", "usb_serial", "virtual"
+  baud_rate: uint               # bits per second (300–4000000)
+  data_bits: uint               # 5, 6, 7, 8
+  parity: string                # "none", "even", "odd", "mark", "space"
+  stop_bits: float              # 1, 1.5, 2
+  flow_control: string          # "none", "rts_cts" (hardware), "xon_xoff" (software)
+  protocol: SerialProtocol?     # application-level protocol running on this link
+  usb_path: string?             # for USB-serial: USB bus path ("1-2.3")
+  usb_chipset: string?          # USB-serial chipset ("FTDI FT232R", "CP2102", "CH340",
+                                # "PL2303", "Silabs CP2104")
+  usb_vid_pid: string?          # USB VID:PID of the adapter
+  persistent_id: string?        # udev persistent path or serial number (for stable identification)
+
+SerialProtocol: enum
+  raw                           # raw byte stream (serial console, custom protocols)
+  modbus_rtu                    # Modbus RTU (RS-485, CRC16, request/response)
+  modbus_ascii                  # Modbus ASCII
+  dmx512                        # DMX lighting control (250 kbaud, RS-485)
+  midi_din                      # MIDI over DIN (31.25 kbaud)
+  nmea                          # GPS NMEA sentences
+  at_commands                   # Hayes AT command set (modems, some IoT modules)
+  custom                        # device-specific protocol (TESmart, Extron, etc.)
+```
+
+**Effective bandwidth**: Serial bandwidth is `baud_rate / (data_bits +
+parity_bits + stop_bits + start_bit)` bytes per second. At 115200 8N1,
+that's 11,520 bytes/sec — plenty for control commands, inadequate for media.
+
+| Baud rate | Effective throughput | Typical use |
+|-----------|---------------------|-------------|
+| 9600 | 960 B/s | Legacy devices, some switches, Modbus sensors |
+| 19200 | 1,920 B/s | Industrial equipment, some actuators |
+| 38400 | 3,840 B/s | Faster control protocols |
+| 57600 | 5,760 B/s | Serial consoles (default on many SBCs) |
+| 115200 | 11,520 B/s | Serial consoles, USB-serial default, most modern devices |
+| 250000 | 25,000 B/s | DMX512 (fixed at 250 kbaud) |
+| 921600 | 92,160 B/s | Fast USB-serial, firmware upload |
+| 1000000+ | 100,000+ B/s | Direct UART (no USB-serial overhead) |
+
+**USB-serial vs native UART**: USB-serial adapters add latency from the USB
+polling interval. A typical USB-serial adapter at full-speed USB has a 1ms
+polling interval — every byte waits up to 1ms before being delivered to the
+host. At high-speed USB this drops to 125µs. Native UART (direct SBC GPIO
+pins) has no USB overhead — latency is just wire propagation + one bit time.
+
+| Interface | Added latency | Notes |
+|-----------|--------------|-------|
+| Native UART (SBC GPIO) | <0.1ms | Direct hardware, no stack overhead |
+| USB-serial (full-speed) | 1–2ms | USB polling interval + driver |
+| USB-serial (high-speed) | 0.1–0.5ms | Faster polling + driver |
+| USB-serial via hub | 1–5ms | Hub adds another polling stage |
+| Bluetooth SPP | 10–30ms | BT Classic serial port profile |
+| WiFi serial bridge | 5–20ms | ESP32/ESP8266 WiFi-to-serial |
+| Virtual serial (socat/pty) | <0.1ms | Software pipe, kernel IPC |
+
+**Persistent identification**: Serial ports change names across reboots
+(`/dev/ttyUSB0` might become `/dev/ttyUSB1`). The spec requires stable
+identification — `persistent_id` uses udev `by-id` or `by-path` symlinks,
+or USB serial number. A device database entry for a USB-serial adapter
+includes its VID/PID and chipset, enabling automatic re-identification.
+
+**RS-485 specifics**: RS-485 is multi-drop (multiple devices on one bus)
+with half-duplex communication. The serial link model includes:
+
+```yaml
+Rs485Config:
+  mode: string                  # "half_duplex" (standard), "full_duplex" (4-wire)
+  termination: bool             # bus termination enabled
+  address: uint?                # device address on the bus (Modbus: 1–247)
+  max_devices: uint?            # maximum devices on this bus (RS-485: 32 standard, 256 with repeaters)
+  turnaround_ms: float?         # minimum time between TX and RX (bus direction change)
+```
+
+RS-485 buses are modelled as a single link with multiple devices — the bus
+is a shared medium, like WiFi. Bandwidth is shared among all devices. The
+router knows not to expect full throughput when multiple devices are active.
+
+**Serial as control path**: Most serial links in Ozma carry control commands,
+not media data. A TESmart matrix switch connected via USB-serial at 9600 baud
+needs a few bytes per command — the bandwidth is irrelevant, but the latency
+matters for pipeline activation (§2.6). The serial link's activation time
+is essentially the command round-trip: send command + wait for response (if
+the device confirms) or send command + assume success (if write-only).
+
+**Serial console as data stream**: A serial console (BIOS output, bootloader
+logs, kernel messages) is a data source. The serial link carries text at
+whatever baud rate is configured. The node captures this via
+`NodeSerialCapture` and exposes it as a data port in the graph. The text
+can be displayed in the dashboard terminal view or processed by OCR triggers.
+
 #### Constrained and exotic transports
 
 Not every transport carries high-bandwidth media. Some transports are
