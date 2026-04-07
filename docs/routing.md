@@ -18,6 +18,17 @@ jitter, loss). Each port has discoverable capabilities (supported formats,
 maximum throughput). The router's job is to assemble the best pipeline through
 this graph to satisfy a declared **intent**.
 
+**The graph model is valuable independent of KVM switching.** A single PC
+running only the desktop agent — no nodes, no target machines, no switching —
+still benefits from the routing graph. It provides: USB topology with
+controller mapping and bandwidth sharing detection, physical port
+recommendations, PipeWire audio routing with mix bus and per-app separation,
+Bluetooth codec negotiation awareness, WiFi quality monitoring, power
+tracking, device database matching (dock internal topology, GPU codec
+capabilities), storage health trending, thermal monitoring, and a unified
+dashboard with historical journal and trend alerts. The KVMA router is the
+headline feature; the graph model is the platform everything else builds on.
+
 This specification defines:
 
 1. **Graph primitives** — the vocabulary for describing the signal fabric
@@ -25,7 +36,7 @@ This specification defines:
 3. **Format system** — how media capabilities are described and negotiated
 4. **Information quality** — how to trust (or not) reported properties
 5. **Route calculation** — how pipelines are assembled and re-evaluated
-6. **Plugin contracts** — interfaces for transports, devices, codecs, and converters
+6. **Plugin contracts** — registration, lifecycle, interfaces for transports, devices, codecs, converters
 7. **Clock model** — distributed timing across independent devices
 8. **Topology discovery** — what can be known, from where, and at what confidence
 9. **Device versioning and mesh updates** — version tracking, OTA delivery, fleet orchestration
@@ -33,8 +44,8 @@ This specification defines:
 11. **Furniture and physical environment** — desks, racks, rooms, sites, relative positioning, zone types
 12. **Control path** — how commands reach devices, dependency chains, reachability, fallback paths
 13. **Audio routing model** — mix buses, monitor controller, insert chains, spatial audio, metering, gain staging
-14. **Physical device database** — universal open catalog of device definitions, hosted on Connect, mesh-distributed
-12. **Node definition** — complete specification of what a node is: hardware, USB gadget, physical I/O, services, lifecycle
+14. **Physical device database** — universal open catalog with motherboard/CPU/chipset topology, hosted on Connect
+15. **Node definition** — complete specification of what a node is: hardware, USB gadget, physical I/O, services, lifecycle
 
 This document does not define wire formats or byte layouts — those live in
 individual protocol specs (`protocol/specs/`). This document defines the
