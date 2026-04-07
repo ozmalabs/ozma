@@ -6201,31 +6201,43 @@ DeviceEntry:
   tags: string[]?               # searchable tags (e.g., ["mechanical", "hot-swap", "wireless"])
 
   # --- Category-specific blocks (all optional) ---
+  # PC platform
   motherboard: MotherboardSpec? # chipset, CPU socket, internal topology, physical port map
   cpu: CpuSpec?                 # CPU/SoC capabilities, cache, iGPU, memory controller
   chipset: ChipsetSpec?         # PCH/southbridge: what connects where, lane allocation
+  ram: RamSpec?                 # DIMM modules: speed, timings, XMP/EXPO, capacity, RGB
+  gpu: GpuSpec?                 # GPUs (encode/decode capabilities, display outputs, display engine)
+  storage: StorageSpec?         # SSDs, HDDs, NVMe drives
+  psu: PsuSpec?                 # power supply: wattage, rails, efficiency, modularity
+  cooler: CoolerSpec?           # CPU cooler, AIO, custom loop components
+  case_component: CaseSpec?     # PC case (fan slots, drive bays, radiator support)
+  pcie: PcieCardSpec?           # PCIe add-in cards (NICs, capture cards, USB controllers, sound cards)
+  cable: CableSpec?             # cables that affect signal quality (HDMI, DP, USB, Ethernet)
+
+  # Peripherals and input
   keyboard: KeyboardSpec?
   mouse: MouseSpec?
-  audio: AudioSpec?
-  display: DisplaySpec?
+  audio: AudioSpec?             # microphones, speakers, headphones, audio interfaces
+  display: DisplaySpec?         # monitors, projectors (compound device model)
+  capture: CaptureSpec?         # capture cards (USB, PCIe, Thunderbolt)
+  camera: CameraSpec?
+  control: ControlSpec?         # control surface capabilities
   hub: HubSpec?
   dock: DockSpec?
-  pcie: PcieCardSpec?           # PCIe cards (GPUs, NICs, capture cards, USB controllers, NVMe)
-  capture: CaptureSpec?
-  camera: CameraSpec?
-  actuator: ActuatorSpec?
-  sensor: SensorSpec?
-  power: PowerSpec?
+
+  # Infrastructure
   network: NetworkCardSpec?     # NICs, WiFi cards, Bluetooth adapters
-  storage: StorageSpec?         # SSDs, HDDs, NVMe drives
-  gpu: GpuSpec?                 # GPUs (encode/decode capabilities, display outputs)
+  network_switch: NetworkSwitchSpec?
+  router: RouterSpec?
+  access_point: AccessPointSpec?
+  power: PowerSpec?             # generic power (PSU for non-PC devices, PoE injectors, etc.)
+  sensor: SensorSpec?
+  actuator: ActuatorSpec?
+
+  # Environment
+  furniture: FurnitureSpec?     # desks, racks, mounts — physical dimensions + slots + state
   rgb: RgbSpec?                 # LED layout, zones (see device-db.md for full spatial schema)
   screen: ScreenSpec?           # embedded screen capabilities
-  control: ControlSpec?         # control surface capabilities
-  furniture: FurnitureSpec?     # desks, racks, mounts — physical dimensions + slots + state
-  network_switch: NetworkSwitchSpec?  # managed/unmanaged switches
-  router: RouterSpec?           # routers, gateways, firewalls
-  access_point: AccessPointSpec?  # WiFi access points
 
   # --- Topology ---
   internal_topology: InternalTopology?  # how ports connect inside this device
@@ -7240,6 +7252,289 @@ SeatingSpec:
   recline_range_deg: { min: float, max: float }?
   occupancy_sensor: string?     # "pressure_mat", "ble_beacon", "camera", "none"
 ```
+
+**RamSpec** (DIMM modules — speed, timings, XMP profiles, RGB):
+
+```yaml
+RamSpec:
+  type: string?                 # "ddr4", "ddr5", "lpddr5", "lpddr4x", "ddr3"
+  form_factor: string?          # "dimm", "so_dimm", "lpcamm2", "soldered"
+  capacity_gb: uint?            # per-module capacity
+  modules: uint?                # number of modules in this kit
+  total_capacity_gb: uint?      # total kit capacity
+
+  # Speed and timings
+  jedec_speed_mhz: uint?        # base JEDEC speed (e.g., 4800 for DDR5)
+  xmp_profiles: XmpProfile[]?   # Intel XMP profiles
+  expo_profiles: XmpProfile[]?  # AMD EXPO profiles
+  active_speed_mhz: uint?       # currently running speed (reported by OS/BIOS)
+  active_timings: RamTimings?   # currently active timings
+  voltage_v: float?             # operating voltage (1.1V DDR5, 1.2V DDR4, 1.35V DDR4 XMP)
+
+  # Physical
+  height_mm: float?             # module height (low-profile matters for cooler clearance)
+  heatspreader: bool?
+  rgb: RgbSpec?                 # addressable RGB on the module (LED count, zones, protocol)
+  rgb_protocol: string?         # "spd_hub" (DDR5 native), "vendor_usb" (Corsair iCUE),
+                                # "vendor_smbus" (G.Skill, Kingston), "openrgb"
+
+  # Identity
+  spd: SpdData?                 # SPD EEPROM data (if readable)
+
+XmpProfile:
+  profile_number: uint          # 1, 2, 3 (XMP 3.0 supports 3 profiles + 2 user)
+  name: string?                 # profile name ("XMP I", "EXPO I", "User 1")
+  speed_mhz: uint               # advertised speed
+  timings: RamTimings
+  voltage_v: float              # required voltage
+  verified_for: string?         # "intel", "amd", "both"
+
+RamTimings:
+  cl: uint                      # CAS latency
+  trcd: uint                    # RAS to CAS delay
+  trp: uint                     # row precharge time
+  tras: uint                    # row active time
+  # First four timings (CL-tRCD-tRP-tRAS) are the headline numbers.
+  # Additional sub-timings are optional:
+  trc: uint?
+  trfc: uint?
+  trrd_s: uint?
+  trrd_l: uint?
+  tfaw: uint?
+  tcwl: uint?
+  cr: uint?                     # command rate (1T or 2T)
+
+SpdData:
+  manufacturer: string?         # JEDEC manufacturer from SPD
+  part_number: string?          # module part number from SPD
+  serial_number: string?
+  manufacturing_date: string?   # year-week
+  revision: string?
+  # SPD data is readable via i2c-tools (Linux), CPU-Z (Windows),
+  # or dmidecode. It's the authoritative source for module identity.
+```
+
+**Why RAM matters for the routing graph**:
+
+1. **Performance detection**: RAM running at JEDEC speed (4800 MHz) instead
+   of XMP/EXPO speed (6000+ MHz) is leaving 20–30% memory bandwidth on the
+   table. The agent can detect this via `dmidecode` or `/sys/devices/`
+   and alert: "Your RAM supports XMP 6400 MHz but is running at JEDEC
+   4800 MHz. Enable XMP in BIOS for better performance."
+
+2. **Capacity and pressure**: The resource model (§2.7) already tracks
+   `memory_mb` as a resource pool. RAM specs tell you the ceiling and
+   whether it's upgradeable (`form_factor: "soldered"` = no upgrade path).
+
+3. **RGB control**: DDR5 has native RGB control via the SPD hub (I2C on the
+   DIMM). DDR4 uses vendor-specific protocols (Corsair iCUE over USB,
+   G.Skill via SMBus). The routing graph models RAM RGB as an RGB endpoint
+   (§2.8) driven through the appropriate protocol. The device database
+   entry for a specific DIMM kit records its RGB protocol so the RGB
+   compositor knows how to address it.
+
+4. **Dual-channel/interleaving detection**: Two DIMMs in the right slots
+   (A2+B2 on most boards) run in dual-channel. One DIMM or two in the
+   same channel runs single-channel — half the bandwidth. The agent can
+   detect this from `dmidecode` or sysfs and warn.
+
+5. **Device database matching**: A Corsair Vengeance DDR5-6400 kit has
+   a database entry with XMP profiles, RGB protocol, and module height.
+   When the agent reads the SPD part number, it matches to the entry and
+   knows the RGB protocol without user configuration.
+
+**PsuSpec** (power supply — the source of all power rails in a PC):
+
+```yaml
+PsuSpec:
+  wattage: uint                 # total rated wattage
+  efficiency: string?           # "80plus_white", "80plus_bronze", "80plus_gold",
+                                # "80plus_platinum", "80plus_titanium"
+  modular: string?              # "non_modular", "semi_modular", "fully_modular"
+  form_factor: string?          # "atx", "sfx", "sfx_l", "tfx", "flex_atx"
+  fan_size_mm: uint?            # cooling fan diameter (120, 135, 140)
+  fan_mode: string?             # "always_on", "semi_passive", "fanless"
+  rails: PsuRail[]?             # output rails with capacity
+  connectors: PsuConnector[]?   # available power connectors
+  protections: string[]?        # ["ovp", "uvp", "ocp", "opp", "scp", "otp"]
+  atx_version: string?          # "atx_2.x", "atx_3.0", "atx_3.1"
+  pcie_gen5: bool?              # 12VHPWR / 12V-2x6 connector
+  monitoring: PsuMonitoring?    # if the PSU reports telemetry
+
+PsuRail:
+  voltage_v: float              # 3.3, 5, 12, -12, 5VSB
+  max_current_a: float          # maximum current on this rail
+  max_power_w: float?           # maximum power on this rail
+  regulation_percent: float?    # voltage regulation (±2%, ±5%)
+  ripple_mv: float?             # maximum ripple
+
+PsuConnector:
+  type: string                  # "24pin_atx", "8pin_eps", "4pin_eps", "8pin_pcie",
+                                # "6pin_pcie", "12vhpwr", "12v_2x6",
+                                # "sata", "molex", "fdd"
+  count: uint                   # how many of this connector
+
+PsuMonitoring:
+  protocol: string?             # "corsair_link", "evga_supernova", "seasonic_connect",
+                                # "pmbus", "none"
+  metrics: string[]?            # ["input_voltage", "output_voltage", "current",
+                                # "power", "temperature", "fan_speed", "efficiency"]
+  # Smart PSUs with monitoring are power measurement devices (§2.10).
+  # A Corsair HX1200i reports per-rail voltage and current in real-time.
+  # This feeds directly into the power model as `measured` quality data.
+```
+
+**CoolerSpec** (CPU coolers, AIOs, case fans, custom loop components):
+
+```yaml
+CoolerSpec:
+  cooler_type: string?          # "air_tower", "aio_120", "aio_240", "aio_280",
+                                # "aio_360", "custom_loop", "passive", "stock"
+  socket_support: string[]?     # ["lga1700", "am5", "lga1200", "am4"]
+  tdp_rated_w: uint?            # rated cooling capacity
+  fan_count: uint?
+  fan_size_mm: uint?            # 80, 92, 120, 140
+  fan_rpm_range: { min: uint, max: uint }?
+  noise_dba: float?             # rated noise at max speed
+  height_mm: float?             # total height (matters for case clearance)
+  radiator_size_mm: Dimensions? # for AIO: { w, d, h }
+  pump_speed_rpm: uint?         # for AIO/custom loop
+  rgb: RgbSpec?                 # fan/block RGB
+
+  # For custom loop components:
+  loop_component: string?       # "pump", "reservoir", "radiator", "block", "fitting", "tubing"
+  thread_size: string?          # "g1_4" (standard PC watercooling)
+  flow_rate_lph: float?         # litres per hour at rated speed
+```
+
+**CaseSpec** (PC case — already in device-db.md for RGB/spatial, extended
+here for the full PC model):
+
+```yaml
+CaseSpec:
+  form_factor: string?          # "full_tower", "mid_tower", "mini_tower", "sff",
+                                # "mini_itx", "desktop", "htpc", "open_frame", "test_bench"
+  motherboard_support: string[]? # ["eatx", "atx", "matx", "mitx", "dtx"]
+  psu_form_factor: string?      # "atx", "sfx", "sfx_l", "flex_atx", "tfx"
+  psu_position: string?         # "bottom", "top", "rear"
+  max_gpu_length_mm: uint?
+  max_cpu_cooler_height_mm: uint?
+  max_psu_length_mm: uint?
+
+  drive_bays: DriveBay[]?
+  fan_mounts: FanMount[]?       # available fan/radiator positions
+  radiator_support: RadiatorMount[]? # where AIOs/radiators can go
+  io_panel: IoPanel?            # front/top I/O panel
+
+  airflow: string?              # "front_intake", "bottom_intake", "negative_pressure",
+                                # "positive_pressure", "passive"
+  dust_filters: string[]?       # ["front", "bottom", "top", "psu"]
+  tempered_glass: string[]?     # which panels are glass (["left", "right", "front"])
+  rgb: RgbSpec?                 # built-in case RGB (strips, fans, logo)
+
+DriveBay:
+  type: string                  # "3.5_internal", "2.5_internal", "5.25_external"
+  count: uint
+  hot_swap: bool?               # hot-swap cage
+
+FanMount:
+  position: string              # "front", "top", "rear", "bottom", "side"
+  sizes_mm: uint[]              # supported fan sizes [120, 140]
+  count: uint                   # how many fans in this position
+  included_fan: string?         # device database ID of pre-installed fan
+
+RadiatorMount:
+  position: string              # "front", "top", "bottom", "side"
+  max_radiator_mm: uint         # maximum radiator length (240, 280, 360, 420)
+  max_thickness_mm: uint?       # maximum radiator + fan thickness
+
+IoPanel:
+  position: string              # "front_top", "front_bottom", "top"
+  ports: PhysicalPort[]         # USB-A, USB-C, audio, etc. (reuses PhysicalPort from MotherboardSpec)
+  # Front panel I/O connects to motherboard internal headers.
+  # The internal topology traces: front USB-C → internal USB-C header →
+  # motherboard USB controller → chipset/CPU. The full path is known.
+```
+
+**CableSpec** (cables that affect signal quality — the invisible bottleneck):
+
+```yaml
+CableSpec:
+  cable_type: string            # "hdmi", "dp", "usb_a_to_c", "usb_c_to_c",
+                                # "usb_a_to_b", "ethernet_cat6", "ethernet_cat6a",
+                                # "optical_fiber", "3.5mm_audio", "xlr", "sata",
+                                # "thunderbolt_4", "usb4"
+  length_m: float?
+  version: string?              # "hdmi_2.1_ultra_high_speed", "dp_1.4_hbr3",
+                                # "usb3_gen2", "usb4_40gbps", "cat6a"
+  max_bandwidth_gbps: float?    # rated bandwidth
+  certified: bool?              # officially certified (HDMI Premium, USB-IF, etc.)
+  active: bool?                 # active cable (has signal repeater/retimer)
+  optical: bool?                # optical cable (fiber, not copper)
+  gauge_awg: uint?              # wire gauge (affects power delivery and signal quality)
+  shielded: bool?
+  max_power_delivery_w: float?  # for USB-C: 60W (passive) or 240W (EPR, active/emarked)
+  emark: bool?                  # USB-C electronically marked cable
+
+  # Cables degrade signals. A 3m passive HDMI cable may not support 4K120.
+  # A USB-C cable rated for USB 2.0 limits a USB 3.2 port to 480 Mbps.
+  # The router can detect this (device reports USB 2.0 speed on a USB 3.0 port)
+  # and recommend: "Your USB-C cable is limiting this connection to USB 2.0.
+  # Use a USB 3.2 Gen 2 certified cable for 10 Gbps."
+  
+  # Cable detection: the router can't directly identify a cable, but it can
+  # infer cable quality from the gap between port capability and measured speed.
+  # A USB 3.0 port measuring USB 2.0 throughput → cable or hub bottleneck.
+  # An HDMI 2.1 port that can't sustain 4K120 → cable bandwidth limit.
+```
+
+**Why cables matter**: Cables are the most common undiagnosed performance
+bottleneck. A USB-C cable that came with a phone charger is typically USB
+2.0 — plugging it into a USB 3.2 Gen 2 port gives you 480 Mbps instead of
+10 Gbps, and no error message tells you why. HDMI cables that don't support
+the full bandwidth of HDMI 2.1 cause resolution or refresh rate drops. The
+router detects the symptom (measured speed < port capability) and infers the
+cause: "The cable between your PC and capture card appears to be limiting
+bandwidth. Check that you're using a USB 3.x cable, not a USB 2.0 cable."
+
+Cables don't have device database entries in the traditional sense (they
+don't have VID/PIDs). But USB-C emarked cables report their capabilities via
+the USB PD CC line, which the agent can read. HDMI 2.1 cables with
+48 Gbps certification are detectable via EDID/SCDC. For everything else,
+the router infers cable quality from the measured vs expected performance gap.
+
+**Putting it together — a complete virtual PC in the device database**:
+
+Every component of a PC can now be modelled:
+
+```
+PC "Gaming Rig"
+├── Case: NZXT H510 (CaseSpec — fan mounts, drive bays, airflow, RGB)
+├── Motherboard: ASRock B760I (MotherboardSpec — physical ports, internal topology)
+│   ├── CPU: Intel i5-13600K (CpuSpec — cores, iGPU/Quick Sync, PCIe lanes)
+│   │   └── iGPU: Intel UHD 770 (IgpuSpec — Quick Sync encode/decode)
+│   ├── Chipset: Intel B760 (ChipsetSpec — DMI uplink, USB controllers, lane sharing)
+│   ├── RAM Slot A2: Corsair Vengeance DDR5-6400 16GB (RamSpec — XMP, timings, RGB)
+│   ├── RAM Slot B2: Corsair Vengeance DDR5-6400 16GB (RamSpec — dual channel)
+│   ├── M.2 Slot 1: Samsung 990 Pro 2TB (StorageSpec — NVMe Gen 4, IOPS)
+│   ├── M.2 Slot 2: WD SN770 1TB (StorageSpec — shares lanes with SATA!)
+│   └── PCIe x16: NVIDIA RTX 4070 (GpuSpec — NVENC, display engine, 4 outputs)
+│       ├── Display Engine (DisplayEngineSpec — heads, PLLs, link bandwidth)
+│       ├── NVENC (GpuCodecCapability — 12 encode sessions, AV1/H.265/H.264)
+│       └── NVDEC (GpuCodecCapability — unlimited decode sessions)
+├── PSU: Corsair RM850x (PsuSpec — 850W, 80+ Gold, 12VHPWR, Corsair Link monitoring)
+├── CPU Cooler: Noctua NH-D15 (CoolerSpec — air tower, 165mm height, dual 140mm fans)
+├── Case Fans: 2× Noctua NF-A14 (CoolerSpec — 140mm, 1500 RPM, 24.6 dBA)
+├── Cables:
+│   ├── HDMI 2.1 to Monitor (CableSpec — 48 Gbps, certified, 2m)
+│   ├── USB-C to Capture Card (CableSpec — USB 3.2 Gen 2, emarked, 0.5m)
+│   └── Cat6a to Switch (CableSpec — 2.5 Gbps capable, shielded, 3m)
+└── Peripherals: [referenced by device ID, positioned via PhysicalLocation]
+```
+
+Every component has a device database entry. Every connection between
+components traces through the internal topology. The router knows the full
+path from any device to the CPU, including every bottleneck.
 
 **MotherboardSpec** (the most important compound device — maps every physical
 port to its internal controller):
