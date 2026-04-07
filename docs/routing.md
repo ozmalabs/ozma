@@ -8295,6 +8295,239 @@ POST /api/v1/device-db/sync               # trigger sync from Connect
 GET /api/v1/device-db/stats               # local cache stats (entries, size, last sync)
 ```
 
+### 15.12 Pinouts
+
+Cables, connectors, and modular PSU cables have specific pin assignments
+that determine compatibility and — in the case of power cables — safety.
+Using a modular cable from one PSU brand on a different brand's PSU can
+destroy components because the 12V and ground pins may be in different
+positions. The device database stores pinout data to enable compatibility
+checking and safety warnings.
+
+**PinoutSpec** (added to CableSpec, PsuSpec, and any connector-bearing device):
+
+```yaml
+PinoutSpec:
+  connector_type: string        # physical connector ("24pin_atx", "8pin_eps",
+                                # "8pin_pcie", "6pin_pcie", "12vhpwr", "12v_2x6",
+                                # "sata_power", "molex_4pin", "fdd_4pin",
+                                # "usb_a", "usb_c", "hdmi_a", "dp_20pin",
+                                # "rj45", "xlr_3pin", "trs_3.5mm", "din5_midi")
+  pin_count: uint               # total pins
+  pins: PinAssignment[]         # per-pin assignment
+  keying: string?               # physical keying type ("polarised", "keyed_notch",
+                                # "asymmetric", "colour_coded", "none")
+  standard: string?             # defining standard ("atx_2.x", "atx_3.0", "usb_2.0",
+                                # "iec_60320", "eia_568b")
+  vendor_specific: bool         # true if pinout is proprietary (modular PSU cables!)
+  compatible_with: string[]?    # other pinout IDs this is compatible with
+
+PinAssignment:
+  pin: uint                     # pin number (per standard pin numbering)
+  name: string                  # signal name ("12V", "GND", "5V", "3.3V", "PS_ON",
+                                # "D+", "D-", "CC1", "SBU1", "TX1+", etc.)
+  voltage_v: float?             # nominal voltage on this pin (for power pins)
+  max_current_a: float?         # maximum current rating
+  signal_type: string?          # "power", "ground", "data", "control", "sense",
+                                # "reserved", "no_connect"
+  notes: string?
+```
+
+**Standard pinouts** (reference — these are universal):
+
+The database includes canonical pinouts for every standard connector. These
+never change — they're defined by specifications:
+
+| Connector | Standard | Pins | Notes |
+|-----------|----------|------|-------|
+| ATX 24-pin | ATX/EPS12V | 24 | Main motherboard power. Universal across all PSUs. |
+| EPS 8-pin (4+4) | EPS12V | 8 | CPU power. Universal. |
+| PCIe 8-pin (6+2) | PCIe CEM | 8 | GPU power. 150W. Universal. |
+| PCIe 6-pin | PCIe CEM | 6 | GPU power. 75W. Universal. |
+| 12VHPWR | ATX 3.0 | 16 | GPU power. 600W. Sense pins determine power level. |
+| 12V-2x6 | ATX 3.1 | 12 | Revised 12VHPWR. Same function, improved connector. |
+| SATA power | Serial ATA | 15 | 3.3V + 5V + 12V. Universal. |
+| Molex 4-pin | AMP MATE-N-LOK | 4 | 5V + 12V. Legacy. Universal. |
+| USB-A | USB 2.0/3.x | 4/9 | Universal. |
+| USB-C | USB Type-C | 24 | Universal. CC pins for PD/Alt Mode negotiation. |
+| HDMI Type A | HDMI 1.x/2.x | 19 | Universal. |
+| DisplayPort | DP 1.x/2.x | 20 | Universal. |
+| RJ-45 | TIA/EIA-568B | 8 | T568A or T568B wiring. Crossover vs straight. |
+| XLR 3-pin | IEC 61076-2-011 | 3 | Pin 1=GND, 2=hot, 3=cold. Universal. |
+| TRS 3.5mm | IEC 60603-11 | 3/4 | Tip=L, Ring=R, Sleeve=GND. TRRS: Ring2=Mic. |
+| DIN 5-pin MIDI | IEC 60268-3 | 5 | Pins 4+5 = data. Universal. |
+
+Standard pinouts are canonical entries in the device database — every ATX
+24-pin connector has the same pin assignments regardless of manufacturer.
+
+**Modular PSU cables — the dangerous case**:
+
+Modular PSU cables (the detachable cables between the PSU and components)
+use proprietary pinouts on the **PSU side** of the cable. The component
+side is standard (SATA, PCIe 8-pin, etc.), but the PSU-side connector
+varies by manufacturer and sometimes by model line within the same
+manufacturer.
+
+```yaml
+ModularPsuPinout:
+  psu_side: PinoutSpec          # the PSU-side connector (PROPRIETARY)
+  component_side: PinoutSpec    # the component-side connector (STANDARD)
+  psu_family: string            # which PSU family this cable works with
+  compatible_models: string[]   # specific PSU models confirmed compatible
+  incompatible_models: string[]? # models confirmed INCOMPATIBLE (danger!)
+  # WARNING: using a cable from one PSU family with a different PSU can
+  # send 12V to 5V/3.3V rails and DESTROY components.
+
+# Example compatibility groups:
+#
+# | PSU Family | Compatible cables between models | PSU-side connector |
+# |------------|--------------------------------|-------------------|
+# | Corsair Type 4 | RM/RMx/HX/AX (2017+) | Corsair proprietary 18-pin |
+# | Corsair Type 3 | RM/HX/AX (2013–2016) | DIFFERENT from Type 4! |
+# | EVGA G2/G3/P2/T2 | All interchangeable | EVGA proprietary |
+# | Seasonic Focus/Prime | All interchangeable | Seasonic proprietary |
+# | be quiet! | Straight Power, Dark Power | be quiet! proprietary |
+# | Corsair Type 4 ↔ EVGA | INCOMPATIBLE — DANGER | Different pinouts |
+# | Corsair Type 3 ↔ Type 4 | INCOMPATIBLE — DANGER | Same brand, different pinout! |
+```
+
+**Safety checking**: If the user tells the system which PSU they have
+(device database match or manual entry), and which modular cables they're
+using (or the cables that came with a different PSU), the system can:
+
+1. **Warn on incompatible cables**: "You have a Corsair RM850x (Type 4)
+   but this SATA cable has a Type 3 pinout — using it will send 12V to
+   your drives' 5V rail and **destroy them**."
+
+2. **Confirm compatible cables**: "This PCIe cable is compatible with your
+   EVGA G3 — same connector family."
+
+3. **Identify unknown cables**: If the user has a box of modular cables
+   with no labels, the system can match them to known pinout families
+   from the device database. (Visual identification from photos is a
+   future feature — cable connector colours and shapes vary by family.)
+
+**Other pinout use cases**:
+
+- **Ethernet crossover detection**: T568A on one end and T568B on the other
+  = crossover cable. Both T568B = straight-through. Modern auto-MDIX makes
+  this irrelevant for GbE, but some legacy 100M devices care.
+
+- **Audio cable type identification**: A 3.5mm cable could be TRS (stereo)
+  or TRRS (stereo + mic). Plugging TRRS into a TRS-only jack may ground
+  the mic ring and cause crosstalk. The database knows which devices
+  expect which.
+
+- **MIDI DIN pin usage**: Standard 5-pin DIN MIDI uses pins 4 and 5.
+  Some older synths use non-standard pin assignments. Known in the database.
+
+- **Fan header pinout**: 3-pin (voltage control) vs 4-pin (PWM control).
+  Plugging a 3-pin fan into a 4-pin header works but loses PWM — the
+  board falls back to voltage control (or may not control at all,
+  running the fan at full speed).
+
+### 15.13 Compatibility and Fitment Rules
+
+The device database contains all the data needed to evaluate whether
+components are physically and electrically compatible. The compatibility
+engine evaluates rules against pairs (or sets) of components.
+
+**Compatibility check structure**:
+
+```yaml
+CompatibilityCheck:
+  component_a: DeviceRef        # first component
+  component_b: DeviceRef        # second component (or slot/location)
+  checks: CheckResult[]         # all evaluated rules
+
+CheckResult:
+  rule: string                  # rule identifier
+  category: CheckCategory       # what kind of check
+  result: string                # "compatible", "incompatible", "warning", "unknown"
+  severity: string              # "info", "warning", "error", "danger"
+  message: string               # human-readable explanation
+  recommendation: string?       # what to do about it
+  data: PropertyBag?            # supporting data (measurements, limits, etc.)
+
+CheckCategory: enum
+  physical_fitment              # does it physically fit?
+  electrical_compatibility      # are the interfaces electrically compatible?
+  bandwidth_constraint          # does this combination create a bottleneck?
+  power_adequacy                # is there enough power?
+  thermal_clearance             # does cooling work with this combination?
+  pinout_safety                 # are cable/connector pinouts compatible? (DANGER level)
+  performance_impact            # does this combination degrade performance?
+  feature_compatibility         # do features work together? (XMP + CPU, VRR + GPU, etc.)
+```
+
+**Rule categories and examples**:
+
+**Physical fitment**:
+- GPU length ≤ case max GPU clearance
+- CPU cooler height ≤ case max cooler clearance
+- PSU length ≤ case max PSU clearance
+- RAM module height vs CPU cooler clearance at DIMM slot positions
+- Radiator size vs case radiator mount dimensions
+- Motherboard form factor ∈ case supported form factors
+- M.2 drive length ≤ M.2 slot supported lengths (2230, 2242, 2260, 2280)
+- GPU slot width (2-slot, 2.5-slot, 3-slot) vs available case expansion slots
+
+**Electrical compatibility**:
+- CPU socket matches motherboard socket
+- RAM type matches motherboard DIMM type (DDR4 ≠ DDR5, physically keyed differently)
+- PCIe device generation vs slot generation (backwards compatible but lower speed)
+- M.2 key type (M key NVMe vs B+M key SATA — different devices, same-ish slot)
+- USB-C cable capabilities vs port capabilities (USB 2.0 cable in USB 3.2 port)
+- Display cable version vs desired resolution/refresh (HDMI 2.0 cable caps 4K at 60Hz)
+
+**Bandwidth constraints**:
+- PCIe device in slot with fewer electrical lanes than optimal
+- Multiple devices sharing chipset DMI/PCIe uplink
+- M.2 slot sharing lanes with SATA ports (NVMe install disables SATA)
+- Multiple USB 3.0 devices on same hub controller (shared 5 Gbps)
+- DP MST daisy-chain exceeding single link bandwidth
+
+**Power adequacy**:
+- Total component TDP vs PSU wattage (with recommended headroom)
+- GPU requires more PCIe power connectors than PSU provides
+- 12VHPWR sense pin configuration vs PSU capability (150W/300W/450W/600W)
+- USB port power budget vs connected device requirements
+- PoE budget vs connected PoE device requirements
+
+**Pinout safety** (severity: DANGER):
+- Modular PSU cable from wrong PSU family → **component destruction risk**
+- ATX 4-pin EPS in 8-pin EPS socket (works but limits CPU power)
+- SATA power with missing 3.3V pin (some PSUs omit it — affects some SSDs)
+
+**Performance impact**:
+- RAM not in optimal slots for dual-channel (§15 DimmTopology)
+- XMP/EXPO profile speed exceeds CPU memory controller rated speed (may work OC'd, not guaranteed)
+- Single-rank vs dual-rank DIMMs (dual-rank = ~5% more bandwidth but harder on memory controller)
+- PCIe Gen 3 device in Gen 5 slot (wastes slot capability, but device works fine)
+- VRR/FreeSync/G-Sync compatibility between GPU and monitor
+
+**Thermal clearance**:
+- Tower cooler orientation vs RAM slot clearance (tall cooler + tall RAM = conflict)
+- Top-mount radiator vs tall RAM/VRM heatsink interference
+- GPU length vs front-mount radiator fan thickness
+
+**API**:
+
+```
+POST /api/v1/device-db/compatibility-check
+# Body: { components: [device_id_1, device_id_2, ...], context: "pc_build" }
+# Returns: all compatibility checks between all component pairs
+
+GET /api/v1/device-db/compatible-with/{device_id}?category=motherboard
+# Returns: all compatible motherboards for this CPU (or any other category)
+
+POST /api/v1/device-db/build-validate
+# Body: { build: { cpu: "...", motherboard: "...", ram: [...], gpu: "...", ... } }
+# Returns: full build validation — all checks, all warnings, all recommendations.
+# Includes: bandwidth graph showing every bottleneck, power budget analysis,
+# physical fitment for the specified case, and performance recommendations.
+```
+
 ---
 
 ## 16. Node Definition
