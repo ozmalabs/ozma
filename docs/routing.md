@@ -7623,15 +7623,129 @@ InternalHeader:
 ```yaml
 ExpansionSlot:
   id: string                    # "pcie_x16_1", "m2_1", "dimm_a1"
-  type: string                  # "pcie_x16", "pcie_x4", "pcie_x1",
-                                # "m2_m_key_2280", "m2_e_key_2230",
-                                # "dimm_ddr5", "dimm_ddr4"
-  source: string                # "cpu" or "chipset" — where the lanes come from
-  lanes: uint?                  # electrical lanes (may be fewer than physical slot)
-  generation: uint?             # PCIe generation (3, 4, 5)
+  slot_type: string             # "pcie", "m2", "dimm", "u2"
+  physical_size: string?        # physical slot size ("x16", "x8", "x4", "x1",
+                                # "m_key_2280", "m_key_2242", "e_key_2230",
+                                # "dimm_288pin", "so_dimm_260pin")
+  electrical_lanes: uint?       # actual electrical lanes wired (may be < physical size)
+                                # An x16 physical slot with 4 electrical lanes = x4 card works,
+                                # x16 card fits but runs at x4 speed.
+  source: string                # "cpu" or "chipset" — where the lanes/channel comes from
+  generation: uint?             # PCIe generation (3, 4, 5) — for PCIe slots
   shared_with: string[]?        # other slots/ports that share lanes with this one
+  bifurcation: BifurcationConfig?  # if this slot can be split
   position: PortPosition        # physical location on the board
   populated: string?            # device database ID of installed device (if known)
+  reinforced: bool?             # metal-reinforced slot (for heavy GPUs)
+
+  # DIMM-specific
+  memory_channel: string?       # which memory channel ("A", "B", "C", "D")
+  rank_in_channel: uint?        # position within the channel (0 = preferred for single-DIMM)
+  daisy_chain_position: string? # "near" (closer to CPU, preferred) or "far"
+
+BifurcationConfig:
+  supported: bool               # can this slot be bifurcated in BIOS?
+  options: string[]?            # ["x16", "x8_x8", "x4_x4_x4_x4"]
+  current: string?              # currently active bifurcation mode
+  requires_bios: bool?          # requires BIOS setting change (not runtime)
+```
+
+**Physical size vs electrical lanes** — the most common source of confusion:
+
+| Scenario | Physical | Electrical | Result |
+|----------|----------|-----------|--------|
+| GPU in primary x16 slot | x16 | x16 | Full bandwidth ✓ |
+| GPU in second x16 slot (many boards) | x16 | x4 | 1/4 bandwidth — GPU works but starved |
+| x1 WiFi card in x16 slot | x16 | x16 | Works fine — card uses 1 lane, slot wastes 15 |
+| NVMe adapter in x4 slot | x4 | x4 | Full bandwidth ✓ |
+| Capture card in x4 slot | x4 | x1 (surprise!) | Bottlenecked — some cheap boards do this |
+| M.2 in "M key" slot | M key | x2 | Some budget boards wire M.2 at x2 not x4 |
+
+The router detects this via `lspci -vv` (reports negotiated link width) and
+compares against the device's rated lane requirement from the device database.
+If a PCIe x4 capture card is running at x1: "Your capture card in `pcie_x4_2`
+is running at x1 speed. This slot has only 1 electrical lane despite being
+physically x4. Move the card to `pcie_x16_1` for full x4 bandwidth."
+
+**DIMM slot topology** — dual channel requires correct slot population:
+
+```yaml
+# Example: 4-DIMM DDR5 motherboard memory topology
+DimmTopology:
+  channels: MemoryChannel[]
+  interleaving_rules: InterleavingRule[]
+
+MemoryChannel:
+  id: string                    # "A", "B"
+  slots: DimmSlot[]
+  max_capacity_gb: uint?        # per-channel maximum
+  max_speed_with_all_populated_mhz: uint?  # speed drops when all slots filled
+
+DimmSlot:
+  id: string                    # "A1", "A2", "B1", "B2"
+  channel: string               # "A", "B"
+  position: string              # "near" or "far" (relative to CPU)
+  daisy_chain: bool?            # daisy-chain topology (affects signal integrity)
+  t_topology: bool?             # T-topology (equal trace length to both slots)
+  preferred_single: bool        # populate this slot first for single-DIMM-per-channel
+                                # (typically A2 and B2 on most boards)
+
+InterleavingRule:
+  population: string            # "1_dimm", "2_dimm_dual", "2_dimm_single",
+                                # "3_dimm", "4_dimm"
+  slots: string[]               # which slots to populate
+  mode: string                  # "single_channel", "dual_channel", "quad_channel",
+                                # "flex_mode"
+  bandwidth_factor: float       # 1.0 = single, 2.0 = dual, 4.0 = quad
+  notes: string?
+
+# Typical 2-channel board (most consumer):
+#
+# For dual-channel: populate A2 + B2 (both "near" slots)
+# Common mistake: populate A1 + A2 (same channel = single-channel, half bandwidth)
+#
+# interleaving_rules:
+#   - population: "1_dimm"
+#     slots: ["A2"]
+#     mode: "single_channel"
+#     bandwidth_factor: 1.0
+#     notes: "Single DIMM — use A2 (near slot, best signal integrity)"
+#
+#   - population: "2_dimm_dual"
+#     slots: ["A2", "B2"]
+#     mode: "dual_channel"
+#     bandwidth_factor: 2.0
+#     notes: "Optimal 2-DIMM — dual channel, near slots"
+#
+#   - population: "2_dimm_single"
+#     slots: ["A1", "A2"]
+#     mode: "single_channel"
+#     bandwidth_factor: 1.0
+#     notes: "WRONG — both DIMMs in channel A, single-channel only"
+#
+#   - population: "4_dimm"
+#     slots: ["A1", "A2", "B1", "B2"]
+#     mode: "dual_channel"
+#     bandwidth_factor: 2.0
+#     notes: "All slots populated — dual channel but may downclock.
+#             DDR5: typically drops from 6400 to 5600 with 4 DIMMs."
+```
+
+The agent detects the current population via `dmidecode -t memory` (which
+slots have DIMMs, their capacity, speed, and part number). Combined with the
+motherboard's `DimmTopology` from the device database, the router can detect:
+
+- **Single-channel when dual is possible**: "You have 2 DIMMs in slots A1
+  and A2 (same channel). Move one to B2 for dual-channel — double your
+  memory bandwidth."
+- **Wrong slots for 1 DIMM**: "Your single DIMM is in A1 (far slot). Move
+  it to A2 (near slot) for better signal integrity and potential speed gain."
+- **4 DIMMs causing speed drop**: "All 4 DIMM slots populated — memory
+  running at 5600 MHz instead of XMP 6400 MHz. This is normal with 4 DIMMs
+  on this board. For maximum speed, use 2× 32GB instead of 4× 16GB."
+- **Mismatched DIMMs**: "Slot A2 has DDR5-6400 CL32, slot B2 has DDR5-5200
+  CL40 — both running at the slower speed. Match your DIMMs for best
+  performance."
 ```
 
 **Example — a typical mini-ITX motherboard's port mapping**:
