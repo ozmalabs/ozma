@@ -3748,6 +3748,14 @@ the plugin interface methods. A misbehaving plugin (crash, hang, excessive
 resource use) is caught by the plugin host, logged, and disabled. The
 controller continues operating without it.
 
+**Language stability guarantee**: The plugin interface is defined in Python.
+This is a stable contract — plugins written in Python today will continue
+to work if the controller core is rewritten in another language (e.g., Rust
+via PyO3 embedded interpreter). The Python plugin interface is the public
+API; the controller's implementation language is an internal detail. Plugin
+authors should not depend on the controller being Python — only on the
+plugin interface classes and the graph query API they expose.
+
 **Plugin API**:
 
 ```
