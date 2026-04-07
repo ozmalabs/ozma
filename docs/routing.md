@@ -32,7 +32,8 @@ This specification defines:
 10. **Power model** — voltage rails, current budgets, measurement, USB PD, PoE, RGB power limiting
 11. **Furniture and physical environment** — desks, racks, rooms, sites, relative positioning, zone types
 12. **Control path** — how commands reach devices, dependency chains, reachability, fallback paths
-13. **Physical device database** — universal open catalog of device definitions, hosted on Connect, mesh-distributed
+13. **Audio routing model** — mix buses, monitor controller, insert chains, spatial audio, metering, gain staging
+14. **Physical device database** — universal open catalog of device definitions, hosted on Connect, mesh-distributed
 12. **Node definition** — complete specification of what a node is: hardware, USB gadget, physical I/O, services, lifecycle
 
 This document does not define wire formats or byte layouts — those live in
@@ -2166,6 +2167,487 @@ control.path.degraded           # control path latency increased significantly
 control.path.fallback_activated # primary control path failed, using fallback
 ```
 
+### 2.13 Audio Routing Model
+
+The routing graph handles audio as pipelines between source and sink ports
+(§2.4). For basic KVM audio (stereo from target machine to desk speakers),
+this is sufficient. Professional audio requires additional primitives:
+mix buses, monitor controllers, channel mapping, insert chains, metering,
+and precision processing.
+
+These are modelled as **virtual devices** in the routing graph — they don't
+correspond to physical hardware, but they have ports, participate in
+pipelines, consume resources, and contribute latency. On machines running
+PipeWire, each virtual device maps to a PipeWire node (see §13.3).
+
+#### Channel mapping
+
+`AudioFormat` (§4.1) specifies channel count but not channel assignment. Pro
+audio requires knowing which channel carries what signal:
+
+```yaml
+AudioFormat:
+  # ... existing fields ...
+  channel_layout: string?       # named layout (see table below)
+  channel_map: string[]?        # explicit per-channel assignment, ITU-R BS.2051 labels
+
+  # If channel_layout is set, channel_map is derived from it.
+  # If channel_map is set, it overrides channel_layout.
+  # If neither is set, channels are positional (ch0=left, ch1=right, etc.)
+```
+
+**Standard channel layouts**:
+
+| Layout | Channels | Map |
+|--------|----------|-----|
+| `mono` | 1 | `["FC"]` |
+| `stereo` | 2 | `["FL", "FR"]` |
+| `stereo_lfe` | 3 | `["FL", "FR", "LFE"]` |
+| `quad` | 4 | `["FL", "FR", "RL", "RR"]` |
+| `5.1` | 6 | `["FL", "FR", "FC", "LFE", "SL", "SR"]` |
+| `7.1` | 8 | `["FL", "FR", "FC", "LFE", "SL", "SR", "RL", "RR"]` |
+| `7.1.4` | 12 | `["FL", "FR", "FC", "LFE", "SL", "SR", "RL", "RR", "TFL", "TFR", "TRL", "TRR"]` |
+| `custom` | N | Explicit `channel_map` required |
+
+Channel labels follow ITU-R BS.2051: `FL` (front left), `FR` (front right),
+`FC` (front centre), `LFE` (low frequency effects), `SL`/`SR` (side left/right),
+`RL`/`RR` (rear left/right), `TFL`/`TFR`/`TRL`/`TRR` (top/height channels).
+
+When a link connects ports with different channel layouts, the converter
+plugin (§6.4) performs channel remixing — upmix, downmix, or remap. The
+format negotiation system (§4.3) handles this: if the source produces 7.1
+and the sink accepts stereo, a downmix converter is inserted.
+
+#### Mix bus
+
+A mix bus is a virtual device that sums multiple audio inputs with per-input
+gain, pan, and mute. It is the fundamental building block for monitor
+controllers, headphone mixes, cue sends, and multi-source mixing.
+
+```yaml
+MixBusDevice:
+  type: virtual
+  virtual_type: "mix_bus"
+  name: string                  # "Main Mix", "Headphone Mix A", "Cue Send 1"
+  ports:
+    - id: input_0               # one sink port per input source
+      direction: sink
+      media_type: audio
+    - id: input_1
+      direction: sink
+      media_type: audio
+    # ... up to N inputs
+    - id: output                # one source port (summed output)
+      direction: source
+      media_type: audio
+  config: MixBusConfig
+
+MixBusConfig:
+  output_format: AudioFormat    # output sample rate, bit depth, channels
+  inputs: MixBusInput[]
+  master_gain_db: float         # master output gain
+  master_mute: bool
+
+MixBusInput:
+  source: PortRef               # which port feeds this input
+  gain_db: float                # per-input gain (-inf to +12 dB)
+  pan: float                    # -1.0 (full left) to +1.0 (full right), 0.0 = centre
+  mute: bool
+  solo: bool                    # solo-in-place (mute all non-soloed inputs)
+  phase_invert: bool            # invert polarity
+  channel_routing: ChannelRouting?  # custom channel routing for this input
+```
+
+A mix bus maps to a PipeWire node with N input ports and 1 output port
+group. PipeWire's native port-level linking handles the per-channel
+connections; gain/pan/mute are applied via PipeWire stream volume controls
+or a `pw-filter-chain` summing node.
+
+#### Monitor controller
+
+A monitor controller is a compound virtual device that provides source
+selection, speaker set switching, and monitoring utilities. It replaces
+a $500–$2000 hardware monitor controller.
+
+```yaml
+MonitorControllerDevice:
+  type: virtual
+  virtual_type: "monitor_controller"
+  ports:
+    # Source inputs (any number of stereo/multichannel sources)
+    - id: source_0              # e.g., "DAW Mix"
+      direction: sink
+      media_type: audio
+    - id: source_1              # e.g., "Reference Player"
+      direction: sink
+      media_type: audio
+    - id: source_2              # e.g., "Node Audio (target machine)"
+      direction: sink
+      media_type: audio
+    # Speaker outputs (multiple speaker sets)
+    - id: speakers_a            # e.g., "Main Monitors"
+      direction: source
+      media_type: audio
+    - id: speakers_b            # e.g., "Secondary Monitors"
+      direction: source
+      media_type: audio
+    - id: speakers_c            # e.g., "Headphones"
+      direction: source
+      media_type: audio
+    - id: sub                   # subwoofer output (optional)
+      direction: source
+      media_type: audio
+    # Talkback
+    - id: talkback_mic          # engineer's microphone
+      direction: sink
+      media_type: audio
+    - id: talkback_out          # routed to selected cue outputs
+      direction: source
+      media_type: audio
+  config: MonitorControllerConfig
+
+MonitorControllerConfig:
+  active_source: uint           # which source input is selected (0-indexed)
+  active_speakers: string[]     # which speaker sets are active (can be multiple)
+  volume_db: float              # master volume
+  dim: bool                     # reduce level by dim_amount_db
+  dim_amount_db: float          # typically -20 dB
+  mono: bool                    # sum to mono (for mono compatibility check)
+  mute: bool                    # mute all outputs
+  sub_enabled: bool             # route LFE to sub output
+  sub_crossover_hz: float?      # crossover frequency (if bass management is active)
+  talkback: TalkbackConfig
+
+TalkbackConfig:
+  mode: string                  # "momentary" (PTT), "latching", "auto" (voice-activated)
+  destinations: string[]        # which outputs receive talkback ("cue_1", "cue_2")
+  dim_on_talk: bool             # dim main monitors during talkback
+  dim_amount_db: float          # how much to dim
+  level_db: float               # talkback mic level
+```
+
+The monitor controller is a routing device — it's a managed switch (§2.5)
+for audio, with additional processing (dim, mono, talkback). On PipeWire,
+it maps to a combination of `pw-link` operations (source selection), volume
+controls (dim/level), and a filter-chain node (mono sum, crossover).
+
+#### Cue sends / aux sends
+
+Cue sends allow per-source, per-destination level control — "send 50% of
+source A to headphone mix B". These are modelled as mix buses with a
+specific purpose:
+
+```yaml
+CueSendConfig:
+  name: string                  # "Cue 1", "Headphone Mix A"
+  mix_bus: MixBusDevice         # the underlying mix bus
+  sends: CueSend[]              # per-source send levels
+  output: PortRef               # where this cue mix goes (headphone amp, VBAN to node, etc.)
+
+CueSend:
+  source: PortRef               # which audio source
+  send_level_db: float          # send level (-inf to +12 dB)
+  pre_fader: bool               # true = level is independent of source's main fader
+  pan: float                    # pan in the cue mix
+  mute: bool
+```
+
+This maps to PipeWire as a separate mix bus node with per-input volumes.
+Pre-fader sends tap the signal before the main mix bus gain stage.
+
+#### Insert chain
+
+An insert chain is an ordered sequence of audio processors (§2.9) applied
+to a signal path. The order matters — EQ before compressor produces
+different results than compressor before EQ.
+
+```yaml
+InsertChain:
+  id: string
+  name: string                  # "Main Bus Processing", "Vocal Chain"
+  processors: InsertSlot[]      # ordered list of processors
+  bypass: bool                  # bypass entire chain
+
+InsertSlot:
+  position: uint                # 0-indexed position in chain
+  processor: DeviceRef          # audio_processor device
+  bypass: bool                  # bypass this slot
+  wet_dry: float?               # 0.0 = dry, 1.0 = full wet (for parallel processing)
+```
+
+On PipeWire, an insert chain is a sequence of `pw-filter-chain` nodes linked
+in series. Each slot is a separate filter-chain node (allowing independent
+bypass and parameter control). The pipeline model (§2.4) already supports
+this — each processor is a hop with its own latency contribution.
+
+#### Automatic latency compensation
+
+When multiple audio paths have different processing chain lengths, their
+latencies diverge. A source going through 3 processors arrives later than
+one going through none. For time-aligned mixing, the shorter paths need
+delay inserted to match the longest path:
+
+```yaml
+LatencyCompensation:
+  mode: string                  # "auto", "manual", "disabled"
+  reference_path: string?       # which pipeline is the reference (others compensate to match)
+  per_path_delay: PathDelay[]   # computed or manual per-path delays
+
+PathDelay:
+  pipeline_id: string
+  processing_latency_ms: float  # sum of processor latencies in this path
+  compensation_delay_ms: float  # delay added to align with reference
+  total_latency_ms: float       # processing + compensation = same for all paths
+```
+
+The router computes this automatically in `auto` mode: find the longest
+processing chain latency across all paths feeding a mix bus, insert delay
+on shorter paths to match. On PipeWire, delay insertion uses `pw-loopback
+--delay`.
+
+#### Metering
+
+Metering is observation of audio levels at any point in the graph. The spec
+defines metering types so that monitoring consumers know how to interpret
+the data:
+
+```yaml
+MeteringPoint:
+  port: PortRef                 # where in the graph to meter
+  type: MeteringType            # what measurement algorithm
+  channels: uint                # number of channels metered
+  values: MeterValue[]          # current readings (per channel)
+  update_rate_hz: float         # how often readings update
+
+MeteringType: enum
+  peak                          # instantaneous sample peak (dBFS)
+  true_peak                     # inter-sample true peak per ITU-R BS.1770 (dBTP)
+  rms                           # root mean square level (dBFS)
+  vu                            # VU meter (300ms integration, +4 dBu = 0 VU)
+  ppm                           # peak programme meter (5ms attack, configurable release)
+  lufs_momentary                # ITU-R BS.1770 momentary loudness (400ms window)
+  lufs_short_term               # ITU-R BS.1770 short-term (3s window)
+  lufs_integrated               # ITU-R BS.1770 integrated loudness (programme duration)
+
+MeterValue:
+  channel: string               # channel label ("FL", "FR", "LFE", etc.)
+  level: float                  # current level in the metering type's native unit
+  peak_hold: float?             # peak hold value (highest level in decay window)
+  clip: bool                    # true if signal has clipped (reached 0 dBFS)
+```
+
+Metering data feeds into the monitoring system (§11) and is available via
+WebSocket events (`audio.meters`) and REST API. On PipeWire, metering reads
+from `pw-dump` volume/peak data or from a dedicated analysis filter-chain.
+
+#### Gain staging and headroom
+
+Every audio hop in a pipeline has a gain contribution. The total gain through
+the pipeline determines whether the signal clips or is too quiet:
+
+```yaml
+GainStage:
+  hop: PipelineHopRef           # which hop in the pipeline
+  input_level_dbfs: float       # signal level entering this stage
+  gain_db: float                # gain applied at this stage
+  output_level_dbfs: float      # signal level leaving this stage
+  headroom_db: float            # distance from 0 dBFS (clipping)
+  clip_risk: bool               # true if headroom < 3 dB
+```
+
+The router tracks gain staging across the entire pipeline and warns when
+headroom is insufficient. This feeds into the monitoring system as
+`audio.gain_stage.clip_risk` events.
+
+#### Dither
+
+When audio passes through a bit-depth conversion (e.g., 32-bit float
+processing → 24-bit output), truncation introduces quantisation distortion.
+Dither adds shaped noise to mask this:
+
+```yaml
+DitherConfig:
+  enabled: bool                 # default: true when bit depth decreases
+  type: string                  # "tpdf" (triangular PDF, default), "rpdf" (rectangular),
+                                # "hp_tpdf" (high-pass TPDF), "noise_shaped"
+  auto: bool                    # automatically apply when format negotiation
+                                # selects a lower bit depth at any hop
+```
+
+Dither is modelled as a property of format conversion, not a separate device.
+When the format negotiation engine (§4.3) fixates a format that reduces bit
+depth, dither is applied automatically unless explicitly disabled. The
+converter plugin (§6.4) handles this.
+
+#### Professional audio transports
+
+Additional transport types for pro audio installations:
+
+| Transport | Channels | Latency | Use case |
+|-----------|----------|---------|----------|
+| AES67 | 8–64 | <1ms (LAN) | Studio networked audio (Dante-compatible) |
+| Dante | 2–512 | <1ms (LAN) | Broadcast, live sound, installed AV |
+| MADI | 64 | <0.5ms | Studio multitrack (BNC/fibre) |
+| ADAT | 8 | <0.5ms | Studio interface interconnect (TOSLINK) |
+| AES3 (AES/EBU) | 2 | <0.1ms | Studio master clock + digital audio (XLR) |
+| S/PDIF | 2 | <0.1ms | Consumer digital audio (coax/TOSLINK) |
+
+These are transport plugins (§6.1). AES67 and Dante are network transports
+(UDP/RTP with PTP clock). MADI, ADAT, AES3, and S/PDIF are physical
+transports that require specific hardware interfaces — they appear in the
+graph as device ports with fixed capabilities.
+
+#### Active redundancy
+
+Professional installations require redundant audio paths — two independent
+network paths carrying the same audio, with automatic failover:
+
+```yaml
+RedundantPipeline:
+  primary: Pipeline             # primary audio path
+  secondary: Pipeline           # secondary audio path (different physical route)
+  mode: string                  # "active_active" (both running, receiver selects),
+                                # "active_standby" (secondary warm, activates on failure)
+  switchover_ms: float          # maximum time to switch from primary to secondary
+  monitoring: bool              # continuously monitor both paths for differential errors
+```
+
+This extends the pipeline model (§2.4). Both pipelines carry the same audio
+data. The receiver compares packet sequence numbers and selects from
+whichever path is delivering. On failure, switchover is seamless (packets
+are already arriving on the secondary path in `active_active` mode).
+
+Dante natively supports primary/secondary redundancy. AES67 achieves it
+via IGMP multicast on two independent network paths. The routing graph
+models both pipelines and their independent link health.
+
+#### Sample-accurate synchronisation
+
+When multiple audio sources must be time-aligned (multi-machine recording,
+distributed DAW), they need a shared sample clock:
+
+```yaml
+SampleClockSync:
+  mode: string                  # "ptp" (IEEE 1588), "word_clock" (BNC),
+                                # "aes_clock" (AES11), "internal" (free-run)
+  master: DeviceRef?            # which device is the clock master
+  rate: uint                    # sample rate (all devices must agree)
+  lock_status: string           # "locked", "locking", "unlocked", "freewheel"
+  offset_samples: int?          # measured offset from master (for alignment)
+```
+
+This extends the clock model (§7). PTP provides sub-microsecond sync over
+Ethernet (sufficient for sample accuracy at 192kHz — one sample = 5.2µs).
+Word clock and AES11 are hardware clock distribution standards used in
+studios. The routing graph tracks lock status and raises events when sync
+is lost.
+
+On PipeWire, the clock master maps to a PipeWire driver node — the device
+whose hardware clock drives the graph scheduling. When Ozma manages the
+clock, it sets the appropriate PipeWire node as the driver.
+
+#### Spatial audio
+
+The routing graph knows the physical position and orientation of every
+speaker (§2.1 `PhysicalLocation` — `pos` + `rot`), the speaker's
+directional characteristics (§15 `SpeakerSpatialSpec` — dispersion angles,
+directivity), and the listener's position (inferred from zone or explicitly
+set). This is sufficient to build spatial audio:
+
+**Speaker arrangement**:
+
+```yaml
+SpeakerArrangement:
+  id: string
+  name: string                  # "Studio Monitors", "Living Room 5.1", "Desk Stereo"
+  speakers: SpeakerPlacement[]
+  listener: ListenerPosition
+  room: RoomAcoustics?          # optional room model for correction
+  channel_assignment: ChannelAssignment  # how channels map to speakers
+
+SpeakerPlacement:
+  device_id: string             # speaker device in the graph
+  location: PhysicalLocation    # position + orientation (§2.1)
+  role: string                  # "front_left", "front_right", "centre", "sub",
+                                # "surround_left", "surround_right", "rear_left",
+                                # "rear_right", "height_front_left", etc.
+  distance_m: float?            # measured distance from listener (overrides computed)
+  angle_deg: float?             # measured angle from listener (overrides computed)
+  elevation_deg: float?         # measured elevation from listener (overrides computed)
+  level_trim_db: float?         # per-speaker level trim
+
+ListenerPosition:
+  pos: Position3d               # listener's head position in world space (mm)
+  facing: float                 # yaw angle the listener faces (degrees, 0 = +X)
+  ear_height_mm: float?         # ear height above floor (default: seated ~1100mm)
+  source: string                # "manual", "furniture_derived", "zone_centre"
+  # If source is "furniture_derived": computed from the chair/desk position
+  # If source is "zone_centre": computed from the zone bounds centre point
+
+ChannelAssignment:
+  mode: string                  # "itu" (standard angles), "measured" (actual angles),
+                                # "phantom" (virtual speakers from fewer physical speakers)
+  assignments: ChannelSpeakerMap[]
+
+ChannelSpeakerMap:
+  channel: string               # "FL", "FR", "FC", "LFE", "SL", "SR", etc.
+  speaker_id: string            # which physical speaker
+  gain_db: float?               # trim for this channel→speaker mapping
+  delay_ms: float?              # per-channel delay (for distance compensation)
+```
+
+**What the location data provides for spatial audio**:
+
+1. **Distance compensation**: Each speaker's distance from the listener is
+   known from `pos` coordinates. The closer speaker needs delay added so
+   sound from all speakers arrives simultaneously. Computed automatically:
+   ```
+   delay_ms = (max_distance - this_distance) / speed_of_sound_mm_per_ms
+   ```
+   Speed of sound ≈ 343,000 mm/s = 343 mm/ms.
+
+2. **Level compensation**: Inverse square law — a speaker 2× farther away
+   is 6 dB quieter. The system can auto-trim levels based on distance.
+
+3. **Angle verification**: ITU-R BS.775 recommends specific speaker angles
+   (±30° for stereo, ±110° for surrounds). The system knows actual speaker
+   angles from position data and can warn when placement deviates from
+   standards, or adapt processing to compensate.
+
+4. **Dispersion coverage**: The speaker's dispersion spec (horizontal/vertical
+   degrees from device database) combined with its orientation (`rot`) and
+   the listener position tells you whether the listener is within the
+   speaker's coverage angle. If not, the system warns ("your left surround
+   is aimed at the wall, not the listener").
+
+5. **Subwoofer integration**: Subwoofer position relative to walls and
+   corners affects bass response. The system knows room dimensions (§2.11
+   `Space.dimensions_mm`) and sub position, enabling room mode estimation
+   and optimal crossover selection.
+
+6. **Headphone virtualisation**: When the output switches from speakers to
+   headphones (e.g., monitor controller speaker set change), the speaker
+   arrangement data enables binaural rendering — virtualising the physical
+   speaker positions in the headphone soundstage using HRTF.
+
+**Room acoustics** (optional, feeds into room correction):
+
+```yaml
+RoomAcoustics:
+  dimensions_mm: Dimensions     # room width, depth, height
+  rt60_ms: float?               # measured or estimated reverberation time
+  treatment: string[]?          # ["absorption_panels", "diffusers", "bass_traps"]
+  floor: string?                # "carpet", "hardwood", "concrete", "tile"
+  walls: string?                # "drywall", "concrete", "glass", "curtains"
+  ceiling: string?              # "drywall", "acoustic_tile", "exposed"
+  noise_floor_dba: float?       # measured ambient noise level
+```
+
+Room acoustics combined with speaker positions feeds the room correction
+system (§2.9 `audio_processor` with `processor_type: "room_correction"`).
+The sweep → FFT → parametric EQ pipeline uses speaker position and room
+dimensions to optimise the correction curve per speaker.
+
 ---
 
 ## 3. Intents
@@ -2600,6 +3082,8 @@ AudioFormat:
   bitrate_bps: uint64?          # for compressed codecs
   frame_size: uint?             # samples per frame/packet
   lossy: bool                   # true for opus, aac, mp3, etc.
+  channel_layout: string?       # "stereo", "5.1", "7.1", "7.1.4", "custom" (see §2.13)
+  channel_map: string[]?        # per-channel labels: ["FL","FR","FC","LFE","SL","SR"]
 ```
 
 **HidFormat**:
@@ -4434,17 +4918,102 @@ The routing model can be adopted incrementally over the existing codebase:
 
 ### 13.3 PipeWire integration
 
-On machines running PipeWire, the Ozma routing graph should integrate with
-PipeWire's graph rather than duplicating it:
+On machines running PipeWire, the Ozma routing graph integrates with
+PipeWire's graph rather than duplicating it. The two systems have parallel
+models — every Ozma audio concept maps to a PipeWire primitive:
 
-- PipeWire nodes become Ozma devices with audio ports
-- PipeWire links become Ozma links with `reported` quality metrics
-- PipeWire's format negotiation (SPA) is used for audio links on the same machine
-- Cross-machine audio links use Ozma's format negotiation
+**Node mapping**:
 
-The WirePlumber policy script (`wireplumber/ozma-routing.lua`) bridges the two
-graphs: Ozma's router decides what should be connected, WirePlumber executes the
-PipeWire-level link commands.
+| Ozma concept | PipeWire equivalent | Implementation |
+|-------------|-------------------|----------------|
+| Audio source device | PipeWire node (Audio/Source) | Discovered via `pw-dump` |
+| Audio sink device | PipeWire node (Audio/Sink) | Discovered via `pw-dump` |
+| Mix bus (§2.13) | PipeWire node with N input port groups | `pw-filter-chain` summing node or `module-null-sink` + volume controls |
+| Monitor controller (§2.13) | Combination of `pw-link` + volume + filter-chain | Source selection = link management, dim/mono = filter-chain |
+| Insert chain processor (§2.13) | `pw-filter-chain` node | One filter-chain per insert slot, linked in series |
+| Room correction EQ | `pw-filter-chain` with biquad filters | `ozma-room-eq` capture → EQ bands → playback |
+| VBAN network bridge | `pw-cat` virtual source/sink | VBAN receiver → `pw-cat --playback`; `pw-cat --capture` → VBAN sender |
+| Audio output target | PipeWire module sink | `module-raop-sink`, `module-rtp-sink`, `module-roc-sink`, etc. |
+| Delay compensation (§2.13) | `pw-loopback --delay` | Per-output delay alignment |
+| Cue send (§2.13) | Mix bus node with independent volume controls | Separate PipeWire node per cue mix |
+
+**Port mapping**:
+
+| Ozma concept | PipeWire equivalent |
+|-------------|-------------------|
+| Audio port (source) | PipeWire output port(s) — one per channel (FL, FR, etc.) |
+| Audio port (sink) | PipeWire input port(s) — one per channel |
+| Channel map (§2.13) | PipeWire port `audio.channel` property |
+| Port power budget | N/A in PipeWire (Ozma-only concept) |
+
+**Link mapping**:
+
+| Ozma concept | PipeWire equivalent |
+|-------------|-------------------|
+| Audio link (same machine) | PipeWire Link object between ports |
+| Audio link (cross-machine) | VBAN/Opus transport → `pw-cat` bridge → PipeWire link |
+| Link metrics | PipeWire node `Props` (volume, mute, latency) |
+| Format negotiation | PipeWire SPA format enumeration (same-machine); Ozma format negotiation (cross-machine) |
+
+**Routing modes**:
+
+1. **pw-link mode** (default): Ozma calls `pw-link` directly to connect
+   PipeWire nodes. Simple, works for basic KVM audio. Node-level granularity
+   (all channels auto-mapped).
+
+2. **WirePlumber mode** (`OZMA_AUDIO_WIREPLUMBER=1`): Ozma writes a single
+   metadata key (`pw-metadata -n ozma set 0 active_node <name>`).
+   WirePlumber's Lua script (`ozma-routing.lua`) watches this and manages
+   port-level links with explicit channel mapping. More reliable for
+   multichannel audio and complex scenarios.
+
+3. **Router mode** (Phase 3+): The routing graph computes audio pipelines
+   and translates them to PipeWire operations. WirePlumber executes the
+   link commands. The router handles format negotiation, insert chain
+   assembly, mix bus creation, and latency compensation. WirePlumber is
+   the executor, not the decision-maker.
+
+**Clock mapping**:
+
+| Ozma concept | PipeWire equivalent |
+|-------------|-------------------|
+| Clock domain (§7) | PipeWire driver node |
+| Clock master | Driver node's hardware clock |
+| Sample-accurate sync (§2.13) | PipeWire clock class + rate matching |
+| Drift compensation | PipeWire adaptive resampling (built-in) or Ozma-managed `pw-loopback` |
+
+PipeWire already handles same-machine clock synchronisation via its
+driver/follower model. Ozma's clock model (§7) extends this across machines
+— PTP/NTP provide inter-machine sync, and PipeWire handles intra-machine
+scheduling. The two complement each other.
+
+**Metering mapping**:
+
+PipeWire nodes expose peak levels via the `Props` parameter
+(`channelVolumes`, `softVolumes`). For pro audio metering (§2.13 — LUFS,
+true peak, VU), a dedicated `pw-filter-chain` analysis node is inserted at
+each metering point. The analysis node reads audio data and computes metrics
+without modifying the signal (wet_dry = 0.0).
+
+**What PipeWire handles natively (Ozma should not duplicate)**:
+
+- Same-machine buffer management and zero-copy transport
+- Hardware device enumeration and driver management
+- Format negotiation for same-machine links (SPA format)
+- Driver/follower clock scheduling within a machine
+- Adaptive resampling for same-machine clock domain mismatches
+- Port-level channel routing
+
+**What Ozma adds on top of PipeWire**:
+
+- Cross-machine audio routing (VBAN, Opus, AES67)
+- Intent-driven pipeline selection (which sources go where)
+- Mix bus and monitor controller as managed virtual devices
+- Insert chain orchestration (processor ordering and bypass)
+- Cross-machine clock sync (PTP/NTP)
+- Power-aware routing (audio device power budgets)
+- Monitoring, journaling, and trend analysis on audio paths
+- Device database integration (microphone response curves, speaker specs)
 
 ---
 
@@ -4845,6 +5414,35 @@ AudioSpec:
   dsp: bool?                    # built-in DSP
   power_watts: float?           # amplifier power (speakers)
   driver_size_mm: float?        # speaker/headphone driver diameter
+
+  # Speaker spatial characteristics (for spatial audio — see §2.13)
+  speaker: SpeakerSpatialSpec?
+
+SpeakerSpatialSpec:
+  speaker_type: string?         # "bookshelf", "floorstanding", "satellite", "subwoofer",
+                                # "soundbar", "ceiling", "in_wall", "on_wall", "portable"
+  driver_count: uint?           # number of drivers (woofer + tweeter + mid = 3)
+  driver_config: string?        # "2-way", "3-way", "coaxial", "full_range", "horn"
+  enclosure: string?            # "sealed", "ported", "open_baffle", "transmission_line"
+  dispersion: DispersionSpec?   # how sound radiates from this speaker
+  crossover_hz: float[]?        # crossover frequencies between drivers
+  bass_extension_hz: float?     # -6dB low-frequency point
+  max_spl_db: float?            # maximum output SPL at 1m
+  is_active: bool?              # powered speaker (built-in amplifier)
+  is_powered_sub: bool?         # subwoofer with built-in amp + crossover
+  sub_crossover_hz: float?      # built-in crossover frequency (if sub)
+
+DispersionSpec:
+  horizontal_deg: float?        # horizontal dispersion angle (-6dB, typically 60–120°)
+  vertical_deg: float?          # vertical dispersion angle (-6dB, typically 30–60°)
+  directivity_index_db: float?  # DI at 1kHz (higher = more focused)
+  measurement_freq_hz: float?   # frequency at which dispersion was measured
+  beamwidth_data: BeamwidthPoint[]?  # frequency-dependent dispersion if available
+
+BeamwidthPoint:
+  hz: float
+  horizontal_deg: float
+  vertical_deg: float
 
 FrequencyResponse:
   type: string                  # "measured", "specified", "community"
