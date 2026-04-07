@@ -226,6 +226,7 @@ Port:
   current_state: PortState      # what the port is currently doing
   properties: PropertyBag       # port-specific metadata
   latency: LatencySpec          # see §7
+  physical: PhysicalPortInfo?   # where this port is on the device's body (see §15)
 ```
 
 **PortState**:
@@ -6189,6 +6190,9 @@ DeviceEntry:
   tags: string[]?               # searchable tags (e.g., ["mechanical", "hot-swap", "wireless"])
 
   # --- Category-specific blocks (all optional) ---
+  motherboard: MotherboardSpec? # chipset, CPU socket, internal topology, physical port map
+  cpu: CpuSpec?                 # CPU/SoC capabilities, cache, iGPU, memory controller
+  chipset: ChipsetSpec?         # PCH/southbridge: what connects where, lane allocation
   keyboard: KeyboardSpec?
   mouse: MouseSpec?
   audio: AudioSpec?
@@ -6733,6 +6737,338 @@ SeatingSpec:
   recline_range_deg: { min: float, max: float }?
   occupancy_sensor: string?     # "pressure_mat", "ble_beacon", "camera", "none"
 ```
+
+**MotherboardSpec** (the most important compound device — maps every physical
+port to its internal controller):
+
+```yaml
+MotherboardSpec:
+  form_factor: string?          # "atx", "matx", "mitx", "dtx", "eatx", "sff",
+                                # "laptop", "sbc" (Pi, OPi), "embedded"
+  chipset_id: string?           # device database ref for the chipset
+  cpu_socket: string?           # "lga1700", "am5", "lga4677", "bga" (soldered)
+  bios_type: string?            # "uefi", "legacy", "coreboot", "uboot"
+  physical_ports: PhysicalPort[]  # every external port with location and internal routing
+  internal_headers: InternalHeader[]?  # internal connectors (USB headers, fan, RGB, audio)
+  expansion_slots: ExpansionSlot[]?    # PCIe, M.2, DIMM slots
+  power_connectors: string[]?   # "24pin_atx", "8pin_eps", "4pin_eps"
+  vrm: VrmSpec?                 # voltage regulator (determines CPU power delivery quality)
+
+PhysicalPort:
+  id: string                    # unique port identifier ("rear_usb_a_1", "front_usb_c_1",
+                                # "rear_hdmi_1", "rear_eth_1", "rear_audio_line_out")
+  connector: string             # physical connector type (see table below)
+  position: PortPosition        # where on the device body
+  internal_path: string         # what controller this port connects to internally
+  controller_id: string?        # which USB/PCIe/SATA controller
+  shared_bandwidth: string?     # what other ports share bandwidth with this one
+  speed: string?                # actual speed class (may differ from connector capability)
+  color: string?                # physical port color (useful for user instructions)
+  label: string?                # silkscreen label on the board/chassis
+  power_delivery: PortPowerBudget?  # power available on this port (§2.10)
+
+PortPosition:
+  face: string                  # "rear", "front", "left", "right", "top", "bottom"
+  row: uint?                    # row number (0 = top/leftmost)
+  column: uint?                 # column number (0 = leftmost/topmost)
+  offset_mm: Position2d?        # precise position on the face (mm from top-left of face)
+  label_position: string?       # human-readable ("upper left", "lower right", "beside HDMI")
+```
+
+**Connector types**:
+
+| Connector | Media types | Notes |
+|-----------|------------|-------|
+| `usb_a` | data, power | USB Type-A (2.0/3.0/3.1/3.2 — speed in `speed` field) |
+| `usb_c` | data, power, video | USB Type-C (may carry USB, Thunderbolt, DP Alt, PD) |
+| `usb_micro_b` | data, power | USB Micro-B (OTG on SBCs) |
+| `hdmi` | video, audio | HDMI (1.4/2.0/2.1 — version in `speed` field) |
+| `dp` | video, audio | DisplayPort (1.2/1.4/2.0/2.1) |
+| `mini_dp` | video, audio | Mini DisplayPort |
+| `usb_c_dp_alt` | video, audio, data, power | USB-C carrying DP Alt Mode |
+| `usb_c_thunderbolt` | video, audio, data, power | USB-C carrying Thunderbolt |
+| `rj45` | data | Ethernet (100M/1G/2.5G/5G/10G) |
+| `3.5mm_audio` | audio | TRS/TRRS audio jack (line out, mic in, combo) |
+| `optical_audio` | audio | TOSLINK S/PDIF optical |
+| `coax_audio` | audio | Coaxial S/PDIF |
+| `xlr` | audio | XLR (mic, AES3, DMX) |
+| `6.35mm_audio` | audio | 1/4" TRS (instruments, headphones) |
+| `bnc` | video, data, audio | BNC (SDI video, word clock, MADI) |
+| `dvi` | video | DVI-I / DVI-D |
+| `vga` | video | VGA (D-Sub 15) |
+| `sma` | radio | SMA antenna connector (WiFi, LoRa, cellular) |
+| `barrel_dc` | power | DC barrel jack (various sizes) |
+| `gpio_header` | data, power | Pin header (SBC GPIO, internal USB header) |
+| `m2` | data | M.2 slot (NVMe, WiFi, cellular) |
+| `sata_data` | data | SATA data connector |
+| `sata_power` | power | SATA power connector |
+| `sd_card` | data | SD/microSD card slot |
+| `sim` | data | SIM card slot (nano/micro/mini) |
+
+**Internal header** (motherboard internal connectors):
+
+```yaml
+InternalHeader:
+  id: string                    # "usb_header_1", "front_panel_audio", "rgb_12v_1"
+  type: string                  # "usb2_header", "usb3_header", "usb_c_header",
+                                # "front_panel_audio", "spdif_out",
+                                # "argb_3pin", "rgb_12v_4pin", "fan_4pin", "fan_3pin",
+                                # "front_panel_io", "tpm", "serial_com"
+  position: PortPosition        # location on the board
+  controller_id: string?        # which internal controller
+  ports_provided: uint?         # how many ports this header provides (USB header = 2)
+  shared_bandwidth: string?     # bandwidth sharing group
+```
+
+**Expansion slot**:
+
+```yaml
+ExpansionSlot:
+  id: string                    # "pcie_x16_1", "m2_1", "dimm_a1"
+  type: string                  # "pcie_x16", "pcie_x4", "pcie_x1",
+                                # "m2_m_key_2280", "m2_e_key_2230",
+                                # "dimm_ddr5", "dimm_ddr4"
+  source: string                # "cpu" or "chipset" — where the lanes come from
+  lanes: uint?                  # electrical lanes (may be fewer than physical slot)
+  generation: uint?             # PCIe generation (3, 4, 5)
+  shared_with: string[]?        # other slots/ports that share lanes with this one
+  position: PortPosition        # physical location on the board
+  populated: string?            # device database ID of installed device (if known)
+```
+
+**Example — a typical mini-ITX motherboard's port mapping**:
+
+```yaml
+id: "asrock-b760i-lightning-wifi"
+type: motherboard
+motherboard:
+  form_factor: "mitx"
+  chipset_id: "intel-b760"
+  cpu_socket: "lga1700"
+
+  physical_ports:
+    # Rear I/O — left to right, top to bottom
+    - id: rear_usb_a_1
+      connector: usb_a
+      position: { face: rear, row: 0, column: 0, label_position: "top left" }
+      internal_path: "chipset → usb3.0_hub"
+      speed: "usb3_5gbps"
+      color: "blue"
+
+    - id: rear_usb_a_2
+      connector: usb_a
+      position: { face: rear, row: 0, column: 1, label_position: "top left, second" }
+      internal_path: "chipset → usb3.0_hub"
+      speed: "usb3_5gbps"
+      color: "blue"
+
+    - id: rear_usb_c_1
+      connector: usb_c
+      position: { face: rear, row: 0, column: 2, label_position: "top centre" }
+      internal_path: "cpu → usb3.2_gen2"
+      speed: "usb3_10gbps"
+      # NOTE: this port is on the CPU's native USB controller — faster than the
+      # chipset ports. The router knows to recommend this port for high-bandwidth
+      # devices (capture cards, fast storage).
+
+    - id: rear_usb_a_3
+      connector: usb_a
+      position: { face: rear, row: 1, column: 0, label_position: "bottom left" }
+      internal_path: "chipset → usb2.0_hub"
+      speed: "usb2"
+      color: "black"
+      # NOTE: USB 2.0 only! On the rear I/O next to USB 3.0 ports. Easy to
+      # plug a USB 3.0 device into the wrong port. The router detects this
+      # and warns: "Capture card on rear_usb_a_3 is running at USB 2.0 speed.
+      # Move it to rear_usb_c_1 for USB 3.2 Gen 2 (10 Gbps)."
+
+    - id: rear_hdmi_1
+      connector: hdmi
+      position: { face: rear, row: 1, column: 3, label_position: "bottom right" }
+      internal_path: "cpu → igpu → hdmi"
+      speed: "hdmi_2.0"
+
+    - id: rear_dp_1
+      connector: dp
+      position: { face: rear, row: 1, column: 4 }
+      internal_path: "cpu → igpu → dp"
+      speed: "dp_1.4"
+
+    - id: rear_eth_1
+      connector: rj45
+      position: { face: rear, row: 1, column: 5 }
+      internal_path: "chipset → i226v"
+      speed: "2.5gbe"
+
+  expansion_slots:
+    - id: pcie_x16_1
+      type: pcie_x16
+      source: "cpu"
+      lanes: 16
+      generation: 4
+      position: { face: top, row: 0 }
+
+    - id: m2_1
+      type: m2_m_key_2280
+      source: "cpu"
+      lanes: 4
+      generation: 4
+      shared_with: []            # direct to CPU, not shared
+      position: { face: top, row: 1, label_position: "under heatsink" }
+
+    - id: m2_2
+      type: m2_m_key_2280
+      source: "chipset"
+      lanes: 4
+      generation: 3              # chipset provides Gen 3, not Gen 4
+      shared_with: ["sata_1", "sata_2"]  # shares lanes with SATA ports!
+      position: { face: bottom }
+
+  internal_headers:
+    - id: usb_header_1
+      type: usb3_header
+      controller_id: "chipset_usb3"
+      ports_provided: 2
+      position: { face: top, label_position: "bottom edge near front panel" }
+
+    - id: front_panel_usb_c
+      type: usb_c_header
+      controller_id: "cpu_usb32"
+      ports_provided: 1
+      position: { face: top, label_position: "bottom edge" }
+
+    - id: argb_1
+      type: argb_3pin
+      position: { face: top, label_position: "top edge" }
+```
+
+This data enables the router to tell the user: "Your capture card is on
+`rear_usb_a_3` which is USB 2.0 via the chipset. Move it to `rear_usb_c_1`
+which is USB 3.2 Gen 2 direct from the CPU — you'll get 10× the bandwidth."
+Without the physical port mapping, the router knows the device is on USB 2.0
+but can't tell the user *which port to move it to*.
+
+**CpuSpec**:
+
+```yaml
+CpuSpec:
+  vendor: string?               # "intel", "amd", "apple", "qualcomm", "broadcom",
+                                # "allwinner", "rockchip", "sophgo"
+  family: string?               # "core_ultra", "ryzen", "m3", "bcm2712", "rk3588"
+  model: string?                # "i5-13600K", "R7 7800X3D", "M3 Pro"
+  cores: uint?                  # physical cores
+  threads: uint?                # logical threads
+  base_clock_mhz: uint?
+  boost_clock_mhz: uint?
+  tdp_w: float?                 # thermal design power
+  igpu: IgpuSpec?               # integrated graphics (if present)
+  memory_controller: MemoryControllerSpec?
+  pcie_lanes: PcieLaneAllocation?  # how CPU PCIe lanes are allocated
+  usb_controller: UsbControllerSpec?  # CPU-native USB controller (if any)
+  npu: NpuSpec?                 # neural processing unit (if present)
+  cache: CacheSpec?
+
+IgpuSpec:
+  name: string?                 # "Intel UHD 770", "Radeon 780M", "Apple GPU"
+  encode: GpuCodecCapability?   # hardware encoder (Quick Sync, VCN)
+  decode: GpuCodecCapability?   # hardware decoder
+  display_outputs: uint?        # maximum simultaneous displays
+  max_resolution: Resolution?
+
+NpuSpec:
+  name: string?                 # "Intel NPU", "Rockchip NPU", "Apple Neural Engine"
+  tops: float?                  # tera operations per second
+  supported_frameworks: string[]?  # "openvino", "rknn", "coreml", "onnx"
+
+MemoryControllerSpec:
+  type: string?                 # "ddr4", "ddr5", "lpddr5", "lpddr4x"
+  channels: uint?               # memory channels
+  max_speed_mhz: uint?          # maximum memory clock
+  max_capacity_gb: uint?
+
+PcieLaneAllocation:
+  total_lanes: uint             # total CPU PCIe lanes
+  allocations: LaneAllocation[]
+
+LaneAllocation:
+  destination: string           # "x16_slot", "m2_1", "chipset_uplink", "thunderbolt"
+  lanes: uint
+  generation: uint              # PCIe generation
+  bifurcatable: bool?           # can be split (x16 → x8+x8, x8 → x4+x4)
+
+UsbControllerSpec:
+  ports: uint?                  # number of USB ports directly on the CPU
+  speed: string?                # "usb3_10gbps", "usb3_20gbps", "usb4"
+  # CPU USB ports are typically faster than chipset USB ports because they
+  # don't traverse the chipset uplink. This matters for capture cards.
+```
+
+**ChipsetSpec** (PCH / southbridge — the hub that connects everything):
+
+```yaml
+ChipsetSpec:
+  vendor: string?               # "intel", "amd"
+  name: string?                 # "B760", "X670E", "Z790"
+  uplink: ChipsetUplink         # connection to CPU
+  usb_controllers: UsbControllerBlock[]
+  sata_ports: uint?
+  pcie_lanes: PcieLaneAllocation?
+  other_features: string[]?     # "thunderbolt_4", "wifi_cnvi", "2.5gbe"
+
+ChipsetUplink:
+  type: string                  # "dmi_4.0" (Intel), "pcie_gen4" (AMD)
+  bandwidth_gbps: float         # e.g., DMI 4.0 = ~16 GB/s (x8 Gen 4)
+  # CRITICAL: this is the single bottleneck between CPU and everything
+  # on the chipset. All chipset USB, SATA, PCIe, and Ethernet share this.
+
+UsbControllerBlock:
+  controller_id: string         # "usb3_hub_1", "usb2_hub_1"
+  speed: string                 # "usb2", "usb3_5gbps", "usb3_10gbps"
+  ports: uint                   # ports on this controller
+  shared_bandwidth: bool        # do all ports share the controller's bandwidth?
+  total_bandwidth_bps: uint64?  # total bandwidth across all ports on this controller
+  # A USB 3.0 hub with 4 ports shares 5 Gbps among all 4. Two capture cards
+  # on the same hub get 2.5 Gbps each, not 5 Gbps each.
+```
+
+**Why this matters for routing**: The router traces the full path from a
+device to the CPU. A capture card on a chipset USB 3.0 port traverses:
+USB device → USB 3.0 hub (shared 5 Gbps) → chipset → DMI uplink (shared
+with all other chipset devices) → CPU. If the Ethernet NIC is also on the
+chipset, heavy network traffic reduces available bandwidth for USB. The
+router knows this from the internal topology and accounts for it in
+bandwidth calculations.
+
+On AMD platforms, the chipset uplink is typically 4× Gen 4 PCIe lanes
+(~8 GB/s). On Intel, it's DMI 4.0 (~16 GB/s for x8). These numbers
+determine the maximum aggregate throughput of all chipset-connected
+devices — a real constraint that block diagrams rarely make clear.
+
+**PhysicalPortInfo** (on the Port primitive in §2.2 — where this port is on
+the device's body):
+
+```yaml
+PhysicalPortInfo:
+  connector: string             # connector type from the table above
+  position: PortPosition        # face, row, column, offset
+  color: string?                # physical color of the port/surround
+  label: string?                # printed label (silkscreen, chassis label)
+  panel: string?                # which panel ("rear_io", "front_io", "side", "top")
+  adjacent_to: string[]?        # IDs of physically adjacent ports (for user instructions)
+  internal_path_summary: string? # human-readable path ("CPU → USB 3.2 Gen 2, direct")
+```
+
+This field on Port (§2.2) is populated from the device database when the
+device is matched. The router uses it to generate user-facing recommendations:
+
+- "Move your capture card from the black USB-A port (rear, lower left —
+  USB 2.0) to the USB-C port (rear, top centre — USB 3.2 Gen 2 direct
+  from CPU)"
+- "Your capture card and external SSD are both on the same USB 3.0
+  controller. Total bandwidth is shared at 5 Gbps. Consider moving
+  one to the CPU-direct USB-C port."
+- "M.2 slot 2 shares PCIe lanes with SATA ports 1–2. Your NVMe drive
+  in M.2_2 disabled your SATA ports."
 
 **InternalTopology** (the key to understanding compound devices):
 
