@@ -6861,14 +6861,28 @@ GpuCodecDetail:
 
 | GPU | Engine | Max encode | Max decode | Limit type | Notes |
 |-----|--------|-----------|-----------|-----------|-------|
-| NVIDIA GeForce (consumer) | NVENC | 3 | Unlimited | Driver | Patched drivers remove the cap |
-| NVIDIA Quadro/A-series (pro) | NVENC | Unlimited | Unlimited | Hardware | Same silicon, no driver cap |
-| NVIDIA (any) + NVDEC | NVDEC | — | Unlimited | Hardware | Decode is separate engine |
-| AMD RX 7000 | VCN 4.0 | 4 | Unlimited | Hardware | Per-engine, some SKUs have 2 VCN engines |
+| NVIDIA GeForce (pre-2023) | NVENC | 3 | Unlimited | Driver | Historic limit |
+| NVIDIA GeForce (2023) | NVENC | 5 | Unlimited | Driver | Raised March 2023 |
+| NVIDIA GeForce (2024) | NVENC | 8 | Unlimited | Driver | Raised early 2024 |
+| NVIDIA GeForce (late 2025+) | NVENC | 12 | Unlimited | Driver | Raised ~Dec 2025 |
+| NVIDIA Quadro/RTX Pro/L-series | NVENC | Unlimited | Unlimited | None | Same silicon, no driver cap |
+| NVIDIA (any) + NVDEC | NVDEC | — | Unlimited | Hardware | Decode engine is separate, limited by GPU power not session count |
+| AMD RX 7000 | VCN 4.0 | 4 | Unlimited | Hardware | Per-engine; some SKUs have 2 VCN engines (= 8 total) |
+| AMD RX 9000 | VCN 5.0 | TBD | Unlimited | Hardware | |
 | Intel Arc | Xe media engine | Unlimited | Unlimited | Hardware | AV1 encode at hardware speed |
 | Intel iGPU (12th+ gen) | Quick Sync | Unlimited | Unlimited | Hardware | Independent of dGPU |
 | Apple M-series | VideoToolbox | 4–8 | Unlimited | Hardware | Varies by chip; media engine shared with ProRes |
 | Rockchip RK3588 | MPP | 4 | 8 | Hardware | Separate encode/decode engines |
+
+Note: NVIDIA consumer session limits are driver-enforced and have been
+steadily increasing (2→3→5→8→12 over 2020–2025). The hardware has no
+inherent session cap — the limit differentiates consumer from professional
+cards. The device database should track the limit per driver version, not
+just per GPU model, since a driver update changes the limit on existing
+hardware. Performance is the real constraint at high session counts — 8
+concurrent 4K60 NVENC sessions may exceed the encoder's throughput even
+though the driver allows them. The router should track actual encoder
+utilisation (§2.7) alongside the session count.
 
 **iGPU + dGPU simultaneously**: On a system with both an Intel iGPU (Quick
 Sync) and an NVIDIA dGPU (NVENC), both encode engines are available
