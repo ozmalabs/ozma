@@ -7647,6 +7647,7 @@ MotherboardSpec:
   chipset_id: string?           # device database ref for the chipset
   cpu_socket: string?           # "lga1700", "am5", "lga4677", "bga" (soldered)
   bios_type: string?            # "uefi", "legacy", "coreboot", "uboot"
+  bios: BiosDatabase?           # BIOS version history, CPU support, known issues
   physical_ports: PhysicalPort[]  # every external port with location and internal routing
   internal_headers: InternalHeader[]?  # internal connectors (USB headers, fan, RGB, audio)
   expansion_slots: ExpansionSlot[]?    # PCIe, M.2, DIMM slots
@@ -7960,6 +7961,163 @@ This data enables the router to tell the user: "Your capture card is on
 which is USB 3.2 Gen 2 direct from the CPU — you'll get 10× the bandwidth."
 Without the physical port mapping, the router knows the device is on USB 2.0
 but can't tell the user *which port to move it to*.
+
+**BiosDatabase** — BIOS/UEFI version history, CPU support, upstream
+firmware, and known issues per revision:
+
+```yaml
+BiosDatabase:
+  vendor: string?               # "ami", "phoenix", "insyde", "coreboot", "american_megatrends"
+  current_version: string?      # detected running BIOS version (from dmidecode/SMBIOS)
+  current_date: string?         # detected BIOS date
+  versions: BiosVersion[]       # complete version history
+  cpu_support: CpuSupportList   # which CPUs are supported at which BIOS version
+  upstream: UpstreamFirmware?   # AGESA, microcode, FSP, ME version embedded in each BIOS
+
+BiosVersion:
+  version: string               # BIOS version string (e.g., "7.03", "F37", "2803")
+  date: string?                 # release date (ISO)
+  upstream_version: UpstreamVersion?  # AGESA/microcode/FSP version in this BIOS
+  changelog: string[]?          # vendor release notes (often terse/unhelpful)
+  cpu_support_added: string[]?  # CPUs added in this version (device database CPU IDs)
+  known_issues: BiosIssue[]?    # known bugs/problems in this version
+  known_fixes: string[]?        # issues fixed in this version (references BiosIssue.id)
+  recommended: bool?            # is this the vendor-recommended version?
+  beta: bool?                   # beta/test release
+  download_url: string?         # where to get this BIOS update
+  recovery_only: bool?          # can only be flashed via recovery (e.g., USB BIOS flashback)
+
+BiosIssue:
+  id: string                    # unique issue identifier
+  severity: string              # "critical", "major", "minor", "cosmetic"
+  category: string              # "usb", "pcie", "memory", "boot", "stability", "security",
+                                # "sleep", "power", "display", "audio", "network", "tpm",
+                                # "virtualization", "nvme", "thunderbolt", "bluetooth"
+  summary: string               # one-line description
+  description: string?          # detailed description
+  affected_hardware: string[]?  # which components are affected (CPU models, USB devices, etc.)
+  workaround: string?           # known workaround if one exists
+  fixed_in: string?             # BIOS version that fixes this issue (null = still unfixed)
+  upstream_bug: string?         # upstream issue reference (AGESA, microcode, chipset driver)
+  source: string[]?             # where this info came from ("vendor_notes", "community",
+                                # "kernel_bugzilla", "reddit", "forum")
+  affects_ozma: bool?           # does this issue specifically impact Ozma functionality?
+  ozma_impact: string?          # how it affects Ozma ("usb_dropout", "xhci_crash",
+                                # "s3_resume_fail", "pcie_link_train_fail")
+
+CpuSupportList:
+  initial_cpus: string[]        # CPUs supported from launch BIOS
+  updates: CpuSupportUpdate[]   # CPUs added per BIOS version
+
+CpuSupportUpdate:
+  min_bios_version: string      # minimum BIOS version required
+  cpus_added: string[]          # device database CPU IDs
+  notes: string?                # e.g., "Requires AGESA 1.0.0.7 or later"
+
+UpstreamFirmware:
+  # The BIOS embeds upstream firmware blobs that determine much of the
+  # platform's actual behaviour. Tracking these separately from the BIOS
+  # version is critical because:
+  # - The same AGESA version may appear in multiple BIOS versions
+  # - An AGESA bug affects all boards using that AGESA, regardless of vendor
+  # - Microcode updates fix CPU-level bugs independently of BIOS features
+  type: UpstreamType            # which upstream firmware
+  components: UpstreamComponent[]
+
+UpstreamType: enum
+  amd_agesa                     # AMD Generic Encapsulated Software Architecture
+  intel_fsp                     # Intel Firmware Support Package
+  intel_me                      # Intel Management Engine
+  intel_microcode               # Intel CPU microcode
+  amd_microcode                 # AMD CPU microcode
+  arm_trusted_firmware          # ARM TF-A (for ARM SBCs)
+  coreboot_payload              # coreboot payload version
+
+UpstreamComponent:
+  name: string                  # "agesa", "microcode", "me_firmware", "fsp"
+  version: string               # version string (e.g., "ComboAM5PI 1.2.0.2",
+                                # "0x0A704104", "16.1.30.2307")
+  known_issues: UpstreamIssue[]?
+  known_fixes: string[]?
+
+UpstreamIssue:
+  id: string                    # e.g., "agesa-usb-dropout-am5", "intel-mc-downfall"
+  severity: string
+  summary: string
+  description: string?
+  affected_platforms: string[]  # which chipsets/CPUs are affected
+  fixed_in_version: string?     # upstream version that fixes it
+  cve: string?                  # CVE ID if security-related
+  source: string[]?
+```
+
+**Why this matters — real-world examples**:
+
+**AMD AM5 USB dropouts (AGESA issue)**:
+Early AMD AM5 boards (X670E, B650) had widespread USB disconnect issues —
+devices would randomly drop and reconnect. This was an AGESA bug, not a
+board-specific bug. It affected ALL AM5 boards until AGESA ComboAM5PI
+1.0.0.7b. The fix rolled out over months as each board vendor released
+BIOS updates containing the new AGESA.
+
+```yaml
+# Example issue in the database:
+- id: "agesa-am5-usb-dropout-2022"
+  severity: "critical"
+  category: "usb"
+  summary: "USB devices randomly disconnect and reconnect on AM5 platforms"
+  affected_hardware: ["amd-x670e-chipset", "amd-b650-chipset"]
+  workaround: "Disable USB selective suspend; avoid USB hubs on affected ports"
+  fixed_in: null  # fixed per-board when BIOS with AGESA 1.0.0.7b was released
+  upstream_bug: "agesa-combo-am5pi-pre-1.0.0.7b"
+  affects_ozma: true
+  ozma_impact: "usb_dropout — capture cards and nodes lose connection intermittently"
+```
+
+The agent detects the running BIOS version via `dmidecode -t bios`. The
+device database entry for the motherboard contains the BIOS version history
+with AGESA versions. The system checks:
+
+1. Is the running BIOS version affected by any known issues?
+2. Is there a newer BIOS that fixes known issues?
+3. Does the running AGESA version have known upstream bugs?
+4. Is the installed CPU supported by the running BIOS version?
+
+**Alerts the user can see**:
+
+- "Your ASRock B650E Taichi is running BIOS 1.08 (AGESA ComboAM5PI 1.0.0.6).
+  This version has a known USB disconnect bug that affects capture cards.
+  **Update to BIOS 3.08+ (AGESA 1.0.0.7b)** to fix USB stability."
+
+- "Your BIOS (version F31) does not support the Ryzen 9 7950X3D. Minimum
+  required: F37. **Update BIOS before installing this CPU** or it will not
+  POST."
+
+- "Intel microcode 0x0A704104 addresses the Downfall vulnerability (CVE-2022-40982).
+  Your current microcode is 0x0A704103. **Update BIOS** for the security fix."
+
+- "Your board's BIOS is 18 months old. 3 newer versions are available with
+  stability improvements and new CPU support."
+
+**Intel Management Engine version tracking**:
+
+Intel ME is a separate firmware that runs on the chipset. It has its own
+vulnerabilities (e.g., SA-00086, SA-00125) that are patched via BIOS
+updates containing newer ME firmware. The database tracks ME versions per
+BIOS version so the system can flag: "Your Intel ME version (11.8.50) is
+affected by SA-00086. Update BIOS to version X for ME 11.8.93 which fixes
+this."
+
+**Discovery**:
+
+| Data | Linux | Windows | macOS |
+|------|-------|---------|-------|
+| BIOS version/date | `dmidecode -t bios` | WMI `Win32_BIOS` | `system_profiler SPHardwareDataType` |
+| BIOS vendor | `dmidecode -t bios` | WMI | N/A (Apple controls firmware) |
+| CPU microcode | `/proc/cpuinfo` (`microcode` field) | `CPUID` instruction | N/A |
+| Intel ME version | `mei-amt-check`, `lsmod \| grep mei` | Intel ME driver | N/A |
+| AGESA version | Not directly exposed; inferred from BIOS version + database | Same | N/A |
+| Board model | `dmidecode -t baseboard` | WMI `Win32_BaseBoard` | N/A |
 
 **CpuSpec**:
 
