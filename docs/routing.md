@@ -1601,6 +1601,134 @@ Network switches and routers matter to the routing protocol because:
   jitter, bandwidth) from LAN interfaces — the transport characteristics
   table (§6.1) depends on knowing whether traffic crosses the WAN
 
+#### Media sessions on target machines
+
+A target machine may have multiple media players running simultaneously —
+Spotify playing music, YouTube paused in a browser tab, a game with its own
+audio. The OS mixes all of these into a single system audio output, which
+the node captures as one audio stream. But the **desktop agent** inside the
+OS can observe each media session individually via platform APIs.
+
+Media sessions on a target are modelled as child devices of the target,
+reported by the desktop agent:
+
+```yaml
+MediaSessionDevice:
+  type: media_receiver          # same type as controller-side receivers
+  session_source: string        # "agent" — discovered by desktop agent, not by controller
+  host_device: DeviceRef        # the target machine this session is on
+  process: ProcessInfo          # which application
+  ports:
+    - id: audio_out             # this session's audio stream (if separable)
+      direction: source
+      media_type: audio
+    - id: metadata              # track info, playback state
+      direction: source
+      media_type: data
+    - id: transport_control     # play/pause/skip (via MPRIS2/SMTC)
+      direction: sink
+      media_type: control
+  playback_state: PlaybackState # current state of this specific session
+  audio_separable: bool         # can this session's audio be captured independently?
+
+ProcessInfo:
+  name: string                  # "spotify", "chrome", "vlc", "firefox"
+  pid: uint?
+  window_title: string?         # "Spotify - Bohemian Rhapsody", "YouTube - Some Video"
+  app_id: string?               # "com.spotify.Client", "org.mozilla.firefox"
+```
+
+**Example — desktop with Spotify playing and YouTube paused**:
+
+```yaml
+# The target machine
+- type: target
+  id: "gaming-pc"
+  ports:
+    - id: system_audio           # mixed system audio (what the node captures)
+      direction: source
+      media_type: audio
+      # This is Spotify + YouTube + system sounds, all mixed by the OS
+  media_sessions:
+    - type: media_receiver
+      id: "gaming-pc/spotify"
+      process: { name: "spotify", app_id: "com.spotify.Client" }
+      playback_state:
+        state: playing
+        track: { title: "Bohemian Rhapsody", artist: "Queen",
+                 codec: "flac", sample_rate: 44100, bit_depth: 16, lossy: false }
+        volume: 0.8
+      audio_separable: true      # PipeWire can isolate this stream
+      # On Linux: PipeWire sees Spotify as a separate stream node
+      # On Windows: WASAPI can capture per-app with process loopback
+
+    - type: media_receiver
+      id: "gaming-pc/chrome-youtube"
+      process: { name: "chrome", window_title: "YouTube - Some Video" }
+      playback_state:
+        state: paused
+        track: { title: "Some Video", codec: "opus", lossy: true }
+        volume: 1.0
+      audio_separable: true
+```
+
+**Audio separability**:
+
+The `audio_separable` field indicates whether this session's audio can be
+captured independently from the system mix:
+
+| Platform | Per-app audio capture | How |
+|----------|----------------------|-----|
+| Linux (PipeWire) | Yes | Each app is a PipeWire stream node; agent can capture individually |
+| Linux (PulseAudio) | Yes | `pactl` per-source-output capture |
+| Windows 10+ | Yes | WASAPI process loopback (`AUDCLNT_PROCESS_LOOPBACK_MODE`) |
+| macOS | Partial | Requires virtual audio driver (BlackHole/Loopback); per-app not native |
+
+When audio is separable, the agent can capture individual streams and send
+them to the controller as separate VBAN/Opus channels. The controller then
+has per-source routing control — Spotify audio to the desk speakers at full
+quality, YouTube audio muted, game audio ducked. This is a **per-application
+mix bus** on the target machine, bridged to the controller via the agent.
+
+When audio is NOT separable (no agent, or platform doesn't support it), the
+controller receives mixed system audio as a single stream. Media session
+metadata is still available (the agent reports playback state even if it
+can't separate audio), so intent bindings and screen metadata still work —
+you just can't route individual apps.
+
+**How this affects the routing graph**:
+
+1. **Without agent (node-only capture)**: One audio source port on the target.
+   One `system_audio` stream. No per-app control. This is the basic KVM path.
+
+2. **With agent, non-separable**: Same one audio source port, but media
+   session metadata is available as data ports. Intent bindings can react
+   to "Spotify is playing" even though audio can't be separated.
+
+3. **With agent, separable audio**: Multiple audio source ports on the target,
+   one per separable session. Each enters the routing graph independently.
+   The controller's mix bus handles per-source volume/mute/routing. Full
+   control.
+
+**Intent binding examples**:
+
+```yaml
+# Duck all other audio when a video call starts
+- conditions:
+    - { source: media_session, field: process.name, op: in,
+        value: ["zoom", "teams", "meet", "slack"] }
+    - { source: media_session, field: playback_state.state, op: eq, value: "playing" }
+  actions:
+    - { type: "mix_bus.duck", target: "all_except_source", amount_db: -20 }
+
+# Show now-playing on Stream Deck from whichever app is actively playing
+- conditions:
+    - { source: media_session, field: playback_state.state, op: eq, value: "playing" }
+  actions:
+    - { type: "screen.show_metadata", target: "streamdeck-key-5",
+        data: "playback_state.track" }
+```
+
 #### Macro and synthetic input sources
 
 The macro system and automation engine produce synthetic HID input. They are
