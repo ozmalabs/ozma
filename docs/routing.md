@@ -3780,6 +3780,274 @@ plugin reports the detected path class (from traceroute analysis, interface
 type, or user configuration), and the router selects the matching baseline
 row from the table above.
 
+#### Bluetooth connection model
+
+Bluetooth is a transport with highly variable characteristics depending on
+the profile, codec, and connection quality. The router needs to understand
+these to make correct pipeline decisions.
+
+**Bluetooth link state**:
+
+```yaml
+BluetoothLinkState:
+  profile: BluetoothProfile     # which profile is active
+  codec: BluetoothCodec?        # negotiated audio codec (A2DP/LE Audio)
+  connection: BluetoothConnection  # signal quality and parameters
+  device: BluetoothDeviceInfo   # remote device capabilities
+
+BluetoothProfile: enum
+  a2dp_source                   # high-quality audio output (speaker, headphones)
+  a2dp_sink                     # receive audio from phone/tablet
+  hfp                           # hands-free call audio (bidirectional, narrowband)
+  hfp_wideband                  # HFP with mSBC (16kHz wideband)
+  hid                           # human interface device (keyboard, mouse, gamepad)
+  le_audio_unicast              # LE Audio (LC3, low latency, bidirectional)
+  le_audio_broadcast            # Auracast broadcast (one-to-many)
+  ble_gatt                      # BLE data (sensors, control, beacons)
+  spp                           # serial port profile (legacy data)
+  pan                           # personal area network (IP over BT)
+
+BluetoothCodec:
+  name: string                  # codec identifier
+  bitrate_kbps: uint?           # negotiated bitrate
+  sample_rate: uint?            # Hz
+  bit_depth: uint?              # bits per sample
+  channels: uint?               # 1=mono, 2=stereo
+  latency_ms: float?            # codec latency (encode + decode)
+  lossy: bool
+  quality: InfoQuality          # how we know this (reported from stack, or assumed from codec name)
+```
+
+**Bluetooth audio codecs** — what the router needs to know for format
+negotiation and intent matching:
+
+| Codec | Bitrate | Sample rate | Latency | Lossy | Notes |
+|-------|---------|-------------|---------|-------|-------|
+| SBC | 198–345 kbps | 44.1/48 kHz | 30–50ms | Yes | Mandatory A2DP. Worst quality, always available. |
+| AAC | 256 kbps | 44.1/48 kHz | 50–80ms | Yes | Good quality. Higher latency (encoder complexity). |
+| aptX | 352 kbps | 44.1/48 kHz | ~40ms | Yes | Qualcomm. CD-like quality. |
+| aptX HD | 576 kbps | 48 kHz/24-bit | ~40ms | Yes | Qualcomm. Hi-res. |
+| aptX Adaptive | 280–420 kbps | 48/96 kHz | 50–80ms | Yes | Qualcomm. Variable bitrate, adaptive latency. |
+| aptX Lossless | ~1 Mbps | 44.1 kHz/16-bit | ~40ms | No* | Qualcomm. CD lossless (*falls back to lossy if bandwidth constrained). |
+| LDAC | 330/660/990 kbps | Up to 96 kHz/24-bit | 40–60ms | Yes | Sony. Best A2DP quality at 990 kbps. |
+| LC3 (LE Audio) | 16–345 kbps | 8–48 kHz | 7–10ms | Yes | Bluetooth 5.2+. Low latency. Future standard. |
+| LC3plus | 16–672 kbps | Up to 96 kHz | 5–10ms | Yes | Enhanced LC3. Hi-res + low latency. |
+| mSBC | 64 kbps | 16 kHz | ~10ms | Yes | HFP wideband voice. |
+| CVSD | 64 kbps | 8 kHz | ~10ms | Yes | HFP narrowband voice. Legacy. |
+
+**Impact on routing**: `fidelity_audio` intent would reject all Bluetooth
+audio codecs except aptX Lossless (and even that has caveats). `desktop`
+intent accepts any codec. The router checks `BluetoothCodec.lossy` against
+the intent's `forbidden_formats` and `prefer_lossless` preference. The
+codec's latency adds to the pipeline's total latency budget.
+
+**Bluetooth connection quality**:
+
+```yaml
+BluetoothConnection:
+  rssi_dbm: int?                # received signal strength (-30 = excellent, -90 = poor)
+  tx_power_dbm: int?            # transmit power level
+  link_quality: uint?           # 0–255 (controller-reported link quality)
+  distance_estimate_m: float?   # estimated distance from RSSI (very approximate)
+  interference: bool?           # detected interference (frequent retransmits)
+  version: string?              # "4.0", "4.2", "5.0", "5.2", "5.3"
+  phy: string?                  # "1m" (LE 1M), "2m" (LE 2M), "coded" (LE Coded, long range)
+  mtu: uint?                    # negotiated MTU
+  connection_interval_ms: float? # BLE connection interval (7.5–4000ms)
+  supervision_timeout_ms: uint?  # how long before disconnect on silence
+
+BluetoothDeviceInfo:
+  name: string?                 # device name
+  address: string               # MAC address
+  address_type: string?         # "public", "random"
+  paired: bool
+  bonded: bool                  # has long-term key
+  supported_profiles: BluetoothProfile[]
+  supported_codecs: string[]?   # A2DP codec capabilities from device SDP/AVDTP
+  battery_percent: uint?        # if reported via HFP or BLE battery service
+  manufacturer: string?         # from device database or OUI
+  device_db_id: string?         # matched device database entry
+```
+
+**Bluetooth RSSI feeds into the routing graph**: The signal strength is a
+`measured` quality link property. If RSSI drops below -80 dBm, the router
+expects increased jitter and loss. If it drops below -90 dBm, the link is
+marked `degraded`. This feeds into re-evaluation triggers (§8.4) — the
+router may switch to a wired path if Bluetooth quality degrades.
+
+**Multi-device**: Bluetooth can maintain multiple simultaneous connections
+(Classic + BLE, or multiple BLE). Each connection is a separate link in
+the graph with its own profile, codec, and quality metrics.
+
+#### WiFi connection model
+
+WiFi links have highly variable characteristics depending on the standard,
+band, channel conditions, client count, and interference. The router needs
+real-time visibility into these to make good decisions.
+
+**WiFi link state**:
+
+```yaml
+WiFiLinkState:
+  interface: string             # OS interface name ("wlan0", "wlp2s0")
+  standard: string              # "wifi4" (802.11n), "wifi5" (ac), "wifi6" (ax),
+                                # "wifi6e" (ax 6GHz), "wifi7" (be)
+  band: string                  # "2.4ghz", "5ghz", "6ghz"
+  channel: uint                 # channel number (1–14 for 2.4GHz, 36–177 for 5GHz, etc.)
+  channel_width_mhz: uint      # 20, 40, 80, 160, 320
+  signal: WiFiSignalQuality     # signal strength and noise
+  link_rate: WiFiLinkRate       # PHY rate and negotiated speed
+  ap: WiFiAccessPointInfo?      # connected AP details (if STA mode)
+  clients: uint?                # connected client count (if AP mode)
+  airtime: WiFiAirtime?         # channel utilisation metrics
+  roaming: WiFiRoamingState?    # roaming state (if multiple APs)
+
+WiFiSignalQuality:
+  rssi_dbm: int                 # received signal strength (-30 = excellent, -90 = barely usable)
+  noise_dbm: int?               # noise floor (typically -90 to -95 dBm)
+  snr_db: float?                # signal-to-noise ratio (rssi - noise)
+  quality_percent: float?       # OS-reported quality (0–100)
+  quality: InfoQuality          # "measured" from driver, "reported" from OS
+
+WiFiLinkRate:
+  tx_rate_mbps: float           # current transmit PHY rate
+  rx_rate_mbps: float           # current receive PHY rate
+  mcs_index: uint?              # MCS index (determines modulation + coding)
+  spatial_streams: uint?        # MIMO spatial streams (1–8)
+  guard_interval: string?       # "long" (800ns), "short" (400ns), "very_short" (800ns WiFi7)
+  # Note: PHY rate ≠ throughput. Real throughput is typically 50–70% of PHY rate
+  # due to protocol overhead, retransmits, and contention.
+  estimated_throughput_mbps: float?  # estimated real throughput
+
+WiFiAirtime:
+  channel_utilisation_percent: float?  # how busy the channel is (0–100)
+  tx_airtime_percent: float?    # our transmit airtime
+  rx_airtime_percent: float?    # our receive airtime
+  busy_percent: float?          # total detected busy time (includes other networks)
+  # High channel utilisation = high jitter, high latency, potential packet loss
+  # The router uses this to predict link quality degradation
+
+WiFiAccessPointInfo:
+  bssid: string                 # AP MAC address
+  ssid: string                  # network name
+  security: string?             # "wpa2", "wpa3", "open"
+  ap_device_id: string?         # if this AP is an Ozma-managed access_point device
+
+WiFiRoamingState:
+  current_ap: string            # BSSID of currently connected AP
+  available_aps: WiFiApCandidate[]  # other APs on same SSID with their signal levels
+  last_roam: timestamp?         # when we last roamed
+  roam_count: uint?             # total roams in this session
+  # Frequent roaming indicates marginal coverage — the router should prefer
+  # wired paths for latency-sensitive traffic on this device
+
+WiFiApCandidate:
+  bssid: string
+  rssi_dbm: int
+  channel: uint
+  band: string
+```
+
+**WiFi quality ranges and routing implications**:
+
+| RSSI | SNR | Quality | Expected throughput | Expected jitter | Router action |
+|------|-----|---------|--------------------|-----------------|----|
+| > -50 dBm | > 40 dB | Excellent | 80–100% of PHY rate | <2ms | Full bandwidth, all intents |
+| -50 to -60 | 30–40 | Good | 60–80% | 2–5ms | Most intents OK; prefer wired for gaming/creative |
+| -60 to -70 | 20–30 | Fair | 40–60% | 5–15ms | Degrade video quality; HID OK; audio may glitch |
+| -70 to -80 | 10–20 | Poor | 20–40% | 15–50ms | HID and control only; route media over wired |
+| < -80 dBm | < 10 | Unusable | Unreliable | > 50ms | Mark link as degraded; failover |
+
+**Channel utilisation**: Even with strong signal, a congested channel
+degrades performance. If `channel_utilisation_percent` > 70%, the router
+treats the link as if RSSI were 10 dBm worse. This is how apartment
+buildings with 30 WiFi networks on channel 6 get correctly modelled — the
+signal is strong but the medium is saturated.
+
+**Band selection awareness**: The router knows that 2.4 GHz has longer
+range but less bandwidth and more interference than 5 GHz, and that 6 GHz
+(WiFi 6E/7) has the most bandwidth but shortest range. If a device supports
+multiple bands, the link's expected characteristics depend on which band
+is active. A device on 5 GHz channel 36 at 80 MHz width has very different
+properties than the same device on 2.4 GHz channel 1 at 20 MHz.
+
+#### Constrained and exotic transports
+
+Not every transport carries high-bandwidth media. Some transports are
+extremely low-bandwidth but serve important functions — sensor data,
+control commands, presence detection, or telemetry from remote locations.
+The routing graph models these with the same primitives but different
+characteristic profiles.
+
+**Constrained transport characteristics**:
+
+| Transport | Bandwidth | Range | Latency | Use in Ozma |
+|-----------|-----------|-------|---------|-------------|
+| LoRa | 0.3–50 kbps | 2–15 km | 100ms–5s | Remote sensor data, presence, alerts from distant buildings/farms |
+| Zigbee | 250 kbps | 10–100m (mesh) | 15–30ms | IoT sensors, door contacts, motion detectors |
+| Z-Wave | 100 kbps | 30–100m (mesh) | 15–30ms | IoT sensors, locks, thermostats |
+| Thread/Matter | 250 kbps | 10–100m (mesh) | 10–30ms | IP-based IoT mesh (newer devices) |
+| Sub-GHz (433/868/915 MHz) | 1–100 kbps | 0.5–5 km | 50ms–1s | Custom sensors, weather stations, gate controllers |
+| Power line (HomePlug/G.hn) | 50–2000 Mbps | Same circuit | 5–30ms | Networking through existing wiring |
+| IrDA | 9.6–16000 kbps | <1m, line of sight | <5ms | Legacy data transfer |
+| NFC | 424 kbps | <10cm | <1ms | Badge/tag read for workspace profiles |
+| UWB | 6.8–27.2 Mbps | 10–30m | <1ms | Precise positioning (~10cm accuracy) |
+
+**Constrained transports as plugins**: These follow the same transport
+plugin contract (§6.1). A LoRa plugin discovers LoRa gateways and devices,
+reports links with appropriate characteristics (50 kbps, 2s latency), and
+opens/closes data streams. The router knows not to route video over LoRa
+because the bandwidth constraint (§8.2) eliminates it — but it happily
+routes sensor data or control commands.
+
+**LoRa-specific model**:
+
+```yaml
+LoRaLinkState:
+  spreading_factor: uint        # SF7–SF12 (higher = longer range, lower bitrate)
+  bandwidth_khz: uint           # 125, 250, 500
+  coding_rate: string           # "4/5", "4/6", "4/7", "4/8"
+  frequency_mhz: float         # operating frequency (868.1, 915.0, etc.)
+  tx_power_dbm: int             # transmit power
+  rssi_dbm: int                 # received signal strength
+  snr_db: float                 # signal-to-noise ratio
+  airtime_ms: float?            # last packet airtime
+  duty_cycle_percent: float?    # regulatory duty cycle limit (1% in EU 868MHz)
+  gateway: LoRaGatewayInfo?     # which gateway received this
+
+LoRaGatewayInfo:
+  id: string
+  location: PhysicalLocation?
+  type: string                  # "single_channel", "8_channel", "lorawan_gateway"
+  network: string?              # "private", "ttn" (The Things Network), "helium", "chirpstack"
+```
+
+**Use cases for constrained transports in Ozma**:
+
+- **Remote building sensors**: A farm outbuilding with a LoRa temperature/
+  humidity sensor → gateway on the controller's building → sensor device in
+  the graph → monitoring dashboard + trend alerts + automation triggers.
+  No WiFi needed at the outbuilding.
+
+- **Gate/door status**: Sub-GHz contact sensor on a driveway gate, 500m from
+  the house → received by controller with sub-GHz radio → event triggers
+  doorbell alert or security scenario.
+
+- **Workspace presence via NFC**: Tap NFC badge at desk → workspace profile
+  activates → scenarios, audio routing, screen layout all switch. The NFC
+  read is a near-zero-latency, near-zero-bandwidth transport that carries
+  identity data.
+
+- **UWB positioning**: UWB anchors in a room provide ~10cm positioning
+  accuracy → feeds `UserZone` (§8.1) with `measured` quality position data →
+  spatial routing decisions based on actual position, not inferred from
+  which keyboard is active.
+
+- **Power line networking**: A node in a garage that can't be wired with
+  Ethernet but is on the same electrical circuit → HomePlug adapter gives
+  50–200 Mbps, enough for KVM video. The transport characteristics table
+  gives it appropriate jitter/latency expectations.
+
 **Built-in transports** (shipped with Ozma):
 
 | Transport ID | Description |
@@ -3819,6 +4087,14 @@ row from the table above.
 | `kdeconnect` | KDE Connect protocol. Phone integration (notifications, media, clipboard). |
 | `nut` | Network UPS Tools protocol. UPS monitoring. |
 | `wol` | Wake-on-LAN magic packets. Target machine power-on. |
+| `lora` | LoRa/LoRaWAN. Remote sensors, gate status, farm buildings. |
+| `zigbee` | Zigbee mesh. IoT sensors, contacts, motion. |
+| `zwave` | Z-Wave mesh. IoT sensors, locks, thermostats. |
+| `thread` | Thread/Matter mesh. IP-based IoT. |
+| `sub-ghz` | Custom sub-GHz radio (433/868/915 MHz). Long-range sensors. |
+| `powerline` | HomePlug/G.hn. Networking through electrical wiring. |
+| `nfc` | NFC tag/badge read. Workspace profile activation. |
+| `uwb` | Ultra-wideband. Precise indoor positioning (~10cm). |
 
 ### 6.2 Device plugin
 
