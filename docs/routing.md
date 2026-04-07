@@ -4030,10 +4030,56 @@ ClockReference: enum
 **Same machine**: All devices share `system_monotonic`. No synchronisation
 needed. Latency measurements are directly comparable.
 
-**LAN (same broadcast domain)**: PTP is preferred if available (sub-microsecond
-accuracy). NTP is acceptable for most Ozma use cases (millisecond accuracy is
-sufficient for KVM latency budgets). The controller runs a PTP grandmaster or
-NTP server; nodes synchronise to it.
+**LAN (same broadcast domain)**: PTP (IEEE 1588v2) provides sub-microsecond
+synchronisation on standard Ethernet — no proprietary hardware required. This
+is the same clock mechanism used by Dante, AES67, and SMPTE ST 2059. The
+controller runs a PTP grandmaster; nodes synchronise to it.
+
+PTP accuracy depends on hardware timestamping support:
+
+| NIC capability | PTP accuracy | Audio quality achievable | Hardware examples |
+|---------------|-------------|------------------------|-------------------|
+| Hardware timestamps (PHC) | <1µs | Sample-accurate at 192kHz (1 sample = 5.2µs) | Intel I210, I225, I226; Broadcom BCM5720; Realtek RTL8125B (some) |
+| Software timestamps only | 10–100µs | Sample-accurate at 48kHz (1 sample = 20.8µs); sub-sample at 96kHz | Most USB Ethernet, WiFi adapters, budget NICs |
+| NTP only (no PTP) | 1–10ms | Adequate for KVM audio; not for pro audio sync | Any network interface |
+
+The controller detects PTP hardware timestamp support via `ethtool -T` (Linux)
+and selects the best available clock source automatically. Hardware PTP is
+preferred; software PTP is the fallback; NTP is the last resort. The
+`InfoQuality` on the clock sync reflects this: hardware PTP = `measured`,
+software PTP = `measured` (lower confidence), NTP = `reported`.
+
+**QoS marking**: Audio packets are marked with DSCP EF (Expedited Forwarding,
+value 46) to receive priority treatment on managed switches. This is the same
+QoS classification used by Dante and AES67. The transport plugin sets the
+DSCP value on the socket (`setsockopt IP_TOS`). On unmanaged switches, DSCP
+has no effect but causes no harm.
+
+**Latency classes**: Like Dante's selectable latency, Ozma's audio transport
+offers configurable jitter buffer depth that determines the latency/reliability
+trade-off:
+
+| Jitter buffer | One-way latency added | Tolerance | Use case |
+|--------------|----------------------|-----------|----------|
+| 0.25ms (12 samples @ 48k) | 0.25ms | Very tight — requires PTP + dedicated/managed switch | Local monitoring |
+| 0.5ms (24 samples) | 0.5ms | Tight — PTP recommended | Studio recording |
+| 1ms (48 samples) | 1ms | Moderate — software PTP sufficient | Live performance |
+| 2ms (96 samples) | 2ms | Comfortable — works on any decent LAN | General pro audio |
+| 5ms (240 samples) | 5ms | Relaxed — tolerates WiFi jitter | Non-critical audio |
+| 20ms (960 samples) | 20ms | Very relaxed — tolerates internet jitter | Remote audio |
+
+The intent's `max_latency_ms` constraint determines which buffer depth is
+acceptable. The router selects the smallest buffer that the measured link
+jitter can sustain — if the link has 0.3ms p99 jitter, a 0.5ms buffer works;
+if jitter is 2ms, the buffer must be ≥2ms.
+
+**Dante-equivalent on commodity hardware**: On a wired Gigabit LAN with a
+managed switch (QoS enabled) and a NIC with hardware PTP timestamps, Ozma
+achieves the same sync accuracy and latency as Dante — without Audinate
+licensing, without proprietary chipsets, without vendor lock-in. The
+difference is purely protocol: Dante is a closed standard; Ozma's audio
+transport is open and interoperable with AES67 (which Dante itself
+supports as a compatibility mode).
 
 **Remote (via Connect relay)**: NTP synchronised to a common reference. Clock
 offset is measured during session establishment and applied to latency
