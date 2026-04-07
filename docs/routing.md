@@ -103,6 +103,8 @@ Device:
 | `switch` | KVM switch, HDMI matrix, audio matrix, crosspoint switch |
 | `vm_host` | QEMU/KVM/Proxmox hypervisor (manages VM targets) (see §2.9) |
 | `service` | Managed service (Frigate, Jellyfin, Immich, Vaultwarden, HA) (see §2.9) |
+| `media_receiver` | Spotify Connect (librespot), AirPlay (shairport-sync), Chromecast, DLNA renderer |
+| `media_source` | Jellyfin, Plex, Tidal Connect, local media library — controllable content sources |
 | `notification_sink` | Webhook, Slack, Discord, email, Pushover, ntfy |
 | `metrics_sink` | Prometheus, Datadog, InfluxDB, syslog exporter |
 | `furniture` | Motorised desk, monitor arm — furniture that is also an actuator (see §2.11) |
@@ -1386,6 +1388,126 @@ MetricsSinkDevice:
 These are data sinks. They appear in the graph so the router can track their
 health, resource usage, and connectivity — but they don't participate in
 media pipeline routing.
+
+#### Media receivers and sources
+
+A media receiver is a software endpoint that receives audio (and sometimes
+video) from an external streaming service and produces it locally as a
+PipeWire source. A media source is a controllable content library that
+can be directed to play through specific outputs.
+
+```yaml
+MediaReceiverDevice:
+  type: media_receiver
+  receiver_type: string         # "spotify_connect", "airplay", "chromecast",
+                                # "dlna_renderer", "bluetooth_a2dp", "roc_receiver"
+  ports:
+    - id: audio_out             # decoded audio into PipeWire
+      direction: source
+      media_type: audio
+    - id: video_out             # video output (Chromecast, AirPlay video)
+      direction: source
+      media_type: video
+    - id: metadata              # track info, album art, playback state
+      direction: source
+      media_type: data
+    - id: transport_control     # play/pause/skip/seek commands from the sender
+      direction: sink
+      media_type: control
+  discovery: DiscoveryConfig    # how this receiver advertises itself
+  playback_state: PlaybackState # what's currently playing
+
+MediaSourceDevice:
+  type: media_source
+  source_type: string           # "jellyfin", "plex", "tidal_connect", "local_library",
+                                # "youtube_music", "subsonic", "navidrome"
+  ports:
+    - id: audio_out             # audio stream (if controller decodes)
+      direction: source
+      media_type: audio
+    - id: video_out             # video stream (if controller decodes)
+      direction: source
+      media_type: video
+    - id: api_control           # library browsing, queue management
+      direction: sink
+      media_type: control
+    - id: metadata              # now playing, queue, library info
+      direction: source
+      media_type: data
+  connection: ConnectionInfo    # API endpoint
+  can_cast_to: string[]?        # devices this source can direct playback to
+                                # (Spotify can cast to any Spotify Connect device,
+                                #  Jellyfin can cast to DLNA renderers, etc.)
+
+DiscoveryConfig:
+  protocol: string              # "mdns", "upnp_ssdp", "bluetooth"
+  service_type: string?         # "_spotify-connect._tcp", "_raop._tcp",
+                                # "_googlecast._tcp", "urn:schemas-upnp-org:device:MediaRenderer:1"
+  instance_name: string?        # advertised name ("Living Room Speakers")
+
+PlaybackState:
+  state: string                 # "playing", "paused", "stopped", "buffering"
+  track: TrackInfo?
+  position_ms: uint?
+  duration_ms: uint?
+  volume: float?                # 0.0–1.0 (service-level volume, independent of Ozma volume)
+  source: string?               # who's sending ("matt's phone", "desktop app")
+
+TrackInfo:
+  title: string?
+  artist: string?
+  album: string?
+  art_url: string?              # album art URL (for screen endpoints, dashboard)
+  genre: string?
+  codec: string?                # source codec ("ogg_vorbis", "aac", "flac", "mqa")
+  sample_rate: uint?            # source sample rate (if known)
+  bit_depth: uint?              # source bit depth (if known)
+  lossy: bool?                  # is the source lossy?
+```
+
+**Why media receivers are in the routing graph**:
+
+A Spotify Connect receiver isn't just a service — it's an audio source in
+the routing graph with a PipeWire port. The router needs to know about it
+because:
+
+1. **It produces audio that enters the mix bus.** When Spotify plays, its
+   audio competes for the desk speakers with KVM node audio. The mix bus
+   (§2.13) handles summing, but the router needs to know the source exists.
+
+2. **It has format properties.** Spotify outputs Ogg Vorbis 320kbps (lossy).
+   Tidal can output FLAC (lossless) or MQA. The `fidelity_audio` intent
+   would reject a Spotify source but accept Tidal FLAC — this is format
+   negotiation.
+
+3. **It can be routed to multiple outputs.** Spotify playing on the
+   controller can be sent to desk speakers + AirPlay living room +
+   VBAN to kitchen — this is fan-out from one source to multiple sinks
+   via audio output targets.
+
+4. **Metadata feeds screen endpoints.** Track info and album art from
+   `metadata` port → Stream Deck key images, OLED status display,
+   dashboard now-playing widget. This is a `data` pipeline from the
+   media receiver to screen sinks.
+
+5. **Intent bindings react to playback state.** "When Spotify starts
+   playing, switch to music intent (lower KVM audio, enable room
+   correction, set RGB to ambient mode)" — the `PlaybackState` is a
+   condition source for intent bindings (§8.7).
+
+**Casting model**:
+
+Some services can direct playback to a specific device — Spotify Connect,
+AirPlay, Chromecast. This is a **control path** (§2.12) operation: the
+controller tells the service "play through this receiver". The audio then
+appears at that receiver's PipeWire port. The `can_cast_to` field on
+MediaSourceDevice indicates which receivers a source can target.
+
+This is distinct from Ozma's own audio routing. Spotify casting routes
+within Spotify's infrastructure; Ozma routing happens after the audio
+reaches PipeWire. Both can coexist — Spotify casts to the controller's
+Spotify Connect receiver, then Ozma routes the PipeWire output to
+multiple speakers via its own transport plugins.
 
 #### Network switches and routers
 
