@@ -6826,25 +6826,98 @@ GpuSpec:
   driver_version: string?       # currently installed driver
 
 GpuCodecCapability:
-  engine: string?               # "nvenc", "vcn", "qsv", "videotoolbox", "vaapi"
-  max_sessions: uint?           # simultaneous encode/decode sessions
+  engine: string?               # "nvenc", "vcn", "qsv", "videotoolbox", "vaapi",
+                                # "rkmpp", "v4l2m2m"
+  max_encode_sessions: uint?    # simultaneous encode sessions
+  max_decode_sessions: uint?    # simultaneous decode sessions (often unlimited)
+  max_total_sessions: uint?     # combined encode+decode limit (if shared engine)
+  session_limit_source: string? # "hardware", "driver" (NVIDIA consumer = driver-limited)
+  independent_engines: bool?    # can encode and decode run simultaneously without contention?
+  shared_with: string[]?        # other subsystems sharing this engine ("npu", "vpp", "jpeg")
   codecs: GpuCodecDetail[]?
 
 GpuCodecDetail:
-  codec: string                 # "h264", "h265", "av1", "vp9", "jpeg"
+  codec: string                 # "h264", "h265", "av1", "vp9", "vp8", "jpeg", "mpeg2"
+  direction: string             # "encode", "decode", "both"
   max_resolution: Resolution?
   max_framerate: float?         # at max resolution
-  profiles: string[]?           # ["main", "high", "main10"]
-  b_frames: bool?               # B-frame support
-  lookahead: bool?              # lookahead support
+  max_framerate_at_1080p: float? # many encoders handle higher fps at lower res
+  max_framerate_at_4k: float?
+  profiles: string[]?           # ["main", "high", "main10", "main_444"]
+  bit_depth: uint[]?            # [8, 10, 12]
+  chroma: string[]?             # ["4:2:0", "4:2:2", "4:4:4"]
+  b_frames: bool?               # B-frame support (encode only)
+  lookahead: bool?              # lookahead support (encode only)
   max_bitrate_mbps: float?
-  latency_ms: float?            # typical encode latency
+  latency_ms: float?            # typical encode/decode latency at default settings
+  low_latency_mode: bool?       # supports ultra-low-latency mode (disables B-frames, lookahead)
+  low_latency_ms: float?        # latency in low-latency mode
+  quality_presets: string[]?    # ["p1_fastest", "p4_medium", "p7_slowest"] (NVENC)
+                                # or ["speed", "balanced", "quality"] (QSV/VCN)
+  session_limit_override: uint? # per-codec session limit (if different from engine max)
 ```
 
-This is how the router knows that an RTX 4080 has 3 NVENC sessions available
-and can encode H.265 4K60 with ~3ms latency, while an Intel Arc A380 has 2
-QSV sessions with different codec support. The `gpu` block on a device database
-entry feeds directly into the codec plugin's capability enumeration (§6.3).
+**Encode/decode session limits in practice**:
+
+| GPU | Engine | Max encode | Max decode | Limit type | Notes |
+|-----|--------|-----------|-----------|-----------|-------|
+| NVIDIA GeForce (consumer) | NVENC | 3 | Unlimited | Driver | Patched drivers remove the cap |
+| NVIDIA Quadro/A-series (pro) | NVENC | Unlimited | Unlimited | Hardware | Same silicon, no driver cap |
+| NVIDIA (any) + NVDEC | NVDEC | — | Unlimited | Hardware | Decode is separate engine |
+| AMD RX 7000 | VCN 4.0 | 4 | Unlimited | Hardware | Per-engine, some SKUs have 2 VCN engines |
+| Intel Arc | Xe media engine | Unlimited | Unlimited | Hardware | AV1 encode at hardware speed |
+| Intel iGPU (12th+ gen) | Quick Sync | Unlimited | Unlimited | Hardware | Independent of dGPU |
+| Apple M-series | VideoToolbox | 4–8 | Unlimited | Hardware | Varies by chip; media engine shared with ProRes |
+| Rockchip RK3588 | MPP | 4 | 8 | Hardware | Separate encode/decode engines |
+
+**iGPU + dGPU simultaneously**: On a system with both an Intel iGPU (Quick
+Sync) and an NVIDIA dGPU (NVENC), both encode engines are available
+independently. The router can use Quick Sync for one encode job and NVENC
+for another, doubling the total encode capacity. The `gpu` block on the CPU
+entry (§15 `CpuSpec.igpu`) and the discrete GPU entry both contribute
+encode capabilities to the same machine's codec pool.
+
+**CPU software encoding** (not GPU — but part of the same codec pool):
+
+Software encoders (x264, x265, SVT-AV1, libvpx) run on CPU cores. They
+don't have session limits — they're limited by CPU capacity (§2.7). The
+codec plugin (§6.3) models them as `software_codec` devices with resource
+costs:
+
+| Encoder | Resolution | CPU cost (typical) | Latency | Quality vs HW |
+|---------|-----------|-------------------|---------|---------------|
+| x264 (ultrafast) | 1080p30 | 10–20% (4-core) | 5–10ms | Lower |
+| x264 (medium) | 1080p30 | 30–50% (4-core) | 20–40ms | Higher |
+| x265 (ultrafast) | 1080p30 | 20–40% (4-core) | 10–20ms | Lower |
+| SVT-AV1 (preset 10) | 1080p30 | 15–30% (4-core) | 10–20ms | Good |
+| SVT-AV1 (preset 4) | 1080p30 | 60–90% (4-core) | 50–100ms | Excellent |
+
+The router selects between hardware and software encoding based on the
+intent, available hardware sessions, and CPU headroom. `gaming` intent
+prefers hardware (low latency). `broadcast` intent may prefer software at
+a slower preset (higher quality, latency doesn't matter). If all NVENC
+sessions are in use, the router falls back to CPU encoding — and accounts
+for the CPU resource cost (§2.7).
+
+**NPU/media engine contention**: On some platforms, the video encode engine
+shares silicon with other subsystems:
+
+| Platform | Shared between | Impact |
+|----------|---------------|--------|
+| Intel (12th+ gen) | Quick Sync + AI inference (OpenVINO) | Heavy AI workload reduces encode throughput |
+| AMD APU (Ryzen AI) | VCN + XDNA NPU | Encode and NPU inference may contend for memory bandwidth |
+| Apple M-series | VideoToolbox + ProRes + Neural Engine | ProRes encode/decode shares media engine time |
+| Rockchip RK3588 | MPP + RKNN NPU | Separate engines but shared memory bus |
+
+The `shared_with` field on `GpuCodecCapability` expresses this. When the
+router knows that Quick Sync shares resources with OpenVINO inference, it
+can predict that running Frigate AI detection (on the same iGPU) will
+reduce available encode performance — and route encoding to the dGPU or
+CPU instead.
+
+This feeds directly into the codec plugin (§6.3) and the cost model (§8.1) —
+the router treats each encode session as a resource on the device, with
+known capacity limits and contention with other subsystems.
 
 **DisplayEngineSpec** — the internal display pipeline that determines which
 combinations of outputs actually work simultaneously:
