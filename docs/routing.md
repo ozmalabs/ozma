@@ -3864,6 +3864,108 @@ TransportPlugin:
     # (e.g., USB hotplug, network interface up/down)
 ```
 
+#### Multiplexed connections
+
+Inspired by SSH's channel model, a single transport connection between two
+devices can carry multiple typed channels simultaneously. Rather than
+opening separate connections for HID, audio, video, and control (4
+handshakes, 4 keepalive loops, 4 failure modes), a multiplexed connection
+provides one authenticated, encrypted tunnel with independent channels
+inside.
+
+```yaml
+MultiplexedConnection:
+  id: string
+  transport: string             # underlying transport ("udp-aead", "wireguard", etc.)
+  local: DeviceRef              # this end
+  remote: DeviceRef             # other end
+  state: string                 # "establishing", "active", "rekeying", "draining", "closed"
+  channels: Channel[]           # active channels on this connection
+  session: SessionState         # encryption session (keys, counters, rekey schedule)
+  keepalive: KeepaliveConfig    # connection health monitoring
+  shared_by: PipelineRef[]      # which pipelines share this connection
+
+Channel:
+  id: uint                      # channel number (unique within connection)
+  type: string                  # media type this channel carries
+  name: string                  # human-readable ("hid", "audio-vban", "video-h264", "control")
+  priority: ChannelPriority     # scheduling priority
+  flow_control: FlowControl     # per-channel flow management
+  state: string                 # "open", "half_closed", "closed"
+  format: Format?               # negotiated format on this channel
+  stats: ChannelStats           # per-channel metrics
+
+ChannelPriority: enum
+  realtime                      # HID, control commands — never delayed, tiny packets
+  high                          # audio — low latency, moderate bandwidth
+  normal                        # video — high bandwidth, can tolerate brief delays
+  low                           # sensors, RGB, screen updates — best effort
+  bulk                          # file transfer, firmware upload — use remaining bandwidth
+
+FlowControl:
+  window_bytes: uint?           # per-channel receive window (backpressure)
+  max_packet_size: uint?        # maximum payload per packet on this channel
+  rate_limit_bps: uint64?       # optional rate cap on this channel
+```
+
+**Priority scheduling**: When the underlying transport has limited bandwidth
+(WiFi, WireGuard over internet, serial), the connection multiplexer ensures
+`realtime` channels (HID) are never starved by `normal` channels (video).
+A keypress is 8 bytes and must go out immediately; a video frame is 50 KB
+and can wait one packet slot. This is strict priority: higher priority
+channels are always serviced first. Within the same priority, round-robin.
+
+On high-bandwidth transports (wired Gigabit LAN), priority scheduling is
+irrelevant — there's enough bandwidth for everything simultaneously. The
+multiplexer detects this and skips the scheduling overhead.
+
+**Session rekeying**: Long-lived connections (a node that's been connected
+for weeks) rotate encryption keys periodically without dropping the
+connection. Default: rekey every 1 GB of data or every 1 hour, whichever
+comes first. During rekeying, data continues to flow — the old keys are
+used until the new keys are established, then traffic switches atomically.
+
+```yaml
+RekeyPolicy:
+  max_bytes: uint64             # rekey after this many bytes (default: 1 GB)
+  max_seconds: uint             # rekey after this many seconds (default: 3600)
+  algorithm: string             # key exchange algorithm ("noise_xx", "noise_nk")
+```
+
+**Connection sharing**: Multiple pipelines between the same pair of devices
+share a single multiplexed connection. Opening a video pipeline to a node
+that already has an HID pipeline reuses the existing connection and adds a
+video channel. Closing the video pipeline removes the channel but keeps the
+connection alive for HID. The connection is torn down only when the last
+channel closes (or on keepalive failure).
+
+**Subsystem advertisement**: When a connection is established, each side
+advertises which channel types it supports:
+
+```yaml
+SubsystemAdvertisement:
+  supported: SubsystemCapability[]
+
+SubsystemCapability:
+  name: string                  # "hid", "audio", "video", "control", "sensors",
+                                # "rgb", "screen", "serial_console", "file_transfer"
+  formats: FormatSet            # what formats this subsystem accepts/produces
+  max_channels: uint?           # maximum simultaneous channels of this type
+```
+
+The controller opens only the subsystems it needs. A node with no capture
+card doesn't advertise `video`. A display-only node advertises `screen` but
+not `hid`. This is capability negotiation at the connection level — before
+any pipeline is assembled.
+
+**Relationship to the transport plugin interface**: Multiplexing is an
+optional capability of a transport plugin. Transports that support it
+expose channels; transports that don't (e.g., a raw serial link, a VBAN
+UDP stream) carry a single data type per link as before. The `open()`
+method on the transport plugin returns either a simple `StreamHandle` or
+a `MultiplexedConnection` with channel management methods. The router
+adapts to whichever the transport provides.
+
 **TransportCharacteristics** — baseline expectations before any measurement:
 
 ```yaml
