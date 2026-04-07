@@ -6213,6 +6213,7 @@ DeviceEntry:
   case_component: CaseSpec?     # PC case (fan slots, drive bays, radiator support)
   pcie: PcieCardSpec?           # PCIe add-in cards (NICs, capture cards, USB controllers, sound cards)
   cable: CableSpec?             # cables that affect signal quality (HDMI, DP, USB, Ethernet)
+  adapter: AdapterSpec?         # adapters, risers, converters that bridge between interface types
 
   # Peripherals and input
   keyboard: KeyboardSpec?
@@ -7502,6 +7503,106 @@ don't have VID/PIDs). But USB-C emarked cables report their capabilities via
 the USB PD CC line, which the agent can read. HDMI 2.1 cables with
 48 Gbps certification are detectable via EDID/SCDC. For everything else,
 the router infers cable quality from the measured vs expected performance gap.
+
+**AdapterSpec** (adapters, risers, and converters that bridge interface types):
+
+Adapters change the physical form factor and often constrain the electrical
+capabilities. They sit in the graph as devices with an input port and an
+output port (or multiple), with the adapter's constraints applied as
+internal link properties.
+
+```yaml
+AdapterSpec:
+  adapter_type: string          # type of adaptation (see table below)
+  input: AdapterPort            # what this adapter plugs into
+  output: AdapterPort           # what this adapter exposes
+  signal_conversion: bool       # does this adapter convert the signal? (active)
+                                # or just change the physical connector? (passive)
+  max_generation: uint?         # maximum PCIe generation supported (for PCIe adapters)
+  max_lanes: uint?              # maximum electrical lanes passed through
+  bandwidth_limit_gbps: float?  # if the adapter constrains bandwidth below the interface max
+  signal_integrity: string?     # "transparent", "minor_degradation", "retimed"
+  power_passthrough: bool?      # does it pass power (e.g., USB-C PD passthrough)
+  power_limit_w: float?         # maximum power passthrough if limited
+  active: bool?                 # active adapter (has electronics, may need power)
+  chipset: string?              # conversion chipset (for active adapters)
+  additional_ports: PhysicalPort[]?  # extra ports on the adapter (e.g., USB hub on a USB-C dock adapter)
+
+AdapterPort:
+  connector: string             # physical connector type (from §15 connector table)
+  interface: string             # electrical interface ("pcie_x4", "usb3_10gbps",
+                                # "dp_1.4", "hdmi_2.0", "m2_m_key", "sata")
+  gender: string?               # "male" (plug), "female" (socket)
+```
+
+**Common adapter types and their constraints**:
+
+| Adapter | Input | Output | Electrical | Key constraint |
+|---------|-------|--------|-----------|---------------|
+| PCIe riser (vertical GPU mount) | x16 male | x16 female | x16 passthrough | Signal integrity — Gen 4/5 need shielded riser. Cheap risers may force Gen 3 negotiation. |
+| M.2 to PCIe x16 card | M.2 M-key | x16 physical (x4 electrical) | x4 passthrough | Looks like x16 slot but is x4. GPU will fit but run at x4 speed. |
+| PCIe x1 to x16 riser (mining style) | x1 male | x16 female | x1 only | USB cable between halves — x1 bandwidth (1 GB/s Gen 3). For capture cards, not GPUs. |
+| M.2 to U.2 | M.2 M-key | U.2 (SFF-8639) | x4 passthrough | For enterprise NVMe drives. Transparent. |
+| M.2 to SATA | M.2 B+M key | SATA data + power | SATA only | Only works with M.2 SATA drives, not NVMe. Common confusion. |
+| USB-C to HDMI (passive) | USB-C male | HDMI female | DP Alt Mode → HDMI | Limited to HDMI 2.0 (18 Gbps) on most passive adapters. No 4K120. |
+| USB-C to HDMI (active) | USB-C male | HDMI female | DP → HDMI conversion | Active chipset enables HDMI 2.1. Some support 4K120. |
+| USB-C to DP | USB-C male | DP female | DP Alt Mode passthrough | Transparent if enough DP lanes allocated. 2-lane = half bandwidth. |
+| USB-C multiport (hub adapter) | USB-C male | HDMI + USB-A + Ethernet + PD | Splits USB-C bandwidth | Video + USB data + Ethernet share the USB-C link. Internal topology matters (§15 DockSpec). |
+| DP to HDMI (passive) | DP male | HDMI female | DP++ → HDMI | DP++ single-link only — max 4K30 or 1080p120. |
+| DP to HDMI (active) | DP male | HDMI female | Signal conversion | Active chipset. Can do 4K60+ depending on chipset. |
+| HDMI to DP | HDMI male | DP female | Signal conversion | Always active — HDMI→DP requires a converter chip. No passive option. |
+| HDMI to VGA | HDMI male | VGA female | Digital → analog | Active — DAC conversion. Max 1080p60. Audio lost (VGA is video only). |
+| DVI to HDMI | DVI male | HDMI female | Pin-compatible | Passive — DVI-D and HDMI are electrically compatible. No audio over DVI. |
+| Thunderbolt dock | TB male | Multiple | PCIe + DP tunneled | Full DockSpec (§15) — internal topology, USB hub chipset, DP MST, etc. |
+| USB-A to USB-C | USB-A male | USB-C female | USB data + limited power | USB 3.x data. No DP Alt Mode, no PD negotiation, max 5V/0.9A power. |
+
+**Adapters in the routing graph**: An adapter is modelled as a device with
+an input port (what it plugs into) and one or more output ports (what it
+exposes). The internal link between them carries the adapter's constraints:
+
+```
+GPU → [PCIe riser cable] → Motherboard x16 slot
+      ↑
+      Device: "pcie_riser_1"
+      Input port: x16 female (from GPU)
+      Output port: x16 male (to motherboard slot)
+      Internal link: x16 passthrough, Gen 4, signal_integrity: "minor_degradation"
+```
+
+```
+NVMe SSD → [M.2 to PCIe x16 adapter card] → Motherboard x16 slot
+            ↑
+            Device: "m2_to_pcie_adapter_1"
+            Input port: M.2 M-key (from SSD)
+            Output port: x16 physical / x4 electrical (to slot)
+            Internal link: x4 passthrough, Gen 4
+            # Router knows: device in this slot is x4, not x16
+```
+
+```
+Laptop USB-C → [USB-C to HDMI adapter] → Monitor HDMI input
+               ���
+               Device: "usb_c_hdmi_adapter_1"
+               Input port: USB-C male (DP Alt Mode, 2 DP lanes)
+               Output port: HDMI female
+               Internal link: DP→HDMI conversion, max 4K60, HDMI 2.0
+               chipset: "Parade PS176"
+               # Router knows: this path can't do 4K120 — adapter limits it
+```
+
+The router traces through adapters like any other device in the path. When
+it calculates pipeline bandwidth, the adapter's constraints are applied at
+its internal link. "Your USB-C to HDMI adapter limits this path to HDMI 2.0
+(4K60 max). For 4K120, use a direct DisplayPort connection or an active
+USB-C to HDMI 2.1 adapter."
+
+**Detection**: Some adapters are visible to the OS:
+- USB-C display adapters appear as USB devices with VID/PID → device database match
+- PCIe adapters are transparent (the device behind them is visible, the adapter isn't)
+- Risers are invisible — detected by inference (Gen 4 device negotiating Gen 3 = possible riser issue)
+
+For invisible adapters, the user can add them to their setup in the layout
+editor, or the router infers their presence from performance discrepancies.
 
 **Putting it together — a complete virtual PC in the device database**:
 
