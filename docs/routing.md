@@ -5963,17 +5963,69 @@ provides a mechanism for updating devices through the mesh.
 
 ```yaml
 DeviceVersion:
-  component: string             # "controller", "node", "agent", "softnode",
+  # --- Ozma software version (for Ozma-managed components) ---
+  component: string?            # "controller", "node", "agent", "softnode",
                                 # "screen_firmware", "rgb_firmware", "plugin"
-  current_version: SemVer       # currently running version
-  channel: string               # "stable", "beta", "nightly", "pinned"
-  platform: string              # "linux-amd64", "linux-arm64", "linux-riscv64",
+  current_version: SemVer?      # currently running version
+  channel: string?              # "stable", "beta", "nightly", "pinned"
+  platform: string?             # "linux-amd64", "linux-arm64", "linux-riscv64",
                                 # "windows-amd64", "macos-arm64", "esp32", "rp2040"
   build_info: BuildInfo?        # build metadata
   update_state: UpdateState     # current update status
-  protocol_version: string      # ozma protocol version this device speaks ("ozma/0.1")
+  protocol_version: string?     # ozma protocol version this device speaks ("ozma/0.1")
   min_compatible: string?       # minimum controller version this device works with
   max_compatible: string?       # maximum controller version (if known)
+
+  # --- Third-party device firmware (for any device with updateable firmware) ---
+  firmware: FirmwareInfo[]?     # firmware components on this device (may be multiple)
+
+FirmwareInfo:
+  component: string             # what firmware this is
+  current_version: string?      # running firmware version (as reported by device)
+  vendor: string?               # firmware vendor
+  device_type: string?          # LVFS device type / GUID
+  updatable: bool               # can this firmware be updated?
+  update_method: FirmwareUpdateMethod?  # how to update it
+  update_state: UpdateState     # current update status
+  known_issues: FirmwareIssue[]?  # known bugs in current version
+  history: FirmwareVersion[]?   # version history (from device database or LVFS)
+
+FirmwareUpdateMethod:
+  mechanism: string             # "fwupd", "vendor_tool", "usb_dfu", "ota_http",
+                                # "via_qmk", "bluetooth_ota", "serial_flash",
+                                # "bios_flash", "manual_rom", "not_updatable"
+  lvfs: bool                    # available via LVFS (Linux Vendor Firmware Service)
+  lvfs_guid: string?            # LVFS device GUID for update matching
+  vendor_url: string?           # vendor's firmware download page
+  requires: string?             # special requirements ("windows_only", "vendor_app",
+                                # "usb_cable", "bluetooth", "bios_menu")
+  risk: string                  # "safe", "low", "medium", "high", "brick_risk"
+  # "safe" = automatic, reliable rollback (fwupd with capsule update)
+  # "low" = well-tested process, rare failures
+  # "medium" = vendor tool required, some failure reports
+  # "high" = manual process, failure = RMA or recovery mode
+  # "brick_risk" = no recovery if interrupted (some keyboard MCUs, old SSDs)
+
+FirmwareVersion:
+  version: string
+  date: string?                 # release date
+  changelog: string[]?          # what changed
+  known_issues: FirmwareIssue[]?
+  known_fixes: string[]?        # issues fixed in this version
+  lvfs_release: string?         # LVFS release ID (if available)
+  source: string?               # "lvfs", "vendor", "community"
+
+FirmwareIssue:
+  id: string
+  severity: string              # "critical", "major", "minor", "cosmetic"
+  category: string              # subsystem affected
+  summary: string
+  description: string?
+  workaround: string?
+  fixed_in: string?             # firmware version that fixes it
+  cve: string?                  # CVE if security-related
+  affects_ozma: bool?
+  ozma_impact: string?
 
 BuildInfo:
   commit: string?               # git commit hash
@@ -5984,7 +6036,7 @@ BuildInfo:
 
 UpdateState:
   status: up_to_date | update_available | updating | update_failed | unknown
-  available_version: SemVer?    # newest version available (null if up_to_date or unknown)
+  available_version: string?    # newest version available (null if up_to_date or unknown)
   available_channel: string?    # channel of available update
   last_check: timestamp?        # when we last checked for updates
   last_update: timestamp?       # when the device was last updated
@@ -5992,6 +6044,107 @@ UpdateState:
   can_update: bool              # does this device support remote update?
   requires_reboot: bool?        # will the update require a restart?
   rollback_available: bool?     # can this device roll back to previous version?
+```
+
+**What has firmware** — almost everything:
+
+| Device class | Firmware components | Update method | LVFS coverage |
+|-------------|-------------------|---------------|---------------|
+| Motherboard | BIOS/UEFI (see §15 BiosDatabase) | BIOS flash, fwupd capsule | Good (many vendors) |
+| CPU | Microcode | Loaded by OS or BIOS | Via BIOS update |
+| GPU | VBIOS, driver firmware | Vendor tool, fwupd | Partial (some NVIDIA/AMD) |
+| SSD/NVMe | Controller firmware | fwupd, vendor tool | Good (Samsung, WD, Intel, Crucial) |
+| HDD | Controller firmware | Vendor tool | Limited |
+| Thunderbolt dock | Thunderbolt controller FW, USB hub FW, PD controller FW | fwupd, vendor tool | Good (CalDigit, Lenovo, Dell) |
+| USB hub | Hub controller firmware | Vendor tool (rare) | Rare |
+| Monitor | Scaler firmware | OSD menu, USB, vendor app | Rare (Dell via fwupd) |
+| Keyboard (QMK/VIA) | MCU firmware | QMK DFU, VIA | No (community tooling) |
+| Keyboard (vendor) | MCU firmware | Vendor app (iCUE, Synapse, G Hub) | No |
+| Mouse | Sensor + wireless firmware | Vendor app | No |
+| Headset | DSP firmware, Bluetooth firmware | Vendor app | Rare |
+| Webcam | ISP firmware | fwupd, vendor tool | Partial (Logitech) |
+| Network card | NIC firmware | fwupd, ethtool flash | Good (Intel, Mellanox) |
+| WiFi card | WiFi firmware | fwupd, kernel firmware | Good (Intel) |
+| Bluetooth adapter | BT firmware | fwupd, kernel firmware | Partial |
+| WLED controller | ESP firmware | OTA HTTP | No (Ozma manages directly) |
+| Stream Deck | MCU firmware | Elgato app, fwupd | Partial |
+| Printer | Controller firmware | Vendor tool | Partial (HP, Lexmark) |
+| UPS | Controller firmware | NUT, vendor tool | Rare |
+| Smart PSU | Controller firmware | Vendor app (Corsair Link, etc.) | No |
+| USB-C PD controller | PD firmware | fwupd | Partial (TI, Cypress/Infineon) |
+
+**LVFS / fwupd integration**:
+
+LVFS (Linux Vendor Firmware Service) is the primary data source for
+third-party firmware versions and updates. `fwupd` is the client that
+reads from LVFS and applies updates.
+
+```yaml
+LvfsIntegration:
+  # The controller/agent queries fwupd for firmware state of all devices
+  discovery: string             # "fwupdmgr get-devices" — lists all fwupd-visible devices
+                                # with current version, update availability, and GUID
+  update_check: string          # "fwupdmgr get-updates" — available updates from LVFS
+  history: string               # "fwupdmgr get-history" — past update attempts + results
+
+  # Mapping to the routing graph:
+  # For each fwupd device:
+  #   1. Match to graph device via USB VID/PID, PCI ID, or device path
+  #   2. Populate FirmwareInfo.current_version from fwupd
+  #   3. Populate FirmwareInfo.update_state from LVFS metadata
+  #   4. Populate FirmwareInfo.known_issues from device database
+  #   5. Cross-reference with device database for Ozma-specific impact
+```
+
+On Linux, fwupd is the primary mechanism. On Windows, the agent queries
+Windows Update for driver/firmware versions and checks vendor APIs where
+available. On macOS, `system_profiler` provides firmware versions for
+Apple hardware and some third-party devices.
+
+**Firmware as a routing concern**:
+
+Firmware versions affect device capabilities and reliability. The routing
+graph needs to know about firmware because:
+
+1. **Known bugs affect routing quality**: A Thunderbolt dock with firmware
+   v1.2 has a known USB dropout bug. The router marks the dock's links as
+   lower reliability until firmware is updated.
+
+2. **New firmware enables new capabilities**: A monitor firmware update adds
+   VRR support. A NIC firmware update enables 2.5GbE on hardware that
+   previously only ran at 1GbE. The device database tracks which capabilities
+   require which firmware version.
+
+3. **Security vulnerabilities**: Firmware CVEs (Thunderbolt Spy, SSD
+   encryption bypass, NIC remote code execution) should be surfaced. The
+   agent detects the firmware version, the database flags the CVE, the
+   dashboard shows the warning.
+
+4. **Fleet firmware management**: For managed deployments, firmware versions
+   across all devices in the fleet should be visible. "3 of 8 docks are
+   running firmware with a known USB bug — update them." This is the same
+   fleet version management as §14.3 but for third-party devices.
+
+**Firmware observability**:
+
+```
+GET /api/v1/firmware/devices             # all devices with firmware info
+GET /api/v1/firmware/devices/{id}        # firmware detail for one device
+GET /api/v1/firmware/updates-available   # all devices with pending firmware updates
+GET /api/v1/firmware/issues              # all known firmware issues affecting current fleet
+GET /api/v1/firmware/history             # firmware update history
+POST /api/v1/firmware/check              # trigger firmware update check (fwupd refresh)
+POST /api/v1/firmware/update/{id}        # apply firmware update (if safe + user approves)
+```
+
+**Events**:
+
+```
+firmware.update_available       # new firmware detected for a device
+firmware.update_applied         # firmware successfully updated
+firmware.update_failed          # firmware update failed
+firmware.issue_detected         # known issue affects a device's current firmware
+firmware.security_advisory      # CVE affects a device's firmware
 ```
 
 ### 14.2 Version in the routing graph
