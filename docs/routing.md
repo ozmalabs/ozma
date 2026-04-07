@@ -6465,35 +6465,281 @@ CaptureSpec:
 
 ```yaml
 DisplaySpec:
-  panel_type: string?           # "ips", "va", "tn", "oled", "mini_led"
+  # --- Panel ---
+  panel_type: string?           # "ips", "va", "tn", "oled", "mini_led", "micro_led", "qd_oled"
   size_inches: float?
-  aspect_ratio: string?         # "16:9", "21:9", "32:9", "16:10"
+  aspect_ratio: string?         # "16:9", "21:9", "32:9", "16:10", "4:3", "3:2"
   native_resolution: Resolution?
   max_refresh: float?
-  hdr: string?                  # "hdr400", "hdr600", "hdr1000", "dolby_vision"
-  color_gamut: string?          # "srgb_100", "dci_p3_95", "adobe_rgb_99"
+  hdr: string?                  # "hdr400", "hdr600", "hdr1000", "hdr1400", "dolby_vision",
+                                # "hdr10", "hdr10_plus"
+  color_gamut: string?          # "srgb_100", "dci_p3_95", "adobe_rgb_99", "bt2020_80"
+  color_depth_bits: uint?       # panel bit depth (8, 10, 12)
+  frc: bool?                    # frame rate control (8-bit+FRC ≠ true 10-bit)
   response_time_ms: float?      # GtG
-  inputs: DisplayInput[]?
-  speakers: bool?
-  usb_hub: HubSpec?             # built-in USB hub
-  ddc_ci: DdcCapabilities?      # DDC/CI feature support
-  bezel_mm: { top: float, bottom: float, left: float, right: float }?
-  vesa: string?                 # "75x75", "100x100", "200x200"
-  curve_radius_mm: uint?        # for curved panels
+  black_frame_insertion: bool?
+  vrr: VrrSpec?                 # variable refresh rate support
+
+  # --- Physical ---
+  bezel_mm: BezelSpec?
+  active_area_mm: Dimensions?   # actual screen area (w, h)
+  weight_kg: float?             # panel weight (without stand)
+  weight_with_stand_kg: float?
+  vesa: string?                 # "75x75", "100x100", "200x200", "300x300"
+  curve_radius_mm: uint?        # for curved panels (1000R, 1800R, etc.)
+  pivot: bool?                  # can rotate to portrait
+  tilt_range_deg: { min: float, max: float }?
+  height_adjust_mm: float?      # height adjustment range
+  swivel_range_deg: float?
+
+  # --- Inputs (the monitor's port topology) ---
+  inputs: DisplayInput[]
+  active_input: uint?           # currently selected input (if known)
+
+  # --- Built-in features (monitor as compound device) ---
+  speakers: DisplaySpeakerSpec?       # built-in speakers (not just bool)
+  usb_hub: HubSpec?                   # built-in USB hub
+  kvm_switch: DisplayKvmSpec?         # built-in KVM switch
+  usb_c_power_delivery: UsbPdSpec?    # USB-C upstream power delivery
+  microphone: bool?                   # built-in microphone
+  webcam: bool?                       # built-in camera
+  ambient_light_sensor: bool?         # auto-brightness sensor
+  proximity_sensor: bool?             # presence detection
+  pip_pbp: PipPbpSpec?                # picture-in-picture / picture-by-picture
+
+  # --- Control methods ---
+  control: DisplayControlSpec
+
+VrrSpec:
+  type: string?                 # "freesync", "freesync_premium", "freesync_premium_pro",
+                                # "gsync", "gsync_compatible", "gsync_ultimate", "adaptive_sync"
+  range_hz: { min: float, max: float }?  # VRR frequency range (e.g., 48–165 Hz)
+  lfc: bool?                    # low framerate compensation
+
+BezelSpec:
+  top_mm: float?
+  bottom_mm: float?
+  left_mm: float?
+  right_mm: float?
+  uniform: bool?                # all bezels same width (for tiling calculations)
 
 DisplayInput:
-  connector: string             # "hdmi", "dp", "usb_c", "vga", "dvi"
-  version: string?              # "hdmi_2.1", "dp_1.4"
-  arc: bool?                    # HDMI ARC/eARC support
-  input_number: uint?           # physical input number (for DDC/CI switching)
+  id: string                    # unique input identifier ("hdmi_1", "dp_1", "usb_c_1")
+  connector: string             # "hdmi", "dp", "mini_dp", "usb_c", "vga", "dvi_d", "dvi_i"
+  version: string?              # "hdmi_1.4", "hdmi_2.0", "hdmi_2.1", "dp_1.2", "dp_1.4", "dp_2.1"
+  max_resolution: Resolution?   # maximum resolution on this specific input
+  max_refresh: float?           # maximum refresh on this input (may differ per input)
+  max_bandwidth_gbps: float?    # maximum link bandwidth (HDMI 2.1 = 48 Gbps, DP 1.4 = 32.4 Gbps)
+  hdr_supported: bool?          # HDR on this input
+  hdcp: string?                 # "hdcp_1.4", "hdcp_2.2", "hdcp_2.3"
+  arc: bool?                    # HDMI ARC support
+  earc: bool?                   # HDMI eARC support
+  cec: bool?                    # HDMI CEC support on this input
+  dsc: bool?                    # Display Stream Compression (enables higher res/refresh)
+  input_number: uint?           # OSD/DDC input number (for input switching commands)
+  usb_c_features: UsbCDisplayFeatures?  # if USB-C: what else this port carries
+  physical: PhysicalPortInfo?   # where on the monitor body
 
-DdcCapabilities:
-  brightness: bool?
-  contrast: bool?
-  volume: bool?
-  input_select: bool?
-  power: bool?
-  osd_language: bool?
+UsbCDisplayFeatures:
+  dp_alt_mode: bool?            # carries DisplayPort Alt Mode
+  dp_version: string?           # "dp_1.4", "dp_2.0"
+  usb_data: bool?               # carries USB data (to built-in hub)
+  usb_data_speed: string?       # "usb2", "usb3_5gbps", "usb3_10gbps"
+  power_delivery_w: float?      # watts delivered upstream to connected device
+  pd_spec: UsbPdSpec?           # full PD negotiation capabilities
+  # A single USB-C port on a monitor might carry: DP 1.4 video + USB 3.0 data
+  # to the built-in hub + 90W PD charging. The spec captures all of this.
+
+DisplaySpeakerSpec:
+  count: uint?                  # number of speakers (typically 2)
+  power_watts: float?           # per-speaker or total power
+  frequency_response: FrequencyResponse?  # if known
+  volume_control: string?       # "ddc_ci", "osd_only", "none"
+  # Built-in monitor speakers are audio sinks in the routing graph.
+  # They can receive audio via HDMI/DP embedded audio, ARC, or USB audio.
+
+DisplayKvmSpec:
+  # Many monitors have a built-in KVM switch — they switch their USB hub's
+  # upstream between multiple inputs. When you select HDMI 1, the USB hub
+  # connects to the PC on HDMI 1. Select HDMI 2, USB hub switches to PC 2.
+  # This is a switch device (§2.5) embedded inside the monitor.
+  type: string                  # "auto" (follows video input), "manual" (separate button),
+                                # "hotkey" (keyboard shortcut), "none"
+  usb_upstream_ports: uint?     # number of USB-B/USB-C upstream connections
+  auto_follows_input: bool?     # KVM switches when video input switches
+  independent_switching: bool?  # KVM can be switched independently of video input
+  controllable: bool?           # can the KVM be switched via DDC/CI or USB command
+  # The monitor's built-in KVM is modelled as a switch (§2.5) with
+  # controllability derived from this spec. If controllable, the router
+  # can switch the monitor's KVM as part of pipeline activation.
+
+PipPbpSpec:
+  pip: bool?                    # picture-in-picture support
+  pbp: bool?                    # picture-by-picture (side-by-side)
+  max_sources: uint?            # how many simultaneous inputs (typically 2–4)
+  controllable: bool?           # can PIP/PBP be controlled via DDC/CI
+  pip_sizes: string[]?          # ["small", "medium", "large"]
+  pbp_layouts: string[]?        # ["50_50", "70_30", "triple"]
+
+DisplayControlSpec:
+  # How the monitor can be controlled — this determines the control path (§2.12)
+  methods: DisplayControlMethod[]
+  osd_lockout: bool?            # can the OSD be locked via DDC/CI (prevent physical tampering)
+
+DisplayControlMethod:
+  type: string                  # control method type (see table below)
+  capabilities: string[]        # what can be controlled via this method
+  bidirectional: bool           # can we read state back?
+  notes: string?
+
+# Control method types:
+#
+# | Method | Bidirectional | Typical capabilities | Notes |
+# |--------|--------------|---------------------|-------|
+# | ddc_ci | Yes (read+write) | brightness, contrast, input, volume, power, color temp, OSD lock | Primary electronic control. Via I2C over display cable. Only works from the connected PC. |
+# | osd_buttons | No (write only, no feedback) | everything (via menu navigation) | Physical buttons on monitor. Manual only. |
+# | osd_joystick | No | everything (via menu) | Joystick/nub on monitor. Manual only. |
+# | ir_remote | No (write only) | input, volume, power, brightness, PIP/PBP | IR remote control. Some monitors include one. Write-only. |
+# | usb_control | Yes | brightness, input, KVM, firmware update | Vendor-specific USB HID commands. Monitor-specific driver needed. |
+# | cec | Yes (HDMI CEC) | power, input, volume, OSD | Via HDMI CEC (pin 13). Only on HDMI inputs. |
+# | network | Yes (IP) | everything | Smart monitors with IP management (enterprise, digital signage). Rare. |
+# | bluetooth | Varies | power, input, settings | Some Samsung/LG monitors. Vendor app required. |
+# | vendor_app | Varies | everything | Desktop app (Dell Display Manager, LG OnScreen Control, Samsung Easy Setting Box). Runs on connected PC. |
+```
+
+**Example — a modern 27" monitor as a compound device in the database**:
+
+```yaml
+id: "dell-u2723qe"
+type: display
+name: "Dell U2723QE"
+vendor: "Dell"
+display:
+  panel_type: "ips"
+  size_inches: 27
+  aspect_ratio: "16:9"
+  native_resolution: { w: 3840, h: 2160 }
+  max_refresh: 60
+  hdr: "hdr400"
+  color_gamut: "dci_p3_98"
+  color_depth_bits: 10
+  frc: false
+
+  inputs:
+    - id: hdmi_1
+      connector: hdmi
+      version: "hdmi_2.0"
+      max_resolution: { w: 3840, h: 2160 }
+      max_refresh: 60
+      hdcp: "hdcp_2.2"
+      input_number: 1
+      physical: { position: { face: rear, row: 0, column: 0 } }
+
+    - id: dp_1
+      connector: dp
+      version: "dp_1.4"
+      max_resolution: { w: 3840, h: 2160 }
+      max_refresh: 60
+      dsc: true
+      hdcp: "hdcp_2.2"
+      input_number: 2
+      physical: { position: { face: rear, row: 0, column: 1 } }
+
+    - id: usb_c_1
+      connector: usb_c
+      version: "dp_1.4"
+      max_resolution: { w: 3840, h: 2160 }
+      max_refresh: 60
+      dsc: true
+      input_number: 3
+      usb_c_features:
+        dp_alt_mode: true
+        dp_version: "dp_1.4"
+        usb_data: true
+        usb_data_speed: "usb3_10gbps"
+        power_delivery_w: 90
+      physical: { position: { face: rear, row: 0, column: 2 } }
+
+  speakers:
+    count: 2
+    power_watts: 5
+
+  usb_hub:
+    ports:
+      - { id: "usb_a_1", speed: "usb3_10gbps", type: "type_a" }
+      - { id: "usb_a_2", speed: "usb3_10gbps", type: "type_a" }
+      - { id: "usb_a_3", speed: "usb3_5gbps", type: "type_a" }
+      - { id: "usb_c_downstream", speed: "usb3_10gbps", type: "type_c" }
+    upstream_speed: "usb3_10gbps"
+    # Hub upstream connects to whichever USB-C/USB-B upstream is active
+
+  kvm_switch:
+    type: "auto"
+    usb_upstream_ports: 2           # USB-C input + USB-B upstream
+    auto_follows_input: true        # USB follows video input
+    independent_switching: false
+    controllable: true              # via DDC/CI custom command
+
+  usb_c_power_delivery:
+    source_pdos:
+      - { type: "fixed", voltage_v: 5, current_ma: 3000 }
+      - { type: "fixed", voltage_v: 9, current_ma: 3000 }
+      - { type: "fixed", voltage_v: 15, current_ma: 3000 }
+      - { type: "fixed", voltage_v: 20, current_ma: 4500 }  # 90W
+
+  control:
+    methods:
+      - type: ddc_ci
+        capabilities: ["brightness", "contrast", "input_select", "volume", "power",
+                       "color_temp", "kvm_switch"]
+        bidirectional: true
+      - type: osd_joystick
+        capabilities: ["everything"]
+        bidirectional: false
+      - type: vendor_app
+        capabilities: ["everything", "firmware_update", "window_layout"]
+        bidirectional: true
+        notes: "Dell Display Manager 2.0 (DDM)"
+
+  bezel_mm: { top: 7.5, bottom: 7.5, left: 7.5, right: 7.5, uniform: true }
+  vesa: "100x100"
+  pivot: true
+  tilt_range_deg: { min: -5, max: 21 }
+  height_adjust_mm: 150
+  swivel_range_deg: 45
+```
+
+**Why this level of detail matters**:
+
+1. **Input switching**: The router knows this monitor has HDMI, DP, and USB-C
+   inputs, each with different capabilities (USB-C carries USB data + 90W PD,
+   HDMI doesn't). When switching scenarios, the router can command input
+   switching via DDC/CI as part of pipeline activation.
+
+2. **Built-in KVM**: The monitor's USB hub follows the video input — when Ozma
+   switches the monitor to HDMI 1 (connected to PC A), the USB hub also
+   switches. The router knows this and doesn't need to switch the USB hub
+   separately. This is modelled as a switch (§2.5) with `auto_follows_input`.
+
+3. **USB-C as compound port**: A single USB-C cable carries 4K60 video + USB
+   3.0 data to the hub + 90W charging. The spec decomposes this into its
+   component functions so the router can reason about each independently —
+   video bandwidth, USB data bandwidth, and power delivery are separate
+   concerns that happen to share a connector.
+
+4. **Control path selection**: The router knows this monitor can be controlled
+   via DDC/CI (bidirectional, from connected PC), OSD joystick (manual only),
+   or Dell Display Manager (app on connected PC). The control path (§2.12) is:
+   DDC/CI via desktop agent on the connected PC → monitor. If the agent is
+   offline, control falls back to manual.
+
+5. **PIP/PBP for monitoring**: Some monitors show two inputs simultaneously.
+   The router can use this for KVM preview — show the active machine full
+   screen and the other machine in PIP. If the monitor supports DDC/CI
+   PIP control, this is automated.
+
+6. **Physical port location**: "Plug the Ozma node into `usb_c_1` (rear,
+   third from left) — it carries video + USB + 90W power in one cable."
 ```
 
 **CameraSpec**:
