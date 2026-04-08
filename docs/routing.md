@@ -2771,6 +2771,7 @@ Space:
   dimensions_mm: Dimensions?    # room dimensions
   zones: SpatialZone[]          # zones within this space
   furniture: FurnitureEntity[]  # furniture in this space
+  floor_plan: FloorPlan?         # physical layout with walls, doors, materials (for RF modelling)
   datacentre: DatacentreSpaceSpec?  # datacentre-specific properties (if applicable)
 
 DatacentreSpaceSpec:
@@ -2846,11 +2847,187 @@ SpaceType: enum
   custom                        # anything else
 ```
 
+**FloorPlan** — physical layout of a space with walls, doors, windows, and
+construction materials. Enables WiFi coverage prediction, LoRa/BLE range
+estimation, audio acoustics modelling, and cable run planning:
+
+```yaml
+FloorPlan:
+  source: string?               # "manual", "imported_dxf", "imported_image",
+                                # "imported_pdf", "3d_scan"
+  scale: float?                 # if traced from image: mm per pixel
+  origin: Position2d?           # floor plan coordinate origin
+  walls: Wall[]
+  doors: Door[]?
+  windows: Window[]?
+  floors: FloorSurface[]?       # floor material (affects acoustics + cable routing)
+  ceilings: CeilingSurface[]?   # ceiling material and height
+  columns: Column[]?            # structural columns
+  cable_paths: CablePath[]?     # known cable routes (conduit, trunking, floor void, overhead)
+
+Wall:
+  id: string
+  start: Position2d             # start point (mm)
+  end: Position2d               # end point (mm)
+  height_mm: float?             # wall height (default: room height)
+  thickness_mm: float?          # wall thickness
+  material: WallMaterial        # construction material (determines RF attenuation)
+  exterior: bool?               # is this an external wall?
+  load_bearing: bool?           # structural (can't be modified)
+
+WallMaterial:
+  type: string                  # material type (see RF attenuation table below)
+  rf_attenuation_2_4ghz_db: float?  # signal loss at 2.4 GHz
+  rf_attenuation_5ghz_db: float?    # signal loss at 5 GHz
+  rf_attenuation_6ghz_db: float?    # signal loss at 6 GHz (WiFi 6E/7)
+  acoustic_stc: uint?           # Sound Transmission Class (for audio leakage)
+  # Custom materials can specify measured attenuation. Standard materials
+  # use lookup values from the table below.
+
+# Standard wall material RF attenuation:
+#
+# | Material | 2.4 GHz | 5 GHz | 6 GHz | Notes |
+# |----------|---------|-------|-------|-------|
+# | plasterboard (drywall) | 3 dB | 4 dB | 5 dB | Standard interior partition |
+# | plasterboard_double | 5 dB | 7 dB | 9 dB | Double-layer drywall |
+# | brick_single | 6 dB | 10 dB | 12 dB | Single brick (110mm) |
+# | brick_double | 10 dB | 18 dB | 22 dB | Double brick cavity wall |
+# | concrete_100mm | 10 dB | 15 dB | 18 dB | Poured concrete |
+# | concrete_200mm | 15 dB | 23 dB | 28 dB | Thick concrete (fire wall, lift shaft) |
+# | concrete_block | 8 dB | 12 dB | 15 dB | Concrete masonry unit |
+# | glass_single | 2 dB | 3 dB | 4 dB | Single glazing |
+# | glass_double | 4 dB | 6 dB | 8 dB | Double glazing |
+# | glass_tinted | 5 dB | 8 dB | 10 dB | Tinted/coated glass (metal oxide) |
+# | glass_low_e | 8 dB | 15 dB | 20 dB | Low-E glass (metallic coating — WiFi killer!) |
+# | wood_door | 3 dB | 4 dB | 5 dB | Solid wood door |
+# | hollow_door | 2 dB | 3 dB | 3 dB | Hollow-core interior door |
+# | metal_door | 10 dB | 15 dB | 18 dB | Steel security door |
+# | fire_door | 6 dB | 10 dB | 12 dB | Fire-rated door (dense core) |
+# | metal_stud | 4 dB | 6 dB | 8 dB | Metal stud partition with plasterboard |
+# | curtain_wall | 6 dB | 10 dB | 15 dB | Glass curtain wall (aluminium frame) |
+# | elevator_shaft | 20 dB | 30 dB | 35 dB | Concrete + steel (essentially opaque) |
+# | metal_clad | 15 dB | 25 dB | 30 dB | Metal-clad wall (warehouse, server room) |
+# | floor_concrete | 12 dB | 18 dB | 22 dB | Concrete floor/ceiling between levels |
+# | floor_wood | 5 dB | 8 dB | 10 dB | Timber floor between levels |
+#
+# These are typical values. Actual attenuation varies with construction
+# quality, age, moisture content, and exact thickness. Community-verified
+# measurements for specific buildings can override the defaults.
+
+Door:
+  id: string
+  position: Position2d          # centre point on the wall
+  wall_id: string               # which wall this door is in
+  width_mm: float
+  height_mm: float?
+  material: WallMaterial        # door material (wood, metal, glass, fire-rated)
+  normally_open: bool?          # is this door typically left open? (affects RF model)
+  # An open door is ~0 dB attenuation. A closed hollow-core door is ~2 dB.
+  # A closed fire door is ~10 dB. Whether the door is open or closed
+  # significantly affects WiFi prediction. The model defaults to the
+  # `normally_open` state but can be overridden by sensor data (§2.9 —
+  # door contact sensor).
+
+Window:
+  id: string
+  position: Position2d          # centre point on the wall
+  wall_id: string               # which wall this window is in
+  width_mm: float
+  height_mm: float
+  material: WallMaterial        # glass type (single, double, low-E, tinted)
+  # Low-E glass deserves special attention — the metallic coating that
+  # reflects heat also reflects RF. A building with floor-to-ceiling low-E
+  # glass can have 15–20 dB attenuation at 5 GHz per window. This is why
+  # modern office buildings often have terrible WiFi — the glass walls
+  # that let light through block radio.
+
+FloorSurface:
+  material: string              # "concrete", "raised_floor", "hardwood", "carpet",
+                                # "tile", "vinyl"
+  rf_attenuation_db: float?     # between-floor attenuation (if modelling multi-storey)
+  cable_accessible: bool?       # can cables be run under this floor?
+  void_depth_mm: float?         # raised floor void depth (for cable routing)
+
+CeilingSurface:
+  height_mm: float              # ceiling height
+  material: string              # "plasterboard", "acoustic_tile", "exposed_concrete",
+                                # "suspended_grid", "exposed_structure"
+  plenum: bool?                 # is the space above the ceiling a plenum?
+  cable_accessible: bool?       # can cables be run above this ceiling?
+
+Column:
+  position: Position2d
+  diameter_mm: float?           # for circular columns
+  dimensions_mm: Dimensions?    # for rectangular columns { w, d }
+  material: string              # "concrete", "steel"
+  # Columns are RF obstacles — concrete columns can shadow WiFi significantly.
+
+CablePath:
+  id: string
+  type: string                  # "conduit", "trunking", "floor_void", "ceiling_void",
+                                # "cable_tray", "wall_chase", "external"
+  waypoints: Position2d[]       # path through the building
+  capacity: string?             # how many cables can this path carry
+  current_usage: string?        # approximately how full
+  accessible: bool              # can new cables be pulled through this path?
+```
+
+**What the floor plan enables**:
+
+1. **WiFi coverage prediction**: Place an AP on the floor plan → the system
+   calculates signal strength at every point using the wall materials and
+   distances. "Your AP in the study gives -72 dBm in the bedroom (through
+   2 plasterboard walls at 3+3 dB = 6 dB loss). That's marginal for 5 GHz.
+   Consider a second AP or switch to 2.4 GHz for the bedroom."
+
+2. **AP placement optimisation**: "Given these walls, the optimal placement
+   for a single AP to cover all rooms is here. For two APs, place them
+   here and here. Channel assignment: AP1 on channel 36, AP2 on channel
+   149 to avoid co-channel interference."
+
+3. **BLE/LoRa range estimation**: Same attenuation model, different
+   frequencies. BLE beacon in the living room: "Signal reaches the garage
+   through a brick wall at -85 dBm (marginal). Place a second beacon near
+   the garage door."
+
+4. **Cable run planning**: "The shortest Cat6a run from the server room
+   patch panel to Office 3 is 28m via the ceiling void (accessible),
+   through the corridor, down the wall chase. Cat6a supports 10GbE at
+   this distance."
+
+5. **Audio leakage**: Wall STC (Sound Transmission Class) values predict
+   how much sound bleeds between rooms. "Your studio shares a plasterboard
+   wall (STC 33) with the bedroom. Loud monitoring will be clearly audible
+   next door. Consider adding mass-loaded vinyl for STC 45+."
+
+6. **Security camera coverage**: Place cameras on the floor plan → calculate
+   field-of-view coverage considering walls and obstructions. "This camera
+   covers 80% of the hallway. The column at position (3200, 1500) creates
+   a blind spot of 2.5m²."
+
+**Floor plan import**: Users shouldn't have to draw walls from scratch.
+The system should accept:
+- **Image trace**: Upload a floor plan image (PDF, PNG from architect or
+  real estate listing), set the scale, trace walls over the image
+- **DXF/DWG import**: Import from CAD drawings (architects provide these)
+- **Simple drawing**: Draw walls, doors, windows in the dashboard editor
+- **3D scan import**: From LiDAR scans (iPhone Pro, Matterport) — generates
+  walls and dimensions automatically
+- **Template**: Common house/apartment layouts as starting points
+
+**Accuracy**: The RF attenuation values are estimates. Real-world results
+vary with construction quality, moisture, furniture, and the specific
+frequency and antenna pattern. The model provides a useful prediction
+(±5 dB) without requiring a professional RF survey. Community-measured
+values for specific building types can improve accuracy over time.
+
 **Physical environment is optional at every level**. A user with one desk
 and two machines needs none of this — their devices just have bus-level
 locations. A user who wants spatial RGB adds furniture positions. A business
 with multiple rooms adds spaces and zones. An MSP managing 50 sites adds
-the full hierarchy. Each level is independently useful and none is required.
+the full hierarchy. A user who wants WiFi coverage prediction adds a floor
+plan with wall materials. Each level is independently useful and none is
+required.
 
 ### 2.12 Control Path
 
