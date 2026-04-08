@@ -7276,18 +7276,214 @@ NetworkCardSpec:
 
 ```yaml
 StorageSpec:
-  interface: string?            # "nvme", "sata", "usb", "sd_card"
-  form_factor: string?          # "m2_2280", "2.5_inch", "3.5_inch", "sd", "microsd"
+  # --- Individual drive ---
+  interface: string?            # "nvme", "sata", "sas", "usb", "sd_card", "u2", "edsff"
+  form_factor: string?          # "m2_2280", "m2_2242", "m2_2230",
+                                # "2.5_inch", "3.5_inch", "u2_2.5", "edsff_e1s",
+                                # "sd", "microsd", "msata", "pcie_aic"
+  protocol: string?             # "ahci", "nvme", "scsi", "usb_mass_storage", "usb_uas"
   capacity_gb: uint?
   sequential_read_mbps: float?
   sequential_write_mbps: float?
   random_read_iops: uint?
   random_write_iops: uint?
   endurance_tbw: float?         # TBW rating
-  type: string?                 # "nand_tlc", "nand_qlc", "nand_slc", "hdd_cmr", "hdd_smr"
+  type: string?                 # "nand_tlc", "nand_qlc", "nand_slc", "nand_mlc",
+                                # "hdd_cmr", "hdd_smr", "optane"
+  rpm: uint?                    # HDD rotational speed (5400, 7200, 10000, 15000)
   dram_cache: bool?
+  dram_cache_mb: uint?
   power_loss_protection: bool?
+  smart: SmartAttributes?       # SMART health data (if available)
+  firmware: FirmwareInfo?       # drive firmware (see §14.1)
+  controller: string?           # drive controller chipset ("Phison E18", "Samsung Elpis",
+                                # "WD in-house", "Marvell 88SS1321")
+
+  # --- SAS-specific ---
+  sas: SasSpec?                 # SAS drive properties (if SAS interface)
+
+  # --- Encryption ---
+  hardware_encryption: string?  # "opal_2.0", "sed", "none", "bitlocker_edrive"
+
+SmartAttributes:
+  health: string?               # "healthy", "warning", "failing"
+  temperature_c: float?
+  power_on_hours: uint?
+  reallocated_sectors: uint?
+  wear_leveling_percent: float? # SSD wear (0% = new, 100% = end of life)
+  media_errors: uint?           # NVMe media/data integrity errors
+  unsafe_shutdowns: uint?
+  # SMART data feeds into trend analysis (§11.7) — increasing reallocated
+  # sectors or declining wear leveling triggers a trend alert.
+
+SasSpec:
+  sas_version: string?          # "sas_2", "sas_3", "sas_4"
+  link_speed_gbps: float?       # 6, 12, 22.5
+  dual_port: bool?              # SAS drives can have two ports for multipath
+  sas_address: string?          # SAS WWN (World Wide Name)
 ```
+
+**Storage controllers — HBAs, RAID cards, and NVMe switches**:
+
+A storage controller (HBA or RAID card) is a compound device that connects
+drives to the system bus. It has its own internal topology, firmware, cache,
+and bandwidth constraints.
+
+```yaml
+StorageControllerSpec:
+  controller_type: string       # "hba", "raid", "nvme_switch", "sata_controller",
+                                # "usb_storage_bridge"
+  interface_to_host: string     # "pcie_x8", "pcie_x4", "pcie_x16", "chipset_sata"
+  host_bandwidth_gbps: float?   # total bandwidth to host
+  ports: StoragePort[]          # physical connectors on the controller
+  firmware: FirmwareInfo?       # controller firmware
+  cache: ControllerCache?       # write cache (RAID cards)
+  raid_levels: string[]?        # supported RAID levels ["0","1","5","6","10","50","60"]
+  jbod: bool?                   # supports pass-through / IT mode
+  max_drives: uint?             # maximum drives supported
+  chipset: string?              # "Broadcom SAS3816", "LSI SAS3008", "Marvell 88SE9230",
+                                # "ASMedia ASM1166", "JMicron JMB585"
+
+StoragePort:
+  id: string                    # "sas_0", "sata_0", "mini_sas_hd_0"
+  connector: string             # "sata", "sas_sff8482", "mini_sas_hd_sff8643",
+                                # "mini_sas_sff8087", "u2_sff8639", "oculink",
+                                # "m2_m_key", "m2_b_key"
+  protocol: string[]            # ["sas", "sata"] (SAS ports accept both SAS and SATA)
+  link_speed_gbps: float        # per-link speed (6, 12, 22.5)
+  lanes: uint                   # number of PHY lanes (SAS: 1 per drive; mini-SAS HD: 4)
+  shared_bandwidth: bool        # do drives on this port share bandwidth?
+  physical: PhysicalPortInfo?
+
+ControllerCache:
+  size_mb: uint?                # cache size
+  type: string?                 # "write_back", "write_through", "none"
+  battery_backed: bool?         # BBU or supercap protects cache on power loss
+  flash_backed: bool?           # flash-backed write cache (survives extended outage)
+```
+
+**Drive enclosures and backplanes** — the 24-bay SAS case:
+
+A drive enclosure is a compound device containing a backplane, SAS/SATA
+expander(s), drive bays, and cooling. It connects to an HBA via one or more
+SAS cables and presents multiple drive slots on a shared backplane.
+
+```yaml
+DriveEnclosureSpec:
+  enclosure_type: string        # "das_jbod", "nas_enclosure", "server_chassis",
+                                # "external_bay", "hot_swap_cage"
+  bays: DriveBay[]              # physical drive bays
+  backplane: BackplaneSpec      # how drives connect internally
+  expanders: SasExpander[]?     # SAS expanders (if any)
+  uplinks: EnclosureUplink[]    # connections to host/HBA
+  cooling: EnclosureCooling?    # fans, temperature sensors
+  power: EnclosurePower?        # PSU, redundancy
+  management: EnclosureManagement?  # SES, SGPIO, enclosure management
+
+DriveBay:
+  id: string                    # "bay_0" through "bay_23"
+  form_factor: string           # "3.5_inch", "2.5_inch", "edsff_e1s"
+  hot_swap: bool
+  position: PortPosition?       # physical position in the enclosure
+  connected_to: string          # which expander/backplane port this bay is on
+  populated: string?            # device database ID of installed drive (if known)
+  activity_led: bool?           # per-bay activity LED
+  fault_led: bool?              # per-bay fault LED
+  power_disable: bool?          # can individual bay power be controlled?
+
+BackplaneSpec:
+  protocol: string              # "sas", "sata", "nvme", "mixed"
+  ports: uint                   # total backplane ports (= max drives)
+  zones: BackplaneZone[]?       # if the backplane is zoned (different zones on different expanders)
+
+BackplaneZone:
+  id: string
+  bays: string[]                # which bays are in this zone
+  expander: string?             # which SAS expander serves this zone
+  bandwidth_gbps: float?        # aggregate bandwidth for this zone
+
+SasExpander:
+  chipset: string?              # "Broadcom SAS3x36", "LSI SAS2x36"
+  phy_count: uint               # total PHY lanes
+  uplink_phys: uint             # PHYs allocated to uplink (to HBA)
+  drive_phys: uint              # PHYs allocated to drives
+  link_speed_gbps: float        # per-PHY speed (6, 12, 22.5)
+  cascade: bool?                # is this expander cascaded behind another?
+  firmware: FirmwareInfo?       # expander firmware
+  zoning: bool?                 # SAS zoning support
+
+EnclosureUplink:
+  connector: string             # "mini_sas_hd_sff8643", "mini_sas_sff8088",
+                                # "qsfp", "oculink", "pcie"
+  lanes: uint                   # number of SAS/PCIe lanes in this uplink
+  link_speed_gbps: float        # per-lane speed
+  total_bandwidth_gbps: float   # lanes × speed = aggregate uplink bandwidth
+  redundant_path: bool?         # dual-path to a second HBA/expander
+
+EnclosureManagement:
+  ses: bool?                    # SES (SCSI Enclosure Services) — temp, fan, power, bay status
+  sgpio: bool?                  # SGPIO — per-bay LED control (locate, fault, activity)
+  bmc: bool?                    # BMC/IPMI management interface
+  protocol: string?             # "ses_2", "ses_3", "sgpio", "i2c"
+```
+
+**Worked example — 24-bay SAS JBOD connected via HBA**:
+
+```
+Host PCIe bus
+  └── HBA: Broadcom SAS 9300-8i (PCIe x8 Gen 3 = 64 Gbps to host)
+      ├── Port: mini-SAS HD 0 (4× SAS 12 Gbps = 48 Gbps)
+      │   └── Cable: SFF-8643 to SFF-8643 → Enclosure Uplink A
+      └── Port: mini-SAS HD 1 (4× SAS 12 Gbps = 48 Gbps)
+          └── Cable: SFF-8643 to SFF-8643 → Enclosure Uplink B
+
+Enclosure: SuperMicro 24-bay JBOD
+  ├── Uplink A → SAS Expander 0 (24-port, SAS3x36)
+  │   ├── 4 PHYs uplink (48 Gbps aggregate to HBA)
+  │   └── 20 PHYs to backplane zone A (bays 0–11)
+  │       └── 12 bays × 12 Gbps each, sharing 20× 12 Gbps = 240 Gbps backplane bandwidth
+  │           (non-blocking for 12 drives — each gets full 12 Gbps)
+  ├── Uplink B → SAS Expander 1 (backup path / zone B)
+  │   ├── 4 PHYs uplink (48 Gbps aggregate to HBA)
+  │   └── 20 PHYs to backplane zone B (bays 12–23)
+  └── 24 drive bays (hot-swap, 3.5" SAS/SATA)
+      ├── Bay 0:  Seagate Exos X18 16TB SAS (12 Gbps, dual-port)
+      ├── Bay 1:  Seagate Exos X18 16TB SAS
+      ├── ...
+      └── Bay 23: Seagate Exos X18 16TB SAS
+```
+
+**What the routing graph captures from this**:
+
+1. **Aggregate bandwidth**: 24 drives × 12 Gbps = 288 Gbps potential, but
+   the uplinks carry 2× 48 Gbps = 96 Gbps. With 24 drives active, each
+   drive gets ~4 Gbps effective uplink bandwidth (oversubscribed 3:1).
+   For spinning drives (max ~250 MB/s = 2 Gbps), this is fine — the uplink
+   isn't the bottleneck. For SSDs (up to 12 Gbps each), it would be.
+
+2. **Zone awareness**: Bays 0–11 share expander 0's uplink. Bays 12–23
+   share expander 1's uplink. Heavy I/O on bays 0–11 doesn't affect
+   bays 12–23. The router knows which zone a drive is in.
+
+3. **Multipath**: SAS dual-port drives can be reached via either expander.
+   If expander 0 fails, drives in zone A are still accessible via a
+   cascade through expander 1 (if configured). This maps to active
+   redundancy (§2.13).
+
+4. **HBA bandwidth bottleneck**: The HBA's PCIe x8 Gen 3 link gives
+   64 Gbps to the host. Both uplinks combined carry 96 Gbps. If both
+   zones are saturated, the PCIe link is the bottleneck. The graph
+   traces this all the way to the CPU.
+
+5. **SMART health per bay**: Each drive's SMART attributes feed into
+   monitoring (§11). Trend analysis detects degrading drives before
+   failure. The enclosure's SES data provides bay-level status (healthy,
+   rebuilding, fault, locate LED).
+
+6. **Firmware across the stack**: HBA firmware, SAS expander firmware,
+   and individual drive firmware are all tracked (§14.1). A known
+   expander firmware bug affecting I/O stability is flagged just like
+   a known BIOS bug.
 
 Storage specs inform the router about recording capabilities — a node with
 a slow SD card can't sustain 4K recording, but one with an NVMe drive can.
