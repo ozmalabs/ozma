@@ -6794,6 +6794,140 @@ spec explicitly states: **physical access and digital access are separate
 authorization domains**. A person can be authorized for physical access
 to a zone without having any digital access to the systems in that zone.
 
+#### Security posture
+
+A home user who's happy with face recognition at 0.85 confidence for their
+front door is making a reasonable decision for their context. An auditor
+reviewing a SOC 2 environment would reject the same configuration. Both
+are valid — they have different security postures.
+
+A security posture is a named policy that cascades through the entire
+system — not just authentication, but encryption, audit, access control,
+data retention, and operational security. The posture determines the
+acceptable trade-off between convenience and rigour.
+
+```yaml
+SecurityPosture:
+  id: string                    # "home", "small_business", "regulated", "high_security"
+  name: string
+  description: string
+
+  # --- Authentication ---
+  auth: PostureAuthPolicy
+  # --- Encryption ---
+  encryption: PostureEncryptionPolicy
+  # --- Audit ---
+  audit: PostureAuditPolicy
+  # --- Data retention ---
+  retention: PostureRetentionPolicy
+  # --- Operational ---
+  operational: PostureOperationalPolicy
+
+PostureAuthPolicy:
+  min_factors_physical: uint    # minimum factors for physical access control
+  min_factors_digital: uint     # minimum factors for digital access (API, dashboard)
+  min_factors_admin: uint       # minimum factors for admin/destructive operations
+  biometric_min_confidence: float?  # minimum confidence threshold for biometric match
+  biometric_require_liveness: bool  # require anti-spoofing liveness check
+  biometric_require_3d: bool?   # require 3D depth sensing for face
+  ble_proximity_allowed_as_factor: bool  # allow BLE proximity as a security factor
+  password_min_length: uint?
+  password_require_complexity: bool?
+  session_max_age_hours: uint?  # maximum session duration before re-auth
+  idle_timeout_minutes: uint?   # lock after idle
+  credential_max_age_days: uint?  # maximum credential lifetime
+  lockout_after_failures: uint  # lock after this many failures
+  lockout_duration_s: uint      # lockout time
+  enrollment_requires_admin: bool  # new credential enrollment needs admin approval
+  federation_allowed: bool      # allow external IdP federation
+
+PostureEncryptionPolicy:
+  data_plane: string            # "required", "preferred", "none"
+  control_plane: string         # "tls_required", "tls_preferred"
+  at_rest: string               # "required" (all stored data), "sensitive_only", "none"
+  key_rotation_days: uint?      # rotate session keys this often
+  min_key_strength: string      # "128bit", "256bit"
+  approved_ciphers: string[]?   # whitelist of acceptable ciphers
+  pfs_required: bool            # require perfect forward secrecy
+
+PostureAuditPolicy:
+  journal_enabled: bool         # state change journal required
+  journal_retention_days: uint  # minimum journal retention
+  hashchain_enabled: bool       # hashchained audit log required
+  auth_events_logged: bool      # all authentication events logged
+  access_events_logged: bool    # all access control events logged
+  config_changes_logged: bool   # all configuration changes logged
+  export_required: bool?        # must export to external SIEM
+  tamper_detection: bool        # detect and alert on journal tampering
+  review_interval_days: uint?   # how often audit logs must be reviewed
+
+PostureRetentionPolicy:
+  auth_log_retention_days: uint # how long to keep authentication logs
+  access_log_retention_days: uint
+  video_retention_days: uint?   # camera footage retention
+  metric_retention_days: uint   # monitoring metric retention
+  min_backup_frequency_days: uint  # maximum time between backups
+  backup_encryption_required: bool
+
+PostureOperationalPolicy:
+  auto_update_allowed: bool     # can devices auto-update without approval
+  remote_access_allowed: bool   # is remote access via Connect relay permitted
+  remote_access_requires_mfa: bool
+  agent_resource_budget_max_percent: float  # max resources agent can use on target machines
+  unmanaged_devices_allowed: bool  # can unmanaged devices join the network
+  usb_device_policy: string     # "allow_all", "allow_known", "block_unknown"
+  firmware_policy: string       # "auto_update", "notify", "manual", "pin_versions"
+  vulnerability_response: string  # "auto_patch", "notify_and_schedule", "manual"
+```
+
+**Built-in postures**:
+
+| Posture | Auth | Encryption | Audit | Target environment |
+|---------|------|-----------|-------|-------------------|
+| `home` | Single factor for everything. Face at 0.85. BLE as factor allowed. No idle timeout. Passwords optional. | Preferred, not required. | Journal on, 30-day retention, no hashchain. | Personal home, homelab. Convenience first. |
+| `small_business` | MFA for admin. Single factor for physical. Face at 0.90. 30-min idle timeout. Passwords required. | Required on LAN. | Journal + hashchain. 90-day retention. Auth events logged. | Small office, 5–50 people. Balance of security and convenience. |
+| `regulated` | MFA for everything. Face at 0.95 + second factor. No BLE as security factor. 15-min idle timeout. Credential rotation. | Required everywhere. 256-bit minimum. PFS required. | Full audit trail. 1-year retention. SIEM export required. Review every 90 days. | SOC 2, ISO 27001, HIPAA, PCI-DSS. Compliance-driven. |
+| `high_security` | MFA with hardware token for admin. Face at 0.99 + badge + PIN for physical. 5-min idle timeout. Admin enrollment only. No federation. | Required, approved ciphers only. At-rest encryption required. 30-day key rotation. | Full hashchained audit. 7-year retention. SIEM + tamper detection. Monthly review. | Government, defence, critical infrastructure. Rigour above all. |
+| `custom` | Per-field configuration. | Per-field. | Per-field. | Anything that doesn't fit the built-in postures. |
+
+**Posture is inherited and overridable**: A site has a posture. A space
+within the site can override specific fields (server room within a
+`small_business` site uses `high_security` authentication for physical
+access). A device can override its posture for specific operations
+(this lock requires MFA even though the site posture doesn't). The
+cascade is: site → space → zone → device, with each level able to
+**tighten** but never **loosen** the parent's posture.
+
+**Posture validation**: The system validates the current configuration
+against the declared posture and reports compliance gaps:
+
+```
+GET /api/v1/security/posture                # current posture and compliance status
+GET /api/v1/security/posture/gaps           # where current config doesn't meet posture
+POST /api/v1/security/posture/validate      # validate a hypothetical config change
+```
+
+Example gap report:
+```
+Posture: regulated
+Gaps:
+  - FAIL: Lock "server_room_door" has single-factor authentication (badge only).
+    Required: min_factors_physical = 2. Fix: add PIN or biometric.
+  - FAIL: Dashboard session timeout is 60 minutes.
+    Required: idle_timeout_minutes = 15. Fix: reduce to 15.
+  - WARN: 3 devices have firmware older than 90 days.
+    Policy: vulnerability_response = "notify_and_schedule". Action: schedule updates.
+  - PASS: All data plane encryption is enabled.
+  - PASS: Hashchained audit log is active with 365-day retention.
+  - PASS: All authentication events are logged.
+```
+
+This is how auditors interact with the system — they set the posture to
+`regulated`, run the gap report, and see exactly what needs to change.
+It's also how a home user interacts — they set `home` and never think
+about it again. The posture is the policy; the gap report is the evidence;
+the spec defines both.
+
 ---
 
 ## 11. Observability and Monitoring
