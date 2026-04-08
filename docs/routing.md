@@ -5456,6 +5456,19 @@ GET /api/v1/monitoring/power
 # Asset inventory snapshot
 GET /api/v1/monitoring/inventory
 # Returns: all devices with hardware info, versions, location, health.
+
+# Sankey / flow diagram data for any resource type
+GET /api/v1/monitoring/sankey?type=bandwidth
+GET /api/v1/monitoring/sankey?type=power
+GET /api/v1/monitoring/sankey?type=audio
+GET /api/v1/monitoring/sankey?type=storage_io
+GET /api/v1/monitoring/sankey?device_id={id}&type=bandwidth
+# Returns: directed graph of flows with source, destination, and magnitude
+# at each hop. Renderable as a Sankey diagram, flow map, or treemap.
+# type=bandwidth: bytes/sec through every link, showing shared segments and bottlenecks
+# type=power: watts from PSU rails through every device to every consumer
+# type=audio: audio signal paths with gain, format, and latency per hop
+# type=storage_io: I/O flow from applications through controllers to drives
 # Exportable as CSV/JSON for compliance evidence.
 ```
 
