@@ -59,7 +59,7 @@ RESULTS_DIR = Path(__file__).parent.parent / "test_results" / "virtual_node_agen
 
 # ── Test harness ──────────────────────────────────────────────────────────
 
-class TestResult:
+class VirtualNodeTestResult:
     def __init__(self, name: str):
         self.name = name
         self.passed = False
@@ -76,7 +76,7 @@ class IntegrationTest:
     def __init__(self, quick: bool = False, verbose: bool = False):
         self.quick = quick
         self.verbose = verbose
-        self.results: list[TestResult] = []
+        self.results: list[VirtualNodeTestResult] = []
         self.engine: AgentEngine | None = None
 
     async def setup(self):
@@ -114,8 +114,8 @@ class IntegrationTest:
         # Warm up models
         await self.engine.execute("screenshot", node_id=NODE_ID)
 
-    async def run_test(self, name: str, coro) -> TestResult:
-        result = TestResult(name)
+    async def run_test(self, name: str, coro) -> VirtualNodeTestResult:
+        result = VirtualNodeTestResult(name)
         t0 = time.time()
         try:
             await coro(result)
@@ -219,7 +219,7 @@ class IntegrationTest:
 
     # ── Phase 1: VM + Input ───────────────────────────────────────────
 
-    async def test_desktop_visible(self, result: TestResult):
+    async def test_desktop_visible(self, result: VirtualNodeTestResult):
         r = await self.engine.execute("screenshot", node_id=NODE_ID)
         if not r.success or not r.screenshot_base64:
             result.error = "Cannot capture screenshot"
@@ -230,7 +230,7 @@ class IntegrationTest:
         if len(data) < 1000:
             result.error = "Screenshot too small (black screen?)"
 
-    async def test_keyboard_input(self, result: TestResult):
+    async def test_keyboard_input(self, result: VirtualNodeTestResult):
         # Open cmd
         await self.engine.execute("hotkey", node_id=NODE_ID, keys=["win", "r"])
         await asyncio.sleep(1.5)
@@ -244,7 +244,7 @@ class IntegrationTest:
         if not await self.assert_text("KB_TEST_OK"):
             result.error = "Typed text not found on screen"
 
-    async def test_mouse_input(self, result: TestResult):
+    async def test_mouse_input(self, result: VirtualNodeTestResult):
         # Click somewhere on the desktop
         r = await self.engine.execute("click", node_id=NODE_ID, x=500, y=400)
         if not r.success:
@@ -252,20 +252,20 @@ class IntegrationTest:
 
     # ── Phase 2: Python + Agent ───────────────────────────────────────
 
-    async def test_python_installed(self, result: TestResult):
+    async def test_python_installed(self, result: VirtualNodeTestResult):
         await self.type_cmd("python --version")
         await asyncio.sleep(2)
         if not await self.assert_text("3.13"):
             result.error = "Python 3.13 not found"
 
-    async def test_agent_exists(self, result: TestResult):
+    async def test_agent_exists(self, result: VirtualNodeTestResult):
         await self.type_cmd("dir C:\\ozma-agent\\dist\\ozma-agent.exe")
         await asyncio.sleep(2)
         text = await self.read_text()
         if "ozma-agent" not in text.lower() or "not found" in text.lower():
             result.error = "ozma-agent.exe not found"
 
-    async def test_agent_help(self, result: TestResult):
+    async def test_agent_help(self, result: VirtualNodeTestResult):
         await self.type_cmd("C:\\ozma-agent\\dist\\ozma-agent.exe --help")
         await asyncio.sleep(3)
         if not await self.assert_text("make any machine part"):
@@ -274,17 +274,17 @@ class IntegrationTest:
 
     # ── Phase 3: Screen Understanding ─────────────────────────────────
 
-    async def test_ocr(self, result: TestResult):
+    async def test_ocr(self, result: VirtualNodeTestResult):
         text = await self.read_text()
         if len(text) < 20:
             result.error = f"OCR returned too little text ({len(text)} chars)"
 
-    async def test_elements(self, result: TestResult):
+    async def test_elements(self, result: VirtualNodeTestResult):
         r = await self.engine.execute("find_elements", node_id=NODE_ID, som=True)
         if len(r.som_elements) < 5:
             result.error = f"Only {len(r.som_elements)} elements found (expected >5)"
 
-    async def test_som(self, result: TestResult):
+    async def test_som(self, result: VirtualNodeTestResult):
         r = await self.engine.execute("screenshot", node_id=NODE_ID, som=True)
         if not r.som_elements:
             result.error = "No SoM elements generated"
@@ -292,7 +292,7 @@ class IntegrationTest:
 
     # ── Phase 4: RPA ──────────────────────────────────────────────────
 
-    async def test_open_notepad(self, result: TestResult):
+    async def test_open_notepad(self, result: VirtualNodeTestResult):
         # Close any existing windows first
         await self.engine.execute("hotkey", node_id=NODE_ID, keys=["alt", "f4"])
         await asyncio.sleep(0.5)
@@ -307,7 +307,7 @@ class IntegrationTest:
         if not await self.assert_text("Notepad"):
             result.error = "Notepad didn't open"
 
-    async def test_type_notepad(self, result: TestResult):
+    async def test_type_notepad(self, result: VirtualNodeTestResult):
         await self.engine.execute("type", node_id=NODE_ID, text="Ozma RPA test OK")
         await asyncio.sleep(1)
         text = await self.read_text()
@@ -315,7 +315,7 @@ class IntegrationTest:
             result.error = "Typed text not found in Notepad"
         await self.screenshot("notepad_typed")
 
-    async def test_close_notepad(self, result: TestResult):
+    async def test_close_notepad(self, result: VirtualNodeTestResult):
         await self.engine.execute("hotkey", node_id=NODE_ID, keys=["alt", "f4"])
         await asyncio.sleep(1)
         # Don't save dialog — press N or Tab+Enter
@@ -324,7 +324,7 @@ class IntegrationTest:
 
     # ── Phase 5: Agent Runtime ────────────────────────────────────────
 
-    async def test_start_agent(self, result: TestResult):
+    async def test_start_agent(self, result: VirtualNodeTestResult):
         await self.engine.execute("hotkey", node_id=NODE_ID, keys=["win", "r"])
         await asyncio.sleep(1)
         await self.engine.execute("type", node_id=NODE_ID, text="cmd")
@@ -334,13 +334,13 @@ class IntegrationTest:
         await self.type_cmd("start C:\\ozma-agent\\dist\\ozma-agent.exe run --no-tray --no-capture --debug")
         await asyncio.sleep(5)
 
-    async def test_agent_running(self, result: TestResult):
+    async def test_agent_running(self, result: VirtualNodeTestResult):
         await self.type_cmd('tasklist /fi "imagename eq ozma-agent.exe"')
         await asyncio.sleep(2)
         if not await self.assert_text("ozma-agent"):
             result.error = "Agent process not found in tasklist"
 
-    async def test_stop_agent(self, result: TestResult):
+    async def test_stop_agent(self, result: VirtualNodeTestResult):
         await self.type_cmd("taskkill /im ozma-agent.exe /f")
         await asyncio.sleep(2)
 

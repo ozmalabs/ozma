@@ -31,7 +31,12 @@ from unittest.mock import MagicMock
 for _mod in ("aiohttp", "aiohttp.web", "zeroconf", "zeroconf.asyncio",
              "zeroconf._utils.ipaddress", "zeroconf._dns", "zeroconf._services.browser",
              "dbus_fast", "dbus_fast.aio"):
-    sys.modules.setdefault(_mod, MagicMock())
+    _top = _mod.split(".")[0]
+    if _top not in sys.modules:
+        try:
+            __import__(_top)
+        except ImportError:
+            sys.modules.setdefault(_mod, MagicMock())
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "softnode"))
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "proxmox-plugin" / "python"))
