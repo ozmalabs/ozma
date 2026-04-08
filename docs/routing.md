@@ -123,6 +123,7 @@ Device:
 | `network_switch` | Managed/unmanaged Ethernet switch, PoE switch (see §2.9) |
 | `router` | Network router, gateway, firewall (see §2.9) |
 | `access_point` | WiFi access point (standalone or integrated in router) |
+| `avr` | AV receiver (HDMI switch + audio processor + amplifier + streaming) |
 | `virtual` | Any software-defined device (loopback, pipe, virtual display, macro source) |
 
 A device may be **compound** — a Thunderbolt dock contains a USB hub, an
@@ -6588,6 +6589,7 @@ DeviceEntry:
   network_switch: NetworkSwitchSpec?
   router: RouterSpec?
   access_point: AccessPointSpec?
+  avr: AvrSpec?                 # AV receiver (HDMI switch + audio processor + amplifier)
   power: PowerSpec?             # generic power (PSU for non-PC devices, PoE injectors, etc.)
   sensor: SensorSpec?
   actuator: ActuatorSpec?
@@ -7883,6 +7885,220 @@ AccessPointSpec:
   management: string[]?         # ["unifi", "omada", "standalone", "cloud"]
   mesh: bool?
   ethernet_uplink: string?      # "1g", "2.5g", "10g"
+```
+
+**AvrSpec** (AV receiver — the most complex compound consumer device):
+
+An AV receiver is simultaneously an HDMI matrix switch (§2.5), an audio
+processor (§2.13), a power amplifier (§2.10), a speaker router, and a
+collection of media receivers (§2.9). It's modelled as a single compound
+device with multiple sub-devices and a rich internal topology.
+
+```yaml
+AvrSpec:
+  # --- HDMI switching ---
+  hdmi: AvrHdmiSpec
+
+  # --- Audio processing ---
+  audio_processing: AvrAudioProcessingSpec
+
+  # --- Amplification ---
+  amplifier: AvrAmplifierSpec
+
+  # --- Zones ---
+  zones: AvrZone[]?             # multi-zone support (main + zone 2/3/4)
+
+  # --- Streaming / media receivers ---
+  streaming: AvrStreamingSpec?
+
+  # --- Control ---
+  control: AvrControlSpec
+
+AvrHdmiSpec:
+  inputs: AvrHdmiInput[]
+  outputs: AvrHdmiOutput[]
+  passthrough: bool?            # passes video through without processing
+  upscaling: string?            # "none", "1080p", "4k", "8k"
+  video_processing: string?     # vendor video processor ("Sigma Designs", "Analog Devices", "none")
+  arc: bool?                    # ARC on output 1
+  earc: bool?                   # eARC on output 1 (uncompressed Atmos)
+  allm: bool?                   # Auto Low Latency Mode passthrough
+  vrr: bool?                    # VRR passthrough
+  qms: bool?                    # Quick Media Switching
+  qft: bool?                    # Quick Frame Transport
+  hdcp: string?                 # "hdcp_2.3", "hdcp_2.2"
+  standby_passthrough: bool?    # HDMI passes through when AVR is in standby
+  # The HDMI switch is modelled as §2.5 — the router can switch inputs
+  # via IP/CEC/serial as part of pipeline activation.
+
+AvrHdmiInput:
+  id: string                    # "hdmi_1", "hdmi_2", etc.
+  version: string?              # "hdmi_2.1", "hdmi_2.0"
+  bandwidth_gbps: float?        # 48 (HDMI 2.1) or 18 (HDMI 2.0)
+  max_resolution: Resolution?
+  max_refresh: float?
+  earc: bool?                   # some inputs support eARC (rare, usually outputs only)
+  physical: PhysicalPortInfo?
+  label: string?                # front panel label ("CBL/SAT", "GAME", "BD/DVD", "PC")
+  # Vendor labels hint at intended use but don't restrict functionality.
+
+AvrHdmiOutput:
+  id: string                    # "hdmi_out_1", "hdmi_out_2"
+  version: string?
+  bandwidth_gbps: float?
+  arc: bool?                    # ARC/eARC capable (typically output 1 only)
+  earc: bool?
+  zone: string?                 # "main", "zone_2" — which zone this output serves
+  physical: PhysicalPortInfo?
+
+AvrAudioProcessingSpec:
+  # Decoding
+  codecs: string[]?             # ["dolby_atmos", "dolby_truehd", "dolby_digital_plus",
+                                #  "dts_x", "dts_hd_ma", "dts", "auro_3d",
+                                #  "multichannel_pcm", "stereo_pcm"]
+  max_channels: uint?           # maximum decoded channels (7.1, 9.1, 11.1)
+  max_atmos_objects: uint?      # Dolby Atmos object count (if applicable)
+
+  # Room correction
+  room_correction: string?      # "audyssey_multeq_xt32", "audyssey_multeq_xt",
+                                # "audyssey_multeq", "ypao_rsc",
+                                # "ypao", "dirac_live", "anthem_arc",
+                                # "mcacc", "dcac", "none"
+  room_correction_mic: bool?    # measurement mic included?
+  # Room correction data from the AVR can be read and compared against
+  # Ozma's own room correction measurements (§2.13) for validation.
+
+  # DSP
+  bass_management: bool?        # crossover + sub routing
+  configurable_crossover: bool? # per-speaker crossover frequency
+  crossover_range_hz: { min: float, max: float }?
+  parametric_eq: bool?          # manual parametric EQ
+  parametric_eq_bands: uint?    # bands per channel
+  dialog_enhancement: bool?
+  night_mode: bool?             # dynamic range compression for quiet listening
+
+  # Additional audio inputs (non-HDMI)
+  analog_inputs: AvrAnalogInput[]?
+  digital_inputs: AvrDigitalInput[]?
+  phono_input: bool?            # MM phono preamp
+  multi_channel_input: bool?    # 7.1 analog input (legacy)
+
+AvrAnalogInput:
+  id: string                    # "analog_1", "cd", "tuner"
+  connector: string             # "rca_stereo", "xlr_stereo", "3.5mm"
+  physical: PhysicalPortInfo?
+
+AvrDigitalInput:
+  id: string                    # "optical_1", "coax_1"
+  connector: string             # "toslink", "coax_spdif", "aes_ebu"
+  max_sample_rate: uint?        # TOSLINK caps at 96kHz for PCM, 48kHz for Dolby/DTS
+  physical: PhysicalPortInfo?
+
+AvrAmplifierSpec:
+  channels: uint                # amplified channels (7, 9, 11, 13)
+  power_per_channel_w: float?   # rated power (watts per channel, typically at 8Ω)
+  impedance_ohm: float[]?       # supported impedances [4, 6, 8]
+  class: string?                # "ab", "d", "g_h"
+  total_power_w: float?         # maximum total power draw
+  speaker_outputs: AvrSpeakerOutput[]
+  pre_outs: AvrPreOut[]?        # pre-amp outputs for external amplification
+  bi_amp: bool?                 # bi-amplification support (uses 2 channels per speaker)
+
+AvrSpeakerOutput:
+  id: string                    # "front_left", "front_right", "center", "surround_left", etc.
+  channel: string               # ITU-R channel label ("FL", "FR", "FC", "SL", "SR", etc.)
+  connector: string             # "binding_post", "spring_clip", "speakon"
+  assignable: bool?             # can this output be reassigned to a different channel?
+  # Assignable outputs are common — a 9.2 AVR with 9 amp channels can
+  # be configured as 7.2.2 (Atmos height) or 7.2+Zone2 or 5.2.4, etc.
+
+AvrPreOut:
+  id: string                    # "sub_1", "sub_2", "zone_2_pre", "front_pre"
+  channel: string               # what this pre-out carries
+  connector: string             # "rca"
+  physical: PhysicalPortInfo?
+
+AvrZone:
+  id: string                    # "main", "zone_2", "zone_3"
+  name: string?
+  independent_source: bool      # can this zone play a different source than main?
+  sources: string[]?            # available sources for this zone
+  output_type: string           # "amplified" (speaker binding posts),
+                                # "pre_out" (RCA to external amp),
+                                # "hdmi" (HDMI output 2)
+  volume_control: bool
+  max_channels: uint?           # zone 2 is typically stereo only
+
+AvrStreamingSpec:
+  airplay: bool?                # AirPlay 2
+  spotify_connect: bool?
+  chromecast: bool?             # Chromecast built-in
+  bluetooth: BluetoothSpec?     # A2DP sink
+  dlna: bool?                   # DLNA/UPnP renderer
+  vendor_platform: string?      # "heos", "musiccast", "sonos_ready", "bluesound"
+  internet_radio: bool?         # vTuner, TuneIn, etc.
+  usb_playback: bool?           # USB-A for flash drive playback
+  ethernet: bool?
+  wifi: WifiSpec?
+
+AvrControlSpec:
+  ip: bool?                     # HTTP API / Telnet
+  ip_protocol: string?          # "denon_avr", "onkyo_iscp", "yamaha_ynca",
+                                # "marantz_ip", "anthem_ip", "nad_bluos"
+  serial: bool?                 # RS-232 (DB-9 or 3.5mm)
+  serial_protocol: string?      # vendor command set
+  cec: bool?                    # HDMI CEC
+  ir: bool?                     # IR remote
+  ir_code_set: string?          # "denon", "marantz", "onkyo", "yamaha", "sony"
+  vendor_app: string?           # "heos", "musiccast", "sonos", "bluos"
+  home_automation: string[]?    # ["control4", "crestron", "savant", "amx", "ip_control"]
+  # Most AVRs have IP control with a documented (or reverse-engineered)
+  # protocol. This makes them confirmed controllable (§2.5) — the router
+  # can switch inputs, change volume, select source, and read state.
+```
+
+**The AVR in the routing graph**:
+
+An AVR creates multiple sub-devices in the graph:
+
+1. **HDMI switch**: `type: switch` with HDMI inputs and outputs, `controllability:
+   confirmed` via IP/CEC. The router switches HDMI inputs as part of
+   scenario activation — "switch AVR to HDMI 3 (gaming PC)".
+
+2. **Audio processor**: `type: audio_processor` — audio extracted from
+   the active HDMI input, decoded (Atmos/DTS:X/PCM), processed (room
+   correction, bass management, EQ), and routed to speakers.
+
+3. **Amplifier**: Power delivery to speakers, modelled via §2.10 power
+   model. 9×150W at 8Ω from a device drawing up to 800W.
+
+4. **Speaker outputs**: Each speaker output is a sink port in the graph.
+   The speaker arrangement (§2.13) uses the AVR's speaker configuration
+   (which channels are active, distances, levels from Audyssey/YPAO)
+   as the authoritative source — the AVR has already calibrated.
+
+5. **Media receivers**: AirPlay 2, Spotify Connect, DLNA, Bluetooth —
+   each is a `media_receiver` device (§2.9) discoverable via mDNS/UPnP.
+
+6. **Zones**: Zone 2/3 are independent audio paths with their own source
+   selection and volume. Each zone is a sub-device with its own ports.
+
+**Example — Ozma controlling a home theatre**:
+
+```
+Scenario: "Movie Night"
+  → AVR: switch to HDMI 1 (Apple TV)           [via IP command]
+  → AVR: set audio mode to Dolby Atmos          [via IP command]
+  → AVR: volume to -25 dB                       [via IP command]
+  → TV: switch to HDMI 1 (AVR output)           [via CEC]
+  → Lights: dim to 10%                          [via HA integration]
+
+Scenario: "Gaming"
+  → AVR: switch to HDMI 3 (Gaming PC)           [via IP command]
+  → AVR: set audio mode to Game (low latency)   [via IP command]
+  → TV: enable ALLM                             [via CEC passthrough]
+  → AVR: Zone 2 source = Spotify Connect         [via IP command]
+  → Zone 2 speakers play background music while gaming in main zone
 ```
 
 **FurnitureSpec** (desks, racks, stands, mounts — physical objects that contain
