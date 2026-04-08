@@ -92,6 +92,18 @@ from .transport_plugin import (
     SerialProtocol,
     SerialLinkState,
 )
+from .measurement import (
+    QualifiedValue,
+    StalenessAction,
+    StalenessPolicy,
+    RefreshCost,
+    RefreshClass,
+    ClassFreshness,
+    DeviceFreshness,
+    MeasurementStore,
+    STANDARD_REFRESH_CLASSES,
+    get_refresh_class,
+)
 from .formats import (
     VideoFormat,
     AudioFormat,
@@ -207,6 +219,17 @@ __all__ = [
     "screen_bandwidth_raw",
     "rgb_bandwidth",
     "serial_bandwidth_bytes_per_sec",
+    # Phase 5 — active measurement + quality decay
+    "QualifiedValue",
+    "StalenessAction",
+    "StalenessPolicy",
+    "RefreshCost",
+    "RefreshClass",
+    "ClassFreshness",
+    "DeviceFreshness",
+    "MeasurementStore",
+    "STANDARD_REFRESH_CLASSES",
+    "get_refresh_class",
     # Phase 4 — transport plugin interface
     "ChannelPriority",
     "FlowControl",
