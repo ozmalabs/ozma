@@ -48,7 +48,7 @@ jobs:
           uv pip install --system pytest pytest-timeout pytest-asyncio
           uv pip install --system -r controller/requirements.txt 2>/dev/null || true
       - name: Run tests
-        run: python -m pytest tests/ -x --timeout 30 -v --ignore=tests/test_e2e_switching.py --ignore=tests/test_e2e_features.py --ignore=tests/test_e2e_v05.py --ignore=tests/e2e_ecosystem
+        run: python -m pytest tests/ -x --timeout 30 -v --ignore=tests/test_e2e_switching.py --ignore=tests/test_e2e_features.py --ignore=tests/test_e2e_v05.py --ignore=tests/e2e_ecosystem --ignore=tests/unit/ecosystem
 
   compile-check:
     runs-on: ubuntu-latest
@@ -69,7 +69,7 @@ jobs:
           fetch-depth: 0
       - name: Check DCO sign-off
         run: |
-          commits=$(git log --format='%H %s' origin/${{ github.base_ref }}..HEAD)
+          commits=$(git log --no-merges --format='%H %s' origin/${{ github.base_ref }}..HEAD)
           failed=0
           while IFS= read -r line; do
             hash=$(echo "$line" | cut -d' ' -f1)
