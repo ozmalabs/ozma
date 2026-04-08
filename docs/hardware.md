@@ -21,7 +21,7 @@ possible. This means:
 - KiCad for PCB design
 - Commodity hardware (TP-Link, Reolink, AliExpress SBCs) over locked ecosystems
 
-This is a deliberate product position, not a cost optimisation.
+This is a deliberate design choice.
 
 ---
 
@@ -184,10 +184,8 @@ One N150 box, running everything:
 └─────────────────────────────────────────────────────┘
 ```
 
-This replaces: your router, your NVR, your KVM switch, your media server, your
-home automation hub, and the cloud subscriptions each of those would otherwise
-require — with one box under your control, running open-source software, with
-no vendor lock-in.
+This runs all of these services on one box under your control, with open-source
+software and no vendor lock-in.
 
 See [Network Architecture](network.md) for the router/IoT details and
 [Camera Recommendations](cameras.md) for the Frigate camera setup.
@@ -284,8 +282,7 @@ Laptop ──USB-C──▶ OPi5 (OTG/gadget: HID + UAC2 + charging)
                      └─Ethernet──▶ controller
 ```
 
-This replaces a $150+ Thunderbolt dock for machines where Thunderbolt isn't
-available, while simultaneously being a full Ozma node.
+This works as a full Ozma node while also acting as a USB-C dock for the laptop.
 
 ### Bill of materials
 
@@ -330,99 +327,16 @@ extra hardware on the desk.
 
 ---
 
-## Option 3 — Ozma Dock (custom PCB, V2.0)
-
-**Target cost: ~$150–200 BOM in low volume**
-
-A purpose-built dock that replaces a Thunderbolt dock while being a full Ozma node.
-One cable from the laptop. No separate capture dongles. No HDMI cables. Arbitrary
-number of display streams.
-
-```
-Laptop ──USB4──▶ [TPS65994AD]       USB4 PD + DP Alt Mode controller
-                      │ DP lanes
-                      ▼
-                 [FPGA]              Open RTL DisplayPort receiver
-                  │   │              AUX channel, 8b/10b, MSA parser,
-                  │   │              MST branch device, frame buffer
-                  │   └──▶ [external monitor outputs]
-                  │
-                  ▼ raw frames (PCIe or MIPI CSI)
-                 [RK3588S]           Node daemon: HLS encode, HID, mDNS
-                      │
-                 Ethernet ──▶ controller
-```
-
-### Key chips
-
-| Chip | Role | Notes |
-|------|------|-------|
-| TI TPS65994AD | USB4 + PD + DP Alt Mode | Handles USB4 negotiation, DP lane mux, PD up to 140W. Protocol stack in ROM — no USB4 firmware to write. |
-| Lattice CrossLink-NX | DisplayPort receiver (open RTL) | 6.25 Gbps SerDes → DP 1.2 HBR2; covers 1080p60 and 4K30. See `hardware/rtl/dp_rx/`. |
-| Rockchip RK3588S | Node SoC | Same chip as OPi5. H.265 hardware encode, 6 TOPS NPU, proven node daemon. |
-
-**V1 target** (ECP5, open toolchain): DP 1.1 HBR1, 1080p30 single display.
-**V2 target** (CrossLink-NX): DP 1.2 HBR2, 1080p60 / 4K30, MST multi-display.
-
-### Open RTL DisplayPort receiver
-
-The DisplayPort protocol above the SerDes is fully documented by VESA (public spec,
-free registration). The entire receiver stack is implemented as open RTL:
-
-```
-hardware/rtl/dp_rx/
-  aux_channel.v      1 Mbps Manchester-encoded AUX controller (I2C-like)
-  dpcd_regs.v        DPCD register file (sink capabilities, link config)
-  link_training.v    TPS1/TPS2/TPS3 pattern response, EQ via AUX replies
-  decoder_8b10b.v    4-lane 8b/10b decode (standard, many open references)
-  msa_parser.v       Main Stream Attribute extraction (resolution, depth, fps)
-  video_framer.v     Pixel reassembly from transport packets → pixel clock + RGB
-  mst_branch.v       Multi-stream topology management (V2 target)
-  frame_buffer.v     Dual-port BRAM frame store, async read for SoC DMA
-```
-
-The hard SerDes in the FPGA handles clock/data recovery and equalization at the
-wire level — that's unavoidable in any FPGA design. Everything above it is open.
-
-### Multiple displays
-
-USB4 carries DisplayPort MST natively. The FPGA acts as an MST branch device,
-exposing N virtual displays to the laptop. Each stream is an independent capture
-channel fed to the SoC. The controller sees N HLS streams from one node — one per
-display. No additional hardware per monitor.
-
-### Development path
-
-```
-Now      OPi5 + MS2130 (COTS)     Proves dock concept, validates node daemon
-V1 HW    ECP5 + TPS65994 + RK3588 Open toolchain, DP 1.1, 1080p30, 100W PD
-V2 HW    CrossLink-NX variant      DP 1.2, 1080p60 / 4K30, MST, 140W EPR PD
-```
-
-The OPi5 COTS work (Option 2) directly de-risks the dock: the node daemon, HID
-gadget, and dock-mode UX are all proven before a single PCB is spun.
-
-### PCB
-
-- 6-layer controlled impedance (USB4 differential pairs need tight stackup)
-- KiCad — fully open, files in `hardware/dock/`
-- USB4 connector: USB-C receptacle with appropriate EMI shielding
-- USB4 compliance: TPS65994 handles signaling; full TBT4 cert is optional / deferred
-
----
-
 ## Comparison
 
-| | Zero 3 + MS2109 | OPi5 + MS2130 | Ozma Dock (V2.0) |
-|---|---|---|---|
-| Cost | ~$30 | ~$100 | ~$150–200 BOM |
-| Max capture | 1080p30 | 1080p60 | 1080p60 / 4K30+ |
-| Multi-display | Via separate capture | Via separate capture | Yes, MST (1 cable) |
-| Laptop charging | No | Optional (PD) | Yes, up to 140W |
-| NPU | No | 6 TOPS | 6 TOPS |
-| Open RTL | N/A | N/A | Yes (DP receiver) |
-| HDMI cables to target | Yes | Yes | No |
-| Best for | Desktop targets, budget | Laptops, AI features | Laptops, product SKU |
+| | Zero 3 + MS2109 | OPi5 + MS2130 |
+|---|---|---|
+| Cost | ~$30 | ~$100 |
+| Max capture | 1080p30 | 1080p60 |
+| Laptop charging | No | Optional (PD) |
+| NPU | No | 6 TOPS |
+| HDMI cables to target | Yes | Yes |
+| Best for | Desktop targets, budget | Laptops, AI features |
 
 ---
 

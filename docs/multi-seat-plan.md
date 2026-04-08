@@ -291,18 +291,3 @@ ozma-agent --multi-seat --seat-config seats.json
 
 ---
 
-## vs ASTER Multiseat
-
-| Feature | ASTER ($60) | Ozma (free) |
-|---------|-------------|-------------|
-| Windows multi-seat | ✓ | ✓ |
-| Linux multi-seat | ✗ | ✓ |
-| Stream to remote devices | ✗ | ✓ (WebRTC) |
-| Audio isolation | Partial | Full (per-seat) |
-| Auto-detect peripherals | ✗ | ✓ (USB topology) |
-| Game launcher | ✗ | ✓ (dashboard) |
-| Virtual displays | ✗ | ✓ (IDD) |
-| Open source | ✗ | ✓ (AGPL) |
-| Ecosystem integration | ✗ | ✓ (scenarios, RGB, AI, widgets) |
-
-This is a standalone product-level feature that drives adoption far beyond the KVM niche.
