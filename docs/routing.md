@@ -6928,6 +6928,114 @@ It's also how a home user interacts — they set `home` and never think
 about it again. The posture is the policy; the gap report is the evidence;
 the spec defines both.
 
+**Posture enforcement**: The tighten-only inheritance rule is **enforced at
+write time** — an API call that would loosen the effective posture at any
+level is rejected with an error explaining which parent posture field
+constrains it. To intentionally deviate from posture, an admin creates a
+**posture exception**:
+
+```yaml
+PostureException:
+  id: string
+  target: string                # device/zone/space the exception applies to
+  field: string                 # which posture field is overridden ("auth.min_factors_physical")
+  override_value: any           # the exception value
+  justification: string         # why this exception exists (required, auditable)
+  approved_by: string           # who approved it (person identity)
+  created_at: timestamp
+  expires_at: timestamp?        # when the exception auto-expires (null = permanent until revoked)
+  review_interval_days: uint?   # how often this exception must be re-approved
+```
+
+Exceptions appear in the gap report as a separate category — distinct from
+violations. An auditor sees: "3 exceptions granted (with justifications,
+approvers, and expiry dates)" vs "2 violations (no exception, must be
+fixed)". Expired exceptions automatically become violations.
+
+**Continuous posture monitoring**: Posture compliance is evaluated on every
+state change, not just when the gap report is run. Events fire in real time:
+
+```
+security.posture.violation      # a change made the system non-compliant
+security.posture.exception_created  # an approved exception was granted
+security.posture.exception_expired  # an exception expired → now a violation
+security.posture.restored       # a previous violation was fixed
+security.posture.drift          # gradual drift — multiple small changes aggregate
+```
+
+These feed notification sinks (Slack alert on violation), the hashchained
+audit log, and the monitoring dashboard. The gap report is a snapshot; the
+events are the continuous feed.
+
+**Incident response posture**: What happens when a violation is detected
+depends on the posture:
+
+```yaml
+PostureIncidentResponse:
+  on_violation: string          # "log_only", "alert", "alert_and_require_ack",
+                                # "lock_affected", "lock_zone", "emergency_lockdown"
+  ack_required_within_hours: uint?  # time to acknowledge before escalation
+  escalation: string?           # "notify_admin", "notify_all_admins", "lock_zone",
+                                # "disable_affected_device", "external_webhook"
+  auto_remediate: bool?         # attempt to fix automatically (e.g., re-enable MFA
+                                # that was disabled, re-lock a door that was held open)
+```
+
+| Posture | on_violation | ack_required | escalation |
+|---------|-------------|--------------|------------|
+| `home` | `log_only` | — | — |
+| `small_business` | `alert` | 48h | `notify_admin` |
+| `regulated` | `alert_and_require_ack` | 24h | `notify_all_admins` + `external_webhook` |
+| `high_security` | `lock_affected` | 1h | `lock_zone` + `external_webhook` |
+
+**Network segmentation posture**: Added to `PostureOperationalPolicy`:
+
+```yaml
+  # --- Network segmentation ---
+  require_management_vlan: bool     # management traffic on separate VLAN
+  require_iot_isolation: bool       # IoT devices on isolated VLAN (default-deny)
+  require_camera_isolation: bool    # camera traffic segregated
+  require_server_no_direct_internet: bool  # servers cannot reach internet directly
+  require_guest_isolation: bool     # guest WiFi isolated from production
+```
+
+These map directly to the existing IoT VLAN management (V1.6) and router
+mode. The posture validates that the network configuration meets the
+declared segmentation requirements.
+
+**USB device policy — granular**:
+
+```yaml
+  usb_device_policy: UsbDevicePolicy
+
+UsbDevicePolicy:
+  default_action: string        # "allow", "block", "prompt"
+  rules: UsbPolicyRule[]        # per-class or per-device rules
+
+UsbPolicyRule:
+  match: string                 # "class:hid" (keyboards/mice), "class:storage",
+                                # "class:wireless" (WiFi/BT adapters), "class:video",
+                                # "vid_pid:1234:5678" (specific device),
+                                # "db:known" (in device database), "db:unknown"
+  action: string                # "allow", "block", "prompt", "read_only" (storage)
+  zones: string[]?              # applies only in these zones (null = everywhere)
+  log: bool                     # log when this rule triggers
+  # Example regulated policy:
+  # - HID devices: allow (keyboards and mice always work)
+  # - Known storage: prompt (user must approve, logged)
+  # - Unknown storage: block (no unknown USB drives)
+  # - Wireless adapters: block in server zones (rogue AP risk)
+  # - Video devices (capture cards): allow
+  # - Everything else: block
+```
+
+**Home posture hardening**: Even `home` now requires MFA for destructive
+admin operations (factory reset, credential enrollment, audit log
+deletion, posture change). Single factor remains acceptable for daily use
+(physical access, scenario switching, dashboard viewing), but actions that
+can't be undone require a second factor. This prevents: compromised phone
+BLE = full admin access including credential enrollment of attacker's face.
+
 ---
 
 ## 11. Observability and Monitoring
