@@ -7,46 +7,127 @@
 
 ## 1. Overview
 
-Ozma is a software-defined KVMA router. The routing protocol defines how video,
-audio, and peripheral signals are modelled, discovered, negotiated, and delivered
-across an arbitrarily complex graph of devices, transports, and conversions.
+Ozma is a software-defined KVMA router. The routing protocol defines how
+signals — video, audio, peripherals, data, power, and control — are modelled,
+discovered, negotiated, and delivered across an arbitrarily complex graph of
+devices, transports, and conversions.
 
-The core premise: every signal path — from a keyboard through a USB cable, across
-a network, into a USB gadget on a target machine — is a graph of typed ports
-connected by links. Each link has measurable properties (bandwidth, latency,
-jitter, loss). Each port has discoverable capabilities (supported formats,
-maximum throughput). The router's job is to assemble the best pipeline through
-this graph to satisfy a declared **intent**.
+The core premise: every path through the system — from a keyboard through a
+USB cable, across a network, into a USB gadget on a target machine; from a
+wall outlet through a UPS, PDU, and PSU to a CPU core; from a microphone
+through a mix bus, insert chain, and network transport to a remote speaker —
+is a graph of typed ports connected by links. Each link has measurable
+properties (bandwidth, latency, jitter, loss, voltage, current). Each port
+has discoverable capabilities (supported formats, maximum throughput, power
+budget). The router's job is to assemble the best pipeline through this
+graph to satisfy a declared **intent**.
 
-**The graph model is valuable independent of KVM switching.** A single PC
-running only the desktop agent — no nodes, no target machines, no switching —
-still benefits from the routing graph. It provides: USB topology with
-controller mapping and bandwidth sharing detection, physical port
-recommendations, PipeWire audio routing with mix bus and per-app separation,
-Bluetooth codec negotiation awareness, WiFi quality monitoring, power
-tracking, device database matching (dock internal topology, GPU codec
-capabilities), storage health trending, thermal monitoring, and a unified
-dashboard with historical journal and trend alerts. The KVMA router is the
-headline feature; the graph model is the platform everything else builds on.
+### What the graph model covers
 
-This specification defines:
+The specification models the complete physical and logical infrastructure of
+any computing environment — from a single PC on a desk to a multi-hall
+datacentre:
 
-1. **Graph primitives** — the vocabulary for describing the signal fabric
-2. **Intents** — what the user wants to achieve, and the constraints that implies
-3. **Format system** — how media capabilities are described and negotiated
-4. **Information quality** — how to trust (or not) reported properties
-5. **Route calculation** — how pipelines are assembled and re-evaluated
-6. **Plugin contracts** — registration, lifecycle, interfaces for transports, devices, codecs, converters
-7. **Clock model** — distributed timing across independent devices
-8. **Topology discovery** — what can be known, from where, and at what confidence
-9. **Device versioning and mesh updates** — version tracking, OTA delivery, fleet orchestration
-10. **Power model** — voltage rails, current budgets, measurement, USB PD, PoE, RGB power limiting
-11. **Furniture and physical environment** — desks, racks, rooms, sites, relative positioning, zone types
-12. **Control path** — how commands reach devices, dependency chains, reachability, fallback paths
-13. **Audio routing model** — mix buses, monitor controller, insert chains, spatial audio, metering, gain staging
-14. **Thermal and power management** — fan curves, power profiles, thermal zones, intent-driven control
-15. **Physical device database** — universal open catalog with motherboard/CPU/chipset topology, hosted on Connect
-16. **Node definition** — complete specification of what a node is: hardware, USB gadget, physical I/O, services, lifecycle
+**Signal routing**: Video (HDMI/DP/NDI/HLS/WebRTC), audio (PCM/VBAN/Opus/
+AES67 with pro audio mixing, spatial speaker arrangements, room correction),
+HID (keyboard/mouse/gamepad), RGB lighting, screen content, control surface
+I/O — all as pipelines assembled from graph primitives with format negotiation,
+bandwidth calculation, and latency budgeting.
+
+**Device topology**: Every device — from an SFP+ transceiver to a
+motherboard to a Thunderbolt dock to an AV receiver to a 24-bay SAS JBOD —
+is a compound device with ports, internal links, and discoverable
+capabilities. USB controller mapping, PCIe lane sharing, chipset uplink
+bottlenecks, GPU display engine head/PLL constraints, DIMM channel
+interleaving, and SAS expander zoning are all expressed in the graph.
+
+**Power**: Every voltage rail traced from utility feed through UPS, PDU,
+PSU, and regulator to every consumer. Per-port USB power budgets. PoE
+allocation. RGB LED current calculation. Barrel jack specifications with
+polarity and actual-vs-labelled voltage. Modular PSU cable pinout safety.
+Battery state for every device that has one.
+
+**Physical environment**: Sites, buildings, rooms (including datacentre
+halls with hot/cold aisle containment and A/B power feeds), rack rows,
+racks (including the LackRack), rack units with occupancy, patch panels
+with per-port structured cabling documentation, furniture with relative
+positioning, spatial zones for routing decisions.
+
+**Monitoring**: Every property in the graph — resource utilisation, link
+health, power state, thermal readings, firmware versions — is observable
+in real time, recorded in a persistent journal, trended for predictive
+alerting, and exportable to external systems. The routing graph is a
+monitoring platform by construction: the data needed for routing decisions
+is exactly the data a monitoring platform needs.
+
+**Asset management**: Every device has hardware identity (serial numbers,
+MAC addresses, UUIDs), firmware tracking (including BIOS/AGESA/microcode
+version history with known issues), and a complete lifecycle journal.
+Compatibility checking validates physical fitment, electrical compatibility,
+bandwidth constraints, power adequacy, pinout safety, and thermal clearance
+across any combination of components.
+
+**Audio production**: Mix buses, monitor controller (source selection,
+speaker switching, dim, mono, talkback), insert chains with processor
+ordering, cue sends, per-app audio separation, metering (peak/LUFS/VU),
+gain staging, dither, spatial audio with speaker arrangement and listener
+position, room acoustics model, Dante-equivalent clock sync on commodity
+Ethernet (PTP with hardware timestamps), and full PipeWire integration.
+
+**Control**: Every device has a control path — how commands reach it,
+through what intermediary, with what dependency chain. DDC/CI via display
+cable, CEC via HDMI, serial via USB adapter on a specific node, IP via
+vendor API, IR via blaster — all with reachability tracking and fallback
+paths.
+
+### Scale independence
+
+The same primitives model:
+
+| Scale | Example |
+|-------|---------|
+| Single device | One PC — USB topology, audio routing, storage health, thermal monitoring |
+| Desk | PC + monitors + speakers + peripherals + desk lamp — spatial audio, RGB, power budget |
+| Room | Multiple desks + rack + AV receiver + cameras — KVM switching, network, AV routing |
+| Building | Multiple rooms + structured cabling + WiFi + IoT — fleet management, VLAN, cooling |
+| Campus | Multiple buildings + inter-building fiber + WAN — federation, remote access, Connect relay |
+| Datacentre | Halls + rack rows + A/B power + CRAC cooling — full infrastructure graph |
+
+No model changes between scales. A `Device` is a `Device` whether it's a
+USB keyboard or a 48-port spine switch. A `Link` is a `Link` whether it's
+a 10cm USB cable or a 40km singlemode fiber run. A `VoltageRail` is a
+`VoltageRail` whether it's a 5V USB port or a 480V 3-phase utility feed.
+The graph grows; the primitives don't change.
+
+### Plugin extensibility
+
+Everything that is not a core graph primitive is a plugin — transports,
+device discovery, codecs, converters, switch controllers. Third-party
+plugins register new transport types, device classes, and capabilities at
+runtime. The plugin interface is Python and stable — plugins written today
+will continue to work when the controller core is rewritten in Rust (via
+PyO3 embedded interpreter). Built-in transports and community-contributed
+LoRa/Zigbee/Dante plugins use the same interface.
+
+### This specification defines:
+
+1. **Graph primitives** — Device, Port, Link, Pipeline, with hardware identity, physical location, power profile, and control path on every entity
+2. **Intents** — what the user wants to achieve (gaming, creative, desktop, fidelity audio, broadcast), with constraints, preferences, degradation policies, and automatic binding to observed conditions
+3. **Format system** — video, audio (with channel mapping), HID, screen, RGB, control surface, and data formats with three-phase negotiation (enumerate → restrict → fixate)
+4. **Information quality** — seven trust levels (user → measured → inferred → reported → commanded → spec → assumed) with provenance tracking and temporal decay
+5. **Route calculation** — cost model with device pressure, spatial zones, and activation time; constraint satisfaction; remediation with safety levels; intent bindings
+6. **Plugin contracts** — registration, lifecycle, language stability guarantee; interfaces for transports, devices, codecs, converters, switches
+7. **Clock model** — PTP with hardware timestamps (Dante-equivalent on commodity Ethernet), configurable jitter buffers, drift compensation, sample-accurate sync
+8. **Topology discovery** — five-layer discovery (hardware → OS interface → network → measurement → enrichment), opaque device handling, topology calibration probes
+9. **Device versioning** — Ozma software + third-party firmware (LVFS/fwupd), BIOS/AGESA/microcode tracking with known issue database, fleet update orchestration
+10. **Power model** — voltage rails with measured/inferred current, USB PD negotiation state, PoE, per-function power cost, RGB current calculation, power distribution (PDU/UPS/strips with per-outlet metering and switching)
+11. **Physical environment** — sites, spaces (offices through datacentre halls), spatial zones, furniture (desks through 42U racks), relative positioning, hot/cold aisle containment, A/B power feeds
+12. **Control path** — how commands reach devices through intermediaries, dependency chains, reachability tracking, fallback paths, cloud control risk surfacing
+13. **Audio routing** — mix buses, monitor controller, insert chains, cue sends, metering (LUFS/peak/VU), gain staging, dither, spatial audio with speaker arrangement and room acoustics, active redundancy, per-app audio separation, platform virtual audio devices
+14. **Thermal and power management** — fan curves (zone-aware, cause-aware, noise-aware), power profiles (CPU/GPU/platform with intent-driven switching), thermal-aware routing (encode placement, storage path selection, noise-sensitive fan capping)
+15. **Physical device database** — universal open catalog: motherboards with physical port mapping and chipset topology, CPUs with iGPU/NPU, GPUs with display engine constraints and codec sessions, RAM with XMP/channel topology, storage with SAS/NVMe/HBA/enclosure/backplane, monitors with compound device model (KVM/hub/speakers/DDC-CI), AV receivers, pro audio interfaces, SFP transceivers with EEPROM/DOM/firmware/recode, cables/adapters/risers with bandwidth constraints, power connectors with pinout/polarity/actual voltage, racks with accessories and patch panels — all community-contributed via Connect
+16. **Node definition** — complete specification of Ozma nodes: platform, target binding, USB gadget composition, GPIO/I2C/SPI peripheral buses, services, network/mesh identity, lifecycle
+17. **Observability** — real-time metrics, historical journal, trend analysis, Sankey flow diagrams, asset inventory with serial numbers and lifecycle tracking, fleet firmware state, compatibility checking with build validation
 
 This document does not define wire formats or byte layouts — those live in
 individual protocol specs (`protocol/specs/`). This document defines the
