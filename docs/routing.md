@@ -7452,12 +7452,130 @@ display_engine:
    through vs keep for the host. "Pass HDMI to the VM; keep DP 1 for the
    host's management console."
 
+**USB displays and software-rendered outputs**:
+
+USB display adapters (DisplayLink, Fresco Logic) and virtual displays
+(macOS Sidecar, Windows Miracast, headless display emulators) bypass the
+GPU's display engine entirely. They don't consume heads, PLLs, or output
+links — they render via the CPU or GPU's 3D engine, compress the
+framebuffer, and send it over USB or network. This makes them a workaround
+for head-limited systems (like Apple M1) but with different tradeoffs.
+
+```yaml
+UsbDisplaySpec:
+  type: string                  # "displaylink", "fresco_logic", "mcdp2900",
+                                # "evdi" (virtual), "sidecar", "miracast",
+                                # "headless_dongle"
+  chipset: string?              # "DL-6950", "FL2000", "MCDP2900"
+  max_resolution: Resolution?
+  max_refresh: float?
+  compression: string?          # "displaylink_adaptive", "h264", "h265", "none"
+  connection: string            # "usb3", "usb2", "wifi", "thunderbolt", "virtual"
+
+  # Performance characteristics (very different from native display output)
+  cpu_usage_percent: float?     # CPU overhead for rendering + compression
+  gpu_usage_percent: float?     # GPU overhead (some use GPU for encode)
+  latency_ms: float?            # additional display latency vs native output
+  color_accuracy: string?       # "full" (no compression artefacts),
+                                # "good" (slight compression), "limited"
+  hdr_supported: bool?          # typically no for USB displays
+
+  # Does NOT consume a display engine head/PLL/link.
+  # This is the key property — it's an additional display path
+  # independent of the GPU's native output constraints.
+  consumes_head: bool           # always false for USB displays
+  consumes_encode_session: bool? # true if uses GPU video encoder for compression
+```
+
+**Display path types** — a unified model of how displays are driven:
+
+| Path type | Heads used | Latency | Quality | CPU/GPU cost | Use case |
+|-----------|-----------|---------|---------|-------------|----------|
+| Native (DP/HDMI) | Yes — 1 head + PLL + output link | <1ms | Perfect | None | Primary displays |
+| DP Alt Mode (USB-C) | Yes — same as native DP | <1ms | Perfect | None | Laptop/dock displays |
+| Thunderbolt DP tunnel | Yes — head used, DP tunneled | 1–2ms | Perfect | Minimal | TB dock displays |
+| DisplayLink USB | No | 5–30ms | Good (compressed) | 5–15% CPU | Extra monitors, M1 workaround |
+| EVDI / virtual | No | 1–5ms | Perfect (uncompressed) | 5–10% CPU | Headless servers, testing |
+| Sidecar (macOS) | No | 10–30ms | Good | 5–10% CPU + GPU | iPad as display |
+| Miracast | No | 20–50ms | Good (H.264) | 5–10% GPU encode | Wireless display |
+| Headless dongle | Yes — consumes 1 head | <1ms | N/A (no physical display) | None | Tricks GPU into rendering for capture |
+
+**Apple silicon display limits** — the canonical example of head constraints
+where USB displays are the workaround:
+
+```yaml
+# Apple M1 display engine
+display_engine:
+  heads: 2                      # M1 has exactly 2 display heads
+  max_external: 1               # only 1 external display via native output
+  # The internal panel uses 1 head. That leaves 1 head for external.
+  # This is a hard limit — no amount of adapters changes it.
+  output_links:
+    - { output_id: internal, link_type: edp, head_assignment: "head_0" }
+    - { output_id: thunderbolt_0, link_type: dp_tunnel, head_assignment: "head_1" }
+    - { output_id: thunderbolt_1, link_type: dp_tunnel, head_assignment: "head_1" }
+    # Both TB ports share head_1 — you can use one OR the other, not both.
+  constraints:
+    - type: max_external
+      description: "M1 supports only 1 external display via native output"
+      outputs_affected: ["thunderbolt_0", "thunderbolt_1"]
+    - type: shared_head
+      description: "Both Thunderbolt ports share one display head — only one external via DP"
+
+# Apple M1 Pro/Max display engine
+display_engine:
+  heads: 4                      # M1 Pro: 3 heads (2 external). M1 Max: 5 heads (4 external).
+  max_external: 2               # M1 Pro. M1 Max = 4.
+  # No single-external limit. Multiple external displays work natively.
+
+# Apple M2 display engine
+display_engine:
+  heads: 2                      # same 1-external limit as M1
+  max_external: 1
+
+# Apple M3 display engine
+display_engine:
+  heads: 3                      # M3 supports 2 external (improvement over M1/M2)
+  max_external: 2
+
+# Apple M4 display engine
+display_engine:
+  heads: 4                      # M4 supports 3 external
+  max_external: 3
+```
+
+The router uses this to:
+
+1. **Warn before hitting the limit**: "Your M1 MacBook supports 1 external
+   display via Thunderbolt. Adding a second monitor requires a DisplayLink
+   adapter (USB display, not native — expect 5–30ms latency and CPU overhead)."
+
+2. **Recommend the right solution**: "You need 3 displays on an M1. Options:
+   (a) 1 native Thunderbolt + 2 DisplayLink USB (CPU overhead, latency).
+   (b) Upgrade to M1 Pro which supports 2 native + 1 DisplayLink.
+   (c) Use a DisplayLink triple-head dock (3 USB displays, 15% CPU)."
+
+3. **Account for USB display overhead**: A DisplayLink adapter consumes
+   CPU and possibly a GPU encode session. The resource model (§2.7)
+   tracks this. Three DisplayLink adapters on an M1 = ~30% CPU just for
+   display rendering — the router warns about resource pressure.
+
+4. **Headless dongle awareness**: A headless HDMI/DP dongle (EDID emulator)
+   consumes a real display head — it tricks the GPU into rendering a
+   framebuffer for capture. On an M1, plugging in a headless dongle
+   uses the only external head, preventing a real monitor. The router
+   flags this: "Headless dongle on Thunderbolt is using your only
+   external display head. Consider a virtual display (EVDI) instead."
+
 **Discovery**: Display engine capabilities can come from:
 - Device database entry (`spec` quality) — known constraints per GPU model
 - Driver query (`reported` quality) — `nvidia-smi`, `xrandr --verbose`,
   DRM/KMS `drmModeGetResources` for head/CRTC count
 - Measured (`measured` quality) — attempt a configuration, observe if it
   succeeds or the driver downclocks
+- Platform APIs (`reported`) — macOS `CGGetActiveDisplayList` for current
+  count, `IODisplayConnect` for output topology, `system_profiler` for
+  chip identity
 
 **NetworkCardSpec** (NICs, WiFi, Bluetooth — beyond the physical port):
 
