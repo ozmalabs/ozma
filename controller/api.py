@@ -7,6 +7,10 @@ REST endpoints:
   GET  /api/v1/nodes/{id}            — get a single node
   POST /api/v1/nodes/{id}/activate   — make a node active
   GET  /api/v1/status                — system snapshot
+  GET  /api/v1/graph                 — routing graph (devices + links)
+  GET  /api/v1/graph/devices         — all devices in the graph
+  GET  /api/v1/graph/devices/{id}    — single device
+  GET  /api/v1/graph/links           — all links in the graph
 
 WebSocket:
   ws://<host>:7380/api/v1/events     — real-time push events
@@ -1334,6 +1338,28 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             **state.snapshot(),
             "active_scenario_id": scenarios.active_id,
         }
+
+    # --- Routing graph endpoints (Phase 1: observational) ---
+
+    @app.get("/api/v1/graph")
+    async def get_graph() -> dict[str, Any]:
+        """Return the current routing graph (devices, ports, links)."""
+        return state.routing_graph.to_dict()
+
+    @app.get("/api/v1/graph/devices")
+    async def list_graph_devices() -> dict[str, Any]:
+        return {"devices": [d.to_dict() for d in state.routing_graph.devices()]}
+
+    @app.get("/api/v1/graph/devices/{device_id}")
+    async def get_graph_device(device_id: str) -> dict[str, Any]:
+        device = state.routing_graph.get_device(device_id)
+        if device is None:
+            raise HTTPException(status_code=404, detail=f"Device not found: {device_id}")
+        return device.to_dict()
+
+    @app.get("/api/v1/graph/links")
+    async def list_graph_links() -> dict[str, Any]:
+        return {"links": [l.to_dict() for l in state.routing_graph.links()]}
 
     # --- Scenario endpoints ---
 

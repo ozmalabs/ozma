@@ -148,6 +148,11 @@ class AppState:
         # Vaultwarden manager — set by main.py if OZMA_VAULTWARDEN=1
         self.vaultwarden_manager: Any | None = None
 
+        # Routing graph (Phase 1: observational)
+        from routing import RoutingGraph, GraphBuilder
+        self.routing_graph: RoutingGraph = RoutingGraph()
+        self._graph_builder: GraphBuilder = GraphBuilder(self.routing_graph)
+
     async def add_node(self, node: NodeInfo) -> None:
         async with self._lock:
             is_new = node.id not in self.nodes
@@ -191,6 +196,7 @@ class AppState:
                     # Union of capabilities
                     node.capabilities = list(set(node.capabilities) | set(existing.capabilities))
             self.nodes[node.id] = node
+        self._graph_builder.apply_node_added(node, self)
         if is_new:
             await self.events.put({"type": "node.online", "node": node.to_dict()})
 
@@ -200,6 +206,7 @@ class AppState:
             if self.active_node_id == node_id:
                 self.active_node_id = None
         if removed:
+            self._graph_builder.apply_node_removed(node_id)
             await self.events.put({"type": "node.offline", "node_id": node_id})
 
     async def set_active_node(self, node_id: str) -> None:
@@ -207,6 +214,8 @@ class AppState:
             if node_id not in self.nodes:
                 raise KeyError(f"Unknown node: {node_id}")
             self.active_node_id = node_id
+        # Rebuild graph so link statuses reflect the new active node
+        self._graph_builder.rebuild(self)
         await self.events.put({"type": "node.switched", "node_id": node_id})
 
     def get_active_node(self) -> NodeInfo | None:
