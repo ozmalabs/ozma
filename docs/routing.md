@@ -6409,15 +6409,251 @@ The intent's `encryption` constraint controls this:
 - `preferred`: encrypt if the transport supports it, allow unencrypted otherwise
 - `none`: explicitly disable encryption (for debugging or trusted networks)
 
-### 10.2 Authentication
+### 10.2 Identity and Authentication
 
-Devices authenticate during discovery/enrollment using the existing mesh CA
-(Ed25519 identity keys). The routing protocol does not introduce new
-authentication — it relies on the identity layer established by the security
-architecture (see `security.md`).
+Authentication in the routing graph is a unified model covering every way
+an entity can prove its identity — from a device enrolling in the mesh to
+a person's face recognised by a camera to a fingerprint on a reader to a
+passkey in a browser. These are all authentication events in the same
+system, and they all affect the graph.
 
-A device's identity is verified before its ports and capabilities are added to
-the graph. Unauthenticated devices are never routed to.
+#### Identity model
+
+Two classes of identity exist in the graph:
+
+```yaml
+DeviceIdentity:
+  # Devices authenticate via cryptographic identity (mesh CA)
+  type: "device"
+  id: string                    # device's stable Ozma identifier
+  identity_key: Ed25519Key      # device's identity keypair
+  certificates: Certificate[]?  # issued by controller's mesh CA
+  enrollment_state: string      # "enrolled", "pending", "revoked"
+  # A device's identity is verified before its ports and capabilities
+  # are added to the graph. Unauthenticated devices are never routed to.
+
+PersonIdentity:
+  # People authenticate via credentials — physical, biometric, or digital
+  type: "person"
+  id: string                    # person's stable identifier (opaque, not PII)
+  display_name: string?         # "Matt", "Guest 1" (optional, for UI)
+  credentials: Credential[]     # all registered credentials for this person
+  roles: string[]?              # "admin", "user", "guest", "operator"
+  zones: string[]?              # which spatial zones this person can access
+  scenarios: string[]?          # which scenarios this person can activate
+  preferences: PersonPreferences?  # per-person defaults (intent, audio, lighting, thermal)
+```
+
+#### Credential types
+
+Every way to prove identity is a credential. Credentials are typed,
+have strength levels, and can be combined for multi-factor authentication:
+
+```yaml
+Credential:
+  id: string                    # credential identifier
+  type: CredentialType
+  strength: string              # "possession" (something you have),
+                                # "knowledge" (something you know),
+                                # "biometric" (something you are)
+  enrolled_at: timestamp
+  last_used: timestamp?
+  device_binding: string?       # which device this credential is bound to
+                                # (e.g., fingerprint reader ID, camera ID)
+  revoked: bool
+
+CredentialType: enum
+  # --- Physical (possession) ---
+  badge_rfid                    # RFID proximity badge (HID Prox, EM4100)
+  badge_nfc                     # NFC smart card (Mifare DESFire, HID iClass SE)
+  badge_ble                     # BLE badge/beacon
+  phone_ble                     # phone BLE proximity (Ozma app)
+  phone_nfc                     # phone NFC tap
+  hardware_key                  # FIDO2/WebAuthn hardware key (YubiKey, etc.)
+  physical_key                  # traditional physical key (not electronic — manual only)
+
+  # --- Knowledge ---
+  pin                           # numeric PIN code
+  password                      # password (API/dashboard login)
+  passkey                       # FIDO2 passkey (phone/laptop biometric → cryptographic)
+  totp                          # time-based OTP (authenticator app)
+
+  # --- Biometric ---
+  fingerprint                   # fingerprint reader
+  face                          # facial recognition (camera + AI)
+  iris                          # iris scanner
+  voice                         # voice recognition
+  palm_vein                     # palm vein scanner
+
+  # --- Network/device ---
+  certificate                   # X.509 / Ed25519 certificate (device mesh CA, 802.1X)
+  wifi_802_1x                   # WiFi 802.1X authentication (RADIUS)
+  vpn_key                       # VPN/WireGuard identity
+  ssh_key                       # SSH public key
+  oauth_token                   # OAuth2/OIDC token (from IdP)
+  api_key                       # static API key
+```
+
+#### Authentication events
+
+Every authentication attempt — success or failure — is an event in the
+graph that feeds intent bindings, the journal, and access control decisions:
+
+```yaml
+AuthenticationEvent:
+  timestamp: timestamp
+  person_id: string?            # who (null if unknown/failed identification)
+  credential_type: CredentialType  # what method was used
+  credential_id: string?        # which specific credential
+  device_id: string             # which device performed the authentication
+                                # (lock, camera, fingerprint reader, API endpoint)
+  location: PhysicalLocation?   # where (derived from the authenticating device's location)
+  result: AuthResult
+  confidence: float?            # for biometric: match confidence (0.0–1.0)
+  multi_factor: bool            # was this part of an MFA sequence?
+  mfa_session: string?          # MFA session ID (groups multiple factors)
+
+AuthResult: enum
+  success                       # authenticated successfully
+  denied_credential             # valid credential, but not authorised for this action
+  denied_time                   # valid credential, but outside allowed time window
+  denied_zone                   # valid credential, but not allowed in this zone
+  failed_no_match               # credential presented but no match found
+  failed_expired                # credential matched but expired/revoked
+  failed_confidence             # biometric match below confidence threshold
+  failed_liveness               # biometric failed liveness check (photo/replay)
+  failed_mfa_incomplete         # first factor OK, second factor not provided in time
+```
+
+#### Multi-factor composition
+
+Credentials combine for multi-factor authentication. The model supports
+arbitrary factor combinations:
+
+```yaml
+MfaPolicy:
+  name: string                  # "face_and_phone", "badge_and_pin", "any_two_factors"
+  required_factors: MfaFactor[]
+  timeout_s: uint               # all factors must complete within this window
+  order: string                 # "any_order", "sequential" (first factor must precede second)
+
+MfaFactor:
+  credential_types: CredentialType[]  # any of these satisfies this factor
+  strength: string                    # "possession", "knowledge", "biometric"
+  # Each factor requires a different strength class — face (biometric) +
+  # phone proximity (possession) = two-factor. Two badges (possession +
+  # possession) = only one factor despite two credentials.
+```
+
+**Standard MFA policies**:
+
+| Policy | Factor 1 | Factor 2 | Use case |
+|--------|----------|----------|----------|
+| `face_and_phone` | Face recognition (biometric) | Phone BLE proximity (possession) | Front door auto-unlock — recognise the person AND their phone is in range |
+| `badge_and_pin` | Badge tap (possession) | PIN entry (knowledge) | Server room — two-factor physical access |
+| `fingerprint_and_badge` | Fingerprint (biometric) | Badge (possession) | High-security zone |
+| `passkey` | Passkey (biometric + possession in one — phone/laptop authenticates) | — | Dashboard login — single gesture, two factors |
+| `any_biometric` | Any biometric credential | — | Desk unlock — face, fingerprint, or voice |
+
+#### Identity in the routing graph
+
+A person's identity affects the graph:
+
+1. **Intent binding**: "When Matt authenticates at his desk, activate his
+   personal scenario (monitor layout, audio routing, lighting, thermal)."
+   Different people at the same desk get different environments.
+
+2. **Zone-based routing**: "Matt is authenticated in Zone A (desk) — route
+   his keyboard and mouse to his gaming PC. When he authenticates in Zone B
+   (couch via phone BLE), route to the TV."
+
+3. **Access control on pipelines**: "Guest users can view the preview
+   stream but cannot activate the gaming scenario or access the server
+   room's KVM."
+
+4. **Audit trail**: Every authentication event goes into the state change
+   journal (§11.6). The audit log (hashchained) records security-relevant
+   events with full credential and location detail.
+
+5. **Hot-desking**: Person authenticates at any desk (badge, fingerprint,
+   phone) → their workspace profile (§ workspace_profiles.py) activates
+   at that physical location. Monitors switch to their layout, audio routes
+   to their preferences, their cloud sessions resume.
+
+#### Authentication devices in the graph
+
+Every device that can authenticate a person is a device in the routing
+graph with a control path and specific capabilities:
+
+| Device | Credential types | Strength | Connection |
+|--------|-----------------|----------|-----------|
+| Smart lock (§10.2) | Badge, PIN, fingerprint, BLE | Possession + knowledge + biometric | Z-Wave, Zigbee, BLE, IP |
+| Camera (Frigate) | Face recognition | Biometric | IP (existing camera infrastructure) |
+| Fingerprint reader (USB) | Fingerprint | Biometric | USB HID |
+| NFC reader (USB/desk) | Badge NFC, phone NFC | Possession | USB HID, I2C |
+| Intercom (door station) | Face, voice, PIN | Biometric + knowledge | IP, SIP |
+| Laptop (agent) | Passkey, fingerprint (built-in), face (Windows Hello/Face ID) | Biometric + possession | Agent reports auth events |
+| Phone (KDE Connect) | BLE proximity, NFC tap | Possession | BLE, NFC |
+| WiFi AP | 802.1X certificate | Certificate (device/person) | RADIUS |
+| VPN endpoint | WireGuard key, certificate | Certificate | Network |
+| Dashboard (browser) | Password, passkey, OAuth/OIDC, hardware key | Knowledge + possession + biometric | HTTPS |
+
+These aren't new device types — they're capabilities on existing devices.
+A camera is already in the graph for video; face recognition is a
+capability. A laptop agent already reports presence; fingerprint/passkey
+authentication is an event it can emit. A smart lock is already modelled
+(§15 LockSpec). The authentication model unifies them under one identity
+framework.
+
+#### PersonPreferences
+
+When a person is identified, their preferences can drive the environment:
+
+```yaml
+PersonPreferences:
+  default_intent: string?       # preferred intent when this person is active
+  scenarios: { zone: string, scenario: string }[]?  # per-zone scenario preference
+  audio: PersonAudioPrefs?
+  display: PersonDisplayPrefs?
+  thermal: PersonThermalPrefs?
+  lighting: PersonLightingPrefs?
+
+PersonAudioPrefs:
+  volume_db: float?             # preferred volume
+  output: string?               # preferred speaker set ("headphones", "monitors_a")
+  eq_profile: string?           # preferred EQ profile
+
+PersonDisplayPrefs:
+  brightness: float?            # preferred display brightness (0–100)
+  color_temp_k: uint?           # preferred color temperature
+  layout: string?               # preferred multi-monitor layout
+
+PersonThermalPrefs:
+  target_temp_c: float?         # preferred room temperature
+  fan_profile: string?          # preferred fan noise level ("silent", "balanced")
+
+PersonLightingPrefs:
+  scene: string?                # preferred lighting scene
+  brightness: float?            # preferred brightness
+  color_temp_k: uint?           # preferred color temperature
+```
+
+**Example — hot-desking with person authentication**:
+
+```
+Matt badges in at Desk 3 (NFC reader on desk)
+  → AuthenticationEvent: person=matt, credential=badge_nfc, device=desk_3_reader
+  → PersonIdentity lookup: matt → preferences loaded
+  → Intent binding fires:
+    → Scenario: matt_desktop (monitors to his layout, audio to his preferences)
+    → Lighting: 4000K, 70% brightness (matt's preference)
+    → Thermal: 22°C target (matt's preference)
+    → Audio: volume -25dB, output monitors_a (matt's preference)
+  → When Matt leaves (badge out, or occupancy timeout):
+    → Desk returns to neutral state
+    → Scenario deactivates
+    → Ready for next person
+```
 
 ---
 
