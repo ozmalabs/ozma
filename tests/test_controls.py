@@ -100,7 +100,7 @@ class TestControlManager(unittest.TestCase):
         self.mgr = ControlManager(self.state, self.scenarios, self.audio)
 
     def _run(self, coro):
-        return asyncio.get_event_loop().run_until_complete(coro)
+        return asyncio.run(coro)
 
     # ── Surface registration ─────────────────────────────────────────────────
 

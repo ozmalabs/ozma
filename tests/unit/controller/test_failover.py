@@ -149,7 +149,7 @@ class TestFailoverManagerInit:
             assert mgr._heartbeat_task is None
             assert mgr._poll_task is None
 
-        asyncio.get_event_loop().run_until_complete(_run())
+        asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------

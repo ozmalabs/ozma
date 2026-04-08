@@ -325,7 +325,7 @@ class TestAlertCallback:
             t.ingest("n1", _report("red"))   # degradation → alert task created
             await asyncio.sleep(0)           # allow task to run
 
-        asyncio.get_event_loop().run_until_complete(_run())
+        asyncio.run(_run())
         assert len(fired) == 1
         assert fired[0][0] == "n1"
         assert fired[0][1] == "red"
@@ -355,5 +355,5 @@ class TestAlertCallback:
             t.ingest("n1", _report("green"))  # improvement → no alert
             await asyncio.sleep(0)
 
-        asyncio.get_event_loop().run_until_complete(_run())
+        asyncio.run(_run())
         assert len(fired) == 0

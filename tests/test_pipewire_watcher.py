@@ -132,7 +132,7 @@ class TestPipeWireWatcher(unittest.TestCase):
         self.watcher.on_event = capture
 
     def _run(self, coro):
-        return asyncio.get_event_loop().run_until_complete(coro)
+        return asyncio.run(coro)
 
     # ── Node parsing ─────────────────────────────────────────────────────────
 

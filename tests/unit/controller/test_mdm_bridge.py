@@ -421,13 +421,13 @@ class TestMDMBridgeManagerNoProvider(unittest.TestCase):
 
     def test_starts_without_provider(self):
         mgr = _mgr(self._path)
-        asyncio.get_event_loop().run_until_complete(mgr.start())
+        asyncio.run(mgr.start())
         # No tasks started — no provider configured
         self.assertEqual(len(mgr._tasks), 0)
 
     def test_sync_returns_error_without_provider(self):
         mgr = _mgr(self._path)
-        result = asyncio.get_event_loop().run_until_complete(mgr.sync())
+        result = asyncio.run(mgr.sync())
         self.assertFalse(result["ok"])
         self.assertIn("error", result)
 
@@ -665,7 +665,7 @@ class TestMDMBridgeManagerSync(unittest.TestCase):
         self._mgr._provider = self._mock_provider
 
     def _run(self, coro):
-        return asyncio.get_event_loop().run_until_complete(coro)
+        return asyncio.run(coro)
 
     def test_sync_adds_new_devices(self):
         fresh = [_make_device(id="new-dev", user_email="alice@x.com")]
@@ -735,7 +735,7 @@ class TestVPNProfilePush(unittest.TestCase):
         self._mgr._provider = self._mock_provider
 
     def _run(self, coro):
-        return asyncio.get_event_loop().run_until_complete(coro)
+        return asyncio.run(coro)
 
     def test_push_generates_keypair(self):
         dev = _make_device(id="phone-1", platform="android")
@@ -851,7 +851,7 @@ class TestOffboarding(unittest.TestCase):
         self._mgr._devices[b.id] = b
 
     def _run(self, coro):
-        return asyncio.get_event_loop().run_until_complete(coro)
+        return asyncio.run(coro)
 
     def test_offboard_unenrolls_all_user_devices(self):
         result = self._run(self._mgr.offboard_user("alice@x.com", wipe=False))
