@@ -6021,6 +6021,21 @@ GET /api/v1/monitoring/power
 # Asset inventory snapshot
 GET /api/v1/monitoring/inventory
 # Returns: all devices with hardware info, versions, location, health.
+# Includes: serial numbers, MAC addresses, firmware versions, purchase/first-seen
+# date, physical location, current health, connected topology.
+# Exportable as CSV/JSON for compliance evidence, insurance, auditing.
+
+# Asset lifecycle
+GET /api/v1/monitoring/inventory/{device_id}/history
+# Returns: complete lifecycle for one device — first seen, every firmware update,
+# every location change, every state change, health trend, connected-to history.
+
+# Asset search
+GET /api/v1/monitoring/inventory/search?serial=ABC123
+GET /api/v1/monitoring/inventory/search?mac=AA:BB:CC:DD:EE:FF
+GET /api/v1/monitoring/inventory/search?location=rack-1
+GET /api/v1/monitoring/inventory/search?status=degraded
+# Search across all asset fields — serial, MAC, location, type, status, vendor.
 
 # Sankey / flow diagram data for any resource type
 GET /api/v1/monitoring/sankey?type=bandwidth
@@ -6270,6 +6285,20 @@ GET /api/v1/monitoring/journal/{sequence_id}  # single record with full before/a
 - **Debugging intermittent issues** — USB device dropping and reconnecting
   shows up as repeated `port_disconnected` / `port_connected` pairs with
   timestamps, revealing the pattern
+- **Asset lifecycle tracking** — every device has a complete history from
+  first discovery to current state: when it was first seen (acquisition/
+  deployment), every firmware update, every physical location change, every
+  health state transition, every connection change. This is IT asset
+  management (ITAM) built into the routing graph — no separate CMDB or
+  spreadsheet. The journal + hardware identity + device database entry
+  together give you: what it is, which specific one, where it is, what
+  state it's in, and everything that ever happened to it.
+- **Internal hardware tracking** — for Ozma Labs and any organisation: track
+  provenance and status of every piece of hardware from acquisition through
+  deployment to disposal. Know which dev board ran which firmware, which
+  capture card has had USB errors, which SFP module was reflashed, which
+  PSU cable belongs to which PSU. The state change journal is the source
+  of truth — queryable, exportable, auditable.
 
 **Relationship to the audit log** (`controller/audit_log.py`): The audit log
 is a hashchained compliance record of security-relevant actions (authentication,
