@@ -2108,6 +2108,10 @@ PowerSpec:
   per_function_power: FunctionPowerCost[]?  # breakdown by function
   efficiency_percent: float?            # PSU/regulator efficiency (for delivery devices)
 
+  # --- Power input connector (the physical power port) ---
+  power_input: PowerConnectorSpec?      # what connector and what it actually needs
+  power_inputs: PowerConnectorSpec[]?   # if multiple power inputs (redundant PSU, AC+USB)
+
   # For devices that deliver power:
   output_rails: OutputRail[]?
 
@@ -2116,6 +2120,127 @@ PowerSpec:
 
   # For LED devices:
   led_power: LedPowerSpec?
+
+PowerConnectorSpec:
+  connector: string             # physical connector type (see table below)
+  label_voltage_v: float?       # what's printed on the device label
+  actual_voltage_v: float?      # what the device actually needs (may differ from label!)
+  actual_voltage_range: VoltageRange?  # full acceptable range
+  current_ma: float?            # required/rated current
+  power_w: float?               # wattage rating
+  polarity: string?             # "center_positive", "center_negative", "ac" (for barrel jacks)
+  barrel: BarrelJackSpec?       # barrel jack dimensions (if barrel_dc connector)
+  iec: IecSpec?                 # IEC connector details (if IEC)
+  country_plug: string?         # wall plug standard if hardwired ("nema_5_15", "type_g", etc.)
+  included_adapter: PowerAdapterSpec?  # PSU/adapter that ships with the device
+  compatible_adapters: string[]?  # device database IDs of known compatible adapters
+  incompatible_adapters: string[]?  # adapters known to NOT work (wrong voltage, wrong polarity)
+  notes: string?                # free-text notes ("label says 9V but ships with 12V adapter")
+  source: string?               # where this info came from ("label", "measured", "manual",
+                                # "community_verified")
+
+BarrelJackSpec:
+  outer_diameter_mm: float      # outer barrel diameter
+  inner_diameter_mm: float      # inner pin diameter
+  barrel_length_mm: float?      # barrel depth
+  # Common sizes:
+  # 5.5×2.1mm — most common (Arduino, LED strips, many devices)
+  # 5.5×2.5mm — many laptops, some pro audio
+  # 4.0×1.7mm — some small devices
+  # 3.5×1.35mm — smaller devices
+  # 6.3×3.0mm — some older equipment
+  # 2.1 and 2.5mm inner pins physically fit the same 5.5mm barrel —
+  # a 2.5mm plug in a 2.1mm jack makes intermittent contact.
+  # A 2.1mm plug in a 2.5mm jack wobbles and may not connect.
+  # The database captures exact dimensions to warn about this.
+
+IecSpec:
+  type: string                  # IEC 60320 type
+  temperature_rating_c: uint?   # max temperature (C15/C17 = 120°C, C13 = 70°C)
+  current_rating_a: float       # rated current
+  voltage_rating_v: uint        # rated voltage (typically 250V AC)
+  fused: bool?                  # fused connector (UK C13 with built-in fuse)
+  locking: bool?                # locking variant (IEC 60320-1 C13L/C19L)
+  # IEC types that look similar but are NOT interchangeable:
+  # C13 (70°C, 10A) vs C15 (120°C, 10A) — C15 has a notch, for hot devices
+  # C19 (70°C, 16A) vs C21 (120°C, 16A) — C21 has a notch
+  # Using a C13 cable on a device that needs C15 (e.g., kettle, high-temp
+  # equipment) is a fire hazard — the cable isn't rated for the temperature.
+
+PowerAdapterSpec:
+  type: string                  # "ac_adapter" (wall wart), "inline_psu", "usb_charger",
+                                # "internal_psu", "open_frame_psu"
+  input_voltage: string?        # "100-240V AC" (universal), "120V AC", "230V AC"
+  input_frequency: string?      # "50/60Hz", "50Hz", "60Hz"
+  output_voltage_v: float       # DC output voltage
+  output_current_ma: float      # DC output current
+  output_power_w: float?        # output power
+  output_connector: string      # connector type on the output
+  output_barrel: BarrelJackSpec?  # barrel dimensions if barrel_dc
+  output_polarity: string?      # "center_positive", "center_negative"
+  regulation: string?           # "regulated", "unregulated"
+  # Unregulated adapters output higher voltage at low load (a "12V"
+  # unregulated adapter may output 15V with no load, 12V at rated current,
+  # and 10V when overloaded). Regulated adapters maintain constant voltage.
+  efficiency: string?           # "level_vi" (modern efficient), "level_v", "linear"
+  standby_power_w: float?       # power consumed when device is off/standby
+  replacement_available: bool?  # can you still buy this adapter?
+  generic_compatible: bool?     # can a generic adapter with matching specs work?
+
+# Example — your FireWire mixer that says 9V but needs 12V:
+#
+# power_input:
+#   connector: "barrel_dc"
+#   label_voltage_v: 9          # WRONG — label is incorrect
+#   actual_voltage_v: 12        # what it actually needs
+#   actual_voltage_range: { nominal: 12, min: 11, max: 13 }
+#   current_ma: 1500
+#   polarity: "center_positive"
+#   barrel: { outer_diameter_mm: 5.5, inner_diameter_mm: 2.1 }
+#   included_adapter:
+#     output_voltage_v: 12      # ships with 12V despite 9V label
+#     output_current_ma: 2000
+#     output_connector: "barrel_dc"
+#     output_polarity: "center_positive"
+#   notes: "Device label reads 9V DC but ships with 12V adapter and
+#           requires 12V to operate. 9V supply causes erratic behaviour.
+#           Community verified."
+#   source: "community_verified"
+```
+
+**Why this matters**:
+
+1. **Second-hand equipment**: When you buy a mixer/interface/device without
+   its original adapter, you need to know the actual voltage, current,
+   polarity, and barrel size. The label might be wrong. The device database
+   is the source of truth — community-verified, not manufacturer labels.
+
+2. **Cable/adapter shopping**: "I need a replacement power cable for my
+   monitor" — the database tells you it's IEC C14 (not C8, not C6),
+   10A rated. "I need a power supply for this LED strip" — 5V, 10A,
+   5.5×2.1mm center-positive barrel.
+
+3. **Polarity warnings**: Center-negative barrel jacks exist (some older
+   effects pedals, some Yamaha keyboards). Plugging in a center-positive
+   adapter can damage the device. The database captures polarity per device
+   and warns on mismatch.
+
+4. **IEC temperature ratings**: A C13 cable on a device that generates heat
+   (laboratory equipment, some industrial gear) is a fire hazard if the
+   device needs C15 (120°C rated). They look almost identical — C15 has
+   a small notch. The database knows which type is required.
+
+5. **Universal adapter compatibility**: The database tracks which devices
+   can use generic adapters (voltage + current + polarity + barrel match)
+   vs which need specific vendor adapters (proprietary connectors, specific
+   regulation requirements, communication pins).
+
+6. **Complete cable inventory**: With power connectors modelled alongside
+   data connectors, the system can generate a complete cable shopping list
+   for any setup: "Your rack needs: 3× IEC C13-C14 cables (1.8m), 2×
+   IEC C19-C20 cables (1.0m), 1× 12V/3A 5.5×2.1mm center-positive
+   barrel adapter, 4× Cat6a patch cables (0.5m), 2× SFF-8643 SAS cables
+   (1.0m)."
 
 VoltageRange:
   nominal: float                # expected input voltage
@@ -9208,7 +9333,19 @@ PortPosition:
 | `dvi` | video | DVI-I / DVI-D |
 | `vga` | video | VGA (D-Sub 15) |
 | `sma` | radio | SMA antenna connector (WiFi, LoRa, cellular) |
-| `barrel_dc` | power | DC barrel jack (various sizes) |
+| `barrel_dc` | power | DC barrel jack (see PowerConnectorSpec for size/polarity) |
+| `iec_c14` | power | IEC 60320 C14 inlet (C13 cable, 10A, most PC PSUs + monitors) |
+| `iec_c20` | power | IEC 60320 C20 inlet (C19 cable, 16A, servers + UPS) |
+| `iec_c8` | power | IEC 60320 C8 inlet (C7 "figure-8" cable, 2.5A, small devices) |
+| `iec_c6` | power | IEC 60320 C6 inlet (C5 "clover/mickey" cable, 2.5A, laptop PSUs) |
+| `iec_c18` | power | IEC 60320 C18 inlet (C17 cable, 10A, hot conditions) |
+| `nema_5_15` | power | NEMA 5-15 (US standard wall plug, 120V/15A) |
+| `type_g` | power | BS 1363 (UK wall plug, 230V/13A) |
+| `type_c_euro` | power | CEE 7/16 Europlug (230V/2.5A) |
+| `type_f_schuko` | power | CEE 7/4 Schuko (230V/16A) |
+| `anderson_pp` | power | Anderson Powerpole (DC, various ratings) |
+| `xt60` | power | XT60 (DC, 60A, hobby/solar/battery) |
+| `terminal_block` | power | Screw terminal (bare wire, various ratings) |
 | `firewire_400` | data, (power 12V/1.5A) | IEEE 1394a 6-pin (powered) or 4-pin (unpowered) |
 | `firewire_800` | data, (power 12V/1.5A) | IEEE 1394b 9-pin (bilingual — accepts 400 + 800) |
 | `gpio_header` | data, power | Pin header (SBC GPIO, internal USB header) |
