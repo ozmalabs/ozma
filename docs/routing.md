@@ -110,7 +110,9 @@ Device:
 | `phone` | Mobile phone connected via USB (UAC2, ADB, tethering, screen mirror) or KDE Connect (see §2.9) |
 | `actuator` | Monitor stand, sit/stand desk, crane, linear actuator (see §2.9) |
 | `sensor` | Temperature, current, humidity, motion, door contact (see §2.9) |
-| `ups` | UPS via NUT — battery, load, runtime, power state |
+| `ups` | UPS — battery backup, power conditioning, load monitoring |
+| `pdu` | Power Distribution Unit — rack or desk, metered/switched/basic |
+| `power_strip` | Power strip, surge protector, extension cord |
 | `relay` | Connect relay endpoint |
 | `switch` | KVM switch, HDMI matrix, audio matrix, crosspoint switch |
 | `vm_host` | QEMU/KVM/Proxmox hypervisor (manages VM targets) (see §2.9) |
@@ -2269,6 +2271,220 @@ LedPowerSpec:
   voltage: float                # LED operating voltage (5V or 12V)
   recommended_psu_headroom: float  # recommended PSU headroom factor (1.2 = 20% over max)
 ```
+
+**PowerDistributionSpec** (PDUs, UPS, power strips, surge protectors,
+extension cords, splitters — anything between the wall and the equipment):
+
+These are power routing devices — they sit in the power graph and distribute
+mains or DC power to downstream devices. They have input capacity, output
+outlets with individual ratings, and potentially monitoring, switching, and
+battery backup. They are the power equivalent of a network switch.
+
+```yaml
+PowerDistributionSpec:
+  device_type: string           # "ups", "pdu_basic", "pdu_metered", "pdu_switched",
+                                # "pdu_managed", "power_strip", "surge_protector",
+                                # "extension_cord", "dc_splitter", "dc_distribution"
+  input: PowerDistInput         # power input (what feeds this device)
+  outputs: PowerDistOutput[]    # power outputs (what this device feeds)
+  total_capacity: PowerCapacity # total rated capacity
+  monitoring: PowerMonitoring?  # metering/monitoring capabilities
+  switching: PowerSwitching?    # per-outlet switching (if supported)
+  surge: SurgeSpec?             # surge protection (if any)
+  ups: UpsSpec?                 # battery backup (if UPS)
+  cascading: CascadingSpec?     # daisy-chain / cascading rules
+  cord_length_m: float?         # for extension cords and strips
+  mounting: string?             # "rack_horizontal", "rack_vertical", "rack_0u",
+                                # "wall", "desk", "floor", "none"
+  rack_units: uint?             # for rack-mount PDUs (0U = vertical mount)
+
+PowerDistInput:
+  connector: string             # "iec_c14", "iec_c20", "nema_5_15", "nema_l6_30",
+                                # "type_g", "type_f_schuko", "hardwired",
+                                # "barrel_dc", "terminal_block"
+  voltage: string               # "120v_ac", "230v_ac", "100-240v_ac", "208v_ac",
+                                # "12v_dc", "24v_dc", "48v_dc"
+  phase: string?                # "single", "three_phase", "split_phase"
+  max_current_a: float          # input breaker/fuse rating
+  max_power_w: float?           # total input power rating
+  frequency_hz: string?         # "50", "60", "50/60"
+  plug: PowerConnectorSpec?     # the physical plug (for cable shopping)
+  cord_length_m: float?         # input cord length
+
+PowerDistOutput:
+  id: string                    # "outlet_1", "outlet_a1", "bank_a_1"
+  connector: string             # output receptacle type
+  bank: string?                 # which bank/group ("A", "B", "all")
+  max_current_a: float?         # per-outlet rating (may be less than total)
+  switched: bool?               # can this outlet be switched on/off?
+  metered: bool?                # is power metered on this outlet?
+  always_on: bool?              # designated always-on (UPS: on battery too)
+  battery_backed: bool?         # UPS: on battery during outage?
+  physical: PhysicalPortInfo?   # position on the device
+  connected_device: string?     # device database ID of what's plugged in (user-configured)
+  # connected_device enables the power graph: wall → PDU outlet 3 → server PSU.
+  # The router traces power from wall to every device.
+
+PowerCapacity:
+  max_current_a: float          # total rated current
+  max_power_va: float?          # total rated VA (apparent power)
+  max_power_w: float?           # total rated watts (real power)
+  outlets_total: uint           # total outlet count
+  outlet_types: OutletCount[]?  # breakdown by type
+
+OutletCount:
+  connector: string             # "iec_c13", "iec_c19", "nema_5_15", "nema_5_20",
+                                # "type_g", "type_f_schuko", "usb_a", "usb_c"
+  count: uint
+  max_current_a: float?         # per-outlet of this type
+
+PowerMonitoring:
+  type: string                  # "none", "total_input", "per_bank", "per_outlet"
+  metrics: string[]?            # ["voltage", "current", "power_w", "power_va",
+                                # "power_factor", "energy_kwh", "frequency",
+                                # "temperature", "humidity"]
+  protocol: string?             # "snmp", "http", "serial", "modbus", "nut",
+                                # "apc_ap9630", "raritan_px", "servertech_sentry",
+                                # "cyberpower_cloud", "eaton_ipp"
+  # Per-outlet metered PDUs provide measured power per device — this feeds
+  # directly into the power model (§2.10) as `measured` quality data.
+  # A metered PDU is a fleet of INA219 sensors for AC power.
+
+PowerSwitching:
+  type: string                  # "none", "per_outlet", "per_bank", "master"
+  remote: bool?                 # switchable via network/serial (not just physical button)
+  scheduled: bool?              # supports scheduled on/off
+  delay_sequencing: bool?       # staggered power-on to avoid inrush current spike
+  default_state: string?        # "last_state", "always_on", "always_off"
+  # Remote-switched outlets enable: graceful shutdown sequencing (storage
+  # before compute), power cycling as remediation (§8.6), and scheduled
+  # power for non-essential equipment.
+
+SurgeSpec:
+  joules: uint?                 # surge energy absorption rating
+  clamping_voltage_v: float?    # voltage at which protection activates
+  response_time_ns: float?      # surge response time
+  protection_indicators: bool?  # LED showing protection status
+  protection_modes: string[]?   # ["line_to_neutral", "line_to_ground", "neutral_to_ground"]
+  emi_rfi_filter: bool?         # EMI/RFI noise filtering
+  coax_protection: bool?        # coax/antenna surge protection
+  ethernet_protection: bool?    # Ethernet surge protection
+  phone_protection: bool?       # phone/DSL line protection
+  connected_equipment_warranty: float?  # vendor warranty on connected equipment ($)
+  # Surge ratings degrade over time as the MOV absorbs surges.
+  # The trend analysis (§11.7) can track if a smart surge protector
+  # reports declining protection capacity.
+
+UpsSpec:
+  topology: string              # "standby" (offline), "line_interactive", "online_double_conversion"
+  capacity_va: uint             # rated VA capacity
+  capacity_w: uint?             # rated watt capacity (typically 60% of VA)
+  battery: BatterySpec          # battery type, capacity, chemistry
+  runtime_minutes: RuntimeEstimate[]?  # estimated runtime at various load levels
+  transfer_time_ms: float?      # time to switch to battery (standby: 5-12ms,
+                                # line-interactive: 2-4ms, online: 0ms)
+  input_voltage_range: VoltageRange?  # input voltage tolerance before switching to battery
+  avr: bool?                    # automatic voltage regulation (boosts/bucks without battery)
+  pure_sine_wave: bool?         # pure sine output (vs simulated/stepped sine)
+  # Simulated sine can cause problems with active PFC PSUs (most modern PSUs).
+  # Pure sine is required for reliable operation of computer equipment.
+  outlets_battery: uint?        # outlets on battery backup
+  outlets_surge_only: uint?     # outlets with surge only (no battery)
+  usb_port: bool?               # USB for NUT/apcupsd communication
+  serial_port: bool?            # serial for NUT/apcupsd
+  network_card: bool?           # SNMP network management card (slot or built-in)
+  network_protocol: string?     # "snmp", "apc_smartconnect", "eaton_ipp", "cyberpower_cloud"
+  display: bool?                # LCD/LED status display
+  audible_alarm: bool?          # beep on battery/overload
+  self_test: bool?              # automatic self-test capability
+  firmware: FirmwareInfo?       # UPS firmware (updateable on some models)
+
+  # Generator compatibility
+  generator_compatible: bool?   # works with generator power (frequency tolerance)
+  frequency_tolerance_hz: float?  # input frequency range (generators may drift)
+
+RuntimeEstimate:
+  load_percent: uint            # load as percentage of capacity
+  load_w: uint?                 # load in watts
+  runtime_min: float            # estimated minutes of battery runtime
+
+CascadingSpec:
+  max_daisy_chain: uint?        # max units chained (some power strips have pass-through outlets)
+  passthrough_outlet: bool?     # has an outlet that passes through to chain
+  # Daisy-chaining power strips is generally unsafe and violates electrical
+  # codes in most jurisdictions. The compatibility engine (§15.13) should
+  # warn if the user models a chain: "Power strip connected to another
+  # power strip. This is unsafe and may violate local electrical codes."
+  # PDUs are different — rack PDUs are designed for high-density deployment
+  # and don't have the same daisy-chain issues.
+```
+
+**Power distribution in the routing graph**:
+
+Power distribution devices sit in the power graph between the wall outlet
+and the equipment. The graph traces power from source to every consumer:
+
+```
+Wall outlet (NEMA 5-15, 120V/15A = 1800W max on this circuit)
+└── UPS: APC Smart-UPS 1500 (line-interactive, 1000W)
+    ├── Battery outlets:
+    │   ├── Outlet 1 → Server PSU (measured: 280W) [via IEC C13 cable]
+    │   ├── Outlet 2 → Network switch (measured: 25W) [via IEC C13 cable]
+    │   └── Outlet 3 → NAS (measured: 65W) [via IEC C13 cable]
+    │   Total battery-backed: 370W of 1000W capacity (37% load)
+    │   Estimated runtime on battery: 22 minutes
+    │
+    └── Surge-only outlets:
+        ├── Outlet 4 → Monitor (measured: 45W)
+        ├── Outlet 5 → Desk lamp (15W)
+        └── Outlet 6 → Phone charger (20W)
+
+Wall outlet 2 (same circuit — shares 1800W with outlet 1!)
+└── Power strip: Belkin 12-outlet surge protector (1875W, 4320J)
+    ├── Outlet 1 → Audio interface PSU (30W)
+    ├── Outlet 2 → Monitor 2 (45W)
+    ├── Outlet 3 → Powered speakers (2× 50W = 100W)
+    ├── Outlet 4 → LED strip PSU (60W)
+    └── Outlet 5–12: empty
+
+Total circuit load: 370W + 80W + 235W = 685W of 1800W (38%)
+```
+
+The router surfaces this as a power Sankey diagram (§11.2). It knows:
+- Total circuit capacity and current load
+- UPS battery runtime at current load
+- Which devices lose power on outage (surge-only outlets)
+- Which devices stay up (battery-backed outlets)
+- Whether adding a new device would overload the UPS or the circuit
+- Per-outlet power via metered PDU (if available) or estimated from
+  device database power specs
+
+**UPS integration with Ozma**:
+
+The existing NUT integration (`controller/ups_monitor.py`) feeds UPS state
+into the graph. With the full UPS model:
+
+1. **Runtime estimation**: "At current load (370W), battery runtime is
+   22 minutes. If the server starts a heavy encode (450W total), runtime
+   drops to 14 minutes."
+
+2. **Graceful shutdown sequencing**: On battery, after X minutes: shut down
+   non-essential devices first (switched PDU outlets), then gracefully
+   shut down the server, then the NAS. The switched PDU and the UPS
+   coordinate via the power graph.
+
+3. **Overload prevention**: "Adding this GPU server (600W) to the UPS would
+   exceed its 1000W capacity. Move it to a dedicated circuit or upgrade
+   the UPS."
+
+4. **Circuit-level awareness**: Two UPS units on the same wall circuit share
+   the circuit's amperage limit. The graph models this — both UPS inputs
+   trace to the same circuit.
+
+5. **Battery health trending**: UPS battery capacity degrades over time.
+   NUT reports remaining capacity. Trend analysis (§11.7): "UPS battery
+   capacity has dropped 15% in the last year. Runtime at full load is now
+   14 minutes vs 22 minutes when new. Consider battery replacement."
 
 #### Observability
 
@@ -6718,6 +6934,7 @@ DeviceEntry:
   avr: AvrSpec?                 # AV receiver (HDMI switch + audio processor + amplifier)
   audio_interface: AudioInterfaceSpec?  # pro audio interface (multi-I/O, DSP, routing matrix)
   power: PowerSpec?             # generic power (PSU for non-PC devices, PoE injectors, etc.)
+  power_distribution: PowerDistributionSpec?  # PDU, UPS, power strip, surge protector, extension
   sensor: SensorSpec?
   actuator: ActuatorSpec?
 
