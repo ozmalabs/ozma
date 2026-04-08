@@ -6935,6 +6935,10 @@ DeviceEntry:
   audio_interface: AudioInterfaceSpec?  # pro audio interface (multi-I/O, DSP, routing matrix)
   power: PowerSpec?             # generic power (PSU for non-PC devices, PoE injectors, etc.)
   power_distribution: PowerDistributionSpec?  # PDU, UPS, power strip, surge protector, extension
+  transceiver: TransceiverSpec?   # SFP/SFP+/SFP28/QSFP+/QSFP28/QSFP-DD modules
+  fiber_cable: FiberCableSpec?    # fiber optic cables (single-mode, multi-mode, OM1-OM5)
+  server_chassis: ServerChassisSpec?  # server chassis (1U-4U, blade, multi-node)
+  rack: RackSpec?                 # server/network racks (full-depth, half-depth, open frame, LackRack)
   sensor: SensorSpec?
   actuator: ActuatorSpec?
 
@@ -8771,6 +8775,300 @@ connections map to transport plugins with characteristics:
 - No bandwidth sharing with non-audio traffic (unlike USB)
 - Daisy-chainable (unlike USB)
 
+**TransceiverSpec** (SFP/SFP+/SFP28/QSFP+/QSFP28/QSFP-DD pluggable
+optics and DAC cables):
+
+Transceiver modules are pluggable devices that sit in a cage on a switch,
+NIC, or HBA. They determine the actual link speed, reach, and media type.
+A 10GbE NIC with an SFP+ cage can run at 1G or 10G depending on the
+inserted module, over fiber or copper depending on the module type.
+
+```yaml
+TransceiverSpec:
+  form_factor: string           # "sfp", "sfp_plus", "sfp28", "qsfp_plus",
+                                # "qsfp28", "qsfp_dd", "osfp", "cfp", "xfp"
+  type: string                  # "optical", "dac" (Direct Attach Copper),
+                                # "aoc" (Active Optical Cable), "copper_rj45"
+  speed_gbps: float             # line rate (1, 10, 25, 40, 100, 200, 400)
+  protocol: string[]?           # ["ethernet", "fibre_channel", "infiniband",
+                                # "sonet", "otu"]
+  wavelength_nm: uint?          # optical wavelength (850, 1310, 1550, CWDM/DWDM)
+  reach: TransceiverReach       # maximum distance
+  fiber_type: string?           # "multimode_om3", "multimode_om4", "singlemode_os2"
+  connector: string?            # "lc_duplex", "mpo_mtp", "none" (DAC has integral cable)
+  power_draw_w: float?          # module power consumption (1–3.5W typical, high for QSFP-DD)
+  dom: bool?                    # Digital Optical Monitoring (temperature, TX/RX power,
+                                # laser bias, voltage — real-time module health)
+  vendor: string?               # transceiver vendor
+  coding: string?               # "nrz", "pam4" (25G+ uses PAM4)
+  duplex: bool?                 # true for most; false for BiDi (single fiber, two wavelengths)
+  breakout: BreakoutSpec?       # for QSFP: can split into multiple lower-speed links
+  vendor_lock: bool?            # some switches reject third-party transceivers
+
+TransceiverReach:
+  max_distance_m: float         # maximum link distance
+  typical_distance_m: float?    # typical deployment distance
+  distance_class: string?       # "sr" (short reach, <300m), "lr" (long reach, <10km),
+                                # "er" (extended, <40km), "zr" (zero-dispersion, <80km)
+
+BreakoutSpec:
+  mode: string                  # "4x10g", "4x25g", "2x50g", "8x50g", "4x100g"
+  cables: string                # "mpo_to_4xlc" (breakout cable), "direct"
+  # A QSFP+ (40G) can break out into 4× SFP+ (10G) with a breakout cable.
+  # A QSFP28 (100G) can break out into 4× SFP28 (25G).
+  # The routing graph models each breakout lane as a separate link.
+```
+
+**Common transceiver types**:
+
+| Module | Speed | Type | Reach | Fiber | Use case |
+|--------|-------|------|-------|-------|----------|
+| SFP SX | 1G | Optical | 550m | OM3/OM4 MM | Short-reach 1G |
+| SFP LX | 1G | Optical | 10km | OS2 SM | Long-reach 1G |
+| SFP-T | 1G | Copper RJ45 | 100m | — | 1G over existing Cat5e+ |
+| SFP+ SR | 10G | Optical | 300m (OM3), 400m (OM4) | MM | Data centre 10G |
+| SFP+ LR | 10G | Optical | 10km | OS2 SM | Building-to-building 10G |
+| SFP+ DAC | 10G | Direct copper | 1–7m | — | Rack-to-rack (cheapest 10G) |
+| SFP28 SR | 25G | Optical | 100m | OM3/OM4 | 25G server links |
+| QSFP+ SR4 | 40G | Optical | 150m | OM3/OM4 | 40G uplinks |
+| QSFP28 SR4 | 100G | Optical | 100m | OM3/OM4 | 100G spine |
+| QSFP28 LR4 | 100G | Optical (CWDM) | 10km | OS2 SM | 100G WAN |
+| QSFP28 DAC | 100G | Direct copper | 1–5m | — | Top-of-rack (cheapest 100G) |
+
+**DOM (Digital Optical Monitoring)**: Most SFP+ and above transceivers
+report real-time diagnostics — TX/RX optical power (dBm), temperature,
+laser bias current, supply voltage. These feed into the monitoring system
+(§11) as `measured` quality link metrics. Declining RX power over time is
+a trend alert: "Fiber link to switch-2 showing 2 dB loss increase over
+6 months — check connectors or patch cable."
+
+**FiberCableSpec** (fiber optic cables — the physical fiber between
+transceivers):
+
+```yaml
+FiberCableSpec:
+  fiber_type: string            # "multimode", "singlemode"
+  grade: string                 # "om1", "om2", "om3", "om4", "om5",
+                                # "os1", "os2"
+  core_um: float                # core diameter (50µm for OM3/OM4, 62.5µm for OM1/OM2,
+                                #                9µm for OS1/OS2)
+  cladding_um: float?           # typically 125µm
+  strand_count: uint?           # fiber count (2 for duplex, 12/24 for MPO/MTP trunks)
+  connector_a: string           # connector on end A ("lc", "sc", "mpo_12", "mpo_24", "st")
+  connector_b: string           # connector on end B (may differ — LC to SC patch)
+  polish: string?               # "upc" (flat, blue), "apc" (angled, green — singlemode only)
+  length_m: float
+  jacket: string?               # "ofnr" (riser), "ofnp" (plenum), "lszh", "outdoor_armored",
+                                # "outdoor_direct_burial"
+  bend_radius_mm: float?        # minimum bend radius
+  attenuation_db_per_km: float? # fiber attenuation (OM3: 3.5 @ 850nm, OS2: 0.4 @ 1310nm)
+  bandwidth_mhz_km: float?      # modal bandwidth (OM3: 2000, OM4: 4700 @ 850nm)
+  # Higher bandwidth_mhz_km = longer reach at higher speeds.
+  # OM3 supports 10G at 300m. OM4 supports 10G at 400m. Same speed, more margin.
+```
+
+**Fiber grade capabilities**:
+
+| Grade | Core | 1G reach | 10G reach | 25G reach | 40G reach | 100G reach | Notes |
+|-------|------|----------|-----------|-----------|-----------|------------|-------|
+| OM1 | 62.5µm | 275m | 33m | — | — | — | Legacy. Orange jacket. Avoid for new install. |
+| OM2 | 50µm | 550m | 82m | — | — | — | Legacy. Orange jacket. |
+| OM3 | 50µm | 1000m | 300m | 100m | 150m | 100m | Aqua jacket. Current standard. |
+| OM4 | 50µm | 1000m | 400m | 100m | 150m | 150m | Aqua/violet. Better bandwidth. |
+| OM5 | 50µm | 1000m | 400m | 100m | 150m | 400m | Lime green. SWDM wideband. |
+| OS1 | 9µm | 10km | 10km | 10km | 10km | 10km | Yellow. Indoor singlemode. |
+| OS2 | 9µm | 10km+ | 10km+ | 10km+ | 10km+ | 40km+ | Yellow. Indoor/outdoor singlemode. |
+
+The router uses this to validate: "Your OM1 fiber between buildings can't
+sustain 10G at 200m. You need OM3 or better. Or use singlemode (OS2) with
+LR transceivers."
+
+**ServerChassisSpec** (1U–4U rackmount servers, blade chassis, multi-node):
+
+```yaml
+ServerChassisSpec:
+  form_factor: string           # "1u", "2u", "4u", "blade_chassis", "tower_server",
+                                # "multi_node_2u4n", "multi_node_1u2n"
+  rack_units: uint              # height in U (1, 2, 4, 7, 10 for blade chassis)
+  depth_mm: uint?               # chassis depth (short ~500mm, standard ~700mm, deep ~900mm)
+  width: string?                # "19_inch" (standard), "open_compute", "proprietary"
+
+  # --- Compute ---
+  motherboard_form_factor: string?  # "proprietary_server", "atx", "eatx",
+                                    # "blade_module", "sled"
+  cpu_sockets: uint?            # 1, 2, 4
+  max_memory_slots: uint?
+  max_memory_tb: float?
+
+  # --- Storage ---
+  drive_bays: DriveBayGroup[]?  # front + rear drive bays
+  backplane: BackplaneSpec?     # SAS/SATA/NVMe backplane (from §15 StorageSpec)
+  hot_swap_drives: bool?
+  rear_drive_bays: uint?        # some 1U chassis have 2× rear 2.5" bays
+
+  # --- Expansion ---
+  pcie_slots: ExpansionSlot[]?  # PCIe risers and slots
+  riser_cards: RiserConfig[]?   # which risers are installed (determines available slots)
+  ocp_slots: uint?              # OCP 3.0 NIC slots
+
+  # --- Power ---
+  psu_bays: PsuBay[]
+  redundant_psu: bool?          # N+1 PSU redundancy
+  hot_swap_psu: bool?           # PSUs are hot-swappable
+
+  # --- Cooling ---
+  fan_zones: ThermalZone[]?     # reuses ThermalTopology model
+  hot_swap_fans: bool?
+  redundant_fans: bool?
+
+  # --- Management ---
+  bmc: BmcSpec?                 # BMC/IPMI/iLO/iDRAC/AMT
+
+  # --- Front panel ---
+  front_io: PhysicalPort[]?     # front panel ports (VGA, USB, serial, ID button)
+  rear_io: PhysicalPort[]?      # rear panel ports
+  status_leds: string[]?        # ["power", "health", "nic", "uid", "fault"]
+
+DriveBayGroup:
+  position: string              # "front", "rear", "internal"
+  form_factor: string           # "3.5_inch", "2.5_inch", "edsff_e1s", "edsff_e3s"
+  count: uint
+  hot_swap: bool
+  interface: string[]           # ["sas", "sata", "nvme", "u2"]
+  backplane_zones: string[]?    # which backplane zones these bays connect to
+
+PsuBay:
+  id: string
+  form_factor: string           # "crps" (Common Redundant Power Supply),
+                                # "atx", "proprietary_server", "flex_atx"
+  max_wattage_w: uint?
+  hot_swap: bool
+  populated: string?            # device database ID of installed PSU
+
+RiserConfig:
+  id: string                    # "riser_1", "riser_2"
+  type: string                  # vendor-specific riser model
+  slots: ExpansionSlot[]        # what PCIe slots this riser provides
+  # Server PCIe risers are specific to the chassis model. A Dell R740
+  # has 3 riser options that provide different slot configurations.
+  # The device database entry for the chassis lists available risers
+  # and what slots each provides.
+
+BmcSpec:
+  type: string                  # "ipmi_2.0", "ilo_5", "ilo_6", "idrac_9",
+                                # "idrac_8", "amt", "openbmc", "aspeed"
+  network: bool                 # dedicated management NIC
+  shared_nic: bool?             # shares a NIC with host OS
+  vlan: bool?                   # management on separate VLAN
+  virtual_media: bool?          # remote ISO mount
+  virtual_console: bool?        # remote KVM (HTML5/Java)
+  sol: bool?                    # Serial over LAN
+  firmware: FirmwareInfo?       # BMC firmware version
+  # BMC is both a control path (§2.12) — commands reach the server via
+  # BMC even when the OS is down — and a monitoring source (temperature,
+  # fan speed, PSU status, event log). It maps to a sub-device in the graph
+  # with its own network port, firmware, and known vulnerabilities.
+```
+
+**RackSpec** (expanded from FurnitureSpec — racks deserve their own model):
+
+```yaml
+RackSpec:
+  rack_type: string             # "enclosed_4post", "enclosed_2post",
+                                # "open_4post", "open_2post", "wall_mount",
+                                # "desktop", "portable", "lackrack"
+  units: uint                   # total rack units (4, 6, 8, 12, 15, 18, 22, 25, 42, 45, 48)
+  width: string                 # "19_inch" (standard), "10_inch" (SOHO), "23_inch" (telco)
+  depth_mm: uint?               # external depth
+  usable_depth_mm: uint?        # internal rail-to-rail depth (matters for server clearance)
+  height_mm: uint?              # external height
+  weight_capacity_kg: float?    # static weight capacity
+  rolling_weight_kg: float?     # weight capacity on casters
+  material: string?             # "steel", "aluminum", "wood", "ikea_lack"
+
+  # --- Rails and mounting ---
+  rail_type: string?            # "square_hole", "round_hole", "threaded",
+                                # "cage_nut", "clip_nut"
+  adjustable_depth: bool?       # rails can adjust front-to-rear spacing
+  rail_depth_range_mm: { min: uint, max: uint }?
+
+  # --- Cable management ---
+  cable_management: CableManagementSpec?
+
+  # --- Environment ---
+  enclosed: bool                # has side panels and door(s)
+  front_door: string?           # "mesh", "glass", "solid", "none"
+  rear_door: string?            # "mesh", "split_mesh", "solid", "none"
+  side_panels: bool?
+  ventilation: string?          # "passive", "top_fan", "bottom_intake", "climate_controlled"
+  lock: bool?                   # lockable doors
+
+  # --- Power ---
+  pdu_mounts: PduMount[]?       # where PDUs can be mounted
+  power_inlet: PowerConnectorSpec?  # if the rack has a built-in power inlet
+
+  # --- Layout ---
+  unit_positions: RackUnit[]?   # what's in each U position
+
+CableManagementSpec:
+  vertical_managers: uint?      # vertical cable managers (0, 1, or 2 — left/right)
+  horizontal_managers: uint?    # horizontal cable management panels between equipment
+  cable_tray: bool?             # overhead or under-floor cable tray
+  cable_rings: bool?            # cable rings on rear posts
+  velcro_included: bool?
+  brush_panels: uint?           # blanking panels with brush cable pass-through
+  lacing_bars: uint?            # horizontal lacing bars
+
+PduMount:
+  position: string              # "rear_left", "rear_right", "rear_center",
+                                # "side_left", "side_right"
+  orientation: string           # "vertical_0u", "horizontal"
+  max_length_mm: uint?          # maximum PDU length in this position
+
+RackUnit:
+  u_position: uint              # 1 = bottom, N = top (or configurable)
+  occupied_by: string?          # device ID of what's installed here
+  occupied_units: uint?         # how many U this device takes (1, 2, 4)
+  blanking_panel: bool?         # blanking panel for airflow management
+  notes: string?                # "reserved for future switch", "cable management"
+```
+
+**The LackRack**: An IKEA LACK side table ($10) whose legs happen to be
+exactly 19" (483mm) apart — the same width as a standard server rack.
+It's a legitimate entry in the device database:
+
+```yaml
+id: "ikea-lack-side-table"
+type: rack
+name: "IKEA LACK Side Table (LackRack)"
+vendor: "IKEA"
+model: "LACK"
+rack:
+  rack_type: "lackrack"
+  units: 8                      # approximately 8U between shelf and legs
+  width: "19_inch"              # 500mm external, 483mm between legs = 19" !!
+  depth_mm: 550
+  usable_depth_mm: 500
+  height_mm: 550
+  weight_capacity_kg: 25        # IKEA-rated. Your mileage may vary.
+  material: "ikea_lack"         # particleboard + honeycomb paper fill
+  rail_type: null               # no rails — equipment sits on the shelf or is screwed to legs
+  adjustable_depth: false
+  enclosed: false
+  cable_management:
+    vertical_managers: 0        # zip ties recommended
+    cable_rings: false
+  pdu_mounts: []                # velcro a power strip to the leg
+tags: ["budget", "homelab", "meme", "surprisingly_functional"]
+sources:
+  - { type: "community", note: "The LackRack — eth-0.de/lackrack/" }
+dimensions_mm: { w: 550, d: 550, h: 550 }
+price_approximate: "$10"
+notes: "Legs are exactly 19 inches apart. Not rated for heavy servers.
+        Stack two for a full-height rack. Drill the shelf for cable routing.
+        Has housed more production infrastructure than anyone wants to admit."
+```
+
 **FurnitureSpec** (desks, racks, stands, mounts — physical objects that contain
 or support devices):
 
@@ -9563,6 +9861,17 @@ PortPosition:
 | `anderson_pp` | power | Anderson Powerpole (DC, various ratings) |
 | `xt60` | power | XT60 (DC, 60A, hobby/solar/battery) |
 | `terminal_block` | power | Screw terminal (bare wire, various ratings) |
+| `sfp` | data | SFP cage (1 Gbps — SX/LX/T copper) |
+| `sfp_plus` | data | SFP+ cage (10 Gbps — SR/LR/DAC) |
+| `sfp28` | data | SFP28 cage (25 Gbps) |
+| `qsfp_plus` | data | QSFP+ cage (40 Gbps — 4×10G) |
+| `qsfp28` | data | QSFP28 cage (100 Gbps — 4×25G) |
+| `qsfp_dd` | data | QSFP-DD cage (200/400 Gbps) |
+| `osfp` | data | OSFP cage (400/800 Gbps) |
+| `lc_duplex` | data | LC duplex fiber connector (most common SFP fiber) |
+| `sc_duplex` | data | SC duplex fiber connector (older, common in premises) |
+| `mpo_mtp` | data | MPO/MTP multi-fiber connector (12/24 fiber, data centres) |
+| `st` | data | ST bayonet fiber connector (legacy) |
 | `firewire_400` | data, (power 12V/1.5A) | IEEE 1394a 6-pin (powered) or 4-pin (unpowered) |
 | `firewire_800` | data, (power 12V/1.5A) | IEEE 1394b 9-pin (bilingual — accepts 400 + 800) |
 | `gpio_header` | data, power | Pin header (SBC GPIO, internal USB header) |
