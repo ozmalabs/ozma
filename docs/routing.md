@@ -278,6 +278,8 @@ HardwareIdentity:
 | `service` | Managed service (Frigate, Jellyfin, Immich, Vaultwarden, HA) (see §2.9) |
 | `media_receiver` | Spotify Connect (librespot), AirPlay (shairport-sync), Chromecast, DLNA renderer |
 | `media_source` | Jellyfin, Plex, Tidal Connect, local media library — controllable content sources |
+| `sip_endpoint` | SIP desk phone, softphone, door station, PBX trunk — voice call endpoint |
+| `pbx` | PBX / IP telephony server (Asterisk, FreePBX, 3CX, Teams Phone) |
 | `notification_sink` | Webhook, Slack, Discord, email, Pushover, ntfy |
 | `metrics_sink` | Prometheus, Datadog, InfluxDB, syslog exporter |
 | `furniture` | Motorised desk, monitor arm — furniture that is also an actuator (see §2.11) |
@@ -1683,6 +1685,137 @@ within Spotify's infrastructure; Ozma routing happens after the audio
 reaches PipeWire. Both can coexist — Spotify casts to the controller's
 Spotify Connect receiver, then Ozma routes the PipeWire output to
 multiple speakers via its own transport plugins.
+
+#### SIP endpoints and PBX
+
+SIP (Session Initiation Protocol) desk phones, softphones, door stations,
+and PBX systems are devices in the routing graph. A SIP phone is an audio
+endpoint with bidirectional voice, a control interface (call control, BLF
+status), and a physical device with a screen, buttons, and sometimes a
+camera.
+
+```yaml
+SipEndpointDevice:
+  type: sip_endpoint
+  endpoint_type: string         # "desk_phone", "softphone", "door_station",
+                                # "conference_phone", "cordless_dect",
+                                # "analog_ata", "sip_intercom"
+  ports:
+    - id: audio_out             # audio to the phone speaker/handset/headset
+      direction: sink
+      media_type: audio
+    - id: audio_in              # audio from the phone microphone
+      direction: source
+      media_type: audio
+    - id: call_control          # call state, DTMF, hold, transfer, BLF
+      direction: source | sink
+      media_type: control
+    - id: video_out             # video call (if supported)
+      direction: source
+      media_type: video
+    - id: video_in              # video receive (if supported)
+      direction: sink
+      media_type: video
+    - id: screen                # phone display (caller ID, BLF, directory)
+      direction: sink
+      media_type: screen
+  sip: SipConfig
+  phone_features: PhoneFeatures?
+
+SipConfig:
+  registrar: string?            # SIP registrar address ("pbx.local", "sip.provider.com")
+  extension: string?            # SIP extension / DID ("101", "+61299998888")
+  protocol: string              # "sip", "sips" (TLS)
+  audio_codecs: string[]?       # ["g711_ulaw", "g711_alaw", "g722", "opus",
+                                # "g729", "ilbc", "speex"]
+  video_codecs: string[]?       # ["h264", "vp8"]
+  transport: string?            # "udp", "tcp", "tls", "websocket"
+  srtp: bool?                   # secure RTP (encrypted media)
+  dtmf_mode: string?            # "rfc2833", "sip_info", "inband"
+  registration_state: string?   # "registered", "unregistered", "failed"
+  pbx_id: string?               # which PBX this endpoint is registered with
+
+PhoneFeatures:
+  lines: uint?                  # number of simultaneous call appearances
+  blf_keys: uint?               # busy lamp field keys (shows other extensions' state)
+  programmable_keys: uint?      # soft keys / programmable buttons
+  display: ScreenEndpoint?      # phone display (type, resolution)
+  speakerphone: bool?
+  headset_port: bool?           # dedicated headset jack
+  bluetooth: bool?              # Bluetooth headset support
+  wifi: bool?                   # WiFi connectivity (vs wired only)
+  poe: bool?                    # powered by PoE
+  gigabit: bool?                # gigabit Ethernet (with passthrough for PC)
+  passthrough_port: bool?       # Ethernet passthrough to PC (single cable to desk)
+  camera: CameraSpec?           # video phone camera
+  usb: bool?                    # USB port (headset, recording)
+  expansion_module: bool?       # supports sidecar expansion (more BLF keys)
+
+PbxDevice:
+  type: pbx
+  pbx_type: string              # "asterisk", "freepbx", "3cx", "teams_phone",
+                                # "freeswitch", "kamailio", "yeastar",
+                                # "hosted_voip", "ozma_built_in"
+  ports:
+    - id: sip_trunk             # external PSTN/SIP trunk
+      direction: source | sink
+      media_type: audio
+    - id: internal_extensions   # internal SIP endpoints
+      direction: source | sink
+      media_type: audio
+    - id: api                   # management API
+      direction: sink
+      media_type: control
+  extensions: uint?             # number of registered extensions
+  trunks: uint?                 # number of external trunks
+  concurrent_calls: uint?       # maximum simultaneous calls
+  features: string[]?           # ["ivr", "voicemail", "call_recording",
+                                # "call_queue", "ring_group", "conference",
+                                # "paging", "intercom", "blf"]
+  control_interface: string?    # "ami" (Asterisk), "rest_api", "teams_graph",
+                                # "3cx_api", "yeastar_api"
+```
+
+**SIP in the routing graph**:
+
+A SIP desk phone is an audio endpoint like any other — it has a speaker
+(audio sink) and a microphone (audio source). The routing graph can:
+
+1. **Route call audio through the mix bus**: Incoming call audio from the
+   PBX → mix bus → desk speakers (instead of phone speaker). The phone
+   becomes a control surface for call management while audio goes through
+   the high-quality desk audio system.
+
+2. **Seamless handoff to/from phone**: Teams call on PC → user picks up
+   SIP desk phone → audio routes to desk phone. Or: SIP call on desk
+   phone → user taps "Take on headset" → audio routes to Bluetooth
+   headset via the controller.
+
+3. **Intercom via existing infrastructure**: SIP multicast paging to desk
+   phones doubles as a whole-office intercom. Ozma can trigger SIP pages
+   from intent bindings or automation.
+
+4. **BLF as presence**: Busy Lamp Field keys on a SIP phone show extension
+   status. Ozma can read BLF state via the PBX API and use it as a
+   presence/occupancy signal — "extension 101 is on a call" feeds into
+   intent bindings (don't switch scenarios while someone is on a call).
+
+5. **Desk phone screen as display endpoint**: The phone's LCD is a screen
+   sink in the graph. Ozma can push caller ID enrichment, weather, meeting
+   schedule, or node status to the phone's display via the phone's
+   provisioning interface (many SIP phones support XML apps or action URIs).
+
+6. **PoE + passthrough**: Most desk phones have a PoE Ethernet passthrough
+   port — one cable from the switch carries power to the phone AND network
+   to the PC behind it. The graph models this: switch port → PoE → phone
+   → passthrough → PC NIC. The phone is a single-port PoE-powered switch
+   in the graph with two Ethernet ports (uplink + passthrough).
+
+7. **Call handoff between SIP and Teams/Zoom**: The PBX bridges between
+   SIP trunks and UC platforms. Ozma orchestrates: SIP call comes in on
+   desk phone → user wants to continue on Teams → Ozma triggers PBX to
+   transfer the call to the user's Teams extension → audio moves from
+   desk phone to PC → mix bus handles the routing.
 
 #### Network switches and routers
 
@@ -5477,6 +5610,7 @@ LoRaGatewayInfo:
 | `vban` | VBAN protocol (UDP). Uncompressed audio, established open standard. |
 | `hid-usb` | USB HID reports. Vendor-specific device control (some switches, RGB). |
 | `firewire` | IEEE 1394a/b. Isochronous audio (guaranteed bandwidth, daisy-chainable). |
+| `sip` | SIP/RTP. Voice calls, intercom, PBX integration. Signalling + audio. |
 
 **Example exotic transports** (not shipped, but the contract allows them):
 
