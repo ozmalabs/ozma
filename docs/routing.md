@@ -6568,6 +6568,7 @@ DeviceEntry:
   cooler: CoolerSpec?           # CPU cooler, AIO, custom loop components
   case_component: CaseSpec?     # PC case (fan slots, drive bays, radiator support)
   pcie: PcieCardSpec?           # PCIe add-in cards (NICs, capture cards, USB controllers, sound cards)
+  laptop: LaptopSpec?           # laptop-specific: GPU switching, MUX, power states, thermal modes
   cable: CableSpec?             # cables that affect signal quality (HDMI, DP, USB, Ethernet)
   adapter: AdapterSpec?         # adapters, risers, converters that bridge between interface types
 
@@ -8147,6 +8148,163 @@ IoPanel:
   # The internal topology traces: front USB-C → internal USB-C header →
   # motherboard USB controller → chipset/CPU. The full path is known.
 ```
+
+**LaptopSpec** (laptop-specific topology and power behaviour):
+
+Laptops are fundamentally different from desktops in how GPUs connect to
+displays, how power state affects performance, and how thermal limits
+constrain capability. The routing graph needs to model these differences
+because they directly affect what pipelines are possible and at what quality.
+
+```yaml
+LaptopSpec:
+  # --- GPU topology ---
+  gpu_switching: GpuSwitchingSpec?  # how iGPU and dGPU interact
+  display_mux: DisplayMuxSpec?      # hardware display MUX (if present)
+
+  # --- Power state and performance ---
+  power_states: LaptopPowerState[]  # different performance profiles based on power source
+  charger: LaptopChargerSpec?       # expected charger and wattage effects
+
+  # --- Thermal modes (vendor-specific) ---
+  thermal_modes: LaptopThermalMode[]?  # vendor performance/silent/turbo modes
+
+  # --- Physical (from device-db.md laptop library) ---
+  screen: DisplaySpec?              # built-in display panel
+  keyboard_backlight: bool?
+  trackpad: bool?
+  fingerprint: bool?
+  ir_camera: bool?                  # Windows Hello IR
+  thunderbolt_ports: uint?
+  sd_card: string?                  # "sd", "microsd", "none"
+
+GpuSwitchingSpec:
+  type: string                  # "optimus" (NVIDIA), "enduro" (AMD), "apple_switching",
+                                # "mux_switch", "discrete_only", "integrated_only"
+  igpu: DeviceRef               # iGPU device in the graph
+  dgpu: DeviceRef?              # dGPU device in the graph (null if integrated-only)
+  render_offload: bool?         # dGPU renders, iGPU composites and displays (Optimus/Enduro)
+  direct_output: bool?          # dGPU can drive external displays directly (without iGPU copy)
+  # Optimus/Enduro: dGPU renders to framebuffer, iGPU copies to display → adds ~1 frame latency
+  # Direct output: dGPU drives HDMI/DP directly → no copy latency, but can't use iGPU encode simultaneously
+  output_routing: LaptopOutputRouting[]  # which GPU drives which display output
+
+LaptopOutputRouting:
+  output: string                # "internal_panel", "hdmi_1", "usb_c_1", "mini_dp_1"
+  routed_via: string            # "igpu_only", "dgpu_only", "mux_switchable", "either"
+  mux_state: string?            # if mux_switchable: current state ("igpu", "dgpu")
+  bandwidth_impact: string?     # "full" (direct), "copy_overhead" (Optimus render offload)
+  # Example: internal panel is typically igpu_only (or mux_switchable on gaming laptops)
+  #          HDMI is typically dgpu_only (wired directly to dGPU)
+  #          USB-C DP might be igpu on some, dgpu on others, or either
+
+DisplayMuxSpec:
+  present: bool                 # does this laptop have a hardware MUX?
+  type: string?                 # "advanced_optimus" (NVIDIA), "mux_switch" (manual),
+                                # "dynamic" (switches without reboot)
+  switchable_outputs: string[]  # which outputs the MUX controls
+  requires_reboot: bool?        # does switching require a reboot? (older MUX = yes)
+  current_state: string?        # "igpu", "dgpu" (detected at runtime)
+  # MUX matters because Optimus adds 1 frame of latency (iGPU copy).
+  # With MUX on dGPU: internal panel is driven directly by dGPU = no copy latency.
+  # Gaming laptops with MUX are meaningfully faster than without.
+
+LaptopPowerState:
+  source: string                # "ac_full", "ac_low_wattage", "battery", "usb_c_pd"
+  charger_wattage_w: float?     # wattage of the connected charger (null = battery)
+  cpu_tdp_w: float              # CPU TDP in this power state
+  cpu_boost_w: float?           # CPU boost power limit
+  gpu_tdp_w: float?             # dGPU TDP in this power state
+  gpu_boost_w: float?           # dGPU boost power limit
+  max_display_brightness: float? # brightness cap (some laptops dim on battery)
+  max_refresh: float?           # display refresh cap (some drop to 60Hz on battery)
+  encode_sessions: uint?        # NVENC/VCN session cap in this state (some throttle on battery)
+  notes: string?
+
+# Example: a gaming laptop with 140W charger
+# power_states:
+#   - source: "ac_full"
+#     charger_wattage_w: 140
+#     cpu_tdp_w: 45
+#     cpu_boost_w: 65
+#     gpu_tdp_w: 100
+#     gpu_boost_w: 115
+#     notes: "Full performance — all-core boost + GPU boost"
+#
+#   - source: "ac_low_wattage"
+#     charger_wattage_w: 65        # user plugged in a 65W charger
+#     cpu_tdp_w: 35
+#     cpu_boost_w: 45
+#     gpu_tdp_w: 60                 # GPU power-limited because charger can't supply full draw
+#     notes: "Reduced performance — 65W charger limits total power budget"
+#
+#   - source: "battery"
+#     cpu_tdp_w: 25
+#     gpu_tdp_w: 40
+#     max_display_brightness: 0.7    # 70% brightness cap
+#     max_refresh: 60                # drops from 165Hz to 60Hz to save power
+#     notes: "Battery mode — significant performance reduction"
+#
+#   - source: "usb_c_pd"
+#     charger_wattage_w: 100         # USB-C PD charger
+#     cpu_tdp_w: 35
+#     gpu_tdp_w: 75
+#     notes: "USB-C PD — better than battery, less than barrel jack"
+
+LaptopChargerSpec:
+  rated_wattage_w: float        # OEM charger wattage
+  connector: string             # "barrel_dc", "usb_c_pd", "magsafe", "proprietary"
+  voltage_v: float?             # charger voltage
+  min_wattage_for_charging_w: float?  # below this: runs but doesn't charge
+  min_wattage_for_full_perf_w: float?  # below this: performance is throttled
+  usb_c_pd_capable: bool?       # can be charged via USB-C PD (even if OEM is barrel)
+  usb_c_pd_max_w: float?        # max wattage via USB-C PD (may be less than barrel)
+
+LaptopThermalMode:
+  id: string                    # vendor mode ID
+  name: string                  # "Silent", "Balanced", "Performance", "Turbo", "Beast Mode"
+  vendor_api: string?           # how to switch ("acpi_platform_profile", "asus_armoury",
+                                # "lenovo_legion", "dell_thermal", "hp_omen", "razer_synapse",
+                                # "msi_center", "framework_ectool")
+  cpu_tdp_w: float?             # CPU TDP in this mode
+  gpu_tdp_w: float?             # GPU TDP in this mode
+  fan_behavior: string?         # "silent", "standard", "aggressive", "full_speed"
+  display_boost: bool?          # enables high-refresh on some laptops
+  # Vendor thermal modes override the OS power profile. A laptop in
+  # "Performance" mode with the OS set to "Power Saver" still uses the
+  # vendor's aggressive fan curve and higher TDP limits.
+```
+
+**Why this matters for routing**:
+
+1. **Charger-dependent encode capability**: A laptop on battery may throttle
+   NVENC sessions or reduce GPU clock below what's needed for real-time H.265
+   encoding. The router checks `LaptopPowerState` before placing encode jobs
+   on a laptop's GPU. "Laptop is on battery — routing encode to controller's
+   hardware encoder instead."
+
+2. **Display output routing**: On an Optimus laptop, the HDMI port is
+   wired to the dGPU — the iGPU can't drive it. If the user wants to capture
+   the internal panel via the desktop agent, it goes through the iGPU. But
+   capturing the HDMI output goes through the dGPU. The routing graph knows
+   which GPU drives which output and can recommend: "Connect the capture
+   card to HDMI (dGPU direct) for lowest latency."
+
+3. **MUX state awareness**: With Advanced Optimus, the MUX state determines
+   whether the internal panel has Optimus copy overhead or not. The agent
+   detects MUX state and reports it. The router accounts for the ~1 frame
+   additional latency when Optimus is copying through the iGPU.
+
+4. **65W charger alert**: "Your laptop supports 140W but is connected via
+   a 65W USB-C charger. GPU performance is limited to 60W. Use the OEM
+   140W charger for full performance." The agent detects charger wattage
+   via ACPI/platform driver and compares against `LaptopChargerSpec`.
+
+5. **Thermal mode integration**: The vendor's thermal mode (ASUS Armoury,
+   Lenovo Legion, Dell Thermal) maps to an Ozma power profile. When the
+   intent switches to `gaming`, Ozma can switch the laptop's thermal mode
+   to "Performance" via the vendor API — and switch back to "Silent" when
+   the intent returns to `desktop`.
 
 **CableSpec** (cables that affect signal quality — the invisible bottleneck):
 
