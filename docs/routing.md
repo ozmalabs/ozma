@@ -2648,6 +2648,59 @@ Space:
   dimensions_mm: Dimensions?    # room dimensions
   zones: SpatialZone[]          # zones within this space
   furniture: FurnitureEntity[]  # furniture in this space
+  datacentre: DatacentreSpaceSpec?  # datacentre-specific properties (if applicable)
+
+DatacentreSpaceSpec:
+  # --- Rack layout ---
+  rows: RackRow[]?              # rack rows in this space
+  hot_cold_aisle: bool?         # hot/cold aisle arrangement
+  containment: string?          # "hot_aisle_containment", "cold_aisle_containment",
+                                # "chimney", "none"
+  raised_floor: bool?           # raised floor (cable routing, cold air plenum)
+  raised_floor_height_mm: uint? # clearance under raised floor
+  overhead_cable_tray: bool?    # overhead cable trays / ladder rack
+
+  # --- Power infrastructure ---
+  power_feeds: PowerFeed[]?     # utility/generator feeds to this space
+  power_redundancy: string?     # "single_feed", "a_b_redundant", "2n",
+                                # "2n_plus_1", "concurrent_maintainable"
+  total_power_kw: float?        # total available power for this space
+  pue: float?                   # Power Usage Effectiveness (total facility / IT load)
+                                # PUE 1.0 = perfect. Typical DC: 1.3–1.6. Good: 1.1–1.2.
+
+  # --- Cooling ---
+  cooling_type: string?         # "crac" (computer room AC), "crah" (air handler),
+                                # "in_row", "rear_door_heat_exchanger", "liquid",
+                                # "free_air", "evaporative"
+  cooling_capacity_kw: float?   # total cooling capacity
+  target_temp_c: float?         # cold aisle target temperature
+  humidity_range: { min: float, max: float }?  # relative humidity range (%)
+
+  # --- Physical security ---
+  access_control: string?       # "badge", "biometric", "mantrap", "none"
+  cameras: bool?                # CCTV monitoring
+  fire_suppression: string?     # "sprinkler", "fm200", "novec_1230", "inergen", "none"
+
+RackRow:
+  id: string                    # "row_a", "row_1"
+  name: string?
+  orientation: string?          # "north_south", "east_west"
+  racks: string[]               # rack device IDs in this row, in order
+  aisle: string?                # which aisle this row faces ("hot", "cold")
+  power_feed: string?           # which power feed serves this row ("a", "b")
+
+PowerFeed:
+  id: string                    # "feed_a", "feed_b", "generator"
+  source: string                # "utility", "generator", "solar", "ups_output"
+  voltage: string               # "208v_3phase", "480v_3phase", "240v_single"
+  capacity_a: float             # amperage capacity
+  capacity_kw: float?           # kilowatt capacity
+  redundant_with: string?       # which other feed provides redundancy
+  transfer_switch: string?      # "ats" (automatic transfer switch), "sts" (static), "manual"
+  transfer_time_ms: float?      # switchover time (ATS: 10-20ms, STS: 4-8ms, manual: minutes)
+  # A+B redundancy means every rack has two power feeds from different
+  # UPS systems, and every server has dual PSUs — each on a different feed.
+  # If feed A fails, feed B carries 100% of the load.
 
 SpaceType: enum
   office                        # private office
@@ -2658,6 +2711,11 @@ SpaceType: enum
   living_room                   # residential living area
   bedroom                       # residential bedroom
   server_room                   # dedicated server/network room
+  data_hall                     # datacentre compute hall (rows of racks)
+  network_room                  # MDF/IDF, meet-me room, cross-connects
+  power_room                    # UPS room, PDU switchboards, generator, battery
+  cooling_plant                 # CRAC/CRAH units, chiller plant
+  loading_dock                  # receiving, staging
   utility_room                  # storage, mechanical
   outdoor                       # patio, garden, yard
   classroom                     # teaching space
