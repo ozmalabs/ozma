@@ -8797,13 +8797,130 @@ TransceiverSpec:
   fiber_type: string?           # "multimode_om3", "multimode_om4", "singlemode_os2"
   connector: string?            # "lc_duplex", "mpo_mtp", "none" (DAC has integral cable)
   power_draw_w: float?          # module power consumption (1–3.5W typical, high for QSFP-DD)
-  dom: bool?                    # Digital Optical Monitoring (temperature, TX/RX power,
-                                # laser bias, voltage — real-time module health)
-  vendor: string?               # transceiver vendor
   coding: string?               # "nrz", "pam4" (25G+ uses PAM4)
   duplex: bool?                 # true for most; false for BiDi (single fiber, two wavelengths)
   breakout: BreakoutSpec?       # for QSFP: can split into multiple lower-speed links
-  vendor_lock: bool?            # some switches reject third-party transceivers
+
+  # --- EEPROM identity (MSA A0h — read from module I2C address 0x50) ---
+  eeprom: TransceiverEeprom?
+
+  # --- Diagnostics (MSA A2h — read from module I2C address 0x51) ---
+  dom: TransceiverDom?
+
+  # --- Firmware and coding ---
+  firmware: TransceiverFirmware?
+
+  # --- Vendor lock and compatibility ---
+  vendor_lock: VendorLockSpec?
+
+TransceiverEeprom:
+  # SFP MSA defines a 256-byte EEPROM at I2C address 0x50 (A0h).
+  # This is the module's identity — readable on any standards-compliant host.
+  vendor_name: string?          # bytes 20–35 (ASCII, space-padded)
+  vendor_oui: string?           # bytes 37–39 (IEEE OUI)
+  vendor_pn: string?            # bytes 40–55 (vendor part number)
+  vendor_rev: string?           # bytes 56–59 (revision)
+  vendor_sn: string?            # bytes 68–83 (serial number)
+  date_code: string?            # bytes 84–91 (YYMMDD + lot code)
+  transceiver_type: uint?       # byte 6 (SFF-8472 type code)
+  connector_type: uint?         # byte 2 (LC=7, SC=1, copper=0x21, etc.)
+  encoding: uint?               # byte 11 (8b10b, 64b66b, NRZ, PAM4)
+  bit_rate_nominal_mbps: uint?  # byte 12 × 100 (or byte 66 for >25.4 Gbps)
+  length_smf_km: uint?          # byte 14 (single-mode reach in km)
+  length_smf_100m: uint?        # byte 15 (single-mode reach in 100m units)
+  length_om3_10m: uint?         # byte 19 (OM3 reach in 10m units)
+  length_om2_10m: uint?         # byte 16 (OM2 reach)
+  length_om1_10m: uint?         # byte 17 (OM1 reach)
+  length_copper_m: uint?        # byte 18 (copper reach in metres)
+  # The agent reads this via ethtool (Linux), PowerShell (Windows), or
+  # switch CLI / SNMP. Every inserted SFP module auto-identifies.
+  raw_a0h: bytes?               # full 256-byte A0h dump (for advanced analysis)
+
+TransceiverDom:
+  # Digital Optical Monitoring — real-time module health.
+  # Read from I2C address 0x51 (A2h), or pages on QSFP+.
+  supported: bool               # does this module support DOM?
+  calibration: string?          # "internal" (module calibrates), "external" (host calibrates)
+  # Current readings (updated periodically by the agent):
+  temperature_c: float?         # module temperature
+  voltage_v: float?             # supply voltage (typically 3.3V)
+  tx_bias_ma: float?            # laser bias current
+  tx_power_dbm: float?          # transmit optical power
+  rx_power_dbm: float?          # receive optical power
+  # Alarm and warning thresholds (from module EEPROM):
+  thresholds: DomThresholds?
+
+DomThresholds:
+  # Each metric has high/low alarm and high/low warning thresholds
+  # stored in the module EEPROM. When exceeded, the module sets flag bits.
+  temp_high_alarm_c: float?
+  temp_low_alarm_c: float?
+  temp_high_warn_c: float?
+  temp_low_warn_c: float?
+  voltage_high_alarm_v: float?
+  voltage_low_alarm_v: float?
+  tx_bias_high_alarm_ma: float?
+  tx_bias_low_alarm_ma: float?
+  tx_power_high_alarm_dbm: float?
+  tx_power_low_alarm_dbm: float?
+  rx_power_high_alarm_dbm: float?
+  rx_power_low_alarm_dbm: float?
+  rx_power_low_warn_dbm: float?
+  # These thresholds feed into the monitoring system (§11). An RX power
+  # reading below the low warning threshold triggers a trend alert:
+  # "Fiber link to switch-2 RX power -18.3 dBm (warning threshold -17 dBm).
+  # Check fiber connectors and patch cables."
+
+TransceiverFirmware:
+  firmware_version: string?     # module firmware version (coded/smart modules only)
+  firmware_updateable: bool     # can the EEPROM/firmware be reflashed?
+  flash_tool: string?           # tool used to flash ("sfp_reflash", "mikrotik_cli",
+                                # "fs_sfp_tool", "flexoptix_tool", "vendor_proprietary")
+  # --- Reflashing / recoding ---
+  # Many third-party SFP modules can be reflashed to change the vendor
+  # coding stored in the EEPROM. This is used to:
+  # 1. Bypass vendor lock (Cisco/Juniper/Arista reject non-OEM modules)
+  # 2. Change the reported speed/type for compatibility
+  # 3. Update module firmware for bug fixes
+  # The device database tracks known reflash compatibility:
+  recoding: RecodingSpec?
+
+RecodingSpec:
+  eeprom_writable: bool         # is the A0h EEPROM writable?
+  password_protected: bool?     # EEPROM write requires password (some modules)
+  default_password: string?     # factory default password (often "00000000" or "FFFFFFFF")
+  known_tools: string[]?        # ["mikrotik_routeros", "linux_i2c", "flexoptix",
+                                # "fs_com_tool", "sfp_diag", "taobao_programmer"]
+  vendor_code_targets: VendorCode[]?  # known vendor codings this module can be set to
+  risks: string?                # "safe — EEPROM only, laser unaffected",
+                                # "moderate — wrong coding may disable TX",
+                                # "dangerous — can permanently brick module"
+  community_notes: string?      # "FS.com modules accept Cisco/Juniper/HPE coding
+                                #  via their free online tool. No hardware programmer needed."
+
+VendorCode:
+  target_vendor: string         # "cisco", "juniper", "arista", "hpe", "dell",
+                                # "ubiquiti", "mikrotik", "mellanox"
+  coding_bytes: string?         # hex bytes to write (if known and safe to publish)
+  tool: string?                 # tool to use for this specific coding
+  verified: bool?               # community verified to work
+  switch_models: string[]?      # specific switch models confirmed working
+  notes: string?
+
+VendorLockSpec:
+  locked: bool                  # does the host device reject third-party modules?
+  behavior: string?             # "rejected" (won't link), "warning_only" (works but logs error),
+                                # "speed_limited" (forced to lower speed), "no_dom" (works but
+                                # diagnostics disabled), "accepted" (no vendor check)
+  bypass_method: string?        # "recode_eeprom", "cli_command", "unsupported_transceiver_allow",
+                                # "none_known"
+  # Vendor lock behavior:
+  # Cisco: rejects by default, "service unsupported-transceiver" enables
+  # Juniper: warns but works (most models)
+  # Arista: warns but works
+  # HPE/Aruba: rejects by default on some models
+  # Ubiquiti: accepts most third-party
+  # MikroTik: accepts everything, can even reflash EEPROMs from the CLI
 
 TransceiverReach:
   max_distance_m: float         # maximum link distance
