@@ -129,6 +129,47 @@ LoRa/Zigbee/Dante plugins use the same interface.
 16. **Node definition** — complete specification of Ozma nodes: platform, target binding, USB gadget composition, GPIO/I2C/SPI peripheral buses, services, network/mesh identity, lifecycle
 17. **Observability** — real-time metrics, historical journal, trend analysis, Sankey flow diagrams, asset inventory with serial numbers and lifecycle tracking, fleet firmware state, compatibility checking with build validation
 
+### Decentralised decision-making
+
+The specification defines a global model but does not require global
+knowledge for every decision. Routing decisions are made at the level that
+has sufficient context:
+
+**A node** knows its own USB topology, its connected devices, its thermal
+state, its power budget, and its link to the controller. It can make local
+decisions: which USB port to recommend for a capture card, when to ramp
+its fans, whether its power budget can sustain another device. It doesn't
+need to know about the datacentre's CRAC units or the chipset topology of
+a server three racks away.
+
+**A controller** knows its local mesh — the nodes it manages, the links
+between them, the scenarios configured, the audio routing. It makes
+pipeline decisions for its scope: which node gets HID, which codec to use,
+when to failover. It doesn't need to know the internal topology of a
+remote controller's mesh.
+
+**Connect** sees across meshes — device populations, firmware distribution,
+provenance chains, fleet health trends. It makes platform-level decisions:
+which firmware updates to distribute, which device database entries are
+popular, aggregate failure patterns.
+
+**The graph is composable, not monolithic.** Each participant holds the
+subgraph relevant to its decisions. Subgraphs overlap at boundaries
+(a controller knows its nodes; a node knows its devices; the device
+database provides specs for both). More data enables better decisions —
+a controller with chipset topology data can identify DMI bottlenecks that
+a node without that data can't — but the system functions at every level
+of knowledge. A node with no device database match still routes traffic
+using `assumed` quality properties. A controller with no chipset data
+still switches scenarios. The model degrades gracefully as information
+decreases.
+
+This is the same principle as `InfoQuality` (§5): the system makes the
+best decision possible with the data available, tracks the confidence of
+that decision, and improves as better data arrives. A routing decision
+based on `assumed` properties works. A routing decision based on `measured`
+properties works better. Neither requires the other to exist.
+
 This document does not define wire formats or byte layouts — those live in
 individual protocol specs (`protocol/specs/`). This document defines the
 **model** that those specs implement.
