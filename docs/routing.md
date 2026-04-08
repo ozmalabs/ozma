@@ -4625,6 +4625,7 @@ LoRaGatewayInfo:
 | `ir` | Infrared blaster/receiver. Write-only switch control. |
 | `vban` | VBAN protocol (UDP). Uncompressed audio, established open standard. |
 | `hid-usb` | USB HID reports. Vendor-specific device control (some switches, RGB). |
+| `firewire` | IEEE 1394a/b. Isochronous audio (guaranteed bandwidth, daisy-chainable). |
 
 **Example exotic transports** (not shipped, but the contract allows them):
 
@@ -7171,7 +7172,8 @@ PcieCardSpec:
   power_draw_w: float?          # TDP or measured power draw
   bifurcation: string?          # if the card splits lanes ("x8x8", "x4x4x4x4")
   subsystem: string[]?          # what the card provides: ["gpu", "nic", "capture", "usb_controller",
-                                # "nvme", "sata", "thunderbolt", "sound_card", "fpga"]
+                                # "nvme", "sata", "thunderbolt", "sound_card", "fpga",
+                                # "firewire_controller"]
 ```
 
 A PCIe card is often compound — a GPU has display outputs, encode/decode
@@ -7179,6 +7181,92 @@ engines, and sometimes a USB-C port with DP alt mode. A Thunderbolt add-in
 card has a USB controller, a DP input, and a Thunderbolt port. The `subsystem`
 field lists what the card provides, and the detailed capabilities live in
 the relevant category blocks (`gpu`, `capture`, `hub`, etc.) on the same entry.
+
+**FireWireControllerSpec** (IEEE 1394 host controllers — chipset matters
+enormously for pro audio compatibility):
+
+```yaml
+FireWireControllerSpec:
+  standard: string              # "1394a" (FireWire 400), "1394b" (FireWire 800),
+                                # "1394b_s3200" (3.2 Gbps, rare)
+  chipset: string?              # CRITICAL for pro audio compatibility
+  chipset_vendor: string?       # "ti" (Texas Instruments), "via", "agere", "lsi",
+                                # "nec_renesas", "ricoh", "jmicron", "oxford"
+  ports: FireWirePort[]
+  bus: FireWireBusSpec
+
+FireWirePort:
+  id: string                    # "fw_1", "fw_2"
+  connector: string             # "firewire_400" (6-pin or 4-pin), "firewire_800" (9-pin)
+  powered: bool?                # 6-pin/9-pin = bus-powered, 4-pin = unpowered
+  max_power_ma: uint?           # bus power per port (typically 1500mA at 12V for 6-pin)
+  physical: PhysicalPortInfo?
+
+FireWireBusSpec:
+  max_speed_mbps: uint          # 400 (S400), 800 (S800), 1600 (S1600), 3200 (S3200)
+  isochronous_channels: uint?   # guaranteed-bandwidth channels (typically 64)
+  isochronous_bandwidth_percent: float?  # max bandwidth allocatable to isochronous (80%)
+  # Isochronous is what makes FireWire good for audio — guaranteed bandwidth
+  # with bounded latency, unlike USB's best-effort polling. One 96kHz/24-bit
+  # 8-channel ADAT stream over FireWire uses one isochronous channel with
+  # guaranteed delivery.
+  max_devices: uint?            # max devices on one bus (63)
+  max_hops: uint?               # max cable hops in daisy chain (16 for 1394a, 63 for 1394b)
+  bus_topology: string          # "daisy_chain", "tree", "point_to_point"
+```
+
+**Why chipset matters**:
+
+| Chipset | Pro audio compatibility | Notes |
+|---------|----------------------|-------|
+| TI (Texas Instruments) XIO2213, TSB43AB23 | **Excellent** — the gold standard | Every pro audio vendor recommends TI. Stable isochronous timing. |
+| TI TSB82AA2 | Excellent | Newer TI, FireWire 800. Recommended. |
+| Agere FW643 | Good | Used in Apple Macs. Compatible with most interfaces. |
+| LSI FW643E | Good | Same silicon as Agere (LSI acquired Agere). |
+| VIA VT6306, VT6307 | **Poor** — known issues | Isochronous timing errors. Audio dropouts with many devices. Budget cards use these. |
+| NEC/Renesas μPD72873, μPD72874 | Fair | Works for simple setups. Struggles with high channel counts. |
+| Ricoh R5C832 | Fair | Found in laptops. Some interfaces won't initialise. |
+| JMicron JMB38x | **Poor** — avoid for audio | Same issues as VIA. Not recommended by any audio vendor. |
+| Oxford OXFW971 | Good | Used in some FireWire-to-PCIe bridges. |
+
+This is knowledge that exists in forum posts and vendor FAQs but nowhere
+in a structured database. The device database captures it — when a user
+adds a FireWire audio interface and the agent detects a VIA chipset
+FireWire controller: "Your FireWire controller uses a VIA VT6307 chipset.
+This is known to cause audio dropouts with pro audio interfaces. Consider
+a TI-based FireWire PCIe card (e.g., Syba SD-PEX30009) for reliable
+operation."
+
+**FireWire topology in the graph**:
+
+FireWire is a bus with daisy-chain or tree topology — fundamentally
+different from USB's host-centric star. Multiple devices share the bus
+bandwidth, and isochronous channels provide guaranteed-bandwidth reservations.
+
+```
+FireWire bus (800 Mbps)
+├── Host controller (TI TSB82AA2, PCIe x1)
+│   └── Port 1 (9-pin FireWire 800) → Cable →
+│       └── RME Fireface 800
+│           ├── Uses: 2 isochronous channels (in + out), ~40 Mbps
+│           └── Port (9-pin FW800) → Cable →
+│               └── MOTU 828mk3
+│                   ├── Uses: 2 isochronous channels, ~40 Mbps
+│                   └── Port (9-pin FW800) → [end of chain]
+│
+│   Total bus: 800 Mbps, ~80 Mbps used, 80% iso budget = 640 Mbps max
+│   Headroom: plenty for 2 interfaces
+```
+
+The routing graph models each device on the FireWire bus as a device with
+a `firewire` transport link. The bus is a shared medium (like RS-485 in
+§ serial) — bandwidth is shared, isochronous channels are reserved.
+Adding a third interface may exceed the isochronous budget. The router
+checks: "Bus has 640 Mbps isochronous budget. Currently using 80 Mbps.
+Adding a third 40-channel interface (160 Mbps) would bring total to
+240 Mbps — within budget."
+
+**FireWire as a built-in transport**:
 
 **GpuSpec** (GPU-specific capabilities — critical for routing encode/decode):
 
@@ -9121,6 +9209,8 @@ PortPosition:
 | `vga` | video | VGA (D-Sub 15) |
 | `sma` | radio | SMA antenna connector (WiFi, LoRa, cellular) |
 | `barrel_dc` | power | DC barrel jack (various sizes) |
+| `firewire_400` | data, (power 12V/1.5A) | IEEE 1394a 6-pin (powered) or 4-pin (unpowered) |
+| `firewire_800` | data, (power 12V/1.5A) | IEEE 1394b 9-pin (bilingual — accepts 400 + 800) |
 | `gpio_header` | data, power | Pin header (SBC GPIO, internal USB header) |
 | `m2` | data | M.2 slot (NVMe, WiFi, cellular) |
 | `sata_data` | data | SATA data connector |
