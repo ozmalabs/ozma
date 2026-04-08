@@ -44,8 +44,9 @@ This specification defines:
 11. **Furniture and physical environment** — desks, racks, rooms, sites, relative positioning, zone types
 12. **Control path** — how commands reach devices, dependency chains, reachability, fallback paths
 13. **Audio routing model** — mix buses, monitor controller, insert chains, spatial audio, metering, gain staging
-14. **Physical device database** — universal open catalog with motherboard/CPU/chipset topology, hosted on Connect
-15. **Node definition** — complete specification of what a node is: hardware, USB gadget, physical I/O, services, lifecycle
+14. **Thermal and power management** — fan curves, power profiles, thermal zones, intent-driven control
+15. **Physical device database** — universal open catalog with motherboard/CPU/chipset topology, hosted on Connect
+16. **Node definition** — complete specification of what a node is: hardware, USB gadget, physical I/O, services, lifecycle
 
 This document does not define wire formats or byte layouts — those live in
 individual protocol specs (`protocol/specs/`). This document defines the
@@ -2909,6 +2910,195 @@ Room acoustics combined with speaker positions feeds the room correction
 system (§2.9 `audio_processor` with `processor_type: "room_correction"`).
 The sweep → FFT → parametric EQ pipeline uses speaker position and room
 dimensions to optimise the correction curve per speaker.
+
+### 2.14 Thermal and Power Management
+
+The routing graph has temperature sensors, fan controls, power consumption
+data, and the thermal topology linking them. This makes Ozma a thermal and
+power management system — not just monitoring, but active control with
+full knowledge of the system's physical structure.
+
+#### Fan curves
+
+A fan curve maps a sensor reading to a fan speed. Existing tools use
+sensor → fan (one-to-one). Ozma's model uses the thermal topology:
+a zone has multiple sensors and multiple fans, and the curve considers
+all of them.
+
+```yaml
+FanCurve:
+  id: string
+  name: string                  # "Silent", "Balanced", "Performance", "Full Speed"
+  zone: string?                 # thermal zone this curve applies to (null = per-fan override)
+  fan_ids: string[]?            # specific fans (null = all fans in zone)
+  sensor_ids: string[]          # which sensors drive this curve
+  sensor_mode: string           # "max" (hottest sensor wins), "average", "weighted"
+  points: FanCurvePoint[]       # temperature → speed mapping
+  hysteresis_c: float?          # temperature hysteresis to prevent oscillation (default: 2°C)
+  ramp_rate: float?             # max speed change per second (% per sec, prevents sudden jumps)
+  min_duty_percent: float?      # minimum fan speed (never stop, or allow zero-RPM)
+  max_duty_percent: float?      # maximum fan speed (cap below 100% for noise)
+  critical_override: CriticalOverride?  # override to full speed at critical temp
+
+FanCurvePoint:
+  temp_c: float                 # temperature threshold
+  duty_percent: float           # fan duty cycle (0–100)
+  # Points are interpolated linearly between them.
+  # Example: [{20, 25%}, {40, 35%}, {60, 60%}, {75, 100%}]
+
+CriticalOverride:
+  threshold_c: float            # above this: override to max regardless of curve
+  shutdown_c: float?            # above this: emergency shutdown
+  action: string                # "max_speed", "throttle_and_max", "shutdown"
+```
+
+**What Ozma does differently from BIOS fan curves**:
+
+| Feature | BIOS / fancontrol | Ozma |
+|---------|------------------|------|
+| Sensor source | One sensor per fan | Multiple sensors per zone, weighted |
+| Cause awareness | No — just sees temperature number | Knows WHY temp is rising (I/O load, GPU render, ambient change) |
+| Cross-zone coordination | No — each fan independent | Zone-aware — drive cage fans coordinate with exhaust fans |
+| Predictive | No — reactive only | Predictive — "encode job starting, pre-ramp fans" |
+| Profile switching | Manual (BIOS, software) | Automatic via intent bindings — gaming = performance, idle = silent |
+| Noise-aware | No | Links fan noise to room acoustics model — adjusts during recording |
+| Remote control | No | API-driven, fleet-wide, per-zone |
+| Redundancy-aware | No | Knows N+1 status — compensates for failed fan |
+| Power-aware | No | Knows fan power draw, adjusts within power budget |
+
+**Intent-driven fan profiles**: Fan curves are tied to intents (§3). When
+the scenario switches to `gaming`, the fan profile switches to
+"Performance". When idle, "Silent". When recording audio (`creative`
+intent), fans are capped to keep noise below a threshold — the system
+knows the microphone's distance from each fan and the fan's noise output
+at each speed.
+
+#### Power profiles
+
+Power profiles control CPU/GPU frequency, voltage, and power limits. Like
+fan curves, these are currently managed by BIOS or per-application tools
+(Ryzen Master, Intel XTU, NVIDIA GPU Tweak). Ozma unifies them with the
+same intent-driven model.
+
+```yaml
+PowerProfile:
+  id: string
+  name: string                  # "Power Saver", "Balanced", "Performance",
+                                # "Max Performance", "Silent"
+  cpu: CpuPowerConfig?
+  gpu: GpuPowerConfig[]?        # per-GPU
+  platform: PlatformPowerConfig?
+
+CpuPowerConfig:
+  governor: string?             # "performance", "powersave", "schedutil", "conservative"
+  min_freq_mhz: uint?           # minimum CPU frequency
+  max_freq_mhz: uint?           # maximum CPU frequency (cap below max for power/heat)
+  tdp_limit_w: float?           # PL1 / PPT power limit
+  boost_limit_w: float?         # PL2 / PBO boost power limit
+  boost_enabled: bool?          # allow turbo/boost clocks
+  core_parking: bool?           # park idle cores (Windows)
+  epp: string?                  # Energy Performance Preference (intel)
+                                # "performance", "balance_performance",
+                                # "balance_power", "power"
+  amd_pbo: PboConfig?           # AMD Precision Boost Overdrive settings
+  undervolt_mv: int?            # undervolt offset (negative = less voltage = less heat)
+
+PboConfig:
+  mode: string                  # "disabled", "enabled", "advanced"
+  ppt_limit_w: float?           # Package Power Tracking limit
+  tdc_limit_a: float?           # Thermal Design Current limit
+  edc_limit_a: float?           # Electrical Design Current limit
+  curve_optimizer: int?         # per-core curve optimizer offset (negative = undervolt)
+  max_boost_override_mhz: int?  # additional boost clock offset
+
+GpuPowerConfig:
+  device_id: string             # which GPU
+  power_limit_w: float?         # GPU power limit (percentage or absolute)
+  core_clock_offset_mhz: int?   # core clock offset
+  memory_clock_offset_mhz: int? # memory clock offset
+  fan_curve: FanCurve?          # GPU-specific fan curve (overrides zone default)
+  performance_mode: string?     # "max_performance", "balanced", "quiet",
+                                # "power_saver" (vendor-specific)
+
+PlatformPowerConfig:
+  usb_suspend: bool?            # USB selective suspend (saves power, can cause device issues)
+  pcie_aspm: string?            # "disabled", "l0s", "l1", "l0s_l1" — PCIe power saving
+  sata_alpm: string?            # "disabled", "min_power", "medium_power", "max_performance"
+  display_sleep_min: uint?      # display sleep timeout
+  disk_sleep_min: uint?         # disk spindown timeout
+  wake_on_lan: bool?            # WoL (must stay enabled for Ozma remote wake)
+```
+
+**Power profile selection via intent**:
+
+```yaml
+# Intent → power profile mapping (configurable per scenario)
+IntentPowerMapping:
+  gaming:       "Performance"     # max clocks, boost enabled, fans aggressive
+  creative:     "Balanced"        # good performance, moderate noise
+  desktop:      "Balanced"
+  fidelity_audio: "Silent"       # cap CPU, cap fans, minimum noise for recording
+  observe:      "Power Saver"    # minimal power when just monitoring
+  control:      "Power Saver"    # headless — no display, minimal clocks
+  preview:      "Power Saver"
+```
+
+#### Thermal-aware routing
+
+The routing graph uses thermal data as an input to routing decisions:
+
+1. **Encode job placement**: GPU at 85°C and throttling → route encode to
+   iGPU (Quick Sync) or CPU (software) instead. The router checks thermal
+   headroom before placing compute-intensive pipeline operations.
+
+2. **Storage path selection**: NVMe at 70°C and throttling → if the system
+   has a second NVMe or SATA drive with thermal headroom, route recording
+   there instead.
+
+3. **Predictive fan ramp**: Intent binding detects "game launching" →
+   pre-ramp fans before the GPU load arrives. The system doesn't wait for
+   temperature to rise — it knows the thermal consequence of the workload
+   and acts proactively.
+
+4. **Noise-sensitive scenarios**: `creative` or `fidelity_audio` intent →
+   cap fans to keep ambient noise below microphone sensitivity threshold.
+   The system knows: mic sensitivity (from AudioSpec), mic distance from
+   each fan (from PhysicalLocation), fan noise at each speed (from FanSpec).
+   It computes the maximum fan speed that keeps fan noise below the mic's
+   self-noise floor at the mic's position.
+
+5. **Power budget enforcement**: PSU at 90% capacity → reduce GPU power
+   limit to create headroom. Or: UPS on battery → switch to "Power Saver"
+   profile to extend runtime.
+
+#### Observability
+
+```
+GET /api/v1/thermal/zones                   # all thermal zones with current temps + fan speeds
+GET /api/v1/thermal/zones/{id}              # zone detail with sensor history
+GET /api/v1/thermal/fans                    # all fans with RPM, duty, power draw
+GET /api/v1/thermal/profiles                # available fan profiles
+PUT /api/v1/thermal/profiles/{id}           # create/update fan profile
+POST /api/v1/thermal/profiles/{id}/activate # switch active profile
+GET /api/v1/power/profiles                  # available power profiles
+PUT /api/v1/power/profiles/{id}             # create/update power profile
+POST /api/v1/power/profiles/{id}/activate   # switch active profile
+GET /api/v1/power/state                     # current CPU/GPU clocks, voltages, power draw
+```
+
+**Events**:
+
+```
+thermal.zone.warning             # zone temperature approaching threshold
+thermal.zone.critical            # zone at critical temperature
+thermal.zone.recovered           # zone returned to normal
+thermal.fan.failed               # fan RPM dropped to zero or below minimum
+thermal.fan.degraded             # fan not reaching target speed
+thermal.profile.switched         # fan/power profile changed (by intent or user)
+power.profile.switched           # power profile changed
+power.throttle.active            # CPU or GPU thermal throttling detected
+power.throttle.cleared           # throttling ended
+```
 
 ---
 
