@@ -86,7 +86,7 @@ class TestAudioOutputManager(unittest.TestCase):
         self.mgr.on_event = capture
 
     def _run(self, coro):
-        return asyncio.get_event_loop().run_until_complete(coro)
+        return asyncio.run(coro)
 
     # ── Defaults ─────────────────────────────────────────────────────────────
 
@@ -236,7 +236,7 @@ class TestAudioOutputManager(unittest.TestCase):
 class TestAudioOutputManagerLifecycle(unittest.TestCase):
 
     def _run(self, coro):
-        return asyncio.get_event_loop().run_until_complete(coro)
+        return asyncio.run(coro)
 
     def test_stop_kills_delay_procs(self):
         mgr = AudioOutputManager()

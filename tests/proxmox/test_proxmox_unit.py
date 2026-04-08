@@ -294,34 +294,41 @@ class TestVMProfiles:
 class TestDisplayService:
     """Test the display service initialization."""
 
+    def teardown_method(self, method):
+        """Remove display-related mocks so they don't leak to other tests."""
+        for _mod in ('looking_glass', 'qemu_display', 'dbus_display', 'display_service'):
+            sys.modules.pop(_mod, None)
+
     def test_init(self):
         """VMDisplayService initializes with correct ports."""
         sys.path.insert(0, str(Path(__file__).parent.parent.parent / "proxmox-plugin" / "python"))
-        # Mock the imports that aren't available in test env
-        sys.modules['looking_glass'] = MagicMock()
-        sys.modules['qemu_display'] = MagicMock()
-        sys.modules['dbus_display'] = MagicMock()
+        _mocked = {
+            'looking_glass': MagicMock(),
+            'qemu_display': MagicMock(),
+            'dbus_display': MagicMock(),
+        }
+        # Use patch.dict so mocks are removed after the test
+        with patch.dict(sys.modules, _mocked):
+            # Import after mocking
+            import importlib
+            if 'display-service' in sys.modules:
+                del sys.modules['display-service']
 
-        # Import after mocking
-        import importlib
-        if 'display-service' in sys.modules:
-            del sys.modules['display-service']
+            # Can't import with hyphen in name, use importlib
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "display_service",
+                str(Path(__file__).parent.parent.parent / "proxmox-plugin" / "python" / "display-service.py")
+            )
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
 
-        # Can't import with hyphen in name, use importlib
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "display_service",
-            str(Path(__file__).parent.parent.parent / "proxmox-plugin" / "python" / "display-service.py")
-        )
-        if spec and spec.loader:
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-
-            svc = mod.VMDisplayService(vmid=100)
-            assert svc.vmid == 100
-            assert svc.api_port == 7490  # 7390 + 100
-            assert svc.name == "vm100"
-            assert svc.shm_path == "/dev/shm/ozma-vm100"
+                svc = mod.VMDisplayService(vmid=100)
+                assert svc.vmid == 100
+                assert svc.api_port == 7490  # 7390 + 100
+                assert svc.name == "vm100"
+                assert svc.shm_path == "/dev/shm/ozma-vm100"
 
     def test_qmp_path_proxmox(self):
         """QMP path uses ozma's dedicated socket."""

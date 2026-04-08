@@ -248,7 +248,8 @@ class TestEncoderProbing:
         mock_proc.returncode = 0
         mock_proc.wait = AsyncMock(return_value=0)
 
-        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        with patch("shutil.which", return_value="/usr/bin/ffmpeg"), \
+             patch("asyncio.create_subprocess_exec", return_value=mock_proc):
             await inv._probe_software_encoders()
 
         # Should find both libx264 and libx265

@@ -28,7 +28,17 @@ import time
 from pathlib import Path
 
 import pytest
-from playwright.sync_api import Page, expect, sync_playwright, Browser, BrowserContext
+
+try:
+    from playwright.sync_api import Page, expect, sync_playwright, Browser, BrowserContext
+    _PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    _PLAYWRIGHT_AVAILABLE = False
+
+pytestmark = pytest.mark.skipif(
+    not _PLAYWRIGHT_AVAILABLE,
+    reason="playwright not installed — run: pip install playwright && playwright install chromium",
+)
 
 # ── Configuration ──────────────────────────────────────────────────
 
