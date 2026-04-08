@@ -70,6 +70,8 @@ Device:
   id: string                    # globally unique (derived from hardware identity or assigned)
   name: string                  # human-readable label
   type: enum                    # see Device Types below
+  identity: HardwareIdentity?   # hardware serial numbers and unique identifiers
+  device_db_id: string?         # matched device database entry (§15)
   location: Location            # where this device is in the topology
   ports: Port[]                 # all ports on this device
   internal_links: Link[]        # connections between ports within the device
@@ -81,6 +83,36 @@ Device:
   resource_budget: ResourceBudget? # maximum resources Ozma may consume on this device (see §2.7)
   power_profile: DevicePowerProfile? # power consumption, delivery, and rail state (see §2.10)
   version: DeviceVersion?       # software/firmware version and update state (see §14)
+```
+
+**HardwareIdentity** — every discoverable unique identifier for this device:
+
+```yaml
+HardwareIdentity:
+  serial_number: string?        # primary serial number (from USB descriptor, SMBIOS,
+                                # SMART, EDID, SPD, EEPROM, label, etc.)
+  serial_source: string?        # where the serial came from ("usb", "smbios", "smart",
+                                # "edid", "spd", "sfp_eeprom", "label", "user")
+  uuid: string?                 # UUID (SMBIOS system UUID, disk UUID, etc.)
+  mac_addresses: string[]?      # MAC addresses (one per network interface)
+  usb_vid_pid: string?          # USB VID:PID ("1b1c:0150")
+  usb_serial: string?           # USB serial number string descriptor
+  pci_id: string?               # PCI vendor:device:subsystem ("8086:1533:15a1")
+  sas_wwn: string?              # SAS World Wide Name
+  wwn: string?                  # generic World Wide Name (FC, SAS)
+  asset_tag: string?            # asset tag (from SMBIOS, or user-assigned)
+  manufacturer_date: string?    # manufacturing date if available
+  board_serial: string?         # motherboard serial (SMBIOS type 2)
+  chassis_serial: string?       # chassis serial (SMBIOS type 3)
+  system_serial: string?        # system serial (SMBIOS type 1)
+  # Devices may have multiple identifiers from different sources.
+  # The `id` field on Device is Ozma's stable identifier (survives
+  # reconnection). HardwareIdentity carries the raw hardware serials
+  # for asset tracking, warranty lookup, and deduplication.
+  #
+  # Discovery priority: USB serial > SMBIOS serial > MAC > PCI ID > user-assigned.
+  # If a device has no discoverable serial, the user can assign one manually
+  # (e.g., reading the serial sticker on the back of a monitor).
 ```
 
 **Device types**:
