@@ -6590,6 +6590,7 @@ DeviceEntry:
   router: RouterSpec?
   access_point: AccessPointSpec?
   avr: AvrSpec?                 # AV receiver (HDMI switch + audio processor + amplifier)
+  audio_interface: AudioInterfaceSpec?  # pro audio interface (multi-I/O, DSP, routing matrix)
   power: PowerSpec?             # generic power (PSU for non-PC devices, PoE injectors, etc.)
   sensor: SensorSpec?
   actuator: ActuatorSpec?
@@ -8100,6 +8101,245 @@ Scenario: "Gaming"
   → AVR: Zone 2 source = Spotify Connect         [via IP command]
   → Zone 2 speakers play background music while gaming in main zone
 ```
+
+**AudioInterfaceSpec** (pro audio interfaces — USB, Thunderbolt, FireWire,
+PCIe. These are compound devices with multiple I/O types, internal routing
+matrices, DSP, and sample-rate-dependent channel counts):
+
+```yaml
+AudioInterfaceSpec:
+  connection: string            # "usb_c", "usb_b", "thunderbolt", "firewire_400",
+                                # "firewire_800", "pcie", "dante_network", "aes67_network"
+  driver: string?               # "class_compliant" (USB Audio Class 2/3, driverless),
+                                # "vendor" (ASIO/CoreAudio driver required),
+                                # "vendor_with_mixer" (driver + software mixer app)
+  driver_name: string?          # "Focusrite Control", "RME TotalMix FX",
+                                # "Universal Audio Console", "MOTU CueMix 5"
+
+  # --- I/O at each sample rate (channel counts change!) ---
+  io_configurations: IoConfiguration[]
+
+  # --- Analog inputs ---
+  analog_inputs: AnalogInput[]
+
+  # --- Analog outputs ---
+  analog_outputs: AnalogOutput[]
+
+  # --- Digital I/O ---
+  digital_io: DigitalIo[]?
+
+  # --- Headphone outputs ---
+  headphone_outputs: HeadphoneOutput[]?
+
+  # --- MIDI ---
+  midi_ports: MidiPort[]?
+
+  # --- Clock ---
+  clock: InterfaceClockSpec
+
+  # --- Internal DSP ---
+  dsp: InterfaceDspSpec?
+
+  # --- Internal routing/mixer ---
+  mixer: InterfaceMixerSpec?
+
+  # --- Monitoring ---
+  direct_monitoring: bool?      # zero-latency hardware monitoring (bypasses computer)
+  talkback_mic: bool?           # built-in talkback microphone
+
+IoConfiguration:
+  sample_rate_range: { min: uint, max: uint }  # e.g., 44100–48000
+  analog_in: uint               # analog input channels at this rate
+  analog_out: uint              # analog output channels
+  adat_in: uint?                # ADAT input channels (8 @ 48k, 4 @ 96k SMUX, 2 @ 192k)
+  adat_out: uint?
+  spdif_in: uint?               # S/PDIF input channels (always 2)
+  spdif_out: uint?
+  aes_in: uint?                 # AES3 input channels
+  aes_out: uint?
+  madi_in: uint?                # MADI channels (64 @ 48k, 32 @ 96k)
+  madi_out: uint?
+  dante_in: uint?               # Dante/AES67 network channels
+  dante_out: uint?
+  total_in: uint                # total input channels (sum of all)
+  total_out: uint               # total output channels
+  usb_bandwidth_required: string? # "usb2_sufficient", "usb3_required"
+  # CRITICAL: channel counts change with sample rate. An interface with
+  # 18 inputs at 48kHz may have only 10 at 96kHz (ADAT drops from 8→4
+  # channels in SMUX mode) and 4 at 192kHz. The router must check the
+  # active sample rate to know the actual channel count.
+
+AnalogInput:
+  id: string                    # "input_1", "mic_1", "inst_1", "line_5"
+  channel_number: uint          # DAW channel number (1-indexed)
+  type: string[]                # ["mic", "line", "instrument", "hi_z"]
+                                # Many inputs are switchable between types
+  connector: string             # "xlr", "xlr_trs_combo", "trs_6.35mm", "rca",
+                                # "trs_3.5mm", "din"
+  phantom_power: bool?          # 48V phantom (per-input switchable on good interfaces)
+  phantom_group: string?        # if phantom is grouped ("1-4", "5-8", "all")
+  pad_db: float?                # input pad (-10dB, -20dB)
+  gain_range_db: { min: float, max: float }?  # preamp gain range
+  impedance: InputImpedance?    # input impedance (affects sound, especially for mics/guitars)
+  max_input_level_dbu: float?   # maximum input level before clipping
+  dynamic_range_db: float?      # measured dynamic range (A-weighted)
+  thd_percent: float?           # total harmonic distortion + noise
+  frequency_response: FrequencyResponse?
+  physical: PhysicalPortInfo?
+
+InputImpedance:
+  mic_ohm: float?               # microphone impedance (typically 1.5–3 kΩ)
+  line_ohm: float?              # line level impedance (typically 10–20 kΩ)
+  instrument_ohm: float?        # instrument/hi-Z (typically 500 kΩ – 1 MΩ)
+  # Impedance matching matters for guitar DI and ribbon mics.
+  # A low-impedance guitar input sounds thin on a 10kΩ line input.
+  # A 1 MΩ hi-Z input is correct. The database captures this per input.
+
+AnalogOutput:
+  id: string                    # "output_1", "main_l", "monitor_a_l"
+  channel_number: uint          # DAW channel number
+  type: string                  # "line", "main", "monitor", "aux"
+  connector: string             # "xlr", "trs_6.35mm", "rca", "trs_3.5mm"
+  balanced: bool?               # balanced (XLR, TRS) or unbalanced (RCA, TS)
+  max_output_level_dbu: float?  # maximum output level
+  impedance_ohm: float?         # output impedance
+  physical: PhysicalPortInfo?
+  assignable: bool?             # can be reassigned to different mix/bus in software
+
+HeadphoneOutput:
+  id: string                    # "hp_1", "hp_2"
+  connector: string             # "trs_6.35mm", "trs_3.5mm"
+  impedance_range_ohm: { min: float, max: float }?  # can drive headphones from X to Y ohm
+  max_power_mw: float?          # at reference impedance
+  independent_source: bool      # can play a different mix than main outputs?
+  independent_volume: bool      # has its own volume control?
+  physical: PhysicalPortInfo?
+
+DigitalIo:
+  id: string                    # "adat_1", "spdif_1", "aes_1", "madi_1", "dante_1"
+  type: string                  # "adat", "spdif_coax", "spdif_optical", "aes3",
+                                # "madi_bnc", "madi_optical", "madi_sc",
+                                # "dante", "aes67", "ravenna"
+  direction: string             # "input", "output", "bidirectional"
+  connector: string             # "toslink", "bnc", "rca", "xlr", "sc_fiber", "rj45"
+  channels_at_48k: uint?        # channels at standard rate
+  channels_at_96k: uint?        # channels at double rate (SMUX)
+  channels_at_192k: uint?       # channels at quad rate (SMUX4)
+  physical: PhysicalPortInfo?
+  # ADAT: 8ch @ 44.1/48k, 4ch @ 88.2/96k (SMUX), 2ch @ 176.4/192k (SMUX4)
+  # MADI: 64ch @ 48k, 32ch @ 96k
+  # S/PDIF: always 2ch, up to 192kHz
+  # AES3: 2ch per cable, up to 192kHz
+
+MidiPort:
+  id: string                    # "midi_1", "midi_in", "midi_out"
+  direction: string             # "input", "output", "bidirectional"
+  connector: string             # "din_5pin", "trs_3.5mm_type_a", "trs_3.5mm_type_b", "usb"
+  physical: PhysicalPortInfo?
+
+InterfaceClockSpec:
+  internal: bool                # can be clock master (internal crystal)
+  word_clock_in: bool?          # BNC word clock input
+  word_clock_out: bool?         # BNC word clock output
+  word_clock_thru: bool?        # BNC word clock pass-through
+  sync_sources: string[]?       # ["internal", "word_clock", "adat", "spdif", "aes",
+                                # "madi", "dante", "ptp"]
+  superclock: bool?             # 256× superclock output (Digidesign/Avid legacy)
+  # The interface's clock source determines the sample rate for the entire
+  # audio chain. When an interface is word clock slave to an external master,
+  # its sample rate is set by the master. This feeds into §7 Clock Model.
+  # On PipeWire, the interface's clock maps to a driver node — it determines
+  # PipeWire's graph scheduling rate.
+
+InterfaceDspSpec:
+  type: string?                 # "sharc", "fpga", "arm", "custom_asic"
+  processor: string?            # "Analog Devices SHARC", "Xilinx FPGA", "UA custom"
+  processing_power: string?     # qualitative ("16 plugins per channel", "full mix")
+  plugins: string[]?            # built-in DSP plugins ("eq", "compressor", "reverb",
+                                # "amp_sim", "channel_strip", "de-esser")
+  vendor_plugin_format: string? # "uad", "antelope_fpga", "metric_halo"
+  latency_samples: uint?        # DSP processing latency in samples
+  realtime: bool?               # DSP processing is real-time (no added buffer)
+  # Some interfaces (UA Apollo, Antelope, Metric Halo) run DSP plugins
+  # on dedicated hardware inside the interface. These don't consume
+  # host CPU — they're modelled as audio processors (§2.13) running
+  # on the interface's own compute resources (§2.7).
+
+InterfaceMixerSpec:
+  matrix: bool                  # full N×M routing matrix?
+  inputs_to_mix: uint?          # how many sources can feed the mixer
+  mix_buses: uint?              # independent mix buses (for headphone mixes, etc.)
+  per_channel: string[]?        # ["gain", "pan", "mute", "solo", "eq", "compressor",
+                                # "reverb_send", "phase", "phantom"]
+  total_mix_recall: bool?       # mixer state saved in hardware and recalled on boot
+  software_controlled: bool     # mixer is configured via host software
+  standalone_operation: bool?   # mixer works without host computer connected
+  # RME TotalMix FX: full matrix, 3 hardware submixes, per-channel EQ/comp,
+  #   standalone operation, recall on boot. This is a monitor controller.
+  # Focusrite Control: simpler routing, per-output source selection,
+  #   loopback routing. Software-only.
+  # UA Console: DSP-accelerated channel strip + monitor section,
+  #   insert effects on input, talkback mic routing.
+```
+
+**How the routing graph models an audio interface**:
+
+An audio interface creates many ports in the graph — every analog input,
+every analog output, every digital I/O channel, every headphone output,
+and every MIDI port is an independent port with its own format capabilities.
+
+```
+Audio Interface: Focusrite Scarlett 18i20 (USB-C)
+├── Analog inputs (8 ports):
+│   ├── input_1: XLR/TRS combo, mic/line/inst, 48V, gain 0–56dB → audio source port
+│   ├── input_2: XLR/TRS combo, mic/line/inst, 48V, gain 0–56dB → audio source port
+│   ├── input_3–4: XLR/TRS combo, mic/line, 48V (grouped 3-4) → audio source ports
+│   └── input_5–8: TRS line only → audio source ports
+├── Analog outputs (10 ports):
+│   ├── output_1–2: TRS balanced, line → audio sink ports (main monitors)
+│   ├── output_3–10: TRS balanced, line → audio sink ports (assignable)
+│   └── hp_1, hp_2: 6.35mm TRS, independent source/volume → audio sink ports
+├── Digital I/O:
+│   ├── ADAT in: 8ch @ 48kHz / 4ch @ 96kHz → audio source ports
+│   ├── ADAT out: 8ch @ 48kHz / 4ch @ 96kHz → audio sink ports
+│   ├── S/PDIF in: 2ch → audio source ports
+│   └── S/PDIF out: 2ch → audio sink ports
+├── MIDI: DIN in + DIN out → control ports
+├── Clock: internal + ADAT + S/PDIF sync → clock domain master/slave
+└── Internal mixer: 20 in × 12 out matrix → virtual mix bus devices
+```
+
+At 48kHz, this is 20 inputs and 12 outputs. At 96kHz, it's 14 inputs and
+12 outputs (ADAT halves). The router's format negotiation (§4.3) handles
+this — when the interface's sample rate changes, its FormatSet changes,
+the port count changes, and affected pipelines are re-evaluated.
+
+**Internal mixer as graph devices**: The interface's internal mixer (Focusrite
+Control, RME TotalMix FX, UA Console) maps to mix buses (§2.13) running on
+the interface's hardware — not on the host CPU. These are `audio_processor`
+devices with `resource_cost` on the interface, not on the controller.
+RME TotalMix FX is effectively a full monitor controller running inside
+the interface — source selection, per-channel EQ/comp, 3 independent
+submixes for headphone monitoring, and it works standalone without a
+computer. The graph models this as a monitor controller (§2.13) whose
+control path (§2.12) goes through the vendor's software.
+
+**Word clock in the graph**: An interface's clock source feeds into the
+clock model (§7). When the interface is word clock master, it sets the
+sample rate for the entire audio chain. When it's slave (to a studio
+word clock generator or another interface), it follows. The routing graph
+tracks the clock chain: word clock generator → interface A → interface B
+(via ADAT) → PipeWire (locked to interface A's clock as the driver node).
+
+**FireWire note**: FireWire (IEEE 1394) audio interfaces are still in use
+in studios (RME Fireface, MOTU 828, Metric Halo LIO-8). FireWire is a
+transport with its own isochronous scheduling — guaranteed bandwidth
+without contention, unlike USB. The `firewire_400` and `firewire_800`
+connections map to transport plugins with characteristics:
+- FireWire 400: 400 Mbps, <1ms latency, isochronous
+- FireWire 800: 800 Mbps, <1ms latency, isochronous
+- No bandwidth sharing with non-audio traffic (unlike USB)
+- Daisy-chainable (unlike USB)
 
 **FurnitureSpec** (desks, racks, stands, mounts — physical objects that contain
 or support devices):
