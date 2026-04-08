@@ -268,6 +268,10 @@ HardwareIdentity:
 | `ups` | UPS — battery backup, power conditioning, load monitoring |
 | `pdu` | Power Distribution Unit — rack or desk, metered/switched/basic |
 | `power_strip` | Power strip, surge protector, extension cord |
+| `lock` | Smart lock, badge reader, access controller, intercom |
+| `hvac` | Thermostat, CRAC, CRAH, split system, fan coil unit |
+| `lighting` | Smart lighting controller, dimmer, scene controller (non-RGB — for room lighting) |
+| `occupancy` | Occupancy/presence sensor, people counter, desk booking sensor |
 | `relay` | Connect relay endpoint |
 | `switch` | KVM switch, HDMI matrix, audio matrix, crosspoint switch |
 | `vm_host` | QEMU/KVM/Proxmox hypervisor (manages VM targets) (see §2.9) |
@@ -9858,6 +9862,172 @@ connection point between studio equipment. A 48-point TRS patchbay
 routes audio between the mixing desk, outboard gear, and the audio
 interface. The same `PatchPanelSpec` model handles audio patchbays with
 `port_type: "trs_6.35mm"` or `"trs_bantam"`.
+
+**Building management device types** — locks, HVAC, lighting, and occupancy
+sensors are devices in the graph with control paths, state, events, and
+physical locations. They use the same primitives as everything else — the
+building management system is not a separate product, it's a natural
+extension of the routing graph into the physical environment.
+
+```yaml
+LockSpec:
+  lock_type: string             # "smart_lock", "badge_reader", "keypad",
+                                # "intercom", "electric_strike", "mag_lock",
+                                # "turnstile", "garage_door"
+  authentication: string[]      # ["badge_rfid", "badge_nfc", "pin", "fingerprint",
+                                # "face", "ble_phone", "key", "remote", "buzzer"]
+  credential_formats: string[]? # ["hid_iclass", "hid_prox", "mifare_classic",
+                                # "mifare_desfire", "em4100", "nfc_ndef"]
+  state: LockState
+  control_interface: string?    # "zwave", "zigbee", "ble", "wifi", "wiegand",
+                                # "osdp", "ip", "dry_contact"
+  camera: bool?                 # integrated camera (video doorbell, intercom)
+  two_way_audio: bool?          # intercom capability
+  auto_lock: bool?              # re-locks after timeout
+  door_sensor: bool?            # detects door open/closed (not just locked/unlocked)
+  tamper_detection: bool?       # detects physical tampering
+  battery: BatterySpec?         # for battery-powered locks
+  fire_release: bool?           # unlocks on fire alarm (safety requirement)
+  fail_mode: string?            # "fail_secure" (stays locked on power loss) or
+                                # "fail_safe" (unlocks on power loss — for fire exits)
+
+LockState:
+  locked: bool
+  door_open: bool?              # door position (if sensor present)
+  last_access: LockAccessEvent?
+  battery_percent: float?
+
+LockAccessEvent:
+  timestamp: timestamp
+  action: string                # "unlock", "lock", "denied", "forced_entry", "held_open"
+  method: string?               # "badge", "pin", "fingerprint", "ble", "remote", "key", "exit_button"
+  credential_id: string?        # which badge/code was used (not the person — privacy)
+  # Access events feed into the state change journal (§11.6) and can
+  # trigger intent bindings (§8.7): "office door unlocked → lights on,
+  # HVAC to occupied mode, WiFi APs at full power"
+
+HvacSpec:
+  hvac_type: string             # "thermostat", "crac", "crah", "split_system",
+                                # "fan_coil", "vrf", "ptac", "baseboard", "radiant"
+  heating: bool?
+  cooling: bool?
+  fan: bool?
+  humidity_control: bool?
+  temperature_range_c: { min: float, max: float }?
+  control_interface: string?    # "zwave", "zigbee", "wifi", "modbus", "bacnet",
+                                # "ip", "ir", "dry_contact"
+  zones: uint?                  # number of independently controlled zones
+  schedule: bool?               # supports scheduling
+  occupancy_aware: bool?        # has or accepts occupancy input
+  state: HvacState
+
+HvacState:
+  mode: string                  # "heating", "cooling", "auto", "fan_only", "off"
+  current_temp_c: float?
+  target_temp_c: float?
+  humidity_percent: float?
+  fan_speed: string?            # "auto", "low", "medium", "high"
+  running: bool?                # compressor/heater currently active
+
+LightingSpec:
+  lighting_type: string         # "smart_switch", "smart_dimmer", "smart_bulb",
+                                # "scene_controller", "occupancy_switch",
+                                # "daylight_harvesting", "emergency_lighting"
+  dimmable: bool?
+  color_temp: bool?             # adjustable color temperature (warm/cool white)
+  color: bool?                  # full RGB color (overlaps with rgb device type — this is room lighting, not accent/indicator)
+  control_interface: string?    # "zwave", "zigbee", "wifi", "dali", "dmx",
+                                # "0_10v", "phase_cut", "ip"
+  wattage: float?
+  lumens: float?
+  circuits: uint?               # number of independently controllable circuits
+  emergency: bool?              # emergency lighting (battery backup, legally required)
+  state: LightingState
+
+LightingState:
+  on: bool
+  brightness_percent: float?    # 0–100
+  color_temp_k: uint?           # color temperature in Kelvin
+  scene: string?                # active scene name
+
+OccupancySpec:
+  sensor_type: string           # "pir", "ultrasonic", "dual_tech", "mmwave_radar",
+                                # "camera_ai", "desk_sensor", "thermal_array",
+                                # "people_counter", "ble_beacon", "wifi_probe"
+  detection_range_m: float?     # maximum detection range
+  detection_angle_deg: float?   # field of detection
+  people_counting: bool?        # can count people, not just detect presence
+  max_count: uint?              # maximum people it can count simultaneously
+  direction_detection: bool?    # can detect entry vs exit direction
+  desk_level: bool?             # per-desk occupancy (under-desk sensor or booking system)
+  control_interface: string?    # "zigbee", "ble", "wifi", "dry_contact", "ip"
+  state: OccupancyState
+
+OccupancyState:
+  occupied: bool
+  count: uint?                  # number of people detected
+  last_motion: timestamp?       # when motion was last detected
+  confidence: float?            # 0.0–1.0 detection confidence
+```
+
+**Building management through intent bindings (§8.7)**:
+
+These devices don't need custom building management logic — the existing
+intent binding system handles it:
+
+```yaml
+# Office opens — first person arrives
+- conditions:
+    - { source: lock, field: state.action, op: eq, value: "unlock" }
+    - { source: occupancy, field: state.occupied, op: eq, value: false }
+      # was unoccupied, now someone unlocked the door
+  actions:
+    - { type: hvac.set_mode, target: "office_thermostat", mode: "auto", temp: 22 }
+    - { type: lighting.on, target: "office_lights", brightness: 80 }
+    - { type: ap.enable, target: "office_ap" }
+
+# Office empties — last person leaves
+- conditions:
+    - { source: occupancy, field: state.count, op: eq, value: 0 }
+    - { source: occupancy, field: state.last_motion, op: age_gt, value: 600 }
+      # no motion for 10 minutes
+  actions:
+    - { type: hvac.set_mode, target: "office_thermostat", mode: "off" }
+    - { type: lighting.off, target: "office_lights" }
+    - { type: ap.disable, target: "office_ap" }  # disable WiFi to save power
+    - { type: lock.lock, target: "office_door" }
+
+# After hours — building unoccupied
+- conditions:
+    - { source: time, field: hour, op: gt, value: 22 }
+    - { source: occupancy, field: state.count, op: eq, value: 0 }
+  actions:
+    - { type: hvac.setback, temp: 16 }            # heating setback
+    - { type: lighting.off, target: "all" }
+    - { type: ap.reduce_power, target: "all" }    # reduce WiFi to minimum
+    - { type: security.arm, target: "alarm_panel" }
+
+# Meeting room booked — pre-condition
+- conditions:
+    - { source: calendar, field: event_active, op: eq, value: true }
+    - { source: calendar, field: event_room, op: eq, value: "meeting_room_1" }
+  actions:
+    - { type: hvac.set_mode, target: "meeting_room_1_hvac", mode: "cooling", temp: 21 }
+    - { type: lighting.scene, target: "meeting_room_1_lights", scene: "presentation" }
+    - { type: display.power_on, target: "meeting_room_1_screen" }
+    # Pre-cool and light the room before the meeting starts
+```
+
+**What Ozma adds beyond Home Assistant**: HA can do occupancy-driven
+automation. The difference is that Ozma's graph also knows the IT
+infrastructure — when the office empties, Ozma doesn't just turn off
+lights, it also: reduces AP transmit power (saves energy, reduces RF
+exposure), cools warm pipelines (saves server power), adjusts thermal
+profiles on servers (quiet mode when nobody's there to hear fans),
+pauses non-essential monitoring refresh cycles (saves CPU and I/O on
+constrained devices), and arms the security system. The building
+automation and IT management share one event bus, one intent system,
+one graph.
 
 **FurnitureSpec** (desks, racks, stands, mounts — physical objects that contain
 or support devices):
