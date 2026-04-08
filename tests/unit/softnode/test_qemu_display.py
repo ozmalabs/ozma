@@ -1,11 +1,29 @@
 """Unit tests for QEMU D-Bus display console."""
 
+import sys
+import importlib.util as _util
+from pathlib import Path
+
 import pytest
 
 pytestmark = pytest.mark.unit
 
+_SOFTNODE = Path(__file__).parent.parent.parent.parent / "softnode"
+
+
+def _force_load(name: str):
+    """Load a softnode module from its exact file, bypassing sys.path/sys.modules."""
+    spec = _util.spec_from_file_location(name, _SOFTNODE / f"{name}.py")
+    mod = _util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
 
 class TestQEMUDBusConsole:
+    def setup_method(self, method):
+        _force_load("qemu_display")
+
     def test_console_path_default(self):
         from qemu_display import QEMUDBusConsole, DBUS_DISPLAY_PATH
         c = QEMUDBusConsole(0)
@@ -42,6 +60,9 @@ class TestQEMUDBusConsole:
 
 
 class TestLookingGlassCapture:
+    def setup_method(self, method):
+        _force_load("looking_glass")
+
     def test_initial_state(self):
         from looking_glass import LookingGlassCapture
         lg = LookingGlassCapture("test-vm", shm_path="/nonexistent")
