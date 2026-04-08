@@ -7000,6 +7000,7 @@ DeviceEntry:
   fiber_cable: FiberCableSpec?    # fiber optic cables (single-mode, multi-mode, OM1-OM5)
   server_chassis: ServerChassisSpec?  # server chassis (1U-4U, blade, multi-node)
   rack: RackSpec?                 # server/network racks (full-depth, half-depth, open frame, LackRack)
+  rack_accessory: RackAccessorySpec?  # patch panels, shelves, drawers, blanking panels, cable management
   sensor: SensorSpec?
   actuator: ActuatorSpec?
 
@@ -9246,6 +9247,143 @@ notes: "Legs are exactly 19 inches apart. Not rated for heavy servers.
         Stack two for a full-height rack. Drill the shelf for cable routing.
         Has housed more production infrastructure than anyone wants to admit."
 ```
+
+**RackAccessorySpec** (passive rack infrastructure — patch panels, shelves,
+blanking panels, cable management, drawers, and other non-powered items
+that occupy rack units or attach to rack structure):
+
+```yaml
+RackAccessorySpec:
+  accessory_type: string        # see table below
+  rack_units: uint?             # height in U (0 for non-U-mounted items like vertical managers)
+  mounting: string?             # "front", "rear", "front_and_rear", "side", "vertical", "toolless"
+  depth_mm: uint?
+
+  # --- Patch panel specific ---
+  patch_panel: PatchPanelSpec?
+
+  # --- Shelf/drawer specific ---
+  shelf: RackShelfSpec?
+
+  # --- Blanking/airflow specific ---
+  blanking: BlankingSpec?
+
+  # --- Cable management specific ---
+  cable_mgmt: CableMgmtPanelSpec?
+
+# Accessory types:
+# | Type | U | Description |
+# |------|---|-------------|
+# | patch_panel_copper | 1–2 | Copper patch panel (Cat5e/6/6a/8) with keystone or punch-down |
+# | patch_panel_fiber | 1–2 | Fiber patch panel / splice enclosure (LC/SC/MPO) |
+# | patch_panel_coax | 1 | Coaxial patch panel (BNC/F-type) |
+# | patch_panel_xlr | 1–2 | XLR audio patch panel |
+# | patch_panel_trs | 1–2 | TRS/bantam audio patchbay |
+# | patch_panel_blank | 1 | Blank keystone panel (user populates with modules) |
+# | shelf_fixed | 1–2 | Fixed shelf (for non-rack-mount equipment) |
+# | shelf_sliding | 1–2 | Sliding shelf (pull out for access) |
+# | shelf_vented | 1–2 | Vented shelf (airflow through) |
+# | shelf_keyboard | 1 | Keyboard tray (sliding, with mouse area) |
+# | drawer | 2–4 | Rack-mount drawer (tools, parts, documentation) |
+# | blanking_panel | 1–3 | Solid blanking panel (airflow management) |
+# | blanking_brush | 1 | Brush strip panel (cable pass-through with airflow seal) |
+# | blanking_vented | 1 | Vented blanking panel (passive airflow) |
+# | cable_manager_h | 1–2 | Horizontal cable management panel (D-rings, fingers) |
+# | cable_manager_v | 0 | Vertical cable manager (side-mount, full rack height) |
+# | lacing_bar | 0 | Horizontal lacing bar (bolt-on, cable tie-down) |
+# | power_strip_mount | 0 | Bracket for mounting a power strip to rack rail |
+# | rack_mount_ears | 0 | Ears/brackets to rack-mount non-rack equipment |
+# | rail_kit | 0 | Sliding rail kit for specific server/device |
+# | kvm_console | 1 | Rack-mount LCD + keyboard (fold-out) |
+
+PatchPanelSpec:
+  port_count: uint              # total ports (12, 24, 48)
+  port_type: string             # "rj45_cat6a", "rj45_cat6", "rj45_cat5e",
+                                # "rj45_cat8", "keystone_blank",
+                                # "lc_duplex", "sc_duplex", "mpo",
+                                # "bnc", "f_type",
+                                # "xlr_3pin", "xlr_5pin", "trs_6.35mm",
+                                # "trs_bantam", "rca"
+  wiring_standard: string?      # "t568a", "t568b" (copper), "straight", "crossover"
+  shielded: bool?               # shielded/STP (for Cat6a/Cat8)
+  keystone: bool?               # keystone jack based (modular, replaceable)
+  punch_down: string?           # "110", "krone", "lsa_plus" (punch-down block type)
+  feed_through: bool?           # coupler/feed-through (no punch-down — RJ45 on both sides)
+  loaded: bool?                 # shipped with jacks installed, or blank?
+  numbering: string?            # port numbering scheme ("1-24_left_to_right",
+                                # "1-24_top_bottom_zigzag")
+  # Patch panels are passthrough devices in the graph — they add a hop
+  # with near-zero latency but they define the physical cable topology.
+  # Port 1 on the patch panel maps to a specific wall run or device.
+  # The graph traces: switch port 1 → patch cable → patch panel port 1 →
+  # structured cabling → wall plate → device. Every hop is visible.
+  ports: PatchPort[]?           # per-port mapping (what each port connects to)
+
+PatchPort:
+  port_number: uint
+  label: string?                # printed or handwritten label ("Desk 3", "AP-2F", "CCTV-NW")
+  destination: string?          # where this port's cable run goes ("office_3_north_wall",
+                                # "server_room_rack2_u15", "ceiling_ap_2nd_floor")
+  cable_type: string?           # "cat6a_plenum", "cat6_riser", "om3_lc_duplex"
+  cable_length_m: float?        # estimated or measured cable run length
+  tested: bool?                 # has this run been certified/tested?
+  test_result: string?          # "pass_cat6a", "pass_cat6", "fail_near_end_xt"
+  connected_device: string?     # device ID at the other end (if known)
+  # This is the structured cabling documentation that usually lives in a
+  # spreadsheet or on a clipboard taped to the rack. Now it's in the graph,
+  # queryable, and visualisable.
+
+RackShelfSpec:
+  shelf_type: string            # "fixed", "sliding", "vented", "cantilever"
+  weight_capacity_kg: float?
+  depth_mm: uint?               # usable depth
+  width: string?                # "full_width", "half_width"
+
+BlankingSpec:
+  type: string                  # "solid", "brush", "vented", "hinged"
+  # Blanking panels matter for airflow — an uncovered U creates a hot-air
+  # recirculation path that reduces cooling efficiency. The graph can flag:
+  # "3 empty U positions between your switch and server have no blanking
+  # panels. This may cause hot air recirculation."
+
+CableMgmtPanelSpec:
+  type: string                  # "d_ring", "finger", "brush", "waterfall"
+  capacity: uint?               # number of cables this panel can manage
+  depth_mm: uint?               # cable management depth
+```
+
+**Patch panels in the routing graph**:
+
+A patch panel is a passthrough device — data enters one side and exits the
+other with no processing, no latency, and no bandwidth limitation (up to
+the cable's rating). But it's critical for the graph because it defines
+the **physical cable topology**. Without modelling the patch panel, the
+graph shows "switch port 1 → server NIC" but doesn't know the cable route
+goes through a patch panel at U6 and a 30-metre structured cable run
+through the ceiling.
+
+```
+Switch (U5, port 1)
+  → 0.3m patch cable (Cat6a, blue)
+  → Patch panel (U6, port 1, labelled "Desk 3")
+  → 30m structured cable run (Cat6a, plenum, through ceiling)
+  → Wall plate (Office 3, north wall)
+  → 2m patch cable (Cat6a)
+  → Desktop NIC
+```
+
+The graph captures every hop. The cable inventory (from CableSpec) knows
+every cable. The patch panel port mapping knows where each structured
+cable run goes. Together: a complete wiring diagram, automatically
+generated from the graph, printable for the clipboard on the rack.
+
+**Audio patchbays**: In studio environments, TRS or bantam patchbays serve
+the same function as Ethernet patch panels — they provide a normalised
+connection point between studio equipment. A 48-point TRS patchbay
+(24 in top row, 24 in bottom row) with half-normal or full-normal wiring
+routes audio between the mixing desk, outboard gear, and the audio
+interface. The same `PatchPanelSpec` model handles audio patchbays with
+`port_type: "trs_6.35mm"` or `"trs_bantam"`.
 
 **FurnitureSpec** (desks, racks, stands, mounts — physical objects that contain
 or support devices):
