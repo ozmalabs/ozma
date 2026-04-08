@@ -102,7 +102,8 @@ DeviceEntry:
   # Peripherals and input
   keyboard: KeyboardSpec?
   mouse: MouseSpec?
-  audio: AudioSpec?             # microphones, speakers, headphones, audio interfaces
+  audio: AudioSpec?             # microphones, speakers, audio interfaces
+  headphone: HeadphoneSpec?     # headphones, headsets, earbuds (wired + wireless)
   display: DisplaySpec?         # monitors, projectors (compound device model)
   capture: CaptureSpec?         # capture cards (USB, PCIe, Thunderbolt)
   camera: CameraSpec?
@@ -287,6 +288,111 @@ BeamwidthPoint:
   hz: float
   horizontal_deg: float
   vertical_deg: float
+
+**HeadphoneSpec** (headphones, headsets, earbuds — compound audio devices):
+
+A headphone/headset is a compound device: audio sinks (speakers), optionally
+an audio source (microphone), controls (play/pause/ANC/volume), and battery.
+The connection type determines transport, codec, and latency.
+
+```yaml
+HeadphoneSpec:
+  form_factor: string           # "over_ear", "on_ear", "in_ear", "earbuds",
+                                # "bone_conduction", "open_ear"
+  type: string                  # "headphone", "headset", "gaming_headset",
+                                # "aviation_headset", "monitoring_headphone"
+
+  # --- Connection ---
+  connection: HeadphoneConnection[]  # MAY support multiple (wired + BT + USB dongle)
+
+  # --- Audio ---
+  driver_size_mm: float?
+  driver_type: string?          # "dynamic", "planar", "balanced_armature",
+                                # "electrostatic", "bone_conduction", "hybrid"
+  impedance_ohm: float?         # 16Ω earbuds, 32–80Ω typical, 300Ω studio
+  sensitivity_db: float?
+  frequency_response: FrequencyResponse?
+  open_back: bool?              # open-back (wider soundstage, leaks sound)
+  noise_isolation_db: float?    # passive isolation (closed-back)
+
+  # --- Microphone ---
+  microphone: HeadphoneMicSpec?
+
+  # --- Active features ---
+  anc: AncSpec?                 # active noise cancellation
+  transparency_mode: bool?      # ambient awareness / pass-through
+  sidetone: bool?               # hear own voice in earpiece
+  spatial_audio: bool?          # head-tracked spatial (Apple, Sony)
+  spatial_audio_type: string?   # "head_tracked", "fixed", "none"
+
+  # --- Controls ---
+  controls: HeadphoneControls?
+
+  # --- Battery ---
+  battery: BatterySpec?
+  battery_life_hours: float?    # rated (ANC on)
+  battery_life_anc_off_hours: float?
+  charging: string?             # "usb_c", "case_wireless", "case_usb_c", etc.
+  quick_charge: string?         # "5min_60min"
+
+  # --- Physical ---
+  weight_g: float?
+  replaceable_pads: bool?
+  replaceable_cable: bool?
+  foldable: bool?
+
+HeadphoneConnection:
+  type: string                  # "bluetooth", "usb_c_wired", "3.5mm_wired",
+                                # "6.35mm_wired", "usb_dongle_2_4ghz", "dect"
+  bluetooth: BluetoothSpec?     # if BT: version, supported codecs, profiles
+  multi_point: bool?            # connect to 2+ sources simultaneously
+  multi_point_max: uint?        # max simultaneous connections
+  dongle_connection: string?    # "usb_a", "usb_c"
+  simultaneous_wired_wireless: bool?
+  # Multi-point is a routing concern: headset connected to phone (BT) AND
+  # PC (USB dongle) — Ozma's mix bus handles which source plays based on
+  # priority. The headset's own multi-point behaviour means it makes routing
+  # decisions the controller SHOULD be aware of.
+
+HeadphoneMicSpec:
+  mic_type: string              # "boom", "inline", "built_in", "detachable_boom",
+                                # "retractable_boom", "beamforming_array"
+  noise_cancelling_mic: bool?   # ANC on the mic (for calls in noisy environments)
+  mic_mute: string?             # "button", "boom_flip", "app", "none"
+  frequency_response: FrequencyResponse?
+  pickup_pattern: string?       # "cardioid", "omnidirectional", "beamforming"
+  sidetone_adjustable: bool?
+
+AncSpec:
+  type: string                  # "feedforward", "feedback", "hybrid"
+  levels: uint?                 # number of ANC levels (1 = on/off, 3+ = adjustable)
+  adaptive: bool?               # auto-adjusts to environment
+  wind_noise_reduction: bool?
+  rated_reduction_db: float?
+  # ANC affects the routing graph: when ANC is on, the effective noise floor
+  # at the user's ears drops by 20–30 dB. The thermal management system
+  # (§2.14) SHOULD relax fan noise limits for noise-sensitive scenarios —
+  # the user can't hear the fans. Intent binding: "ANC headphones connected
+  # → allow server fans up to 45 dBA instead of 30 dBA."
+
+HeadphoneControls:
+  type: string                  # "physical_buttons", "touch_surface", "stem_squeeze"
+  volume: bool?
+  play_pause: bool?
+  skip_track: bool?
+  voice_assistant: bool?
+  anc_toggle: bool?
+  customisable: bool?
+  # Controls are a control surface in the graph (§2.8). Ozma intent bindings
+  # MAY map headphone gestures to actions: "triple-tap right earbud = switch
+  # scenario."
+```
+
+**Codec affects routing**: A Bluetooth headset on SBC (~200 kbps, lossy)
+sounds significantly worse than on LDAC (990 kbps) or LC3 (LE Audio). The
+`fidelity_audio` intent MUST reject SBC. The router MUST check the negotiated
+Bluetooth codec against the intent's format constraints before routing audio
+to the headset.
 
 FrequencyResponse:
   type: string                  # "measured", "specified", "community"
