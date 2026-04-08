@@ -1361,6 +1361,194 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     async def list_graph_links() -> dict[str, Any]:
         return {"links": [l.to_dict() for l in state.routing_graph.links()]}
 
+    # --- Routing engine endpoints (Phase 2–6) ---
+
+    @app.get("/api/v1/routing/intents")
+    async def list_routing_intents(request: Request) -> dict[str, Any]:
+        """List all built-in routing intents."""
+        _require_scope(request, SCOPE_READ)
+        from routing.intent import BUILTIN_INTENTS
+        return {"intents": {k: v.to_dict() for k, v in BUILTIN_INTENTS.items()}}
+
+    @app.get("/api/v1/routing/intents/{name}")
+    async def get_routing_intent(request: Request, name: str) -> dict[str, Any]:
+        """Get a single routing intent by name."""
+        _require_scope(request, SCOPE_READ)
+        from routing.intent import BUILTIN_INTENTS
+        intent = BUILTIN_INTENTS.get(name)
+        if intent is None:
+            raise HTTPException(status_code=404, detail=f"Intent not found: {name}")
+        return intent.to_dict()
+
+    @app.get("/api/v1/routing/explain")
+    async def routing_explain(
+        request: Request,
+        source: str,
+        destination: str,
+        intent: str = "desktop",
+        top_n: int = 3,
+    ) -> dict[str, Any]:
+        """
+        Explain what pipelines the router would select for a given intent
+        between source and destination devices.
+        """
+        _require_scope(request, SCOPE_READ)
+        from routing.intent import BUILTIN_INTENTS
+        chosen_intent = BUILTIN_INTENTS.get(intent)
+        if chosen_intent is None:
+            raise HTTPException(status_code=404, detail=f"Intent not found: {intent}")
+        src_device = state.routing_graph.get_device(source)
+        if src_device is None:
+            raise HTTPException(status_code=404, detail=f"Source device not found: {source}")
+        dst_device = state.routing_graph.get_device(destination)
+        if dst_device is None:
+            raise HTTPException(status_code=404, detail=f"Destination device not found: {destination}")
+        recommendations = state.routing_engine.recommend(
+            chosen_intent, src_device, dst_device, top_n=top_n
+        )
+        return {
+            "source": source,
+            "destination": destination,
+            "intent": intent,
+            "streams": [
+                {
+                    "media_type": si.media_type.value,
+                    "pipelines": [p.to_dict() for p in pipelines],
+                }
+                for si, pipelines in recommendations
+            ],
+        }
+
+    @app.get("/api/v1/routing/feasibility")
+    async def routing_feasibility(
+        request: Request,
+        source: str,
+        destination: str,
+        intent: str = "desktop",
+    ) -> dict[str, Any]:
+        """Check whether an intent is feasible between two devices."""
+        _require_scope(request, SCOPE_READ)
+        from routing.intent import BUILTIN_INTENTS
+        chosen_intent = BUILTIN_INTENTS.get(intent)
+        if chosen_intent is None:
+            raise HTTPException(status_code=404, detail=f"Intent not found: {intent}")
+        src_device = state.routing_graph.get_device(source)
+        if src_device is None:
+            raise HTTPException(status_code=404, detail=f"Source device not found: {source}")
+        dst_device = state.routing_graph.get_device(destination)
+        if dst_device is None:
+            raise HTTPException(status_code=404, detail=f"Destination device not found: {destination}")
+        result = state.routing_engine.check_feasibility(chosen_intent, src_device, dst_device)
+        return {
+            "source": source,
+            "destination": destination,
+            "intent": intent,
+            "feasible": {mt.value: ok for mt, ok in result.items()},
+        }
+
+    @app.post("/api/v1/routing/evaluate")
+    async def routing_evaluate(request: Request) -> dict[str, Any]:
+        """
+        Evaluate an ad-hoc intent against the current graph.
+
+        Body: { "source": str, "destination": str, "intent": str, "top_n": int }
+        """
+        _require_scope(request, SCOPE_READ)
+        from routing.intent import BUILTIN_INTENTS
+        body = await request.json()
+        source = body.get("source", "")
+        destination = body.get("destination", "")
+        intent_name = body.get("intent", "desktop")
+        top_n = int(body.get("top_n", 3))
+        chosen_intent = BUILTIN_INTENTS.get(intent_name)
+        if chosen_intent is None:
+            raise HTTPException(status_code=400, detail=f"Unknown intent: {intent_name}")
+        src_device = state.routing_graph.get_device(source)
+        dst_device = state.routing_graph.get_device(destination)
+        if src_device is None or dst_device is None:
+            raise HTTPException(status_code=404, detail="Source or destination device not found")
+        recommendations = state.routing_engine.recommend(
+            chosen_intent, src_device, dst_device, top_n=top_n
+        )
+        return {
+            "source": source,
+            "destination": destination,
+            "intent": intent_name,
+            "streams": [
+                {
+                    "media_type": si.media_type.value,
+                    "pipelines": [p.to_dict() for p in pipelines],
+                }
+                for si, pipelines in recommendations
+            ],
+        }
+
+    # --- Monitoring endpoints (Phase 6) ---
+
+    @app.get("/api/v1/monitoring/journal")
+    async def monitoring_journal_query(
+        request: Request,
+        device_id: str | None = None,
+        link_id: str | None = None,
+        severity: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Query the state change journal."""
+        _require_scope(request, SCOPE_READ)
+        entries = state.monitoring_journal.query(
+            device_id=device_id,
+            link_id=link_id,
+            severity=severity,
+            limit=limit,
+            offset=offset,
+        )
+        return {
+            "entries": [e.to_dict() for e in entries],
+            "total": len(state.monitoring_journal),
+        }
+
+    @app.get("/api/v1/monitoring/metrics/{device_id}")
+    async def monitoring_device_metrics(
+        request: Request, device_id: str
+    ) -> dict[str, Any]:
+        """Return all stored metric values for a device (with quality decay applied)."""
+        _require_scope(request, SCOPE_READ)
+        metrics = state.measurement_store.metrics_for_device(device_id)
+        freshness = state.measurement_store.get_device_freshness(device_id)
+        return {
+            "device_id": device_id,
+            "metrics": {k: v.to_dict() for k, v in metrics.items()},
+            "freshness": freshness.to_dict() if freshness else None,
+        }
+
+    @app.get("/api/v1/monitoring/health")
+    async def monitoring_health(request: Request) -> dict[str, Any]:
+        """Return per-device freshness state for all monitored devices."""
+        _require_scope(request, SCOPE_READ)
+        result = {}
+        for device_id in state.measurement_store.all_device_ids():
+            f = state.measurement_store.get_device_freshness(device_id)
+            if f:
+                result[device_id] = f.to_dict()
+        return {"devices": result}
+
+    @app.get("/api/v1/monitoring/trends")
+    async def monitoring_trends(
+        request: Request,
+        device_id: str | None = None,
+        active_only: bool = True,
+    ) -> dict[str, Any]:
+        """Return active trend alerts, optionally filtered by device."""
+        _require_scope(request, SCOPE_READ)
+        mgr = getattr(state, "trend_alert_manager", None)
+        if mgr is None:
+            return {"alerts": []}
+        alerts = mgr.active_alerts() if active_only else mgr.all_alerts()
+        if device_id:
+            alerts = [a for a in alerts if a.device_id == device_id]
+        return {"alerts": [a.to_dict() for a in alerts]}
+
     # --- Scenario endpoints ---
 
     @app.get("/api/v1/scenarios")

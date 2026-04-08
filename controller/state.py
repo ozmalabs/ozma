@@ -153,6 +153,15 @@ class AppState:
         self.routing_graph: RoutingGraph = RoutingGraph()
         self._graph_builder: GraphBuilder = GraphBuilder(self.routing_graph)
 
+        # Routing engine (Phase 2: intent-based path selection)
+        from routing import Router, MeasurementStore, MonitoringJournal, MetricStore
+        from routing.monitoring import TrendAlertManager
+        self.routing_engine: Router = Router(self.routing_graph)
+        self.measurement_store: MeasurementStore = MeasurementStore()
+        self.monitoring_journal: MonitoringJournal = MonitoringJournal()
+        self.metric_store: MetricStore = MetricStore()
+        self.trend_alert_manager: TrendAlertManager = TrendAlertManager()
+
     async def add_node(self, node: NodeInfo) -> None:
         async with self._lock:
             is_new = node.id not in self.nodes

@@ -92,6 +92,20 @@ from .transport_plugin import (
     SerialProtocol,
     SerialLinkState,
 )
+from .monitoring import (
+    StateChangeType,
+    StateChangeRecord,
+    JournalRetention,
+    JournalPolicy,
+    MonitoringJournal,
+    TrendAlertType,
+    TrendAlert,
+    TrendAlertManager,
+    MetricRetention,
+    MetricPoint,
+    MetricSeries,
+    MetricStore,
+)
 from .measurement import (
     QualifiedValue,
     StalenessAction,
@@ -219,6 +233,19 @@ __all__ = [
     "screen_bandwidth_raw",
     "rgb_bandwidth",
     "serial_bandwidth_bytes_per_sec",
+    # Phase 6 — monitoring, journal, trend alerts, metric time series
+    "StateChangeType",
+    "StateChangeRecord",
+    "JournalRetention",
+    "JournalPolicy",
+    "MonitoringJournal",
+    "TrendAlertType",
+    "TrendAlert",
+    "TrendAlertManager",
+    "MetricRetention",
+    "MetricPoint",
+    "MetricSeries",
+    "MetricStore",
     # Phase 5 — active measurement + quality decay
     "QualifiedValue",
     "StalenessAction",
