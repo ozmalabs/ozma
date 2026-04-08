@@ -41,10 +41,16 @@ class InfoQuality(str, Enum):
             "reported": 3, "commanded": 2, "spec": 1, "assumed": 0,
         }[self.value]
 
-    def __gt__(self, other: InfoQuality) -> bool:
+    def __lt__(self, other: "InfoQuality") -> bool:
+        return self.trust_level < other.trust_level
+
+    def __le__(self, other: "InfoQuality") -> bool:
+        return self.trust_level <= other.trust_level
+
+    def __gt__(self, other: "InfoQuality") -> bool:
         return self.trust_level > other.trust_level
 
-    def __ge__(self, other: InfoQuality) -> bool:
+    def __ge__(self, other: "InfoQuality") -> bool:
         return self.trust_level >= other.trust_level
 
 

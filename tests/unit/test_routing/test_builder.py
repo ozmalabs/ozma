@@ -130,6 +130,27 @@ class TestGraphBuilderBasic:
         hid_ports = ctrl.ports_by_media(MediaType.hid)
         assert len(hid_ports) == 1
 
+    def test_controller_has_audio_source_port(self):
+        g = RoutingGraph()
+        b = GraphBuilder(g)
+        b.rebuild(StubAppState())
+        ctrl = g.get_device("controller")
+        audio_ports = ctrl.ports_by_media(MediaType.audio)
+        assert len(audio_ports) == 1
+        assert audio_ports[0].id == "audio_out"
+
+    def test_audio_links_use_audio_out_not_hid_out(self):
+        """Audio links must originate from controller's audio_out port, not hid_out."""
+        g = RoutingGraph()
+        b = GraphBuilder(g)
+        node = StubNodeInfo(id="vm1", audio_type="pipewire", audio_sink="ozma-vm1")
+        state = StubAppState(nodes={"vm1": node})
+        b.rebuild(state)
+        audio_links = [l for l in g.links() if l.transport in ("pipewire", "vban")]
+        assert len(audio_links) == 1
+        assert audio_links[0].source.port_id == "audio_out"
+        assert audio_links[0].source.device_id == "controller"
+
 
 class TestGraphBuilderAudio:
     def test_pipewire_audio_adds_port(self):

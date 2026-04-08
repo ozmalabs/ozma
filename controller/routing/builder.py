@@ -62,6 +62,7 @@ _VBAN_BANDWIDTH = BandwidthSpec(
     capacity_bps=10_000_000, available_bps=9_000_000, used_bps=192_000,
     quality=InfoQuality.spec,
 )
+_VBAN_LOSS = LossSpec(rate=0.001, window_seconds=10, quality=InfoQuality.spec)
 _VBAN_ACTIVATION = ActivationTimeSpec(
     cold_to_warm_ms=100, warm_to_active_ms=10,
     active_to_warm_ms=10, warm_to_standby_ms=100,
@@ -156,6 +157,14 @@ class GraphBuilder:
                     direction=PortDirection.source,
                     media_type=MediaType.hid,
                     label="HID out (UDP to active node)",
+                ),
+                # Audio source — controller's PipeWire/VBAN output to nodes
+                Port(
+                    id="audio_out",
+                    device_id=self._controller_device_id(),
+                    direction=PortDirection.source,
+                    media_type=MediaType.audio,
+                    label="Audio out (PipeWire routing / VBAN to nodes)",
                 ),
                 # Control API — WebSocket/REST for scenario switching
                 Port(
@@ -350,7 +359,7 @@ class GraphBuilder:
         if audio_type == "pipewire":
             pw_link = Link(
                 id=f"audio:pw:{ctrl_id}→{node_dev_id}",
-                source=PortRef(ctrl_id, "hid_out"),  # controller runs PW routing
+                source=PortRef(ctrl_id, "audio_out"),
                 sink=PortRef(node_dev_id, "audio_pw_in"),
                 transport="pipewire",
                 state=LinkState(
@@ -364,13 +373,14 @@ class GraphBuilder:
         elif audio_type == "vban":
             vban_link = Link(
                 id=f"audio:vban:{ctrl_id}→{node_dev_id}",
-                source=PortRef(ctrl_id, "hid_out"),
+                source=PortRef(ctrl_id, "audio_out"),
                 sink=PortRef(node_dev_id, "audio_vban_in"),
                 transport="vban",
                 state=LinkState(
                     status=LinkStatus.active if is_active else LinkStatus.standby,
                     latency=_VBAN_LATENCY,
                     bandwidth=_VBAN_BANDWIDTH,
+                    loss=_VBAN_LOSS,
                     activation_time=_VBAN_ACTIVATION,
                 ),
                 properties={

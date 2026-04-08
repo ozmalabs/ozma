@@ -48,6 +48,14 @@ class TestInfoQuality:
         assert InfoQuality.user >= InfoQuality.user
         assert InfoQuality.measured >= InfoQuality.spec
 
+    def test_lt(self):
+        assert InfoQuality.assumed < InfoQuality.spec
+        assert InfoQuality.spec < InfoQuality.user
+
+    def test_le(self):
+        assert InfoQuality.assumed <= InfoQuality.assumed
+        assert InfoQuality.spec <= InfoQuality.measured
+
     def test_all_values_serialise(self):
         for q in InfoQuality:
             assert isinstance(q.value, str)
