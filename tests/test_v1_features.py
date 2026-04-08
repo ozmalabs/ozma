@@ -259,40 +259,49 @@ class TestNetworkHealth(unittest.TestCase):
 
 @unittest.skipUnless(_ZEROCONF, "zeroconf not available")
 class TestGridService(unittest.TestCase):
-    def test_claim_mark(self):
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._data_dir = Path(self._tmpdir.name) / "grid"
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def _make_grid(self):
         from grid import GridService
-        grid = GridService()
+        return GridService(data_dir=self._data_dir)
+
+    def test_claim_mark(self):
+        grid = self._make_grid()
         ok = grid.claim_mark("mark-1", "desk-a")
         self.assertTrue(ok)
         claim = grid.get_claim("mark-1")
         self.assertEqual(claim.desk_id, "desk-a")
 
     def test_claim_transfer(self):
-        from grid import GridService
-        grid = GridService()
+        grid = self._make_grid()
         grid.claim_mark("mark-1", "desk-a")
         grid.claim_mark("mark-1", "desk-b")
         claim = grid.get_claim("mark-1")
         self.assertEqual(claim.desk_id, "desk-b")
 
     def test_release_mark(self):
-        from grid import GridService
-        grid = GridService()
+        grid = self._make_grid()
         grid.claim_mark("mark-1", "desk-a")
         ok = grid.release_mark("mark-1", "desk-a")
         self.assertTrue(ok)
         self.assertIsNone(grid.get_claim("mark-1"))
 
     def test_release_wrong_desk(self):
-        from grid import GridService
-        grid = GridService()
+        grid = self._make_grid()
         grid.claim_mark("mark-1", "desk-a")
         ok = grid.release_mark("mark-1", "desk-b")
         self.assertFalse(ok)
 
     def test_show_state(self):
-        from grid import GridService, DeskInfo
-        grid = GridService()
+        from grid import DeskInfo
+        grid = self._make_grid()
         grid.register_desk(DeskInfo(id="d1", name="Desk 1", host="10.0.0.1", port=7380))
         grid.claim_mark("m1", "d1")
         state = grid.show_state()
