@@ -7752,22 +7752,161 @@ PsuMonitoring:
 ```yaml
 CoolerSpec:
   cooler_type: string?          # "air_tower", "aio_120", "aio_240", "aio_280",
-                                # "aio_360", "custom_loop", "passive", "stock"
+                                # "aio_360", "custom_loop", "passive", "stock",
+                                # "case_fan", "server_fan", "blower"
   socket_support: string[]?     # ["lga1700", "am5", "lga1200", "am4"]
   tdp_rated_w: uint?            # rated cooling capacity
-  fan_count: uint?
-  fan_size_mm: uint?            # 80, 92, 120, 140
-  fan_rpm_range: { min: uint, max: uint }?
-  noise_dba: float?             # rated noise at max speed
   height_mm: float?             # total height (matters for case clearance)
   radiator_size_mm: Dimensions? # for AIO: { w, d, h }
   pump_speed_rpm: uint?         # for AIO/custom loop
   rgb: RgbSpec?                 # fan/block RGB
 
+  # Fan specifications (applies to standalone fans, fans on coolers, server fans)
+  fan: FanSpec?                 # detailed fan specs (null for fanless/passive coolers)
+
   # For custom loop components:
   loop_component: string?       # "pump", "reservoir", "radiator", "block", "fitting", "tubing"
   thread_size: string?          # "g1_4" (standard PC watercooling)
   flow_rate_lph: float?         # litres per hour at rated speed
+
+FanSpec:
+  count: uint?                  # number of fans (dual-tower coolers = 2, AIO = 1–3)
+  size_mm: uint?                # fan diameter (40, 60, 80, 92, 120, 140, 200)
+  thickness_mm: uint?           # fan thickness (15, 25, 38 — server fans often 38mm)
+  rpm_range: { min: uint, max: uint }?
+  noise_dba: float?             # rated noise at max speed
+  noise_at_idle_dba: float?     # noise at minimum speed
+
+  # Airflow and pressure
+  airflow_cfm: float?           # cubic feet per minute (max)
+  airflow_m3h: float?           # cubic metres per hour (max)
+  static_pressure_mmh2o: float? # static pressure (mm H₂O) — matters for pushing
+                                # air through drive cages, radiators, filters
+  # High CFM + low pressure = good for open airflow (case exhaust)
+  # Low CFM + high pressure = good for obstructed paths (radiator, drive cage)
+  # Server fans typically have both high CFM AND high pressure.
+
+  # Electrical
+  voltage_v: float?             # operating voltage (typically 12V, some 5V)
+  current_max_a: float?         # maximum current draw
+  power_max_w: float?           # maximum power consumption
+  connector: string?            # "4pin_pwm", "3pin_dc", "2pin", "molex",
+                                # "server_6pin", "proprietary"
+  pwm: bool?                    # PWM speed control (4-pin)
+  tachometer: bool?             # RPM feedback signal
+  hot_swap: bool?               # can be replaced while system is running (server fans)
+
+  # Mechanical
+  bearing: string?              # "sleeve", "ball", "dual_ball", "fluid_dynamic",
+                                # "maglev", "rifle", "hydro"
+  rated_life_hours: uint?       # expected lifespan (ball bearing ~70k hrs, sleeve ~30k hrs)
+  direction: string?            # "intake", "exhaust" — when mounted in this orientation
+
+  # Server-specific
+  redundant: bool?              # part of a redundant fan group (N+1)
+  fan_zone: string?             # which thermal zone this fan serves (see ThermalTopology)
+```
+
+**ThermalTopology** — which fans cool which components, and what happens
+when a fan fails. Added to MotherboardSpec and CaseSpec:
+
+```yaml
+ThermalTopology:
+  zones: ThermalZone[]
+  redundancy: ThermalRedundancy?
+
+ThermalZone:
+  id: string                    # "cpu_zone", "drive_zone", "pcie_zone", "exhaust"
+  name: string                  # "CPU / VRM area", "Drive cage", "PCIe card area"
+  fans: string[]                # fan device IDs that serve this zone
+  components: string[]          # device IDs of components cooled by this zone
+  sensors: string[]?            # temperature sensor IDs monitoring this zone
+  target_temp_c: float?         # target temperature for fan curve
+  critical_temp_c: float?       # thermal throttle / shutdown threshold
+  airflow_direction: string?    # "front_to_rear", "bottom_to_top", "rear_exhaust"
+
+ThermalRedundancy:
+  mode: string                  # "none", "n_plus_1", "n_plus_2", "full_redundancy"
+  min_fans_operational: uint?   # minimum fans before degraded state
+  action_on_fan_failure: string? # "increase_remaining", "throttle", "alert", "shutdown"
+  # N+1: system can lose one fan and still cool adequately (remaining fans speed up)
+  # Full: every fan has a dedicated backup
+```
+
+**Your server modelled**:
+
+```yaml
+# Thermal topology for the 4U server
+thermal_topology:
+  zones:
+    - id: "drive_zone"
+      name: "24-bay drive cage"
+      fans: ["arctic_fan_1", "arctic_fan_2"]  # two fans push air through drive cage
+      components: ["sas_backplane", "sas_expander_0", "sas_expander_1"]
+      sensors: ["drive_cage_temp"]
+      airflow_direction: "front_to_rear"
+      # Arctic S12038-4K: 120×38mm, 4000 RPM, 84 CFM, 3.58 mmH₂O static pressure
+      # High static pressure pushes air through 24 populated drive bays
+
+    - id: "cpu_pcie_zone"
+      name: "CPU, motherboard, and PCIe cards"
+      fans: ["arctic_fan_3"]    # one fan behind CPU/PCIe area
+      components: ["cpu_5900x", "x570s_mobo", "rx6600xt", "x540_10gbe",
+                   "9300i_hba", "1660s_via_riser"]
+      sensors: ["cpu_tdie", "vrm_temp", "chipset_temp"]
+      airflow_direction: "front_to_rear"
+
+    - id: "psu_zone"
+      name: "PSU"
+      fans: []                  # PSU has its own internal fan
+      components: ["evga_1600t2"]
+
+  redundancy:
+    mode: "n_plus_1"            # with 3 fans, can lose 1 and still cool
+    min_fans_operational: 2
+    action_on_fan_failure: "increase_remaining"
+    # If arctic_fan_2 dies, fan_1 and fan_3 ramp to compensate.
+    # Drive zone has only 1 fan remaining — may thermal throttle under
+    # heavy I/O. Alert the user.
+```
+
+**Bandwidth topology for your server** (the interesting part):
+
+```
+CPU: Ryzen 9 5900X (Zen 3, AM4)
+├── PCIe Gen 4 x16 → RX 6600 XT (full bandwidth, 32 GB/s)
+│   └── Display engine: 4 heads, 4 PLLs, RDNA2 VCN 3.0 (4 encode sessions)
+│
+├── PCIe Gen 4 x4 → X570S chipset (uplink: 8 GB/s) ← BOTTLENECK
+│   ├── Chipset PCIe → X540-T2 10GbE dual (25 Gbps per port = 6.25 GB/s)
+│   ├── Chipset PCIe x1 → [x1-to-x16 riser] → GTX 1660 Super
+│   │   └── x1 Gen 3 = 1 GB/s — GPU runs but severely starved.
+│   │       NVENC works fine for encoding (data is small).
+│   │       Gaming/rendering: unusable at x1.
+│   ├── Chipset M.2 x4 → [M.2-to-x16 adapter] → Broadcom 9300-8i
+│   │   └── HBA is PCIe x8 card but adapter limits to x4 = 4 GB/s.
+│   │       HBA drives 24-bay SAS backplane.
+│   │       24× spinning drives at 250 MB/s each = 6 GB/s aggregate
+│   │       but adapter limits to 4 GB/s. Mild bottleneck under full load.
+│   ├── Chipset USB 3.0 (shared 5 Gbps)
+│   ├── Chipset SATA (if any drives connected)
+│   └── Chipset USB 2.0 / audio / etc.
+│
+│   Total chipset demand: 10GbE (6.25 GB/s) + HBA (4 GB/s) + 1660S (1 GB/s)
+│                       + USB + SATA = ~11+ GB/s through 8 GB/s uplink
+│                       ← OVERSUBSCRIBED. Under full 10GbE + storage load,
+���                          the chipset uplink is the bottleneck.
+│
+├── Direct USB (if AM4 has any — varies by board)
+└── Memory: 2× 32GB DDR4 (dual channel, slots A2+B2 presumably)
+    └── If running at JEDEC 3200 MHz: 51.2 GB/s
+        If XMP enabled (e.g., 3600 MHz): 57.6 GB/s
+```
+
+The Sankey diagram for this system would clearly show the chipset uplink as
+the narrowest point between the CPU and all the storage + networking. The
+router knows: "heavy NFS serving (10GbE saturated) will reduce available
+bandwidth for the SAS array because they share the 8 GB/s chipset uplink."
 ```
 
 **CaseSpec** (PC case — already in device-db.md for RGB/spatial, extended
