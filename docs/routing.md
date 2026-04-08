@@ -6655,6 +6655,145 @@ Matt badges in at Desk 3 (NFC reader on desk)
     → Ready for next person
 ```
 
+#### Security considerations
+
+**Biometric data protection**: Biometric data (face templates, fingerprint
+minutiae, voiceprints) is special-category personal data under GDPR
+Article 9 and equivalent legislation. The spec requires:
+
+- **Local storage only**: Biometric templates are stored on the device
+  that captured them (camera's local storage, fingerprint reader's secure
+  element) or on the local controller. Never transmitted to Connect.
+  Never stored in the cloud.
+- **Explicit consent**: Biometric enrollment requires informed consent
+  with clear explanation of what's captured, where it's stored, and how
+  to delete it. No silent enrollment.
+- **Right to erasure**: A person can request deletion of all their
+  biometric data, authentication history, and associated preferences.
+  The system must be able to honour this completely.
+- **Data minimisation**: Store the minimum necessary — comparison
+  templates, not raw images. `credential_id` in AuthenticationEvent is
+  an opaque reference, not a template.
+
+**Biometric confidence and false acceptance**: The spec does not prescribe
+a default confidence threshold because the acceptable false acceptance
+rate (FAR) depends on the deployment:
+
+| Context | Acceptable FAR | Confidence needed | Notes |
+|---------|---------------|-------------------|-------|
+| Desk personalisation | 1:100 | ~0.85 | Low risk — wrong person gets wrong wallpaper |
+| Front door (residential) | 1:10,000 | ~0.95 + second factor | Medium risk — MFA required |
+| Server room | 1:100,000 | ~0.99 + second factor | High risk — critical infrastructure |
+| Access control should never rely on face alone | — | — | Always require a second factor for physical access |
+
+The biometric provider must publish FAR/FRR curves at each confidence
+threshold. The deployment configures the threshold based on their risk
+tolerance. The spec recommends that biometrics are **never the sole
+factor** for physical access control — always combined with possession
+(badge, phone) or knowledge (PIN).
+
+**BLE proximity relay attacks**: BLE signal strength (RSSI) can be relayed
+by an attacker with two radios, extending apparent proximity from hundreds
+of metres. BLE proximity is a **convenience factor, not a security factor**.
+For security-critical access:
+
+- Prefer UWB (Ultra-Wideband) — time-of-flight measurement that cannot be
+  relayed without adding detectable latency
+- Require a second factor of a different type (biometric, knowledge)
+- Constrain both factors to the same physical zone (intent binding
+  condition: `zone_of(face_detection) == zone_of(ble_proximity)`)
+
+**Anti-spoofing for biometrics**:
+
+| Biometric | Attack | Mitigation required |
+|-----------|--------|-------------------|
+| Face | Printed photo | 3D depth sensing (structured light, ToF) |
+| Face | Screen replay | 3D depth + liveness (blink, head turn) |
+| Face | Deepfake video | 3D depth (deepfakes are 2D) + frame consistency checks |
+| Fingerprint | Lifted print on gelatin | Capacitive sensor (detects sub-surface, not surface) |
+| Fingerprint | 3D-printed finger | Multi-spectral sensor (blood flow detection) |
+| Voice | Recording | Challenge-response (say a random phrase) |
+| Voice | Real-time synthesis | Acoustic environment consistency (room signature) |
+
+The spec requires that biometric authentication devices declare their
+anti-spoofing capabilities in the device database (`LockSpec` or sensor
+spec). The MFA policy can require specific anti-spoofing levels:
+`require_3d_liveness: true` for face, `require_capacitive: true` for
+fingerprint.
+
+**Credential lifecycle**:
+
+```yaml
+CredentialLifecycle:
+  max_age_days: uint?           # credential expires after this many days (re-enrollment required)
+  max_uses: uint?               # credential expires after this many uses
+  lockout: LockoutPolicy?       # what happens on repeated failures
+  rotation: RotationPolicy?     # when to re-enroll (biometric templates age)
+  recovery: RecoveryPolicy?     # what happens when all credentials are lost
+
+LockoutPolicy:
+  max_failures: uint            # lock out after this many consecutive failures
+  lockout_duration_s: uint      # lock out for this long (0 = until admin reset)
+  escalation: string?           # "notify_admin", "alarm", "camera_snapshot"
+  per_credential: bool          # lock out just this credential, or all access?
+
+RotationPolicy:
+  biometric_refresh_months: uint?  # re-enroll biometrics this often (face changes)
+  badge_expiry_months: uint?       # badges expire and must be re-issued
+  password_rotation: string?       # "never" (passkeys are better), or interval
+
+RecoveryPolicy:
+  methods: string[]             # ["admin_reset", "recovery_code", "supervisor_override",
+                                # "physical_key_backup"]
+  # Recovery is the hardest part of credential management. If someone
+  # loses their badge AND forgets their PIN AND their phone is dead,
+  # they need a way in. Options:
+  # - Admin reset: another admin unlocks and re-enrolls
+  # - Recovery code: pre-generated one-time codes (printed, stored safely)
+  # - Supervisor override: a supervisor's credentials unlock on behalf
+  # - Physical key: traditional key backup (always works, no batteries)
+```
+
+**Enrollment security**: Enrolling a new credential is a privileged
+operation — an attacker who compromises enrollment registers their face as
+a legitimate user. Requirements:
+
+- Initial enrollment requires admin-level authentication
+- Self-enrollment of additional credentials requires an existing
+  authenticated session (you must prove who you are before adding a new
+  way to prove who you are)
+- All enrollment events are logged in the hashchained audit trail
+- Biometric enrollment captures an audit photo (separate from the template)
+  showing who was physically present during enrollment
+
+**External identity federation**: In enterprise deployments, Ozma is not
+the source of truth for identity. The identity model supports federation:
+
+```yaml
+IdentityFederation:
+  provider: string              # "entra_id", "okta", "google_workspace",
+                                # "jumpcloud", "freeipa", "ldap", "oidc_generic"
+  person_mapping: string        # how external identity maps to PersonIdentity
+                                # ("email", "employee_id", "upn", "sub_claim")
+  credential_sync: bool         # sync external credentials (AD badge enrollment → Ozma lock)
+  group_mapping: GroupMapping[]? # external groups → Ozma roles/zones
+  # Ozma should never require being the sole IdP. In enterprise:
+  # - Identity comes from AD/Entra/Okta
+  # - Ozma maps external identity to its PersonIdentity model
+  # - Group membership determines roles, zones, scenarios
+  # - Credential management may be delegated (HR enrolls badges in AD,
+  #   Ozma syncs badge→lock access automatically)
+```
+
+**Physical security separation**: Authentication for physical access
+(locks) and authentication for digital access (dashboard, API, SSH) should
+be independently configurable. Unlocking the front door should not grant
+API admin access. Logging into the dashboard should not unlock the server
+room. The `roles` and `zones` on PersonIdentity enforce this — but the
+spec explicitly states: **physical access and digital access are separate
+authorization domains**. A person can be authorized for physical access
+to a zone without having any digital access to the systems in that zone.
+
 ---
 
 ## 11. Observability and Monitoring
