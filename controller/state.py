@@ -153,14 +153,19 @@ class AppState:
         self.routing_graph: RoutingGraph = RoutingGraph()
         self._graph_builder: GraphBuilder = GraphBuilder(self.routing_graph)
 
-        # Routing engine (Phase 2: intent-based path selection)
+        # Routing engine (Phase 2–6)
         from routing import Router, MeasurementStore, MonitoringJournal, MetricStore
-        from routing.monitoring import TrendAlertManager
+        from routing.monitoring import TrendAlertManager, StateChangeRecord, StateChangeType
+        from routing.pipeline_cache import PipelineCache
         self.routing_engine: Router = Router(self.routing_graph)
         self.measurement_store: MeasurementStore = MeasurementStore()
         self.monitoring_journal: MonitoringJournal = MonitoringJournal()
         self.metric_store: MetricStore = MetricStore()
         self.trend_alert_manager: TrendAlertManager = TrendAlertManager()
+        self.pipeline_cache: PipelineCache = PipelineCache(self.routing_engine)
+        # Bind these for use in add_node/remove_node without re-importing each call
+        self._journal_record = StateChangeRecord
+        self._journal_type = StateChangeType
 
     async def add_node(self, node: NodeInfo) -> None:
         async with self._lock:
@@ -206,8 +211,25 @@ class AppState:
                     node.capabilities = list(set(node.capabilities) | set(existing.capabilities))
             self.nodes[node.id] = node
         self._graph_builder.apply_node_added(node, self)
+        self._graph_builder.seed_measurements(self.measurement_store)
+        self.pipeline_cache.invalidate()
         if is_new:
             await self.events.put({"type": "node.online", "node": node.to_dict()})
+            self.monitoring_journal.append(self._journal_record(
+                type=self._journal_type.device_online,
+                device_id=f"node:{node.id}",
+                message=f"Node {node.id} registered ({node.host}:{node.port})",
+                source="state.add_node",
+                severity="info",
+            ))
+        else:
+            self.monitoring_journal.append(self._journal_record(
+                type=self._journal_type.metric_refreshed,
+                device_id=f"node:{node.id}",
+                message=f"Node {node.id} re-registered",
+                source="state.add_node",
+                severity="info",
+            ))
 
     async def remove_node(self, node_id: str) -> None:
         async with self._lock:
@@ -216,7 +238,15 @@ class AppState:
                 self.active_node_id = None
         if removed:
             self._graph_builder.apply_node_removed(node_id)
+            self.pipeline_cache.invalidate()
             await self.events.put({"type": "node.offline", "node_id": node_id})
+            self.monitoring_journal.append(self._journal_record(
+                type=self._journal_type.device_offline,
+                device_id=f"node:{node_id}",
+                message=f"Node {node_id} went offline",
+                source="state.remove_node",
+                severity="warning",
+            ))
 
     async def set_active_node(self, node_id: str) -> None:
         async with self._lock:
@@ -225,7 +255,16 @@ class AppState:
             self.active_node_id = node_id
         # Rebuild graph so link statuses reflect the new active node
         self._graph_builder.rebuild(self)
+        self._graph_builder.seed_measurements(self.measurement_store)
+        self.pipeline_cache.invalidate()
         await self.events.put({"type": "node.switched", "node_id": node_id})
+        self.monitoring_journal.append(self._journal_record(
+            type=self._journal_type.pipeline_activated,
+            device_id=f"node:{node_id}",
+            message=f"Active node switched to {node_id}",
+            source="state.set_active_node",
+            severity="info",
+        ))
 
     def get_active_node(self) -> NodeInfo | None:
         nid = self.active_node_id

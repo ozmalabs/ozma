@@ -20,6 +20,7 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 
+from .formats import FormatSet, negotiate_format, NegotiationFailure
 from .graph import RoutingGraph
 from .intent import Intent, StreamIntent, Preferences
 from .model import (
@@ -86,6 +87,34 @@ class CandidatePath:
         return min(bws) if bws else 0
 
     @property
+    def aggregate_loss(self) -> float:
+        """
+        End-to-end packet loss rate.
+
+        P(packet lost) = 1 - P(packet survives all hops)
+                       = 1 - product(1 - loss_i)
+        """
+        survival = 1.0
+        for link in self.links:
+            if link.state and link.state.loss:
+                survival *= (1.0 - link.state.loss.rate)
+        return 1.0 - survival
+
+    @property
+    def aggregate_jitter_ms(self) -> float:
+        """
+        End-to-end p99 jitter: conservative sum of per-hop p99 values.
+
+        True statistical combination requires variance data; per-hop p99 sum
+        is a safe upper bound used for constraint checking.
+        """
+        return sum(
+            link.state.jitter.p99_ms
+            for link in self.links
+            if link.state and link.state.jitter
+        )
+
+    @property
     def weakest_quality(self) -> InfoQuality:
         worst = InfoQuality.user
         for link in self.links:
@@ -105,6 +134,9 @@ class ConstraintChecker:
 
     All checks are hard filters — any failure disqualifies the path.
     """
+
+    def __init__(self, graph: RoutingGraph | None = None) -> None:
+        self._graph = graph
 
     def check(
         self,
@@ -138,25 +170,42 @@ class ConstraintChecker:
 
         # 6. Power budget (Phase 2: placeholder)
 
-        # 7. Loss
+        # 7. Loss — checked as aggregate end-to-end probability
         if c.max_loss is not None:
-            for link in path.links:
-                if link.state and link.state.loss:
-                    if link.state.loss.rate > c.max_loss:
-                        violations.append(ConstraintViolation(
-                            "loss",
-                            f"link {link.id} loss {link.state.loss.rate:.4f} > {c.max_loss}"))
+            agg_loss = path.aggregate_loss
+            if agg_loss > c.max_loss:
+                violations.append(ConstraintViolation(
+                    "loss",
+                    f"aggregate loss {agg_loss:.4f} > {c.max_loss} "
+                    f"({path.hop_count} hops)"))
 
-        # 8. Jitter
+        # 8. Jitter — checked as aggregate end-to-end (sum of per-hop p99)
         if c.max_jitter_ms is not None:
-            for link in path.links:
-                if link.state and link.state.jitter:
-                    if link.state.jitter.p99_ms > c.max_jitter_ms:
-                        violations.append(ConstraintViolation(
-                            "jitter",
-                            f"link {link.id} p99 jitter {link.state.jitter.p99_ms}ms > {c.max_jitter_ms}ms"))
+            agg_jitter = path.aggregate_jitter_ms
+            if agg_jitter > c.max_jitter_ms:
+                violations.append(ConstraintViolation(
+                    "jitter",
+                    f"aggregate p99 jitter {agg_jitter:.2f}ms > {c.max_jitter_ms}ms "
+                    f"({path.hop_count} hops)"))
 
-        # 9. Format (Phase 2: we don't negotiate formats yet — skip)
+        # 9. Format negotiation — collect format_sets from all ports on the path
+        #    and verify they have at least one compatible intersection.
+        if self._graph is not None:
+            format_sets: list[FormatSet] = []
+            for link in path.links:
+                for ref in (link.source, link.sink):
+                    device = self._graph.get_device(ref.device_id)
+                    if device is None:
+                        continue
+                    port = device.get_port(ref.port_id)
+                    if port is not None and port.format_set is not None:
+                        format_sets.append(port.format_set)
+            if format_sets:
+                try:
+                    negotiate_format(format_sets, stream.media_type)
+                except NegotiationFailure as exc:
+                    violations.append(ConstraintViolation(
+                        "format", str(exc)))
 
         # 10. Hops
         if c.max_hops is not None and path.hop_count > c.max_hops:
@@ -329,7 +378,7 @@ class Router:
 
     def __init__(self, graph: RoutingGraph) -> None:
         self._graph = graph
-        self._checker = ConstraintChecker()
+        self._checker = ConstraintChecker(graph)
 
     def recommend(
         self,
@@ -425,6 +474,60 @@ class Router:
         pipeline.aggregate.weakest_quality = path.weakest_quality
 
         return pipeline
+
+    def recommend_devices(
+        self,
+        intent: Intent,
+        source: Device,
+        destination: Device,
+        top_n: int = 3,
+    ) -> list[tuple[StreamIntent, list[Pipeline]]]:
+        """
+        Convenience wrapper: resolve Device → PortRef pairs and call recommend().
+
+        For each StreamIntent's media type, picks the first source-direction port
+        on *source* and first sink-direction port on *destination* that carry that
+        media type, then merges the per-stream results.
+
+        Streams with no matching port on either device are returned with an empty
+        pipeline list (same semantics as an infeasible required stream).
+        """
+        results: list[tuple[StreamIntent, list[Pipeline]]] = []
+        for stream in intent.streams:
+            mt = stream.media_type
+            src_port = next(
+                (p for p in source.ports
+                 if p.direction == PortDirection.source and p.media_type == mt),
+                None,
+            )
+            dst_port = next(
+                (p for p in destination.ports
+                 if p.direction == PortDirection.sink and p.media_type == mt),
+                None,
+            )
+            if src_port is None or dst_port is None:
+                results.append((stream, []))
+                continue
+            src_ref = PortRef(device_id=source.id, port_id=src_port.id)
+            dst_ref = PortRef(device_id=destination.id, port_id=dst_port.id)
+            # Enumerate paths for just this stream
+            max_hops = stream.constraints.max_hops or 8
+            paths = _enumerate_paths(
+                self._graph, src_ref, dst_ref, mt, max_hops=max_hops,
+            )
+            feasible = [
+                p for p in paths if not self._checker.check(p, stream)
+            ]
+            prefs = stream.preferences
+            for p in feasible:
+                p.cost = _compute_cost(p, prefs)
+            feasible.sort(key=lambda p: p.cost)
+            pipelines = [
+                self._build_pipeline(intent, stream, p, src_ref, dst_ref)
+                for p in feasible[:top_n]
+            ]
+            results.append((stream, pipelines))
+        return results
 
     def check_feasibility(
         self,
