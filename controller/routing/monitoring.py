@@ -460,6 +460,41 @@ class MetricSeries:
         cutoff = t - seconds
         return [p for p in self._tier1 if p.timestamp >= cutoff]
 
+    def history(
+        self,
+        tier: int = 1,
+        limit: int | None = None,
+        since: float | None = None,
+        now: float | None = None,
+    ) -> list[MetricPoint]:
+        """
+        Return data points from the requested tier (1, 2, or 3), newest first.
+
+        tier=1: 1-second resolution, last 1 hour  (real-time monitoring)
+        tier=2: 1-minute resolution, last 24 hours (recent history)
+        tier=3: 15-minute resolution, last 30 days (long-term trends)
+
+        since: monotonic timestamp; only return points newer than this.
+        limit: cap the result length.
+        """
+        _t = now or time.monotonic()
+        src: deque[MetricPoint]
+        if tier == 1:
+            src = self._tier1
+        elif tier == 2:
+            src = self._tier2
+        elif tier == 3:
+            src = self._tier3
+        else:
+            raise ValueError(f"tier must be 1, 2, or 3 (got {tier})")
+        points = list(src)
+        if since is not None:
+            points = [p for p in points if p.timestamp > since]
+        points.sort(key=lambda p: p.timestamp, reverse=True)
+        if limit is not None:
+            points = points[:limit]
+        return points
+
     def to_dict(self) -> dict:
         return {
             "tier1_count": len(self._tier1),
