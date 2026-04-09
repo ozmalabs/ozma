@@ -1645,6 +1645,29 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             ],
         }
 
+    @app.get("/api/v1/routing/measurement_engine")
+    async def routing_measurement_engine_status(request: Request) -> dict[str, Any]:
+        """Return the active measurement engine status."""
+        _require_scope(request, SCOPE_READ)
+        return state.measurement_engine.to_dict()
+
+    @app.post("/api/v1/routing/probe/{link_id}")
+    async def routing_probe_link(request: Request, link_id: str) -> dict[str, Any]:
+        """
+        Trigger an immediate ICMP probe of a specific link.
+
+        Only works for links with a `target_ip` property (network links).
+        Returns the updated link state after probing.
+        """
+        _require_scope(request, SCOPE_WRITE)
+        found = await state.measurement_engine.probe_link_now(link_id)
+        if not found:
+            raise HTTPException(404, f"Link not found or not probeable: {link_id}")
+        link = state.routing_graph.get_link(link_id)
+        if link is None:
+            raise HTTPException(404, f"Link not found: {link_id}")
+        return {"link_id": link_id, "state": link.state.to_dict() if link.state else None}
+
     # --- Scenario endpoints ---
 
     @app.get("/api/v1/scenarios")
