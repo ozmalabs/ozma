@@ -328,6 +328,7 @@ async def run(config: Config) -> None:
     await screen_ws.start()
     await net_health.start()
     await state.measurement_engine.start()
+    await state.binding_loop.start()
 
     # OCR triggers — watch screens for errors
     from text_capture import TextCapture
@@ -872,6 +873,7 @@ async def run(config: Config) -> None:
     await discovery.stop()
     await net_health.stop()
     await state.measurement_engine.stop()
+    await state.binding_loop.stop()
     await sched.stop()
     await kbd_mgr.stop()
     await sharing_mgr.stop()

@@ -155,7 +155,8 @@ class AppState:
 
         # Routing engine (Phase 2–6)
         from routing import Router, MeasurementStore, MonitoringJournal, MetricStore
-        from routing import MeasurementEngine
+        from routing import MeasurementEngine, BindingLoop, AppStateResolver
+        from routing.binding import BindingRegistry
         from routing.monitoring import TrendAlertManager, StateChangeRecord, StateChangeType
         from routing.pipeline_cache import PipelineCache
         self.routing_engine: Router = Router(self.routing_graph)
@@ -169,6 +170,12 @@ class AppState:
             self.measurement_store,
             self.monitoring_journal,
             metric_store=self.metric_store,
+        )
+        self.binding_registry: BindingRegistry = BindingRegistry()
+        self.binding_loop: BindingLoop = BindingLoop(
+            self.binding_registry,
+            AppStateResolver(self),
+            journal=self.monitoring_journal,
         )
         # Bind these for use in add_node/remove_node without re-importing each call
         self._journal_record = StateChangeRecord
