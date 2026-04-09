@@ -1567,6 +1567,59 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             alerts = [a for a in alerts if a.device_id == device_id]
         return {"alerts": [a.to_dict() for a in alerts]}
 
+    @app.get("/api/v1/monitoring/link/{link_id}/history")
+    async def monitoring_link_history(
+        request: Request,
+        link_id: str,
+        tier: int = 1,
+        limit: int = 200,
+        metric: str = "latency_ms",
+    ) -> dict[str, Any]:
+        """
+        Return time-series history for a specific link metric.
+
+        Parameters:
+          link_id: the link ID from the routing graph (e.g. "hid:controller→node:vm1")
+          tier:    data resolution (1=1s/1h, 2=1m/24h, 3=15m/30d)
+          limit:   max number of points to return (default 200, newest first)
+          metric:  one of latency_ms, loss_rate, jitter_p99_ms (default latency_ms)
+
+        Returns {link_id, metric, tier, points: [{t, v, n, min, max}, ...]}
+        """
+        _require_scope(request, SCOPE_READ)
+        if tier not in (1, 2, 3):
+            raise HTTPException(400, "tier must be 1, 2, or 3")
+        valid_metrics = ("latency_ms", "loss_rate", "jitter_p99_ms")
+        if metric not in valid_metrics:
+            raise HTTPException(
+                400,
+                f"metric must be one of: {', '.join(valid_metrics)}"
+            )
+        # Find the link to get its source device_id
+        link = state.routing_graph.get_link(link_id)
+        if link is None:
+            raise HTTPException(404, f"Link not found: {link_id}")
+        dev_id = link.source.device_id
+        metric_key = f"link.{link_id}.{metric}"
+
+        metric_store = getattr(state, "metric_store", None)
+        if metric_store is None:
+            return {"link_id": link_id, "metric": metric, "tier": tier, "points": []}
+
+        series = metric_store.get_series(dev_id, metric_key)
+        if series is None:
+            return {"link_id": link_id, "metric": metric, "tier": tier, "points": []}
+
+        points = series.history(tier=tier, limit=limit)
+        return {
+            "link_id": link_id,
+            "device_id": dev_id,
+            "metric": metric,
+            "metric_key": metric_key,
+            "tier": tier,
+            "points": [p.to_dict() for p in points],
+        }
+
     @app.get("/api/v1/routing/pipelines")
     async def routing_pipelines(request: Request) -> dict[str, Any]:
         """

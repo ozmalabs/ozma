@@ -31,7 +31,7 @@ from .model import InfoQuality, LinkStatus
 if TYPE_CHECKING:
     from .graph import RoutingGraph
     from .measurement import MeasurementStore
-    from .monitoring import MonitoringJournal
+    from .monitoring import MonitoringJournal, MetricStore
 
 log = logging.getLogger("ozma.routing.measurement_engine")
 
@@ -184,10 +184,12 @@ class MeasurementEngine:
         graph: "RoutingGraph",
         store: "MeasurementStore",
         journal: "MonitoringJournal | None" = None,
+        metric_store: "MetricStore | None" = None,
     ) -> None:
         self._graph = graph
         self._store = store
         self._journal = journal
+        self._metric_store = metric_store
         self._task: asyncio.Task | None = None
         self._running = False
         # Track consecutive probe failures per link_id
@@ -304,6 +306,13 @@ class MeasurementEngine:
             result.p99_jitter_ms, InfoQuality.measured,
             source="icmp", refresh_class="network_health", now=now,
         )
+
+        # Also record to MetricStore for time-series history (if wired)
+        if self._metric_store is not None:
+            ms = self._metric_store
+            ms.record(dev_id, f"link.{link_id}.latency_ms", result.avg_ms, now)  # type: ignore[union-attr]
+            ms.record(dev_id, f"link.{link_id}.loss_rate", result.loss_rate, now)  # type: ignore[union-attr]
+            ms.record(dev_id, f"link.{link_id}.jitter_p99_ms", result.p99_jitter_ms, now)  # type: ignore[union-attr]
 
         # Update the link's live state metrics so the graph reflects reality.
         self._update_link_state(link, result, now)

@@ -168,6 +168,7 @@ class AppState:
             self.routing_graph,
             self.measurement_store,
             self.monitoring_journal,
+            metric_store=self.metric_store,
         )
         # Bind these for use in add_node/remove_node without re-importing each call
         self._journal_record = StateChangeRecord
