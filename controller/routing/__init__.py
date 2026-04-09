@@ -118,6 +118,7 @@ from .measurement import (
     STANDARD_REFRESH_CLASSES,
     get_refresh_class,
 )
+from .measurement_engine import MeasurementEngine
 from .formats import (
     VideoFormat,
     AudioFormat,
@@ -257,6 +258,7 @@ __all__ = [
     "MeasurementStore",
     "STANDARD_REFRESH_CLASSES",
     "get_refresh_class",
+    "MeasurementEngine",
     # Phase 4 — transport plugin interface
     "ChannelPriority",
     "FlowControl",
