@@ -1,0 +1,5 @@
+# Nested repos / uninitialized submodules — exclude from repo-map
+ecosystem/
+tinynode/
+protocol/
+site/
