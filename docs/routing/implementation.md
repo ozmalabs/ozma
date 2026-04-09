@@ -19,33 +19,78 @@ RFC 2119 keywords appear, they indicate recommendations, not requirements.
 
 ---
 
+## Current Implementation Status
+
+All six routing phases are implemented and merged into `main`. The routing
+subsystem lives in `controller/routing/` and is wired into `AppState`
+(`controller/state.py`) and the API (`controller/api.py`).
+
+| Phase | Module | Status | Tests |
+|-------|--------|--------|-------|
+| 1 — Graph model | `routing/model.py`, `routing/graph.py`, `routing/builder.py` | Done | 54 |
+| 2 — Intent + bindings + pipeline + router | `routing/intent.py`, `routing/binding.py`, `routing/pipeline.py`, `routing/router.py` | Done | 187 |
+| 3 — Format negotiation | `routing/formats.py` | Done | 186 |
+| 4 — Transport plugins | `routing/transport_plugin.py` | Done | 54 |
+| 5 — Active measurement + quality decay | `routing/measurement.py`, `routing/measurement_engine.py` | Done | 98 |
+| 6 — Monitoring, journal, trend alerts, metric time-series | `routing/monitoring.py` | Done | 75 |
+
+**Supplementary components:**
+- `routing/pipeline_cache.py` — Generation-counter lazy pipeline cache; invalidated on graph changes
+- `routing/binding_loop.py` — Background binding evaluation loop with `AppStateResolver`
+- `routing/formats.py` — `Port.format_set` field; format negotiation wired as constraint check #9
+
+**Total routing unit tests: 526** (as of PRs #7–#10)
+
+**API endpoint groups** (all under `/api/v1`):
+
+| Group | Endpoints |
+|-------|-----------|
+| Graph | `GET /graph`, `/graph/devices`, `/graph/devices/{id}`, `/graph/links` |
+| Routing | `GET /routing/intents`, `/routing/intents/{name}`, `/routing/explain`, `/routing/feasibility`, `/routing/pipelines`, `/routing/simulate`, `/routing/binding_loop`; `POST /routing/evaluate`, `/routing/probe/{link_id}`, `/routing/bindings/evaluate` |
+| Bindings | `GET /routing/bindings`, `/routing/bindings/current` |
+| Monitoring | `GET /monitoring/journal`, `/monitoring/metrics/{device_id}`, `/monitoring/health`, `/monitoring/trends`, `/monitoring/link/{link_id}/history` |
+| Measurement engine | `GET /routing/measurement_engine` |
+
+---
+
 ## Specification
 
 ### 1. Incremental Adoption
 
-The routing model is RECOMMENDED to be adopted incrementally over the existing
-codebase. The following phased approach is RECOMMENDED:
+The routing model was adopted incrementally over the existing codebase in six
+phases. The phased approach is documented here as a reference for future
+extensions and transport plugin authors:
 
-1. **Phase 1: Graph model** -- Build the graph data structures. Populate them
-   from existing discovery (mDNS, V4L2 enumeration, PipeWire node listing). No
-   routing changes -- the graph is observational only.
+1. **Phase 1: Graph model** *(done)* — Graph data structures (`Device`, `Port`,
+   `Link`, `PortRef`) populated from mDNS discovery and V4L2/PipeWire
+   enumeration. The graph is observational only; no routing changes.
 
-2. **Phase 2: Intent system** -- Define intents. Map existing scenario switching
-   to intent-driven pipeline selection. The router recommends pipelines; the
-   existing code activates them.
+2. **Phase 2: Intent system** *(done)* — Eight built-in intents; intent bindings
+   with 9 condition sources and 7 operators; `Router` with 12-point constraint
+   satisfaction and preference-weighted cost function; `Pipeline` primitive;
+   `BindingRegistry` priority-ordered evaluation.
 
-3. **Phase 3: Format negotiation** -- Add capability enumeration to ports. The
-   router negotiates formats instead of hardcoding them.
+3. **Phase 3: Format negotiation** *(done)* — `FormatSet` on every port;
+   `negotiate_format()` called as constraint check #9 during path evaluation;
+   bandwidth helpers for all media types.
 
-4. **Phase 4: Transport plugins** -- Factor existing transport code (UDP HID,
-   VBAN, RTP) into the plugin interface. New transports can be added without
-   modifying core routing.
+4. **Phase 4: Transport plugins** *(done)* — `TransportPlugin` ABC,
+   `TransportRegistry`, `TRANSPORT_CHARACTERISTICS` table with 27 built-in
+   transport entries. New transports can be added without modifying core routing.
 
-5. **Phase 5: Active measurement** -- Add link probing. Replace `assumed` and
-   `spec` quality data with `measured` data. Enable dynamic re-evaluation.
+5. **Phase 5: Active measurement** *(done)* — `QualifiedValue[T]` with
+   provenance and automatic quality decay; 13 standard refresh classes;
+   `MeasurementEngine` background asyncio task using ICMP probing
+   (`ping -c 4`) for latency/loss/jitter; staggered startup; failure threshold
+   (3 consecutive failures → `LinkStatus.failed`); recovery detection; dual
+   recording to `MeasurementStore` (quality-annotated current values) and
+   `MetricStore` (time-series history).
 
-6. **Phase 6: Full routing** -- The router assembles and manages pipelines
-   end-to-end. The existing protocol-specific code becomes transport plugins.
+6. **Phase 6: Full routing** *(done)* — `MonitoringJournal` (28 change types,
+   dedup, retention, multi-field query); `TrendAlertManager` (raise/resolve/
+   acknowledge); `MetricStore` three-tier RRD (1s/1h, 1m/24h, 15m/30d);
+   `BindingLoop` background evaluation loop; `AppStateResolver` reading live
+   `AppState` for condition evaluation.
 
 ### 2. Performance Considerations
 

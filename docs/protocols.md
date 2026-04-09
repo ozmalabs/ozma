@@ -153,6 +153,43 @@ Base URL: `http://<controller>:7380/api/v1`
 | POST | `/peers` | admin | Link a peer controller |
 | DELETE | `/peers/{id}` | admin | Unlink peer |
 
+### Routing graph endpoints
+
+| Method | Path | Scope | Description |
+|--------|------|-------|-------------|
+| GET | `/graph` | read | Full routing graph (devices + links) |
+| GET | `/graph/devices` | read | List all graph devices |
+| GET | `/graph/devices/{id}` | read | Get device by ID |
+| GET | `/graph/links` | read | List all graph links |
+
+### Routing engine endpoints
+
+| Method | Path | Scope | Description |
+|--------|------|-------|-------------|
+| GET | `/routing/intents` | read | List all built-in intents |
+| GET | `/routing/intents/{name}` | read | Get intent by name |
+| GET | `/routing/explain` | read | Explain current routing decision |
+| GET | `/routing/feasibility` | read | Check path feasibility |
+| GET | `/routing/pipelines` | read | List cached pipeline recommendations |
+| GET | `/routing/simulate` | read | Simulate routing for a given intent |
+| GET | `/routing/measurement_engine` | read | Measurement engine status |
+| GET | `/routing/binding_loop` | read | Binding loop status |
+| GET | `/routing/bindings` | read | List all registered bindings |
+| GET | `/routing/bindings/current` | read | Currently active binding + intent |
+| POST | `/routing/evaluate` | write | Evaluate intents against current state |
+| POST | `/routing/probe/{link_id}` | write | Trigger on-demand ICMP probe for a link |
+| POST | `/routing/bindings/evaluate` | write | Run one binding evaluation cycle |
+
+### Monitoring endpoints
+
+| Method | Path | Scope | Description |
+|--------|------|-------|-------------|
+| GET | `/monitoring/journal` | read | Query monitoring journal (type/device/severity/since filters) |
+| GET | `/monitoring/metrics/{device_id}` | read | All metric series for a device |
+| GET | `/monitoring/health` | read | Aggregated system health summary |
+| GET | `/monitoring/trends` | read | Active trend alerts |
+| GET | `/monitoring/link/{link_id}/history` | read | Link metric history (`?metric=latency_ms&tier=1&limit=N&since=T`) |
+
 ### External publishing endpoints
 
 | Method | Path | Scope | Description |
