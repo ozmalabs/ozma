@@ -1,19 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
-"""
-Wake-on-LAN — power on machines via magic packet.
-
-Sends the standard WoL magic packet (6× 0xFF + 16× target MAC) to the
-broadcast address.  Works alongside the GPIO power relay — WoL for
-machines that support it, relay for machines that don't.
-
-MAC addresses are learned from:
-  1. Node mDNS announcement (if node includes mac= in TXT)
-  2. ARP table (controller has talked to the node before)
-  3. Manual configuration in scenarios.json
-
-Usage:
-  POST /api/v1/nodes/{id}/wol   — wake a specific node's target machine
-"""
+"""Wake-on-LAN magic packet support."""
 
 from __future__ import annotations
 

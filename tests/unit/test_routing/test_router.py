@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "controller"))
 
 import pytest
+from routing.formats import FormatRange, FormatSet
 from routing.model import (
     BandwidthSpec,
     Device,
@@ -453,3 +454,233 @@ class TestRouter:
         # Each call produces new UUIDs
         if p1 and p2:
             assert p1[0].id != p2[0].id
+
+
+# ── Format negotiation (check #9) ────────────────────────────────────────────
+
+def _make_port_with_fmt(
+    port_id: str,
+    direction: PortDirection,
+    media_type: MediaType = MediaType.hid,
+    format_set: FormatSet | None = None,
+) -> Port:
+    return Port(
+        id=port_id,
+        device_id="",
+        direction=direction,
+        media_type=media_type,
+        current_state=PortState(),
+        format_set=format_set,
+    )
+
+
+def _hid_format_set(protocols: list[str] | None = None) -> FormatSet:
+    """FormatSet restricted to specific HID protocols (or unrestricted if None)."""
+    if protocols is None:
+        return FormatSet(formats=[FormatRange(media_type=MediaType.hid)])
+    return FormatSet(formats=[
+        FormatRange(media_type=MediaType.hid, hid_protocols=protocols)
+    ])
+
+
+class TestConstraintCheckerFormatNegotiation:
+    """Check #9: format negotiation rejects incompatible port combinations."""
+
+    def _two_port_graph(
+        self,
+        src_fmt: FormatSet | None,
+        dst_fmt: FormatSet | None,
+    ) -> tuple[RoutingGraph, PortRef, PortRef]:
+        ctrl = _make_device("ctrl", DeviceType.controller, [
+            _make_port_with_fmt("out", PortDirection.source,
+                                MediaType.hid, src_fmt),
+        ])
+        node = _make_device("node", DeviceType.node, [
+            _make_port_with_fmt("in", PortDirection.sink,
+                                MediaType.hid, dst_fmt),
+        ])
+        graph = RoutingGraph()
+        graph.add_device(ctrl)
+        graph.add_device(node)
+        graph.add_link(_make_link("l1", "ctrl", "out", "node", "in"))
+        src = PortRef("ctrl", "out")
+        dst = PortRef("node", "in")
+        return graph, src, dst
+
+    def test_compatible_format_sets_pass(self):
+        graph, src, dst = self._two_port_graph(
+            _hid_format_set(),
+            _hid_format_set(),
+        )
+        checker = ConstraintChecker(graph)
+        link = list(graph.links())[0]
+        path = CandidatePath(links=[link])
+        stream = StreamIntent(media_type=MediaType.hid, constraints=Constraints())
+        violations = checker.check(path, stream)
+        assert not any(v.check == "format" for v in violations)
+
+    def test_no_format_sets_skips_check(self):
+        """Ports without format_set → check is skipped, no violation."""
+        graph, src, dst = self._two_port_graph(None, None)
+        checker = ConstraintChecker(graph)
+        link = list(graph.links())[0]
+        path = CandidatePath(links=[link])
+        stream = StreamIntent(media_type=MediaType.hid, constraints=Constraints())
+        violations = checker.check(path, stream)
+        assert not any(v.check == "format" for v in violations)
+
+    def test_no_graph_skips_check(self):
+        """ConstraintChecker without graph → check #9 never runs."""
+        graph, src, dst = self._two_port_graph(
+            _hid_format_set(),
+            _hid_format_set(),
+        )
+        # No graph = no check
+        checker = ConstraintChecker(graph=None)
+        link = list(graph.links())[0]
+        path = CandidatePath(links=[link])
+        stream = StreamIntent(media_type=MediaType.hid, constraints=Constraints())
+        violations = checker.check(path, stream)
+        assert not any(v.check == "format" for v in violations)
+
+    def test_router_passes_graph_to_checker(self):
+        """Router() passes the graph so format check is active."""
+        graph, src, dst = self._two_port_graph(
+            _hid_format_set(),
+            _hid_format_set(),
+        )
+        router = Router(graph)
+        assert router._checker._graph is graph
+
+
+class TestBuilderFormatSetWiring:
+    """Format sets are added to all ports by GraphBuilder._add_node()."""
+
+    def _make_node_info(self) -> object:
+        class FakeNode:
+            id = "vm1"
+            host = "127.0.0.1"
+            port = 7332
+            role = "compute"
+            hw = "vm"
+            fw_version = "0.0.0"
+            proto_version = 3
+            capabilities: list = []
+            machine_class = "workstation"
+            audio_type = "vban"
+            audio_sink = None
+            audio_vban_port = 6980
+            mic_vban_port = 6981
+            stream_port = 7382
+            stream_path = "/stream/stream.m3u8"
+            vnc_host = None
+            vnc_port = None
+            capture_device = None
+            display_outputs: list = []
+            camera_streams: list = []
+            frigate_host = None
+            frigate_port = None
+
+        return FakeNode()
+
+    def test_node_hid_ports_have_format_set(self):
+        from routing.builder import GraphBuilder
+        graph = RoutingGraph()
+        builder = GraphBuilder(graph)
+
+        class FakeState:
+            nodes: dict = {}
+            active_node_id = None
+
+        node_info = self._make_node_info()
+        builder._add_controller(FakeState())
+        builder._add_node(node_info, FakeState())
+
+        node_dev = graph.get_device("node:vm1")
+        assert node_dev is not None
+        hid_in = node_dev.get_port("hid_in")
+        assert hid_in is not None
+        assert hid_in.format_set is not None
+        hid_usb_out = node_dev.get_port("hid_usb_out")
+        assert hid_usb_out is not None
+        assert hid_usb_out.format_set is not None
+
+    def test_node_audio_ports_have_format_set(self):
+        from routing.builder import GraphBuilder
+        graph = RoutingGraph()
+        builder = GraphBuilder(graph)
+
+        class FakeState:
+            nodes: dict = {}
+            active_node_id = None
+
+        node_info = self._make_node_info()
+        builder._add_controller(FakeState())
+        builder._add_node(node_info, FakeState())
+
+        node_dev = graph.get_device("node:vm1")
+        assert node_dev is not None
+        # VBAN audio in
+        audio_vban = node_dev.get_port("audio_vban_in")
+        assert audio_vban is not None
+        assert audio_vban.format_set is not None
+        # Mic VBAN out
+        mic_out = node_dev.get_port("mic_vban_out")
+        assert mic_out is not None
+        assert mic_out.format_set is not None
+
+    def test_node_video_port_has_format_set(self):
+        from routing.builder import GraphBuilder
+        graph = RoutingGraph()
+        builder = GraphBuilder(graph)
+
+        class FakeState:
+            nodes: dict = {}
+            active_node_id = None
+
+        node_info = self._make_node_info()
+        builder._add_controller(FakeState())
+        builder._add_node(node_info, FakeState())
+
+        node_dev = graph.get_device("node:vm1")
+        assert node_dev is not None
+        video_out = node_dev.get_port("video_out")
+        assert video_out is not None
+        assert video_out.format_set is not None
+
+    def test_target_ports_have_format_set(self):
+        from routing.builder import GraphBuilder
+        graph = RoutingGraph()
+        builder = GraphBuilder(graph)
+
+        class FakeState:
+            nodes: dict = {}
+            active_node_id = None
+
+        node_info = self._make_node_info()
+        builder._add_controller(FakeState())
+        builder._add_node(node_info, FakeState())
+
+        target_dev = graph.get_device("target:vm1")
+        assert target_dev is not None
+        for port in target_dev.ports:
+            assert port.format_set is not None, (
+                f"target port {port.id} missing format_set"
+            )
+
+    def test_controller_ports_have_format_set(self):
+        from routing.builder import GraphBuilder
+        graph = RoutingGraph()
+        builder = GraphBuilder(graph)
+
+        class FakeState:
+            nodes: dict = {}
+            active_node_id = None
+
+        builder._add_controller(FakeState())
+        ctrl_dev = graph.get_device("controller")
+        assert ctrl_dev is not None
+        for port in ctrl_dev.ports:
+            assert port.format_set is not None, (
+                f"controller port {port.id} missing format_set"
+            )

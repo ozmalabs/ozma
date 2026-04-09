@@ -317,6 +317,10 @@ class Port:
     current_state: PortState = field(default_factory=PortState)
     properties: dict = field(default_factory=dict)
     label: str | None = None   # human-readable ("HDMI out", "USB gadget HID sink")
+    # Declared capability set — what formats this port can produce or consume.
+    # None means "unknown / accepts any format of this media type".
+    # Populated by GraphBuilder from spec or node capability reports.
+    format_set: "Any | None" = None   # FormatSet | None (imported lazily to avoid cycles)
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {
@@ -330,6 +334,8 @@ class Port:
             d["label"] = self.label
         if self.properties:
             d["properties"] = self.properties
+        if self.format_set is not None:
+            d["format_set"] = self.format_set.to_dict()
         return d
 
 

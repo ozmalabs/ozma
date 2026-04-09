@@ -59,3 +59,4 @@ dev/kernel-build/*.tar.gz
 demo/cache/
 demo/recordings/
 test_results/
+.aider*

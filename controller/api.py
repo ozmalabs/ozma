@@ -1403,9 +1403,10 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         dst_device = state.routing_graph.get_device(destination)
         if dst_device is None:
             raise HTTPException(status_code=404, detail=f"Destination device not found: {destination}")
-        recommendations = state.routing_engine.recommend(
+        recommendations = state.routing_engine.recommend_devices(
             chosen_intent, src_device, dst_device, top_n=top_n
         )
+        # Populate the pipeline cache as a side-effect of explain queries
         return {
             "source": source,
             "destination": destination,
@@ -1438,12 +1439,29 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         dst_device = state.routing_graph.get_device(destination)
         if dst_device is None:
             raise HTTPException(status_code=404, detail=f"Destination device not found: {destination}")
-        result = state.routing_engine.check_feasibility(chosen_intent, src_device, dst_device)
+        # Use device-aware feasibility check
+        feasible: dict = {}
+        for stream in chosen_intent.streams:
+            mt = stream.media_type
+            from routing.model import PortDirection, PortRef
+            src_port = next(
+                (p for p in src_device.ports
+                 if p.direction == PortDirection.source and p.media_type == mt), None)
+            dst_port = next(
+                (p for p in dst_device.ports
+                 if p.direction == PortDirection.sink and p.media_type == mt), None)
+            if src_port is None or dst_port is None:
+                feasible[mt.value] = False
+                continue
+            src_ref = PortRef(device_id=src_device.id, port_id=src_port.id)
+            dst_ref = PortRef(device_id=dst_device.id, port_id=dst_port.id)
+            result = state.routing_engine.check_feasibility(chosen_intent, src_ref, dst_ref)
+            feasible[mt.value] = result.get(mt, False)
         return {
             "source": source,
             "destination": destination,
             "intent": intent,
-            "feasible": {mt.value: ok for mt, ok in result.items()},
+            "feasible": feasible,
         }
 
     @app.post("/api/v1/routing/evaluate")
@@ -1467,7 +1485,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         dst_device = state.routing_graph.get_device(destination)
         if src_device is None or dst_device is None:
             raise HTTPException(status_code=404, detail="Source or destination device not found")
-        recommendations = state.routing_engine.recommend(
+        recommendations = state.routing_engine.recommend_devices(
             chosen_intent, src_device, dst_device, top_n=top_n
         )
         return {
@@ -1548,6 +1566,84 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if device_id:
             alerts = [a for a in alerts if a.device_id == device_id]
         return {"alerts": [a.to_dict() for a in alerts]}
+
+    @app.get("/api/v1/routing/pipelines")
+    async def routing_pipelines(request: Request) -> dict[str, Any]:
+        """
+        Return all currently cached pipeline candidates.
+
+        The cache is populated lazily when /routing/explain or /routing/evaluate
+        is called, and is invalidated whenever the graph topology changes
+        (node joins, leaves, or active node switches).
+        """
+        _require_scope(request, SCOPE_READ)
+        cache = getattr(state, "pipeline_cache", None)
+        if cache is None:
+            return {"generation": 0, "cached_entries": 0, "entries": []}
+        return cache.to_dict()
+
+    @app.get("/api/v1/routing/simulate")
+    async def routing_simulate(
+        request: Request,
+        fail_link: str,
+        source: str,
+        destination: str,
+        intent: str = "desktop",
+        top_n: int = 3,
+    ) -> dict[str, Any]:
+        """
+        Simulate a link failure and return what the router would recommend.
+
+        Temporarily marks the given link as failed, calls recommend(), then
+        restores the original link state. Does not mutate the live pipeline cache.
+        """
+        _require_scope(request, SCOPE_READ)
+        from routing.intent import BUILTIN_INTENTS
+        from routing.model import LinkStatus
+        chosen_intent = BUILTIN_INTENTS.get(intent)
+        if chosen_intent is None:
+            raise HTTPException(404, f"Intent not found: {intent}")
+        src_device = state.routing_graph.get_device(source)
+        dst_device = state.routing_graph.get_device(destination)
+        if src_device is None:
+            raise HTTPException(404, f"Source device not found: {source}")
+        if dst_device is None:
+            raise HTTPException(404, f"Destination device not found: {destination}")
+        link = state.routing_graph.get_link(fail_link)
+        if link is None:
+            raise HTTPException(404, f"Link not found: {fail_link}")
+
+        # Temporarily mark link as failed, run router, restore
+        original_status = link.state.status
+        try:
+            link.state.status = LinkStatus.failed
+            from routing.model import PortRef
+            # Determine source/destination PortRefs — use first matching port
+            src_ports = src_device.ports
+            dst_ports = dst_device.ports
+            if not src_ports or not dst_ports:
+                raise HTTPException(422, "Source or destination device has no ports")
+            src_ref = PortRef(device_id=src_device.id, port_id=src_ports[0].id)
+            dst_ref = PortRef(device_id=dst_device.id, port_id=dst_ports[-1].id)
+            recommendations = state.routing_engine.recommend(
+                chosen_intent, src_ref, dst_ref, top_n=top_n
+            )
+        finally:
+            link.state.status = original_status
+
+        return {
+            "simulated_failure": fail_link,
+            "source": source,
+            "destination": destination,
+            "intent": intent,
+            "streams": [
+                {
+                    "media_type": si.media_type.value,
+                    "pipelines": [p.to_dict() for p in pipes],
+                }
+                for si, pipes in recommendations
+            ],
+        }
 
     # --- Scenario endpoints ---
 

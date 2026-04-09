@@ -22,6 +22,7 @@ import logging
 import socket
 
 from .graph import RoutingGraph
+from .formats import FormatRange, FormatSet
 from .model import (
     ActivationTimeSpec,
     BandwidthSpec,
@@ -40,6 +41,14 @@ from .model import (
     PortRef,
     PortState,
 )
+
+
+def _default_format_set(media_type: MediaType) -> FormatSet:
+    """
+    Return a permissive FormatSet for a port whose capabilities are not yet
+    precisely known. Accepts any format of the given media type.
+    """
+    return FormatSet(formats=[FormatRange(media_type=media_type)])
 
 log = logging.getLogger("ozma.routing.builder")
 
@@ -114,6 +123,39 @@ class GraphBuilder:
             self._add_node(node_info, state)
         log.debug("Graph rebuilt: %r", self._graph)
 
+    def seed_measurements(self, store: object) -> None:
+        """
+        Seed a MeasurementStore with spec-quality values from every link in
+        the current graph. This gives the router real (spec-quality) data
+        from startup rather than None, so cost comparisons are meaningful.
+
+        Called after rebuild(). The store is typed as object to avoid circular
+        imports — it must have a record(device_id, metric_key, value, quality, ...) method.
+        """
+        from .model import InfoQuality
+        for link in self._graph.links():
+            if not link.state:
+                continue
+            dev_id = link.source.device_id
+            lid = link.id
+            s = link.state
+            if s.latency:
+                store.record(dev_id, f"link.{lid}.latency_ms",  # type: ignore[union-attr]
+                             s.latency.typical_ms, s.latency.quality,
+                             source="spec", refresh_class="network_health")
+            if s.loss:
+                store.record(dev_id, f"link.{lid}.loss_rate",   # type: ignore[union-attr]
+                             s.loss.rate, s.loss.quality,
+                             source="spec", refresh_class="network_health")
+            if s.jitter:
+                store.record(dev_id, f"link.{lid}.jitter_p99_ms",  # type: ignore[union-attr]
+                             s.jitter.p99_ms, s.jitter.quality,
+                             source="spec", refresh_class="network_health")
+            if s.bandwidth:
+                store.record(dev_id, f"link.{lid}.bandwidth_bps",  # type: ignore[union-attr]
+                             s.bandwidth.available_bps, s.bandwidth.quality,
+                             source="spec", refresh_class="link_bandwidth")
+
     def apply_node_added(self, node_info: object, state: object) -> None:
         """Incremental update: add or replace a single node."""
         self._remove_node_devices(node_info.id)  # type: ignore[union-attr]
@@ -157,6 +199,7 @@ class GraphBuilder:
                     direction=PortDirection.source,
                     media_type=MediaType.hid,
                     label="HID out (UDP to active node)",
+                    format_set=_default_format_set(MediaType.hid),
                 ),
                 # Audio source — controller's PipeWire/VBAN output to nodes
                 Port(
@@ -165,6 +208,7 @@ class GraphBuilder:
                     direction=PortDirection.source,
                     media_type=MediaType.audio,
                     label="Audio out (PipeWire routing / VBAN to nodes)",
+                    format_set=_default_format_set(MediaType.audio),
                 ),
                 # Control API — WebSocket/REST for scenario switching
                 Port(
@@ -174,6 +218,7 @@ class GraphBuilder:
                     media_type=MediaType.control,
                     label="REST/WebSocket API",
                     properties={"port": 7380},
+                    format_set=_default_format_set(MediaType.control),
                 ),
             ],
             properties={"active_node_id": getattr(state, "active_node_id", None)},
@@ -197,6 +242,7 @@ class GraphBuilder:
                 media_type=MediaType.hid,
                 label="HID in (UDP from controller)",
                 properties={"udp_port": node_info.port},  # type: ignore[union-attr]
+                format_set=_default_format_set(MediaType.hid),
             ),
             # Sends HID to target via USB gadget
             Port(
@@ -205,6 +251,7 @@ class GraphBuilder:
                 direction=PortDirection.source,
                 media_type=MediaType.hid,
                 label="HID out (USB gadget to target)",
+                format_set=_default_format_set(MediaType.hid),
             ),
         ]
 
@@ -223,6 +270,7 @@ class GraphBuilder:
                 media_type=MediaType.video,
                 label="Video out (HLS/MJPEG stream)",
                 properties=self._video_props(node_info),
+                format_set=_default_format_set(MediaType.video),
             ))
 
         # Audio
@@ -235,6 +283,7 @@ class GraphBuilder:
                 media_type=MediaType.audio,
                 label="Audio in (PipeWire sink)",
                 properties={"sink_name": node_info.audio_sink},  # type: ignore[union-attr]
+                format_set=_default_format_set(MediaType.audio),
             ))
         elif audio_type == "vban":
             node_ports.append(Port(
@@ -244,6 +293,7 @@ class GraphBuilder:
                 media_type=MediaType.audio,
                 label="Audio in (VBAN UDP)",
                 properties={"vban_port": getattr(node_info, "audio_vban_port", None)},
+                format_set=_default_format_set(MediaType.audio),
             ))
             mic_port = getattr(node_info, "mic_vban_port", None)
             if mic_port:
@@ -254,6 +304,7 @@ class GraphBuilder:
                     media_type=MediaType.audio,
                     label="Mic out (VBAN UDP)",
                     properties={"vban_port": mic_port},
+                    format_set=_default_format_set(MediaType.audio),
                 ))
 
         node_device = Device(
@@ -284,6 +335,7 @@ class GraphBuilder:
                 direction=PortDirection.sink,
                 media_type=MediaType.hid,
                 label="HID in (USB from node)",
+                format_set=_default_format_set(MediaType.hid),
             ),
         ]
         if has_video:
@@ -293,6 +345,7 @@ class GraphBuilder:
                 direction=PortDirection.source,
                 media_type=MediaType.video,
                 label="Video out (HDMI/Display to node capture)",
+                format_set=_default_format_set(MediaType.video),
             ))
         if audio_type:
             target_ports.append(Port(
@@ -301,6 +354,7 @@ class GraphBuilder:
                 direction=PortDirection.source,
                 media_type=MediaType.audio,
                 label="Audio out (to node)",
+                format_set=_default_format_set(MediaType.audio),
             ))
 
         target_device = Device(
