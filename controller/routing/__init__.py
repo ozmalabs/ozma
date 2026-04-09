@@ -119,6 +119,7 @@ from .measurement import (
     get_refresh_class,
 )
 from .measurement_engine import MeasurementEngine
+from .binding_loop import BindingLoop, AppStateResolver, EvaluationResult
 from .formats import (
     VideoFormat,
     AudioFormat,
@@ -259,6 +260,9 @@ __all__ = [
     "STANDARD_REFRESH_CLASSES",
     "get_refresh_class",
     "MeasurementEngine",
+    "BindingLoop",
+    "AppStateResolver",
+    "EvaluationResult",
     # Phase 4 — transport plugin interface
     "ChannelPriority",
     "FlowControl",

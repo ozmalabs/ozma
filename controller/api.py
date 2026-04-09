@@ -1721,6 +1721,46 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(404, f"Link not found: {link_id}")
         return {"link_id": link_id, "state": link.state.to_dict() if link.state else None}
 
+    # --- Binding endpoints ---
+
+    @app.get("/api/v1/routing/bindings")
+    async def list_bindings(request: Request) -> dict[str, Any]:
+        """Return all registered intent bindings."""
+        _require_scope(request, SCOPE_READ)
+        registry = getattr(state, "binding_registry", None)
+        if registry is None:
+            return {"bindings": []}
+        return {"bindings": [b.to_dict() for b in registry.list_all()]}
+
+    @app.get("/api/v1/routing/bindings/current")
+    async def current_binding(request: Request) -> dict[str, Any]:
+        """Return the currently active binding result."""
+        _require_scope(request, SCOPE_READ)
+        loop = getattr(state, "binding_loop", None)
+        if loop is None:
+            return {"current": None}
+        current = loop.current
+        return {"current": current.to_dict() if current else None}
+
+    @app.post("/api/v1/routing/bindings/evaluate")
+    async def evaluate_bindings(request: Request) -> dict[str, Any]:
+        """Trigger an immediate binding evaluation cycle and return the result."""
+        _require_scope(request, SCOPE_WRITE)
+        loop = getattr(state, "binding_loop", None)
+        if loop is None:
+            return {"current": None}
+        result = loop.evaluate_once()
+        return {"current": result.to_dict()}
+
+    @app.get("/api/v1/routing/binding_loop")
+    async def binding_loop_status(request: Request) -> dict[str, Any]:
+        """Return the binding evaluation loop status."""
+        _require_scope(request, SCOPE_READ)
+        loop = getattr(state, "binding_loop", None)
+        if loop is None:
+            return {"running": False}
+        return loop.to_dict()
+
     # --- Scenario endpoints ---
 
     @app.get("/api/v1/scenarios")
