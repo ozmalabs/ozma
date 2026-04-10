@@ -1,250 +1,122 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
 """
-GraphQL Schema for Ozma Controller.
+GraphQL schema for Ozma Controller.
 
-This module defines the GraphQL schema using Strawberry GraphQL.
-It includes queries for:
-- Audio routing (AudioRoute, AudioVolume)
-- VBAN streams (VBANStream)
-- Video streams (StreamInfo, CameraInfo)
-- Control surfaces (ControlSurface, Binding)
-- System health (SystemHealth)
+This module creates the Strawberry GraphQL schema that combines
+queries, mutations, and subscriptions into a single executable schema.
 """
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import strawberry
 from strawberry.types import Info
 
-from .types import (
-    AudioRoute,
-    AudioVolume,
-    VBANStream,
-    StreamInfo,
-    CameraInfo,
-    ControlSurface,
-    Binding,
-    SystemHealth,
-)
-
-# Import resolvers (module-level to avoid circular import issues)
-from .types.audio import (
-    resolve_audio_route,
-    resolve_audio_volume,
-    resolve_audio_routes,
-)
-from .types.vban import resolve_vban_stream, resolve_vban_streams
-from .types.stream import (
-    resolve_stream_info,
-    resolve_stream_info_for_active_node,
-    resolve_all_streams,
-    resolve_camera_info,
-    resolve_all_cameras,
-)
-from .types.controls import (
-    resolve_control_surface,
-    resolve_all_control_surfaces,
-    resolve_active_control_surface,
-)
-from .types.system import resolve_system_health
-
 if TYPE_CHECKING:
     from state import AppState
+    from scenarios import ScenarioManager
 
 log = logging.getLogger("ozma.graphql.schema")
 
 
+# Query type for read operations
 @strawberry.type
 class Query:
-    """
-    GraphQL root query type.
-
-    All queries in the Ozma GraphQL API are defined here.
-    Each query method receives an Info context containing the AppState.
-    """
-
-    # --- Audio Routes ---
+    """GraphQL query root type for read operations."""
 
     @strawberry.field
-    async def audio_route(
-        self,
-        info: Info,
-        source_id: str,
-        target_id: str,
-    ) -> AudioRoute:
-        """
-        Get the audio route between a source and target.
-
-        Args:
-            source_id: ID of the source node or audio sink
-            target_id: ID of the target output or node
-        """
-        return await resolve_audio_route(info, source_id, target_id)
+    def nodes(self, info: Info) -> list["NodeType"]:
+        """List all known nodes."""
+        from state import AppState
+        app_state: AppState = info.context["state"]
+        from .types import NodeType
+        return [NodeType.from_node(node) for node in app_state.nodes.values()]
 
     @strawberry.field
-    async def audio_volume(
-        self,
-        info: Info,
-        node_id: str,
-    ) -> AudioVolume:
-        """
-        Get the audio volume for a node.
-
-        Args:
-            node_id: ID of the node
-        """
-        return await resolve_audio_volume(info, node_id)
+    def node(self, info: Info, id: str) -> "NodeType | None":
+        """Get a single node by ID."""
+        from state import AppState
+        app_state: AppState = info.context["state"]
+        node = app_state.nodes.get(id)
+        if node:
+            from .types import NodeType
+            return NodeType.from_node(node)
+        return None
 
     @strawberry.field
-    async def audio_routes(
-        self,
-        info: Info,
-    ) -> list[AudioRoute]:
-        """
-        Get all active audio routes.
-        """
-        return await resolve_audio_routes(info)
-
-    # --- VBAN Streams ---
-
-    @strawberry.field
-    async def vban_stream(
-        self,
-        info: Info,
-        node_id: str,
-    ) -> VBANStream | None:
-        """
-        Get the VBAN stream status for a node.
-
-        Args:
-            node_id: ID of the node
-        """
-        return await resolve_vban_stream(info, node_id)
+    def active_node(self, info: Info) -> "NodeType | None":
+        """Get the currently active node."""
+        from state import AppState
+        app_state: AppState = info.context["state"]
+        node_id = app_state.active_node_id
+        if node_id and node_id in app_state.nodes:
+            from .types import NodeType
+            return NodeType.from_node(app_state.nodes[node_id])
+        return None
 
     @strawberry.field
-    async def vban_streams(
-        self,
-        info: Info,
-    ) -> list[VBANStream]:
-        """
-        Get all VBAN audio streams.
-        """
-        return await resolve_vban_streams(info)
+    def snapshot(self, info: Info) -> "SnapshotType":
+        """Get a full system snapshot."""
+        from state import AppState
+        app_state: AppState = info.context["state"]
+        from .types import SnapshotType, NodeType
+        nodes = [NodeType.from_node(node) for node in app_state.nodes.values()]
+        return SnapshotType(
+            nodes=nodes,
+            active_node_id=app_state.active_node_id,
+        )
 
-    # --- Stream Info ---
 
-    @strawberry.field
-    async def stream_info(
-        self,
-        info: Info,
-        node_id: str,
-    ) -> StreamInfo | None:
-        """
-        Get stream information for a node.
-
-        Args:
-            node_id: ID of the node
-        """
-        return await resolve_stream_info(info, node_id)
+# Mutation type for write operations
+@strawberry.type
+class Mutation:
+    """GraphQL mutation root type for write operations."""
 
     @strawberry.field
-    async def stream_info_for_active_node(
-        self,
-        info: Info,
-    ) -> StreamInfo | None:
-        """
-        Get stream information for the currently active node.
-        """
-        return await resolve_stream_info_for_active_node(info)
+    def activate_node(self, info: Info, node_id: str) -> "SnapshotType":
+        """Activate a node and return the updated snapshot."""
+        from state import AppState
+        app_state: AppState = info.context["state"]
+        import asyncio
+        asyncio.create_task(app_state.set_active_node(node_id))
+        # Return updated snapshot
+        from .types import SnapshotType, NodeType
+        nodes = [NodeType.from_node(node) for node in app_state.nodes.values()]
+        return SnapshotType(
+            nodes=nodes,
+            active_node_id=app_state.active_node_id,
+        )
 
     @strawberry.field
-    async def all_streams(
-        self,
-        info: Info,
-    ) -> list[StreamInfo]:
-        """
-        Get stream information for all nodes with streams.
-        """
-        return await resolve_all_streams(info)
-
-    # --- Camera Info ---
+    def create_scenario(self, info: Info, name: str, node_id: str | None = None) -> "ScenarioType":
+        """Create a new scenario."""
+        scenario_mgr = info.context.get("scenario_manager")
+        if scenario_mgr:
+            scenario = scenario_mgr.create_scenario(name, node_id=node_id)
+            from .types import ScenarioType
+            return ScenarioType.from_scenario(scenario)
+        raise Exception("Scenario manager not available")
 
     @strawberry.field
-    async def camera_info(
-        self,
-        info: Info,
-        node_id: str,
-    ) -> CameraInfo | None:
-        """
-        Get camera information for a node.
-
-        Args:
-            node_id: ID of the camera node
-        """
-        return await resolve_camera_info(info, node_id)
-
-    @strawberry.field
-    async def all_cameras(
-        self,
-        info: Info,
-    ) -> list[CameraInfo]:
-        """
-        Get information for all camera nodes.
-        """
-        return await resolve_all_cameras(info)
-
-    # --- Control Surfaces ---
-
-    @strawberry.field
-    async def control_surface(
-        self,
-        info: Info,
-        surface_id: str,
-    ) -> ControlSurface | None:
-        """
-        Get a specific control surface by ID.
-
-        Args:
-            surface_id: ID of the control surface
-        """
-        return await resolve_control_surface(info, surface_id)
-
-    @strawberry.field
-    async def all_control_surfaces(
-        self,
-        info: Info,
-    ) -> list[ControlSurface]:
-        """
-        Get all registered control surfaces.
-        """
-        return await resolve_all_control_surfaces(info)
-
-    @strawberry.field
-    async def active_control_surface(
-        self,
-        info: Info,
-    ) -> ControlSurface | None:
-        """
-        Get the currently active control surface.
-        """
-        return await resolve_active_control_surface(info)
-
-    # --- System Health ---
-
-    @strawberry.field
-    async def system_health(
-        self,
-        info: Info,
-    ) -> SystemHealth:
-        """
-        Get overall system health status.
-        """
-        return await resolve_system_health(info)
+    def activate_scenario(self, info: Info, scenario_id: str) -> "ScenarioType":
+        """Activate a scenario."""
+        scenario_mgr = info.context.get("scenario_manager")
+        if scenario_mgr:
+            scenario = scenario_mgr.activate_scenario(scenario_id)
+            from .types import ScenarioType
+            return ScenarioType.from_scenario(scenario)
+        raise Exception("Scenario manager not available")
 
 
-# Create the GraphQL schema
+# Import types after class definitions
+from .types import NodeType, ScenarioType, AlertType, SnapshotType
+
+# Create the schema
+# Note: subscriptions are passed as a class, not an instance
+from .subscriptions import Subscription
+
 schema = strawberry.Schema(
     query=Query,
-    # Add mutation and subscription types here when needed
+    mutation=Mutation,
+    subscription=Subscription,
 )
