@@ -73,13 +73,13 @@ class SubscriptionEventDispatcher:
         - node.online, node.offline, node.switched -> node subscriptions
         - scenario.activated -> scenario subscriptions
         - audio.levels -> audio subscriptions
-        - alert.fired, alert.updated -> alert subscriptions
+        - alert.created, alert.acknowledged, alert.dismissed, alert.updated, alert.expired -> alert subscriptions
         """
         if not self._subscription_context:
             return
-        
+
         event_type = event.get("type", "")
-        
+
         # Map event types to subscription type filters
         event_type_to_subscription_type = {
             "node.online": "node",
@@ -92,7 +92,9 @@ class SubscriptionEventDispatcher:
             "audio.levels": "audio",
             "audio.node_online": "audio",
             "audio.node_offline": "audio",
-            "alert.fired": "alert",
+            "alert.created": "alert",
+            "alert.acknowledged": "alert",
+            "alert.dismissed": "alert",
             "alert.updated": "alert",
             "alert.expired": "alert",
         }

@@ -35,7 +35,7 @@ EVENT_NODE_OFFLINE = "node.offline"
 EVENT_NODE_SWITCHED = "node.switched"
 EVENT_SCENARIO_ACTIVATED = "scenario.activated"
 EVENT_AUDIO_LEVELS = "audio.levels"
-EVENT_ALERT_FIRED = "alert.fired"
+EVENT_ALERT_FIRED = "alert.created"
 EVENT_ALERT_UPDATED = "alert.updated"
 
 
@@ -698,14 +698,17 @@ class Subscription:
         """
         Subscribe to alert events.
 
-        Yields AlertType when an alert is fired in the system.
+        Yields AlertType when an alert is created or updated in the system.
 
         Events consumed:
-            - alert.fired: new alert raised
-            - alert.updated: alert state changed (acknowledged/resolved)
+            - alert.created: new alert raised
+            - alert.acknowledged: alert acknowledged
+            - alert.dismissed: alert dismissed
+            - alert.updated: alert state changed
+            - alert.expired: alert expired
 
         Each yielded object contains the full alert details including
-        id, type, device_id, message, severity, timestamp, and source.
+        id, kind, title, body, camera, person, severity, state, and timestamps.
         """
         from state import AppState
         from alerts import AlertManager
@@ -735,8 +738,8 @@ class Subscription:
                 event_type = event.get("type", "")
 
                 if event_type == EVENT_ALERT_FIRED:
-                    alert_dict = event.get("alert", {})
-                    yield AlertType.from_alert(alert_dict)
+                    # alert.created events include alert data directly in the event
+                    yield AlertType.from_alert(event)
                 elif event_type == EVENT_ALERT_UPDATED:
                     alert_id = event.get("alert_id", "")
                     updates = event.get("updates", {})
@@ -748,10 +751,10 @@ class Subscription:
                             yield AlertType.from_alert(updated_alert)
                         else:
                             # Apply updates manually if alert not found
-                            if alert_dict := event.get("alert", {}):
-                                for key, value in updates.items():
-                                    alert_dict[key] = value
-                                yield AlertType.from_alert(alert_dict)
+                            alert_dict = dict(event)
+                            for key, value in updates.items():
+                                alert_dict[key] = value
+                            yield AlertType.from_alert(alert_dict)
 
         except asyncio.CancelledError:
             log.debug("Subscription cancelled: alertFired")
