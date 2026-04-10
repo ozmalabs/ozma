@@ -796,14 +796,17 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     @app.on_event("startup")
     async def _startup() -> None:
         asyncio.create_task(_event_pump(), name="event-pump")
-        # Start GraphQL subscription event router
-        start_event_router(state)
+        # Start GraphQL subscription event router with exception handling
+        try:
+            start_event_router(state)
+        except Exception as e:
+            log.error("Failed to start GraphQL event router: %s", e)
 
     # --- WebSocket endpoint ---
 
-    # Expected JWT claims for ozma controller tokens
-    _JWT_EXPECTED_AUDIENCE = "ozma-controller"
-    _JWT_EXPECTED_ISSUER = "ozma-controller"
+    # Expected JWT claims for ozma controller tokens (configurable via environment)
+    _JWT_EXPECTED_AUDIENCE = os.environ.get("OZMA_JWT_AUDIENCE", "ozma-controller")
+    _JWT_EXPECTED_ISSUER = os.environ.get("OZMA_JWT_ISSUER", "ozma-controller")
 
     async def _ws_authenticate(ws: WebSocket) -> bool:
         """Authenticate a WebSocket connection. Returns True if allowed."""
@@ -814,13 +817,16 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             return True
         token = ws.query_params.get("token")
         if token and _verify_key:
-            claims = verify_jwt(
-                token, _verify_key,
-                expected_audience=_JWT_EXPECTED_AUDIENCE,
-                expected_issuer=_JWT_EXPECTED_ISSUER
-            )
-            if claims:
-                return True
+            try:
+                claims = verify_jwt(
+                    token, _verify_key,
+                    expected_audience=_JWT_EXPECTED_AUDIENCE,
+                    expected_issuer=_JWT_EXPECTED_ISSUER
+                )
+                if claims:
+                    return True
+            except Exception:
+                pass
         return False
 
     @app.websocket("/api/v1/events")
@@ -10334,10 +10340,6 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         # Fallback: use manual WebSocket handling
         HAS_WS = False
 
-    # Expected JWT claims for ozma controller tokens
-    _JWT_EXPECTED_AUDIENCE = "ozma-controller"
-    _JWT_EXPECTED_ISSUER = "ozma-controller"
-
     async def _graphql_ws_authenticate(ws: WebSocket) -> bool:
         """Authenticate a GraphQL WebSocket connection. Returns True if allowed."""
         if not _auth.enabled:
@@ -10347,13 +10349,16 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             return True
         token = ws.query_params.get("token")
         if token and _verify_key:
-            claims = verify_jwt(
-                token, _verify_key,
-                expected_audience=_JWT_EXPECTED_AUDIENCE,
-                expected_issuer=_JWT_EXPECTED_ISSUER
-            )
-            if claims:
-                return True
+            try:
+                claims = verify_jwt(
+                    token, _verify_key,
+                    expected_audience=_JWT_EXPECTED_AUDIENCE,
+                    expected_issuer=_JWT_EXPECTED_ISSUER
+                )
+                if claims:
+                    return True
+            except Exception:
+                pass
         return False
 
     @app.websocket("/graphql")

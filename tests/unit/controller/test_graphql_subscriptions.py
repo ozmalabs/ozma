@@ -7,10 +7,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from pytest_mark_asyncio import mark_asyncio
-from pytest_mark_asyncio import mark_asyncio
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "controller"))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 pytestmark = pytest.mark.unit
 
 
@@ -53,8 +51,7 @@ def alert_mgr():
 # ── NodeType Tests ────────────────────────────────────────────────────────────
 
 class TestNodeType:
-    @mark_asyncio
-    async def test_from_node_creates_type(self):
+    def test_from_node_creates_type(self):
         from graphql.subscriptions import NodeType
         from state import NodeInfo
 
@@ -83,8 +80,7 @@ class TestNodeType:
         assert node_type.machine_class == "workstation"
         assert node_type.active is True
 
-    @mark_asyncio
-    async def test_from_node_with_optional_fields(self):
+    def test_from_node_with_optional_fields(self):
         from graphql.subscriptions import NodeType
         from state import NodeInfo
 
@@ -128,8 +124,7 @@ class TestNodeType:
 # ── ScenarioType Tests ────────────────────────────────────────────────────────
 
 class TestScenarioType:
-    @mark_asyncio
-    async def test_from_scenario_creates_type(self):
+    def test_from_scenario_creates_type(self):
         from graphql.subscriptions import ScenarioType
         from scenarios import Scenario
 
@@ -154,8 +149,7 @@ class TestScenarioType:
 # ── AlertType Tests ───────────────────────────────────────────────────────────
 
 class TestAlertType:
-    @mark_asyncio
-    async def test_from_alert_dict(self):
+    def test_from_alert_dict(self):
         from graphql.subscriptions import AlertType
 
         alert_dict = {
@@ -183,8 +177,7 @@ class TestAlertType:
         assert alert_type.created_at == 1234567890.0
         assert alert_type.timeout_s == 30
 
-    @mark_asyncio
-    async def test_from_alert_dict_fallback_fields(self):
+    def test_from_alert_dict_fallback_fields(self):
         from graphql.subscriptions import AlertType
 
         # Test with old field name (created_at instead of started_at)
@@ -200,8 +193,7 @@ class TestAlertType:
         alert_type = AlertType.from_alert(alert_dict)
         assert alert_type.created_at == 1234567890.0
 
-    @mark_asyncio
-    async def test_from_alert_object(self, state):
+    def test_from_alert_object(self, state):
         from graphql.subscriptions import AlertType
         from alerts import AlertSession
 
@@ -228,7 +220,6 @@ class TestAlertType:
 # ── Subscription Registry Tests ───────────────────────────────────────────────
 
 class TestSubscriptionRegistry:
-    @mark_asyncio
     async def test_register_and_unregister(self):
         from graphql.subscriptions import _subscription_registry
 
@@ -247,7 +238,6 @@ class TestSubscriptionRegistry:
         removed_queue = await _subscription_registry.get_queue(subscription_id)
         assert removed_queue is None
 
-    @mark_asyncio
     async def test_matches_filter_exact(self):
         from graphql.subscriptions import _subscription_registry
 
@@ -263,7 +253,6 @@ class TestSubscriptionRegistry:
 
         await _subscription_registry.unregister(subscription_id)
 
-    @mark_asyncio
     async def test_matches_filter_no_filter(self):
         from graphql.subscriptions import _subscription_registry
 
@@ -280,7 +269,6 @@ class TestSubscriptionRegistry:
 # ── Event Router Tests ────────────────────────────────────────────────────────
 
 class TestEventRouter:
-    @mark_asyncio
     async def test_start_and_stop_event_router(self, state):
         from graphql.subscriptions import start_event_router, stop_event_router
 
@@ -292,7 +280,6 @@ class TestEventRouter:
 
         stop_event_router()
 
-    @mark_asyncio
     async def test_event_routing(self, state):
         """Test that events are routed to subscription queues."""
         from graphql.subscriptions import _subscription_registry, _event_router_task
@@ -323,7 +310,6 @@ class TestEventRouter:
 # ── nodeStateChanged Subscription Tests ──────────────────────────────────────
 
 class TestNodeStateChanged:
-    @mark_asyncio
     async def test_node_state_subscription_yields_initial_nodes(self, state):
         """Test that nodeStateChanged yields initial node state on subscription."""
         from graphql.subscriptions import Subscription, start_event_router, stop_event_router
@@ -365,7 +351,6 @@ class TestNodeStateChanged:
 
         stop_event_router()
 
-    @mark_asyncio
     async def test_node_state_subscription_yields_new_node(self, state):
         """Test that nodeStateChanged yields new nodes as they come online."""
         from graphql.subscriptions import (
@@ -423,7 +408,6 @@ class TestNodeStateChanged:
 # ── scenarioActivated Subscription Tests ──────────────────────────────────────
 
 class TestScenarioActivated:
-    @mark_asyncio
     async def test_scenario_activated_subscription_yields_initial_scenarios(self, state, scenario_mgr):
         """Test that scenarioActivated yields initial scenarios on subscription."""
         from graphql.subscriptions import Subscription, start_event_router, stop_event_router
@@ -453,7 +437,6 @@ class TestScenarioActivated:
 
         stop_event_router()
 
-    @mark_asyncio
     async def test_scenario_activated_subscription_yields_new_activation(self, state, scenario_mgr):
         """Test that scenarioActivated yields scenario activation events."""
         from graphql.subscriptions import (
@@ -503,7 +486,6 @@ class TestScenarioActivated:
 # ── audioLevelUpdate Subscription Tests ───────────────────────────────────────
 
 class TestAudioLevelUpdate:
-    @mark_asyncio
     async def test_audio_level_subscription_yields_levels(self, state):
         """Test that audioLevelUpdate yields audio level updates."""
         from graphql.subscriptions import (
@@ -555,7 +537,6 @@ class TestAudioLevelUpdate:
 # ── alertFired Subscription Tests ─────────────────────────────────────────────
 
 class TestAlertFired:
-    @mark_asyncio
     async def test_alert_fired_subscription_yields_initial_alerts(self, state, alert_mgr):
         """Test that alertFired yields initial alerts on subscription."""
         from graphql.subscriptions import Subscription, start_event_router, stop_event_router
@@ -593,7 +574,6 @@ class TestAlertFired:
 
         stop_event_router()
 
-    @mark_asyncio
     async def test_alert_fired_subscription_yields_new_alert(self, state):
         """Test that alertFired yields new alert events."""
         from graphql.subscriptions import (
@@ -644,7 +624,6 @@ class TestAlertFired:
 
         stop_event_router()
 
-    @mark_asyncio
     async def test_alert_fired_subscription_yields_updated_alert(self, state, alert_mgr):
         """Test that alertFired yields updated alert events."""
         from graphql.subscriptions import (
@@ -709,8 +688,7 @@ class TestAlertFired:
 # ── Integration Tests ─────────────────────────────────────────────────────────
 
 class TestGraphQLSchemaIntegration:
-    @mark_asyncio
-    async def test_schema_has_all_subscription_fields(self):
+    def test_schema_has_all_subscription_fields(self):
         """Test that the GraphQL schema includes all subscription fields."""
         from graphql.schema import schema
 
