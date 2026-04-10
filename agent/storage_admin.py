@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
 """
-agent/storage_admin.py — Storage administration: TrueNAS/OMV/HexOS feature parity.
+agent/storage_admin.py — Storage administration: ZFS replication, SMART scheduling,
+iSCSI, ACL management, rsync jobs, secure wipe, capacity trends, S3 gateways.
 
 Covers what storage_manager.py does NOT:
   - ZFS replication (zfs send/receive over SSH to a remote target)
