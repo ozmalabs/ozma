@@ -146,8 +146,8 @@ class ScenarioType:
             name=scenario.name,
             node_id=scenario.node_id,
             color=scenario.color,
-            index=scenario.index,
-            config=scenario.config,
+            index=0,
+            config={},
         )
 
 
