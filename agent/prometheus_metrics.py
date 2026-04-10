@@ -590,4 +590,16 @@ def collect_soft(node_name: str, connect_client: Any = None,
     vm_running = 1 if vm_status == "running" else 0
     lines.append(_g("ozma_node_vm_running", "VM running state", vm_running, lb))
 
+    # ── Deep hardware sensors (HWiNFO64 parity) ────────────────────────
+    # Per-core temps/clocks, RAPL power, GPU extended sensors, NVMe wear,
+    # fan RPMs, voltage rails, motherboard VRM/PCH, battery health.
+    try:
+        from hardware_info import HardwareInfoCollector
+        _hw_collector = HardwareInfoCollector()
+        _hw_snap = _hw_collector.snapshot()
+        from hardware_info import collect_hwinfo_prometheus
+        lines.append(collect_hwinfo_prometheus(_hw_snap, lb))
+    except Exception:
+        pass  # hardware_info not available in all environments
+
     return "".join(lines)
