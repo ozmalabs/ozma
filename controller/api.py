@@ -416,9 +416,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if not query or not isinstance(query, str) or not query.strip():
             raise HTTPException(400, "query field is required")
 
-        # Sanitize input - prevent common injection patterns
-        if len(query) > 65_536:  # 64KB max query size
-            raise HTTPException(413, "Query too large - maximum size is 64KB")
+        # Sanitize input - prevent query injection and DoS
+        if len(query) > 16_384:  # 16KB max query size
+            raise HTTPException(413, "Query too large - maximum size is 16KB")
 
         # Extract optional fields
         variables = body.get("variables")
@@ -432,7 +432,6 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         log.debug(f"GraphQL query received: operation={operation_name}, query_length={len(query)}")
 
         # Execute GraphQL query using Strawberry's async execution
-        from controller.graphql.schema import schema as ozma_schema
 
         # Run in executor to avoid blocking the event loop
         loop = asyncio.get_event_loop()
