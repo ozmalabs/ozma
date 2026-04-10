@@ -527,6 +527,63 @@ If the node fails to check in with the Controller within 5 minutes of rebooting 
 
 ---
 
+## DNS Integrity Verification
+
+DNS is a foundational component of almost every network operation. Compromised DNS
+can redirect users to malicious sites even when every other security control is in
+place. Ozma actively verifies that DNS is operating correctly and has not been
+tampered with.
+
+### Checks performed
+
+| Check | What it detects | How |
+|---|---|---|
+| Resolver integrity | System resolver returns different IP than DoH reference | Compare getaddrinfo() vs Cloudflare/Google DoH for a stable domain |
+| Transparent interception | ISP proxying port 53 without disclosure | Query `one.one.one.one` — system resolver must return Cloudflare's well-known IPs |
+| NXDOMAIN hijacking | ISP returning a real IP for non-existent domains ("search assist") | Query an IANA-reserved `.invalid` TLD — must return NXDOMAIN |
+| DNSSEC validation | Resolver validates signatures; forged records return SERVFAIL | Query known-valid and known-broken signed zones via DoH with validation enabled |
+| DNS rebinding guard | Public name resolves to private/RFC-1918 address (SSRF / LAN pivot) | Every proxy request's resolved IP is checked before forwarding; non-allowlisted private IPs are blocked |
+| Captive portal | Network has intercepted HTTP (hotel WiFi, airport, corporate MITM) | Fetch canary URL and verify expected response; redirects or unexpected content indicate a captive portal |
+| DNS leak (VPN mode) | DNS queries escape the tunnel in full-tunnel VPN mode | Verify queries route through the exit resolver when VPN is active |
+
+### DNS rebinding protection
+
+The service proxy includes a `DNSRebindingGuard` that rejects any request where
+a public hostname resolves to a private IP range (RFC 1918, CGNAT, link-local,
+loopback). This prevents:
+
+- Browser-based LAN pivoting via WebRTC / fetch requests
+- SSRF attacks through Ozma's proxy layer
+- Domain name squatting that routes to internal infrastructure
+
+Private-range addresses can be explicitly allow-listed for legitimate local services:
+
+```
+POST /api/v1/dns/rebinding/allowlist
+{ "entries": ["controller.local", "192.168.1.100"] }
+```
+
+### Continuous monitoring
+
+`DNSVerifier` runs a full check suite on controller startup (after a 15-second
+delay) and every 5 minutes thereafter. When issues are detected, re-check interval
+drops to 60 seconds. Results are surfaced in the dashboard and can be queried via
+the API:
+
+```
+GET  /api/v1/dns/integrity           — controller's current assessment
+GET  /api/v1/dns/integrity/all       — all nodes + controller
+POST /api/v1/dns/integrity/run       — trigger immediate check
+POST /api/v1/dns/environment         — node/agent submits its own assessment
+GET  /api/v1/dns/environment/{id}    — specific node's latest assessment
+```
+
+Nodes and agents can run the same checks locally and submit results via
+`POST /api/v1/dns/environment`. A node on a network with NXDOMAIN hijacking will
+flag this independently of the controller, giving per-node DNS visibility.
+
+---
+
 ## Threat Model
 
 | Threat | Mitigation |
@@ -554,3 +611,9 @@ If the node fails to check in with the Controller within 5 minutes of rebooting 
 | Mobile client inheriting mesh node trust | Mobile clients assigned 10.202.0.0/16, excluded from wireguard_bypass_subnets; always require mTLS or JWT |
 | Fake Ozma app on attacker device | Android Key Attestation / App Attest proves key generated on genuine hardware by genuine app; Play Integrity confirms device integrity — all checked at enrollment |
 | Third-party app access (Jellyfin etc.) without mTLS | Protected by WireGuard tunnel only; no mTLS — security bounded by WireGuard key storage quality (TEE-wrapped on hardware-backed devices) |
+| DNS rebinding attack (browser pivot to LAN) | DNSRebindingGuard rejects proxy requests where a public name resolves to a private/RFC-1918 address; allowlist required for any legitimate private-range endpoint |
+| Transparent DNS interception (ISP port-53 proxy) | DNSVerifier compares system resolver against DoH reference for stable canary names; mismatch flagged and surfaced in dashboard |
+| NXDOMAIN hijacking (ISP search assist) | DNSVerifier queries an IANA-reserved .invalid TLD; any non-NXDOMAIN response is flagged as NXDOMAIN hijacking |
+| Captive portal (hotel / airport WiFi) | Captive portal detection run on startup and periodically; detected portals surface as warnings — VPN or mTLS operations will not work until portal is cleared |
+| DNSSEC validation bypass | DoH resolver with DNSSEC validation checks known-valid and known-broken signed zones; resolver that doesn't validate is flagged |
+| DNS leak in VPN full-tunnel mode | DNS leak check verifies queries route through tunnel resolver in full-tunnel VPN mode |
