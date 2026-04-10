@@ -192,6 +192,7 @@ class TestBuiltinIntents:
         expected = {
             "control", "preview", "observe", "desktop",
             "creative", "gaming", "broadcast", "fidelity_audio",
+            "secure",
         }
         assert set(BUILTIN_INTENTS.keys()) == expected
 
