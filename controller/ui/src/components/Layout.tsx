@@ -1,139 +1,120 @@
-import { ReactNode } from 'react'
+import { ReactNode, useState } from 'react'
 import { Link, useLocation } from 'react-router-dom'
-import { useTheme } from '../contexts/ThemeContext'
 
 interface LayoutProps {
   children: ReactNode
+  title?: string
 }
 
-export default function Layout({ children }: LayoutProps) {
+const Layout = ({ children, title = 'Ozma Controller' }: LayoutProps) => {
+  const [sidebarOpen, setSidebarOpen] = useState(false)
   const location = useLocation()
-  const { theme, toggleTheme } = useTheme()
 
   const navItems = [
-    { name: 'Nodes', path: '/nodes', icon: 'server' },
-    { name: 'Scenarios', path: '/scenarios', icon: 'layers' },
-    { name: 'Settings', path: '/settings', icon: 'settings' },
+    { path: '/nodes', label: 'Nodes', icon: 'server' },
+    { path: '/scenarios', label: 'Scenarios', icon: 'layers' },
+    { path: '/stream', label: 'Stream', icon: 'video' },
+    { path: '/settings', label: 'Settings', icon: 'settings' },
   ]
 
-  const isActive = (path: string) => location.pathname === path
-
   return (
-    <div className="flex h-screen bg-background text-foreground overflow-hidden">
+    <div className="flex h-screen overflow-hidden bg-gray-900">
+      {/* Mobile sidebar overlay */}
+      {sidebarOpen && (
+        <div
+          className="fixed inset-y-0 left-0 z-20 bg-black/50 lg:hidden"
+          onClick={() => setSidebarOpen(false)}
+        />
+      )}
+
       {/* Sidebar */}
-      <aside className="w-64 bg-card border-r border-border flex flex-col hidden md:flex">
-        <div className="p-6 border-b border-border">
-          <h1 className="text-2xl font-bold text-primary">Ozma</h1>
-          <p className="text-sm text-muted-foreground mt-1">KVMA Router</p>
+      <aside className="fixed inset-y-0 left-0 z-30 w-64 transform bg-gray-800 transition-transform duration-300 ease-in-out lg:static lg:translate-x-0">
+        <div className="flex items-center h-16 px-6 bg-gray-900 border-b border-gray-700">
+          <div className="flex items-center gap-2 text-emerald-400">
+            <svg className="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2v10a2 2 0 01-2 2" />
+            </svg>
+            <span className="text-xl font-bold">Ozma</span>
+          </div>
         </div>
 
-        <nav className="flex-1 p-4 space-y-2 overflow-y-auto">
-          {navItems.map((item) => (
-            <Link
-              key={item.path}
-              to={item.path}
-              className={`flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${
-                isActive(item.path)
-                  ? 'bg-primary/10 text-primary'
-                  : 'text-muted-foreground hover:bg-accent/5 hover:text-foreground'
-              }`}
-            >
-              <Icon name={item.icon} className="w-5 h-5" />
-              <span>{item.name}</span>
-            </Link>
-          ))}
+        <nav className="px-4 py-6 space-y-1 overflow-y-auto">
+          {navItems.map((item) => {
+            const isActive = location.pathname === item.path
+            return (
+              <Link
+                key={item.path}
+                to={item.path}
+                className={`flex items-center gap-3 px-4 py-3 text-sm font-medium rounded-lg transition-colors ${
+                  isActive
+                    ? 'bg-emerald-500/10 text-emerald-400'
+                    : 'text-gray-300 hover:bg-gray-700 hover:text-white'
+                }`}
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  {item.icon === 'server' && <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2M5 12a2 2 0 012-2h2a2 2 0 012 2m10 0a2 2 0 012 2v4a2 2 0 01-2 2" />}
+                  {item.icon === 'layers' && <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2v10a2 2 0 01-2 2" />}
+                  {item.icon === 'video' && <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />}
+                  {item.icon === 'settings' && <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c-.94 1.543-.826 3.31 2.37 2.37m-5.334.24c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c.94-1.543.826-3.31-2.37-2.37m5.334.24c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c-.94 1.543-.826 3.31 2.37 2.37m-5.334.24c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c.94-1.543.826-3.31-2.37-2.37" />}
+                </svg>
+                {item.label}
+              </Link>
+            )
+          })}
         </nav>
 
-        <div className="p-4 border-t border-border">
-          <button
-            onClick={toggleTheme}
-            className="flex items-center gap-3 w-full px-4 py-3 rounded-lg text-muted-foreground hover:bg-accent/5 hover:text-foreground transition-colors"
-          >
-            <Icon
-              name={theme === 'dark' ? 'sun' : 'moon'}
-              className="w-5 h-5"
-            />
-            <span className="text-sm">
-              {theme === 'dark' ? 'Light Mode' : 'Dark Mode'}
-            </span>
-          </button>
+        <div className="absolute bottom-0 w-full p-4 border-t border-gray-700">
+          <div className="flex items-center gap-3 px-2">
+            <div className="w-8 h-8 rounded-full bg-emerald-500 flex items-center justify-center text-gray-900 font-bold">
+              O
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-medium text-white truncate">Admin User</p>
+              <p className="text-xs text-gray-400 truncate">controller@ozma.local</p>
+            </div>
+          </div>
         </div>
       </aside>
 
       {/* Main content */}
-      <main className="flex-1 flex flex-col min-w-0 overflow-hidden">
+      <div className="flex flex-col flex-1 min-w-0 overflow-hidden">
         {/* Topbar */}
-        <header className="h-16 bg-card border-b border-border flex items-center px-6 justify-between">
-          <div className="flex items-center gap-4 md:hidden">
-            <Icon name="menu" className="w-6 h-6 text-foreground" />
-          </div>
-          <div className="flex-1" />
+        <header className="flex items-center h-16 px-6 bg-gray-800 border-b border-gray-700">
+          <button
+            className="mr-4 lg:hidden text-gray-300 hover:text-white"
+            onClick={() => setSidebarOpen(true)}
+          >
+            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
+            </svg>
+          </button>
+
+          <h1 className="text-lg font-semibold text-white truncate flex-1">{title}</h1>
+
           <div className="flex items-center gap-4">
-            <div className="hidden md:flex items-center gap-2 px-3 py-1.5 bg-primary/10 text-primary text-sm rounded-full">
-              <div className="w-2 h-2 bg-primary rounded-full animate-pulse" />
-              <span>Connected</span>
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-emerald-500/10 text-emerald-400">
+              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+              <span className="text-xs font-medium">Connected</span>
             </div>
+
+            <button
+              className="p-2 text-gray-300 hover:text-white rounded-lg hover:bg-gray-700 transition-colors"
+              title="Theme toggle"
+            >
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
+              </svg>
+            </button>
           </div>
         </header>
 
         {/* Page content */}
-        <div className="flex-1 overflow-auto p-6">
+        <main className="flex-1 overflow-auto p-6 bg-gray-900">
           {children}
-        </div>
-      </main>
+        </main>
+      </div>
     </div>
   )
 }
 
-function Icon({ name, className = 'w-6 h-6' }: { name: string; className?: string }) {
-  const icons: Record<string, React.JSX.Element> = {
-    server: (
-      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
-        <rect x="2" y="2" width="20" height="8" rx="2" ry="2" />
-        <rect x="2" y="14" width="20" height="8" rx="2" ry="2" />
-        <line x1="6" y1="6" x2="6.01" y2="6" />
-        <line x1="6" y1="18" x2="6.01" y2="18" />
-      </svg>
-    ),
-    layers: (
-      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
-        <polygon points="12 2 2 7 12 12 22 7 12 2" />
-        <polyline points="2 17 12 22 22 17" />
-        <polyline points="2 12 12 17 22 12" />
-      </svg>
-    ),
-    settings: (
-      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
-        <circle cx="12" cy="12" r="3" />
-        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82.33l.06.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
-      </svg>
-    ),
-    moon: (
-      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
-        <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
-      </svg>
-    ),
-    sun: (
-      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
-        <circle cx="12" cy="12" r="5" />
-        <line x1="12" y1="1" x2="12" y2="3" />
-        <line x1="12" y1="21" x2="12" y2="23" />
-        <line x1="4.22" y1="4.22" x2="5.64" y2="5.64" />
-        <line x1="18.36" y1="18.36" x2="19.78" y2="19.78" />
-        <line x1="1" y1="12" x2="3" y2="12" />
-        <line x1="21" y1="12" x2="23" y2="12" />
-        <line x1="4.22" y1="19.78" x2="5.64" y2="18.36" />
-        <line x1="18.36" y1="5.64" x2="19.78" y2="4.22" />
-      </svg>
-    ),
-    menu: (
-      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
-        <line x1="3" y1="12" x2="21" y2="12" />
-        <line x1="3" y1="6" x2="21" y2="6" />
-        <line x1="3" y1="18" x2="21" y2="18" />
-      </svg>
-    ),
-  }
-
-  return icons[name] || null
-}
+export default Layout

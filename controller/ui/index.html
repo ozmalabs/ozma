@@ -2,17 +2,13 @@
 <html lang="en" class="dark">
   <head>
     <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Ozma Controller</title>
     <script>
-      // Theme initialization to prevent flash
-      (function() {
-        const isDark = localStorage.getItem('theme') === 'dark' || 
-                       (!('theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches);
-        if (isDark) {
-          document.documentElement.classList.add('dark');
-        }
-      })();
+      // Dark mode toggle with system preference
+      const isDark = localStorage.getItem('theme') === 'dark' || (!('theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches)
+      document.documentElement.classList.add(isDark ? 'dark' : 'light')
     </script>
   </head>
   <body>

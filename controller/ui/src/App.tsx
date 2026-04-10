@@ -1,10 +1,14 @@
-import { Outlet } from 'react-router-dom'
-import Layout from './components/layout/Layout'
+import { Routes, Route } from 'react-router-dom'
+import Layout from './components/Layout'
+import NodesPage from './pages/NodesPage'
 
 function App() {
   return (
     <Layout>
-      <Outlet />
+      <Routes>
+        <Route path="/" element={<NodesPage />} />
+        <Route path="/nodes" element={<NodesPage />} />
+      </Routes>
     </Layout>
   )
 }

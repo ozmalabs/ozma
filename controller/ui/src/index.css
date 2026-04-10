@@ -2,42 +2,60 @@
 @tailwind components;
 @tailwind utilities;
 
-@layer base {
-  :root {
-    --background: 222.2 84% 4.9%;
-    --foreground: 210 40% 98%;
-    --card: 222.2 84% 4.9%;
-    --card-foreground: 210 40% 98%;
-    --popover: 222.2 84% 4.9%;
-    --popover-foreground: 210 40% 98%;
-    --primary: 142.1 76.2% 45.3%;
-    --primary-foreground: 173 58% 21%;
-    --secondary: 217.2 32.6% 17.5%;
-    --secondary-foreground: 210 40% 98%;
-    --muted: 217.2 32.6% 17.5%;
-    --muted-foreground: 215 20.2% 65.1%;
-    --accent: 142.1 76.2% 45.3%;
-    --accent-foreground: 173 58% 21%;
-    --destructive: 0 62.8% 30.6%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 217.2 32.6% 17.5%;
-    --input: 217.2 32.6% 17.5%;
-    --ring: 142.1 76.2% 45.3%;
-  }
+:root {
+  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
 
-  .dark {
-    color-scheme: dark;
-  }
+  color-scheme: dark;
+  
+  /* Ozma Emerald Accent */
+  --ozma-emerald: #4ae0a4;
+  --ozma-emerald-dark: #3db38a;
+  --ozma-emerald-light: #7ee8b6;
+  
+  /* Dark theme colors */
+  --color-bg: #0a0a0a;
+  --color-bg-secondary: #111111;
+  --color-bg-tertiary: #1a1a1a;
+  --color-text: #e0e0e0;
+  --color-text-secondary: #a0a0a0;
+  --color-border: #2a2a2a;
+  --color-accent: var(--ozma-emerald);
+  --color-accent-hover: var(--ozma-emerald-dark);
+  --color-danger: #ef4444;
+  --color-success: #22c55e;
+  --color-warning: #f59e0b;
 }
 
-@layer base {
-  * {
-    border-color: hsl(var(--border));
-  }
+body {
+  margin: 0;
+  background-color: var(--color-bg);
+  color: var(--color-text);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
 
-  body {
-    background-color: hsl(var(--background));
-    color: hsl(var(--foreground));
-    margin: 0;
-  }
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border) var(--color-bg);
+}
+
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+*::-webkit-scrollbar-track {
+  background: var(--color-bg);
+}
+
+*::-webkit-scrollbar-thumb {
+  background-color: var(--color-border);
+  border-radius: 4px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background-color: var(--color-border);
 }
