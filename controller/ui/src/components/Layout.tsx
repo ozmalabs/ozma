@@ -1,4 +1,4 @@
-import { ReactNode } from 'react'
+import { ReactNode, useState } from 'react'
 import { Link, useLocation } from 'react-router-dom'
 
 interface LayoutProps {
@@ -7,102 +7,125 @@ interface LayoutProps {
 
 export default function Layout({ children }: LayoutProps) {
   const location = useLocation()
+  const [sidebarOpen, setSidebarOpen] = useState(false)
 
   const navItems = [
-    { path: '/', label: 'Nodes', icon: 'server' },
+    { path: '/nodes', label: 'Nodes', icon: 'servers' },
     { path: '/scenarios', label: 'Scenarios', icon: 'layers' },
+    { path: '/streams', label: 'Streams', icon: 'video' },
     { path: '/settings', label: 'Settings', icon: 'settings' },
   ]
 
   return (
-    <div className="flex h-screen overflow-hidden bg-[var(--background)]">
-      {/* Sidebar */}
-      <aside className="w-[var(--sidebar-width)] flex-shrink-0 border-r border-[var(--border-color)] bg-[var(--sidebar-background)] flex flex-col">
-        <div className="p-6 border-b border-[var(--border-color)]">
-          <h1 className="text-2xl font-bold text-[var(--accent-color)]">Ozma</h1>
-          <p className="text-xs text-[var(--text-muted)] mt-1">KVMA Router</p>
+    <div className="min-h-screen flex flex-col bg-slate-950 text-slate-100 font-sans">
+      {/* Top Bar */}
+      <header className="h-16 border-b border-slate-800 bg-slate-900/50 backdrop-blur-md flex items-center justify-between px-4 lg:px-6">
+        <div className="flex items-center gap-4">
+          <button
+            onClick={() => setSidebarOpen(!sidebarOpen)}
+            className="lg:hidden p-2 rounded-md hover:bg-slate-800 transition-colors"
+          >
+            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
+            </svg>
+          </button>
+          <Link to="/" className="flex items-center gap-2">
+            <div className="w-8 h-8 rounded-lg bg-emerald-500 flex items-center justify-center">
+              <svg className="w-5 h-5 text-slate-900" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" />
+              </svg>
+            </div>
+            <span className="font-bold text-lg tracking-tight">Ozma</span>
+          </Link>
         </div>
+        <div className="flex items-center gap-4">
+          <div className="hidden md:flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-800/50 border border-slate-700">
+            <div className={`w-2 h-2 rounded-full ${true ? 'bg-emerald-500 animate-pulse' : 'bg-slate-500'}`} />
+            <span className="text-xs font-medium text-slate-300">Controller Running</span>
+          </div>
+          <button className="p-2 rounded-full hover:bg-slate-800 transition-colors relative">
+            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-2-4.058V5a2 2 0 00-2-2h-10a2 2 0 00-2 2v4.158a2.032 2.032 0 01-1.595 1.986L2 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
+            </svg>
+            <span className="absolute top-1.5 right-1.5 w-2 h-2 bg-red-500 rounded-full" />
+          </button>
+          <button className="p-2 rounded-full hover:bg-slate-800 transition-colors">
+            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+            </svg>
+          </button>
+          <div className="h-8 w-8 rounded-full bg-emerald-500 flex items-center justify-center text-slate-900 font-bold text-sm">
+            AD
+          </div>
+        </div>
+      </header>
 
-        <nav className="flex-1 overflow-y-auto py-4">
-          <ul className="space-y-1">
-            {navItems.map((item) => (
-              <li key={item.path}>
+      {/* Main Layout */}
+      <div className="flex flex-1 overflow-hidden">
+        {/* Sidebar */}
+        <aside
+          className={`fixed inset-y-0 left-0 z-30 w-64 bg-slate-900 border-r border-slate-800 transform transition-transform duration-300 lg:translate-x-0 lg:static lg:block ${
+            sidebarOpen ? 'translate-x-0' : '-translate-x-full'
+          }`}
+        >
+          <nav className="mt-6 px-3 space-y-1">
+            {navItems.map((item) => {
+              const isActive = location.pathname === item.path || (location.pathname === '/' && item.path === '/nodes')
+              return (
                 <Link
+                  key={item.path}
                   to={item.path}
-                  className={`flex items-center gap-3 px-4 py-3 text-sm font-medium transition-colors rounded-lg mx-2 ${
-                    location.pathname === item.path
-                      ? 'bg-[var(--accent-color)]/10 text-[var(--accent-color)]'
-                      : 'text-[var(--text-muted)] hover:bg-[var(--border-color)] hover:text-[var(--foreground)]'
+                  className={`flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all duration-200 group ${
+                    isActive
+                      ? 'bg-emerald-500/10 text-emerald-400'
+                      : 'text-slate-400 hover:bg-slate-800 hover:text-slate-100'
                   }`}
                 >
-                  <Icon name={item.icon} className="w-5 h-5" />
-                  {item.label}
+                  <svg
+                    className={`w-5 h-5 ${isActive ? 'text-emerald-400' : 'text-slate-500 group-hover:text-slate-300'}`}
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    {item.icon === 'servers' && <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14M5 12a2 2 0 01-2-2 2 2 0 00-2 2 2 2 0 002 2 2 2 0 012 2v2a2 2 0 01-2 2 2 2 0 00-2-2 2 2 0 002 2 2 2 0 012-2h14a2 2 0 012 2 2 2 0 002-2 2 2 0 00-2-2 2 2 0 01-2-2v-2a2 2 0 012-2 2 2 0 002 2 2 2 0 00-2-2 2 2 0 01-2 2H5z" />}
+                    {item.icon === 'layers' && <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" />}
+                    {item.icon === 'video' && <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />}
+                    {item.icon === 'settings' && <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />}
+                    {item.icon === 'home' && <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" />}
+                  </svg>
+                  <span className="font-medium">{item.label}</span>
                 </Link>
-              </li>
-            ))}
-          </ul>
-        </nav>
+              )
+            })}
+          </nav>
 
-        <div className="p-4 border-t border-[var(--border-color)]">
-          <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-full bg-[var(--border-color)] flex items-center justify-center text-xs font-bold">
-              <Icon name="user" className="w-4 h-4" />
-            </div>
-            <div className="flex-1 min-w-0">
-              <p className="text-sm font-medium truncate">Operator</p>
-              <p className="text-xs text-[var(--text-muted)] truncate">admin</p>
-            </div>
-          </div>
-        </div>
-      </aside>
-
-      {/* Main content */}
-      <div className="flex-1 flex flex-col overflow-hidden">
-        {/* Topbar */}
-        <header className="h-[var(--topbar-height)] border-b border-[var(--border-color)] bg-[var(--sidebar-background)] flex items-center justify-between px-6">
-          <h2 className="text-lg font-semibold text-[var(--foreground)]">
-            {navItems.find((n) => n.path === location.pathname)?.label || 'Dashboard'}
-          </h2>
-          <div className="flex items-center gap-4">
-            <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-[var(--accent-color)]/10 text-[var(--accent-color)] text-xs">
-              <span className="w-2 h-2 rounded-full bg-[var(--accent-color)] animate-pulse" />
-              Connected
+          <div className="absolute bottom-0 w-full p-4 border-t border-slate-800">
+            <div className="flex items-center gap-3 px-2">
+              <div className="w-10 h-10 rounded-md bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center text-slate-900 font-bold text-xs">
+                v0.1.0
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-medium text-slate-200 truncate">Controller v0.1.0</p>
+                <p className="text-xs text-slate-500 truncate">ozma.local</p>
+              </div>
             </div>
           </div>
-        </header>
+        </aside>
 
-        {/* Page content */}
-        <main className="flex-1 overflow-y-auto p-6">
-          {children}
+        {/* Overlay for mobile sidebar */}
+        {sidebarOpen && (
+          <div
+            className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-20 lg:hidden"
+            onClick={() => setSidebarOpen(false)}
+          />
+        )}
+
+        {/* Content */}
+        <main className="flex-1 overflow-auto bg-slate-950 p-4 lg:p-6">
+          <div className="max-w-7xl mx-auto">{children}</div>
         </main>
       </div>
     </div>
   )
-}
-
-function Icon({ name, className = 'w-6 h-6' }: { name: string; className?: string }) {
-  const icons: Record<string, React.JSX.Element> = {
-    server: (
-      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className={className}>
-        <path strokeLinecap="round" strokeLinejoin="round" d="M21.75 17.25v-.228a4.5 4.5 0 00-.12-1.03l-2.268-9.67A3.375 3.375 0 0015.838 6h-3.76a3.375 3.375 0 00-3.353 2.778l-2.268 9.67a4.5 4.5 0 00-.12 1.03v.228m19.5 0a3 3 0 01-3 3H5.25a3 3 0 01-3-3m19.5 0a3 3 0 00-3-3H5.25a3 3 0 00-3 3m16.5 0h.01v.01h-.01v-.01a3 3 0 00-3 3h-12a3 3 0 00-3-3h.01v-.01h.01v.01a3 3 0 003 3h12a3 3 0 003-3z" />
-      </svg>
-    ),
-    layers: (
-      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className={className}>
-        <path strokeLinecap="round" strokeLinejoin="round" d="M6.429 9.75L2.25 12l4.179 2.25m0-4.5l5.571 3 5.571-3m0 4.5L5.571 15l5.571 3 5.571-3M12 3v7.5" />
-      </svg>
-    ),
-    settings: (
-      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className={className}>
-        <path strokeLinecap="round" strokeLinejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.729.742.966l1.026.604c.436.256.683.76.513 1.236l-.737 2.016c-.12.327.108.69.462.789l1.882.686c.525.192.88.687.84 1.216l-.46 3.156c-.068.463.46.824.906.619l2.763-1.302c.426-.201.806.043.92.48l.534 2.016c.12.455-.19.87-.655.96l-2.322.619a1.147 1.147 0 00-.608.866l-.533 2.016c-.06.227.06.47.28.594l2.016.737c.47.172.716.676.513 1.202l-1.302 2.764c-.205.436-.62.746-1.075.618l-3.156-.46c-.529-.077-.984.387-.984.916v.01c0 .529.46.993.984.916l3.156-.46c.455-.128.87.182.916.608l.533 2.016c.114.438-.03.906-.48.92l-2.016.534c-.22.06-.46-.06-.594-.28l-2.016-.737a1.147 1.147 0 00-.789.462l-1.882 2.016c-.237.505-.74.752-1.236.513l-1.026-.604a2.23 2.23 0 00-.966-.742l-1.281-.213a1.147 1.147 0 00-.92-.12l-2.593.213a1.147 1.147 0 00-.94.594l-1.302 2.764c-.192.426.043.906.48.92l2.016.534c.22.06.47.03.594-.28l.737-2.016a1.147 1.147 0 00.462-.789l.686-1.882c.172-.47.676-.716 1.202-.513l2.016.737c.227.082.47-.03.594-.28l.604-1.026a2.23 2.23 0 00.742-.966l1.281-.213c.542-.09.94-.56.94-1.11v-2.593c0-.55-.398-1.02-.94-1.11l-1.281-.213a2.23 2.23 0 00-.966-.742l-2.016-.737a1.147 1.147 0 00-.594-.28l-2.016-.534a1.147 1.147 0 00-.92-.48l-2.764 1.302c-.436.205-.906-.043-.92-.48l-.533-2.016a1.147 1.147 0 00.462-.789l.737-2.016c.082-.227-.03-.47-.28-.594l-2.016-.737c-.47-.172-.716-.676-.513-1.202l1.302-2.764c.205-.436-.043-.906-.48-.92l-2.016-.534c-.22-.06-.47-.03-.594.28l-.737 2.016a1.147 1.147 0 00-.462.789l-.686 1.882a2.23 2.23 0 00-.742.966l-.213 1.281c-.09.542.398 1.02.94 1.11h2.593c.55 0 1.02-.398 1.11-.94l.213-1.281c.063-.374.313-.729.742-.966l1.026-.604c.436-.256.683-.76.513-1.236l-.737-2.016a1.147 1.147 0 00-.462-.789l-1.882-.686c-.525-.192-.88-.687-.84-1.216l.46-3.156c.068-.463-.46-.824-.906-.619l-2.763 1.302c-.426.201-.806-.043-.92-.48l-.534-2.016c-.12-.455.19-.87.655-.96l2.322-.619a1.147 1.147 0 00.608-.866l.533-2.016c.06-.227-.06-.47-.28-.594l-2.016-.737c-.47-.172-.716-.676-.513-1.202l1.302-2.764c.205-.436.62-.746 1.075-.618l3.156.46c.529.077.984-.387.984-.916v-.01c0-.529-.46-.993-.984-.916z" />
-      </svg>
-    ),
-    user: (
-      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className={className}>
-        <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 6a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0zM4.501 20.118a7.5 7.5 0 0114.998 0A17.933 17.933 0 0112 21.75c-2.676 0-5.216-.584-7.499-1.632zM9.75 11.25a2.25 2.25 0 114.5 0 2.25 2.25 0 01-4.5 0z" />
-      </svg>
-    ),
-  }
-
-  return icons[name] || icons.server
 }
