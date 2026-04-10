@@ -379,66 +379,23 @@ Alice shares her Jellyfin with Bob:
 
 ---
 
-## Scale Limits and Future Topology
+## VPN
 
-### Current Addressing Limits
+The Ozma app includes an optional VPN built on the existing WireGuard mesh
+infrastructure. Three modes are available:
 
-The mesh overlay uses RFC 1918 private addressing with a fixed subnet-per-node-type scheme. Each node type occupies a `/24`, giving 254 usable addresses per type. The controller-to-controller peering overlay occupies a separate `/24`.
+- **Tier 1 — Home exit**: all traffic routed through your controller. Your home
+  ISP sees the traffic; no third party does. Genuinely no logs because you
+  control the hardware. Included, no extra cost.
+- **Tier 2 — Connect relay exit**: traffic exits via Ozma Connect relay servers.
+  Ozma Connect can see this traffic — this is explicitly not zero-knowledge and
+  is stated as such. Included in Connect plans.
+- **Tier 3 — Third-party exit nodes** (planned): partnered exit infrastructure
+  for geographic flexibility. Disclosed per-provider.
 
-| Resource | Current allocation | Hard limit |
-|---|---|---|
-| Hardware Compute Nodes (per controller) | `10.200.1.0/24` | **254** |
-| Room Mic devices (per controller) | `10.200.2.0/24` | **254** |
-| Soft Nodes (per controller) | `10.200.3.0/24` | **254** |
-| Virtual Nodes (per controller) | `10.200.4.0/24` | **254** |
-| Camera Nodes (per controller) | `10.200.5.0/24` | **254** |
-| Relay servers | `10.200.100.0/24` | **254** |
-| Mobile app clients | `10.202.0.0/16` | **65,534** |
-| Controllers per mesh | `10.201.0.0/24` | **254** |
-
-Total addressable nodes per controller under the current scheme is approximately **1,270** across all types. The `10.200.0.0/16` overlay has 250+ unused `/24` slots, so new node types can be added without changing the addressing plan.
-
-**WireGuard performance.** WireGuard's peer routing is O(n) — it searches the peer list for each packet's destination. In practice this is fast (a few microseconds per lookup), but at several hundred peers on a single interface, sustained HID traffic begins to show latency variability. The current architecture (nodes peer only with the controller, not with each other) keeps the peer count on each node at 1, and the controller at N peers. The practical WireGuard peer limit on a typical controller (N100-class CPU) is roughly **500–1,000 peers** before per-packet overhead becomes measurable.
-
-**These limits are not a concern for the vast majority of deployments.** A typical setup has 2–10 compute nodes. Even large deployments — a university department, a broadcast studio, a server farm — rarely exceed 50–100 nodes per controller. The limits exist and should be known; they are not expected to bind in practice until Ozma reaches enterprise/fleet scale.
-
-### Expansion Within the Current Scheme
-
-Without any protocol changes, the existing `/16` overlay can accommodate more nodes per type by widening individual node-type subnets:
-
-- Widening hardware nodes from `/24` to `/16` increases the limit from 254 to 65,534 for that type
-- The full `10.200.0.0/16` has room for several `/16` node subnets before exhaustion
-
-This is a configuration-level change to the address plan — no protocol changes required, no node firmware changes required.
-
-### Future Path: Hierarchical Controller Topology
-
-When a single controller's peer count approaches the practical WireGuard limit, the natural answer is hierarchical topology: a root controller manages a set of sub-controllers, each of which manages its own set of nodes. Routing between sub-meshes works over the existing WireGuard fabric — the mesh already provides IP-level routing between any two endpoints, regardless of which controller enrolled them.
-
-```
-Root Controller (10.200.0.1)
-├── Sub-controller A (10.200.0.2) → nodes 10.200.1.0/24
-├── Sub-controller B (10.200.0.3) → nodes 10.200.2.0/24
-└── Sub-controller C (10.200.0.4) → nodes 10.200.3.0/24
-```
-
-Each sub-controller manages its own subnet allocation. The root controller only holds sub-controller peers (low N), while each sub-controller holds its own node peers (also low N). Scenario switching between nodes on different sub-controllers routes through the sub-controllers transparently — from a user perspective, all nodes are still in one flat inventory.
-
-**Self-rearrangement.** A controller approaching its peer limit could automatically promote an eligible node (one with sufficient compute) to a sub-controller role, migrate a subset of its node registrations to it, and update the routing table. This is automated hierarchical splitting — the mesh topology changes without operator involvement, and users see no change in the node inventory. This is a planned capability for large fleet deployments.
-
-### Future Path: Connect-Managed IPAM
-
-For large deployments where multiple controllers form a mesh, Ozma Connect can act as an **IPAM coordinator**: each controller requests a subnet on mesh join, Connect allocates a non-overlapping block, and the allocation is stored in the Connect-backed config. This avoids the 254-controller limit of the current fixed `/24` scheme and eliminates the need for manual address planning in large organisations.
-
-### Future Path: IPv6 ULA Overlay
-
-The WireGuard mesh can be run over **IPv6 Unique Local Addresses** (fc00::/7, effectively /48 or /64 per controller). This provides:
-
-- Effectively unlimited address space — no per-type subnet limits
-- Easy hierarchical allocation: each controller gets a `/48`, each node type gets a `/64` within it
-- No changes to the node or controller software beyond address family support
-
-IPv6 ULA is the long-term addressing foundation for very large deployments and is the planned V2.0 mesh overlay. IPv4 support is retained for backward compatibility with hardware that does not support IPv6.
+Full tunnel, split tunnel, per-app routing, DNS-over-WireGuard, and an optional
+kill switch are all configurable. See [vpn.md](vpn.md) for the full explanation
+of what VPN does and does not provide.
 
 ---
 
