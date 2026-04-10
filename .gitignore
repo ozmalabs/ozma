@@ -60,3 +60,10 @@ demo/cache/
 demo/recordings/
 test_results/
 .aider*
+
+# Brand assets (moved to internal repo)
+logo.svg
+logo_64.png
+logo_discord.png
+logo-wordmark-options.html
+wordmarks/
