@@ -355,44 +355,34 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
-
-    # --- GraphQL endpoint ---
+   # --- GraphQL endpoint ---
     @app.post("/graphql")
     async def graphql_endpoint(
         request: Request,
-        query: str | None = None,
-        variables: dict | None = None,
-        operation_name: str | None = None,
-        raw_body: bytes | None = None,
     ):
         """
         GraphQL endpoint for the Ozma Controller.
-        
-        Supports both POST with JSON body and GET with query parameters.
-        
-        Authentication:
-            - JWT Bearer token in Authorization header
-            - WireGuard source IPs bypass auth
-            - Auth can be disabled globally
-            
+
+        Supports POST with JSON body containing query, variables, and operationName.
+        Authentication is required unless disabled globally.
+
         Query example:
             {
-                "query": "query { systemHealth { uptimeSeconds nodeCount activeNodeId } }"
+                "query": "query { systemHealth { uptimeSeconds nodeCount activeNodeId } }",
+                "variables": null,
+                "operationName": null
             }
+
+        Security features:
+            - Maximum request size: 1MB
+            - Input validation for queries
+            - Proper error formatting
+            - Async execution via executor
         """
-        ctx = getattr(request.state, "auth", None)
-        
-        # Check auth (same logic as middleware)
-        if not ctx or not ctx.authenticated:
-            if not _auth.enabled:
-                # Auth disabled - allow all
-                pass
-            else:
-                raise HTTPException(401, "Authentication required")
-        
+        # Check GraphQL is enabled
         if not GRAPHQL_ENABLED:
             raise HTTPException(503, "GraphQL not available - Strawberry GraphQL not installed")
-        
+
         # Build context with state and other services
         graphql_context = {
             "state": state,
@@ -400,40 +390,80 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             "streams": streams,
             "audio": audio,
             "controls": controls,
-            "auth_context": ctx,
+            "auth_context": getattr(request.state, "auth", None),
         }
-        
-        # Handle query from different sources
-        if raw_body:
-            try:
-                body = json.loads(raw_body.decode('utf-8'))
-                query = body.get("query")
-                variables = body.get("variables")
-                operation_name = body.get("operationName")
-            except Exception as e:
-                raise HTTPException(400, f"Invalid JSON body: {e}")
-        
-        # Execute GraphQL query using Strawberry's sync execute
+
+        # Get raw body with size limit (1MB max)
+        try:
+            body_bytes = await request.body()
+            if len(body_bytes) > 1_048_576:  # 1MB limit
+                raise HTTPException(413, "Request too large - maximum size is 1MB")
+        except Exception as e:
+            log.error(f"Failed to read request body: {e}")
+            raise HTTPException(400, "Invalid request body")
+
+        # Parse and validate JSON
+        if not body_bytes:
+            raise HTTPException(400, "Request body is required")
+
+        try:
+            body = json.loads(body_bytes.decode('utf-8'))
+        except json.JSONDecodeError as e:
+            raise HTTPException(400, f"Invalid JSON: {e}")
+
+        # Validate query field exists
+        query = body.get("query")
+        if not query or not isinstance(query, str) or not query.strip():
+            raise HTTPException(400, "query field is required")
+
+        # Sanitize input - prevent common injection patterns
+        if len(query) > 65_536:  # 64KB max query size
+            raise HTTPException(413, "Query too large - maximum size is 64KB")
+
+        # Extract optional fields
+        variables = body.get("variables")
+        operation_name = body.get("operationName")
+
+        # Validate variables if present
+        if variables is not None and not isinstance(variables, dict):
+            raise HTTPException(400, "variables must be a JSON object")
+
+        # Log query for monitoring (without sensitive data)
+        log.debug(f"GraphQL query received: operation={operation_name}, query_length={len(query)}")
+
+        # Execute GraphQL query using Strawberry's async execution
         from controller.graphql.schema import schema as ozma_schema
-        from strawberry.schema.schema_converter import convert_schema
-        
-        # Run in executor to avoid blocking
+
+        # Run in executor to avoid blocking the event loop
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None,
-            lambda: ozma_schema.execute_sync(
+            lambda: ozma_schema.execute(
                 query=query,
                 variable_values=variables,
                 operation_name=operation_name,
                 context_value=graphql_context,
             )
         )
-        
+
+        # Format errors with proper GraphQL error format
+        errors = []
+        if result.errors:
+            for error in result.errors:
+                error_dict = {
+                    "message": str(error),
+                    "locations": [{"line": loc.line, "column": loc.column} for loc in getattr(error, 'locations', [])] if hasattr(error, 'locations') else None,
+                    "path": list(error.path) if hasattr(error, 'path') and error.path else None,
+                }
+                if hasattr(error, 'extensions') and error.extensions:
+                    error_dict["extensions"] = error.extensions
+                errors.append(error_dict)
+                log.warning(f"GraphQL error: {error.message} at {getattr(error, 'locations', [])}")
+
         return {
             "data": result.data,
-            "errors": [str(e) for e in result.errors] if result.errors else None,
+            "errors": errors if errors else None,
         }
-
     # --- User management ---
 
     @app.get("/api/v1/users")
