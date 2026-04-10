@@ -10223,7 +10223,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"ok": True, "removed": entries}
 
     # GraphQL API
-    graphql_router = create_router(state, _auth)
+    graphql_router = create_router(state, _auth, mesh_ca)
     add_graphiql_route(graphql_router, state, _auth)
     app.include_router(graphql_router, prefix="")
 

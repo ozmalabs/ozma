@@ -120,19 +120,6 @@ class RequireWritePermission:
         """Initialize the permission class."""
         self.message = "Write scope required for this mutation"
 
-    def get_unauthenticated_message(self, info: strawberry.Info) -> str | None:
-        """
-        Get the message to display when user is not authenticated.
-
-        Args:
-            info: Strawberry info object containing request context.
-
-        Returns:
-            Error message string or None to use default.
-        """
-        log.warning("GraphQL mutation attempted without authentication")
-        return self.message
-
     def has_permission(self, info: strawberry.Info, **kwargs: Any) -> bool:
         """
         Check if the user has the required 'write' scope.
@@ -171,7 +158,7 @@ class Mutation:
     """GraphQL mutations - require write scope."""
 
     @strawberry.mutation(permission_classes=[RequireWritePermission])
-    def activate_node(
+    async def activate_node(
         self, info: strawberry.Info, node_id: str
     ) -> NodeInfo:
         """
@@ -200,13 +187,18 @@ class Mutation:
             )
 
         # Set active node via the app state
-        async def _activate() -> NodeInfo:
-            await app_state.activate_node(node_id)
+        try:
+            await app_state.set_active_node(node_id)
             node = app_state.nodes.get(node_id)
             if not node:
                 raise strawberry.ExceptionField(
                     "Node not found after activation", extensions={"code": "INTERNAL_ERROR"}
                 )
+            log.info(
+                "GraphQL activate_node: activated node %s (%s)",
+                node_id,
+                node.name,
+            )
             return NodeInfo(
                 id=node.id,
                 name=node.name,
@@ -217,19 +209,14 @@ class Mutation:
                 status=node.status.value if hasattr(node, "status") else "unknown",
                 machine_class=getattr(node, "machine_class", "workstation"),
             )
-
-        # Run in executor to avoid blocking
-        import asyncio
-
-        loop = asyncio.get_event_loop()
-        try:
-            result = asyncio.run_coroutine_threadsafe(_activate(), loop).result()
-            log.info(
-                "GraphQL activate_node: activated node %s (%s)",
+        except KeyError:
+            log.warning(
+                "GraphQL activate_node: node not found after activation: %s",
                 node_id,
-                node.name,
             )
-            return result
+            raise strawberry.ExceptionField(
+                "Node not found after activation", extensions={"code": "NOT_FOUND"}
+            )
         except Exception as e:
             log.error(
                 "GraphQL activate_node: failed to activate node %s: %s",
@@ -256,7 +243,7 @@ class GraphQLContext:
     """
 
     def __init__(
-        self, app_state: Any, auth_config: AuthConfig | None
+        self, app_state: Any, auth_config: AuthConfig | None, mesh_ca: Any | None = None
     ) -> None:
         """
         Initialize the GraphQL context builder.
@@ -264,9 +251,11 @@ class GraphQLContext:
         Args:
             app_state: The application state object.
             auth_config: The authentication configuration, or None if auth is disabled.
+            mesh_ca: The MeshCA instance for getting the controller keypair (optional).
         """
         self.app_state = app_state
         self.auth_config = auth_config
+        self.mesh_ca = mesh_ca
 
     async def get_context(self, request: Request) -> dict[str, Any]:
         """
@@ -296,7 +285,7 @@ class GraphQLContext:
             if auth_header.startswith("Bearer ") and self.auth_config:
                 token = auth_header[7:]
                 # Get public key from auth config
-                public_key = self._get_public_key()
+                public_key = self._get_public_key(self.mesh_ca)
                 if public_key:
                     claims = self._verify_jwt(token, public_key)
                     if claims:
@@ -333,9 +322,12 @@ class GraphQLContext:
 
         return context
 
-    def _get_public_key(self) -> bytes | None:
+    def _get_public_key(self, mesh_ca: Any | None = None) -> bytes | None:
         """
         Get the public key for JWT verification.
+
+        Args:
+            mesh_ca: The MeshCA instance to get the controller keypair from.
 
         Returns:
             The public key bytes, or None if not available.
@@ -343,13 +335,11 @@ class GraphQLContext:
         if not self.auth_config or not self.auth_config.enabled:
             return None
 
-        # Try to get key from mesh_ca
-        if hasattr(self.auth_config, "mesh_ca") and self.auth_config.mesh_ca:
-            keypair = getattr(self.auth_config.mesh_ca, "controller_keypair", None)
-            if keypair:
-                return keypair.public_key
+        # Try to get key from mesh_ca if provided
+        if mesh_ca and hasattr(mesh_ca, "controller_keypair") and mesh_ca.controller_keypair:
+            return mesh_ca.controller_keypair.public_key
 
-        # Try to get key from verify_key
+        # Try to get key from verify_key in auth_config
         if hasattr(self.auth_config, "verify_key") and self.auth_config.verify_key:
             return self.auth_config.verify_key
 
@@ -399,6 +389,7 @@ def create_schema() -> strawberry.Schema:
 def create_router(
     app_state: Any,
     auth_config: AuthConfig | None,
+    mesh_ca: Any | None = None,
 ) -> APIRouter:
     """
     Create a GraphQL router with auth context injection.
@@ -410,6 +401,7 @@ def create_router(
     Args:
         app_state: The application state object.
         auth_config: The authentication configuration, or None if auth is disabled.
+        mesh_ca: The MeshCA instance for getting the controller keypair (optional).
 
     Returns:
         The configured APIRouter instance.
@@ -418,7 +410,7 @@ def create_router(
     schema = create_schema()
 
     # Create context builder
-    graphql_context = GraphQLContext(app_state, auth_config)
+    graphql_context = GraphQLContext(app_state, auth_config, mesh_ca)
 
     # Create the main GraphQL router (handles POST /graphql)
     graphql_router = GraphQLRouter(
