@@ -1,33 +1,27 @@
 export interface Node {
   id: string
   name: string
-  hostname: string
-  ip: string
-  mac: string
+  description?: string
+  machine_class: 'workstation' | 'server' | 'kiosk'
   status: 'online' | 'offline' | 'connecting' | 'error'
   active: boolean
-  machine_class: 'workstation' | 'server' | 'kiosk'
   last_seen: string
-  uptime: number
-  cpu_usage: number
-  memory_usage: number
-  disk_usage: number
-  temperature: number
-  video_active: boolean
-  audio_active: boolean
-  usb_active: boolean
-  session_id?: string
-  tags: string[]
+  ip_address?: string
+  hostname?: string
+  version?: string
+  machine_id?: string
+  tags?: string[]
+  metadata?: Record<string, unknown>
 }
 
-export interface NodeListResponse {
+export interface NodesState {
   nodes: Node[]
-  total: number
-  online: number
-}
-
-export interface WebSocketMessage {
-  type: 'nodes_update' | 'status_update' | 'heartbeat'
-  payload: Node | NodeListResponse
-  timestamp: number
+  loading: boolean
+  error: string | null
+  lastUpdated: number | null
+  fetchNodes: () => Promise<void>
+  updateNode: (node: Node) => void
+  removeNode: (id: string) => void
+  setError: (error: string | null) => void
+  subscribeToUpdates: (callback: (node: Node) => void) => () => void
 }
