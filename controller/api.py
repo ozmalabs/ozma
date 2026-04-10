@@ -10127,6 +10127,100 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(502, "External subdomain provisioning failed")
         return result
 
+    # ── DNS integrity verification ────────────────────────────────────────────
+
+    @app.get("/api/v1/dns/integrity")
+    async def dns_integrity_get(request: Request) -> dict[str, Any]:
+        """
+        Return the current DNS environment assessment for the controller.
+
+        Includes: resolver integrity, transparent interception, NXDOMAIN hijacking,
+        DNSSEC validation, DNS rebinding guard status, captive portal detection.
+        """
+        _require_scope(request, SCOPE_READ)
+        if dns_verifier is None:
+            raise HTTPException(503, "DNS verifier not running")
+        env = dns_verifier.get_environment()
+        if env is None:
+            raise HTTPException(503, "DNS assessment not yet available — check back shortly")
+        return env.to_dict()
+
+    @app.get("/api/v1/dns/integrity/all")
+    async def dns_integrity_all(request: Request) -> list[dict[str, Any]]:
+        """Return DNS environment assessments for the controller and all reporting nodes."""
+        _require_scope(request, SCOPE_READ)
+        if dns_verifier is None:
+            raise HTTPException(503, "DNS verifier not running")
+        return dns_verifier.all_environments()
+
+    @app.post("/api/v1/dns/integrity/run")
+    async def dns_integrity_run_now(request: Request) -> dict[str, Any]:
+        """Trigger an immediate DNS integrity check. Returns the result."""
+        _require_scope(request, SCOPE_WRITE)
+        if dns_verifier is None:
+            raise HTTPException(503, "DNS verifier not running")
+        env = await dns_verifier.run_once()
+        return env.to_dict()
+
+    @app.post("/api/v1/dns/environment")
+    async def dns_environment_submit(request: Request) -> dict[str, Any]:
+        """
+        Accept a DNS environment assessment from a remote node or agent.
+
+        Body: DNSEnvironment.to_dict() payload (node_id required).
+        Nodes call this after running their own dns_verify checks locally.
+        """
+        _require_scope(request, SCOPE_WRITE)
+        if dns_verifier is None:
+            raise HTTPException(503, "DNS verifier not running")
+        body = await request.json()
+        node_id = body.get("node_id", "")
+        if not node_id:
+            raise HTTPException(400, "node_id required")
+        dns_verifier.accept_node_environment(node_id, body)
+        return {"ok": True}
+
+    @app.get("/api/v1/dns/environment/{node_id}")
+    async def dns_environment_node(request: Request, node_id: str) -> dict[str, Any]:
+        """Return the DNS environment assessment most recently submitted by a node."""
+        _require_scope(request, SCOPE_READ)
+        if dns_verifier is None:
+            raise HTTPException(503, "DNS verifier not running")
+        env = dns_verifier.get_environment(node_id)
+        if env is None:
+            raise HTTPException(404, f"No DNS assessment for node {node_id!r}")
+        return env.to_dict()
+
+    @app.post("/api/v1/dns/rebinding/allowlist")
+    async def dns_rebinding_allowlist_add(request: Request) -> dict[str, Any]:
+        """
+        Add entries to the DNS rebinding guard allowlist.
+
+        Body: { "entries": ["hostname-or-ip", ...] }
+        """
+        _require_scope(request, SCOPE_ADMIN)
+        if dns_verifier is None:
+            raise HTTPException(503, "DNS verifier not running")
+        body = await request.json()
+        entries: list[str] = body.get("entries", [])
+        if not entries:
+            raise HTTPException(400, "entries list required")
+        dns_verifier.guard.add_allowlist(set(entries))
+        return {"ok": True, "added": entries}
+
+    @app.delete("/api/v1/dns/rebinding/allowlist")
+    async def dns_rebinding_allowlist_remove(request: Request) -> dict[str, Any]:
+        """Remove entries from the DNS rebinding guard allowlist."""
+        _require_scope(request, SCOPE_ADMIN)
+        if dns_verifier is None:
+            raise HTTPException(503, "DNS verifier not running")
+        body = await request.json()
+        entries: list[str] = body.get("entries", [])
+        if not entries:
+            raise HTTPException(400, "entries list required")
+        dns_verifier.guard.remove_allowlist(set(entries))
+        return {"ok": True, "removed": entries}
+
     # Static files — mounted last so they don't shadow API routes
     static_dir = Path(__file__).parent / "static"
     if static_dir.exists():
