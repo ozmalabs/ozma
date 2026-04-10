@@ -15,6 +15,8 @@ import logging
 import time
 from typing import AsyncGenerator, TYPE_CHECKING, Optional, Any
 
+import jwt  # For JWT validation
+
 import strawberry
 from strawberry.types import Info
 

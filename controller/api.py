@@ -10319,6 +10319,8 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
             return response
 
+        except json.JSONDecodeError as e:
+            raise HTTPException(400, f"Invalid JSON in request body: {str(e)}")
         except Exception as e:
             raise HTTPException(400, str(e))
 
