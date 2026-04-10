@@ -13,7 +13,14 @@ This module provides Strawberry GraphQL types and resolvers for:
 from .audio import AudioRoute, AudioVolume
 from .vban import VBANStream
 from .stream import StreamInfo, CameraInfo
-from .controls import ControlSurface, Binding
+from .controls import (
+    ControlSurface,
+    Binding,
+    ControlBinding,
+    Control,
+    DisplayBinding,
+    Display,
+)
 from .system import SystemHealth
 
 __all__ = [
@@ -24,5 +31,9 @@ __all__ = [
     "CameraInfo",
     "ControlSurface",
     "Binding",
+    "ControlBinding",
+    "Control",
+    "DisplayBinding",
+    "Display",
     "SystemHealth",
 ]

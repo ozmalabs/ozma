@@ -19,26 +19,80 @@ log = logging.getLogger("ozma.graphql.controls")
 class Binding:
     """
     Represents a binding between a control and an Ozma action.
-    
+
     Fields:
         action: Action name (e.g., "scenario.activate", "scenario.next")
         target: Target of the action (scenario ID, node name, etc.)
         value: Optional value for the action (e.g., +1/-1 for next scenario)
-        to_target: Optional transformation function (for UI display only)
-        from_target: Optional reverse transformation function (for UI display)
     """
     action: str
     target: str
     value: str | None
-    to_target: str | None
-    from_target: str | None
+
+
+@graphql_type
+class ControlBinding:
+    """
+    Represents a binding for a control on a control surface.
+
+    Fields:
+        action: Action name (e.g., "scenario.activate", "scenario.next")
+        target: Target of the action (scenario ID, node name, etc.)
+        value: Optional value for the action
+    """
+    action: str
+    target: str
+    value: str | None
+
+
+@graphql_type
+class Control:
+    """
+    Represents a named control on a control surface.
+
+    Fields:
+        name: Control name
+        value: Current control value
+        binding: Optional binding to an ozma action
+        lockout: Whether this control is locked out (during physical interaction)
+    """
+    name: str
+    value: str | None
+    binding: ControlBinding | None
+    lockout: bool
+
+
+@graphql_type
+class DisplayBinding:
+    """
+    Represents a binding for a display element on a control surface.
+
+    Fields:
+        binding: What to display (e.g., "@active.name", "@active.color")
+    """
+    binding: str
+
+
+@graphql_type
+class Display:
+    """
+    Represents a named display element on a control surface.
+
+    Fields:
+        name: Display name
+        value: Current display value
+        binding: Optional binding to ozma data
+    """
+    name: str
+    value: str
+    binding: str
 
 
 @graphql_type
 class ControlSurface:
     """
     Represents a control surface (MIDI, gamepad, Stream Deck, etc.).
-    
+
     Fields:
         id: Unique identifier for the surface
         name: Human-readable name
@@ -49,8 +103,8 @@ class ControlSurface:
     """
     id: str
     name: str
-    controls: list[dict]
-    displays: list[dict]
+    controls: list[Control]
+    displays: list[Display]
     active: bool
     surface_type: str
 
@@ -61,13 +115,13 @@ async def resolve_control_surface(
 ) -> ControlSurface | None:
     """
     Get a specific control surface by ID.
-    
+
     Args:
         surface_id: ID of the control surface
-        
+
     Returns:
         ControlSurface: Surface details, or None if not found
-        
+
     Raises:
         ValueError: If surface_id is empty
     """
@@ -75,45 +129,43 @@ async def resolve_control_surface(
         raise ValueError("surface_id cannot be empty")
 
     state: AppState = info.context["state"]
-    
+
     # Get controls manager from state
     controls_mgr = getattr(state, 'controls', None)
     if not controls_mgr:
         return None
-    
+
     surface = controls_mgr._surfaces.get(surface_id)
     if not surface:
         return None
-    
+
     # Build controls list
     controls_list = []
     for name, control in surface.controls.items():
         binding = None
         if control.binding:
-            binding = Binding(
+            binding = ControlBinding(
                 action=control.binding.action,
                 target=control.binding.target or "",
                 value=str(control.binding.value) if control.binding.value is not None else None,
-                to_target=None,  # Callable objects not serializable
-                from_target=None,  # Callable objects not serializable
             )
-        
-        controls_list.append({
-            "name": name,
-            "value": str(control.value) if control.value is not None else None,
-            "binding": binding,
-            "lockout": control.lockout,
-        })
-    
+
+        controls_list.append(Control(
+            name=name,
+            value=str(control.value) if control.value is not None else None,
+            binding=binding,
+            lockout=control.lockout,
+        ))
+
     # Build displays list
     displays_list = []
     for name, display in surface.displays.items():
-        displays_list.append({
-            "name": name,
-            "value": display.value,
-            "binding": display.binding,
-        })
-    
+        displays_list.append(Display(
+            name=name,
+            value=display.value,
+            binding=display.binding,
+        ))
+
     return ControlSurface(
         id=surface.id,
         name=surface.id,  # Use ID as name

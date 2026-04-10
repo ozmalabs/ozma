@@ -186,10 +186,29 @@ async def resolve_all_streams(info: Info) -> list[StreamInfo]:
 
 
 @graphql_type
+class CameraStream:
+    """
+    Represents a camera stream configuration.
+
+    Fields:
+        name: Stream name
+        rtsp_inbound: RTSP input URL (if applicable)
+        backchannel: Backchannel RTSP URL (if applicable)
+        hls: HLS output URL
+        rtmp: RTMP output URL (if applicable)
+    """
+    name: str
+    rtsp_inbound: str | None
+    backchannel: str | None
+    hls: str | None
+    rtmp: str | None
+
+
+@graphql_type
 class CameraInfo:
     """
     Represents a camera node and its streams.
-    
+
     Fields:
         node_id: ID of the camera node
         name: Camera name (from mDNS or registration)
@@ -202,7 +221,7 @@ class CameraInfo:
     """
     node_id: str
     name: str
-    streams: list[dict]
+    streams: list[CameraStream]
     frigate_host: str | None
     frigate_port: int | None
     active: bool
