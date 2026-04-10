@@ -1,1176 +1,581 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
 """
-GraphQL API for Ozma Controller.
+GraphQL API with Strawberry.
 
-Provides mutations for managing nodes, scenarios, audio routing, and system state.
-Uses Strawberry GraphQL for the schema definition and execution.
-
-Authentication: All mutations require the 'write' scope in the JWT token.
+Provides:
+  - JWT auth context injection from Authorization header
+  - GraphiQL playground at /graphiql (enabled when OZMA_AUTH=0 or valid JWT)
+  - Permission system for mutations with @strawberry.permission_class
 """
 
 import logging
 from typing import Any
 
 import strawberry
-from strawberry.extensions import Extension
-from strawberry.types import Info
+from fastapi import Request
+from fastapi.responses import HTMLResponse
+from fastapi.routing import APIRouter
+from strawberry.fastapi import GraphQLRouter
 
-strawberry_type = strawberry.type
-strawberry_field = strawberry.field
-Schema = strawberry.Schema
-
-from auth import AuthContext, has_scope, SCOPE_WRITE
-from state import AppState, NodeInfo
-from scenarios import ScenarioManager
-from audio import AudioRouter
-from wol import send_wol, get_mac_from_arp
+from auth import AuthConfig, AuthContext, SCOPE_READ, SCOPE_WRITE, ALL_SCOPES
 
 log = logging.getLogger("ozma.graphql")
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# GraphQL Error Codes
-# ──────────────────────────────────────────────────────────────────────────────
-
-class GraphQLError(Exception):
-    """Custom GraphQL error with additional metadata."""
-    def __init__(self, message: str, code: str | None = None, extensions: dict | None = None):
-        self.message = message
-        self.code = code
-        self.extensions = extensions or {}
-        super().__init__(self.message)
+# ─────────────────────────────────────────────────────────────────────────────
+# Schema definitions
+# ─────────────────────────────────────────────────────────────────────────────
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# GraphQL Types
-# ──────────────────────────────────────────────────────────────────────────────
+@strawberry.type
+class NodeInfo:
+    """Represents a node in the KVMA router."""
 
-@strawberry_type
-class Node:
-    """Represents a hardware or virtual node in the KVM network."""
-    id: str
-    name: str | None
-    host: str
-    port: int
-    role: str
-    hw: str
-    fw_version: str
-    proto_version: int
-    capabilities: list[str]
-    machine_class: str
-    last_seen: float
-    display_outputs: list[dict]
-    vnc_host: str | None
-    vnc_port: int | None
-    stream_port: int | None
-    stream_path: str | None
-    audio_type: str | None
-    audio_sink: str | None
-    audio_vban_port: int | None
-    mic_vban_port: int | None
-    capture_device: str | None
-    camera_streams: list[dict]
-    frigate_host: str | None
-    frigate_port: int | None
-    owner_user_id: str
-    owner: str | None
-    shared_with: list[str]
-    share_permissions: dict[str, str]
-    parent_id: str | None
-    sunshine_port: int | None
-
-
-@strawberry_type
-class Scenario:
-    """A named configuration that binds a compute node to a logical context."""
     id: str
     name: str
-    node_id: str | None
-    color: str
-    transition_in: "TransitionConfig"
-    motion: dict | None
-    bluetooth: dict | None
-    capture_source: str | None
-    capture_sources: list[str] | None
-    wallpaper: dict | None
-
-
-@strawberry_type
-class TransitionConfig:
-    style: str
-    duration_ms: int
-
-
-@strawberry_type
-class AudioNode:
-    """Represents an audio-capable node with volume and mute controls."""
-    node_id: str
-    volume: float
-    muted: bool
-    audio_type: str | None
-    audio_sink: str | None
-    vban_port: int | None
-
-
-@strawberry_type
-class AudioRoute:
-    """Represents an audio routing connection between source and target."""
-    source_id: str
-    target_id: str
     active: bool
+    hostname: str
+    ip: str
+    port: int
+    status: str
+    machine_class: str
 
 
-@strawberry_type
-class WakeOnLanResult:
-    """Result of a Wake-on-LAN magic packet send."""
-    success: bool
-    mac: str | None
-    broadcast: str
-    message: str
-
-
-@strawberry_type
-class DeleteResult:
-    """Result of a delete operation."""
-    success: bool
-    deleted_id: str
-    message: str
-
-
-@strawberry_type
-class SystemInfo:
-    """System-level information and status."""
-    version: str
-    active_node_id: str | None
-    active_scenario_id: str | None
-    node_count: int
-    scenario_count: int
-    audio_enabled: bool
-    auth_enabled: bool
-    uptime_seconds: int
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Input Types
-# ──────────────────────────────────────────────────────────────────────────────
-
-@strawberry_type
-class TransitionInput:
-    style: str | None = None
-    duration_ms: int | None = None
-
-
-@strawberry_type
-class MotionPresetInput:
-    device_id: str
-    axis: str
-    position: float
-
-
-@strawberry_type
-class BluetoothConfigInput:
-    connect: list[str] | None = None
-    disconnect: list[str] | None = None
-
-
-@strawberry_type
-class WallpaperInput:
-    mode: str | None = None
-    color: str | None = None
-    image: str | None = None
-    url: str | None = None
-
-
-@strawberry_type
-class ScenarioInput:
-    """Input for creating or updating a scenario."""
-    id: str
-    name: str
-    node_id: str | None = None
-    color: str | None = None
-    transition_in: TransitionInput | None = None
-    motion: list[MotionPresetInput] | None = None
-    bluetooth: list[BluetoothConfigInput] | None = None
-    capture_source: str | None = None
-    capture_sources: list[str] | None = None
-    wallpaper: WallpaperInput | None = None
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Enums
-# ──────────────────────────────────────────────────────────────────────────────
-
-@strawberry_type
-class MachineClass:
-    """Machine class types."""
-    WORKSTATION = "workstation"
-    SERVER = "server"
-    KIOSK = "kiosk"
-    CAMERA = "camera"
-
-
-@strawberry_type
-class AudioType:
-    """Audio routing types."""
-    PIPEWIRE = "pipewire"
-    VBAN = "vban"
-    NONE = "none"
-
-
-@strawberry_type
-class ScenarioTransitionStyle:
-    """Scenario transition styles."""
-    CUT = "cut"
-    WAVE_RIGHT = "wave_right"
-    WAVE_LEFT = "wave_left"
-    FADE = "fade"
-    RIPPLE = "ripple"
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Query Class
-# ──────────────────────────────────────────────────────────────────────────────
-
-@strawberry_type
+@strawberry.type
 class Query:
-    """GraphQL queries for reading node, scenario, audio, and system state."""
+    """GraphQL queries."""
 
-    @strawberry_type.field
-    def nodes(self, info: Info) -> list[Node]:
-        """
-        List all known nodes.
+    @strawberry.field
+    def nodes(self, info: strawberry.Info) -> list[NodeInfo]:
+        """List all nodes."""
+        app_state = info.context.app_state
+        return [
+            NodeInfo(
+                id=node.id,
+                name=node.name,
+                active=node.id == app_state.active_node_id,
+                hostname=node.hostname,
+                ip=node.ip or "",
+                port=node.port,
+                status=node.status.value if hasattr(node, "status") else "unknown",
+                machine_class=getattr(node, "machine_class", "workstation"),
+            )
+            for node in app_state.nodes.values()
+        ]
 
-        Returns:
-            list[Node]: All registered nodes
-        """
-        state = _get_state(info)
-        if not state:
-            return []
-        return [_node_to_graphql(node) for node in state.nodes.values()]
-
-    @strawberry_type.field
-    def node(self, info: Info, id: str) -> Node | None:
-        """
-        Get a single node by ID.
-
-        Args:
-            id: The node ID
-
-        Returns:
-            Node | None: The node if found, None otherwise
-        """
-        state = _get_state(info)
-        if not state:
+    @strawberry.field
+    def node(self, info: strawberry.Info, node_id: str) -> NodeInfo | None:
+        """Get a single node by ID."""
+        app_state = info.context.app_state
+        node = app_state.nodes.get(node_id)
+        if not node:
             return None
-        node = state.nodes.get(id)
-        if node:
-            return _node_to_graphql(node)
-        return None
+        return NodeInfo(
+            id=node.id,
+            name=node.name,
+            active=node.id == app_state.active_node_id,
+            hostname=node.hostname,
+            ip=node.ip or "",
+            port=node.port,
+            status=node.status.value if hasattr(node, "status") else "unknown",
+            machine_class=getattr(node, "machine_class", "workstation"),
+        )
 
-    @strawberry_type.field
-    def active_node(self, info: Info) -> Node | None:
-        """
-        Get the currently active node.
-
-        Returns:
-            Node | None: The active node if set, None otherwise
-        """
-        state = _get_state(info)
-        if not state:
+    @strawberry.field
+    def active_node(self, info: strawberry.Info) -> NodeInfo | None:
+        """Get the currently active node."""
+        app_state = info.context.app_state
+        if not app_state.active_node_id:
             return None
-        node_id = state.active_node_id
-        if node_id and node_id in state.nodes:
-            return _node_to_graphql(state.nodes[node_id])
-        return None
-
-    @strawberry_type.field
-    def scenarios(self, info: Info) -> list[Scenario]:
-        """
-        List all scenarios.
-
-        Returns:
-            list[Scenario]: All registered scenarios
-        """
-        scenario_mgr = _get_scenario_manager(info)
-        if not scenario_mgr:
-            return []
-        return [_scenario_to_graphql(s) for s in scenario_mgr.list()]
-
-    @strawberry_type.field
-    def scenario(self, info: Info, id: str) -> Scenario | None:
-        """
-        Get a single scenario by ID.
-
-        Args:
-            id: The scenario ID
-
-        Returns:
-            Scenario | None: The scenario if found, None otherwise
-        """
-        scenario_mgr = _get_scenario_manager(info)
-        if not scenario_mgr:
+        node = app_state.nodes.get(app_state.active_node_id)
+        if not node:
             return None
-        scenario = scenario_mgr.get(id)
-        if scenario:
-            return _scenario_to_graphql(scenario)
-        return None
-
-    @strawberry_type.field
-    def active_scenario(self, info: Info) -> Scenario | None:
-        """
-        Get the currently active scenario.
-
-        Returns:
-            Scenario | None: The active scenario if set, None otherwise
-        """
-        scenario_mgr = _get_scenario_manager(info)
-        if not scenario_mgr:
-            return None
-        active_id = scenario_mgr.active_id
-        if active_id:
-            scenario = scenario_mgr.get(active_id)
-            if scenario:
-                return _scenario_to_graphql(scenario)
-        return None
-
-    @strawberry_type.field
-    def audio_nodes(self, info: Info) -> list[AudioNode]:
-        """
-        List all audio-capable nodes.
-
-        Returns:
-            list[AudioNode]: All nodes with audio capability
-        """
-        state = _get_state(info)
-        if not state:
-            return []
-        return [_get_audio_node(state, node.id) for node in state.nodes.values()]
-
-    @strawberry_type.field
-    def system_info(self, info: Info) -> SystemInfo:
-        """
-        Get system-level information and status.
-
-        Returns:
-            SystemInfo: System status and configuration
-        """
-        state = _get_state(info)
-        scenario_mgr = _get_scenario_manager(info)
-
-        # Get version
-        version = "0.1.0"  # TODO: Get from build_info
-
-        # Check if auth is enabled
-        auth_enabled = False  # TODO: Get from auth config
-
-        # Calculate uptime
-        uptime_seconds = 0  # TODO: Track controller start time
-
-        return SystemInfo(
-            version=version,
-            active_node_id=state.active_node_id if state else None,
-            active_scenario_id=scenario_mgr.active_id if scenario_mgr else None,
-            node_count=len(state.nodes) if state else 0,
-            scenario_count=len(scenario_mgr._scenarios) if scenario_mgr else 0,
-            audio_enabled=True,  # TODO: Get from audio router config
-            auth_enabled=auth_enabled,
-            uptime_seconds=uptime_seconds,
+        return NodeInfo(
+            id=node.id,
+            name=node.name,
+            active=True,
+            hostname=node.hostname,
+            ip=node.ip or "",
+            port=node.port,
+            status=node.status.value if hasattr(node, "status") else "unknown",
+            machine_class=getattr(node, "machine_class", "workstation"),
         )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Mutation Class
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Permissions
+# ─────────────────────────────────────────────────────────────────────────────
 
-@strawberry_type
+
+class RequireWritePermission:
+    """
+    Permission class requiring 'write' scope for mutations.
+
+    Usage:
+        @strawberry.mutation(permission_classes=[RequireWritePermission])
+        def my_mutation(self, info: strawberry.Info) -> str:
+            ...
+    """
+
+    def __init__(self) -> None:
+        """Initialize the permission class."""
+        self.message = "Write scope required for this mutation"
+
+    def get_unauthenticated_message(self, info: strawberry.Info) -> str | None:
+        """
+        Get the message to display when user is not authenticated.
+
+        Args:
+            info: Strawberry info object containing request context.
+
+        Returns:
+            Error message string or None to use default.
+        """
+        log.warning("GraphQL mutation attempted without authentication")
+        return self.message
+
+    def has_permission(self, info: strawberry.Info, **kwargs: Any) -> bool:
+        """
+        Check if the user has the required 'write' scope.
+
+        Args:
+            info: Strawberry info object containing request context.
+            **kwargs: Additional keyword arguments (unused).
+
+        Returns:
+            True if user has write scope, False otherwise.
+        """
+        auth = getattr(info.context, "auth", None)
+        if not auth or not getattr(auth, "authenticated", False):
+            log.debug("GraphQL permission denied: not authenticated")
+            return False
+
+        scopes = getattr(auth, "scopes", [])
+        if SCOPE_WRITE not in scopes:
+            log.warning(
+                "GraphQL permission denied: user lacks write scope, has: %s",
+                scopes,
+            )
+            return False
+
+        log.debug("GraphQL permission granted: user has write scope")
+        return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mutations
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@strawberry.type
 class Mutation:
-    """GraphQL mutations for managing nodes, scenarios, audio, and system state."""
+    """GraphQL mutations - require write scope."""
 
-    # ── Node Mutations ────────────────────────────────────────────────────────
-
-    @strawberry_type.field
-    async def activate_node(self, info: Info, id: str) -> Node:
+    @strawberry.mutation(permission_classes=[RequireWritePermission])
+    def activate_node(
+        self, info: strawberry.Info, node_id: str
+    ) -> NodeInfo:
         """
-        Makes a node active, routing all HID packets to it.
+        Activate a node - requires write scope.
 
         Args:
-            id: The node ID to activate
+            info: Strawberry info object containing request context.
+            node_id: ID of the node to activate.
 
         Returns:
-            Node: The activated node
+            NodeInfo of the activated node.
 
         Raises:
-            GraphQLError: If node not found or activation fails
+            strawberry.ExceptionField: If node not found or activation fails.
         """
-        _require_write_scope(info)
+        app_state = info.context.app_state
+        node = app_state.nodes.get(node_id)
 
-        state = _get_state(info)
-        if not state:
-            raise GraphQLError(
-                "AppState not available",
-                code="INTERNAL_ERROR",
-                extensions={"detail": "AppState is not initialized"}
+        if not node:
+            log.warning(
+                "GraphQL activate_node: node not found: %s",
+                node_id,
+            )
+            raise strawberry.ExceptionField(
+                "Node not found", extensions={"code": "NOT_FOUND"}
             )
 
-        if id not in state.nodes:
-            raise GraphQLError(
-                f"Node not found: {id}",
-                code="NODE_NOT_FOUND",
-                extensions={"node_id": id}
-            )
-
-        try:
-            await state.set_active_node(id)
-            node = state.nodes[id]
-            log.info("Node activated: %s", id)
-            return _node_to_graphql(node)
-        except Exception as e:
-            log.error("Failed to activate node %s: %s", id, e)
-            raise GraphQLError(
-                f"Failed to activate node: {str(e)}",
-                code="GRAPHQL_ERROR",
-                extensions={"node_id": id, "error": str(e)}
-            )
-
-    @strawberry_type.field
-    async def rename_node(self, info: Info, id: str, name: str) -> Node:
-        """
-        Renames a node.
-
-        Args:
-            id: The node ID to rename
-            name: The new name for the node
-
-        Returns:
-            Node: The renamed node
-
-        Raises:
-            GraphQLError: If node not found or name is invalid
-        """
-        _require_write_scope(info)
-
-        # Validate input
-        if not name or len(name.strip()) == 0:
-            raise GraphQLError(
-                "Node name cannot be empty",
-                code="INVALID_NAME",
-                extensions={"field": "name"}
-            )
-
-        if len(name) > 255:
-            raise GraphQLError(
-                "Node name is too long (max 255 characters)",
-                code="INVALID_NAME",
-                extensions={"field": "name", "max_length": 255}
-            )
-
-        state = _get_state(info)
-        if not state:
-            raise GraphQLError(
-                "AppState not available",
-                code="INTERNAL_ERROR",
-                extensions={"detail": "AppState is not initialized"}
-            )
-
-        if id not in state.nodes:
-            raise GraphQLError(
-                f"Node not found: {id}",
-                code="NODE_NOT_FOUND",
-                extensions={"node_id": id}
-            )
-
-        try:
-            node = state.nodes[id]
-            node.name = name.strip()
-            log.info("Node renamed: %s → %s", id, name)
-            return _node_to_graphql(node)
-        except Exception as e:
-            log.error("Failed to rename node %s: %s", id, e)
-            raise GraphQLError(
-                f"Failed to rename node: {str(e)}",
-                code="GRAPHQL_ERROR",
-                extensions={"node_id": id, "error": str(e)}
-            )
-
-    @strawberry_type.field
-    async def wake_on_lan(self, info: Info, id: str) -> WakeOnLanResult:
-        """
-        Sends a Wake-on-LAN magic packet to a node.
-
-        Args:
-            id: The node ID to wake up
-
-        Returns:
-            WakeOnLanResult: The result of the WoL operation
-
-        Raises:
-            GraphQLError: If node not found or WoL not supported
-        """
-        _require_write_scope(info)
-
-        state = _get_state(info)
-        if not state:
-            raise GraphQLError(
-                "AppState not available",
-                code="INTERNAL_ERROR",
-                extensions={"detail": "AppState is not initialized"}
-            )
-
-        if id not in state.nodes:
-            raise GraphQLError(
-                f"Node not found: {id}",
-                code="NODE_NOT_FOUND",
-                extensions={"node_id": id}
-            )
-
-        node = state.nodes[id]
-
-        # Try to get MAC from node metadata first
-        mac = None
-        broadcast = "255.255.255.255"
-
-        # Check if node has MAC address in capabilities or metadata
-        if "mac" in node.capabilities:
-            # This is a placeholder - in practice, MAC would be in node metadata
-            pass
-
-        # Try to get MAC from ARP table using node host
-        if node.host:
-            mac = get_mac_from_arp(node.host)
-            if mac:
-                broadcast = _get_broadcast_address(node.host)
-
-        if not mac:
-            # WoL not supported - node doesn't have a known MAC address
-            log.warning("Wake-on-LAN not supported for node %s (no MAC available)", id)
-            return WakeOnLanResult(
-                success=False,
-                mac=None,
-                broadcast=broadcast,
-                message="Wake-on-LAN not supported: MAC address not available"
-            )
-
-        try:
-            success = send_wol(mac, broadcast)
-            if success:
-                log.info("Wake-on-LAN sent to %s (%s)", id, mac)
-                return WakeOnLanResult(
-                    success=True,
-                    mac=mac,
-                    broadcast=broadcast,
-                    message=f"Wake-on-LAN magic packet sent to {mac}"
+        # Set active node via the app state
+        async def _activate() -> NodeInfo:
+            await app_state.activate_node(node_id)
+            node = app_state.nodes.get(node_id)
+            if not node:
+                raise strawberry.ExceptionField(
+                    "Node not found after activation", extensions={"code": "INTERNAL_ERROR"}
                 )
-            else:
-                log.warning("Wake-on-LAN failed for %s (%s)", id, mac)
-                return WakeOnLanResult(
-                    success=False,
-                    mac=mac,
-                    broadcast=broadcast,
-                    message=f"Wake-on-LAN failed for {mac}"
-                )
-        except Exception as e:
-            log.error("Wake-on-LAN error for %s: %s", id, e)
-            return WakeOnLanResult(
-                success=False,
-                mac=mac,
-                broadcast=broadcast,
-                message=f"Wake-on-LAN error: {str(e)}"
+            return NodeInfo(
+                id=node.id,
+                name=node.name,
+                active=True,
+                hostname=node.hostname,
+                ip=node.ip or "",
+                port=node.port,
+                status=node.status.value if hasattr(node, "status") else "unknown",
+                machine_class=getattr(node, "machine_class", "workstation"),
             )
 
-    # ── Scenario Mutations ────────────────────────────────────────────────────
+        # Run in executor to avoid blocking
+        import asyncio
 
-    @strawberry_type.field
-    async def create_scenario(self, info: Info, input: ScenarioInput) -> Scenario:
+        loop = asyncio.get_event_loop()
+        try:
+            result = asyncio.run_coroutine_threadsafe(_activate(), loop).result()
+            log.info(
+                "GraphQL activate_node: activated node %s (%s)",
+                node_id,
+                node.name,
+            )
+            return result
+        except Exception as e:
+            log.error(
+                "GraphQL activate_node: failed to activate node %s: %s",
+                node_id,
+                e,
+            )
+            raise strawberry.ExceptionField(
+                f"Failed to activate node: {e}",
+                extensions={"code": "ACTIVATION_ERROR"},
+            )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Context builder for Strawberry FastAPI
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class GraphQLContext:
+    """
+    Context builder for Strawberry FastAPI integration.
+
+    Injects auth context (from FastAPI middleware or Authorization header)
+    and app state into Strawberry context.
+    """
+
+    def __init__(
+        self, app_state: Any, auth_config: AuthConfig | None
+    ) -> None:
         """
-        Creates a new scenario.
+        Initialize the GraphQL context builder.
 
         Args:
-            input: Scenario configuration
-
-        Returns:
-            Scenario: The created scenario
-
-        Raises:
-            GraphQLError: If scenario already exists or input is invalid
+            app_state: The application state object.
+            auth_config: The authentication configuration, or None if auth is disabled.
         """
-        _require_write_scope(info)
+        self.app_state = app_state
+        self.auth_config = auth_config
 
-        # Validate input
-        if not input.name or len(input.name.strip()) == 0:
-            raise GraphQLError(
-                "Scenario name cannot be empty",
-                code="INVALID_INPUT",
-                extensions={"field": "name"}
-            )
-
-        if len(input.name) > 255:
-            raise GraphQLError(
-                "Scenario name is too long (max 255 characters)",
-                code="INVALID_INPUT",
-                extensions={"field": "name", "max_length": 255}
-            )
-
-        state = _get_state(info)
-        scenario_mgr = _get_scenario_manager(info)
-
-        if not scenario_mgr:
-            raise GraphQLError(
-                "ScenarioManager not available",
-                code="INTERNAL_ERROR",
-                extensions={"detail": "ScenarioManager is not initialized"}
-            )
-
-        try:
-            # Create the scenario
-            scenario = await scenario_mgr.create(
-                scenario_id=input.id,
-                name=input.name.strip(),
-                node_id=input.node_id
-            )
-
-            log.info("Scenario created: %s", input.id)
-            return _scenario_to_graphql(scenario)
-        except ValueError as e:
-            if "already exists" in str(e):
-                raise GraphQLError(
-                    str(e),
-                    code="SCENARIO_EXISTS",
-                    extensions={"scenario_id": input.id}
-                )
-            raise GraphQLError(
-                f"Failed to create scenario: {str(e)}",
-                code="INVALID_INPUT",
-                extensions={"scenario_id": input.id, "error": str(e)}
-            )
-        except Exception as e:
-            log.error("Failed to create scenario %s: %s", input.id, e)
-            raise GraphQLError(
-                f"Failed to create scenario: {str(e)}",
-                code="GRAPHQL_ERROR",
-                extensions={"scenario_id": input.id, "error": str(e)}
-            )
-
-    @strawberry_type.field
-    async def update_scenario(self, info: Info, id: str, input: ScenarioInput) -> Scenario:
+    async def get_context(self, request: Request) -> dict[str, Any]:
         """
-        Updates an existing scenario.
+        Build context from FastAPI request.
+
+        Injects auth context (from FastAPI middleware or Authorization header)
+        and app state into Strawberry context.
 
         Args:
-            id: The scenario ID to update
-            input: New scenario configuration
+            request: The FastAPI request object.
 
         Returns:
-            Scenario: The updated scenario
-
-        Raises:
-            GraphQLError: If scenario not found or input is invalid
+            Dictionary containing request, app_state, and auth context.
         """
-        _require_write_scope(info)
+        # Get auth context from request state (set by FastAPI middleware)
+        auth_ctx = getattr(request.state, "auth", None)
 
-        # Validate input
-        if not input.name or len(input.name.strip()) == 0:
-            raise GraphQLError(
-                "Scenario name cannot be empty",
-                code="INVALID_INPUT",
-                extensions={"field": "name"}
-            )
+        context: dict[str, Any] = {
+            "request": request,
+            "app_state": self.app_state,
+            "auth": auth_ctx,
+        }
 
-        if len(input.name) > 255:
-            raise GraphQLError(
-                "Scenario name is too long (max 255 characters)",
-                code="INVALID_INPUT",
-                extensions={"field": "name", "max_length": 255}
-            )
+        # If no auth from middleware, try Authorization header
+        if not auth_ctx or not getattr(auth_ctx, "authenticated", False):
+            auth_header = request.headers.get("authorization", "")
+            if auth_header.startswith("Bearer ") and self.auth_config:
+                token = auth_header[7:]
+                # Get public key from auth config
+                public_key = self._get_public_key()
+                if public_key:
+                    claims = self._verify_jwt(token, public_key)
+                    if claims:
+                        sub = claims.get("sub", "")
+                        user_id = sub if sub != "admin" else ""
+                        auth_ctx = AuthContext(
+                            authenticated=True,
+                            scopes=claims.get("scopes", []),
+                            source_ip=(
+                                request.client.host
+                                if request.client
+                                else "127.0.0.1"
+                            ),
+                            auth_method="jwt",
+                            user_id=user_id,
+                        )
+                        context["auth"] = auth_ctx
+                        log.info(
+                            "GraphQL auth: JWT verified for user %s, scopes: %s",
+                            user_id or "admin",
+                            claims.get("scopes", []),
+                        )
+                    else:
+                        log.warning(
+                            "GraphQL auth: JWT verification failed from %s",
+                            request.client.host
+                            if request.client
+                            else "unknown",
+                        )
+                else:
+                    log.warning(
+                        "GraphQL auth: No public key available for JWT verification"
+                    )
 
-        scenario_mgr = _get_scenario_manager(info)
+        return context
 
-        if not scenario_mgr:
-            raise GraphQLError(
-                "ScenarioManager not available",
-                code="INTERNAL_ERROR",
-                extensions={"detail": "ScenarioManager is not initialized"}
-            )
-
-        try:
-            scenario = scenario_mgr.get(id)
-            if not scenario:
-                raise GraphQLError(
-                    f"Scenario not found: {id}",
-                    code="SCENARIO_NOT_FOUND",
-                    extensions={"scenario_id": id}
-                )
-
-            # Update fields
-            scenario.name = input.name.strip()
-            if input.node_id is not None:
-                scenario.node_id = input.node_id
-
-            if input.color:
-                scenario.color = input.color
-
-            if input.transition_in:
-                scenario.transition_in.style = input.transition_in.style or "cut"
-                scenario.transition_in.duration_ms = input.transition_in.duration_ms or 400
-
-            if input.capture_source:
-                scenario.capture_source = input.capture_source
-
-            if input.capture_sources:
-                scenario.capture_sources = input.capture_sources
-
-            if input.wallpaper:
-                scenario.wallpaper = {
-                    "mode": input.wallpaper.mode,
-                    "color": input.wallpaper.color,
-                    "image": input.wallpaper.image,
-                    "url": input.wallpaper.url,
-                }
-
-            # Persist changes
-            scenario_mgr._save()
-            log.info("Scenario updated: %s", id)
-
-            return _scenario_to_graphql(scenario)
-        except GraphQLError:
-            raise
-        except Exception as e:
-            log.error("Failed to update scenario %s: %s", id, e)
-            raise GraphQLError(
-                f"Failed to update scenario: {str(e)}",
-                code="GRAPHQL_ERROR",
-                extensions={"scenario_id": id, "error": str(e)}
-            )
-
-    @strawberry_type.field
-    async def delete_scenario(self, info: Info, id: str) -> DeleteResult:
+    def _get_public_key(self) -> bytes | None:
         """
-        Deletes a scenario.
+        Get the public key for JWT verification.
+
+        Returns:
+            The public key bytes, or None if not available.
+        """
+        if not self.auth_config or not self.auth_config.enabled:
+            return None
+
+        # Try to get key from mesh_ca
+        if hasattr(self.auth_config, "mesh_ca") and self.auth_config.mesh_ca:
+            keypair = getattr(self.auth_config.mesh_ca, "controller_keypair", None)
+            if keypair:
+                return keypair.public_key
+
+        # Try to get key from verify_key
+        if hasattr(self.auth_config, "verify_key") and self.auth_config.verify_key:
+            return self.auth_config.verify_key
+
+        log.warning("GraphQL auth: No public key configured")
+        return None
+
+    def _verify_jwt(self, token: str, public_key: bytes) -> dict[str, Any] | None:
+        """
+        Verify a JWT token and return its claims.
 
         Args:
-            id: The scenario ID to delete
+            token: The JWT token to verify.
+            public_key: The public key for verification.
 
         Returns:
-            DeleteResult: The result of the delete operation
-
-        Raises:
-            GraphQLError: If scenario not found or it's the active scenario
+            The claims dictionary if valid, None otherwise.
         """
-        _require_write_scope(info)
-
-        scenario_mgr = _get_scenario_manager(info)
-
-        if not scenario_mgr:
-            raise GraphQLError(
-                "ScenarioManager not available",
-                code="INTERNAL_ERROR",
-                extensions={"detail": "ScenarioManager is not initialized"}
-            )
+        from auth import verify_jwt
 
         try:
-            scenario_mgr.delete(id)
-            log.info("Scenario deleted: %s", id)
-            return DeleteResult(
-                success=True,
-                deleted_id=id,
-                message=f"Scenario '{id}' deleted successfully"
-            )
-        except KeyError:
-            raise GraphQLError(
-                f"Scenario not found: {id}",
-                code="SCENARIO_NOT_FOUND",
-                extensions={"scenario_id": id}
-            )
-        except ValueError as e:
-            if "active scenario" in str(e).lower():
-                raise GraphQLError(
-                    str(e),
-                    code="ACTIVE_SCENARIO",
-                    extensions={"scenario_id": id}
-                )
-            raise GraphQLError(
-                f"Failed to delete scenario: {str(e)}",
-                code="GRAPHQL_ERROR",
-                extensions={"scenario_id": id, "error": str(e)}
-            )
+            claims = verify_jwt(token, public_key)
+            if claims:
+                log.debug("GraphQL JWT verification successful")
+                return claims
+            log.warning("GraphQL JWT verification failed: invalid token")
+            return None
         except Exception as e:
-            log.error("Failed to delete scenario %s: %s", id, e)
-            raise GraphQLError(
-                f"Failed to delete scenario: {str(e)}",
-                code="GRAPHQL_ERROR",
-                extensions={"scenario_id": id, "error": str(e)}
-            )
-
-    @strawberry_type.field
-    async def activate_scenario(self, info: Info, id: str) -> Scenario:
-        """
-        Activates a scenario, switching to its bound node.
-
-        Args:
-            id: The scenario ID to activate
-
-        Returns:
-            Scenario: The activated scenario
-
-        Raises:
-            GraphQLError: If scenario not found or activation fails
-        """
-        _require_write_scope(info)
-
-        scenario_mgr = _get_scenario_manager(info)
-
-        if not scenario_mgr:
-            raise GraphQLError(
-                "ScenarioManager not available",
-                code="INTERNAL_ERROR",
-                extensions={"detail": "ScenarioManager is not initialized"}
-            )
-
-        try:
-            scenario = await scenario_mgr.activate(id)
-            log.info("Scenario activated: %s", id)
-            return _scenario_to_graphql(scenario)
-        except KeyError:
-            raise GraphQLError(
-                f"Scenario not found: {id}",
-                code="SCENARIO_NOT_FOUND",
-                extensions={"scenario_id": id}
-            )
-        except Exception as e:
-            log.error("Failed to activate scenario %s: %s", id, e)
-            raise GraphQLError(
-                f"Failed to activate scenario: {str(e)}",
-                code="GRAPHQL_ERROR",
-                extensions={"scenario_id": id, "error": str(e)}
-            )
-
-    # ── Audio Mutations ───────────────────────────────────────────────────────
-
-    @strawberry_type.field
-    async def set_audio_volume(self, info: Info, node_id: str, volume: float) -> AudioNode:
-        """
-        Sets the audio volume for a node.
-
-        Args:
-            node_id: The node ID
-            volume: Volume level (0.0 to 1.0)
-
-        Returns:
-            AudioNode: The updated audio node
-
-        Raises:
-            GraphQLError: If node not found or volume is invalid
-        """
-        _require_write_scope(info)
-
-        # Validate volume range
-        if volume < 0.0 or volume > 1.0:
-            raise GraphQLError(
-                "Volume must be between 0.0 and 1.0",
-                code="INVALID_VOLUME",
-                extensions={
-                    "field": "volume",
-                    "min": 0.0,
-                    "max": 1.0,
-                    "value": volume
-                }
-            )
-
-        state = _get_state(info)
-
-        if not state:
-            raise GraphQLError(
-                "AppState not available",
-                code="INTERNAL_ERROR",
-                extensions={"detail": "AppState is not initialized"}
-            )
-
-        if node_id not in state.nodes:
-            raise GraphQLError(
-                f"Node not found: {node_id}",
-                code="NODE_NOT_FOUND",
-                extensions={"node_id": node_id}
-            )
-
-        audio = _get_audio_router(info)
-
-        try:
-            if audio:
-                # Convert node_id to node name for audio router
-                node = state.nodes[node_id]
-                # Node name is typically the first part of the mDNS instance name
-                node_name = node_id.split(".")[0]
-                await audio.set_volume(node_name, volume)
-
-            log.info("Audio volume set for %s: %s", node_id, volume)
-            return _get_audio_node(state, node_id)
-        except Exception as e:
-            log.error("Failed to set audio volume for %s: %s", node_id, e)
-            raise GraphQLError(
-                f"Failed to set audio volume: {str(e)}",
-                code="GRAPHQL_ERROR",
-                extensions={"node_id": node_id, "error": str(e)}
-            )
-
-    @strawberry_type.field
-    async def mute_node(self, info: Info, node_id: str, muted: bool) -> AudioNode:
-        """
-        Mutes or unmutes a node's audio.
-
-        Args:
-            node_id: The node ID
-            muted: True to mute, False to unmute
-
-        Returns:
-            AudioNode: The updated audio node
-
-        Raises:
-            GraphQLError: If node not found
-        """
-        _require_write_scope(info)
-
-        state = _get_state(info)
-
-        if not state:
-            raise GraphQLError(
-                "AppState not available",
-                code="INTERNAL_ERROR",
-                extensions={"detail": "AppState is not initialized"}
-            )
-
-        if node_id not in state.nodes:
-            raise GraphQLError(
-                f"Node not found: {node_id}",
-                code="NODE_NOT_FOUND",
-                extensions={"node_id": node_id}
-            )
-
-        audio = _get_audio_router(info)
-
-        try:
-            if audio:
-                node = state.nodes[node_id]
-                node_name = node_id.split(".")[0]
-                await audio.set_mute(node_name, muted)
-
-            log.info("Audio mute set for %s: %s", node_id, muted)
-            return _get_audio_node(state, node_id)
-        except Exception as e:
-            log.error("Failed to set audio mute for %s: %s", node_id, e)
-            raise GraphQLError(
-                f"Failed to set audio mute: {str(e)}",
-                code="GRAPHQL_ERROR",
-                extensions={"node_id": node_id, "error": str(e)}
-            )
-
-    @strawberry_type.field
-    async def set_audio_route(self, info: Info, source: str, target: str, active: bool) -> AudioRoute:
-        """
-        Configures an audio routing connection.
-
-        Args:
-            source: Source node ID
-            target: Target node/output ID
-            active: True to enable routing, False to disable
-
-        Returns:
-            AudioRoute: The updated route configuration
-
-        Raises:
-            GraphQLError: If source or target node not found
-        """
-        _require_write_scope(info)
-
-        state = _get_state(info)
-
-        if not state:
-            raise GraphQLError(
-                "AppState not available",
-                code="INTERNAL_ERROR",
-                extensions={"detail": "AppState is not initialized"}
-            )
-
-        # Validate nodes exist
-        if source not in state.nodes:
-            raise GraphQLError(
-                f"Source node not found: {source}",
-                code="NODE_NOT_FOUND",
-                extensions={"node_id": source}
-            )
-
-        if target not in state.nodes:
-            raise GraphQLError(
-                f"Target node not found: {target}",
-                code="NODE_NOT_FOUND",
-                extensions={"node_id": target}
-            )
-
-        audio = _get_audio_router(info)
-
-        try:
-            if audio:
-                # Route configuration would go here
-                # This is a placeholder - actual routing depends on audio backend
-                log.info("Audio route %s: %s → %s", "enabled" if active else "disabled", source, target)
-
-            log.info("Audio route set for %s → %s: %s", source, target, active)
-            return AudioRoute(
-                source_id=source,
-                target_id=target,
-                active=active
-            )
-        except Exception as e:
-            log.error("Failed to set audio route %s → %s: %s", source, target, e)
-            raise GraphQLError(
-                f"Failed to set audio route: {str(e)}",
-                code="GRAPHQL_ERROR",
-                extensions={
-                    "source_id": source,
-                    "target_id": target,
-                    "error": str(e)
-                }
-            )
+            log.error("GraphQL JWT verification error: %s", e)
+            return None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Helper Functions
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _require_write_scope(info: Info) -> None:
-    """Require write scope for mutation operations."""
-    auth = getattr(info.context, "auth", None)
-    if not auth or not hasattr(auth, "authenticated") or not auth.authenticated:
-        raise GraphQLError(
-            "Authentication required",
-            code="UNAUTHENTICATED",
-            extensions={"scope": "write"}
-        )
-
-    if not has_scope(auth, SCOPE_WRITE):
-        raise GraphQLError(
-            f"Scope '{SCOPE_WRITE}' required",
-            code="UNAUTHORIZED",
-            extensions={"required_scope": SCOPE_WRITE}
-        )
+# ─────────────────────────────────────────────────────────────────────────────
+# GraphQL schema and router
+# ─────────────────────────────────────────────────────────────────────────────
 
 
-def _get_state(info: Info) -> AppState | None:
-    """Get AppState from context."""
-    context = getattr(info.context, "state", None)
-    return context
+def create_schema() -> strawberry.Schema:
+    """
+    Create the Strawberry schema.
+
+    Returns:
+        The configured strawberry.Schema instance.
+    """
+    return strawberry.Schema(query=Query, mutation=Mutation)
 
 
-def _get_scenario_manager(info: Info) -> ScenarioManager | None:
-    """Get ScenarioManager from context."""
-    context = getattr(info.context, "scenario_manager", None)
-    return context
+def create_router(
+    app_state: Any,
+    auth_config: AuthConfig | None,
+) -> APIRouter:
+    """
+    Create a GraphQL router with auth context injection.
 
+    The router provides:
+      - POST /graphql - GraphQL endpoint
+      - GET /graphiql - GraphiQL playground (when auth disabled or valid JWT)
 
-def _get_audio_router(info: Info) -> AudioRouter | None:
-    """Get AudioRouter from context."""
-    context = getattr(info.context, "audio_router", None)
-    return context
+    Args:
+        app_state: The application state object.
+        auth_config: The authentication configuration, or None if auth is disabled.
 
+    Returns:
+        The configured APIRouter instance.
+    """
+    # Create the GraphQL schema
+    schema = create_schema()
 
-def _node_to_graphql(node: NodeInfo) -> Node:
-    """Convert NodeInfo to GraphQL Node type."""
-    return Node(
-        id=node.id,
-        name=node.name,
-        host=node.host,
-        port=node.port,
-        role=node.role,
-        hw=node.hw,
-        fw_version=node.fw_version,
-        proto_version=node.proto_version,
-        capabilities=node.capabilities,
-        machine_class=node.machine_class,
-        last_seen=node.last_seen,
-        display_outputs=node.display_outputs,
-        vnc_host=node.vnc_host,
-        vnc_port=node.vnc_port,
-        stream_port=node.stream_port,
-        stream_path=node.stream_path,
-        audio_type=node.audio_type,
-        audio_sink=node.audio_sink,
-        audio_vban_port=node.audio_vban_port,
-        mic_vban_port=node.mic_vban_port,
-        capture_device=node.capture_device,
-        camera_streams=node.camera_streams,
-        frigate_host=node.frigate_host,
-        frigate_port=node.frigate_port,
-        owner_user_id=node.owner_user_id,
-        owner=None,  # Would need user manager lookup
-        shared_with=node.shared_with,
-        share_permissions=node.share_permissions,
-        parent_id=node.parent_node_id,
-        sunshine_port=node.sunshine_port,
+    # Create context builder
+    graphql_context = GraphQLContext(app_state, auth_config)
+
+    # Create the main GraphQL router (handles POST /graphql)
+    graphql_router = GraphQLRouter(
+        schema=schema,
+        context=graphql_context,
+        graphiql=False,  # Disable default, we'll add custom GraphiQL route
     )
 
+    return graphql_router
 
-def _scenario_to_graphql(scenario: Any) -> Scenario:
-    """Convert Scenario to GraphQL Scenario type."""
-    return Scenario(
-        id=scenario.id,
-        name=scenario.name,
-        node_id=scenario.node_id,
-        color=scenario.color,
-        transition_in=TransitionConfig(
-            style=scenario.transition_in.style,
-            duration_ms=scenario.transition_in.duration_ms
-        ),
-        motion=scenario.motion,
-        bluetooth=scenario.bluetooth,
-        capture_source=scenario.capture_source,
-        capture_sources=scenario.capture_sources,
-        wallpaper=scenario.wallpaper,
+
+def add_graphiql_route(
+    router: APIRouter,
+    app_state: Any,
+    auth_config: AuthConfig | None,
+) -> None:
+    """
+    Add GraphiQL playground route to an existing router.
+
+    The GraphiQL playground is accessible at GET /graphiql
+    and is enabled when:
+      - Auth is disabled (OZMA_AUTH=0)
+      - Auth is enabled but request has valid JWT with read or write scope
+
+    Args:
+        router: The APIRouter to add the route to.
+        app_state: The application state object.
+        auth_config: The authentication configuration.
+    """
+    from fastapi.responses import HTMLResponse
+
+    @router.get("/graphiql")
+    async def graphiql_endpoint(
+        request: Request,
+    ) -> HTMLResponse:
+        """
+        Serve GraphiQL playground at /graphiql.
+
+        Args:
+            request: The FastAPI request object.
+
+        Returns:
+            HTMLResponse with GraphiQL page, or 401 if auth required.
+        """
+        auth_ctx = getattr(request.state, "auth", None)
+
+        if not should_enable_graphiql(auth_config, auth_ctx):
+            log.warning(
+                "GraphiQL access denied: auth required from %s",
+                request.client.host if request.client else "unknown",
+            )
+            return HTMLResponse(
+                status_code=401,
+                content="Authentication required",
+            )
+
+        log.debug("GraphiQL access granted to %s", request.client.host if request.client else "unknown")
+        return get_graphiql_page("/graphql")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GraphiQL page generator
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def get_graphiql_page(graphql_url: str) -> HTMLResponse:
+    """
+    Generate GraphiQL HTML page.
+
+    Args:
+        graphql_url: The URL path to the GraphQL endpoint.
+
+    Returns:
+        HTMLResponse containing the GraphiQL page.
+    """
+    graphiql_html = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Ozma GraphQL Explorer</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/graphiql@2.2.3/graphiql.min.css" />
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+        }
+        #graphiql {
+            height: 100vh;
+        }
+    </style>
+</head>
+<body>
+    <div id="graphiql">Loading...</div>
+    <script src="https://cdn.jsdelivr.net/npm/graphiql@2.2.3/graphiql.min.js"></script>
+    <script>
+        const fetcher = async (graphQLParams) => {
+            const token = localStorage.getItem('graphql_token') || '';
+            const headers = { 'Content-Type': 'application/json' };
+            if (token) {
+                headers['Authorization'] = `Bearer ${token}`;
+            }
+            return fetch(
+                '${graphql_url}',
+                {
+                    method: 'POST',
+                    headers: headers,
+                    body: JSON.stringify(graphQLParams),
+                }
+            ).then(response => response.json());
+        }
+
+        const graphiql = GraphiQL.create({
+            fetcher,
+            defaultEditorToolsVisibility: true,
+            defaultVariableEditorOpen: false,
+        });
+
+        ReactDOM.render(graphiql, document.getElementById('graphiql'));
+    </script>
+</body>
+</html>"""
+    return HTMLResponse(content=graphiql_html)
+
+
+def should_enable_graphiql(
+    auth_config: AuthConfig | None, auth_ctx: AuthContext | None
+) -> bool:
+    """
+    Determine if GraphiQL should be enabled.
+
+    GraphiQL is enabled when:
+      - Auth is disabled (OZMA_AUTH=0)
+      - Auth is enabled but request has valid JWT with read or write scope
+
+    Args:
+        auth_config: The authentication configuration.
+        auth_ctx: The authentication context from the request.
+
+    Returns:
+        True if GraphiQL should be enabled, False otherwise.
+    """
+    # Auth disabled - always enable
+    if not auth_config or not auth_config.enabled:
+        return True
+
+    # Auth enabled - require authentication
+    if not auth_ctx or not getattr(auth_ctx, "authenticated", False):
+        return False
+
+    # Check if user has read or write scope
+    scopes = getattr(auth_ctx, "scopes", [])
+    if SCOPE_READ in scopes or SCOPE_WRITE in scopes:
+        return True
+
+    log.debug(
+        "GraphiQL denied: user has scopes %s but needs read or write", scopes
     )
-
-
-def _get_audio_node(state: AppState, node_id: str) -> AudioNode:
-    """Get AudioNode for a given node ID."""
-    node = state.nodes[node_id]
-
-    # Get volume and mute state from audio router if available
-    volume = 0.5  # Default
-    muted = False  # Default
-
-    audio = getattr(state, "audio", None)
-    if audio and hasattr(audio, "watcher"):
-        # These would need to be implemented in AudioRouter
-        pass
-
-    return AudioNode(
-        node_id=node_id,
-        volume=volume,
-        muted=muted,
-        audio_type=node.audio_type,
-        audio_sink=node.audio_sink,
-        vban_port=node.audio_vban_port,
-    )
-
-
-def _get_broadcast_address(ip: str) -> str:
-    """Calculate broadcast address from IP."""
-    # Simple approach: use 255.255.255.255 for any IP
-    # In production, this would calculate based on subnet
-    return "255.255.255.255"
-
-
-def create_schema() -> Schema:
-    """Create the GraphQL schema with Query and Mutation."""
-    return Schema(query=Query, mutation=Mutation, extensions=[_AuthExtension])
-
-
-class _AuthExtension(Extension):
-    """Custom extension to handle authentication context."""
-
-    def __init__(self):
-        self._info = None
-
-    def request_started(self, info: Info) -> None:
-        """Store context for authentication checking."""
-        self._info = info
-
-    def resolve(self, next_resolve: Any, info: Info) -> Any:
-        """Resolve with auth context available."""
-        return next_resolve(info)
+    return False

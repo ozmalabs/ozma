@@ -18,6 +18,16 @@ import pytest
 
 OZMA_URL = os.environ.get("OZMA_URL", "http://localhost:7380")
 OZMA_PASSWORD = os.environ.get("OZMA_PASSWORD", "testpassword123")
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Add custom pytest options."""
+    parser.addoption(
+        "--ozma-password",
+        action="store",
+        default=OZMA_PASSWORD,
+        help="Password for admin user authentication",
+    )
 JELLYFIN_URL = os.environ.get("JELLYFIN_URL", "http://localhost:8096")
 IMMICH_URL = os.environ.get("IMMICH_URL", "http://localhost:2283")
 ABS_URL = os.environ.get("ABS_URL", "http://localhost:13378")

@@ -4,11 +4,10 @@ GraphQL API with Strawberry.
 
 Provides:
   - JWT auth context injection from Authorization header
-  - GraphiQL playground at /graphql (enabled when OZMA_AUTH=0 or valid JWT)
+  - GraphiQL playground at /graphiql (enabled when OZMA_AUTH=0 or valid JWT)
   - Permission system for mutations with @strawberry.permission_class
 """
 
-import asyncio
 import logging
 from typing import Any
 
@@ -17,9 +16,8 @@ from fastapi import Request
 from fastapi.responses import HTMLResponse
 from fastapi.routing import APIRouter
 from strawberry.fastapi import GraphQLRouter
-from strawberry.schema.schema_base import SchemaOptions
 
-from auth import AuthConfig, AuthContext, verify_jwt, SCOPE_WRITE, ALL_SCOPES
+from auth import AuthConfig, AuthContext, SCOPE_READ, SCOPE_WRITE, ALL_SCOPES
 
 log = logging.getLogger("ozma.graphql")
 
@@ -31,6 +29,7 @@ log = logging.getLogger("ozma.graphql")
 @strawberry.type
 class NodeInfo:
     """Represents a node in the KVMA router."""
+
     id: str
     name: str
     active: bool
@@ -108,23 +107,58 @@ class Query:
 
 
 class RequireWritePermission:
-    """Permission class requiring 'write' scope for mutations."""
+    """
+    Permission class requiring 'write' scope for mutations.
 
-    def __init__(self):
+    Usage:
+        @strawberry.mutation(permission_classes=[RequireWritePermission])
+        def my_mutation(self, info: strawberry.Info) -> str:
+            ...
+    """
+
+    def __init__(self) -> None:
+        """Initialize the permission class."""
         self.message = "Write scope required for this mutation"
 
     def get_unauthenticated_message(self, info: strawberry.Info) -> str | None:
-        """Message when user is not authenticated."""
+        """
+        Get the message to display when user is not authenticated.
+
+        Args:
+            info: Strawberry info object containing request context.
+
+        Returns:
+            Error message string or None to use default.
+        """
+        log.warning("GraphQL mutation attempted without authentication")
         return self.message
 
     def has_permission(self, info: strawberry.Info, **kwargs: Any) -> bool:
-        """Check if user has write scope."""
-        auth = info.context.auth
-        if not auth or not auth.authenticated:
+        """
+        Check if the user has the required 'write' scope.
+
+        Args:
+            info: Strawberry info object containing request context.
+            **kwargs: Additional keyword arguments (unused).
+
+        Returns:
+            True if user has write scope, False otherwise.
+        """
+        auth = getattr(info.context, "auth", None)
+        if not auth or not getattr(auth, "authenticated", False):
+            log.debug("GraphQL permission denied: not authenticated")
             return False
-        if hasattr(auth, "scopes") and SCOPE_WRITE in auth.scopes:
-            return True
-        return False
+
+        scopes = getattr(auth, "scopes", [])
+        if SCOPE_WRITE not in scopes:
+            log.warning(
+                "GraphQL permission denied: user lacks write scope, has: %s",
+                scopes,
+            )
+            return False
+
+        log.debug("GraphQL permission granted: user has write scope")
+        return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -137,16 +171,42 @@ class Mutation:
     """GraphQL mutations - require write scope."""
 
     @strawberry.mutation(permission_classes=[RequireWritePermission])
-    def activate_node(self, info: strawberry.Info, node_id: str) -> NodeInfo:
-        """Activate a node - requires write scope."""
+    def activate_node(
+        self, info: strawberry.Info, node_id: str
+    ) -> NodeInfo:
+        """
+        Activate a node - requires write scope.
+
+        Args:
+            info: Strawberry info object containing request context.
+            node_id: ID of the node to activate.
+
+        Returns:
+            NodeInfo of the activated node.
+
+        Raises:
+            strawberry.ExceptionField: If node not found or activation fails.
+        """
         app_state = info.context.app_state
         node = app_state.nodes.get(node_id)
+
         if not node:
-            raise strawberry.ExceptionField("Node not found", extensions={"code": "NOT_FOUND"})
+            log.warning(
+                "GraphQL activate_node: node not found: %s",
+                node_id,
+            )
+            raise strawberry.ExceptionField(
+                "Node not found", extensions={"code": "NOT_FOUND"}
+            )
 
         # Set active node via the app state
-        async def _activate():
+        async def _activate() -> NodeInfo:
             await app_state.activate_node(node_id)
+            node = app_state.nodes.get(node_id)
+            if not node:
+                raise strawberry.ExceptionField(
+                    "Node not found after activation", extensions={"code": "INTERNAL_ERROR"}
+                )
             return NodeInfo(
                 id=node.id,
                 name=node.name,
@@ -159,8 +219,27 @@ class Mutation:
             )
 
         # Run in executor to avoid blocking
+        import asyncio
+
         loop = asyncio.get_event_loop()
-        return asyncio.run_coroutine_threadsafe(_activate(), loop).result()
+        try:
+            result = asyncio.run_coroutine_threadsafe(_activate(), loop).result()
+            log.info(
+                "GraphQL activate_node: activated node %s (%s)",
+                node_id,
+                node.name,
+            )
+            return result
+        except Exception as e:
+            log.error(
+                "GraphQL activate_node: failed to activate node %s: %s",
+                node_id,
+                e,
+            )
+            raise strawberry.ExceptionField(
+                f"Failed to activate node: {e}",
+                extensions={"code": "ACTIVATION_ERROR"},
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -169,9 +248,23 @@ class Mutation:
 
 
 class GraphQLContext:
-    """Context builder for Strawberry FastAPI integration."""
+    """
+    Context builder for Strawberry FastAPI integration.
 
-    def __init__(self, app_state: Any, auth_config: AuthConfig | None):
+    Injects auth context (from FastAPI middleware or Authorization header)
+    and app state into Strawberry context.
+    """
+
+    def __init__(
+        self, app_state: Any, auth_config: AuthConfig | None
+    ) -> None:
+        """
+        Initialize the GraphQL context builder.
+
+        Args:
+            app_state: The application state object.
+            auth_config: The authentication configuration, or None if auth is disabled.
+        """
         self.app_state = app_state
         self.auth_config = auth_config
 
@@ -181,42 +274,111 @@ class GraphQLContext:
 
         Injects auth context (from FastAPI middleware or Authorization header)
         and app state into Strawberry context.
+
+        Args:
+            request: The FastAPI request object.
+
+        Returns:
+            Dictionary containing request, app_state, and auth context.
         """
         # Get auth context from request state (set by FastAPI middleware)
         auth_ctx = getattr(request.state, "auth", None)
 
-        context = {
+        context: dict[str, Any] = {
             "request": request,
             "app_state": self.app_state,
             "auth": auth_ctx,
         }
 
         # If no auth from middleware, try Authorization header
-        if not auth_ctx or not auth_ctx.authenticated:
+        if not auth_ctx or not getattr(auth_ctx, "authenticated", False):
             auth_header = request.headers.get("authorization", "")
             if auth_header.startswith("Bearer ") and self.auth_config:
                 token = auth_header[7:]
-                # Check for mesh_ca on auth_config
-                public_key = None
-                if hasattr(self.auth_config, "mesh_ca") and self.auth_config.mesh_ca:
-                    public_key = self.auth_config.mesh_ca.controller_keypair.public_key
-                elif hasattr(self.auth_config, "verify_key") and self.auth_config.verify_key:
-                    public_key = self.auth_config.verify_key
-
+                # Get public key from auth config
+                public_key = self._get_public_key()
                 if public_key:
-                    claims = verify_jwt(token, public_key)
+                    claims = self._verify_jwt(token, public_key)
                     if claims:
                         sub = claims.get("sub", "")
                         user_id = sub if sub != "admin" else ""
-                        context["auth"] = AuthContext(
+                        auth_ctx = AuthContext(
                             authenticated=True,
                             scopes=claims.get("scopes", []),
-                            source_ip=request.client.host if request.client else "127.0.0.1",
+                            source_ip=(
+                                request.client.host
+                                if request.client
+                                else "127.0.0.1"
+                            ),
                             auth_method="jwt",
                             user_id=user_id,
                         )
+                        context["auth"] = auth_ctx
+                        log.info(
+                            "GraphQL auth: JWT verified for user %s, scopes: %s",
+                            user_id or "admin",
+                            claims.get("scopes", []),
+                        )
+                    else:
+                        log.warning(
+                            "GraphQL auth: JWT verification failed from %s",
+                            request.client.host
+                            if request.client
+                            else "unknown",
+                        )
+                else:
+                    log.warning(
+                        "GraphQL auth: No public key available for JWT verification"
+                    )
 
         return context
+
+    def _get_public_key(self) -> bytes | None:
+        """
+        Get the public key for JWT verification.
+
+        Returns:
+            The public key bytes, or None if not available.
+        """
+        if not self.auth_config or not self.auth_config.enabled:
+            return None
+
+        # Try to get key from mesh_ca
+        if hasattr(self.auth_config, "mesh_ca") and self.auth_config.mesh_ca:
+            keypair = getattr(self.auth_config.mesh_ca, "controller_keypair", None)
+            if keypair:
+                return keypair.public_key
+
+        # Try to get key from verify_key
+        if hasattr(self.auth_config, "verify_key") and self.auth_config.verify_key:
+            return self.auth_config.verify_key
+
+        log.warning("GraphQL auth: No public key configured")
+        return None
+
+    def _verify_jwt(self, token: str, public_key: bytes) -> dict[str, Any] | None:
+        """
+        Verify a JWT token and return its claims.
+
+        Args:
+            token: The JWT token to verify.
+            public_key: The public key for verification.
+
+        Returns:
+            The claims dictionary if valid, None otherwise.
+        """
+        from auth import verify_jwt
+
+        try:
+            claims = verify_jwt(token, public_key)
+            if claims:
+                log.debug("GraphQL JWT verification successful")
+                return claims
+            log.warning("GraphQL JWT verification failed: invalid token")
+            return None
+        except Exception as e:
+            log.error("GraphQL JWT verification error: %s", e)
+            return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -225,7 +387,12 @@ class GraphQLContext:
 
 
 def create_schema() -> strawberry.Schema:
-    """Create the Strawberry schema."""
+    """
+    Create the Strawberry schema.
+
+    Returns:
+        The configured strawberry.Schema instance.
+    """
     return strawberry.Schema(query=Query, mutation=Mutation)
 
 
@@ -239,6 +406,13 @@ def create_router(
     The router provides:
       - POST /graphql - GraphQL endpoint
       - GET /graphiql - GraphiQL playground (when auth disabled or valid JWT)
+
+    Args:
+        app_state: The application state object.
+        auth_config: The authentication configuration, or None if auth is disabled.
+
+    Returns:
+        The configured APIRouter instance.
     """
     # Create the GraphQL schema
     schema = create_schema()
@@ -267,7 +441,12 @@ def add_graphiql_route(
     The GraphiQL playground is accessible at GET /graphiql
     and is enabled when:
       - Auth is disabled (OZMA_AUTH=0)
-      - Auth is enabled but request has valid JWT with read scope
+      - Auth is enabled but request has valid JWT with read or write scope
+
+    Args:
+        router: The APIRouter to add the route to.
+        app_state: The application state object.
+        auth_config: The authentication configuration.
     """
     from fastapi.responses import HTMLResponse
 
@@ -275,12 +454,28 @@ def add_graphiql_route(
     async def graphiql_endpoint(
         request: Request,
     ) -> HTMLResponse:
-        """Serve GraphiQL playground at /graphiql."""
-        # Check if GraphiQL should be enabled
-        auth_ctx = getattr(request.state, "auth", None)
-        if not should_enable_graphiql(auth_config, auth_ctx):
-            return HTMLResponse(status_code=401, content="Authentication required")
+        """
+        Serve GraphiQL playground at /graphiql.
 
+        Args:
+            request: The FastAPI request object.
+
+        Returns:
+            HTMLResponse with GraphiQL page, or 401 if auth required.
+        """
+        auth_ctx = getattr(request.state, "auth", None)
+
+        if not should_enable_graphiql(auth_config, auth_ctx):
+            log.warning(
+                "GraphiQL access denied: auth required from %s",
+                request.client.host if request.client else "unknown",
+            )
+            return HTMLResponse(
+                status_code=401,
+                content="Authentication required",
+            )
+
+        log.debug("GraphiQL access granted to %s", request.client.host if request.client else "unknown")
         return get_graphiql_page("/graphql")
 
 
@@ -290,7 +485,15 @@ def add_graphiql_route(
 
 
 def get_graphiql_page(graphql_url: str) -> HTMLResponse:
-    """Generate GraphiQL HTML page."""
+    """
+    Generate GraphiQL HTML page.
+
+    Args:
+        graphql_url: The URL path to the GraphQL endpoint.
+
+    Returns:
+        HTMLResponse containing the GraphiQL page.
+    """
     graphiql_html = """<!DOCTYPE html>
 <html>
 <head>
@@ -342,23 +545,37 @@ def get_graphiql_page(graphql_url: str) -> HTMLResponse:
     return HTMLResponse(content=graphiql_html)
 
 
-def should_enable_graphiql(auth_config: AuthConfig | None, auth_ctx: AuthContext | None) -> bool:
+def should_enable_graphiql(
+    auth_config: AuthConfig | None, auth_ctx: AuthContext | None
+) -> bool:
     """
     Determine if GraphiQL should be enabled.
 
     GraphiQL is enabled when:
       - Auth is disabled (OZMA_AUTH=0)
-      - Auth is enabled but request has valid JWT with read scope
+      - Auth is enabled but request has valid JWT with read or write scope
+
+    Args:
+        auth_config: The authentication configuration.
+        auth_ctx: The authentication context from the request.
+
+    Returns:
+        True if GraphiQL should be enabled, False otherwise.
     """
+    # Auth disabled - always enable
     if not auth_config or not auth_config.enabled:
         return True
 
-    if not auth_ctx or not auth_ctx.authenticated:
+    # Auth enabled - require authentication
+    if not auth_ctx or not getattr(auth_ctx, "authenticated", False):
         return False
 
-    # Check if user has read scope
-    if hasattr(auth_ctx, "scopes"):
-        if SCOPE_WRITE in auth_ctx.scopes or SCOPE_READ in auth_ctx.scopes:
-            return True
+    # Check if user has read or write scope
+    scopes = getattr(auth_ctx, "scopes", [])
+    if SCOPE_READ in scopes or SCOPE_WRITE in scopes:
+        return True
 
+    log.debug(
+        "GraphiQL denied: user has scopes %s but needs read or write", scopes
+    )
     return False
