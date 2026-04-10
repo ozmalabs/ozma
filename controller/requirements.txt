@@ -6,6 +6,9 @@ fastapi>=0.111
 uvicorn[standard]>=0.29
 pydantic>=2.0
 
+# GraphQL
+strawberry-graphql>=0.230
+
 # Networking / discovery
 zeroconf>=0.132
 aiohttp>=3.8
