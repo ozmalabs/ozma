@@ -1,17 +1,12 @@
-import { Routes, Route } from 'react-router-dom'
-import { ThemeProvider } from './contexts/ThemeContext'
-import Layout from './components/Layout'
-import NodesPage from './pages/NodesPage'
+import { Outlet } from 'react-router-dom'
+import Layout from './components/layout/Layout'
 
-export default function App() {
+function App() {
   return (
-    <ThemeProvider>
-      <Layout>
-        <Routes>
-          <Route path="/" element={<NodesPage />} />
-          <Route path="/nodes" element={<NodesPage />} />
-        </Routes>
-      </Layout>
-    </ThemeProvider>
+    <Layout>
+      <Outlet />
+    </Layout>
   )
 }
+
+export default App
