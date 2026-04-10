@@ -328,53 +328,11 @@ class _SubscriptionRegistry:
 _subscription_registry = _SubscriptionRegistry()
 
 
-async def _event_router_task(state: "AppState") -> None:
-    """
-    Background task that routes events from AppState to subscription queues.
-
-    This task:
-    1. Consumes events from state.events
-    2. Routes matching events to all registered subscription queues
-    3. Runs until cancelled
-
-    Args:
-        state: The AppState instance containing the events queue
-    """
-    log.info("Starting event router task")
-    try:
-        while True:
-            event = await state.events.get()
-            event_type = event.get("type", "")
-            event_id = event.get("id", "")
-
-            # Get all queues that match this event type
-            async with _subscription_registry._lock:
-                matching_queues = []
-                for sub_id, queue in _subscription_registry._queues.items():
-                    event_filter = _subscription_registry._event_type_filters.get(sub_id)
-                    if event_filter is None:
-                        matching_queues.append((sub_id, queue))
-                    elif event_type.startswith(event_filter + ".") or event_type == event_filter:
-                        matching_queues.append((sub_id, queue))
-
-            # Route event to matching queues (non-blocking)
-            for sub_id, queue in matching_queues:
-                try:
-                    # Use put_nowait to avoid blocking if queue is full
-                    queue.put_nowait(event)
-                except asyncio.QueueFull:
-                    log.warning("Queue full for subscription %s, dropping event %s", sub_id, event_type)
-
-    except asyncio.CancelledError:
-        log.info("Event router task cancelled")
-        raise
-
-
 # Global event router task reference
 _event_router_task: asyncio.Task | None = None
 
 
-async def _event_router_task(state: "AppState") -> None:
+async def _event_router_worker(state: "AppState") -> None:
     """
     Background task that routes events from AppState to subscription queues.
 
@@ -425,7 +383,9 @@ def start_event_router(state: "AppState") -> None:
     """
     global _event_router_task
     if _event_router_task is None:
-        _event_router_task = asyncio.create_task(_event_router_task(state), name="graphql-event-router")
+        _event_router_task = asyncio.create_task(
+            _event_router_worker(state), name="graphql-event-router"
+        )
 
 
 def stop_event_router() -> None:
