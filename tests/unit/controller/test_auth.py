@@ -88,6 +88,99 @@ class TestJWT:
         assert verify_jwt("not.a.jwt", keypair.public_key) is None
         assert verify_jwt("", keypair.public_key) is None
 
+    def test_audience_validation(self, keypair):
+        from auth import create_jwt, verify_jwt
+        # Token without audience claim
+        token = create_jwt(keypair, ["read"], subject="user-1")
+        # Should pass when no audience expected
+        assert verify_jwt(token, keypair.public_key, expected_audience=None) is not None
+        # Should fail when audience is expected but not present
+        assert verify_jwt(token, keypair.public_key, expected_audience="ozma-controller") is None
+
+    def test_issuer_validation(self, keypair):
+        from auth import create_jwt, verify_jwt
+        # Token without issuer claim
+        token = create_jwt(keypair, ["read"], subject="user-1")
+        # Should pass when no issuer expected
+        assert verify_jwt(token, keypair.public_key, expected_issuer=None) is not None
+        # Should fail when issuer is expected but not present
+        assert verify_jwt(token, keypair.public_key, expected_issuer="ozma-controller") is None
+
+    def test_correct_audience_issuer_pass(self, keypair):
+        from auth import create_jwt, verify_jwt
+        token = create_jwt(
+            keypair, ["read"], subject="user-1",
+            audience="ozma-controller",
+            issuer="ozma-controller"
+        )
+        claims = verify_jwt(
+            token, keypair.public_key,
+            expected_audience="ozma-controller",
+            expected_issuer="ozma-controller"
+        )
+        assert claims is not None
+        assert claims["aud"] == "ozma-controller"
+        assert claims["iss"] == "ozma-controller"
+
+    def test_wrong_audience_rejected(self, keypair):
+        from auth import create_jwt, verify_jwt
+        token = create_jwt(
+            keypair, ["read"], subject="user-1",
+            audience="wrong-audience"
+        )
+        assert verify_jwt(
+            token, keypair.public_key,
+            expected_audience="ozma-controller"
+        ) is None
+
+    def test_wrong_issuer_rejected(self, keypair):
+        from auth import create_jwt, verify_jwt
+        token = create_jwt(
+            keypair, ["read"], subject="user-1",
+            issuer="wrong-issuer"
+        )
+        assert verify_jwt(
+            token, keypair.public_key,
+            expected_issuer="ozma-controller"
+        ) is None
+
+    def test_audience_as_list(self, keypair):
+        from auth import create_jwt, verify_jwt
+        # Create token with audience as list
+        header = {"alg": "EdDSA", "typ": "JWT"}
+        now = int(__import__("time").time())
+        payload = {
+            "sub": "user-1",
+            "scopes": ["read"],
+            "iat": now,
+            "exp": now + 86400,
+            "aud": ["ozma-controller", "ozma-dashboard"]
+        }
+        from auth import _b64url_encode
+        import json
+        header_b64 = _b64url_encode(json.dumps(header, separators=(",", ":")).encode())
+        payload_b64 = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode())
+        signing_input = f"{header_b64}.{payload_b64}".encode()
+        signature = keypair.sign(signing_input)
+        sig_b64 = _b64url_encode(signature)
+        token = f"{header_b64}.{payload_b64}.{sig_b64}"
+
+        # Should pass with matching audience in list
+        assert verify_jwt(
+            token, keypair.public_key,
+            expected_audience="ozma-controller"
+        ) is not None
+        # Should pass with different matching audience in list
+        assert verify_jwt(
+            token, keypair.public_key,
+            expected_audience="ozma-dashboard"
+        ) is not None
+        # Should fail with non-matching audience
+        assert verify_jwt(
+            token, keypair.public_key,
+            expected_audience="other-service"
+        ) is None
+
 
 class TestWireGuardBypass:
     def test_wg_ip_allowed(self):

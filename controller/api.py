@@ -321,7 +321,12 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             scopes = ALL_SCOPES if user.role == "owner" else [SCOPE_READ, SCOPE_WRITE]
             if user.role == "guest":
                 scopes = [SCOPE_READ]
-            token = create_jwt(_signing_key, scopes, _auth.jwt_expiry_seconds, subject=user.id)
+            token = create_jwt(
+                _signing_key, scopes, _auth.jwt_expiry_seconds,
+                subject=user.id,
+                audience="ozma-controller",
+                issuer="ozma-controller"
+            )
             return {
                 "token": token,
                 "expires_in": _auth.jwt_expiry_seconds,
@@ -332,7 +337,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         # Legacy single-admin auth: password only (no username)
         if not _auth.password_hash or not verify_password(password, _auth.password_hash):
             raise HTTPException(401, "Invalid password")
-        token = create_jwt(_signing_key, ALL_SCOPES, _auth.jwt_expiry_seconds)
+        token = create_jwt(
+            _signing_key, ALL_SCOPES, _auth.jwt_expiry_seconds,
+            audience="ozma-controller",
+            issuer="ozma-controller"
+        )
         return {
             "token": token,
             "expires_in": _auth.jwt_expiry_seconds,
@@ -791,6 +800,10 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     # --- WebSocket endpoint ---
 
+    # Expected JWT claims for ozma controller tokens
+    _JWT_EXPECTED_AUDIENCE = "ozma-controller"
+    _JWT_EXPECTED_ISSUER = "ozma-controller"
+
     async def _ws_authenticate(ws: WebSocket) -> bool:
         """Authenticate a WebSocket connection. Returns True if allowed."""
         if not _auth.enabled:
@@ -799,8 +812,14 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if is_wireguard_source(client_ip, _auth):
             return True
         token = ws.query_params.get("token")
-        if token and _verify_key and verify_jwt(token, _verify_key):
-            return True
+        if token and _verify_key:
+            claims = verify_jwt(
+                token, _verify_key,
+                expected_audience=_JWT_EXPECTED_AUDIENCE,
+                expected_issuer=_JWT_EXPECTED_ISSUER
+            )
+            if claims:
+                return True
         return False
 
     @app.websocket("/api/v1/events")
@@ -10312,6 +10331,10 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         # Fallback: use manual WebSocket handling
         HAS_WS = False
 
+    # Expected JWT claims for ozma controller tokens
+    _JWT_EXPECTED_AUDIENCE = "ozma-controller"
+    _JWT_EXPECTED_ISSUER = "ozma-controller"
+
     async def _graphql_ws_authenticate(ws: WebSocket) -> bool:
         """Authenticate a GraphQL WebSocket connection. Returns True if allowed."""
         if not _auth.enabled:
@@ -10320,8 +10343,14 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if is_wireguard_source(client_ip, _auth):
             return True
         token = ws.query_params.get("token")
-        if token and _verify_key and verify_jwt(token, _verify_key):
-            return True
+        if token and _verify_key:
+            claims = verify_jwt(
+                token, _verify_key,
+                expected_audience=_JWT_EXPECTED_AUDIENCE,
+                expected_issuer=_JWT_EXPECTED_ISSUER
+            )
+            if claims:
+                return True
         return False
 
     @app.websocket("/graphql")

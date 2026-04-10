@@ -214,7 +214,7 @@ class AudioLevelType:
     """
 
     node_id: str = ""
-    levels: Annotated[dict[str, float], strawberry.tag("levels")] = strawberry.field(
+    levels: "JSONScalar" = strawberry.field(
         description="Mapping of channel names to dB values"
     )
     timestamp: float = 0.0
