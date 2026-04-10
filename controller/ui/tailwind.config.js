@@ -1,23 +1,32 @@
-import colors from 'tailwindcss/colors'
-
 /** @type {import('tailwindcss').Config} */
 export default {
   content: [
     './index.html',
     './src/**/*.{js,ts,jsx,tsx}',
   ],
-  darkMode: 'class',
   theme: {
     extend: {
       colors: {
-        emerald: {
-          500: '#4ae0a4',
-          400: '#6ee7b7',
-          600: '#22c55e',
+        'bg': {
+          'primary': 'var(--bg-primary)',
+          'secondary': 'var(--bg-secondary)',
+          'tertiary': 'var(--bg-tertiary)',
+          'surface': 'var(--bg-surface)',
         },
-      },
-      fontFamily: {
-        sans: ['Inter', 'system-ui', 'system-ui', 'sans-serif'],
+        'text': {
+          'primary': 'var(--text-primary)',
+          'secondary': 'var(--text-secondary)',
+          'muted': 'var(--text-muted)',
+        },
+        'border-color': 'var(--border-color)',
+        'accent': {
+          'emerald': 'var(--accent-emerald)',
+          'emerald-dim': 'var(--accent-emerald-dim)',
+          'emerald-light': 'var(--accent-emerald-light)',
+          'danger': 'var(--accent-danger)',
+          'warning': 'var(--accent-warning)',
+          'info': 'var(--accent-info)',
+        },
       },
     },
   },

@@ -12,9 +12,13 @@ export default defineConfig({
       },
       '/ws': {
         target: 'http://localhost:7380',
-        ws: true,
         changeOrigin: true,
+        ws: true,
       },
     },
+  },
+  build: {
+    outDir: '../static/ui',
+    sourcemap: true,
   },
 })

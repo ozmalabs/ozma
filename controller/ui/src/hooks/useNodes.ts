@@ -1,83 +1,121 @@
-import { useEffect, useState, useCallback } from 'react'
-import type { NodeInfo } from '../types'
+import { create } from 'zustand'
+import { Node, NodesState } from '../types/node'
 
 const API_BASE = '/api/v1'
 
-export function useNodes() {
-  const [nodes, setNodes] = useState<NodeInfo[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-  const [wsConnected, setWsConnected] = useState(false)
+const getWsUrl = () => {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${protocol}//${window.location.host}/ws/events`
+}
 
-  const fetchNodes = useCallback(async () => {
-    try {
-      const response = await fetch(`${API_BASE}/nodes`, {
-        headers: {
-          'Accept': 'application/json',
-        },
-      })
+export const useNodesStore = create<NodesState>((set, get) => {
+  let ws: WebSocket | null = null
+  let retryTimeout: number | null = null
 
-      if (!response.ok) {
-        throw new Error(`Failed to fetch nodes: ${response.statusText}`)
-      }
+  const setWs = (newWs: WebSocket | null) => {
+    ws = newWs
+    set({ ws })
+  }
 
-      const data = await response.json()
-      setNodes(data.nodes || data)
-      setError(null)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unknown error')
-    } finally {
-      setLoading(false)
-    }
-  }, [])
+  return {
+    nodes: [],
+    loading: false,
+    error: null,
 
-  useEffect(() => {
-    fetchNodes()
-
-    // Set up WebSocket for live updates
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const wsUrl = `${protocol}//${window.location.host}/ws/updates`
-
-    const ws = new WebSocket(wsUrl)
-
-    ws.onopen = () => {
-      setWsConnected(true)
-      // Request initial state on connect
-      ws.send(JSON.stringify({ type: 'subscribe', resource: 'nodes' }))
-    }
-
-    ws.onclose = () => {
-      setWsConnected(false)
-      // Retry connection after delay
-      setTimeout(() => {
-        if (ws.readyState !== WebSocket.OPEN) {
-          ws.close()
-          // Recreate WebSocket in next effect cycle
-        }
-      }, 2000)
-    }
-
-    ws.onmessage = (event) => {
+    refreshNodes: async () => {
+      set({ loading: true, error: null })
       try {
-        const message = JSON.parse(event.data)
-        if (message.type === 'update' && message.resource === 'nodes') {
-          setNodes(message.data.nodes || message.data)
-        } else if (message.type === 'sync') {
-          setNodes(message.nodes || [])
+        const response = await fetch(`${API_BASE}/nodes`)
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`)
         }
+        const data: Node[] = await response.json()
+        set({ nodes: data, loading: false, error: null })
       } catch (err) {
-        console.error('Failed to parse WebSocket message:', err)
+        set({ loading: false, error: err instanceof Error ? err.message : 'Failed to fetch nodes' })
       }
-    }
+    },
 
-    ws.onerror = (err) => {
-      console.error('WebSocket error:', err)
-    }
+    addNode: (node) => {
+      set((state) => {
+        const existing = state.nodes.find((n) => n.id === node.id)
+        if (existing) {
+          return state
+        }
+        return { nodes: [...state.nodes, node] }
+      })
+    },
 
-    return () => {
-      ws.close()
-    }
-  }, [fetchNodes])
+    updateNode: (node) => {
+      set((state) => ({
+        nodes: state.nodes.map((n) => (n.id === node.id ? node : n)),
+      }))
+    },
 
-  return { nodes, loading, error, wsConnected, refresh: fetchNodes }
+    removeNode: (id) => {
+      set((state) => ({
+        nodes: state.nodes.filter((n) => n.id !== id),
+      }))
+    },
+
+    connectWebSocket: async () => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        return
+      }
+
+      const token = localStorage.getItem('ozma_token')
+      const wsUrl = getWsUrl() + (token ? `?token=${token}` : '')
+
+      ws = new WebSocket(wsUrl)
+
+      ws.onopen = () => {
+        console.log('WebSocket connected')
+        if (retryTimeout) {
+          clearTimeout(retryTimeout)
+          retryTimeout = null
+        }
+        get().refreshNodes()
+      }
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data)
+          if (data.type === 'node_state') {
+            const node = data.payload as Node
+            get().updateNode(node)
+          }
+        } catch (err) {
+          console.error('Failed to parse WebSocket message:', err)
+        }
+      }
+
+      ws.onerror = (error) => {
+        console.error('WebSocket error:', error)
+      }
+
+      ws.onclose = () => {
+        console.log('WebSocket disconnected, retrying...')
+        // Schedule reconnection with backoff
+        retryTimeout = window.setTimeout(() => {
+          get().connectWebSocket()
+        }, 3000)
+      }
+
+      setWs(ws)
+    },
+
+    disconnectWebSocket: () => {
+      if (ws) {
+        ws.close()
+        ws = null
+      }
+    },
+  }
+})
+
+export const useNodes = () => {
+  const { nodes, loading, error, refreshNodes, addNode, updateNode, removeNode } =
+    useNodesStore()
+
+  return { nodes, loading, error, refreshNodes, addNode, updateNode, removeNode }
 }
