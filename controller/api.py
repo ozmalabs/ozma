@@ -110,6 +110,16 @@ from msp_portal import MSPPortalManager, PortalConfig
 from parental_controls import ParentalControlsManager
 from backup_status import BackupNudgeService
 
+# GraphQL imports
+try:
+    from graphql import GraphQLError
+    from strawberry.fastapi import GraphQLRouter
+    from controller.graphql.schema import schema as ozma_schema
+    GRAPHQL_ENABLED = True
+except ImportError:
+    GRAPHQL_ENABLED = False
+    log.warning("Strawberry GraphQL not installed - GraphQL API will be unavailable")
+
 log = logging.getLogger("ozma.api")
 
 
@@ -345,6 +355,84 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    # --- GraphQL endpoint ---
+    @app.post("/graphql")
+    async def graphql_endpoint(
+        request: Request,
+        query: str | None = None,
+        variables: dict | None = None,
+        operation_name: str | None = None,
+        raw_body: bytes | None = None,
+    ):
+        """
+        GraphQL endpoint for the Ozma Controller.
+        
+        Supports both POST with JSON body and GET with query parameters.
+        
+        Authentication:
+            - JWT Bearer token in Authorization header
+            - WireGuard source IPs bypass auth
+            - Auth can be disabled globally
+            
+        Query example:
+            {
+                "query": "query { systemHealth { uptimeSeconds nodeCount activeNodeId } }"
+            }
+        """
+        ctx = getattr(request.state, "auth", None)
+        
+        # Check auth (same logic as middleware)
+        if not ctx or not ctx.authenticated:
+            if not _auth.enabled:
+                # Auth disabled - allow all
+                pass
+            else:
+                raise HTTPException(401, "Authentication required")
+        
+        if not GRAPHQL_ENABLED:
+            raise HTTPException(503, "GraphQL not available - Strawberry GraphQL not installed")
+        
+        # Build context with state and other services
+        graphql_context = {
+            "state": state,
+            "scenarios": scenarios,
+            "streams": streams,
+            "audio": audio,
+            "controls": controls,
+            "auth_context": ctx,
+        }
+        
+        # Handle query from different sources
+        if raw_body:
+            try:
+                body = json.loads(raw_body.decode('utf-8'))
+                query = body.get("query")
+                variables = body.get("variables")
+                operation_name = body.get("operationName")
+            except Exception as e:
+                raise HTTPException(400, f"Invalid JSON body: {e}")
+        
+        # Execute GraphQL query using Strawberry's sync execute
+        from controller.graphql.schema import schema as ozma_schema
+        from strawberry.schema.schema_converter import convert_schema
+        
+        # Run in executor to avoid blocking
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: ozma_schema.execute_sync(
+                query=query,
+                variable_values=variables,
+                operation_name=operation_name,
+                context_value=graphql_context,
+            )
+        )
+        
+        return {
+            "data": result.data,
+            "errors": [str(e) for e in result.errors] if result.errors else None,
+        }
 
     # --- User management ---
 
