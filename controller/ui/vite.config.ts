@@ -18,7 +18,7 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: '../static/ui',
+    outDir: 'dist',
     sourcemap: true,
   },
 })

@@ -1,32 +1,46 @@
 /** @type {import('tailwindcss').Config} */
 export default {
   content: [
-    './index.html',
-    './src/**/*.{js,ts,jsx,tsx}',
+    "./index.html",
+    "./src/**/*.{js,ts,jsx,tsx}",
   ],
   theme: {
     extend: {
       colors: {
-        'bg': {
-          'primary': 'var(--bg-primary)',
-          'secondary': 'var(--bg-secondary)',
-          'tertiary': 'var(--bg-tertiary)',
-          'surface': 'var(--bg-surface)',
+        border: 'hsl(var(--border))',
+        input: 'hsl(var(--input))',
+        ring: 'hsl(var(--ring))',
+        background: 'hsl(var(--background))',
+        foreground: 'hsl(var(--foreground))',
+        primary: {
+          DEFAULT: 'hsl(var(--primary))',
+          foreground: 'hsl(var(--primary-foreground))',
         },
-        'text': {
-          'primary': 'var(--text-primary)',
-          'secondary': 'var(--text-secondary)',
-          'muted': 'var(--text-muted)',
+        secondary: {
+          DEFAULT: 'hsl(var(--secondary))',
+          foreground: 'hsl(var(--secondary-foreground))',
         },
-        'border-color': 'var(--border-color)',
-        'accent': {
-          'emerald': 'var(--accent-emerald)',
-          'emerald-dim': 'var(--accent-emerald-dim)',
-          'emerald-light': 'var(--accent-emerald-light)',
-          'danger': 'var(--accent-danger)',
-          'warning': 'var(--accent-warning)',
-          'info': 'var(--accent-info)',
+        destructive: {
+          DEFAULT: 'hsl(var(--destructive))',
+          foreground: 'hsl(var(--destructive-foreground))',
         },
+        muted: {
+          DEFAULT: 'hsl(var(--muted))',
+          foreground: 'hsl(var(--muted-foreground))',
+        },
+        accent: {
+          DEFAULT: 'hsl(var(--accent))',
+          foreground: 'hsl(var(--accent-foreground))',
+        },
+        emerald: {
+          500: '#4ae0a4',
+          600: '#3db58c',
+        },
+      },
+      borderRadius: {
+        lg: 'var(--radius)',
+        md: 'calc(var(--radius) - 2px)',
+        sm: 'calc(var(--radius) - 4px)',
       },
     },
   },

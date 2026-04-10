@@ -6,10 +6,29 @@ export interface Node {
   machine_class: 'workstation' | 'server' | 'kiosk'
   active: boolean
   last_seen: string
+  ip?: string
   ip_address?: string
   mac_address?: string
   tags?: string[]
   metadata?: Record<string, unknown>
+  port?: number
+  uptime?: number
+  cpu_usage?: number
+  memory_usage?: number
+  video_enabled?: boolean
+  audio_enabled?: boolean
+  usb_enabled?: boolean
+  hids?: string[]
+  displays?: DisplayInfo[]
+}
+
+export interface DisplayInfo {
+  id: string
+  name: string
+  width: number
+  height: number
+  refresh_rate: number
+  primary: boolean
 }
 
 export interface NodesState {

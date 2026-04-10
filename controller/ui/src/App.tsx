@@ -1,15 +1,5 @@
-import { useEffect } from 'react'
-import { Router } from './router'
-import { useNodesStore } from './hooks/useNodes'
+import Router from './router'
 
-function App() {
-  const connectWebSocket = useNodesStore((state) => state.connectWebSocket)
-
-  useEffect(() => {
-    connectWebSocket()
-  }, [connectWebSocket])
-
+export default function App() {
   return <Router />
 }
-
-export default App

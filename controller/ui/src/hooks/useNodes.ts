@@ -5,7 +5,8 @@ const API_BASE = '/api/v1'
 
 const getWsUrl = () => {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${protocol}//${window.location.host}/ws/events`
+  const baseUrl = import.meta.env.VITE_API_URL || 'http://localhost:7380'
+  return `${protocol}//${baseUrl.replace('http://', '').replace('https://', '')}/ws/notifications`
 }
 
 export const useNodesStore = create<NodesState>((set, get) => {
@@ -14,13 +15,13 @@ export const useNodesStore = create<NodesState>((set, get) => {
 
   const setWs = (newWs: WebSocket | null) => {
     ws = newWs
-    set({ ws })
   }
 
   return {
     nodes: [],
     loading: false,
     error: null,
+    ws: null,
 
     refreshNodes: async () => {
       set({ loading: true, error: null })
@@ -30,9 +31,9 @@ export const useNodesStore = create<NodesState>((set, get) => {
           throw new Error(`HTTP ${response.status}`)
         }
         const data: Node[] = await response.json()
-        set({ nodes: data, loading: false, error: null })
+        set({ nodes: data, loading: false, error: null, ws })
       } catch (err) {
-        set({ loading: false, error: err instanceof Error ? err.message : 'Failed to fetch nodes' })
+        set({ loading: false, error: err instanceof Error ? err.message : 'Failed to fetch nodes', ws })
       }
     },
 
@@ -42,19 +43,21 @@ export const useNodesStore = create<NodesState>((set, get) => {
         if (existing) {
           return state
         }
-        return { nodes: [...state.nodes, node] }
+        return { nodes: [...state.nodes, node], ws }
       })
     },
 
     updateNode: (node) => {
       set((state) => ({
         nodes: state.nodes.map((n) => (n.id === node.id ? node : n)),
+        ws,
       }))
     },
 
     removeNode: (id) => {
       set((state) => ({
         nodes: state.nodes.filter((n) => n.id !== id),
+        ws,
       }))
     },
 
@@ -63,7 +66,7 @@ export const useNodesStore = create<NodesState>((set, get) => {
         return
       }
 
-      const token = localStorage.getItem('ozma_token')
+      const token = localStorage.getItem('ozma_auth_token')
       const wsUrl = getWsUrl() + (token ? `?token=${token}` : '')
 
       ws = new WebSocket(wsUrl)
@@ -102,6 +105,7 @@ export const useNodesStore = create<NodesState>((set, get) => {
       }
 
       setWs(ws)
+      set({ ws })
     },
 
     disconnectWebSocket: () => {
@@ -109,13 +113,14 @@ export const useNodesStore = create<NodesState>((set, get) => {
         ws.close()
         ws = null
       }
+      set({ ws: null })
     },
   }
 })
 
 export const useNodes = () => {
-  const { nodes, loading, error, refreshNodes, addNode, updateNode, removeNode } =
+  const { nodes, loading, error, refreshNodes, addNode, updateNode, removeNode, connectWebSocket, disconnectWebSocket } =
     useNodesStore()
 
-  return { nodes, loading, error, refreshNodes, addNode, updateNode, removeNode }
+  return { nodes, loading, error, refreshNodes, addNode, updateNode, removeNode, connectWebSocket, disconnectWebSocket }
 }
