@@ -12,7 +12,7 @@ This module provides Strawberry GraphQL types and resolvers for:
 
 from .audio import AudioRoute, AudioVolume
 from .vban import VBANStream
-from .stream import StreamInfo, CameraInfo
+from .stream import StreamInfo, CameraInfo, CameraStream
 from .controls import (
     ControlSurface,
     Binding,
@@ -29,6 +29,7 @@ __all__ = [
     "VBANStream",
     "StreamInfo",
     "CameraInfo",
+    "CameraStream",
     "ControlSurface",
     "Binding",
     "ControlBinding",

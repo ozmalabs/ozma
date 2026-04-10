@@ -28,6 +28,27 @@ from .types import (
     SystemHealth,
 )
 
+# Import resolvers (module-level to avoid circular import issues)
+from .types.audio import (
+    resolve_audio_route,
+    resolve_audio_volume,
+    resolve_audio_routes,
+)
+from .types.vban import resolve_vban_stream, resolve_vban_streams
+from .types.stream import (
+    resolve_stream_info,
+    resolve_stream_info_for_active_node,
+    resolve_all_streams,
+    resolve_camera_info,
+    resolve_all_cameras,
+)
+from .types.controls import (
+    resolve_control_surface,
+    resolve_all_control_surfaces,
+    resolve_active_control_surface,
+)
+from .types.system import resolve_system_health
+
 if TYPE_CHECKING:
     from state import AppState
 
@@ -59,7 +80,6 @@ class Query:
             source_id: ID of the source node or audio sink
             target_id: ID of the target output or node
         """
-        from .types.audio import resolve_audio_route
         return await resolve_audio_route(info, source_id, target_id)
 
     @strawberry.field
@@ -74,7 +94,6 @@ class Query:
         Args:
             node_id: ID of the node
         """
-        from .types.audio import resolve_audio_volume
         return await resolve_audio_volume(info, node_id)
 
     @strawberry.field
@@ -85,7 +104,6 @@ class Query:
         """
         Get all active audio routes.
         """
-        from .types.audio import resolve_audio_routes
         return await resolve_audio_routes(info)
 
     # --- VBAN Streams ---
@@ -102,7 +120,6 @@ class Query:
         Args:
             node_id: ID of the node
         """
-        from .types.vban import resolve_vban_stream
         return await resolve_vban_stream(info, node_id)
 
     @strawberry.field
@@ -113,7 +130,6 @@ class Query:
         """
         Get all VBAN audio streams.
         """
-        from .types.vban import resolve_vban_streams
         return await resolve_vban_streams(info)
 
     # --- Stream Info ---
@@ -130,7 +146,6 @@ class Query:
         Args:
             node_id: ID of the node
         """
-        from .types.stream import resolve_stream_info
         return await resolve_stream_info(info, node_id)
 
     @strawberry.field
@@ -141,7 +156,6 @@ class Query:
         """
         Get stream information for the currently active node.
         """
-        from .types.stream import resolve_stream_info_for_active_node
         return await resolve_stream_info_for_active_node(info)
 
     @strawberry.field
@@ -152,7 +166,6 @@ class Query:
         """
         Get stream information for all nodes with streams.
         """
-        from .types.stream import resolve_all_streams
         return await resolve_all_streams(info)
 
     # --- Camera Info ---
@@ -169,7 +182,6 @@ class Query:
         Args:
             node_id: ID of the camera node
         """
-        from .types.stream import resolve_camera_info
         return await resolve_camera_info(info, node_id)
 
     @strawberry.field
@@ -180,7 +192,6 @@ class Query:
         """
         Get information for all camera nodes.
         """
-        from .types.stream import resolve_all_cameras
         return await resolve_all_cameras(info)
 
     # --- Control Surfaces ---
@@ -197,7 +208,6 @@ class Query:
         Args:
             surface_id: ID of the control surface
         """
-        from .types.controls import resolve_control_surface
         return await resolve_control_surface(info, surface_id)
 
     @strawberry.field
@@ -208,7 +218,6 @@ class Query:
         """
         Get all registered control surfaces.
         """
-        from .types.controls import resolve_all_control_surfaces
         return await resolve_all_control_surfaces(info)
 
     @strawberry.field
@@ -219,7 +228,6 @@ class Query:
         """
         Get the currently active control surface.
         """
-        from .types.controls import resolve_active_control_surface
         return await resolve_active_control_surface(info)
 
     # --- System Health ---
@@ -232,7 +240,6 @@ class Query:
         """
         Get overall system health status.
         """
-        from .types.system import resolve_system_health
         return await resolve_system_health(info)
 
 
