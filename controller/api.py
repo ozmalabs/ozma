@@ -10230,15 +10230,14 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         dns_verifier.guard.remove_allowlist(set(entries))
         return {"ok": True, "removed": entries}
 
-    # --- GraphQL endpoint ---
+    # --- GraphQL endpoint (HTTP for queries/mutations) ---
 
     @app.post("/graphql")
     async def graphql_endpoint(
         request: Request,
-        info: Request,
     ) -> dict[str, Any]:
         """
-        GraphQL endpoint for subscriptions and queries.
+        GraphQL HTTP endpoint for queries and mutations.
 
         Clients can send POST requests with a JSON body containing:
         - query: The GraphQL query string
@@ -10292,6 +10291,181 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
         except Exception as e:
             raise HTTPException(400, str(e))
+
+    # --- GraphQL WebSocket endpoint for subscriptions ---
+
+    # Import Strawberry WebSocket handling
+    try:
+        from strawberry.websockets import GraphQLWSConsumer
+        HAS_WS = True
+    except ImportError:
+        # Fallback: use manual WebSocket handling
+        HAS_WS = False
+
+    async def _graphql_ws_authenticate(ws: WebSocket) -> bool:
+        """Authenticate a GraphQL WebSocket connection. Returns True if allowed."""
+        if not _auth.enabled:
+            return True
+        client_ip = ws.client.host if ws.client else "127.0.0.1"
+        if is_wireguard_source(client_ip, _auth):
+            return True
+        token = ws.query_params.get("token")
+        if token and _verify_key and verify_jwt(token, _verify_key):
+            return True
+        return False
+
+    @app.websocket("/graphql")
+    async def graphql_ws(ws: WebSocket) -> None:
+        """
+        WebSocket endpoint for GraphQL subscriptions.
+
+        Uses the GraphQL over WebSocket protocol (graphql-ws).
+        Strawberry handles the subscription lifecycle automatically.
+
+        Subscription query example:
+        subscription {
+            nodeStateChanged { id host active }
+            scenarioActivated { id name node_id }
+            audioLevelUpdate { node_id levels timestamp }
+            alertFired { id kind severity }
+        }
+        """
+        if not HAS_GRAPHQL:
+            await ws.close(code=4003, reason="GraphQL not available")
+            return
+
+        if not await _graphql_ws_authenticate(ws):
+            await ws.close(code=4001, reason="Authentication required")
+            return
+
+        await ws.accept()
+
+        # Subscription tracking: subscription_id -> async generator
+        subscriptions: dict[str, Any] = {}
+        subscription_tasks: dict[str, asyncio.Task] = {}
+
+        try:
+            while True:
+                message = await ws.receive_text()
+
+                try:
+                    data = json.loads(message)
+                    msg_type = data.get("type", "")
+
+                    if msg_type == "connection_init":
+                        # Client is initializing connection
+                        await ws.send_text(json.dumps({
+                            "type": "connection_ack",
+                        }))
+                    elif msg_type == "subscribe":
+                        # Client is starting a subscription
+                        subscription_id = data.get("id", "")
+                        payload = data.get("payload", {})
+                        query = payload.get("query", "")
+                        variables = payload.get("variables", {})
+
+                        if not query:
+                            await ws.send_text(json.dumps({
+                                "type": "error",
+                                "id": subscription_id,
+                                "payload": {"message": "Missing query"},
+                            }))
+                            continue
+
+                        # Execute the subscription query
+                        result = await graphql_schema.execute(
+                            query=query,
+                            variable_values=variables,
+                            context_value={
+                                "state": state,
+                                "scenario_manager": scenarios,
+                                "audio_router": audio,
+                            },
+                        )
+
+                        if result.errors:
+                            await ws.send_text(json.dumps({
+                                "type": "error",
+                                "id": subscription_id,
+                                "payload": {
+                                    "message": "Subscription error",
+                                    "errors": [
+                                        {"message": str(e)} for e in result.errors
+                                    ],
+                                },
+                            }))
+                            continue
+
+                        if result.data:
+                            # Send initial data
+                            await ws.send_text(json.dumps({
+                                "type": "next",
+                                "id": subscription_id,
+                                "payload": {"data": result.data},
+                            }))
+
+                        # Check if we have a subscription (async generator)
+                        if hasattr(result, "subscribed_field"):
+                            # This subscription will continue to yield data
+                            async def subscription_runner(sub_id: str, gen) -> None:
+                                try:
+                                    async for item in gen:
+                                        await ws.send_text(json.dumps({
+                                            "type": "next",
+                                            "id": sub_id,
+                                            "payload": {"data": item},
+                                        }))
+                                except asyncio.CancelledError:
+                                    pass
+                                except Exception as e:
+                                    log.error("Subscription error for %s: %s", sub_id, e)
+                                    await ws.send_text(json.dumps({
+                                        "type": "error",
+                                        "id": sub_id,
+                                        "payload": {"message": str(e)},
+                                    }))
+
+                            # Start the subscription runner
+                            if result.data:
+                                for field_name, field_value in result.data.items():
+                                    if hasattr(field_value, "__aiter__"):
+                                        # This is an async generator - it's a subscription
+                                        subscriptions[subscription_id] = field_value
+                                        subscription_tasks[subscription_id] = asyncio.create_task(
+                                            subscription_runner(subscription_id, field_value)
+                                        )
+                                        break
+
+                        # Send completion
+                        await ws.send_text(json.dumps({
+                            "type": "complete",
+                            "id": subscription_id,
+                        }))
+
+                    elif msg_type == "complete":
+                        # Client is closing a subscription
+                        subscription_id = data.get("id", "")
+                        if subscription_id in subscription_tasks:
+                            subscription_tasks[subscription_id].cancel()
+                            del subscription_tasks[subscription_id]
+                        if subscription_id in subscriptions:
+                            del subscriptions[subscription_id]
+
+                except json.JSONDecodeError:
+                    await ws.send_text(json.dumps({
+                        "type": "error",
+                        "payload": {"message": "Invalid JSON"},
+                    }))
+
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            log.error("GraphQL WebSocket error: %s", e)
+        finally:
+            # Cleanup all subscriptions
+            for task in subscription_tasks.values():
+                task.cancel()
+            subscriptions.clear()
 
     # Static files — mounted last so they don't shadow API routes
     static_dir = Path(__file__).parent / "static"

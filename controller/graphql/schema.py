@@ -108,8 +108,11 @@ class Mutation:
         raise Exception("Scenario manager not available")
 
 
-# Import types after class definitions
-from .types import NodeType, ScenarioType, AlertType, SnapshotType
+# Import types after class definitions - use types from subscriptions.py
+# to ensure proper integration with Subscription async generators
+from .subscriptions import (
+    NodeType, ScenarioType, AlertType, AudioLevelType, SnapshotType
+)
 
 # Create the schema
 # Note: subscriptions are passed as a class, not an instance
