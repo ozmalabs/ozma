@@ -866,6 +866,9 @@ async def run(config: Config) -> None:
     logging.getLogger("ozma").info("Shutting down...")
     server.should_exit = True
     await server_task
+    # Stop GraphQL subscription event router
+    from controller.graphql.subscriptions import stop_event_router
+    stop_event_router()
     await hid.stop()
     await controls.stop()
     await kdeconnect.stop()

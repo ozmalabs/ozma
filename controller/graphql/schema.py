@@ -29,7 +29,7 @@ class Query:
         """List all known nodes."""
         from state import AppState
         app_state: AppState = info.context["state"]
-        from .types import NodeType
+        from .subscriptions import NodeType
         return [NodeType.from_node(node) for node in app_state.nodes.values()]
 
     @strawberry.field
@@ -39,7 +39,7 @@ class Query:
         app_state: AppState = info.context["state"]
         node = app_state.nodes.get(id)
         if node:
-            from .types import NodeType
+            from .subscriptions import NodeType
             return NodeType.from_node(node)
         return None
 
@@ -50,7 +50,7 @@ class Query:
         app_state: AppState = info.context["state"]
         node_id = app_state.active_node_id
         if node_id and node_id in app_state.nodes:
-            from .types import NodeType
+            from .subscriptions import NodeType
             return NodeType.from_node(app_state.nodes[node_id])
         return None
 
@@ -59,7 +59,7 @@ class Query:
         """Get a full system snapshot."""
         from state import AppState
         app_state: AppState = info.context["state"]
-        from .types import SnapshotType, NodeType
+        from .subscriptions import SnapshotType, NodeType
         nodes = [NodeType.from_node(node) for node in app_state.nodes.values()]
         return SnapshotType(
             nodes=nodes,
@@ -80,7 +80,7 @@ class Mutation:
         import asyncio
         asyncio.create_task(app_state.set_active_node(node_id))
         # Return updated snapshot
-        from .types import SnapshotType, NodeType
+        from .subscriptions import SnapshotType, NodeType
         nodes = [NodeType.from_node(node) for node in app_state.nodes.values()]
         return SnapshotType(
             nodes=nodes,
@@ -93,7 +93,7 @@ class Mutation:
         scenario_mgr = info.context.get("scenario_manager")
         if scenario_mgr:
             scenario = scenario_mgr.create_scenario(name, node_id=node_id)
-            from .types import ScenarioType
+            from .subscriptions import ScenarioType
             return ScenarioType.from_scenario(scenario)
         raise Exception("Scenario manager not available")
 
@@ -103,7 +103,7 @@ class Mutation:
         scenario_mgr = info.context.get("scenario_manager")
         if scenario_mgr:
             scenario = scenario_mgr.activate_scenario(scenario_id)
-            from .types import ScenarioType
+            from .subscriptions import ScenarioType
             return ScenarioType.from_scenario(scenario)
         raise Exception("Scenario manager not available")
 
