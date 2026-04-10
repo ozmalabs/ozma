@@ -157,6 +157,26 @@ tunnel mode:
 In split tunnel mode, only DNS queries for Ozma-managed domains are routed
 through the tunnel. All other DNS uses the device's default resolver.
 
+### DNS integrity verification
+
+Ozma actively verifies that DNS is behaving correctly — both at the controller
+and at each node/agent independently. Checks run automatically on startup and
+every 5 minutes:
+
+- **Resolver integrity:** system resolver agrees with DoH reference
+- **Transparent interception:** ISP proxying port 53 is detected and flagged
+- **NXDOMAIN hijacking:** ISP "search assist" redirects are detected
+- **DNSSEC validation:** signed zones validate correctly; bad signatures fail
+- **DNS rebinding guard:** public names that resolve to private IPs are blocked
+  at the proxy layer to prevent browser-based LAN pivoting
+- **Captive portal detection:** hotel/airport portal intercepts are detected
+- **DNS leak detection (full tunnel):** verifies queries route through the
+  tunnel resolver rather than leaking to the local network
+
+Results are surfaced in the dashboard and queryable via the API
+(`GET /api/v1/dns/integrity`). A node on a compromised network will detect and
+report its own DNS issues independently of the controller's assessment.
+
 ---
 
 ## Kill switch
