@@ -1,183 +1,214 @@
 # Ozma
 
+[![CI](https://github.com/ozmalabs/ozma/actions/workflows/ci.yml/badge.svg)](https://github.com/ozmalabs/ozma/actions/workflows/ci.yml)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
+[![Platform: Linux](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](https://kernel.org/)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/ozmalabs/ozma/pulls)
+
 > **Easy things automatic. Hard things easy. Amazing things possible.**
 
-A software-defined KVM fabric. A small node device (SBC, RISC-V board, or emulated VM) attaches to a target PC via USB and presents itself as a keyboard, mouse, and audio device. A central Controller manages routing — which node feeds which target — over a local network.
-
-No signal interruption on switch. No host software on the target. Works with any OS that supports standard USB device classes.
+Ozma is a software-defined **KVMA router** — Keyboard, Video, Mouse, and Audio, routed over a network. A small node device (SBC, RISC-V board, or soft node) attaches permanently to a target machine via USB and presents itself as a keyboard, mouse, audio device, and network card. A Controller manages routing — switching focus changes only which node receives input. **The USB cable never moves.**
 
 ```
-┌─────────────────────────────────────┐
-│  Controller  (Linux, port 7380)     │
-│  REST API · WebSocket · mDNS        │
-└────────┬────────────────┬───────────┘
-         │                │
-┌────────┴───────┐  ┌─────┴──────────┐
-│  Node          │  │  Soft Node     │
-│  (RISC-V / SBC)│  │  (QEMU VM)     │
-│  USB HID gadget│  │  QMP + HID     │
-└────────┬───────┘  └─────┬──────────┘
-         │ USB-C           │ USB/IP
-┌────────┴───────┐  ┌─────┴──────────┐
-│  Target PC A   │  │  Target PC B   │
-│  (sees: HID,   │  │  (any desktop) │
-│   audio gadget)│  │                │
-└────────────────┘  └────────────────┘
+Physical keyboard/mouse → Controller (Linux, port 7380)
+                                │
+               ┌────────────────┴────────────────┐
+               │  WireGuard mesh (10.200.0.0/16) │
+               └────────────────┬────────────────┘
+                                │
+          ┌─────────────────────┼─────────────────────┐
+          │                     │                     │
+   ┌──────┴──────┐       ┌──────┴──────┐       ┌─────┴───────┐
+   │  Node A     │       │  Soft Node  │       │  Agent      │
+   │  (RISC-V    │       │  (QEMU VM)  │       │  (desktop   │
+   │   SBC)      │       │  QMP + HID  │       │   OS)       │
+   └──────┬──────┘       └──────┬──────┘       └─────┬───────┘
+          │ USB-C (permanent)   │ USB/IP              │ virtual
+   ┌──────┴──────┐       ┌──────┴──────┐       ┌─────┴───────┐
+   │  Machine A  │       │  Machine B  │       │  Machine C  │
+   │  (any OS)   │       │  (any OS)   │       │  (any OS)   │
+   └─────────────┘       └─────────────┘       └─────────────┘
 ```
+
+No signal interruption on switch. No host software required on the target for hardware nodes. Works with any OS that recognises standard USB HID, audio, and network gadgets.
+
+---
+
+## What Ozma provides
+
+**Core KVMA**
+- Switch keyboard, mouse, and audio between machines in under 5 ms
+- No USB movement on switch — routing is purely in software
+- Hardware nodes (RISC-V / SBC), soft nodes (QEMU VMs), and desktop agents (any OS)
+- HDMI capture for streaming and remote viewing; agent-based virtual display (no HDCP issue)
+
+**Audio**
+- PipeWire graph routing with real-time watcher
+- VBAN V0.3 for low-latency LAN audio between nodes
+- AirPlay, Spotify Connect, RTP, ROC, and Snapcast output targets
+- WirePlumber integration for hardware-native routing
+- Room correction (sweep → FFT → parametric EQ → PipeWire filter-chain)
+
+**Control surfaces**
+- MIDI controllers (X-Touch, any CC-capable surface)
+- Elgato Stream Deck (Mini, Original, XL, Pedal, Neo)
+- OSC network control (TouchOSC, Lemur, any OSC client)
+- Generic evdev (ShuttlePRO, foot pedals, macro pads)
+- Gamepad support (Xbox, PlayStation, generic)
+
+**Screen system**
+- Three-tier rendering: server-rendered frames (Node.js), native on-device (ESP32), constrained displays
+- 14 concrete drivers: Stream Deck, Corsair LCD, OLED, e-ink, LED matrix, and more
+- Pluggable widget packs, downloadable from Ozma Connect
+
+**AI agent control**
+- MCP tool server (stdio + SSE, port 7381) for Claude Desktop / Code / remote agents
+- Set-of-Marks vision, OmniParser, YOLO, and Ollama vision providers
+- Autonomous RPA engine with visual regression test runner
+- Screen reader (OCR + UI element detection)
+
+**Networking and security**
+- WireGuard mesh overlay (10.200.0.0/16) — controller, nodes, mobile clients
+- Device enrollment with Ed25519 identity keys and admin approval
+- Mobile app: WireGuard split tunnel + mTLS client certificates, one QR enrollment
+- DNS integrity verification: resolver integrity, DNSSEC, NXDOMAIN hijacking, rebinding guard, captive portal detection
+- Optional VPN: Tier 1 (home exit — genuinely no logs), Tier 2 (Connect relay, explicitly disclosed), Tier 3 (future geo-exit)
+- 4-level device assurance model (software-only → TPM-attested) integrated into routing constraints
+
+**Enterprise IT (optional modules)**
+- Identity provider: Authentik-backed IdP, OIDC/SAML for LAN services, FreeIPA integration
+- Compliance: Essential Eight, CIS, ISO 27001, SOC 2 evidence generated automatically
+- MDM bridge: WireGuard profile push, device posture, offboarding
+- SIEM, threat intelligence, and Virtual SOC
+- Password manager: managed Vaultwarden (Bitwarden-compatible) on controller hardware
+- ITSM: AI-backed L1/L2 agent, escalation policies, on-call management
+- SaaS management: discovery, licence tracking, shadow IT, vendor risk
+
+**Cameras**
+- `machine_class="camera"` node type: plug-and-play Frigate integration via mDNS
+- Zero-knowledge encrypted footage backup to Ozma Connect
+- Consumer gifting use case: technical installer, non-technical end user
+
+---
 
 ## Repository layout
 
 ```
-controller/     Python FastAPI controller daemon
-node/           Python node listener (runs on the node device)
-softnode/       QEMU-based soft node (node emulated as a VM)
-agent/          Host agent (runs inside the target machine's OS)
-tinynode/       Embedded platform support (Milk-V Duo S, RPi, Teensy) [submodule]
-protocol/       Wire protocol specifications [submodule]
-site/           Cloudflare Pages static web UI [submodule]
-docs/           Architecture, protocols, security, getting started
-dev/            Development harness: QEMU VMs, build scripts, Makefile
-demo/           Demo orchestration scripts
-tests/          Automated tests (E2E, unit, integration)
-firmware/       ESP32 screen firmware
-renderer/       Node.js screen rendering service
+controller/       Python — Controller daemon (port 7380)
+  main.py           entry point; wires all managers together
+  api.py            FastAPI REST + WebSocket
+  state.py          AppState + NodeInfo dataclasses
+  routing/          Intent-based routing graph (devices, links, constraints)
+  scenarios.py      ScenarioManager; scenarios.json persistence
+  hid.py            evdev capture → UDP forwarder
+  audio.py          AudioRouter (PipeWire + VBAN)
+  controls.py       Control surface abstraction
+  agent_engine.py   AI agent control (MCP, SoM, vision, RPA)
+  dns_verify.py     DNS integrity verification + rebinding guard
+  auth.py           JWT + Ed25519, Argon2id, WireGuard bypass
+  connect.py        Ozma Connect client (relay, backup, AI proxy)
+  … (60+ modules — see CLAUDE.md for full index)
+
+node/             Python — Hardware node daemon (runs on SBC)
+softnode/         Python — Soft node (runs on hypervisor, targets QEMU VMs)
+agent/            Python — Host agent (installs inside the target OS)
+tinynode/         Embedded platform support (RISC-V, RPi, Teensy) [submodule]
+protocol/         Wire protocol specifications [submodule]
+firmware/         ESP32 screen firmware
+renderer/         Node.js screen rendering service (port 7390)
+docs/             Architecture, protocols, security, VPN, getting started
+dev/              Development harness (RISC-V QEMU, Makefile, build scripts)
+demo/             Demo orchestration scripts
+tests/            Automated tests (E2E, unit)
 ```
+
+---
 
 ## Quick start (dev harness)
 
-The dev harness emulates the full hardware stack with QEMU VMs.
+The dev harness emulates the full hardware stack with QEMU VMs — no physical hardware needed.
 
 ### Prerequisites
 
 ```bash
+# Required: qemu-system-riscv64, qemu-system-x86_64, usbip, python3, uv
 cd dev
-make deps          # check: qemu-system-riscv64, qemu-system-x86_64, usbip, python3
-make ssh-key       # generate SSH key for VM access
-make build-node-image   # build Alpine RISC-V disk image (requires sudo, ~5 min)
+make deps        # check all prerequisites
+make ssh-key     # generate SSH key for VM access
+make build-node-image   # build Alpine RISC-V disk image (~5 min, requires sudo)
 ```
 
-### Start everything
+### Start the stack
 
 ```bash
-# Terminal 1: controller
-cd controller && uv pip install -r requirements.txt
-python -m uvicorn main:app --port 7380
-
-# Terminal 2: soft nodes (vm1, vm2)
-cd demo && bash start_vms.sh
-
-# Terminal 3: RISC-V node VM + USB chain
-cd dev
-make node-vm       # start RISC-V VM (waits ~15s to boot)
-make connect-vms   # setup USB gadget → USB/IP → host vhci → vm1
-```
-
-The RISC-V node will register with the controller as `ozma-riscv-node` with `capabilities: ["hid"]`. vm1 and vm2 register as soft nodes with `capabilities: ["qmp"]`.
-
-### Useful dev commands
-
-```bash
-make logs           # tail node.py inside the RISC-V VM
-make shell-node     # SSH into the RISC-V VM
-make disconnect-vms # detach USB gadget from vm1
-make stop           # stop all VMs
-```
-
-## Components
-
-### Controller (`controller/`)
-
-FastAPI daemon that manages the node inventory, routes HID input to the active node, and exposes a REST + WebSocket API on port 7380.
-
-```bash
+# Terminal 1 — Controller
 cd controller
 uv pip install -r requirements.txt
-python -m uvicorn main:app --port 7380 --reload
+python main.py
+
+# Terminal 2 — Soft nodes (vm1, vm2)
+bash demo/start_vms.sh
+
+# Terminal 3 — RISC-V hardware node VM
+cd dev && make node-vm
 ```
 
-Key endpoints:
-- `GET /api/v1/nodes` — list registered nodes
-- `POST /api/v1/nodes/register` — node self-registration
-- `POST /api/v1/switch/{node_id}` — set active node
-- `WS /api/v1/events` — real-time event stream
+The controller starts on `http://localhost:7380`. The RISC-V node registers as `ozma-riscv-node`. VMs register as soft nodes via mDNS.
 
-### Node (`node/`)
-
-Python daemon that runs on the node device. Receives HID packets over UDP (port 7331) and writes them to the USB HID gadget (`/dev/hidg0`, `/dev/hidg1`). Registers with the controller via mDNS or direct HTTP.
+### Test switching
 
 ```bash
-python3 node/node.py \
-    --name my-node \
-    --register-url http://controller:7380
+python tests/test_e2e_switching.py
 ```
 
-The node requires a Linux USB HID gadget stack: `dummy_hcd` + ConfigFS for dev/test, or the hardware UDC on a real SBC.
-
-### Soft Node (`softnode/`)
-
-Emulates a node using a QEMU VM. Instead of writing to `/dev/hidg0`, HID input is forwarded to the VM via QMP (`usb-host` device hotplug or QMP key injection). Used for testing without hardware.
+### Dev shortcuts
 
 ```bash
-python3 softnode/soft_node.py \
-    --name vm1 \
-    --port 7332 \
-    --qmp /tmp/ozma-vm1.qmp \
-    --vnc-host 127.0.0.1 \
-    --vnc-port 5901
+make logs           # tail node.py logs inside the RISC-V VM
+make shell-node     # SSH into the RISC-V VM
+make stop           # stop all VMs
+bash demo/start_vms.sh stop   # stop soft nodes
 ```
 
-### TinyNode (`tinynode/`) — submodule
-
-Platform-specific support for embedded targets: Milk-V Duo S (RISC-V), Raspberry Pi, and Teensy 4.1. See [`tinynode/README.md`](tinynode/README.md).
-
-### Protocol (`protocol/`) — submodule
-
-Wire protocol specifications for all Ozma communication channels (HID UDP, control REST/WS, audio VBAN/Opus, video MJPEG/H.265, OTA, presence). See [`protocol/README.md`](protocol/README.md).
-
-## Dev harness: RISC-V USB gadget chain
-
-The dev harness implements the real hardware path using QEMU + USB/IP:
-
-```
-RISC-V VM (dummy_hcd + ConfigFS HID gadget + node.py)
-  → usbipd (inside VM, TCP 3240, SLIRP-forwarded to host)
-  → host vhci_hcd (usbip attach -r 127.0.0.1)
-  → QEMU usb-host (QMP device_add → vm1 USB EHCI)
-  → vm1 sees USB HID keyboard + mouse (1d6b:0104)
-```
-
-The cross-compiled USB gadget kernel modules (`dummy_hcd`, `libcomposite`, `usb_f_hid`, `usbip_host`, etc.) are built by `dev/kernel-build/build-gadget-modules.sh` and baked into the RISC-V image.
-
-See [`dev/README.md`](dev/README.md) for the full setup guide.
+---
 
 ## Network ports
 
 | Port | Protocol | Purpose |
 |------|----------|---------|
 | 7380 | TCP | Controller REST API + WebSocket |
-| 7331 | UDP | HID input (keyboard/mouse packets to node) |
+| 7331 | UDP | HID packets → hardware node |
 | 7332–7339 | UDP | Soft node HID ports (one per VM) |
-| 7382 | TCP | Node HTTP API (USB info, status) |
-| 3240 | TCP | USB/IP (usbipd inside RISC-V VM → host) |
-| 2222 | TCP | RISC-V VM SSH (SLIRP forward) |
+| 7381 | TCP | MCP server (SSE transport for AI agents) |
+| 7382 | TCP | Node HTTP API (status, HLS stream) |
+| 7390 | TCP | Screen rendering server (WebSocket, Node.js) |
+| 7391 | TCP | Native screen rendering server (on-device) |
+| 6980 | UDP | VBAN audio (per-node) |
+| 3240 | TCP | USB/IP (RISC-V node → host, via SLIRP) |
+| 2222 | TCP | SSH → RISC-V node VM |
+| 51820 | UDP | WireGuard mesh |
 
-See [`protocol/specs/00-ports.md`](protocol/specs/00-ports.md) for the full port registry.
+---
 
 ## Documentation
 
-- [Architecture](docs/architecture.md) — system overview, three-layer model, data paths
-- [Protocols](docs/protocols.md) — wire protocol specs, packet formats, REST API
-- [Security](docs/security.md) — device identity, WireGuard mesh, enrollment, OTA signing
-- [Getting Started](docs/getting-started.md) — dev harness setup guide
+| Document | Contents |
+|----------|----------|
+| [Architecture](docs/architecture.md) | System overview, three-layer model, mesh topology, scale limits |
+| [Protocols](docs/protocols.md) | Wire protocol specs, HID packet format, REST API reference |
+| [Security](docs/security.md) | Device identity, WireGuard mesh, enrollment, OTA signing, device assurance, mobile auth, DNS integrity |
+| [VPN](docs/vpn.md) | Tiered VPN — what each mode provides and does not provide |
+| [Getting Started](docs/getting-started.md) | Dev harness setup guide |
+
+---
 
 ## License
 
-AGPL-3.0 with plugin exception. See `COPYING` for full text.
+**Code:** AGPL-3.0 with plugin exception. The controller, nodes, and agents are free software under the GNU Affero General Public License v3. Third-party plugins loaded via the plugin API may be any licence.
 
-The ozma platform is free software under the GNU Affero General Public License v3.
-Third-party plugins (loaded via the plugin API) may be any license.
+**Hardware designs** (PCB, enclosures): proprietary.
 
-Hardware designs (PCB, enclosures): proprietary.
-Documentation: CC-BY-4.0.
+**Documentation:** CC-BY-4.0.
 
-Copyright (C) 2024-2026 Ozma Labs Pty Ltd.
+Copyright (C) 2024–2026 Ozma Labs Pty Ltd.

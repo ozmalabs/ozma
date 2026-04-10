@@ -57,9 +57,14 @@ Physical network (LAN, WiFi, internet, 4G, VPN — anything)
 | `10.200.2.0/24` | Room Mic devices |
 | `10.200.3.0/24` | Soft Nodes |
 | `10.200.4.0/24` | Virtual Nodes |
+| `10.200.5.0/24` | Camera Nodes |
 | `10.200.100.0/24` | Relay servers |
+| `10.201.0.0/24` | Controller-to-controller peering overlay |
+| `10.202.0.0/16` | Mobile app clients (Android + iOS) |
 
 Addresses are assigned by the Controller during enrollment and are stable for the lifetime of the device registration.
+
+Mobile clients occupy a distinct `/16` (`10.202.0.0/16`) that is explicitly **excluded** from the WireGuard bypass check. Requests arriving from mobile addresses are never treated as trusted mesh nodes — they must authenticate via mTLS or JWT regardless of network path.
 
 ### Deployment Modes
 
@@ -80,15 +85,66 @@ Addresses are assigned by the Controller during enrollment and are stable for th
 
 ---
 
+## Device Assurance Levels
+
+Every Ozma endpoint — hardware node, desktop agent, mobile app — is assigned a **device assurance level** at enrollment based on the hardware security capabilities it can demonstrate. This level is stored in the controller's device registry, surfaced in the admin UI, and can be used as a policy gate.
+
+| Level | Name | What it means |
+|---|---|---|
+| **3** | Hardware-attested | Key generated inside hardware security module; external attestation quote cryptographically verified by controller |
+| **2** | Hardware-bound | Key in hardware security module; hardware-bound but no external attestation quote available |
+| **1** | Software-protected | Key protected by OS credential store (encrypted at rest, requires OS auth to access) |
+| **0** | Software-only | Key in filesystem; protected only by file permissions |
+
+Level 0 is the fallback for hardware that has no security module (containers, old SBCs, embedded targets). Admin approval remains the primary gate at all levels; assurance level provides visibility and enables policy-based restrictions.
+
+### Attestation by Device Type
+
+#### Hardware Nodes (SBCs / MCUs)
+
+SBCs used as compute or camera nodes typically lack a dedicated TPM. Key storage tiers:
+
+| Platform | Key storage | Assurance level |
+|---|---|---|
+| Any SBC + ATECC608A or SE050 (i2c secure element, ~$1 BOM) | Hardware secure element; key non-extractable | 3 (with attestation certificate) |
+| SBC with eFuse-locked boot (U-Boot secure boot, signed firmware) | Flash-protected; firmware chain verified | 1 + firmware attestation flag |
+| SBC without secure element | Protected flash partition | 1 |
+| Microcontroller (Teensy, RP2040) | Flash (no hardware protection) | 0 |
+
+At enrollment, nodes provide:
+- `hw_serial` — manufacturer hardware serial (MAC-derived or SoC ID where available). Weak signal, spoofable, but logged.
+- `fw_signature` — Ed25519 signature over firmware image. Verified against the OTA signing key. Proves the firmware has not been tampered with.
+- `secure_element_cert` — (future) X.509 certificate from a hardware secure element (ATECC608A / SE050) proving the WireGuard private key lives in hardware.
+
+#### Desktop Agents (Windows, macOS, Linux)
+
+Desktop agents detect available hardware security on first run and generate their identity keypair accordingly.
+
+**Windows:**
+- If TPM 2.0 is available: generate the agent keypair inside the TPM using the Windows CNG `NCrypt` API (`NCRYPT_TPM_PAD_PSS_IGNORE_SALT`). At enrollment, provide a **TPM attestation quote** — a `TPM2_Quote` over the PCR values and agent public key, signed by the TPM's Endorsement Key. The controller verifies the EK certificate chain (from the TPM manufacturer CA) and the quote. This proves the key is hardware-bound and the device's boot state at enrollment time. **Assurance level 3.**
+- If no TPM (old hardware, VMs without vTPM): generate key encrypted with Windows DPAPI (`CryptProtectData`). Key is protected by the user's Windows credential and cannot easily be extracted by another user or offline. **Assurance level 1.**
+
+**macOS:**
+- Apple Silicon (M1/M2/M3) and Intel Macs with T2 chip: generate keypair in the **Secure Enclave** using `SecKeyCreateRandomKey` with `kSecAttrTokenIDSecureEnclave`. On macOS 14 (Sonoma)+, request **Managed Device Attestation** via the ACME protocol — the Secure Enclave signs an attestation statement that the key is hardware-bound, signed by Apple's attestation CA. The controller verifies the Apple attestation chain. **Assurance level 3 (macOS 14+) or 2 (earlier macOS with Secure Enclave but no ACME).**
+- Intel Macs without T2: generate keypair in the macOS Keychain without hardware backing. **Assurance level 1.**
+
+**Linux:**
+- If TPM 2.0 is detected (via `tpm2-tools`): generate agent keypair under TPM control. Provide a TPM attestation quote at enrollment as for Windows. **Assurance level 3.**
+- If no TPM but Linux kernel keyring available: store key in kernel keyring (protected by login credential). **Assurance level 1.**
+- In containers or VMs without vTPM: plaintext key, file permission protected only. **Assurance level 0.** vTPM support in Proxmox and Hyper-V elevates this to level 3 when enabled.
+
+#### Mobile (Android / iOS)
+
+See the [Mobile Client Authentication](#mobile-client-authentication) section. Short summary:
+- Android Key Attestation + Play Integrity → **level 3** (StrongBox) or **level 2** (TEE-backed, no StrongBox)
+- iOS App Attest (Secure Enclave) → **level 3**
+- Software-backed fallback → **level 1**
+
+---
+
 ## Enrollment
 
-Enrollment adds a new node's public key to the Controller's authorized peer list and provides the node with the WireGuard configuration needed to connect.
-
-### First-Boot Sequence
-
-1. Node generates a WireGuard keypair and stores the private key in protected storage.
-2. Node enters **enrollment mode**: broadcasts a beacon or displays its public key fingerprint.
-3. Node sends an enrollment request to the Controller.
+Enrollment adds a new device's public key to the Controller's authorized peer list and provides the device with the WireGuard configuration needed to join the mesh. All device types — hardware nodes, desktop agents, and mobile clients — use the same enrollment endpoint with type-specific attestation fields.
 
 ### Enrollment Request
 
@@ -97,18 +153,42 @@ Enrollment adds a new node's public key to the Controller's authorized peer list
 ```json
 {
   "public_key": "<base64-encoded Curve25519 public key>",
+  "device_type": "node",
   "hw": "milkv-duo-s",
   "fw": "0.2.0",
   "caps": ["hid", "audio"],
-  "fingerprint": "wK3fP2aX"
+  "fingerprint": "wK3fP2aX",
+  "attestation": {
+    "type": "fw_signed",
+    "fw_signature": "<base64 Ed25519 signature over firmware image>",
+    "hw_serial": "CV1800B-a3f29b1c"
+  }
 }
 ```
 
+The `attestation` object is type-specific:
+
+| Device type | `attestation.type` | Attestation payload |
+|---|---|---|
+| Hardware node (no secure element) | `fw_signed` | `fw_signature` (Ed25519 over firmware), `hw_serial` |
+| Hardware node (with secure element) | `secure_element` | `se_cert` (X.509 cert from ATECC608A/SE050), `hw_serial` |
+| Windows agent (TPM 2.0) | `tpm2_quote` | `ek_cert` (EK certificate chain), `quote` (TPM2_Quote), `quote_sig` |
+| Windows agent (no TPM) | `dpapi_protected` | `os_version`, `hw_serial` |
+| macOS agent (ACME, macOS 14+) | `managed_device_attest` | `acme_cert_chain` (Apple attestation CA chain), `hw_serial` |
+| macOS agent (Secure Enclave, pre-14) | `secure_enclave` | `hw_serial` |
+| macOS agent (no T2/SE) | `keychain_protected` | `os_version`, `hw_serial` |
+| Linux agent (TPM 2.0) | `tpm2_quote` | `ek_cert`, `quote`, `quote_sig` |
+| Linux agent (no TPM) | `software_protected` | `os_version` |
+| Mobile Android | `android_key_attest` | `key_attestation_chain`, `play_integrity_token` |
+| Mobile iOS | `app_attest` | `app_attest_statement`, `receipt` |
+
+Missing or absent `attestation` fields are accepted but logged. The resulting assurance level is recorded in the device registry and reflected in the admin UI.
+
 ### Approval
 
-- The Controller places the request in a **pending** queue.
+- The Controller places the request in a **pending** queue with the resolved assurance level displayed.
 - An admin approves or rejects via the web UI or REST API.
-- On approval, the Controller assigns a stable `10.200.x.x` virtual IP and adds the node as a WireGuard peer.
+- On approval, the Controller assigns a stable virtual IP and adds the device as a WireGuard peer.
 
 ### Enrollment Response (200 OK)
 
@@ -119,13 +199,131 @@ Enrollment adds a new node's public key to the Controller's authorized peer list
   "controller_public_key": "<base64>",
   "controller_endpoint": "203.0.113.5:51820",
   "relay_endpoint": "relay1.ozma.io:51820",
-  "relay_public_key": "<base64>"
+  "relay_public_key": "<base64>",
+  "assurance_level": 3
 }
 ```
 
+### Assurance Level Policy
+
+Admins can configure minimum assurance level requirements per resource:
+
+- **Minimum enrollment level**: devices below this level are rejected at enrollment (not just flagged). Default: 0 (accept all, flag in UI).
+- **Minimum level for write access**: devices below this level get `read` scope only. Useful for enforcing that mutating operations (scenario switches, HID, power control) require at minimum a software-protected key.
+- **Minimum level for admin scope**: default: 1. Prevents zero-protection devices from performing admin operations.
+
+These policies are configurable per controller via `PUT /api/v1/security/assurance-policy`.
+
 ### Revocation
 
-`DELETE /api/v1/nodes/{id}` removes the node's public key from the WireGuard peer list. The node is immediately unable to establish a tunnel. No explicit revocation message is needed.
+`DELETE /api/v1/nodes/{id}` removes the device's public key from the WireGuard peer list. The device is immediately unable to establish a tunnel. For mobile clients, additionally adds the mTLS certificate serial to the revocation blocklist (see [Mobile Client Authentication](#mobile-client-authentication)).
+
+---
+
+## Mobile Client Authentication
+
+The Ozma app (Android + iOS) authenticates to controller services without a system-wide VPN. This is required because a system-wide VPN disrupts Android Auto and CarPlay.
+
+### Architecture
+
+Two complementary mechanisms work together:
+
+**WireGuard split tunnel** — the app runs a WireGuard tunnel restricted to Ozma service traffic. All other device traffic (including Android Auto / CarPlay) uses the default network path.
+
+- **Android**: per-app tunnel using `VpnService`. Android Auto (`com.google.android.projection.gearhead`) is explicitly excluded via `addDisallowedApplication()`. All other installed apps can be added as needed.
+- **iOS**: route-based tunnel using `NEPacketTunnelProvider` (requires the Network Extension entitlement from Apple). Allowed IPs are scoped to Ozma service address ranges. CarPlay traffic never matches the tunnel routes and is unaffected.
+
+**mTLS client certificates** — the Ozma app presents a hardware-backed client certificate on every HTTPS connection to first-party services. Third-party apps (Jellyfin, Immich, etc.) are protected by WireGuard only and do not use mTLS.
+
+### Certificate Authority Separation
+
+Mobile client certificates are signed by a dedicated **Mobile Client CA** — a separate intermediate CA derived from the controller's root, distinct from the Mesh CA used for node identities. This separation ensures:
+
+- A compromised Mesh CA cannot forge mobile client credentials
+- A compromised Mobile Client CA cannot forge node identities
+- Revocation lists and cert stores for each trust domain remain independent
+
+### Hardware-Backed Key Storage
+
+| Platform | Mechanism | Key types supported | Extractable? |
+|---|---|---|---|
+| Android (StrongBox) | Dedicated secure element (Titan M, NXP SE050) | P-256, RSA | No |
+| Android (TEE-backed) | ARM TrustZone in main SoC | P-256, RSA, X25519 (API 31+) | No |
+| Android (software) | Android userspace | All | Yes (if rooted) |
+| iOS (Secure Enclave) | Dedicated secure element, all iPhone 5s+ | P-256 only | No |
+
+**mTLS keypair**: generated natively in Keystore / Secure Enclave (P-256 / ECDSA). Private key is non-extractable on all hardware-backed tiers.
+
+**WireGuard keypair**: uses X25519. On Android 12+ (API 31), this can be generated directly in Keystore. On older Android and all iOS, generate the keypair in software and encrypt it with a hardware-backed AES-256-GCM key that lives in Keystore / Secure Enclave — the WireGuard private key never touches disk unencrypted, and decryption requires device authentication.
+
+The key backing tier is recorded at enrollment and surfaced in the admin UI per device.
+
+### Enrollment Flow
+
+Enrollment provisions both credentials in a single step:
+
+1. Admin generates an enrollment QR code from the controller dashboard. The QR encodes:
+   ```
+   ozma-enroll://v1/<token>/<controller_fingerprint>/<endpoint>
+   ```
+   The token is **single-use**, **160-bit entropy** (`secrets.token_bytes(20)`), and expires after **10 minutes**. The controller fingerprint allows the app to verify the enrollment response before trusting it.
+
+2. User scans QR in the Ozma app. The app:
+   - Generates a WireGuard keypair (X25519) and an mTLS keypair (P-256) in hardware-backed storage
+   - Requests **Android Key Attestation** (or **App Attest** on iOS) on the mTLS keypair — proof that the key was generated on a real device inside hardware-backed storage, verifiable without Google/Apple servers after initial registration
+   - Sends `POST /api/v1/mobile/enroll` with both public keys, the enrollment token, and the attestation token
+
+3. Controller validates:
+   - Enrollment token is valid, unused, and not expired (marks it consumed immediately)
+   - Play Integrity / App Attest verdict (recorded; enforcement is admin-configurable)
+   - Android Key Attestation chain (verifies the mTLS key is hardware-backed)
+
+4. Controller responds with:
+   - WireGuard peer config (controller public key, allowed IPs, endpoint)
+   - Signed mTLS certificate (P-256, 30-day lifetime, `CN=<user_id>:<device_id>`)
+   - Assigned IP in `10.202.0.0/16`
+
+5. App activates the WireGuard tunnel and stores the mTLS cert. The enrollment QR is now invalid.
+
+### Certificate Lifecycle
+
+- **Lifetime**: 30 days
+- **Renewal**: background task begins renewal at day 15. Uses `WorkManager` (Android) or `BGTaskScheduler` (iOS) with `RequiresNetworkConnectivity`. Exponential backoff on failure.
+- **Expiry warnings**: in-app notification at 7 days remaining; persistent notification at 3 days; access degraded at expiry
+- **Renewal authentication**: the renewal request (`POST /api/v1/mobile/renew`) is authenticated with the existing mTLS cert — no user interaction required
+
+### Attestation
+
+| Mechanism | Platform | What it proves | When checked |
+|---|---|---|---|
+| Android Key Attestation | Android | mTLS private key is hardware-backed, generated on this device | At enrollment (key attestation chain verified server-side) |
+| App Attest | iOS | mTLS key was generated inside this device's Secure Enclave by your genuine app | At enrollment |
+| Play Integrity | Android | Device passes basic Android CDD integrity checks; app is genuine | At enrollment (verdict recorded) |
+
+Attestation is recorded in the enrollment record and surfaced in the admin UI. Failed or missing attestation logs a security event but does not hard-reject enrollment by default. Admins can enable `require_device_integrity` policy to gate enrollment on passing attestation.
+
+### Device Management
+
+```
+GET    /api/v1/mobile/devices              — list enrolled devices for current user (admin: all users)
+GET    /api/v1/mobile/devices/{id}         — device detail: user, enrollment time, last seen, attestation, key backing tier
+DELETE /api/v1/mobile/devices/{id}         — revoke (user: own devices; admin: any)
+POST   /api/v1/mobile/enroll              — enrollment (QR token required; unauthenticated)
+POST   /api/v1/mobile/renew               — cert renewal (mTLS-authenticated)
+```
+
+**Revocation** is immediate on `DELETE`:
+1. WireGuard peer removed — new handshakes fail within seconds
+2. mTLS certificate serial added to blocklist — rejected on next connection (TLS session resumption is disabled for mTLS-authenticated connections)
+3. Any active relay sessions for the device are dropped
+
+**Per-user device limit**: default 10 enrolled devices. Enrollment beyond the limit requires revoking an existing device. Configurable by admin.
+
+**Last-seen tracking**: the controller records the timestamp of the last successful mTLS authentication per device. Devices inactive for 30+ days are flagged for review in the admin UI.
+
+### TLS Session Security
+
+TLS session resumption is **disabled** for connections requiring mTLS client certificates. This ensures the revocation blocklist is checked on every connection, not just on initial handshake. A revoked certificate is rejected immediately on the next request regardless of any prior session state.
 
 ---
 
@@ -329,6 +527,63 @@ If the node fails to check in with the Controller within 5 minutes of rebooting 
 
 ---
 
+## DNS Integrity Verification
+
+DNS is a foundational component of almost every network operation. Compromised DNS
+can redirect users to malicious sites even when every other security control is in
+place. Ozma actively verifies that DNS is operating correctly and has not been
+tampered with.
+
+### Checks performed
+
+| Check | What it detects | How |
+|---|---|---|
+| Resolver integrity | System resolver returns different IP than DoH reference | Compare getaddrinfo() vs Cloudflare/Google DoH for a stable domain |
+| Transparent interception | ISP proxying port 53 without disclosure | Query `one.one.one.one` — system resolver must return Cloudflare's well-known IPs |
+| NXDOMAIN hijacking | ISP returning a real IP for non-existent domains ("search assist") | Query an IANA-reserved `.invalid` TLD — must return NXDOMAIN |
+| DNSSEC validation | Resolver validates signatures; forged records return SERVFAIL | Query known-valid and known-broken signed zones via DoH with validation enabled |
+| DNS rebinding guard | Public name resolves to private/RFC-1918 address (SSRF / LAN pivot) | Every proxy request's resolved IP is checked before forwarding; non-allowlisted private IPs are blocked |
+| Captive portal | Network has intercepted HTTP (hotel WiFi, airport, corporate MITM) | Fetch canary URL and verify expected response; redirects or unexpected content indicate a captive portal |
+| DNS leak (VPN mode) | DNS queries escape the tunnel in full-tunnel VPN mode | Verify queries route through the exit resolver when VPN is active |
+
+### DNS rebinding protection
+
+The service proxy includes a `DNSRebindingGuard` that rejects any request where
+a public hostname resolves to a private IP range (RFC 1918, CGNAT, link-local,
+loopback). This prevents:
+
+- Browser-based LAN pivoting via WebRTC / fetch requests
+- SSRF attacks through Ozma's proxy layer
+- Domain name squatting that routes to internal infrastructure
+
+Private-range addresses can be explicitly allow-listed for legitimate local services:
+
+```
+POST /api/v1/dns/rebinding/allowlist
+{ "entries": ["controller.local", "192.168.1.100"] }
+```
+
+### Continuous monitoring
+
+`DNSVerifier` runs a full check suite on controller startup (after a 15-second
+delay) and every 5 minutes thereafter. When issues are detected, re-check interval
+drops to 60 seconds. Results are surfaced in the dashboard and can be queried via
+the API:
+
+```
+GET  /api/v1/dns/integrity           — controller's current assessment
+GET  /api/v1/dns/integrity/all       — all nodes + controller
+POST /api/v1/dns/integrity/run       — trigger immediate check
+POST /api/v1/dns/environment         — node/agent submits its own assessment
+GET  /api/v1/dns/environment/{id}    — specific node's latest assessment
+```
+
+Nodes and agents can run the same checks locally and submit results via
+`POST /api/v1/dns/environment`. A node on a network with NXDOMAIN hijacking will
+flag this independently of the controller, giving per-node DNS visibility.
+
+---
+
 ## Threat Model
 
 | Threat | Mitigation |
@@ -338,10 +593,10 @@ If the node fails to check in with the Controller within 5 minutes of rebooting 
 | Man-in-the-middle on control plane | WireGuard provides mutual auth; control plane only reachable inside the tunnel |
 | Unauthorized firmware install | Ed25519 signature required on all images |
 | Firmware downgrade attack | Signed payload includes version string; Controller only distributes current or newer versions |
-| Stolen node (physical access) | Private key compromise allows that one node until admin revokes it; does not affect other nodes |
+| Stolen node (physical access) | Private key compromise allows that one node until admin revoked; assurance level 3 nodes have non-extractable keys (secure element) — physical theft does not yield the private key |
 | Relay server compromise | Relay sees only encrypted WireGuard packets; cannot decrypt or inject traffic |
-| Enrollment abuse | Rate-limited; requests require admin approval |
-| Token theft (web UI) | JWTs are short-lived (24h); WireGuard-sourced requests do not use tokens |
+| Enrollment abuse | Rate-limited; requests require admin approval; mobile enrollment tokens are single-use and 10-minute TTL |
+| Token theft (web UI) | JWTs are short-lived (24h, 2–4h for mobile); WireGuard-sourced mesh node requests do not use tokens |
 | SSRF via service proxy | Target host validated against blocklist; cloud metadata ranges blocked |
 | Open redirect via login | redirect_to validated as relative path only; absolute URLs rejected |
 | XSS in login page | All user-controlled values HTML-escaped before rendering |
@@ -350,3 +605,15 @@ If the node fails to check in with the Controller within 5 minutes of rebooting 
 | Shared service token leakage | Proxy strips Authorization/Cookie headers before forwarding to backends |
 | IdP session hijack | Cookies: httponly + SameSite=lax + secure (HTTPS); sessions expire after 24h |
 | Public service exposure | Requires admin scope + explicit confirmation; dashboard warning displayed |
+| Lost / stolen phone | WireGuard peer + mTLS cert revoked immediately on DELETE /api/v1/mobile/devices/{id}; hardware-backed keys non-extractable from locked device; TLS session resumption disabled so blocklist is checked on next connection |
+| Phone compromised (software exploit) | mTLS private key non-extractable from Keystore/Secure Enclave even with root (TEE/hardware boundary); WireGuard key protected by hardware-backed AES wrap; 30-day cert expiry limits window without active revocation |
+| Mobile enrollment QR code theft | Token is single-use and expires in 10 minutes; controller fingerprint in QR binds enrollment response to specific controller; audit log records all attempts including failures |
+| Mobile client inheriting mesh node trust | Mobile clients assigned 10.202.0.0/16, excluded from wireguard_bypass_subnets; always require mTLS or JWT |
+| Fake Ozma app on attacker device | Android Key Attestation / App Attest proves key generated on genuine hardware by genuine app; Play Integrity confirms device integrity — all checked at enrollment |
+| Third-party app access (Jellyfin etc.) without mTLS | Protected by WireGuard tunnel only; no mTLS — security bounded by WireGuard key storage quality (TEE-wrapped on hardware-backed devices) |
+| DNS rebinding attack (browser pivot to LAN) | DNSRebindingGuard rejects proxy requests where a public name resolves to a private/RFC-1918 address; allowlist required for any legitimate private-range endpoint |
+| Transparent DNS interception (ISP port-53 proxy) | DNSVerifier compares system resolver against DoH reference for stable canary names; mismatch flagged and surfaced in dashboard |
+| NXDOMAIN hijacking (ISP search assist) | DNSVerifier queries an IANA-reserved .invalid TLD; any non-NXDOMAIN response is flagged as NXDOMAIN hijacking |
+| Captive portal (hotel / airport WiFi) | Captive portal detection run on startup and periodically; detected portals surface as warnings — VPN or mTLS operations will not work until portal is cleared |
+| DNSSEC validation bypass | DoH resolver with DNSSEC validation checks known-valid and known-broken signed zones; resolver that doesn't validate is flagged |
+| DNS leak in VPN full-tunnel mode | DNS leak check verifies queries route through tunnel resolver in full-tunnel VPN mode |

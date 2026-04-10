@@ -63,6 +63,10 @@ class Constraints:
     required_formats: list[str] = field(default_factory=list)
     forbidden_formats: list[str] = field(default_factory=list)
     encryption: EncryptionRequirement = EncryptionRequirement.none
+    # Minimum device assurance level for every device in the pipeline.
+    # 0=any (default), 1=software-protected, 2=hardware-bound, 3=hardware-attested.
+    # Any device below this level causes the pipeline to be rejected.
+    min_assurance_level: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -76,6 +80,7 @@ class Constraints:
             "required_formats": list(self.required_formats),
             "forbidden_formats": list(self.forbidden_formats),
             "encryption": self.encryption.value,
+            "min_assurance_level": self.min_assurance_level,
         }
 
     def intersect(self, other: "Constraints") -> "Constraints":
@@ -84,7 +89,7 @@ class Constraints:
 
         For numeric limits, the lower value wins. For lists, union of both
         (required from either is still required; forbidden from either is still
-        forbidden). For encryption, the stricter requirement wins.
+        forbidden). For encryption and assurance level, the stricter requirement wins.
         """
         def _min(a, b):
             if a is None: return b
@@ -115,6 +120,8 @@ class Constraints:
             required_formats=list(set(self.required_formats) | set(other.required_formats)),
             forbidden_formats=list(set(self.forbidden_formats) | set(other.forbidden_formats)),
             encryption=enc,
+            # Higher assurance requirement wins (stricter)
+            min_assurance_level=max(self.min_assurance_level, other.min_assurance_level),
         )
 
 
@@ -134,6 +141,9 @@ class Preferences:
     prefer_fewer_hops: bool = False
     prefer_lower_latency: bool = False
     prefer_higher_quality: bool = False
+    # When True, among pipelines that satisfy all hard constraints, prefer
+    # paths whose devices have higher assurance levels.
+    prefer_higher_assurance: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -148,6 +158,7 @@ class Preferences:
             "prefer_fewer_hops": self.prefer_fewer_hops,
             "prefer_lower_latency": self.prefer_lower_latency,
             "prefer_higher_quality": self.prefer_higher_quality,
+            "prefer_higher_assurance": self.prefer_higher_assurance,
         }
 
     def merge(self, other: "Preferences") -> "Preferences":
@@ -167,6 +178,7 @@ class Preferences:
             prefer_fewer_hops=other.prefer_fewer_hops or self.prefer_fewer_hops,
             prefer_lower_latency=other.prefer_lower_latency or self.prefer_lower_latency,
             prefer_higher_quality=other.prefer_higher_quality or self.prefer_higher_quality,
+            prefer_higher_assurance=other.prefer_higher_assurance or self.prefer_higher_assurance,
         )
 
 
@@ -557,6 +569,53 @@ BUILTIN_INTENTS: dict[str, Intent] = {
             ),
         ],
         degradation=DegradationPolicy(
+            audio=AudioStrategy.never_degrade,
+        ),
+    ),
+
+    "secure": Intent(
+        name="secure",
+        description=(
+            "Security overlay — compose with any other intent to require "
+            "hardware-bound key material on all devices in the pipeline. "
+            "Rejects paths through software-only (level 0) devices. "
+            "Prefers hardware-attested (level 3) endpoints when available."
+        ),
+        priority=90,   # high priority so it wins on composition ties
+        streams=[
+            # One constraint entry per media type that may appear in a pipeline.
+            # min_assurance_level=2: hardware-bound keys required everywhere.
+            StreamIntent(
+                media_type=MediaType.hid,
+                required=False,
+                constraints=Constraints(
+                    min_assurance_level=2,
+                    encryption=EncryptionRequirement.required,
+                ),
+                preferences=Preferences(prefer_higher_assurance=True),
+            ),
+            StreamIntent(
+                media_type=MediaType.video,
+                required=False,
+                constraints=Constraints(
+                    min_assurance_level=2,
+                    encryption=EncryptionRequirement.required,
+                ),
+                preferences=Preferences(prefer_higher_assurance=True),
+            ),
+            StreamIntent(
+                media_type=MediaType.audio,
+                required=False,
+                constraints=Constraints(
+                    min_assurance_level=2,
+                    encryption=EncryptionRequirement.required,
+                ),
+                preferences=Preferences(prefer_higher_assurance=True),
+            ),
+        ],
+        degradation=DegradationPolicy(
+            hid=HidStrategy.never_degrade,
+            video=VideoStrategy.never_degrade,
             audio=AudioStrategy.never_degrade,
         ),
     ),

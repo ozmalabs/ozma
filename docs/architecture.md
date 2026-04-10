@@ -379,6 +379,26 @@ Alice shares her Jellyfin with Bob:
 
 ---
 
+## VPN
+
+The Ozma app includes an optional VPN built on the existing WireGuard mesh
+infrastructure. Three modes are available:
+
+- **Tier 1 — Home exit**: all traffic routed through your controller. Your home
+  ISP sees the traffic; no third party does. Genuinely no logs because you
+  control the hardware. Included, no extra cost.
+- **Tier 2 — Connect relay exit**: traffic exits via Ozma Connect relay servers.
+  Ozma Connect can see this traffic — this is explicitly not zero-knowledge and
+  is stated as such. Included in Connect plans.
+- **Tier 3 — Third-party exit nodes** (planned): partnered exit infrastructure
+  for geographic flexibility. Disclosed per-provider.
+
+Full tunnel, split tunnel, per-app routing, DNS-over-WireGuard, and an optional
+kill switch are all configurable. See [vpn.md](vpn.md) for the full explanation
+of what VPN does and does not provide.
+
+---
+
 ## External Publishing
 
 Services can be published to the internet under `.e.` subdomains:
