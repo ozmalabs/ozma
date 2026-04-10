@@ -1,8 +1,14 @@
-import { RouterProvider } from 'react-router-dom'
-import { router } from './router/router'
+import { Routes, Route } from 'react-router-dom'
+import { Layout } from './components/layout'
+import NodesPage from './pages/nodes'
 
-function App() {
-  return <RouterProvider router={router} />
+export default function App() {
+  return (
+    <Layout>
+      <Routes>
+        <Route path="/" element={<NodesPage />} />
+        <Route path="/nodes" element={<NodesPage />} />
+      </Routes>
+    </Layout>
+  )
 }
-
-export default App
