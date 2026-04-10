@@ -221,6 +221,25 @@ class ConstraintChecker:
         # If encryption is "required" but transport provides none, we'd fail here.
         # Deferred to transport layer (Phase 4).
 
+        # 13. Device assurance level — all devices in the pipeline must meet
+        #     the minimum assurance level declared by the constraint.
+        if c.min_assurance_level > 0 and self._graph is not None:
+            seen: set[str] = set()
+            for link in path.links:
+                for ref in (link.source, link.sink):
+                    if ref.device_id in seen:
+                        continue
+                    seen.add(ref.device_id)
+                    device = self._graph.get_device(ref.device_id)
+                    if device is None:
+                        continue
+                    if device.assurance_level < c.min_assurance_level:
+                        violations.append(ConstraintViolation(
+                            "assurance_level",
+                            f"device '{device.name}' assurance level "
+                            f"{device.assurance_level} < required "
+                            f"{c.min_assurance_level}"))
+
         return violations
 
 
@@ -249,7 +268,11 @@ _TRUST_FACTOR: dict[InfoQuality, float] = {
 }
 
 
-def _compute_cost(path: CandidatePath, prefs: Preferences) -> float:
+def _compute_cost(
+    path: CandidatePath,
+    prefs: Preferences,
+    graph: "RoutingGraph | None" = None,
+) -> float:
     """
     Compute routing cost for a candidate path given the active preferences.
 
@@ -283,6 +306,25 @@ def _compute_cost(path: CandidatePath, prefs: Preferences) -> float:
     # Uncertainty = same as quality_loss in Phase 2
     uncertainty = quality_loss
 
+    # Assurance term: penalise paths with low-assurance devices when
+    # prefer_higher_assurance is set. Score = 1 - (min_level / 3), so a
+    # fully-attested path (all level 3) contributes 0 cost, software-only
+    # (all level 0) contributes the full weight. Applied only when preference
+    # is active and graph is available for device lookup.
+    assurance_term = 0.0
+    if prefs.prefer_higher_assurance and graph is not None:
+        min_level = 3
+        seen: set[str] = set()
+        for link in path.links:
+            for ref in (link.source, link.sink):
+                if ref.device_id in seen:
+                    continue
+                seen.add(ref.device_id)
+                device = graph.get_device(ref.device_id)
+                if device is not None:
+                    min_level = min(min_level, device.assurance_level)
+        assurance_term = 1.0 - (min_level / 3.0)
+
     cost = (
         w["latency"] * latency_norm
         + w["hops"] * path.hop_count
@@ -290,6 +332,7 @@ def _compute_cost(path: CandidatePath, prefs: Preferences) -> float:
         + w["bandwidth"] * bw_term
         + w["quality_loss"] * quality_loss
         + w["uncertainty"] * uncertainty
+        + w.get("assurance", 1.0) * assurance_term
         # pressure term: Phase 5 (no resource data yet)
     )
     return cost
@@ -421,7 +464,7 @@ class Router:
             # Rank by cost
             prefs = stream.preferences
             for path in feasible:
-                path.cost = _compute_cost(path, prefs)
+                path.cost = _compute_cost(path, prefs, graph=self._graph)
             feasible.sort(key=lambda p: p.cost)
 
             # Build Pipeline objects for top-N
@@ -520,7 +563,7 @@ class Router:
             ]
             prefs = stream.preferences
             for p in feasible:
-                p.cost = _compute_cost(p, prefs)
+                p.cost = _compute_cost(p, prefs, graph=self._graph)
             feasible.sort(key=lambda p: p.cost)
             pipelines = [
                 self._build_pipeline(intent, stream, p, src_ref, dst_ref)
