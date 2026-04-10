@@ -1,13 +1,12 @@
-import { Routes, Route } from 'react-router-dom'
-import Layout from './components/Layout'
-import NodesPage from './pages/NodesPage'
+import { Outlet } from 'react-router-dom'
+import Layout from './components/layout/Layout'
 
-export default function App() {
+function App() {
   return (
     <Layout>
-      <Routes>
-        <Route path="/" element={<NodesPage />} />
-      </Routes>
+      <Outlet />
     </Layout>
   )
 }
+
+export default App
