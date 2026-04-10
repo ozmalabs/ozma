@@ -262,16 +262,23 @@ class HardwareIdentity:
     usb_vid_pid: str | None = None
     usb_serial: str | None = None
     asset_tag: str | None = None
+    # Device assurance level: 0=software-only, 1=software-protected,
+    # 2=hardware-bound (no external proof), 3=hardware-attested (TPM quote /
+    # Secure Enclave / Android Key Attestation / App Attest).
+    assurance_level: int = 0
+    # The attestation mechanism that produced the assurance level.
+    attestation_type: str | None = None   # e.g. "tpm2_quote", "app_attest", "fw_signed"
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {}
         for k in ("serial_number", "serial_source", "uuid", "usb_vid_pid",
-                  "usb_serial", "asset_tag"):
+                  "usb_serial", "asset_tag", "attestation_type"):
             v = getattr(self, k)
             if v is not None:
                 d[k] = v
         if self.mac_addresses:
             d["mac_addresses"] = self.mac_addresses
+        d["assurance_level"] = self.assurance_level
         return d
 
 
@@ -398,6 +405,10 @@ class Device:
     ports: list[Port] = field(default_factory=list)
     internal_links: list[Link] = field(default_factory=list)
     identity: HardwareIdentity | None = None
+    # Assurance level mirrors HardwareIdentity.assurance_level for fast
+    # access during constraint checking without dereferencing identity.
+    # 0=software-only, 1=software-protected, 2=hardware-bound, 3=hardware-attested.
+    assurance_level: int = 0
     properties: dict = field(default_factory=dict)
 
     def get_port(self, port_id: str) -> Port | None:
@@ -416,6 +427,7 @@ class Device:
             "type": self.type.value,
             "location": self.location.to_dict(),
             "ports": [p.to_dict() for p in self.ports],
+            "assurance_level": self.assurance_level,
         }
         if self.internal_links:
             d["internal_links"] = [l.to_dict() for l in self.internal_links]

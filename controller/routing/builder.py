@@ -317,6 +317,9 @@ class GraphBuilder:
                 bus="network",
             ),
             ports=node_ports,
+            # Seed assurance level from NodeInfo; defaults to 0 (software-only)
+            # until enrollment stores the attested value.
+            assurance_level=getattr(node_info, "assurance_level", 0),
             properties={
                 "role": getattr(node_info, "role", ""),
                 "hw": getattr(node_info, "hw", ""),
