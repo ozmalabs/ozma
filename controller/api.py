@@ -114,9 +114,16 @@ try:
     import strawberry
     from strawberry.types import Info
     from .graphql.schema import schema as graphql_schema
+    from .graphql.subscriptions import start_event_router, stop_event_router
     HAS_GRAPHQL = True
 except ImportError:
     HAS_GRAPHQL = False
+    # Define stub functions when GraphQL is not available
+    def start_event_router(state: Any) -> None:  # type: ignore
+        pass
+
+    def stop_event_router() -> None:  # type: ignore
+        pass
 
 log = logging.getLogger("ozma.api")
 
@@ -779,6 +786,8 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     @app.on_event("startup")
     async def _startup() -> None:
         asyncio.create_task(_event_pump(), name="event-pump")
+        # Start GraphQL subscription event router
+        start_event_router(state)
 
     # --- WebSocket endpoint ---
 
@@ -10270,6 +10279,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
                     "state": state,
                     "scenario_manager": scenarios,
                     "audio_router": audio,
+                    "alert_manager": alert_mgr,
                 },
             )
 
@@ -10380,6 +10390,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
                                 "state": state,
                                 "scenario_manager": scenarios,
                                 "audio_router": audio,
+                                "alert_manager": alert_mgr,
                             },
                         )
 

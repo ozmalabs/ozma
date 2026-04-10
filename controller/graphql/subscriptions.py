@@ -11,47 +11,42 @@ GraphQL subscription endpoint.
 """
 
 import asyncio
-import json
 import logging
 import time
-from typing import AsyncGenerator, TYPE_CHECKING
+from typing import AsyncGenerator, TYPE_CHECKING, Optional, Any
 
 import strawberry
 from strawberry.types import Info
 
 if TYPE_CHECKING:
     from state import AppState, NodeInfo
-    from scenarios import ScenarioManager
+    from scenarios import Scenario, ScenarioManager
     from audio import AudioRouter
-
-
-# Custom scalar for JSON types (dict/list)
-@strawberry.scalar
-class JSONScalar:
-    """Custom scalar for JSON-serializable data."""
-
-    @staticmethod
-    def serialize(value):
-        return value
-
-    @staticmethod
-    def parse_literal(value):
-        return value
-
-    @staticmethod
-    def parse_value(value):
-        return value
+    from alerts import AlertManager, Alert
 
 log = logging.getLogger("ozma.graphql.subscriptions")
-
 
 # Rate limit for audio level updates (10Hz = 100ms interval)
 AUDIO_LEVEL_INTERVAL = 0.1  # seconds
 
+# Event type constants
+EVENT_NODE_ONLINE = "node.online"
+EVENT_NODE_OFFLINE = "node.offline"
+EVENT_NODE_SWITCHED = "node.switched"
+EVENT_SCENARIO_ACTIVATED = "scenario.activated"
+EVENT_AUDIO_LEVELS = "audio.levels"
+EVENT_ALERT_FIRED = "alert.fired"
+EVENT_ALERT_UPDATED = "alert.updated"
+
 
 @strawberry.type
 class NodeType:
-    """GraphQL type for a node in the KVMA system."""
+    """
+    GraphQL type for a node in the KVMA system.
+
+    Represents a hardware node (SBC or VM) that is permanently wired to
+    one target machine via USB (HID gadget) and optionally HDMI.
+    """
 
     id: str
     host: str
@@ -63,7 +58,7 @@ class NodeType:
     capabilities: list[str]
     machine_class: str
     last_seen: float
-    display_outputs: list[JSONScalar] = strawberry.field(default_factory=list)
+    display_outputs: list["JSONScalar"] = strawberry.field(default_factory=list)
     vnc_host: str | None = None
     vnc_port: int | None = None
     stream_port: int | None = None
@@ -74,14 +69,14 @@ class NodeType:
     audio_vban_port: int | None = None
     mic_vban_port: int | None = None
     capture_device: str | None = None
-    camera_streams: list[JSONScalar] = strawberry.field(default_factory=list)
+    camera_streams: list["JSONScalar"] = strawberry.field(default_factory=list)
     frigate_host: str | None = None
     frigate_port: int | None = None
     owner_user_id: str = ""
     owner_id: str = ""
     shared_with: list[str] = strawberry.field(default_factory=list)
     seat_count: int = 1
-    seat_config: JSONScalar = strawberry.field(default_factory=dict)
+    seat_config: "JSONScalar" = strawberry.field(default_factory=dict)
     parent_node_id: str = ""
     sunshine_port: int | None = None
     active: bool = False
@@ -127,14 +122,19 @@ class NodeType:
 
 @strawberry.type
 class ScenarioType:
-    """GraphQL type for a scenario."""
+    """
+    GraphQL type for a scenario.
+
+    A scenario represents a saved configuration that can be activated,
+    typically containing node assignment, color, and custom configuration.
+    """
 
     id: str
     name: str
     node_id: str | None = None
     color: str = ""
     index: int = 0
-    config: JSONScalar = strawberry.field(default_factory=dict)
+    config: "JSONScalar" = strawberry.field(default_factory=dict)
 
     @staticmethod
     def from_scenario(scenario: "Scenario") -> "ScenarioType":
@@ -151,7 +151,12 @@ class ScenarioType:
 
 @strawberry.type
 class AlertType:
-    """GraphQL type for an alert."""
+    """
+    GraphQL type for an alert.
+
+    Alerts represent system events that require attention, such as
+    camera motion detection, device status changes, or error conditions.
+    """
 
     id: str
     kind: str = ""
@@ -166,8 +171,23 @@ class AlertType:
     camera_id: str | None = None
 
     @staticmethod
-    def from_alert(alert: "Alert") -> "AlertType":
-        """Convert internal alert to GraphQL AlertType."""
+    def from_alert(alert: "Alert | dict[str, Any]") -> "AlertType":
+        """Convert internal Alert or alert dict to GraphQL AlertType."""
+        # Handle both AlertSession objects and dict payloads from events
+        if isinstance(alert, dict):
+            return AlertType(
+                id=alert.get("id", ""),
+                kind=alert.get("kind", ""),
+                title=alert.get("title", ""),
+                body=alert.get("body", ""),
+                camera=alert.get("camera"),
+                person=alert.get("person"),
+                severity=alert.get("severity", ""),
+                state=alert.get("state", ""),
+                created_at=alert.get("started_at", alert.get("created_at", 0.0)),
+                timeout_s=alert.get("timeout_s", 0.0),
+                camera_id=alert.get("camera"),
+            )
         return AlertType(
             id=alert.id,
             kind=alert.kind,
@@ -175,17 +195,21 @@ class AlertType:
             body=alert.body,
             camera=alert.camera,
             person=alert.person,
-            severity=alert.severity,
+            severity="",
             state=alert.state,
-            created_at=alert.created_at,
+            created_at=alert.started_at,
             timeout_s=alert.timeout_s,
-            camera_id=alert.camera_id,
+            camera_id=alert.camera,
         )
 
 
 @strawberry.type
 class AudioLevelType:
-    """GraphQL type for audio level data for a single node."""
+    """
+    GraphQL type for audio level data for a single node.
+
+    Contains per-channel dB measurements for audio monitoring.
+    """
 
     node_id: str = ""
     levels: dict[str, float] = strawberry.field(
@@ -202,28 +226,67 @@ class SnapshotType:
     active_node_id: str | None
 
 
-# Global subscription tracking
+# Custom scalar for JSON types (dict/list)
+@strawberry.scalar
+class JSONScalar:
+    """Custom scalar for JSON-serializable data."""
+
+    @staticmethod
+    def serialize(value: Any) -> Any:
+        return value
+
+    @staticmethod
+    def parse_literal(value: Any) -> Any:
+        return value
+
+    @staticmethod
+    def parse_value(value: Any) -> Any:
+        return value
+
+
+# Global subscription registry - manages event routing to subscriptions
 class _SubscriptionRegistry:
-    """Thread-safe registry for subscription queues."""
+    """
+    Thread-safe registry for subscription queues and event routing.
+
+    This registry:
+    1. Tracks all active subscriptions with their IDs and event type filters
+    2. Routes events from AppState.events to matching subscription queues
+    3. Provides cleanup when subscriptions are terminated
+    """
 
     def __init__(self):
         self._queues: dict[str, asyncio.Queue] = {}
-        self._event_types: dict[str, str] = {}  # subscription_id -> event_type_filter
+        self._event_type_filters: dict[str, str | None] = {}  # subscription_id -> event_type_filter
         self._lock = asyncio.Lock()
 
     async def register(
-        self, subscription_id: str, queue: asyncio.Queue, event_type_filter: str
+        self, subscription_id: str, queue: asyncio.Queue, event_type_filter: str | None = None
     ) -> None:
-        """Register a subscription."""
+        """
+        Register a new subscription.
+
+        Args:
+            subscription_id: Unique identifier for this subscription
+            queue: Asyncio queue to deliver events to
+            event_type_filter: Optional event type filter (e.g., "node", "scenario", "audio")
+        """
         async with self._lock:
             self._queues[subscription_id] = queue
-            self._event_types[subscription_id] = event_type_filter
+            self._event_type_filters[subscription_id] = event_type_filter
+            log.debug("Registered subscription %s with filter '%s'", subscription_id, event_type_filter)
 
     async def unregister(self, subscription_id: str) -> None:
-        """Unregister a subscription."""
+        """
+        Unregister a subscription and clean up resources.
+
+        Args:
+            subscription_id: The subscription ID to remove
+        """
         async with self._lock:
             self._queues.pop(subscription_id, None)
-            self._event_types.pop(subscription_id, None)
+            self._event_type_filters.pop(subscription_id, None)
+            log.debug("Unregistered subscription %s", subscription_id)
 
     async def get_queue(self, subscription_id: str) -> asyncio.Queue | None:
         """Get a subscription queue by ID."""
@@ -233,21 +296,148 @@ class _SubscriptionRegistry:
     async def get_event_type_filter(self, subscription_id: str) -> str | None:
         """Get the event type filter for a subscription."""
         async with self._lock:
-            return self._event_types.get(subscription_id)
-
-    async def get_all_event_types(self) -> dict[str, str]:
-        """Get all event type filters."""
-        async with self._lock:
-            return dict(self._event_types)
+            return self._event_type_filters.get(subscription_id)
 
     async def get_all_queues(self) -> dict[str, asyncio.Queue]:
-        """Get all queues."""
+        """Get all subscription queues."""
         async with self._lock:
             return dict(self._queues)
+
+    async def matches_filter(self, subscription_id: str, event: dict[str, Any]) -> bool:
+        """
+        Check if an event matches a subscription's filter.
+
+        Args:
+            subscription_id: The subscription ID
+            event: The event to check
+
+        Returns:
+            True if the event matches the filter or if no filter is set
+        """
+        async with self._lock:
+            event_filter = self._event_type_filters.get(subscription_id)
+            if event_filter is None:
+                return True
+            event_type = event.get("type", "")
+            return event_type.startswith(event_filter + ".") or event_type == event_filter
 
 
 # Global registry instance
 _subscription_registry = _SubscriptionRegistry()
+
+
+async def _event_router_task(state: "AppState") -> None:
+    """
+    Background task that routes events from AppState to subscription queues.
+
+    This task:
+    1. Consumes events from state.events
+    2. Routes matching events to all registered subscription queues
+    3. Runs until cancelled
+
+    Args:
+        state: The AppState instance containing the events queue
+    """
+    log.info("Starting event router task")
+    try:
+        while True:
+            event = await state.events.get()
+            event_type = event.get("type", "")
+            event_id = event.get("id", "")
+
+            # Get all queues that match this event type
+            async with _subscription_registry._lock:
+                matching_queues = []
+                for sub_id, queue in _subscription_registry._queues.items():
+                    event_filter = _subscription_registry._event_type_filters.get(sub_id)
+                    if event_filter is None:
+                        matching_queues.append((sub_id, queue))
+                    elif event_type.startswith(event_filter + ".") or event_type == event_filter:
+                        matching_queues.append((sub_id, queue))
+
+            # Route event to matching queues (non-blocking)
+            for sub_id, queue in matching_queues:
+                try:
+                    # Use put_nowait to avoid blocking if queue is full
+                    queue.put_nowait(event)
+                except asyncio.QueueFull:
+                    log.warning("Queue full for subscription %s, dropping event %s", sub_id, event_type)
+
+    except asyncio.CancelledError:
+        log.info("Event router task cancelled")
+        raise
+
+
+# Global event router task reference
+_event_router_task: asyncio.Task | None = None
+
+
+def start_event_router(state: "AppState") -> None:
+    """
+    Start the global event router task that routes events to subscriptions.
+
+    This should be called once during application startup.
+
+    Args:
+        state: The AppState instance containing the events queue
+    """
+    global _event_router_task
+    if _event_router_task is None:
+        _event_router_task = asyncio.create_task(_event_router_task_wrapper(state), name="graphql-event-router")
+
+
+async def _event_router_task_wrapper(state: "AppState") -> None:
+    """Wrapper for the event router task that handles exceptions gracefully."""
+    try:
+        await _event_router_task_wrapper_impl(state)
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        log.error("Event router task crashed: %s", e, exc_info=True)
+        raise
+
+
+async def _event_router_task_wrapper_impl(state: "AppState") -> None:
+    """Implementation of the event router task."""
+    log.info("Starting event router task")
+    while True:
+        try:
+            await _event_router_task_loop(state)
+        except Exception as e:
+            log.error("Event router error: %s", e)
+            await asyncio.sleep(1)  # Brief delay before retry
+
+
+async def _event_router_task_loop(state: "AppState") -> None:
+    """Main loop of the event router task."""
+    while True:
+        event = await state.events.get()
+        event_type = event.get("type", "")
+
+        # Route event to matching subscription queues
+        async with _subscription_registry._lock:
+            matching_queues = []
+            for sub_id, queue in _subscription_registry._queues.items():
+                event_filter = _subscription_registry._event_type_filters.get(sub_id)
+                if event_filter is None:
+                    matching_queues.append((sub_id, queue))
+                elif event_type.startswith(event_filter + ".") or event_type == event_filter:
+                    matching_queues.append((sub_id, queue))
+
+        # Route event to matching queues (non-blocking)
+        for sub_id, queue in matching_queues:
+            try:
+                queue.put_nowait(event)
+            except asyncio.QueueFull:
+                log.warning("Queue full for subscription %s, dropping event %s", sub_id, event_type)
+
+
+def stop_event_router() -> None:
+    """Stop the global event router task."""
+    global _event_router_task
+    if _event_router_task is not None:
+        _event_router_task.cancel()
+        _event_router_task = None
 
 
 @strawberry.type
@@ -264,10 +454,10 @@ class Subscription:
 
     Example query:
         subscription {
-            nodeStateChanged
-            scenarioActivated
-            audioLevelUpdate
-            alertFired
+            nodeStateChanged { id host active }
+            scenarioActivated { id name color }
+            audioLevelUpdate { node_id levels timestamp }
+            alertFired { id kind severity title }
         }
     """
 
@@ -286,9 +476,11 @@ class Subscription:
             - node.offline: node removed from the system
             - node.switched: active node changed
 
-        The active_node_id field in each yielded object indicates which
+        The active field in each yielded object indicates whether this
         node is currently active (None if no active node).
         """
+        from state import AppState, NodeInfo
+
         app_state: AppState = info.context["state"]
         active_node_id = app_state.active_node_id
 
@@ -298,7 +490,7 @@ class Subscription:
         # Create a queue for this subscription
         event_queue: asyncio.Queue = asyncio.Queue()
 
-        # Register the subscription
+        # Register the subscription with node event filter
         await _subscription_registry.register(subscription_id, event_queue, "node")
 
         try:
@@ -308,115 +500,50 @@ class Subscription:
             for node in nodes.values():
                 yield NodeType.from_node(node, active=(active == node.id))
 
-            # Drain any pre-existing events in the queue
-            while True:
-                try:
-                    event = event_queue.get_nowait()
-                    node_id = event.get("node_id", "")
-                    event_type = event.get("type", "")
-
-                    if event_type == "node.online":
-                        node = event.get("node", {})
-                        # Create a temporary NodeInfo from dict if needed
-                        from state import NodeInfo
-                        temp_node = NodeInfo(
-                            id=node.get("id", ""),
-                            host=node.get("host", ""),
-                            port=node.get("port", 0),
-                            role=node.get("role", ""),
-                            hw=node.get("hw", ""),
-                            fw_version=node.get("fw_version", ""),
-                            proto_version=node.get("proto_version", 1),
-                            capabilities=node.get("capabilities", []),
-                            machine_class=node.get("machine_class", "workstation"),
-                            last_seen=node.get("last_seen", time.monotonic()),
-                            display_outputs=node.get("display_outputs", []),
-                            vnc_host=node.get("vnc_host"),
-                            vnc_port=node.get("vnc_port"),
-                            stream_port=node.get("stream_port"),
-                            stream_path=node.get("stream_path"),
-                            api_port=node.get("api_port"),
-                            audio_type=node.get("audio_type"),
-                            audio_sink=node.get("audio_sink"),
-                            audio_vban_port=node.get("audio_vban_port"),
-                            mic_vban_port=node.get("mic_vban_port"),
-                            capture_device=node.get("capture_device"),
-                            camera_streams=node.get("camera_streams", []),
-                            frigate_host=node.get("frigate_host"),
-                            frigate_port=node.get("frigate_port"),
-                            owner_user_id=node.get("owner_user_id", ""),
-                            owner_id=node.get("owner_id", ""),
-                            shared_with=node.get("shared_with", []),
-                            seat_count=node.get("seat_count", 1),
-                            seat_config=node.get("seat_config", {}),
-                            parent_node_id=node.get("parent_node_id", ""),
-                            sunshine_port=node.get("sunshine_port"),
-                        )
-                        yield NodeType.from_node(temp_node, active=(active == temp_node.id))
-                    elif event_type == "node.offline":
-                        # Yield with active=False to indicate removal
-                        yield NodeType.from_node(NodeInfo(
-                            id=node_id,
-                            host="",
-                            port=0,
-                            role="",
-                            hw="",
-                            fw_version="",
-                            proto_version=1,
-                            machine_class="",
-                        ), active=False)
-                    elif event_type == "node.switched":
-                        # Re-fetch the node to get current data
-                        if node_id in app_state.nodes:
-                            yield NodeType.from_node(app_state.nodes[node_id], active=True)
-
-                except asyncio.QueueEmpty:
-                    break
-
             # Yield new events as they arrive
             while True:
                 event = await event_queue.get()
-                node_id = event.get("node_id", "")
                 event_type = event.get("type", "")
 
-                if event_type == "node.online":
-                    node = event.get("node", {})
-                    from state import NodeInfo
+                if event_type == EVENT_NODE_ONLINE:
+                    node_dict = event.get("node", {})
                     temp_node = NodeInfo(
-                        id=node.get("id", ""),
-                        host=node.get("host", ""),
-                        port=node.get("port", 0),
-                        role=node.get("role", ""),
-                        hw=node.get("hw", ""),
-                        fw_version=node.get("fw_version", ""),
-                        proto_version=node.get("proto_version", 1),
-                        capabilities=node.get("capabilities", []),
-                        machine_class=node.get("machine_class", "workstation"),
-                        last_seen=node.get("last_seen", time.monotonic()),
-                        display_outputs=node.get("display_outputs", []),
-                        vnc_host=node.get("vnc_host"),
-                        vnc_port=node.get("vnc_port"),
-                        stream_port=node.get("stream_port"),
-                        stream_path=node.get("stream_path"),
-                        api_port=node.get("api_port"),
-                        audio_type=node.get("audio_type"),
-                        audio_sink=node.get("audio_sink"),
-                        audio_vban_port=node.get("audio_vban_port"),
-                        mic_vban_port=node.get("mic_vban_port"),
-                        capture_device=node.get("capture_device"),
-                        camera_streams=node.get("camera_streams", []),
-                        frigate_host=node.get("frigate_host"),
-                        frigate_port=node.get("frigate_port"),
-                        owner_user_id=node.get("owner_user_id", ""),
-                        owner_id=node.get("owner_id", ""),
-                        shared_with=node.get("shared_with", []),
-                        seat_count=node.get("seat_count", 1),
-                        seat_config=node.get("seat_config", {}),
-                        parent_node_id=node.get("parent_node_id", ""),
-                        sunshine_port=node.get("sunshine_port"),
+                        id=node_dict.get("id", ""),
+                        host=node_dict.get("host", ""),
+                        port=node_dict.get("port", 0),
+                        role=node_dict.get("role", ""),
+                        hw=node_dict.get("hw", ""),
+                        fw_version=node_dict.get("fw_version", ""),
+                        proto_version=node_dict.get("proto_version", 1),
+                        capabilities=node_dict.get("capabilities", []),
+                        machine_class=node_dict.get("machine_class", "workstation"),
+                        last_seen=node_dict.get("last_seen", time.monotonic()),
+                        display_outputs=node_dict.get("display_outputs", []),
+                        vnc_host=node_dict.get("vnc_host"),
+                        vnc_port=node_dict.get("vnc_port"),
+                        stream_port=node_dict.get("stream_port"),
+                        stream_path=node_dict.get("stream_path"),
+                        api_port=node_dict.get("api_port"),
+                        audio_type=node_dict.get("audio_type"),
+                        audio_sink=node_dict.get("audio_sink"),
+                        audio_vban_port=node_dict.get("audio_vban_port"),
+                        mic_vban_port=node_dict.get("mic_vban_port"),
+                        capture_device=node_dict.get("capture_device"),
+                        camera_streams=node_dict.get("camera_streams", []),
+                        frigate_host=node_dict.get("frigate_host"),
+                        frigate_port=node_dict.get("frigate_port"),
+                        owner_user_id=node_dict.get("owner_user_id", ""),
+                        owner_id=node_dict.get("owner_id", ""),
+                        shared_with=node_dict.get("shared_with", []),
+                        seat_count=node_dict.get("seat_count", 1),
+                        seat_config=node_dict.get("seat_config", {}),
+                        parent_node_id=node_dict.get("parent_node_id", ""),
+                        sunshine_port=node_dict.get("sunshine_port"),
+                        direct_registered=node_dict.get("direct_registered", False),
                     )
                     yield NodeType.from_node(temp_node, active=(active == temp_node.id))
-                elif event_type == "node.offline":
+                elif event_type == EVENT_NODE_OFFLINE:
+                    node_id = event.get("node_id", "")
                     yield NodeType.from_node(NodeInfo(
                         id=node_id,
                         host="",
@@ -427,10 +554,14 @@ class Subscription:
                         proto_version=1,
                         machine_class="",
                     ), active=False)
-                elif event_type == "node.switched":
+                elif event_type == EVENT_NODE_SWITCHED:
+                    node_id = event.get("node_id", "")
                     if node_id in app_state.nodes:
                         yield NodeType.from_node(app_state.nodes[node_id], active=True)
 
+        except asyncio.CancelledError:
+            log.debug("Subscription cancelled: nodeStateChanged")
+            raise
         finally:
             # Cleanup subscription
             await _subscription_registry.unregister(subscription_id)
@@ -451,6 +582,9 @@ class Subscription:
         The yielded object contains the scenario details including
         id, name, node_id, and configuration.
         """
+        from state import AppState
+        from scenarios import ScenarioManager
+
         app_state: AppState = info.context["state"]
         scenario_mgr: ScenarioManager | None = info.context.get("scenario_manager")
 
@@ -460,7 +594,7 @@ class Subscription:
         # Create a queue for this subscription
         event_queue: asyncio.Queue = asyncio.Queue()
 
-        # Register the subscription
+        # Register the subscription with scenario event filter
         await _subscription_registry.register(subscription_id, event_queue, "scenario")
 
         try:
@@ -475,13 +609,16 @@ class Subscription:
                 event = await event_queue.get()
                 event_type = event.get("type", "")
 
-                if event_type == "scenario.activated":
+                if event_type == EVENT_SCENARIO_ACTIVATED:
                     scenario_id = event.get("scenario_id")
                     if scenario_id and scenario_mgr:
                         scenario = scenario_mgr.get_scenario(scenario_id)
                         if scenario:
                             yield ScenarioType.from_scenario(scenario)
 
+        except asyncio.CancelledError:
+            log.debug("Subscription cancelled: scenarioActivated")
+            raise
         finally:
             await _subscription_registry.unregister(subscription_id)
 
@@ -507,6 +644,9 @@ class Subscription:
             - levels: dict mapping channel names to dB values
             - timestamp: when the measurement was taken
         """
+        from state import AppState
+        from audio import AudioRouter
+
         app_state: AppState = info.context["state"]
         audio_router: AudioRouter | None = info.context.get("audio_router")
 
@@ -516,7 +656,7 @@ class Subscription:
         # Create a queue for this subscription
         event_queue: asyncio.Queue = asyncio.Queue()
 
-        # Register the subscription
+        # Register the subscription with audio event filter
         await _subscription_registry.register(subscription_id, event_queue, "audio")
 
         try:
@@ -542,6 +682,9 @@ class Subscription:
                         )
                         last_update_time = current_time
 
+        except asyncio.CancelledError:
+            log.debug("Subscription cancelled: audioLevelUpdate")
+            raise
         finally:
             await _subscription_registry.unregister(subscription_id)
 
@@ -562,6 +705,9 @@ class Subscription:
         Each yielded object contains the full alert details including
         id, type, device_id, message, severity, timestamp, and source.
         """
+        from state import AppState
+        from alerts import AlertManager
+
         app_state: AppState = info.context["state"]
 
         # Create a unique subscription ID
@@ -570,13 +716,14 @@ class Subscription:
         # Create a queue for this subscription
         event_queue: asyncio.Queue = asyncio.Queue()
 
-        # Register the subscription
+        # Register the subscription with alert event filter
         await _subscription_registry.register(subscription_id, event_queue, "alert")
 
         try:
             # Send initial snapshot of pending alerts if available
-            pending_alerts = getattr(app_state, "pending_alerts", None)
-            if pending_alerts:
+            alert_mgr: AlertManager | None = info.context.get("alert_manager")
+            if alert_mgr:
+                pending_alerts = alert_mgr.get_pending_alerts()
                 for alert in pending_alerts:
                     yield AlertType.from_alert(alert)
 
@@ -585,21 +732,27 @@ class Subscription:
                 event = await event_queue.get()
                 event_type = event.get("type", "")
 
-                if event_type == "alert.fired":
-                    alert = event.get("alert", {})
-                    yield AlertType.from_alert(alert)
-                elif event_type == "alert.updated":
+                if event_type == EVENT_ALERT_FIRED:
+                    alert_dict = event.get("alert", {})
+                    yield AlertType.from_alert(alert_dict)
+                elif event_type == EVENT_ALERT_UPDATED:
                     alert_id = event.get("alert_id", "")
                     updates = event.get("updates", {})
-                    # Update existing alert with new data
-                    if pending_alerts:
-                        for alert in pending_alerts:
-                            if alert.id == alert_id:
-                                # Apply updates
-                                for key, value in updates.items():
-                                    setattr(alert, key, value)
-                                yield AlertType.from_alert(alert)
-                                break
 
+                    # If we have an alert manager, get the updated alert
+                    if alert_mgr:
+                        updated_alert = alert_mgr.get_alert(alert_id)
+                        if updated_alert:
+                            yield AlertType.from_alert(updated_alert)
+                        else:
+                            # Apply updates manually if alert not found
+                            if alert_dict := event.get("alert", {}):
+                                for key, value in updates.items():
+                                    alert_dict[key] = value
+                                yield AlertType.from_alert(alert_dict)
+
+        except asyncio.CancelledError:
+            log.debug("Subscription cancelled: alertFired")
+            raise
         finally:
             await _subscription_registry.unregister(subscription_id)
