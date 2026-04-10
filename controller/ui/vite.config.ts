@@ -9,19 +9,12 @@ export default defineConfig({
       '/api': {
         target: 'http://localhost:7380',
         changeOrigin: true,
-        secure: false,
       },
       '/ws': {
         target: 'http://localhost:7380',
-        ws: true,
         changeOrigin: true,
-        secure: false,
+        ws: true,
       },
     },
-  },
-  build: {
-    outDir: '../static',
-    assetsDir: 'assets',
-    emptyOutDir: true,
   },
 })

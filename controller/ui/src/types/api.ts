@@ -1,17 +1,14 @@
-export interface NodeInfo {
-  id: string
-  name: string
-  hostname: string
-  ip_address?: string
-  status: 'online' | 'offline' | 'connecting' | 'error'
-  machine_class: 'workstation' | 'server' | 'kiosk'
-  last_seen: string
-  capabilities: {
-    hid: boolean
-    video: boolean
-    audio: boolean
-  }
-  metadata?: Record<string, unknown>
+import { NodeInfo } from './node'
+
+export interface ApiResponse<T> {
+  data?: T
+  error?: string
+  message?: string
+}
+
+export interface AuthResponse {
+  token: string
+  expires_at: string
 }
 
 export interface NodesResponse {
@@ -19,6 +16,7 @@ export interface NodesResponse {
   total: number
 }
 
-export interface NodeResponse {
+export interface NodeUpdateEvent {
+  type: 'node_added' | 'node_updated' | 'node_removed' | 'status_changed'
   node: NodeInfo
 }
