@@ -388,3 +388,23 @@ tangible hardware product in the same tier as the node hardware: plug it into
 your TV, scan a QR code, instantly have a console for every machine in your
 mesh. No cables. No KVM switch. No separate remote desktop app for each machine.
 Every machine is a window.
+
+---
+
+## Overlays, smart mirror, and information display
+
+See [display-overlays.md](display-overlays.md) for the full design covering:
+
+- **HUD overlay system** — widgets composited over live KVM streams; overlay
+  modes per scenario (persistent, edge-reveal, auto-hide, clean)
+- **Smart mirror mode** — black background + zone layout for two-way mirror
+  hardware; portrait / landscape / window / lobby / bedside configurations
+- **Data providers** — controller-side modules publishing weather, calendar,
+  news, transit, stocks, crypto, now-playing, HA entities, and Ozma-native
+  mesh/camera/audio data to the widget metric bus
+- **MagicMirror² feature parity** — full parity table; all built-in MM²
+  modules covered; face recognition via Frigate, proximity via PIR / camera
+- **Widget event bus** — inter-widget notifications (doorbell ring → camera
+  popup; meeting starting → reminder banner; presence away → display off)
+- **Scenes and personalisation** — named layouts triggered by time, scenario,
+  presence, face recognition, or calendar events; per-user scenes
