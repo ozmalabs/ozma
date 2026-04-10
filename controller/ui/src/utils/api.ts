@@ -1,4 +1,4 @@
-import { Node } from '../types'
+import { NodeInfo } from '../types'
 
 const API_BASE = '/api/v1'
 
@@ -18,7 +18,7 @@ interface RequestOptions extends RequestInit {
 
 async function fetchWithAuth(url: string, options: RequestOptions = {}): Promise<Response> {
   const headers = new Headers(options.headers)
-  
+
   if (!options.skipAuth && authToken) {
     headers.set('Authorization', `Bearer ${authToken}`)
   }
@@ -30,15 +30,16 @@ async function fetchWithAuth(url: string, options: RequestOptions = {}): Promise
   })
 }
 
-export async function getNodes(): Promise<Node[]> {
+export async function getNodes(): Promise<NodeInfo[]> {
   const response = await fetchWithAuth('/nodes')
   if (!response.ok) {
     throw new Error(`Failed to fetch nodes: ${response.status}`)
   }
-  return response.json()
+  const data = await response.json()
+  return data.nodes
 }
 
-export async function getNode(id: string): Promise<Node> {
+export async function getNode(id: string): Promise<NodeInfo> {
   const response = await fetchWithAuth(`/nodes/${id}`)
   if (!response.ok) {
     throw new Error(`Failed to fetch node: ${response.status}`)
