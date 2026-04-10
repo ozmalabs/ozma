@@ -374,6 +374,46 @@ async def _event_router_task(state: "AppState") -> None:
 _event_router_task: asyncio.Task | None = None
 
 
+async def _event_router_task(state: "AppState") -> None:
+    """
+    Background task that routes events from AppState to subscription queues.
+
+    This task:
+    1. Consumes events from state.events
+    2. Routes matching events to all registered subscription queues
+    3. Runs until cancelled
+
+    Args:
+        state: The AppState instance containing the events queue
+    """
+    log.info("Starting event router task")
+    try:
+        while True:
+            event = await state.events.get()
+            event_type = event.get("type", "")
+
+            # Route event to matching subscription queues
+            async with _subscription_registry._lock:
+                matching_queues = []
+                for sub_id, queue in _subscription_registry._queues.items():
+                    event_filter = _subscription_registry._event_type_filters.get(sub_id)
+                    if event_filter is None:
+                        matching_queues.append((sub_id, queue))
+                    elif event_type.startswith(event_filter + ".") or event_type == event_filter:
+                        matching_queues.append((sub_id, queue))
+
+            # Route event to matching queues (non-blocking)
+            for sub_id, queue in matching_queues:
+                try:
+                    queue.put_nowait(event)
+                except asyncio.QueueFull:
+                    log.debug("Queue full for subscription %s, dropping event %s", sub_id, event_type)
+
+    except asyncio.CancelledError:
+        log.info("Event router task cancelled")
+        raise
+
+
 def start_event_router(state: "AppState") -> None:
     """
     Start the global event router task that routes events to subscriptions.
@@ -385,53 +425,7 @@ def start_event_router(state: "AppState") -> None:
     """
     global _event_router_task
     if _event_router_task is None:
-        _event_router_task = asyncio.create_task(_event_router_task_wrapper(state), name="graphql-event-router")
-
-
-async def _event_router_task_wrapper(state: "AppState") -> None:
-    """Wrapper for the event router task that handles exceptions gracefully."""
-    try:
-        await _event_router_task_wrapper_impl(state)
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        log.error("Event router task crashed: %s", e, exc_info=True)
-        raise
-
-
-async def _event_router_task_wrapper_impl(state: "AppState") -> None:
-    """Implementation of the event router task."""
-    log.info("Starting event router task")
-    while True:
-        try:
-            await _event_router_task_loop(state)
-        except Exception as e:
-            log.error("Event router error: %s", e)
-            await asyncio.sleep(1)  # Brief delay before retry
-
-
-async def _event_router_task_loop(state: "AppState") -> None:
-    """Main loop of the event router task."""
-    while True:
-        event = await state.events.get()
-        event_type = event.get("type", "")
-
-        # Route event to matching subscription queues
-        async with _subscription_registry._lock:
-            matching_queues = []
-            for sub_id, queue in _subscription_registry._queues.items():
-                event_filter = _subscription_registry._event_type_filters.get(sub_id)
-                if event_filter is None:
-                    matching_queues.append((sub_id, queue))
-                elif event_type.startswith(event_filter + ".") or event_type == event_filter:
-                    matching_queues.append((sub_id, queue))
-
-        # Route event to matching queues (non-blocking)
-        for sub_id, queue in matching_queues:
-            try:
-                queue.put_nowait(event)
-            except asyncio.QueueFull:
-                log.warning("Queue full for subscription %s, dropping event %s", sub_id, event_type)
+        _event_router_task = asyncio.create_task(_event_router_task(state), name="graphql-event-router")
 
 
 def stop_event_router() -> None:
