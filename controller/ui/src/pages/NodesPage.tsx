@@ -1,358 +1,220 @@
-import { useEffect } from 'react'
-import { useNodeStore } from '../store/useNodeStore'
-import { LayoutDashboard, Activity, Server, Settings, Search } from 'lucide-react'
-import { Link } from 'react-router-dom'
+import React, { useEffect } from 'react';
+import { Server, Plus, RefreshCw, Search, AlertCircle } from 'lucide-react';
+import { useNodesStore } from '../hooks/useNodes';
+import { NodeInfo } from '../types/node';
 
-const NodesPage = () => {
-  const { nodes, loading, error, fetchNodes, connectWebSocket } = useNodeStore()
+const NodesPage: React.FC = () => {
+  const store = useNodesStore();
+  const { nodes, loading, error, selectedNodeId, webSocketStatus } = store;
+  const { fetchNodes, selectNode } = store;
+  
+  const [filter, setFilter] = React.useState('');
+  const [statusFilter, setStatusFilter] = React.useState<string>('all');
 
+  const filteredNodes = nodes.filter((node) => {
+    const matchesSearch =
+      node.name?.toLowerCase().includes(filter.toLowerCase()) ||
+      node.hostname?.toLowerCase().includes(filter.toLowerCase()) ||
+      node.id?.toLowerCase().includes(filter.toLowerCase());
+    const matchesStatus = statusFilter === 'all' || node.status === statusFilter;
+    return matchesSearch && matchesStatus;
+  });
+
+  const handleRefresh = () => {
+    fetchNodes();
+  };
+
+  // Auto-refresh when WebSocket reconnects
   useEffect(() => {
-    fetchNodes()
-    connectWebSocket()
-  }, [fetchNodes, connectWebSocket])
-
-  const getNodeStatus = (node: any) => {
-    switch (node.status) {
-      case 'online':
-        return {
-          text: 'Online',
-          color: 'text-emerald-500',
-          bg: 'bg-emerald-500/10',
-          border: 'border-emerald-500/20',
-          dot: 'bg-emerald-500',
-        }
-      case 'offline':
-        return {
-          text: 'Offline',
-          color: 'text-slate-500',
-          bg: 'bg-slate-500/10',
-          border: 'border-slate-500/20',
-          dot: 'bg-slate-500',
-        }
-      case 'connecting':
-        return {
-          text: 'Connecting',
-          color: 'text-blue-500',
-          bg: 'bg-blue-500/10',
-          border: 'border-blue-500/20',
-          dot: 'bg-blue-500 animate-pulse',
-        }
-      case 'error':
-        return {
-          text: 'Error',
-          color: 'text-red-500',
-          bg: 'bg-red-500/10',
-          border: 'border-red-500/20',
-          dot: 'bg-red-500',
-        }
-      default:
-        return {
-          text: 'Unknown',
-          color: 'text-slate-400',
-          bg: 'bg-slate-500/10',
-          border: 'border-slate-500/20',
-          dot: 'bg-slate-400',
-        }
+    if (webSocketStatus === 'connected') {
+      fetchNodes();
     }
-  }
+  }, [webSocketStatus, fetchNodes]);
 
-  const getNodeClassColor = (machineClass: string) => {
+  const getStatusColor = (status: NodeInfo['status']) => {
+    switch (status) {
+      case 'online':
+        return 'bg-emerald-500';
+      case 'offline':
+        return 'bg-gray-500';
+      case 'connecting':
+        return 'bg-amber-500';
+      case 'error':
+        return 'bg-red-500';
+      default:
+        return 'bg-gray-500';
+    }
+  };
+
+  const getMachineClassColor = (machineClass: NodeInfo['machine_class']) => {
     switch (machineClass) {
       case 'workstation':
-        return 'text-blue-400'
+        return 'text-blue-400 bg-blue-500/10';
       case 'server':
-        return 'text-purple-400'
+        return 'text-purple-400 bg-purple-500/10';
       case 'kiosk':
-        return 'text-amber-400'
+        return 'text-emerald-400 bg-emerald-500/10';
       default:
-        return 'text-slate-400'
+        return 'text-gray-400 bg-gray-500/10';
     }
-  }
+  };
 
-  const stats = {
-    total: nodes.length,
-    online: nodes.filter((n) => n.status === 'online').length,
-    active: nodes.filter((n) => n.active).length,
-  }
-
-  if (loading) {
+  if (loading && nodes.length === 0) {
     return (
       <div className="flex items-center justify-center h-full">
-        <div className="text-center">
-          <div className="w-12 h-12 border-4 border-emerald-500/30 border-t-emerald-500 rounded-full animate-spin mx-auto mb-4" />
-          <p className="text-slate-500">Loading nodes...</p>
+        <div className="flex flex-col items-center gap-4">
+          <div className="w-12 h-12 border-4 border-emerald-500 border-t-transparent rounded-full animate-spin" />
+          <span className="text-gray-400">Loading nodes...</span>
         </div>
       </div>
-    )
+    );
   }
 
   if (error) {
     return (
       <div className="flex items-center justify-center h-full">
         <div className="text-center">
-          <p className="text-red-500 mb-4">Error: {error}</p>
+          <AlertCircle className="w-16 h-16 text-red-500 mx-auto mb-4" />
+          <h3 className="text-lg font-semibold text-gray-200 mb-2">Failed to load nodes</h3>
+          <p className="text-gray-400 mb-4">{error}</p>
           <button
-            onClick={() => fetchNodes()}
-            className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg transition-colors"
+            onClick={handleRefresh}
+            className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg transition-colors flex items-center gap-2 mx-auto"
           >
+            <RefreshCw className="w-4 h-4" />
             Retry
           </button>
         </div>
       </div>
-    )
+    );
   }
 
   return (
-    <div className="max-w-7xl mx-auto space-y-6">
+    <div className="space-y-6">
       {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
-          <h1 className="text-3xl font-bold text-white">Nodes</h1>
-          <p className="text-slate-400">Manage and monitor your KVMA nodes</p>
+          <h2 className="text-2xl font-bold text-white">Nodes</h2>
+          <p className="text-gray-400 mt-1">
+            {nodes.length} node{nodes.length !== 1 && 's'} total
+          </p>
         </div>
-        <div className="flex gap-2">
-          <button className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg font-medium transition-colors flex items-center gap-2">
-            <Activity size={18} />
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 bg-gray-800 rounded-lg p-1">
+            {['all', 'online', 'offline'].map((status) => (
+              <button
+                key={status}
+                onClick={() => setStatusFilter(status)}
+                className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
+                  statusFilter === status
+                    ? 'bg-emerald-500 text-white'
+                    : 'text-gray-400 hover:text-gray-200'
+                }`}
+              >
+                {status.charAt(0).toUpperCase() + status.slice(1)}
+              </button>
+            ))}
+          </div>
+          <button
+            onClick={handleRefresh}
+            disabled={loading}
+            className="p-2 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg transition-colors disabled:opacity-50"
+            aria-label="Refresh nodes"
+          >
+            <RefreshCw className={`w-5 h-5 ${loading ? 'animate-spin' : ''}`} />
+          </button>
+          <button className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg transition-colors flex items-center gap-2">
+            <Plus className="w-4 h-4" />
             Add Node
           </button>
         </div>
       </div>
 
-      {/* Stats cards */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-5">
-          <div className="flex items-center justify-between mb-2">
-            <h3 className="text-slate-400 text-sm font-medium">Total Nodes</h3>
-            <LayoutDashboard className="text-slate-500" size={20} />
-          </div>
-          <p className="text-3xl font-bold text-white">{stats.total}</p>
-          <p className="text-xs text-slate-500 mt-1">
-            {stats.total === 1 ? 'node' : 'nodes'} registered
-          </p>
-        </div>
-
-        <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-5">
-          <div className="flex items-center justify-between mb-2">
-            <h3 className="text-slate-400 text-sm font-medium">Online</h3>
-            <Activity className="text-emerald-500" size={20} />
-          </div>
-          <p className="text-3xl font-bold text-emerald-500">{stats.online}</p>
-          <p className="text-xs text-slate-500 mt-1">
-            {stats.online === 1 ? 'node' : 'nodes'} online
-          </p>
-        </div>
-
-        <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-5">
-          <div className="flex items-center justify-between mb-2">
-            <h3 className="text-slate-400 text-sm font-medium">Active Session</h3>
-            <Server className="text-blue-500" size={20} />
-          </div>
-          <p className="text-3xl font-bold text-blue-500">{stats.active}</p>
-          <p className="text-xs text-slate-500 mt-1">
-            {stats.active === 1 ? 'node' : 'nodes'} receiving input
-          </p>
-        </div>
+      {/* Search */}
+      <div className="relative">
+        <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+        <input
+          type="text"
+          placeholder="Search nodes by name, hostname, or ID..."
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+          className="w-full pl-10 pr-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-200 placeholder-gray-500 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500"
+        />
       </div>
 
-      {/* Search and filters */}
-      <div className="flex flex-col sm:flex-row gap-4">
-        <div className="relative flex-1">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" size={18} />
-          <input
-            type="text"
-            placeholder="Search nodes by name, hostname, or IP..."
-            className="w-full pl-10 pr-4 py-2.5 bg-slate-800 border border-slate-700 rounded-lg text-sm text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 transition-colors"
-          />
+      {/* Nodes Grid */}
+      {filteredNodes.length === 0 ? (
+        <div className="flex flex-col items-center justify-center py-12 text-center">
+          <div className="w-16 h-16 bg-gray-800 rounded-full flex items-center justify-center mb-4">
+            <Server className="w-8 h-8 text-gray-500" />
+          </div>
+          <h3 className="text-lg font-semibold text-gray-200">No nodes found</h3>
+          <p className="text-gray-400 mt-2 max-w-md">
+            {filter || statusFilter !== 'all'
+              ? 'Try adjusting your search or filters'
+              : 'No nodes registered with the controller yet'}
+          </p>
         </div>
-        <div className="flex gap-2">
-          <select className="px-4 py-2.5 bg-slate-800 border border-slate-700 rounded-lg text-sm text-slate-300 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 transition-colors">
-            <option>All Status</option>
-            <option>Online</option>
-            <option>Offline</option>
-            <option>Connecting</option>
-            <option>Error</option>
-          </select>
-          <select className="px-4 py-2.5 bg-slate-800 border border-slate-700 rounded-lg text-sm text-slate-300 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 transition-colors">
-            <option>All Classes</option>
-            <option>Workstation</option>
-            <option>Server</option>
-            <option>Kiosk</option>
-          </select>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+          {filteredNodes.map((node) => (
+            <div
+              key={node.id}
+              onClick={() => selectNode(node.id)}
+              className={`group relative p-4 bg-gray-800 border rounded-xl transition-all duration-200 cursor-pointer hover:shadow-lg hover:shadow-emerald-500/5 ${
+                selectedNodeId === node.id
+                  ? 'border-emerald-500 ring-1 ring-emerald-500'
+                  : 'border-gray-700 hover:border-emerald-500/50'
+              }`}
+            >
+              {/* Node status indicator */}
+              <div className="absolute top-4 right-4">
+                <div className="flex items-center gap-2">
+                  <div className={`w-2.5 h-2.5 rounded-full ${getStatusColor(node.status)}`} />
+                  <span className="text-xs font-medium text-gray-400 uppercase tracking-wider">
+                    {node.status}
+                  </span>
+                </div>
+              </div>
+
+              <div className="flex items-start gap-3">
+                <div className="w-12 h-12 bg-gray-700 rounded-lg flex items-center justify-center flex-shrink-0">
+                  <Server className="w-6 h-6 text-gray-300 group-hover:text-emerald-500 transition-colors" />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <h3 className="font-semibold text-white truncate">{node.name}</h3>
+                  <p className="text-sm text-gray-400 truncate">{node.hostname}</p>
+                  <p className="text-xs text-gray-500 mt-1">{node.id}</p>
+                </div>
+              </div>
+
+              <div className="mt-4 flex items-center justify-between text-xs text-gray-400">
+                <div className="flex items-center gap-3">
+                  <span className="flex items-center gap-1">
+                    <Server className="w-3 h-3" />
+                    {node.machine_class}
+                  </span>
+                  {node.ip_address && (
+                    <span className="text-gray-500">{node.ip_address}</span>
+                  )}
+                </div>
+                <div className={`px-2 py-0.5 rounded-full text-xs font-medium ${getMachineClassColor(node.machine_class)}`}>
+                  {node.machine_class}
+                </div>
+              </div>
+
+              {/* Active indicator */}
+              {node.active && (
+                <div className="absolute -top-2 -right-2 w-6 h-6 bg-emerald-500 rounded-full flex items-center justify-center shadow-lg">
+                  <div className="w-2.5 h-2.5 bg-white rounded-full animate-pulse" />
+                </div>
+              )}
+            </div>
+          ))}
         </div>
-      </div>
-
-      {/* Nodes table */}
-      <div className="bg-slate-800/50 border border-slate-700 rounded-xl overflow-hidden">
-        {nodes.length === 0 ? (
-          <div className="p-12 text-center">
-            <div className="w-16 h-16 bg-slate-700/50 rounded-full flex items-center justify-center mx-auto mb-4">
-              <LayoutDashboard className="text-slate-500" size={32} />
-            </div>
-            <h3 className="text-lg font-medium text-white mb-2">No nodes found</h3>
-            <p className="text-slate-500 mb-6">Get started by adding your first node</p>
-            <button className="px-6 py-2 border border-dashed border-emerald-500/50 text-emerald-500 hover:bg-emerald-500/10 rounded-lg transition-colors">
-              Register New Node
-            </button>
-          </div>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full">
-              <thead>
-                <tr className="border-b border-slate-700 bg-slate-800/80">
-                  <th className="px-6 py-4 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                    Node
-                  </th>
-                  <th className="px-6 py-4 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                    Status
-                  </th>
-                  <th className="px-6 py-4 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                    Machine Class
-                  </th>
-                  <th className="px-6 py-4 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                    IP Address
-                  </th>
-                  <th className="px-6 py-4 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                    CPU
-                  </th>
-                  <th className="px-6 py-4 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                    Memory
-                  </th>
-                  <th className="px-6 py-4 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                    Last Seen
-                  </th>
-                  <th className="px-6 py-4 text-right text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                    Actions
-                  </th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-700">
-                {nodes.map((node) => {
-                  const status = getNodeStatus(node)
-                  return (
-                    <tr
-                      key={node.id}
-                      className="hover:bg-slate-700/30 transition-colors group cursor-pointer"
-                    >
-                      <td className="px-6 py-4">
-                        <div className="flex items-center gap-3">
-                          <div className="w-10 h-10 rounded-lg bg-slate-700/50 flex items-center justify-center group-hover:bg-slate-700 transition-colors">
-                            {node.machine_class === 'kiosk' ? (
-                              <Activity size={20} className="text-amber-400" />
-                            ) : node.machine_class === 'server' ? (
-                              <Server size={20} className="text-purple-400" />
-                            ) : (
-                              <LayoutDashboard size={20} className="text-blue-400" />
-                            )}
-                          </div>
-                          <div>
-                            <div className="flex items-center gap-2">
-                              <span className="font-medium text-white">{node.name}</span>
-                              {node.active && (
-                                <span className="w-2 h-2 bg-emerald-500 rounded-full" title="Active node" />
-                              )}
-                            </div>
-                            <p className="text-xs text-slate-500">{node.hostname}</p>
-                          </div>
-                        </div>
-                      </td>
-                      <td className="px-6 py-4">
-                        <span
-                          className={`px-2.5 py-1 rounded-full text-xs font-medium border ${status.bg} ${status.border} ${status.color}`}
-                        >
-                          {status.text}
-                        </span>
-                      </td>
-                      <td className="px-6 py-4">
-                        <span className={`text-sm ${getNodeClassColor(node.machine_class)}`}>
-                          {node.machine_class.charAt(0).toUpperCase() +
-                            node.machine_class.slice(1)}
-                        </span>
-                      </td>
-                      <td className="px-6 py-4">
-                        <div>
-                          <div className="text-sm text-slate-300">{node.ip}</div>
-                          <div className="text-xs text-slate-500">{node.mac}</div>
-                        </div>
-                      </td>
-                      <td className="px-6 py-4">
-                        <div className="flex items-center gap-2">
-                          <div className="w-20 h-2 bg-slate-700 rounded-full overflow-hidden">
-                            <div
-                              className={`h-full rounded-full ${
-                                node.cpu_usage > 80
-                                  ? 'bg-red-500'
-                                  : node.cpu_usage > 50
-                                  ? 'bg-amber-500'
-                                  : 'bg-emerald-500'
-                              }`}
-                              style={{ width: `${node.cpu_usage}%` }}
-                            />
-                          </div>
-                          <span className="text-xs text-slate-400">{node.cpu_usage}%</span>
-                        </div>
-                      </td>
-                      <td className="px-6 py-4">
-                        <div className="flex items-center gap-2">
-                          <div className="w-20 h-2 bg-slate-700 rounded-full overflow-hidden">
-                            <div
-                              className={`h-full rounded-full ${
-                                node.memory_usage > 80
-                                  ? 'bg-red-500'
-                                  : node.memory_usage > 50
-                                  ? 'bg-amber-500'
-                                  : 'bg-blue-500'
-                              }`}
-                              style={{ width: `${node.memory_usage}%` }}
-                            />
-                          </div>
-                          <span className="text-xs text-slate-400">{node.memory_usage}%</span>
-                        </div>
-                      </td>
-                      <td className="px-6 py-4">
-                        <div className="text-sm text-slate-300">
-                          {new Date(node.last_seen).toLocaleString()}
-                        </div>
-                        <div className="text-xs text-slate-500">
-                          Uptime: {Math.floor(node.uptime / 3600)}h
-                        </div>
-                      </td>
-                      <td className="px-6 py-4 text-right">
-                        <div className="flex items-center justify-end gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                          <button className="p-1.5 text-slate-400 hover:text-white hover:bg-slate-700 rounded transition-colors">
-                            <Activity size={16} />
-                          </button>
-                          <button className="p-1.5 text-slate-400 hover:text-white hover:bg-slate-700 rounded transition-colors">
-                            <Settings size={16} />
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  )
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-
-        {/* Pagination */}
-        {nodes.length > 0 && (
-          <div className="flex items-center justify-between px-6 py-4 border-t border-slate-700">
-            <div className="text-sm text-slate-500">
-              Showing {nodes.length} of {nodes.length} nodes
-            </div>
-            <div className="flex gap-2">
-              <button className="px-3 py-1.5 text-sm text-slate-400 hover:text-white bg-slate-800 border border-slate-700 rounded hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors">
-                Previous
-              </button>
-              <button className="px-3 py-1.5 text-sm text-slate-400 hover:text-white bg-slate-800 border border-slate-700 rounded hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors">
-                Next
-              </button>
-            </div>
-          </div>
-        )}
-      </div>
+      )}
     </div>
-  )
-}
+  );
+};
 
-export default NodesPage
+export default NodesPage;

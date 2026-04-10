@@ -1,18 +1,8 @@
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
-import Layout from './components/Layout'
-import NodesPage from './pages/NodesPage'
+import React from 'react';
+import AppRouter from './router';
 
-function App() {
-  return (
-    <BrowserRouter>
-      <Layout>
-        <Routes>
-          <Route path="/" element={<NodesPage />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
-      </Layout>
-    </BrowserRouter>
-  )
-}
+const App: React.FC = () => {
+  return <AppRouter />;
+};
 
-export default App
+export default App;
