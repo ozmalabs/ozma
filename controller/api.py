@@ -28,7 +28,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from strawberry.fastapi import GraphQLRouter
 
 from auth import (
     AuthConfig, AuthContext, create_jwt, verify_jwt, verify_password,
@@ -112,13 +111,12 @@ from backup_status import BackupNudgeService
 
 # GraphQL imports
 try:
-    from graphql import GraphQLError
-    from strawberry.fastapi import GraphQLRouter
-    from controller.graphql.schema import schema as ozma_schema
-    GRAPHQL_ENABLED = True
+    import strawberry
+    from strawberry.types import Info
+    from .graphql.schema import schema as graphql_schema
+    HAS_GRAPHQL = True
 except ImportError:
-    GRAPHQL_ENABLED = False
-    log.warning("Strawberry GraphQL not installed - GraphQL API will be unavailable")
+    HAS_GRAPHQL = False
 
 log = logging.getLogger("ozma.api")
 
@@ -192,24 +190,6 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         allow_methods=["*"],
         allow_headers=["*"],
     )
-
-    # --- GraphQL Schema and Context Factory ---
-
-    from .graphql.schema import schema
-
-    def graphql_context_factory() -> dict[str, Any]:
-        """Create context for GraphQL queries with AppState and ScenarioManager."""
-        return {
-            "app_state": state,
-            "scenario_manager": scenarios,
-        }
-
-    # Mount GraphQL at /graphql
-    graphql_app = GraphQLRouter(
-        schema=schema,
-        context=graphql_context_factory,
-    )
-    app.include_router(graphql_app, prefix="/graphql")
 
     # --- Authentication ---
 
@@ -355,114 +335,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
-   # --- GraphQL endpoint ---
-    @app.post("/graphql")
-    async def graphql_endpoint(
-        request: Request,
-    ):
-        """
-        GraphQL endpoint for the Ozma Controller.
 
-        Supports POST with JSON body containing query, variables, and operationName.
-        Authentication is required unless disabled globally.
-
-        Query example:
-            {
-                "query": "query { systemHealth { uptimeSeconds nodeCount activeNodeId } }",
-                "variables": null,
-                "operationName": null
-            }
-
-        Security features:
-            - Maximum request size: 1MB
-            - Input validation for queries
-            - Proper error formatting
-            - Async execution via executor
-        """
-        # Check GraphQL is enabled
-        if not GRAPHQL_ENABLED:
-            raise HTTPException(503, "GraphQL not available - Strawberry GraphQL not installed")
-
-        # Build context with state and other services
-        graphql_context = {
-            "state": state,
-            "scenarios": scenarios,
-            "streams": streams,
-            "audio": audio,
-            "controls": controls,
-            "auth_context": getattr(request.state, "auth", None),
-        }
-
-        # Get raw body with size limit (1MB max)
-        try:
-            body_bytes = await request.body()
-            if len(body_bytes) > 1_048_576:  # 1MB limit
-                raise HTTPException(413, "Request too large - maximum size is 1MB")
-        except Exception as e:
-            log.error(f"Failed to read request body: {e}")
-            raise HTTPException(400, "Invalid request body")
-
-        # Parse and validate JSON
-        if not body_bytes:
-            raise HTTPException(400, "Request body is required")
-
-        try:
-            body = json.loads(body_bytes.decode('utf-8'))
-        except json.JSONDecodeError as e:
-            raise HTTPException(400, f"Invalid JSON: {e}")
-
-        # Validate query field exists
-        query = body.get("query")
-        if not query or not isinstance(query, str) or not query.strip():
-            raise HTTPException(400, "query field is required")
-
-        # Sanitize input - prevent query injection and DoS
-        if len(query) > 16_384:  # 16KB max query size
-            raise HTTPException(413, "Query too large - maximum size is 16KB")
-
-        # Extract optional fields
-        variables = body.get("variables")
-        operation_name = body.get("operationName")
-
-        # Validate variables if present
-        if variables is not None and not isinstance(variables, dict):
-            raise HTTPException(400, "variables must be a JSON object")
-
-        # Log query for monitoring (without sensitive data)
-        log.debug(f"GraphQL query received: operation={operation_name}, query_length={len(query)}")
-
-        # Execute GraphQL query using Strawberry's async execution
-
-        # Run in executor to avoid blocking the event loop
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: ozma_schema.execute(
-                query=query,
-                variable_values=variables,
-                operation_name=operation_name,
-                context_value=graphql_context,
-            )
-        )
-
-        # Format errors with proper GraphQL error format
-        errors = []
-        if result.errors:
-            for error in result.errors:
-                error_dict = {
-                    "message": str(error),
-                    "locations": [{"line": loc.line, "column": loc.column} for loc in getattr(error, 'locations', [])] if hasattr(error, 'locations') else None,
-                    "path": list(error.path) if hasattr(error, 'path') and error.path else None,
-                }
-                if hasattr(error, 'extensions') and error.extensions:
-                    error_dict["extensions"] = error.extensions
-                errors.append(error_dict)
-                log.warning(f"GraphQL error: {error.message} at {getattr(error, 'locations', [])}")
-
-        return {
-            "data": result.data,
-            "errors": errors if errors else None,
-        }
     # --- User management ---
 
     @app.get("/api/v1/users")
@@ -10356,6 +10229,69 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(400, "entries list required")
         dns_verifier.guard.remove_allowlist(set(entries))
         return {"ok": True, "removed": entries}
+
+    # --- GraphQL endpoint ---
+
+    @app.post("/graphql")
+    async def graphql_endpoint(
+        request: Request,
+        info: Request,
+    ) -> dict[str, Any]:
+        """
+        GraphQL endpoint for subscriptions and queries.
+
+        Clients can send POST requests with a JSON body containing:
+        - query: The GraphQL query string
+        - variables: Optional variables for the query
+
+        For subscriptions, clients should use a WebSocket connection to
+        ws://<host>:7380/graphql with the subscription protocol.
+        """
+        _require_scope(request, SCOPE_READ)
+
+        if not HAS_GRAPHQL:
+            raise HTTPException(503, "GraphQL not available")
+
+        try:
+            body = await request.json()
+            query = body.get("query", "")
+            variables = body.get("variables", {})
+
+            if not query:
+                raise HTTPException(400, "Missing 'query' field")
+
+            # Execute the query/mutation/subscription
+            from strawberry.http import GraphQLHTTPResponse
+            from strawberry.types import ExecutionResult
+
+            result = await graphql_schema.execute(
+                query=query,
+                variable_values=variables,
+                context_value={
+                    "state": state,
+                    "scenario_manager": scenarios,
+                    "audio_router": audio,
+                },
+            )
+
+            response: dict[str, Any] = {
+                "data": result.data,
+            }
+
+            if result.errors:
+                response["errors"] = [
+                    {
+                        "message": str(error),
+                        "locations": list(error.locations) if error.locations else None,
+                        "path": list(error.path) if error.path else None,
+                    }
+                    for error in result.errors
+                ]
+
+            return response
+
+        except Exception as e:
+            raise HTTPException(400, str(e))
 
     # Static files — mounted last so they don't shadow API routes
     static_dir = Path(__file__).parent / "static"
