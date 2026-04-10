@@ -203,6 +203,8 @@ class AlertType:
         )
 
 
+from typing import Annotated
+
 @strawberry.type
 class AudioLevelType:
     """
@@ -212,7 +214,7 @@ class AudioLevelType:
     """
 
     node_id: str = ""
-    levels: dict[str, float] = strawberry.field(
+    levels: Annotated[dict[str, float], strawberry.tag("levels")] = strawberry.field(
         description="Mapping of channel names to dB values"
     )
     timestamp: float = 0.0
@@ -461,9 +463,9 @@ class Subscription:
         }
     """
 
-    @staticmethod
     @strawberry.subscription
     async def nodeStateChanged(
+        self,
         info: Info,
     ) -> AsyncGenerator[NodeType, None]:
         """
@@ -566,9 +568,9 @@ class Subscription:
             # Cleanup subscription
             await _subscription_registry.unregister(subscription_id)
 
-    @staticmethod
     @strawberry.subscription
     async def scenarioActivated(
+        self,
         info: Info,
     ) -> AsyncGenerator[ScenarioType, None]:
         """
@@ -622,9 +624,9 @@ class Subscription:
         finally:
             await _subscription_registry.unregister(subscription_id)
 
-    @staticmethod
     @strawberry.subscription
     async def audioLevelUpdate(
+        self,
         info: Info,
     ) -> AsyncGenerator[AudioLevelType, None]:
         """
@@ -688,9 +690,9 @@ class Subscription:
         finally:
             await _subscription_registry.unregister(subscription_id)
 
-    @staticmethod
     @strawberry.subscription
     async def alertFired(
+        self,
         info: Info,
     ) -> AsyncGenerator[AlertType, None]:
         """
