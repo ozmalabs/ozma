@@ -19,9 +19,10 @@ log = logging.getLogger("ozma.graphql.stream")
 class StreamInfo:
     """
     Represents a video stream from a node.
-    
+
     Fields:
         node_id: ID of the node
+        node_name: Human-readable name of the node
         type: Stream type (hls, mjpeg, none)
         url: URL to access the stream
         active: Whether the stream is currently active
@@ -34,8 +35,12 @@ class StreamInfo:
         bitrate: Current bitrate in kbps
         uptime_s: Uptime in seconds
         restarts: Number of restarts
+        stream_path: Path to the HLS manifest
+        vnc_host: VNC host for this stream
+        vnc_port: VNC port for this stream
     """
     node_id: str
+    node_name: str | None
     type: str
     url: str
     active: bool
@@ -48,6 +53,9 @@ class StreamInfo:
     bitrate: int
     uptime_s: float
     restarts: int
+    stream_path: str | None
+    vnc_host: str | None
+    vnc_port: int | None
 
 
 async def resolve_stream_info(
@@ -56,13 +64,13 @@ async def resolve_stream_info(
 ) -> StreamInfo | None:
     """
     Get stream information for a node.
-    
+
     Args:
         node_id: ID of the node
-        
+
     Returns:
         StreamInfo: Current stream status, or None if no stream
-        
+
     Raises:
         ValueError: If node_id is empty
     """
@@ -70,15 +78,16 @@ async def resolve_stream_info(
         raise ValueError("node_id cannot be empty")
 
     state: AppState = info.context["state"]
-    
+
     if node_id not in state.nodes:
         return None
 
     node = state.nodes[node_id]
-    
+    node_name = node.id.split('.')[0] if '.' in node.id else node.id
+
     # Get stream info from StreamManager
-    streams = getattr(state, 'streams', None)
-    
+    streams = info.context.get("streams")
+
     if streams and hasattr(streams, '_captures'):
         entry = streams._captures.get(node_id)
         if entry:
@@ -93,7 +102,8 @@ async def resolve_stream_info(
             uptime_s = 0.0
             restarts = 0
             active = False
-            
+            stream_path = None
+
             if hasattr(entry, 'stats'):
                 stats = entry.stats
                 encoder = getattr(stats, 'encoder', 'unknown')
@@ -103,19 +113,23 @@ async def resolve_stream_info(
                 restarts = getattr(stats, 'restarts', 0)
                 uptime_s = getattr(stats, 'uptime_s', 0.0)
                 active = getattr(stats, 'active', False)
-            
+
             # Get dimensions from VNC if available
             if hasattr(streams, 'vnc_dimensions'):
                 dims = streams.vnc_dimensions(node_id)
                 if dims:
                     width, height = dims
-            
+
             # Determine stream type and URL
             stream_type = streams.stream_type(node_id) if streams else "none"
             stream_url = streams.stream_url(node_id) if streams else None
-            
+
+            if hasattr(entry, 'stream_path'):
+                stream_path = entry.stream_path
+
             return StreamInfo(
                 node_id=node_id,
+                node_name=node_name,
                 type=stream_type if stream_type else "none",
                 url=stream_url or "",
                 active=active,
@@ -128,8 +142,11 @@ async def resolve_stream_info(
                 bitrate=bitrate,
                 uptime_s=uptime_s,
                 restarts=restarts,
+                stream_path=stream_path,
+                vnc_host=node.vnc_host,
+                vnc_port=node.vnc_port,
             )
-    
+
     return None
 
 
@@ -138,33 +155,33 @@ async def resolve_stream_info_for_active_node(
 ) -> StreamInfo | None:
     """
     Get stream information for the currently active node.
-    
+
     Returns:
         StreamInfo: Current stream status, or None if no active node
     """
     state: AppState = info.context["state"]
-    
+
     if not state.active_node_id:
         return None
-    
+
     return await resolve_stream_info(info, state.active_node_id)
 
 
 async def resolve_all_streams(info: Info) -> list[StreamInfo]:
     """
     Get stream information for all nodes with streams.
-    
+
     Returns:
         List[StreamInfo]: All active streams
     """
     state: AppState = info.context["state"]
     streams: list[StreamInfo] = []
-    
+
     for node_id in state.nodes:
         stream = await resolve_stream_info(info, node_id)
         if stream:
             streams.append(stream)
-    
+
     return streams
 
 

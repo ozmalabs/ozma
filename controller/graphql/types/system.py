@@ -87,11 +87,11 @@ class SystemHealth:
 async def resolve_system_health(info: Info) -> SystemHealth:
     """
     Get overall system health status.
-    
+
     Returns:
         SystemHealth: Current system health and status
     """
-    state: AppState = info.graphql_context["state"]
+    state: AppState = info.context["state"]
     
     # Calculate uptime
     import os
