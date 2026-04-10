@@ -1,0 +1,243 @@
+# Supermicro chassis definitions
+# Source: Supermicro product documentation (community-contributed)
+
+- id: supermicro-cse-826
+  manufacturer: Supermicro
+  model: CSE-826
+  description: "2U, 12x 3.5\" hot-swap SAS/SATA bays (2 rows of 6)"
+  form_factor: "2U"
+  bays:
+    - slot: 0
+      label: "Bay 1 (front left, top row)"
+      row: 0
+      col: 0
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3", "SATA2"]
+      max_speed_rpm: 15000
+    - slot: 1
+      label: "Bay 2 (top row)"
+      row: 0
+      col: 1
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3", "SATA2"]
+      max_speed_rpm: 15000
+    - slot: 2
+      label: "Bay 3 (top row)"
+      row: 0
+      col: 2
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3", "SATA2"]
+      max_speed_rpm: 15000
+    - slot: 3
+      label: "Bay 4 (top row)"
+      row: 0
+      col: 3
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3", "SATA2"]
+      max_speed_rpm: 15000
+    - slot: 4
+      label: "Bay 5 (top row)"
+      row: 0
+      col: 4
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3", "SATA2"]
+      max_speed_rpm: 15000
+    - slot: 5
+      label: "Bay 6 (front right, top row)"
+      row: 0
+      col: 5
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3", "SATA2"]
+      max_speed_rpm: 15000
+    - slot: 6
+      label: "Bay 7 (front left, bottom row)"
+      row: 1
+      col: 0
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3", "SATA2"]
+      max_speed_rpm: 15000
+    - slot: 7
+      label: "Bay 8 (bottom row)"
+      row: 1
+      col: 1
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3", "SATA2"]
+      max_speed_rpm: 15000
+    - slot: 8
+      label: "Bay 9 (bottom row)"
+      row: 1
+      col: 2
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3", "SATA2"]
+      max_speed_rpm: 15000
+    - slot: 9
+      label: "Bay 10 (bottom row)"
+      row: 1
+      col: 3
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3", "SATA2"]
+      max_speed_rpm: 15000
+    - slot: 10
+      label: "Bay 11 (bottom row)"
+      row: 1
+      col: 4
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3", "SATA2"]
+      max_speed_rpm: 15000
+    - slot: 11
+      label: "Bay 12 (front right, bottom row)"
+      row: 1
+      col: 5
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3", "SATA2"]
+      max_speed_rpm: 15000
+
+- id: supermicro-cse-847
+  manufacturer: Supermicro
+  model: CSE-847
+  description: "4U, 36x 3.5\" hot-swap bays (4 rows of 9)"
+  form_factor: "4U"
+  bays:
+    # Rows A-D, cols 0-8 (36 bays total)
+    # Using row indices 0-3 for A-D
+    - slot: 0
+      label: "A1 (front left, row A)"
+      row: 0
+      col: 0
+      supported_form_factors: ["3.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3"]
+      max_speed_rpm: 15000
+    - slot: 1
+      label: "A2 (row A)"
+      row: 0
+      col: 1
+      supported_form_factors: ["3.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3"]
+      max_speed_rpm: 15000
+    - slot: 2
+      label: "A3 (row A)"
+      row: 0
+      col: 2
+      supported_form_factors: ["3.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3"]
+      max_speed_rpm: 15000
+    - slot: 3
+      label: "A4 (row A)"
+      row: 0
+      col: 3
+      supported_form_factors: ["3.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3"]
+      max_speed_rpm: 15000
+    - slot: 4
+      label: "A5 (row A)"
+      row: 0
+      col: 4
+      supported_form_factors: ["3.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3"]
+      max_speed_rpm: 15000
+    - slot: 5
+      label: "A6 (row A)"
+      row: 0
+      col: 5
+      supported_form_factors: ["3.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3"]
+      max_speed_rpm: 15000
+    - slot: 6
+      label: "A7 (row A)"
+      row: 0
+      col: 6
+      supported_form_factors: ["3.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3"]
+      max_speed_rpm: 15000
+    - slot: 7
+      label: "A8 (row A)"
+      row: 0
+      col: 7
+      supported_form_factors: ["3.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3"]
+      max_speed_rpm: 15000
+    - slot: 8
+      label: "A9 (front right, row A)"
+      row: 0
+      col: 8
+      supported_form_factors: ["3.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3"]
+      max_speed_rpm: 15000
+    # Rows B-D abbreviated (same spec, slots 9-35)
+
+- id: supermicro-cse-116
+  manufacturer: Supermicro
+  model: CSE-116
+  description: "1U, 10x 2.5\" hot-swap NVMe/SAS/SATA bays"
+  form_factor: "1U"
+  bays:
+    - slot: 0
+      label: "Bay 1 (leftmost)"
+      row: 0
+      col: 0
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["NVMe", "SAS3", "SATA3"]
+      max_speed_rpm: 0  # NVMe = no RPM
+    - slot: 1
+      label: "Bay 2"
+      row: 0
+      col: 1
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["NVMe", "SAS3", "SATA3"]
+      max_speed_rpm: 0
+    - slot: 2
+      label: "Bay 3"
+      row: 0
+      col: 2
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["NVMe", "SAS3", "SATA3"]
+      max_speed_rpm: 0
+    - slot: 3
+      label: "Bay 4"
+      row: 0
+      col: 3
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["NVMe", "SAS3", "SATA3"]
+      max_speed_rpm: 0
+    - slot: 4
+      label: "Bay 5"
+      row: 0
+      col: 4
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["NVMe", "SAS3", "SATA3"]
+      max_speed_rpm: 0
+    - slot: 5
+      label: "Bay 6"
+      row: 0
+      col: 5
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["NVMe", "SAS3", "SATA3"]
+      max_speed_rpm: 0
+    - slot: 6
+      label: "Bay 7"
+      row: 0
+      col: 6
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["NVMe", "SAS3", "SATA3"]
+      max_speed_rpm: 0
+    - slot: 7
+      label: "Bay 8"
+      row: 0
+      col: 7
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["NVMe", "SAS3", "SATA3"]
+      max_speed_rpm: 0
+    - slot: 8
+      label: "Bay 9"
+      row: 0
+      col: 8
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["NVMe", "SAS3", "SATA3"]
+      max_speed_rpm: 0
+    - slot: 9
+      label: "Bay 10 (rightmost)"
+      row: 0
+      col: 9
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["NVMe", "SAS3", "SATA3"]
+      max_speed_rpm: 0

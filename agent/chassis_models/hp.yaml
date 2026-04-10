@@ -1,0 +1,192 @@
+# HP/HPE ProLiant chassis definitions
+# Source: HP product documentation (community-contributed)
+
+- id: hp-dl380-gen9
+  manufacturer: HP
+  model: ProLiant DL380 Gen9
+  description: "2U, 25x 2.5\" hot-swap bays (SmartArray P440ar)"
+  form_factor: "2U"
+  bays:
+    - slot: 0
+      label: "Bay 1 (leftmost)"
+      row: 0
+      col: 0
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3"]
+      max_speed_rpm: 15000
+    - slot: 1
+      label: "Bay 2"
+      row: 0
+      col: 1
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3"]
+      max_speed_rpm: 15000
+    - slot: 2
+      label: "Bay 3"
+      row: 0
+      col: 2
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3"]
+      max_speed_rpm: 15000
+    - slot: 3
+      label: "Bay 4"
+      row: 0
+      col: 3
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3"]
+      max_speed_rpm: 15000
+    - slot: 4
+      label: "Bay 5"
+      row: 0
+      col: 4
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3"]
+      max_speed_rpm: 15000
+    - slot: 5
+      label: "Bay 6"
+      row: 0
+      col: 5
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3"]
+      max_speed_rpm: 15000
+    - slot: 6
+      label: "Bay 7"
+      row: 0
+      col: 6
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3"]
+      max_speed_rpm: 15000
+    - slot: 7
+      label: "Bay 8 (rightmost, front row)"
+      row: 0
+      col: 7
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["SAS3", "SAS2", "SATA3"]
+      max_speed_rpm: 15000
+
+- id: hp-dl380-gen10
+  manufacturer: HP
+  model: ProLiant DL380 Gen10
+  description: "2U, 24x 2.5\" NVMe/SAS/SATA hot-swap bays"
+  form_factor: "2U"
+  bays:
+    - slot: 0
+      label: "Bay 1"
+      row: 0
+      col: 0
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["NVMe", "SAS3", "SATA3"]
+      max_speed_rpm: 15000
+    - slot: 1
+      label: "Bay 2"
+      row: 0
+      col: 1
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["NVMe", "SAS3", "SATA3"]
+      max_speed_rpm: 15000
+    - slot: 2
+      label: "Bay 3"
+      row: 0
+      col: 2
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["NVMe", "SAS3", "SATA3"]
+      max_speed_rpm: 15000
+    - slot: 3
+      label: "Bay 4"
+      row: 0
+      col: 3
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["NVMe", "SAS3", "SATA3"]
+      max_speed_rpm: 15000
+
+- id: hp-msa-2040
+  manufacturer: HP
+  model: MSA 2040 SAN
+  description: "2U SAN array, 24x 2.5\" SAS3 hot-swap bays (2 rows of 12)"
+  form_factor: "2U"
+  is_jbod: false
+  bays:
+    - slot: 0
+      label: "Upper row, Bay 1 (leftmost)"
+      row: 0
+      col: 0
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["SAS3"]
+      max_speed_rpm: 15000
+    - slot: 1
+      label: "Upper row, Bay 2"
+      row: 0
+      col: 1
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["SAS3"]
+      max_speed_rpm: 15000
+    - slot: 2
+      label: "Upper row, Bay 3"
+      row: 0
+      col: 2
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["SAS3"]
+      max_speed_rpm: 15000
+    - slot: 3
+      label: "Upper row, Bay 4"
+      row: 0
+      col: 3
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["SAS3"]
+      max_speed_rpm: 15000
+    - slot: 4
+      label: "Upper row, Bay 5"
+      row: 0
+      col: 4
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["SAS3"]
+      max_speed_rpm: 15000
+    - slot: 5
+      label: "Upper row, Bay 6"
+      row: 0
+      col: 5
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["SAS3"]
+      max_speed_rpm: 15000
+    - slot: 6
+      label: "Upper row, Bay 7"
+      row: 0
+      col: 6
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["SAS3"]
+      max_speed_rpm: 15000
+    - slot: 7
+      label: "Upper row, Bay 8"
+      row: 0
+      col: 7
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["SAS3"]
+      max_speed_rpm: 15000
+    - slot: 8
+      label: "Upper row, Bay 9"
+      row: 0
+      col: 8
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["SAS3"]
+      max_speed_rpm: 15000
+    - slot: 9
+      label: "Upper row, Bay 10"
+      row: 0
+      col: 9
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["SAS3"]
+      max_speed_rpm: 15000
+    - slot: 10
+      label: "Upper row, Bay 11"
+      row: 0
+      col: 10
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["SAS3"]
+      max_speed_rpm: 15000
+    - slot: 11
+      label: "Upper row, Bay 12 (rightmost)"
+      row: 0
+      col: 11
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["SAS3"]
+      max_speed_rpm: 15000

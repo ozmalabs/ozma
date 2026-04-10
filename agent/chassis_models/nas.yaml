@@ -1,0 +1,219 @@
+# Consumer/prosumer NAS chassis definitions
+# Source: product documentation (community-contributed)
+
+- id: qnap-ts-873a
+  manufacturer: QNAP
+  model: TS-873A
+  description: "Rackmount 8-bay NAS, 3.5\"/2.5\" SATA bays"
+  form_factor: "desktop"
+  bays:
+    - slot: 0
+      label: "Bay 1 (top)"
+      row: 0
+      col: 0
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SATA3", "SATA2"]
+      max_speed_rpm: 7200
+    - slot: 1
+      label: "Bay 2"
+      row: 1
+      col: 0
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SATA3", "SATA2"]
+      max_speed_rpm: 7200
+    - slot: 2
+      label: "Bay 3"
+      row: 2
+      col: 0
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SATA3", "SATA2"]
+      max_speed_rpm: 7200
+    - slot: 3
+      label: "Bay 4"
+      row: 3
+      col: 0
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SATA3", "SATA2"]
+      max_speed_rpm: 7200
+    - slot: 4
+      label: "Bay 5"
+      row: 4
+      col: 0
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SATA3", "SATA2"]
+      max_speed_rpm: 7200
+    - slot: 5
+      label: "Bay 6"
+      row: 5
+      col: 0
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SATA3", "SATA2"]
+      max_speed_rpm: 7200
+    - slot: 6
+      label: "Bay 7"
+      row: 6
+      col: 0
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SATA3", "SATA2"]
+      max_speed_rpm: 7200
+    - slot: 7
+      label: "Bay 8 (bottom)"
+      row: 7
+      col: 0
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SATA3", "SATA2"]
+      max_speed_rpm: 7200
+
+- id: synology-rs1221
+  manufacturer: Synology
+  model: RackStation RS1221+
+  description: "1U rackmount NAS, 12x 3.5\"/2.5\" SATA bays"
+  form_factor: "1U"
+  bays:
+    - slot: 0
+      label: "Disk 1 (leftmost)"
+      row: 0
+      col: 0
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SATA3"]
+      max_speed_rpm: 7200
+    - slot: 1
+      label: "Disk 2"
+      row: 0
+      col: 1
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SATA3"]
+      max_speed_rpm: 7200
+    - slot: 2
+      label: "Disk 3"
+      row: 0
+      col: 2
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SATA3"]
+      max_speed_rpm: 7200
+    - slot: 3
+      label: "Disk 4"
+      row: 0
+      col: 3
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SATA3"]
+      max_speed_rpm: 7200
+    - slot: 4
+      label: "Disk 5"
+      row: 0
+      col: 4
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SATA3"]
+      max_speed_rpm: 7200
+    - slot: 5
+      label: "Disk 6"
+      row: 0
+      col: 5
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SATA3"]
+      max_speed_rpm: 7200
+    - slot: 6
+      label: "Disk 7"
+      row: 0
+      col: 6
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SATA3"]
+      max_speed_rpm: 7200
+    - slot: 7
+      label: "Disk 8"
+      row: 0
+      col: 7
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SATA3"]
+      max_speed_rpm: 7200
+    - slot: 8
+      label: "Disk 9"
+      row: 0
+      col: 8
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SATA3"]
+      max_speed_rpm: 7200
+    - slot: 9
+      label: "Disk 10"
+      row: 0
+      col: 9
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SATA3"]
+      max_speed_rpm: 7200
+    - slot: 10
+      label: "Disk 11"
+      row: 0
+      col: 10
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SATA3"]
+      max_speed_rpm: 7200
+    - slot: 11
+      label: "Disk 12 (rightmost)"
+      row: 0
+      col: 11
+      supported_form_factors: ["3.5in", "2.5in"]
+      supported_interfaces: ["SATA3"]
+      max_speed_rpm: 7200
+
+- id: truenas-mini-xl
+  manufacturer: iXsystems
+  model: TrueNAS Mini XL+
+  description: "Desktop NAS tower, 7x 3.5\" + 1x 2.5\" hot-swap bays"
+  form_factor: "tower"
+  bays:
+    - slot: 0
+      label: "Drive 1 (top)"
+      row: 0
+      col: 0
+      supported_form_factors: ["3.5in"]
+      supported_interfaces: ["SATA3", "SATA2"]
+      max_speed_rpm: 7200
+    - slot: 1
+      label: "Drive 2"
+      row: 1
+      col: 0
+      supported_form_factors: ["3.5in"]
+      supported_interfaces: ["SATA3", "SATA2"]
+      max_speed_rpm: 7200
+    - slot: 2
+      label: "Drive 3"
+      row: 2
+      col: 0
+      supported_form_factors: ["3.5in"]
+      supported_interfaces: ["SATA3", "SATA2"]
+      max_speed_rpm: 7200
+    - slot: 3
+      label: "Drive 4"
+      row: 3
+      col: 0
+      supported_form_factors: ["3.5in"]
+      supported_interfaces: ["SATA3", "SATA2"]
+      max_speed_rpm: 7200
+    - slot: 4
+      label: "Drive 5"
+      row: 4
+      col: 0
+      supported_form_factors: ["3.5in"]
+      supported_interfaces: ["SATA3", "SATA2"]
+      max_speed_rpm: 7200
+    - slot: 5
+      label: "Drive 6"
+      row: 5
+      col: 0
+      supported_form_factors: ["3.5in"]
+      supported_interfaces: ["SATA3", "SATA2"]
+      max_speed_rpm: 7200
+    - slot: 6
+      label: "Drive 7 (bottom, 3.5\")"
+      row: 6
+      col: 0
+      supported_form_factors: ["3.5in"]
+      supported_interfaces: ["SATA3", "SATA2"]
+      max_speed_rpm: 7200
+    - slot: 7
+      label: "Drive 8 (2.5\" SSD cache)"
+      row: 7
+      col: 0
+      supported_form_factors: ["2.5in"]
+      supported_interfaces: ["SATA3", "NVMe"]
+      max_speed_rpm: 0
