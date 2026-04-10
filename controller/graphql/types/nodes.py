@@ -32,15 +32,6 @@ class CameraStreamType:
 
 
 @strawberry.type
-class BindingType:
-    """Represents a binding configuration (for scenarios)."""
-
-    id: str
-    scenario_id: str
-    node_id: str
-
-
-@strawberry.type
 class NodeType:
     """Represents a hardware or virtual node in the KVM network."""
 

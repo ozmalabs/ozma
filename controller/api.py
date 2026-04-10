@@ -185,7 +185,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     # --- GraphQL Schema and Context Factory ---
 
-    from graphql.schema import schema
+    from .graphql.schema import schema
 
     def graphql_context_factory() -> dict[str, Any]:
         """Create context for GraphQL queries with AppState and ScenarioManager."""

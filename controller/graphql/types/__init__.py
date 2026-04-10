@@ -8,7 +8,7 @@ from .nodes import (
     NodeType as NodeType,
 )
 from .scenarios import (
-    BindingType as ScenarioBindingType,
+    BindingType as BindingType,
     ScenarioType as ScenarioType,
     TransitionConfigType as TransitionConfigType,
 )
@@ -18,7 +18,7 @@ __all__ = [
     "DisplayOutputType",
     "NodeInfoType",
     "NodeType",
-    "ScenarioBindingType",
+    "BindingType",
     "ScenarioType",
     "TransitionConfigType",
 ]
