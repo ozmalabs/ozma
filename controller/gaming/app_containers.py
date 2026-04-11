@@ -38,24 +38,52 @@ DEFAULT_GPU_DEVICE = "/dev/dri/renderD128"
 DEFAULT_PODMAN_RUNTIME = "runc"
 
 
+class GPUError(Exception):
+    """Raised when no GPU device is available."""
+    pass
+
+
 def get_gpu_device() -> str:
-    """Detect available GPU device automatically."""
+    """
+    Detect available GPU device automatically.
+
+    Returns:
+        Path to detected GPU device.
+
+    Raises:
+        GPUError: If no GPU device is available.
+    """
     import os
-    # Try Intel render nodes first
+
+    # Try Intel render nodes first (most common)
     for i in range(128, 144):
         device = f"/dev/dri/renderD{i}"
         if os.path.exists(device):
+            log.info("Detected GPU device: %s", device)
             return device
-    # Try NVIDIA
+
+    # Try NVIDIA render nodes
     for i in range(128, 144):
         device = f"/dev/dri/renderD{i}"
         if os.path.exists(device):
+            log.info("Detected GPU device: %s", device)
             return device
-    # Fallback to generic
-    return "/dev/dri/card0"
+
+    # Fallback to generic card0
+    device = "/dev/dri/card0"
+    if os.path.exists(device):
+        log.info("Detected GPU device: %s", device)
+        return device
+
+    raise GPUError(
+        "No GPU device found. Please ensure a GPU is available at /dev/dri/renderD* or /dev/dri/card*"
+    )
 
 
 # ─── Container Configuration ─────────────────────────────────────────────────
+
+import re
+
 
 @dataclass
 class ContainerConfig:
@@ -95,6 +123,7 @@ class ContainerConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ContainerConfig":
+        """Create a ContainerConfig from a dictionary, handling all fields."""
         return cls(
             app_id=data.get("app_id", ""),
             image=data.get("image", "alpine:latest"),
@@ -111,6 +140,116 @@ class ContainerConfig:
             auto_start=data.get("auto_start", False),
             auto_remove=data.get("auto_remove", True),
         )
+
+    @staticmethod
+    def validate_app_id(app_id: str) -> bool:
+        """
+        Validate app_id format.
+
+        Args:
+            app_id: The application identifier to validate.
+
+        Returns:
+            True if valid, False otherwise.
+
+        Validates:
+            - Length (1-64 characters)
+            - Allowed characters (alphanumeric, hyphen, underscore, dot)
+            - No consecutive hyphens or underscores
+            - Does not start or end with hyphen or underscore
+        """
+        if not app_id or len(app_id) > 64:
+            return False
+
+        # Check for valid characters
+        if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*[a-zA-Z0-9]$", app_id):
+            # Allow single-character IDs
+            if len(app_id) == 1 and not re.match(r"^[a-zA-Z0-9]$", app_id):
+                return False
+
+        # Check for consecutive hyphens or underscores
+        if "--" in app_id or "__" in app_id:
+            return False
+
+        # Check for consecutive dots
+        if ".." in app_id:
+            return False
+
+        return True
+
+    def validate(self) -> tuple[bool, list[str]]:
+        """
+        Validate the container configuration.
+
+        Returns:
+            Tuple of (is_valid, list_of_error_messages).
+        """
+        errors = []
+
+        # Validate app_id
+        if not self.app_id:
+            errors.append("app_id is required")
+        elif not self.validate_app_id(self.app_id):
+            errors.append(
+                f"Invalid app_id '{self.app_id}': "
+                "must be 1-64 chars, alphanumeric/hyphen/underscore/dot only"
+            )
+
+        # Validate image
+        if not self.image or not self.image.strip():
+            errors.append("image is required")
+
+        # Validate network
+        valid_networks = ["bridge", "host", "none", "container"]
+        if self.network not in valid_networks:
+            errors.append(
+                f"Invalid network '{self.network}': "
+                f"must be one of {valid_networks}"
+            )
+
+        # Validate GPU device if GPU is enabled
+        if self.gpu and self.gpu_device and not Path(self.gpu_device).exists():
+            log.warning(
+                "GPU device %s specified but not found - may fail at runtime",
+                self.gpu_device
+            )
+
+        # Validate CPU limit
+        try:
+            float(self.cpu_limit)
+        except (ValueError, TypeError):
+            errors.append(f"Invalid cpu_limit '{self.cpu_limit}': must be a number")
+
+        # Validate memory limit format (e.g., "4G", "512M", "2048")
+        if not re.match(r"^\d+([KMGT]?)$", self.memory_limit.upper()):
+            errors.append(
+                f"Invalid memory_limit '{self.memory_limit}': "
+                "must be in format like '4G', '512M', '2048'"
+            )
+
+        return (len(errors) == 0, errors)
+
+    def generate_container_name(self, session_id: str | None = None) -> str:
+        """
+        Generate a unique container name based on configuration.
+
+        Args:
+            session_id: Optional session identifier for uniqueness.
+
+        Returns:
+            A valid container name.
+        """
+        # Sanitize app_id for container name
+        safe_app_id = re.sub(r"[^a-zA-Z0-9]", "-", self.app_id.lower())
+
+        if session_id:
+            # Include session ID for per-session containers
+            return f"{CONTAINER_PREFIX}{safe_app_id[:16]}-{session_id[:8]}"
+        else:
+            # Use hash for unique naming
+            import hashlib
+            hash_suffix = hashlib.md5(self.app_id.encode()).hexdigest()[:8]
+            return f"{CONTAINER_PREFIX}{safe_app_id[:20]}-{hash_suffix}"
 
 
 @dataclass
