@@ -13,10 +13,14 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+import {NativeStackNavigationProp} from '@react-navigation/native-stack';
 import {NodeStatusBadge} from '../components/NodeStatusBadge';
 import {useMachines} from '../hooks/useMachines';
 import {useStore} from '../store/useStore';
 import {NodeInfo} from '../api/types';
+import {RootStackParamList} from '../navigation/AppNavigator';
+
+type Navigation = NativeStackNavigationProp<RootStackParamList, 'Machines'>;
 
 interface WoLToast {
   nodeId: string;
@@ -24,7 +28,7 @@ interface WoLToast {
   message: string;
 }
 
-export function MachineListScreen() {
+export function MachineListScreen({navigation}: {navigation: Navigation}) {
   const nodes = useStore((s) => s.nodes);
   const loading = useStore((s) => s.nodesLoading);
   const error = useStore((s) => s.nodesError);
@@ -46,6 +50,13 @@ export function MachineListScreen() {
     [sendWoL, showToast],
   );
 
+  const handleNodePress = useCallback(
+    (node: NodeInfo) => {
+      navigation.navigate('NodeDetail', {nodeId: node.id});
+    },
+    [navigation],
+  );
+
   const renderNode = useCallback(
     ({item}: {item: NodeInfo}) => {
       const isActive = item.id === activeNodeId;
@@ -53,7 +64,10 @@ export function MachineListScreen() {
       const isWolLoading = wolLoading[item.id] ?? false;
 
       return (
-        <View style={[styles.card, isActive && styles.cardActive]}>
+        <TouchableOpacity
+          style={[styles.card, isActive && styles.cardActive]}
+          onPress={() => handleNodePress(item)}
+          activeOpacity={0.8}>
           <View style={styles.cardHeader}>
             <View style={styles.nameRow}>
               <Text style={styles.nodeName} numberOfLines={1}>

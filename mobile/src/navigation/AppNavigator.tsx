@@ -27,6 +27,7 @@ import {PushManager} from '../push/PushManager';
 import {CameraGridScreen} from '../screens/CameraGridScreen';
 import {CameraDetailScreen} from '../screens/CameraDetailScreen';
 import {MachineListScreen} from '../screens/MachineListScreen';
+import {NodeDetailScreen} from '../screens/NodeDetailScreen';
 import {NotificationsScreen} from '../screens/NotificationsScreen';
 import {GuestInviteScreen} from '../screens/GuestInviteScreen';
 import {SettingsScreen} from '../screens/SettingsScreen';
@@ -42,6 +43,7 @@ export type RootStackParamList = {
   Login: undefined;
   MainTabs: undefined;
   CameraDetail: {cameraId: string; cameraName: string};
+  NodeDetail: {nodeId: string};
 };
 
 export type TabParamList = {
@@ -183,6 +185,14 @@ function RootNavigator() {
         component={CameraDetailScreen}
         options={({route}) => ({
           title: route.params.cameraName,
+          presentation: 'card',
+        })}
+      />
+      <Stack.Screen
+        name="NodeDetail"
+        component={NodeDetailScreen}
+        options={({route}) => ({
+          title: 'Node Details',
           presentation: 'card',
         })}
       />

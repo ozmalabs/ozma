@@ -97,6 +97,10 @@ export interface NodeInfo {
   ip_address: string | null;
   platform: string | null;
   os_version: string | null;
+  /** Relative stream path, e.g. /nodes/{id}/stream.m3u8 */
+  stream_path: string | null;
+  /** Stream port number */
+  stream_port: number | null;
 }
 
 export interface CameraStream {
