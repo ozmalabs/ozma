@@ -6,7 +6,7 @@ Implements the control plane auth model from docs/security.md:
 
   - Human/application clients authenticate with a bearer token (JWT)
   - JWTs are signed with the controller's Ed25519 identity key
-  - WireGuard-sourced requests (10.200.x.x) bypass token requirements
+  - WireGuard-sourced requests (10.200.x.x or ULA fdXX::/48) bypass token requirements
   - Scopes: read, write, admin
 
 On first run with no password configured, a random admin password is generated

@@ -393,8 +393,23 @@ async def run(config: Config) -> None:
     # Visual regression test runner
     test_runner = TestRunner(agent_engine, notifier)
 
-    # Authentication setup
-    auth_cfg = AuthConfig(enabled=config.auth_enabled)
+    # Authentication setup — include mesh IPv6 ULA in WireGuard bypass.
+    # Read the ULA prefix from mesh config directly (the canonical
+    # MeshNetworkManager instance lives in api.py — don't create a second).
+    _mesh_bypass = ["10.200.0.0/16"]
+    try:
+        from mesh_network import CONFIG_PATH as _mesh_cfg_path
+        if _mesh_cfg_path.exists():
+            import json as _json
+            _mesh_data = _json.loads(_mesh_cfg_path.read_text())
+            if ula := _mesh_data.get("ula_prefix"):
+                _mesh_bypass.append(f"{ula}::/48")
+    except Exception:
+        pass
+    auth_cfg = AuthConfig(
+        enabled=config.auth_enabled,
+        wireguard_bypass_subnets=_mesh_bypass,
+    )
     if config.auth_password_hash:
         auth_cfg.password_hash = config.auth_password_hash
     elif config.auth_enabled:

@@ -20,15 +20,21 @@ Platform support:
   Windows: Wintun or TAP-Windows (used by WireGuard/OpenVPN)
 
 Interface name: ozma0
-IP: assigned by controller from 10.200.X.0/24
-Routes: 10.200.0.0/16 → ozma0 (all mesh traffic goes through the TAP)
+IPv4: assigned by controller from 10.200.X.0/24
+IPv6: ULA address from fdXX:XXXX:XXXX::/48 (collision-proof fallback)
+Routes: 10.200.0.0/16 + fdXX:XXXX:XXXX::/48 → ozma0
 DNS: mesh nodes resolvable by name (via controller as DNS proxy)
+
+If the IPv4 mesh subnet (10.200.0.0/16) collides with a local network
+(e.g. laptop moved to an office using the same range), the IPv6 ULA
+addresses still work — ULA space never conflicts with real networks.
 """
 
 from __future__ import annotations
 
 import asyncio
 import fcntl
+import ipaddress
 import logging
 import os
 import struct
@@ -58,15 +64,20 @@ class MeshInterface:
     """
 
     def __init__(self, mesh_ip: str = "", mesh_subnet: str = "10.200.0.0/16",
+                 mesh_ip6: str = "", mesh_subnet6: str = "",
                  gateway: str = "", mtu: int = 1400) -> None:
         self._mesh_ip = mesh_ip
         self._mesh_subnet = mesh_subnet
+        self._mesh_ip6 = mesh_ip6        # ULA IPv6 address (collision-proof fallback)
+        self._mesh_subnet6 = mesh_subnet6  # e.g. "fdXX:XXXX:XXXX::/48"
         self._gateway = gateway
         self._mtu = mtu
         self._tap_fd: int = -1
         self._active = False
         self._read_task: asyncio.Task | None = None
+        self._conflict_task: asyncio.Task | None = None
         self._on_packet: Any = None  # callback(packet: bytes) for mesh forwarding
+        self._on_conflict: Any = None  # callback() when IPv4 mesh collides with LAN
 
     @property
     def active(self) -> bool:
@@ -80,9 +91,17 @@ class MeshInterface:
     def mesh_ip(self) -> str:
         return self._mesh_ip
 
+    @property
+    def mesh_ip6(self) -> str:
+        return self._mesh_ip6
+
     def set_packet_handler(self, handler: Any) -> None:
         """Set callback for packets read from the TAP (to be forwarded to mesh)."""
         self._on_packet = handler
+
+    def set_conflict_handler(self, handler: Any) -> None:
+        """Set callback for IPv4 mesh subnet conflicts with local routes."""
+        self._on_conflict = handler
 
     async def start(self) -> bool:
         """Create the TAP interface and configure networking."""
@@ -104,15 +123,21 @@ class MeshInterface:
         self._read_task = asyncio.create_task(
             self._read_loop(), name="mesh-tap-read"
         )
+        self._conflict_task = asyncio.create_task(
+            self._monitor_route_conflicts(), name="mesh-conflict-monitor"
+        )
 
-        log.info("Mesh interface active: %s ip=%s subnet=%s",
-                 INTERFACE_NAME, self._mesh_ip, self._mesh_subnet)
+        v6_info = f" v6={self._mesh_ip6}" if self._mesh_ip6 else ""
+        log.info("Mesh interface active: %s ip=%s%s subnet=%s",
+                 INTERFACE_NAME, self._mesh_ip, v6_info, self._mesh_subnet)
         return True
 
     async def stop(self) -> None:
         self._active = False
         if self._read_task:
             self._read_task.cancel()
+        if self._conflict_task:
+            self._conflict_task.cancel()
         if self._tap_fd >= 0:
             # Bring down the interface
             subprocess.run(["ip", "link", "set", INTERFACE_NAME, "down"],
@@ -154,7 +179,7 @@ class MeshInterface:
             return False
 
     async def _configure_interface(self) -> bool:
-        """Configure IP, MTU, and routes on the TAP interface."""
+        """Configure dual-stack IP, MTU, and routes on the TAP interface."""
         try:
             cmds = [
                 ["ip", "addr", "add", f"{self._mesh_ip}/24", "dev", INTERFACE_NAME],
@@ -162,14 +187,23 @@ class MeshInterface:
                 ["ip", "link", "set", INTERFACE_NAME, "up"],
                 ["ip", "route", "add", self._mesh_subnet, "dev", INTERFACE_NAME],
             ]
+            # Add IPv6 ULA address and route if available
+            if self._mesh_ip6 and self._mesh_subnet6:
+                cmds.extend([
+                    ["ip", "-6", "addr", "add", f"{self._mesh_ip6}/64",
+                     "dev", INTERFACE_NAME],
+                    ["ip", "-6", "route", "add", self._mesh_subnet6,
+                     "dev", INTERFACE_NAME],
+                ])
             for cmd in cmds:
                 result = subprocess.run(cmd, capture_output=True, text=True)
                 if result.returncode != 0 and "File exists" not in result.stderr:
                     log.warning("Interface config failed: %s → %s",
                                 " ".join(cmd), result.stderr.strip())
 
-            log.debug("Interface configured: %s ip=%s mtu=%d",
-                      INTERFACE_NAME, self._mesh_ip, self._mtu)
+            log.debug("Interface configured: %s ip=%s ip6=%s mtu=%d",
+                      INTERFACE_NAME, self._mesh_ip,
+                      self._mesh_ip6 or "(none)", self._mtu)
             return True
         except Exception as e:
             log.error("Interface configuration failed: %s", e)
@@ -203,11 +237,78 @@ class MeshInterface:
                 return b""
         return b""
 
+    # ── IPv4 conflict detection ───────────────────────────────────────────
+
+    async def detect_ipv4_conflict(self) -> bool:
+        """Check if the mesh IPv4 subnet overlaps with any local route.
+
+        Returns True if a conflict is found. IPv6 ULA mesh is unaffected
+        by such conflicts — that's the whole point of dual-stack.
+        """
+        try:
+            mesh_net = ipaddress.ip_network(self._mesh_subnet, strict=False)
+        except ValueError:
+            return False
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ip", "-4", "route", "show",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            for line in stdout.decode().splitlines():
+                parts = line.split()
+                if not parts or parts[0] in ("default", "unreachable"):
+                    continue
+                if INTERFACE_NAME in line:
+                    continue  # our own route
+                try:
+                    route_net = ipaddress.ip_network(parts[0], strict=False)
+                    if route_net.overlaps(mesh_net):
+                        log.warning(
+                            "IPv4 mesh conflict: %s overlaps route '%s' — "
+                            "IPv6 mesh (%s) still available",
+                            self._mesh_subnet, line.strip(),
+                            self._mesh_ip6 or "not configured",
+                        )
+                        return True
+                except ValueError:
+                    continue
+        except Exception as e:
+            log.debug("Route conflict check failed: %s", e)
+        return False
+
+    async def _monitor_route_conflicts(self, interval: float = 30.0) -> None:
+        """Periodically check for IPv4 mesh subnet conflicts with local routes.
+
+        Only fires the callback on state transitions (conflict detected /
+        conflict resolved), not on every check while conflict persists.
+        """
+        was_conflicting = False
+        while self._active:
+            try:
+                is_conflicting = await self.detect_ipv4_conflict()
+                if is_conflicting and not was_conflicting:
+                    if self._on_conflict:
+                        await self._on_conflict()
+                elif was_conflicting and not is_conflicting:
+                    log.info("IPv4 mesh conflict resolved")
+                was_conflicting = is_conflicting
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                pass
+            await asyncio.sleep(interval)
+
     def to_dict(self) -> dict:
-        return {
+        d = {
             "interface": INTERFACE_NAME,
             "mesh_ip": self._mesh_ip,
             "mesh_subnet": self._mesh_subnet,
             "active": self._active,
             "mtu": self._mtu,
         }
+        if self._mesh_ip6:
+            d["mesh_ip6"] = self._mesh_ip6
+            d["mesh_subnet6"] = self._mesh_subnet6
+        return d

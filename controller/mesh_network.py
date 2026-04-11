@@ -31,6 +31,10 @@ Architecture:
   Target B can reach Target A at 10.200.0.2 — through the mesh.
   Neither target has any other network connection.
 
+  Dual-stack: every node also gets a ULA IPv6 address (fdXX:XXXX:XXXX::/48).
+  If the IPv4 mesh subnet collides with a local network (e.g. laptop moves
+  to an office using 10.200.x.x), IPv6 ULA addresses still work.
+
   Via Ozma Connect:
   ┌──────────┐         ┌──────────┐         ┌──────────┐
   │ Internet │──HTTPS──│ Connect  │──relay──│Controller│──mesh──│Nodes│
@@ -81,6 +85,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -90,6 +95,25 @@ log = logging.getLogger("ozma.mesh_network")
 
 MESH_SUBNET = "10.200"  # 10.200.X.Y — X = node index, Y = device
 CONFIG_PATH = Path(__file__).parent / "mesh_network.json"
+
+
+# ── ULA IPv6 helpers (RFC 4193) ────────────────────────────────────────────
+
+def generate_ula_prefix() -> str:
+    """Generate a random /48 ULA prefix stem: fdXX:XXXX:XXXX."""
+    global_id = secrets.token_bytes(5)  # 40 random bits
+    b = b'\xfd' + global_id
+    return f"{b[0]:02x}{b[1]:02x}:{b[2]:02x}{b[3]:02x}:{b[4]:02x}{b[5]:02x}"
+
+
+def ula_node_ip(prefix: str, index: int, device: int = 1) -> str:
+    """Derive a node/target IPv6 address from the ULA /48 prefix stem."""
+    return f"{prefix}::{index:x}:{device}"
+
+
+def ula_controller_ip(prefix: str) -> str:
+    """Controller's mesh IPv6 address (::fe = 254)."""
+    return f"{prefix}::fe"
 
 
 @dataclass
@@ -140,20 +164,29 @@ class FirewallRule:
 
 @dataclass
 class MeshNode:
-    """A node's network identity in the mesh."""
+    """A node's network identity in the mesh (dual-stack IPv4 + IPv6 ULA)."""
     node_id: str
     mesh_ip: str = ""                 # 10.200.X.1 (node's mesh IP)
     target_ip: str = ""               # 10.200.X.2 (target's USB network IP)
     subnet: str = ""                  # 10.200.X.0/24
+    mesh_ip6: str = ""               # fdXX:XXXX:XXXX::X:1 (IPv6 ULA)
+    target_ip6: str = ""             # fdXX:XXXX:XXXX::X:2
+    subnet6: str = ""               # fdXX:XXXX:XXXX::/48
     usb_ethernet_active: bool = False
     index: int = 0
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "node_id": self.node_id, "mesh_ip": self.mesh_ip,
             "target_ip": self.target_ip, "subnet": self.subnet,
-            "usb_ethernet": self.usb_ethernet_active,
+            "usb_ethernet_active": self.usb_ethernet_active,
+            "index": self.index,
         }
+        if self.mesh_ip6:
+            d["mesh_ip6"] = self.mesh_ip6
+            d["target_ip6"] = self.target_ip6
+            d["subnet6"] = self.subnet6
+        return d
 
 
 class MeshNetworkManager:
@@ -167,6 +200,7 @@ class MeshNetworkManager:
         self._forwards: dict[str, PortForward] = {}
         self._firewall: list[FirewallRule] = []
         self._next_index = 1
+        self._ula_prefix: str = ""  # e.g. "fd12:abcd:ef01" (/48 stem)
         self._load_config()
 
         # Default firewall: deny all, allow ozma control traffic
@@ -186,7 +220,11 @@ class MeshNetworkManager:
         if CONFIG_PATH.exists():
             try:
                 data = json.loads(CONFIG_PATH.read_text())
+                self._ula_prefix = data.get("ula_prefix", "")
                 for n in data.get("nodes", []):
+                    # Backward compat: old configs used "usb_ethernet" key
+                    if "usb_ethernet" in n and "usb_ethernet_active" not in n:
+                        n["usb_ethernet_active"] = n.pop("usb_ethernet")
                     mn = MeshNode(**{k: v for k, v in n.items()
                                     if k in MeshNode.__dataclass_fields__})
                     self._nodes[mn.node_id] = mn
@@ -199,11 +237,28 @@ class MeshNetworkManager:
                     fr = FirewallRule(**{k: v for k, v in r.items()
                                         if k in FirewallRule.__dataclass_fields__})
                     self._firewall.append(fr)
-            except Exception:
-                pass
+            except Exception as e:
+                log.error("Failed to load mesh config %s: %s", CONFIG_PATH, e)
+
+        # Generate ULA prefix on first run or upgrade from pre-IPv6 config
+        if not self._ula_prefix:
+            self._ula_prefix = generate_ula_prefix()
+            log.info("Generated ULA /48 prefix: %s::/48", self._ula_prefix)
+
+        # Back-fill IPv6 addresses on nodes loaded from old configs
+        backfilled = False
+        for node in self._nodes.values():
+            if not node.mesh_ip6 and node.index:
+                node.mesh_ip6 = ula_node_ip(self._ula_prefix, node.index, 1)
+                node.target_ip6 = ula_node_ip(self._ula_prefix, node.index, 2)
+                node.subnet6 = f"{self._ula_prefix}::/48"
+                backfilled = True
+        if backfilled or not CONFIG_PATH.exists():
+            self._save_config()
 
     def _save_config(self) -> None:
         data = {
+            "ula_prefix": self._ula_prefix,
             "nodes": [n.to_dict() for n in self._nodes.values()],
             "forwards": [f.to_dict() for f in self._forwards.values()],
             "firewall": [r.to_dict() for r in self._firewall],
@@ -218,6 +273,8 @@ class MeshNetworkManager:
             return self._nodes[node_id]
 
         idx = self._next_index
+        if idx > 253:  # 10.200.X.Y — X must fit in one octet; .254 = controller
+            raise ValueError(f"Mesh full: cannot allocate index {idx} (max 253 nodes)")
         self._next_index += 1
 
         node = MeshNode(
@@ -225,12 +282,15 @@ class MeshNetworkManager:
             mesh_ip=f"{MESH_SUBNET}.{idx}.1",
             target_ip=f"{MESH_SUBNET}.{idx}.2",
             subnet=f"{MESH_SUBNET}.{idx}.0/24",
+            mesh_ip6=ula_node_ip(self._ula_prefix, idx, 1),
+            target_ip6=ula_node_ip(self._ula_prefix, idx, 2),
+            subnet6=f"{self._ula_prefix}::/48",
             index=idx,
         )
         self._nodes[node_id] = node
         self._save_config()
-        log.info("Mesh IP allocated: %s → node=%s target=%s",
-                 node_id, node.mesh_ip, node.target_ip)
+        log.info("Mesh IP allocated: %s → v4=%s v6=%s",
+                 node_id, node.mesh_ip, node.mesh_ip6)
         return node
 
     def get_node_mesh(self, node_id: str) -> MeshNode | None:
@@ -300,7 +360,7 @@ class MeshNetworkManager:
         if not node:
             return None
 
-        return {
+        cfg = {
             "gadget_type": "ecm",  # or "rndis" for Windows targets
             "node_ip": node.mesh_ip,
             "target_ip": node.target_ip,
@@ -311,6 +371,25 @@ class MeshNetworkManager:
             "gateway": node.mesh_ip,  # node routes to the mesh
             "mtu": 1400,  # slightly under 1500 for encapsulation overhead
         }
+        if node.mesh_ip6:
+            cfg["node_ip6"] = node.mesh_ip6
+            cfg["target_ip6"] = node.target_ip6
+            cfg["prefix_len6"] = 64
+        return cfg
+
+    # ── Properties ──────────────────────────────────────────────────────────
+
+    @property
+    def ula_prefix(self) -> str:
+        """The mesh ULA /48 prefix stem (e.g. 'fd12:abcd:ef01')."""
+        return self._ula_prefix
+
+    def bypass_subnets(self) -> list[str]:
+        """Subnets that should bypass auth (mesh traffic). Dual-stack."""
+        subnets = [f"{MESH_SUBNET}.0.0/16"]
+        if self._ula_prefix:
+            subnets.append(f"{self._ula_prefix}::/48")
+        return subnets
 
     # ── Status ──────────────────────────────────────────────────────────────
 
@@ -320,4 +399,6 @@ class MeshNetworkManager:
             "forwards": self.list_forwards(),
             "firewall_rules": len(self._firewall),
             "mesh_subnet": f"{MESH_SUBNET}.0.0/16",
+            "mesh_subnet6": f"{self._ula_prefix}::/48",
+            "ula_prefix": self._ula_prefix,
         }
