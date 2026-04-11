@@ -1,7 +1,7 @@
 import { create } from 'zustand'
 import { useEffect } from 'react'
 import { client } from '../graphql/client'
-import { GET_NODES, GET_ACTIVE_NODE, SUBSCRIBE_NODE_STATE } from '../graphql/queries'
+import { GET_NODES, GET_ACTIVE_NODE, SUBSCRIBE_NODE_CHANGED } from '../graphql/queries'
 
 export interface CameraStream {
   name: string

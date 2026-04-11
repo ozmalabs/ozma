@@ -58,6 +58,28 @@ export const GET_NODES = gql`
         id
         name
         color
+        node_id
+        transition_in {
+          style
+          duration_ms
+        }
+        motion {
+          device_id
+          axis
+          position
+        }
+        bluetooth {
+          connect
+          disconnect
+        }
+        capture_source
+        capture_sources
+        wallpaper {
+          mode
+          color
+          image
+          url
+        }
       }
       hid_stats {
         total_keys
