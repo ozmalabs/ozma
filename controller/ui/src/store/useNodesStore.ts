@@ -1,7 +1,15 @@
 import { create } from 'zustand'
 import { useEffect } from 'react'
 import { client } from '../graphql/client'
-import { GET_NODES, GET_ACTIVE_NODE, SUBSCRIBE_NODE_CHANGED } from '../graphql/queries'
+import { 
+  GET_NODES, 
+  GET_ACTIVE_NODE, 
+  GET_NODE_BY_ID,
+  SUBSCRIBE_NODE_CHANGED,
+  SUBSCRIBE_NODE_ADDED,
+  SUBSCRIBE_NODE_REMOVED,
+  ACTIVATE_NODE
+} from '../graphql/queries'
 
 export interface CameraStream {
   name: string
@@ -22,6 +30,28 @@ export interface Scenario {
   id: string
   name: string
   color: string
+  node_id?: string
+  transition_in?: {
+    style: string
+    duration_ms: number
+  }
+  motion?: {
+    device_id: string
+    axis: string
+    position: number
+  }[]
+  bluetooth?: {
+    connect: string[]
+    disconnect: string[]
+  }[]
+  capture_source?: string
+  capture_sources?: string[]
+  wallpaper?: {
+    mode: string
+    color?: string
+    image?: string
+    url?: string
+  }
 }
 
 export interface HIDStats {
@@ -49,7 +79,7 @@ export interface NodeInfo {
   vnc_port: number | null
   stream_port: number | null
   stream_path: string | null
-  api_port: number | null
+  api_port?: number | null
   audio_type: string | null
   audio_sink: string | null
   audio_vban_port: number | null
@@ -73,6 +103,8 @@ export interface NodeInfo {
   scenario?: Scenario
   hid_stats?: HIDStats
   active?: boolean
+  seat_count?: number
+  seat_config?: string
 }
 
 interface NodesStore {
@@ -93,6 +125,7 @@ interface NodesStore {
   removeNode: (id: string) => void
   setActiveNode: (node: NodeInfo | null) => void
   updateSelectedNode: (node: NodeInfo) => void
+  setWsConnected: (connected: boolean) => void
 }
 
 const API_BASE = '/api/v1'
@@ -106,15 +139,21 @@ export const useNodesStore = create<NodesStore>((set, get) => ({
   selectedNodeId: null,
   selectedNode: null,
 
+  setWsConnected: (connected: boolean) => {
+    set({ wsConnected: connected })
+  },
+
   fetchNodes: async () => {
     try {
       set({ loading: true, error: null })
-      const response = await fetch(`${API_BASE}/nodes`)
-      if (!response.ok) {
-        throw new Error(`Failed to fetch nodes: ${response.statusText}`)
+      const result = await client.query(GET_NODES, {}).toPromise()
+      if (result.data?.nodes) {
+        const nodes = result.data.nodes as NodeInfo[]
+        const activeNode = getActiveNodeFromList(nodes, null)
+        set({ nodes, activeNode, loading: false, error: null })
+      } else {
+        set({ loading: false, error: 'Failed to load nodes' })
       }
-      const data = await response.json()
-      set({ nodes: data.nodes || data, loading: false, error: null })
     } catch (error) {
       console.error('Error fetching nodes:', error)
       set({ loading: false, error: 'Failed to load nodes' })
@@ -124,12 +163,13 @@ export const useNodesStore = create<NodesStore>((set, get) => ({
   fetchNodeById: async (id: string) => {
     try {
       set({ loading: true, error: null })
-      const response = await fetch(`${API_BASE}/nodes/${id}`)
-      if (!response.ok) {
-        throw new Error(`Failed to fetch node: ${response.statusText}`)
+      const result = await client.query(GET_NODE_BY_ID, { id }).toPromise()
+      if (result.data?.node) {
+        const node = result.data.node as NodeInfo
+        set({ selectedNode: node, loading: false, error: null })
+      } else {
+        set({ loading: false, error: 'Node not found' })
       }
-      const data = await response.json()
-      set({ selectedNode: data, loading: false, error: null })
     } catch (error) {
       console.error('Error fetching node:', error)
       set({ loading: false, error: 'Failed to load node details' })
@@ -144,104 +184,96 @@ export const useNodesStore = create<NodesStore>((set, get) => ({
   },
 
   connectWebSocket: () => {
-    // Try GraphQL WebSocket first, fall back to REST events
-    const wsUrl = 'ws://localhost:7380/api/v1/events'
-    const token = localStorage.getItem('ozma_token')
-    
-    const socket = new WebSocket(`${wsUrl}${token ? `?token=${encodeURIComponent(token)}` : ''}`)
+    const subscriptions: (() => void)[] = []
 
-    socket.onopen = () => {
-      console.log('WebSocket connected')
-      set({ wsConnected: true })
-    }
+    // Subscribe to node changes
+    const nodeChangedSub = client.subscription(SUBSCRIBE_NODE_CHANGED, {}).subscribe({
+      next: (result) => {
+        if (result.data?.node_changed) {
+          get().updateNode(result.data.node_changed as NodeInfo)
+        }
+      },
+      error: (error) => {
+        console.error('Node changed subscription error:', error)
+      },
+    })
+    subscriptions.push(() => nodeChangedSub.unsubscribe())
 
-    socket.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data)
-        handleWebSocketMessage(data)
-      } catch (error) {
-        console.error('Error parsing WebSocket message:', error)
-      }
-    }
+    // Subscribe to node added events
+    const nodeAddedSub = client.subscription(SUBSCRIBE_NODE_ADDED, {}).subscribe({
+      next: (result) => {
+        if (result.data?.node_added) {
+          get().addNode(result.data.node_added as NodeInfo)
+        }
+      },
+      error: (error) => {
+        console.error('Node added subscription error:', error)
+      },
+    })
+    subscriptions.push(() => nodeAddedSub.unsubscribe())
 
-    socket.onclose = () => {
-      console.log('WebSocket disconnected')
-      set({ wsConnected: false })
-    }
+    // Subscribe to node removed events
+    const nodeRemovedSub = client.subscription(SUBSCRIBE_NODE_REMOVED, {}).subscribe({
+      next: (result) => {
+        if (result.data?.node_removed) {
+          get().removeNode(result.data.node_removed.id)
+        }
+      },
+      error: (error) => {
+        console.error('Node removed subscription error:', error)
+      },
+    })
+    subscriptions.push(() => nodeRemovedSub.unsubscribe())
 
-    socket.onerror = (error) => {
-      console.error('WebSocket error:', error)
-    }
+    // Also keep REST event WebSocket for compatibility
+    try {
+      const wsUrl = typeof window !== 'undefined' && window.location.protocol === 'https:'
+        ? `wss://${window.location.host}/api/v1/events`
+        : `ws://localhost:7380/api/v1/events`
+      const token = localStorage.getItem('ozma_token')
 
-    const handleWebSocketMessage = (data: unknown) => {
-      if (!data || typeof data !== 'object') return
+      const socket = new WebSocket(`${wsUrl}${token ? `?token=${encodeURIComponent(token)}` : ''}`)
 
-      const { type, node, node_id, data: eventData } = data as {
-        type?: string
-        node?: NodeInfo
-        node_id?: string
-        data?: { nodes?: NodeInfo[]; active_node_id?: string }
-      }
-
-      // Handle snapshot event on connect
-      if (type === 'snapshot' && eventData) {
-        const nodesList = eventData.nodes ? Object.values(eventData.nodes) : []
-        set({ nodes: nodesList, activeNode: getActiveNodeFromList(nodesList, eventData.active_node_id) })
-        return
-      }
-
-      // Handle node online event
-      if (type === 'node.online' && node) {
-        set((state) => {
-          const exists = state.nodes.find((n) => n.id === node.id)
-          if (exists) return state
-          return { nodes: [...state.nodes, node] }
-        })
-        return
-      }
-
-      // Handle node offline event
-      if (type === 'node.offline' && node_id) {
-        set((state) => ({
-          nodes: state.nodes.filter((n) => n.id !== node_id),
-          activeNode: state.activeNode?.id === node_id ? null : state.activeNode,
-          selectedNode: state.selectedNode?.id === node_id ? null : state.selectedNode,
-        }))
-        return
+      socket.onopen = () => {
+        console.log('REST WebSocket connected')
+        get().setWsConnected(true)
       }
 
-      // Handle node switched event
-      if (type === 'node.switched' && node_id) {
-        const activeNode = get().nodes.find((n) => n.id === node_id)
-        set({ activeNode })
-        return
+      socket.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data)
+          handleWebSocketMessage(data)
+        } catch (error) {
+          console.error('Error parsing WebSocket message:', error)
+        }
       }
 
-      // Handle general node updates
-      if (type === 'node_updated' && node) {
-        get().updateNode(node)
-        return
+      socket.onclose = () => {
+        console.log('REST WebSocket disconnected')
+        get().setWsConnected(false)
       }
+
+      socket.onerror = (error) => {
+        console.error('REST WebSocket error:', error)
+      }
+    } catch (error) {
+      console.error('Failed to connect to REST WebSocket:', error)
     }
 
     return () => {
-      socket.close()
+      subscriptions.forEach((unsubscribe) => unsubscribe())
     }
   },
 
   activateNode: async (nodeId: string) => {
     try {
-      const response = await fetch(`${API_BASE}/nodes/${nodeId}/activate`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${localStorage.getItem('ozma_token') || ''}`,
-        },
-      })
-      if (!response.ok) {
-        throw new Error(`Failed to activate node: ${response.statusText}`)
+      const result = await client.mutation(ACTIVATE_NODE, { nodeId }).toPromise()
+      if (result.data?.activate_node) {
+        // Refresh node list after activation
+        await get().fetchNodes()
+      } else {
+        throw new Error('Failed to activate node')
       }
-      // Refresh node list after activation
-      await get().fetchNodes()
     } catch (error) {
       console.error('Error activating node:', error)
       throw error
@@ -264,7 +296,7 @@ export const useNodesStore = create<NodesStore>((set, get) => ({
     }))
   },
 
-  removeNode: (id) => {
+  removeNode: (id: string) => {
     set((state) => ({
       nodes: state.nodes.filter((n) => n.id !== id),
       activeNode: state.activeNode?.id === id ? null : state.activeNode,
@@ -286,6 +318,52 @@ export const useNodesStore = create<NodesStore>((set, get) => ({
 function getActiveNodeFromList(nodes: NodeInfo[], activeId: string | null): NodeInfo | null {
   if (!activeId) return null
   return nodes.find((n) => n.id === activeId) || null
+}
+
+function handleWebSocketMessage(data: unknown) {
+  if (!data || typeof data !== 'object') return
+
+  const { type, node, node_id, data: eventData } = data as {
+    type?: string
+    node?: NodeInfo
+    node_id?: string
+    data?: { nodes?: NodeInfo[]; active_node_id?: string }
+  }
+
+  // Handle snapshot event on connect
+  if (type === 'snapshot' && eventData) {
+    const nodesList = eventData.nodes ? Object.values(eventData.nodes) : []
+    const activeNode = getActiveNodeFromList(nodesList, eventData.active_node_id)
+    useNodesStore.getState().nodes.forEach((n) => useNodesStore.getState().removeNode(n.id))
+    nodesList.forEach((n) => useNodesStore.getState().addNode(n))
+    useNodesStore.getState().setActiveNode(activeNode)
+    return
+  }
+
+  // Handle node online event
+  if (type === 'node.online' && node) {
+    useNodesStore.getState().addNode(node)
+    return
+  }
+
+  // Handle node offline event
+  if (type === 'node.offline' && node_id) {
+    useNodesStore.getState().removeNode(node_id)
+    return
+  }
+
+  // Handle node switched event
+  if (type === 'node.switched' && node_id) {
+    const activeNode = useNodesStore.getState().nodes.find((n) => n.id === node_id)
+    useNodesStore.getState().setActiveNode(activeNode || null)
+    return
+  }
+
+  // Handle general node updates
+  if (type === 'node_updated' && node) {
+    useNodesStore.getState().updateNode(node)
+    return
+  }
 }
 
 // Custom hook for using nodes with auto-fetch and WebSocket
