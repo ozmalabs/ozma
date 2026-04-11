@@ -27,7 +27,7 @@ from pathlib import Path
 
 log = logging.getLogger("ozma.connect")
 
-CONNECT_API_BASE = "https://connect.ozma.dev/api/v1"
+CONNECT_API_BASE = "https://connect.ozma.dev"
 CACHE_PATH = Path(__file__).parent / "connect_cache.json"
 
 try:
@@ -56,6 +56,8 @@ class OzmaConnect:
         self._authenticated = False
         self._offline_mode = False
         self._cache_valid_until: float = 0
+        self._relay_controller_id: str = ""
+        self._relay_config: dict | None = None
 
     @property
     def authenticated(self) -> bool:
@@ -85,12 +87,11 @@ class OzmaConnect:
         from .build_info import build_info
         result = await self._api_post("/auth/login", {
             "email": email, "password": password,
-            "build": build_info(),
         })
-        if result and result.get("token"):
-            self._token = result["token"]
-            self._account_id = result.get("account_id", "")
-            self._tier = result.get("tier", "free")
+        if result and (result.get("access_token") or result.get("token")):
+            self._token = result.get("access_token") or result["token"]
+            self._account_id = str(result.get("user", {}).get("id", ""))
+            self._tier = result.get("user", {}).get("plan", "free")
             self._authenticated = True
             self._offline_mode = False
             self._cache_valid_until = time.time() + 7 * 86400  # 7 days
@@ -104,8 +105,8 @@ class OzmaConnect:
         result = await self._api_get("/auth/verify", token=token)
         if result and result.get("valid"):
             self._token = token
-            self._account_id = result.get("account_id", "")
-            self._tier = result.get("tier", "free")
+            self._account_id = str(result.get("user", {}).get("id") or result.get("account_id", ""))
+            self._tier = result.get("user", {}).get("plan") or result.get("tier", "free")
             self._authenticated = True
             self._offline_mode = False
             self._cache_valid_until = time.time() + 7 * 86400
@@ -143,6 +144,147 @@ class OzmaConnect:
             "build": build_info(),
         })
         return result
+
+    # ── Relay-aware controller & node registration ───────────────────────
+
+    async def register_controller_relay(
+        self,
+        name: str,
+        wg_pubkey: str,
+        ed25519_pubkey: str,
+        version: str | None = None,
+        zone_hint: str | None = None,
+    ) -> dict | None:
+        """Register this controller with Connect's relay infrastructure.
+
+        Sends the WireGuard and Ed25519 public keys. Connect:
+        1. Creates the controller record
+        2. Provisions a WireGuard mesh on the nearest relay daemon
+        3. Returns relay connection details and an API key (shown once)
+
+        The returned api_key must be persisted by the caller — it is not
+        recoverable. Store in the controller's config (600 permissions).
+
+        Returns dict with: controller_id, api_key, relay_pubkey,
+        relay_endpoint, mesh_ip, zone
+        """
+        result = await self._api_post("/api/controllers/register", {
+            "name": name,
+            "wg_pubkey": wg_pubkey,
+            "ed25519_pubkey": ed25519_pubkey,
+            "version": version,
+            "zone_hint": zone_hint,
+        })
+        if result and result.get("controller_id"):
+            self._relay_controller_id = result["controller_id"]
+            self._relay_config = {
+                "relay_pubkey": result["relay_pubkey"],
+                "relay_endpoint": result["relay_endpoint"],
+                "mesh_ip": result["mesh_ip"],
+                "zone": result["zone"],
+            }
+            self._save_cache()
+            log.info(
+                "Controller registered with Connect relay: id=%s zone=%s mesh_ip=%s",
+                result["controller_id"], result["zone"], result["mesh_ip"],
+            )
+        return result
+
+    async def poll_relay_config(self) -> dict | None:
+        """Fetch current relay config from Connect.
+
+        Call this when WireGuard handshakes stop succeeding — the relay daemon
+        may have restarted and generated a new keypair. Returns the updated
+        relay_pubkey and relay_endpoint so the controller can reconfigure its
+        WireGuard peer.
+
+        Returns dict with: controller_id, relay_pubkey, relay_endpoint,
+        mesh_ip, zone — or None if not registered / unreachable.
+        """
+        cid = getattr(self, "_relay_controller_id", None)
+        if not cid:
+            return None
+        result = await self._api_get(f"/api/controllers/{cid}/config")
+        if result and result.get("relay_pubkey"):
+            self._relay_config = {
+                "relay_pubkey": result["relay_pubkey"],
+                "relay_endpoint": result["relay_endpoint"],
+                "mesh_ip": result.get("mesh_ip", "10.200.0.1"),
+                "zone": result.get("zone", ""),
+            }
+            self._save_cache()
+            log.info("Relay config updated: pubkey=%s...  endpoint=%s",
+                     result["relay_pubkey"][:12], result["relay_endpoint"])
+        return result
+
+    def sign_node_registration(
+        self,
+        node_wg_pubkey: str,
+        ed25519_privkey_bytes: bytes,
+    ) -> tuple[str, str]:
+        """Produce a controller signature authorising a node to join this mesh.
+
+        The relay daemon verifies this signature before adding the WireGuard
+        peer, ensuring a compromised Connect cannot inject arbitrary nodes.
+
+        Args:
+            node_wg_pubkey:      base64-encoded WireGuard public key of the node
+            ed25519_privkey_bytes: raw 32-byte Ed25519 private key (seed)
+
+        Returns:
+            (signature_b64, timestamp_iso)  — pass both to register_node_relay
+        """
+        import base64
+        from datetime import datetime, timezone
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+        cid = getattr(self, "_relay_controller_id", "")
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        message = f"{node_wg_pubkey}:{cid}:{timestamp}".encode()
+
+        privkey = Ed25519PrivateKey.from_private_bytes(ed25519_privkey_bytes)
+        sig_bytes = privkey.sign(message)
+        return base64.b64encode(sig_bytes).decode(), timestamp
+
+    async def register_node_relay(
+        self,
+        name: str,
+        node_wg_pubkey: str,
+        controller_signature: str,
+        timestamp: str,
+    ) -> dict | None:
+        """Register a node with Connect and add it to this controller's relay mesh.
+
+        The controller_signature (from sign_node_registration) is verified by
+        the relay daemon — Connect cannot add unauthorised peers to the mesh.
+
+        Returns dict with: node_id, mesh_ip, relay_pubkey, relay_endpoint,
+        controller_mesh_ip — or None on failure.
+        """
+        cid = getattr(self, "_relay_controller_id", None)
+        if not cid:
+            log.error("Cannot register node: controller not registered with Connect relay")
+            return None
+
+        result = await self._api_post("/api/nodes/register", {
+            "controller_id": cid,
+            "name": name,
+            "wg_pubkey": node_wg_pubkey,
+            "controller_signature": controller_signature,
+            "timestamp": timestamp,
+        })
+        if result and result.get("node_id"):
+            log.info("Node registered with Connect relay: node_id=%s mesh_ip=%s",
+                     result["node_id"], result.get("mesh_ip"))
+        return result
+
+    @property
+    def relay_controller_id(self) -> str:
+        return getattr(self, "_relay_controller_id", "")
+
+    @property
+    def relay_config(self) -> dict | None:
+        return getattr(self, "_relay_config", None)
 
     # ── Config backup (zero-knowledge encrypted) ─────────────────────────
 
@@ -579,6 +721,11 @@ class OzmaConnect:
                     self._authenticated = bool(self._token)
                     self._cache_valid_until = data["valid_until"]
                     self._offline_mode = True  # using cache = offline
+                # Relay config survives token expiry
+                if data.get("relay_controller_id"):
+                    self._relay_controller_id = data["relay_controller_id"]
+                if data.get("relay_config"):
+                    self._relay_config = data["relay_config"]
             except Exception:
                 pass
 
@@ -588,6 +735,8 @@ class OzmaConnect:
             "account_id": self._account_id,
             "token": self._token,
             "valid_until": self._cache_valid_until,
+            "relay_controller_id": getattr(self, "_relay_controller_id", ""),
+            "relay_config": getattr(self, "_relay_config", None),
         }
         try:
             import os
