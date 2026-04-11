@@ -22,7 +22,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
-from .gstreamer_pipeline import GStreamerPipelineManager, PipelineConfig, EncoderConfig
+from .gstreamer_pipeline import GStreamerPipelineManager, PipelineConfig, EncoderConfig, OutputConfig
 from .moonlight_protocol import MoonlightProtocolServer, MoonlightSession, RTPPacketiser
 
 log = logging.getLogger("ozma.controller.gaming.hybrid_streaming")

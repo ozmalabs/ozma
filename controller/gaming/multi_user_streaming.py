@@ -275,19 +275,25 @@ class MultiUserStreamingManager:
             )
 
         # Start GStreamer pipeline
+        from .gstreamer_pipeline import EncoderConfig, SourceConfig, OutputConfig
         pipeline_config = PipelineConfig(
             name=f"stream-{session_id[:8]}",
-            video_encoder={
-                "name": "nvenc",
-                "codec": "h265",
-                "bitrate_kbps": session.limits.max_bitrate_kbps,
-            },
-            sources=[{"type": "display", "width": 1920, "height": 1080, "fps": 60}],
-            outputs=[{
-                "type": "rtp",
-                "host": session.client_addr[0] if session.client_addr else "127.0.0.1",
-                "port": session.rtp_session.rtp_port if session.rtp_session else 47994,
-            }],
+            video_encoder=EncoderConfig(
+                name="nvenc",
+                codec="h265",
+                bitrate_kbps=session.limits.max_bitrate_kbps,
+            ),
+            sources=[SourceConfig(
+                type="display",
+                width=1920,
+                height=1080,
+                fps=60,
+            )],
+            outputs=[OutputConfig(
+                type="rtp",
+                host=session.client_addr[0] if session.client_addr else "127.0.0.1",
+                port=session.rtp_session.rtp_port if session.rtp_session else 47994,
+            )],
         )
 
         session.gstreamer_pipeline = await self._pipeline_mgr.start_pipeline(
@@ -359,7 +365,7 @@ class MultiUserStreamingManager:
         # Remove session
         del self._sessions[session_id]
         if session_id in self._user_sessions.get(session.user_id, []):
-            self._user_sessions(session.user_id).remove(session_id)
+            self._user_sessions[session.user_id].remove(session_id)
 
         session.state = SessionState.TERMINATED
         session.last_activity = time.time()

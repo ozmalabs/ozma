@@ -328,17 +328,17 @@ class HDMIStreamBuilder:
         self._codec = codec
         return self
 
-    def with_bitrate(self, bitrate_kbps: int) -> "HDМИ PipelineBuilder":
+    def with_bitrate(self, bitrate_kbps: int) -> "HDMIStreamBuilder":
         """Set the bitrate in kbps."""
         self._bitrate = bitrate_kbps
         return self
 
-    def with_preset(self, preset: str) -> "HDМИ PipelineBuilder":
+    def with_preset(self, preset: str) -> "HDMIStreamBuilder":
         """Set the encoder preset."""
         self._preset = preset
         return self
 
-    def with_tune(self, tune: str) -> "HDМИ PipelineBuilder":
+    def with_tune(self, tune: str) -> "HDMIStreamBuilder":
         """Set the encoder tune."""
         self._tune = tune
         return self

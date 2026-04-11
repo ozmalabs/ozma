@@ -23,12 +23,6 @@ from typing import Any
 
 log = logging.getLogger("ozma.controller.gaming.virtual_input")
 
-try:
-    import uinput
-    UINPUT_AVAILABLE = True
-except ImportError:
-    UINPUT_AVAILABLE = False
-
 # ─── Constants ───────────────────────────────────────────────────────────────
 
 UINPUT_DIR = Path("/dev/input")
@@ -36,25 +30,57 @@ GAMEPAD_NAME = "Ozma Gamepad"
 MOUSE_NAME = "Ozma Mouse"
 KEYBOARD_NAME = "Ozma Keyboard"
 
-# Gamepad capabilities (Xbox-style)
-GAMEPAD_CAPS = {
-    uinput.BTN_A: (0, 1, 0, 0),
-    uinput.BTN_B: (0, 1, 0, 0),
-    uinput.BTN_X: (0, 1, 0, 0),
-    uinput.BTN_Y: (0, 1, 0, 0),
-    uinput.BTN_LB: (0, 1, 0, 0),
-    uinput.BTN_RB: (0, 1, 0, 0),
-    uinput.BTN_SELECT: (0, 1, 0, 0),
-    uinput.BTN_START: (0, 1, 0, 0),
-    uinput.BTN_THUMBL: (0, 1, 0, 0),
-    uinput.BTN_THUMBR: (0, 1, 0, 0),
-    uinput.ABS_X: (-32768, 32767, 0, 0),
-    uinput.ABS_Y: (-32768, 32767, 0, 0),
-    uinput.ABS_RX: (-32768, 32767, 0, 0),
-    uinput.ABS_RY: (-32768, 32767, 0, 0),
-    uinput.ABS_Z: (0, 1023, 0, 0),
-    uinput.ABS_RZ: (0, 1023, 0, 0),
-}
+# uinput module availability check (must be before caps definition)
+try:
+    import uinput
+    UINPUT_AVAILABLE = True
+except ImportError:
+    UINPUT_AVAILABLE = False
+
+# Gamepad capabilities (Xbox-style) - only if uinput is available
+if UINPUT_AVAILABLE:
+    GAMEPAD_CAPS = {
+        uinput.BTN_A: (0, 1, 0, 0),
+        uinput.BTN_B: (0, 1, 0, 0),
+        uinput.BTN_X: (0, 1, 0, 0),
+        uinput.BTN_Y: (0, 1, 0, 0),
+        uinput.BTN_LB: (0, 1, 0, 0),
+        uinput.BTN_RB: (0, 1, 0, 0),
+        uinput.BTN_SELECT: (0, 1, 0, 0),
+        uinput.BTN_START: (0, 1, 0, 0),
+        uinput.BTN_THUMBL: (0, 1, 0, 0),
+        uinput.BTN_THUMBR: (0, 1, 0, 0),
+        uinput.ABS_X: (-32768, 32767, 0, 0),
+        uinput.ABS_Y: (-32768, 32767, 0, 0),
+        uinput.ABS_RX: (-32768, 32767, 0, 0),
+        uinput.ABS_RY: (-32768, 32767, 0, 0),
+        uinput.ABS_Z: (0, 1023, 0, 0),
+        uinput.ABS_RZ: (0, 1023, 0, 0),
+    }
+else:
+    # Fallback: use evdev-style constants if available
+    try:
+        import evdev.ecodes as ec
+        GAMEPAD_CAPS = {
+            ec.BTN_A: (0, 1, 0, 0),
+            ec.BTN_B: (0, 1, 0, 0),
+            ec.BTN_X: (0, 1, 0, 0),
+            ec.BTN_Y: (0, 1, 0, 0),
+            ec.BTN_L: (0, 1, 0, 0),
+            ec.BTN_R: (0, 1, 0, 0),
+            ec.BTN_SELECT: (0, 1, 0, 0),
+            ec.BTN_START: (0, 1, 0, 0),
+            ec.BTN_THUMBL: (0, 1, 0, 0),
+            ec.BTN_THUMBR: (0, 1, 0, 0),
+            ec.ABS_X: (-32768, 32767, 0, 0),
+            ec.ABS_Y: (-32768, 32767, 0, 0),
+            ec.ABS_RX: (-32768, 32767, 0, 0),
+            ec.ABS_RY: (-32768, 32767, 0, 0),
+            ec.ABS_Z: (0, 1023, 0, 0),
+            ec.ABS_RZ: (0, 1023, 0, 0),
+        }
+    except ImportError:
+        GAMEPAD_CAPS = {}
 
 # ─── Virtual Gamepad ─────────────────────────────────────────────────────────
 
