@@ -28,6 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from strawberry.fastapi import GraphQLRouter
 
 from auth import (
     AuthConfig, AuthContext, create_jwt, verify_jwt, verify_password,
@@ -181,6 +182,24 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # --- GraphQL Schema and Context Factory ---
+
+    from .graphql.schema import schema
+
+    def graphql_context_factory() -> dict[str, Any]:
+        """Create context for GraphQL queries with AppState and ScenarioManager."""
+        return {
+            "app_state": state,
+            "scenario_manager": scenarios,
+        }
+
+    # Mount GraphQL at /graphql
+    graphql_app = GraphQLRouter(
+        schema=schema,
+        context=graphql_context_factory,
+    )
+    app.include_router(graphql_app, prefix="/graphql")
 
     # --- Authentication ---
 
