@@ -24,29 +24,94 @@ interface PushState {
   isRegistered: boolean;
 }
 
-interface NodeDetails {
+interface DisplayOutput {
   id: string;
   name: string;
-  host: string;
-  port: number;
-  machine_class: string;
-  last_seen: string | null;
-  online: boolean;
-  mac_address: string | null;
-  camera_streams: CameraStream[];
-  frigate_host: string | null;
-  frigate_port: number | null;
-  direct_registered: boolean;
-  agent_connected: boolean;
-  ip_address: string | null;
-  platform: string | null;
-  os_version: string | null;
+  resolution: string;
+  connected: boolean;
 }
 
 interface CameraStream {
   url: string;
   name: string;
   type: 'hls' | 'mjpeg' | 'rtsp';
+}
+
+interface TransitionConfig {
+  style: string;
+  durationMs: number;
+}
+
+interface MotionPreset {
+  deviceId: string;
+  axis: string;
+  position: number;
+}
+
+interface BluetoothConfig {
+  connect: string[];
+  disconnect: string[];
+}
+
+interface WallpaperConfig {
+  mode: string;
+  color?: string;
+  image?: string;
+  url?: string;
+}
+
+interface Scenario {
+  id: string;
+  name: string;
+  nodeId: string | null;
+  color: string;
+  transitionIn: TransitionConfig;
+  motion: MotionPreset[];
+  bluetooth: BluetoothConfig[];
+  captureSource: string | null;
+  captureSources: string[];
+  wallpaper: WallpaperConfig | null;
+}
+
+interface NodeDetails {
+  id: string;
+  name: string;
+  host: string;
+  port: number;
+  role: string;
+  hw: string;
+  fwVersion: string;
+  protoVersion: number;
+  capabilities: string[];
+  machineClass: string;
+  lastSeen: string | null;
+  displayOutputs: DisplayOutput[];
+  vncHost: string | null;
+  vncPort: number | null;
+  streamPort: number | null;
+  streamPath: string | null;
+  audioType: string | null;
+  audioSink: string | null;
+  audioVBANPort: number | null;
+  micVBANPort: number | null;
+  captureDevice: string | null;
+  cameraStreams: CameraStream[];
+  frigateHost: string | null;
+  frigatePort: number | null;
+  ownerUserId: string | null;
+  owner: string | null;
+  sharedWith: string[];
+  sharePermissions: string[];
+  parentId: string | null;
+  sunshinePort: number | null;
+  // Legacy fields for compatibility
+  online: boolean;
+  mac_address: string | null;
+  direct_registered: boolean;
+  agent_connected: boolean;
+  ip_address: string | null;
+  platform: string | null;
+  os_version: string | null;
 }
 
 interface NodeStore {
@@ -61,6 +126,19 @@ interface NodeStore {
   setSelectedNodeLoading(loading: boolean): void;
   setSelectedNodeError(error: string | null): void;
   updateSelectedNode(node: Partial<NodeDetails>): void;
+  clearSelectedNode(): void;
+
+  // ── Scenarios ─────────────────────────────────────────────────────────────
+  scenarios: Scenario[];
+  scenariosLoading: boolean;
+  scenariosError: string | null;
+  activeScenarioId: string | null;
+
+  setScenarios(scenarios: Scenario[]): void;
+  setScenariosLoading(loading: boolean): void;
+  setScenariosError(error: string | null): void;
+  setActiveScenarioId(id: string | null): void;
+  updateScenario(scenario: Partial<Scenario>): void;
 }
 
 interface AppStore {
@@ -220,5 +298,25 @@ export const useStore = create<AppStore>((set) => ({
           : null,
       },
     })),
+    clearSelectedNode: () => set((state) => ({
+      nodeStore: {...state.nodeStore, selectedNodeId: null, selectedNode: null, selectedNodeError: null},
+    })),
   },
+
+  // ── Scenarios ─────────────────────────────────────────────────────────────
+  scenarios: [],
+  scenariosLoading: false,
+  scenariosError: null,
+  activeScenarioId: null,
+
+  setScenarios: (scenarios) => set({scenarios}),
+  setScenariosLoading: (loading) => set({scenariosLoading}),
+  setScenariosError: (error) => set({scenariosError}),
+  setActiveScenarioId: (id) => set({activeScenarioId: id}),
+  updateScenario: (scenario) =>
+    set((state) => ({
+      scenarios: state.scenarios.map((s) =>
+        s.id === scenario.id ? {...s, ...scenario} : s,
+      ),
+    })),
 }));

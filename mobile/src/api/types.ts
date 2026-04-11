@@ -289,3 +289,162 @@ export interface StreamTarget {
   url: string;
   relayWhipEndpoint?: string;
 }
+
+// ── GraphQL response types (from /mnt/internal/implementation/graphql-schema-design.md) ───────────────────────
+
+export interface GraphQLNode {
+  id: string;
+  name: string;
+  host: string;
+  port: number;
+  role: string;
+  hw: string;
+  fwVersion: string;
+  protoVersion: number;
+  capabilities: string[];
+  machineClass: MachineClass;
+  lastSeen: string;
+  displayOutputs: DisplayOutput[];
+  vncHost: string | null;
+  vncPort: number | null;
+  streamPort: number | null;
+  streamPath: string | null;
+  audioType: string | null;
+  audioSink: string | null;
+  audioVBANPort: number | null;
+  micVBANPort: number | null;
+  captureDevice: string | null;
+  cameraStreams: CameraStream[];
+  frigateHost: string | null;
+  frigatePort: number | null;
+  ownerUserId: string | null;
+  owner: string | null;
+  sharedWith: string[];
+  sharePermissions: string[];
+  parentId: string | null;
+  sunshinePort: number | null;
+}
+
+export interface DisplayOutput {
+  id: string;
+  name: string;
+  resolution: string;
+  connected: boolean;
+}
+
+export interface GraphQLScenario {
+  id: string;
+  name: string;
+  nodeId: string | null;
+  color: string;
+  transitionIn: TransitionConfig;
+  motion: MotionPreset[];
+  bluetooth: BluetoothConfig[];
+  captureSource: string | null;
+  captureSources: string[];
+  wallpaper: WallpaperConfig | null;
+}
+
+export interface TransitionConfig {
+  style: string;
+  durationMs: number;
+}
+
+export interface MotionPreset {
+  deviceId: string;
+  axis: string;
+  position: number;
+}
+
+export interface BluetoothConfig {
+  connect: string[];
+  disconnect: string[];
+}
+
+export interface WallpaperConfig {
+  mode: string;
+  color?: string;
+  image?: string;
+  url?: string;
+}
+
+// GraphQL Response wrappers
+export interface GraphQLResponse<T> {
+  data?: T;
+  error?: GraphQLError;
+}
+
+export interface GraphQLError {
+  message: string;
+  locations?: GraphQLErrorLocation[];
+  path?: (string | number)[];
+  extensions?: {
+    code: string;
+    message: string;
+    details?: Record<string, unknown>;
+  };
+}
+
+export interface GraphQLErrorLocation {
+  line: number;
+  column: number;
+}
+
+// GraphQL Query responses
+export interface GetNodeResponse {
+  node: GraphQLNode | null;
+}
+
+export interface GetActiveNodeResponse {
+  activeNode: GraphQLNode | null;
+}
+
+export interface GetNodeListResponse {
+  nodes: GraphQLNode[];
+}
+
+export interface ActivateNodeResponse {
+  activateNode: GraphQLNode;
+}
+
+export interface RenameNodeResponse {
+  renameNode: GraphQLNode;
+}
+
+export interface WakeOnLanResponseGraphQL {
+  wakeOnLan: {
+    success: boolean;
+    mac: string | null;
+    broadcast: string;
+    message: string;
+  };
+}
+
+export interface ActivateScenarioResponse {
+  activateScenario: GraphQLScenario;
+}
+
+export interface GetScenarioResponse {
+  scenario: GraphQLScenario | null;
+}
+
+export interface GetScenariosResponse {
+  scenarios: GraphQLScenario[];
+}
+
+// GraphQL Subscription responses
+export interface NodeChangedSubscription {
+  nodeChanged: GraphQLNode;
+}
+
+export interface NodeAddedSubscription {
+  nodeAdded: GraphQLNode;
+}
+
+export interface NodeRemovedSubscription {
+  nodeRemoved: GraphQLNode;
+}
+
+export interface ScenarioChangedSubscription {
+  scenarioChanged: GraphQLScenario;
+}

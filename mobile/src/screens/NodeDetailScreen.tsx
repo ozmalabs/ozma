@@ -23,28 +23,172 @@ import {
 import {NativeStackScreenProps} from '@react-navigation/native-stack';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import {useStore} from '../store/useStore';
-import {ozmaClient} from '../api/client';
-import {NodeInfo, OzmaApiError} from '../api/types';
-import {RootStackParamList} from '../navigation/AppNavigator';
 import {NodeStatusBadge} from '../components/NodeStatusBadge';
+import {RootStackParamList} from '../navigation/AppNavigator';
+import {useQuery, useMutation} from '@urql/react';
+import {graphqlClient, connectWebSocket, addWebSocketListener, closeWebSocket} from '../graphql/client';
+import {
+  GET_NODE,
+  ACTIVATE_NODE,
+  SUBSCRIBE_NODE_CHANGED,
+  NODE_FRAGMENT,
+} from '../graphql/queries';
+import {NodeDetails, DisplayOutput, Scenario} from '../store/useStore';
+
+// Helper to convert GraphQL node to NodeDetails for compatibility
+function graphqlNodeToNodeDetails(node: any): NodeDetails | null {
+  if (!node) return null;
+  return {
+    id: node.id,
+    name: node.name,
+    host: node.host,
+    port: node.port,
+    role: node.role || '',
+    hw: node.hw || '',
+    fwVersion: node.fwVersion || '',
+    protoVersion: node.protoVersion || 0,
+    capabilities: node.capabilities || [],
+    machineClass: node.machineClass || '',
+    lastSeen: node.lastSeen,
+    displayOutputs: node.displayOutputs || [],
+    vncHost: node.vncHost,
+    vncPort: node.vncPort,
+    streamPort: node.streamPort,
+    streamPath: node.streamPath,
+    audioType: node.audioType,
+    audioSink: node.audioSink,
+    audioVBANPort: node.audioVBANPort,
+    micVBANPort: node.micVBANPort,
+    captureDevice: node.captureDevice,
+    cameraStreams: node.cameraStreams || [],
+    frigateHost: node.frigateHost,
+    frigatePort: node.frigatePort,
+    ownerUserId: node.ownerUserId,
+    owner: node.owner,
+    sharedWith: node.sharedWith || [],
+    sharePermissions: node.sharePermissions || [],
+    parentId: node.parentId,
+    sunshinePort: node.sunshinePort,
+    // Legacy fields for compatibility
+    online: true, // Assume online if we have data
+    mac_address: null,
+    direct_registered: false,
+    agent_connected: false,
+    ip_address: null,
+    platform: null,
+    os_version: null,
+  };
+}
 
 type Props = NativeStackScreenProps<RootStackParamList, 'NodeDetail'>;
 
 export function NodeDetailScreen({route, navigation}: Props) {
   const {nodeId} = route.params;
 
-  const setNodes = useStore((s) => s.setNodes);
-  const setNodesLoading = useStore((s) => s.setNodesLoading);
-  const setNodesError = useStore((s) => s.setNodesError);
+  const setSelectedNodeId = useStore((s) => s.nodeStore.setSelectedNodeId);
+  const setSelectedNode = useStore((s) => s.nodeStore.setSelectedNode);
+  const setSelectedNodeLoading = useStore((s) => s.nodeStore.setSelectedNodeLoading);
+  const setSelectedNodeError = useStore((s) => s.nodeStore.setSelectedNodeError);
+  const updateSelectedNode = useStore((s) => s.nodeStore.updateSelectedNode);
+  const clearSelectedNode = useStore((s) => s.nodeStore.clearSelectedNode);
   const setActiveNodeId = useStore((s) => s.setActiveNodeId);
-  const nodes = useStore((s) => s.nodes);
   const activeNodeId = useStore((s) => s.activeNodeId);
 
-  const [node, setNode] = useState<NodeInfo | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [activating, setActivating] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
+  const [activating, setActivating] = useState(false);
+  const [toast, setToast] = useState<{message: string; type: 'success' | 'error'} | null>(null);
+
+  // Display toast for 3 seconds
+  const showToast = useCallback((message: string, type: 'success' | 'error') => {
+    setToast({message, type});
+    setTimeout(() => setToast(null), 3000);
+  }, []);
+
+  // ── GraphQL query for node data ─────────────────────────────────────────────
+
+  const [{data: nodeData, fetching: nodeLoading, error: nodeError}, reexecuteQuery] = useQuery({
+    query: GET_NODE,
+    variables: {id: nodeId},
+    pause: false,
+  });
+
+  // ── Activate node mutation ──────────────────────────────────────────────────
+
+  const [{fetching: activateLoading}, executeActivateMutation] = useMutation(ACTIVATE_NODE);
+
+  const handleActivateNode = useCallback(async () => {
+    if (!nodeData?.node) return;
+    setActivating(true);
+    try {
+      const response = await executeActivateMutation({id: nodeId});
+      if (response.data?.activateNode) {
+        setActiveNodeId(response.data.activateNode.id);
+        showToast('Node activated successfully', 'success');
+      } else if (response.error) {
+        showToast(response.error.message || 'Failed to activate node', 'error');
+      }
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to activate node', 'error');
+    } finally {
+      setActivating(false);
+    }
+  }, [nodeData, nodeId, executeActivateMutation, setActiveNodeId, showToast]);
+
+  // ── WebSocket subscription for live updates ─────────────────────────────────
+
+  useEffect(() => {
+    // Connect WebSocket
+    const ws = connectWebSocket((data) => {
+      // Handle subscription messages
+      if (data.data?.nodeChanged) {
+        const updatedNode = data.data.nodeChanged;
+        if (updatedNode.id === nodeId) {
+          updateSelectedNode(updatedNode);
+        }
+      }
+      // Handle active node changes from subscription
+      if (data.data?.nodeChanged && data.data.nodeChanged.id === activeNodeId) {
+        // Active node changed, refresh current node data
+        reexecuteQuery({requestPolicy: 'network-only'});
+      }
+    });
+
+    setWsConnected(ws.readyState === WebSocket.OPEN);
+
+    ws.onopen = () => setWsConnected(true);
+    ws.onclose = () => setWsConnected(false);
+
+    return () => {
+      closeWebSocket();
+    };
+  }, [nodeId, activeNodeId, reexecuteQuery, updateSelectedNode]);
+
+  // ── Cleanup on unmount ──────────────────────────────────────────────────────
+
+  useEffect(() => {
+    return () => {
+      clearSelectedNode();
+      closeWebSocket();
+    };
+  }, [clearSelectedNode]);
+
+  // ── Update store when GraphQL data loads ───────────────────────────────────
+
+  useEffect(() => {
+    if (nodeLoading) {
+      setSelectedNodeLoading(true);
+    } else if (nodeError) {
+      setSelectedNodeError(nodeError.message);
+      setSelectedNode(null);
+    } else if (nodeData?.node) {
+      const nodeDetails = graphqlNodeToNodeDetails(nodeData.node);
+      setSelectedNode(nodeDetails);
+      setSelectedNodeError(null);
+      setSelectedNodeLoading(false);
+    }
+  }, [nodeData, nodeLoading, nodeError, setSelectedNode, setSelectedNodeError, setSelectedNodeLoading]);
+
+  // ── Navigation header update ────────────────────────────────────────────────
 
   useEffect(() => {
     navigation.setOptions({
@@ -58,146 +202,51 @@ export function NodeDetailScreen({route, navigation}: Props) {
     });
   }, [navigation, nodeId, activating]);
 
-  const loadNode = useCallback(
-    async (id: string) => {
-      setLoading(true);
-      setError(null);
-      try {
-        const fetchedNode = await ozmaClient.getNode(id);
-        setNode(fetchedNode);
-      } catch (err) {
-        const message =
-          err instanceof OzmaApiError
-            ? err.detail
-            : err instanceof Error
-            ? err.message
-            : 'Failed to load node';
-        setError(message);
-      } finally {
-        setLoading(false);
-      }
-    },
-    [],
-  );
+  // ── Derived state ───────────────────────────────────────────────────────────
 
-  useEffect(() => {
-    loadNode(nodeId).catch(() => undefined);
-  }, [loadNode, nodeId]);
-
-  const handleActivateNode = useCallback(async () => {
-    if (!node) return;
-    setActivating(true);
-    try {
-      await ozmaClient.listNodes(); // Will trigger active_node_id update
-      const response = await fetch(
-        `${getControllerUrl()}/api/v1/nodes/${encodeURIComponent(node.id)}/activate`,
-        {method: 'POST'},
-      );
-      if (response.ok) {
-        const data = await response.json();
-        setActiveNodeId(data.active_node_id);
-        // Update local node state
-        const updatedNodes = nodes.map((n) =>
-          n.id === node.id ? {...n, online: true} : n,
-        );
-        setNodes(updatedNodes);
-        setNode({...node, online: true});
-      }
-    } catch (err) {
-      const message =
-        err instanceof OzmaApiError
-          ? err.detail
-          : err instanceof Error
-          ? err.message
-          : 'Failed to activate node';
-      setError(message);
-    } finally {
-      setActivating(false);
-    }
-  }, [node, nodes, setActiveNodeId, setNodes]);
-
-  // WebSocket subscription for live updates
-  useEffect(() => {
-    let ws: WebSocket | null = null;
-    let reconnectTimeout: NodeJS.Timeout | null = null;
-
-    const connectWebSocket = () => {
-      const controllerUrl = getControllerUrl();
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${controllerUrl.replace(/^https?:\/\//, '')}/api/v1/events`;
-
-      ws = new WebSocket(wsUrl);
-
-      ws.onopen = () => {
-        setWsConnected(true);
-        console.log('WebSocket connected for node updates');
-      };
-
-      ws.onclose = () => {
-        setWsConnected(false);
-        console.log('WebSocket disconnected, reconnecting in 3s...');
-        reconnectTimeout = setTimeout(connectWebSocket, 3000);
-      };
-
-      ws.onerror = (err) => {
-        console.log('WebSocket error, will reconnect:', err);
-      };
-
-      ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          // Handle node state updates
-          if (data.type === 'node.changed' || data.type === 'node.status') {
-            const updatedNodeId = data.node_id || data.node?.id;
-            if (updatedNodeId === nodeId) {
-              const updatedNode = data.node || data;
-              setNode((prev) => {
-                if (!prev) return prev;
-                return {...prev, ...updatedNode, online: true};
-              });
-            }
-          }
-          // Handle active node changes
-          if (data.type === 'active_node.changed' || data.type === 'routing.changed') {
-            const newActiveNodeId = data.active_node_id || data.node_id;
-            setActiveNodeId(newActiveNodeId);
-          }
-        } catch (e) {
-          console.log('WebSocket message parse error:', e);
-        }
-      };
-    };
-
-    connectWebSocket();
-
-    return () => {
-      if (ws) {
-        ws.close();
-      }
-      if (reconnectTimeout) {
-        clearTimeout(reconnectTimeout);
-      }
-    };
-  }, [nodeId, setActiveNodeId]);
+  const node = useMemo(() => {
+    return nodeData?.node as NodeDetails | undefined;
+  }, [nodeData]);
 
   const streamUrl = useMemo(() => {
-    if (!node) return null;
+    if (!node?.streamPath) return null;
     const base = getControllerUrl();
-    if (node.stream_path) {
-      return node.stream_path.startsWith('http')
-        ? node.stream_path
-        : `${base}${node.stream_path}`;
-    }
-    return null;
+    return node.streamPath.startsWith('http')
+      ? node.streamPath
+      : `${base}${node.streamPath}`;
   }, [node]);
 
   const isNodeActive = node?.id === activeNodeId;
-  const uptime = node?.last_seen
-    ? formatUptime(node.last_seen)
-    : 'Unknown';
-  const machineClassLabel = getNodeClassLabel(node?.machine_class);
+  const uptime = useMemo(() => {
+    if (!node?.lastSeen) return 'Unknown';
+    try {
+      const diff = Date.now() - new Date(node.lastSeen).getTime();
+      const seconds = Math.floor(diff / 1000);
+      if (seconds < 60) return 'just now';
+      const minutes = Math.floor(seconds / 60);
+      if (minutes < 60) return `${minutes}m ago`;
+      const hours = Math.floor(minutes / 60);
+      if (hours < 24) return `${hours}h ago`;
+      return `${Math.floor(hours / 24)}d ago`;
+    } catch {
+      return 'Unknown';
+    }
+  }, [node?.lastSeen]);
 
-  if (loading) {
+  const machineClassLabel = useMemo(() => {
+    if (!node?.machineClass) return 'Unknown';
+    const map: Record<string, string> = {
+      WORKSTATION: 'Workstation',
+      SERVER: 'Server',
+      KIOSK: 'Kiosk',
+      CAMERA: 'Camera',
+    };
+    return map[node.machineClass] || 'Unknown';
+  }, [node?.machineClass]);
+
+  // ── Render loading state ────────────────────────────────────────────────────
+
+  if (nodeLoading && !node) {
     return (
       <View style={[styles.centered, {paddingTop: useSafeAreaInsets().top}]}>
         <ActivityIndicator size="large" color="#2563EB" />
@@ -205,21 +254,32 @@ export function NodeDetailScreen({route, navigation}: Props) {
     );
   }
 
-  if (error || !node) {
+  // ── Render error state ──────────────────────────────────────────────────────
+
+  if (nodeError || !node) {
     return (
       <View style={[styles.centered, {paddingTop: useSafeAreaInsets().top}]}>
-        <Text style={styles.errorText}>{error ?? 'Node not found'}</Text>
-        <TouchableOpacity style={styles.retryButton} onPress={() => loadNode(nodeId)}>
+        <Text style={styles.errorText}>{nodeError?.message ?? 'Node not found'}</Text>
+        <TouchableOpacity style={styles.retryButton} onPress={() => reexecuteQuery({requestPolicy: 'network-only'})}>
           <Text style={styles.retryButtonText}>Retry</Text>
         </TouchableOpacity>
       </View>
     );
   }
 
+  // ── Render content ──────────────────────────────────────────────────────────
+
   return (
     <ScrollView
       style={[styles.container, {paddingTop: useSafeAreaInsets().top}]}
       contentContainerStyle={styles.content}>
+      {/* Toast notification */}
+      {toast && (
+        <View style={[styles.toast, toast.type === 'success' ? styles.toastSuccess : styles.toastError]}>
+          <Text style={styles.toastText}>{toast.message}</Text>
+        </View>
+      )}
+
       {/* Node header */}
       <View style={styles.header}>
         <View style={styles.headerRow}>
@@ -269,8 +329,8 @@ export function NodeDetailScreen({route, navigation}: Props) {
           <View style={styles.streamContainer}>
             <View style={styles.streamPlaceholder}>
               <Text style={styles.streamPlaceholderText}>Stream Preview</Text>
-              {node.stream_port && (
-                <Text style={styles.streamPort}>Port: {node.stream_port}</Text>
+              {node.streamPort && (
+                <Text style={styles.streamPort}>Port: {node.streamPort}</Text>
               )}
             </View>
           </View>
@@ -322,8 +382,8 @@ export function NodeDetailScreen({route, navigation}: Props) {
           )}
           {node.host && <DetailRow label="Host" value={node.host} />}
           {node.port && <DetailRow label="Port" value={String(node.port)} />}
-          {node.last_seen && (
-            <DetailRow label="Last Seen" value={node.last_seen} />
+          {node.lastSeen && (
+            <DetailRow label="Last Seen" value={node.lastSeen} />
           )}
         </View>
       </View>
@@ -379,32 +439,6 @@ function getControllerUrl(): string {
   }
   // Strip trailing slash
   return url.replace(/\/$/, '');
-}
-
-function formatUptime(lastSeen: string): string {
-  try {
-    const diff = Date.now() - new Date(lastSeen).getTime();
-    const seconds = Math.floor(diff / 1000);
-    if (seconds < 60) return 'just now';
-    const minutes = Math.floor(seconds / 60);
-    if (minutes < 60) return `${minutes}m ago`;
-    const hours = Math.floor(minutes / 60);
-    if (hours < 24) return `${hours}h ago`;
-    return `${Math.floor(hours / 24)}d ago`;
-  } catch {
-    return 'Unknown';
-  }
-}
-
-function getNodeClassLabel(machineClass?: string): string {
-  if (!machineClass) return 'Unknown';
-  const map: Record<string, string> = {
-    workstation: 'Workstation',
-    server: 'Server',
-    kiosk: 'Kiosk',
-    camera: 'Camera',
-  };
-  return map[machineClass] || 'Unknown';
 }
 
 const styles = StyleSheet.create({
@@ -606,5 +640,27 @@ const styles = StyleSheet.create({
   retryButtonText: {
     color: '#FFFFFF',
     fontWeight: '600',
+  },
+  toast: {
+    position: 'absolute',
+    top: 50,
+    left: 16,
+    right: 16,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    alignItems: 'center',
+    zIndex: 100,
+  },
+  toastSuccess: {
+    backgroundColor: '#064E3B',
+  },
+  toastError: {
+    backgroundColor: '#7F1D1D',
+  },
+  toastText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    textAlign: 'center',
   },
 });
