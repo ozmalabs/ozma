@@ -1079,22 +1079,29 @@ class MoonlightProtocolServer:
 
     def _generate_sdp(self, session_id: str, client_addr: tuple[str, int]) -> str:
         """Generate SDP description for the stream."""
-        return f"""v=0
+        # Use double braces to escape them in f-strings for SDP content
+        sdp_content = """v=0
 o=- {session_id} {session_id} IN IP4 127.0.0.1
 s=Ozma Moonlight Stream
-c=IN IP4 {client_addr[0]}
+c=IN IP4 {client_addr}
 t=0 0
 a=tool:Ozma Moonlight Protocol v1.2
-m=video {self._rtp_port_counter} RTP/AVP 96
+m=video {video_port} RTP/AVP 96
 b=AS:100000
 a=rtpmap:96 H264/90000
-a=fmtp:96 packetization-mode=1;profile-level-id=640028;sprop-parameter-sets=AAAAAUFE//wB9qB4A+wN4A=,AAMAAAMAAAAQAADEAAAAAA==}
+a=fmtp:96 packetization-mode=1;profile-level-id=640028;sprop-parameter-sets=AAAAAUFE//wB9qB4A+wN4A=,AAMAAAMAAAAQAADEAAAAAA==
 a=control:streamid=0
-m=audio {self._rtp_port_counter + 2} RTP/AVP 97
+m=audio {audio_port} RTP/AVP 97
 b=AS:1024
 a=rtpmap:97 opus/48000/2
 a=control:streamid=1
 """
+        return sdp_content.format(
+            session_id=session_id,
+            client_addr=client_addr[0],
+            video_port=self._rtp_port_counter,
+            audio_port=self._rtp_port_counter + 2,
+        )
 
     async def _handle_rtp_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
