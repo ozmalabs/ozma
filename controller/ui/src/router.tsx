@@ -4,6 +4,7 @@ export const routerConfig = {
   paths: {
     nodes: '/nodes',
     node: '/nodes/:id',
+    controls: '/controls',
     settings: '/settings',
   },
 }

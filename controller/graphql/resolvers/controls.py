@@ -1,20 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
 """
-GraphQL types for control surfaces.
-
-Supports MIDI controllers, Stream Decks, gamepads, and hotkeys.
+Resolvers for control surface-related GraphQL queries.
 """
 
-import logging
-from typing import Any
+from typing import Optional, Any
 
 import strawberry
 from strawberry.types import Info
 
-if TYPE_CHECKING:
-    from controller.controls import ControlSurface
-
-log = logging.getLogger("ozma.graphql.controls")
+from controller.controls import ControlSurface
 
 
 @strawberry.type
@@ -75,20 +69,37 @@ class ControlSurfaceType:
     displays: list[DisplayControlType]
 
 
-async def resolve_control_surfaces(info: Info) -> list[ControlSurfaceType]:
+@strawberry.type
+class QueryControls:
+    """
+    Query resolvers for control surfaces.
+    """
+
+    @strawberry.field
+    def control_surfaces(self, info: Info) -> list[ControlSurfaceType]:
+        """Query all connected control surfaces."""
+        return _resolve_control_surfaces(info)
+
+    @strawberry.field
+    def control_surface(self, info: Info, id: str) -> ControlSurfaceType | None:
+        """Query a single control surface by ID."""
+        surfaces = _resolve_control_surfaces(info)
+        for surface in surfaces:
+            if surface.id == id:
+                return surface
+        return None
+
+
+def _resolve_control_surfaces(info: Info) -> list[ControlSurfaceType]:
     """
     Resolve all connected control surfaces.
 
     Args:
-        info: Strawberry info context containing app_state and controls manager
+        info: Strawberry info context containing controls manager
 
     Returns:
         List of ControlSurfaceType objects
     """
-    from controller.state import AppState
-    from controller.controls import ControlSurface
-
-    app_state: AppState = info.context.get("state")
     controls_mgr = info.context.get("controls")
 
     if not controls_mgr:
@@ -147,24 +158,3 @@ async def resolve_control_surfaces(info: Info) -> list[ControlSurfaceType]:
         ))
 
     return result
-
-
-@strawberry.type
-class QueryControls:
-    """
-    Query resolvers for control surfaces.
-    """
-
-    @strawberry.field
-    def control_surfaces(self, info: Info) -> list[ControlSurfaceType]:
-        """Query all connected control surfaces."""
-        return resolve_control_surfaces(info)
-
-    @strawberry.field
-    def control_surface(self, info: Info, id: str) -> ControlSurfaceType | None:
-        """Query a single control surface by ID."""
-        surfaces = resolve_control_surfaces(info)
-        for surface in surfaces:
-            if surface.id == id:
-                return surface
-        return None
