@@ -47,10 +47,30 @@ MachineClass = strawberry.enum(MachineClassEnum)
 
 
 @strawberry.type
+class ScenarioRef:
+    """Reference to a scenario bound to a node."""
+
+    id: str
+    name: str
+    color: str
+
+
+@strawberry.type
+class HIDStats:
+    """HID (Human Interface Device) statistics for a node."""
+
+    total_keys: int = 0
+    total_clicks: int = 0
+    total_scrolls: int = 0
+    last_activity: Optional[str] = None
+
+
+@strawberry.type
 class NodeType:
     """Represents a hardware or virtual node in the KVM network."""
 
     id: str
+    name: Optional[str] = None
     host: str
     port: int
     role: str
@@ -81,12 +101,37 @@ class NodeType:
     sunshine_port: Optional[int] = None
     seat_count: int = 1
     seat_config: dict = strawberry.field(default_factory=dict)
+    # Additional fields for detail page
+    status: str = "offline"
+    uptime_seconds: int = 0
+    ip_address: Optional[str] = None
+    mac_address: Optional[str] = None
+    hostname: Optional[str] = None
+    platform: Optional[str] = None
+    version: Optional[str] = None
+    scenario: Optional[ScenarioRef] = None
+    hid_stats: Optional[HIDStats] = None
 
     @classmethod
-    def from_nodeinfo(cls, node: NodeInfo) -> "NodeType":
+    def from_nodeinfo(cls, node: NodeInfo, active: bool = False, active_node_id: Optional[str] = None) -> "NodeType":
         """Create a NodeType from a NodeInfo dataclass."""
+        # Calculate status based on last_seen
+        from datetime import datetime
+        now = datetime.now().timestamp()
+        time_since_seen = now - (node.last_seen if node.last_seen else now)
+        if time_since_seen > 300:
+            status = "offline"
+        elif time_since_seen > 60:
+            status = "disconnected"
+        else:
+            status = "online" if active else "available"
+
+        # Calculate uptime
+        uptime_seconds = int(now - (node.last_seen if node.last_seen else now))
+
         return cls(
             id=node.id,
+            name=None,
             host=node.host,
             port=node.port,
             role=node.role,
@@ -136,6 +181,15 @@ class NodeType:
             sunshine_port=node.sunshine_port,
             seat_count=node.seat_count,
             seat_config=node.seat_config,
+            status=status,
+            uptime_seconds=uptime_seconds,
+            ip_address=None,
+            mac_address=None,
+            hostname=None,
+            platform=None,
+            version=None,
+            scenario=None,
+            hid_stats=None,
         )
 
 
