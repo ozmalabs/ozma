@@ -211,6 +211,56 @@ class NessusConfig:
         )
 
 
+# ── Trivy scanner (container image CVE scanner) ───────────────────────────────
+
+@dataclass
+class TrivyConfig:
+    """Configuration for Trivy container image vulnerability scanner."""
+    enabled: bool = False          # Enable/disable Trivy scanning
+    images: list[str] = field(default_factory=list)  # Docker images to scan
+    severity: str = "critical,high,medium"  # comma-separated severity levels
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "images": self.images,
+            "severity": self.severity,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TrivyConfig":
+        return cls(
+            enabled=d.get("enabled", False),
+            images=d.get("images", []),
+            severity=d.get("severity", "critical,high,medium"),
+        )
+
+
+# ── Trufflehog scanner (git secrets scanner) ───────────────────────────────────
+
+@dataclass
+class TrufflehogConfig:
+    """Configuration for Trufflehog git secrets scanner."""
+    enabled: bool = False          # Enable/disable Trufflehog scanning
+    paths: list[str] = field(default_factory=list)  # Git repos/paths to scan
+    severity: str = "critical,high,medium"  # severity filter
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "paths": self.paths,
+            "severity": self.severity,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TrufflehogConfig":
+        return cls(
+            enabled=d.get("enabled", False),
+            paths=d.get("paths", []),
+            severity=d.get("severity", "critical,high,medium"),
+        )
+
+
 @dataclass
 class OpenVASConfig:
     host: str = "localhost"
