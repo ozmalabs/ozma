@@ -1,17 +1,9 @@
 import { create } from 'zustand'
 import { useEffect } from 'react'
+import { NodeInfo as NodeType } from '../types/node'
 
-export interface NodeInfo {
-  id: string
-  name: string
-  hostname: string
-  machine_class: 'workstation' | 'server' | 'kiosk'
-  status: 'online' | 'offline' | 'connecting'
-  active: boolean
-  last_seen: string
-  ip_address: string
-  mac_address: string | null
-  machine_id: string | null
+export interface NodeInfo extends NodeType {
+  hostname?: string
 }
 
 interface NodesStore {
@@ -28,7 +20,7 @@ interface NodesStore {
 
 const API_BASE = '/api/v1'
 
-export const useNodesStore = create<NodesStore>((set) => ({
+export const useNodesStore = create<NodesStore>((set, get) => ({
   nodes: [],
   loading: true,
   error: null,
@@ -90,7 +82,12 @@ export const useNodesStore = create<NodesStore>((set) => ({
 
   updateNode: (node) => {
     set((state) => ({
-      nodes: state.nodes.map((n) => (n.id === node.id ? node : n)),
+      nodes: state.nodes.map((n) => {
+        if (n.id === node.id) {
+          return { ...n, ...node }
+        }
+        return n
+      }),
     }))
   },
 
