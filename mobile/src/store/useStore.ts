@@ -286,20 +286,72 @@ export const useStore = create<AppStore>((set) => ({
     selectedNodeLoading: false,
     selectedNodeError: null,
 
-    setSelectedNodeId: (id) => set((state) => ({nodeStore: {...state.nodeStore, selectedNodeId: id}})),
-    setSelectedNode: (node) => set((state) => ({nodeStore: {...state.nodeStore, selectedNode: node}})),
-    setSelectedNodeLoading: (loading) => set((state) => ({nodeStore: {...state.nodeStore, selectedNodeLoading: loading}})),
-    setSelectedNodeError: (error) => set((state) => ({nodeStore: {...state.nodeStore, selectedNodeError: error}})),
-    updateSelectedNode: (partial) => set((state) => ({
+    setSelectedNodeId: (id) => set((state) => {
+      // Validate ID format
+      if (id && typeof id !== 'string') {
+        console.warn('NodeStore: Invalid node ID type, expected string');
+        return state;
+      }
+      if (id && state.nodeStore.selectedNodeId === id) return state;
+      return {
+        nodeStore: {
+          ...state.nodeStore,
+          selectedNodeId: id,
+          selectedNodeError: null,
+          selectedNodeLoading: false,
+        },
+      };
+    }),
+    setSelectedNode: (node) => set((state) => {
+      // Validate node
+      if (node && typeof node !== 'object') {
+        console.warn('NodeStore: Invalid node data type');
+        return state;
+      }
+      // Ensure node ID matches selected node ID
+      if (node?.id !== state.nodeStore.selectedNodeId) return state;
+      return {
+        nodeStore: {
+          ...state.nodeStore,
+          selectedNode: node,
+          selectedNodeError: null,
+        },
+      };
+    }),
+    setSelectedNodeLoading: (loading) => set((state) => ({
       nodeStore: {
         ...state.nodeStore,
-        selectedNode: state.nodeStore.selectedNode
-          ? {...state.nodeStore.selectedNode, ...partial}
-          : null,
+        selectedNodeLoading: typeof loading === 'boolean' ? loading : false,
       },
     })),
+    setSelectedNodeError: (error) => set((state) => ({
+      nodeStore: {
+        ...state.nodeStore,
+        selectedNodeError: error || null,
+      },
+    })),
+    updateSelectedNode: (partial) => set((state) => {
+      if (!partial || typeof partial !== 'object') {
+        console.warn('NodeStore: Invalid update data type');
+        return state;
+      }
+      const node = state.nodeStore.selectedNode;
+      if (!node) return state;
+      return {
+        nodeStore: {
+          ...state.nodeStore,
+          selectedNode: {...node, ...partial},
+        },
+      };
+    }),
     clearSelectedNode: () => set((state) => ({
-      nodeStore: {...state.nodeStore, selectedNodeId: null, selectedNode: null, selectedNodeError: null},
+      nodeStore: {
+        ...state.nodeStore,
+        selectedNodeId: null,
+        selectedNode: null,
+        selectedNodeLoading: false,
+        selectedNodeError: null,
+      },
     })),
   },
 
