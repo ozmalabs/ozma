@@ -116,8 +116,23 @@ def _b64url_decode(s: str) -> bytes:
 
 
 def create_jwt(keypair: IdentityKeyPair, scopes: list[str],
-               expiry_seconds: int = 86400, subject: str = "admin") -> str:
-    """Create a JWT signed with Ed25519."""
+               expiry_seconds: int = 86400, subject: str = "admin",
+               audience: str | None = None,
+               issuer: str | None = None) -> str:
+    """
+    Create a JWT signed with Ed25519.
+
+    Args:
+        keypair: The Ed25519 keypair for signing
+        scopes: List of scopes (read, write, admin)
+        expiry_seconds: Token expiry time in seconds
+        subject: The subject of the token (user ID or "admin")
+        audience: Optional audience claim (aud)
+        issuer: Optional issuer claim (iss)
+
+    Returns:
+        The signed JWT token string
+    """
     header = {"alg": "EdDSA", "typ": "JWT"}
     now = int(time.time())
     payload = {
@@ -126,6 +141,11 @@ def create_jwt(keypair: IdentityKeyPair, scopes: list[str],
         "iat": now,
         "exp": now + expiry_seconds,
     }
+    # Add optional claims
+    if audience is not None:
+        payload["aud"] = audience
+    if issuer is not None:
+        payload["iss"] = issuer
     header_b64 = _b64url_encode(json.dumps(header, separators=(",", ":")).encode())
     payload_b64 = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode())
     signing_input = f"{header_b64}.{payload_b64}".encode()
@@ -134,11 +154,23 @@ def create_jwt(keypair: IdentityKeyPair, scopes: list[str],
     return f"{header_b64}.{payload_b64}.{sig_b64}"
 
 
-def verify_jwt(token: str, public_key: bytes) -> dict | None:
+def verify_jwt(token: str, public_key: bytes,
+               expected_audience: str | None = None,
+               expected_issuer: str | None = None) -> dict | None:
     """
     Verify a JWT and return its claims, or None if invalid.
 
-    Checks: signature (Ed25519), expiry, required fields.
+    Checks: signature (Ed25519), expiry, required fields, and optionally
+    audience and issuer claims if provided.
+
+    Args:
+        token: The JWT token string
+        public_key: The Ed25519 public key for signature verification
+        expected_audience: Optional expected audience claim (aud)
+        expected_issuer: Optional expected issuer claim (iss)
+
+    Returns:
+        The payload dict if valid, None if invalid
     """
     parts = token.split(".")
     if len(parts) != 3:
@@ -157,6 +189,22 @@ def verify_jwt(token: str, public_key: bytes) -> dict | None:
             return None
         if "sub" not in payload or "scopes" not in payload:
             return None
+
+        # Validate audience if expected
+        if expected_audience is not None:
+            payload_audience = payload.get("aud")
+            if isinstance(payload_audience, list):
+                if expected_audience not in payload_audience:
+                    return None
+            elif payload_audience != expected_audience:
+                return None
+
+        # Validate issuer if expected
+        if expected_issuer is not None:
+            payload_issuer = payload.get("iss")
+            if payload_issuer != expected_issuer:
+                return None
+
         return payload
     except Exception:
         return None

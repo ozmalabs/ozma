@@ -17,6 +17,7 @@ WebSocket:
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -28,7 +29,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from strawberry.fastapi import GraphQLRouter
 
 from auth import (
     AuthConfig, AuthContext, create_jwt, verify_jwt, verify_password,
@@ -112,13 +112,19 @@ from backup_status import BackupNudgeService
 
 # GraphQL imports
 try:
-    from graphql import GraphQLError
-    from strawberry.fastapi import GraphQLRouter
-    from controller.graphql.schema import schema as ozma_schema
-    GRAPHQL_ENABLED = True
+    import strawberry
+    from strawberry.types import Info
+    from .graphql.schema import schema as graphql_schema
+    from .graphql.subscriptions import start_event_router, stop_event_router
+    HAS_GRAPHQL = True
 except ImportError:
-    GRAPHQL_ENABLED = False
-    log.warning("Strawberry GraphQL not installed - GraphQL API will be unavailable")
+    HAS_GRAPHQL = False
+    # Define stub functions when GraphQL is not available
+    def start_event_router(state: Any) -> None:  # type: ignore
+        pass
+
+    def stop_event_router() -> None:  # type: ignore
+        pass
 
 log = logging.getLogger("ozma.api")
 
@@ -192,24 +198,6 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         allow_methods=["*"],
         allow_headers=["*"],
     )
-
-    # --- GraphQL Schema and Context Factory ---
-
-    from .graphql.schema import schema
-
-    def graphql_context_factory() -> dict[str, Any]:
-        """Create context for GraphQL queries with AppState and ScenarioManager."""
-        return {
-            "app_state": state,
-            "scenario_manager": scenarios,
-        }
-
-    # Mount GraphQL at /graphql
-    graphql_app = GraphQLRouter(
-        schema=schema,
-        context=graphql_context_factory,
-    )
-    app.include_router(graphql_app, prefix="/graphql")
 
     # --- Authentication ---
 
@@ -334,7 +322,12 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             scopes = ALL_SCOPES if user.role == "owner" else [SCOPE_READ, SCOPE_WRITE]
             if user.role == "guest":
                 scopes = [SCOPE_READ]
-            token = create_jwt(_signing_key, scopes, _auth.jwt_expiry_seconds, subject=user.id)
+            token = create_jwt(
+                _signing_key, scopes, _auth.jwt_expiry_seconds,
+                subject=user.id,
+                audience="ozma-controller",
+                issuer="ozma-controller"
+            )
             return {
                 "token": token,
                 "expires_in": _auth.jwt_expiry_seconds,
@@ -345,7 +338,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         # Legacy single-admin auth: password only (no username)
         if not _auth.password_hash or not verify_password(password, _auth.password_hash):
             raise HTTPException(401, "Invalid password")
-        token = create_jwt(_signing_key, ALL_SCOPES, _auth.jwt_expiry_seconds)
+        token = create_jwt(
+            _signing_key, ALL_SCOPES, _auth.jwt_expiry_seconds,
+            audience="ozma-controller",
+            issuer="ozma-controller"
+        )
         return {
             "token": token,
             "expires_in": _auth.jwt_expiry_seconds,
@@ -355,114 +352,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
-   # --- GraphQL endpoint ---
-    @app.post("/graphql")
-    async def graphql_endpoint(
-        request: Request,
-    ):
-        """
-        GraphQL endpoint for the Ozma Controller.
 
-        Supports POST with JSON body containing query, variables, and operationName.
-        Authentication is required unless disabled globally.
-
-        Query example:
-            {
-                "query": "query { systemHealth { uptimeSeconds nodeCount activeNodeId } }",
-                "variables": null,
-                "operationName": null
-            }
-
-        Security features:
-            - Maximum request size: 1MB
-            - Input validation for queries
-            - Proper error formatting
-            - Async execution via executor
-        """
-        # Check GraphQL is enabled
-        if not GRAPHQL_ENABLED:
-            raise HTTPException(503, "GraphQL not available - Strawberry GraphQL not installed")
-
-        # Build context with state and other services
-        graphql_context = {
-            "state": state,
-            "scenarios": scenarios,
-            "streams": streams,
-            "audio": audio,
-            "controls": controls,
-            "auth_context": getattr(request.state, "auth", None),
-        }
-
-        # Get raw body with size limit (1MB max)
-        try:
-            body_bytes = await request.body()
-            if len(body_bytes) > 1_048_576:  # 1MB limit
-                raise HTTPException(413, "Request too large - maximum size is 1MB")
-        except Exception as e:
-            log.error(f"Failed to read request body: {e}")
-            raise HTTPException(400, "Invalid request body")
-
-        # Parse and validate JSON
-        if not body_bytes:
-            raise HTTPException(400, "Request body is required")
-
-        try:
-            body = json.loads(body_bytes.decode('utf-8'))
-        except json.JSONDecodeError as e:
-            raise HTTPException(400, f"Invalid JSON: {e}")
-
-        # Validate query field exists
-        query = body.get("query")
-        if not query or not isinstance(query, str) or not query.strip():
-            raise HTTPException(400, "query field is required")
-
-        # Sanitize input - prevent query injection and DoS
-        if len(query) > 16_384:  # 16KB max query size
-            raise HTTPException(413, "Query too large - maximum size is 16KB")
-
-        # Extract optional fields
-        variables = body.get("variables")
-        operation_name = body.get("operationName")
-
-        # Validate variables if present
-        if variables is not None and not isinstance(variables, dict):
-            raise HTTPException(400, "variables must be a JSON object")
-
-        # Log query for monitoring (without sensitive data)
-        log.debug(f"GraphQL query received: operation={operation_name}, query_length={len(query)}")
-
-        # Execute GraphQL query using Strawberry's async execution
-
-        # Run in executor to avoid blocking the event loop
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: ozma_schema.execute(
-                query=query,
-                variable_values=variables,
-                operation_name=operation_name,
-                context_value=graphql_context,
-            )
-        )
-
-        # Format errors with proper GraphQL error format
-        errors = []
-        if result.errors:
-            for error in result.errors:
-                error_dict = {
-                    "message": str(error),
-                    "locations": [{"line": loc.line, "column": loc.column} for loc in getattr(error, 'locations', [])] if hasattr(error, 'locations') else None,
-                    "path": list(error.path) if hasattr(error, 'path') and error.path else None,
-                }
-                if hasattr(error, 'extensions') and error.extensions:
-                    error_dict["extensions"] = error.extensions
-                errors.append(error_dict)
-                log.warning(f"GraphQL error: {error.message} at {getattr(error, 'locations', [])}")
-
-        return {
-            "data": result.data,
-            "errors": errors if errors else None,
-        }
     # --- User management ---
 
     @app.get("/api/v1/users")
@@ -906,8 +796,17 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     @app.on_event("startup")
     async def _startup() -> None:
         asyncio.create_task(_event_pump(), name="event-pump")
+        # Start GraphQL subscription event router with exception handling
+        try:
+            start_event_router(state)
+        except Exception as e:
+            log.error("Failed to start GraphQL event router: %s", e)
 
     # --- WebSocket endpoint ---
+
+    # Expected JWT claims for ozma controller tokens (configurable via environment)
+    _JWT_EXPECTED_AUDIENCE = os.environ.get("OZMA_JWT_AUDIENCE", "ozma-controller")
+    _JWT_EXPECTED_ISSUER = os.environ.get("OZMA_JWT_ISSUER", "ozma-controller")
 
     async def _ws_authenticate(ws: WebSocket) -> bool:
         """Authenticate a WebSocket connection. Returns True if allowed."""
@@ -917,8 +816,17 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if is_wireguard_source(client_ip, _auth):
             return True
         token = ws.query_params.get("token")
-        if token and _verify_key and verify_jwt(token, _verify_key):
-            return True
+        if token and _verify_key:
+            try:
+                claims = verify_jwt(
+                    token, _verify_key,
+                    expected_audience=_JWT_EXPECTED_AUDIENCE,
+                    expected_issuer=_JWT_EXPECTED_ISSUER
+                )
+                if claims:
+                    return True
+            except Exception:
+                pass
         return False
 
     @app.websocket("/api/v1/events")
@@ -10356,6 +10264,283 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(400, "entries list required")
         dns_verifier.guard.remove_allowlist(set(entries))
         return {"ok": True, "removed": entries}
+
+    # --- GraphQL endpoint (HTTP for queries/mutations) ---
+
+    @app.post("/graphql")
+    async def graphql_endpoint(
+        request: Request,
+    ) -> dict[str, Any]:
+        """
+        GraphQL HTTP endpoint for queries and mutations.
+
+        Clients can send POST requests with a JSON body containing:
+        - query: The GraphQL query string
+        - variables: Optional variables for the query
+
+        For subscriptions, clients should use a WebSocket connection to
+        ws://<host>:7380/graphql with the subscription protocol.
+        """
+        _require_scope(request, SCOPE_READ)
+
+        if not HAS_GRAPHQL:
+            raise HTTPException(503, "GraphQL not available")
+
+        try:
+            body = await request.json()
+            query = body.get("query", "")
+            variables = body.get("variables", {})
+
+            if not query:
+                raise HTTPException(400, "Missing 'query' field")
+
+            # Execute the query/mutation/subscription
+            from strawberry.http import GraphQLHTTPResponse
+            from strawberry.types import ExecutionResult
+
+            result = await graphql_schema.execute(
+                query=query,
+                variable_values=variables,
+                context_value={
+                    "state": state,
+                    "scenario_manager": scenarios,
+                    "audio_router": audio,
+                    "alert_manager": alert_mgr,
+                },
+            )
+
+            response: dict[str, Any] = {
+                "data": result.data,
+            }
+
+            if result.errors:
+                response["errors"] = [
+                    {
+                        "message": str(error),
+                        "locations": list(error.locations) if error.locations else None,
+                        "path": list(error.path) if error.path else None,
+                    }
+                    for error in result.errors
+                ]
+
+            return response
+
+        except json.JSONDecodeError as e:
+            raise HTTPException(400, f"Invalid JSON in request body: {str(e)}")
+        except Exception as e:
+            raise HTTPException(400, str(e))
+
+    # --- GraphQL WebSocket endpoint for subscriptions ---
+
+    # Import Strawberry WebSocket handling
+    try:
+        from strawberry.websockets import GraphQLWSConsumer
+        HAS_WS = True
+    except ImportError:
+        # Fallback: use manual WebSocket handling
+        HAS_WS = False
+
+    async def _graphql_ws_authenticate(ws: WebSocket) -> bool:
+        """Authenticate a GraphQL WebSocket connection. Returns True if allowed."""
+        if not _auth.enabled:
+            return True
+        client_ip = ws.client.host if ws.client else "127.0.0.1"
+        if is_wireguard_source(client_ip, _auth):
+            return True
+        token = ws.query_params.get("token")
+        if token and _verify_key:
+            try:
+                claims = verify_jwt(
+                    token, _verify_key,
+                    expected_audience=_JWT_EXPECTED_AUDIENCE,
+                    expected_issuer=_JWT_EXPECTED_ISSUER
+                )
+                if claims:
+                    return True
+            except Exception:
+                pass
+        return False
+
+    @app.websocket("/graphql")
+    async def graphql_ws(ws: WebSocket) -> None:
+        """
+        WebSocket endpoint for GraphQL subscriptions.
+
+        Uses the GraphQL over WebSocket protocol (graphql-ws).
+        Strawberry handles the subscription lifecycle automatically.
+
+        Subscription query example:
+        subscription {
+            nodeStateChanged { id host active }
+            scenarioActivated { id name node_id }
+            audioLevelUpdate { node_id levels timestamp }
+            alertFired { id kind severity }
+        }
+        """
+        if not HAS_GRAPHQL:
+            await ws.close(code=4003, reason="GraphQL not available")
+            return
+
+        if not await _graphql_ws_authenticate(ws):
+            await ws.close(code=4001, reason="Authentication required")
+            return
+
+        await ws.accept()
+
+        # Subscription tracking: subscription_id -> (async_gen, task)
+        subscriptions: dict[str, tuple[Any, asyncio.Task]] = {}
+        log.info("GraphQL WebSocket client connected")
+
+        async def _send_message(message_type: str, subscription_id: str, payload: dict) -> None:
+            """Send a graphql-ws protocol message."""
+            try:
+                await ws.send_text(json.dumps({
+                    "type": message_type,
+                    "id": subscription_id,
+                    "payload": payload,
+                }))
+            except Exception as e:
+                log.error("Failed to send message %s for %s: %s", message_type, subscription_id, e)
+
+        async def subscription_runner(
+            sub_id: str, gen, send_func
+        ) -> None:
+            """Runner task for an async generator subscription."""
+            try:
+                async for item in gen:
+                    try:
+                        await send_func("next", sub_id, {"data": item})
+                    except Exception as e:
+                        log.error("Failed to send subscription data for %s: %s", sub_id, e)
+                        break
+            except asyncio.CancelledError:
+                log.debug("Subscription cancelled: %s", sub_id)
+            except GeneratorExit:
+                log.debug("Subscription generator exited: %s", sub_id)
+            except Exception as e:
+                log.error("Subscription error for %s: %s", sub_id, e, exc_info=True)
+                try:
+                    await send_func("error", sub_id, {"message": str(e)})
+                except Exception:
+                    pass
+
+        try:
+            while True:
+                message = await ws.receive_text()
+
+                try:
+                    data = json.loads(message)
+                    msg_type = data.get("type", "")
+
+                    if msg_type == "connection_init":
+                        # Client is initializing connection
+                        log.debug("GraphQL WS: connection_init")
+                        await _send_message("connection_ack", "", {})
+                    elif msg_type == "subscribe":
+                        # Client is starting a subscription
+                        subscription_id = data.get("id", "")
+                        payload = data.get("payload", {})
+                        query = payload.get("query", "")
+                        variables = payload.get("variables", {})
+
+                        if not query:
+                            log.warning("GraphQL WS: subscribe without query")
+                            await _send_message("error", subscription_id, {"message": "Missing query"})
+                            continue
+
+                        log.info("GraphQL WS: subscribe %s", subscription_id)
+
+                        try:
+                            # Execute the subscription query
+                            result = await graphql_schema.execute(
+                                query=query,
+                                variable_values=variables,
+                                context_value={
+                                    "state": state,
+                                    "scenario_manager": scenarios,
+                                    "audio_router": audio,
+                                    "alert_manager": alert_mgr,
+                                },
+                            )
+
+                            if result.errors:
+                                log.error("GraphQL WS: subscription %s errors: %s", subscription_id, result.errors)
+                                for err in result.errors:
+                                    log.error("GraphQL WS: error details: %s", err)
+                                await _send_message("error", subscription_id, {
+                                    "message": "Subscription error",
+                                    "errors": [
+                                        {"message": str(e)} for e in result.errors
+                                    ],
+                                })
+                                continue
+
+                            if result.data:
+                                # Send initial data
+                                await _send_message("next", subscription_id, {"data": result.data})
+
+                            # Check for async generators (subscriptions)
+                            if result.data:
+                                for field_name, field_value in result.data.items():
+                                    # Check if this is an async generator
+                                    # Strawberry's subscriptions return async generators
+                                    if inspect.isasyncgenfunction(type(field_value).__get__) or hasattr(field_value, "__aiter__"):
+                                        # This is an async generator - start a runner task
+                                        task = asyncio.create_task(
+                                            subscription_runner(
+                                                subscription_id, field_value, _send_message
+                                            )
+                                        )
+                                        subscriptions[subscription_id] = (field_value, task)
+                                        log.info(
+                                            "GraphQL WS: started subscription %s for field %s",
+                                            subscription_id, field_name
+                                        )
+                                        break
+
+                        except Exception as e:
+                            log.error("GraphQL WS: subscription %s execution error: %s", subscription_id, e)
+                            await _send_message("error", subscription_id, {"message": str(e)})
+                            continue
+
+                        # Send completion after starting the subscription
+                        await _send_message("complete", subscription_id, {})
+
+                    elif msg_type == "complete":
+                        # Client is closing a subscription
+                        subscription_id = data.get("id", "")
+                        log.info("GraphQL WS: complete %s", subscription_id)
+                        if subscription_id in subscriptions:
+                            _, task = subscriptions.pop(subscription_id)
+                            task.cancel()
+                            log.debug("GraphQL WS: cancelled subscription task %s", subscription_id)
+                        else:
+                            log.warning("GraphQL WS: unknown subscription to complete: %s", subscription_id)
+
+                    elif msg_type == "connection_terminate":
+                        # Client wants to terminate the connection
+                        log.info("GraphQL WS: connection_terminate")
+                        break
+
+                    else:
+                        log.debug("GraphQL WS: unknown message type: %s", msg_type)
+
+                except json.JSONDecodeError as e:
+                    log.error("GraphQL WS: invalid JSON - %s", e)
+                    await _send_message("error", "", {"message": "Invalid JSON"})
+
+        except WebSocketDisconnect:
+            log.info("GraphQL WS: client disconnected")
+        except Exception as e:
+            log.error("GraphQL WebSocket error: %s", e, exc_info=True)
+        finally:
+            # Cleanup all subscriptions
+            log.info("GraphQL WS: cleaning up %d subscriptions", len(subscriptions))
+            for sub_id, (_, task) in subscriptions.items():
+                log.debug("GraphQL WS: cancelling subscription %s", sub_id)
+                task.cancel()
+            subscriptions.clear()
+            log.info("GraphQL WS: connection closed")
 
     # Static files — mounted last so they don't shadow API routes
     static_dir = Path(__file__).parent / "static"
