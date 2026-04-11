@@ -135,9 +135,12 @@ class NodeInfo:
 
 class AppState:
     def __init__(self) -> None:
+        import time
         self.nodes: dict[str, NodeInfo] = {}
         self.active_node_id: str | None = None
         self._lock = asyncio.Lock()
+        # Start time for uptime calculation
+        self._start_time: float = time.monotonic()
 
         # Broadcast queue — api.py drains this for WebSocket clients
         self.events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()

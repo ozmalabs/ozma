@@ -1,27 +1,40 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
 """
-GraphQL types package.
+GraphQL types for Ozma Controller.
+
+This module provides Strawberry GraphQL types and resolvers for:
+- Audio routing (AudioRoute, AudioVolume)
+- VBAN streams (VBANStream)
+- Video streams (StreamInfo, CameraInfo)
+- Control surfaces (ControlSurface, Binding)
+- System health (SystemHealth)
 """
 
-from .nodes import NodeType, NodeInfoType, DisplayOutputType, CameraStreamType
-from .scenarios import (
-    ScenarioType,
-    BindingType,
-    TransitionConfigType,
-    MotionPresetType,
-    BluetoothConfigType,
-    WallpaperConfigType,
+from .audio import AudioRoute, AudioVolume
+from .vban import VBANStream
+from .stream import StreamInfo, CameraInfo, CameraStream
+from .controls import (
+    ControlSurface,
+    Binding,
+    ControlBinding,
+    Control,
+    DisplayBinding,
+    Display,
 )
+from .system import SystemHealth
 
 __all__ = [
-    "NodeType",
-    "NodeInfoType",
-    "DisplayOutputType",
-    "CameraStreamType",
-    "ScenarioType",
-    "BindingType",
-    "TransitionConfigType",
-    "MotionPresetType",
-    "BluetoothConfigType",
-    "WallpaperConfigType",
+    "AudioRoute",
+    "AudioVolume",
+    "VBANStream",
+    "StreamInfo",
+    "CameraInfo",
+    "CameraStream",
+    "ControlSurface",
+    "Binding",
+    "ControlBinding",
+    "Control",
+    "DisplayBinding",
+    "Display",
+    "SystemHealth",
 ]
