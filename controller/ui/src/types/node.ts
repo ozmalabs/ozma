@@ -18,7 +18,6 @@ export interface NodeInfo {
   fw_version?: string
   proto_version?: string
   capabilities?: string[]
-  port?: number
   stream_port?: number
   stream_path?: string
   video_enabled?: boolean

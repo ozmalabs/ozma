@@ -46,15 +46,17 @@ export function NodeCard({ node, isActive, onClick, onDragEnd }: NodeCardProps) 
     }
   }
 
+  // Check if video is available (stream_port or vnc_port)
+  const hasVideo = (node.stream_port !== undefined && node.stream_port !== null) ||
+                   (node.vnc_port !== undefined && node.vnc_port !== null)
+
   return (
     <Reorder.Item
       value={node}
       id={node.id}
       dragHandlerId={`drag-handle-${node.id}`}
       layoutId={`node-card-${node.id}`}
-      onDragEnd={() => {
-        // Drag end is handled by Reorder.Group
-      }}
+      className="outline-none"
     >
       <motion.div
         layoutId={`node-card-container-${node.id}`}
@@ -62,8 +64,8 @@ export function NodeCard({ node, isActive, onClick, onDragEnd }: NodeCardProps) 
         className={`
           relative group cursor-pointer rounded-xl border transition-all duration-200
           hover:shadow-lg active:scale-95
-          ${isActive 
-            ? 'border-emerald-500 shadow-[0_0_20px_rgba(16,185,129,0.3)] ring-2 ring-emerald-500/50' 
+          ${isActive
+            ? 'border-emerald-500 shadow-[0_0_20px_rgba(16,185,129,0.3)] ring-2 ring-emerald-500/50'
             : 'border-border bg-card hover:border-emerald-500/50'
           }
           touch-active:scale-[0.98]
@@ -101,23 +103,23 @@ export function NodeCard({ node, isActive, onClick, onDragEnd }: NodeCardProps) 
                 <line x1="4" x2="8" y1="20" y2="20" />
               </svg>
             </div>
-            
+
             <div>
               <h3 className="font-semibold text-base group-hover:text-emerald-500 transition-colors">
                 {node.name}
               </h3>
               <div className="flex items-center gap-2 text-xs text-muted-foreground mt-1">
-                <StatusDot 
-                  status={getStatusColor(node.status || 'unknown')} 
-                  size="sm" 
+                <StatusDot
+                  status={getStatusColor(node.status || 'unknown')}
+                  size="sm"
                 />
                 <span>{getStatusText(node.status || 'unknown')}</span>
               </div>
             </div>
           </div>
-          
+
           {/* Drag handle */}
-          <div 
+          <div
             id={`drag-handle-${node.id}`}
             className="opacity-0 group-hover:opacity-100 transition-opacity cursor-grab active:cursor-grabbing text-muted-foreground"
           >
@@ -184,16 +186,18 @@ export function NodeCard({ node, isActive, onClick, onDragEnd }: NodeCardProps) 
           </div>
 
           {/* Machine class badge */}
-          <div className="flex items-center gap-2 mt-2">
-            <span className="px-2 py-1 text-xs font-medium bg-secondary text-secondary-foreground rounded-md">
-              {node.machine_class === 'kiosk' ? 'Kiosk' : node.machine_class === 'server' ? 'Server' : 'Workstation'}
-            </span>
-          </div>
+          {node.machine_class && (
+            <div className="flex items-center gap-2 mt-2">
+              <span className="px-2 py-1 text-xs font-medium bg-secondary text-secondary-foreground rounded-md">
+                {node.machine_class === 'kiosk' ? 'Kiosk' : node.machine_class === 'server' ? 'Server' : node.machine_class === 'camera' ? 'Camera' : 'Workstation'}
+              </span>
+            </div>
+          )}
         </div>
 
         {/* Video thumbnail placeholder */}
-        {node.status === 'online' && (
-          <div className="relative h-24 w-full bg-muted/30 border-t border-border/50">
+        {node.status === 'online' && hasVideo && (
+          <div className="relative h-24 w-full bg-muted/30 border-t border-border/50 overflow-hidden">
             <div className="absolute inset-0 flex items-center justify-center">
               <div className="relative w-full h-full overflow-hidden">
                 <div className="absolute inset-0 bg-gradient-to-t from-black/50 to-transparent" />
@@ -215,6 +219,10 @@ export function NodeCard({ node, isActive, onClick, onDragEnd }: NodeCardProps) 
                       <rect width="16" height="14" x="1" y="5" rx="2" ry="2" />
                     </svg>
                   </div>
+                </div>
+                {/* Placeholder for actual video thumbnail */}
+                <div className="absolute inset-0 flex items-center justify-center">
+                  <span className="text-xs text-white/50">Video Preview</span>
                 </div>
               </div>
             </div>

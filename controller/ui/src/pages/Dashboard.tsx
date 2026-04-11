@@ -1,9 +1,10 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
-import { motion, Reorder } from 'framer-motion'
-import { StatusDot } from '../components/StatusDot'
+import { Reorder } from 'framer-motion'
+import { NodeCard } from '../components/NodeCard'
 import { useNodesStore } from '../store/useNodesStore'
-import { useNodesQuery, useNodeUpdates } from '../hooks/useGraphQL'
+import { useNodeUpdates, useSwitchNode } from '../hooks/useGraphQL'
 import { NodeInfo } from '../types/node'
+import { useNavigate } from 'react-router-dom'
 
 // localStorage key for node order
 const NODE_ORDER_KEY = 'ozma_node_order'
@@ -31,8 +32,10 @@ function saveNodeOrder(order: string[]) {
 }
 
 export default function Dashboard() {
-  const { nodes, loading: storeLoading, error: storeError } = useNodesStore()
+  const { nodes: storeNodes, loading: storeLoading, error: storeError } = useNodesStore()
   const { nodes: graphqlNodes, error: graphqlError } = useNodeUpdates()
+  const { switchNode } = useSwitchNode()
+  const navigate = useNavigate()
 
   // Track active node (for quick-switch)
   const [activeNodeId, setActiveNodeId] = useState<string | null>(null)
@@ -43,18 +46,32 @@ export default function Dashboard() {
   // Get nodes from either store or GraphQL, prefer GraphQL for real-time data
   const allNodes = useMemo(() => {
     // Use GraphQL nodes if available, otherwise fall back to store nodes
-    return graphqlNodes.length > 0 ? graphqlNodes : nodes
-  }, [graphqlNodes, nodes])
+    return graphqlNodes.length > 0 ? graphqlNodes : storeNodes
+  }, [graphqlNodes, storeNodes])
 
-  // Handle node switch
-  const handleNodeSwitch = useCallback((node: NodeInfo) => {
+  // Track active node from GraphQL data
+  useEffect(() => {
+    if (graphqlNodes.length > 0) {
+      // Find the active node from the subscription data
+      const activeNode = graphqlNodes.find(n => n.active)
+      if (activeNode) {
+        setActiveNodeId(activeNode.id)
+      }
+    }
+  }, [graphqlNodes])
+
+  // Handle node switch (quick-switch)
+  const handleNodeSwitch = useCallback(async (node: NodeInfo) => {
     console.log('Switching to node:', node.id, node.name)
     setActiveNodeId(node.id)
-
+    
+    // Trigger the switch mutation
+    await switchNode(node.id)
+    
     // Update node in store
     const { updateNode } = useNodesStore.getState()
     updateNode({ ...node, active: true })
-  }, [])
+  }, [switchNode])
 
   // Handle drag and drop reordering
   const handleDragEnd = useCallback((oldIndex: number, newIndex: number) => {
@@ -107,6 +124,13 @@ export default function Dashboard() {
     )
   }
 
+  const getErrorMessage = (error: unknown): string => {
+    if (error instanceof Error) {
+      return error.message
+    }
+    return String(error)
+  }
+
   if (storeError || graphqlError) {
     return (
       <div className="flex items-center justify-center h-full">
@@ -129,7 +153,7 @@ export default function Dashboard() {
             </svg>
           </div>
           <h3 className="text-xl font-semibold mb-2">Failed to load nodes</h3>
-          <p className="text-muted-foreground mb-6">{storeError?.message || graphqlError?.message}</p>
+          <p className="text-muted-foreground mb-6">{getErrorMessage(storeError) || getErrorMessage(graphqlError)}</p>
           <button
             onClick={() => window.location.reload()}
             className="px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors"
@@ -166,7 +190,10 @@ export default function Dashboard() {
               </div>
             </div>
 
-            <button className="px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors flex items-center gap-2">
+            <button 
+              onClick={() => navigate('/nodes')}
+              className="px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors flex items-center gap-2"
+            >
               <svg
                 xmlns="http://www.w3.org/2000/svg"
                 width="16"
@@ -242,255 +269,15 @@ export default function Dashboard() {
             <p className="text-muted-foreground mb-6">
               Get started by adding a new node to your controller.
             </p>
-            <button className="px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors">
+            <button 
+              onClick={() => navigate('/nodes')}
+              className="px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors"
+            >
               Add First Node
             </button>
           </div>
         )}
       </div>
     </div>
-  )
-}
-
-// NodeCard component for the dashboard
-interface NodeCardProps {
-  node: NodeInfo
-  isActive: boolean
-  onClick: (node: NodeInfo) => void
-  index: number
-}
-
-function NodeCard({ node, isActive, onClick, index }: NodeCardProps) {
-  const handleCardClick = () => {
-    onClick(node)
-  }
-
-  const getStatusColor = (status: string) => {
-    switch (status) {
-      case 'online':
-        return 'online'
-      case 'offline':
-        return 'offline'
-      case 'connecting':
-        return 'connecting'
-      default:
-        return 'unknown'
-    }
-  }
-
-  const getStatusText = (status: string) => {
-    switch (status) {
-      case 'online':
-        return 'Online'
-      case 'offline':
-        return 'Offline'
-      case 'connecting':
-        return 'Connecting'
-      default:
-        return 'Unknown'
-    }
-  }
-
-  return (
-    <Reorder.Item
-      value={node}
-      id={node.id}
-      dragHandlerId={`drag-handle-${node.id}`}
-      layoutId={`node-card-${node.id}`}
-      className="outline-none"
-    >
-      <motion.div
-        layoutId={`node-card-container-${node.id}`}
-        onClick={handleCardClick}
-        className={`
-          relative group cursor-pointer rounded-xl border transition-all duration-200
-          hover:shadow-lg active:scale-95
-          ${isActive
-            ? 'border-emerald-500 shadow-[0_0_20px_rgba(16,185,129,0.3)] ring-2 ring-emerald-500/50'
-            : 'border-border bg-card hover:border-emerald-500/50'
-          }
-          touch-active:scale-[0.98]
-        `}
-        whileHover={{ y: -2 }}
-        whileTap={{ scale: 0.98 }}
-      >
-        {/* Active indicator badge */}
-        {isActive && (
-          <div className="absolute -top-3 right-4">
-            <span className="px-3 py-1 text-xs font-medium bg-emerald-500 text-white rounded-full shadow-md">
-              Active
-            </span>
-          </div>
-        )}
-
-        {/* Card header */}
-        <div className="flex items-start justify-between p-4 pb-3">
-          <div className="flex items-center gap-3">
-            {/* Node icon */}
-            <div className="h-10 w-10 rounded-lg bg-gradient-to-br from-emerald-500 to-emerald-600 flex items-center justify-center text-white shadow-sm">
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                width="20"
-                height="20"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <rect width="18" height="15" x="3" y="4" rx="2" ry="2" />
-                <line x1="2" x2="22" y1="20" y2="20" />
-                <line x1="4" x2="8" y1="20" y2="20" />
-              </svg>
-            </div>
-
-            <div>
-              <h3 className="font-semibold text-base group-hover:text-emerald-500 transition-colors">
-                {node.name}
-              </h3>
-              <div className="flex items-center gap-2 text-xs text-muted-foreground mt-1">
-                <StatusDot
-                  status={getStatusColor(node.status || 'unknown')}
-                  size="sm"
-                />
-                <span>{getStatusText(node.status || 'unknown')}</span>
-              </div>
-            </div>
-          </div>
-
-          {/* Drag handle */}
-          <div
-            id={`drag-handle-${node.id}`}
-            className="opacity-0 group-hover:opacity-100 transition-opacity cursor-grab active:cursor-grabbing text-muted-foreground"
-          >
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <circle cx="9" cy="6" r="1" />
-              <circle cx="9" cy="12" r="1" />
-              <circle cx="9" cy="18" r="1" />
-              <circle cx="15" cy="6" r="1" />
-              <circle cx="15" cy="12" r="1" />
-              <circle cx="15" cy="18" r="1" />
-            </svg>
-          </div>
-        </div>
-
-        {/* Card body */}
-        <div className="px-4 pb-4 space-y-2">
-          {/* Machine info */}
-          <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              width="14"
-              height="14"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <rect width="18" height="12" x="3" y="3" rx="2" />
-              <path d="M2 10h20" />
-            </svg>
-            <span className="truncate" title={node.hostname}>
-              {node.hostname || node.address || 'Unknown machine'}
-            </span>
-          </div>
-
-          {/* IP address */}
-          <div className="flex items-center gap-2 text-xs text-muted-foreground">
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              width="12"
-              height="12"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
-            </svg>
-            <span className="font-mono">{node.ip_address || 'N/A'}</span>
-          </div>
-
-          {/* Machine class badge */}
-          {node.machine_class && (
-            <div className="flex items-center gap-2 mt-2">
-              <span className="px-2 py-1 text-xs font-medium bg-secondary text-secondary-foreground rounded-md">
-                {node.machine_class === 'kiosk' ? 'Kiosk' : node.machine_class === 'server' ? 'Server' : 'Workstation'}
-              </span>
-            </div>
-          )}
-        </div>
-
-        {/* Video thumbnail placeholder */}
-        {node.status === 'online' && (
-          <div className="relative h-24 w-full bg-muted/30 border-t border-border/50">
-            <div className="absolute inset-0 flex items-center justify-center">
-              <div className="relative w-full h-full overflow-hidden">
-                <div className="absolute inset-0 bg-gradient-to-t from-black/50 to-transparent" />
-                <div className="absolute inset-0 flex items-center justify-center">
-                  <div className="h-12 w-12 rounded-full bg-black/30 flex items-center justify-center backdrop-blur-sm">
-                    <svg
-                      xmlns="http://www.w3.org/2000/svg"
-                      width="24"
-                      height="24"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      className="text-white"
-                    >
-                      <polygon points="23 7 16 12 23 17 23 7" />
-                      <rect width="16" height="14" x="1" y="5" rx="2" ry="2" />
-                    </svg>
-                  </div>
-                </div>
-              </div>
-            </div>
-            <div className="absolute bottom-2 right-2 px-2 py-1 bg-black/60 text-white text-xs rounded">
-              Video
-            </div>
-          </div>
-        )}
-
-        {/* Quick switch hint */}
-        <div className="px-4 pb-3 pt-2 flex items-center justify-center text-xs text-muted-foreground opacity-60">
-          <svg
-            xmlns="http://www.w3.org/2000/svg"
-            width="12"
-            height="12"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            className="mr-1"
-          >
-            <path d="m10 13 5 7L5 20" />
-            <path d="m14 7 5 7L19 7" />
-            <path d="M5 20 14 13" />
-            <path d="m19 7-5 7L5 7" />
-          </svg>
-          Click to switch
-        </div>
-      </motion.div>
-    </Reorder.Item>
   )
 }

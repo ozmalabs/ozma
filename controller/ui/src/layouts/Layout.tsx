@@ -1,91 +1,293 @@
 import { ReactNode } from 'react'
-import { Link, useLocation } from 'react-router-dom'
+import { Link, useLocation, useNavigate } from 'react-router-dom'
 
 interface LayoutProps {
   children: ReactNode
 }
 
+interface NavItem {
+  path: string
+  label: string
+  icon: string
+}
+
 export default function Layout({ children }: LayoutProps) {
   const location = useLocation()
+  const navigate = useNavigate()
 
-  const navItems = [
-    { name: 'Nodes', path: '/nodes', icon: 'computer' },
+  const navItems: NavItem[] = [
+    { path: '/dashboard', label: 'Dashboard', icon: 'dashboard' },
+    { path: '/nodes', label: 'Nodes', icon: 'grid' },
+    { path: '/scenarios', label: 'Scenarios', icon: 'layers' },
+    { path: '/audio', label: 'Audio', icon: 'volume' },
+    { path: '/settings', label: 'Settings', icon: 'settings' },
   ]
 
   return (
     <div className="flex h-screen bg-background text-foreground">
       {/* Sidebar */}
-      <aside className="w-64 border-r bg-card hidden md:flex flex-col">
-        <div className="p-6 border-b">
-          <h1 className="text-2xl font-bold text-primary">Ozma</h1>
-          <p className="text-sm text-muted-foreground">Controller UI</p>
+      <aside className="w-64 flex-shrink-0 border-r border-border bg-card hidden md:flex flex-col">
+        {/* Logo */}
+        <div className="p-6">
+          <div className="flex items-center gap-3">
+            <div className="h-10 w-10 rounded-lg bg-gradient-to-br from-emerald-500 to-emerald-600 flex items-center justify-center text-white shadow-lg">
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                className="h-6 w-6"
+              >
+                <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" />
+              </svg>
+            </div>
+            <div>
+              <span className="text-xl font-bold tracking-tight">Ozma</span>
+              <p className="text-xs text-muted-foreground font-medium">
+                Controller
+              </p>
+            </div>
+          </div>
         </div>
-        <nav className="flex-1 p-4 space-y-1">
+
+        {/* Navigation */}
+        <nav className="flex-1 px-3 py-2 overflow-y-auto">
           {navItems.map((item) => (
             <Link
               key={item.path}
               to={item.path}
-              className={`flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${
-                location.pathname === item.path
-                  ? 'bg-primary text-primary-foreground'
-                  : 'text-foreground hover:bg-secondary'
-              }`}
+              className={`
+                flex items-center gap-3 rounded-lg px-4 py-3 text-sm font-medium transition-all duration-200
+                ${location.pathname === item.path
+                  ? 'bg-emerald-500 text-white shadow-md shadow-emerald-500/20'
+                  : 'text-foreground hover:bg-accent hover:text-accent-foreground'
+                }
+              `}
             >
-              {getIcon(item.icon)}
-              <span>{item.name}</span>
+              {getIcon(item.icon, 'h-5 w-5')}
+              {item.label}
             </Link>
           ))}
         </nav>
-        <div className="p-4 border-t">
-          <div className="text-xs text-muted-foreground">
-            <p>Controller Status:</p>
-            <span className="text-emerald-500">● Online</span>
+
+        {/* Footer */}
+        <div className="p-4 border-t border-border">
+          <div className="flex items-center gap-2 px-3 py-2 bg-muted/30 rounded-lg">
+            <div className="relative flex items-center justify-center">
+              <div className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
+              <div className="absolute h-2 w-2 rounded-full bg-emerald-500 animate-ping opacity-50" />
+            </div>
+            <div className="text-xs">
+              <div className="font-medium text-emerald-500">Connected</div>
+            </div>
+          </div>
+          <div className="mt-3 flex justify-between text-xs text-muted-foreground px-1">
+            <span>Ozma Controller</span>
+            <span>v1.0.0</span>
           </div>
         </div>
       </aside>
 
-      {/* Main content */}
-      <div className="flex-1 flex flex-col overflow-hidden">
+      {/* Mobile Navigation Header */}
+      <div className="md:hidden flex items-center justify-between p-4 border-b border-border bg-card">
+        <div className="flex items-center gap-2">
+          <div className="h-8 w-8 rounded bg-gradient-to-br from-emerald-500 to-emerald-600 flex items-center justify-center text-white">
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className="h-5 w-5"
+            >
+              <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" />
+            </svg>
+          </div>
+          <span className="font-bold">Ozma</span>
+        </div>
+        <button
+          onClick={() => navigate('/scenarios')}
+          className="p-2 text-muted-foreground"
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className="h-6 w-6"
+          >
+            <circle cx="12" cy="12" r="1" />
+            <circle cx="12" cy="5" r="1" />
+            <circle cx="12" cy="19" r="1" />
+          </svg>
+        </button>
+      </div>
+
+      {/* Main Content */}
+      <div className="flex flex-1 flex-col overflow-hidden">
         {/* Topbar */}
-        <header className="h-16 border-b bg-card flex items-center px-6 justify-between">
-          <h2 className="text-lg font-semibold">
-            {navItems.find((n) => n.path === location.pathname)?.name || 'Dashboard'}
-          </h2>
+        <header className="hidden md:flex h-16 items-center justify-between border-b border-border bg-card px-6">
           <div className="flex items-center gap-4">
-            <div className="text-sm text-muted-foreground">
-              <span className="text-emerald-500">●</span> API: Connected
+            <h1 className="text-lg font-semibold">
+              {navItems.find(item => item.path === location.pathname)?.label || 'Dashboard'}
+            </h1>
+            <div className="h-6 w-px bg-border" />
+            <div className="text-xs text-muted-foreground">
+              <span className="font-medium">Controller</span> &rsaquo;
+              <span className="ml-1 capitalize">{location.pathname.replace('/', '') || 'dashboard'}</span>
             </div>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <button className="px-4 py-2 text-sm font-medium hover:bg-accent rounded-lg transition-colors flex items-center gap-2">
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <circle cx="12" cy="12" r="3" />
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06-.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
+              </svg>
+              Notifications
+              <span className="ml-1 px-1.5 py-0.5 text-xs font-medium bg-destructive text-destructive-foreground rounded-full">
+                3
+              </span>
+            </button>
+            <button className="px-4 py-2 text-sm font-medium hover:bg-accent rounded-lg transition-colors">
+              Logout
+            </button>
           </div>
         </header>
 
-        {/* Page content */}
-        <main className="flex-1 overflow-auto p-6">{children}</main>
+        {/* Mobile Navigation */}
+        <div className="md:hidden border-b border-border bg-card px-4 py-2 flex justify-around">
+          {navItems.map((item) => (
+            <button
+              key={item.path}
+              onClick={() => navigate(item.path)}
+              className={`
+                flex flex-col items-center gap-1 p-2 rounded-lg transition-colors
+                ${location.pathname === item.path ? 'text-emerald-500' : 'text-muted-foreground'}
+              `}
+            >
+              {getIcon(item.icon, 'h-6 w-6')}
+              <span className="text-[10px] font-medium">{item.label}</span>
+            </button>
+          ))}
+        </div>
+
+        {/* Content */}
+        <main className="flex-1 overflow-y-auto bg-background p-4 md:p-6">
+          {children}
+        </main>
       </div>
     </div>
   )
 }
 
-function getIcon(name: string) {
-  switch (name) {
-    case 'computer':
-      return (
-        <svg
-          xmlns="http://www.w3.org/2000/svg"
-          width="20"
-          height="20"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        >
-          <rect width="18" height="15" x="3" y="4" rx="2" ry="2" />
-          <line x1="2" x2="22" y1="20" y2="20" />
-          <line x1="4" x2="8" y1="20" y2="20" />
-        </svg>
-      )
-    default:
-      return null
+interface IconProps {
+  name: string
+  className?: string
+}
+
+function getIcon(name: string, className = 'h-6 w-6') {
+  const icons: Record<string, React.JSX.Element> = {
+    dashboard: (
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        className={className}
+      >
+        <rect width="7" height="9" x="3" y="3" rx="1" />
+        <rect width="7" height="5" x="14" y="3" rx="1" />
+        <rect width="7" height="9" x="14" y="12" rx="1" />
+        <rect width="7" height="5" x="3" y="16" rx="1" />
+      </svg>
+    ),
+    grid: (
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        className={className}
+      >
+        <rect width="7" height="7" x="3" y="3" rx="1" />
+        <rect width="7" height="7" x="14" y="3" rx="1" />
+        <rect width="7" height="7" x="14" y="14" rx="1" />
+        <rect width="7" height="7" x="3" y="14" rx="1" />
+      </svg>
+    ),
+    layers: (
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        className={className}
+      >
+        <path d="m12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.82l9.16 4.54l9.16-4.54a1 1 0 0 0 0-1.82z" />
+        <path d="m22 17.65-9.16 4.55a2 2 0 0 1-1.66 0L2 17.65" />
+        <path d="m22 12.65-9.16 4.55a2 2 0 0 1-1.66 0L2 12.65" />
+      </svg>
+    ),
+    volume: (
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        className={className}
+      >
+        <path d="M11 5 6 9H2v6h4l5 4V5z" />
+        <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+        <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+      </svg>
+    ),
+    settings: (
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        className={className}
+      >
+        <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.5a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.1a2 2 0 0 1-1-1.72v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" />
+        <circle cx="12" cy="12" r="3" />
+      </svg>
+    ),
   }
+
+  return icons[name] || null
 }
