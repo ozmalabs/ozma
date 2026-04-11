@@ -447,6 +447,18 @@ async def run(config: Config) -> None:
     await vault_mgr.start()
     state.vaultwarden_manager = vault_mgr
 
+    # SSH bastion — terminal access to mesh nodes via SSH
+    from ssh_bastion import SSHBastionServer, BastionConfig
+    bastion_cfg = BastionConfig(
+        enabled=config.ssh_bastion_enabled,
+        port=config.ssh_bastion_port,
+    )
+    ssh_bastion = SSHBastionServer(
+        bastion_cfg, state=state, audit=audit_log,
+        auth_config=auth_cfg, user_manager=user_mgr,
+    )
+    await ssh_bastion.start()
+
     # Email security monitor
     async def _email_alert(domain: str, posture) -> None:
         high = [i for i in posture.issues if i.severity in ("critical", "high")]

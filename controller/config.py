@@ -51,6 +51,10 @@ class Config:
     transcription_enabled: bool = False
     transcription_source: str = ""   # PipeWire source name; empty = default mic
 
+    # SSH bastion — terminal access to mesh nodes via SSH
+    ssh_bastion_enabled: bool = False
+    ssh_bastion_port: int = 2222
+
     # Vaultwarden — self-hosted password manager (requires Docker)
     vaultwarden_enabled: bool = False
     vaultwarden_data_dir: str = ""   # abs path; empty → ./vaultwarden-data
@@ -82,6 +86,8 @@ class Config:
             update_manager_enabled=os.environ.get("OZMA_UPDATE_MANAGER", "0").lower() in ("1", "true", "yes"),
             transcription_enabled=os.environ.get("OZMA_TRANSCRIPTION", "0").lower() in ("1", "true", "yes"),
             transcription_source=os.environ.get("OZMA_TRANSCRIPTION_SOURCE", ""),
+            ssh_bastion_enabled=os.environ.get("OZMA_SSH_BASTION", "0").lower() in ("1", "true", "yes"),
+            ssh_bastion_port=int(os.environ.get("OZMA_SSH_BASTION_PORT", "2222")),
             vaultwarden_enabled=os.environ.get("OZMA_VAULTWARDEN", "0").lower() in ("1", "true", "yes"),
             vaultwarden_data_dir=os.environ.get("OZMA_VAULTWARDEN_DATA", ""),
             vaultwarden_port=int(os.environ.get("OZMA_VAULTWARDEN_PORT", "8222")),
