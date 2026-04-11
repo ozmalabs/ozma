@@ -1,5 +1,6 @@
 import { useNodes } from '../store/useNodesStore'
 import { Link } from 'react-router-dom'
+import { StatusDot } from '../components/StatusDot'
 
 export default function NodesPage() {
   const { nodes, loading, error } = useNodes()
@@ -107,87 +108,53 @@ export default function NodesPage() {
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {nodes.map((node) => (
-            <NodeCard key={node.id} node={node} />
+            <div key={node.id} className="bg-card rounded-xl border p-5 hover:border-primary/50 transition-all group">
+              <div className="flex justify-between items-start mb-4">
+                <div className="flex items-center gap-3">
+                  <StatusDot status={node.status === 'online' ? 'online' : node.status === 'offline' ? 'offline' : 'connecting'} />
+                  <h3 className="font-semibold text-lg">{node.name}</h3>
+                </div>
+                {node.active && (
+                  <span className="px-2 py-1 text-xs font-medium bg-primary text-primary-foreground rounded-full">
+                    Active
+                  </span>
+                )}
+              </div>
+
+              <div className="space-y-2 text-sm">
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Hostname</span>
+                  <span className="font-mono">{node.hostname || 'N/A'}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">IP Address</span>
+                  <span className="font-mono">{node.ip_address || 'N/A'}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Machine Class</span>
+                  <span className="capitalize">{node.machine_class || 'workstation'}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Last Seen</span>
+                  <span className="text-muted-foreground">{formatDate(node.last_seen)}</span>
+                </div>
+              </div>
+
+              <div className="mt-4 pt-4 border-t flex gap-2">
+                <Link
+                  to={`/nodes/${node.id}`}
+                  className="flex-1 px-3 py-2 text-sm font-medium bg-secondary text-foreground rounded-lg hover:bg-secondary/80 transition-colors"
+                >
+                  View Details
+                </Link>
+                <button className="px-3 py-2 text-sm font-medium bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors">
+                  Remote Desktop
+                </button>
+              </div>
+            </div>
           ))}
         </div>
       )}
-    </div>
-  )
-}
-
-interface NodeCardProps {
-  node: {
-    id: string
-    name: string
-    hostname: string
-    machine_class: 'workstation' | 'server' | 'kiosk'
-    status: 'online' | 'offline' | 'connecting'
-    active: boolean
-    last_seen: string
-    ip_address: string
-    mac_address: string | null
-    machine_id: string | null
-  }
-}
-
-function NodeCard({ node }: NodeCardProps) {
-  const getStatusColor = (status: string) => {
-    switch (status) {
-      case 'online':
-        return 'text-emerald-500'
-      case 'offline':
-        return 'text-destructive'
-      case 'connecting':
-        return 'text-amber-500'
-      default:
-        return 'text-muted-foreground'
-    }
-  }
-
-  return (
-    <div className="bg-card rounded-xl border p-5 hover:border-primary/50 transition-all group">
-      <div className="flex justify-between items-start mb-4">
-        <div className="flex items-center gap-3">
-          <div className={`w-3 h-3 rounded-full ${getStatusColor(node.status)} animate-pulse`} />
-          <h3 className="font-semibold text-lg">{node.name}</h3>
-        </div>
-        {node.active && (
-          <span className="px-2 py-1 text-xs font-medium bg-primary text-primary-foreground rounded-full">
-            Active
-          </span>
-        )}
-      </div>
-
-      <div className="space-y-2 text-sm">
-        <div className="flex justify-between">
-          <span className="text-muted-foreground">Hostname</span>
-          <span className="font-mono">{node.hostname}</span>
-        </div>
-        <div className="flex justify-between">
-          <span className="text-muted-foreground">IP Address</span>
-          <span className="font-mono">{node.ip_address}</span>
-        </div>
-        <div className="flex justify-between">
-          <span className="text-muted-foreground">Machine Class</span>
-          <span className="capitalize">{node.machine_class}</span>
-        </div>
-        <div className="flex justify-between">
-          <span className="text-muted-foreground">Last Seen</span>
-          <span className="text-muted-foreground">{formatDate(node.last_seen)}</span>
-        </div>
-      </div>
-
-      <div className="mt-4 pt-4 border-t flex gap-2">
-        <Link
-          to={`/nodes/${node.id}`}
-          className="flex-1 px-3 py-2 text-sm font-medium bg-secondary text-foreground rounded-lg hover:bg-secondary/80 transition-colors"
-        >
-          View Details
-        </Link>
-        <button className="px-3 py-2 text-sm font-medium bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors">
-          Remote Desktop
-        </button>
-      </div>
     </div>
   )
 }

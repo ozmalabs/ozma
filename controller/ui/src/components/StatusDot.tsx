@@ -10,7 +10,7 @@ const statusColors = {
   online: 'bg-emerald-500',
   offline: 'bg-rose-500',
   connecting: 'bg-amber-500',
-  error: 'bg-red-500',
+  error: 'bg-red-600',
   unknown: 'bg-slate-500',
 }
 
@@ -25,8 +25,8 @@ const statusAnimations = {
 export function StatusDot({ status, size = 'md', className = '' }: StatusDotProps) {
   const sizeClasses = {
     sm: 'h-2 w-2',
-    md: 'h-3 w-3',
-    lg: 'h-4 w-4',
+    md: 'h-2.5 w-2.5',
+    lg: 'h-3 w-3',
   }
 
   const colorClass = statusColors[status] || statusColors.unknown
