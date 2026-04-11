@@ -11,6 +11,98 @@ import {Camera, NodeInfo, NotificationRecord} from '../api/types';
 
 export type GridLayout = 1 | 4 | 9;
 
+// ── Export Types for Reuse ────────────────────────────────────────────────────
+
+export interface NodeDetails {
+  id: string;
+  name: string;
+  host: string;
+  port: number;
+  role: string;
+  hw: string;
+  fwVersion: string;
+  protoVersion: number;
+  capabilities: string[];
+  machineClass: string;
+  lastSeen: string | null;
+  displayOutputs: DisplayOutput[];
+  vncHost: string | null;
+  vncPort: number | null;
+  streamPort: number | null;
+  streamPath: string | null;
+  audioType: string | null;
+  audioSink: string | null;
+  audioVBANPort: number | null;
+  micVBANPort: number | null;
+  captureDevice: string | null;
+  cameraStreams: CameraStream[];
+  frigateHost: string | null;
+  frigatePort: number | null;
+  ownerUserId: string | null;
+  owner: string | null;
+  sharedWith: string[];
+  sharePermissions: string[];
+  parentId: string | null;
+  sunshinePort: number | null;
+  // Legacy fields for compatibility
+  online: boolean;
+  mac_address: string | null;
+  direct_registered: boolean;
+  agent_connected: boolean;
+  ip_address: string | null;
+  platform: string | null;
+  os_version: string | null;
+}
+
+export interface DisplayOutput {
+  id: string;
+  name: string;
+  resolution: string;
+  connected: boolean;
+}
+
+export interface CameraStream {
+  url: string;
+  name: string;
+  type: 'hls' | 'mjpeg' | 'rtsp';
+}
+
+export interface Scenario {
+  id: string;
+  name: string;
+  nodeId: string | null;
+  color: string;
+  transitionIn: TransitionConfig;
+  motion: MotionPreset[];
+  bluetooth: BluetoothConfig[];
+  captureSource: string | null;
+  captureSources: string[];
+  wallpaper: WallpaperConfig | null;
+}
+
+export interface TransitionConfig {
+  style: string;
+  durationMs: number;
+}
+
+export interface MotionPreset {
+  deviceId: string;
+  axis: string;
+  position: number;
+}
+
+export interface BluetoothConfig {
+  connect: string[];
+  disconnect: string[];
+}
+
+export interface WallpaperConfig {
+  mode: string;
+  color?: string;
+  image?: string;
+  url?: string;
+}
+
 interface NotificationPrefs {
   motionAlerts: boolean;
   nodeOfflineAlerts: boolean;

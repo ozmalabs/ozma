@@ -21,6 +21,7 @@ import {
   View,
   Alert,
   Image,
+  SafeAreaView,
 } from 'react-native';
 import {NativeStackScreenProps} from '@react-navigation/native-stack';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
@@ -29,15 +30,15 @@ import {NodeStatusBadge} from '../components/NodeStatusBadge';
 import {Layout, Section} from '../components/Layout';
 import {VideoPlayer} from '../components/VideoPlayer';
 import {RootStackParamList} from '../navigation/AppNavigator';
-import {useQuery, useMutation} from '@urql/react';
-import {graphqlClient, connectWebSocket, addWebSocketListener, closeWebSocket, getWsUrl} from '../graphql/client';
+import {useQuery, useMutation, useSubscription} from '@urql/react';
+import {graphqlClient, getWebSocketStatus, closeWebSocket, getWebSocketUrl, addWebSocketListener, getControllerUrl} from '../graphql/client';
 import {
   GET_NODE,
   ACTIVATE_NODE,
   SUBSCRIBE_NODE_CHANGED,
   NODE_FRAGMENT,
   GET_SCENARIO,
-  GET_ACTIVE_SCENARIO,
+  GET_ACTIVE_NODE,
 } from '../graphql/queries';
 import {NodeDetails, DisplayOutput, Scenario} from '../store/useStore';
 
@@ -186,7 +187,6 @@ export function NodeDetailScreen({route, navigation}: Props) {
   // ── WebSocket subscription for live updates ─────────────────────────────────
 
   const wsRef = useRef<WebSocket | null>(null);
-  const subscriptionIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     // Validate node ID before connecting
@@ -197,83 +197,61 @@ export function NodeDetailScreen({route, navigation}: Props) {
     }
 
     log('Connecting to WebSocket...');
-    const wsUrl = getWsUrl();
+    const wsUrl = getWebSocketUrl();
     log('WebSocket URL:', wsUrl);
 
-    const ws = new WebSocket(wsUrl);
+    // Connect using the improved WebSocket client
+    const ws = connectWebSocket((data) => {
+      log('WebSocket message received:', data.type, data);
 
-    ws.onopen = () => {
-      log('WebSocket connected');
-      setWsConnected(true);
-      // Subscribe to node changes
-      const subscription = {
-        type: 'subscribe',
-        id: nodeId,
-        payload: {
-          type: 'node_changed',
-          variables: {id: nodeId},
-        },
-      };
-      try {
-        ws.send(JSON.stringify(subscription));
-        subscriptionIdRef.current = nodeId;
-        log('Subscribed to node changes for:', nodeId);
-      } catch (err) {
-        errorLog('Failed to send subscription:', err);
+      // Handle subscription data for node updates
+      if (data.payload?.data?.nodeChanged) {
+        const updatedNode = data.payload.data.nodeChanged;
+        if (updatedNode.id === nodeId) {
+          log('Node data updated via WebSocket');
+          updateSelectedNode(updatedNode);
+        }
       }
-    };
 
-    ws.onclose = (event) => {
-      log('WebSocket disconnected:', event.code, event.reason);
-      setWsConnected(false);
-    };
-
-    ws.onerror = (error) => {
-      errorLog('WebSocket error:', error);
-      setWsConnected(false);
-    };
-
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        log('Received WebSocket message:', data.type, data);
-
-        // Handle subscription data
-        if (data.type === 'data' && data.payload?.data?.nodeChanged) {
-          const updatedNode = data.payload.data.nodeChanged;
-          if (updatedNode.id === nodeId) {
-            log('Node data updated via WebSocket');
-            updateSelectedNode(updatedNode);
-          }
+      // Handle active node change notification
+      if (data.payload?.data?.nodeChanged) {
+        const changedNodeId = data.payload.data.nodeChanged.id;
+        if (changedNodeId === activeNodeId) {
+          log('Active node changed, refreshing data');
+          reexecuteQuery({requestPolicy: 'network-only'});
         }
-
-        // Handle active node change notification
-        if (data.type === 'data' && data.payload?.data?.nodeChanged) {
-          const changedNodeId = data.payload.data.nodeChanged.id;
-          if (changedNodeId === activeNodeId) {
-            log('Active node changed, refreshing data');
-            reexecuteQuery({requestPolicy: 'network-only'});
-          }
-        }
-
-        // Handle subscription error
-        if (data.type === 'error') {
-          errorLog('Subscription error:', data.payload);
-        }
-      } catch (err) {
-        errorLog('Failed to parse WebSocket message:', err);
       }
-    };
+    });
 
     wsRef.current = ws;
 
+    // Register additional listener for direct updates
+    const unsubscribe = addWebSocketListener((data) => {
+      try {
+        const parsed = typeof data === 'string' ? JSON.parse(data) : data;
+        log('Direct WebSocket listener triggered');
+
+        if (parsed.payload?.data?.nodeChanged) {
+          const updatedNode = parsed.payload.data.nodeChanged;
+          if (updatedNode.id === nodeId) {
+            log('Node updated via direct listener');
+            updateSelectedNode(updatedNode);
+          }
+        }
+      } catch (e) {
+        log('Failed to parse listener data:', e);
+      }
+    });
+
     return () => {
-      log('Cleaning up WebSocket connection');
+      log('Cleaning up WebSocket resources');
       if (wsRef.current) {
         wsRef.current.close(1000, 'Component unmounted');
         wsRef.current = null;
       }
-      subscriptionIdRef.current = null;
+      if (unsubscribe) {
+        unsubscribe();
+      }
     };
   }, [nodeId, activeNodeId, reexecuteQuery, updateSelectedNode]);
 
@@ -283,10 +261,7 @@ export function NodeDetailScreen({route, navigation}: Props) {
     return () => {
       log('Component unmounting, clearing selected node');
       clearSelectedNode();
-      if (wsRef.current) {
-        wsRef.current.close(1000, 'Component unmounted');
-        wsRef.current = null;
-      }
+      closeWebSocket();
     };
   }, [clearSelectedNode]);
 
@@ -576,24 +551,7 @@ function DetailRow({label, value}: {label: string; value: string}) {
   );
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-function getControllerUrl(): string {
-  try {
-    const storage = require('react-native-mmkv').MMKV;
-    const STORAGE_KEY_CONTROLLER_URL = 'ozma.controller_url';
-    const storageInstance = new storage({id: 'ozma-api'});
-    const url = storageInstance.getString(STORAGE_KEY_CONTROLLER_URL);
-    if (!url) {
-      throw new Error('Controller URL not configured');
-    }
-    // Strip trailing slash
-    return url.replace(/\/$/, '');
-  } catch (err) {
-    log('getControllerUrl error:', err);
-    return '';
-  }
-}
+// ── Styles ────────────────────────────────────────────────────────────────────
 
 const styles = StyleSheet.create({
   container: {
