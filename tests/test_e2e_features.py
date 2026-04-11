@@ -15,6 +15,10 @@ paste-as-typing, and system status.
 
 Usage:
   python tests/test_e2e_features.py [--host localhost] [--port 7380]
+
+Hardware-required tests:
+  - test_ocr_capture: requires HDMI capture card for OCR pipeline
+  - test_session_recording: requires HDMI capture card for recording
 """
 
 import argparse
@@ -27,6 +31,13 @@ import time
 import urllib.error
 import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
+try:
+    from tests.conftest import requires_hardware
+except ImportError:
+    # Fall back for direct execution
+    import pytest
+    requires_hardware = pytest.mark.hardware
 
 BASE_URL = "http://localhost:7380"
 TIMEOUT = 5.0
@@ -461,6 +472,7 @@ def test_hotkey_switching():
 # Test: OCR text capture
 # ---------------------------------------------------------------------------
 
+@requires_hardware
 def test_ocr_capture():
     print("\n[F18] OCR text capture from display")
 
@@ -584,6 +596,7 @@ log "automation test complete"
 # Test: Session recording
 # ---------------------------------------------------------------------------
 
+@requires_hardware
 def test_session_recording():
     print("\n[F21] Session recording start/stop")
 

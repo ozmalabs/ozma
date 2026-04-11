@@ -18,7 +18,11 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "unit: fast unit test, no external deps")
     config.addinivalue_line("markers", "e2e: end-to-end, requires infrastructure")
     config.addinivalue_line("markers", "security: security/compliance test")
+    config.addinivalue_line("markers", "hardware: requires physical hardware (HDMI capture card, etc.)")
     config.addinivalue_line("markers", "slow: takes >5 seconds")
+
+
+requires_hardware = pytest.mark.hardware
 
 
 @pytest.fixture
