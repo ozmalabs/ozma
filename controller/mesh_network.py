@@ -85,6 +85,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -263,7 +264,10 @@ class MeshNetworkManager:
             "forwards": [f.to_dict() for f in self._forwards.values()],
             "firewall": [r.to_dict() for r in self._firewall],
         }
-        CONFIG_PATH.write_text(json.dumps(data, indent=2))
+        # Atomic write: write to temp file then rename (atomic on POSIX)
+        tmp_path = CONFIG_PATH.with_suffix(CONFIG_PATH.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(data, indent=2))
+        os.rename(tmp_path, CONFIG_PATH)
 
     # ── Node IP allocation ──────────────────────────────────────────────────
 
