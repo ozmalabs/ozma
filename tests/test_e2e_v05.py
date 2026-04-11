@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import json
+import logging
 import shutil
 import sys
 import time
@@ -21,6 +22,7 @@ import urllib.request
 
 BASE_URL = "http://localhost:7380"
 TIMEOUT = 5.0
+log = logging.getLogger(__name__)
 
 
 def api_get(path: str) -> dict:
@@ -51,6 +53,42 @@ def check(condition: bool, msg: str) -> None:
 
 def skip(msg: str) -> None:
     print(f"  SKIP  {msg}")
+
+
+def _ensure_test_sink() -> bool:
+    """Create a dummy PipeWire null sink for testing if none exist.
+    Returns True if a sink is available (either pre-existing or created).
+    """
+    try:
+        # First check if there are already PW nodes
+        data = api_get("/api/v1/audio/nodes")
+        if data.get("nodes"):
+            return True
+
+        # Check if pw-dump is available
+        if not shutil.which("pw-dump"):
+            return False
+
+        # Create a dummy sink for testing
+        import subprocess
+        result = subprocess.run(
+            ["pactl", "load-module", "module-null-sink",
+             "sink_name=ozma-test-sink",
+             "sink_properties=device.description=Ozma-Test-Sink"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            module_id = int(result.stdout.strip())
+            log.debug("Created test sink module %d", module_id)
+            # Give the watcher time to detect the new node
+            time.sleep(0.5)
+            # Verify it was detected
+            data = api_get("/api/v1/audio/nodes")
+            return bool(data.get("nodes"))
+        return False
+    except Exception as e:
+        log.debug("Failed to create test sink: %s", e)
+        return False
 
 
 # ── Audio node endpoints ─────────────────────────────────────────────────────
