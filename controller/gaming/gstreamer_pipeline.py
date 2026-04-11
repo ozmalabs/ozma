@@ -687,3 +687,12 @@ class GStreamerPipelineManager:
             low_latency=True,
         )
         return await self.start_pipeline(config.name, config)
+
+
+# ─── Module initialization ───────────────────────────────────────────────────
+
+async def create_pipeline_manager(state: Any = None) -> GStreamerPipelineManager:
+    """Factory function to create and start the pipeline manager."""
+    manager = GStreamerPipelineManager()
+    await manager.start()
+    return manager

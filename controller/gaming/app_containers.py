@@ -32,8 +32,27 @@ log = logging.getLogger("ozma.controller.gaming.app_containers")
 # ─── Constants ───────────────────────────────────────────────────────────────
 
 CONTAINER_PREFIX = "ozma-game-"
+# Default GPU device - can be overridden in ContainerConfig
+# Common values: /dev/dri/renderD128 (Intel), /dev/dri/renderD129 (NVIDIA), /dev/dri/card0 (generic)
 DEFAULT_GPU_DEVICE = "/dev/dri/renderD128"
 DEFAULT_PODMAN_RUNTIME = "runc"
+
+
+def get_gpu_device() -> str:
+    """Detect available GPU device automatically."""
+    import os
+    # Try Intel render nodes first
+    for i in range(128, 144):
+        device = f"/dev/dri/renderD{i}"
+        if os.path.exists(device):
+            return device
+    # Try NVIDIA
+    for i in range(128, 144):
+        device = f"/dev/dri/renderD{i}"
+        if os.path.exists(device):
+            return device
+    # Fallback to generic
+    return "/dev/dri/card0"
 
 
 # ─── Container Configuration ─────────────────────────────────────────────────

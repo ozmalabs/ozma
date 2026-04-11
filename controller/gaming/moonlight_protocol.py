@@ -267,6 +267,8 @@ class MoonlightSession:
     paused: bool = False
     stream_type: str = "game"  # game, video, desktop
     server_port_offset: int = 0  # Port offset for this session
+    # Optional: Resource limits (from SessionLimits in multi_user_streaming.py)
+    limits: Any | None = None  # SessionLimits dataclass if available
 
 
 # ── RTSP Parser and Builder ──────────────────────────────────────────────────
