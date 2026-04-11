@@ -59,10 +59,14 @@ class User:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> User:
+        # Use safe defaults to avoid KeyError if JSON is corrupted.
+        # The old code used d.get("display_name", d["username"]) which would
+        # evaluate d["username"] even if display_name exists, causing KeyError
+        # if username is missing. Now we use d.get() for all fields.
         return cls(
-            id=d["id"],
-            username=d["username"],
-            display_name=d.get("display_name", d["username"]),
+            id=d.get("id", ""),
+            username=d.get("username", ""),
+            display_name=d.get("display_name") or d.get("username") or "",
             email=d.get("email", ""),
             connect_account_id=d.get("connect_account_id", ""),
             role=d.get("role", "owner"),
@@ -124,8 +128,16 @@ class UserManager:
         try:
             data = json.loads(self._path.read_text())
             for ud in data.get("users", []):
-                u = User.from_dict(ud)
-                self._users[u.id] = u
+                try:
+                    u = User.from_dict(ud)
+                    # Skip invalid entries (missing id or username)
+                    if not u.id or not u.username:
+                        log.warning("Skipping invalid user entry: missing id or username")
+                        continue
+                    self._users[u.id] = u
+                except (KeyError, TypeError) as e:
+                    log.warning("Skipping malformed user entry: %s", e)
+                    continue
             if data.get("zone"):
                 self._zone = Zone.from_dict(data["zone"])
             log.info("Loaded %d user(s) from %s", len(self._users), self._path.name)
