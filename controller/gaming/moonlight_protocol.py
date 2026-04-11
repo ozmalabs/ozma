@@ -56,6 +56,10 @@ log = logging.getLogger("ozma.controller.gaming.moonlight_protocol")
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
+# Data directory for persistent state
+DATA_DIR = Path("/var/lib/ozma/gaming")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 # Moonlight default ports (Sunshine-compatible)
 MOONLIGHT_PAIRING_PORT = 47990
 MOONLIGHT_PAIRING_PORT_ALT = 47991
