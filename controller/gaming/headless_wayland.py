@@ -93,6 +93,7 @@ class VirtualCompositor:
         self._data_dir = data_dir
         self._data_dir.mkdir(parents=True, exist_ok=True)
         self._compositor_process: asyncio.subprocess.Process | None = None
+        self._compositor_pid: int | None = None
         self._display_id: int | None = None
         self._xdg_runtime_dir: Path | None = None
 

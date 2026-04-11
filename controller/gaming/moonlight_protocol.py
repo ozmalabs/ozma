@@ -840,8 +840,11 @@ class MoonlightProtocolServer:
         self._tasks: list[asyncio.Task] = []
         self._running = False
         self._pairing_app: web.Application | None = None
+        self._pairing_runner: web.AppRunner | None = None
         self._rtsp_server: asyncio.Server | None = None
         self._video_servers: dict[int, asyncio.Server] = {}
+        self._audio_servers: dict[int, asyncio.Server] = {}
+        self._enet_servers: dict[int, asyncio.Server] = {}
 
     async def start(self) -> None:
         """Start the Moonlight protocol server."""
@@ -867,16 +870,35 @@ class MoonlightProtocolServer:
             task.cancel()
         self._tasks.clear()
 
-        if self._pairing_app:
-            self._pairing_app = None
+        # Stop pairing server
+        if self._pairing_runner:
+            await self._pairing_runner.cleanup()
+            self._pairing_runner = None
+        self._pairing_app = None
 
+        # Stop RTSP server
         if self._rtsp_server:
             self._rtsp_server.close()
+            await self._rtsp_server.wait_closed()
             self._rtsp_server = None
 
+        # Stop video servers
         for server in self._video_servers.values():
             server.close()
+            await server.wait_closed()
         self._video_servers.clear()
+
+        # Stop audio servers
+        for server in self._audio_servers.values():
+            server.close()
+            await server.wait_closed()
+        self._audio_servers.clear()
+
+        # Stop ENET servers
+        for server in self._enet_servers.values():
+            server.close()
+            await server.wait_closed()
+        self._enet_servers.clear()
 
         log.info("MoonlightProtocolServer stopped")
 
