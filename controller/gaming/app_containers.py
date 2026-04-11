@@ -53,16 +53,7 @@ def get_gpu_device() -> str:
     Raises:
         GPUError: If no GPU device is available.
     """
-    import os
-
     # Try Intel render nodes first (most common)
-    for i in range(128, 144):
-        device = f"/dev/dri/renderD{i}"
-        if os.path.exists(device):
-            log.info("Detected GPU device: %s", device)
-            return device
-
-    # Try NVIDIA render nodes
     for i in range(128, 144):
         device = f"/dev/dri/renderD{i}"
         if os.path.exists(device):

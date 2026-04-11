@@ -96,6 +96,25 @@ from __future__ import annotations
 
 from pathlib import Path
 
+# Import all submodules
+from . import (
+    app_containers,
+    capture_to_moonlight,
+    gstreamer_pipeline,
+    headless_wayland,
+    hybrid_streaming,
+    moonlight_input,
+    moonlight_protocol,
+    moonlight_server,
+    multi_user_streaming,
+    per_app_state,
+    profiles,
+    scenario_app_mapping,
+    virtual_audio,
+    virtual_input,
+    wolf_ui,
+)
+
 # Module-level constants
 MODULE_DIR = Path(__file__).parent
 GAMING_DIR = MODULE_DIR  # /controller/gaming
@@ -105,19 +124,19 @@ DATA_DIR = Path("/var/lib/ozma/gaming")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 __all__ = [
-    "moonlight_protocol",
-    "moonlight_input",
-    "gstreamer_pipeline",
-    "moonlight_server",
-    "headless_wayland",
-    "virtual_input",
-    "virtual_audio",
-    "multi_user_streaming",
-    "scenario_app_mapping",
-    "hybrid_streaming",
-    "capture_to_moonlight",
     "app_containers",
-    "profiles",
+    "capture_to_moonlight",
+    "gstreamer_pipeline",
+    "headless_wayland",
+    "hybrid_streaming",
+    "moonlight_input",
+    "moonlight_protocol",
+    "moonlight_server",
+    "multi_user_streaming",
     "per_app_state",
+    "profiles",
+    "scenario_app_mapping",
+    "virtual_audio",
+    "virtual_input",
     "wolf_ui",
 ]
