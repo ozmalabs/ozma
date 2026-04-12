@@ -3825,14 +3825,14 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     # --- Session recording endpoints ---
 
-    @app.get("/api/v1/recording/status")
-    async def recording_status() -> dict[str, Any]:
+    @app.get("/api/v1/session-recording/status")
+    async def session_recording_status() -> dict[str, Any]:
         if not recorder:
             return {"recording": False}
         return recorder.status()
 
-    @app.post("/api/v1/recording/start")
-    async def recording_start(body: dict = {}) -> dict[str, Any]:
+    @app.post("/api/v1/session-recording/start")
+    async def session_recording_start(body: dict = {}) -> dict[str, Any]:
         if not recorder:
             raise HTTPException(status_code=503, detail="Recorder not available")
         source_id = body.get("source_id", "hdmi-0")
@@ -3841,15 +3841,15 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         ok = await recorder.start_recording(source_id, hls_path, scenario_id)
         return {"ok": ok}
 
-    @app.post("/api/v1/recording/stop")
-    async def recording_stop() -> dict[str, Any]:
+    @app.post("/api/v1/session-recording/stop")
+    async def session_recording_stop() -> dict[str, Any]:
         if not recorder:
             raise HTTPException(status_code=503, detail="Recorder not available")
         rec = await recorder.stop_recording()
         return {"ok": bool(rec), "recording": rec.to_dict() if rec else None}
 
-    @app.get("/api/v1/recording/list")
-    async def recording_list() -> dict[str, Any]:
+    @app.get("/api/v1/session-recording/list")
+    async def session_recording_list() -> dict[str, Any]:
         if not recorder:
             return {"recordings": []}
         return {"recordings": recorder.list_recordings()}
@@ -5461,6 +5461,8 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             "ts": __import__("time").time(),
         }
         _clipboard_ring.append(entry)
+        while len(_clipboard_ring) > 50:
+            _clipboard_ring.pop(0)
         return {"ok": True, "id": entry["id"]}
 
     # --- Edge-crossing endpoints ---
@@ -8806,8 +8808,8 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(503, "Camera recording not configured")
         return cam_rec
 
-    @app.get("/api/v1/recording/status")
-    async def recording_status(request: Request) -> dict[str, Any]:
+    @app.get("/api/v1/cam-recording/status")
+    async def cam_recording_status(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         return _cr().get_status()
 
