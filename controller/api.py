@@ -407,11 +407,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     # --- User management ---
 
     @app.get("/api/v1/users")
-    async def list_users(request: Request) -> list[dict]:
+    async def list_users(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         if not user_manager:
-            return []
-        return [u.to_dict() for u in user_manager.list_users()]
+            return {"users": []}
+        return {"users": [u.to_dict() for u in user_manager.list_users()]}
 
     @app.get("/api/v1/users/me")
     async def get_current_user(request: Request) -> dict:
@@ -500,11 +500,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     # --- Service proxy management ---
 
     @app.get("/api/v1/services")
-    async def list_services(request: Request) -> list[dict]:
+    async def list_services(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         if not service_proxy:
-            return []
-        return [s.to_dict() for s in service_proxy.list_services()]
+            return {"services": []}
+        return {"services": [s.to_dict() for s in service_proxy.list_services()]}
 
     @app.get("/api/v1/services/{service_id}")
     async def get_service(service_id: str, request: Request) -> dict:
@@ -685,14 +685,20 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     async def list_shares(request: Request) -> dict:
         ctx = _require_scope(request, SCOPE_READ)
         if not sharing:
-            return {"given": [], "received": []}
+            return {"given": [], "received": [], "all": []}
         if ctx.user_id:
-            return {
-                "given": [g.to_dict() for g in sharing.list_grants_from_user(ctx.user_id)],
-                "received": [g.to_dict() for g in sharing.list_grants_for_user(ctx.user_id)],
-            }
-        return {"given": [], "received": [],
-                "all": [g.to_dict() for g in sharing.list_all_grants()]}
+            # Combine given and received, then de-duplicate by id
+            grants = {}
+            given = [g.to_dict() for g in sharing.list_grants_from_user(ctx.user_id)]
+            received = [g.to_dict() for g in sharing.list_grants_for_user(ctx.user_id)]
+            for g_dict in given:
+                grants[g_dict["id"]] = g_dict
+            for g_dict in received:
+                grants[g_dict["id"]] = g_dict
+            return {"given": given, "received": received, "all": list(grants.values())}
+
+        # Admin or unauthenticated with no user context
+        return {"given": [], "received": [], "all": [g.to_dict() for g in sharing.list_all_grants()]}
 
     @app.post("/api/v1/shares")
     async def create_share(body: dict, request: Request) -> dict:
@@ -763,11 +769,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"controllers": found}
 
     @app.get("/api/v1/peers")
-    async def list_peers(request: Request) -> list[dict]:
+    async def list_peers(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         if not sharing:
-            return []
-        return [p.to_dict() for p in sharing.list_peers()]
+            return {"peers": []}
+        return {"peers": [p.to_dict() for p in sharing.list_peers()]}
 
     @app.post("/api/v1/peers")
     async def link_peer(body: dict, request: Request) -> dict:
@@ -802,11 +808,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     # --- External publishing ---
 
     @app.get("/api/v1/publish")
-    async def list_published(request: Request) -> list[dict]:
+    async def list_published(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         if not ext_publish:
-            return []
-        return [e.to_dict() for e in ext_publish.list_entries()]
+            return {"entries": []}
+        return {"entries": [e.to_dict() for e in ext_publish.list_entries()]}
 
     @app.post("/api/v1/publish")
     async def publish_service(body: dict, request: Request) -> dict:
@@ -3588,13 +3594,23 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if not macro_mgr:
             raise HTTPException(status_code=503, detail="Macro manager not available")
         macro = macro_mgr.stop_recording()
-        return {"ok": bool(macro), "macro": macro.to_dict() if macro else None}
+        if not macro:
+            return {"ok": False, "error": "No macro recorded"}
+        return {"ok": True, "macro": macro.to_dict()}
 
     @app.post("/api/v1/macros/{macro_id}/play")
     async def macro_play(macro_id: str) -> dict[str, Any]:
         if not macro_mgr:
             raise HTTPException(status_code=503, detail="Macro manager not available")
+
+        # Check if macro exists to provide better error for not found vs no HID
+        if not any(m.get("id") == macro_id for m in macro_mgr.list_macros()):
+            raise HTTPException(status_code=404, detail="Macro not found")
+
         ok = await macro_mgr.play(macro_id)
+        if not ok:
+            log.warning("Could not play macro %s, likely no active HID", macro_id)
+            return {"ok": False, "error": "Could not play macro, no active HID device"}
         return {"ok": ok}
 
     @app.delete("/api/v1/macros/{macro_id}")
@@ -3947,9 +3963,10 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     @app.get("/api/v1/codecs")
     async def list_codecs() -> dict[str, Any]:
         if not codec_mgr:
-            raise HTTPException(status_code=503, detail="Codec manager not available")
+            return {"codecs": {}, "configs": {}}
+        available = codec_mgr.list_available()
         return {
-            "codecs": codec_mgr.list_available(),
+            "codecs": available or {},
             "configs": codec_mgr.list_configs(),
             "ndi_available": codec_mgr.ndi_available,
         }
@@ -4442,7 +4459,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         limit: int = 50,
         before: float | None = None,
         event_type: str | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, Any]:
         """List recorded clips for a camera, newest first."""
         _require_scope(request, SCOPE_READ)
         if mobile_cam is None:
@@ -4451,7 +4468,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         recordings_dir = getattr(mobile_cam, "_hls_dir", Path(".")).parent / "recordings"
         browser = ClipBrowser(recordings_dir)
         clips = browser.list_clips(camera_id, limit=limit, before=before, event_type=event_type)
-        return [c.to_dict() for c in clips]
+        return {"clips": [c.to_dict() for c in clips]}
 
     @app.get("/api/v1/cameras/{camera_id}/clips/{clip_id}")
     async def camera_get_clip(request: Request, camera_id: str, clip_id: str) -> dict[str, Any]:
@@ -4486,15 +4503,15 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return gt.to_dict()
 
     @app.get("/api/v1/cameras/guest-tokens")
-    async def list_guest_tokens(request: Request) -> list[dict[str, Any]]:
+    async def list_guest_tokens(request: Request) -> dict[str, Any]:
         """List active guest tokens."""
         _require_scope(request, SCOPE_READ)
         if mobile_cam is None:
-            raise HTTPException(503, "Mobile camera service not available")
+            return {"tokens": []}
         from mobile_camera import GuestTokenManager
         gtm_dir = getattr(mobile_cam, "_hls_dir", Path(".")).parent / "guest_tokens"
         gtm = GuestTokenManager(data_dir=gtm_dir)
-        return gtm.list_tokens()
+        return {"tokens": gtm.list_tokens()}
 
     @app.delete("/api/v1/cameras/guest-tokens/{token}")
     async def revoke_guest_token(request: Request, token: str) -> dict[str, Any]:
@@ -4519,10 +4536,10 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return MotionPushManager(data_dir=push_dir)
 
     @app.get("/api/v1/cameras/push-webhooks")
-    async def list_push_webhooks(request: Request) -> list[dict[str, Any]]:
+    async def list_push_webhooks(request: Request) -> dict[str, Any]:
         """List registered motion push webhooks."""
         _require_scope(request, SCOPE_READ)
-        return _get_push_mgr().list_webhooks()
+        return {"webhooks": _get_push_mgr().list_webhooks()}
 
     @app.post("/api/v1/cameras/push-webhooks")
     async def register_push_webhook(request: Request) -> dict[str, Any]:
@@ -4570,10 +4587,10 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     _overlays_store: list[dict] = []
 
     @app.get("/api/v1/overlays")
-    async def overlays_list(request: Request) -> list[dict]:
+    async def overlays_list(request: Request) -> dict[str, Any]:
         """List active video overlays (PiP cameras, media, etc.)."""
         _require_scope(request, SCOPE_READ)
-        return list(_overlays_store)
+        return {"overlays": list(_overlays_store)}
 
     @app.post("/api/v1/overlays")
     async def overlay_add(request: Request, body: CreateOverlayRequest) -> dict[str, Any]:
@@ -5519,10 +5536,10 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     _clipboard_ring: list[dict] = []
 
     @app.get("/api/v1/clipboard")
-    async def clipboard_list(request: Request) -> list[dict]:
+    async def clipboard_list(request: Request) -> dict[str, Any]:
         """Return the cross-desk clipboard ring."""
         _require_scope(request, SCOPE_READ)
-        return list(_clipboard_ring[-50:])
+        return {"clipboard": list(_clipboard_ring[-50:])}
 
     @app.post("/api/v1/clipboard")
     async def clipboard_push(request: Request, body: PushClipboardRequest) -> dict[str, Any]:
@@ -6810,11 +6827,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     # ── Devices ────────────────────────────────────────────────────────
 
     @app.get("/api/v1/iot/devices")
-    async def iot_list_devices(request: Request) -> list[dict]:
+    async def iot_list_devices(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         if not iot:
             raise HTTPException(503, "IoT network manager not enabled")
-        return [d.to_dict() for d in iot.list_devices()]
+        return {"devices": [d.to_dict() for d in iot.list_devices()]}
 
     @app.post("/api/v1/iot/devices")
     async def iot_add_device(request: Request, body: AddDeviceRequest) -> dict:
@@ -6909,11 +6926,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"ok": True}
 
     @app.get("/api/v1/iot/onboard")
-    async def iot_list_sessions(request: Request, active: bool = False) -> list[dict]:
+    async def iot_list_sessions(request: Request, active: bool = False) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         if not iot:
             raise HTTPException(503, "IoT network manager not enabled")
-        return [s.to_dict() for s in iot.list_sessions(active_only=active)]
+        return {"sessions": [s.to_dict() for s in iot.list_sessions(active_only=active)]}
 
     @app.post("/api/v1/iot/sync-leases")
     async def iot_sync_leases(request: Request) -> dict:
@@ -7158,19 +7175,22 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         )
         return app_obj.to_dict()
 
+    @app.get("/api/v1/saas/cost")
+    async def saas_cost_summary(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_READ)
+        if not saas_mgr:
+            return {"summary": {"total": 0.0, "monthly": 0.0, "services": [], "costs": {}}}
+        summary = saas_mgr.cost_summary()
+        # Normalize to expected field names for test compatibility
+        if "total" not in summary and "total_monthly_cost" in summary:
+            summary["total"] = summary["total_monthly_cost"]
+            summary["monthly"] = summary.get("total_monthly_cost", 0)
+        return {"summary": summary}
+
     @app.get("/api/v1/saas/{app_id}")
     async def saas_get(request: Request, app_id: str) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         # Static sub-paths that are registered after this parameterized route
-        if app_id == "cost":
-            if not saas_mgr:
-                return {"total": 0.0, "monthly": 0.0, "services": [], "costs": {}}
-            summary = saas_mgr.cost_summary()
-            # Normalize to expected field names for test compatibility
-            if "total" not in summary and "total_monthly_cost" in summary:
-                summary["total"] = summary["total_monthly_cost"]
-                summary["monthly"] = summary.get("total_monthly_cost", 0)
-            return summary
         if app_id in ("status", "config"):
             # Forward to the appropriate handler via redirect logic
             raise HTTPException(404, f"Use /api/v1/saas/{app_id} sub-path endpoint")
@@ -7225,7 +7245,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         _require_scope(request, SCOPE_READ)
         if not license_mgr:
             raise HTTPException(503, "License manager not enabled")
-        return license_mgr.cost_summary()
+        return {"summary": license_mgr.cost_summary()}
 
     @app.get("/api/v1/licenses/analytics/renewals")
     async def license_upcoming_renewals(request: Request,
@@ -7263,7 +7283,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if not license_mgr:
             raise HTTPException(503, "License manager not enabled")
         dups = license_mgr.find_duplicate_categories()
-        return {cat: [a.to_dict() for a in apps] for cat, apps in dups.items()}
+        return {"duplicates": {cat: [a.to_dict() for a in apps] for cat, apps in dups.items()}}
 
     @app.get("/api/v1/saas/offboarding/{user_id}")
     async def saas_offboarding_checklist(request: Request, user_id: str) -> dict[str, Any]:
@@ -8295,7 +8315,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return saas_mgr.set_config(body).to_dict()
 
     @app.get("/api/v1/saas/apps")
-    async def saas_list_apps(request: Request) -> list[dict[str, Any]]:
+    async def saas_list_apps(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         if not saas_mgr:
             raise HTTPException(503, "SaaS management not configured")
@@ -8303,12 +8323,12 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         shadow_it = None
         if "shadow_it" in params:
             shadow_it = params["shadow_it"].lower() == "true"
-        return [a.to_dict() for a in saas_mgr.list_apps(
+        return {"apps": [a.to_dict() for a in saas_mgr.list_apps(
             shadow_it=shadow_it,
             category=params.get("category"),
             renewal_risk=params.get("renewal_risk"),
             source=params.get("source"),
-        )]
+        )]}
 
     @app.post("/api/v1/saas/apps")
     async def saas_register_app(request: Request) -> dict[str, Any]:
@@ -8374,43 +8394,36 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         _require_scope(request, SCOPE_READ)
         if not saas_mgr:
             raise HTTPException(503, "SaaS management not configured")
-        return saas_mgr.shadow_it_summary()
-
-    @app.get("/api/v1/saas/cost")
-    async def saas_cost_summary(request: Request) -> dict[str, Any]:
-        _require_scope(request, SCOPE_READ)
-        if not saas_mgr:
-            return {"total": 0.0, "monthly": 0.0, "services": [], "costs": {}}
-        return saas_mgr.cost_summary()
+        return {"summary": saas_mgr.shadow_it_summary()}
 
     @app.get("/api/v1/saas/renewals")
-    async def saas_renewals(request: Request) -> list[dict[str, Any]]:
+    async def saas_renewals(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         if not saas_mgr:
             raise HTTPException(503, "SaaS management not configured")
         days = int(request.query_params.get("days", "90"))
-        return saas_mgr.upcoming_renewals(days=days)
+        return {"renewals": saas_mgr.upcoming_renewals(days=days)}
 
     @app.get("/api/v1/saas/duplicates")
-    async def saas_duplicates(request: Request) -> list[dict[str, Any]]:
+    async def saas_duplicates(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         if not saas_mgr:
             raise HTTPException(503, "SaaS management not configured")
-        return saas_mgr.duplicate_categories()
+        return {"duplicates": saas_mgr.duplicate_categories()}
 
     @app.get("/api/v1/saas/vendor-risk")
-    async def saas_vendor_risk(request: Request) -> list[dict[str, Any]]:
+    async def saas_vendor_risk(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         if not saas_mgr:
             raise HTTPException(503, "SaaS management not configured")
-        return saas_mgr.vendor_risk_summary()
+        return {"risks": saas_mgr.vendor_risk_summary()}
 
     @app.get("/api/v1/saas/offboarding/{user_email}")
     async def saas_offboarding_checklist(request: Request, user_email: str) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         if not saas_mgr:
             raise HTTPException(503, "SaaS management not configured")
-        return saas_mgr.create_offboarding_checklist(user_email)
+        return {"checklist": saas_mgr.create_offboarding_checklist(user_email)}
 
     @app.post("/api/v1/saas/discover/chrome-extensions")
     async def saas_ingest_chrome_extensions(request: Request) -> dict[str, Any]:
@@ -8476,7 +8489,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"ok": True, "new_entries": len(new_entries)}
 
     @app.get("/api/v1/threat/kev")
-    async def threat_list_kev(request: Request) -> list[dict[str, Any]]:
+    async def threat_list_kev(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         if not threat_intel:
             raise HTTPException(503, "Threat intelligence not configured")
@@ -8484,7 +8497,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         matched_sbom = None
         if "matched_sbom" in params:
             matched_sbom = params["matched_sbom"].lower() == "true"
-        return [e.to_dict() for e in threat_intel.list_kev(matched_sbom=matched_sbom)]
+        return {"entries": [e.to_dict() for e in threat_intel.list_kev(matched_sbom=matched_sbom)]}
 
     @app.post("/api/v1/threat/poll/advisories")
     async def threat_poll_advisories(request: Request) -> dict[str, Any]:
@@ -8504,7 +8517,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return adv.to_dict()
 
     @app.get("/api/v1/threat/advisories")
-    async def threat_list_advisories(request: Request) -> list[dict[str, Any]]:
+    async def threat_list_advisories(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         if not threat_intel:
             raise HTTPException(503, "Threat intelligence not configured")
@@ -8512,11 +8525,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         ack = None
         if "acknowledged" in params:
             ack = params["acknowledged"].lower() == "true"
-        return [a.to_dict() for a in threat_intel.list_advisories(
+        return {"advisories": [a.to_dict() for a in threat_intel.list_advisories(
             source=params.get("source"),
             severity=params.get("severity"),
             acknowledged=ack,
-        )]
+        )]}
 
     @app.post("/api/v1/threat/advisories/{advisory_id}/acknowledge")
     async def threat_ack_advisory(request: Request, advisory_id: str) -> dict[str, Any]:
@@ -8539,7 +8552,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"ok": True, "new_exposures": len(new_exp)}
 
     @app.get("/api/v1/threat/exposures")
-    async def threat_list_exposures(request: Request) -> list[dict[str, Any]]:
+    async def threat_list_exposures(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         if not threat_intel:
             raise HTTPException(503, "Threat intelligence not configured")
@@ -8547,7 +8560,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         resolved = None
         if "resolved" in params:
             resolved = params["resolved"].lower() == "true"
-        return [e.to_dict() for e in threat_intel.list_exposures(resolved=resolved)]
+        return {"exposures": [e.to_dict() for e in threat_intel.list_exposures(resolved=resolved)]}
 
     @app.post("/api/v1/threat/exposures/{exposure_id}/resolve")
     async def threat_resolve_exposure(request: Request, exposure_id: str) -> dict[str, Any]:
@@ -8600,11 +8613,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return threat_intel.generate_threat_briefing(active_controls)
 
     @app.get("/api/v1/threat/posture-changes")
-    async def threat_posture_changes(request: Request) -> list[dict[str, Any]]:
+    async def threat_posture_changes(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         if not threat_intel:
             raise HTTPException(503, "Threat intelligence not configured")
-        return [p.to_dict() for p in threat_intel.list_posture_changes()]
+        return {"changes": [p.to_dict() for p in threat_intel.list_posture_changes()]}
 
     # ── Audit Log ─────────────────────────────────────────────────────────────
 
@@ -8647,10 +8660,10 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         request: Request,
         action: str | None = None,
         limit: int = 100,
-    ) -> dict | list:
+    ) -> dict[str, Any]:
         """Compatibility alias for GET /api/v1/audit."""
         result = await audit_log_entries(request, action=action, limit=limit)
-        return result["entries"]
+        return {"entries": result["entries"]}
 
     # ── Compliance Reports ────────────────────────────────────────────────────
 
@@ -8704,11 +8717,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return report.to_dict()
 
     @app.get("/api/v1/compliance/reports")
-    async def compliance_list_reports(request: Request) -> list[dict[str, Any]]:
+    async def compliance_list_reports(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         if not compliance:
             raise HTTPException(503, "Compliance engine not configured")
-        return compliance.list_reports()
+        return {"reports": compliance.list_reports()}
 
     @app.get("/api/v1/compliance/reports/{report_id}")
     async def compliance_get_report(request: Request, report_id: str) -> dict[str, Any]:
@@ -8721,7 +8734,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return report.to_dict()
 
     @app.get("/api/v1/compliance/gaps")
-    async def compliance_list_gaps(request: Request) -> list[dict[str, Any]]:
+    async def compliance_list_gaps(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         if not compliance:
             raise HTTPException(503, "Compliance engine not configured")
@@ -8729,11 +8742,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         resolved = None
         if "resolved" in params:
             resolved = params["resolved"].lower() == "true"
-        return [g.to_dict() for g in compliance.list_gaps(
+        return {"gaps": [g.to_dict() for g in compliance.list_gaps(
             framework=params.get("framework"),
             resolved=resolved,
             severity=params.get("severity"),
-        )]
+        )]}
 
     @app.post("/api/v1/compliance/gaps/{gap_id}/resolve")
     async def compliance_resolve_gap(request: Request, gap_id: str) -> dict[str, Any]:
@@ -8778,11 +8791,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return cfg.to_dict()
 
     @app.get("/api/v1/wifi-ap/interfaces")
-    async def wifi_ap_interfaces(request: Request) -> list[dict[str, Any]]:
+    async def wifi_ap_interfaces(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         if not wifi_ap:
             raise HTTPException(503, "Wi-Fi AP not configured")
-        return await wifi_ap.probe_interfaces()
+        return {"interfaces": await wifi_ap.probe_interfaces()}
 
     # ── Router Mode ───────────────────────────────────────────────────────────
 
@@ -8810,11 +8823,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return cfg.to_dict()
 
     @app.get("/api/v1/router/cloud-allow-rules")
-    async def router_cloud_allow_list(request: Request) -> list[dict[str, Any]]:
+    async def router_cloud_allow_list(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         if not router:
             raise HTTPException(503, "Router mode not configured")
-        return router.list_cloud_allow_rules()
+        return {"rules": router.list_cloud_allow_rules()}
 
     @app.post("/api/v1/router/cloud-allow-rules")
     async def router_cloud_allow_add(request: Request) -> dict[str, Any]:
@@ -8889,14 +8902,14 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return _cr().get_status()
 
     @app.get("/api/v1/recording/jobs")
-    async def recording_jobs(request: Request) -> list[dict[str, Any]]:
+    async def recording_jobs(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
-        return _cr().list_jobs()
+        return {"jobs": _cr().list_jobs()}
 
     @app.get("/api/v1/recording/policies")
-    async def recording_list_policies(request: Request) -> list[dict[str, Any]]:
+    async def recording_list_policies(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
-        return [p.to_dict() for p in _cr().list_policies()]
+        return {"policies": [p.to_dict() for p in _cr().list_policies()]}
 
     @app.post("/api/v1/recording/policies")
     async def recording_create_policy(request: Request) -> dict[str, Any]:
@@ -9096,10 +9109,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return await _ss().pair(node_id, pin)
 
     @app.get("/api/v1/streaming/nodes/{node_id}/clients")
-    async def streaming_list_clients(request: Request, node_id: str) -> list[dict[str, Any]]:
+    async def streaming_list_clients(request: Request, node_id: str) -> dict[str, Any]:
         """List paired Moonlight clients for a node."""
         _require_scope(request, SCOPE_READ)
-        return await _ss().list_clients(node_id)
+        clients = await _ss().list_clients(node_id)
+        return {"clients": clients}
 
     @app.delete("/api/v1/streaming/nodes/{node_id}/clients/{cert}")
     async def streaming_unpair_client(
@@ -9236,10 +9250,10 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     # Clients
     @app.get("/api/v1/msp/clients")
-    async def msp_list_clients(request: Request) -> list[dict]:
+    async def msp_list_clients(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_ADMIN)
         clients = await _msp().list_clients()
-        return [c.to_dict() for c in clients]
+        return {"clients": [c.to_dict() for c in clients]}
 
     @app.post("/api/v1/msp/clients")
     async def msp_add_client(request: Request) -> dict:
@@ -9290,16 +9304,16 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     # Health
     @app.get("/api/v1/msp/health")
-    async def msp_list_health(request: Request) -> list[dict]:
+    async def msp_list_health(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_ADMIN)
         healths = await _msp().get_all_health()
-        return [h.to_dict() for h in healths]
+        return {"healths": [h.to_dict() for h in healths]}
 
     @app.post("/api/v1/msp/health/refresh")
-    async def msp_refresh_all_health(request: Request) -> list[dict]:
+    async def msp_refresh_all_health(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_ADMIN)
         healths = await _msp().refresh_all_health()
-        return [h.to_dict() for h in healths]
+        return {"healths": [h.to_dict() for h in healths]}
 
     @app.get("/api/v1/msp/health/{client_id}")
     async def msp_get_health(request: Request, client_id: str) -> dict:
@@ -9353,10 +9367,10 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return op.to_dict()
 
     @app.get("/api/v1/msp/bulk")
-    async def msp_list_operations(request: Request) -> list[dict]:
+    async def msp_list_operations(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_ADMIN)
         ops = await _msp().list_operations()
-        return [op.to_dict() for op in ops]
+        return {"operations": [op.to_dict() for op in ops]}
 
     @app.get("/api/v1/msp/bulk/{op_id}")
     async def msp_get_operation(request: Request, op_id: str) -> dict:
@@ -9368,18 +9382,18 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     # Alerts
     @app.get("/api/v1/msp/alerts")
-    async def msp_alerts(request: Request) -> list[dict]:
+    async def msp_alerts(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_ADMIN)
         severity = request.query_params.get("severity", "")
         client_id = request.query_params.get("client_id", "")
-        return await _msp().aggregate_alerts(severity=severity, client_id=client_id)
+        return {"alerts": await _msp().aggregate_alerts(severity=severity, client_id=client_id)}
 
     # Billing
     @app.get("/api/v1/msp/billing/{year}/{month}")
-    async def msp_billing(request: Request, year: int, month: int) -> list[dict]:
+    async def msp_billing(request: Request, year: int, month: int) -> dict[str, Any]:
         _require_scope(request, SCOPE_ADMIN)
         lines = await _msp().monthly_billing_export(year, month)
-        return [line.to_dict() for line in lines]
+        return {"lines": [line.to_dict() for line in lines]}
 
     @app.get("/api/v1/msp/billing/{year}/{month}/csv")
     async def msp_billing_csv(request: Request, year: int, month: int):
@@ -9445,10 +9459,10 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return auto_configure
 
     @app.get("/api/v1/auto-configure/devices")
-    async def ac_list_devices(request: Request) -> list[dict[str, Any]]:
+    async def ac_list_devices(request: Request) -> dict[str, Any]:
         """List all discovered devices on the PoE subnet."""
         _require_scope(request, SCOPE_READ)
-        return _ac().list_devices()
+        return {"devices": _ac().list_devices()}
 
     @app.get("/api/v1/auto-configure/devices/{ip}")
     async def ac_get_device(request: Request, ip: str) -> dict[str, Any]:
@@ -9508,10 +9522,10 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return cam_connect
 
     @app.get("/api/v1/camera-connect/registrations")
-    async def cc_list_registrations(request: Request) -> list[dict[str, Any]]:
+    async def cc_list_registrations(request: Request) -> dict[str, Any]:
         """List Connect registration records for all camera nodes."""
         _require_scope(request, SCOPE_READ)
-        return _cc().list_registrations()
+        return {"registrations": _cc().list_registrations()}
 
     @app.get("/api/v1/camera-connect/registrations/{node_id:path}")
     async def cc_get_registration(request: Request, node_id: str) -> dict[str, Any]:
@@ -9567,9 +9581,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     # Desks
     @app.get("/api/v1/grid/desks")
-    async def grid_list_desks(request: Request) -> list[dict[str, Any]]:
+    async def grid_list_desks(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
-        return _grid().list_desks()
+        return {"desks": _grid().list_desks()}
 
     @app.get("/api/v1/grid/desks/{desk_id}")
     async def grid_get_desk(request: Request, desk_id: str) -> dict[str, Any]:
@@ -9615,9 +9629,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     # Claims
     @app.get("/api/v1/grid/claims")
-    async def grid_list_claims(request: Request) -> list[dict[str, Any]]:
+    async def grid_list_claims(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
-        return _grid().list_claims()
+        return {"claims": _grid().list_claims()}
 
     @app.post("/api/v1/grid/claims")
     async def grid_claim_mark(request: Request) -> dict[str, Any]:
@@ -9645,16 +9659,16 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"ok": ok, "mark_id": mark_id}
 
     @app.get("/api/v1/grid/desks/{desk_id}/failover-candidates")
-    async def grid_failover_candidates(request: Request, desk_id: str) -> list[dict[str, Any]]:
+    async def grid_failover_candidates(request: Request, desk_id: str) -> dict[str, Any]:
         """Return online failover candidates for a Desk."""
         _require_scope(request, SCOPE_READ)
-        return [d.to_dict() for d in _grid().failover_candidates(desk_id)]
+        return {"candidates": [d.to_dict() for d in _grid().failover_candidates(desk_id)]}
 
     # Feeds
     @app.get("/api/v1/grid/feeds")
-    async def grid_list_feeds(request: Request) -> list[dict[str, Any]]:
+    async def grid_list_feeds(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
-        return _grid().list_feeds()
+        return {"feeds": _grid().list_feeds()}
 
     @app.get("/api/v1/grid/feeds/{feed_id}")
     async def grid_get_feed(request: Request, feed_id: str) -> dict[str, Any]:
@@ -9723,9 +9737,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return parental
 
     @app.get("/api/v1/parental/profiles")
-    async def parental_list_profiles(request: Request) -> list[dict]:
+    async def parental_list_profiles(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
-        return _parental().list_profiles()
+        return {"profiles": _parental().list_profiles()}
 
     @app.post("/api/v1/parental/profiles")
     async def parental_create_profile(request: Request) -> dict:
@@ -9888,9 +9902,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"ok": True}
 
     @app.get("/api/v1/parental/overrides")
-    async def parental_list_overrides(request: Request) -> list[dict]:
+    async def parental_list_overrides(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
-        return _parental().list_overrides()
+        return {"overrides": _parental().list_overrides()}
 
     @app.post("/api/v1/parental/profiles/{profile_id}/check")
     async def parental_check_permission(request: Request, profile_id: str) -> dict:
@@ -9914,7 +9928,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return backup_nudge
 
     @app.get("/api/v1/backup/nodes/{node_id}/snapshots")
-    async def backup_node_snapshots(request: Request, node_id: str) -> list[dict]:
+    async def backup_node_snapshots(request: Request, node_id: str) -> dict[str, Any]:
         """
         List Restic snapshots for a node.
 
@@ -9925,12 +9939,13 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         result = await _backup_nudge().proxy_get(node_id, "/backup/snapshots")
         if result is None:
             raise HTTPException(503, f"Node {node_id!r} agent unreachable or backup not configured")
-        return result if isinstance(result, list) else [result]
+        snapshots = result if isinstance(result, list) else [result]
+        return {"snapshots": snapshots}
 
     @app.get("/api/v1/backup/nodes/{node_id}/snapshots/{snapshot_id}/files")
     async def backup_node_snapshot_files(
         request: Request, node_id: str, snapshot_id: str,
-    ) -> list[dict]:
+    ) -> dict[str, Any]:
         """Browse the file tree within a specific snapshot."""
         _require_scope(request, SCOPE_READ)
         path = request.query_params.get("path", "/")
@@ -9940,7 +9955,8 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         )
         if result is None:
             raise HTTPException(503, f"Node {node_id!r} agent unreachable")
-        return result if isinstance(result, list) else [result]
+        files = result if isinstance(result, list) else [result]
+        return {"files": files}
 
     @app.post("/api/v1/backup/nodes/{node_id}/restore")
     async def backup_node_restore(request: Request, node_id: str) -> dict[str, Any]:
@@ -9969,13 +9985,14 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return result
 
     @app.get("/api/v1/backup/nodes/{node_id}/apps")
-    async def backup_node_apps(request: Request, node_id: str) -> list[dict]:
+    async def backup_node_apps(request: Request, node_id: str) -> dict[str, Any]:
         """List installed apps on a node (for selective restore)."""
         _require_scope(request, SCOPE_READ)
         result = await _backup_nudge().proxy_get(node_id, "/backup/apps")
         if result is None:
             raise HTTPException(503, f"Node {node_id!r} agent unreachable")
-        return result if isinstance(result, list) else [result]
+        apps = result if isinstance(result, list) else [result]
+        return {"apps": apps}
 
     @app.post("/api/v1/backup/nodes/{node_id}/restore-apps")
     async def backup_node_restore_apps(request: Request, node_id: str) -> dict[str, Any]:
@@ -10025,10 +10042,10 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return mgr.get_config().to_dict()
 
     @app.get("/api/v1/dns-filter/sources")
-    async def dns_filter_sources(request: Request) -> list[dict]:
+    async def dns_filter_sources(request: Request) -> dict[str, Any]:
         """List all blocklist sources (built-in + custom)."""
         _require_scope(request, SCOPE_READ)
-        return _dns_filter().list_sources()
+        return {"sources": _dns_filter().list_sources()}
 
     @app.post("/api/v1/dns-filter/sources")
     async def dns_filter_sources_add(request: Request) -> dict[str, Any]:
@@ -10089,9 +10106,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return results
 
     @app.get("/api/v1/dns-filter/allowlist")
-    async def dns_filter_allowlist_get(request: Request) -> list[str]:
+    async def dns_filter_allowlist_get(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
-        return list(_dns_filter().get_config().allowlist)
+        return {"domains": list(_dns_filter().get_config().allowlist)}
 
     @app.post("/api/v1/dns-filter/allowlist")
     async def dns_filter_allowlist_add(request: Request) -> dict[str, Any]:
@@ -10117,9 +10134,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"ok": True}
 
     @app.get("/api/v1/dns-filter/custom-blocklist")
-    async def dns_filter_custom_block_get(request: Request) -> list[str]:
+    async def dns_filter_custom_block_get(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
-        return list(_dns_filter().get_config().custom_blocklist)
+        return {"domains": list(_dns_filter().get_config().custom_blocklist)}
 
     @app.post("/api/v1/dns-filter/custom-blocklist")
     async def dns_filter_custom_block_add(request: Request) -> dict[str, Any]:
@@ -10160,10 +10177,10 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     # ── Local DNS records ──────────────────────────────────────────────
 
     @app.get("/api/v1/dns-filter/records")
-    async def dns_records_list(request: Request) -> list[dict]:
+    async def dns_records_list(request: Request) -> dict[str, Any]:
         """List all local DNS records (A/AAAA/CNAME/PTR)."""
         _require_scope(request, SCOPE_READ)
-        return _dns_filter().list_records()
+        return {"records": _dns_filter().list_records()}
 
     @app.post("/api/v1/dns-filter/records")
     async def dns_records_add(request: Request) -> dict[str, Any]:
@@ -10259,9 +10276,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return cfg.to_dict()
 
     @app.get("/api/v1/proxy/routes")
-    async def proxy_routes_list(request: Request) -> list[dict]:
+    async def proxy_routes_list(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
-        return _local_proxy().list_routes()
+        return {"routes": _local_proxy().list_routes()}
 
     @app.post("/api/v1/proxy/routes")
     async def proxy_routes_add(request: Request) -> dict[str, Any]:
@@ -10344,9 +10361,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return cfg.to_dict()
 
     @app.get("/api/v1/file-sharing/shares")
-    async def file_sharing_shares_list(request: Request) -> list[dict]:
+    async def file_sharing_shares_list(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
-        return _file_sharing().list_shares()
+        return {"shares": _file_sharing().list_shares()}
 
     @app.post("/api/v1/file-sharing/shares")
     async def file_sharing_shares_add(request: Request) -> dict[str, Any]:
@@ -10390,9 +10407,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"ok": True}
 
     @app.get("/api/v1/file-sharing/users")
-    async def file_sharing_users_list(request: Request) -> list[dict]:
+    async def file_sharing_users_list(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
-        return _file_sharing().list_samba_users()
+        return {"users": _file_sharing().list_samba_users()}
 
     @app.post("/api/v1/file-sharing/users")
     async def file_sharing_users_add(request: Request) -> dict[str, Any]:
@@ -10474,9 +10491,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return cfg.to_dict()
 
     @app.get("/api/v1/ddns/records")
-    async def ddns_records_list(request: Request) -> list[dict]:
+    async def ddns_records_list(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
-        return _ddns().list_records()
+        return {"records": _ddns().list_records()}
 
     @app.post("/api/v1/ddns/records")
     async def ddns_records_add(request: Request) -> dict[str, Any]:
@@ -10552,10 +10569,10 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return cfg.to_dict()
 
     @app.get("/api/v1/speedtest/history")
-    async def speedtest_history(request: Request) -> list[dict]:
+    async def speedtest_history(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         limit = int(request.query_params.get("limit", 48))
-        return _speedtest().get_history(limit=limit)
+        return {"history": _speedtest().get_history(limit=limit)}
 
     @app.post("/api/v1/speedtest/run")
     async def speedtest_run_now(request: Request) -> dict[str, Any]:
@@ -10592,16 +10609,16 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return _zfs().set_config(**body).to_dict()
 
     @app.get("/api/v1/zfs/pools")
-    async def zfs_pools(request: Request) -> list[dict]:
+    async def zfs_pools(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
-        return await _zfs().list_pools()
+        return {"pools": await _zfs().list_pools()}
 
     @app.get("/api/v1/zfs/datasets")
-    async def zfs_datasets(request: Request) -> list[dict]:
+    async def zfs_datasets(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         pool = request.query_params.get("pool")
         datasets = await _zfs().list_datasets(pool=pool)
-        return [d.to_dict() for d in datasets]
+        return {"datasets": [d.to_dict() for d in datasets]}
 
     @app.post("/api/v1/zfs/datasets")
     async def zfs_dataset_create(request: Request) -> dict[str, Any]:
@@ -10631,11 +10648,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"dataset": dataset, "destroyed": True}
 
     @app.get("/api/v1/zfs/snapshots")
-    async def zfs_snapshots(request: Request) -> list[dict]:
+    async def zfs_snapshots(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         dataset = request.query_params.get("dataset")
         snaps = await _zfs().list_snapshots(dataset=dataset)
-        return [s.to_dict() for s in snaps]
+        return {"snapshots": [s.to_dict() for s in snaps]}
 
     @app.post("/api/v1/zfs/snapshots")
     async def zfs_snapshot_take(request: Request) -> dict[str, Any]:
@@ -10660,9 +10677,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     # Managed dataset registry (Ozma-tracked — auto-snapshot + cloud backup)
 
     @app.get("/api/v1/zfs/managed")
-    async def zfs_managed_list(request: Request) -> list[dict]:
+    async def zfs_managed_list(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
-        return _zfs().list_managed()
+        return {"datasets": _zfs().list_managed()}
 
     @app.post("/api/v1/zfs/managed")
     async def zfs_managed_register(request: Request) -> dict[str, Any]:
@@ -10871,12 +10888,12 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return env.to_dict()
 
     @app.get("/api/v1/dns/integrity/all")
-    async def dns_integrity_all(request: Request) -> list[dict[str, Any]]:
+    async def dns_integrity_all(request: Request) -> dict[str, Any]:
         """Return DNS environment assessments for the controller and all reporting nodes."""
         _require_scope(request, SCOPE_READ)
         if dns_verifier is None:
             raise HTTPException(503, "DNS verifier not running")
-        return dns_verifier.all_environments()
+        return {"environments": dns_verifier.all_environments()}
 
     @app.post("/api/v1/dns/integrity/run")
     async def dns_integrity_run_now(request: Request) -> dict[str, Any]:
