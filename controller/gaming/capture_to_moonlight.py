@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,9 @@ from .moonlight_protocol import (
 from .moonlight_input import MoonlightInputHandler
 
 log = logging.getLogger("ozma.moonlight.capture")
+
+# Maximum concurrent capture sessions per capture card
+MAX_CONCURRENT_SESSIONS = 4
 
 
 @dataclass
@@ -129,17 +133,20 @@ class CaptureToMoonlightManager:
         """Stop the capture-to-moonlight manager."""
         self._running = False
 
-        # Stop all capture sessions
-        for session in self._capture_sessions.values():
-            await self._stop_session(session.capture_source_id)
+        # Stop all capture sessions (copy keys to avoid dict modification during iteration)
+        session_ids = list(self._capture_sessions.keys())
+        for session_id in session_ids:
+            await self._stop_session(session_id)
 
         # Stop pipeline manager
         await self._pipeline_manager.stop_all()
 
-        # Cancel tasks
-        for task in self._tasks:
+        # Cancel tasks (copy to avoid modification during iteration)
+        tasks_copy = list(self._tasks)
+        for task in tasks_copy:
             task.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
+        await asyncio.gather(*tasks_copy, return_exceptions=True)
+        self._tasks.clear()
 
     async def _rescan_capture_cards(self) -> None:
         """Scan for capture cards and register them as Moonlight apps."""
@@ -204,6 +211,15 @@ class CaptureToMoonlightManager:
             log.error("Capture card device not available: %s", card.path)
             return None
 
+        # Validate card capabilities
+        if card.max_width < 160 or card.max_height < 120:
+            log.error("Capture card has invalid resolution: %dx%d", card.max_width, card.max_height)
+            return None
+
+        if card.max_fps < 1 or card.max_fps > 240:
+            log.error("Capture card has invalid framerate: %d fps", card.max_fps)
+            return None
+
         # Track resources for cleanup on failure
         resources_created = []
 
@@ -230,12 +246,41 @@ class CaptureToMoonlightManager:
                 gamescope_enabled=False,
             )
 
+            # Validate pipeline config before creating pipeline
+            is_valid, error_msg = pipeline_config.validate()
+            if not is_valid:
+                log.error("Invalid pipeline config: %s", error_msg)
+                raise ValueError(f"Invalid pipeline config: {error_msg}")
+
             # Create GStreamer pipeline
             pipeline = await self._pipeline_manager.create_pipeline(
                 moonlight_session.session_id,
                 pipeline_config,
             )
             resources_created.append(("pipeline", moonlight_session.session_id))
+
+            # Set up error callback for better pipeline error logging
+            def on_pipeline_error(msg: str) -> None:
+                log.error("GStreamer pipeline error for session %s: %s", moonlight_session.session_id, msg)
+                # Try to stop the pipeline gracefully
+                try:
+                    asyncio.create_task(self._pipeline_manager.remove_pipeline(moonlight_session.session_id))
+                except Exception:
+                    pass
+
+            pipeline.set_on_error(on_pipeline_error)
+
+            # Set up stats callback for pipeline monitoring
+            def on_pipeline_stats(stats: dict[str, Any]) -> None:
+                log.debug(
+                    "GStreamer pipeline stats for session %s: %d frames encoded, %d dropped, %.1f kbps",
+                    moonlight_session.session_id,
+                    stats.get("frames_encoded", 0),
+                    stats.get("frames_dropped", 0),
+                    stats.get("bitrate_kbps", 0),
+                )
+
+            pipeline.set_on_stats(on_pipeline_stats)
 
             # Validate that pipeline actually started
             if not pipeline._running:
@@ -296,7 +341,7 @@ class CaptureToMoonlightManager:
             pipeline_config=pipeline_config,
             input_handler=input_handler,
             active=True,
-            started_at=asyncio.get_running_loop().time(),
+            started_at=time.perf_counter(),
             clients=[client_id],
         )
 
@@ -313,6 +358,7 @@ class CaptureToMoonlightManager:
     async def _stop_session(self, capture_source_id: str) -> None:
         """Stop a capture session."""
         if capture_source_id not in self._capture_sessions:
+            log.debug("Capture session not found for stop: %s", capture_source_id)
             return
 
         session = self._capture_sessions[capture_source_id]
@@ -345,7 +391,7 @@ class CaptureToMoonlightManager:
                 log.error("Failed to end Moonlight session: %s", e)
 
         session.active = False
-        session._ended_at = asyncio.get_running_loop().time()
+        session._ended_at = time.perf_counter()
 
         del self._capture_sessions[capture_source_id]
 
@@ -384,12 +430,18 @@ class CaptureToMoonlightManager:
         capture_source_id: str,
         **kwargs,
     ) -> bool:
-        """Update pipeline configuration for a capture session."""
+        """Update pipeline configuration for a capture session.
+
+        Returns True if successful, False otherwise.
+        Validates the new configuration before applying it.
+        """
         if capture_source_id not in self._capture_sessions:
+            log.error("Capture session not found: %s", capture_source_id)
             return False
 
         session = self._capture_sessions[capture_source_id]
         if not session.pipeline_config:
+            log.error("No pipeline config for session: %s", capture_source_id)
             return False
 
         # Validate and update config
@@ -407,15 +459,10 @@ class CaptureToMoonlightManager:
             else:
                 log.warning("Unknown pipeline config field: %s", key)
 
-        # Validate required fields after update
-        if session.pipeline_config.input_width <= 0 or session.pipeline_config.input_height <= 0:
-            log.error("Invalid resolution: %dx%d", session.pipeline_config.input_width, session.pipeline_config.input_height)
-            return False
-        if session.pipeline_config.bitrate_kbps < 1000 or session.pipeline_config.bitrate_kbps > 100000:
-            log.error("Invalid bitrate: %d kbps", session.pipeline_config.bitrate_kbps)
-            return False
-        if session.pipeline_config.input_framerate < 1 or session.pipeline_config.input_framerate > 120:
-            log.error("Invalid framerate: %d fps", session.pipeline_config.input_framerate)
+        # Validate the new configuration using the PipelineConfig.validate() method
+        is_valid, error_msg = session.pipeline_config.validate()
+        if not is_valid:
+            log.error("Invalid pipeline configuration: %s", error_msg)
             return False
 
         # Restart pipeline with new config
@@ -496,9 +543,8 @@ class CaptureToMoonlightManager:
             ])
 
             # Check if max sessions reached
-            max_sessions = 4  # Concurrent streams allowed
-            if active_sessions >= max_sessions:
-                log.debug("Capture card %s has reached max sessions (%d)", source_id, max_sessions)
+            if active_sessions >= MAX_CONCURRENT_SESSIONS:
+                log.debug("Capture card %s has reached max sessions (%d)", source_id, MAX_CONCURRENT_SESSIONS)
                 continue
 
             apps.append({
@@ -513,7 +559,7 @@ class CaptureToMoonlightManager:
                 ],
                 "fps": card.max_fps,
                 "current_session_count": active_sessions,
-                "max_sessions": max_sessions,
+                "max_sessions": MAX_CONCURRENT_SESSIONS,
             })
 
         return apps
@@ -538,12 +584,11 @@ class CaptureToMoonlightManager:
             s for s in self._capture_sessions.values()
             if s.capture_source_id == capture_source_id and s.active
         ])
-        max_sessions = 4  # Concurrent streams allowed
 
-        if active_sessions >= max_sessions:
+        if active_sessions >= MAX_CONCURRENT_SESSIONS:
             log.error(
                 "Cannot start capture session: max sessions (%d) reached for source %s",
-                max_sessions, capture_source_id
+                MAX_CONCURRENT_SESSIONS, capture_source_id
             )
             return False
 

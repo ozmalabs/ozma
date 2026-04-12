@@ -144,6 +144,50 @@ class PipelineConfig:
         with open(path, "w") as f:
             toml.dump(self.to_dict(), f)
 
+    def validate(self) -> tuple[bool, str | None]:
+        """Validate pipeline configuration.
+
+        Returns (is_valid, error_message).
+        """
+        # Validate input dimensions
+        if self.input_width < 160 or self.input_width > 7680:
+            return False, f"Invalid input width: {self.input_width} (must be 160-7680)"
+        if self.input_height < 120 or self.input_height > 4320:
+            return False, f"Invalid input height: {self.input_height} (must be 120-4320)"
+
+        # Validate framerate
+        if self.input_framerate < 1 or self.input_framerate > 240:
+            return False, f"Invalid framerate: {self.input_framerate} (must be 1-240)"
+
+        # Validate bitrate
+        if self.bitrate_kbps < 1000 or self.bitrate_kbps > 100000:
+            return False, f"Invalid bitrate: {self.bitrate_kbps} kbps (must be 1000-100000)"
+
+        # Validate encoder
+        valid_encoders = {"auto", "nvenc", "vaapi", "qsv", "software"}
+        if self.encoder not in valid_encoders:
+            return False, f"Invalid encoder: {self.encoder} (must be one of {valid_encoders})"
+
+        # Validate codec
+        valid_codecs = {"auto", "h264", "h265", "av1"}
+        if self.codec not in valid_codecs:
+            return False, f"Invalid codec: {self.codec} (must be one of {valid_codecs})"
+
+        # Validate quality preset
+        valid_presets = {"p1", "p2", "p3", "p4", "p5", "p6", "p7", "1", "2", "3", "4", "5", "6", "7", "ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"}
+        if self.quality_preset not in valid_presets:
+            return False, f"Invalid quality preset: {self.quality_preset}"
+
+        # Validate FEC percentage
+        if self.enable_fec and (self.fec_percentage < 5 or self.fec_percentage > 50):
+            return False, f"Invalid FEC percentage: {self.fec_percentage} (must be 5-50)"
+
+        # Validate RTP destination
+        if not self.rtp_destination:
+            return False, "RTP destination cannot be empty"
+
+        return True, None
+
 
 class GStreamerPipeline:
     """
