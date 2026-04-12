@@ -525,8 +525,113 @@ class MetricStore:
     def device_series_keys(self, device_id: str) -> list[str]:
         return [k for (did, k) in self._series if did == device_id]
 
+    def all_device_ids(self) -> list[str]:
+        return list({did for (did, _) in self._series})
+
     def to_dict(self) -> dict:
         return {
             "series_count": len(self._series),
             "retention": self._retention.to_dict(),
+        }
+
+
+# ── Measurement store (used by API monitoring endpoints) ─────────────────────
+
+@dataclass
+class MetricValue:
+    """A single named metric value with quality tag."""
+    key: str
+    value: float
+    quality: str = "assumed"
+    timestamp: float = field(default_factory=time.monotonic)
+    unit: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "key": self.key,
+            "value": self.value,
+            "quality": self.quality,
+            "timestamp": self.timestamp,
+            "unit": self.unit,
+        }
+
+
+@dataclass
+class DeviceFreshness:
+    """Freshness summary for a device's measurements."""
+    device_id: str
+    last_updated: float = field(default_factory=time.monotonic)
+    stale: bool = False
+    expired: bool = False
+    metric_count: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "device_id": self.device_id,
+            "last_updated": self.last_updated,
+            "stale": self.stale,
+            "expired": self.expired,
+            "metric_count": self.metric_count,
+        }
+
+
+class MeasurementStore:
+    """
+    Stores the latest measured metric values per device.
+
+    Used by the monitoring API endpoints to serve current device metrics
+    and freshness state without requiring a full time-series query.
+    """
+
+    _STALE_AFTER_S: float = 60.0
+    _EXPIRED_AFTER_S: float = 300.0
+
+    def __init__(self) -> None:
+        self._metrics: dict[str, dict[str, MetricValue]] = {}   # device_id → {key → value}
+        self._freshness: dict[str, DeviceFreshness] = {}
+
+    def record(
+        self,
+        device_id: str,
+        key: str,
+        value: float,
+        quality: str = "measured",
+        unit: str = "",
+        now: float | None = None,
+    ) -> None:
+        t = now or time.monotonic()
+        if device_id not in self._metrics:
+            self._metrics[device_id] = {}
+        self._metrics[device_id][key] = MetricValue(
+            key=key, value=value, quality=quality, timestamp=t, unit=unit
+        )
+        self._freshness[device_id] = DeviceFreshness(
+            device_id=device_id,
+            last_updated=t,
+            stale=False,
+            expired=False,
+            metric_count=len(self._metrics[device_id]),
+        )
+
+    def metrics_for_device(self, device_id: str) -> dict[str, MetricValue]:
+        return dict(self._metrics.get(device_id, {}))
+
+    def get_device_freshness(self, device_id: str, now: float | None = None) -> DeviceFreshness | None:
+        f = self._freshness.get(device_id)
+        if f is None:
+            return None
+        t = now or time.monotonic()
+        age = t - f.last_updated
+        f.stale = age > self._STALE_AFTER_S
+        f.expired = age > self._EXPIRED_AFTER_S
+        return f
+
+    def all_device_ids(self) -> list[str]:
+        return list(self._metrics.keys())
+
+    def to_dict(self) -> dict:
+        return {
+            "device_count": len(self._metrics),
+            "stale_threshold_s": self._STALE_AFTER_S,
+            "expired_threshold_s": self._EXPIRED_AFTER_S,
         }
