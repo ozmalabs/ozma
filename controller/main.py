@@ -207,6 +207,15 @@ async def run(config: Config) -> None:
     stream_router = StreamRouter(codec_manager=codec_mgr)
     guac_mgr = GuacamoleManager(state=state)
     provision_mgr = ProvisioningManager(state=state)
+    notifier = NotificationManager()
+    alert_mgr = AlertManager(state=state, kdeconnect=kdeconnect, notifier=notifier)
+    await alert_mgr.start()
+    doorbell_mgr = DoorbellManager(
+        state=state,
+        frigate_url=os.environ.get("OZMA_FRIGATE_URL", "http://localhost:5000"),
+        alert_mgr=alert_mgr,
+    )
+    await doorbell_mgr.start()
     controls = ControlManager(state, scenarios, audio, motion, doorbell=doorbell_mgr, alerts=alert_mgr)
 
     # Built-in hotkey surface: ScrollLock = next scenario, Pause = prev
@@ -310,15 +319,6 @@ async def run(config: Config) -> None:
     macro_mgr = MacroManager(state, paste_typer)
     sched = Scheduler(scenarios)
     await sched.start()
-    notifier = NotificationManager()
-    alert_mgr = AlertManager(state=state, kdeconnect=kdeconnect, notifier=notifier)
-    await alert_mgr.start()
-    doorbell_mgr = DoorbellManager(
-        state=state,
-        frigate_url=os.environ.get("OZMA_FRIGATE_URL", "http://localhost:5000"),
-        alert_mgr=alert_mgr,
-    )
-    await doorbell_mgr.start()
     recorder = SessionRecorder()
     net_health = NetworkHealthMonitor(state)
     metrics_collector = MetricsCollector(state)
@@ -454,7 +454,7 @@ async def run(config: Config) -> None:
         port=config.ssh_bastion_port,
     )
     ssh_bastion = SSHBastionServer(
-        bastion_cfg, state=state, audit=audit_log,
+        bastion_cfg, state=state, audit=None,
         auth_config=auth_cfg, user_manager=user_mgr,
     )
     await ssh_bastion.start()
@@ -499,7 +499,7 @@ async def run(config: Config) -> None:
 
     # License & SaaS management
     license_mgr = LicenseManager(
-        on_alert=notifier.send_event if notifier else None,
+        on_alert=notifier.on_event if notifier else None,
     )
     await license_mgr.start()
 
@@ -742,6 +742,14 @@ async def run(config: Config) -> None:
         from live_transcription import LiveTranscriptionManager
         transcription_mgr = LiveTranscriptionManager(connect=connect)
 
+    # WireGuard inter-controller peering (needs ctrl_id derived from mesh_ca)
+    _ctrl_id_for_wg = (
+        mesh_ca.controller_keypair.fingerprint()
+        if mesh_ca and mesh_ca.controller_keypair
+        else "ozma-controller"
+    )
+    wg_mgr = WGPeeringManager(controller_id=_ctrl_id_for_wg, api_port=config.api_port)
+
     # Build the FastAPI app — all managers must be created before this point
     app = build_app(state, scenarios, streams, audio, controls, rgb_out, motion, bt, kdeconnect, wifi_audio, captures, paste_typer, kbd_mgr, macro_mgr, sched, notifier, recorder, net_health, ocr_triggers, auto_engine, metrics_collector, screen_mgr, codec_mgr=codec_mgr, camera_mgr=camera_mgr, obs_studio=obs_studio, stream_router=stream_router, guac_mgr=guac_mgr, provision_mgr=provision_mgr, connect=connect, mesh_ca=mesh_ca, sess_mgr=sess_mgr, room_correction=room_corr, testbench=testbench, agent_engine=agent_engine, test_runner=test_runner, auth_config=auth_cfg, user_manager=user_mgr, service_proxy=svc_proxy, idp=idp_instance, sharing=sharing_mgr, ext_publish=ext_pub, node_reconciler=reconciler, update_mgr=update_mgr, transcription_mgr=transcription_mgr, discovery=discovery, doorbell_mgr=doorbell_mgr, alert_mgr=alert_mgr, vaultwarden=vault_mgr, email_security=email_sec, cloud_backup=cloud_backup, iot=iot_mgr, wg=wg_mgr, itsm=itsm_mgr, license_mgr=license_mgr, mdm=mdm_mgr, job_queue=job_queue, net_scan=net_scan_mgr, key_store=key_store, dlp=dlp_mgr, saas_mgr=saas_mgr, threat_intel=threat_intel, compliance=compliance_engine, cam_rec=cam_rec_mgr, wifi_ap=wifi_ap_mgr, router=router_mgr, backup_tracker=backup_tracker, mobile_cam=mob_cam, sunshine=sunshine_mgr, msp_mgr=msp_mgr, msp_portal=msp_portal_mgr, auto_configure=auto_configure_mgr, cam_connect=cam_connect_mgr, grid=grid_svc, parental=parental_mgr, backup_nudge=backup_nudge, dns_filter=dns_filter_mgr, local_proxy=local_proxy_mgr, file_sharing=file_sharing_mgr, zfs=zfs_mgr, failover=failover_mgr, ups_monitor=ups_monitor, ddns=ddns_mgr, speedtest=speedtest_mgr, dns_verifier=dns_verifier)
 
@@ -783,9 +791,11 @@ async def run(config: Config) -> None:
     )
     await discovery.announce_controller(ctrl_id, api_port=config.api_port)
 
-    # WireGuard inter-controller peering
-    wg_mgr = WGPeeringManager(controller_id=ctrl_id, api_port=config.api_port)
-    await wg_mgr.start()
+    # WireGuard inter-controller peering start
+    try:
+        await wg_mgr.start()
+    except Exception as e:
+        log.warning("WireGuard peering start failed (ip/wg not available?): %s", e)
 
     # Auto-link LAN peer controllers discovered via mDNS
     async def _on_peer_found(info: dict) -> None:

@@ -267,13 +267,16 @@ class WGPeeringManager:
 
     async def _run(self, *args: str) -> tuple[int, str, str]:
         """Run a command, return (returncode, stdout, stderr)."""
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        return proc.returncode, stdout.decode(), stderr.decode()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            return proc.returncode, stdout.decode(), stderr.decode()
+        except FileNotFoundError:
+            return 1, "", f"{args[0]}: command not found"
 
     async def _bring_up_interface(self) -> bool:
         """Create ozma-ctrl0 WireGuard interface and configure it."""

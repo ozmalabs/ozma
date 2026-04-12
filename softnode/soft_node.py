@@ -138,6 +138,7 @@ class SoftNode:
         qmp_input_path: str = "",         # Dedicated input QMP socket (recommended)
         power_backend: "PowerBackend | None" = None,  # libvirt/qmp power control
         vm_guest_ip: str | None = None,   # VM's actual guest IP (advertised via mDNS vm_ip TXT)
+        pci_devices: list[str] | None = None,  # PCI addresses passed through to this VM
     ) -> None:
         self._name = name
         self._host = host
@@ -151,6 +152,7 @@ class SoftNode:
         self._audio_sink = audio_sink
         self._api_port = api_port
         self._vm_guest_ip = vm_guest_ip
+        self._pci_devices: list[str] = pci_devices or []
         # Async D-Bus display client (fast input + framebuffer)
         self._dbus_client: DBusDisplayClient | None = None
         # Direct evdev for input-linux (kernel-level input)
@@ -918,6 +920,7 @@ class SoftNode:
                                    if self._virtual_capture and self._virtual_capture.device_path
                                    else "")),
             **({"vm_guest_ip": self._vm_guest_ip} if self._vm_guest_ip else {}),
+            **({"pci_devices": json.dumps(self._pci_devices)} if self._pci_devices else {}),
         }
         # Multi-display outputs
         if self._displays:
@@ -1433,6 +1436,8 @@ def main() -> None:
                    help="HTTP API port for power control (default: udp-port + 50)")
     p.add_argument("--vm-guest-ip", default=None,
                    help="VM's guest network IP (advertised via mDNS vm_ip TXT record)")
+    p.add_argument("--pci-passthrough", default="", metavar="PCI_ADDRS",
+                   help="Comma-separated PCI addresses passed through to this VM (e.g. 0000:31:00.0,0000:31:00.1)")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args()
 
@@ -1442,6 +1447,7 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
+    pci_list = [p.strip() for p in args.pci_passthrough.split(",") if p.strip()]
     node = SoftNode(args.name, args.host, args.port,
                     qmp_path=args.qmp,
                     vnc_host=args.vnc_host, vnc_port=args.vnc_port,
@@ -1449,7 +1455,8 @@ def main() -> None:
                     capture_device=args.capture_device,
                     audio_sink=args.audio_sink, api_port=args.api_port,
                     qmp_input_path=args.qmp_input,
-                    vm_guest_ip=args.vm_guest_ip)
+                    vm_guest_ip=args.vm_guest_ip,
+                    pci_devices=pci_list or None)
 
     async def run() -> None:
         loop = asyncio.get_running_loop()

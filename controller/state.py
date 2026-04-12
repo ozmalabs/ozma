@@ -79,6 +79,9 @@ class NodeInfo:
     # host machine IP that mDNS resolves to.  Used by tests and the fleet UI to
     # identify which VM a soft node belongs to.
     vm_guest_ip: str | None = None
+    # PCI devices passed through to this node's VM (GPU passthrough etc.)
+    # Format: ["0000:31:00.0", "0000:31:00.1"]
+    pci_devices: list[str] = field(default_factory=list)
 
     @property
     def stream_url(self) -> str | None:
@@ -144,6 +147,8 @@ class NodeInfo:
             # Expose guest IP as "host" so consumers see the VM's IP, not the
             # host machine IP used internally for HID routing.
             d["host"] = self.vm_guest_ip
+        if self.pci_devices:
+            d["pci_devices"] = self.pci_devices
         return d
 
 
