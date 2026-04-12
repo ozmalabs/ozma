@@ -123,10 +123,10 @@ XBOX_AXIS_MAP = {
 }
 
 PLAYSTATION_BUTTON_MAP = {
-    0: ecodes.BTN_CROSS,    # Cross
-    1: ecodes.BTN_CIRCLE,   # Circle
-    2: ecodes.BTN-square,   # Square
-    3: ecodes.BTN_TRIANGLE, # Triangle
+    0: ecodes.BTN_SOUTH,    # Cross (A equivalent)
+    1: ecodes.BTN_EAST,     # Circle (B equivalent)
+    2: ecodes.BTN_WEST,     # Square (X equivalent)
+    3: ecodes.BTN_NORTH,    # Triangle (Y equivalent)
     4: ecodes.BTN_TL,       # L1
     5: ecodes.BTN_TR,       # R1
     6: ecodes.BTN_SELECT,   # Share
