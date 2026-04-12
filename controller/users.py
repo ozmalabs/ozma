@@ -11,6 +11,7 @@ Persistence: ``users.json`` next to main.py (same pattern as scenarios.json).
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
@@ -116,6 +117,7 @@ class UserManager:
 
     def __init__(self, path: Path) -> None:
         self._path = path
+        self._lock_path = path.with_suffix(".json.lock")
         self._users: dict[str, User] = {}       # keyed by user.id
         self._zone: Zone | None = None
         self._load()
@@ -145,6 +147,7 @@ class UserManager:
             log.warning("Failed to load users: %s", e)
 
     def _save(self) -> None:
+        """Save users to JSON file with file locking to prevent race conditions."""
         data: dict[str, Any] = {
             "users": [u.to_storage() for u in self._users.values()],
         }
@@ -155,6 +158,30 @@ class UserManager:
         os.chmod(tmp, 0o600)
         tmp.replace(self._path)
 
+    def _acquire_lock(self, timeout: float = 30.0) -> int:
+        """Acquire an exclusive lock on the users file.
+        
+        Uses fcntl.flock with non-blocking mode and retry.
+        Returns the file descriptor on success.
+        Raises TimeoutError if lock cannot be acquired within timeout.
+        """
+        lock_fd = os.open(str(self._lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        start_time = time.time()
+        while True:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return lock_fd
+            except (IOError, OSError):
+                if time.time() - start_time >= timeout:
+                    os.close(lock_fd)
+                    raise TimeoutError("Could not acquire lock within timeout")
+                time.sleep(0.05)  # Small delay before retry
+
+    def _release_lock(self, lock_fd: int) -> None:
+        """Release the lock and close the file descriptor."""
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
     # ── User CRUD ────────────────────────────────────────────────────
 
     def create_user(self, username: str, display_name: str,
@@ -162,42 +189,54 @@ class UserManager:
                     role: str = "owner",
                     connect_account_id: str = "") -> User:
         """Create a new user.  Raises ValueError if username is taken."""
-        if any(u.username == username for u in self._users.values()):
-            raise ValueError(f"Username already taken: {username}")
-        user = User(
-            id=str(uuid.uuid4()),
-            username=username,
-            display_name=display_name,
-            email=email,
-            connect_account_id=connect_account_id,
-            role=role,
-            password_hash=hash_password(password) if password else "",
-            created_at=time.time(),
-            last_seen=time.time(),
-        )
-        self._users[user.id] = user
-        self._save()
-        log.info("Created user %s (%s)", user.username, user.id)
-        return user
+        # Acquire exclusive lock for atomic check-and-save
+        lock_fd = self._acquire_lock()
+        try:
+            # Re-check for duplicate after acquiring lock (in case it was added)
+            if any(u.username == username for u in self._users.values()):
+                raise ValueError(f"Username already taken: {username}")
+            user = User(
+                id=str(uuid.uuid4()),
+                username=username,
+                display_name=display_name,
+                email=email,
+                connect_account_id=connect_account_id,
+                role=role,
+                password_hash=hash_password(password) if password else "",
+                created_at=time.time(),
+                last_seen=time.time(),
+            )
+            self._users[user.id] = user
+            self._save()
+            log.info("Created user %s (%s)", user.username, user.id)
+            return user
+        finally:
+            self._release_lock(lock_fd)
 
     def create_user_with_hash(self, username: str, display_name: str,
                               password_hash: str, role: str = "owner") -> User:
         """Create a user with a pre-hashed password (for migration)."""
-        if any(u.username == username for u in self._users.values()):
-            raise ValueError(f"Username already taken: {username}")
-        user = User(
-            id=str(uuid.uuid4()),
-            username=username,
-            display_name=display_name,
-            role=role,
-            password_hash=password_hash,
-            created_at=time.time(),
-            last_seen=time.time(),
-        )
-        self._users[user.id] = user
-        self._save()
-        log.info("Created user %s (%s) [migrated]", user.username, user.id)
-        return user
+        # Acquire exclusive lock for atomic check-and-save
+        lock_fd = self._acquire_lock()
+        try:
+            # Re-check for duplicate after acquiring lock (in case it was added)
+            if any(u.username == username for u in self._users.values()):
+                raise ValueError(f"Username already taken: {username}")
+            user = User(
+                id=str(uuid.uuid4()),
+                username=username,
+                display_name=display_name,
+                role=role,
+                password_hash=password_hash,
+                created_at=time.time(),
+                last_seen=time.time(),
+            )
+            self._users[user.id] = user
+            self._save()
+            log.info("Created user %s (%s) [migrated]", user.username, user.id)
+            return user
+        finally:
+            self._release_lock(lock_fd)
 
     def get_user(self, user_id: str) -> User | None:
         return self._users.get(user_id)
@@ -213,41 +252,53 @@ class UserManager:
 
     def update_user(self, user_id: str, **kwargs: Any) -> User | None:
         """Update user fields.  Accepts: display_name, email, role, password."""
-        user = self._users.get(user_id)
-        if not user:
-            return None
-        if "display_name" in kwargs:
-            user.display_name = kwargs["display_name"]
-        if "email" in kwargs:
-            user.email = kwargs["email"]
-        if "role" in kwargs:
-            user.role = kwargs["role"]
-        if "password" in kwargs and kwargs["password"]:
-            user.password_hash = hash_password(kwargs["password"])
-        if "connect_account_id" in kwargs:
-            user.connect_account_id = kwargs["connect_account_id"]
-        self._save()
-        return user
+        lock_fd = self._acquire_lock()
+        try:
+            user = self._users.get(user_id)
+            if not user:
+                return None
+            if "display_name" in kwargs:
+                user.display_name = kwargs["display_name"]
+            if "email" in kwargs:
+                user.email = kwargs["email"]
+            if "role" in kwargs:
+                user.role = kwargs["role"]
+            if "password" in kwargs and kwargs["password"]:
+                user.password_hash = hash_password(kwargs["password"])
+            if "connect_account_id" in kwargs:
+                user.connect_account_id = kwargs["connect_account_id"]
+            self._save()
+            return user
+        finally:
+            self._release_lock(lock_fd)
 
     def delete_user(self, user_id: str) -> bool:
         """Remove a user.  Returns True if the user existed."""
-        user = self._users.pop(user_id, None)
-        if user:
-            self._save()
-            log.info("Deleted user %s (%s)", user.username, user.id)
-            return True
-        return False
+        lock_fd = self._acquire_lock()
+        try:
+            user = self._users.pop(user_id, None)
+            if user:
+                self._save()
+                log.info("Deleted user %s (%s)", user.username, user.id)
+                return True
+            return False
+        finally:
+            self._release_lock(lock_fd)
 
     def authenticate(self, username: str, password: str) -> User | None:
         """Verify username + password.  Returns the User on success, None on failure."""
-        user = self.get_by_username(username)
-        if not user or not user.password_hash:
+        lock_fd = self._acquire_lock()
+        try:
+            user = self.get_by_username(username)
+            if not user or not user.password_hash:
+                return None
+            if verify_password(password, user.password_hash):
+                user.last_seen = time.time()
+                self._save()
+                return user
             return None
-        if verify_password(password, user.password_hash):
-            user.last_seen = time.time()
-            self._save()
-            return user
-        return None
+        finally:
+            self._release_lock(lock_fd)
 
     # ── Zone ─────────────────────────────────────────────────────────
 
@@ -256,8 +307,12 @@ class UserManager:
         return self._zone
 
     def set_zone(self, zone: Zone) -> None:
-        self._zone = zone
-        self._save()
+        lock_fd = self._acquire_lock()
+        try:
+            self._zone = zone
+            self._save()
+        finally:
+            self._release_lock(lock_fd)
 
     # ── Connect sync (stubs) ─────────────────────────────────────────
 

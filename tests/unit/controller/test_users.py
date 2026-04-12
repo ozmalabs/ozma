@@ -109,3 +109,93 @@ class TestPersistence:
         assert user_mgr.user_count == 1
         user_mgr.create_user("b", "B")
         assert user_mgr.user_count == 2
+
+
+class TestConcurrentAccess:
+    """Tests for concurrent user creation - race condition prevention."""
+
+    def test_concurrent_create_users_same_username(self, tmp_path):
+        """Test that concurrent attempts to create the same username raise ValueError for all but one."""
+        from users import UserManager
+        import threading
+        import time
+
+        manager = UserManager(tmp_path / "users_concurrent.json")
+        errors = []
+        success_count = [0]
+
+        def create_user_task(username, results):
+            try:
+                u = manager.create_user(username, username, password="test")
+                results.append(("success", u.username))
+            except ValueError as e:
+                results.append(("valueerror", str(e)))
+            except Exception as e:
+                errors.append(str(e))
+
+        # Launch 10 threads trying to create the same user
+        threads = []
+        results = []
+        for i in range(10):
+            t = threading.Thread(target=create_user_task, args=("alice", results))
+            threads.append(t)
+
+        # Start all threads at approximately the same time
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # Check that no exceptions other than ValueError occurred
+        assert len(errors) == 0, f"Unexpected errors: {errors}"
+
+        # Count successes - exactly one should succeed
+        successes = [r for r in results if r[0] == "success"]
+        assert len(successes) == 1, f"Expected 1 success, got {len(successes)}: {successes}"
+
+        # Count ValueError exceptions - the rest should fail with ValueError
+        valueerrors = [r for r in results if r[0] == "valueerror"]
+        assert len(valueerrors) == 9, f"Expected 9 ValueErrors, got {len(valueerrors)}"
+
+        # Verify only one user exists
+        assert manager.user_count == 1
+        assert manager.get_by_username("alice") is not None
+
+    def test_concurrent_create_users_different_usernames(self, tmp_path):
+        """Test that concurrent attempts to create different usernames all succeed."""
+        from users import UserManager
+        import threading
+
+        manager = UserManager(tmp_path / "users_concurrent2.json")
+        errors = []
+        success_count = [0]
+        lock = threading.Lock()
+
+        def create_user_task(username):
+            try:
+                u = manager.create_user(username, username, password="test")
+                with lock:
+                    success_count[0] += 1
+            except Exception as e:
+                with lock:
+                    errors.append(f"{username}: {e}")
+
+        # Launch 10 threads trying to create different users
+        threads = []
+        for i in range(10):
+            username = f"user_{i}"
+            t = threading.Thread(target=create_user_task, args=(username,))
+            threads.append(t)
+
+        # Start all threads at approximately the same time
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # Check that no exceptions occurred
+        assert len(errors) == 0, f"Unexpected errors: {errors}"
+        assert success_count[0] == 10, f"Expected 10 successes, got {success_count[0]}"
+
+        # Verify all users were created
+        assert manager.user_count == 10
