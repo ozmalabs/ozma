@@ -514,6 +514,51 @@ class DisplayCaptureManager:
 
         return _gen()
 
+    async def _read_mjpeg(self, source: DisplaySource) -> None:
+        """Read and parse MJPEG frames from ffmpeg stdout."""
+        if not source.proc or not source.proc.stdout:
+            return
+
+        buf = bytearray()
+        while source.active:
+            try:
+                chunk = await source.proc.stdout.read(4096)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+
+                while True:
+                    start = buf.find(b'\xff\xd8')
+                    if start == -1:
+                        # No SOI found, keep last few bytes in case it spans a chunk boundary
+                        if len(buf) > 3:
+                            del buf[:-3]
+                        break
+
+                    end = buf.find(b'\xff\xd9', start)
+                    if end == -1:
+                        # No EOI found, wait for more data.
+                        # If buffer is huge, something is wrong. Trim to recover.
+                        if len(buf) > 2 * 1024 * 1024:  # 2MB safety limit
+                            log.warning("MJPEG buffer for %s is too large, trimming.", source.id)
+                            del buf[:start]
+                        break
+
+                    # We have a full frame
+                    frame = buf[start:end+2]
+                    source._mjpeg_frame = bytes(frame)
+                    source._mjpeg_event.set()
+
+                    # Remove frame from buffer
+                    del buf[:end+2]
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                if source.active:
+                    log.warning("MJPEG reader for %s failed: %s", source.id, e)
+                break
+
     # ── Internal pipeline ────────────────────────────────────────────────────
 
     async def _start_capture(self, source: DisplaySource) -> None:
@@ -581,10 +626,20 @@ class DisplayCaptureManager:
             str(manifest),
         ])
 
+        # MJPEG output to stdout
+        # Map 1-100 quality (higher is better) to ffmpeg's 1-255 inverse scale
+        q_val = max(1, min(255, int((100 - MJPEG_QUALITY) / 100 * 254 + 1)))
+        cmd.extend([
+            "-c:v", "mjpeg",
+            "-q:v", str(q_val),
+            "-f", "mjpeg",
+            "-"  # stdout
+        ])
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             source.proc = proc
@@ -592,9 +647,12 @@ class DisplayCaptureManager:
             log.info("Capture started: %s (%s → %s, pid %d)",
                      source.id, card.path, enc.name, proc.pid)
 
-            # Monitor stderr in background
+            # Monitor stderr and stdout in background
             asyncio.create_task(
                 self._monitor_stderr(source), name=f"capture-log-{source.id}"
+            )
+            asyncio.create_task(
+                self._read_mjpeg(source), name=f"mjpeg-reader-{source.id}"
             )
         except Exception as e:
             log.error("Failed to start capture %s: %s", source.id, e)
