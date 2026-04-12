@@ -13,6 +13,7 @@ const Streaming  = lazy(() => import('./pages/Streaming'))
 const Controls   = lazy(() => import('./pages/Controls'))
 const RGB        = lazy(() => import('./pages/RGB'))
 const Settings   = lazy(() => import('./pages/Settings'))
+const Streams    = lazy(() => import('./pages/StreamsPage'))
 
 function PageFallback() {
   return (
@@ -45,6 +46,7 @@ export default function App() {
                     <Route path="/streaming" element={<Streaming />} />
                     <Route path="/controls"  element={<Controls />} />
                     <Route path="/rgb"       element={<RGB />} />
+                    <Route path="/streams"   element={<Streams />} />
                     <Route path="/settings"  element={<Settings />} />
                     <Route path="*"          element={<Navigate to="/" replace />} />
                   </Routes>

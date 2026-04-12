@@ -11,6 +11,7 @@ const NAV_ITEMS: NavItem[] = [
   { to: '/nodes',     label: 'Nodes' },
   { to: '/scenarios', label: 'Scenarios' },
   { to: '/streaming', label: 'Streaming' },
+  { to: '/streams',   label: 'Streams & Cameras' },
   { to: '/audio',     label: 'Audio' },
   { to: '/rgb',       label: 'RGB' },
   { to: '/controls',  label: 'Controls' },
