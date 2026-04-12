@@ -58,14 +58,17 @@ MAX_CONTEXT   = 200    # chars of redacted context to store per match
 # ── Built-in patterns ─────────────────────────────────────────────────────────
 
 _BUILTIN_PATTERNS: dict[str, str] = {
+    # Credit card: matches both compact (4111111111111111) and formatted (4111-1111-1111-1111)
+    # Luhn validation applied on top (validate=True by default in built-in rules).
     "credit_card": (
-        r"\b(?:4[0-9]{12}(?:[0-9]{3})?|"           # Visa
-        r"5[1-5][0-9]{14}|"                          # Mastercard
-        r"3[47][0-9]{13}|"                           # Amex
-        r"3(?:0[0-5]|[68][0-9])[0-9]{11}|"          # Diners
-        r"6(?:011|5[0-9]{2})[0-9]{12}|"             # Discover
-        r"(?:2131|1800|35\d{3})\d{11})"             # JCB
-        r"\b"
+        r"\b(?:"
+        r"4[0-9]{3}[\s\-]?[0-9]{4}[\s\-]?[0-9]{4}[\s\-]?[0-9]{1,4}|"  # Visa
+        r"5[1-5][0-9]{2}[\s\-]?[0-9]{4}[\s\-]?[0-9]{4}[\s\-]?[0-9]{4}|"  # Mastercard
+        r"3[47][0-9]{2}[\s\-]?[0-9]{6}[\s\-]?[0-9]{5}|"                  # Amex
+        r"3(?:0[0-5]|[68][0-9])[0-9]{2}[\s\-]?[0-9]{6}[\s\-]?[0-9]{4}|"  # Diners
+        r"6(?:011|5[0-9]{2})[0-9]{2}[\s\-]?[0-9]{4}[\s\-]?[0-9]{4}[\s\-]?[0-9]{4}|"  # Discover
+        r"(?:2131|1800|35\d{3})[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{3}"    # JCB
+        r")\b"
     ),
     "ssn": (
         r"\b(?!000|666|9\d\d)\d{3}"
