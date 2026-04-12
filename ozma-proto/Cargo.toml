@@ -1,15 +1,12 @@
 [package]
-name = "ozma-proto"
-version = "0.1.0"
-edition = "2021"
-description = "Shared wire-format types for ozma: HID reports and VBAN audio frames"
-license = "MIT"
+name        = "ozma-proto"
+version     = "0.1.0"
+edition     = "2021"
+description = "Shared wire-format types for ozma: HID reports and VBAN audio frames."
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
+serde    = { version = "1", features = ["derive"] }
 zerocopy = { version = "0.7", features = ["derive"] }
-bytemuck = { version = "1", features = ["derive"] }
-thiserror = "1"
 
 [dev-dependencies]
 serde_json = "1"
