@@ -27,7 +27,10 @@ export default function ProtectedRoute({ children, requiredRoles = [] }: Protect
     return <Navigate to="/login" state={{ from: location }} replace />
   }
 
-  if (requiredRoles.length > 0 && user) {
+  if (requiredRoles.length > 0) {
+    if (!user) {
+      return <Navigate to="/login" state={{ from: location }} replace />
+    }
     const hasAccess = requiredRoles.some((role) => user.roles.includes(role))
     if (!hasAccess) {
       return <Navigate to="/nodes" replace />
