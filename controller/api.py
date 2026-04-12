@@ -144,9 +144,6 @@ class SelectOutputRequest(BaseModel):
     output_id: str
 
 
-class OutputDelayRequest(BaseModel):
-    output_id: str
-    delay_ms: float
 
 
 class DirectRegisterRequest(BaseModel):
@@ -2375,6 +2372,35 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             "channels": 2,
         }
 
+    @app.post("/api/v1/audio/vban")
+    async def set_vban_config(request: Request, body: dict) -> dict[str, Any]:
+        """Enable or update VBAN for a node."""
+        _require_scope(request, SCOPE_WRITE)
+        node_id = body.get("node_id")
+        port = body.get("port")
+        enabled = body.get("enabled", True)
+        if not node_id:
+            raise HTTPException(400, "node_id is required")
+        node = state.nodes.get(node_id)
+        if not node:
+            raise HTTPException(404, "Node not found")
+
+        if enabled:
+            if port is None:
+                raise HTTPException(400, "port is required to enable VBAN")
+            node.audio_vban_port = int(port)
+        else:
+            node.audio_vban_port = None
+
+        await state.events.put({
+            "type": "node.vban_config_changed",
+            "node_id": node_id,
+            "port": node.audio_vban_port,
+            "enabled": enabled,
+        })
+
+        return {"ok": True, "node_id": node_id, "port": node.audio_vban_port, "enabled": bool(node.audio_vban_port)}
+
     # --- KVM input proxy (dashboard → soft node API) ---
 
     async def _proxy_to_node(node_id: str, path: str, body: dict) -> dict:
@@ -2597,16 +2623,17 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(status_code=404, detail=f"Output '{req.output_id}' not found")
         return {"ok": True, "output_id": req.output_id}
 
-    @app.post("/api/v1/audio/outputs/delay")
-    async def set_audio_output_delay(request: Request, req: OutputDelayRequest) -> dict[str, Any]:
+    @app.put("/api/v1/audio/outputs/{output_id}/delay")
+    async def set_audio_output_delay(request: Request, output_id: str, body: dict) -> dict[str, Any]:
         """Set time-alignment delay (ms) on an audio output."""
         _require_scope(request, SCOPE_WRITE)
         if not audio:
             raise HTTPException(status_code=503, detail="Audio routing disabled")
-        ok = await audio.outputs.set_delay(req.output_id, req.delay_ms)
+        delay_ms = float(body.get("delay_ms", 0.0))
+        ok = await audio.outputs.set_delay(output_id, delay_ms)
         if not ok:
-            raise HTTPException(status_code=404, detail=f"Output '{req.output_id}' not found")
-        return {"ok": True, "output_id": req.output_id, "delay_ms": req.delay_ms}
+            raise HTTPException(status_code=404, detail=f"Output '{output_id}' not found")
+        return {"ok": True, "output_id": output_id, "delay_ms": delay_ms}
 
     # --- RGB zone endpoints ---
 
@@ -3888,9 +3915,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             "ndi_available": codec_mgr.ndi_available,
         }
 
-    @app.post("/api/v1/codecs/config")
+    @app.put("/api/v1/codecs")
     async def set_codec_config(request: Request, body: dict = {}) -> dict[str, Any]:
-        """Set codec configuration for a source."""
+        """Set or update codec configuration for a source."""
         _require_scope(request, SCOPE_WRITE)
         if not codec_mgr:
             raise HTTPException(status_code=503, detail="Codec manager not available")
@@ -8884,6 +8911,32 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if not _cr().remove_policy(policy_id):
             raise HTTPException(404, "Policy not found")
         return {"deleted": policy_id}
+
+    @app.post("/api/v1/recording/start")
+    async def recording_start(request: Request) -> dict[str, Any]:
+        """Start a recording job based on a policy."""
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        policy_id = body.get("policy_id")
+        if not policy_id:
+            raise HTTPException(400, "policy_id is required")
+        job = await _cr().start_recording(policy_id)
+        if not job:
+            raise HTTPException(500, "Failed to start recording")
+        return {"ok": True, "job": job.to_dict()}
+
+    @app.post("/api/v1/recording/stop")
+    async def recording_stop(request: Request) -> dict[str, Any]:
+        """Stop an active recording job."""
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        job_id = body.get("job_id")
+        if not job_id:
+            raise HTTPException(400, "job_id is required")
+        ok = await _cr().stop_recording(job_id)
+        if not ok:
+            raise HTTPException(404, "Recording job not found or already stopped")
+        return {"ok": True}
 
     # ── Node Backup Status ───────────────────────────────────────────────────
 
