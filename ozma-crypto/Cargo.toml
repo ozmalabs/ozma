@@ -1,10 +1,36 @@
 [package]
-name    = "ozma-crypto"
-version = "0.1.0"
-edition = "2021"
+name        = "ozma-crypto"
+version     = "0.1.0"
+edition     = "2021"
+description = "Encrypted transport layer for Ozma — XChaCha20-Poly1305 AEAD, HKDF key derivation, replay protection."
+license     = "AGPL-3.0-only"
+
+# no_std compatible (requires alloc)
+[features]
+default = ["std"]
+std     = []
 
 [dependencies]
-chacha20poly1305 = { version = "0.10", features = ["std"] }
-thiserror        = { workspace = true }
-bytes            = { workspace = true }
-rand             = "0.8"
+# AEAD: XChaCha20-Poly1305 (RustCrypto)
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["xchacha20poly1305", "alloc"] }
+
+# Key derivation
+hkdf = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
+
+# X25519 DH key exchange
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
+
+# Ed25519 signing
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "zeroize"] }
+
+# Random number generation
+rand_core = { version = "0.6", default-features = false }
+
+# Zeroize sensitive key material on drop
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+hex-literal = "0.4"
+rand        = "0.8"
