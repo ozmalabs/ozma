@@ -443,6 +443,17 @@ class DisplayCaptureManager:
     def get_source(self, source_id: str) -> DisplaySource | None:
         return self._sources.get(source_id)
 
+    def get_sources(self) -> dict[str, DisplaySource]:
+        """Get all capture sources."""
+        return dict(self._sources)
+
+    def get_source_for_card(self, card_path: str) -> DisplaySource | None:
+        """Find source by V4L2 device path."""
+        for s in self._sources.values():
+            if s.card.path == card_path:
+                return s
+        return None
+
     async def register_virtual_capture(self, source_id: str, device_path: str,
                                         name: str = "", width: int = 1024,
                                         height: int = 768, fps: int = 20) -> bool:

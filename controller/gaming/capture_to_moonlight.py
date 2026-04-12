@@ -203,90 +203,86 @@ class CaptureToMoonlightManager:
             log.error("Capture card device not available: %s", card.path)
             return None
 
-        # Create Moonlight session
+        # Track resources for cleanup on failure
+        resources_created = []
+
         try:
+            # Create Moonlight session
             moonlight_session = await self._moonlight.create_session(client_id)
-        except Exception as e:
-            log.error("Failed to create Moonlight session for %s: %s", client_id, e)
-            return None
+            resources_created.append(("moonlight_session", moonlight_session.session_id))
 
-        # Create pipeline config based on capture card capabilities
-        pipeline_config = PipelineConfig(
-            name=f"capture-{capture_source_id}",
-            input_source="v4l2",
-            input_device=card.path,
-            input_width=card.max_width,
-            input_height=card.max_height,
-            input_framerate=min(card.max_fps, 60),
-            encoder="auto",
-            codec="h264",
-            bitrate_kbps=10000,
-            rtp_destination="127.0.0.1",
-            rtp_port=moonlight_session.stream_port,
-            rtcp_port=moonlight_session.control_port,
-            enable_fec=True,
-            gamescope_enabled=False,
-        )
+            # Create pipeline config based on capture card capabilities
+            pipeline_config = PipelineConfig(
+                name=f"capture-{capture_source_id}",
+                input_source="v4l2",
+                input_device=card.path,
+                input_width=card.max_width,
+                input_height=card.max_height,
+                input_framerate=min(card.max_fps, 60),
+                encoder="auto",
+                codec="h264",
+                bitrate_kbps=10000,
+                rtp_destination="127.0.0.1",
+                rtp_port=moonlight_session.stream_port,
+                rtcp_port=moonlight_session.control_port,
+                enable_fec=True,
+                gamescope_enabled=False,
+            )
 
-        # Create GStreamer pipeline
-        try:
+            # Create GStreamer pipeline
             pipeline = await self._pipeline_manager.create_pipeline(
                 moonlight_session.session_id,
                 pipeline_config,
             )
+            resources_created.append(("pipeline", moonlight_session.session_id))
+
             # Validate that pipeline actually started
             if not pipeline._running:
                 log.error("GStreamer pipeline failed to start for session %s", moonlight_session.session_id)
-                await self._pipeline_manager.remove_pipeline(moonlight_session.session_id)
-                await self._moonlight.end_session(moonlight_session.session_id)
-                return None
-        except Exception as e:
-            log.error("Failed to create GStreamer pipeline: %s", e)
-            # Clean up Moonlight session
-            try:
-                await self._moonlight.end_session(moonlight_session.session_id)
-            except Exception:
-                pass
-            return None
+                raise RuntimeError("Pipeline failed to start")
 
-        # Create input handler
-        try:
+            # Create input handler
             input_handler = MoonlightInputHandler(client_id)
             await input_handler.start()
-        except Exception as e:
-            log.error("Failed to create input handler: %s", e)
-            # Clean up pipeline and Moonlight session
-            try:
-                await self._pipeline_manager.remove_pipeline(moonlight_session.session_id)
-            except Exception:
-                pass
-            try:
-                await self._moonlight.end_session(moonlight_session.session_id)
-            except Exception:
-                pass
-            return None
+            resources_created.append(("input_handler", client_id))
 
-        # Register with Moonlight protocol
-        try:
+            # Register with Moonlight protocol
             await self._moonlight.register_input_handler(
                 moonlight_session.session_id,
                 lambda report: self._handle_input_report(report, input_handler),
             )
+            resources_created.append(("input_handler_registered", moonlight_session.session_id))
+
         except Exception as e:
-            log.error("Failed to register input handler: %s", e)
-            # Clean up everything
-            try:
-                await input_handler.stop()
-            except Exception:
-                pass
-            try:
-                await self._pipeline_manager.remove_pipeline(moonlight_session.session_id)
-            except Exception:
-                pass
-            try:
-                await self._moonlight.end_session(moonlight_session.session_id)
-            except Exception:
-                pass
+            log.error("Failed to create capture session: %s", e)
+
+            # Clean up in reverse order
+            for resource_type, resource_id in reversed(resources_created):
+                try:
+                    if resource_type == "input_handler_registered":
+                        # Registration doesn't need explicit cleanup
+                        pass
+                    elif resource_type == "input_handler":
+                        # Stop input handler
+                        pass  # Will be cleaned up below
+                    elif resource_type == "pipeline":
+                        await self._pipeline_manager.remove_pipeline(resource_id)
+                    elif resource_type == "moonlight_session":
+                        await self._moonlight.end_session(resource_id)
+                except Exception:
+                    pass
+
+            # Clean up input handler if it was created
+            if "input_handler" in [r[0] for r in resources_created]:
+                client_id_from_resources = [r[1] for r in resources_created if r[0] == "input_handler"]
+                if client_id_from_resources:
+                    try:
+                        # Try to find and stop the input handler
+                        if client_id_from_resources[0] in self._input_handlers:
+                            await self._input_handlers[client_id_from_resources[0]].stop()
+                    except Exception:
+                        pass
+
             return None
 
         # Create session
@@ -366,16 +362,21 @@ class CaptureToMoonlightManager:
         )
 
     def _encode_report(self, report: InputReport) -> bytes:
-        """Encode input report to Moonlight protocol format."""
-        # Simplified encoding - in production, use proper Moonlight protocol
+        """Encode input report to Moonlight protocol format.
+
+        Uses the same format as ENETControlChannel.encode_input_report
+        from moonlight_protocol.py for compatibility.
+        """
+        # Use JSON encoding to match the Moonlight protocol
+        # Format: {"keyboard": ..., "mouse": ..., "gamepad": ..., "touch": ...}
         import json
-        return json.dumps({
+        data = {
             "keyboard": report.keyboard,
             "mouse": report.mouse,
             "gamepad": report.gamepad,
             "touch": report.touch,
-            "haptics": report.haptics,
-        }).encode()
+        }
+        return json.dumps(data).encode()
 
     async def update_pipeline_config(
         self,
@@ -390,10 +391,31 @@ class CaptureToMoonlightManager:
         if not session.pipeline_config:
             return False
 
-        # Update config
+        # Validate and update config
+        valid_fields = {
+            "name", "input_source", "input_device", "input_format",
+            "input_width", "input_height", "input_framerate",
+            "encoder", "codec", "bitrate_kbps", "gop_size", "quality_preset",
+            "rtp_destination", "rtp_port", "rtcp_port", "enable_fec", "fec_percentage",
+            "gamescope_enabled", "gamescope_xwayland", "gamescope_fsr",
+            "gamescope_fsr_mode", "gamescope_hdr", "dmabuf_zero_copy"
+        }
         for key, value in kwargs.items():
-            if hasattr(session.pipeline_config, key):
+            if key in valid_fields:
                 setattr(session.pipeline_config, key, value)
+            else:
+                log.warning("Unknown pipeline config field: %s", key)
+
+        # Validate required fields after update
+        if session.pipeline_config.input_width <= 0 or session.pipeline_config.input_height <= 0:
+            log.error("Invalid resolution: %dx%d", session.pipeline_config.input_width, session.pipeline_config.input_height)
+            return False
+        if session.pipeline_config.bitrate_kbps < 1000 or session.pipeline_config.bitrate_kbps > 100000:
+            log.error("Invalid bitrate: %d kbps", session.pipeline_config.bitrate_kbps)
+            return False
+        if session.pipeline_config.input_framerate < 1 or session.pipeline_config.input_framerate > 120:
+            log.error("Invalid framerate: %d fps", session.pipeline_config.input_framerate)
+            return False
 
         # Restart pipeline with new config
         if session.pipeline:
@@ -408,7 +430,8 @@ class CaptureToMoonlightManager:
     def list_capture_sources(self) -> list[dict[str, Any]]:
         """List all available capture sources."""
         sources = []
-        for source_id, display_source in self._display_capture._sources.items():
+        sources_dict = self._display_capture.get_sources()
+        for source_id, display_source in sources_dict.items():
             sources.append({
                 "capture_source_id": source_id,
                 "name": display_source.card.name if display_source.card else "Unknown",
@@ -453,7 +476,8 @@ class CaptureToMoonlightManager:
         Only includes cards that are available and can be used for streaming.
         """
         apps = []
-        for source_id, display_source in self._display_capture._sources.items():
+        sources_dict = self._display_capture.get_sources()
+        for source_id, display_source in sources_dict.items():
             card = display_source.card
             if not card:
                 continue
@@ -470,6 +494,12 @@ class CaptureToMoonlightManager:
                 if s.capture_source_id == source_id and s.active
             ])
 
+            # Check if max sessions reached
+            max_sessions = 4  # Concurrent streams allowed
+            if active_sessions >= max_sessions:
+                log.debug("Capture card %s has reached max sessions (%d)", source_id, max_sessions)
+                continue
+
             apps.append({
                 "id": f"capture:{source_id}",
                 "name": f"HDMI Capture: {card.name}",
@@ -482,7 +512,7 @@ class CaptureToMoonlightManager:
                 ],
                 "fps": card.max_fps,
                 "current_session_count": active_sessions,
-                "max_sessions": 4,  # Concurrent streams allowed
+                "max_sessions": max_sessions,
             })
 
         return apps
@@ -501,6 +531,21 @@ class CaptureToMoonlightManager:
             return False
 
         capture_source_id = app_id.split(":", 1)[1]
+
+        # Check max sessions before starting
+        active_sessions = len([
+            s for s in self._capture_sessions.values()
+            if s.capture_source_id == capture_source_id and s.active
+        ])
+        max_sessions = 4  # Concurrent streams allowed
+
+        if active_sessions >= max_sessions:
+            log.error(
+                "Cannot start capture session: max sessions (%d) reached for source %s",
+                max_sessions, capture_source_id
+            )
+            return False
+
         return bool(await self.start_capture_session(capture_source_id, client_id))
 
     async def quit_moonlight_app(
@@ -530,6 +575,8 @@ class CaptureToMoonlightManager:
 
             return True
 
+        # Session not found - this can happen if session was already stopped
+        log.debug("Session not found for app %s (may have already been stopped)", app_id)
         return False
 
 
