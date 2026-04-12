@@ -151,6 +151,7 @@ class AutomationEngine:
         self._captures = captures
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._running_scripts: dict[str, AutomationContext] = {}
+        self._script_tasks: dict[str, asyncio.Task] = {}   # run_id → asyncio.Task
         self._image_templates: dict[str, Any] = {}  # cached template images
 
     # ── Script execution ─────────────────────────────────────────────────────
@@ -190,6 +191,75 @@ class AutomationEngine:
             "ok": not ctx.errors,
             "lines_executed": ctx.lines_executed,
             "errors": ctx.errors,
+        }
+
+    async def run_script_background(
+        self,
+        script: str,
+        source_id: str = "",
+        node_id: str | None = None,
+        variables: dict[str, str] | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Start script in a background task; return (run_id, status_dict) immediately.
+
+        The caller can cancel via cancel_script(run_id).  Completed/cancelled
+        tasks are reaped lazily when the run_id is looked up.
+        """
+        node = self._state.nodes.get(node_id) if node_id else self._state.get_active_node()
+        if not node:
+            return "", {"ok": False, "error": "No active node"}
+
+        run_id = f"run-{int(time.monotonic() * 1000)}"
+        ctx = AutomationContext(
+            variables=variables or {},
+            source_id=source_id,
+            node_host=node.host,
+            node_port=node.port,
+        )
+        self._running_scripts[run_id] = ctx
+
+        async def _task() -> None:
+            lines = script.splitlines()
+            try:
+                await self._execute_lines(lines, 0, len(lines), ctx)
+            except _AbortScript:
+                pass
+            except asyncio.CancelledError:
+                ctx.running = False
+            except Exception as e:
+                ctx.errors.append(f"Line {ctx.line_num}: {e}")
+            finally:
+                self._running_scripts.pop(run_id, None)
+                self._script_tasks.pop(run_id, None)
+
+        task = asyncio.create_task(_task(), name=f"automation-{run_id}")
+        self._script_tasks[run_id] = task
+        return run_id, {"ok": True, "id": run_id, "status": "running"}
+
+    def cancel_script(self, run_id: str) -> bool:
+        """Cancel a running background script. Returns True if it was found and cancelled."""
+        task = self._script_tasks.get(run_id)
+        if task and not task.done():
+            task.cancel()
+            ctx = self._running_scripts.get(run_id)
+            if ctx:
+                ctx.running = False
+            return True
+        return False
+
+    def get_script_status(self, run_id: str) -> dict[str, Any] | None:
+        """Return status of a background run, or None if not found."""
+        task = self._script_tasks.get(run_id)
+        ctx = self._running_scripts.get(run_id)
+        if task is None and ctx is None:
+            return None
+        running = task is not None and not task.done()
+        return {
+            "id": run_id,
+            "status": "running" if running else "completed",
+            "ok": not (ctx.errors if ctx else []),
+            "errors": ctx.errors if ctx else [],
+            "lines_executed": ctx.lines_executed if ctx else 0,
         }
 
     async def _execute_lines(

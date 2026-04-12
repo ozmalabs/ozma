@@ -3362,18 +3362,45 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     @app.post("/api/v1/automation/run")
     async def run_automation(body: dict = {}) -> dict[str, Any]:
-        """Execute an automation script."""
+        """Execute an automation script.
+
+        Always runs in the background: returns {"ok": true, "id": run_id}
+        immediately.  Use POST /api/v1/automation/{run_id}/cancel to abort.
+        """
         if not auto_engine:
             raise HTTPException(status_code=503, detail="Automation engine not available")
         script = body.get("script", "")
         if not script:
             raise HTTPException(status_code=400, detail="No script provided")
-        result = await auto_engine.run_script(
+        run_id, result = await auto_engine.run_script_background(
             script,
             source_id=body.get("source_id", ""),
+            node_id=body.get("node_id"),
             variables=body.get("variables"),
         )
+        if not run_id:
+            return result  # error (no active node)
         return result
+
+    @app.get("/api/v1/automation/{run_id}/status")
+    async def automation_status(run_id: str) -> dict[str, Any]:
+        """Get status of a background automation run."""
+        if not auto_engine:
+            raise HTTPException(status_code=503, detail="Automation engine not available")
+        status = auto_engine.get_script_status(run_id)
+        if status is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        return status
+
+    @app.post("/api/v1/automation/{run_id}/cancel")
+    async def cancel_automation(run_id: str) -> dict[str, Any]:
+        """Cancel a running background automation script."""
+        if not auto_engine:
+            raise HTTPException(status_code=503, detail="Automation engine not available")
+        cancelled = auto_engine.cancel_script(run_id)
+        if not cancelled:
+            raise HTTPException(status_code=404, detail="Run not found or already completed")
+        return {"ok": True, "cancelled": True, "id": run_id}
 
     # --- Node RPA proxy (forward to node's local RPA engine) ---
 

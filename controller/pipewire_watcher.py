@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine
@@ -130,6 +131,15 @@ class PipeWireWatcher:
         self._task: asyncio.Task | None = None
         self._ready = asyncio.Event()
 
+        # Optional PipeWire runtime dir override (for root processes that need
+        # to reach a user-owned PipeWire socket at /run/user/<uid>/pipewire-0).
+        # Reads OZMA_PIPEWIRE_RUNTIME_DIR env var; set XDG_RUNTIME_DIR when
+        # spawning pw-dump/pw-cli subprocesses.
+        _rt = os.environ.get("OZMA_PIPEWIRE_RUNTIME_DIR", "")
+        self._pw_env: dict[str, str] | None = None
+        if _rt:
+            self._pw_env = {**os.environ, "XDG_RUNTIME_DIR": _rt, "PIPEWIRE_RUNTIME_DIR": _rt}
+
     @property
     def available(self) -> bool:
         return shutil.which("pw-dump") is not None
@@ -207,7 +217,8 @@ class PipeWireWatcher:
             "softVolumes": [volume] * node.channels,
         }
         rc, err = await _run_pw_cmd(
-            ["pw-cli", "set-param", str(node.id), "Props", json.dumps(props)]
+            ["pw-cli", "set-param", str(node.id), "Props", json.dumps(props)],
+            env=self._pw_env,
         )
         if rc != 0:
             log.warning("set_volume %s=%.3f failed: %s", node_name, volume, err)
@@ -215,7 +226,8 @@ class PipeWireWatcher:
         # Also set on the device if this node has one
         if node.device_id and node.device_id in self.nodes:
             await _run_pw_cmd(
-                ["pw-cli", "set-param", str(node.device_id), "Props", json.dumps(props)]
+                ["pw-cli", "set-param", str(node.device_id), "Props", json.dumps(props)],
+                env=self._pw_env,
             )
         return True
 
@@ -227,7 +239,8 @@ class PipeWireWatcher:
             return False
         props = {"mute": mute, "softMute": mute}
         rc, err = await _run_pw_cmd(
-            ["pw-cli", "set-param", str(node.id), "Props", json.dumps(props)]
+            ["pw-cli", "set-param", str(node.id), "Props", json.dumps(props)],
+            env=self._pw_env,
         )
         if rc != 0:
             log.warning("set_mute %s=%s failed: %s", node_name, mute, err)
@@ -265,6 +278,7 @@ class PipeWireWatcher:
                     "pw-dump", "-N",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.DEVNULL,
+                    env=self._pw_env,
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
                 raw = stdout.decode("utf-8", errors="replace")
@@ -485,13 +499,14 @@ class PipeWireWatcher:
 
 # ── Subprocess helper ────────────────────────────────────────────────────────
 
-async def _run_pw_cmd(args: list[str]) -> tuple[int, str]:
+async def _run_pw_cmd(args: list[str], env: dict[str, str] | None = None) -> tuple[int, str]:
     """Run a pw-* command, return (returncode, stderr)."""
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
         _, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=5.0)
         return proc.returncode or 0, (stderr_b or b"").decode(errors="replace").strip()
