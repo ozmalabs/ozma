@@ -1,10 +1,9 @@
-import { createBrowserRouter, Navigate, Outlet, useLocation } from 'react-router-dom'
+import { createBrowserRouter, Navigate, Outlet } from 'react-router-dom'
 import { useAuth } from './store/useAuthStore'
 import Layout from './layouts/Layout'
 import NodesPage from './pages/NodesPage'
 import NodeDetailPage from './pages/NodeDetailPage'
 import SettingsPage from './pages/SettingsPage'
-import DashboardPage from './pages/DashboardPage'
 import LoginPage from './pages/LoginPage'
 import ProtectedRoute from './components/ProtectedRoute'
 import ErrorBoundary from './components/ErrorBoundary'
@@ -21,8 +20,6 @@ export const ROUTES = {
 
 // Protected route component that checks authentication
 function AuthLayout() {
-  const location = useLocation()
-
   return (
     <ProtectedRoute>
       <Layout>
@@ -65,7 +62,7 @@ export const router = createBrowserRouter([
       },
       {
         path: ROUTES.dashboard,
-        element: <DashboardPage />,
+        element: <NodesPage />,
       },
       {
         path: ROUTES.nodes,
@@ -102,4 +99,4 @@ export const router = createBrowserRouter([
   },
 ])
 
-export { Navigate, useLocation }
+export { Navigate }

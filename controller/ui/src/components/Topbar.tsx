@@ -1,4 +1,4 @@
-import { ReactNode } from 'react'
+import React, { ReactNode } from 'react'
 import { Link, useLocation, useParams } from 'react-router-dom'
 import { ROUTES } from '../router'
 import { useAuth } from '../store/useAuthStore'
