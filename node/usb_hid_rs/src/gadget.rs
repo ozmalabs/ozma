@@ -67,7 +67,9 @@ impl UsbHidGadget {
         match guard.as_mut() {
             Some(dev) => {
                 if let Err(e) = dev.write(&buf) {
-                    warn!("keyboard write error: {}", e);
+                    error!("keyboard write error ({}): {}", self.kbd_path.display(), e);
+                    // Disable so subsequent calls are no-ops, matching Python behaviour.
+                    *guard = None;
                 }
             }
             None => {
@@ -83,7 +85,9 @@ impl UsbHidGadget {
         match guard.as_mut() {
             Some(dev) => {
                 if let Err(e) = dev.write(&buf) {
-                    warn!("mouse write error: {}", e);
+                    error!("mouse write error ({}): {}", self.mouse_path.display(), e);
+                    // Disable so subsequent calls are no-ops, matching Python behaviour.
+                    *guard = None;
                 }
             }
             None => {
