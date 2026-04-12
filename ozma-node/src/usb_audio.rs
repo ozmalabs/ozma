@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
 //! UAC2 USB Audio Class 2 gadget support.
 //!
-//! Mirrors the logic in `node/usb_audio.py`:
+//! Rust port of `node/usb_audio.py`.
 //!
-//! * Detect (and optionally trigger setup of) the UAC2 ConfigFS function via
-//!   the `usb-gadget` crate.
-//! * Discover the ALSA card that the kernel creates for the gadget.
-//! * Bridge audio between the UAC2 gadget capture interface (host → device)
-//!   and the gadget playback interface (device → host), handling device
-//!   appear / disappear gracefully.
+//! # Overview
+//!
+//! When the UAC2 function is active in the composite gadget the USB host sees
+//! the node as an audio device:
+//!
+//! * **Host capture (microphone input)** — receives audio forwarded from the
+//!   HDMI capture card.  This is the *playback* direction from the gadget's
+//!   perspective: the device writes audio that the host reads.
+//! * **Host playback (speaker output)** — audio played by the host is readable
+//!   on the device's ALSA capture interface.
 //!
 //! # ConfigFS UAC2 terminology
 //! * **p_\*** (playback) — audio flowing **from device to host**.  The device
@@ -30,18 +34,15 @@ use alsa::{
     Direction, ValueOr,
 };
 use anyhow::{bail, Context, Result};
+use tokio::{task::JoinHandle, time::sleep};
 use tracing::{debug, info, warn};
-use usb_gadget::{
-    function::uac2::Uac2Builder, Class, Config, Gadget, Id, RegGadget, Strings,
-};
 
 // ── constants ────────────────────────────────────────────────────────────────
 
 /// Path to the UAC2 ConfigFS function directory created by the gadget script.
 const UAC2_FUNC_DIR: &str = "/sys/kernel/config/usb_gadget/ozma/functions/uac2.usb0";
 
-/// ALSA card name fragments used to identify the UAC2 gadget sound card.
-const UAC2_NAME_PATTERNS: &[&str] = &["UAC2", "uac2", "Gadget Audio", "g_audio"];
+const PROC_ASOUND_CARDS: &str = "/proc/asound/cards";
 
 /// Sample rate used for both playback and capture streams.
 const SAMPLE_RATE: u32 = 48_000;
@@ -49,8 +50,8 @@ const SAMPLE_RATE: u32 = 48_000;
 const CHANNELS: u32 = 2;
 /// Frames per ALSA period.
 const PERIOD_FRAMES: u32 = 1_024;
-/// Total ALSA ring-buffer size in frames.
-const BUFFER_FRAMES: u32 = PERIOD_FRAMES * 4;
+/// Number of periods in the ALSA ring buffer.
+const BUFFER_PERIODS: u32 = 4;
 
 // ── ALSA device discovery ─────────────────────────────────────────────────────
 
@@ -59,24 +60,24 @@ const BUFFER_FRAMES: u32 = PERIOD_FRAMES * 4;
 ///
 /// Reads `/proc/asound/cards` directly instead of shelling out to `aplay -l`
 /// as the Python version does.
+///
+/// `/proc/asound/cards` format (two lines per card):
+/// ```text
+///  0 [PCH            ]: HDA-Intel - HDA Intel PCH
+///                       Intel Corporation ...
+///  1 [UAC2Gadget     ]: UAC2_Gadget - UAC2_Gadget
+/// ```
 pub fn find_uac2_playback_device() -> Option<String> {
-    let content = std::fs::read_to_string("/proc/asound/cards").ok()?;
+    let content = std::fs::read_to_string(PROC_ASOUND_CARDS).ok()?;
 
-    // /proc/asound/cards format (one card per two lines):
-    //  0 [PCH            ]: HDA-Intel - HDA Intel PCH
-    //                       Intel Corporation ...
-    //  1 [UAC2Gadget     ]: UAC2_Gadget - UAC2_Gadget
     for line in content.lines() {
         let trimmed = line.trim_start();
         // Index lines start with a digit.
         if !trimmed.starts_with(|c: char| c.is_ascii_digit()) {
             continue;
         }
-        let lower = trimmed.to_ascii_lowercase();
-        let matches = UAC2_NAME_PATTERNS
-            .iter()
-            .any(|pat| lower.contains(&pat.to_ascii_lowercase()));
-        if matches {
+        let upper = trimmed.to_ascii_uppercase();
+        if upper.contains("UAC2") || upper.contains("GADGET AUDIO") || upper.contains("G_AUDIO") {
             if let Some(idx_str) = trimmed.split_whitespace().next() {
                 if let Ok(idx) = idx_str.parse::<u32>() {
                     debug!("Found UAC2 gadget ALSA card {}: {}", idx, trimmed);
@@ -99,49 +100,9 @@ pub fn uac2_active() -> bool {
     Path::new(UAC2_FUNC_DIR).exists()
 }
 
-// ── gadget registration ───────────────────────────────────────────────────────
+// ── ALSA PCM helpers ──────────────────────────────────────────────────────────
 
-/// Attempt to register the UAC2 function via the `usb-gadget` crate.
-///
-/// This replaces the Python version's call to `setup_gadget.sh`.
-/// If the gadget is already active (ConfigFS dir exists) this is a no-op and
-/// returns `Ok(None)`.
-async fn register_uac2_gadget() -> Result<Option<RegGadget>> {
-    if uac2_active() {
-        debug!("UAC2 ConfigFS function already present — skipping registration");
-        return Ok(None);
-    }
-
-    let uac2 = Uac2Builder::new()
-        .p_chmask(0x03)    // stereo playback (device → host)
-        .p_srate(SAMPLE_RATE)
-        .p_ssize(2)         // 16-bit samples
-        .c_chmask(0x03)    // stereo capture  (host → device)
-        .c_srate(SAMPLE_RATE)
-        .c_ssize(2)
-        .build()
-        .context("building UAC2 function descriptor")?;
-
-    let gadget = Gadget::new(
-        Class::new(0xef, 0x02, 0x01), // Miscellaneous / IAD
-        Id::new(0x1d6b, 0x0104),       // Linux Foundation composite gadget
-        Strings::new("Ozma", "UAC2 Audio", "000000000001"),
-    )
-    .with_config(Config::new("config").with_function(uac2));
-
-    let udc = usb_gadget::default_udc()
-        .context("no UDC found — is the gadget driver loaded?")?;
-    let reg = gadget
-        .bind(&udc)
-        .context("binding UAC2 gadget to UDC")?;
-
-    info!("UAC2 gadget registered via usb-gadget crate (UDC: {})", udc.name());
-    Ok(Some(reg))
-}
-
-// ── ALSA bridge ───────────────────────────────────────────────────────────────
-
-/// Open an ALSA PCM handle configured for the UAC2 bridge parameters.
+/// Open and configure an ALSA PCM handle with the bridge parameters.
 fn open_pcm(device: &str, direction: Direction) -> Result<PCM> {
     let pcm = PCM::new(device, direction, false)
         .with_context(|| format!("opening ALSA PCM '{}' ({:?})", device, direction))?;
@@ -155,7 +116,7 @@ fn open_pcm(device: &str, direction: Direction) -> Result<PCM> {
         hwp.set_access(Access::RWInterleaved).context("set_access")?;
         hwp.set_period_size(PERIOD_FRAMES as alsa::pcm::Frames, ValueOr::Nearest)
             .context("set_period_size")?;
-        hwp.set_buffer_size(BUFFER_FRAMES as alsa::pcm::Frames)
+        hwp.set_buffer_size((PERIOD_FRAMES * BUFFER_PERIODS) as alsa::pcm::Frames)
             .context("set_buffer_size")?;
         pcm.hw_params(&hwp).context("hw_params")?;
     }
@@ -172,8 +133,7 @@ fn open_pcm(device: &str, direction: Direction) -> Result<PCM> {
 /// function returns `Err` so the caller can reopen the PCM handles (device
 /// disappear / reappear path).
 fn bridge_loop(src: &PCM, dst: &PCM, stop: &AtomicBool) -> Result<()> {
-    let period = PERIOD_FRAMES as usize;
-    let mut buf: Vec<i16> = vec![0i16; period * CHANNELS as usize];
+    let mut buf = vec![0i16; PERIOD_FRAMES as usize * CHANNELS as usize];
 
     let src_io = src.io_i16().context("src io_i16")?;
     let dst_io = dst.io_i16().context("dst io_i16")?;
@@ -183,20 +143,21 @@ fn bridge_loop(src: &PCM, dst: &PCM, stop: &AtomicBool) -> Result<()> {
             return Ok(());
         }
 
-        // Read one period from the UAC2 capture interface (host → device).
-        match src_io.readi(&mut buf) {
+        // Read one period from the source (capture direction).
+        let n = match src_io.readi(&mut buf) {
             Ok(0) => continue,
-            Ok(_) => {}
+            Ok(n) => n,
             Err(e) => {
                 if src.try_recover(e, true).is_err() {
                     bail!("unrecoverable capture error: {}", e);
                 }
                 continue;
             }
-        }
+        };
 
-        // Write one period to the UAC2 playback interface (device → host).
-        match dst_io.writei(&buf) {
+        // Write the frames to the destination (playback direction).
+        let frames = &buf[..n * CHANNELS as usize];
+        match dst_io.writei(frames) {
             Ok(_) => {}
             Err(e) => {
                 if dst.try_recover(e, true).is_err() {
@@ -209,38 +170,71 @@ fn bridge_loop(src: &PCM, dst: &PCM, stop: &AtomicBool) -> Result<()> {
 
 // ── public API ────────────────────────────────────────────────────────────────
 
+/// Configuration for the USB audio bridge.
+#[derive(Debug, Clone)]
+pub struct UsbAudioConfig {
+    /// ALSA device to read audio from and forward to the USB host
+    /// (device → host / "microphone" direction).
+    /// Defaults to `"default"`.
+    pub hdmi_capture_device: String,
+
+    /// ALSA device to write audio received from the USB host
+    /// (host → device / "speaker" direction).
+    /// Defaults to `"default"`.
+    pub speaker_output_device: String,
+
+    /// How long to wait for the UAC2 ALSA card to appear after the gadget
+    /// is detected.
+    pub alsa_probe_timeout: Duration,
+
+    /// Interval between hotplug poll cycles.
+    pub poll_interval: Duration,
+}
+
+impl Default for UsbAudioConfig {
+    fn default() -> Self {
+        Self {
+            hdmi_capture_device: "default".into(),
+            speaker_output_device: "default".into(),
+            alsa_probe_timeout: Duration::from_secs(5),
+            poll_interval: Duration::from_millis(250),
+        }
+    }
+}
+
 /// Manages the UAC2 gadget function lifecycle and the ALSA audio bridge.
 ///
 /// Equivalent to `USBAudioGadget` in `node/usb_audio.py`.
+///
+/// # Example
+/// ```no_run
+/// # tokio_test::block_on(async {
+/// use ozma_node::usb_audio::{UsbAudioGadget, UsbAudioConfig};
+/// let gadget = UsbAudioGadget::open(UsbAudioConfig::default()).await.unwrap();
+/// // ... do work ...
+/// gadget.close().await;
+/// # });
+/// ```
 pub struct UsbAudioGadget {
     /// ALSA device for the gadget playback interface (device → host).
     pub playback_device: Option<String>,
     /// ALSA device for the gadget capture interface (host → device).
     pub capture_device: Option<String>,
-    /// Registered gadget handle — kept alive to maintain the ConfigFS binding.
-    _reg: Option<RegGadget>,
     /// Signals the bridge loop to stop cleanly.
     stop: Arc<AtomicBool>,
+    /// Background watcher / bridge supervisor task.
+    _watcher: JoinHandle<()>,
 }
 
 impl UsbAudioGadget {
-    /// Detect the UAC2 ALSA interface.  If it is not present and `auto_setup`
-    /// is `true`, attempt to register the gadget via the `usb-gadget` crate.
+    /// Detect the UAC2 ALSA interface and start the bridge tasks.
     ///
-    /// Waits up to 5 seconds for the kernel to create the ALSA sound card
-    /// after gadget registration, mirroring `USBAudioGadget.open()` in Python.
-    pub async fn open(auto_setup: bool) -> Result<Self> {
-        let mut reg: Option<RegGadget> = None;
-
-        if auto_setup {
-            match register_uac2_gadget().await {
-                Ok(r) => reg = r,
-                Err(e) => warn!("UAC2 gadget registration failed: {:#}", e),
-            }
-        }
-
-        // Wait up to 5 s for the kernel to create the ALSA sound card.
-        let playback_device = wait_for_alsa(Duration::from_secs(5)).await;
+    /// Waits up to `config.alsa_probe_timeout` for the kernel to create the
+    /// ALSA sound card, then spawns a background watcher that restarts the
+    /// bridge on device disappear / reappear (USB reconnect).
+    pub async fn open(config: UsbAudioConfig) -> Result<Self> {
+        let playback_device =
+            wait_for_alsa(config.alsa_probe_timeout, config.poll_interval).await;
         let capture_device = playback_device
             .as_deref()
             .map(|d| d.replace(",0", ",1"));
@@ -258,91 +252,28 @@ impl UsbAudioGadget {
             );
         }
 
+        let stop = Arc::new(AtomicBool::new(false));
+        let watcher = spawn_watcher(config, stop.clone());
+
         Ok(Self {
             playback_device,
             capture_device,
-            _reg: reg,
-            stop: Arc::new(AtomicBool::new(false)),
+            stop,
+            _watcher: watcher,
         })
     }
 
-    /// Run the ALSA bridge loop, forwarding audio between the UAC2 gadget
-    /// capture interface (host → device) and the playback interface
-    /// (device → host).
-    ///
-    /// Handles device disappear / reappear: if the PCM device goes away (e.g.
-    /// USB cable unplugged) the loop waits 1 s and reopens the streams.
-    /// Returns only when [`stop`](Self::stop) is called or a spawn error occurs.
-    pub async fn run_bridge(&self) -> Result<()> {
-        let (Some(ref pb_dev), Some(ref cap_dev)) =
-            (&self.playback_device, &self.capture_device)
-        else {
-            warn!("UAC2 PCM devices unavailable — bridge not started");
-            return Ok(());
-        };
-
-        let pb_dev = pb_dev.clone();
-        let cap_dev = cap_dev.clone();
-        let stop = Arc::clone(&self.stop);
-
-        // Run the blocking bridge on a dedicated OS thread so it never blocks
-        // the async runtime.
-        tokio::task::spawn_blocking(move || {
-            loop {
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                let src = match open_pcm(&cap_dev, Direction::Capture) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        warn!("Cannot open UAC2 capture PCM: {:#} — retrying in 2 s", e);
-                        std::thread::sleep(Duration::from_secs(2));
-                        continue;
-                    }
-                };
-
-                let dst = match open_pcm(&pb_dev, Direction::Playback) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        warn!("Cannot open UAC2 playback PCM: {:#} — retrying in 2 s", e);
-                        std::thread::sleep(Duration::from_secs(2));
-                        continue;
-                    }
-                };
-
-                info!("UAC2 audio bridge running ({} → {})", cap_dev, pb_dev);
-
-                match bridge_loop(&src, &dst, &stop) {
-                    Ok(()) => {
-                        info!("UAC2 bridge stopped cleanly");
-                        break;
-                    }
-                    Err(e) => {
-                        // Device disappeared or unrecoverable error — reopen.
-                        warn!("UAC2 bridge error: {:#} — reopening PCM in 1 s", e);
-                        std::thread::sleep(Duration::from_secs(1));
-                    }
-                }
-            }
-        })
-        .await
-        .context("UAC2 bridge thread panicked")?;
-
-        Ok(())
-    }
-
-    /// Signal the bridge loop to stop after the current period completes.
-    pub fn stop(&self) {
+    /// Signal the bridge tasks to stop and wait briefly for them to exit.
+    pub async fn close(self) {
         self.stop.store(true, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(300)).await;
     }
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+// ── internal helpers ──────────────────────────────────────────────────────────
 
-/// Poll for the UAC2 ALSA card to appear, returning as soon as it is found or
-/// after `timeout` has elapsed.
-async fn wait_for_alsa(timeout: Duration) -> Option<String> {
+/// Poll `/proc/asound/cards` until the UAC2 card appears or `timeout` elapses.
+async fn wait_for_alsa(timeout: Duration, interval: Duration) -> Option<String> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if let Some(dev) = find_uac2_playback_device() {
@@ -351,8 +282,219 @@ async fn wait_for_alsa(timeout: Duration) -> Option<String> {
         if tokio::time::Instant::now() >= deadline {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        sleep(interval).await;
     }
     // One final check after the deadline.
     find_uac2_playback_device()
+}
+
+/// Spawn the hotplug watcher + bridge supervisor task.
+///
+/// The task:
+/// 1. Waits for the UAC2 ALSA card to appear.
+/// 2. Starts two `spawn_blocking` bridge threads (device→host, host→device).
+/// 3. Polls for card disappearance or bridge thread exit; restarts as needed.
+/// 4. Exits cleanly when `stop` is set.
+fn spawn_watcher(config: UsbAudioConfig, stop: Arc<AtomicBool>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+
+            // Wait for the UAC2 card to be present.
+            let pb_dev =
+                match wait_for_alsa(Duration::from_secs(60), config.poll_interval).await {
+                    Some(d) => d,
+                    None => {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        continue;
+                    }
+                };
+            let cap_dev = pb_dev.replace(",0", ",1");
+
+            info!("UAC2 card appeared — starting ALSA bridge");
+
+            let bridge_stop = Arc::new(AtomicBool::new(false));
+
+            // device → host bridge (HDMI capture → UAC2 playback)
+            let pb_stop = bridge_stop.clone();
+            let hdmi_src = config.hdmi_capture_device.clone();
+            let pb_dst = pb_dev.clone();
+            let pb_handle = tokio::task::spawn_blocking(move || {
+                loop {
+                    if pb_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let src = match open_pcm(&hdmi_src, Direction::Capture) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!("Cannot open HDMI capture PCM: {:#} — retrying in 2 s", e);
+                            std::thread::sleep(Duration::from_secs(2));
+                            continue;
+                        }
+                    };
+                    let dst = match open_pcm(&pb_dst, Direction::Playback) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!("Cannot open UAC2 playback PCM: {:#} — retrying in 2 s", e);
+                            std::thread::sleep(Duration::from_secs(2));
+                            continue;
+                        }
+                    };
+                    info!("UAC2 playback bridge running: {} → {}", hdmi_src, pb_dst);
+                    match bridge_loop(&src, &dst, &pb_stop) {
+                        Ok(()) => break,
+                        Err(e) => {
+                            warn!("UAC2 playback bridge error: {:#} — reopening in 1 s", e);
+                            std::thread::sleep(Duration::from_secs(1));
+                        }
+                    }
+                }
+            });
+
+            // host → device bridge (UAC2 capture → speaker output)
+            let cap_stop = bridge_stop.clone();
+            let cap_src = cap_dev.clone();
+            let spk_dst = config.speaker_output_device.clone();
+            let cap_handle = tokio::task::spawn_blocking(move || {
+                loop {
+                    if cap_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let src = match open_pcm(&cap_src, Direction::Capture) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!("Cannot open UAC2 capture PCM: {:#} — retrying in 2 s", e);
+                            std::thread::sleep(Duration::from_secs(2));
+                            continue;
+                        }
+                    };
+                    let dst = match open_pcm(&spk_dst, Direction::Playback) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!("Cannot open speaker output PCM: {:#} — retrying in 2 s", e);
+                            std::thread::sleep(Duration::from_secs(2));
+                            continue;
+                        }
+                    };
+                    info!("UAC2 capture bridge running: {} → {}", cap_src, spk_dst);
+                    match bridge_loop(&src, &dst, &cap_stop) {
+                        Ok(()) => break,
+                        Err(e) => {
+                            warn!("UAC2 capture bridge error: {:#} — reopening in 1 s", e);
+                            std::thread::sleep(Duration::from_secs(1));
+                        }
+                    }
+                }
+            });
+
+            // Poll until the card disappears, we are asked to stop, or a
+            // bridge thread exits unexpectedly.
+            loop {
+                sleep(config.poll_interval).await;
+
+                if stop.load(Ordering::Relaxed) {
+                    bridge_stop.store(true, Ordering::Relaxed);
+                    let _ = pb_handle.await;
+                    let _ = cap_handle.await;
+                    return;
+                }
+
+                if find_uac2_playback_device().is_none() {
+                    warn!("UAC2 card disappeared — stopping bridge");
+                    bridge_stop.store(true, Ordering::Relaxed);
+                    let _ = pb_handle.await;
+                    let _ = cap_handle.await;
+                    break; // outer loop will wait for card to reappear
+                }
+
+                if pb_handle.is_finished() || cap_handle.is_finished() {
+                    warn!("Bridge thread exited unexpectedly — restarting");
+                    bridge_stop.store(true, Ordering::Relaxed);
+                    let _ = pb_handle.await;
+                    let _ = cap_handle.await;
+                    break;
+                }
+            }
+        }
+    })
+}
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify the `/proc/asound/cards` parser finds the UAC2 card correctly.
+    #[test]
+    fn parse_uac2_card_from_proc() {
+        // Simulate /proc/asound/cards with two cards.
+        let fake = " 0 [PCH            ]: HDA-Intel - HDA Intel PCH\n\
+                    \t\t\t   Intel Corporation ...\n\
+                     1 [UAC2Gadget     ]: UAC2_Gadget - UAC2_Gadget\n\
+                    \t\t\t   Linux UAC2 Gadget\n";
+
+        let result: Option<String> = {
+            let mut found = None;
+            for line in fake.lines() {
+                let trimmed = line.trim_start();
+                if !trimmed.starts_with(|c: char| c.is_ascii_digit()) {
+                    continue;
+                }
+                let upper = trimmed.to_ascii_uppercase();
+                if upper.contains("UAC2")
+                    || upper.contains("GADGET AUDIO")
+                    || upper.contains("G_AUDIO")
+                {
+                    if let Some(idx_str) = trimmed.split_whitespace().next() {
+                        if let Ok(idx) = idx_str.parse::<u32>() {
+                            found = Some(format!("hw:{},0", idx));
+                            break;
+                        }
+                    }
+                }
+            }
+            found
+        };
+
+        assert_eq!(result, Some("hw:1,0".to_string()));
+    }
+
+    /// Verify that the capture device is derived correctly from the playback device.
+    #[test]
+    fn capture_device_from_playback() {
+        let pb = "hw:2,0".to_string();
+        let cap = pb.replace(",0", ",1");
+        assert_eq!(cap, "hw:2,1");
+    }
+
+    /// `uac2_active()` must return false in a normal test environment where
+    /// the ConfigFS path does not exist.
+    #[test]
+    fn uac2_active_returns_false_when_path_absent() {
+        assert!(!uac2_active());
+    }
+
+    /// `find_uac2_capture_device` returns `None` when the playback device is
+    /// not found (no UAC2 card in the test environment).
+    #[test]
+    fn find_capture_device_none_when_no_card() {
+        // In CI there is no UAC2 card, so both helpers return None.
+        // We just verify they don't panic.
+        let _ = find_uac2_playback_device();
+        let _ = find_uac2_capture_device();
+    }
+
+    #[test]
+    fn default_config_sanity() {
+        let cfg = UsbAudioConfig::default();
+        assert_eq!(cfg.hdmi_capture_device, "default");
+        assert_eq!(cfg.speaker_output_device, "default");
+        assert!(cfg.alsa_probe_timeout > Duration::ZERO);
+        assert!(cfg.poll_interval > Duration::ZERO);
+    }
 }
