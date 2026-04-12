@@ -20,6 +20,13 @@ let _memoryToken: string | null = null
 
 let _cachedExpiry: number | null = null
 
+/**
+ * Optional callback invoked by `startExpiryWatcher` when the stored token
+ * is found to have expired. Typically wired to the auth store's logout action.
+ */
+let _onExpiredCallback: (() => void) | null = null
+let _watcherTimer: ReturnType<typeof setInterval> | null = null
+
 function parseExpiry(token: string): number | null {
   try {
     const parts = token.split('.')
@@ -102,5 +109,37 @@ export const tokenStorage = {
     const expiry = this.getExpiry()
     if (expiry === null) return true
     return Date.now() >= expiry
+  },
+
+  /**
+   * Start a periodic watcher that calls `onExpired` when the stored token
+   * expires mid-session. Safe to call multiple times — only one watcher runs
+   * at a time. Call `stopExpiryWatcher()` on unmount / logout.
+   *
+   * @param onExpired  Called once when expiry is detected.
+   * @param intervalMs Poll interval (default 30 s).
+   */
+  startExpiryWatcher(onExpired: () => void, intervalMs = 30_000): void {
+    _onExpiredCallback = onExpired
+    if (_watcherTimer !== null) return // already running
+    _watcherTimer = setInterval(() => {
+      if (tokenStorage.isExpired()) {
+        tokenStorage.stopExpiryWatcher()
+        try {
+          _onExpiredCallback?.()
+        } catch {
+          // ignore
+        }
+      }
+    }, intervalMs)
+  },
+
+  /** Stop the expiry watcher started by `startExpiryWatcher`. */
+  stopExpiryWatcher(): void {
+    if (_watcherTimer !== null) {
+      clearInterval(_watcherTimer)
+      _watcherTimer = null
+    }
+    _onExpiredCallback = null
   },
 }

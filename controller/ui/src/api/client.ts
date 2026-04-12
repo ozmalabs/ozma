@@ -377,29 +377,41 @@ export const api = {
 // WebSocket client
 // ---------------------------------------------------------------------------
 
+/** Maximum number of automatic reconnection attempts (0 = unlimited). */
+const WS_MAX_RECONNECT_ATTEMPTS = 10
+const WS_BASE_RECONNECT_MS = 1_000
+const WS_MAX_RECONNECT_MS = 30_000
+
 export class WebSocketClient<T = unknown> {
   private socket: WebSocket | null = null
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private _connected = false
+  /** Set to true by `disconnect()` to suppress automatic reconnection. */
+  private _intentionallyClosed = false
+  private _reconnectAttempts = 0
   private readonly messageHandlers: Array<(data: T) => void> = []
   private readonly errorHandlers: Array<(err: Event) => void> = []
   private readonly closeHandlers: Array<(ev: CloseEvent) => void> = []
+  private readonly openHandlers: Array<() => void> = []
 
-  constructor(
-    private readonly url: string,
-    private readonly reconnectInterval = 5_000,
-  ) {}
+  constructor(private readonly url: string) {}
 
   connect(): void {
-    if (this.socket?.readyState === WebSocket.CONNECTING) return
+    if (
+      this.socket?.readyState === WebSocket.CONNECTING ||
+      this.socket?.readyState === WebSocket.OPEN
+    ) return
 
-    const wsUrl = this.url.startsWith('ws') ? this.url : `ws://${this.url}`
+    this._intentionallyClosed = false
+    const wsUrl = this.url.startsWith('ws') ? this.url : `ws://${location.host}${this.url}`
     this.socket = new WebSocket(wsUrl)
 
     this.socket.onopen = () => {
       this._connected = true
+      this._reconnectAttempts = 0
       const token = tokenStorage.get()
       if (token) this.socket?.send(JSON.stringify({ type: 'auth', token }))
+      this.openHandlers.forEach((h) => h())
     }
 
     this.socket.onmessage = (ev) => {
@@ -418,11 +430,14 @@ export class WebSocketClient<T = unknown> {
     this.socket.onclose = (ev) => {
       this._connected = false
       this.closeHandlers.forEach((h) => h(ev))
-      this._scheduleReconnect()
+      if (!this._intentionallyClosed) {
+        this._scheduleReconnect()
+      }
     }
   }
 
   disconnect(): void {
+    this._intentionallyClosed = true
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
@@ -430,6 +445,7 @@ export class WebSocketClient<T = unknown> {
     this.socket?.close()
     this.socket = null
     this._connected = false
+    this._reconnectAttempts = 0
   }
 
   send(data: unknown): boolean {
@@ -442,16 +458,28 @@ export class WebSocketClient<T = unknown> {
     }
   }
 
+  onOpen(cb: () => void): void { this.openHandlers.push(cb) }
   onMessage(cb: (data: T) => void): void { this.messageHandlers.push(cb) }
   onError(cb: (err: Event) => void): void { this.errorHandlers.push(cb) }
   onClose(cb: (ev: CloseEvent) => void): void { this.closeHandlers.push(cb) }
   isConnected(): boolean { return this._connected && this.socket?.readyState === WebSocket.OPEN }
+  reconnectAttempts(): number { return this._reconnectAttempts }
 
   private _scheduleReconnect(): void {
+    if (WS_MAX_RECONNECT_ATTEMPTS > 0 && this._reconnectAttempts >= WS_MAX_RECONNECT_ATTEMPTS) {
+      console.warn(`[WebSocketClient] Max reconnect attempts (${WS_MAX_RECONNECT_ATTEMPTS}) reached for ${this.url}`)
+      return
+    }
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
+    // Exponential backoff with jitter, capped at WS_MAX_RECONNECT_MS
+    const delay = Math.min(
+      WS_BASE_RECONNECT_MS * 2 ** this._reconnectAttempts * (1 + Math.random() * 0.3),
+      WS_MAX_RECONNECT_MS,
+    )
+    this._reconnectAttempts++
     this.reconnectTimer = setTimeout(() => {
-      if (!this._connected) this.connect()
-    }, this.reconnectInterval)
+      if (!this._intentionallyClosed && !this._connected) this.connect()
+    }, delay)
   }
 }
 

@@ -19,6 +19,10 @@ interface AuthContextValue extends AuthState {
   login: (username: string, password: string) => Promise<void>
   logout: () => Promise<void>
   isAuthenticated: boolean
+  /** Returns true if the current user has ALL of the given roles. */
+  hasRole: (...roles: string[]) => boolean
+  /** Returns true if the current user has AT LEAST ONE of the given roles. */
+  hasAnyRole: (...roles: string[]) => boolean
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null)
@@ -46,18 +50,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setState({ user: null, loading: false })
   }, [])
 
-  // Periodically check whether the stored token has expired mid-session and
-  // log the user out automatically if so. Checks every 30 s.
+  // Use tokenStorage's built-in watcher so the interval is managed in one place.
+  // The watcher is started when a user is present and stopped on logout/unmount.
   useEffect(() => {
-    const CHECK_INTERVAL_MS = 30_000
-    const id = setInterval(() => {
-      const token = tokenStorage.get()
-      if (state.user !== null && isTokenExpired(token)) {
-        removeToken()
-        setState({ user: null, loading: false })
-      }
-    }, CHECK_INTERVAL_MS)
-    return () => clearInterval(id)
+    if (state.user === null) return
+    tokenStorage.startExpiryWatcher(() => {
+      removeToken()
+      setState({ user: null, loading: false })
+    })
+    return () => tokenStorage.stopExpiryWatcher()
   }, [state.user])
 
   const login = useCallback(async (username: string, password: string) => {
@@ -67,6 +68,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [])
 
   const logout = useCallback(async () => {
+    tokenStorage.stopExpiryWatcher()
     try {
       await api.auth.logout()
     } finally {
@@ -75,6 +77,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   }, [])
 
+  const hasRole = useCallback(
+    (...roles: string[]) => roles.every((r) => state.user?.roles.includes(r) ?? false),
+    [state.user],
+  )
+
+  const hasAnyRole = useCallback(
+    (...roles: string[]) => roles.some((r) => state.user?.roles.includes(r) ?? false),
+    [state.user],
+  )
+
   return (
     <AuthContext.Provider
       value={{
@@ -82,6 +94,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         isAuthenticated: state.user !== null,
         login,
         logout,
+        hasRole,
+        hasAnyRole,
       }}
     >
       {children}

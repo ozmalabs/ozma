@@ -33,7 +33,22 @@ export default function ProtectedRoute({ children, requiredRoles = [] }: Protect
     }
     const hasAccess = requiredRoles.some((role) => user.roles.includes(role))
     if (!hasAccess) {
-      return <Navigate to="/nodes" replace />
+      return (
+        <div className="flex items-center justify-center h-screen">
+          <div className="text-center max-w-sm">
+            <p className="text-destructive font-semibold mb-2">Access Denied</p>
+            <p className="text-sm text-muted-foreground mb-4">
+              You do not have permission to view this page.
+            </p>
+            <a
+              href="/nodes"
+              className="px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors text-sm"
+            >
+              Go to Nodes
+            </a>
+          </div>
+        </div>
+      )
     }
   }
 

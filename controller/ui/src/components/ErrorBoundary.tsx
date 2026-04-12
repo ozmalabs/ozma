@@ -1,9 +1,12 @@
-import { Component, ReactNode } from 'react'
+import { Component, createRef, ReactNode } from 'react'
 
 interface Props {
   children: ReactNode
-  fallback?: ReactNode
+  /** Custom fallback UI. Receives a reset callback. */
+  fallback?: (reset: () => void) => ReactNode
   onError?: (error: Error, errorInfo: React.ErrorInfo) => void
+  /** Called after the boundary resets itself. */
+  onReset?: () => void
 }
 
 interface State {
@@ -34,8 +37,23 @@ export default class ErrorBoundary extends Component<Props, State> {
     }
   }
 
-  private handleReset = () => {
+  /** Public reset — can be called via a ref: `boundaryRef.current?.resetError()` */
+  resetError = () => {
     this.setState({ hasError: false, error: null })
+    try {
+      this.props.onReset?.()
+    } catch {
+      // ignore
+    }
+  }
+
+  private handleReset = () => {
+    this.resetError()
+  }
+
+  /** Convenience factory: attach to a component with `ref={ErrorBoundary.createRef()}` */
+  static createRef() {
+    return createRef<ErrorBoundary>()
   }
 
   render() {
@@ -44,7 +62,7 @@ export default class ErrorBoundary extends Component<Props, State> {
     }
 
     if (this.props.fallback) {
-      return this.props.fallback
+      return this.props.fallback(this.handleReset)
     }
 
     return (
