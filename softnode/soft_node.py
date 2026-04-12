@@ -137,6 +137,7 @@ class SoftNode:
         api_port: int = 0,                # HTTP port for power/status API (0 = auto)
         qmp_input_path: str = "",         # Dedicated input QMP socket (recommended)
         power_backend: "PowerBackend | None" = None,  # libvirt/qmp power control
+        vm_guest_ip: str | None = None,   # VM's actual guest IP (advertised via mDNS vm_ip TXT)
     ) -> None:
         self._name = name
         self._host = host
@@ -149,6 +150,7 @@ class SoftNode:
         self._capture_device = capture_device
         self._audio_sink = audio_sink
         self._api_port = api_port
+        self._vm_guest_ip = vm_guest_ip
         # Async D-Bus display client (fast input + framebuffer)
         self._dbus_client: DBusDisplayClient | None = None
         # Direct evdev for input-linux (kernel-level input)
@@ -855,6 +857,7 @@ class SoftNode:
                 **({"vnc_port": str(self._vnc_port)} if self._vnc_port else {}),
                 **({"capture_device": self._virtual_capture.device_path}
                    if self._virtual_capture and self._virtual_capture.device_path else {}),
+                **({"vm_ip": self._vm_guest_ip} if self._vm_guest_ip else {}),
                 **audio_props,
             },
         )
@@ -914,6 +917,7 @@ class SoftNode:
                                or (self._virtual_capture.device_path
                                    if self._virtual_capture and self._virtual_capture.device_path
                                    else "")),
+            **({"vm_guest_ip": self._vm_guest_ip} if self._vm_guest_ip else {}),
         }
         # Multi-display outputs
         if self._displays:
@@ -1427,6 +1431,8 @@ def main() -> None:
                    help="PipeWire null sink name for this node's audio (e.g. ozma-vm1)")
     p.add_argument("--api-port", type=int, default=0,
                    help="HTTP API port for power control (default: udp-port + 50)")
+    p.add_argument("--vm-guest-ip", default=None,
+                   help="VM's guest network IP (advertised via mDNS vm_ip TXT record)")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args()
 
@@ -1442,7 +1448,8 @@ def main() -> None:
                     vnc_socket=args.vnc_socket,
                     capture_device=args.capture_device,
                     audio_sink=args.audio_sink, api_port=args.api_port,
-                    qmp_input_path=args.qmp_input)
+                    qmp_input_path=args.qmp_input,
+                    vm_guest_ip=args.vm_guest_ip)
 
     async def run() -> None:
         loop = asyncio.get_running_loop()

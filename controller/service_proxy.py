@@ -124,6 +124,7 @@ class ServiceDefinition:
             "owner_user_id": self.owner_user_id,
             "target_host": self.target_host,
             "target_port": self.target_port,
+            "url": self.target_url(),
             "protocol": self.protocol,
             "subdomain": self.subdomain,
             "service_type": self.service_type,

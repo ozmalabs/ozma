@@ -70,6 +70,10 @@ class NodeInfo:
     # Game streaming (V1.2) — Sunshine/Moonlight
     # Set by agent mDNS TXT record ("sunshine_port") or by SunshineManager on enable.
     sunshine_port: int | None = None   # Sunshine stream base port on this node's host
+    # Guest IP for soft nodes — the VM's actual network IP, distinct from the
+    # host machine IP that mDNS resolves to.  Used by tests and the fleet UI to
+    # identify which VM a soft node belongs to.
+    vm_guest_ip: str | None = None
 
     @property
     def stream_url(self) -> str | None:
@@ -130,6 +134,11 @@ class NodeInfo:
             d["parent_node_id"] = self.parent_node_id
         if self.sunshine_port:
             d["sunshine_port"] = self.sunshine_port
+        if self.vm_guest_ip:
+            d["vm_guest_ip"] = self.vm_guest_ip
+            # Expose guest IP as "host" so consumers see the VM's IP, not the
+            # host machine IP used internally for HID routing.
+            d["host"] = self.vm_guest_ip
         return d
 
 
@@ -221,6 +230,7 @@ class AppState:
                 node.shared_with = existing.shared_with or node.shared_with
                 node.share_permissions = existing.share_permissions or node.share_permissions
                 node.parent_node_id = existing.parent_node_id or node.parent_node_id
+                node.vm_guest_ip = node.vm_guest_ip or existing.vm_guest_ip
                 if existing.capabilities and not node.capabilities:
                     node.capabilities = existing.capabilities
                 elif node.capabilities and existing.capabilities:
