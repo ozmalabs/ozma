@@ -1,6 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react'
 import { tokenStorage } from './tokenStorage'
-import { parseToken, isTokenValid } from './tokenUtils'
+import { parseToken, isTokenValid, isTokenExpired } from './tokenUtils'
 import { api, setToken, removeToken } from '../api/client'
 
 interface User {
@@ -45,6 +45,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     removeToken()
     setState({ user: null, loading: false })
   }, [])
+
+  // Periodically check whether the stored token has expired mid-session and
+  // log the user out automatically if so. Checks every 30 s.
+  useEffect(() => {
+    const CHECK_INTERVAL_MS = 30_000
+    const id = setInterval(() => {
+      const token = tokenStorage.get()
+      if (state.user !== null && isTokenExpired(token)) {
+        removeToken()
+        setState({ user: null, loading: false })
+      }
+    }, CHECK_INTERVAL_MS)
+    return () => clearInterval(id)
+  }, [state.user])
 
   const login = useCallback(async (username: string, password: string) => {
     const res = await api.auth.login(username, password)

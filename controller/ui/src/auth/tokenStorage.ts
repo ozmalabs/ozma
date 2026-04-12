@@ -24,7 +24,14 @@ function parseExpiry(token: string): number | null {
 }
 
 function localStorageAvailable(): boolean {
-  return typeof localStorage !== 'undefined'
+  try {
+    const test = '__ozma_ls_test__'
+    localStorage.setItem(test, '1')
+    localStorage.removeItem(test)
+    return true
+  } catch {
+    return false
+  }
 }
 
 export const tokenStorage = {
@@ -66,5 +73,15 @@ export const tokenStorage = {
       _cachedExpiry = parseExpiry(token)
     }
     return _cachedExpiry
+  },
+
+  /**
+   * Returns true if there is no stored token, or if the stored token's expiry
+   * is in the past. Never throws.
+   */
+  isExpired(): boolean {
+    const expiry = this.getExpiry()
+    if (expiry === null) return true
+    return Date.now() >= expiry
   },
 }

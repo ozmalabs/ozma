@@ -1,6 +1,6 @@
 import { AuthResponse, NodesResponse } from '../types/api'
 import { tokenStorage } from '../auth/tokenStorage'
-import { isTokenExpiringSoon, isTokenValid, constantTimeEquals, parseToken } from '../auth/tokenUtils'
+import { isTokenExpired, isTokenExpiringSoon, isTokenValid, constantTimeEquals, parseToken } from '../auth/tokenUtils'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -191,6 +191,12 @@ async function refreshAuthToken(): Promise<string> {
 async function ensureFreshToken(): Promise<void> {
   const token = tokenStorage.get()
   if (!token) return // unauthenticated — let the request fail naturally with 401
+
+  // Token is fully expired — clear it and surface a clean 401
+  if (isTokenExpired(token)) {
+    tokenStorage.remove()
+    throw new ApiError(401, 'Session expired. Please log in again.')
+  }
 
   if (!isTokenExpiringSoon(token)) return
 

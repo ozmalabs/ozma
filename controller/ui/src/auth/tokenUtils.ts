@@ -85,6 +85,14 @@ export function isTokenValid(token: string): boolean {
   return Date.now() < p.exp * 1000
 }
 
+/** True if the token is missing, unparseable, or its expiry is in the past. */
+export function isTokenExpired(token: string | null | undefined): boolean {
+  if (!token) return true
+  const p = parseToken(token)
+  if (!p) return true
+  return Date.now() >= p.exp * 1000
+}
+
 /** True if the token expires within TOKEN_REFRESH_BUFFER_MS. */
 export function isTokenExpiringSoon(token: string): boolean {
   const p = parseToken(token)
