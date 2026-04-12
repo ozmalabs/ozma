@@ -43,6 +43,6 @@ pub mod manager;
 pub mod node;
 
 // Convenience re-exports — `use ozma_mesh::{MeshManager, MeshNode, ...}`.
-pub use error::MeshError;
+pub use error::{MeshError, Result};
 pub use manager::MeshManager;
 pub use node::{MeshNode, WgPrivateKey, WgPublicKey};

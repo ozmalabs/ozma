@@ -5,7 +5,7 @@
 //! loopback UDP sockets using boringtun's userspace WireGuard implementation.
 
 use ozma_mesh::error::{MeshError, Result};
-use ozma_mesh::{MeshManager, MeshNode};
+use ozma_mesh::{MeshManager, MeshNode, WgPublicKey};
 
 /// Two ephemeral loopback ports.  If these happen to be in use the test will
 /// fail with a bind error; pick different values if that occurs.
@@ -128,7 +128,6 @@ async fn remove_nonexistent_peer_returns_error() -> Result<()> {
 #[tokio::test]
 async fn private_key_base64_round_trip() -> Result<()> {
     use ozma_mesh::WgPrivateKey;
-
     let sk = WgPrivateKey::generate();
     let pk_original = sk.public_key();
 

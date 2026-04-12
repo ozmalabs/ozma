@@ -39,6 +39,7 @@ use libmdns::{Responder, Service};
 use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 use crate::error::{MeshError, Result};
 use crate::node::{MeshNode, WgPrivateKey};
@@ -67,7 +68,7 @@ pub struct MeshManager {
     pub(crate) inner: Arc<RwLock<Inner>>,
 
     /// UDP socket used to send/receive WireGuard-encapsulated packets.
-    socket: Arc<UdpSocket>,
+    pub socket: Arc<UdpSocket>,
 
     /// mDNS responder — kept alive for the lifetime of the manager.
     _mdns_responder: Responder,
@@ -88,6 +89,7 @@ impl MeshManager {
     /// `_ozma._udp.local` advertising the node's id, mesh IP, and public key.
     pub async fn new(node: MeshNode, private_key: WgPrivateKey) -> Result<Self> {
         // Bind the WireGuard UDP socket on all interfaces.
+        // Use port 0 to let the OS pick an ephemeral port when wg_port == 0.
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), node.wg_port);
         let socket = UdpSocket::bind(bind_addr)
             .map_err(|e| MeshError::TunnelError(format!("bind {bind_addr}: {e}")))?;
@@ -149,11 +151,12 @@ impl MeshManager {
             .socket
             .try_clone()
             .map_err(|e| MeshError::TunnelError(format!("socket clone for recv loop: {e}")))?;
+        // from_std requires the socket to already be non-blocking (set in new())
+        let async_sock = TokioUdpSocket::from_std(socket_clone)
+            .map_err(|e| MeshError::TunnelError(format!("tokio UdpSocket::from_std: {e}")))?;
         let inner = Arc::clone(&self.inner);
 
         tokio::spawn(async move {
-            let async_sock = TokioUdpSocket::from_std(socket_clone)
-                .expect("convert std UdpSocket to tokio UdpSocket");
             let mut buf = vec![0u8; 65535];
             let mut out = vec![0u8; 65535];
 
@@ -228,13 +231,14 @@ impl MeshManager {
         }
 
         // Decode keys for boringtun.
-        let local_sk_bytes = self.private_key.0.as_bytes().to_owned();
+        let local_sk = StaticSecret::from(self.private_key.to_bytes());
         let peer_pk_bytes = peer_node.wg_pubkey.to_bytes()?;
+        let peer_pk = X25519PublicKey::from(peer_pk_bytes);
 
         // Tunn::new(static_private, peer_public, preshared_key, keepalive, index, rate_limiter)
         let tunnel = Tunn::new(
-            local_sk_bytes.into(),
-            peer_pk_bytes.into(),
+            local_sk,
+            peer_pk,
             None,       // no preshared key
             Some(25),   // persistent keepalive every 25 s
             guard.peers.len() as u32,
@@ -314,7 +318,13 @@ impl MeshManager {
 
         match result {
             TunnResult::WriteToNetwork(data) => {
-                self.socket.send_to(data, peer_addr).map_err(|e| {
+                let async_sock = TokioUdpSocket::from_std(
+                    self.socket.try_clone().map_err(|e| {
+                        MeshError::TunnelError(format!("socket clone: {e}"))
+                    })?,
+                )
+                .map_err(|e| MeshError::TunnelError(format!("from_std: {e}")))?;
+                async_sock.send_to(data, peer_addr).await.map_err(|e| {
                     MeshError::TunnelError(format!("send handshake to {peer_addr}: {e}"))
                 })?;
                 debug!(peer_id = %peer_id, endpoint = %peer_addr,
@@ -362,7 +372,13 @@ impl MeshManager {
 
         match result {
             TunnResult::WriteToNetwork(packet) => {
-                let sent = self.socket.send_to(packet, peer_addr)?;
+                let async_sock = TokioUdpSocket::from_std(
+                    self.socket.try_clone().map_err(|e| {
+                        MeshError::TunnelError(format!("socket clone: {e}"))
+                    })?,
+                )
+                .map_err(|e| MeshError::TunnelError(format!("from_std: {e}")))?;
+                let sent = async_sock.send_to(packet, peer_addr).await?;
                 debug!(peer_id = %peer_id, bytes = sent, "WireGuard: packet sent");
                 Ok(sent)
             }

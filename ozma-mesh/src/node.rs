@@ -63,6 +63,11 @@ impl WgPrivateKey {
             .map_err(|_| MeshError::KeyError("private key must be 32 bytes".into()))?;
         Ok(Self(StaticSecret::from(arr)))
     }
+
+    /// Return the raw 32-byte secret key material.
+    pub(crate) fn to_bytes(&self) -> [u8; 32] {
+        *self.0.as_bytes()
+    }
 }
 
 // ── MeshNode ─────────────────────────────────────────────────────────────────
