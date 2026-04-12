@@ -407,11 +407,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     # --- User management ---
 
     @app.get("/api/v1/users")
-    async def list_users(request: Request) -> list[dict]:
+    async def list_users(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         if not user_manager:
-            return []
-        return [u.to_dict() for u in user_manager.list_users()]
+            return {"users": []}
+        return {"users": [u.to_dict() for u in user_manager.list_users()]}
 
     @app.get("/api/v1/users/me")
     async def get_current_user(request: Request) -> dict:
@@ -500,11 +500,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     # --- Service proxy management ---
 
     @app.get("/api/v1/services")
-    async def list_services(request: Request) -> list[dict]:
+    async def list_services(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         if not service_proxy:
-            return []
-        return [s.to_dict() for s in service_proxy.list_services()]
+            return {"services": []}
+        return {"services": [s.to_dict() for s in service_proxy.list_services()]}
 
     @app.get("/api/v1/services/{service_id}")
     async def get_service(service_id: str, request: Request) -> dict:
@@ -685,14 +685,18 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     async def list_shares(request: Request) -> dict:
         ctx = _require_scope(request, SCOPE_READ)
         if not sharing:
-            return {"given": [], "received": []}
+            return {"given": [], "received": [], "all": []}
         if ctx.user_id:
             return {
                 "given": [g.to_dict() for g in sharing.list_grants_from_user(ctx.user_id)],
                 "received": [g.to_dict() for g in sharing.list_grants_for_user(ctx.user_id)],
+                "all": [],
             }
-        return {"given": [], "received": [],
-                "all": [g.to_dict() for g in sharing.list_all_grants()]}
+        return {
+            "given": [],
+            "received": [],
+            "all": [g.to_dict() for g in sharing.list_all_grants()],
+        }
 
     @app.post("/api/v1/shares")
     async def create_share(body: dict, request: Request) -> dict:
@@ -3948,8 +3952,18 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     async def list_codecs() -> dict[str, Any]:
         if not codec_mgr:
             raise HTTPException(status_code=503, detail="Codec manager not available")
+        available = codec_mgr.list_available()
+        # Normalize: if available is a dict of {family: [encoder, ...]}, flatten to a list
+        if isinstance(available, dict):
+            codecs_list = [
+                {"family": family, "encoder": enc}
+                for family, encoders in available.items()
+                for enc in (encoders if isinstance(encoders, list) else [encoders])
+            ]
+        else:
+            codecs_list = available
         return {
-            "codecs": codec_mgr.list_available(),
+            "codecs": codecs_list,
             "configs": codec_mgr.list_configs(),
             "ndi_available": codec_mgr.ndi_available,
         }
