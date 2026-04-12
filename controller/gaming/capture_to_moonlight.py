@@ -71,15 +71,19 @@ class CaptureSession:
     # Status
     active: bool = False
     started_at: float | None = None
+    _ended_at: float | None = None
     clients: list[str] = field(default_factory=list)  # Client IDs connected
 
     @property
     def duration(self) -> float | None:
-        if self.started_at and self._ended_at:
+        if self.started_at and self._ended_at is not None:
             return self._ended_at - self.started_at
         return None
 
-    _ended_at: float | None = None
+    @property
+    def ended_at(self) -> float | None:
+        """Get the end time of the session."""
+        return self._ended_at
 
 
 class CaptureToMoonlightManager:
@@ -153,7 +157,34 @@ class CaptureToMoonlightManager:
           1. A Moonlight session
           2. A GStreamer pipeline
           3. Registers as a Moonlight app
+
+        Returns CaptureSession on success, None on failure.
+        Raises:
+            ValueError: If capture_source_id or client_id is invalid
+            RuntimeError: If session already active
         """
+        # Validate parameters
+        if not capture_source_id or not isinstance(capture_source_id, str):
+            log.error("Invalid capture_source_id: %s", capture_source_id)
+            return None
+
+        if not client_id or not isinstance(client_id, str):
+            log.error("Invalid client_id: %s", client_id)
+            return None
+
+        # Check if session already exists and is active
+        if capture_source_id in self._capture_sessions:
+            existing_session = self._capture_sessions[capture_source_id]
+            if existing_session.active:
+                log.warning(
+                    "Session already active for capture source %s",
+                    capture_source_id
+                )
+                # Add client to existing session
+                if client_id not in existing_session.clients:
+                    existing_session.clients.append(client_id)
+                return existing_session
+
         # Find the capture source
         display_source = self._display_capture.get_source(capture_source_id)
         if not display_source:
@@ -164,11 +195,19 @@ class CaptureToMoonlightManager:
             log.error("Capture source has no card info: %s", capture_source_id)
             return None
 
+        card = display_source.card
+        if not card.path or not Path(card.path).exists():
+            log.error("Capture card device not available: %s", card.path)
+            return None
+
         # Create Moonlight session
-        moonlight_session = await self._moonlight.create_session(client_id)
+        try:
+            moonlight_session = await self._moonlight.create_session(client_id)
+        except Exception as e:
+            log.error("Failed to create Moonlight session for %s: %s", client_id, e)
+            return None
 
         # Create pipeline config based on capture card capabilities
-        card = display_source.card
         pipeline_config = PipelineConfig(
             name=f"capture-{capture_source_id}",
             input_source="v4l2",
@@ -187,20 +226,59 @@ class CaptureToMoonlightManager:
         )
 
         # Create GStreamer pipeline
-        pipeline = await self._pipeline_manager.create_pipeline(
-            moonlight_session.session_id,
-            pipeline_config,
-        )
+        try:
+            pipeline = await self._pipeline_manager.create_pipeline(
+                moonlight_session.session_id,
+                pipeline_config,
+            )
+        except Exception as e:
+            log.error("Failed to create GStreamer pipeline: %s", e)
+            # Clean up Moonlight session
+            try:
+                await self._moonlight.end_session(moonlight_session.session_id)
+            except Exception:
+                pass
+            return None
 
         # Create input handler
-        input_handler = MoonlightInputHandler(client_id)
-        await input_handler.start()
+        try:
+            input_handler = MoonlightInputHandler(client_id)
+            await input_handler.start()
+        except Exception as e:
+            log.error("Failed to create input handler: %s", e)
+            # Clean up pipeline and Moonlight session
+            try:
+                await self._pipeline_manager.remove_pipeline(moonlight_session.session_id)
+            except Exception:
+                pass
+            try:
+                await self._moonlight.end_session(moonlight_session.session_id)
+            except Exception:
+                pass
+            return None
 
         # Register with Moonlight protocol
-        await self._moonlight.register_input_handler(
-            moonlight_session.session_id,
-            lambda report: self._handle_input_report(report, input_handler),
-        )
+        try:
+            await self._moonlight.register_input_handler(
+                moonlight_session.session_id,
+                lambda report: self._handle_input_report(report, input_handler),
+            )
+        except Exception as e:
+            log.error("Failed to register input handler: %s", e)
+            # Clean up everything
+            try:
+                await input_handler.stop()
+            except Exception:
+                pass
+            try:
+                await self._pipeline_manager.remove_pipeline(moonlight_session.session_id)
+            except Exception:
+                pass
+            try:
+                await self._moonlight.end_session(moonlight_session.session_id)
+            except Exception:
+                pass
+            return None
 
         # Create session
         session = CaptureSession(
@@ -235,20 +313,30 @@ class CaptureToMoonlightManager:
 
         # Stop input handler
         if session.input_handler:
-            await session.input_handler.stop()
-            for client_id in list(self._input_handlers.keys()):
-                if self._input_handlers[client_id] is session.input_handler:
-                    del self._input_handlers[client_id]
+            try:
+                await session.input_handler.stop()
+                for client_id in list(self._input_handlers.keys()):
+                    if self._input_handlers[client_id] is session.input_handler:
+                        del self._input_handlers[client_id]
+            except Exception as e:
+                log.error("Failed to stop input handler: %s", e)
 
         # Stop pipeline
         if session.pipeline:
-            await self._pipeline_manager.remove_pipeline(
-                session.moonlight_session.session_id
-            )
+            try:
+                if session.moonlight_session:
+                    await self._pipeline_manager.remove_pipeline(
+                        session.moonlight_session.session_id
+                    )
+            except Exception as e:
+                log.error("Failed to stop pipeline: %s", e)
 
         # End Moonlight session
         if session.moonlight_session:
-            await self._moonlight.end_session(session.moonlight_session.session_id)
+            try:
+                await self._moonlight.end_session(session.moonlight_session.session_id)
+            except Exception as e:
+                log.error("Failed to end Moonlight session: %s", e)
 
         session.active = False
         session._ended_at = asyncio.get_event_loop().time()
