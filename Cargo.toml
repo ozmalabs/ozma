@@ -8,7 +8,6 @@ members = [
     "ozma-proto",
     "ozma-mesh",
     "ozma-crypto",
-    "ozma-drivers",
 ]
 
 [workspace.dependencies]
