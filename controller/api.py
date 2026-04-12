@@ -3881,8 +3881,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     # --- Session recording endpoints ---
 
-    @app.get("/api/v1/recording/status")
-    async def recording_status() -> dict[str, Any]:
+    @app.get("/api/v1/recording/session/status")
+    async def recording_session_status() -> dict[str, Any]:
+        """Session recorder status (active recording session)."""
         if not recorder:
             return {"recording": False}
         return recorder.status()
@@ -4409,13 +4410,6 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(status_code=404, detail="WHIP session not found")
         await mobile_cam.end_session(session_id)
         return {"ok": True}
-
-    @app.get("/api/v1/cameras/whip")
-    async def whip_list() -> dict[str, Any]:
-        """List active WHIP (mobile camera) sessions."""
-        if not mobile_cam:
-            return {"sessions": []}
-        return {"sessions": await mobile_cam.list_sessions()}
 
     @app.get("/api/v1/cameras/whip/{session_id}")
     async def whip_get(session_id: str) -> dict[str, Any]:
@@ -7157,9 +7151,19 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
                 summary["total"] = summary["total_monthly_cost"]
                 summary["monthly"] = summary.get("total_monthly_cost", 0)
             return summary
-        if app_id in ("status", "config"):
-            # Forward to the appropriate handler via redirect logic
-            raise HTTPException(404, f"Use /api/v1/saas/{app_id} sub-path endpoint")
+        if app_id == "status":
+            if not saas_mgr:
+                raise HTTPException(503, "SaaS management not configured")
+            return saas_mgr.status()
+        if app_id == "config":
+            if not saas_mgr:
+                raise HTTPException(503, "SaaS management not configured")
+            return saas_mgr.get_config().to_dict()
+        if app_id in ("shadow-it", "renewals", "duplicates", "vendor-risk",
+                      "apps", "analytics"):
+            # These are handled by dedicated routes registered before this one
+            # but FastAPI may match this parameterized route first — forward correctly
+            raise HTTPException(404, f"Use the dedicated /api/v1/saas/{app_id} endpoint")
         if not license_mgr:
             raise HTTPException(503, "License manager not enabled")
         app_obj = license_mgr.get_saas(app_id)
@@ -8258,20 +8262,6 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     # ── SaaS Management ───────────────────────────────────────────────────────
 
-    @app.get("/api/v1/saas/status")
-    async def saas_status(request: Request) -> dict[str, Any]:
-        _require_scope(request, SCOPE_READ)
-        if not saas_mgr:
-            raise HTTPException(503, "SaaS management not configured")
-        return saas_mgr.status()
-
-    @app.get("/api/v1/saas/config")
-    async def saas_get_config(request: Request) -> dict[str, Any]:
-        _require_scope(request, SCOPE_READ)
-        if not saas_mgr:
-            raise HTTPException(503, "SaaS management not configured")
-        return saas_mgr.get_config().to_dict()
-
     @app.patch("/api/v1/saas/config")
     async def saas_update_config(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_WRITE)
@@ -8871,7 +8861,13 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     @app.get("/api/v1/recording/status")
     async def recording_status(request: Request) -> dict[str, Any]:
+        """Camera recording status (policies + active jobs)."""
         _require_scope(request, SCOPE_READ)
+        if cam_rec is None:
+            # Fall back to session recorder status when cam_rec not configured
+            if not recorder:
+                return {"recording": False}
+            return recorder.status()
         return _cr().get_status()
 
     @app.get("/api/v1/recording/jobs")
