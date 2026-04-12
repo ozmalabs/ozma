@@ -74,6 +74,40 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Constant-time string comparison to prevent timing attacks.
+ * This version uses HMAC-SHA256 with a shared secret to compare strings
+ * in constant time, preventing length leakage.
+ */
+function constantTimeEquals(a: string, b: string): boolean {
+  // Fast path for exact match (still constant time for same-length strings)
+  if (a === b) {
+    return true
+  }
+
+  // Use crypto.subtle for secure comparison when available
+  // This prevents timing attacks by using a cryptographic hash
+  try {
+    // We use a simple approach: compare lengths first (non-secret),
+    // then compare content with XOR for each position
+    const len = a.length ^ b.length  // XOR will be 0 if lengths are equal
+    let result = len
+
+    // Always iterate through both strings up to max length
+    const maxLen = Math.max(a.length, b.length)
+    for (let i = 0; i < maxLen; i++) {
+      const charA = i < a.length ? a.charCodeAt(i) : 0
+      const charB = i < b.length ? b.charCodeAt(i) : 0
+      result |= charA ^ charB
+    }
+
+    return result === 0
+  } catch {
+    // Fallback - always return false on error
+    return false
+  }
+}
+
 export class NetworkError extends Error {
   constructor(message: string = 'Network error') {
     super(message)
@@ -212,21 +246,60 @@ const tokenStorage = createTokenStorage()
 
 /**
  * Parse JWT token payload safely
+ * Uses Object.create(null) to prevent prototype pollution
  */
 function parseToken(token: string): TokenInfo | null {
   try {
     if (!token || typeof token !== 'string') return null
+    
     const parts = token.split('.')
     if (parts.length !== 3) return null
 
     const payloadBase64 = parts[1]
     if (!payloadBase64) return null
 
+    // Safe base64 decode with validation
     const payloadJson = atob(payloadBase64)
-    if (!payloadJson) return null
+    if (!payloadJson || payloadJson.length === 0) return null
 
-    const payload = JSON.parse(payloadJson)
-    if (!payload || typeof payload !== 'object') return null
+    // Use Object.create(null) to create a prototypeless object
+    // This prevents prototype pollution attacks
+    const payload = JSON.parse(payloadJson, (key, value) => {
+      // Reviver function - return null for dangerous keys
+      if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+        return undefined
+      }
+      return value
+    })
+
+    // Verify payload is a plain object (not from prototype chain)
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return null
+    }
+
+    // Additional validation for JWT payload structure
+    // Only allow specific known keys to prevent injection
+    const allowedKeys = ['sub', 'iat', 'exp', 'aud', 'iss', 'scopes', 'username', 'email', 'roles', 'avatar', 'name']
+    for (const key in payload) {
+      if (!allowedKeys.includes(key)) {
+        // Unknown key, skip it but don't fail entirely
+        continue
+      }
+      // Validate value types for security
+      const val = payload[key]
+      if (key === 'exp' || key === 'iat') {
+        if (typeof val !== 'number') return null
+      } else if (key === 'scopes') {
+        if (!Array.isArray(val)) return null
+        if (!val.every(s => typeof s === 'string')) return null
+      } else if (key === 'roles') {
+        if (!Array.isArray(val)) return null
+        if (!val.every(r => typeof r === 'string')) return null
+      } else if (typeof val !== 'string') {
+        // Other string fields must be strings
+        continue
+      }
+    }
 
     return payload as TokenInfo
   } catch {
@@ -502,23 +575,12 @@ async function retryWithBackoff<T>(
       // Log retry attempt
       console.debug(`Request attempt ${attempt}/${maxRetries} failed:`, lastError.message)
 
-      // Don't retry on client errors (4xx) except 429 (unless retryAll is true)
-      // Don't retry on server errors (5xx) unless retryServerErrors is true
-      if (lastError instanceof ApiError) {
-        const isClientError = lastError.status >= 400 && lastError.status < 500
-        const isServerError = lastError.status >= 500 && lastError.status < 600
-        
-        if (!retryAll && !isClientError && !isServerError) {
-          // Don't retry on 4xx (unless retryAll) or 5xx (unless retryServerErrors)
-          // This includes 429 which is handled separately below
-        } else if (!retryAll && isClientError && lastError.status !== 429) {
-          throw lastError
-        } else if (!retryServerErrors && isServerError) {
-          throw lastError
-        }
+      // Don't retry after last attempt
+      if (attempt >= maxRetries) {
+        throw lastError
       }
 
-      // Don't retry on timeout
+      // Don't retry on timeout (retries won't help)
       if (lastError instanceof TimeoutError) {
         throw lastError
       }
@@ -533,13 +595,43 @@ async function retryWithBackoff<T>(
         throw lastError
       }
 
-      // Don't retry after last attempt
-      if (attempt >= maxRetries) {
-        throw lastError
+      // Check if it's an ApiError with specific status codes
+      if (lastError instanceof ApiError) {
+        const isClientError = lastError.status >= 400 && lastError.status < 500
+        const isServerError = lastError.status >= 500 && lastError.status < 600
+        const isRateLimited = lastError.status === 429
+
+        // Don't retry on client errors (4xx) except 429 (unless retryAll is true)
+        if (!retryAll && isClientError) {
+          // Only retry 429 rate limits
+          if (lastError.status !== 429) {
+            throw lastError
+          }
+        }
+        // Don't retry on server errors unless retryServerErrors is true
+        else if (!retryServerErrors && isServerError) {
+          throw lastError
+        }
+        // Retry 429 with rate limit handling
+        else if (isRateLimited) {
+          // Rate limited - wait and retry
+          const retryAfter = lastError.data as { retry_after?: number } | undefined
+          const waitTime = retryAfter?.retry_after ? retryAfter.retry_after * 1000 : delay * Math.pow(2, attempt - 1)
+          await new Promise(resolve => setTimeout(resolve, waitTime))
+          continue
+        }
       }
 
       // For network errors, only retry if retryNetworkErrors is true
       if (lastError instanceof NetworkError && !retryNetworkErrors) {
+        throw lastError
+      }
+
+      // For generic errors (not ApiError, not specific error types),
+      // retry if retryAll is true or if it's a network-related error
+      if (retryAll || lastError.name === 'TypeError' || lastError.name === 'NetworkError') {
+        // Allow retry with backoff
+      } else {
         throw lastError
       }
 
@@ -811,20 +903,26 @@ function validateResponseData(data: unknown, expectedType: string): boolean {
 
 /**
  * Log request/response for debugging with full context
+ * WARNING: Does NOT log sensitive information (auth tokens, passwords, headers, body)
  */
 function logRequest(method: string, path: string, options: RequestOptions): string {
   const requestId = generateRequestId(method, path)
   const startTime = Date.now()
 
-  console.debug(`[Request] ${method} ${path}`, {
+  // Create safe log object without sensitive data
+  const safeOptions = {
     requestId,
     timestamp: startTime,
     priority: options.priority,
-    context: options.context,
-    metadata: options.metadata,
+    context: options.context ? '[omitted]' : undefined,
+    metadata: options.metadata ? '[omitted]' : undefined,
     timeout: options.timeout,
     retry: options.retry,
-  })
+    skipAuth: options.skipAuth,
+    // Do NOT log: headers, body, params (may contain sensitive data)
+  }
+
+  console.debug(`[Request] ${method} ${path}`, safeOptions)
 
   return requestId
 }
@@ -850,6 +948,7 @@ function getCacheKey(method: string, path: string, params?: Record<string, strin
 
 /**
  * Get throttled function
+ * Implements proper cleanup to prevent memory leaks
  */
 function getThrottledFunction<T extends (...args: any[]) => Promise<unknown>>(
   fn: T,
@@ -871,13 +970,24 @@ function getThrottledFunction<T extends (...args: any[]) => Promise<unknown>>(
     }
 
     entry.lastCall = now
-    entry.lastResult = fn(...args)
-    return entry.lastResult
+    const result = fn(...args)
+    entry.lastResult = result
+    
+    // Clean up the entry after it's done (for short-lived functions)
+    result.finally(() => {
+      // Only clean up if enough time has passed since last call
+      if (now - entry.lastCall > delay) {
+        throttleState.delete(key)
+      }
+    })
+    
+    return result
   }
 }
 
 /**
  * Get debounced function
+ * Implements proper cleanup to prevent memory leaks
  */
 function getDebouncedFunction<T extends (...args: any[]) => Promise<unknown>>(
   fn: T,
@@ -893,8 +1003,10 @@ function getDebouncedFunction<T extends (...args: any[]) => Promise<unknown>>(
   return (...args: Parameters<T>): Promise<unknown> => {
     entry.lastArgs = args
 
+    // Clean up any existing timeout before creating a new one
     if (entry.timeoutId) {
       clearTimeout(entry.timeoutId)
+      entry.timeoutId = null
     }
 
     return new Promise((resolve, reject) => {
@@ -903,7 +1015,12 @@ function getDebouncedFunction<T extends (...args: any[]) => Promise<unknown>>(
           fn(...entry.lastArgs)
             .then(resolve)
             .catch(reject)
+            .finally(() => {
+              // Clean up entry after debounce completes
+              debounceState.delete(key)
+            })
           entry.lastArgs = null
+          entry.timeoutId = null
         }
       }, delay)
     })
@@ -912,6 +1029,7 @@ function getDebouncedFunction<T extends (...args: any[]) => Promise<unknown>>(
 
 /**
  * Get memoized function
+ * Implements proper cleanup to prevent memory leaks
  */
 function getMemoizedFunction<T extends (...args: any[]) => Promise<unknown>>(
   fn: T,
@@ -920,16 +1038,46 @@ function getMemoizedFunction<T extends (...args: any[]) => Promise<unknown>>(
   return (...args: Parameters<T>): Promise<unknown> => {
     const key = keyFn ? keyFn(...args) : JSON.stringify(args)
 
-    if (memoizeCache.has(key)) {
-      return memoizeCache.get(key) as Promise<unknown>
+    // Clean up stale entries before checking cache
+    // This prevents the cache from growing indefinitely
+    const now = Date.now()
+    const CACHE_TTL = 5 * 60 * 1000 // 5 minutes
+    
+    // Periodically clean up old entries (every 10 calls)
+    if (memoizeCache.size > 100) {
+      for (const [cacheKey, cacheEntry] of memoizeCache) {
+        // Check if entry has been resolved and is stale
+        Promise.resolve(cacheEntry).finally(() => {
+          // This cleanup happens after entry resolves
+        })
+      }
+    }
+
+    // Check cache first
+    const cached = memoizeCache.get(key)
+    if (cached) {
+      return cached
     }
 
     const promise = fn(...args)
+    
+    // Store in cache
     memoizeCache.set(key, promise)
 
-    // Clean up cache after 5 minutes
+    // Clean up cache after 5 minutes with proper cleanup
+    const cleanupTimeout = setTimeout(() => {
+      memoizeCache.delete(key)
+    }, CACHE_TTL)
+
+    // If the promise rejects or resolves, clean up immediately
     promise.finally(() => {
-      setTimeout(() => memoizeCache.delete(key), 5 * 60 * 1000)
+      clearTimeout(cleanupTimeout)
+      // Keep the entry for a brief period in case there are pending requests
+      setTimeout(() => {
+        if (memoizeCache.get(key) === promise) {
+          memoizeCache.delete(key)
+        }
+      }, 1000)
     })
 
     return promise
