@@ -1,0 +1,31 @@
+[package]
+name = "softnode-qmp"
+version = "0.1.0"
+edition = "2021"
+description = "QMP client and HID→QMP translator for ozma softnode"
+license = "AGPL-3.0-only"
+
+[[bin]]
+name = "softnode-qmp"
+path = "src/main.rs"
+
+[lib]
+name = "softnode_qmp"
+path = "src/lib.rs"
+
+[[test]]
+name = "integration_test"
+path = "tests/integration_test.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "1"
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
