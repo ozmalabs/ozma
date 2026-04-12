@@ -1993,7 +1993,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
                 "link_id": lnk.get("id"),
             }
             for lnk in links
-            if isinstance(lnk, dict)
+            if isinstance(lnk, dict) and lnk.get("out_node") and lnk.get("in_node")
         ]
         return {"routes": routes, "nodes": nodes, "links": links}
 
@@ -2444,9 +2444,12 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             if port is None:
                 raise HTTPException(400, "port is required to enable VBAN")
             try:
-                node.audio_vban_port = int(port)
+                port_int = int(port)
             except (TypeError, ValueError):
                 raise HTTPException(400, "port must be a valid integer")
+            if not (1024 <= port_int <= 65535):
+                raise HTTPException(400, "port must be between 1024 and 65535")
+            node.audio_vban_port = port_int
         else:
             node.audio_vban_port = None
 
@@ -2687,6 +2690,10 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         _require_scope(request, SCOPE_WRITE)
         if not audio:
             raise HTTPException(status_code=503, detail="Audio routing disabled")
+        if body.delay_ms < 0:
+            raise HTTPException(status_code=400, detail="delay_ms must be non-negative")
+        if body.delay_ms > 10_000:
+            raise HTTPException(status_code=400, detail="delay_ms must not exceed 10000 ms")
         ok = await audio.outputs.set_delay(output_id, body.delay_ms)
         if not ok:
             raise HTTPException(status_code=404, detail=f"Output '{output_id}' not found")
@@ -2895,6 +2902,8 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(status_code=503, detail="Paste typing not available")
         if not body.text:
             raise HTTPException(status_code=400, detail="No text provided")
+        if not (1 <= body.rate <= 200):
+            raise HTTPException(status_code=400, detail="rate must be between 1 and 200 characters per second")
         result = await paste_typer.type_text(
             body.text,
             layout=body.layout,
@@ -3435,6 +3444,10 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         _require_scope(request, SCOPE_WRITE)
         if not ocr_triggers:
             raise HTTPException(status_code=503, detail="OCR triggers not available")
+        # Prevent overwriting built-in patterns
+        existing = {p.get("id") for p in ocr_triggers.list_patterns() if p.get("builtin")}
+        if getattr(body, "id", None) and body.id in existing:
+            raise HTTPException(status_code=409, detail=f"Cannot overwrite built-in pattern '{body.id}'")
         ocr_triggers.add_pattern(body)
         return {"ok": True, "pattern": body.to_dict()}
 
