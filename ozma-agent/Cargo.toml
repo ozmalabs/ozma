@@ -1,17 +1,49 @@
 [package]
-name    = "ozma-agent"
-version = "0.1.0"
-edition = "2021"
+name        = "ozma-agent"
+version     = "0.1.0"
+edition     = "2021"
+description = "Ozma Connect client — registration, heartbeat, relay tunnel, metrics push"
+license     = "AGPL-3.0-only"
 
 [[bin]]
 name = "ozma-agent"
 path = "src/main.rs"
 
+[lib]
+name = "ozma_agent"
+path = "src/lib.rs"
+
 [dependencies]
+# Workspace
 tokio              = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow             = { workspace = true }
-ozma-proto         = { path = "../ozma-proto" }
-ozma-mesh          = { path = "../ozma-mesh" }
-ozma-crypto        = { path = "../ozma-crypto" }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+uuid               = { workspace = true }
+
+# HTTP client — rustls only, no OpenSSL
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "rustls-tls-native-roots",
+] }
+
+# Exponential backoff
+backoff = { version = "0.4", features = ["tokio"] }
+
+# System metrics
+sysinfo = "0.30"
+
+# Misc
+hostname = "0.3"
+
+# ozma workspace crates
+ozma-proto  = { path = "../ozma-proto" }
+ozma-mesh   = { path = "../ozma-mesh" }
+ozma-crypto = { path = "../ozma-crypto" }
+
+[dev-dependencies]
+tokio-test = "0.4"
+wiremock   = "0.6"
