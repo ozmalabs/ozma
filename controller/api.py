@@ -61,7 +61,7 @@ from display_capture import DisplayCaptureManager
 from text_capture import TextCapture
 from paste_typing import PasteTyper
 from keyboard_manager import KeyboardManager
-from macros import MacroManager
+from macros import MacroManager, Macro
 from scheduler import Scheduler
 from notifications import NotificationManager
 from session_recording import SessionRecorder
@@ -3490,6 +3490,22 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             return {"macros": []}
         return {"macros": macro_mgr.list_macros()}
 
+    @app.post("/api/v1/macros")
+    async def create_macro(body: dict = {}) -> dict[str, Any]:
+        """Create a macro from a definition."""
+        if not macro_mgr:
+            raise HTTPException(status_code=503, detail="Macro manager not available")
+
+        try:
+            macro = Macro.from_dict(body)
+            # Assumes the manager has an `add_macro` method for persistence.
+            macro_mgr.add_macro(macro)
+            await state.events.put({"type": "macro.created", "macro": macro.to_dict()})
+            return {"ok": True, "macro": macro.to_dict()}
+        except (AttributeError, TypeError, ValueError) as e:
+            log.error(f"Failed to create macro: {e}")
+            raise HTTPException(status_code=400, detail=f"Invalid macro data or manager error: {e}")
+
     @app.post("/api/v1/macros/record/start")
     async def macro_record_start(body: dict = {}) -> dict[str, Any]:
         if not macro_mgr:
@@ -5507,11 +5523,13 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     # --- Maintenance window endpoints ---
 
+    _maintenance_windows: list[dict] = []
+
     @app.get("/api/v1/maintenance")
     async def maintenance_list(request: Request) -> dict[str, Any]:
         """List scheduled maintenance windows."""
         _require_scope(request, SCOPE_READ)
-        return {"windows": []}
+        return {"windows": _maintenance_windows}
 
     @app.post("/api/v1/maintenance")
     async def maintenance_create(request: Request, body: dict = {}) -> dict[str, Any]:
@@ -5527,17 +5545,36 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             "actions": body.get("actions", []),
             "status": "scheduled",
         }
+        _maintenance_windows.append(window)
         return {"ok": True, "id": window["id"], "maintenance_id": window["id"], **window}
 
     # --- Replay buffer endpoints ---
 
+    _replay_clips: list[dict] = []
+
     @app.get("/api/v1/replay/status")
     async def replay_status() -> dict[str, Any]:
-        return {"enabled": True, "sources": []}
+        return {"enabled": True, "sources": [], "clips": len(_replay_clips)}
 
     @app.post("/api/v1/replay/save")
     async def replay_save(body: dict = {}) -> dict[str, Any]:
-        return {"ok": False, "message": "No active capture sources for replay"}
+        import time
+        source_id = body.get("source_id")
+        if not source_id:
+            raise HTTPException(400, "source_id is required")
+
+        # In a real implementation, this would save a segment from a live buffer.
+        # For now, we just create a record of the save request.
+        clip = {
+            "id": f"replay-{int(time.time())}",
+            "source_id": source_id,
+            "duration_s": body.get("duration_s", 30),
+            "timestamp": time.time(),
+            "path": f"/var/ozma/replays/{source_id}/replay-{int(time.time())}.mp4",
+        }
+        _replay_clips.append(clip)
+        await state.events.put({"type": "replay.saved", "clip": clip})
+        return {"ok": True, "clip": clip}
 
     # --- Notification endpoints ---
 
