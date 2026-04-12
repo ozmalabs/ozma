@@ -3517,6 +3517,23 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             return {"macros": []}
         return {"macros": macro_mgr.list_macros()}
 
+    @app.post("/api/v1/macros")
+    async def create_macro(body: dict = {}) -> dict[str, Any]:
+        """Create a macro from a definition (steps list).
+        Body: {"id": "...", "name": "...", "steps": [...]}
+        """
+        if not macro_mgr:
+            raise HTTPException(status_code=503, detail="Macro manager not available")
+        macro_id = body.get("id", "")
+        name = body.get("name", "")
+        steps = body.get("steps", [])
+        if not macro_id:
+            raise HTTPException(status_code=400, detail="id is required")
+        macro = macro_mgr.create_macro(macro_id, name, steps)
+        if not macro:
+            raise HTTPException(status_code=409, detail="Macro already exists or invalid steps")
+        return macro.to_dict()
+
     @app.post("/api/v1/macros/record/start")
     async def macro_record_start(body: dict = {}) -> dict[str, Any]:
         if not macro_mgr:
