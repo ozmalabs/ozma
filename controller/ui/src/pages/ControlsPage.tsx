@@ -28,50 +28,6 @@ interface ControlSurface {
   displays: Record<string, DisplayControl>
 }
 
-// Mock data for demo - will be replaced with actual API calls
-const MOCK_SURFACES: ControlSurface[] = [
-  {
-    id: 'midi-xtouch',
-    type: 'midi',
-    device: 'X-Touch One',
-    controls: {
-      fader1: { name: 'fader1', value: 85, binding: { action: 'audio.volume', target: '@active', value: null }, lockout: false },
-      button1: { name: 'button1', value: false, binding: { action: 'scenario.activate', target: 'matt-workstation', value: null }, lockout: false },
-    },
-    displays: {},
-  },
-  {
-    id: 'streamdeck-main',
-    type: 'streamdeck',
-    device: 'Stream Deck Mini',
-    controls: {
-      key_0: { name: 'key_0', value: null, binding: { action: 'scenario.activate', target: 'streamdeck-main', value: 'home' }, lockout: false },
-      key_1: { name: 'key_1', value: null, binding: { action: 'scenario.activate', target: 'streamdeck-main', value: 'studio' }, lockout: false },
-      key_2: { name: 'key_2', value: null, binding: { action: 'scenario.activate', target: 'streamdeck-main', value: 'office' }, lockout: false },
-      key_3: { name: 'key_3', value: null, binding: { action: 'scenario.activate', target: 'streamdeck-main', value: 'post' }, lockout: false },
-      key_4: { name: 'key_4', value: null, binding: { action: 'scenario.activate', target: 'streamdeck-main', value: 'stream' }, lockout: false },
-      key_5: { name: 'key_5', value: null, binding: { action: 'audio.mute', target: '@active', value: null }, lockout: false },
-    },
-    displays: {},
-  },
-  {
-    id: 'gamepad-xbox',
-    type: 'gamepad',
-    device: 'Xbox Wireless Controller',
-    controls: {
-      south: { name: 'south (A)', value: null, binding: { action: 'scenario.activate', target: 'gamepad-xbox', value: null }, lockout: false },
-      lb: { name: 'lb', value: null, binding: { action: 'scenario.next', target: null, value: -1 }, lockout: false },
-      rb: { name: 'rb', value: null, binding: { action: 'scenario.next', target: null, value: 1 }, lockout: false },
-      guide: { name: 'guide', value: null, binding: { action: 'audio.mute', target: '@active', value: null }, lockout: false },
-      rt_volume: { name: 'rt_volume', value: null, binding: { action: 'audio.volume', target: '@active', value: null }, lockout: false },
-      dpad_up: { name: 'dpad_up', value: null, binding: { action: 'audio.volume_step', target: '@active', value: 0.05 }, lockout: false },
-      dpad_down: { name: 'dpad_down', value: null, binding: { action: 'audio.volume_step', target: '@active', value: -0.05 }, lockout: false },
-      dpad_left: { name: 'dpad_left', value: null, binding: { action: 'scenario.next', target: null, value: -1 }, lockout: false },
-      dpad_right: { name: 'dpad_right', value: null, binding: { action: 'scenario.next', target: null, value: 1 }, lockout: false },
-    },
-    displays: {},
-  },
-]
 
 export default function ControlsPage() {
   const [surfaces, setSurfaces] = useState<ControlSurface[]>([])
@@ -85,13 +41,16 @@ export default function ControlsPage() {
   async function fetchControls() {
     try {
       setLoading(true)
-      // TODO: Replace with actual GraphQL/API call
-      // const response = await fetch('/api/v1/controls')
-      // const data = await response.json()
-      setSurfaces(MOCK_SURFACES)
+      const response = await fetch('/api/v1/controls')
+      if (!response.ok) {
+        const errorText = await response.text()
+        throw new Error(`Failed to fetch control surfaces: ${response.status} ${errorText}`)
+      }
+      const data = await response.json()
+      setSurfaces(data.surfaces || [])
       setError(null)
-    } catch (err) {
-      setError('Failed to load control surfaces')
+    } catch (err: any) {
+      setError(err.message || 'Failed to load control surfaces')
       console.error('Error fetching controls:', err)
     } finally {
       setLoading(false)
