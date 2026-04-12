@@ -3095,6 +3095,16 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     # --- Paste typing endpoints ---
 
+    @app.get("/api/v1/paste-typing")
+    async def paste_typing_status() -> dict[str, Any]:
+        """Return paste-typing availability and supported keyboard layouts."""
+        if not paste_typer:
+            return {"available": False, "layouts": []}
+        return {
+            "available": True,
+            "layouts": PasteTyper.available_layouts(),
+        }
+
     @app.post("/api/v1/paste")
     async def paste_text(request: Request, body: PasteTextRequest) -> dict[str, Any]:
         """Type text to the active node via HID keystrokes.
@@ -3641,6 +3651,22 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(status_code=503, detail="OCR triggers not available")
         return {"patterns": ocr_triggers.list_patterns()}
 
+    @app.get("/api/v1/ocr-triggers")
+    async def list_ocr_triggers_alias() -> dict[str, Any]:
+        """Alias for GET /api/v1/ocr/triggers."""
+        if not ocr_triggers:
+            raise HTTPException(status_code=503, detail="OCR triggers not available")
+        return {"patterns": ocr_triggers.list_patterns()}
+
+    @app.post("/api/v1/ocr-triggers")
+    async def add_ocr_trigger_alias(request: Request, body: TriggerPattern) -> dict[str, Any]:
+        """Alias for POST /api/v1/ocr/triggers."""
+        _require_scope(request, SCOPE_WRITE)
+        if not ocr_triggers:
+            raise HTTPException(status_code=503, detail="OCR triggers not available")
+        ocr_triggers.add_pattern(body)
+        return {"ok": True, "pattern": body.to_dict()}
+
     @app.post("/api/v1/ocr/triggers")
     async def add_ocr_trigger(request: Request, body: TriggerPattern) -> dict[str, Any]:
         """Add a custom OCR trigger pattern."""
@@ -3677,6 +3703,13 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if not run_id:
             return result  # error (no active node)
         return result
+
+    @app.get("/api/v1/automation")
+    async def list_automation_runs() -> dict[str, Any]:
+        """List all active and recent background automation runs."""
+        if not auto_engine:
+            raise HTTPException(status_code=503, detail="Automation engine not available")
+        return {"runs": auto_engine.list_runs() if hasattr(auto_engine, "list_runs") else []}
 
     @app.get("/api/v1/automation/{run_id}/status")
     async def automation_status(run_id: str) -> dict[str, Any]:
@@ -4096,6 +4129,13 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     @app.get("/api/v1/schedule")
     async def list_schedule() -> dict[str, Any]:
+        if not sched:
+            raise HTTPException(status_code=503, detail="Scheduler not available")
+        return {"rules": sched.list_rules()}
+
+    @app.get("/api/v1/scheduler/rules")
+    async def list_scheduler_rules_alias() -> dict[str, Any]:
+        """Alias for GET /api/v1/schedule."""
         if not sched:
             raise HTTPException(status_code=503, detail="Scheduler not available")
         return {"rules": sched.list_rules()}
@@ -5903,6 +5943,34 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         "sticky_ms": 0,
         "screens": [],
     }
+
+    @app.get("/api/v1/display-topology")
+    async def get_display_topology(request: Request) -> dict[str, Any]:
+        """
+        Return the display topology for all nodes.
+
+        Each node reports its display outputs (width, height, name).
+        This endpoint aggregates them into a flat topology map.
+        """
+        _require_scope(request, SCOPE_READ)
+        topology = []
+        for nid, node in state.nodes.items():
+            outputs = getattr(node, "display_outputs", []) or []
+            topology.append({
+                "node_id": nid,
+                "host": node.host,
+                "machine_class": getattr(node, "machine_class", "workstation"),
+                "displays": [
+                    {
+                        "index": i,
+                        "name": o.get("name", f"display{i}"),
+                        "width": o.get("width", 0),
+                        "height": o.get("height", 0),
+                    }
+                    for i, o in enumerate(outputs)
+                ],
+            })
+        return {"topology": topology, "node_count": len(topology)}
 
     @app.get("/api/v1/edge-crossing")
     async def edge_crossing_get(request: Request) -> dict[str, Any]:
