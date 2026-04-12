@@ -2000,6 +2000,21 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         ]
         return {"routes": routes, "nodes": nodes, "links": links}
 
+    @app.get("/api/v1/audio/volume")
+    async def get_audio_volume(request: Request, node_name: str = "") -> dict[str, Any]:
+        """Get volume state for a PipeWire node (or all nodes if node_name omitted)."""
+        _require_scope(request, SCOPE_READ)
+        if not audio:
+            raise HTTPException(status_code=503, detail="Audio routing disabled")
+        snap = audio.watcher.snapshot()
+        nodes = snap.get("nodes", {})
+        if node_name:
+            node = nodes.get(node_name)
+            if node is None:
+                raise HTTPException(status_code=404, detail=f"PW node '{node_name}' not found")
+            return {"node_name": node_name, "volume": node.get("volume", 1.0), "mute": node.get("mute", False)}
+        return {"nodes": {n: {"volume": v.get("volume", 1.0), "mute": v.get("mute", False)} for n, v in nodes.items()}}
+
     @app.post("/api/v1/audio/volume")
     async def set_audio_volume(request: Request, req: VolumeRequest) -> dict[str, Any]:
         """Set volume (linear 0.0-1.0+) on a PipeWire node."""
@@ -2010,6 +2025,21 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if not ok:
             raise HTTPException(status_code=404, detail=f"PW node '{req.node_name}' not found")
         return {"ok": True, "node_name": req.node_name, "volume": req.volume}
+
+    @app.get("/api/v1/audio/mute")
+    async def get_audio_mute(request: Request, node_name: str = "") -> dict[str, Any]:
+        """Get mute state for a PipeWire node (or all nodes if node_name omitted)."""
+        _require_scope(request, SCOPE_READ)
+        if not audio:
+            raise HTTPException(status_code=503, detail="Audio routing disabled")
+        snap = audio.watcher.snapshot()
+        nodes = snap.get("nodes", {})
+        if node_name:
+            node = nodes.get(node_name)
+            if node is None:
+                raise HTTPException(status_code=404, detail=f"PW node '{node_name}' not found")
+            return {"node_name": node_name, "mute": node.get("mute", False)}
+        return {"nodes": {n: {"mute": v.get("mute", False)} for n, v in nodes.items()}}
 
     @app.post("/api/v1/audio/mute")
     async def set_audio_mute(request: Request, req: MuteRequest) -> dict[str, Any]:
@@ -5652,9 +5682,10 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return dict(_edge_crossing_config)
 
     @app.put("/api/v1/edge-crossing")
-    async def edge_crossing_update(request: Request, body: dict = {}) -> dict[str, Any]:
+    async def edge_crossing_update(request: Request) -> dict[str, Any]:
         """Update edge-crossing configuration."""
         _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
         for k in ("enabled", "sticky_ms", "screens"):
             if k in body:
                 _edge_crossing_config[k] = body[k]
