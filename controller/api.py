@@ -523,7 +523,10 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(503, "Service proxy not enabled")
         name = body.get("name", "").strip()
         target_host = body.get("target_host", "127.0.0.1")
-        target_port = int(body.get("target_port", 0))
+        try:
+            target_port = int(body.get("target_port", 0))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "target_port must be an integer")
         if not name or not target_port:
             raise HTTPException(400, "name and target_port are required")
         try:
@@ -541,6 +544,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             )
         except ValueError as e:
             raise HTTPException(409, str(e))
+        except Exception as e:
+            log.exception("register_service failed for name=%r: %s", name, e)
+            raise HTTPException(500, f"Service registration failed: {e}")
         await state.events.put({"type": "service.registered", "service": s.to_dict()})
         return s.to_dict()
 
