@@ -54,7 +54,11 @@ function useAudioData() {
       const allNodesData = await allNodesRes.json()
 
       setPwNodes(nodesData.nodes ?? {})
-      setLinks(routesData.links ?? [])
+      // /audio/routes returns {routes: [{from, to, link_id}], links: [...]}
+      // Map to AudioLink shape expected by RoutingMatrix
+      const rawRoutes: Array<{ from: string | null; to: string | null; link_id: number | null }> =
+        routesData.routes ?? []
+      setLinks(rawRoutes)
 
       // Build VBAN list from controller nodes
       const nodeList: NodeInfo[] = allNodesData.nodes ?? []
@@ -286,11 +290,12 @@ export default function Audio() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ node_name: nodeName, volume }),
         })
+        await refresh()
       } finally {
         setSaving(null)
       }
     },
-    []
+    [refresh]
   )
 
   const handleMuteToggle = useCallback(async (nodeName: string, mute: boolean) => {
