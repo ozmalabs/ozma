@@ -38,9 +38,8 @@ reqwest            = { version = "0.12", features = ["json"] }
 # CLI
 clap               = { version = "4", features = ["derive"] }
 # mDNS
-libmdns            = "0.9"
+mdns-sd            = "0.11"
 # Networking helpers
-local-ip-address   = "0.6"
 hostname           = "0.4"
 # Shared state
 arc-swap           = "1"
