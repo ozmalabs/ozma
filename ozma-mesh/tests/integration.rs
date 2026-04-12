@@ -2,9 +2,10 @@
 //! WireGuard tunnel and exchange packets.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::thread;
 use std::time::Duration;
 
-use ozma_mesh::{generate_keypair, MeshManager, MeshNode, MeshError};
+use ozma_mesh::{generate_keypair, MeshError, MeshManager, MeshNode};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -13,7 +14,7 @@ fn recv_with_retry(mgr: &MeshManager, attempts: u32) -> Option<(String, Vec<u8>)
     for _ in 0..attempts {
         match mgr.recv_packet() {
             Ok(Some(pkt)) => return Some(pkt),
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
             Err(e) => panic!("recv_packet error: {e}"),
         }
     }
@@ -31,14 +32,14 @@ fn two_managers_exchange_packet_over_loopback() {
     // Build node A (port 0 → OS assigns a free port).
     let mgr_a = MeshManager::new("node-a", "10.200.1.1", 0)
         .expect("MeshManager A failed to start");
-    let port_a = mgr_a.wg_port();
     let node_a = mgr_a.local_node();
+    let port_a = node_a.wg_port;
 
     // Build node B.
     let mgr_b = MeshManager::new("node-b", "10.200.2.1", 0)
         .expect("MeshManager B failed to start");
-    let port_b = mgr_b.wg_port();
     let node_b = mgr_b.local_node();
+    let port_b = node_b.wg_port;
 
     let addr_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_a);
     let addr_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_b);
@@ -82,6 +83,7 @@ fn add_duplicate_peer_returns_error() {
         id: "peer-1".to_string(),
         wg_pubkey: pubkey,
         mesh_ip: "10.200.4.1".to_string(),
+        wg_port: 51820,
     };
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51820);
 
@@ -104,7 +106,7 @@ fn remove_nonexistent_peer_returns_error() {
     );
 }
 
-/// `local_node()` returns the correct id, mesh_ip, and a non-empty public key.
+/// `local_node()` returns the correct id, mesh_ip, wg_port, and a non-empty public key.
 #[test]
 fn local_node_identity_is_correct() {
     let mgr = MeshManager::new("node-z", "10.200.6.1", 0).unwrap();
@@ -112,6 +114,7 @@ fn local_node_identity_is_correct() {
     assert_eq!(node.id, "node-z");
     assert_eq!(node.mesh_ip, "10.200.6.1");
     assert!(!node.wg_pubkey.0.is_empty(), "public key should not be empty");
+    assert!(node.wg_port > 0, "OS-assigned port should be non-zero");
 }
 
 /// `MeshNode::to_txt` / `from_txt` round-trips correctly.
@@ -122,6 +125,7 @@ fn mesh_node_txt_round_trip() {
         id: "round-trip".to_string(),
         wg_pubkey: pubkey,
         mesh_ip: "10.200.7.1".to_string(),
+        wg_port: 51820,
     };
     let txt = node.to_txt();
     let decoded = MeshNode::from_txt(&txt).expect("from_txt failed");
