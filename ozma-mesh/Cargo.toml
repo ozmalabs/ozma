@@ -1,0 +1,13 @@
+[package]
+name    = "ozma-mesh"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio       = { workspace = true }
+tracing     = { workspace = true }
+anyhow      = { workspace = true }
+thiserror   = { workspace = true }
+serde       = { workspace = true }
+boringtun   = "0.6"
+libmdns     = "0.8"

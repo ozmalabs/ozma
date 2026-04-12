@@ -1,0 +1,10 @@
+[package]
+name    = "ozma-crypto"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+thiserror        = { workspace = true }
+bytes            = { workspace = true }
+rand             = "0.8"
