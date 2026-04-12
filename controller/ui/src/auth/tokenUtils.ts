@@ -37,7 +37,12 @@ export function parseToken(token: string): TokenPayload | null {
 
   let payload: Record<string, unknown>
   try {
-    const json = atob(parts[1])
+    // atob is not available in Node.js / SSR environments
+    const b64decode: (s: string) => string =
+      typeof atob === 'function'
+        ? atob
+        : (s) => Buffer.from(s, 'base64').toString('utf8')
+    const json = b64decode(parts[1])
     payload = JSON.parse(json, (key, value) => {
       // Drop prototype-polluting keys at any nesting level
       if (key === '__proto__' || key === 'constructor' || key === 'prototype') {

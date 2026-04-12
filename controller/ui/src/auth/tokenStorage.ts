@@ -143,3 +143,17 @@ export const tokenStorage = {
     _onExpiredCallback = null
   },
 }
+
+// ---------------------------------------------------------------------------
+// Named exports for watcher functions (so callers can import them directly)
+// ---------------------------------------------------------------------------
+
+/** @see tokenStorage.startExpiryWatcher */
+export function startExpiryWatcher(onExpired: () => void, intervalMs = 30_000): void {
+  tokenStorage.startExpiryWatcher(onExpired, intervalMs)
+}
+
+/** @see tokenStorage.stopExpiryWatcher */
+export function stopExpiryWatcher(): void {
+  tokenStorage.stopExpiryWatcher()
+}

@@ -93,6 +93,32 @@ function buildUrl(base: string, params?: Record<string, string | number | boolea
 }
 
 // ---------------------------------------------------------------------------
+// HTTP status → user-friendly message
+// ---------------------------------------------------------------------------
+
+const HTTP_STATUS_MESSAGES: Record<number, string> = {
+  400: 'Bad request. Please check your input and try again.',
+  401: 'You are not authenticated. Please log in.',
+  403: 'You do not have permission to perform this action.',
+  404: 'The requested resource was not found.',
+  409: 'A conflict occurred. The resource may already exist.',
+  422: 'The request could not be processed. Please check your input.',
+  429: 'Too many requests. Please wait a moment and try again.',
+  500: 'An internal server error occurred. Please try again later.',
+  502: 'The server is temporarily unavailable (bad gateway).',
+  503: 'The service is temporarily unavailable. Please try again later.',
+  504: 'The server did not respond in time. Please try again.',
+}
+
+function getErrorMessage(status: number, serverMessage?: string): string {
+  // Prefer a non-generic server-supplied message when available
+  if (serverMessage && serverMessage.length > 0 && !serverMessage.startsWith('HTTP ')) {
+    return serverMessage
+  }
+  return HTTP_STATUS_MESSAGES[status] ?? `Unexpected error (HTTP ${status}).`
+}
+
+// ---------------------------------------------------------------------------
 // Response handler
 // ---------------------------------------------------------------------------
 
@@ -101,21 +127,21 @@ async function handleResponse<T>(res: Response): Promise<T> {
   const isJson = ct.includes('application/json')
 
   if (!res.ok) {
-    let message = `HTTP ${res.status}`
+    let serverMessage = ''
     let data: unknown = null
     if (isJson) {
       try {
         data = await res.json()
         const d = data as { error?: string; message?: string; detail?: string }
-        message = d.error ?? d.message ?? d.detail ?? message
+        serverMessage = d.error ?? d.message ?? d.detail ?? ''
       } catch { /* ignore */ }
     } else {
       try {
         const text = await res.text()
-        if (text) message = text.slice(0, 500)
+        if (text) serverMessage = text.slice(0, 500)
       } catch { /* ignore */ }
     }
-    throw new ApiError(res.status, message, data)
+    throw new ApiError(res.status, getErrorMessage(res.status, serverMessage), data)
   }
 
   if (isJson) {
@@ -274,10 +300,17 @@ export async function request<T>(
         ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
       })
     } catch (err) {
-      if (err instanceof DOMException && err.name === 'AbortError') {
-        throw new TimeoutError()
+      if (
+        (err instanceof DOMException && err.name === 'AbortError') ||
+        (err instanceof Error && err.name === 'AbortError')
+      ) {
+        throw new TimeoutError('The request timed out. Please check your connection and try again.')
       }
-      throw new NetworkError(err instanceof Error ? err.message : 'Network error')
+      throw new NetworkError(
+        err instanceof Error && err.message
+          ? `Network error: ${err.message}`
+          : 'A network error occurred. Please check your connection.',
+      )
     }
 
     // On 401, attempt one token refresh then retry once
@@ -292,8 +325,10 @@ export async function request<T>(
           signal: ac.signal,
           ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
         })
-      } catch {
-        throw new ApiError(401, 'Session expired. Please log in again.')
+      } catch (err) {
+        // If the retry itself threw an ApiError (e.g. from refreshAuthToken), re-throw it
+        if (err instanceof ApiError) throw err
+        throw new ApiError(401, getErrorMessage(401))
       }
     }
 
@@ -306,6 +341,9 @@ export async function request<T>(
     clearTimeout(timerId)
   }
 }
+
+// Re-export for use in UI components
+export { getErrorMessage }
 
 // ---------------------------------------------------------------------------
 // Convenience methods
