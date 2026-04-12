@@ -767,11 +767,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"controllers": found}
 
     @app.get("/api/v1/peers")
-    async def list_peers(request: Request) -> list[dict]:
+    async def list_peers(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         if not sharing:
-            return []
-        return [p.to_dict() for p in sharing.list_peers()]
+            return {"peers": []}
+        return {"peers": [p.to_dict() for p in sharing.list_peers()]}
 
     @app.post("/api/v1/peers")
     async def link_peer(body: dict, request: Request) -> dict:
@@ -806,11 +806,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     # --- External publishing ---
 
     @app.get("/api/v1/publish")
-    async def list_published(request: Request) -> list[dict]:
+    async def list_published(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         if not ext_publish:
-            return []
-        return [e.to_dict() for e in ext_publish.list_entries()]
+            return {"entries": []}
+        return {"entries": [e.to_dict() for e in ext_publish.list_entries()]}
 
     @app.post("/api/v1/publish")
     async def publish_service(body: dict, request: Request) -> dict:
@@ -3953,15 +3953,17 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if not codec_mgr:
             raise HTTPException(status_code=503, detail="Codec manager not available")
         available = codec_mgr.list_available()
-        # Normalize: if available is a dict of {family: [encoder, ...]}, flatten to a list
+        # Normalize: always return codecs as a flat list of {family, encoder} dicts
         if isinstance(available, dict):
-            codecs_list = [
+            codecs_list: list[dict] = [
                 {"family": family, "encoder": enc}
                 for family, encoders in available.items()
                 for enc in (encoders if isinstance(encoders, list) else [encoders])
             ]
-        else:
+        elif isinstance(available, list):
             codecs_list = available
+        else:
+            codecs_list = []
         return {
             "codecs": codecs_list,
             "configs": codec_mgr.list_configs(),
