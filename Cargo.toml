@@ -11,24 +11,16 @@ members = [
 ]
 
 [workspace.dependencies]
-tokio              = { version = "1",    features = ["full"] }
-serde              = { version = "1",    features = ["derive"] }
+tokio              = { version = "1",   features = ["full"] }
+serde              = { version = "1",   features = ["derive"] }
 serde_json         = "1"
 tracing            = "0.1"
-tracing-subscriber = { version = "0.3",  features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow             = "1"
 thiserror          = "1"
 bytes              = "1"
-axum               = { version = "0.7",  features = ["tokio"] }
-uuid               = { version = "1",    features = ["v4", "serde"] }
-prometheus         = { version = "0.13", features = ["process"] }
-clap               = { version = "4",    features = ["derive", "env"] }
-
-# Packaging configuration for cross-platform deployment
-[target.'cfg(target_os = "windows")'.build-dependencies]
-winres = "0.1"
-
-[package.metadata.winrt]
-display_name = "Ozma Agent"
-publisher_display_name = "Ozma Technologies"
-installer_icon = "assets/icon.ico"
+axum               = { version = "0.7", features = ["tokio"] }
+tower-http         = { version = "0.5", features = ["fs"] }
+notify             = "6"
+v4l                = "0.14"
+ffmpeg-sidecar     = "2"
