@@ -41,6 +41,7 @@ from permissions import (
     get_user_seats, get_user_permission_level, PERMISSION_LEVELS,
 )
 from scenarios import ScenarioManager
+from gaming.moonlight_app_mapping import MoonlightAppMapper, create_app_mapper
 from stream import StreamManager
 from audio import AudioRouter
 from controls import ControlManager
@@ -8497,6 +8498,86 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(400, "host is required")
         _ss().register_remote(node_id, host, api_port)
         return {"ok": True, "node_id": node_id, "host": host, "api_port": api_port}
+
+    # ── Moonlight App Mapping (V1.2) ────────────────────────────────────────
+    # Each scenario appears as a Moonlight app. When Moonlight selects an app,
+    # the corresponding scenario is activated and streaming is started.
+
+    def _mam() -> MoonlightAppMapper:
+        """Get the Moonlight app mapper (creates if needed)."""
+        if scenarios is None:
+            raise HTTPException(503, "Scenarios not configured")
+        from gaming.moonlight_app_mapping import MoonlightAppMapper, create_app_mapper
+        return create_app_mapper(scenarios, sunshine)
+
+    @app.get("/api/v1/moonlight/apps")
+    async def moonlight_list_apps(request: Request) -> dict[str, Any]:
+        """
+        Get the Moonlight app list.
+
+        Returns all Ozma scenarios as Moonlight app entries. Each scenario
+        becomes one app with its app_id matching the scenario_id.
+
+        Moonlight clients use this list to display available apps.
+        """
+        _require_scope(request, SCOPE_READ)
+        mapper = _mam()
+        return {"apps": mapper.get_app_list()}
+
+    @app.post("/api/v1/moonlight/launch/{app_id}")
+    async def moonlight_launch_app(request: Request, app_id: str) -> dict[str, Any]:
+        """
+        Launch a Moonlight app (activate the corresponding scenario).
+
+        When Moonlight selects an app from the list, it sends a POST request
+        to this endpoint. The scenario is activated and streaming is started.
+
+        Path params:
+            app_id: The scenario ID to launch
+
+        Body (optional):
+            node_id: Override node to stream (for multi-node scenarios)
+
+        Returns:
+            {ok: True, scenario_id: ..., streaming_enabled: ...}
+        """
+        _require_scope(request, SCOPE_WRITE)
+        mapper = _mam()
+        body: dict = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+
+        result = await mapper.launch_app(app_id)
+
+        # If node_id override was provided and streaming wasn't enabled,
+        # try to start streaming on the specified node
+        if not result.get("streaming_enabled") and body.get("node_id"):
+            node_id = body["node_id"]
+            if sunshine:
+                try:
+                    await sunshine.enable_node(node_id)
+                    result["streaming_enabled"] = True
+                    result["node_id"] = node_id
+                except Exception as e:
+                    log.warning("Failed to enable streaming for override node %s: %s", node_id, e)
+                    result["streaming_warning"] = str(e)
+
+        return result
+
+    @app.post("/api/v1/moonlight/refresh")
+    async def moonlight_refresh_apps(request: Request) -> dict[str, Any]:
+        """
+        Refresh the Moonlight app list from current scenarios.
+
+        Call this endpoint when scenarios change to update the app list
+        without restarting the controller.
+        """
+        _require_scope(request, SCOPE_WRITE)
+        mapper = _mam()
+        mapper.invalidate_cache()
+        return {"ok": True, "apps": mapper.get_app_list()}
 
     # ── MSP Multi-tenant Dashboard ────────────────────────────────────────────
 
