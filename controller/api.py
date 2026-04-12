@@ -521,8 +521,8 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         ctx = _require_scope(request, SCOPE_WRITE)
         if not service_proxy:
             raise HTTPException(503, "Service proxy not enabled")
+        name = body.get("name", "").strip()
         try:
-            name = body.get("name", "").strip()
             target_host = body.get("target_host", "127.0.0.1")
             try:
                 target_port = int(body.get("target_port", 0))
@@ -541,24 +541,28 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             )
             if existing:
                 raise HTTPException(409, f"Service with name '{name}' already exists")
-            s = service_proxy.register_service(
-                name=name,
-                owner_user_id=ctx.user_id,
-                target_host=target_host,
-                target_port=target_port,
-                subdomain=body.get("subdomain", ""),
-                protocol=body.get("protocol", "http"),
-                service_type=body.get("service_type", ""),
-                auth_required=body.get("auth_required", True),
-                health_path=body.get("health_path", "/health"),
-                icon=body.get("icon", ""),
-            )
+            try:
+                s = service_proxy.register_service(
+                    name=name,
+                    owner_user_id=ctx.user_id,
+                    target_host=target_host,
+                    target_port=target_port,
+                    subdomain=body.get("subdomain", ""),
+                    protocol=body.get("protocol", "http"),
+                    service_type=body.get("service_type", ""),
+                    auth_required=body.get("auth_required", True),
+                    health_path=body.get("health_path", "/health"),
+                    icon=body.get("icon", ""),
+                )
+            except ValueError as e:
+                raise HTTPException(409, str(e))
+            except Exception as e:
+                log.exception("register_service failed for name=%r: %s", name, e)
+                raise HTTPException(500, f"Service registration failed: {e}")
         except HTTPException:
             raise
-        except ValueError as e:
-            raise HTTPException(409, str(e))
         except Exception as e:
-            log.exception("register_service failed for name=%r: %s", name, e)
+            log.exception("register_service unexpected error for name=%r: %s", name, e)
             raise HTTPException(500, f"Service registration failed: {e}")
         await state.events.put({"type": "service.registered", "service": s.to_dict()})
         return s.to_dict()
