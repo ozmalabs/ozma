@@ -8,19 +8,15 @@ members = [
     "ozma-proto",
     "ozma-mesh",
     "ozma-crypto",
+    "ozma-drivers",
 ]
 
 [workspace.dependencies]
-tokio              = { version = "1",   features = ["full"] }
-serde              = { version = "1",   features = ["derive"] }
+tokio              = { version = "1", features = ["full"] }
+serde              = { version = "1", features = ["derive"] }
 serde_json         = "1"
 tracing            = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 anyhow             = "1"
 thiserror          = "1"
 bytes              = "1"
-axum               = { version = "0.7", features = ["tokio"] }
-tower-http         = { version = "0.5", features = ["fs"] }
-notify             = "6"
-v4l                = "0.14"
-ffmpeg-sidecar     = "2"
