@@ -2,17 +2,20 @@
 name        = "ozma-mesh"
 version     = "0.1.0"
 edition     = "2021"
-description = "Ozma mesh networking: WireGuard tunnels + mDNS peer discovery"
+description = "WireGuard mesh networking + mDNS peer discovery for ozma nodes"
 license     = "AGPL-3.0-only"
 
 [dependencies]
-# WireGuard userspace implementation (Cloudflare boringtun)
+# Userspace WireGuard (Cloudflare boringtun)
 boringtun    = { version = "0.6", default-features = false }
 
-# mDNS advertising (_ozma._udp.local)
+# mDNS advertising / browsing (_ozma._udp.local)
 libmdns      = "0.7"
 
-# Crypto: X25519 key generation for WireGuard
+# Async runtime
+tokio        = { version = "1", features = ["full"] }
+
+# Crypto: X25519 key generation
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 rand         = "0.8"
 
@@ -30,8 +33,9 @@ tracing      = "0.1"
 thiserror    = "1"
 
 [dev-dependencies]
+tokio              = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [[test]]
-name = "integration"
-path = "tests/integration.rs"
+name = "integration_test"
+path = "tests/integration_test.rs"

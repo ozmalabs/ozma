@@ -1,28 +1,48 @@
-//! ozma-mesh — WireGuard mesh networking + mDNS peer discovery.
+//! # ozma-mesh
 //!
-//! # Overview
+//! Userspace WireGuard mesh networking + mDNS peer discovery for ozma nodes.
 //!
-//! This crate provides the shared mesh-networking layer used by every ozma
-//! node and the controller:
+//! ## Crate layout
 //!
-//! * [`MeshNode`] — identity record (node ID, WireGuard public key, mesh IP).
-//! * [`MeshManager`] — lifecycle manager: key generation, peer add/remove,
-//!   WireGuard tunnel maintenance, mDNS advertising.
+//! | Module | Contents |
+//! |--------|----------|
+//! | [`error`] | [`MeshError`] enum and `Result<T>` alias |
+//! | [`node`]  | [`MeshNode`], [`WgPublicKey`], [`WgPrivateKey`] |
+//! | [`manager`] | [`MeshManager`] — lifecycle, peer table, tunnels, mDNS |
 //!
-//! # WireGuard backend
+//! ## Quick start
 //!
-//! Uses [boringtun](https://github.com/cloudflare/boringtun) — Cloudflare's
-//! pure-Rust userspace WireGuard implementation.  No kernel module required.
+//! ```rust,no_run
+//! use ozma_mesh::{MeshManager, MeshNode};
+//! use ozma_mesh::error::Result;
 //!
-//! # mDNS
+//! #[tokio::main]
+//! async fn main() -> Result<()> {
+//!     // Generate a node identity + WireGuard keypair.
+//!     let (node, sk) = MeshNode::generate("my-node", "10.200.1.1", 51820);
 //!
-//! Advertises `_ozma._udp.local` so nodes on the same LAN segment discover
-//! each other without a central rendezvous server.
+//!     // Start the manager (binds UDP socket, registers mDNS).
+//!     let mgr = MeshManager::new(node, sk).await?;
+//!
+//!     // Start the background receive loop.
+//!     mgr.start().await?;
+//!
+//!     // Add a remote peer (its identity is discovered via mDNS or the controller).
+//!     let (peer_node, _peer_sk) = MeshNode::generate("peer", "10.200.2.1", 51821);
+//!     mgr.add_peer(peer_node).await?;
+//!
+//!     // Initiate the WireGuard handshake.
+//!     mgr.initiate_handshake("peer").await?;
+//!
+//!     Ok(())
+//! }
+//! ```
 
 pub mod error;
 pub mod manager;
 pub mod node;
 
+// Convenience re-exports — `use ozma_mesh::{MeshManager, MeshNode, ...}`.
 pub use error::MeshError;
 pub use manager::MeshManager;
-pub use node::{generate_keypair, MeshNode, WgPrivateKey, WgPublicKey};
+pub use node::{MeshNode, WgPrivateKey, WgPublicKey};
