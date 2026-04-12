@@ -183,7 +183,10 @@ class TestVolumeAndMute:
     async def test_audio_volume_set_readback(self):
         """set_volume followed by get_volume should return the same value.
 
-        Uses mocked pactl so the test never requires a live PipeWire instance.
+        Fully mocked — does not require a live PipeWire or PulseAudio instance.
+        The executor is patched at the asyncio loop level so that no real
+        pactl subprocess is ever spawned, regardless of whether PipeWire is
+        running in the test environment.
         """
         backend = LinuxAudioBackend()
         backend._modules["seat-0"] = 42
@@ -194,15 +197,16 @@ class TestVolumeAndMute:
         # The backend is expected to parse the percentage; we return 75%.
         get_result = MagicMock(
             returncode=0,
-            stdout="Volume: front-left: 49152 /   75% / -0.00 dB,   front-right: 49152 /   75% / -0.00 dB\n",
+            stdout=(
+                "Volume: front-left: 49152 /   75% / -0.00 dB,"
+                "   front-right: 49152 /   75% / -0.00 dB\n"
+            ),
             stderr="",
         )
 
-        call_results = [set_result, get_result]
-
         with patch("asyncio.get_running_loop") as mock_loop:
             mock_loop.return_value.run_in_executor = AsyncMock(
-                side_effect=call_results,
+                side_effect=[set_result, get_result],
             )
             set_ok = await backend.set_volume("seat-0", 75)
             volume = await backend.get_volume("seat-0")
@@ -214,7 +218,10 @@ class TestVolumeAndMute:
     async def test_audio_mute_set_readback(self):
         """set_mute followed by get_mute should return the same state.
 
-        Uses mocked pactl so the test never requires a live PipeWire instance.
+        Fully mocked — does not require a live PipeWire or PulseAudio instance.
+        The executor is patched at the asyncio loop level so that no real
+        pactl subprocess is ever spawned, regardless of whether PipeWire is
+        running in the test environment.
         """
         backend = LinuxAudioBackend()
         backend._modules["seat-0"] = 42
@@ -228,11 +235,9 @@ class TestVolumeAndMute:
             stderr="",
         )
 
-        call_results = [set_result, get_result]
-
         with patch("asyncio.get_running_loop") as mock_loop:
             mock_loop.return_value.run_in_executor = AsyncMock(
-                side_effect=call_results,
+                side_effect=[set_result, get_result],
             )
             set_ok = await backend.set_mute("seat-0", True)
             muted = await backend.get_mute("seat-0")
