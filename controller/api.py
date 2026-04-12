@@ -251,6 +251,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         "/api/v1/enroll",
         "/api/v1/nodes/register",
         "/api/v1/nodes/heartbeat",
+        "/api/v1/connect/status",
         "/health",
         "/docs",
         "/openapi.json",
@@ -263,7 +264,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         "/auth/userinfo",
     }
 
-    _AUTH_EXEMPT_PREFIXES = ("/auth/login/", "/auth/callback/", "/console/", "/terminal/")
+    _AUTH_EXEMPT_PREFIXES = ("/auth/login/", "/auth/callback/", "/console/", "/terminal/", "/.well-known/")
 
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
@@ -614,10 +615,13 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     @app.get("/.well-known/openid-configuration")
     async def oidc_discovery(request: Request) -> dict:
+        # OpenID Connect spec requires this endpoint to be publicly accessible
+        # (no authentication required). The auth middleware exempts /.well-known/
+        # paths, but we also set the response here unconditionally.
         if idp and idp.enabled:
             return idp.oidc_discovery()
         # Minimal OIDC discovery for the built-in JWT issuer
-        base = f"{request.base_url.scheme}://{request.base_url.netloc}"
+        base = str(request.base_url).rstrip("/")
         return {
             "issuer": base,
             "authorization_endpoint": f"{base}/auth/login",
