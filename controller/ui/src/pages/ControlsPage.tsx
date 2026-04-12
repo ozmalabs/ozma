@@ -1,5 +1,4 @@
 import { useState, useEffect } from 'react'
-import { Link } from 'react-router-dom'
 
 interface ControlBinding {
   action: string
@@ -8,14 +7,12 @@ interface ControlBinding {
 }
 
 interface Control {
-  name: string
   value: any
   binding: ControlBinding | null
   lockout: boolean
 }
 
 interface DisplayControl {
-  name: string
   value: string
   binding: string
 }
@@ -367,13 +364,13 @@ function SurfaceCard({ surface, iconType }: SurfaceCardProps) {
             >
               {control.binding ? (
                 <div className="flex flex-col">
-                  <span className="font-medium truncate">{control.name}</span>
+                  <span className="font-medium truncate">{name}</span>
                   <span className="text-[10px] text-muted-foreground truncate">
                     {control.binding.action}
                   </span>
                 </div>
               ) : (
-                <span className="text-muted-foreground">{control.name}</span>
+                <span className="text-muted-foreground">{name}</span>
               )}
             </div>
           ))}
