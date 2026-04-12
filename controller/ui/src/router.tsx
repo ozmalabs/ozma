@@ -1,100 +1,46 @@
-import { createBrowserRouter, Navigate, Outlet } from 'react-router-dom'
-import { useAuthStore } from './store/useAuthStore'
-import Layout from './layouts/Layout'
-import NodesPage from './pages/NodesPage'
-import NodeDetailPage from './pages/NodeDetailPage'
-import SettingsPage from './pages/SettingsPage'
+import React from 'react'
+import { createBrowserRouter, Navigate } from 'react-router-dom'
+import { useAuth } from './auth/AuthContext'
 import LoginPage from './pages/LoginPage'
-import ProtectedRoute from './components/ProtectedRoute'
-import ErrorBoundary from './components/ErrorBoundary'
+import DashboardPage from './pages/DashboardPage'
+import NodesPage from './pages/NodesPage'
 
-// Route configuration
-export const ROUTES = {
-  root: '/',
-  login: '/login',
-  dashboard: '/dashboard',
-  nodes: '/nodes',
-  node: '/nodes/:id',
-  settings: '/settings',
-} as const
-
-// Protected route component that checks authentication
-function AuthLayout() {
-  return (
-    <ProtectedRoute>
-      <Layout>
-        <ErrorBoundary>
-          <Outlet />
-        </ErrorBoundary>
-      </Layout>
-    </ProtectedRoute>
-  )
-}
-
-// Public route — redirects to /nodes if already authenticated
-function PublicRoute({ children }: { children: React.ReactNode }) {
-  const { isAuthenticated } = useAuthStore()
-
-  if (isAuthenticated) {
-    return <Navigate to={ROUTES.nodes} replace />
+function RequireAuth({ children }: { children: React.ReactNode }) {
+  const { isAuthenticated, loading } = useAuth()
+  if (loading) {
+    return (
+      <div className="flex h-screen items-center justify-center text-muted-foreground">
+        Loading…
+      </div>
+    )
   }
-
+  if (!isAuthenticated) return <Navigate to="/login" replace />
   return <>{children}</>
 }
 
-// Route definitions
 export const router = createBrowserRouter([
   {
-    path: ROUTES.login,
+    path: '/login',
+    element: <LoginPage />,
+  },
+  {
+    path: '/',
     element: (
-      <PublicRoute>
-        <LoginPage />
-      </PublicRoute>
+      <RequireAuth>
+        <DashboardPage />
+      </RequireAuth>
     ),
   },
   {
-    path: ROUTES.root,
-    element: <AuthLayout />,
-    children: [
-      {
-        index: true,
-        element: <Navigate to={ROUTES.dashboard} replace />,
-      },
-      {
-        path: ROUTES.dashboard,
-        element: <NodesPage />,
-      },
-      {
-        path: ROUTES.nodes,
-        element: <NodesPage />,
-      },
-      {
-        path: ROUTES.node,
-        element: <NodeDetailPage />,
-      },
-      {
-        path: ROUTES.settings,
-        element: <SettingsPage />,
-      },
-    ],
+    path: '/nodes',
+    element: (
+      <RequireAuth>
+        <NodesPage />
+      </RequireAuth>
+    ),
   },
   {
     path: '*',
-    element: (
-      <div className="flex items-center justify-center h-screen">
-        <div className="text-center">
-          <h1 className="text-6xl font-bold text-muted-foreground mb-4">404</h1>
-          <p className="text-xl text-foreground mb-4">Page not found</p>
-          <button
-            onClick={() => window.history.back()}
-            className="px-6 py-2 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors"
-          >
-            Go Back
-          </button>
-        </div>
-      </div>
-    ),
+    element: <Navigate to="/" replace />,
   },
 ])
-
-export { Navigate }

@@ -1,8 +1,10 @@
+import { tokenStorage } from '../auth/tokenStorage'
+
 // GraphQL endpoint — proxied by Vite dev server to the controller
 const GRAPHQL_URL = '/graphql'
 
 function makeFetchOptions(): RequestInit {
-  const token = localStorage.getItem('ozma_token')
+  const token = tokenStorage.get()
   return {
     headers: {
       'Content-Type': 'application/json',
@@ -40,11 +42,11 @@ export async function graphqlRequest<T = unknown>(
 
 /** Returns auth headers for use in custom fetch calls. */
 export function getAuthHeaders(): Record<string, string> {
-  const token = localStorage.getItem('ozma_token')
+  const token = tokenStorage.get()
   return token ? { Authorization: `Bearer ${token}` } : {}
 }
 
 /** Returns true if an auth token is present in storage. */
 export function isTokenAvailable(): boolean {
-  return !!localStorage.getItem('ozma_token')
+  return tokenStorage.get() !== null
 }

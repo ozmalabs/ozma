@@ -16,11 +16,10 @@ export interface AuthResponse {
 export interface NodeInfo {
   id: string
   name: string
-  host: string
-  online: boolean
-  machine_class: 'workstation' | 'server' | 'kiosk' | 'camera'
-  last_seen: string | null
-  tags: string[]
+  status: 'online' | 'offline' | 'connecting'
+  ip?: string
+  os?: string
+  last_seen?: string
 }
 
 export interface NodesResponse {
