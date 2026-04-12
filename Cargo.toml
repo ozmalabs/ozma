@@ -10,15 +10,22 @@ members = [
     "ozma-crypto",
 ]
 
+# ozma-mesh has its own pinned dependency versions and does not inherit
+# workspace deps — it is listed in members above but excluded from
+# workspace.dependencies below.
+
 # ozma-mesh is a standalone crate with its own dependency versions;
 # it is listed in members above but does not inherit workspace deps.
 
 [workspace.dependencies]
-tokio       = { version = "1", features = ["full"] }
-serde       = { version = "1", features = ["derive"] }
-serde_json  = "1"
-tracing     = "0.1"
+tokio              = { version = "1", features = ["full"] }
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-anyhow      = "1"
-thiserror   = "1"
-bytes       = "1"
+anyhow             = "1"
+thiserror          = "1"
+bytes              = "1"
+
+# ── ozma-mesh (not inherited — pinned independently in ozma-mesh/Cargo.toml) ──
+# boringtun, libmdns, x25519-dalek, rand, base64 are declared only there.
