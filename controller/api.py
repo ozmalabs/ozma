@@ -2443,7 +2443,10 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if enabled:
             if port is None:
                 raise HTTPException(400, "port is required to enable VBAN")
-            node.audio_vban_port = int(port)
+            try:
+                node.audio_vban_port = int(port)
+            except (TypeError, ValueError):
+                raise HTTPException(400, "port must be a valid integer")
         else:
             node.audio_vban_port = None
 
