@@ -33,7 +33,28 @@ export interface HIDStats {
 export interface Scenario {
   id: string
   name: string
+  description?: string
   color: string
+  /** Node ID this scenario is assigned to, if any */
+  node_id?: string
+  /** Whether this scenario is currently active */
+  active: boolean
+  created_at?: string
+  updated_at?: string
+}
+
+export interface ScenarioCreateRequest {
+  name: string
+  description?: string
+  color?: string
+  node_id?: string
+}
+
+export interface ScenarioUpdateRequest {
+  name?: string
+  description?: string
+  color?: string
+  node_id?: string
 }
 
 export interface NodeInfo {
