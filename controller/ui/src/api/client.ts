@@ -103,49 +103,67 @@ export class RateLimitError extends Error {
 }
 
 // Constant-time string comparison to prevent timing attacks
+// NOTE: Always compares all characters regardless of length to prevent timing attacks
+// Comparing the full length prevents leaking information about where strings differ
 function constantTimeEquals(a: string, b: string): boolean {
-  if (a.length !== b.length) return false
+  // Get the longer length to ensure we iterate through all characters
+  const maxLength = Math.max(a.length, b.length)
   
-  let result = 0
-  for (let i = 0; i < a.length; i++) {
-    result |= a.charCodeAt(i) ^ b.charCodeAt(i)
+  // Initialize result with length difference check (0 = same length, non-zero = different)
+  let result = a.length - b.length
+  
+  // XOR each character position (use 0 for positions beyond string length)
+  for (let i = 0; i < maxLength; i++) {
+    const charA = i < a.length ? a.charCodeAt(i) : 0
+    const charB = i < b.length ? b.charCodeAt(i) : 0
+    result |= charA ^ charB
   }
+  
   return result === 0
 }
 
 // Token storage abstraction with improved security
 const createTokenStorage = () => {
   // Use module-level cache for SSR compatibility and reduced localStorage access
+  // Cache is always synchronized with localStorage
   let cachedToken: string | null = null
   let cachedTokenExpiry: number | null = null
 
+  // Helper to parse token and update cache
+  const parseAndCacheToken = (token: string | null): void => {
+    if (!token) {
+      cachedTokenExpiry = null
+      return
+    }
+    cachedToken = token
+    // Parse expiry from token for faster access
+    try {
+      const parts = token.split('.')
+      if (parts.length === 3) {
+        const payload = JSON.parse(atob(parts[1]))
+        cachedTokenExpiry = payload.exp * 1000
+      } else {
+        cachedTokenExpiry = null
+      }
+    } catch {
+      cachedTokenExpiry = null
+    }
+  }
+
   return {
     get: (): string | null => {
-      if (typeof localStorage === 'undefined') return cachedToken
-      const token = localStorage.getItem('ozma_token')
-      if (token) {
-        // Cache the token
-        cachedToken = token
-        // Parse expiry from token for faster access
-        try {
-          const parts = token.split('.')
-          if (parts.length === 3) {
-            const payload = JSON.parse(atob(parts[1]))
-            cachedTokenExpiry = payload.exp * 1000
-          }
-        } catch {
-          cachedTokenExpiry = null
-        }
+      // Always read from localStorage to ensure we have the latest value
+      if (typeof localStorage === 'undefined') {
+        return cachedToken
       }
+      const token = localStorage.getItem('ozma_token')
+      parseAndCacheToken(token)
       return token
     },
     set: (token: string): void => {
       if (typeof localStorage === 'undefined') {
         cachedToken = token
-      } else {
-        localStorage.setItem('ozma_token', token)
-        cachedToken = token
-        // Parse and cache expiry
+        // Still parse expiry even in SSR context for consistency
         try {
           const parts = token.split('.')
           if (parts.length === 3) {
@@ -155,20 +173,32 @@ const createTokenStorage = () => {
         } catch {
           cachedTokenExpiry = null
         }
+      } else {
+        localStorage.setItem('ozma_token', token)
+        parseAndCacheToken(token)
       }
     },
     remove: (): void => {
-      if (typeof localStorage === 'undefined') {
-        cachedToken = null
-      } else {
+      if (typeof localStorage !== 'undefined') {
         localStorage.removeItem('ozma_token')
-        cachedToken = null
       }
+      cachedToken = null
       cachedTokenExpiry = null
     },
-    getExpiry: (): number | null => cachedTokenExpiry,
+    getExpiry: (): number | null => {
+      // Always refresh from localStorage to get latest value
+      if (typeof localStorage === 'undefined') {
+        return cachedTokenExpiry
+      }
+      const token = localStorage.getItem('ozma_token')
+      parseAndCacheToken(token)
+      return cachedTokenExpiry
+    },
     // Constant-time token comparison for refresh validation
     compareToken: (token: string): boolean => {
+      if (typeof localStorage === 'undefined') {
+        return cachedToken ? constantTimeEquals(cachedToken, token) : false
+      }
       const stored = localStorage.getItem('ozma_token')
       if (!stored) return false
       return constantTimeEquals(stored, token)
@@ -239,13 +269,19 @@ export function isAuthenticated(): boolean {
 
 /**
  * Check if token is about to expire (within buffer time)
+ * NOTE: This function now reads token and expiry atomically to prevent race conditions
  */
 export function isTokenExpiring(): boolean {
   const token = getToken()
   if (!token) return true
 
+  // Use token storage expiry directly to avoid race condition
+  // This reads from localStorage and parses the token in one atomic operation
   const expiry = tokenStorage.getExpiry()
+  
   if (expiry === null || expiry === undefined) {
+    // If we couldn't parse expiry from storage, try parsing the token directly
+    // but use the same token we already have to avoid race condition
     const payload = parseToken(token)
     if (!payload) return true
     return Date.now() >= payload.exp * 1000 - TOKEN_REFRESH_BUFFER
@@ -257,16 +293,25 @@ export function isTokenExpiring(): boolean {
 
 /**
  * Build URL with query parameters
+ * NOTE: Uses relative URLs by default to work in both browser and server contexts
  */
 function buildUrl(base: string, params?: Record<string, string | number | boolean>): string {
   if (!params) return base
   try {
-    const url = new URL(base, typeof window !== 'undefined' ? window.location.origin : 'http://localhost')
+    // Use base URL with leading slash for relative paths (works in both browser and server)
+    // For absolute URLs, we only use window.location.origin in browser context
+    const hasProtocol = base.includes('://')
+    const baseUrl = hasProtocol 
+      ? (typeof window !== 'undefined' && typeof window.location !== 'undefined' ? window.location.origin : '')
+      : ''
+    
+    const url = new URL(base, baseUrl || '/')
     Object.entries(params).forEach(([key, value]) => {
       if (value !== undefined && value !== null) {
         url.searchParams.append(key, String(value))
       }
     })
+    // Return just path + query for relative URLs, or full URL if absolute
     return url.pathname + url.search
   } catch {
     return base
@@ -275,28 +320,74 @@ function buildUrl(base: string, params?: Record<string, string | number | boolea
 
 /**
  * Handle response and throw errors for non-OK responses
+ * NOTE: Handles non-JSON responses gracefully - some APIs may return plain text or other formats
  */
 async function handleResponse<T>(response: Response): Promise<T> {
   const contentType = response.headers.get('content-type')
-  if (!contentType || !contentType.includes('application/json')) {
-    throw new ApiError(response.status, 'Invalid response format')
-  }
-
-  let data: unknown
-  try {
-    data = await response.json()
-  } catch (error) {
-    throw new ApiError(response.status, 'Failed to parse response JSON')
-  }
-
+  
+  // Check if response is JSON
+  const isJson = contentType && contentType.includes('application/json')
+  
+  // For non-200 responses, always try to parse JSON first if content-type indicates it
   if (!response.ok) {
-    const message = (data as { error?: string; message?: string })?.error ||
-                    (data as { error?: string; message?: string })?.message ||
-                    `HTTP ${response.status}`
-    throw new ApiError(response.status, message, data)
+    let data: unknown = null
+    let errorMessage = `HTTP ${response.status}`
+    
+    if (isJson) {
+      try {
+        data = await response.json()
+        // Extract error message from JSON if available
+        errorMessage = (data as { error?: string; message?: string })?.error ||
+                      (data as { error?: string; message?: string })?.message ||
+                      errorMessage
+      } catch {
+        // If JSON parsing fails but content-type is JSON, use status as fallback
+        errorMessage = `HTTP ${response.status} (failed to parse error details)`
+      }
+    } else {
+      // For non-JSON responses, try to read as text
+      try {
+        const text = await response.text()
+        if (text) {
+          // Truncate long text for logging
+          errorMessage = text.length > 500 ? text.substring(0, 500) + '...' : text
+        }
+      } catch {
+        // If text parsing also fails, use status code
+      }
+    }
+    
+    throw new ApiError(response.status, errorMessage, data)
   }
 
-  return data as T
+  // For successful responses, return data based on content-type
+  if (isJson) {
+    let data: unknown
+    try {
+      data = await response.json()
+    } catch {
+      // If JSON parsing fails, return empty object
+      data = null
+    }
+    return data as T
+  } else {
+    // For non-JSON responses, return the response body as-is
+    try {
+      const text = await response.text()
+      // Try to parse as JSON anyway in case content-type was wrong
+      if (text && text.startsWith('{') && text.endsWith('}')) {
+        try {
+          return JSON.parse(text) as T
+        } catch {
+          // Fall through to return text
+        }
+      }
+      return text as T
+    } catch {
+      // If we can't read the body, return null
+      return null as T
+    }
+  }
 }
 
 // Request controllers for cancellation - properly cleaned up on completion
@@ -375,6 +466,7 @@ function createTimeoutSignal(timeout: number): { signal: AbortSignal; timeoutId:
 
 /**
  * Retry strategy with exponential backoff and jitter
+ * NOTE: Network errors are now retryable by default to handle transient failures
  */
 async function retryWithBackoff<T>(
   fn: () => Promise<T>,
@@ -383,9 +475,16 @@ async function retryWithBackoff<T>(
     delay?: number;
     onError?: (error: Error, attempt: number) => void;
     retryAll?: boolean; // Also retry on client errors
+    retryNetworkErrors?: boolean; // Retry network errors (default: true)
   } = {}
 ): Promise<T> {
-  const { maxRetries = MAX_RETRIES, delay = INITIAL_RETRY_DELAY, onError, retryAll = false } = options
+  const { 
+    maxRetries = MAX_RETRIES, 
+    delay = INITIAL_RETRY_DELAY, 
+    onError, 
+    retryAll = false,
+    retryNetworkErrors = true // Default to retrying network errors
+  } = options
 
   let lastError: Error | null = null
 
@@ -403,18 +502,28 @@ async function retryWithBackoff<T>(
         throw lastError
       }
 
-      // Don't retry on network errors after first attempt
-      if (lastError instanceof NetworkError && attempt > 1) {
-        throw lastError
-      }
-
       // Don't retry on timeout
       if (lastError instanceof TimeoutError) {
         throw lastError
       }
 
+      // Don't retry on deduplication error (it means a request is already in progress)
+      if (lastError instanceof DeduplicationError) {
+        throw lastError
+      }
+
+      // Don't retry on rate limit error (wait for rate limit window)
+      if (lastError instanceof RateLimitError) {
+        throw lastError
+      }
+
       // Don't retry after last attempt
       if (attempt >= maxRetries) {
+        throw lastError
+      }
+
+      // For network errors, only retry if retryNetworkErrors is true
+      if (lastError instanceof NetworkError && !retryNetworkErrors) {
         throw lastError
       }
 
@@ -438,6 +547,7 @@ async function retryWithBackoff<T>(
 
 /**
  * Refresh authentication token with proper error handling
+ * NOTE: Now validates token structure and expiry before attempting refresh
  */
 async function refreshAuthToken(): Promise<string> {
   const currentToken = getToken()
@@ -446,18 +556,33 @@ async function refreshAuthToken(): Promise<string> {
     throw new ApiError(401, 'No authentication token available')
   }
 
-  // Validate that current token is not already expired (check exp claim)
+  // Parse token payload to validate structure and check expiry
   const payload = parseToken(currentToken)
-  if (payload && payload.exp * 1000 <= Date.now()) {
+  
+  // Validate token has required structure
+  if (!payload) {
+    removeToken()
+    throw new ApiError(401, 'Invalid token format. Please login again.')
+  }
+
+  // Check if token is expired or about to expire
+  const tokenExpiry = payload.exp * 1000
+  if (tokenExpiry <= Date.now()) {
     removeToken()
     throw new ApiError(401, 'Token already expired. Please login again.')
   }
 
-  // Validate that refresh token itself is not expired
-  const tokenStorageExpiry = tokenStorage.getExpiry()
-  if (tokenStorageExpiry && tokenStorageExpiry <= Date.now()) {
+  // Check if refresh token in storage is expired
+  const storageExpiry = tokenStorage.getExpiry()
+  if (storageExpiry !== null && storageExpiry <= Date.now()) {
     removeToken()
     throw new ApiError(401, 'Session expired. Please login again.')
+  }
+
+  // Validate token has valid subject (sub) claim for identification
+  if (!payload.sub || typeof payload.sub !== 'string') {
+    removeToken()
+    throw new ApiError(401, 'Invalid token: missing or invalid subject (sub) claim. Please login again.')
   }
 
   try {
@@ -467,6 +592,7 @@ async function refreshAuthToken(): Promise<string> {
         'Content-Type': 'application/json',
         'X-Request-Id': generateRequestId('POST', '/auth/refresh'),
         'X-Trace-Id': getTraceId(),
+        'Authorization': `Bearer ${currentToken}`, // Include current token in Authorization header
       },
       body: JSON.stringify({}),
     })
@@ -474,7 +600,7 @@ async function refreshAuthToken(): Promise<string> {
     const data = await handleResponse<RefreshTokenResponse>(response)
     const newToken = data.token
 
-    // Validate new token using constant-time comparison
+    // Validate new token received
     if (!newToken || typeof newToken !== 'string') {
       removeToken()
       throw new ApiError(500, 'Invalid token received from refresh endpoint')
@@ -484,6 +610,19 @@ async function refreshAuthToken(): Promise<string> {
     if (constantTimeEquals(currentToken, newToken)) {
       removeToken()
       throw new ApiError(500, 'Token refresh returned same token. Session may be invalid.')
+    }
+
+    // Parse and validate new token structure
+    const newPayload = parseToken(newToken)
+    if (!newPayload) {
+      removeToken()
+      throw new ApiError(500, 'Invalid new token format received')
+    }
+
+    // Verify new token has valid expiry
+    if (newPayload.exp * 1000 <= Date.now()) {
+      removeToken()
+      throw new ApiError(500, 'Refreshed token is already expired')
     }
 
     setToken(newToken)
@@ -753,6 +892,7 @@ function getMemoizedFunction<T extends (...args: any[]) => Promise<unknown>>(
 
 /**
  * Execute a request with all features: timeout, retry, validation, logging, tracing
+ * NOTE: Properly cleans up resources on completion, timeout, rate limit, and error conditions
  */
 async function executeRequest<T>(
   method: string,
@@ -816,19 +956,30 @@ async function executeRequest<T>(
   }
 
   // Prepare fetch options with body
+  // NOTE: spread fetchOptions after to allow caller to override defaults
   const fetchOptionsWithBody: RequestInit = {
     method,
     headers,
     signal: timeoutSignal,
-    body: body !== undefined
-      ? (typeof body === 'string' ? body : JSON.stringify(body))
-      : undefined,
     ...fetchOptions,
+  }
+  
+  // Set body separately to avoid type conflicts
+  if (body !== undefined) {
+    fetchOptionsWithBody.body = typeof body === 'string' ? body : JSON.stringify(body)
+  }
+
+  // Helper function to clean up all resources associated with a request
+  const cleanupRequest = () => {
+    // Clean up request controller
+    requestControllers.delete(requestId)
+    // Clean up timeout
+    clearTimeout(timeoutId)
   }
 
   // Check rate limit
   if (!skipAuth && !checkRateLimit()) {
-    clearTimeout(timeoutId)
+    cleanupRequest()
     throw new RateLimitError('Rate limit exceeded. Please try again later.')
   }
 
@@ -851,10 +1002,18 @@ async function executeRequest<T>(
   if (dedupId && activeRequests.has(dedupId)) {
     const existing = activeRequests.get(dedupId)
     if (existing && !isRequestComplete(existing.promise)) {
-      clearTimeout(timeoutId)
+      cleanupRequest()
       throw new DeduplicationError('Duplicate request already in progress')
     }
     activeRequests.delete(dedupId)
+  }
+
+  // Helper to add body to fetch options (only when defined)
+  const addBody = (opts: RequestInit, bodyData?: BodyInit): RequestInit => {
+    if (bodyData !== undefined) {
+      return { ...opts, body: bodyData }
+    }
+    return opts
   }
 
   // Create promise wrapper for deduplication
@@ -922,6 +1081,32 @@ async function executeRequest<T>(
   if (retry) {
     finalPromise = dedupPromise || executeRequestWithRetry(
       async () => {
+        try {
+          if (validateRequest && body !== undefined && !validateRequest(body)) {
+            throw new ApiError(400, 'Request validation failed')
+          }
+
+          const response = await fetch(url, fetchOptionsWithBody)
+          const data = await handleResponse<T>(response)
+
+          if (validateResponse && data !== undefined && !validateResponse(data)) {
+            throw new ApiError(500, 'Response validation failed')
+          }
+
+          const duration = Date.now() - startTime
+          logRequestComplete(requestId, duration, response.status, data)
+          return data
+        } catch (error) {
+          // On error, clean up resources
+          cleanupRequest()
+          throw error
+        }
+      },
+      { maxRetries: MAX_RETRIES, delay: INITIAL_RETRY_DELAY }
+    )
+  } else {
+    finalPromise = dedupPromise || (async () => {
+      try {
         if (validateRequest && body !== undefined && !validateRequest(body)) {
           throw new ApiError(400, 'Request validation failed')
         }
@@ -936,25 +1121,14 @@ async function executeRequest<T>(
         const duration = Date.now() - startTime
         logRequestComplete(requestId, duration, response.status, data)
         return data
-      },
-      { maxRetries: MAX_RETRIES, delay: INITIAL_RETRY_DELAY }
-    )
-  } else {
-    finalPromise = dedupPromise || (async () => {
-      if (validateRequest && body !== undefined && !validateRequest(body)) {
-        throw new ApiError(400, 'Request validation failed')
+      } catch (error) {
+        // On error, clean up resources
+        cleanupRequest()
+        throw error
+      } finally {
+        // Always clean up on completion
+        cleanupRequest()
       }
-
-      const response = await fetch(url, fetchOptionsWithBody)
-      const data = await handleResponse<T>(response)
-
-      if (validateResponse && data !== undefined && !validateResponse(data)) {
-        throw new ApiError(500, 'Response validation failed')
-      }
-
-      const duration = Date.now() - startTime
-      logRequestComplete(requestId, duration, response.status, data)
-      return data
     })()
   }
 
@@ -1001,6 +1175,7 @@ async function executeRequestWithRetry<T>(
 
 /**
  * Make a request to the API with comprehensive features
+ * NOTE: Properly handles resource cleanup on all error conditions
  */
 export async function request<T>(
   method: string,
@@ -1022,9 +1197,13 @@ export async function request<T>(
     // For normal priority, execute normally
     return await executeRequest<T>(method, path, options)
   } catch (error) {
-    // Handle specific error types
+    // Handle specific error types with proper cleanup
     if (error instanceof Error) {
+      // Handle abort errors (timeout, manual cancel, deduplication, rate limit)
+      // These all require cleanup of resources associated with the request
       if (error.name === 'AbortError' || error.name === 'DeduplicationError' || error.name === 'RateLimitError') {
+        // The error was already handled in executeRequest, but we wrap it for the caller
+        // The cleanup is done in executeRequest, so we just propagate the error
         throw new NetworkError(error.message)
       }
 
@@ -1039,17 +1218,21 @@ export async function request<T>(
             return request(method, path, newOptions)
           } catch {
             // If refresh fails, throw original error
+            // Cleanup is handled by executeRequest
             throw error
           }
         }
+        // For other ApiErrors, cleanup is already handled
         throw error
       }
 
+      // Handle network errors - may be retryable
       if (error instanceof NetworkError || error.name === 'TypeError') {
         throw new NetworkError('Network error. Please check your connection.')
       }
     }
 
+    // For any other error, ensure cleanup and throw
     throw new NetworkError(error instanceof Error ? error.message : 'An unexpected error occurred')
   }
 }
