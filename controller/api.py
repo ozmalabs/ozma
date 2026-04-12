@@ -2607,6 +2607,17 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(status_code=404, detail=f"Output '{req.output_id}' not found")
         return {"ok": True, "output_id": req.output_id, "delay_ms": req.delay_ms}
 
+    @app.put("/api/v1/audio/outputs/{output_id}/delay")
+    async def set_audio_output_delay_put(output_id: str, body: dict = {}) -> dict[str, Any]:
+        """PUT alias: set time-alignment delay (ms) on an audio output by path param."""
+        if not audio:
+            raise HTTPException(status_code=503, detail="Audio routing disabled")
+        delay_ms = float(body.get("delay_ms", 0))
+        ok = await audio.outputs.set_delay(output_id, delay_ms)
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"Output '{output_id}' not found")
+        return {"ok": True, "output_id": output_id, "delay_ms": delay_ms}
+
     # --- RGB zone endpoints ---
 
     @app.get("/api/v1/rgb/zones")
@@ -2799,6 +2810,22 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(status_code=502, detail=f"Push to node failed: {e}")
 
     # --- Paste typing endpoints ---
+
+    @app.post("/api/v1/paste-typing")
+    async def paste_typing_alias(body: dict = {}) -> dict[str, Any]:
+        """Alias for POST /api/v1/paste — paste text via HID keystrokes."""
+        if not paste_typer:
+            raise HTTPException(status_code=503, detail="Paste typing not available")
+        text = body.get("text", "")
+        if not text:
+            raise HTTPException(status_code=400, detail="No text provided")
+        result = await paste_typer.type_text(
+            text,
+            layout=body.get("layout", "us"),
+            rate=float(body.get("rate", 30)),
+            node_id=body.get("node_id"),
+        )
+        return result
 
     @app.post("/api/v1/paste")
     async def paste_text(body: dict = {}) -> dict[str, Any]:
@@ -3857,6 +3884,17 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     # --- Codec endpoints ---
 
+    @app.put("/api/v1/codecs")
+    async def put_codec_config(body: dict = {}) -> dict[str, Any]:
+        """PUT alias for codec config — sets the default codec configuration."""
+        if not codec_mgr:
+            raise HTTPException(status_code=503, detail="Codec manager not available")
+        source_id = body.get("source_id", "default")
+        cfg = CodecConfig.from_dict(body)
+        codec_mgr.set_config(source_id, cfg)
+        resolved = codec_mgr.resolve(cfg)
+        return {"ok": True, "source_id": source_id, "resolved": resolved.to_dict()}
+
     @app.get("/api/v1/codecs")
     async def list_codecs() -> dict[str, Any]:
         if not codec_mgr:
@@ -4514,6 +4552,18 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"ok": True}
 
     # --- OBS / Broadcast studio endpoints ---
+
+    @app.post("/api/v1/broadcast/start")
+    async def broadcast_start(body: dict = {}) -> dict[str, Any]:
+        """Start broadcast (record + stream). Convenience alias."""
+        if not obs_studio:
+            raise HTTPException(status_code=503, detail="Broadcast not available")
+        results: dict[str, Any] = {}
+        if body.get("record", True):
+            results["recording"] = await obs_studio.start_recording()
+        if body.get("stream", False):
+            results["streaming"] = await obs_studio.start_streaming()
+        return {"ok": True, **results}
 
     @app.get("/api/v1/broadcast/status")
     async def broadcast_status() -> dict[str, Any]:
@@ -5538,6 +5588,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     @app.post("/api/v1/replay/save")
     async def replay_save(body: dict = {}) -> dict[str, Any]:
         return {"ok": False, "message": "No active capture sources for replay"}
+
+    @app.post("/api/v1/replay/clip")
+    async def replay_clip(body: dict = {}) -> dict[str, Any]:
+        """Save a replay buffer clip. Stub — no active capture sources."""
+        return {"ok": False, "message": "No active capture sources for replay clip"}
 
     # --- Notification endpoints ---
 
