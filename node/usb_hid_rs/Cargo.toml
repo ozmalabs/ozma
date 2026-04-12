@@ -1,0 +1,21 @@
+[package]
+name        = "ozma-usb-hid"
+version     = "0.1.0"
+edition     = "2021"
+description = "USB HID gadget writer for ozma-node — ports node/usb_hid.py to Rust"
+
+[[bin]]
+name = "ozma-usb-hid"
+path = "src/main.rs"
+
+[dependencies]
+tokio              = { version = "1",   features = ["full"] }
+hidg               = { version = "0.3", features = ["tokio"] }
+serde              = { version = "1",   features = ["derive"] }
+serde_json         = "1"
+anyhow             = "1"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# unit tests use only std + the crate itself
