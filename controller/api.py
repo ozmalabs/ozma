@@ -541,6 +541,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             )
         except ValueError as e:
             raise HTTPException(409, str(e))
+        except Exception as e:
+            log.exception("register_service failed for name=%r: %s", name, e)
+            raise HTTPException(500, f"Failed to register service: {e}")
         await state.events.put({"type": "service.registered", "service": s.to_dict()})
         return s.to_dict()
 
