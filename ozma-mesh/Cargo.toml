@@ -1,13 +1,47 @@
 [package]
-name    = "ozma-mesh"
-version = "0.1.0"
-edition = "2021"
+name        = "ozma-mesh"
+version     = "0.1.0"
+edition     = "2021"
+description = "Ozma mesh networking: WireGuard tunnels + mDNS peer discovery"
+license     = "AGPL-3.0-only"
 
 [dependencies]
-tokio       = { workspace = true }
-tracing     = { workspace = true }
-anyhow      = { workspace = true }
-thiserror   = { workspace = true }
-serde       = { workspace = true }
-boringtun   = "0.7"
-libmdns     = "0.8"
+# WireGuard userspace implementation (Cloudflare boringtun)
+boringtun   = { version = "0.6", default-features = false }
+
+# Async runtime
+tokio       = { version = "1", features = ["full"] }
+
+# mDNS advertising + browsing
+libmdns     = "0.9"
+
+# Crypto: X25519 key generation for WireGuard
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+rand         = "0.8"
+
+# Base64 for WireGuard key encoding
+base64      = "0.22"
+
+# Serialisation
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+
+# Logging
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror   = "1"
+
+# Networking helpers
+socket2     = { version = "0.5", features = ["all"] }
+ipnet       = "2"
+
+[dev-dependencies]
+tokio              = { version = "1", features = ["full", "test-util"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base64             = "0.22"
+
+[[test]]
+name = "integration_tunnel"
+path = "tests/integration_tunnel.rs"
