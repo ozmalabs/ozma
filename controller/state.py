@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
 import asyncio
+import json
+import logging
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+
+log = logging.getLogger("ozma.state")
 
 
 # Machine class — what kind of machine is this node plugged into?
@@ -150,6 +155,11 @@ class AppState:
         self._lock = asyncio.Lock()
         # Start time for uptime calculation
         self._start_time: float = time.monotonic()
+        # Per-node metadata persisted across controller restarts.
+        # Currently tracks vm_guest_ip for soft nodes so controller restart
+        # doesn't lose the VM-IP association until the soft node re-registers.
+        self._meta_path = Path("nodes_meta.json")
+        self._nodes_meta: dict[str, dict] = self._load_meta()
 
         # Broadcast queue — api.py drains this for WebSocket clients
         self.events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -193,6 +203,22 @@ class AppState:
         self._journal_record = StateChangeRecord
         self._journal_type = StateChangeType
 
+    # ── Persistent node metadata ───────────────────────────────────────────────
+
+    def _load_meta(self) -> dict[str, dict]:
+        try:
+            return json.loads(self._meta_path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def _save_meta(self) -> None:
+        try:
+            self._meta_path.write_text(json.dumps(self._nodes_meta, indent=2))
+        except OSError as e:
+            log.debug("Could not save nodes_meta.json: %s", e)
+
+    # ── Node lifecycle ─────────────────────────────────────────────────────────
+
     async def add_node(self, node: NodeInfo) -> None:
         async with self._lock:
             is_new = node.id not in self.nodes
@@ -231,11 +257,19 @@ class AppState:
                 node.share_permissions = existing.share_permissions or node.share_permissions
                 node.parent_node_id = existing.parent_node_id or node.parent_node_id
                 node.vm_guest_ip = node.vm_guest_ip or existing.vm_guest_ip
+                node.vm_guest_ip = node.vm_guest_ip or self._nodes_meta.get(node.id, {}).get("vm_guest_ip")
                 if existing.capabilities and not node.capabilities:
                     node.capabilities = existing.capabilities
                 elif node.capabilities and existing.capabilities:
                     # Union of capabilities
                     node.capabilities = list(set(node.capabilities) | set(existing.capabilities))
+            # Restore vm_guest_ip from persisted meta for fresh registrations
+            if not node.vm_guest_ip:
+                node.vm_guest_ip = self._nodes_meta.get(node.id, {}).get("vm_guest_ip")
+            # Persist vm_guest_ip when we learn it
+            if node.vm_guest_ip:
+                self._nodes_meta.setdefault(node.id, {})["vm_guest_ip"] = node.vm_guest_ip
+                self._save_meta()
             self.nodes[node.id] = node
         self._graph_builder.apply_node_added(node, self)
         self._graph_builder.seed_measurements(self.measurement_store)
