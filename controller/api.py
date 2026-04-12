@@ -144,6 +144,55 @@ class SelectOutputRequest(BaseModel):
     output_id: str
 
 
+class AddScheduleRuleRequest(BaseModel):
+    time: str = "09:00"
+    days: str = "*"
+    scenario: str
+
+
+class CreateMaintenanceWindowRequest(BaseModel):
+    name: str
+    start_time: str
+    end_time: str
+    node_ids: list[str] = []
+    actions: list[str] = []
+
+
+class OverlayPosition(BaseModel):
+    x: int = 0
+    y: int = 0
+    width: int = 320
+    height: int = 180
+
+
+class CreateOverlayRequest(BaseModel):
+    type: str = "camera"
+    source_id: str
+    label: str = ""
+    position: OverlayPosition = OverlayPosition()
+
+
+class SaveReplayRequest(BaseModel):
+    source_id: str
+    duration_s: int = 30
+
+
+class PushClipboardRequest(BaseModel):
+    text: str
+    source: str = "unknown"
+
+
+class PasteTextRequest(BaseModel):
+    text: str
+    layout: str = "us"
+    rate: float = 30
+    node_id: str | None = None
+
+
+class SetAudioDelayRequest(BaseModel):
+    delay_ms: float
+
+
 
 
 class DirectRegisterRequest(BaseModel):
@@ -2624,16 +2673,15 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"ok": True, "output_id": req.output_id}
 
     @app.put("/api/v1/audio/outputs/{output_id}/delay")
-    async def set_audio_output_delay(request: Request, output_id: str, body: dict) -> dict[str, Any]:
+    async def set_audio_output_delay(request: Request, output_id: str, body: SetAudioDelayRequest) -> dict[str, Any]:
         """Set time-alignment delay (ms) on an audio output."""
         _require_scope(request, SCOPE_WRITE)
         if not audio:
             raise HTTPException(status_code=503, detail="Audio routing disabled")
-        delay_ms = float(body.get("delay_ms", 0.0))
-        ok = await audio.outputs.set_delay(output_id, delay_ms)
+        ok = await audio.outputs.set_delay(output_id, body.delay_ms)
         if not ok:
             raise HTTPException(status_code=404, detail=f"Output '{output_id}' not found")
-        return {"ok": True, "output_id": output_id, "delay_ms": delay_ms}
+        return {"ok": True, "output_id": output_id, "delay_ms": body.delay_ms}
 
     # --- RGB zone endpoints ---
 
@@ -2829,21 +2877,20 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     # --- Paste typing endpoints ---
 
     @app.post("/api/v1/paste")
-    async def paste_text(request: Request, body: dict = {}) -> dict[str, Any]:
+    async def paste_text(request: Request, body: PasteTextRequest) -> dict[str, Any]:
         """Type text to the active node via HID keystrokes.
         Body: {"text": "...", "layout": "us", "rate": 30, "node_id": null}
         """
         _require_scope(request, SCOPE_WRITE)
         if not paste_typer:
             raise HTTPException(status_code=503, detail="Paste typing not available")
-        text = body.get("text", "")
-        if not text:
+        if not body.text:
             raise HTTPException(status_code=400, detail="No text provided")
         result = await paste_typer.type_text(
-            text,
-            layout=body.get("layout", "us"),
-            rate=float(body.get("rate", 30)),
-            node_id=body.get("node_id"),
+            body.text,
+            layout=body.layout,
+            rate=body.rate,
+            node_id=body.node_id,
         )
         return result
 
@@ -3374,21 +3421,13 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"patterns": ocr_triggers.list_patterns()}
 
     @app.post("/api/v1/ocr/triggers")
-    async def add_ocr_trigger(request: Request, body: dict = {}) -> dict[str, Any]:
+    async def add_ocr_trigger(request: Request, body: TriggerPattern) -> dict[str, Any]:
         """Add a custom OCR trigger pattern."""
         _require_scope(request, SCOPE_WRITE)
         if not ocr_triggers:
             raise HTTPException(status_code=503, detail="OCR triggers not available")
-        pattern = TriggerPattern(
-            id=body.get("id", "custom"),
-            pattern=body.get("pattern", ""),
-            is_regex=body.get("is_regex", False),
-            severity=body.get("severity", "error"),
-            category=body.get("category", "custom"),
-            description=body.get("description", ""),
-        )
-        ocr_triggers.add_pattern(pattern)
-        return {"ok": True, "pattern": pattern.to_dict()}
+        ocr_triggers.add_pattern(body)
+        return {"ok": True, "pattern": body.to_dict()}
 
     # --- Automation ---
 
@@ -3521,7 +3560,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"macros": macro_mgr.list_macros()}
 
     @app.post("/api/v1/macros")
-    async def create_macro(request: Request, body: dict = {}) -> dict[str, Any]:
+    async def create_macro(request: Request, body: dict) -> dict[str, Any]:
         """Create a macro from a definition."""
         _require_scope(request, SCOPE_WRITE)
         if not macro_mgr:
@@ -3827,14 +3866,14 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"rules": sched.list_rules()}
 
     @app.post("/api/v1/schedule")
-    async def add_schedule_rule(request: Request, body: dict = {}) -> dict[str, Any]:
+    async def add_schedule_rule(request: Request, body: AddScheduleRuleRequest) -> dict[str, Any]:
         _require_scope(request, SCOPE_WRITE)
         if not sched:
             raise HTTPException(status_code=503, detail="Scheduler not available")
         rule = sched.add_rule(
-            time=body.get("time", "09:00"),
-            days=body.get("days", "*"),
-            scenario=body.get("scenario", ""),
+            time=body.time,
+            days=body.days,
+            scenario=body.scenario,
         )
         return {"ok": True, "rule": rule}
 
@@ -3916,15 +3955,14 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         }
 
     @app.put("/api/v1/codecs")
-    async def set_codec_config(request: Request, body: dict = {}) -> dict[str, Any]:
+    async def set_codec_config(request: Request, body: CodecConfig) -> dict[str, Any]:
         """Set or update codec configuration for a source."""
         _require_scope(request, SCOPE_WRITE)
         if not codec_mgr:
             raise HTTPException(status_code=503, detail="Codec manager not available")
-        source_id = body.get("source_id", "default")
-        cfg = CodecConfig.from_dict(body)
-        codec_mgr.set_config(source_id, cfg)
-        resolved = codec_mgr.resolve(cfg)
+        source_id = getattr(body, "source_id", "default")
+        codec_mgr.set_config(source_id, body)
+        resolved = codec_mgr.resolve(body)
         return {"ok": True, "source_id": source_id, "resolved": resolved.to_dict()}
 
     @app.post("/api/v1/codecs/resolve")
@@ -4538,16 +4576,16 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return list(_overlays_store)
 
     @app.post("/api/v1/overlays")
-    async def overlay_add(request: Request, body: dict = {}) -> dict[str, Any]:
+    async def overlay_add(request: Request, body: CreateOverlayRequest) -> dict[str, Any]:
         """Add a video overlay source."""
         _require_scope(request, SCOPE_WRITE)
         import time as _time
         overlay = {
             "id": f"overlay-{int(_time.time() * 1000)}",
-            "type": body.get("type", "camera"),
-            "source_id": body.get("source_id", ""),
-            "label": body.get("label", ""),
-            "position": body.get("position", {"x": 0, "y": 0, "width": 320, "height": 180}),
+            "type": body.type,
+            "source_id": body.source_id,
+            "label": body.label,
+            "position": body.position.model_dump(),
             "enabled": True,
         }
         _overlays_store.append(overlay)
@@ -5487,13 +5525,13 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return list(_clipboard_ring[-50:])
 
     @app.post("/api/v1/clipboard")
-    async def clipboard_push(request: Request, body: dict = {}) -> dict[str, Any]:
+    async def clipboard_push(request: Request, body: PushClipboardRequest) -> dict[str, Any]:
         """Push text to the cross-desk clipboard ring."""
         _require_scope(request, SCOPE_WRITE)
         entry = {
             "id": f"clip-{len(_clipboard_ring)}",
-            "text": body.get("text", ""),
-            "source": body.get("source", "unknown"),
+            "text": body.text,
+            "source": body.source,
             "ts": __import__("time").time(),
         }
         _clipboard_ring.append(entry)
@@ -5540,7 +5578,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"profiles": profiles}
 
     @app.post("/api/v1/profiles")
-    async def workspace_profile_create(request: Request, body: dict = {}) -> dict[str, Any]:
+    async def workspace_profile_create(request: Request, body: dict) -> dict[str, Any]:
         """Create or update a workspace profile."""
         _require_scope(request, SCOPE_WRITE)
         import json as _json
@@ -5570,17 +5608,17 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"windows": _maintenance_windows}
 
     @app.post("/api/v1/maintenance")
-    async def maintenance_create(request: Request, body: dict = {}) -> dict[str, Any]:
+    async def maintenance_create(request: Request, body: CreateMaintenanceWindowRequest) -> dict[str, Any]:
         """Schedule a maintenance window."""
         _require_scope(request, SCOPE_WRITE)
         import time as _time
         window = {
             "id": f"mw-{int(_time.time())}",
-            "name": body.get("name", ""),
-            "start_time": body.get("start_time", ""),
-            "end_time": body.get("end_time", ""),
-            "node_ids": body.get("node_ids", []),
-            "actions": body.get("actions", []),
+            "name": body.name,
+            "start_time": body.start_time,
+            "end_time": body.end_time,
+            "node_ids": body.node_ids,
+            "actions": body.actions,
             "status": "scheduled",
         }
         _maintenance_windows.append(window)
@@ -5595,20 +5633,18 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"enabled": True, "sources": [], "clips": len(_replay_clips)}
 
     @app.post("/api/v1/replay/save")
-    async def replay_save(request: Request, body: dict = {}) -> dict[str, Any]:
+    async def replay_save(request: Request, body: SaveReplayRequest) -> dict[str, Any]:
         """Save a clip from the replay buffer."""
         _require_scope(request, SCOPE_WRITE)
         import time
-        source_id = body.get("source_id")
-        if not source_id:
-            raise HTTPException(400, "source_id is required")
+        source_id = body.source_id
 
         # In a real implementation, this would save a segment from a live buffer.
         # For now, we just create a record of the save request.
         clip = {
             "id": f"replay-{int(time.time())}",
             "source_id": source_id,
-            "duration_s": body.get("duration_s", 30),
+            "duration_s": body.duration_s,
             "timestamp": time.time(),
             "path": f"/var/ozma/replays/{source_id}/replay-{int(time.time())}.mp4",
         }
@@ -7354,7 +7390,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"ok": ok, "email": email}
 
     @app.post("/api/v1/mdm/enroll/invite")
-    async def mdm_enroll_invite(request: Request, body: dict = {}) -> dict[str, Any]:
+    async def mdm_enroll_invite(request: Request, body: dict) -> dict[str, Any]:
         """Alias: send MDM enrollment invitation (alternative path)."""
         _require_scope(request, SCOPE_ADMIN)
         if not mdm:
