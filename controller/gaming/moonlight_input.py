@@ -766,7 +766,8 @@ class MoonlightInputHandler:
         }.get(event.type)
 
         if device:
-            device.write(event.type.to_evdev_event())
+            # UInput.write() is synchronous - this is fine for low-frequency events
+            device.write(event.to_evdev_event())
 
     async def update_mouse_settings(self, settings: MouseSettings) -> None:
         """Update mouse settings for this client."""

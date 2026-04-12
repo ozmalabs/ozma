@@ -144,6 +144,9 @@ class CaptureToMoonlightManager:
         """Scan for capture cards and register them as Moonlight apps."""
         # This will be called periodically or on device change
         # For now, we just list available sources
+        # The list_moonlight_apps method already queries display_capture
+        # This method can be extended for dynamic card detection if needed
+        pass
 
     async def start_capture_session(
         self,
@@ -290,7 +293,7 @@ class CaptureToMoonlightManager:
             pipeline_config=pipeline_config,
             input_handler=input_handler,
             active=True,
-            started_at=asyncio.get_event_loop().time(),
+            started_at=asyncio.get_running_loop().time(),
             clients=[client_id],
         )
 

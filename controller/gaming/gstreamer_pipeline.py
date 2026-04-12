@@ -217,7 +217,18 @@ class GStreamerPipeline:
 
             return True
         except Exception as e:
+            # Clean up any partially created resources
             log.error("Failed to start GStreamer pipeline: %s", e)
+            # Kill the process if it was created but monitoring failed
+            if self._pipeline:
+                try:
+                    self._pipeline.terminate()
+                    await asyncio.wait_for(self._pipeline.wait(), timeout=2.0)
+                except Exception:
+                    self._pipeline.kill()
+                    await self._pipeline.wait()
+                self._pipeline = None
+            self._running = False
             return False
 
     async def stop(self) -> None:
