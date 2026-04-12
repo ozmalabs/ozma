@@ -3341,7 +3341,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     async def list_ocr_triggers() -> dict[str, Any]:
         """List all OCR trigger patterns (built-in + custom)."""
         if not ocr_triggers:
-            return {"patterns": []}
+            raise HTTPException(status_code=503, detail="OCR triggers not available")
         return {"patterns": ocr_triggers.list_patterns()}
 
     @app.post("/api/v1/ocr/triggers")
@@ -3487,7 +3487,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     @app.get("/api/v1/macros")
     async def list_macros() -> dict[str, Any]:
         if not macro_mgr:
-            return {"macros": []}
+            raise HTTPException(status_code=503, detail="Macro manager not available")
         return {"macros": macro_mgr.list_macros()}
 
     @app.post("/api/v1/macros")
@@ -3792,7 +3792,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     @app.get("/api/v1/schedule")
     async def list_schedule() -> dict[str, Any]:
         if not sched:
-            return {"rules": []}
+            raise HTTPException(status_code=503, detail="Scheduler not available")
         return {"rules": sched.list_rules()}
 
     @app.post("/api/v1/schedule")
@@ -3828,7 +3828,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     @app.get("/api/v1/session-recording/status")
     async def session_recording_status() -> dict[str, Any]:
         if not recorder:
-            return {"recording": False}
+            raise HTTPException(status_code=503, detail="Recorder not available")
         return recorder.status()
 
     @app.post("/api/v1/session-recording/start")
@@ -3876,7 +3876,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     @app.get("/api/v1/codecs")
     async def list_codecs() -> dict[str, Any]:
         if not codec_mgr:
-            return {"codecs": {}, "configs": {}}
+            raise HTTPException(status_code=503, detail="Codec manager not available")
         return {
             "codecs": codec_mgr.list_available(),
             "configs": codec_mgr.list_configs(),
@@ -4534,7 +4534,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     @app.get("/api/v1/broadcast/status")
     async def broadcast_status() -> dict[str, Any]:
         if not obs_studio:
-            return {"connected": False, "scenes": [], "sources": []}
+            raise HTTPException(status_code=503, detail="Broadcast not available")
         return obs_studio.status()
 
     @app.get("/api/v1/broadcast/scenes")
@@ -5590,6 +5590,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
         The mobile app sends ?limit=N&offset=N&unread_only=true.
         """
+        if not notifier:
+            raise HTTPException(status_code=503, detail="Notifications not available")
+
         fmt = request.query_params.get("format", "channels")
         limit = int(request.query_params.get("limit", "50"))
         offset = int(request.query_params.get("offset", "0"))
@@ -5601,8 +5604,6 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             # For now return an empty list with the correct shape.
             return {"notifications": [], "unread_count": 0, "limit": limit, "offset": offset}
 
-        if not notifier:
-            return {"channels": [], "recent": []}
         return {"channels": notifier.list_channels() if hasattr(notifier, 'list_channels') else [],
                 "recent": []}
 
@@ -7319,13 +7320,13 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         """Alias: send MDM enrollment invitation (alternative path)."""
         _require_scope(request, SCOPE_ADMIN)
         if not mdm:
-            raise HTTPException(404, "MDM bridge not enabled")
+            raise HTTPException(503, "MDM bridge not enabled")
         email = body.get("email", "")
         name = body.get("name", "")
         try:
             ok = await mdm.invite_enrollment(email, name=name)
         except (RuntimeError, NotImplementedError):
-            raise HTTPException(404, "MDM provider not configured")
+            raise HTTPException(503, "MDM provider not configured")
         return {"ok": ok, "email": email, "invite_sent": ok}
 
     @app.post("/api/v1/mdm/offboard/{email:path}")
