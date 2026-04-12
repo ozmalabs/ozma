@@ -1,236 +1,324 @@
-import React, { FormEvent, useState } from 'react';
-import { useAuth } from '../auth/AuthContext';
-import { useSettings } from '../settings/useSettings';
-import { useConnect } from '../settings/useConnect';
+import { useState, useEffect, FormEvent } from 'react'
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+interface ConnectStatus {
+  authenticated: boolean
+  tier: string
+  email?: string
+  account_email?: string
+  subdomain?: string
+  usage?: { nodes: number; controllers: number }
+  limits?: { controllers: number; nodes: number }
+}
+
+interface CurrentUser {
+  id: string
+  username: string
+  display_name?: string
+  role: string
+  auth_enabled: boolean
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-const MACHINE_CLASSES = ['workstation', 'server', 'kiosk', 'camera'] as const;
-const THEMES = ['dark', 'light', 'system'] as const;
-
-function Section({
-  title,
-  children,
-}: {
-  title: string;
-  children: React.ReactNode;
-}) {
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <section style={s.section}>
-      <h2 style={s.sectionTitle}>{title}</h2>
+    <section className="bg-white rounded-xl shadow-sm border border-gray-200 p-6 space-y-4">
+      <h2 className="text-base font-semibold text-gray-500 uppercase tracking-wide">{title}</h2>
       {children}
     </section>
-  );
+  )
 }
 
-function Field({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <label style={s.field}>
-      <span style={s.fieldLabel}>{label}</span>
+    <label className="flex flex-col gap-1 text-sm text-gray-700">
+      <span className="font-medium">{label}</span>
       {children}
     </label>
-  );
+  )
 }
 
-function SaveBar({
-  saving,
-  saved,
-  error,
-  onSave,
-}: {
-  saving: boolean;
-  saved: boolean;
-  error: string | null;
-  onSave: () => void;
-}) {
-  return (
-    <div style={s.saveBar}>
-      {error && <span style={s.errorText}>{error}</span>}
-      {saved && !error && <span style={s.savedText}>✓ Saved</span>}
-      <button style={s.primaryBtn} onClick={onSave} disabled={saving}>
-        {saving ? 'Saving…' : 'Save changes'}
-      </button>
-    </div>
-  );
-}
+const inputCls =
+  'border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-white'
+
+const btnPrimary =
+  'bg-indigo-600 text-white text-sm font-medium px-4 py-2 rounded-lg hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed'
+
+const btnDanger =
+  'border border-red-300 text-red-600 text-sm font-medium px-4 py-2 rounded-lg hover:bg-red-50 disabled:opacity-50'
+
+const btnGhost =
+  'border border-gray-300 text-gray-600 text-sm font-medium px-4 py-2 rounded-lg hover:bg-gray-50'
 
 // ---------------------------------------------------------------------------
 // Connect section
 // ---------------------------------------------------------------------------
 
 function ConnectSection() {
-  const { status, loading, working, error, link, unlink } = useConnect();
-  const [linkToken, setLinkToken] = useState('');
-  const [showLinkForm, setShowLinkForm] = useState(false);
+  const [status, setStatus] = useState<ConnectStatus | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [working, setWorking] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [success, setSuccess] = useState<string | null>(null)
+  const [subdomainInput, setSubdomainInput] = useState('')
+  const [subdomainWorking, setSubdomainWorking] = useState(false)
+  const [subdomainError, setSubdomainError] = useState<string | null>(null)
 
-  async function handleLink(e: FormEvent) {
-    e.preventDefault();
-    await link(linkToken.trim());
-    setLinkToken('');
-    setShowLinkForm(false);
+  useEffect(() => { fetchStatus() }, [])
+
+  async function fetchStatus() {
+    setLoading(true)
+    try {
+      const r = await fetch('/api/v1/connect/status')
+      if (r.ok) setStatus(await r.json())
+    } catch { /* ignore */ } finally { setLoading(false) }
   }
 
-  if (loading) return <p style={s.muted}>Loading Connect status…</p>;
+  async function handleLogin(e: FormEvent) {
+    e.preventDefault()
+    setError(null); setSuccess(null); setWorking(true)
+    try {
+      const r = await fetch('/api/v1/connect/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password }),
+      })
+      const data = await r.json()
+      if (!r.ok) throw new Error(data.detail ?? data.error ?? 'Login failed')
+      setSuccess(`Connected! Tier: ${data.tier}`)
+      setPassword('')
+      await fetchStatus()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Login failed')
+    } finally { setWorking(false) }
+  }
+
+  async function handleLogout() {
+    setError(null); setSuccess(null)
+    try {
+      await fetch('/api/v1/connect/logout', { method: 'POST' })
+      setSuccess('Disconnected from Ozma Connect.')
+      await fetchStatus()
+    } catch { setError('Logout failed') }
+  }
+
+  async function handleClaimSubdomain(e: FormEvent) {
+    e.preventDefault()
+    setSubdomainError(null)
+    if (!subdomainInput.trim()) { setSubdomainError('Subdomain cannot be empty'); return }
+    if (!/^[a-z0-9-]+$/.test(subdomainInput)) {
+      setSubdomainError('Only lowercase letters, numbers, and hyphens allowed')
+      return
+    }
+    setSubdomainWorking(true)
+    try {
+      const r = await fetch('/api/v1/subdomain/claim', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: subdomainInput }),
+      })
+      const data = await r.json()
+      if (!r.ok) throw new Error(data.detail ?? 'Claim failed')
+      setSuccess(`Subdomain claimed: ${data.domain}`)
+      await fetchStatus()
+    } catch (err) {
+      setSubdomainError(err instanceof Error ? err.message : 'Claim failed')
+    } finally { setSubdomainWorking(false) }
+  }
+
+  if (loading) return <p className="text-sm text-gray-400">Loading Connect status…</p>
+
+  const accountEmail = status?.account_email ?? status?.email
 
   return (
     <Section title="Ozma Connect">
-      {error && <p style={s.errorText}>{error}</p>}
+      {error && <p className="text-sm text-red-600">{error}</p>}
+      {success && <p className="text-sm text-green-600">{success}</p>}
 
-      {status?.linked ? (
-        <div style={s.connectLinked}>
-          <div style={s.connectRow}>
-            <span style={s.connectedDot} />
-            <span style={s.connectEmail}>
-              {status.account_email ?? status.account_id ?? 'Linked account'}
+      {status?.authenticated ? (
+        <div className="space-y-3">
+          <div className="flex items-center gap-2">
+            <span className="w-2 h-2 rounded-full bg-green-500 flex-shrink-0" />
+            <span className="text-sm font-medium text-gray-800">
+              {accountEmail ?? 'Connected'}
+            </span>
+            <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
+              status.tier === 'pro' ? 'bg-purple-100 text-purple-700'
+              : status.tier === 'team' ? 'bg-blue-100 text-blue-700'
+              : 'bg-gray-100 text-gray-600'
+            }`}>
+              {status.tier}
             </span>
           </div>
-          {status.last_seen && (
-            <p style={s.muted}>
-              Last seen: {new Date(status.last_seen).toLocaleString()}
+
+          {status.subdomain ? (
+            <p className="text-sm text-gray-600">
+              Subdomain:{' '}
+              <a
+                href={`https://${status.subdomain}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-indigo-600 hover:underline font-medium"
+              >
+                {status.subdomain}
+              </a>
+            </p>
+          ) : (
+            <form onSubmit={handleClaimSubdomain} className="space-y-2">
+              <p className="text-sm text-gray-500">Claim a public subdomain for remote access:</p>
+              <div className="flex gap-2 items-center">
+                <input
+                  type="text"
+                  placeholder="your-name"
+                  value={subdomainInput}
+                  onChange={e => setSubdomainInput(e.target.value.toLowerCase())}
+                  className={`${inputCls} flex-1`}
+                />
+                <span className="text-sm text-gray-400 whitespace-nowrap">.c.ozma.dev</span>
+                <button type="submit" disabled={subdomainWorking} className={btnPrimary}>
+                  {subdomainWorking ? 'Claiming…' : 'Claim'}
+                </button>
+              </div>
+              {subdomainError && <p className="text-sm text-red-600">{subdomainError}</p>}
+            </form>
+          )}
+
+          {status.usage && (
+            <p className="text-xs text-gray-400">
+              Nodes: {status.usage.nodes}
+              {status.limits && status.limits.nodes > 0 ? ` / ${status.limits.nodes}` : ''}
             </p>
           )}
-          <button
-            style={s.dangerBtn}
-            onClick={unlink}
-            disabled={working}
-          >
-            {working ? 'Unlinking…' : 'Unlink account'}
+
+          <button onClick={handleLogout} className={btnDanger}>
+            Disconnect account
           </button>
         </div>
       ) : (
-        <div>
-          <p style={s.muted}>
-            Link this controller to an Ozma Connect account to enable remote
-            access, push notifications, and cloud backup.
+        <form onSubmit={handleLogin} className="space-y-3">
+          <p className="text-sm text-gray-600">
+            Link this controller to Ozma Connect for remote access, relay, and cloud backup.
           </p>
-          {showLinkForm ? (
-            <form onSubmit={handleLink} style={s.linkForm}>
-              <input
-                style={s.input}
-                type="text"
-                placeholder="Paste your Connect link token"
-                value={linkToken}
-                onChange={(e) => setLinkToken(e.target.value)}
-                required
-              />
-              <div style={s.linkFormBtns}>
-                <button style={s.primaryBtn} type="submit" disabled={working}>
-                  {working ? 'Linking…' : 'Link'}
-                </button>
-                <button
-                  style={s.ghostBtn}
-                  type="button"
-                  onClick={() => setShowLinkForm(false)}
-                >
-                  Cancel
-                </button>
-              </div>
-            </form>
-          ) : (
-            <button style={s.primaryBtn} onClick={() => setShowLinkForm(true)}>
-              Link account
-            </button>
-          )}
-        </div>
+          <Field label="Email">
+            <input
+              type="email"
+              required
+              value={email}
+              onChange={e => setEmail(e.target.value)}
+              className={inputCls}
+              placeholder="you@example.com"
+            />
+          </Field>
+          <Field label="Password">
+            <input
+              type="password"
+              required
+              value={password}
+              onChange={e => setPassword(e.target.value)}
+              className={inputCls}
+              placeholder="••••••••"
+            />
+          </Field>
+          <button type="submit" disabled={working} className={`${btnPrimary} w-full`}>
+            {working ? 'Linking…' : 'Link to Ozma Connect'}
+          </button>
+          <p className="text-xs text-gray-400 text-center">
+            No account?{' '}
+            <a
+              href="https://ozma.dev/signup"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-indigo-600 hover:underline"
+            >
+              Sign up free
+            </a>
+          </p>
+        </form>
       )}
     </Section>
-  );
+  )
 }
 
 // ---------------------------------------------------------------------------
 // Change-password section
 // ---------------------------------------------------------------------------
 
-function ChangePasswordSection() {
-  const { user } = useAuth();
-  const [current, setCurrent] = useState('');
-  const [next, setNext] = useState('');
-  const [confirm, setConfirm] = useState('');
-  const [error, setError] = useState<string | null>(null);
-  const [success, setSuccess] = useState(false);
-  const [loading, setLoading] = useState(false);
-
-  if (!user?.auth_enabled) return null;
+function ChangePasswordSection({ user }: { user: CurrentUser }) {
+  const [newPass, setNewPass] = useState('')
+  const [confirm, setConfirm] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const [success, setSuccess] = useState<string | null>(null)
+  const [loading, setLoading] = useState(false)
 
   async function handleSubmit(e: FormEvent) {
-    e.preventDefault();
-    setError(null);
-    setSuccess(false);
-    if (next !== confirm) {
-      setError('New passwords do not match');
-      return;
-    }
-    setLoading(true);
+    e.preventDefault()
+    setError(null); setSuccess(null)
+    if (!newPass) { setError('Password cannot be empty'); return }
+    if (newPass.length < 8) { setError('Password must be at least 8 characters'); return }
+    if (newPass !== confirm) { setError('Passwords do not match'); return }
+    setLoading(true)
     try {
-      const res = await fetch('/api/v1/users/me/password', {
-        method: 'POST',
+      const r = await fetch('/api/v1/users/me', {
+        method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ current_password: current, new_password: next }),
-      });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body?.detail ?? body?.error ?? `HTTP ${res.status}`);
+        body: JSON.stringify({ password: newPass }),
+      })
+      if (!r.ok) {
+        const data = await r.json().catch(() => ({}))
+        throw new Error(data.detail ?? data.error ?? `HTTP ${r.status}`)
       }
-      setSuccess(true);
-      setCurrent('');
-      setNext('');
-      setConfirm('');
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to change password');
-    } finally {
-      setLoading(false);
-    }
+      setSuccess('Password updated.')
+      setNewPass(''); setConfirm('')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to update password')
+    } finally { setLoading(false) }
   }
 
   return (
-    <Section title="Change password">
-      <form onSubmit={handleSubmit} style={s.form}>
-        <Field label="Current password">
-          <input
-            style={s.input}
-            type="password"
-            autoComplete="current-password"
-            value={current}
-            onChange={(e) => setCurrent(e.target.value)}
-            required
-          />
-        </Field>
+    <Section title="Account">
+      <div className="text-sm text-gray-600 space-y-1">
+        <p>Username: <span className="font-medium">{user.username}</span></p>
+        <p>Role: <span className="font-medium capitalize">{user.role}</span></p>
+      </div>
+
+      <form onSubmit={handleSubmit} className="space-y-3 pt-3 border-t border-gray-100">
+        <h3 className="text-sm font-semibold text-gray-700">Change Password</h3>
         <Field label="New password">
           <input
-            style={s.input}
             type="password"
+            value={newPass}
+            onChange={e => setNewPass(e.target.value)}
+            className={inputCls}
+            placeholder="Min. 8 characters"
             autoComplete="new-password"
-            value={next}
-            onChange={(e) => setNext(e.target.value)}
-            required
           />
         </Field>
         <Field label="Confirm new password">
           <input
-            style={s.input}
             type="password"
-            autoComplete="new-password"
             value={confirm}
-            onChange={(e) => setConfirm(e.target.value)}
-            required
+            onChange={e => setConfirm(e.target.value)}
+            className={inputCls}
+            placeholder="Repeat new password"
+            autoComplete="new-password"
           />
         </Field>
-        {error && <p style={s.errorText}>{error}</p>}
-        {success && <p style={s.savedText}>✓ Password updated</p>}
-        <button style={s.primaryBtn} type="submit" disabled={loading}>
-          {loading ? 'Updating…' : 'Update password'}
+        {error && <p className="text-sm text-red-600">{error}</p>}
+        {success && <p className="text-sm text-green-600">{success}</p>}
+        <button type="submit" disabled={loading} className={btnPrimary}>
+          {loading ? 'Saving…' : 'Update password'}
         </button>
       </form>
     </Section>
-  );
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -238,290 +326,50 @@ function ChangePasswordSection() {
 // ---------------------------------------------------------------------------
 
 export default function Settings() {
-  const { settings, setSettings, loading, saving, saved, error, save } =
-    useSettings();
+  const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null)
 
-  function handleSave() {
-    save(settings);
-  }
-
-  if (loading) {
-    return <div style={s.page}><p style={s.muted}>Loading settings…</p></div>;
-  }
+  useEffect(() => {
+    fetch('/api/v1/users/me')
+      .then(r => r.ok ? r.json() : null)
+      .then(data => { if (data) setCurrentUser(data) })
+      .catch(() => {})
+  }, [])
 
   return (
-    <div style={s.page}>
-      <h1 style={s.pageTitle}>Settings</h1>
-
-      {/* ── Controller config ─────────────────────────────────────── */}
-      <Section title="Controller">
-        <Field label="Node name">
-          <input
-            style={s.input}
-            type="text"
-            value={settings.node_name}
-            onChange={(e) =>
-              setSettings((p) => ({ ...p, node_name: e.target.value }))
-            }
-            placeholder="my-controller"
-          />
-        </Field>
-        <Field label="Machine class">
-          <select
-            style={s.select}
-            value={settings.machine_class}
-            onChange={(e) =>
-              setSettings((p) => ({
-                ...p,
-                machine_class: e.target.value as typeof settings.machine_class,
-              }))
-            }
-          >
-            {MACHINE_CLASSES.map((c) => (
-              <option key={c} value={c}>
-                {c.charAt(0).toUpperCase() + c.slice(1)}
-              </option>
-            ))}
-          </select>
-        </Field>
-      </Section>
-
-      {/* ── Virtual display defaults ───────────────────────────────── */}
-      <Section title="Default virtual display">
-        <div style={s.row}>
-          <Field label="Width (px)">
-            <input
-              style={{ ...s.input, width: '6rem' }}
-              type="number"
-              min={640}
-              max={7680}
-              value={settings.display_width}
-              onChange={(e) =>
-                setSettings((p) => ({
-                  ...p,
-                  display_width: Number(e.target.value),
-                }))
-              }
-            />
-          </Field>
-          <Field label="Height (px)">
-            <input
-              style={{ ...s.input, width: '6rem' }}
-              type="number"
-              min={480}
-              max={4320}
-              value={settings.display_height}
-              onChange={(e) =>
-                setSettings((p) => ({
-                  ...p,
-                  display_height: Number(e.target.value),
-                }))
-              }
-            />
-          </Field>
-          <Field label="Refresh (Hz)">
-            <input
-              style={{ ...s.input, width: '5rem' }}
-              type="number"
-              min={24}
-              max={360}
-              value={settings.display_refresh}
-              onChange={(e) =>
-                setSettings((p) => ({
-                  ...p,
-                  display_refresh: Number(e.target.value),
-                }))
-              }
-            />
-          </Field>
-        </div>
-      </Section>
-
-      {/* ── Preferences ───────────────────────────────────────────── */}
-      <Section title="Preferences">
-        <Field label="Theme">
-          <select
-            style={s.select}
-            value={settings.theme}
-            onChange={(e) =>
-              setSettings((p) => ({
-                ...p,
-                theme: e.target.value as typeof settings.theme,
-              }))
-            }
-          >
-            {THEMES.map((t) => (
-              <option key={t} value={t}>
-                {t.charAt(0).toUpperCase() + t.slice(1)}
-              </option>
-            ))}
-          </select>
-        </Field>
-      </Section>
-
-      <SaveBar saving={saving} saved={saved} error={error} onSave={handleSave} />
+    <div className="max-w-2xl mx-auto py-8 px-4 space-y-6">
+      <h1 className="text-2xl font-bold text-gray-900">Settings</h1>
 
       {/* ── Ozma Connect ──────────────────────────────────────────── */}
       <ConnectSection />
 
-      {/* ── Account / password ────────────────────────────────────── */}
-      <ChangePasswordSection />
+      {/* ── Account / password (only when auth is enabled) ────────── */}
+      {currentUser?.auth_enabled && (
+        <ChangePasswordSection user={currentUser} />
+      )}
+
+      {/* ── Controller info ───────────────────────────────────────── */}
+      <Section title="Controller">
+        <div className="text-sm text-gray-600 space-y-2">
+          <p>
+            API docs:{' '}
+            <a href="/docs" target="_blank" rel="noopener noreferrer" className="text-indigo-600 hover:underline">
+              /docs
+            </a>
+          </p>
+          <p>
+            Prometheus metrics:{' '}
+            <a href="/metrics" target="_blank" rel="noopener noreferrer" className="text-indigo-600 hover:underline">
+              /metrics
+            </a>
+          </p>
+          <p>
+            GraphQL:{' '}
+            <a href="/graphql" target="_blank" rel="noopener noreferrer" className="text-indigo-600 hover:underline">
+              /graphql
+            </a>
+          </p>
+        </div>
+      </Section>
     </div>
-  );
+  )
 }
-
-// ---------------------------------------------------------------------------
-// Styles
-// ---------------------------------------------------------------------------
-
-const s: Record<string, React.CSSProperties> = {
-  page: {
-    padding: '1.5rem 2rem',
-    maxWidth: '640px',
-    color: '#e2e8f0',
-  },
-  pageTitle: {
-    margin: '0 0 1.5rem',
-    fontSize: '1.5rem',
-    fontWeight: 700,
-    color: '#fff',
-  },
-  section: {
-    marginBottom: '2rem',
-    padding: '1.25rem 1.5rem',
-    background: '#1a1d27',
-    border: '1px solid #2a2d3a',
-    borderRadius: '0.75rem',
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '1rem',
-  },
-  sectionTitle: {
-    margin: 0,
-    fontSize: '1rem',
-    fontWeight: 600,
-    color: '#94a3b8',
-    textTransform: 'uppercase',
-    letterSpacing: '0.05em',
-  },
-  field: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '0.375rem',
-    fontSize: '0.875rem',
-    color: '#94a3b8',
-  },
-  fieldLabel: {
-    fontSize: '0.8125rem',
-    color: '#94a3b8',
-  },
-  input: {
-    padding: '0.5rem 0.75rem',
-    borderRadius: '0.375rem',
-    border: '1px solid #2a2d3a',
-    background: '#0f1117',
-    color: '#e2e8f0',
-    fontSize: '0.9375rem',
-    outline: 'none',
-  },
-  select: {
-    padding: '0.5rem 0.75rem',
-    borderRadius: '0.375rem',
-    border: '1px solid #2a2d3a',
-    background: '#0f1117',
-    color: '#e2e8f0',
-    fontSize: '0.9375rem',
-    outline: 'none',
-    cursor: 'pointer',
-  },
-  row: {
-    display: 'flex',
-    gap: '1rem',
-    flexWrap: 'wrap',
-  },
-  form: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '0.875rem',
-  },
-  saveBar: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: '1rem',
-    marginBottom: '2rem',
-  },
-  primaryBtn: {
-    padding: '0.5rem 1.25rem',
-    borderRadius: '0.375rem',
-    border: 'none',
-    background: '#6366f1',
-    color: '#fff',
-    fontSize: '0.9375rem',
-    fontWeight: 600,
-    cursor: 'pointer',
-  },
-  ghostBtn: {
-    padding: '0.5rem 1rem',
-    borderRadius: '0.375rem',
-    border: '1px solid #2a2d3a',
-    background: 'transparent',
-    color: '#94a3b8',
-    fontSize: '0.9375rem',
-    cursor: 'pointer',
-  },
-  dangerBtn: {
-    padding: '0.5rem 1rem',
-    borderRadius: '0.375rem',
-    border: '1px solid #7f1d1d',
-    background: 'transparent',
-    color: '#f87171',
-    fontSize: '0.9375rem',
-    cursor: 'pointer',
-    alignSelf: 'flex-start',
-  },
-  errorText: {
-    margin: 0,
-    color: '#f87171',
-    fontSize: '0.875rem',
-  },
-  savedText: {
-    margin: 0,
-    color: '#4ade80',
-    fontSize: '0.875rem',
-  },
-  muted: {
-    margin: 0,
-    color: '#64748b',
-    fontSize: '0.875rem',
-  },
-  connectLinked: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '0.5rem',
-  },
-  connectRow: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: '0.5rem',
-  },
-  connectedDot: {
-    width: '0.5rem',
-    height: '0.5rem',
-    borderRadius: '50%',
-    background: '#4ade80',
-    flexShrink: 0,
-  },
-  connectEmail: {
-    color: '#e2e8f0',
-    fontSize: '0.9375rem',
-  },
-  linkForm: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '0.75rem',
-  },
-  linkFormBtns: {
-    display: 'flex',
-    gap: '0.75rem',
-  },
-};
