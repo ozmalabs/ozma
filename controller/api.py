@@ -3599,7 +3599,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if not macro_mgr:
             raise HTTPException(status_code=503, detail="Macro manager not available")
         ok = await macro_mgr.play(macro_id)
-        return {"ok": ok}
+        if not ok:
+            raise HTTPException(status_code=404, detail="Macro not found or playback failed")
+        return {"ok": True}
 
     @app.delete("/api/v1/macros/{macro_id}")
     async def macro_delete(macro_id: str) -> dict[str, Any]:
@@ -3969,7 +3971,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         else:
             codecs_list = []
         return {
-            "codecs": codecs_list,
+            "codecs": codecs_list,  # always a list, never a dict
             "configs": codec_mgr.list_configs(),
             "ndi_available": codec_mgr.ndi_available,
         }
