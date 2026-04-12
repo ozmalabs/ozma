@@ -568,3 +568,114 @@ class ControlManager:
 
     def list_surfaces(self) -> list[dict[str, Any]]:
         return [s.to_dict() for s in self._surfaces.values()]
+
+
+# ── Rust driver IPC reader ────────────────────────────────────────────────────
+
+class DriverIPCReader:
+    """
+    Connects to the ozma-drivers Unix-domain socket and feeds incoming
+    ``ControlEvent`` JSON messages into a :class:`ControlManager`.
+
+    The Rust daemon emits newline-delimited JSON objects of the form::
+
+        {"surface_id": "midi:0", "control_name": "fader_0", "value": 0.75, "seq": 42}
+
+    This reader deserialises each line and calls
+    ``manager.on_control_changed(surface_id, control_name, value)``.
+
+    Usage::
+
+        reader = DriverIPCReader("/tmp/ozma-drivers.sock", manager)
+        asyncio.create_task(reader.run())
+    """
+
+    RECONNECT_DELAY = 3.0   # seconds between reconnection attempts
+    READ_TIMEOUT    = 60.0  # seconds; keepalive / stale-connection detection
+
+    def __init__(self, sock_path: str, manager: ControlManager) -> None:
+        self._sock_path = sock_path
+        self._manager = manager
+        self._running = False
+
+    async def run(self) -> None:
+        """Connect (with reconnection) and process events until stopped."""
+        self._running = True
+        while self._running:
+            try:
+                await self._connect_and_read()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                log.warning(
+                    "DriverIPCReader: connection to %s lost (%s); "
+                    "retrying in %.0fs",
+                    self._sock_path, exc, self.RECONNECT_DELAY,
+                )
+                await asyncio.sleep(self.RECONNECT_DELAY)
+
+    async def stop(self) -> None:
+        self._running = False
+
+    async def _connect_and_read(self) -> None:
+        log.info("DriverIPCReader: connecting to %s", self._sock_path)
+        reader, _writer = await asyncio.open_unix_connection(self._sock_path)
+        log.info("DriverIPCReader: connected")
+
+        while self._running:
+            try:
+                line = await asyncio.wait_for(
+                    reader.readline(), timeout=self.READ_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                log.debug("DriverIPCReader: read timeout — checking connection")
+                continue
+
+            if not line:
+                log.info("DriverIPCReader: server closed connection")
+                return
+
+            await self._handle_line(line.decode(errors="replace").strip())
+
+    async def _handle_line(self, line: str) -> None:
+        if not line:
+            return
+        try:
+            event: dict[str, Any] = __import__("json").loads(line)
+        except ValueError:
+            log.debug("DriverIPCReader: invalid JSON: %r", line)
+            return
+
+        surface_id   = event.get("surface_id", "")
+        control_name = event.get("control_name", "")
+        value        = event.get("value")
+
+        if not surface_id or not control_name:
+            log.debug("DriverIPCReader: incomplete event: %r", event)
+            return
+
+        log.debug(
+            "DriverIPCReader: event surface=%s control=%s value=%r",
+            surface_id, control_name, value,
+        )
+        await self._manager.on_control_changed(surface_id, control_name, value)
+
+
+async def connect_driver_ipc(
+    sock_path: str,
+    manager: ControlManager,
+) -> asyncio.Task:
+    """
+    Convenience helper: create a :class:`DriverIPCReader` and schedule it as
+    a background ``asyncio.Task``.
+
+    Returns the task so the caller can cancel it on shutdown::
+
+        task = await connect_driver_ipc("/tmp/ozma-drivers.sock", manager)
+        # … on shutdown:
+        task.cancel()
+    """
+    reader = DriverIPCReader(sock_path, manager)
+    task = asyncio.create_task(reader.run(), name="driver-ipc-reader")
+    log.info("Driver IPC reader task started (sock=%s)", sock_path)
+    return task

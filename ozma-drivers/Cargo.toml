@@ -1,24 +1,21 @@
 [package]
-name        = "ozma-drivers"
-version     = "0.1.0"
-edition     = "2021"
-description = "Hardware input drivers for ozma (gamepad, etc.)"
-license     = "AGPL-3.0-only"
+name    = "ozma-drivers"
+version = "0.1.0"
+edition = "2021"
 
 [[bin]]
-name = "ozma-gamepad"
-path = "src/bin/gamepad.rs"
+name = "ozma-drivers"
+path = "src/main.rs"
 
 [dependencies]
-gilrs              = { version = "0.10", features = ["serde-serialize"] }
 tokio              = { workspace = true, features = ["full"] }
 tracing            = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["env-filter"] }
-serde              = { version = "1", features = ["derive"] }
-serde_json         = "1"
-thiserror          = "1"
+tracing-subscriber = { workspace = true }
+anyhow             = { workspace = true }
 ozma-proto         = { path = "../ozma-proto" }
 ozma-crypto        = { path = "../ozma-crypto" }
 
-[dev-dependencies]
-uinput = "0.1"
+clap        = { version = "4", features = ["derive"] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+uuid        = { version = "1", features = ["v4"] }

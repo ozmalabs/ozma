@@ -1,68 +1,63 @@
-// SPDX-License-Identifier: AGPL-3.0-only
-//! ozma-drivers — standalone binary entry point.
+//! ozma-drivers — virtual display / IDD driver helper daemon.
 //!
-//! In production the driver surfaces are embedded in the controller process.
-//! This binary is useful for hardware bring-up and manual testing.
+//! Spawns one async task per detected control surface and exposes a
+//! Unix-domain-socket IPC server that streams newline-delimited JSON
+//! [`ControlEvent`] messages to every connected client (e.g. the Python
+//! controller).
+//!
+//! Usage:
+//!   ozma-drivers --ipc /tmp/ozma-drivers.sock
 
-use tracing_subscriber::EnvFilter;
+mod ipc;
+mod surface;
+
+use anyhow::Result;
+use clap::Parser;
+use std::path::PathBuf;
+use tokio::sync::broadcast;
+use tracing::info;
+
+/// ozma-drivers daemon — bridges hardware surfaces to the ozma controller.
+#[derive(Parser, Debug)]
+#[command(author, version, about)]
+struct Cli {
+    /// Path for the Unix-domain IPC socket.
+    #[arg(long, default_value = "/tmp/ozma-drivers.sock")]
+    ipc: PathBuf,
+}
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("ozma_drivers=debug".parse()?),
+        )
         .init();
 
-    #[cfg(feature = "streamdeck")]
-    {
-        use ozma_drivers::{
-            control_surface::{ControlEvent, ControlSurface, ScenarioInfo},
-            streamdeck::StreamDeckSurface,
-        };
-        use tokio::sync::mpsc;
+    let cli = Cli::parse();
 
-        let mut surfaces = StreamDeckSurface::discover().await;
-        if surfaces.is_empty() {
-            tracing::warn!("No Stream Deck devices found.");
-            return;
-        }
+    info!("ozma-drivers starting (ipc={})", cli.ipc.display());
 
-        let (tx, mut rx) = mpsc::channel::<ControlEvent>(64);
+    // Broadcast channel: surface tasks → IPC server → all connected clients.
+    // Capacity 256 — slow clients drop old events rather than blocking surfaces.
+    let (tx, _) = broadcast::channel::<String>(256);
 
-        for surface in &mut surfaces {
-            tracing::info!("Starting: {}", surface.description());
-            surface.start(tx.clone()).await.expect("start failed");
-
-            let scenarios = vec![
-                ScenarioInfo { id: "s1".into(), name: "Gaming".into(), color: "#ff4400".into() },
-                ScenarioInfo { id: "s2".into(), name: "Work".into(),   color: "#0044ff".into() },
-                ScenarioInfo { id: "s3".into(), name: "Media".into(),  color: "#00cc44".into() },
-            ];
-            surface
-                .update_scenarios(&scenarios, Some("s1"))
-                .await
-                .expect("update_scenarios failed");
-        }
-
-        tracing::info!("Listening for key events (Ctrl-C to quit)…");
-        loop {
-            tokio::select! {
-                Some(ev) = rx.recv() => {
-                    tracing::info!(
-                        surface = %ev.surface_id,
-                        control = %ev.control_name,
-                        payload = %ev.payload,
-                        "key event"
-                    );
-                }
-                _ = tokio::signal::ctrl_c() => break,
-            }
-        }
-
-        for surface in &mut surfaces {
-            surface.stop().await.ok();
-        }
+    // Detect surfaces and spawn a task for each.
+    let surfaces = surface::detect().await;
+    if surfaces.is_empty() {
+        info!("No control surfaces detected — daemon running in IPC-only mode");
+    }
+    for s in surfaces {
+        let tx2 = tx.clone();
+        tokio::spawn(async move {
+            surface::run(s, tx2).await;
+        });
     }
 
-    #[cfg(not(feature = "streamdeck"))]
-    tracing::warn!("Built without streamdeck feature — nothing to do.");
+    // Run the IPC server (blocks until signal).
+    ipc::serve(cli.ipc, tx).await?;
+
+    info!("ozma-drivers stopped");
+    Ok(())
 }
