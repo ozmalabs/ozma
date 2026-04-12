@@ -7,7 +7,7 @@
 //!
 //! * [`MeshNode`] — identity record (node ID, WireGuard public key, mesh IP).
 //! * [`MeshManager`] — lifecycle manager: key generation, peer add/remove,
-//!   WireGuard tunnel maintenance, mDNS advertising and browsing.
+//!   WireGuard tunnel maintenance, mDNS advertising.
 //!
 //! # WireGuard backend
 //!
@@ -20,13 +20,9 @@
 //! each other without a central rendezvous server.
 
 pub mod error;
-pub mod keys;
-pub mod mdns;
-pub mod node;
-pub mod tunnel;
 pub mod manager;
+pub mod node;
 
 pub use error::MeshError;
-pub use keys::{WgKeypair, WgPublicKey};
 pub use manager::MeshManager;
-pub use node::MeshNode;
+pub use node::{generate_keypair, MeshNode, WgPrivateKey, WgPublicKey};

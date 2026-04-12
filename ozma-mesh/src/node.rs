@@ -1,13 +1,66 @@
-//! [`MeshNode`] — the identity record for a node in the ozma mesh.
+//! [`MeshNode`] — identity record for a node in the ozma mesh, plus WireGuard
+//! key types and key-generation helpers.
 
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
+use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::keys::WgPublicKey;
+use crate::error::MeshError;
 
-/// A node's identity in the ozma mesh network.
+// ── Key types ────────────────────────────────────────────────────────────────
+
+/// A WireGuard X25519 private key.
 ///
-/// This is the data exchanged between nodes during peer discovery (mDNS TXT
-/// records) and stored by the controller.
+/// Kept in a newtype so it is never accidentally serialised or logged.
+#[derive(Clone)]
+pub struct WgPrivateKey(pub(crate) StaticSecret);
+
+impl WgPrivateKey {
+    /// Raw 32-byte representation (needed by boringtun).
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.0.to_bytes()
+    }
+}
+
+/// A WireGuard X25519 public key, stored as a base64 string.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WgPublicKey(pub String);
+
+impl WgPublicKey {
+    /// Decode the base64 public key to raw 32 bytes.
+    pub fn to_bytes(&self) -> Result<[u8; 32], MeshError> {
+        let bytes = B64
+            .decode(&self.0)
+            .map_err(|e| MeshError::InvalidKey(e.to_string()))?;
+        bytes
+            .try_into()
+            .map_err(|_| MeshError::InvalidKey("expected 32 bytes".into()))
+    }
+}
+
+impl std::fmt::Display for WgPublicKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Generate a fresh WireGuard X25519 keypair using the OS RNG.
+///
+/// Returns `(private_key, public_key)`.
+pub fn generate_keypair() -> (WgPrivateKey, WgPublicKey) {
+    let secret = StaticSecret::random_from_rng(OsRng);
+    let public = PublicKey::from(&secret);
+    let pubkey_b64 = B64.encode(public.as_bytes());
+    (WgPrivateKey(secret), WgPublicKey(pubkey_b64))
+}
+
+// ── MeshNode ─────────────────────────────────────────────────────────────────
+
+/// Identity record for a node in the ozma mesh.
+///
+/// Exchanged during mDNS peer discovery (as a JSON TXT record) and stored by
+/// the controller.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeshNode {
     /// Stable, human-readable node identifier (e.g. `"living-room-node"`).
@@ -16,29 +69,11 @@ pub struct MeshNode {
     /// WireGuard X25519 public key (base64).
     pub wg_pubkey: WgPublicKey,
 
-    /// IPv4 address on the ozma mesh (e.g. `"10.200.1.1"`).
+    /// IPv4 address assigned to this node on the ozma mesh (e.g. `"10.200.1.1"`).
     pub mesh_ip: String,
-
-    /// UDP port the WireGuard endpoint listens on.
-    pub wg_port: u16,
 }
 
 impl MeshNode {
-    /// Create a new [`MeshNode`].
-    pub fn new(
-        id: impl Into<String>,
-        wg_pubkey: WgPublicKey,
-        mesh_ip: impl Into<String>,
-        wg_port: u16,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            wg_pubkey,
-            mesh_ip: mesh_ip.into(),
-            wg_port,
-        }
-    }
-
     /// Serialise to a compact JSON string (used in mDNS TXT records).
     pub fn to_txt(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
