@@ -522,25 +522,48 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if not service_proxy:
             raise HTTPException(503, "Service proxy not enabled")
         name = body.get("name", "").strip()
-        target_host = body.get("target_host", "127.0.0.1")
-        target_port = int(body.get("target_port", 0))
-        if not name or not target_port:
-            raise HTTPException(400, "name and target_port are required")
         try:
-            s = service_proxy.register_service(
-                name=name,
-                owner_user_id=ctx.user_id,
-                target_host=target_host,
-                target_port=target_port,
-                subdomain=body.get("subdomain", ""),
-                protocol=body.get("protocol", "http"),
-                service_type=body.get("service_type", ""),
-                auth_required=body.get("auth_required", True),
-                health_path=body.get("health_path", "/health"),
-                icon=body.get("icon", ""),
+            target_host = body.get("target_host", "127.0.0.1")
+            try:
+                target_port = int(body.get("target_port", 0))
+            except (TypeError, ValueError):
+                raise HTTPException(400, "target_port must be an integer")
+            if not name:
+                raise HTTPException(400, "name is required")
+            if not target_port:
+                raise HTTPException(400, "target_port is required and must be non-zero")
+            # Validate name length and characters to prevent injection
+            if len(name) > 128:
+                raise HTTPException(400, "name must be 128 characters or fewer")
+            # Check for duplicate before attempting registration
+            existing = next(
+                (s for s in service_proxy.list_services() if s.name == name), None
             )
-        except ValueError as e:
-            raise HTTPException(409, str(e))
+            if existing:
+                raise HTTPException(409, f"Service with name '{name}' already exists")
+            try:
+                s = service_proxy.register_service(
+                    name=name,
+                    owner_user_id=ctx.user_id,
+                    target_host=target_host,
+                    target_port=target_port,
+                    subdomain=body.get("subdomain", ""),
+                    protocol=body.get("protocol", "http"),
+                    service_type=body.get("service_type", ""),
+                    auth_required=body.get("auth_required", True),
+                    health_path=body.get("health_path", "/health"),
+                    icon=body.get("icon", ""),
+                )
+            except ValueError as e:
+                raise HTTPException(409, str(e))
+            except Exception as e:
+                log.exception("register_service failed for name=%r: %s", name, e)
+                raise HTTPException(500, f"Service registration failed: {e}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.exception("register_service unexpected error for name=%r: %s", name, e)
+            raise HTTPException(500, f"Service registration failed: {e}")
         await state.events.put({"type": "service.registered", "service": s.to_dict()})
         return s.to_dict()
 
