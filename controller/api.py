@@ -410,8 +410,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     async def list_users(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         if not user_manager:
-            return {"users": []}
-        return {"users": [u.to_dict() for u in user_manager.list_users()]}
+            return {"users": [], "total": 0}
+        users = [u.to_dict() for u in user_manager.list_users()]
+        return {"users": users, "total": len(users)}
 
     @app.get("/api/v1/users/me")
     async def get_current_user(request: Request) -> dict:
@@ -503,8 +504,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     async def list_services(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         if not service_proxy:
-            return {"services": []}
-        return {"services": [s.to_dict() for s in service_proxy.list_services()]}
+            return {"services": [], "total": 0}
+        services = [s.to_dict() for s in service_proxy.list_services()]
+        return {"services": services, "total": len(services)}
 
     @app.get("/api/v1/services/{service_id}")
     async def get_service(service_id: str, request: Request) -> dict:
@@ -685,17 +687,19 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     async def list_shares(request: Request) -> dict:
         ctx = _require_scope(request, SCOPE_READ)
         if not sharing:
-            return {"given": [], "received": [], "all": []}
+            return {"given": [], "received": [], "all": [], "total": 0}
+        all_grants = [g.to_dict() for g in sharing.list_all_grants()]
         if ctx.user_id:
-            return {
-                "given": [g.to_dict() for g in sharing.list_grants_from_user(ctx.user_id)],
-                "received": [g.to_dict() for g in sharing.list_grants_for_user(ctx.user_id)],
-                "all": [g.to_dict() for g in sharing.list_all_grants()],
-            }
+            given = [g.to_dict() for g in sharing.list_grants_from_user(ctx.user_id)]
+            received = [g.to_dict() for g in sharing.list_grants_for_user(ctx.user_id)]
+        else:
+            given = []
+            received = []
         return {
-            "given": [],
-            "received": [],
-            "all": [g.to_dict() for g in sharing.list_all_grants()],
+            "given": given,
+            "received": received,
+            "all": all_grants,
+            "total": len(all_grants),
         }
 
     @app.post("/api/v1/shares")
@@ -3592,7 +3596,10 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if not macro_mgr:
             raise HTTPException(status_code=503, detail="Macro manager not available")
         macro = macro_mgr.stop_recording()
-        return {"ok": bool(macro), "macro": macro.to_dict() if macro else None}
+        result: dict[str, Any] = {"ok": bool(macro), "macro": macro.to_dict() if macro else None}
+        if macro:
+            result["macro_id"] = macro.to_dict().get("id", "")
+        return result
 
     @app.post("/api/v1/macros/{macro_id}/play")
     async def macro_play(macro_id: str) -> dict[str, Any]:
@@ -3972,6 +3979,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             codecs_list = []
         return {
             "codecs": codecs_list,  # always a list, never a dict
+            "total": len(codecs_list),
             "configs": codec_mgr.list_configs(),
             "ndi_available": codec_mgr.ndi_available,
         }
