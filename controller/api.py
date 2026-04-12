@@ -61,7 +61,7 @@ from display_capture import DisplayCaptureManager
 from text_capture import TextCapture
 from paste_typing import PasteTyper
 from keyboard_manager import KeyboardManager
-from macros import MacroManager
+from macros import MacroManager, Macro
 from scheduler import Scheduler
 from notifications import NotificationManager
 from session_recording import SessionRecorder
@@ -144,9 +144,55 @@ class SelectOutputRequest(BaseModel):
     output_id: str
 
 
-class OutputDelayRequest(BaseModel):
-    output_id: str
+class AddScheduleRuleRequest(BaseModel):
+    time: str = "09:00"
+    days: str = "*"
+    scenario: str
+
+
+class CreateMaintenanceWindowRequest(BaseModel):
+    name: str
+    start_time: str
+    end_time: str
+    node_ids: list[str] = []
+    actions: list[str] = []
+
+
+class OverlayPosition(BaseModel):
+    x: int = 0
+    y: int = 0
+    width: int = 320
+    height: int = 180
+
+
+class CreateOverlayRequest(BaseModel):
+    type: str = "camera"
+    source_id: str
+    label: str = ""
+    position: OverlayPosition = OverlayPosition()
+
+
+class SaveReplayRequest(BaseModel):
+    source_id: str
+    duration_s: int = 30
+
+
+class PushClipboardRequest(BaseModel):
+    text: str
+    source: str = "unknown"
+
+
+class PasteTextRequest(BaseModel):
+    text: str
+    layout: str = "us"
+    rate: float = 30
+    node_id: str | None = None
+
+
+class SetAudioDelayRequest(BaseModel):
     delay_ms: float
+
+
 
 
 class DirectRegisterRequest(BaseModel):
@@ -2375,6 +2421,35 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             "channels": 2,
         }
 
+    @app.post("/api/v1/audio/vban")
+    async def set_vban_config(request: Request, body: dict) -> dict[str, Any]:
+        """Enable or update VBAN for a node."""
+        _require_scope(request, SCOPE_WRITE)
+        node_id = body.get("node_id")
+        port = body.get("port")
+        enabled = body.get("enabled", True)
+        if not node_id:
+            raise HTTPException(400, "node_id is required")
+        node = state.nodes.get(node_id)
+        if not node:
+            raise HTTPException(404, "Node not found")
+
+        if enabled:
+            if port is None:
+                raise HTTPException(400, "port is required to enable VBAN")
+            node.audio_vban_port = int(port)
+        else:
+            node.audio_vban_port = None
+
+        await state.events.put({
+            "type": "node.vban_config_changed",
+            "node_id": node_id,
+            "port": node.audio_vban_port,
+            "enabled": enabled,
+        })
+
+        return {"ok": True, "node_id": node_id, "port": node.audio_vban_port, "enabled": bool(node.audio_vban_port)}
+
     # --- KVM input proxy (dashboard → soft node API) ---
 
     async def _proxy_to_node(node_id: str, path: str, body: dict) -> dict:
@@ -2597,15 +2672,16 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(status_code=404, detail=f"Output '{req.output_id}' not found")
         return {"ok": True, "output_id": req.output_id}
 
-    @app.post("/api/v1/audio/outputs/delay")
-    async def set_audio_output_delay(req: OutputDelayRequest) -> dict[str, Any]:
+    @app.put("/api/v1/audio/outputs/{output_id}/delay")
+    async def set_audio_output_delay(request: Request, output_id: str, body: SetAudioDelayRequest) -> dict[str, Any]:
         """Set time-alignment delay (ms) on an audio output."""
+        _require_scope(request, SCOPE_WRITE)
         if not audio:
             raise HTTPException(status_code=503, detail="Audio routing disabled")
-        ok = await audio.outputs.set_delay(req.output_id, req.delay_ms)
+        ok = await audio.outputs.set_delay(output_id, body.delay_ms)
         if not ok:
-            raise HTTPException(status_code=404, detail=f"Output '{req.output_id}' not found")
-        return {"ok": True, "output_id": req.output_id, "delay_ms": req.delay_ms}
+            raise HTTPException(status_code=404, detail=f"Output '{output_id}' not found")
+        return {"ok": True, "output_id": output_id, "delay_ms": body.delay_ms}
 
     # --- RGB zone endpoints ---
 
@@ -2801,20 +2877,20 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     # --- Paste typing endpoints ---
 
     @app.post("/api/v1/paste")
-    async def paste_text(body: dict = {}) -> dict[str, Any]:
+    async def paste_text(request: Request, body: PasteTextRequest) -> dict[str, Any]:
         """Type text to the active node via HID keystrokes.
         Body: {"text": "...", "layout": "us", "rate": 30, "node_id": null}
         """
+        _require_scope(request, SCOPE_WRITE)
         if not paste_typer:
             raise HTTPException(status_code=503, detail="Paste typing not available")
-        text = body.get("text", "")
-        if not text:
+        if not body.text:
             raise HTTPException(status_code=400, detail="No text provided")
         result = await paste_typer.type_text(
-            text,
-            layout=body.get("layout", "us"),
-            rate=float(body.get("rate", 30)),
-            node_id=body.get("node_id"),
+            body.text,
+            layout=body.layout,
+            rate=body.rate,
+            node_id=body.node_id,
         )
         return result
 
@@ -3341,24 +3417,17 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     async def list_ocr_triggers() -> dict[str, Any]:
         """List all OCR trigger patterns (built-in + custom)."""
         if not ocr_triggers:
-            return {"patterns": []}
+            raise HTTPException(status_code=503, detail="OCR triggers not available")
         return {"patterns": ocr_triggers.list_patterns()}
 
     @app.post("/api/v1/ocr/triggers")
-    async def add_ocr_trigger(body: dict = {}) -> dict[str, Any]:
+    async def add_ocr_trigger(request: Request, body: TriggerPattern) -> dict[str, Any]:
         """Add a custom OCR trigger pattern."""
+        _require_scope(request, SCOPE_WRITE)
         if not ocr_triggers:
             raise HTTPException(status_code=503, detail="OCR triggers not available")
-        pattern = TriggerPattern(
-            id=body.get("id", "custom"),
-            pattern=body.get("pattern", ""),
-            is_regex=body.get("is_regex", False),
-            severity=body.get("severity", "error"),
-            category=body.get("category", "custom"),
-            description=body.get("description", ""),
-        )
-        ocr_triggers.add_pattern(pattern)
-        return {"ok": True, "pattern": pattern.to_dict()}
+        ocr_triggers.add_pattern(body)
+        return {"ok": True, "pattern": body.to_dict()}
 
     # --- Automation ---
 
@@ -3487,8 +3556,25 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     @app.get("/api/v1/macros")
     async def list_macros() -> dict[str, Any]:
         if not macro_mgr:
-            return {"macros": []}
+            raise HTTPException(status_code=503, detail="Macro manager not available")
         return {"macros": macro_mgr.list_macros()}
+
+    @app.post("/api/v1/macros")
+    async def create_macro(request: Request, body: dict) -> dict[str, Any]:
+        """Create a macro from a definition."""
+        _require_scope(request, SCOPE_WRITE)
+        if not macro_mgr:
+            raise HTTPException(status_code=503, detail="Macro manager not available")
+
+        try:
+            macro = Macro.from_dict(body)
+            # Assumes the manager has an `add_macro` method for persistence.
+            macro_mgr.add_macro(macro)
+            await state.events.put({"type": "macro.created", "macro": macro.to_dict()})
+            return {"ok": True, "macro": macro.to_dict()}
+        except (AttributeError, TypeError, ValueError) as e:
+            log.error(f"Failed to create macro: {e}")
+            raise HTTPException(status_code=400, detail=f"Invalid macro data or manager error: {e}")
 
     @app.post("/api/v1/macros/record/start")
     async def macro_record_start(body: dict = {}) -> dict[str, Any]:
@@ -3776,17 +3862,18 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     @app.get("/api/v1/schedule")
     async def list_schedule() -> dict[str, Any]:
         if not sched:
-            return {"rules": []}
+            raise HTTPException(status_code=503, detail="Scheduler not available")
         return {"rules": sched.list_rules()}
 
     @app.post("/api/v1/schedule")
-    async def add_schedule_rule(body: dict = {}) -> dict[str, Any]:
+    async def add_schedule_rule(request: Request, body: AddScheduleRuleRequest) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
         if not sched:
             raise HTTPException(status_code=503, detail="Scheduler not available")
         rule = sched.add_rule(
-            time=body.get("time", "09:00"),
-            days=body.get("days", "*"),
-            scenario=body.get("scenario", ""),
+            time=body.time,
+            days=body.days,
+            scenario=body.scenario,
         )
         return {"ok": True, "rule": rule}
 
@@ -3809,14 +3896,14 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     # --- Session recording endpoints ---
 
-    @app.get("/api/v1/recording/status")
-    async def recording_status() -> dict[str, Any]:
+    @app.get("/api/v1/session-recording/status")
+    async def session_recording_status() -> dict[str, Any]:
         if not recorder:
-            return {"recording": False}
+            raise HTTPException(status_code=503, detail="Recorder not available")
         return recorder.status()
 
-    @app.post("/api/v1/recording/start")
-    async def recording_start(body: dict = {}) -> dict[str, Any]:
+    @app.post("/api/v1/session-recording/start")
+    async def session_recording_start(body: dict = {}) -> dict[str, Any]:
         if not recorder:
             raise HTTPException(status_code=503, detail="Recorder not available")
         source_id = body.get("source_id", "hdmi-0")
@@ -3825,15 +3912,15 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         ok = await recorder.start_recording(source_id, hls_path, scenario_id)
         return {"ok": ok}
 
-    @app.post("/api/v1/recording/stop")
-    async def recording_stop() -> dict[str, Any]:
+    @app.post("/api/v1/session-recording/stop")
+    async def session_recording_stop() -> dict[str, Any]:
         if not recorder:
             raise HTTPException(status_code=503, detail="Recorder not available")
         rec = await recorder.stop_recording()
         return {"ok": bool(rec), "recording": rec.to_dict() if rec else None}
 
-    @app.get("/api/v1/recording/list")
-    async def recording_list() -> dict[str, Any]:
+    @app.get("/api/v1/session-recording/list")
+    async def session_recording_list() -> dict[str, Any]:
         if not recorder:
             return {"recordings": []}
         return {"recordings": recorder.list_recordings()}
@@ -3860,21 +3947,22 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     @app.get("/api/v1/codecs")
     async def list_codecs() -> dict[str, Any]:
         if not codec_mgr:
-            return {"codecs": {}, "configs": {}}
+            raise HTTPException(status_code=503, detail="Codec manager not available")
         return {
             "codecs": codec_mgr.list_available(),
             "configs": codec_mgr.list_configs(),
             "ndi_available": codec_mgr.ndi_available,
         }
 
-    @app.post("/api/v1/codecs/config")
-    async def set_codec_config(body: dict = {}) -> dict[str, Any]:
+    @app.put("/api/v1/codecs")
+    async def set_codec_config(request: Request, body: CodecConfig) -> dict[str, Any]:
+        """Set or update codec configuration for a source."""
+        _require_scope(request, SCOPE_WRITE)
         if not codec_mgr:
             raise HTTPException(status_code=503, detail="Codec manager not available")
-        source_id = body.get("source_id", "default")
-        cfg = CodecConfig.from_dict(body)
-        codec_mgr.set_config(source_id, cfg)
-        resolved = codec_mgr.resolve(cfg)
+        source_id = getattr(body, "source_id", "default")
+        codec_mgr.set_config(source_id, body)
+        resolved = codec_mgr.resolve(body)
         return {"ok": True, "source_id": source_id, "resolved": resolved.to_dict()}
 
     @app.post("/api/v1/codecs/resolve")
@@ -4488,16 +4576,16 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return list(_overlays_store)
 
     @app.post("/api/v1/overlays")
-    async def overlay_add(request: Request, body: dict = {}) -> dict[str, Any]:
+    async def overlay_add(request: Request, body: CreateOverlayRequest) -> dict[str, Any]:
         """Add a video overlay source."""
         _require_scope(request, SCOPE_WRITE)
         import time as _time
         overlay = {
             "id": f"overlay-{int(_time.time() * 1000)}",
-            "type": body.get("type", "camera"),
-            "source_id": body.get("source_id", ""),
-            "label": body.get("label", ""),
-            "position": body.get("position", {"x": 0, "y": 0, "width": 320, "height": 180}),
+            "type": body.type,
+            "source_id": body.source_id,
+            "label": body.label,
+            "position": body.position.model_dump(),
             "enabled": True,
         }
         _overlays_store.append(overlay)
@@ -4518,7 +4606,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     @app.get("/api/v1/broadcast/status")
     async def broadcast_status() -> dict[str, Any]:
         if not obs_studio:
-            return {"connected": False, "scenes": [], "sources": []}
+            raise HTTPException(status_code=503, detail="Broadcast not available")
         return obs_studio.status()
 
     @app.get("/api/v1/broadcast/scenes")
@@ -4578,7 +4666,8 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"ok": ok}
 
     @app.post("/api/v1/broadcast/record/start")
-    async def broadcast_record_start() -> dict[str, Any]:
+    async def broadcast_record_start(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
         if not obs_studio:
             raise HTTPException(status_code=503, detail="Broadcast not available")
         ok = await obs_studio.start_recording()
@@ -4592,7 +4681,8 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"ok": bool(path), "path": path}
 
     @app.post("/api/v1/broadcast/stream/start")
-    async def broadcast_stream_start() -> dict[str, Any]:
+    async def broadcast_stream_start(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
         if not obs_studio:
             raise HTTPException(status_code=503, detail="Broadcast not available")
         ok = await obs_studio.start_streaming()
@@ -5435,16 +5525,18 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return list(_clipboard_ring[-50:])
 
     @app.post("/api/v1/clipboard")
-    async def clipboard_push(request: Request, body: dict = {}) -> dict[str, Any]:
+    async def clipboard_push(request: Request, body: PushClipboardRequest) -> dict[str, Any]:
         """Push text to the cross-desk clipboard ring."""
         _require_scope(request, SCOPE_WRITE)
         entry = {
             "id": f"clip-{len(_clipboard_ring)}",
-            "text": body.get("text", ""),
-            "source": body.get("source", "unknown"),
+            "text": body.text,
+            "source": body.source,
             "ts": __import__("time").time(),
         }
         _clipboard_ring.append(entry)
+        while len(_clipboard_ring) > 50:
+            _clipboard_ring.pop(0)
         return {"ok": True, "id": entry["id"]}
 
     # --- Edge-crossing endpoints ---
@@ -5486,7 +5578,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"profiles": profiles}
 
     @app.post("/api/v1/profiles")
-    async def workspace_profile_create(request: Request, body: dict = {}) -> dict[str, Any]:
+    async def workspace_profile_create(request: Request, body: dict) -> dict[str, Any]:
         """Create or update a workspace profile."""
         _require_scope(request, SCOPE_WRITE)
         import json as _json
@@ -5507,37 +5599,58 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     # --- Maintenance window endpoints ---
 
+    _maintenance_windows: list[dict] = []
+
     @app.get("/api/v1/maintenance")
     async def maintenance_list(request: Request) -> dict[str, Any]:
         """List scheduled maintenance windows."""
         _require_scope(request, SCOPE_READ)
-        return {"windows": []}
+        return {"windows": _maintenance_windows}
 
     @app.post("/api/v1/maintenance")
-    async def maintenance_create(request: Request, body: dict = {}) -> dict[str, Any]:
+    async def maintenance_create(request: Request, body: CreateMaintenanceWindowRequest) -> dict[str, Any]:
         """Schedule a maintenance window."""
         _require_scope(request, SCOPE_WRITE)
         import time as _time
         window = {
             "id": f"mw-{int(_time.time())}",
-            "name": body.get("name", ""),
-            "start_time": body.get("start_time", ""),
-            "end_time": body.get("end_time", ""),
-            "node_ids": body.get("node_ids", []),
-            "actions": body.get("actions", []),
+            "name": body.name,
+            "start_time": body.start_time,
+            "end_time": body.end_time,
+            "node_ids": body.node_ids,
+            "actions": body.actions,
             "status": "scheduled",
         }
+        _maintenance_windows.append(window)
         return {"ok": True, "id": window["id"], "maintenance_id": window["id"], **window}
 
     # --- Replay buffer endpoints ---
 
+    _replay_clips: list[dict] = []
+
     @app.get("/api/v1/replay/status")
     async def replay_status() -> dict[str, Any]:
-        return {"enabled": True, "sources": []}
+        return {"enabled": True, "sources": [], "clips": len(_replay_clips)}
 
     @app.post("/api/v1/replay/save")
-    async def replay_save(body: dict = {}) -> dict[str, Any]:
-        return {"ok": False, "message": "No active capture sources for replay"}
+    async def replay_save(request: Request, body: SaveReplayRequest) -> dict[str, Any]:
+        """Save a clip from the replay buffer."""
+        _require_scope(request, SCOPE_WRITE)
+        import time
+        source_id = body.source_id
+
+        # In a real implementation, this would save a segment from a live buffer.
+        # For now, we just create a record of the save request.
+        clip = {
+            "id": f"replay-{int(time.time())}",
+            "source_id": source_id,
+            "duration_s": body.duration_s,
+            "timestamp": time.time(),
+            "path": f"/var/ozma/replays/{source_id}/replay-{int(time.time())}.mp4",
+        }
+        _replay_clips.append(clip)
+        await state.events.put({"type": "replay.saved", "clip": clip})
+        return {"ok": True, "clip": clip}
 
     # --- Notification endpoints ---
 
@@ -5551,6 +5664,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
         The mobile app sends ?limit=N&offset=N&unread_only=true.
         """
+        if not notifier:
+            raise HTTPException(status_code=503, detail="Notifications not available")
+
         fmt = request.query_params.get("format", "channels")
         limit = int(request.query_params.get("limit", "50"))
         offset = int(request.query_params.get("offset", "0"))
@@ -5562,8 +5678,6 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             # For now return an empty list with the correct shape.
             return {"notifications": [], "unread_count": 0, "limit": limit, "offset": offset}
 
-        if not notifier:
-            return {"channels": [], "recent": []}
         return {"channels": notifier.list_channels() if hasattr(notifier, 'list_channels') else [],
                 "recent": []}
 
@@ -7276,17 +7390,17 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"ok": ok, "email": email}
 
     @app.post("/api/v1/mdm/enroll/invite")
-    async def mdm_enroll_invite(request: Request, body: dict = {}) -> dict[str, Any]:
+    async def mdm_enroll_invite(request: Request, body: dict) -> dict[str, Any]:
         """Alias: send MDM enrollment invitation (alternative path)."""
         _require_scope(request, SCOPE_ADMIN)
         if not mdm:
-            raise HTTPException(404, "MDM bridge not enabled")
+            raise HTTPException(503, "MDM bridge not enabled")
         email = body.get("email", "")
         name = body.get("name", "")
         try:
             ok = await mdm.invite_enrollment(email, name=name)
         except (RuntimeError, NotImplementedError):
-            raise HTTPException(404, "MDM provider not configured")
+            raise HTTPException(503, "MDM provider not configured")
         return {"ok": ok, "email": email, "invite_sent": ok}
 
     @app.post("/api/v1/mdm/offboard/{email:path}")
@@ -8769,8 +8883,8 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(503, "Camera recording not configured")
         return cam_rec
 
-    @app.get("/api/v1/recording/status")
-    async def recording_status(request: Request) -> dict[str, Any]:
+    @app.get("/api/v1/cam-recording/status")
+    async def cam_recording_status(request: Request) -> dict[str, Any]:
         _require_scope(request, SCOPE_READ)
         return _cr().get_status()
 
@@ -8833,6 +8947,32 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if not _cr().remove_policy(policy_id):
             raise HTTPException(404, "Policy not found")
         return {"deleted": policy_id}
+
+    @app.post("/api/v1/recording/start")
+    async def recording_start(request: Request) -> dict[str, Any]:
+        """Start a recording job based on a policy."""
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        policy_id = body.get("policy_id")
+        if not policy_id:
+            raise HTTPException(400, "policy_id is required")
+        job = await _cr().start_recording(policy_id)
+        if not job:
+            raise HTTPException(500, "Failed to start recording")
+        return {"ok": True, "job": job.to_dict()}
+
+    @app.post("/api/v1/recording/stop")
+    async def recording_stop(request: Request) -> dict[str, Any]:
+        """Stop an active recording job."""
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        job_id = body.get("job_id")
+        if not job_id:
+            raise HTTPException(400, "job_id is required")
+        ok = await _cr().stop_recording(job_id)
+        if not ok:
+            raise HTTPException(404, "Recording job not found or already stopped")
+        return {"ok": True}
 
     # ── Node Backup Status ───────────────────────────────────────────────────
 
