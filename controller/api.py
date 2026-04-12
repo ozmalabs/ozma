@@ -3958,7 +3958,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             codecs_list: list[dict] = [
                 {"family": family, "encoder": enc}
                 for family, encoders in available.items()
-                for enc in (encoders if isinstance(encoders, list) else [encoders])
+                for enc in (encoders if isinstance(encoders, (list, tuple)) else [encoders])
             ]
         elif isinstance(available, list):
             # Normalise list entries: bare strings → {"encoder": str}
