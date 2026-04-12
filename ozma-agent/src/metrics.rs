@@ -1,64 +1,45 @@
-//! System metrics collection.
+//! Prometheus metrics registry and scrape endpoint.
 //!
-//! Gathered every 60 s and pushed to the Connect API.
+//! Exposes a `/metrics` endpoint on a dedicated port so Prometheus can scrape
+//! the agent without going through the main API server.
 
-use serde::Serialize;
-use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
+use anyhow::Result;
+use axum::{routing::get, Router};
+use prometheus::{Encoder, Registry, TextEncoder, process_collector::ProcessCollector};
+use std::sync::Arc;
+use tracing::info;
 
-/// Snapshot of host system statistics.
-#[derive(Debug, Clone, Serialize)]
-pub struct SystemMetrics {
-    /// CPU usage across all logical cores, 0.0–100.0.
-    pub cpu_usage_pct: f32,
-    /// Total physical RAM in bytes.
-    pub mem_total_bytes: u64,
-    /// Used RAM in bytes.
-    pub mem_used_bytes: u64,
-    /// Total swap in bytes.
-    pub swap_total_bytes: u64,
-    /// Used swap in bytes.
-    pub swap_used_bytes: u64,
-    /// Number of logical CPU cores.
-    pub cpu_count: usize,
-    /// OS name + version string, e.g. "Linux 6.8.0".
-    pub os_version: String,
-    /// Hostname.
-    pub hostname: String,
+/// Build a Prometheus registry pre-populated with process metrics.
+pub fn build_registry() -> Arc<Registry> {
+    let registry = Registry::new();
+    let pc = ProcessCollector::for_self();
+    registry.register(Box::new(pc)).ok();
+    Arc::new(registry)
 }
 
-/// Collect a fresh [`SystemMetrics`] snapshot.
-///
-/// `sysinfo` requires two refreshes separated by a short interval to produce
-/// meaningful CPU percentages; callers that need accurate CPU figures should
-/// call this function twice with a ~200 ms sleep between calls, or accept the
-/// first call returning 0 % CPU (which is fine for 60-second polling).
-pub fn collect() -> SystemMetrics {
-    let mut sys = System::new_with_specifics(
-        RefreshKind::new()
-            .with_cpu(CpuRefreshKind::everything())
-            .with_memory(MemoryRefreshKind::everything()),
-    );
-    sys.refresh_all();
+/// Axum handler: render all metrics as Prometheus text exposition format.
+async fn scrape(
+    axum::extract::State(registry): axum::extract::State<Arc<Registry>>,
+) -> axum::response::Response<String> {
+    let encoder = TextEncoder::new();
+    let mut buf = Vec::new();
+    encoder
+        .encode(&registry.gather(), &mut buf)
+        .unwrap_or_default();
+    axum::response::Response::builder()
+        .header("Content-Type", encoder.format_type())
+        .body(String::from_utf8_lossy(&buf).into_owned())
+        .unwrap()
+}
 
-    let cpu_usage_pct = {
-        let cpus = sys.cpus();
-        if cpus.is_empty() {
-            0.0
-        } else {
-            cpus.iter().map(|c| c.cpu_usage()).sum::<f32>() / cpus.len() as f32
-        }
-    };
+/// Start the metrics scrape server and block until it exits.
+pub async fn serve(addr: String, registry: Arc<Registry>) -> Result<()> {
+    let app = Router::new()
+        .route("/metrics", get(scrape))
+        .with_state(registry);
 
-    SystemMetrics {
-        cpu_usage_pct,
-        mem_total_bytes: sys.total_memory(),
-        mem_used_bytes: sys.used_memory(),
-        swap_total_bytes: sys.total_swap(),
-        swap_used_bytes: sys.used_swap(),
-        cpu_count: sys.cpus().len(),
-        os_version: System::long_os_version().unwrap_or_default(),
-        hostname: hostname::get()
-            .map(|h| h.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| "unknown".into()),
-    }
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    info!(addr, "metrics server listening");
+    axum::serve(listener, app).await?;
+    Ok(())
 }

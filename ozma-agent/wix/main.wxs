@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ozma-agent Windows MSI installer definition.
+  Build with: cargo wix --nocapture
+  Requires: cargo install cargo-wix  +  WiX Toolset v3 on PATH.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product
+    Id="*"
+    Name="Ozma Agent"
+    Language="1033"
+    Version="!(bind.FileVersion.OzmaAgentEXE)"
+    Manufacturer="Ozma Labs"
+    UpgradeCode="4F8A2C1D-3B7E-4F9A-8C2D-1E5F6A7B8C9D">
+
+    <Package
+      InstallerVersion="450"
+      Compressed="yes"
+      InstallScope="perMachine"
+      Description="Ozma desktop seat agent"
+      Comments="https://ozma.dev" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Ozma Agent is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Feature Id="ProductFeature" Title="Ozma Agent" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+      <ComponentRef Id="ApplicationShortcut" />
+    </Feature>
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="Ozma Agent" />
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ApplicationProgramsFolder" Name="Ozma" />
+      </Directory>
+    </Directory>
+
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+      <Component Id="OzmaAgentBinary" Guid="*">
+        <File
+          Id="OzmaAgentEXE"
+          Source="$(var.CargoTargetBinDir)\ozma-agent.exe"
+          KeyPath="yes" />
+        <!-- Register as a Windows service so the agent starts at boot. -->
+        <ServiceInstall
+          Id="OzmaAgentService"
+          Name="OzmaAgent"
+          DisplayName="Ozma Agent"
+          Description="Ozma desktop seat agent — screen capture, HID routing, WireGuard mesh."
+          Type="ownProcess"
+          Start="auto"
+          ErrorControl="normal"
+          Account="LocalSystem" />
+        <ServiceControl
+          Id="StartOzmaAgentService"
+          Name="OzmaAgent"
+          Start="install"
+          Stop="both"
+          Remove="uninstall"
+          Wait="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Component Id="ApplicationShortcut" Directory="ApplicationProgramsFolder" Guid="*">
+      <Shortcut
+        Id="AppStartMenuShortcut"
+        Name="Ozma Agent"
+        Description="Ozma desktop seat agent"
+        Target="[INSTALLFOLDER]ozma-agent.exe"
+        WorkingDirectory="INSTALLFOLDER" />
+      <RemoveFolder Id="CleanUpShortCut" Directory="ApplicationProgramsFolder" On="uninstall" />
+      <RegistryValue
+        Root="HKCU"
+        Key="Software\OzmaLabs\OzmaAgent"
+        Name="installed"
+        Type="integer"
+        Value="1"
+        KeyPath="yes" />
+    </Component>
+
+  </Product>
+</Wix>

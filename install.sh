@@ -27,6 +27,8 @@ set -euo pipefail
 OZMA_DIR="${OZMA_DIR:-$HOME/.ozma}"
 REPO_URL="https://github.com/ozmalabs/ozma.git"
 BRANCH="main"
+AGENT_REPO="ozmalabs/ozma"
+AGENT_BIN_DIR="${OZMA_AGENT_BIN_DIR:-$HOME/.local/bin}"
 
 # Colours
 RED='\033[0;31m'
@@ -41,7 +43,7 @@ err()   { echo -e "${RED}[ozma]${NC} $*" >&2; }
 
 # ── Pre-flight checks ──────────────────────────────────────────────────────
 
-info "Ozma Controller installer"
+info "Ozma Controller + Agent installer"
 echo ""
 
 # Check Python 3.11+
@@ -143,6 +145,69 @@ systemctl --user start ozma-controller
 
 ok "Systemd service installed and started"
 
+# ── Install ozma-agent binary ──────────────────────────────────────────────
+
+info "Installing ozma-agent..."
+
+# Detect architecture
+ARCH="$(uname -m)"
+case "$ARCH" in
+    x86_64)  AGENT_ARCH="x86_64" ;;
+    aarch64) AGENT_ARCH="aarch64" ;;
+    arm64)   AGENT_ARCH="aarch64" ;;
+    *)
+        err "Unsupported architecture: $ARCH (only x86_64 and aarch64 are supported)"
+        exit 1
+        ;;
+esac
+
+# Fetch the latest release tag from GitHub API
+AGENT_TAG=$(curl -sSfL \
+    "https://api.github.com/repos/${AGENT_REPO}/releases/latest" \
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
+
+AGENT_URL="https://github.com/${AGENT_REPO}/releases/download/${AGENT_TAG}/ozma-agent-linux-${AGENT_ARCH}.AppImage"
+
+mkdir -p "$AGENT_BIN_DIR"
+curl -sSfL "$AGENT_URL" -o "$AGENT_BIN_DIR/ozma-agent"
+chmod +x "$AGENT_BIN_DIR/ozma-agent"
+
+ok "ozma-agent ${AGENT_TAG} installed to $AGENT_BIN_DIR/ozma-agent"
+
+# Ensure bin dir is on PATH for this session
+export PATH="$AGENT_BIN_DIR:$PATH"
+
+# ── Systemd user service for ozma-agent ───────────────────────────────────
+
+AGENT_SERVICE_FILE="$SERVICE_DIR/ozma-agent.service"
+
+cat > "$AGENT_SERVICE_FILE" << EOF
+[Unit]
+Description=Ozma Agent
+After=network.target ozma-controller.service
+Wants=ozma-controller.service
+
+[Service]
+Type=simple
+ExecStart=$AGENT_BIN_DIR/ozma-agent \
+    --api-host 0.0.0.0 \
+    --api-port 7381 \
+    --metrics-port 9101 \
+    --controller-url http://localhost:7380
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=ozma_agent=info
+
+[Install]
+WantedBy=default.target
+EOF
+
+systemctl --user daemon-reload
+systemctl --user enable ozma-agent
+systemctl --user start ozma-agent
+
+ok "ozma-agent systemd service installed and started"
+
 # ── Done ───────────────────────────────────────────────────────────────────
 
 echo ""
@@ -150,18 +215,21 @@ echo -e "${BOLD}═════════════════════�
 echo -e "${BOLD}  Ozma Controller is running!${NC}"
 echo -e "${BOLD}════════════════════════════════════════════════${NC}"
 echo ""
-echo -e "  ${BLUE}Dashboard:${NC}  http://localhost:7380"
-echo -e "  ${BLUE}API:${NC}        http://localhost:7380/api/v1/status"
-echo -e "  ${BLUE}Logs:${NC}       journalctl --user -u ozma-controller -f"
+echo -e "  ${BLUE}Dashboard:${NC}   http://localhost:7380"
+echo -e "  ${BLUE}API:${NC}         http://localhost:7380/api/v1/status"
+echo -e "  ${BLUE}Agent API:${NC}   http://localhost:7381/api/v1/status"
+echo -e "  ${BLUE}Metrics:${NC}     http://localhost:9101/metrics"
+echo -e "  ${BLUE}Logs:${NC}        journalctl --user -u ozma-controller -f"
+echo -e "  ${BLUE}Agent logs:${NC}  journalctl --user -u ozma-agent -f"
 echo ""
 echo -e "  ${BOLD}Add machines:${NC}"
 echo -e "    uv pip install ozma-softnode"
 echo -e "    ozma-softnode --name my-desktop"
 echo ""
 echo -e "  ${BOLD}Manage:${NC}"
-echo -e "    systemctl --user status ozma-controller"
-echo -e "    systemctl --user restart ozma-controller"
-echo -e "    systemctl --user stop ozma-controller"
+echo -e "    systemctl --user status ozma-controller ozma-agent"
+echo -e "    systemctl --user restart ozma-controller ozma-agent"
+echo -e "    systemctl --user stop ozma-controller ozma-agent"
 echo ""
 echo -e "  ${BOLD}Update:${NC}"
 echo -e "    cd $OZMA_DIR && git pull && systemctl --user restart ozma-controller"

@@ -1,0 +1,263 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
+#
+# Builds ozma-agent for every supported platform and publishes a GitHub Release
+# whenever a tag matching v* is pushed.
+#
+# Artifacts
+# ---------
+#   ozma-agent-linux-x86_64.AppImage
+#   ozma-agent-linux-x86_64.deb
+#   ozma-agent-linux-aarch64.AppImage
+#   ozma-agent-linux-aarch64.deb
+#   ozma-agent-windows-x86_64.msi
+#   ozma-agent-macos-universal.dmg
+
+name: Release ozma-agent
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY: ozma-agent
+
+jobs:
+  # ── Linux x86_64 ────────────────────────────────────────────────────────
+  linux-x86_64:
+    name: Linux x86_64 (AppImage + deb)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libpipewire-0.3-dev libspa-0.2-dev \
+            libdbus-1-dev pkg-config \
+            dpkg-dev fakeroot
+
+      - name: Build release binary
+        run: cargo build --release --bin ozma-agent --target x86_64-unknown-linux-gnu
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build .deb
+        run: cargo deb --no-build --target x86_64-unknown-linux-gnu -p ozma-agent
+        # Output: target/x86_64-unknown-linux-gnu/debian/ozma-agent_*.deb
+
+      - name: Build AppImage
+        run: |
+          curl -sSfL https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage \
+            -o /tmp/appimagetool && chmod +x /tmp/appimagetool
+
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps
+
+          cp target/x86_64-unknown-linux-gnu/release/ozma-agent AppDir/usr/bin/
+
+          cat > AppDir/ozma-agent.desktop << 'EOF'
+          [Desktop Entry]
+          Name=Ozma Agent
+          Exec=ozma-agent
+          Icon=ozma-agent
+          Type=Application
+          Categories=Utility;
+          EOF
+
+          # Placeholder icon (1×1 PNG) — replace with real asset.
+          printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82' \
+            > AppDir/usr/share/icons/hicolor/256x256/apps/ozma-agent.png
+          cp AppDir/usr/share/icons/hicolor/256x256/apps/ozma-agent.png AppDir/ozma-agent.png
+          cp AppDir/ozma-agent.desktop AppDir/.DirIcon 2>/dev/null || true
+
+          ARCH=x86_64 /tmp/appimagetool AppDir ozma-agent-linux-x86_64.AppImage
+
+      - name: Rename deb
+        run: |
+          cp target/x86_64-unknown-linux-gnu/debian/ozma-agent_*.deb \
+             ozma-agent-linux-x86_64.deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: |
+            ozma-agent-linux-x86_64.AppImage
+            ozma-agent-linux-x86_64.deb
+
+  # ── Linux aarch64 ───────────────────────────────────────────────────────
+  linux-aarch64:
+    name: Linux aarch64 (AppImage + deb)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable + aarch64 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install cross-compilation toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            gcc-aarch64-linux-gnu \
+            libpipewire-0.3-dev libspa-0.2-dev \
+            libdbus-1-dev pkg-config \
+            dpkg-dev fakeroot
+
+      - name: Build release binary (cross)
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --bin ozma-agent --target aarch64-unknown-linux-gnu
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build .deb
+        run: cargo deb --no-build --target aarch64-unknown-linux-gnu -p ozma-agent
+
+      - name: Build AppImage (aarch64)
+        run: |
+          curl -sSfL https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-aarch64.AppImage \
+            -o /tmp/appimagetool && chmod +x /tmp/appimagetool
+
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps
+
+          cp target/aarch64-unknown-linux-gnu/release/ozma-agent AppDir/usr/bin/
+
+          cat > AppDir/ozma-agent.desktop << 'EOF'
+          [Desktop Entry]
+          Name=Ozma Agent
+          Exec=ozma-agent
+          Icon=ozma-agent
+          Type=Application
+          Categories=Utility;
+          EOF
+
+          printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82' \
+            > AppDir/usr/share/icons/hicolor/256x256/apps/ozma-agent.png
+          cp AppDir/usr/share/icons/hicolor/256x256/apps/ozma-agent.png AppDir/ozma-agent.png
+
+          ARCH=aarch64 /tmp/appimagetool AppDir ozma-agent-linux-aarch64.AppImage
+
+      - name: Rename deb
+        run: |
+          cp target/aarch64-unknown-linux-gnu/debian/ozma-agent_*.deb \
+             ozma-agent-linux-aarch64.deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-aarch64
+          path: |
+            ozma-agent-linux-aarch64.AppImage
+            ozma-agent-linux-aarch64.deb
+
+  # ── Windows x86_64 MSI ──────────────────────────────────────────────────
+  windows-x86_64:
+    name: Windows x86_64 (MSI)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install WiX Toolset v3
+        run: |
+          choco install wixtoolset --version 3.11.2 -y
+          echo "C:\Program Files (x86)\WiX Toolset v3.11\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --locked
+
+      - name: Build release binary
+        run: cargo build --release --bin ozma-agent --target x86_64-pc-windows-msvc
+
+      - name: Build MSI
+        run: cargo wix --no-build --nocapture -p ozma-agent --target x86_64-pc-windows-msvc
+
+      - name: Rename MSI
+        run: |
+          Copy-Item target\wix\ozma-agent-*.msi ozma-agent-windows-x86_64.msi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: ozma-agent-windows-x86_64.msi
+
+  # ── macOS universal DMG ─────────────────────────────────────────────────
+  macos-universal:
+    name: macOS universal (DMG)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable + targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Build x86_64 binary
+        run: cargo build --release --bin ozma-agent --target x86_64-apple-darwin
+
+      - name: Build arm64 binary
+        run: cargo build --release --bin ozma-agent --target aarch64-apple-darwin
+
+      - name: Create universal binary
+        run: |
+          lipo -create \
+            target/x86_64-apple-darwin/release/ozma-agent \
+            target/aarch64-apple-darwin/release/ozma-agent \
+            -output ozma-agent-universal
+
+      - name: Build DMG
+        run: |
+          mkdir -p dmg_staging
+          cp ozma-agent-universal dmg_staging/ozma-agent
+          hdiutil create \
+            -volname "Ozma Agent" \
+            -srcfolder dmg_staging \
+            -ov -format UDZO \
+            ozma-agent-macos-universal.dmg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: ozma-agent-macos-universal.dmg
+
+  # ── Publish GitHub Release ──────────────────────────────────────────────
+  release:
+    name: Publish GitHub Release
+    needs: [linux-x86_64, linux-aarch64, windows-x86_64, macos-universal]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifact directories
+        run: find artifacts -type f | xargs -I{} cp {} .
+
+      - name: Create release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            ozma-agent-linux-x86_64.AppImage
+            ozma-agent-linux-x86_64.deb
+            ozma-agent-linux-aarch64.AppImage
+            ozma-agent-linux-aarch64.deb
+            ozma-agent-windows-x86_64.msi
+            ozma-agent-macos-universal.dmg
