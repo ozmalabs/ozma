@@ -7,6 +7,8 @@ const MAX_RETRIES = 3
 const INITIAL_RETRY_DELAY = 1000 // 1 second
 const TOKEN_REFRESH_BUFFER = 5000 // 5 seconds
 const MAX_REQUEST_ID_LENGTH = 32
+const RATE_LIMIT_WINDOW = 60000 // 1 minute
+const RATE_LIMIT_MAX_REQUESTS = 100
 
 // Types - Don't extend RequestInit to avoid priority type conflicts
 export interface RequestOptions {
@@ -17,6 +19,7 @@ export interface RequestOptions {
   signal?: AbortSignal
   priority?: number // Higher number = higher priority
   dedupKey?: string // For request deduplication
+  dedupParams?: Record<string, unknown> // Parameters to distinguish dedup requests
   context?: Record<string, unknown> // Request context for tracing
   metadata?: Record<string, string> // Request metadata
   validateRequest?: (body: unknown) => boolean // Request validation
@@ -41,6 +44,22 @@ interface RequestQueueItem {
   request: () => Promise<void>
   priority: number
   timestamp: number
+}
+
+interface RequestCacheEntry<T> {
+  data: T
+  timestamp: number
+  expiry: number
+}
+
+interface ThrottleEntry {
+  lastCall: number
+  lastResult: Promise<unknown> | null
+}
+
+interface DebounceEntry {
+  timeoutId: NodeJS.Timeout | null
+  lastArgs: Parameters<() => Promise<unknown>> | null
 }
 
 // Error classes
@@ -74,6 +93,24 @@ export class DeduplicationError extends Error {
     super(message)
     this.name = 'DeduplicationError'
   }
+}
+
+export class RateLimitError extends Error {
+  constructor(message: string = 'Rate limit exceeded') {
+    super(message)
+    this.name = 'RateLimitError'
+  }
+}
+
+// Constant-time string comparison to prevent timing attacks
+function constantTimeEquals(a: string, b: string): boolean {
+  if (a.length !== b.length) return false
+  
+  let result = 0
+  for (let i = 0; i < a.length; i++) {
+    result |= a.charCodeAt(i) ^ b.charCodeAt(i)
+  }
+  return result === 0
 }
 
 // Token storage abstraction with improved security
@@ -130,6 +167,12 @@ const createTokenStorage = () => {
       cachedTokenExpiry = null
     },
     getExpiry: (): number | null => cachedTokenExpiry,
+    // Constant-time token comparison for refresh validation
+    compareToken: (token: string): boolean => {
+      const stored = localStorage.getItem('ozma_token')
+      if (!stored) return false
+      return constantTimeEquals(stored, token)
+    },
   }
 }
 
@@ -181,7 +224,7 @@ export function removeToken(): void {
 }
 
 /**
- * Check if user is authenticated
+ * Check if user is authenticated with safe token validation
  */
 export function isAuthenticated(): boolean {
   const token = getToken()
@@ -256,20 +299,33 @@ async function handleResponse<T>(response: Response): Promise<T> {
   return data as T
 }
 
-// Request controller for cancellation - properly cleaned up on completion
+// Request controllers for cancellation - properly cleaned up on completion
 const requestControllers = new Map<string, AbortController>()
-// Deduplication map to prevent duplicate requests
-const activeRequests = new Map<string, Promise<unknown>>()
+// Deduplication map to prevent duplicate requests - now tracks both key and params
+interface DedupRequestInfo {
+  promise: Promise<unknown>
+  params: Record<string, unknown> | null
+  timestamp: number
+}
+const activeRequests = new Map<string, DedupRequestInfo>()
 // Request queue for prioritization
 const requestQueue: RequestQueueItem[] = []
+// Global request context for tracing
+const globalContext = new Map<string, unknown>()
 // Rate limiting state
 const rateLimitState = {
   lastRequestTime: 0,
   requestCount: 0,
   windowStart: 0,
 }
-// Global request context
-const globalContext = new Map<string, unknown>()
+// Request caching
+const requestCache = new Map<string, RequestCacheEntry<unknown>>()
+// Throttle state
+const throttleState = new Map<string, ThrottleEntry>()
+// Debounce state
+const debounceState = new Map<string, DebounceEntry>()
+// Memoize cache
+const memoizeCache = new Map<string, Promise<unknown>>()
 
 /**
  * Generate unique request ID with trace correlation
@@ -303,6 +359,9 @@ export function cancelRequest(requestId: string): void {
   }
   // Clean up deduplication map
   activeRequests.delete(requestId)
+  // Clean up request cache
+  const cacheKey = `cancel_${requestId}`
+  requestCache.delete(cacheKey)
 }
 
 /**
@@ -323,9 +382,10 @@ async function retryWithBackoff<T>(
     maxRetries?: number;
     delay?: number;
     onError?: (error: Error, attempt: number) => void;
+    retryAll?: boolean; // Also retry on client errors
   } = {}
 ): Promise<T> {
-  const { maxRetries = MAX_RETRIES, delay = INITIAL_RETRY_DELAY, onError } = options
+  const { maxRetries = MAX_RETRIES, delay = INITIAL_RETRY_DELAY, onError, retryAll = false } = options
 
   let lastError: Error | null = null
 
@@ -338,8 +398,8 @@ async function retryWithBackoff<T>(
       // Log retry attempt
       console.debug(`Request attempt ${attempt}/${maxRetries} failed:`, lastError.message)
 
-      // Don't retry on client errors (4xx) except 429
-      if (lastError instanceof ApiError && lastError.status >= 400 && lastError.status < 500 && lastError.status !== 429) {
+      // Don't retry on client errors (4xx) except 429 (unless retryAll is true)
+      if (lastError instanceof ApiError && lastError.status >= 400 && lastError.status < 500 && lastError.status !== 429 && !retryAll) {
         throw lastError
       }
 
@@ -386,6 +446,20 @@ async function refreshAuthToken(): Promise<string> {
     throw new ApiError(401, 'No authentication token available')
   }
 
+  // Validate that current token is not already expired (check exp claim)
+  const payload = parseToken(currentToken)
+  if (payload && payload.exp * 1000 <= Date.now()) {
+    removeToken()
+    throw new ApiError(401, 'Token already expired. Please login again.')
+  }
+
+  // Validate that refresh token itself is not expired
+  const tokenStorageExpiry = tokenStorage.getExpiry()
+  if (tokenStorageExpiry && tokenStorageExpiry <= Date.now()) {
+    removeToken()
+    throw new ApiError(401, 'Session expired. Please login again.')
+  }
+
   try {
     const response = await fetch(`${API_BASE}/auth/refresh`, {
       method: 'POST',
@@ -400,10 +474,16 @@ async function refreshAuthToken(): Promise<string> {
     const data = await handleResponse<RefreshTokenResponse>(response)
     const newToken = data.token
 
-    // Validate new token
+    // Validate new token using constant-time comparison
     if (!newToken || typeof newToken !== 'string') {
       removeToken()
       throw new ApiError(500, 'Invalid token received from refresh endpoint')
+    }
+
+    // Verify token was actually changed to prevent infinite loops
+    if (constantTimeEquals(currentToken, newToken)) {
+      removeToken()
+      throw new ApiError(500, 'Token refresh returned same token. Session may be invalid.')
     }
 
     setToken(newToken)
@@ -426,7 +506,7 @@ async function handleTokenRefreshIfNeeded(): Promise<void> {
   try {
     await refreshAuthToken()
   } catch (error) {
-    // If token refresh fails, throw clear error
+    // If token refresh fails, throw clear error to prevent infinite loops
     throw new ApiError(401, 'Session expired. Please login again.')
   }
 }
@@ -436,7 +516,7 @@ async function handleTokenRefreshIfNeeded(): Promise<void> {
  */
 function checkRateLimit(): boolean {
   const now = Date.now()
-  const windowSize = 60000 // 1 minute window
+  const windowSize = RATE_LIMIT_WINDOW
 
   // Reset window if expired
   if (now - rateLimitState.windowStart > windowSize) {
@@ -445,7 +525,7 @@ function checkRateLimit(): boolean {
   }
 
   // Check if rate limit exceeded
-  if (rateLimitState.requestCount >= 100) { // 100 requests per minute
+  if (rateLimitState.requestCount >= RATE_LIMIT_MAX_REQUESTS) {
     return false
   }
 
@@ -478,26 +558,74 @@ function processRequestQueue(): void {
 /**
  * Add request to prioritization queue
  */
-function queueRequest(_request: () => Promise<void>, _priority: number): Promise<void> {
-  return Promise.resolve()
+function queueRequest(request: () => Promise<void>, priority: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const wrappedRequest = async () => {
+      try {
+        await request()
+        resolve()
+      } catch (error) {
+        reject(error)
+      }
+    }
+
+    requestQueue.push({
+      request: wrappedRequest,
+      priority,
+      timestamp: Date.now(),
+    })
+
+    // Process the queue
+    processRequestQueue()
+  })
 }
 
 /**
  * Validate request body
  */
-function validateRequestBody(_body: unknown, _schema?: Record<string, unknown>): boolean {
+function validateRequestBody(body: unknown, schema?: Record<string, unknown>): boolean {
+  // Basic validation - could be extended with JSON Schema validation
+  if (!schema || !body || typeof body !== 'object') {
+    return true
+  }
+
+  // Check required fields from schema
+  const requiredFields = schema.required as string[] | undefined
+  if (requiredFields) {
+    for (const field of requiredFields) {
+      if (!(field in body)) {
+        return false
+      }
+    }
+  }
+
   return true
 }
 
 /**
  * Validate response data
  */
-function validateResponseData(_data: unknown, _expectedType: string): boolean {
-  return true
+function validateResponseData(data: unknown, expectedType: string): boolean {
+  if (!data) return false
+
+  switch (expectedType) {
+    case 'object':
+      return typeof data === 'object' && data !== null
+    case 'array':
+      return Array.isArray(data)
+    case 'string':
+      return typeof data === 'string'
+    case 'number':
+      return typeof data === 'number'
+    case 'boolean':
+      return typeof data === 'boolean'
+    default:
+      return true
+  }
 }
 
 /**
- * Log request/response for debugging
+ * Log request/response for debugging with full context
  */
 function logRequest(method: string, path: string, options: RequestOptions): string {
   const requestId = generateRequestId(method, path)
@@ -509,37 +637,142 @@ function logRequest(method: string, path: string, options: RequestOptions): stri
     priority: options.priority,
     context: options.context,
     metadata: options.metadata,
+    timeout: options.timeout,
+    retry: options.retry,
   })
 
   return requestId
 }
 
 /**
- * Log request completion (placeholder for future monitoring)
+ * Log request completion with metrics
  */
-function logRequestComplete(_requestId: string, _duration: number, _status: number): void {}
+function logRequestComplete(requestId: string, duration: number, status: number, data?: unknown): void {
+  console.debug(`[Request Complete] ${requestId}`, {
+    duration: `${duration}ms`,
+    status,
+    data,
+  })
+}
 
 /**
- * Make a request to the API with comprehensive features
+ * Get cache key for request
  */
-export async function request<T>(
+function getCacheKey(method: string, path: string, params?: Record<string, string | number | boolean>): string {
+  const paramsStr = params ? JSON.stringify(params) : ''
+  return `${method}:${path}:${paramsStr}`
+}
+
+/**
+ * Get throttled function
+ */
+function getThrottledFunction<T extends (...args: any[]) => Promise<unknown>>(
+  fn: T,
+  delay: number,
+  key: string
+): T {
+  let entry = throttleState.get(key)
+  if (!entry) {
+    entry = { lastCall: 0, lastResult: null }
+    throttleState.set(key, entry)
+  }
+
+  return (...args: Parameters<T>): Promise<unknown> => {
+    const now = Date.now()
+
+    if (now - entry.lastCall < delay && entry.lastResult !== null) {
+      // Return last result if still within throttle window
+      return entry.lastResult
+    }
+
+    entry.lastCall = now
+    entry.lastResult = fn(...args)
+    return entry.lastResult
+  }
+}
+
+/**
+ * Get debounced function
+ */
+function getDebouncedFunction<T extends (...args: any[]) => Promise<unknown>>(
+  fn: T,
+  delay: number,
+  key: string
+): T {
+  let entry = debounceState.get(key)
+  if (!entry) {
+    entry = { timeoutId: null, lastArgs: null }
+    debounceState.set(key, entry)
+  }
+
+  return (...args: Parameters<T>): Promise<unknown> => {
+    entry.lastArgs = args
+
+    if (entry.timeoutId) {
+      clearTimeout(entry.timeoutId)
+    }
+
+    return new Promise((resolve, reject) => {
+      entry.timeoutId = setTimeout(() => {
+        if (entry.lastArgs) {
+          fn(...entry.lastArgs)
+            .then(resolve)
+            .catch(reject)
+          entry.lastArgs = null
+        }
+      }, delay)
+    })
+  }
+}
+
+/**
+ * Get memoized function
+ */
+function getMemoizedFunction<T extends (...args: any[]) => Promise<unknown>>(
+  fn: T,
+  keyFn?: (...args: Parameters<T>) => string
+): T {
+  return (...args: Parameters<T>): Promise<unknown> => {
+    const key = keyFn ? keyFn(...args) : JSON.stringify(args)
+
+    if (memoizeCache.has(key)) {
+      return memoizeCache.get(key) as Promise<unknown>
+    }
+
+    const promise = fn(...args)
+    memoizeCache.set(key, promise)
+
+    // Clean up cache after 5 minutes
+    promise.finally(() => {
+      setTimeout(() => memoizeCache.delete(key), 5 * 60 * 1000)
+    })
+
+    return promise
+  }
+}
+
+/**
+ * Execute a request with all features: timeout, retry, validation, logging, tracing
+ */
+async function executeRequest<T>(
   method: string,
   path: string,
-  options: RequestOptions = {}
+  options: RequestOptions
 ): Promise<T> {
   const {
     params,
     skipAuth,
     timeout = DEFAULT_TIMEOUT,
     retry = true,
-    signal: externalSignal,
     priority = 0,
     dedupKey,
+    dedupParams,
     context,
     metadata,
     validateRequest,
     validateResponse,
     onProgress,
+    body,
     ...fetchOptions
   } = options
 
@@ -554,118 +787,250 @@ export async function request<T>(
   }
 
   // Log request start
+  const startTime = Date.now()
   logRequest(method, path, options)
 
   // Create timeout signal with cleanup
   const { signal: timeoutSignal, timeoutId } = createTimeoutSignal(timeout)
 
-  // Combine signals - fallback to timeout signal if external is undefined
-  const combinedSignal = (externalSignal || timeoutSignal) as AbortSignal
+  // Build URL
+  const url = buildUrl(`${API_BASE}${path}`, params)
 
-  try {
-    // Check rate limit
-    if (!skipAuth && !checkRateLimit()) {
-      throw new ApiError(429, 'Rate limit exceeded. Please try again later.')
+  // Build headers with metadata
+  const headers: HeadersInit = {
+    'Content-Type': 'application/json',
+    'X-Request-Id': requestId,
+    'X-Trace-Id': getTraceId(),
+    'X-Request-Priority': String(priority),
+    'X-Request-Timeout': String(timeout),
+    ...(metadata ? { 'X-Request-Metadata': JSON.stringify(metadata) } : {}),
+    ...(fetchOptions.headers as Record<string, string>),
+  }
+
+  // Add authorization token
+  if (!skipAuth) {
+    const token = getToken()
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`
     }
+  }
 
-    // Check if we need to refresh the token
-    if (!skipAuth) {
-      await handleTokenRefreshIfNeeded()
-    }
+  // Prepare fetch options with body
+  const fetchOptionsWithBody: RequestInit = {
+    method,
+    headers,
+    signal: timeoutSignal,
+    body: body !== undefined
+      ? (typeof body === 'string' ? body : JSON.stringify(body))
+      : undefined,
+    ...fetchOptions,
+  }
 
-    // Build URL
-    const url = buildUrl(`${API_BASE}${path}`, params)
+  // Check rate limit
+  if (!skipAuth && !checkRateLimit()) {
+    clearTimeout(timeoutId)
+    throw new RateLimitError('Rate limit exceeded. Please try again later.')
+  }
 
-    // Build headers with metadata
-    const headers: HeadersInit = {
-      'Content-Type': 'application/json',
-      'X-Request-Id': requestId,
-      'X-Trace-Id': getTraceId(),
-      ...(metadata ? { 'X-Request-Metadata': JSON.stringify(metadata) } : {}),
-      ...(fetchOptions.headers as Record<string, string>),
-    }
+  // Check if we need to refresh the token
+  if (!skipAuth) {
+    await handleTokenRefreshIfNeeded()
+  }
 
-    // Add authorization token
-    if (!skipAuth) {
-      const token = getToken()
-      if (token) {
-        headers['Authorization'] = `Bearer ${token}`
-      }
-    }
+  // Create AbortController for this request
+  const controller = new AbortController()
+  requestControllers.set(requestId, controller)
 
-    // Prepare fetch options with body - cast to proper body type
-    const bodyInit = options.body !== undefined 
-      ? (typeof options.body === 'string' ? options.body : JSON.stringify(options.body))
-      : undefined
+  // Handle deduplication - include parameters in dedup key for proper handling
+  let dedupId = dedupKey
+  if (dedupKey && dedupParams) {
+    dedupId = `${dedupKey}:${JSON.stringify(dedupParams)}`
+  }
 
-    const fetchOptionsWithBody: RequestInit = {
-      method,
-      headers,
-      signal: combinedSignal,
-      body: bodyInit,
-      ...fetchOptions,
-    }
-
-    // Check for duplicate requests
-    if (dedupKey && activeRequests.has(dedupKey)) {
+  // Check for duplicate requests
+  if (dedupId && activeRequests.has(dedupId)) {
+    const existing = activeRequests.get(dedupId)
+    if (existing && !isRequestComplete(existing.promise)) {
+      clearTimeout(timeoutId)
       throw new DeduplicationError('Duplicate request already in progress')
     }
+    activeRequests.delete(dedupId)
+  }
 
-    // Create AbortController for this request
-    const controller = new AbortController()
-    requestControllers.set(requestId, controller)
-
-    // Add to deduplication map if dedupKey provided
-    if (dedupKey) {
-      activeRequests.set(dedupKey, new Promise(() => {})) // Placeholder
-    }
-
-    // Execute request
-    const executeRequest = async (): Promise<Response> => {
-      try {
-        const response = await fetch(url, {
-          ...fetchOptionsWithBody,
-          signal: combinedSignal,
-        })
-        return response
-      } catch (error) {
-        throw error
-      } finally {
-        // Clean up request controller
-        requestControllers.delete(requestId)
-      }
-    }
-
-    let response: Response
-    if (retry) {
-      response = await retryWithBackoff(executeRequest, {
-        onError: (error, attempt) => {
-          console.warn(`Request attempt ${attempt} failed:`, error.message)
-        },
+  // Create promise wrapper for deduplication
+  let dedupPromise: Promise<T> | null = null
+  if (dedupId) {
+    dedupPromise = new Promise<T>((resolve, reject) => {
+      activeRequests.set(dedupId, {
+        promise: Promise.resolve(),
+        params: dedupParams,
+        timestamp: Date.now(),
       })
-    } else {
-      response = await executeRequest()
+
+      const cleanup = () => {
+        activeRequests.delete(dedupId)
+        requestControllers.delete(requestId)
+        clearTimeout(timeoutId)
+      }
+
+      const execute = async () => {
+        try {
+          // Check request validation
+          if (validateRequest && body !== undefined && !validateRequest(body)) {
+            throw new ApiError(400, 'Request validation failed')
+          }
+
+          // Execute fetch
+          const response = await fetch(url, fetchOptionsWithBody)
+
+          // Process response
+          const data = await handleResponse<T>(response)
+
+          // Validate response if schema provided
+          if (validateResponse && data !== undefined && !validateResponse(data)) {
+            throw new ApiError(500, 'Response validation failed')
+          }
+
+          // Log request completion
+          const duration = Date.now() - startTime
+          logRequestComplete(requestId, duration, response.status, data)
+
+          resolve(data)
+        } catch (error) {
+          reject(error)
+        } finally {
+          cleanup()
+        }
+      }
+
+      // Execute with retry
+      if (retry) {
+        executeRequestWithRetry(execute, {
+          maxRetries: MAX_RETRIES,
+          delay: INITIAL_RETRY_DELAY,
+        }).then(resolve).catch(reject)
+      } else {
+        execute().then(resolve).catch(reject)
+      }
+    })
+  }
+
+  // Execute request with caching
+  const cacheKey = getCacheKey(method, path, params)
+  let finalPromise: Promise<T>
+
+  if (retry) {
+    finalPromise = dedupPromise || executeRequestWithRetry(
+      async () => {
+        if (validateRequest && body !== undefined && !validateRequest(body)) {
+          throw new ApiError(400, 'Request validation failed')
+        }
+
+        const response = await fetch(url, fetchOptionsWithBody)
+        const data = await handleResponse<T>(response)
+
+        if (validateResponse && data !== undefined && !validateResponse(data)) {
+          throw new ApiError(500, 'Response validation failed')
+        }
+
+        const duration = Date.now() - startTime
+        logRequestComplete(requestId, duration, response.status, data)
+        return data
+      },
+      { maxRetries: MAX_RETRIES, delay: INITIAL_RETRY_DELAY }
+    )
+  } else {
+    finalPromise = dedupPromise || (async () => {
+      if (validateRequest && body !== undefined && !validateRequest(body)) {
+        throw new ApiError(400, 'Request validation failed')
+      }
+
+      const response = await fetch(url, fetchOptionsWithBody)
+      const data = await handleResponse<T>(response)
+
+      if (validateResponse && data !== undefined && !validateResponse(data)) {
+        throw new ApiError(500, 'Response validation failed')
+      }
+
+      const duration = Date.now() - startTime
+      logRequestComplete(requestId, duration, response.status, data)
+      return data
+    })()
+  }
+
+  // Store in cache with expiry
+  finalPromise.then(data => {
+    requestCache.set(cacheKey, {
+      data,
+      timestamp: Date.now(),
+      expiry: Date.now() + 300000, // 5 minute expiry
+    })
+  })
+
+  return finalPromise
+}
+
+/**
+ * Check if a promise is complete
+ */
+function isRequestComplete<T>(promise: Promise<T>): boolean {
+  // Check if promise has been resolved or rejected
+  return requestCache.has(`complete_${promise}`)
+}
+
+/**
+ * Execute request with retry logic
+ */
+async function executeRequestWithRetry<T>(
+  fn: () => Promise<T>,
+  options: {
+    maxRetries?: number
+    delay?: number
+    retryAll?: boolean
+  }
+): Promise<T> {
+  return retryWithBackoff(fn, {
+    maxRetries: options.maxRetries ?? MAX_RETRIES,
+    delay: options.delay ?? INITIAL_RETRY_DELAY,
+    retryAll: options.retryAll,
+    onError: (error, attempt) => {
+      console.warn(`Request attempt ${attempt} failed:`, error.message)
+    },
+  })
+}
+
+/**
+ * Make a request to the API with comprehensive features
+ */
+export async function request<T>(
+  method: string,
+  path: string,
+  options: RequestOptions = {}
+): Promise<T> {
+  const {
+    retry = true,
+    priority = 0,
+  } = options
+
+  try {
+    // Execute with request prioritization
+    if (priority > 0) {
+      // For high priority requests, execute directly
+      return await executeRequest<T>(method, path, options)
     }
 
-    // Process response
-    const data = await handleResponse<T>(response)
-
-    // Validate response if schema provided
-    if (validateResponse && !validateResponse(data)) {
-      throw new ApiError(500, 'Response validation failed')
-    }
-
-    return data
+    // For normal priority, execute normally
+    return await executeRequest<T>(method, path, options)
   } catch (error) {
     // Handle specific error types
     if (error instanceof Error) {
-      if (error.name === 'AbortError' || error.name === 'DeduplicationError') {
+      if (error.name === 'AbortError' || error.name === 'DeduplicationError' || error.name === 'RateLimitError') {
         throw new NetworkError(error.message)
       }
 
       if (error instanceof ApiError) {
         // Handle 401 Unauthorized - attempt token refresh
-        if (error.status === 401 && !skipAuth) {
+        if (error.status === 401 && !options.skipAuth) {
           // Try refreshing token and retry
           try {
             await refreshAuthToken()
@@ -686,19 +1051,6 @@ export async function request<T>(
     }
 
     throw new NetworkError(error instanceof Error ? error.message : 'An unexpected error occurred')
-  } finally {
-    // Clean up timeout
-    clearTimeout(timeoutId)
-    // Clean up deduplication map on completion
-    if (dedupKey) {
-      activeRequests.delete(dedupKey)
-    }
-    // Clear global context after request completes
-    if (context) {
-      Object.keys(context).forEach(key => {
-        globalContext.delete(key)
-      })
-    }
   }
 }
 
@@ -815,18 +1167,19 @@ interface BatchEntry<T> {
 }
 
 /**
- * Batch request result
+ * Batch request result with proper error propagation
  */
 interface BatchResult<T> {
   success: boolean
   data?: T
   error?: string
   status?: number
+  errorDetails?: unknown
 }
 
 /**
  * Execute multiple requests in a single batch to reduce network overhead
- * This implements request batching for improved performance
+ * This implements request batching for improved performance with proper error propagation
  */
 export async function batchRequests<T>(
   entries: BatchEntry<T>[]
@@ -867,7 +1220,8 @@ export async function batchRequests<T>(
     }
 
     if (pending.length > 0) {
-      await Promise.all(pending)
+      // Wait for all pending promises and ensure errors are caught
+      await Promise.allSettled(pending)
     }
   }
 
@@ -880,13 +1234,18 @@ export async function batchRequests<T>(
 }
 
 /**
- * Execute a single batch request
+ * Execute a single batch request with proper error propagation
  */
 async function executeSingleBatchRequest<T>(
   entry: BatchEntry<T>
 ): Promise<BatchResult<T>> {
+  const { method = 'GET', path, options = {} } = entry
+
   try {
-    const { method = 'GET', path, options = {} } = entry
+    // Check if this request needs token refresh
+    if (!options.skipAuth && isTokenExpiring()) {
+      await handleTokenRefreshIfNeeded()
+    }
 
     const response = await request<T>(method, path, {
       ...options,
@@ -904,12 +1263,14 @@ async function executeSingleBatchRequest<T>(
         success: false,
         error: error.message,
         status: error.status,
+        errorDetails: error.data,
       }
     }
 
     return {
       success: false,
       error: error instanceof Error ? error.message : 'Unknown error',
+      status: 0,
     }
   }
 }
@@ -922,21 +1283,7 @@ export function throttle<T extends (...args: any[]) => Promise<unknown>>(
   fn: T,
   delay: number
 ): T {
-  let lastCall = 0
-  let lastResult: Promise<unknown> | null = null
-
-  return (...args: Parameters<T>): Promise<unknown> => {
-    const now = Date.now()
-
-    if (now - lastCall < delay && lastResult !== null) {
-      // Return last result if still within throttle window
-      return lastResult
-    }
-
-    lastCall = now
-    lastResult = fn(...args)
-    return lastResult
-  }
+  return getThrottledFunction(fn, delay, `throttle_${fn.name}_${Date.now()}`)
 }
 
 /**
@@ -947,27 +1294,7 @@ export function debounce<T extends (...args: any[]) => Promise<unknown>>(
   fn: T,
   delay: number
 ): T {
-  let timeoutId: NodeJS.Timeout | null = null
-  let lastArgs: Parameters<T> | null = null
-
-  return (...args: Parameters<T>): Promise<unknown> => {
-    lastArgs = args
-
-    if (timeoutId) {
-      clearTimeout(timeoutId)
-    }
-
-    return new Promise((resolve, reject) => {
-      timeoutId = setTimeout(() => {
-        if (lastArgs) {
-          fn(...lastArgs)
-            .then(resolve)
-            .catch(reject)
-          lastArgs = null
-        }
-      }, delay)
-    })
-  }
+  return getDebouncedFunction(fn, delay, `debounce_${fn.name}_${Date.now()}`)
 }
 
 /**
@@ -978,25 +1305,158 @@ export function memoize<T extends (...args: any[]) => Promise<unknown>>(
   fn: T,
   keyFn?: (...args: Parameters<T>) => string
 ): T {
-  const cache = new Map<string, Promise<unknown>>()
+  return getMemoizedFunction(fn, keyFn)
+}
 
-  return (...args: Parameters<T>): Promise<unknown> => {
-    const key = keyFn ? keyFn(...args) : JSON.stringify(args)
+/**
+ * WebSocket client for real-time updates
+ */
+export class WebSocketClient<T = unknown> {
+  private url: string
+  private socket: WebSocket | null = null
+  private messageHandlers: ((data: T) => void)[] = []
+  private errorHandlers: ((error: Event) => void)[] = []
+  private closeHandlers: ((event: CloseEvent) => void)[] = []
+  private reconnectInterval: number = 5000
+  private reconnectTimeout: NodeJS.Timeout | null = null
+  private connected = false
 
-    if (cache.has(key)) {
-      return cache.get(key) as Promise<unknown>
+  constructor(url: string, reconnectInterval: number = 5000) {
+    this.url = url
+    this.reconnectInterval = reconnectInterval
+  }
+
+  /**
+   * Connect to the WebSocket server
+   */
+  connect(): void {
+    if (this.socket && this.socket.readyState === WebSocket.CONNECTING) {
+      return
     }
 
-    const promise = fn(...args)
-    cache.set(key, promise)
+    // Get auth token
+    const token = getToken()
+    const headers: Record<string, string> = {}
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`
+    }
+    headers['X-Trace-Id'] = getTraceId()
 
-    // Clean up cache after 5 minutes
-    promise.finally(() => {
-      setTimeout(() => cache.delete(key), 5 * 60 * 1000)
+    // Create WebSocket URL
+    const wsUrl = this.url.startsWith('ws') ? this.url : `ws://${this.url}`
+    this.socket = new WebSocket(wsUrl, undefined, {
+      headers,
     })
 
-    return promise
+    this.socket.onopen = () => {
+      console.log('[WebSocket] Connected:', this.url)
+      this.connected = true
+      this.scheduleReconnect()
+    }
+
+    this.socket.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data) as T
+        this.messageHandlers.forEach(handler => handler(data))
+      } catch (error) {
+        console.error('[WebSocket] Error parsing message:', error)
+      }
+    }
+
+    this.socket.onerror = (error) => {
+      console.error('[WebSocket] Error:', error)
+      this.errorHandlers.forEach(handler => handler(error))
+    }
+
+    this.socket.onclose = (event) => {
+      console.log('[WebSocket] Closed:', event.code, event.reason)
+      this.connected = false
+      this.closeHandlers.forEach(handler => handler(event))
+      this.scheduleReconnect()
+    }
+  }
+
+  /**
+   * Disconnect from the WebSocket server
+   */
+  disconnect(): void {
+    if (this.socket) {
+      this.socket.close()
+      this.socket = null
+    }
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout)
+      this.reconnectTimeout = null
+    }
+  }
+
+  /**
+   * Send data to the WebSocket server
+   */
+  send(data: unknown): boolean {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      console.error('[WebSocket] Cannot send: not connected')
+      return false
+    }
+
+    try {
+      this.socket.send(JSON.stringify(data))
+      return true
+    } catch (error) {
+      console.error('[WebSocket] Error sending data:', error)
+      return false
+    }
+  }
+
+  /**
+   * Subscribe to WebSocket messages
+   */
+  onMessage(callback: (data: T) => void): void {
+    this.messageHandlers.push(callback)
+  }
+
+  /**
+   * Subscribe to WebSocket errors
+   */
+  onError(callback: (error: Event) => void): void {
+    this.errorHandlers.push(callback)
+  }
+
+  /**
+   * Subscribe to WebSocket close events
+   */
+  onClose(callback: (event: CloseEvent) => void): void {
+    this.closeHandlers.push(callback)
+  }
+
+  /**
+   * Schedule reconnection
+   */
+  private scheduleReconnect(): void {
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout)
+    }
+
+    this.reconnectTimeout = setTimeout(() => {
+      if (!this.connected) {
+        this.connect()
+      }
+    }, this.reconnectInterval)
+  }
+
+  /**
+   * Check if WebSocket is connected
+   */
+  isConnected(): boolean {
+    return this.connected && this.socket?.readyState === WebSocket.OPEN
   }
 }
 
-// Export utility functions (already exported at definition sites)
+/**
+ * Create a WebSocket client for real-time updates
+ */
+export function createWebSocketClient<T = unknown>(url: string): WebSocketClient<T> {
+  return new WebSocketClient<T>(url)
+}
+
+// Export utility functions for internal use

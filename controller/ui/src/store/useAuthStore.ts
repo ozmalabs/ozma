@@ -33,8 +33,40 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     set({ isLoading: true, error: null })
     try {
       const response = await api.auth.login(username, password)
+      
+      // Store token in localStorage directly (using the token storage abstraction)
       localStorage.setItem('ozma_token', response.token)
-      set({ token: response.token, isLoading: false })
+      
+      // Parse and extract user info from token
+      try {
+        const parts = response.token.split('.')
+        if (parts.length === 3) {
+          const payload = JSON.parse(atob(parts[1]))
+          const user: User = {
+            id: payload.sub || payload.id?.toString() || payload.sub || 'unknown',
+            username: payload.username || 'unknown',
+            email: payload.email || '',
+            roles: Array.isArray(payload.roles) ? payload.roles : [],
+            avatar: payload.avatar,
+          }
+          set({ 
+            user, 
+            token: response.token, 
+            isAuthenticated: true,
+            isLoading: false 
+          })
+          return
+        }
+      } catch {
+        // If token parsing fails, store the token anyway
+      }
+      
+      // Fallback if token parsing fails
+      set({ 
+        token: response.token, 
+        isAuthenticated: true,
+        isLoading: false 
+      })
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Login failed'
       set({ isLoading: false, error: errorMessage })
@@ -62,9 +94,42 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     set({ isLoading: true, error: null })
     try {
       const response = await api.auth.refresh()
+      
+      // Store token in localStorage
       localStorage.setItem('ozma_token', response.token)
-      set({ token: response.token, isLoading: false })
+      
+      // Parse and extract user info from token
+      try {
+        const parts = response.token.split('.')
+        if (parts.length === 3) {
+          const payload = JSON.parse(atob(parts[1]))
+          const user: User = {
+            id: payload.sub || payload.id?.toString() || 'unknown',
+            username: payload.username || 'unknown',
+            email: payload.email || '',
+            roles: Array.isArray(payload.roles) ? payload.roles : [],
+            avatar: payload.avatar,
+          }
+          set({ 
+            user,
+            token: response.token, 
+            isAuthenticated: true,
+            isLoading: false 
+          })
+          return
+        }
+      } catch {
+        // If token parsing fails, store the token anyway
+      }
+      
+      // Fallback if token parsing fails
+      set({ 
+        token: response.token, 
+        isAuthenticated: true,
+        isLoading: false 
+      })
     } catch (error) {
+      // On refresh failure, clear token
       localStorage.removeItem('ozma_token')
       set({ user: null, token: null, isAuthenticated: false, isLoading: false, error: null })
     }
