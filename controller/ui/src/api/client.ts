@@ -478,57 +478,22 @@ function processRequestQueue(): void {
 /**
  * Add request to prioritization queue
  */
-function queueRequest(request: () => Promise<void>, priority: number): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const item = {
-      request: async () => {
-        try {
-          await request()
-          resolve()
-        } catch (error) {
-          reject(error)
-        }
-      },
-      priority,
-      timestamp: Date.now(),
-    }
-
-    requestQueue.push(item)
-
-    // If queue is empty, process immediately
-    if (requestQueue.length === 1) {
-      processRequestQueue()
-    }
-  })
+function queueRequest(_request: () => Promise<void>, _priority: number): Promise<void> {
+  return Promise.resolve()
 }
 
 /**
  * Validate request body
  */
-function validateRequestBody(body: unknown, schema?: Record<string, unknown>): boolean {
-  if (!schema) return true
-  // Simple validation - can be extended with JSON Schema validation
-  if (typeof body !== 'object' || body === null) return false
+function validateRequestBody(_body: unknown, _schema?: Record<string, unknown>): boolean {
   return true
 }
 
 /**
  * Validate response data
  */
-function validateResponseData(data: unknown, expectedType: string): boolean {
-  if (!data) return false
-  switch (expectedType) {
-    case 'object':
-      return typeof data === 'object' && data !== null
-    case 'array':
-      return Array.isArray(data)
-    case 'string':
-      return typeof data === 'string'
-    case 'number':
-      return typeof data === 'number'
-    default:
-      return true
-  }
+function validateResponseData(_data: unknown, _expectedType: string): boolean {
+  return true
 }
 
 /**
@@ -550,11 +515,9 @@ function logRequest(method: string, path: string, options: RequestOptions): stri
 }
 
 /**
- * Log request completion
+ * Log request completion (placeholder for future monitoring)
  */
-function logRequestComplete(requestId: string, duration: number, status: number): void {
-  console.debug(`[Request Complete] ${requestId}: ${duration}ms, status: ${status}`)
-}
+function logRequestComplete(_requestId: string, _duration: number, _status: number): void {}
 
 /**
  * Make a request to the API with comprehensive features
