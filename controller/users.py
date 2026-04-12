@@ -167,6 +167,7 @@ class UserManager:
         Raises PermissionError if lock file cannot be accessed.
         """
         lock_path = str(self._lock_path)
+        lock_fd = None
         try:
             lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         except PermissionError:
@@ -181,13 +182,21 @@ class UserManager:
                 return lock_fd
             except (IOError, OSError):
                 if time.time() - start_time >= timeout:
-                    os.close(lock_fd)
+                    if lock_fd is not None:
+                        try:
+                            os.close(lock_fd)
+                        except OSError:
+                            pass
                     raise TimeoutError("Could not acquire lock within timeout")
                 # Check for stale lock - if lock file was deleted by another process,
                 # recreate it and continue trying to acquire the lock
                 try:
                     if not os.path.exists(lock_path):
-                        os.close(lock_fd)
+                        if lock_fd is not None:
+                            try:
+                                os.close(lock_fd)
+                            except OSError:
+                                pass
                         lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
                 except (PermissionError, OSError):
                     pass
@@ -195,8 +204,16 @@ class UserManager:
 
     def _release_lock(self, lock_fd: int) -> None:
         """Release the lock and close the file descriptor."""
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        os.close(lock_fd)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except (OSError, IOError):
+            # Lock file may have been deleted or fd already closed
+            pass
+        try:
+            os.close(lock_fd)
+        except OSError:
+            # fd already closed or invalid
+            pass
 
     # ── User CRUD ────────────────────────────────────────────────────
 
