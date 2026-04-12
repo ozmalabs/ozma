@@ -690,7 +690,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             return {
                 "given": [g.to_dict() for g in sharing.list_grants_from_user(ctx.user_id)],
                 "received": [g.to_dict() for g in sharing.list_grants_for_user(ctx.user_id)],
-                "all": [],
+                "all": [g.to_dict() for g in sharing.list_all_grants()],
             }
         return {
             "given": [],
@@ -3961,7 +3961,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
                 for enc in (encoders if isinstance(encoders, list) else [encoders])
             ]
         elif isinstance(available, list):
-            codecs_list = available
+            # Normalise list entries: bare strings → {"encoder": str}
+            codecs_list = [
+                e if isinstance(e, dict) else {"encoder": e}
+                for e in available
+            ]
         else:
             codecs_list = []
         return {
