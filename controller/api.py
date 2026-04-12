@@ -2174,7 +2174,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         node_id = body.get("node_id", "")
         node = state.nodes.get(node_id) if node_id else None
         if node and node.api_port:
-            return await _proxy_to_node(node, "/audio/apply", {"profile_id": profile_id})
+            return await _proxy_to_node_obj(node, "/audio/apply", {"profile_id": profile_id})
         if not room_correction:
             raise HTTPException(status_code=503, detail="Room correction not available")
         ok = await room_correction.apply_correction(profile_id)
@@ -2188,7 +2188,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         node_id = body.get("node_id", "") if body else ""
         node = state.nodes.get(node_id) if node_id else None
         if node and node.api_port:
-            return await _proxy_to_node(node, "/audio/remove", {})
+            return await _proxy_to_node_obj(node, "/audio/remove", {})
         if not room_correction:
             raise HTTPException(status_code=503, detail="Room correction not available")
         await room_correction.remove_correction()
@@ -2203,7 +2203,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         node = state.nodes.get(node_id) if node_id else None
         if not node or not node.api_port:
             raise HTTPException(status_code=400, detail="node_id with api_port required")
-        return await _proxy_to_node(node, "/audio/play", {"track": track, "sink": sink})
+        return await _proxy_to_node_obj(node, "/audio/play", {"track": track, "sink": sink})
 
     @app.post("/api/v1/audio/room-correction/stop")
     async def stop_playback(body: dict) -> dict[str, Any]:
@@ -2212,10 +2212,10 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         node = state.nodes.get(node_id) if node_id else None
         if not node or not node.api_port:
             raise HTTPException(status_code=400, detail="node_id with api_port required")
-        return await _proxy_to_node(node, "/audio/stop", {})
+        return await _proxy_to_node_obj(node, "/audio/stop", {})
 
-    async def _proxy_to_node(node: Any, path: str, body: dict) -> dict:
-        """Proxy a JSON POST request to a node's HTTP API."""
+    async def _proxy_to_node_obj(node: Any, path: str, body: dict) -> dict:
+        """Proxy a JSON POST request to a node's HTTP API (by node object)."""
         import urllib.request
         url = f"http://{node.host}:{node.api_port}{path}"
         try:
@@ -3836,6 +3836,34 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     @app.delete("/api/v1/schedule/{index}")
     async def remove_schedule_rule(index: int) -> dict[str, Any]:
+        if not sched:
+            raise HTTPException(status_code=503, detail="Scheduler not available")
+        ok = sched.remove_rule(index)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Rule not found")
+        return {"ok": True}
+
+    # Alias: /api/v1/scheduler/rules mirrors /api/v1/schedule for clients
+    # that use the longer path (fixes 405 reported in issue #14)
+    @app.get("/api/v1/scheduler/rules")
+    async def list_scheduler_rules() -> dict[str, Any]:
+        if not sched:
+            return {"rules": []}
+        return {"rules": sched.list_rules()}
+
+    @app.post("/api/v1/scheduler/rules")
+    async def add_scheduler_rule(body: dict = {}) -> dict[str, Any]:
+        if not sched:
+            raise HTTPException(status_code=503, detail="Scheduler not available")
+        rule = sched.add_rule(
+            time=body.get("time", "09:00"),
+            days=body.get("days", "*"),
+            scenario=body.get("scenario", ""),
+        )
+        return {"ok": True, "rule": rule}
+
+    @app.delete("/api/v1/scheduler/rules/{index}")
+    async def remove_scheduler_rule(index: int) -> dict[str, Any]:
         if not sched:
             raise HTTPException(status_code=503, detail="Scheduler not available")
         ok = sched.remove_rule(index)
