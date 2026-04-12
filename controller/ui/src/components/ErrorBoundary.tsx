@@ -16,7 +16,7 @@ interface ErrorBoundaryState {
 
 /**
  * ErrorBoundary - Functional component error boundary for React 18+
- * 
+ *
  * Usage:
  * <ErrorBoundary fallback={<CustomFallback />}>
  *   <App />
@@ -31,39 +31,48 @@ function ErrorBoundary({ children, fallback, onError }: ErrorBoundaryProps): Rea
 
   // Effect to handle error logging
   useEffect(() => {
-    if (state.hasError && state.error && state.errorInfo) {
+    if (state.hasError && state.error) {
       console.error('ErrorBoundary caught an error:', state.error, state.errorInfo)
-      
+
       // Log error to console or error reporting service
       // logErrorToService(state.error, state.errorInfo)
-      
-      if (onError) {
-        onError(state.error, state.errorInfo)
+
+      // Safe callback - handle case where onError is not provided
+      if (onError && typeof onError === 'function') {
+        try {
+          onError(state.error, state.errorInfo ?? undefined)
+        } catch (callbackError) {
+          console.error('ErrorBoundary: onError callback threw an error:', callbackError)
+        }
       }
     }
   }, [state.hasError, state.error, state.errorInfo, onError])
 
   if (state.hasError) {
     return (
-      <ErrorFallback 
-        error={state.error} 
-        errorInfo={state.errorInfo} 
+      <ErrorFallback
+        error={state.error}
+        errorInfo={state.errorInfo}
         fallback={fallback}
         onReset={() => setState({ hasError: false, error: null, errorInfo: null })}
       />
     )
   }
 
+  // Use ErrorCatcher directly inline to avoid helper function issues
   return (
-    <ErrorCatcher onError={handleError}>
+    <ErrorCatcher
+      onError={(error, errorInfo) => {
+        setState({
+          hasError: true,
+          error,
+          errorInfo,
+        })
+      }}
+    >
       {children}
     </ErrorCatcher>
   )
-}
-
-// Helper to handle errors in the catch block
-function handleError(error: Error, errorInfo: React.ErrorInfo): void {
-  // This will be called by ErrorCatcher
 }
 
 // ErrorCatcher component that catches errors in its children
@@ -103,7 +112,12 @@ class ErrorCatcher extends React.Component<ErrorCatcherProps, ErrorCatcherState>
       error,
       errorInfo,
     })
-    this.props.onError(error, errorInfo)
+    // Safe callback - handle case where onError is not provided
+    try {
+      this.props.onError(error, errorInfo)
+    } catch (callbackError) {
+      console.error('ErrorBoundary: onError callback threw an error:', callbackError)
+    }
   }
 
   render(): React.ReactNode {
