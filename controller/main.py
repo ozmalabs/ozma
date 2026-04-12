@@ -105,6 +105,10 @@ from ddns import DDNSManager
 from speedtest_monitor import SpeedtestMonitor
 from backup_status import BackupStatusTracker, BackupNudgeService
 from game_streaming import SunshineManager
+from gaming.moonlight_protocol import MoonlightProtocol
+from gaming.moonlight_server import MoonlightServer
+from gaming.scenario_app_mapping import ScenarioAppMapper, HybridStreamingManager
+from gaming.capture_to_moonlight import CaptureToMoonlightManager
 from auto_configure import AutoConfigureManager
 from camera_connect import CameraConnectManager
 from grid import GridService
@@ -627,6 +631,29 @@ async def run(config: Config) -> None:
     sunshine_data = Path(__file__).parent / "sunshine_data"
     sunshine_mgr = SunshineManager(data_dir=sunshine_data, state=state)
     await sunshine_mgr.start()
+
+    # Moonlight protocol server — native Moonlight streaming
+    moonlight_data = Path(__file__).parent / "moonlight_data"
+    moonlight_protocol = MoonlightProtocol(moonlight_data)
+    await moonlight_protocol.start()
+
+    # Scenario-to-Moonlight app mapper
+    app_mapper = ScenarioAppMapper(scenarios, moonlight_protocol)
+
+    # Capture-to-Moonlight bridge (HDMI capture streaming)
+    capture_to_moonlight = CaptureToMoonlightManager(
+        captures, moonlight_protocol, moonlight_data
+    )
+    await capture_to_moonlight.start()
+
+    # Hybrid streaming manager (unified source adapters)
+    hybrid_streaming = HybridStreamingManager(moonlight_data / "hybrid")
+
+    # Full Moonlight server
+    moonlight_server = MoonlightServer(
+        scenarios, moonlight_protocol, app_mapper, hybrid_streaming, moonlight_data
+    )
+    await moonlight_server.start()
 
     # Auto-configure (V1.7) — PoE subnet device discovery + camera auto-registration
     ac_data = Path(__file__).parent / "auto_configure_data"
