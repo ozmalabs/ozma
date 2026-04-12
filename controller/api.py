@@ -2598,8 +2598,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"ok": True, "output_id": req.output_id}
 
     @app.post("/api/v1/audio/outputs/delay")
-    async def set_audio_output_delay(req: OutputDelayRequest) -> dict[str, Any]:
+    async def set_audio_output_delay(request: Request, req: OutputDelayRequest) -> dict[str, Any]:
         """Set time-alignment delay (ms) on an audio output."""
+        _require_scope(request, SCOPE_WRITE)
         if not audio:
             raise HTTPException(status_code=503, detail="Audio routing disabled")
         ok = await audio.outputs.set_delay(req.output_id, req.delay_ms)
@@ -2801,10 +2802,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     # --- Paste typing endpoints ---
 
     @app.post("/api/v1/paste")
-    async def paste_text(body: dict = {}) -> dict[str, Any]:
+    async def paste_text(request: Request, body: dict = {}) -> dict[str, Any]:
         """Type text to the active node via HID keystrokes.
         Body: {"text": "...", "layout": "us", "rate": 30, "node_id": null}
         """
+        _require_scope(request, SCOPE_WRITE)
         if not paste_typer:
             raise HTTPException(status_code=503, detail="Paste typing not available")
         text = body.get("text", "")
@@ -3345,8 +3347,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"patterns": ocr_triggers.list_patterns()}
 
     @app.post("/api/v1/ocr/triggers")
-    async def add_ocr_trigger(body: dict = {}) -> dict[str, Any]:
+    async def add_ocr_trigger(request: Request, body: dict = {}) -> dict[str, Any]:
         """Add a custom OCR trigger pattern."""
+        _require_scope(request, SCOPE_WRITE)
         if not ocr_triggers:
             raise HTTPException(status_code=503, detail="OCR triggers not available")
         pattern = TriggerPattern(
@@ -3491,8 +3494,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"macros": macro_mgr.list_macros()}
 
     @app.post("/api/v1/macros")
-    async def create_macro(body: dict = {}) -> dict[str, Any]:
+    async def create_macro(request: Request, body: dict = {}) -> dict[str, Any]:
         """Create a macro from a definition."""
+        _require_scope(request, SCOPE_WRITE)
         if not macro_mgr:
             raise HTTPException(status_code=503, detail="Macro manager not available")
 
@@ -3796,7 +3800,8 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"rules": sched.list_rules()}
 
     @app.post("/api/v1/schedule")
-    async def add_schedule_rule(body: dict = {}) -> dict[str, Any]:
+    async def add_schedule_rule(request: Request, body: dict = {}) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
         if not sched:
             raise HTTPException(status_code=503, detail="Scheduler not available")
         rule = sched.add_rule(
@@ -3884,7 +3889,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         }
 
     @app.post("/api/v1/codecs/config")
-    async def set_codec_config(body: dict = {}) -> dict[str, Any]:
+    async def set_codec_config(request: Request, body: dict = {}) -> dict[str, Any]:
+        """Set codec configuration for a source."""
+        _require_scope(request, SCOPE_WRITE)
         if not codec_mgr:
             raise HTTPException(status_code=503, detail="Codec manager not available")
         source_id = body.get("source_id", "default")
@@ -4594,7 +4601,8 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"ok": ok}
 
     @app.post("/api/v1/broadcast/record/start")
-    async def broadcast_record_start() -> dict[str, Any]:
+    async def broadcast_record_start(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
         if not obs_studio:
             raise HTTPException(status_code=503, detail="Broadcast not available")
         ok = await obs_studio.start_recording()
@@ -4608,7 +4616,8 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"ok": bool(path), "path": path}
 
     @app.post("/api/v1/broadcast/stream/start")
-    async def broadcast_stream_start() -> dict[str, Any]:
+    async def broadcast_stream_start(request: Request) -> dict[str, Any]:
+        _require_scope(request, SCOPE_WRITE)
         if not obs_studio:
             raise HTTPException(status_code=503, detail="Broadcast not available")
         ok = await obs_studio.start_streaming()
@@ -5559,7 +5568,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {"enabled": True, "sources": [], "clips": len(_replay_clips)}
 
     @app.post("/api/v1/replay/save")
-    async def replay_save(body: dict = {}) -> dict[str, Any]:
+    async def replay_save(request: Request, body: dict = {}) -> dict[str, Any]:
+        """Save a clip from the replay buffer."""
+        _require_scope(request, SCOPE_WRITE)
         import time
         source_id = body.get("source_id")
         if not source_id:
