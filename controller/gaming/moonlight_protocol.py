@@ -30,6 +30,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from pathlib import Path
 from typing import Any, Callable
 from typing_extensions import Self
 
@@ -768,3 +769,15 @@ class MoonlightProtocol:
         """Register an input handler for a session."""
         if handler := self._input_handlers.get(session_id):
             handler.set_input_callback(callback)
+
+    def set_on_app_launch(self, callback: Callable[[str, str], None]) -> None:
+        """Set callback for app launch (for MoonlightServer integration)."""
+        # For now, a no-op. In full implementation, this would register
+        # with the RTSP server or a separate HTTP API handler for app launch events.
+        pass
+
+    def set_on_app_quit(self, callback: Callable[[str, str], None]) -> None:
+        """Set callback for app quit (for MoonlightServer integration)."""
+        # For now, a no-op. In full implementation, this would register
+        # with the RTSP server or a separate HTTP API handler for app quit events.
+        pass
