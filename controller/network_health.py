@@ -35,6 +35,7 @@ class NodeHealth:
     latency_ms: float = 0.0
     packet_loss: float = 0.0
     jitter_ms: float = 0.0
+    p99_latency_ms: float = 0.0
     last_seen: float = 0.0
     online: bool = False
     history: deque[tuple[float, float]] = field(
@@ -48,6 +49,7 @@ class NodeHealth:
             "latency_ms": round(self.latency_ms, 1),
             "packet_loss": round(self.packet_loss, 1),
             "jitter_ms": round(self.jitter_ms, 1),
+            "p99_latency_ms": round(self.p99_latency_ms, 1),
             "online": self.online,
         }
 
@@ -141,3 +143,9 @@ class NetworkHealthMonitor:
             if len(latencies) >= 2:
                 diffs = [abs(latencies[i] - latencies[i-1]) for i in range(1, len(latencies))]
                 health.jitter_ms = sum(diffs) / len(diffs)
+            
+            # Calculate 99th percentile latency
+            if latencies:
+                latencies_sorted = sorted(latencies)
+                index = int(0.99 * (len(latencies_sorted) - 1))
+                health.p99_latency_ms = latencies_sorted[index]
