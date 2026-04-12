@@ -1,47 +1,50 @@
-import { createClient, dedupExchange, cacheExchange, fetchExchange, Client } from 'urql'
-
-// GraphQL endpoint URL
+// GraphQL endpoint — proxied by Vite dev server to the controller
 const GRAPHQL_URL = '/graphql'
 
-// Create the urql client
-export const client: Client = createClient({
-  url: GRAPHQL_URL,
-  fetchOptions: {
-    headers: {
-      // Add authentication token if available
-      Authorization: `Bearer ${localStorage.getItem('ozma_token') || ''}`,
-    },
-  },
-  exchanges: [
-    dedupExchange,
-    cacheExchange,
-    fetchExchange,
-  ],
-})
-
-// Function to get authentication headers
-export function getAuthHeaders(): Record<string, string> {
-  const headers: Record<string, string> = {}
+function makeFetchOptions(): RequestInit {
   const token = localStorage.getItem('ozma_token')
-  if (token) {
-    headers.Authorization = `Bearer ${token}`
+  return {
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
   }
-  return headers
 }
 
-// Function to check if token is available
+/**
+ * Execute a raw GraphQL request against the controller's /graphql endpoint.
+ * Uses plain fetch to avoid urql v2/v3 API churn.
+ */
+export async function graphqlRequest<T = unknown>(
+  query: string,
+  variables?: Record<string, unknown>,
+): Promise<T> {
+  const response = await fetch(GRAPHQL_URL, {
+    method: 'POST',
+    ...makeFetchOptions(),
+    body: JSON.stringify({ query, variables }),
+  })
+
+  if (!response.ok) {
+    throw new Error(`GraphQL HTTP error ${response.status}`)
+  }
+
+  const json = (await response.json()) as { data?: T; errors?: { message: string }[] }
+
+  if (json.errors && json.errors.length > 0) {
+    throw new Error(json.errors.map((e) => e.message).join('; '))
+  }
+
+  return json.data as T
+}
+
+/** Returns auth headers for use in custom fetch calls. */
+export function getAuthHeaders(): Record<string, string> {
+  const token = localStorage.getItem('ozma_token')
+  return token ? { Authorization: `Bearer ${token}` } : {}
+}
+
+/** Returns true if an auth token is present in storage. */
 export function isTokenAvailable(): boolean {
   return !!localStorage.getItem('ozma_token')
-}
-
-// Function to update auth headers
-export function updateAuthHeaders(): void {
-  const token = localStorage.getItem('ozma_token')
-  if (token) {
-    client.setContext({
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
-    })
-  }
 }

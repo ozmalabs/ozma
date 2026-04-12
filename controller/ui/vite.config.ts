@@ -64,7 +64,7 @@ export default defineConfig(({ command }) => {
     },
     esbuild: {
       loader: 'tsx',
-      include: /src\/.*\.tsx$/,
+      include: /src\/.*\.[tj]sx?$/,
       exclude: /node_modules/,
     },
   }

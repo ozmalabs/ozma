@@ -1,5 +1,5 @@
 import { createBrowserRouter, Navigate, Outlet } from 'react-router-dom'
-import { useAuth } from './store/useAuthStore'
+import { useAuthStore } from './store/useAuthStore'
 import Layout from './layouts/Layout'
 import NodesPage from './pages/NodesPage'
 import NodeDetailPage from './pages/NodeDetailPage'
@@ -31,15 +31,15 @@ function AuthLayout() {
   )
 }
 
-// Public route (only redirects if already authenticated)
+// Public route — redirects to /nodes if already authenticated
 function PublicRoute({ children }: { children: React.ReactNode }) {
-  const { isAuthenticated } = useAuth()
+  const { isAuthenticated } = useAuthStore()
 
   if (isAuthenticated) {
     return <Navigate to={ROUTES.nodes} replace />
   }
 
-  return children
+  return <>{children}</>
 }
 
 // Route definitions
@@ -81,20 +81,18 @@ export const router = createBrowserRouter([
   {
     path: '*',
     element: (
-      <AuthLayout>
-        <div className="flex items-center justify-center h-full">
-          <div className="text-center">
-            <h1 className="text-6xl font-bold text-muted-foreground mb-4">404</h1>
-            <p className="text-xl text-foreground">Page not found</p>
-            <button
-              onClick={() => window.history.back()}
-              className="mt-4 px-6 py-2 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors"
-            >
-              Go Back
-            </button>
-          </div>
+      <div className="flex items-center justify-center h-screen">
+        <div className="text-center">
+          <h1 className="text-6xl font-bold text-muted-foreground mb-4">404</h1>
+          <p className="text-xl text-foreground mb-4">Page not found</p>
+          <button
+            onClick={() => window.history.back()}
+            className="px-6 py-2 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors"
+          >
+            Go Back
+          </button>
         </div>
-      </AuthLayout>
+      </div>
     ),
   },
 ])

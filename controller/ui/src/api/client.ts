@@ -74,40 +74,6 @@ export class ApiError extends Error {
   }
 }
 
-/**
- * Constant-time string comparison to prevent timing attacks.
- * This version uses HMAC-SHA256 with a shared secret to compare strings
- * in constant time, preventing length leakage.
- */
-function constantTimeEquals(a: string, b: string): boolean {
-  // Fast path for exact match (still constant time for same-length strings)
-  if (a === b) {
-    return true
-  }
-
-  // Use crypto.subtle for secure comparison when available
-  // This prevents timing attacks by using a cryptographic hash
-  try {
-    // We use a simple approach: compare lengths first (non-secret),
-    // then compare content with XOR for each position
-    const len = a.length ^ b.length  // XOR will be 0 if lengths are equal
-    let result = len
-
-    // Always iterate through both strings up to max length
-    const maxLen = Math.max(a.length, b.length)
-    for (let i = 0; i < maxLen; i++) {
-      const charA = i < a.length ? a.charCodeAt(i) : 0
-      const charB = i < b.length ? b.charCodeAt(i) : 0
-      result |= charA ^ charB
-    }
-
-    return result === 0
-  } catch {
-    // Fallback - always return false on error
-    return false
-  }
-}
-
 export class NetworkError extends Error {
   constructor(message: string = 'Network error') {
     super(message)
@@ -136,21 +102,16 @@ export class RateLimitError extends Error {
   }
 }
 
-// Constant-time string comparison to prevent timing attacks
-// NOTE: Only compares if strings have same length to prevent length leakage
-// If lengths differ, return false immediately without comparing contents
+/**
+ * Constant-time string comparison to prevent timing attacks.
+ * Always iterates all characters to avoid timing leakage on early mismatch.
+ */
 function constantTimeEquals(a: string, b: string): boolean {
-  // First check length - if different, return immediately (constant time check)
-  if (a.length !== b.length) {
-    return false
-  }
-
-  // XOR each character position - always iterate through all characters
+  if (a.length !== b.length) return false
   let result = 0
   for (let i = 0; i < a.length; i++) {
     result |= a.charCodeAt(i) ^ b.charCodeAt(i)
   }
-
   return result === 0
 }
 
@@ -858,50 +819,6 @@ function queueRequest(request: () => Promise<void>, priority: number): Promise<v
 }
 
 /**
- * Validate request body
- */
-function validateRequestBody(body: unknown, schema?: Record<string, unknown>): boolean {
-  // Basic validation - could be extended with JSON Schema validation
-  if (!schema || !body || typeof body !== 'object') {
-    return true
-  }
-
-  // Check required fields from schema
-  const requiredFields = schema.required as string[] | undefined
-  if (requiredFields) {
-    for (const field of requiredFields) {
-      if (!(field in body)) {
-        return false
-      }
-    }
-  }
-
-  return true
-}
-
-/**
- * Validate response data
- */
-function validateResponseData(data: unknown, expectedType: string): boolean {
-  if (!data) return false
-
-  switch (expectedType) {
-    case 'object':
-      return typeof data === 'object' && data !== null
-    case 'array':
-      return Array.isArray(data)
-    case 'string':
-      return typeof data === 'string'
-    case 'number':
-      return typeof data === 'number'
-    case 'boolean':
-      return typeof data === 'boolean'
-    default:
-      return true
-  }
-}
-
-/**
  * Log request/response for debugging with full context
  * WARNING: Does NOT log sensitive information (auth tokens, passwords, headers, body)
  */
@@ -1150,17 +1067,13 @@ async function executeRequest<T>(
   }
 
   // Prepare fetch options with body
-  // NOTE: spread fetchOptions after to allow caller to override defaults
   const fetchOptionsWithBody: RequestInit = {
     method,
     headers,
     signal: timeoutSignal,
-    ...fetchOptions,
-  }
-
-  // Set body separately to avoid type conflicts
-  if (body !== undefined) {
-    fetchOptionsWithBody.body = typeof body === 'string' ? body : JSON.stringify(body)
+    ...(body !== undefined
+      ? { body: typeof body === 'string' ? body : JSON.stringify(body) }
+      : {}),
   }
 
   // Helper function to clean up all resources associated with a request
@@ -1209,12 +1122,6 @@ async function executeRequest<T>(
         // If there's an error, continue with new request
       }
     }
-  }
-
-  // Helper to add body to fetch options (only when defined)
-  const addBody = (_opts: RequestInit, _bodyData?: BodyInit): RequestInit => {
-    // This helper is defined but currently unused - kept for future use
-    return _opts
   }
 
   // Create promise wrapper for deduplication

@@ -1,18 +1,8 @@
-import { BrowserRouter, Routes, Route } from 'react-router-dom'
-import Layout from './layouts/Layout'
-import NodesPage from './pages/NodesPage'
+import { RouterProvider } from 'react-router-dom'
+import { router } from './router'
 
 function App() {
-  return (
-    <BrowserRouter>
-      <Layout>
-        <Routes>
-          <Route path="/" element={<NodesPage />} />
-          <Route path="/nodes" element={<NodesPage />} />
-        </Routes>
-      </Layout>
-    </BrowserRouter>
-  )
+  return <RouterProvider router={router} />
 }
 
 export default App
