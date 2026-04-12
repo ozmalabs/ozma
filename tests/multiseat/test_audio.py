@@ -204,7 +204,10 @@ class TestVolumeAndMute:
             stderr="",
         )
 
-        with patch("asyncio.get_running_loop") as mock_loop:
+        with patch("asyncio.get_running_loop") as mock_loop, \
+             patch.object(
+                 LinuxAudioBackend, "_check_pipewire_nodes", return_value=None
+             ):
             mock_loop.return_value.run_in_executor = AsyncMock(
                 side_effect=[set_result, get_result],
             )
@@ -235,7 +238,10 @@ class TestVolumeAndMute:
             stderr="",
         )
 
-        with patch("asyncio.get_running_loop") as mock_loop:
+        with patch("asyncio.get_running_loop") as mock_loop, \
+             patch.object(
+                 LinuxAudioBackend, "_check_pipewire_nodes", return_value=None
+             ):
             mock_loop.return_value.run_in_executor = AsyncMock(
                 side_effect=[set_result, get_result],
             )
