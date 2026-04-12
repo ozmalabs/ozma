@@ -188,6 +188,18 @@ class GStreamerPipeline:
         backend = ENCODE_BACKENDS.get(encoder, ENCODE_BACKENDS["software"])
         self._encoder = backend.get("codec", "libx264")
         self._h265_encoder = backend.get("h265", "libx265")
+        self._av1_encoder = backend.get("av1", "libaom-av1")
+
+        # Validate that the encoder is actually available
+        encoder_name = self._encoder
+        if self._config.codec == "h265" and self._h265_encoder:
+            encoder_name = self._h265_encoder
+        elif self._config.codec == "av1" and self._av1_encoder:
+            encoder_name = self._av1_encoder
+
+        if not await _test_encoder(encoder, self._config.codec):
+            log.error("Encoder '%s' for codec '%s' is not available on this system", encoder_name, self._config.codec)
+            return False
 
         # Select codec
         codec = self._config.codec

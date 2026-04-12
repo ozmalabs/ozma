@@ -234,6 +234,12 @@ class CaptureToMoonlightManager:
                 moonlight_session.session_id,
                 pipeline_config,
             )
+            # Validate that pipeline actually started
+            if not pipeline._running:
+                log.error("GStreamer pipeline failed to start for session %s", moonlight_session.session_id)
+                await self._pipeline_manager.remove_pipeline(moonlight_session.session_id)
+                await self._moonlight.end_session(moonlight_session.session_id)
+                return None
         except Exception as e:
             log.error("Failed to create GStreamer pipeline: %s", e)
             # Clean up Moonlight session
@@ -342,7 +348,7 @@ class CaptureToMoonlightManager:
                 log.error("Failed to end Moonlight session: %s", e)
 
         session.active = False
-        session._ended_at = asyncio.get_event_loop().time()
+        session._ended_at = asyncio.get_running_loop().time()
 
         del self._capture_sessions[capture_source_id]
 
@@ -391,7 +397,11 @@ class CaptureToMoonlightManager:
 
         # Restart pipeline with new config
         if session.pipeline:
-            return await session.pipeline.restart(session.pipeline_config)
+            success = await session.pipeline.restart(session.pipeline_config)
+            if not success:
+                log.error("Failed to restart pipeline for capture session %s", capture_source_id)
+                return False
+            return True
 
         return False
 
@@ -440,11 +450,18 @@ class CaptureToMoonlightManager:
         List Moonlight apps (capture sources that can be streamed).
 
         Each capture card appears as a "Moonlight app" that clients can launch.
+        Only includes cards that are available and can be used for streaming.
         """
         apps = []
         for source_id, display_source in self._display_capture._sources.items():
             card = display_source.card
             if not card:
+                continue
+
+            # Skip cards that are not available (device file doesn't exist)
+            card_path = Path(card.path)
+            if not card_path.exists():
+                log.debug("Skipping unavailable capture card: %s", card.path)
                 continue
 
             # Count active sessions
