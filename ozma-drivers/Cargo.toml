@@ -1,7 +1,9 @@
 [package]
-name    = "ozma-drivers"
-version = "0.1.0"
-edition = "2021"
+name        = "ozma-drivers"
+version     = "0.1.0"
+edition     = "2021"
+description = "Hardware input drivers for ozma (Stream Deck, gamepad, evdev)"
+license     = "AGPL-3.0-only"
 
 [[bin]]
 name = "ozma-drivers"
@@ -16,5 +18,12 @@ serde              = { version = "1", features = ["derive"] }
 serde_json         = "1"
 uuid               = { version = "1", features = ["v4"] }
 anyhow             = "1"
+thiserror          = "1"
 elgato-streamdeck  = "0.5"
 hidapi             = { version = "2", features = ["linux-static-hidraw"] }
+gilrs              = { version = "0.10", features = ["serde-serialize"] }
+ozma-proto         = { path = "../ozma-proto" }
+ozma-crypto        = { path = "../ozma-crypto" }
+
+[dev-dependencies]
+uinput = "0.1"

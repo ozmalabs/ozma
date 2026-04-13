@@ -8,15 +8,17 @@
 //! - Stream Deck Original / V2 (15 keys)
 //! - Stream Deck XL (32 keys)
 //! - Stream Deck Pedal (3 foot switches, no display)
+//!
+//! Uses elgato-streamdeck 0.5 API: `list_devices` + `StreamDeck::connect`.
 
 use anyhow::Result;
-use elgato_streamdeck::{DeviceManager, DeviceType, StreamDeck};
+use elgato_streamdeck::{info::Kind, list_devices, new_hidapi, StreamDeck};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-/// Represents a control on the Stream Deck surface
+/// Represents a control on the Stream Deck surface.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamDeckControl {
     pub name: String,
@@ -24,7 +26,7 @@ pub struct StreamDeckControl {
     pub binding: ControlBinding,
 }
 
-/// Control binding information
+/// Control binding information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlBinding {
     pub action: String,
@@ -34,7 +36,7 @@ pub struct ControlBinding {
     pub target: Option<String>,
 }
 
-/// Stream Deck control surface implementation
+/// Stream Deck control surface.
 pub struct StreamDeckSurface {
     deck: Arc<Mutex<StreamDeck>>,
     surface_id: String,
@@ -45,7 +47,7 @@ pub struct StreamDeckSurface {
     active_scenario_id: Option<String>,
 }
 
-/// Information about a scenario for display purposes
+/// Scenario info for display on keys.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScenarioInfo {
     pub id: String,
@@ -54,18 +56,17 @@ pub struct ScenarioInfo {
 }
 
 impl StreamDeckSurface {
-    /// Create a new StreamDeckSurface from a connected device
+    /// Create a new `StreamDeckSurface` wrapping an already-connected device.
     pub async fn new(deck: StreamDeck) -> Result<Self> {
-        let device_type = deck.device_type();
-        let is_visual = matches!(
-            device_type,
-            DeviceType::Original | DeviceType::OriginalV2 | DeviceType::Xl | DeviceType::Mini
-        );
-        let key_count = deck.key_count();
-        
+        let kind = deck.kind();
+        let key_count = kind.key_count() as usize;
+        // Devices with key images are the visual variants (not Pedal/Plus encoder-only).
+        let is_visual = key_count > 0
+            && !matches!(kind, Kind::Pedal);
+
         let surface_id = format!(
             "streamdeck-{}",
-            device_type.to_string().to_lowercase().replace(" ", "-")
+            format!("{kind:?}").to_lowercase().replace(' ', "-")
         );
 
         let mut surface = Self {
@@ -78,15 +79,12 @@ impl StreamDeckSurface {
             active_scenario_id: None,
         };
 
-        // Build controls based on device type
         if !is_visual {
-            // Pedal mode: 3 keys → prev / next / mute
             surface.build_pedal_controls();
         } else {
-            // Visual mode: keys map to scenarios
             for i in 0..key_count {
                 let ctrl = StreamDeckControl {
-                    name: format!("key_{}", i),
+                    name: format!("key_{i}"),
                     surface_id: surface.surface_id.clone(),
                     binding: ControlBinding {
                         action: "scenario.activate".to_string(),
@@ -94,150 +92,128 @@ impl StreamDeckSurface {
                         target: None,
                     },
                 };
-                surface.controls.insert(format!("key_{}", i), ctrl);
+                surface.controls.insert(format!("key_{i}"), ctrl);
             }
         }
 
         Ok(surface)
     }
 
-    /// Start the Stream Deck surface
+    /// Initialise the device: reset + set brightness.
     pub async fn start(&mut self) -> Result<()> {
         let deck = self.deck.clone();
-        
-        // Open and initialize the device
         tokio::task::spawn_blocking(move || {
-            let mut deck = deck.blocking_lock();
-            deck.open()?;
+            let deck = deck.blocking_lock();
             deck.reset()?;
             deck.set_brightness(60)?;
             Ok::<(), anyhow::Error>(())
-        }).await??;
+        })
+        .await??;
 
         tracing::info!(
-            "Stream Deck started: {} ({} keys, visual={})",
-            self.deck.blocking_lock().device_type(),
-            self.key_count,
-            self.is_visual
+            surface_id = %self.surface_id,
+            key_count  = self.key_count,
+            visual     = self.is_visual,
+            "Stream Deck started"
         );
-
         Ok(())
     }
 
-    /// Stop the Stream Deck surface
+    /// Reset the device cleanly before teardown.
     pub async fn stop(&mut self) -> Result<()> {
         let deck = self.deck.clone();
         tokio::task::spawn_blocking(move || {
-            let mut deck = deck.blocking_lock();
-            deck.reset().ok(); // Ignore errors on reset
-            deck.close().ok(); // Ignore errors on close
+            let deck = deck.blocking_lock();
+            deck.reset().ok();
             Ok::<(), anyhow::Error>(())
-        }).await??;
-        
+        })
+        .await??;
         Ok(())
     }
 
-    /// Build controls for the Stream Deck Pedal
     fn build_pedal_controls(&mut self) {
-        self.controls.insert(
-            "pedal_left".to_string(),
-            StreamDeckControl {
-                name: "pedal_left".to_string(),
-                surface_id: self.surface_id.clone(),
-                binding: ControlBinding {
-                    action: "scenario.next".to_string(),
-                    value: Some(serde_json::Value::Number((-1).into())),
-                    target: None,
+        for (name, action, value) in [
+            ("pedal_left",   "scenario.next",  Some(serde_json::json!(-1))),
+            ("pedal_middle", "audio.mute",     None),
+            ("pedal_right",  "scenario.next",  Some(serde_json::json!(1))),
+        ] {
+            self.controls.insert(
+                name.to_string(),
+                StreamDeckControl {
+                    name: name.to_string(),
+                    surface_id: self.surface_id.clone(),
+                    binding: ControlBinding {
+                        action: action.to_string(),
+                        value,
+                        target: if action == "audio.mute" {
+                            Some("@active".to_string())
+                        } else {
+                            None
+                        },
+                    },
                 },
-            },
-        );
-
-        self.controls.insert(
-            "pedal_middle".to_string(),
-            StreamDeckControl {
-                name: "pedal_middle".to_string(),
-                surface_id: self.surface_id.clone(),
-                binding: ControlBinding {
-                    action: "audio.mute".to_string(),
-                    value: None,
-                    target: Some("@active".to_string()),
-                },
-            },
-        );
-
-        self.controls.insert(
-            "pedal_right".to_string(),
-            StreamDeckControl {
-                name: "pedal_right".to_string(),
-                surface_id: self.surface_id.clone(),
-                binding: ControlBinding {
-                    action: "scenario.next".to_string(),
-                    value: Some(serde_json::Value::Number(1.into())),
-                    target: None,
-                },
-            },
-        );
+            );
+        }
     }
 
-    /// Update scenarios and re-render all keys
-    pub async fn update_scenarios(&mut self, scenarios: Vec<ScenarioInfo>, active_id: Option<String>) -> Result<()> {
+    /// Push updated scenario list to the device (re-renders all keys).
+    pub async fn update_scenarios(
+        &mut self,
+        scenarios: Vec<ScenarioInfo>,
+        active_id: Option<String>,
+    ) -> Result<()> {
         self.scenarios = scenarios;
         self.active_scenario_id = active_id;
-        
         if self.is_visual {
             self.render_all_keys().await?;
         }
-        
         Ok(())
     }
 
-    /// Render scenario info onto all keys
     async fn render_all_keys(&self) -> Result<()> {
-        // This would be the implementation for rendering key images
-        // For now, we'll just log that it would happen
-        tracing::debug!("Rendering {} keys for {} scenarios", self.key_count, self.scenarios.len());
+        tracing::debug!(
+            keys = self.key_count,
+            scenarios = self.scenarios.len(),
+            "Rendering Stream Deck keys"
+        );
+        // TODO: render scenario names/colours onto key images via set_button_image.
         Ok(())
     }
 
-    /// Get the surface ID
     pub fn id(&self) -> &str {
         &self.surface_id
     }
 
-    /// Get controls
     pub fn controls(&self) -> &HashMap<String, StreamDeckControl> {
         &self.controls
     }
 
-    /// Convert to serializable dictionary
     pub fn to_dict(&self) -> serde_json::Value {
         serde_json::json!({
-            "id": self.surface_id,
-            "deck_type": format!("{:?}", self.deck.blocking_lock().device_type()),
+            "id":        self.surface_id,
             "key_count": self.key_count,
-            "visual": self.is_visual,
-            "controls": self.controls
+            "visual":    self.is_visual,
+            "controls":  self.controls,
         })
     }
 }
 
-/// Discover connected Stream Deck devices
+/// Enumerate and connect to all attached Stream Deck devices.
 pub fn discover_streamdecks() -> Result<Vec<StreamDeck>> {
-    let mut devices = Vec::new();
-    
-    match DeviceManager::init() {
-        Ok(dm) => {
-            match dm.enumerate_devices() {
-                Ok(deck_devices) => {
-                    for deck in deck_devices {
-                        devices.push(deck);
-                    }
-                }
-                Err(e) => tracing::debug!("Stream Deck enumeration failed: {}", e),
+    let hidapi = new_hidapi().map_err(|e| anyhow::anyhow!("hidapi init: {e}"))?;
+    let mut decks = Vec::new();
+
+    for (kind, serial) in list_devices(&hidapi) {
+        match StreamDeck::connect(&hidapi, kind, &serial) {
+            Ok(deck) => {
+                tracing::info!(kind = ?kind, serial = %serial, "Stream Deck connected");
+                decks.push(deck);
+            }
+            Err(e) => {
+                tracing::warn!(kind = ?kind, serial = %serial, error = %e, "Failed to connect to Stream Deck");
             }
         }
-        Err(e) => tracing::debug!("Stream Deck device manager init failed: {}", e),
     }
-    
-    Ok(devices)
+
+    Ok(decks)
 }

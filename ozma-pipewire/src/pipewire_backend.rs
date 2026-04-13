@@ -17,10 +17,10 @@ use std::{
 
 use async_trait::async_trait;
 use pipewire::{
-    context::Context,
+    context::{Context, ContextRc},
     core::Core,
     link::Link,
-    main_loop::MainLoop,
+    main_loop::{MainLoop, MainLoopRc},
     properties::properties,
     registry::GlobalObject,
     spa::utils::dict::DictRef,
@@ -150,7 +150,7 @@ fn pw_thread_main(
     state: Arc<Mutex<GraphState>>,
     ready_tx: oneshot::Sender<anyhow::Result<()>>,
 ) {
-    let main_loop = match MainLoop::new(None) {
+    let main_loop = match MainLoopRc::new(None) {
         Ok(ml) => ml,
         Err(e) => {
             let _ = ready_tx.send(Err(anyhow::anyhow!("PipeWire MainLoop::new: {e}")));
@@ -158,7 +158,7 @@ fn pw_thread_main(
         }
     };
 
-    let context = match Context::new(&main_loop) {
+    let context = match ContextRc::new(&main_loop, None) {
         Ok(ctx) => ctx,
         Err(e) => {
             let _ = ready_tx.send(Err(anyhow::anyhow!("PipeWire Context::new: {e}")));
@@ -166,7 +166,7 @@ fn pw_thread_main(
         }
     };
 
-    let core = match context.connect(None) {
+    let core = match context.connect_rc(None) {
         Ok(c) => c,
         Err(e) => {
             let _ = ready_tx.send(Err(anyhow::anyhow!("PipeWire Core::connect: {e}")));
@@ -214,7 +214,7 @@ fn pw_thread_main(
     let core_cmd = core.clone();
     let state_cmd = Arc::clone(&state);
 
-    let _timer = main_loop.loop_().add_timer(move |_| {
+    let timer = main_loop.loop_().add_timer(move |_| {
         // Drain all pending commands without blocking.
         loop {
             match cmd_rx.borrow_mut().try_recv() {
@@ -226,13 +226,10 @@ fn pw_thread_main(
     });
 
     // Arm the timer: fire every 5 ms.
-    if let Some(t) = _timer.as_ref() {
-        let _ = t.update(
-            std::time::Duration::from_millis(5),
-            std::time::Duration::from_millis(5),
-            false,
-        );
-    }
+    let _ = timer.update_timer(
+        Some(std::time::Duration::from_millis(5)),
+        Some(std::time::Duration::from_millis(5)),
+    );
 
     main_loop.run();
 }
@@ -250,13 +247,12 @@ fn handle_command(cmd: PwCommand, core: &Core, state: &Arc<Mutex<GraphState>>) {
             let _ = reply.send(result);
         }
         PwCommand::DestroyLink { link_id, reply } => {
-            // Destroying a link: look up the proxy and call destroy.
-            // The registry global_remove callback will fire and clean up state.
-            // For now we use core.destroy() with the object ID.
-            let result = core
-                .destroy(link_id)
-                .map_err(|e| anyhow::anyhow!("destroy link {link_id}: {e}"));
-            let _ = reply.send(result);
+            // TODO: destroying a link requires storing the Link proxy from
+            // create_link_sync. For now return an error — the link will be
+            // cleaned up when the PipeWire session ends.
+            let _ = reply.send(Err(anyhow::anyhow!(
+                "DestroyLink {link_id}: proxy-based destroy not yet implemented"
+            )));
         }
     }
 }
@@ -357,6 +353,7 @@ fn handle_port_global(
         return;
     }
     let direction = props.get("port.direction").unwrap_or("").to_string();
+    debug!("PW port added: id={id} node={node_id} dir={direction}");
     state
         .lock()
         .unwrap()
@@ -364,7 +361,6 @@ fn handle_port_global(
         .entry(node_id)
         .or_default()
         .push((id, direction));
-    debug!("PW port added: id={id} node={node_id} dir={direction}");
 }
 
 fn handle_global_remove(

@@ -15,6 +15,7 @@ use std::{
 };
 
 use chrono::Utc;
+use icalendar::{CalendarDateTime, Component, DatePerhapsTime};
 use sysinfo::{ProcessRefreshKind, RefreshKind, System};
 use tracing::{debug, info};
 
@@ -124,6 +125,19 @@ fn find_ics_files(extra_paths: &[PathBuf]) -> Vec<PathBuf> {
     files
 }
 
+/// Convert a `DatePerhapsTime` to a UTC `DateTime`, best-effort.
+fn dpt_to_utc(dpt: DatePerhapsTime) -> Option<chrono::DateTime<Utc>> {
+    match dpt {
+        DatePerhapsTime::DateTime(CalendarDateTime::Utc(dt)) => Some(dt),
+        DatePerhapsTime::DateTime(CalendarDateTime::Floating(ndt)) => Some(ndt.and_utc()),
+        DatePerhapsTime::DateTime(CalendarDateTime::WithTimezone { date_time, .. }) => {
+            // Best effort: treat floating datetime as UTC when no tz lookup available.
+            Some(date_time.and_utc())
+        }
+        DatePerhapsTime::Date(nd) => nd.and_hms_opt(0, 0, 0).map(|ndt| ndt.and_utc()),
+    }
+}
+
 /// Parse a single ICS file and return events whose time window contains now.
 fn parse_active_events(path: &Path) -> Vec<CalendarEvent> {
     let Ok(content) = std::fs::read_to_string(path) else {
@@ -148,8 +162,8 @@ fn parse_active_events(path: &Path) -> Vec<CalendarEvent> {
         // Only include events whose window contains now.
         let active = match (ev.get_start(), ev.get_end()) {
             (Some(s), Some(e)) => {
-                let s_dt: Option<chrono::DateTime<Utc>> = s.try_into().ok();
-                let e_dt: Option<chrono::DateTime<Utc>> = e.try_into().ok();
+                let s_dt = dpt_to_utc(s);
+                let e_dt = dpt_to_utc(e);
                 matches!((s_dt, e_dt), (Some(s), Some(e)) if s <= now && now <= e)
             }
             _ => false,
@@ -162,16 +176,17 @@ fn parse_active_events(path: &Path) -> Vec<CalendarEvent> {
             .property_value("UID")
             .unwrap_or_default()
             .to_string();
-        let summary   = ev.summary().unwrap_or_default().to_string();
+        let summary   = ev.get_summary().unwrap_or_default().to_string();
         let organizer = ev
             .property_value("ORGANIZER")
             .unwrap_or_default()
             .trim_start_matches("mailto:")
             .to_string();
         let attendees: Vec<String> = ev
-            .properties()
-            .filter(|(k, _)| k.eq_ignore_ascii_case("ATTENDEE"))
-            .map(|(_, v)| v.value().trim_start_matches("mailto:").to_string())
+            .multi_properties()
+            .iter()
+            .filter(|p| p.key().eq_ignore_ascii_case("ATTENDEE"))
+            .map(|p| p.value().trim_start_matches("mailto:").to_string())
             .collect();
 
         events.push(CalendarEvent { uid, summary, organizer, attendees });
@@ -248,7 +263,7 @@ impl MeetingDetector {
 
     /// Run one detection cycle.
     pub fn scan_once(&mut self) {
-        self.sys.refresh_processes(ProcessRefreshKind::new());
+        self.sys.refresh_processes();
 
         let detected     = self.detect_platforms();
         let detected_ids: HashSet<String> = detected.iter().map(|m| m.id.clone()).collect();
@@ -309,7 +324,7 @@ impl MeetingDetector {
     /// (case-insensitive substring match).
     fn process_running(&self, names: &[&str]) -> bool {
         self.sys.processes().values().any(|proc| {
-            let pname = proc.name().to_string_lossy().to_lowercase();
+            let pname = proc.name().to_lowercase();
             names.iter().any(|n| pname.contains(*n))
         })
     }

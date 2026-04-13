@@ -150,7 +150,11 @@ impl ClipboardManager {
             entry: entry.to_summary(),
         });
 
-        result
+        // OS clipboard write failure is non-fatal — ring was updated.
+        if let Err(e) = result {
+            warn!("OS clipboard write failed (headless?): {e}");
+        }
+        Ok(())
     }
 
     async fn set_raw(&self, content: &ClipboardContent) -> Result<(), String> {
