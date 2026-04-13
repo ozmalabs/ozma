@@ -161,8 +161,12 @@ class NotificationManager:
 
     async def process_webhook(self, channel: str, body: bytes, headers: dict) -> dict:
         """Process an incoming webhook from a messaging platform."""
-        # Parse the webhook payload based on channel type
-        data = json.loads(body)
+        try:
+            # Parse the webhook payload based on channel type
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            log.warning("Failed to parse webhook JSON for channel %s", channel)
+            return {"ok": False, "error": "Invalid JSON"}
         
         # Extract message content and sender
         message_content = ""
@@ -194,7 +198,11 @@ class NotificationManager:
                     "message": message_content
                 }
                 # Add context to agent engine prompt
-                await self._agent_engine.add_context(context)
+                try:
+                    if hasattr(self._agent_engine, 'add_context'):
+                        await self._agent_engine.add_context(context)
+                except Exception as e:
+                    log.warning("Failed to add context to agent engine: %s", e)
         
         # Return success response
         return {"ok": True, "context_added": context is not None}
