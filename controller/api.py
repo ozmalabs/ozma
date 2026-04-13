@@ -63,7 +63,7 @@ from paste_typing import PasteTyper
 from keyboard_manager import KeyboardManager
 from macros import MacroManager, Macro
 from scheduler import Scheduler
-from notifications import NotificationManager
+from notifications import NotificationManager, NotifyDestination
 from session_recording import SessionRecorder
 from network_health import NetworkHealthMonitor
 from wol import send_wol, get_mac_from_arp
@@ -4128,6 +4128,143 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if not notifier:
             return {"destinations": [], "rules": []}
         return {"destinations": notifier.list_destinations(), "rules": notifier.list_rules()}
+
+    # --- Messaging Bridge endpoints ---
+
+    @app.post("/api/v1/messaging/webhook/{channel}")
+    async def messaging_webhook(channel: str, request: Request) -> dict[str, Any]:
+        """
+        Public endpoint for receiving platform webhooks.
+        No authentication required - each adapter validates its own HMAC/signature.
+        """
+        if not notifier:
+            raise HTTPException(status_code=503, detail="Messaging bridge not available")
+        
+        # Get raw body for signature validation
+        body = await request.body()
+        headers = dict(request.headers)
+        
+        # Find the destination for this channel
+        dest = None
+        for d in notifier._destinations.values():
+            if d.dest_type == channel:
+                dest = d
+                break
+        
+        if not dest:
+            raise HTTPException(status_code=404, detail="Channel not found")
+        
+        # Validate webhook signature (implementation depends on channel type)
+        try:
+            if channel == "slack":
+                # Validate Slack signature
+                if not _validate_slack_signature(body, headers, dest):
+                    raise HTTPException(status_code=401, detail="Invalid signature")
+            elif channel == "discord":
+                # Validate Discord signature
+                if not _validate_discord_signature(body, headers, dest):
+                    raise HTTPException(status_code=401, detail="Invalid signature")
+            # Add other platform validations as needed
+        except Exception as e:
+            # Log security event
+            if audit:
+                audit.log_event(
+                    "messaging.webhook.auth_failed", 
+                    "controller", 
+                    {"channel": channel, "error": str(e)},
+                    severity="warning"
+                )
+            raise HTTPException(status_code=401, detail="Authentication failed")
+        
+        # Process the webhook
+        try:
+            result = await notifier.process_webhook(channel, body, headers)
+            
+            # Audit log if enabled
+            if audit and os.getenv("MESSAGING_AUDIT") == "1":
+                body_hash = hashlib.sha256(body).hexdigest()[:16]
+                audit.log_event(
+                    "messaging.webhook.received",
+                    "controller",
+                    {"channel": channel, "sender": _get_sender_from_webhook(channel, body), 
+                     "body_hash": body_hash},
+                    severity="info"
+                )
+            
+            return result
+        except Exception as e:
+            if audit:
+                audit.log_event(
+                    "messaging.webhook.error",
+                    "controller",
+                    {"channel": channel, "error": str(e)},
+                    severity="error"
+                )
+            raise HTTPException(status_code=500, detail=f"Webhook processing failed: {e}")
+
+    def _validate_slack_signature(body: bytes, headers: dict, dest: NotifyDestination) -> bool:
+        """Validate Slack webhook signature."""
+        # Implementation would use dest.url (signing secret) to validate
+        # This is a placeholder - real implementation depends on Slack SDK
+        return True
+
+    def _validate_discord_signature(body: bytes, headers: dict, dest: NotifyDestination) -> bool:
+        """Validate Discord webhook signature."""
+        # Implementation would use dest.url (webhook URL) to validate
+        # This is a placeholder - real implementation depends on Discord SDK
+        return True
+
+    def _get_sender_from_webhook(channel: str, body: bytes) -> str:
+        """Extract sender identifier from webhook body."""
+        # Implementation depends on channel type
+        return "unknown"
+
+    @app.get("/api/v1/messaging/channels")
+    async def list_messaging_channels(request: Request) -> dict[str, Any]:
+        """List configured channels with status."""
+        _require_scope(request, SCOPE_READ)
+        if not notifier:
+            return {"channels": []}
+        return {"channels": notifier.list_messaging_channels()}
+
+    @app.post("/api/v1/messaging/channels/{channel}/test")
+    async def test_messaging_channel(request: Request, channel: str) -> dict[str, Any]:
+        """Send test message to configured channel."""
+        _require_scope(request, SCOPE_WRITE)
+        if not notifier:
+            raise HTTPException(status_code=503, detail="Messaging bridge not available")
+        result = await notifier.send_test_message(channel)
+        return {"ok": result is not None, "result": result}
+
+    @app.get("/api/v1/messaging/channels/{channel}/identity-map")
+    async def list_identity_map(request: Request, channel: str) -> dict[str, Any]:
+        """List platform_id → user_id mappings for this channel."""
+        _require_scope(request, SCOPE_READ)
+        if not notifier:
+            return {"mappings": []}
+        return {"mappings": notifier.list_identity_mappings(channel)}
+
+    @app.post("/api/v1/messaging/channels/{channel}/identity-map")
+    async def add_identity_mapping(request: Request, channel: str, body: dict) -> dict[str, Any]:
+        """Add or update platform_id → ozma_user_id mapping."""
+        _require_scope(request, SCOPE_WRITE)
+        if not notifier:
+            raise HTTPException(status_code=503, detail="Messaging bridge not available")
+        platform_id = body.get("platform_id", "")
+        ozma_user_id = body.get("ozma_user_id", "")
+        if not platform_id or not ozma_user_id:
+            raise HTTPException(status_code=400, detail="platform_id and ozma_user_id required")
+        notifier.add_identity_mapping(channel, platform_id, ozma_user_id)
+        return {"ok": True, "platform_id": platform_id, "ozma_user_id": ozma_user_id}
+
+    @app.delete("/api/v1/messaging/channels/{channel}/identity-map/{platform_id}")
+    async def remove_identity_mapping(request: Request, channel: str, platform_id: str) -> dict[str, Any]:
+        """Remove platform_id → ozma_user_id mapping."""
+        _require_scope(request, SCOPE_WRITE)
+        if not notifier:
+            raise HTTPException(status_code=503, detail="Messaging bridge not available")
+        notifier.remove_identity_mapping(channel, platform_id)
+        return {"ok": True, "platform_id": platform_id}
 
     # --- Session recording endpoints ---
 

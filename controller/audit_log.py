@@ -35,6 +35,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -137,6 +138,23 @@ class AuditLogger:
                     "match_text": json.dumps(data)[:500],
                 }),
             )
+
+    def log_messaging_event(self, direction: str, channel: str, sender: str, 
+                           message_hash: str, data: dict = None) -> None:
+        """Log messaging events when MESSAGING_AUDIT is enabled."""
+        if not self._enabled or os.getenv("MESSAGING_AUDIT") != "1":
+            return
+            
+        event_data = {
+            "channel": channel,
+            "sender": sender,
+            "message_hash": message_hash,
+            "direction": direction
+        }
+        if data:
+            event_data["data"] = data
+            
+        self.log_event("messaging.message", "messaging_bridge", event_data, "info")
 
     # Convenience methods for common event types
     def log_scenario_switch(self, from_id: str, to_id: str, source: str = "controller") -> None:
