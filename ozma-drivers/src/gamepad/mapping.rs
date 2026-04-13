@@ -55,6 +55,28 @@ pub fn map_button(button: Button) -> Option<ControlEvent> {
             control: "guide".into(),
             action:  Action::AudioMute { target: "@active".into() },
         }),
+        Button::DPadRight => Some(ControlEvent {
+            control: "dpad_right".into(),
+            action:  Action::ScenarioNext { delta: 1 },
+        }),
+        Button::DPadLeft => Some(ControlEvent {
+            control: "dpad_left".into(),
+            action:  Action::ScenarioNext { delta: -1 },
+        }),
+        Button::DPadUp => Some(ControlEvent {
+            control: "dpad_up".into(),
+            action:  Action::AudioVolumeStep {
+                target: "@active".into(),
+                step:   0.05,
+            },
+        }),
+        Button::DPadDown => Some(ControlEvent {
+            control: "dpad_down".into(),
+            action:  Action::AudioVolumeStep {
+                target: "@active".into(),
+                step:   -0.05,
+            },
+        }),
         // East / North / West / Select / Start / thumb-clicks — reserved
         _ => None,
     }
@@ -85,7 +107,7 @@ pub fn map_axis(axis: Axis, value: f32) -> Option<ControlEvent> {
 
         // D-pad vertical
         Axis::DPadY => {
-            if value > 0.5 {
+            if value < -0.5 {
                 Some(ControlEvent {
                     control: "dpad_up".into(),
                     action:  Action::AudioVolumeStep {
@@ -93,7 +115,7 @@ pub fn map_axis(axis: Axis, value: f32) -> Option<ControlEvent> {
                         step:   0.05,
                     },
                 })
-            } else if value < -0.5 {
+            } else if value > 0.5 {
                 Some(ControlEvent {
                     control: "dpad_down".into(),
                     action:  Action::AudioVolumeStep {
@@ -182,5 +204,17 @@ mod tests {
     #[test]
     fn dpad_center_ignored() {
         assert!(map_axis(Axis::DPadX, 0.0).is_none());
+    }
+    
+    #[test]
+    fn dpad_up_volume_up() {
+        let ev = map_button(Button::DPadUp).unwrap();
+        assert!(matches!(ev.action, Action::AudioVolumeStep { step: 0.05, .. }));
+    }
+    
+    #[test]
+    fn dpad_down_volume_down() {
+        let ev = map_button(Button::DPadDown).unwrap();
+        assert!(matches!(ev.action, Action::AudioVolumeStep { step: -0.05, .. }));
     }
 }

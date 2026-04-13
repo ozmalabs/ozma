@@ -192,9 +192,31 @@ impl GamepadDriver {
 
             // ── Axis change ───────────────────────────────────────────────
             EventType::AxisChanged(axis, value, _code) => {
-                if let Some(ev) = mapping::map_axis(axis, value) {
-                    debug!(axis = ?axis, value, control = %ev.control, "Axis change");
-                    self.dispatch(id, ev);
+                // Apply deadzone filtering for all axes
+                let filtered_value = match axis {
+                    Axis::RightZ | Axis::LeftZ => {
+                        // Triggers: 0.0 to 1.0 range
+                        if value.abs() < mapping::TRIGGER_DEADZONE {
+                            0.0
+                        } else {
+                            value
+                        }
+                    }
+                    _ => {
+                        // Sticks and D-pad: -1.0 to 1.0 range
+                        if value.abs() < 0.15 {
+                            0.0
+                        } else {
+                            value
+                        }
+                    }
+                };
+
+                if filtered_value != 0.0 {
+                    if let Some(ev) = mapping::map_axis(axis, filtered_value) {
+                        debug!(axis = ?axis, value = filtered_value, control = %ev.control, "Axis change");
+                        self.dispatch(id, ev);
+                    }
                 }
             }
 
