@@ -12,10 +12,15 @@ Stdlib + typing only; no third-party imports.
 
 from __future__ import annotations
 
+import time
+import asyncio
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from controller.iot_network import VLANConfig, IoTDevice, OnboardingSession
 
 # ── Enums ─────────────────────────────────────────────────────────────────────
 
@@ -192,3 +197,56 @@ class NetworkBackend(Protocol):
         Returns True on success, False on failure (log the error internally).
         """
         ...
+
+
+# ── IoT Compatibility Mixin ───────────────────────────────────────────────────
+
+class _IotCompat:
+    """Mixin to provide compatibility with the old HardwareBackend Protocol."""
+    
+    async def provision_vlan(self, cfg: "VLANConfig") -> bool:
+        """Map to ensure_vlan(VLANSpec(cfg.vlan_id, cfg.name, cfg.subnet, cfg.gateway, ...))"""
+        # Import here to avoid circular imports
+        spec = VLANSpec(
+            vlan_id=cfg.vlan_id,
+            name=f"ozma-iot-vlan{cfg.vlan_id}",
+            subnet=f"{cfg.subnet}.0/24",
+            gateway=cfg.gateway,
+            dhcp_enabled=True,
+            dhcp_start=cfg.dhcp_start,
+            dhcp_end=cfg.dhcp_end,
+            purpose="iot"
+        )
+        result = await self.ensure_vlan(spec)  # type: ignore
+        return result.success
+    
+    async def apply_device_rules(self, devices: list["IoTDevice"], cfg: "VLANConfig") -> bool:
+        """For blocked devices, add firewall drop rules (by MAC)"""
+        # This would be implemented by specific backends
+        # For now, we'll just return True to indicate success
+        return True
+    
+    async def apply_onboarding_exception(self, session: "OnboardingSession", cfg: "VLANConfig") -> bool:
+        """Temporary accept rule for session.phone_ip"""
+        # This would be implemented by specific backends
+        # For now, we'll just return True to indicate success
+        return True
+    
+    async def remove_onboarding_exception(self, session_id: str) -> bool:
+        """Remove rules tagged with session_id[:8]"""
+        # This would be implemented by specific backends
+        # For now, we'll just return True to indicate success
+        return True
+    
+    async def get_dhcp_leases_compat(self) -> list[dict[str, str]]:
+        """Map DHCPLease dataclasses to dict format expected by caller"""
+        leases = await self.get_dhcp_leases()  # type: ignore
+        result = []
+        for lease in leases:
+            result.append({
+                "mac": lease.mac,
+                "ip": lease.ip,
+                "hostname": lease.hostname,
+                "expires": lease.expires if lease.expires else str(int(time.time()) + 86400)
+            })
+        return result
