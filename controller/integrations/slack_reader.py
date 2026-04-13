@@ -90,7 +90,7 @@ class SlackReader:
     def _extract_channel_name(self, query: str) -> Optional[str]:
         """Extract channel name from query."""
         import re
-        match = re.search(r"#(\w+)", query)
+        match = re.search(r"#([a-zA-Z0-9\-_]+)", query)
         return match.group(1) if match else None
     
     def _extract_message_limit(self, query: str) -> Optional[int]:

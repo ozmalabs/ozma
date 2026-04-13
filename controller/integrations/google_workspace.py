@@ -108,11 +108,14 @@ class GoogleWorkspaceReader:
                 query_param = "is:important OR is:unread"
                 
             # Query Gmail
-            results = await self._gmail.users().messages().list(
-                userId='me',
-                q=query_param,
-                maxResults=5
-            ).execute()
+            results = await asyncio.get_event_loop().run_in_executor(
+                None, 
+                lambda: self._gmail.users().messages().list(
+                    userId='me',
+                    q=query_param,
+                    maxResults=5
+                ).execute()
+            )
             
             messages = results.get('messages', [])
             
@@ -121,10 +124,13 @@ class GoogleWorkspaceReader:
                 
             formatted = ["Recent/relevant emails:"]
             for message in messages:
-                msg = await self._gmail.users().messages().get(
-                    userId='me',
-                    id=message['id']
-                ).execute()
+                msg = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda mid=message['id']: self._gmail.users().messages().get(
+                        userId='me',
+                        id=mid
+                    ).execute()
+                )
                 
                 # Extract headers
                 headers = msg['payload']['headers']

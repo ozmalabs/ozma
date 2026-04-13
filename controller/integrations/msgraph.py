@@ -56,8 +56,8 @@ class MicrosoftGraphReader:
             
             # Query calendar events
             events = await self._client.me.calendar_view.get(
-                start_datetime=start_of_day.isoformat(),
-                end_datetime=end_of_day.isoformat()
+                start=start_of_day.isoformat(),
+                end=end_of_day.isoformat()
             )
             
             if not events:
@@ -89,18 +89,16 @@ class MicrosoftGraphReader:
         try:
             # Search for emails based on query keywords
             search_query = self._extract_search_terms(query)
+            query_params = {
+                '$top': 5,
+                '$orderby': 'receivedDateTime DESC'
+            }
             if search_query:
-                messages = await self._client.me.messages.get(
-                    search=search_query,
-                    top=5,
-                    orderby=["receivedDateTime DESC"]
-                )
-            else:
-                # Get recent emails
-                messages = await self._client.me.messages.get(
-                    top=5,
-                    orderby=["receivedDateTime DESC"]
-                )
+                query_params['$search'] = f'"{search_query}"'
+            
+            messages = await self._client.me.messages.get(
+                **query_params
+            )
             
             if not messages:
                 return "No recent emails found"
