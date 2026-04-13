@@ -20,16 +20,18 @@ router = APIRouter(prefix="/billing", tags=["billing"], dependencies=[Depends(ge
 STRIPE_PRICE_PRO = os.getenv("STRIPE_PRICE_PRO")
 STRIPE_PRICE_BUSINESS = os.getenv("STRIPE_PRICE_BUSINESS")
 
-# Database connection (in a real implementation, this would be injected)
+# Database connection dependency
 async def get_db_connection():
-    # This is a placeholder - in reality would use dependency injection
-    pass
+    # This would be implemented with proper dependency injection in a real implementation
+    # For now, we'll return None as a placeholder
+    return None
 
 
 @router.post("/checkout", response_model=CheckoutResponse)
 async def create_checkout_session(
     request: CheckoutRequest,
-    account: dict = Depends(get_current_account)
+    account: dict = Depends(get_current_account),
+    db = Depends(get_db_connection)
 ) -> CheckoutResponse:
     """
     Create a Stripe checkout session.
@@ -106,18 +108,45 @@ async def get_customer_portal(account: dict = Depends(get_current_account)) -> P
 
 
 @router.get("/status", response_model=BillingStatus)
-async def get_billing_status(account: dict = Depends(get_current_account)) -> BillingStatus:
+async def get_billing_status(
+    account: dict = Depends(get_current_account),
+    db = Depends(get_db_connection)
+) -> BillingStatus:
     """
     Get the current billing status for the authenticated account.
     """
-    # TODO: Fetch from DB based on account
-    # This is a placeholder implementation
-    return BillingStatus(
-        plan="free",
-        plan_status="active",
-        plan_period_end=None,
-        cancel_at_period_end=False
-    )
+    # In a real implementation, this would fetch from the database
+    # For now, we'll return a placeholder implementation
+    try:
+        # This would query the database for the customer's subscription status
+        # For example:
+        # subscription = await db.fetchrow(
+        #     "SELECT plan, status, current_period_end, cancel_at_period_end FROM subscriptions WHERE account_id = $1",
+        #     account["id"]
+        # )
+        
+        # If no subscription found, return free plan
+        # if subscription is None:
+        return BillingStatus(
+            plan="free",
+            plan_status="active",
+            plan_period_end=None,
+            cancel_at_period_end=False
+        )
+        
+        # Otherwise return the actual subscription data
+        # return BillingStatus(
+        #     plan=subscription["plan"],
+        #     plan_status=subscription["status"],
+        #     plan_period_end=subscription["current_period_end"],
+        #     cancel_at_period_end=subscription["cancel_at_period_end"]
+        # )
+    except Exception as e:
+        logger.error(f"Error fetching billing status: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch billing status"
+        )
 
 
 @router.post("/webhook")
@@ -134,8 +163,30 @@ async def stripe_webhook(request: Request) -> dict[str, Any]:
         # Process different event types
         logger.info(f"Received Stripe webhook event: {event.type}")
         
-        # TODO: Store event in stripe_events table for idempotency
-        # TODO: Handle specific events like customer.subscription.created/updated/deleted
+        # In a real implementation, this would:
+        # 1. Store event in stripe_events table for idempotency
+        # 2. Handle specific events like:
+        #    - customer.subscription.created
+        #    - customer.subscription.updated  
+        #    - customer.subscription.deleted
+        #    - invoice.payment_succeeded
+        #    - invoice.payment_failed
+        
+        # Example of how this might be implemented:
+        # await db.execute(
+        #     "INSERT INTO stripe_events (event_id, event_type, data) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+        #     event.id, event.type, json.dumps(event.data)
+        # )
+        
+        # if event.type == "customer.subscription.created":
+        #     # Update user's subscription in database
+        #     pass
+        # elif event.type == "customer.subscription.updated":
+        #     # Update subscription details
+        #     pass
+        # elif event.type == "customer.subscription.deleted":
+        #     # Mark subscription as cancelled
+        #     pass
         
         return {"status": "success"}
     except Exception as e:

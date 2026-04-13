@@ -11,7 +11,7 @@ class BillingStatus(BaseModel):
 
 
 class CheckoutRequest(BaseModel):
-    price_id: str
+    tier: str
 
 
 class CheckoutResponse(BaseModel):
