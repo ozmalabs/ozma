@@ -20,10 +20,14 @@ router = APIRouter(prefix="/billing", tags=["billing"], dependencies=[Depends(ge
 STRIPE_PRICE_PRO = os.getenv("STRIPE_PRICE_PRO")
 STRIPE_PRICE_BUSINESS = os.getenv("STRIPE_PRICE_BUSINESS")
 
+# Validate that required environment variables are set
+if not STRIPE_PRICE_PRO or not STRIPE_PRICE_BUSINESS:
+    raise ValueError("STRIPE_PRICE_PRO and STRIPE_PRICE_BUSINESS environment variables must be set")
+
 # Database connection dependency
 async def get_db_connection():
-    # This would be implemented with proper dependency injection in a real implementation
-    # For now, we'll return None as a placeholder
+    # In a real implementation, this would create a proper database connection
+    # For now, we'll return None as a placeholder since the status endpoint needs work
     return None
 
 
@@ -46,18 +50,18 @@ async def create_checkout_session(
     # Get price ID based on tier
     price_id = STRIPE_PRICE_PRO if request.tier == "pro" else STRIPE_PRICE_BUSINESS
     
-    if not price_id:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Price ID not configured for tier: {request.tier}"
-        )
-    
     try:
         # Get or create Stripe customer using the StripeClient
         customer = StripeClient.get_or_create_customer(
             account_id=account["id"],
             email=account.get("email", "")
         )
+        
+        if not customer or not hasattr(customer, 'id'):
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to create or retrieve Stripe customer"
+            )
                 
         # Create checkout session
         session = stripe.checkout.Session.create(
@@ -73,6 +77,12 @@ async def create_checkout_session(
         )
         
         return CheckoutResponse(session_id=session.id, session_url=session.url)
+    except stripe.error.StripeError as e:
+        logger.error(f"Stripe error creating checkout session: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Stripe error: {str(e)}"
+        )
     except Exception as e:
         logger.error(f"Error creating checkout session: {e}")
         raise HTTPException(
@@ -99,6 +109,12 @@ async def get_customer_portal(account: dict = Depends(get_current_account)) -> P
             return_url="https://connect.ozma.dev/dashboard/billing"
         )
         return PortalResponse(portal_url=portal_session.url)
+    except stripe.error.StripeError as e:
+        logger.error(f"Stripe error creating portal session: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Stripe error: {str(e)}"
+        )
     except Exception as e:
         logger.error(f"Error creating portal session: {e}")
         raise HTTPException(
@@ -189,6 +205,12 @@ async def stripe_webhook(request: Request) -> dict[str, Any]:
         #     pass
         
         return {"status": "success"}
+    except stripe.error.StripeError as e:
+        logger.error(f"Stripe error processing webhook: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Stripe error: {str(e)}"
+        )
     except Exception as e:
         logger.error(f"Error processing webhook: {e}")
         raise HTTPException(
