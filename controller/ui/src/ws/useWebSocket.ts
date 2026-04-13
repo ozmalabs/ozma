@@ -5,7 +5,7 @@
  * Reconnects with exponential backoff: 1 s → 2 s → 4 s → … → 30 s (max).
  */
 import { useEffect, useRef } from 'react'
-import { useOzmaStore } from '../store/useOzmaStore'
+import { useOzmaStore } from '../store/ozmaStore'
 
 const BACKOFF_INITIAL = 1000
 const BACKOFF_MAX = 30000
