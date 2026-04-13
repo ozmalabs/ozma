@@ -1280,3 +1280,20 @@ pub mod display;
 pub mod types;
 
 pub use surface::{MidiSurface, MidiSurfaceConfig};
+//! MIDI control surface support for ozma.
+//!
+//! Ported from surfacepresser-run's midi_controller.py + midi_integration.py,
+//! rewritten as a clean async module that integrates with ozma's ControlSurface
+//! abstraction.
+//!
+//! Supports:
+//!   - Faders (motorised, with touch lockout)
+//!   - Buttons (toggle / momentary, with LED feedback)
+//!   - Rotary encoders
+//!   - Jog wheels
+//!   - Behringer X-Touch scribble strip LCD displays
+//!   - Behringer 7-segment displays
+
+pub mod types;
+pub mod surface;
+pub mod io;

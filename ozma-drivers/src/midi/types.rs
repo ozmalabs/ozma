@@ -390,3 +390,136 @@ pub fn unidecode(text: &str) -> String {
         .map(|c| if c.is_ascii() { c } else { '?' })
         .collect()
 }
+//! MIDI control surface types and enums
+
+use serde::{Deserialize, Serialize};
+
+/// LCD colors for Behringer X-Touch displays
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Color {
+    Black = 0,
+    Red = 1,
+    Green = 2,
+    Yellow = 3,
+    Blue = 4,
+    Magenta = 5,
+    Cyan = 6,
+    White = 7,
+}
+
+impl Color {
+    /// Convert hex color string to LCD color
+    pub fn from_hex(hex_color: Option<&str>) -> Self {
+        match hex_color {
+            Some(color) => {
+                let color = color.to_lowercase();
+                match color.as_str() {
+                    "#ff0000" => Color::Red,
+                    "#00ff00" => Color::Green,
+                    "#0000ff" => Color::Blue,
+                    "#ffff00" => Color::Yellow,
+                    "#ff00ff" => Color::Magenta,
+                    "#00ffff" => Color::Cyan,
+                    "#ffffff" => Color::White,
+                    "#000000" => Color::Black,
+                    _ => {
+                        // Try name match
+                        if color.contains("red") {
+                            Color::Red
+                        } else if color.contains("green") {
+                            Color::Green
+                        } else if color.contains("blue") {
+                            Color::Blue
+                        } else if color.contains("yellow") {
+                            Color::Yellow
+                        } else if color.contains("magenta") {
+                            Color::Magenta
+                        } else if color.contains("cyan") {
+                            Color::Cyan
+                        } else if color.contains("black") {
+                            Color::Black
+                        } else {
+                            Color::White
+                        }
+                    }
+                }
+            }
+            None => Color::White,
+        }
+    }
+}
+
+/// Invert options for LCD displays
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Invert {
+    None = 0,
+    Top = 1,
+    Bottom = 2,
+    Both = 3,
+}
+
+/// Control types supported by MIDI surfaces
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ControlType {
+    #[serde(rename = "fader")]
+    Fader,
+    #[serde(rename = "button")]
+    Button,
+    #[serde(rename = "rotary")]
+    Rotary,
+    #[serde(rename = "jogwheel")]
+    JogWheel,
+}
+
+/// Button styles
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ButtonStyle {
+    #[serde(rename = "toggle")]
+    Toggle,
+    #[serde(rename = "momentary")]
+    Momentary,
+}
+
+/// Light styles for buttons
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LightStyle {
+    #[serde(rename = "state")]
+    State,
+    #[serde(rename = "always_on")]
+    AlwaysOn,
+    #[serde(rename = "momentary")]
+    Momentary,
+}
+
+/// MIDI control configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MidiControlConfig {
+    #[serde(rename = "type")]
+    pub control_type: ControlType,
+    #[serde(default)]
+    pub control: Option<u8>,
+    #[serde(default)]
+    pub note: Option<u8>,
+    #[serde(default)]
+    pub style: Option<ButtonStyle>,
+    #[serde(default)]
+    pub light: Option<LightStyle>,
+}
+
+/// Display configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisplayConfig {
+    #[serde(rename = "type")]
+    pub display_type: String,
+    pub binding: Option<String>,
+}
+
+/// MIDI surface configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MidiSurfaceConfig {
+    pub device: String,
+    #[serde(default)]
+    pub controls: std::collections::HashMap<String, MidiControlConfig>,
+    #[serde(default)]
+    pub displays: std::collections::HashMap<String, DisplayConfig>,
+}
