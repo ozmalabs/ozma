@@ -1,0 +1,201 @@
+//! Types and enums for MIDI control surfaces
+
+use serde::{Deserialize, Serialize};
+
+/// MIDI message structure
+#[derive(Debug, Clone)]
+pub struct MidiMessage {
+    pub msg_type: String,
+    pub channel: u8,
+    pub control: Option<u8>,
+    pub note: Option<u8>,
+    pub value: u8,
+}
+
+/// Control types supported by the MIDI surface
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ControlType {
+    Fader,
+    Button,
+    Rotary,
+    JogWheel,
+}
+
+/// Button interaction styles
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ButtonStyle {
+    Toggle,
+    Momentary,
+}
+
+/// LED light behavior styles
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum LightStyle {
+    State,
+    AlwaysOn,
+    Momentary,
+    #[serde(rename = "false")]
+    False,
+}
+
+impl Default for ButtonStyle {
+    fn default() -> Self {
+        ButtonStyle::Toggle
+    }
+}
+
+impl Default for LightStyle {
+    fn default() -> Self {
+        LightStyle::State
+    }
+}
+
+/// LCD display colors
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Color {
+    Black = 0,
+    Red = 1,
+    Green = 2,
+    Yellow = 3,
+    Blue = 4,
+    Magenta = 5,
+    Cyan = 6,
+    White = 7,
+}
+
+impl Color {
+    pub fn from_hex(hex_color: Option<&str>) -> Self {
+        if let Some(color) = hex_color {
+            let color = color.to_lowercase();
+            match color.as_str() {
+                "#ff0000" => Self::Red,
+                "#00ff00" => Self::Green,
+                "#0000ff" => Self::Blue,
+                "#ffff00" => Self::Yellow,
+                "#ff00ff" => Self::Magenta,
+                "#00ffff" => Self::Cyan,
+                "#ffffff" => Self::White,
+                "#000000" => Self::Black,
+                _ => {
+                    // Try name match
+                    if color.contains("red") {
+                        Self::Red
+                    } else if color.contains("green") {
+                        Self::Green
+                    } else if color.contains("blue") {
+                        Self::Blue
+                    } else if color.contains("yellow") {
+                        Self::Yellow
+                    } else if color.contains("magenta") {
+                        Self::Magenta
+                    } else if color.contains("cyan") {
+                        Self::Cyan
+                    } else if color.contains("black") {
+                        Self::Black
+                    } else {
+                        Self::White
+                    }
+                }
+            }
+        } else {
+            Self::White
+        }
+    }
+}
+
+/// LCD display invert options
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Invert {
+    None = 0,
+    Top = 1,
+    Bottom = 2,
+    Both = 3,
+}
+
+/// 7-segment display font mapping
+pub const SEGMENT_FONT: [u8; 128] = {
+    let mut font = [0u8; 128];
+    // Initialize with default values
+    let mut i = 0;
+    while i < 128 {
+        font[i] = 0;
+        i += 1;
+    }
+    
+    // Numbers
+    font[b'0' as usize] = 0x3F;
+    font[b'1' as usize] = 0x06;
+    font[b'2' as usize] = 0x5B;
+    font[b'3' as usize] = 0x4F;
+    font[b'4' as usize] = 0x66;
+    font[b'5' as usize] = 0x6D;
+    font[b'6' as usize] = 0x7D;
+    font[b'7' as usize] = 0x07;
+    font[b'8' as usize] = 0x7F;
+    font[b'9' as usize] = 0x6F;
+    
+    // Letters
+    font[b'A' as usize] = 0x77;
+    font[b'B' as usize] = 0x7F;
+    font[b'C' as usize] = 0x39;
+    font[b'D' as usize] = 0x3F;
+    font[b'E' as usize] = 0x79;
+    font[b'F' as usize] = 0x71;
+    font[b'G' as usize] = 0x3D;
+    font[b'H' as usize] = 0x76;
+    font[b'I' as usize] = 0x06;
+    font[b'J' as usize] = 0x0E;
+    font[b'K' as usize] = 0x75;
+    font[b'L' as usize] = 0x38;
+    font[b'M' as usize] = 0x37;
+    font[b'N' as usize] = 0x37;
+    font[b'O' as usize] = 0x3F;
+    font[b'P' as usize] = 0x73;
+    font[b'Q' as usize] = 0x67;
+    font[b'R' as usize] = 0x77;
+    font[b'S' as usize] = 0x6D;
+    font[b'T' as usize] = 0x78;
+    font[b'U' as usize] = 0x3E;
+    font[b'V' as usize] = 0x3E;
+    font[b'W' as usize] = 0x3E;
+    font[b'X' as usize] = 0x49;
+    font[b'Y' as usize] = 0x6E;
+    font[b'Z' as usize] = 0x5B;
+    
+    // Special characters
+    font[b' ' as usize] = 0x00;
+    font[b'-' as usize] = 0x40;
+    font[b'.' as usize] = 0x08;
+    font[b':' as usize] = 0x09;
+    font[b'(' as usize] = 0x39;
+    font[b')' as usize] = 0x0F;
+    
+    font
+};
+
+pub fn render_7seg(text: &str) -> Vec<u8> {
+    text.chars()
+        .take(12)
+        .map(|c| {
+            let idx = c as u8 as usize;
+            if idx < SEGMENT_FONT.len() {
+                SEGMENT_FONT[idx]
+            } else {
+                SEGMENT_FONT[b' ' as usize]
+            }
+        })
+        .collect()
+}
+
+/// Convert Unicode to ASCII for LCD displays
+pub fn unidecode(text: &str) -> String {
+    // Simple ASCII conversion for now
+    text.chars()
+        .map(|c| if c.is_ascii() { c } else { '?' })
+        .collect()
+}
