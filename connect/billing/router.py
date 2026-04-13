@@ -26,24 +26,9 @@ if not STRIPE_PRICE_PRO or not STRIPE_PRICE_BUSINESS:
     raise ValueError("STRIPE_PRICE_PRO and STRIPE_PRICE_BUSINESS environment variables must be set")
 
 # Database connection dependency
-async def get_db_connection():
-    # This would create a proper database connection pool in a real implementation
-    # For now, we'll return a mock connection object for demonstration
-    class MockConnection:
-        async def fetchrow(self, query, *args):
-            # Mock implementation - in reality this would query the database
-            if "stripe_events" in query:
-                return None  # Simulate event not found
-            return None
-        
-        async def execute(self, query, *args):
-            # Mock implementation - in reality this would execute the query
-            pass
-            
-        async def close(self):
-            pass
-    
-    return MockConnection()
+async def get_db_connection(request: Request):
+    # Get the database connection from the app state
+    return request.app.state.db
 
 
 @router.post("/checkout", response_model=CheckoutResponse)
