@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 from datetime import datetime
@@ -25,6 +26,11 @@ from datetime import datetime
 from ..notifications import NotificationManager
 
 log = logging.getLogger("ozma.messaging.connect_chat")
+
+# Maximum message length to prevent abuse
+MAX_MESSAGE_LENGTH = 10000
+# Maximum queue size for response streaming
+MAX_RESPONSE_QUEUE_SIZE = 100
 
 
 @dataclass
@@ -34,6 +40,10 @@ class ConnectUser:
     username: str
     plan: str  # "free", "pro", "enterprise"
     active: bool
+
+    def is_authenticated(self) -> bool:
+        """Check if user is properly authenticated."""
+        return bool(self.user_id) and self.active
 
 
 @dataclass
@@ -90,20 +100,39 @@ class ConnectChatAdapter:
             message: Parsed WebSocket message
             user: Authenticated Connect user
         """
+        # Validate user authentication
+        if not user.is_authenticated():
+            log.warning("Received message from unauthenticated user")
+            return
+            
+        # Validate message structure
+        if not isinstance(message, dict):
+            log.warning("Received invalid message format from user %s", user.user_id)
+            return
+            
         msg_type = message.get("type")
         if not msg_type:
-            log.warning("Received WebSocket message without type")
+            log.warning("Received WebSocket message without type from user %s", user.user_id)
+            return
+            
+        # Validate message type
+        if not isinstance(msg_type, str):
+            log.warning("Received invalid message type from user %s", user.user_id)
             return
             
         handler = self._message_handlers.get(msg_type)
         if not handler:
-            log.warning("Unknown WebSocket message type: %s", msg_type)
+            log.warning("Unknown WebSocket message type: %s from user %s", msg_type, user.user_id)
             return
             
         try:
             await handler(message, user)
+        except asyncio.CancelledError:
+            # Handle task cancellation gracefully
+            log.debug("WebSocket message handling cancelled for user %s", user.user_id)
+            raise
         except Exception as e:
-            log.error("Error handling WebSocket message: %s", e, exc_info=True)
+            log.error("Error handling WebSocket message from user %s: %s", user.user_id, e, exc_info=True)
             
     async def _handle_agent_message(self, message: dict, user: ConnectUser) -> None:
         """
@@ -113,26 +142,53 @@ class ConnectChatAdapter:
             message: {type: 'agent_message', text: str, node_id?: str}
             user: Authenticated Connect user
         """
+        # Validate message content
         text = message.get("text", "")
+        if not isinstance(text, str):
+            log.warning("Received agent_message with invalid text from user %s", user.user_id)
+            return
+            
+        # Check message length
+        if len(text) > MAX_MESSAGE_LENGTH:
+            log.warning("Received agent_message too long from user %s (length: %d)", user.user_id, len(text))
+            await self._send_error_response(user, "Message too long")
+            return
+            
+        # Validate text content (basic sanitization)
+        if not self._is_valid_message_text(text):
+            log.warning("Received agent_message with invalid content from user %s", user.user_id)
+            await self._send_error_response(user, "Invalid message content")
+            return
+            
         node_id = message.get("node_id")
         thread_id = message.get("thread_id")
         
-        if not text:
-            log.warning("Received agent_message without text")
+        # Validate optional fields
+        if node_id is not None and not isinstance(node_id, str):
+            log.warning("Received agent_message with invalid node_id from user %s", user.user_id)
+            return
+            
+        if thread_id is not None and not isinstance(thread_id, str):
+            log.warning("Received agent_message with invalid thread_id from user %s", user.user_id)
+            return
+        
+        if not text.strip():
+            log.warning("Received agent_message without text from user %s", user.user_id)
+            await self._send_error_response(user, "Message text is required")
             return
             
         # Create chat message
         chat_msg = ChatMessage(
             id=f"msg_{int(datetime.now().timestamp() * 1000000)}",
             user_id=user.user_id,
-            text=text,
+            text=text.strip(),
             timestamp=datetime.now(),
             node_id=node_id,
             thread_id=thread_id,
         )
         
-        # Create response stream
-        response_stream = asyncio.Queue()
+        # Create response stream with size limit
+        response_stream = asyncio.Queue(maxsize=MAX_RESPONSE_QUEUE_SIZE)
         
         # Create chat context
         context = ChatContext(
@@ -148,8 +204,21 @@ class ConnectChatAdapter:
             # Process the message based on user plan
             if user.plan == "free":
                 await self._handle_free_user(context)
-            else:
+            elif user.plan in ["pro", "enterprise"]:
                 await self._handle_paid_user(context)
+            else:
+                log.warning("Unknown plan type for user %s: %s", user.user_id, user.plan)
+                await self._handle_free_user(context)  # Default to free tier
+        except asyncio.CancelledError:
+            # Handle task cancellation gracefully
+            log.debug("Message processing cancelled for user %s", user.user_id)
+            raise
+        except Exception as e:
+            log.error("Error processing message for user %s: %s", user.user_id, e, exc_info=True)
+            try:
+                await self._send_error_response(user, "An error occurred processing your message")
+            except Exception:
+                log.error("Failed to send error response to user %s", user.user_id)
         finally:
             # Clean up session
             self._active_sessions.pop(session_id, None)
@@ -205,6 +274,11 @@ class ConnectChatAdapter:
             text: Response text chunk
             done: Whether this is the final chunk
         """
+        # Validate text content
+        if not isinstance(text, str):
+            log.warning("Attempted to send non-string response chunk to user %s", context.user.user_id)
+            return
+            
         chunk_msg = {
             "type": "agent_chunk",
             "text": text,
@@ -214,10 +288,71 @@ class ConnectChatAdapter:
         
         # In a real implementation, this would send via WebSocket
         # For now, we'll put it on the response stream
-        await context.response_stream.put(chunk_msg)
+        try:
+            # Use put_nowait to avoid hanging if queue is full
+            context.response_stream.put_nowait(chunk_msg)
+        except asyncio.QueueFull:
+            log.warning("Response stream queue full for user %s, dropping chunk", context.user.user_id)
+            return
         
         log.debug("Sent response chunk to user %s: %s (done=%s)", 
-                 context.user.user_id, text[:50], done)
+                 context.user.user_id, text[:50] if text else "", done)
+                 
+    async def _send_error_response(self, user: ConnectUser, error_message: str) -> None:
+        """
+        Send an error response to the user.
+        
+        Args:
+            user: The user to send the error to
+            error_message: The error message to send
+        """
+        error_context = ChatContext(
+            user=user,
+            message=ChatMessage(
+                id=f"error_{int(datetime.now().timestamp() * 1000000)}",
+                user_id=user.user_id,
+                text="",
+                timestamp=datetime.now(),
+            ),
+            response_stream=asyncio.Queue(maxsize=MAX_RESPONSE_QUEUE_SIZE),
+        )
+        
+        try:
+            await self._send_response_chunk(error_context, f"❌ {error_message}", done=True)
+        except Exception as e:
+            log.error("Failed to send error response to user %s: %s", user.user_id, e)
+                 
+    def _is_valid_message_text(self, text: str) -> bool:
+        """
+        Validate message text for basic security checks.
+        
+        Args:
+            text: The text to validate
+            
+        Returns:
+            bool: True if text is valid, False otherwise
+        """
+        if not text:
+            return True
+            
+        # Check for excessive whitespace
+        if len(text) > 100 and text.count(' ') > len(text) * 0.5:
+            return False
+            
+        # Basic pattern checks for potentially malicious content
+        # Note: This is not comprehensive security validation
+        malicious_patterns = [
+            r'<script.*?>',  # Basic XSS patterns
+            r'javascript:',  # JavaScript URLs
+            r'on\w+\s*=',    # HTML event handlers
+        ]
+        
+        text_lower = text.lower()
+        for pattern in malicious_patterns:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                return False
+                
+        return True
                  
     async def send_proactive_alert(self, user_id: str, alert_text: str, 
                                  thread_id: Optional[str] = None) -> None:
@@ -231,6 +366,23 @@ class ConnectChatAdapter:
             alert_text: Alert message text
             thread_id: Optional thread ID to associate with
         """
+        # Validate inputs
+        if not isinstance(user_id, str) or not user_id:
+            log.warning("Invalid user_id for proactive alert")
+            return
+            
+        if not isinstance(alert_text, str) or not alert_text.strip():
+            log.warning("Invalid alert_text for proactive alert")
+            return
+            
+        if thread_id is not None and not isinstance(thread_id, str):
+            log.warning("Invalid thread_id for proactive alert")
+            return
+            
+        # Truncate alert text if too long
+        if len(alert_text) > MAX_MESSAGE_LENGTH:
+            alert_text = alert_text[:MAX_MESSAGE_LENGTH] + "..."
+            
         alert_msg = {
             "type": "agent_chunk",
             "text": f"🚨 Alert: {alert_text}",
@@ -240,14 +392,22 @@ class ConnectChatAdapter:
         }
         
         # TODO: Implement actual WebSocket sending mechanism
-        log.info("Proactive alert for user %s: %s", user_id, alert_text)
+        log.info("Proactive alert for user %s: %s", user_id, alert_text[:100])
         
-        # Trigger notification event for potential other channels
-        await self.notification_manager.on_event(
-            "connect_chat.proactive_alert",
-            {
-                "user_id": user_id,
-                "text": alert_text,
-                "thread_id": alert_msg["thread_id"],
-            }
-        )
+        # Check if notification manager is available
+        if not hasattr(self, 'notification_manager') or not self.notification_manager:
+            log.warning("Notification manager not available for proactive alert")
+            return
+            
+        try:
+            # Trigger notification event for potential other channels
+            await self.notification_manager.on_event(
+                "connect_chat.proactive_alert",
+                {
+                    "user_id": user_id,
+                    "text": alert_text,
+                    "thread_id": alert_msg["thread_id"],
+                }
+            )
+        except Exception as e:
+            log.error("Failed to send proactive alert notification for user %s: %s", user_id, e)
