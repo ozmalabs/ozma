@@ -1437,6 +1437,175 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(status_code=404, detail="Node not found")
         return {"ok": True, "active_node_id": node_id}
 
+    # ── Universal Discovery endpoints ─────────────────────────────────────────
+
+    @app.get("/api/v1/discover")
+    async def list_discovered_devices(
+        request: Request,
+        type_filter: str = "",
+        configured: bool | None = None
+    ) -> dict[str, Any]:
+        """Return all discovered devices with optional filtering."""
+        _require_scope(request, SCOPE_READ)
+        
+        # Get discovery manager from state if available
+        discovery_mgr = getattr(state, 'discovery_manager', None)
+        if not discovery_mgr or not hasattr(discovery_mgr, 'list_devices'):
+            raise HTTPException(status_code=503, detail="Discovery manager not available")
+        
+        # Get all discovered devices
+        devices = discovery_mgr.list_devices()
+        
+        # Apply filters
+        if type_filter:
+            types = type_filter.split(',')
+            devices = [d for d in devices if d.get('type') in types]
+        
+        if configured is not None:
+            devices = [d for d in devices if d.get('configured', False) == configured]
+        
+        return {"devices": devices}
+
+    @app.post("/api/v1/discover/scan")
+    async def trigger_discovery_scan(request: Request) -> dict[str, Any]:
+        """Trigger an on-demand discovery scan."""
+        _require_scope(request, SCOPE_WRITE)
+        
+        # Get discovery manager from state if available
+        discovery_mgr = getattr(state, 'discovery_manager', None)
+        if not discovery_mgr or not hasattr(discovery_mgr, 'start_scan'):
+            raise HTTPException(status_code=503, detail="Discovery manager not available")
+        
+        # Start scan and return scan ID
+        try:
+            scan_id = await discovery_mgr.start_scan()
+            return {"scan_id": scan_id, "status": "started"}
+        except Exception as e:
+            log.error(f"Discovery scan failed: {e}")
+            raise HTTPException(status_code=500, detail=f"Discovery scan failed: {e}")
+
+    @app.get("/api/v1/discover/stream")
+    async def discovery_stream(request: Request) -> StreamingResponse:
+        """SSE stream for discovery events."""
+        _require_scope(request, SCOPE_READ)
+        
+        # Get discovery manager from state if available
+        discovery_mgr = getattr(state, 'discovery_manager', None)
+        if not discovery_mgr:
+            raise HTTPException(status_code=503, detail="Discovery manager not available")
+        
+        async def event_generator():
+            """Generate SSE events from discovery manager."""
+            # Check if discovery manager supports event streaming
+            if not hasattr(discovery_mgr, 'stream_events'):
+                # Fallback to basic event listening
+                queue = asyncio.Queue()
+                
+                # Subscribe to discovery events through state events
+                def subscribe_handler(event):
+                    if event.get("type", "").startswith("device_"):
+                        asyncio.create_task(queue.put(event))
+                
+                # Add temporary subscription
+                if hasattr(state, 'events') and hasattr(state.events, 'subscribe'):
+                    subscription_id = await state.events.subscribe(subscribe_handler)
+                
+                try:
+                    while True:
+                        event = await queue.get()
+                        yield f"data: {json.dumps(event)}\n\n"
+                except asyncio.CancelledError:
+                    # Clean up subscription
+                    if hasattr(state, 'events') and hasattr(state.events, 'unsubscribe'):
+                        await state.events.unsubscribe(subscription_id)
+                    raise
+            else:
+                # Use discovery manager's built-in streaming
+                async for event in discovery_mgr.stream_events():
+                    yield f"data: {json.dumps(event)}\n\n"
+        
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "Access-Control-Allow-Origin": "*",
+            }
+        )
+
+    @app.get("/api/v1/discover/{device_id}")
+    async def get_discovered_device(request: Request, device_id: str) -> dict[str, Any]:
+        """Get full details for a specific discovered device."""
+        _require_scope(request, SCOPE_READ)
+        
+        # Get discovery manager from state if available
+        discovery_mgr = getattr(state, 'discovery_manager', None)
+        if not discovery_mgr or not hasattr(discovery_mgr, 'get_device'):
+            raise HTTPException(status_code=503, detail="Discovery manager not available")
+        
+        device = discovery_mgr.get_device(device_id)
+        if not device:
+            raise HTTPException(status_code=404, detail="Device not found")
+        
+        return device
+
+    @app.post("/api/v1/discover/{device_id}/configure")
+    async def configure_discovered_device(
+        request: Request, 
+        device_id: str, 
+        body: dict
+    ) -> dict[str, Any]:
+        """Attempt to configure a discovered device with provided credentials."""
+        _require_scope(request, SCOPE_WRITE)
+        
+        # Get discovery manager from state if available
+        discovery_mgr = getattr(state, 'discovery_manager', None)
+        if not discovery_mgr or not hasattr(discovery_mgr, 'configure_device'):
+            raise HTTPException(status_code=503, detail="Discovery manager not available")
+        
+        credentials = body.get("credentials", {})
+        
+        try:
+            # Attempt configuration
+            result = await discovery_mgr.configure_device(device_id, credentials)
+            
+            if result.get("success"):
+                # Mark device as configured
+                if hasattr(discovery_mgr, 'mark_configured'):
+                    await discovery_mgr.mark_configured(device_id)
+                
+                # Emit event for WebSocket clients
+                await state.events.put({
+                    "type": "device_configured",
+                    "device_id": device_id,
+                    "device": result.get("device_info", {})
+                })
+                
+                # Integrate with onboarding system if available
+                onboarding_mgr = getattr(state, 'onboarding_manager', None)
+                if onboarding_mgr and hasattr(onboarding_mgr, 'create_task_for_device'):
+                    try:
+                        await onboarding_mgr.create_task_for_device(device_id, result.get("device_info", {}))
+                    except Exception as e:
+                        log.warning(f"Failed to create onboarding task for device {device_id}: {e}")
+                
+                return {"ok": True, "message": "Device configured successfully"}
+            else:
+                return {
+                    "ok": False, 
+                    "error": result.get("error", "Configuration failed"),
+                    "manual_steps": result.get("manual_steps", [])
+                }
+                
+        except Exception as e:
+            log.error(f"Device configuration failed for {device_id}: {e}")
+            return {
+                "ok": False,
+                "error": str(e),
+                "manual_steps": ["Check device connectivity", "Verify credentials", "Review device logs"]
+            }
+
     @app.get("/api/v1/nodes/{node_id}/usb")
     async def node_usb(node_id: str) -> dict[str, Any]:
         """Proxy /usb from the node's HTTP API."""
