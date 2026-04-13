@@ -25,6 +25,7 @@ import asyncio
 import logging
 import os
 import signal
+import subprocess
 import sys
 from pathlib import Path
 
@@ -154,6 +155,30 @@ log = logging.getLogger("ozma")
 
 async def run(config: Config) -> None:
     state = AppState()
+    
+    # Start Rust drivers subprocess
+    rust_driver_process = None
+    try:
+        rust_driver_process = subprocess.Popen(
+            ["ozma-drivers"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        log.info("Started Rust drivers subprocess (PID: %d)", rust_driver_process.pid)
+    except Exception as e:
+        log.warning("Failed to start Rust drivers subprocess: %s", e)
+    
+    # Start Rust drivers subprocess
+    rust_driver_process = None
+    try:
+        rust_driver_process = subprocess.Popen(
+            ["ozma-drivers"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        log.info("Started Rust drivers subprocess (PID: %d)", rust_driver_process.pid)
+    except Exception as e:
+        log.warning("Failed to start Rust drivers subprocess: %s", e)
 
     # Network backend integration
     if config.network_backend:
@@ -951,6 +976,26 @@ async def run(config: Config) -> None:
     logging.getLogger("ozma").info("Shutting down...")
     server.should_exit = True
     await server_task
+    
+    # Terminate Rust drivers subprocess
+    if rust_driver_process and rust_driver_process.poll() is None:
+        rust_driver_process.terminate()
+        try:
+            rust_driver_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            rust_driver_process.kill()
+            rust_driver_process.wait()
+        log.info("Rust drivers subprocess terminated")
+    
+    # Terminate Rust drivers subprocess
+    if rust_driver_process and rust_driver_process.poll() is None:
+        rust_driver_process.terminate()
+        try:
+            rust_driver_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            rust_driver_process.kill()
+            rust_driver_process.wait()
+        log.info("Rust drivers subprocess terminated")
     # Stop GraphQL subscription event router
     from controller.graphql.subscriptions import stop_event_router
     stop_event_router()
