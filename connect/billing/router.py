@@ -202,8 +202,8 @@ async def stripe_webhook(request: Request, db = Depends(get_db_connection)) -> d
         if event.type == "checkout.session.completed":
             # Extract account info and tier from session
             session = event.data.object
-            account_id = session.metadata.get("account_id")
-            tier = session.metadata.get("tier")
+            account_id = session.metadata.get("account_id") if hasattr(session, 'metadata') else None
+            tier = session.metadata.get("tier") if hasattr(session, 'metadata') else None
             
             if account_id and tier:
                 await db.execute(
@@ -211,10 +211,12 @@ async def stripe_webhook(request: Request, db = Depends(get_db_connection)) -> d
                     tier, account_id
                 )
                 logger.info(f"Updated account {account_id} to {tier} plan")
+            else:
+                logger.warning(f"Missing account_id or tier in checkout session metadata: {session.metadata if hasattr(session, 'metadata') else 'No metadata'}")
         
         elif event.type == "customer.subscription.deleted":
             subscription = event.data.object
-            customer_id = subscription.customer
+            customer_id = getattr(subscription, 'customer', None)
             
             if customer_id:
                 await db.execute(
@@ -222,10 +224,12 @@ async def stripe_webhook(request: Request, db = Depends(get_db_connection)) -> d
                     customer_id
                 )
                 logger.info(f"Downgraded account with customer ID {customer_id} to free plan")
+            else:
+                logger.warning("Missing customer_id in subscription.deleted event")
         
         elif event.type == "invoice.payment_failed":
             invoice = event.data.object
-            customer_id = invoice.customer
+            customer_id = getattr(invoice, 'customer', None)
             
             if customer_id:
                 await db.execute(
@@ -233,26 +237,32 @@ async def stripe_webhook(request: Request, db = Depends(get_db_connection)) -> d
                     customer_id
                 )
                 logger.info(f"Marked account with customer ID {customer_id} as past due")
+            else:
+                logger.warning("Missing customer_id in invoice.payment_failed event")
         
         elif event.type == "customer.subscription.updated":
             subscription = event.data.object
-            customer_id = subscription.customer
+            customer_id = getattr(subscription, 'customer', None)
             
-            # Extract plan information
-            plan = None
-            if hasattr(subscription, 'items') and subscription.items.data:
-                price_id = subscription.items.data[0].price.id
-                if price_id == STRIPE_PRICE_PRO:
-                    plan = "pro"
-                elif price_id == STRIPE_PRICE_BUSINESS:
-                    plan = "business"
-            
-            # Extract subscription details
-            subscription_status = subscription.status
-            current_period_end = subscription.current_period_end
-            cancel_at_period_end = subscription.cancel_at_period_end
-            
-            if customer_id:
+            if not customer_id:
+                logger.warning("Missing customer_id in subscription.updated event")
+            else:
+                # Extract plan information
+                plan = None
+                if hasattr(subscription, 'items') and subscription.items.data:
+                    first_item = subscription.items.data[0]
+                    if hasattr(first_item, 'price') and hasattr(first_item.price, 'id'):
+                        price_id = first_item.price.id
+                        if price_id == STRIPE_PRICE_PRO:
+                            plan = "pro"
+                        elif price_id == STRIPE_PRICE_BUSINESS:
+                            plan = "business"
+                
+                # Extract subscription details
+                subscription_status = getattr(subscription, 'status', None)
+                current_period_end = getattr(subscription, 'current_period_end', None)
+                cancel_at_period_end = getattr(subscription, 'cancel_at_period_end', None)
+                
                 update_fields = []
                 params = []
                 param_index = 1
@@ -262,23 +272,29 @@ async def stripe_webhook(request: Request, db = Depends(get_db_connection)) -> d
                     params.append(plan)
                     param_index += 1
                 
-                update_fields.append(f"plan_status = ${param_index}")
-                params.append(subscription_status)
-                param_index += 1
+                if subscription_status:
+                    update_fields.append(f"plan_status = ${param_index}")
+                    params.append(subscription_status)
+                    param_index += 1
                 
-                update_fields.append(f"plan_period_end = ${param_index}")
-                from datetime import datetime
-                params.append(datetime.fromtimestamp(current_period_end))
-                param_index += 1
+                if current_period_end:
+                    update_fields.append(f"plan_period_end = ${param_index}")
+                    from datetime import datetime
+                    params.append(datetime.fromtimestamp(current_period_end))
+                    param_index += 1
                 
-                update_fields.append(f"cancel_at_period_end = ${param_index}")
-                params.append(cancel_at_period_end)
-                params.append(customer_id)  # for WHERE clause
+                if cancel_at_period_end is not None:
+                    update_fields.append(f"cancel_at_period_end = ${param_index}")
+                    params.append(cancel_at_period_end)
+                    param_index += 1
                 
-                query = f"UPDATE accounts SET {', '.join(update_fields)} WHERE stripe_customer_id = ${param_index}"
-                await db.execute(query, *params)
-                
-                logger.info(f"Updated subscription details for customer {customer_id}")
+                if update_fields:
+                    params.append(customer_id)  # for WHERE clause
+                    query = f"UPDATE accounts SET {', '.join(update_fields)} WHERE stripe_customer_id = ${param_index}"
+                    await db.execute(query, *params)
+                    logger.info(f"Updated subscription details for customer {customer_id}")
+                else:
+                    logger.info(f"No updates needed for customer {customer_id}")
         
         # Store event in stripe_events table for idempotency
         await db.execute(
