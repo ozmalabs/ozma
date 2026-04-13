@@ -35,19 +35,19 @@ async def create_checkout_session(
     Create a Stripe checkout session.
     """
     # Validate tier
-    if request.price_id not in ["pro", "business"]:
+    if request.tier not in ["pro", "business"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid price_id. Must be 'pro' or 'business'"
+            detail="Invalid tier. Must be 'pro' or 'business'"
         )
     
     # Get price ID based on tier
-    price_id = STRIPE_PRICE_PRO if request.price_id == "pro" else STRIPE_PRICE_BUSINESS
+    price_id = STRIPE_PRICE_PRO if request.tier == "pro" else STRIPE_PRICE_BUSINESS
     
     if not price_id:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Price ID not configured for tier: {request.price_id}"
+            detail=f"Price ID not configured for tier: {request.tier}"
         )
     
     try:
@@ -67,7 +67,7 @@ async def create_checkout_session(
             }],
             success_url="https://connect.ozma.dev/dashboard/billing?success=true",
             cancel_url="https://connect.ozma.dev/dashboard/billing?canceled=true",
-            metadata={"account_id": account["id"], "tier": request.price_id}
+            metadata={"account_id": account["id"], "tier": request.tier}
         )
         
         return CheckoutResponse(session_id=session.id, session_url=session.url)
