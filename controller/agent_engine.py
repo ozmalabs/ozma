@@ -1066,8 +1066,13 @@ class AgentEngine:
             result.error = f"Context source '{source}' not available. Available sources: {', '.join(self._context_sources.keys())}"
             return
             
+        context_provider = self._context_sources[source]
+        if context_provider is None:
+            result.success = False
+            result.error = f"Context source '{source}' not configured or not available"
+            return
+            
         try:
-            context_provider = self._context_sources[source]
             context_data = await context_provider.get_context(query)
             result.success = True
             result.screen_text = str(context_data)

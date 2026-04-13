@@ -57,9 +57,10 @@ class MicrosoftGraphReader:
             # Query calendar events
             events_result = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: self._client.me.calendar_view.list(
+                lambda: self._client.me.calendar_view.get(
                     start_datetime=start_of_day.isoformat() + 'Z',
-                    end_datetime=end_of_day.isoformat() + 'Z'
+                    end_datetime=end_of_day.isoformat() + 'Z',
+                    top=10
                 )
             )
             events = events_result.value

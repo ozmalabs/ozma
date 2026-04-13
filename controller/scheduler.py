@@ -56,6 +56,23 @@ class ScheduleRule:
         day_names = [d.strip().lower()[:3] for d in self.days.split(",")]
         return now.weekday() in [_DAY_MAP.get(d, -1) for d in day_names]
 
+    async def check_calendar_trigger(self, calendar_reader: Any) -> bool:
+        """Check if calendar-based trigger should fire."""
+        if self.trigger_type != "calendar" or not self.calendar_query:
+            return False
+            
+        if not calendar_reader:
+            return False
+            
+        try:
+            context = await calendar_reader.get_context(self.calendar_query)
+            # Simple heuristic: if context contains relevant keywords, trigger
+            if "meeting" in context.lower() or "event" in context.lower():
+                return True
+        except Exception as e:
+            log.warning("Failed to check calendar trigger: %s", e)
+        return False
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "time": self.time, 
@@ -122,14 +139,8 @@ class Scheduler:
                             should_trigger = True
                             
                         # Calendar-based trigger
-                        elif rule.trigger_type == "calendar" and self._calendar_reader and rule.calendar_query:
-                            try:
-                                context = await self._calendar_reader.get_context(rule.calendar_query)
-                                # Simple heuristic: if context contains relevant keywords, trigger
-                                if "meeting" in context.lower() or "event" in context.lower():
-                                    should_trigger = True
-                            except Exception as e:
-                                log.warning("Failed to check calendar trigger: %s", e)
+                        elif rule.trigger_type == "calendar":
+                            should_trigger = await rule.check_calendar_trigger(self._calendar_reader)
                         
                         if should_trigger:
                             self._last_fired = now_key
