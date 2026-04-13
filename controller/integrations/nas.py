@@ -1,7 +1,7 @@
 from typing import Dict, Any, List
 from dataclasses import dataclass
 import aiohttp
- from .base import IntegrationBackend
+from .base import IntegrationBackend
 
 @dataclass
 class NASStatus:
