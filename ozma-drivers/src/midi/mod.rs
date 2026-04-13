@@ -1662,3 +1662,83 @@ impl MidiSurface {
         })
     }
 }
+//! MIDI control surface support for ozma.
+//!
+//! Ported from surfacepresser-run's midi_controller.py + midi_integration.py,
+//! rewritten as a clean async module that integrates with ozma's ControlSurface
+//! abstraction.
+//!
+//! Supports:
+//!   - Faders (motorised, with touch lockout)
+//!   - Buttons (toggle / momentary, with LED feedback)
+//!   - Rotary encoders
+//!   - Jog wheels
+//!   - Behringer X-Touch scribble strip LCD displays
+//!   - Behringer 7-segment displays
+//!
+//! Requires: midir v0.10.3
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use midir::{MidiInput, MidiOutput};
+use serde::{Deserialize, Serialize};
+
+/// MIDI control surface support
+pub mod surface;
+pub mod io;
+pub mod controls;
+pub mod display;
+
+pub use surface::{MidiSurface, MidiControlType, MidiSurfaceConfig};
+pub use controls::{MidiFader, MidiButton, MidiRotary, MidiJogWheel};
+pub use display::{ScribbleStrip, Color, Invert};
+pub use io::MidiIO;
+
+/// Error types for MIDI operations
+#[derive(Debug, thiserror::Error)]
+pub enum MidiError {
+    #[error("MIDI input error: {0}")]
+    InputError(#[from] midir::ConnectError<midir::InitError>),
+    #[error("MIDI output error: {0}")]
+    OutputError(#[from] midir::ConnectError<midir::InitError>),
+    #[error("Port not found: {0}")]
+    PortNotFound(String),
+    #[error("Invalid message")]
+    InvalidMessage,
+    #[error("IO error: {0}")]
+    IoError(#[from] std::io::Error),
+    #[error("Send error: {0}")]
+    SendError(#[from] midir::SendError),
+}
+
+/// Result type for MIDI operations
+pub type Result<T> = std::result::Result<T, MidiError>;
+
+/// List available MIDI devices
+pub fn list_devices() -> Result<(Vec<String>, Vec<String>)> {
+    let mut input_names = Vec::new();
+    let mut output_names = Vec::new();
+    
+    // Get input devices
+    if let Ok(midi_in) = MidiInput::new("ozma-midi-in") {
+        for port in midi_in.ports() {
+            if let Ok(name) = midi_in.port_name(&port) {
+                input_names.push(name);
+            }
+        }
+    }
+    
+    // Get output devices
+    if let Ok(midi_out) = MidiOutput::new("ozma-midi-out") {
+        for port in midi_out.ports() {
+            if let Ok(name) = midi_out.port_name(&port) {
+                output_names.push(name);
+            }
+        }
+    }
+    
+    Ok((input_names, output_names))
+}

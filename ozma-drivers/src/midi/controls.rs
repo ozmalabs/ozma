@@ -290,3 +290,290 @@ impl MidiControl for MidiJogWheel {
         false
     }
 }
+//! MIDI control types
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use crate::midi::io::MidiIO;
+use crate::midi::{MidiError, Result};
+
+/// Base trait for MIDI controls
+pub trait MidiControl {
+    /// Process incoming MIDI message, return state delta
+    fn on_midi_message(&mut self, msg: &[u8]) -> Option<HashMap<String, serde_json::Value>>;
+    
+    /// Set value from external source (feedback path)
+    fn set_value(&mut self, value: serde_json::Value);
+    
+    /// Get current value
+    fn get_value(&self) -> &serde_json::Value;
+    
+    /// Check if control is in lockout state
+    fn is_lockout(&self) -> bool;
+}
+
+/// Motorised fader with touch detection
+pub struct MidiFader {
+    pub name: String,
+    value: i32,
+    lockout: bool,
+    cc: u8,
+    touch_note: Option<u8>,
+    midi: Arc<Mutex<MidiIO>>,
+}
+
+impl MidiFader {
+    pub fn new(name: String, cc: u8, touch_note: Option<u8>, midi: Arc<Mutex<MidiIO>>) -> Self {
+        Self {
+            name,
+            value: 0,
+            lockout: false,
+            cc,
+            touch_note,
+            midi,
+        }
+    }
+}
+
+impl MidiControl for MidiFader {
+    fn on_midi_message(&mut self, msg: &[u8]) -> Option<HashMap<String, serde_json::Value>> {
+        if msg.len() >= 3 && msg[0] == 0xB0 && msg[1] == self.cc {
+            self.value = msg[2] as i32;
+            let mut delta = HashMap::new();
+            delta.insert("value".to_string(), serde_json::Value::Number(self.value.into()));
+            return Some(delta);
+        }
+        
+        if let Some(touch_note) = self.touch_note {
+            if msg.len() >= 3 && (msg[0] == 0x90 || msg[0] == 0x80) && msg[1] == touch_note {
+                self.lockout = msg[0] == 0x90 && msg[2] >= 64;
+                let mut delta = HashMap::new();
+                delta.insert("lockout".to_string(), serde_json::Value::Bool(self.lockout));
+                return Some(delta);
+            }
+        }
+        
+        None
+    }
+    
+    fn set_value(&mut self, value: serde_json::Value) {
+        if !self.lockout {
+            if let serde_json::Value::Number(n) = value {
+                if let Some(v) = n.as_i64() {
+                    let v = (v.max(0).min(127)) as i32;
+                    self.value = v;
+                    
+                    if let Ok(midi) = self.midi.lock() {
+                        let _ = midi.control_change(self.cc, v as u8);
+                    }
+                }
+            }
+        }
+    }
+    
+    fn get_value(&self) -> &serde_json::Value {
+        &serde_json::Value::Number(self.value.into())
+    }
+    
+    fn is_lockout(&self) -> bool {
+        self.lockout
+    }
+}
+
+/// Button with LED, supports toggle and momentary modes
+#[derive(Debug, Clone, Copy)]
+pub enum ButtonStyle {
+    Toggle,
+    Momentary,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum LightStyle {
+    State,
+    AlwaysOn,
+    Momentary,
+}
+
+pub struct MidiButton {
+    pub name: String,
+    value: bool,
+    pressed: bool,
+    note: u8,
+    style: ButtonStyle,
+    light_style: LightStyle,
+    midi: Arc<Mutex<MidiIO>>,
+}
+
+impl MidiButton {
+    pub fn new(
+        name: String, 
+        note: u8, 
+        style: ButtonStyle, 
+        light_style: LightStyle, 
+        midi: Arc<Mutex<MidiIO>>
+    ) -> Self {
+        let button = Self {
+            name,
+            value: false,
+            pressed: false,
+            note,
+            style,
+            light_style,
+            midi: midi.clone(),
+        };
+        button.update_light();
+        button
+    }
+    
+    fn update_light(&self) {
+        let on = match self.light_style {
+            LightStyle::AlwaysOn => true,
+            LightStyle::Momentary => self.pressed,
+            LightStyle::State => self.value,
+        };
+        
+        if let Ok(midi) = self.midi.lock() {
+            let _ = midi.note_on(self.note, if on { 127 } else { 0 });
+        }
+    }
+}
+
+impl MidiControl for MidiButton {
+    fn on_midi_message(&mut self, msg: &[u8]) -> Option<HashMap<String, serde_json::Value>> {
+        if msg.len() >= 3 && (msg[0] == 0x90 || msg[0] == 0x80) && msg[1] == self.note {
+            if msg[0] == 0x90 && msg[2] >= 64 {  // press
+                self.pressed = true;
+                match self.style {
+                    ButtonStyle::Toggle => self.value = !self.value,
+                    ButtonStyle::Momentary => self.value = true,
+                }
+            } else {  // release
+                self.pressed = false;
+                if let ButtonStyle::Momentary = self.style {
+                    self.value = false;
+                }
+            }
+            
+            self.update_light();
+            
+            let mut delta = HashMap::new();
+            delta.insert("value".to_string(), serde_json::Value::Bool(self.value));
+            delta.insert("pressed".to_string(), serde_json::Value::Bool(self.pressed));
+            return Some(delta);
+        }
+        
+        None
+    }
+    
+    fn set_value(&mut self, value: serde_json::Value) {
+        if let serde_json::Value::Bool(b) = value {
+            self.value = b;
+            self.update_light();
+        }
+    }
+    
+    fn get_value(&self) -> &serde_json::Value {
+        &serde_json::Value::Bool(self.value)
+    }
+    
+    fn is_lockout(&self) -> bool {
+        false
+    }
+}
+
+/// Rotary encoder (continuous CC)
+pub struct MidiRotary {
+    pub name: String,
+    value: i32,
+    lockout: bool,
+    cc: u8,
+    midi: Arc<Mutex<MidiIO>>,
+}
+
+impl MidiRotary {
+    pub fn new(name: String, cc: u8, midi: Arc<Mutex<MidiIO>>) -> Self {
+        Self {
+            name,
+            value: 0,
+            lockout: false,
+            cc,
+            midi,
+        }
+    }
+}
+
+impl MidiControl for MidiRotary {
+    fn on_midi_message(&mut self, msg: &[u8]) -> Option<HashMap<String, serde_json::Value>> {
+        if msg.len() >= 3 && msg[0] == 0xB0 && msg[1] == self.cc {
+            self.value = msg[2] as i32;
+            let mut delta = HashMap::new();
+            delta.insert("value".to_string(), serde_json::Value::Number(self.value.into()));
+            return Some(delta);
+        }
+        None
+    }
+    
+    fn set_value(&mut self, value: serde_json::Value) {
+        if !self.lockout {
+            if let serde_json::Value::Number(n) = value {
+                if let Some(v) = n.as_i64() {
+                    let v = (v.max(0).min(127)) as i32;
+                    self.value = v;
+                    
+                    if let Ok(midi) = self.midi.lock() {
+                        let _ = midi.control_change(self.cc, v as u8);
+                    }
+                }
+            }
+        }
+    }
+    
+    fn get_value(&self) -> &serde_json::Value {
+        &serde_json::Value::Number(self.value.into())
+    }
+    
+    fn is_lockout(&self) -> bool {
+        self.lockout
+    }
+}
+
+/// Jog wheel — emits direction +1 or -1
+pub struct MidiJogWheel {
+    pub name: String,
+    cc: u8,
+    midi: Arc<Mutex<MidiIO>>,
+}
+
+impl MidiJogWheel {
+    pub fn new(name: String, cc: u8, midi: Arc<Mutex<MidiIO>>) -> Self {
+        Self {
+            name,
+            cc,
+            midi,
+        }
+    }
+}
+
+impl MidiControl for MidiJogWheel {
+    fn on_midi_message(&mut self, msg: &[u8]) -> Option<HashMap<String, serde_json::Value>> {
+        if msg.len() >= 3 && msg[0] == 0xB0 && msg[1] == self.cc {
+            let direction = if msg[2] == 65 { 1 } else { -1 };
+            let mut delta = HashMap::new();
+            delta.insert("value".to_string(), serde_json::Value::Number(direction.into()));
+            return Some(delta);
+        }
+        None
+    }
+    
+    fn set_value(&mut self, _value: serde_json::Value) {
+        // Jog wheels don't receive feedback
+    }
+    
+    fn get_value(&self) -> &serde_json::Value {
+        &serde_json::Value::Null
+    }
+    
+    fn is_lockout(&self) -> bool {
+        false
+    }
+}

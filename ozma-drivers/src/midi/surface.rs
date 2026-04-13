@@ -324,3 +324,177 @@ impl ControlSurface for MidiSurface {
     
     // Other ControlSurface methods would be implemented here
 }
+//! MIDI surface implementation
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::midi::{MidiIO, MidiError, Result};
+use crate::midi::controls::{MidiControl, MidiFader, MidiButton, MidiRotary, MidiJogWheel, ButtonStyle, LightStyle};
+use crate::midi::display::ScribbleStrip;
+
+/// Type of MIDI control
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum MidiControlType {
+    #[serde(rename = "fader")]
+    Fader,
+    #[serde(rename = "button")]
+    Button,
+    #[serde(rename = "rotary")]
+    Rotary,
+    #[serde(rename = "jogwheel")]
+    JogWheel,
+}
+
+/// Configuration for a MIDI control
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MidiControlConfig {
+    #[serde(rename = "type")]
+    pub control_type: MidiControlType,
+    #[serde(default)]
+    pub control: Option<u8>,
+    #[serde(default)]
+    pub note: Option<u8>,
+    #[serde(default)]
+    pub style: Option<String>, // for buttons: "toggle" | "momentary"
+    #[serde(default)]
+    pub light: Option<String>, // for buttons: "state" | "always_on" | "momentary"
+}
+
+/// Configuration for a MIDI surface
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MidiSurfaceConfig {
+    pub device: String,
+    #[serde(default)]
+    pub controls: HashMap<String, MidiControlConfig>,
+    #[serde(default)]
+    pub displays: Option<HashMap<String, String>>, // display_name -> display_type
+}
+
+/// Callback for control changes
+pub type ControlChangeCallback = Box<dyn Fn(String, String, serde_json::Value) + Send + Sync>;
+
+/// A MIDI device registered as an ozma control surface
+pub struct MidiSurface {
+    pub id: String,
+    config: MidiSurfaceConfig,
+    midi: Option<Arc<Mutex<MidiIO>>>,
+    controls: HashMap<String, Box<dyn MidiControl + Send>>,
+    scribble: Option<ScribbleStrip>,
+    on_changed: Option<ControlChangeCallback>,
+}
+
+impl MidiSurface {
+    /// Create a new MIDI surface
+    pub fn new(id: String, config: MidiSurfaceConfig) -> Self {
+        Self {
+            id,
+            config,
+            midi: None,
+            controls: HashMap::new(),
+            scribble: None,
+            on_changed: None,
+        }
+    }
+
+    /// Start the MIDI surface
+    pub async fn start(&mut self) -> Result<()> {
+        // Initialize MIDI I/O
+        let mut midi_io = MidiIO::new()?;
+        midi_io.open(&self.config.device)?;
+        
+        let midi_arc = Arc::new(Mutex::new(midi_io));
+        self.midi = Some(midi_arc.clone());
+
+        // Create controls
+        for (name, cfg) in &self.config.controls {
+            let control: Box<dyn MidiControl + Send> = match cfg.control_type {
+                MidiControlType::Fader => {
+                    Box::new(MidiFader::new(
+                        name.clone(),
+                        cfg.control.unwrap_or(70),
+                        cfg.note,
+                        midi_arc.clone(),
+                    ))
+                }
+                MidiControlType::Button => {
+                    let style = match cfg.style.as_deref() {
+                        Some("momentary") => ButtonStyle::Momentary,
+                        _ => ButtonStyle::Toggle,
+                    };
+                    
+                    let light_style = match cfg.light.as_deref() {
+                        Some("always_on") => LightStyle::AlwaysOn,
+                        Some("momentary") => LightStyle::Momentary,
+                        _ => LightStyle::State,
+                    };
+                    
+                    Box::new(MidiButton::new(
+                        name.clone(),
+                        cfg.note.unwrap_or(0),
+                        style,
+                        light_style,
+                        midi_arc.clone(),
+                    ))
+                }
+                MidiControlType::Rotary => {
+                    Box::new(MidiRotary::new(
+                        name.clone(),
+                        cfg.control.unwrap_or(80),
+                        midi_arc.clone(),
+                    ))
+                }
+                MidiControlType::JogWheel => {
+                    Box::new(MidiJogWheel::new(
+                        name.clone(),
+                        cfg.control.unwrap_or(60),
+                        midi_arc.clone(),
+                    ))
+                }
+            };
+            
+            self.controls.insert(name.clone(), control);
+        }
+
+        // Create scribble strip if displays are configured
+        if self.config.displays.is_some() {
+            // Note: In a real implementation, we'd need to handle the display creation
+            // This is a simplified version for now
+        }
+
+        Ok(())
+    }
+
+    /// Stop the MIDI surface
+    pub async fn stop(&mut self) -> Result<()> {
+        if let Some(midi) = &self.midi {
+            if let Ok(mut midi) = midi.lock() {
+                midi.close();
+            }
+        }
+        Ok(())
+    }
+
+    /// Set the callback for when a control value changes
+    pub fn set_on_changed(&mut self, callback: ControlChangeCallback) {
+        self.on_changed = Some(callback);
+    }
+
+    /// Process incoming MIDI message
+    pub fn process_midi_message(&mut self, msg: &[u8]) -> Result<()> {
+        // This would be called from the MIDI input callback
+        // For now, we'll just process it directly
+        for (name, control) in &mut self.controls {
+            if let Some(delta) = control.on_midi_message(msg) {
+                if let Some(ref callback) = self.on_changed {
+                    if let Some(value) = delta.get("value") {
+                        callback(self.id.clone(), name.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
