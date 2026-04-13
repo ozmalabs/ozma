@@ -7,8 +7,14 @@ Supports:
 - Web API for sending/responding to messages
 - Slash command /ozma
 - HMAC signature verification
+- OAuth-based authentication (preferred)
+- Manual token configuration (backward compatibility)
 
-Configuration:
+Configuration (OAuth - preferred):
+- Tokens provided via Connect OAuth flow
+- Stored in Connect DB per controller
+
+Configuration (manual - backward compatibility):
 - MESSAGING_SLACK_BOT_TOKEN
 - MESSAGING_SLACK_SIGNING_SECRET
 """
@@ -26,15 +32,31 @@ log = logging.getLogger("ozma.messaging.slack")
 
 class SlackChannel:
     def __init__(self):
+        # Manual configuration (backward compatibility)
         self.bot_token = os.environ.get("MESSAGING_SLACK_BOT_TOKEN")
         self.signing_secret = os.environ.get("MESSAGING_SLACK_SIGNING_SECRET")
-        self._on_message_callback = None
         
-        if self.bot_token:
+        # OAuth configuration (preferred)
+        self.oauth_token = None
+        self.oauth_team_id = None
+        
+        self._on_message_callback = None
+        self._init_client()
+
+    def _init_client(self):
+        """Initialize the HTTP client with available token."""
+        token = self.oauth_token or self.bot_token
+        if token:
             self.client = httpx.AsyncClient(
                 base_url="https://slack.com/api/",
-                headers={"Authorization": f"Bearer {self.bot_token}"}
+                headers={"Authorization": f"Bearer {token}"}
             )
+
+    def set_oauth_credentials(self, token: str, team_id: str):
+        """Set OAuth credentials received from Connect."""
+        self.oauth_token = token
+        self.oauth_team_id = team_id
+        self._init_client()
 
     async def start(self, on_message_callback):
         """Initialize the Slack channel."""
@@ -47,6 +69,11 @@ class SlackChannel:
 
     async def verify_signature(self, request_body: bytes, timestamp: str, signature: str) -> bool:
         """Verify the Slack request signature."""
+        # Require signing secret for signature verification
+        if not self.signing_secret:
+            log.warning("Slack signing secret not configured")
+            return False
+            
         # Create the signed string
         sig_basestring = f"v0:{timestamp}:{request_body.decode()}"
         
@@ -109,7 +136,8 @@ class SlackChannel:
 
     async def send_message(self, channel: str, text: str, thread_ts: Optional[str] = None):
         """Send a message to a Slack channel."""
-        if not self.bot_token:
+        token = self.oauth_token or self.bot_token
+        if not token:
             log.warning("Slack bot token not configured")
             return
             
@@ -131,7 +159,8 @@ class SlackChannel:
 
     async def update_message(self, channel: str, ts: str, text: str):
         """Update an existing message in Slack."""
-        if not self.bot_token:
+        token = self.oauth_token or self.bot_token
+        if not token:
             log.warning("Slack bot token not configured")
             return
             
