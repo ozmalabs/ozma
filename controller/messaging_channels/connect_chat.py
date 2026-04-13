@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import re
+import websockets
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 from datetime import datetime
@@ -31,6 +32,9 @@ log = logging.getLogger("ozma.messaging.connect_chat")
 MAX_MESSAGE_LENGTH = 10000
 # Maximum queue size for response streaming
 MAX_RESPONSE_QUEUE_SIZE = 100
+# WebSocket connection parameters
+WEBSOCKET_RECONNECT_DELAY = 5  # seconds
+WEBSOCKET_TIMEOUT = 30  # seconds
 
 
 @dataclass
@@ -63,6 +67,7 @@ class ChatContext:
     user: ConnectUser
     message: ChatMessage
     response_stream: asyncio.Queue
+    websocket: Any = None
 
 
 class ConnectChatAdapter:
@@ -73,13 +78,141 @@ class ConnectChatAdapter:
     Integrates with notification system for proactive alerts.
     """
     
-    def __init__(self, notification_manager: NotificationManager) -> None:
+    def __init__(self, notification_manager: NotificationManager, relay_url: str = "ws://localhost:8765/connect") -> None:
         self.notification_manager = notification_manager
+        self.relay_url = relay_url
         self._active_sessions: dict[str, ChatContext] = {}  # session_id -> context
         self._message_handlers: dict[str, Callable] = {
             "agent_message": self._handle_agent_message,
         }
+        self._websocket_task: Optional[asyncio.Task] = None
+        self._websocket: Optional[Any] = None
+        self._connected = False
+        self._reconnect_attempts = 0
+        self._max_reconnect_attempts = 10
         
+    async def start(self) -> None:
+        """Start the WebSocket connection to Connect relay."""
+        self._websocket_task = asyncio.create_task(self._websocket_handler())
+        
+    async def stop(self) -> None:
+        """Stop the WebSocket connection."""
+        if self._websocket_task:
+            self._websocket_task.cancel()
+            try:
+                await self._websocket_task
+            except asyncio.CancelledError:
+                pass
+        if self._websocket:
+            await self._websocket.close()
+            
+    async def _websocket_handler(self) -> None:
+        """Handle WebSocket connection lifecycle."""
+        while True:
+            try:
+                await self._connect_websocket()
+                await self._listen_websocket()
+            except asyncio.CancelledError:
+                log.info("WebSocket handler cancelled")
+                break
+            except Exception as e:
+                log.error(f"WebSocket connection error: {e}")
+                self._connected = False
+                if self._reconnect_attempts < self._max_reconnect_attempts:
+                    self._reconnect_attempts += 1
+                    log.info(f"Reconnecting in {WEBSOCKET_RECONNECT_DELAY} seconds (attempt {self._reconnect_attempts})")
+                    await asyncio.sleep(WEBSOCKET_RECONNECT_DELAY)
+                else:
+                    log.error("Max reconnect attempts reached, giving up")
+                    break
+                    
+    async def _connect_websocket(self) -> None:
+        """Connect to the Connect relay WebSocket."""
+        log.info(f"Connecting to Connect relay at {self.relay_url}")
+        self._websocket = await websockets.connect(
+            self.relay_url,
+            timeout=WEBSOCKET_TIMEOUT
+        )
+        self._connected = True
+        self._reconnect_attempts = 0
+        log.info("Connected to Connect relay")
+        
+    async def _listen_websocket(self) -> None:
+        """Listen for incoming WebSocket messages."""
+        if not self._websocket:
+            return
+            
+        async for message in self._websocket:
+            try:
+                data = json.loads(message)
+                await self._process_websocket_message(data)
+            except json.JSONDecodeError as e:
+                log.warning(f"Invalid JSON message received: {e}")
+            except Exception as e:
+                log.error(f"Error processing WebSocket message: {e}")
+                
+    async def _process_websocket_message(self, message: dict) -> None:
+        """
+        Process an incoming WebSocket message.
+        
+        Args:
+            message: Parsed WebSocket message
+        """
+        # Extract user information from message (in real implementation, this would come from auth)
+        # For now, we'll create a mock user for demonstration
+        user = ConnectUser(
+            user_id=message.get("user_id", "unknown"),
+            username=message.get("username", "Unknown User"),
+            plan=message.get("plan", "free"),
+            active=True
+        )
+        
+        # Validate message structure
+        if not isinstance(message, dict):
+            log.warning("Received invalid message format from user %s", user.user_id)
+            return
+            
+        msg_type = message.get("type")
+        if not msg_type:
+            log.warning("Received WebSocket message without type from user %s", user.user_id)
+            return
+            
+        # Validate message type
+        if not isinstance(msg_type, str):
+            log.warning("Received invalid message type from user %s", user.user_id)
+            return
+            
+        handler = self._message_handlers.get(msg_type)
+        if not handler:
+            log.warning("Unknown WebSocket message type: %s from user %s", msg_type, user.user_id)
+            return
+            
+        try:
+            await handler(message, user)
+        except asyncio.CancelledError:
+            # Handle task cancellation gracefully
+            log.debug("WebSocket message handling cancelled for user %s", user.user_id)
+            raise
+        except Exception as e:
+            log.error("Error handling WebSocket message from user %s: %s", user.user_id, e, exc_info=True)
+            
+    async def _send_websocket_message(self, message: dict) -> None:
+        """
+        Send a message through the WebSocket connection.
+        
+        Args:
+            message: Message to send
+        """
+        if not self._connected or not self._websocket:
+            log.warning("Cannot send message, WebSocket not connected")
+            return
+            
+        try:
+            await self._websocket.send(json.dumps(message))
+        except Exception as e:
+            log.error(f"Failed to send WebSocket message: {e}")
+            self._connected = False
+            
     def list_sessions(self) -> list[dict]:
         """List active chat sessions."""
         return [
@@ -284,16 +417,12 @@ class ConnectChatAdapter:
             "text": text,
             "done": done,
             "timestamp": datetime.now().isoformat(),
+            "user_id": context.user.user_id,
+            "thread_id": context.message.thread_id,
         }
         
-        # In a real implementation, this would send via WebSocket
-        # For now, we'll put it on the response stream
-        try:
-            # Use put_nowait to avoid hanging if queue is full
-            context.response_stream.put_nowait(chunk_msg)
-        except asyncio.QueueFull:
-            log.warning("Response stream queue full for user %s, dropping chunk", context.user.user_id)
-            return
+        # Send via WebSocket
+        await self._send_websocket_message(chunk_msg)
         
         log.debug("Sent response chunk to user %s: %s (done=%s)", 
                  context.user.user_id, text[:50] if text else "", done)
@@ -389,9 +518,11 @@ class ConnectChatAdapter:
             "done": True,
             "proactive": True,
             "thread_id": thread_id or f"alert_{int(datetime.now().timestamp())}",
+            "user_id": user_id,
         }
         
-        # TODO: Implement actual WebSocket sending mechanism
+        # Send via WebSocket
+        await self._send_websocket_message(alert_msg)
         log.info("Proactive alert for user %s: %s", user_id, alert_text[:100])
         
         # Check if notification manager is available
