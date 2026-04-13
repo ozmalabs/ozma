@@ -26,56 +26,47 @@ async fn main() -> Result<()> {
 
     match cmd {
         "kbd" => {
-            let devices =
-                ozma_drivers::evdev_capture::list_devices(ozma_drivers::evdev_capture::is_keyboard);
+            let devices = ozma_drivers::find_keyboard_devices(false);
             println!("Detected keyboard devices ({}):", devices.len());
-            for path in &devices {
-                if let Ok(dev) = evdev::Device::open(path) {
-                    println!("  {:?} — {}", path, dev.name().unwrap_or("?"));
-                }
+            for dev in &devices {
+                println!("  {} — {}", dev.physical_path().map(|p| p.display().to_string()).unwrap_or_default(), dev.name().unwrap_or("?"));
             }
         }
 
         "mouse" => {
-            let devices =
-                ozma_drivers::evdev_capture::list_devices(ozma_drivers::evdev_capture::is_mouse);
+            let devices = ozma_drivers::find_mouse_devices(false);
             println!("Detected mouse devices ({}):", devices.len());
-            for path in &devices {
-                if let Ok(dev) = evdev::Device::open(path) {
-                    println!("  {:?} — {}", path, dev.name().unwrap_or("?"));
-                }
+            for dev in &devices {
+                println!("  {} — {}", dev.physical_path().map(|p| p.display().to_string()).unwrap_or_default(), dev.name().unwrap_or("?"));
             }
         }
 
         "surface" => {
             use ozma_drivers::control_surface::ControlSurface;
+            use ozma_drivers::evdev_capture::{EvdevSurface, EvdevSurfaceConfig};
 
             let config_path = args.get(2).context("missing <config.json>")?;
             let raw = std::fs::read_to_string(config_path)
                 .with_context(|| format!("reading {config_path}"))?;
-            let config: serde_json::Value =
+            let cfg: EvdevSurfaceConfig =
                 serde_json::from_str(&raw).context("parsing config JSON")?;
 
-            let surface_id = config
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("surface0")
-                .to_string();
-
-            let mut surface =
-                ozma_drivers::evdev_surface::EvdevSurface::new(surface_id, &config);
-            surface.start().await.context("starting surface")?;
+            let surface_id = cfg.device.clone();
+            let mut surface = EvdevSurface::new(surface_id, cfg);
+            let mut rx = surface
+                .start()
+                .await
+                .context("starting surface")?;
 
             info!("Surface running — press Ctrl-C to stop");
             loop {
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => break,
-                    evt = surface.next_event() => {
+                    evt = rx.recv() => {
                         match evt {
                             Some(e) => info!(
                                 surface = %e.surface_id,
                                 control = %e.control_name,
-                                action  = %e.binding.action,
                                 value   = %e.value,
                                 "control event"
                             ),
@@ -88,7 +79,7 @@ async fn main() -> Result<()> {
                 }
             }
 
-            surface.stop().await.context("stopping surface")?;
+            surface.stop().await;
             info!("stopped");
         }
 
