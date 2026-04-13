@@ -7,6 +7,8 @@
 ;   4. Adds to PATH
 ;   5. Prompts for the controller URL
 ;   6. Starts the service
+;   7. Writes config to %APPDATA%\Ozma\agent.json
+;   8. Registers version in HKLM\SOFTWARE\Ozma\Agent\Version
 ;
 ; Build: makensis agent/installer/ozma-agent.nsi
 ; Requires: NSIS 3.x, dist/ozma-agent/ from PyInstaller
@@ -14,6 +16,7 @@
 !include "MUI2.nsh"
 !include "nsDialogs.nsh"
 !include "LogicLib.nsh"
+!include "FileFunc.nsh"
 
 ; ── Metadata ──────────────────────────────────────────────────────────────────
 Name "Ozma Agent"
@@ -83,6 +86,31 @@ Function ControllerPageLeave
     ${NSD_GetText} $hCtlName $MachineName
 FunctionEnd
 
+; ── Write JSON config ─────────────────────────────────────────────────────────
+Function WriteAgentConfig
+    ; Create %APPDATA%\Ozma directory if it doesn't exist
+    CreateDirectory "$APPDATA\Ozma"
+
+    ; Write agent.json with JSON formatting
+    FileOpen $0 "$APPDATA\Ozma\agent.json" w
+    FileWrite $0 '{$'
+
+    ; Controller URL
+    FileWrite $0 '$\n  "controller_url": "$ControllerURL"'
+    
+    ; Machine name
+    FileWrite $0 ',$\n  "machine_name": "$MachineName"'
+
+    ; Agent version
+    FileWrite $0 ',$\n  "version": "1.0.0"'
+
+    ; Config path (where agent itself is installed)
+    FileWrite $0 ',$\n  "config_path": "$INSTDIR"'
+
+    FileWrite $0 '$\n}$'
+    FileClose $0
+FunctionEnd
+
 ; ── Install section ───────────────────────────────────────────────────────────
 Section "Install"
     SetOutPath "$INSTDIR"
@@ -90,19 +118,24 @@ Section "Install"
     ; Copy all files from the PyInstaller dist
     File /r "..\..\dist\ozma-agent\*.*"
 
-    ; Write config file
-    FileOpen $0 "$INSTDIR\ozma-agent.conf" w
-    FileWrite $0 "CONTROLLER_URL=$ControllerURL$\r$\n"
-    FileWrite $0 "MACHINE_NAME=$MachineName$\r$\n"
-    FileClose $0
+    ; Write JSON config to %APPDATA%\Ozma\agent.json
+    Call WriteAgentConfig
 
     ; Create uninstaller
     WriteUninstaller "$INSTDIR\uninstall.exe"
 
-    ; Registry
+    ; Registry - InstallDir (legacy compatibility)
     WriteRegStr HKLM "Software\OzmaLabs\Agent" "InstallDir" "$INSTDIR"
+
+    ; Registry - OzmaLabs (legacy compatibility)
     WriteRegStr HKLM "Software\OzmaLabs\Agent" "ControllerURL" "$ControllerURL"
     WriteRegStr HKLM "Software\OzmaLabs\Agent" "MachineName" "$MachineName"
+
+    ; Registry - Ozma\Agent (per spec)
+    WriteRegStr HKLM "Software\Ozma\Agent" "Version" "1.0.0"
+    WriteRegStr HKLM "Software\Ozma\Agent" "InstallDir" "$INSTDIR"
+    WriteRegStr HKLM "Software\Ozma\Agent" "ControllerURL" "$ControllerURL"
+    WriteRegStr HKLM "Software\Ozma\Agent" "MachineName" "$MachineName"
 
     ; Add/Remove Programs entry
     WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\OzmaAgent" \
@@ -156,13 +189,21 @@ Section "Uninstall"
 
     UninstServiceDone:
 
+    ; Remove config file from %APPDATA%\Ozma
+    Delete "$APPDATA\Ozma\agent.json"
+
     ; Remove files
     RMDir /r "$INSTDIR"
 
     ; Remove shortcuts
     RMDir /r "$SMPROGRAMS\Ozma"
 
-    ; Remove registry
+    ; Remove registry - OzmaLabs
     DeleteRegKey HKLM "Software\OzmaLabs\Agent"
+
+    ; Remove registry - Ozma
+    DeleteRegKey HKLM "Software\Ozma\Agent"
+
+    ; Remove Add/Remove Programs entry
     DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\OzmaAgent"
 SectionEnd
