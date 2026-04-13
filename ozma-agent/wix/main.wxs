@@ -1,84 +1,362 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  ozma-agent Windows MSI installer definition.
-  Build with: cargo wix --nocapture
-  Requires: cargo install cargo-wix  +  WiX Toolset v3 on PATH.
+  ozma-agent Windows MSI installer (WiX v3)
+
+  Build (from repo root on Windows):
+    See ozma-agent/installer/build-windows.ps1 for the full build workflow.
+    Or directly: cargo wix -p ozma-agent
+
+  Prerequisites:
+    WiX Toolset v3.x  (wixtoolset.org/releases/)
+    cargo-wix         (cargo install cargo-wix)
+
+  Output: target\wix\ozma-agent-VERSION-x86_64.msi
+
+  Mirrors the Python agent installer (agent/installer/ozma-agent.nsi):
+    - Installs to %ProgramFiles64%\Ozma\Agent\
+    - Prompts for controller URL and machine name
+    - Registers OzmaAgent as a Windows service (auto-start, LocalSystem)
+    - Writes %ProgramData%\Ozma\agent.json config
+    - Adds Start Menu shortcuts
+    - Writes registry: HKLM\SOFTWARE\Ozma\Agent and HKLM\SOFTWARE\OzmaLabs\Agent
+    - Registers in Add/Remove Programs
+    - Uninstall stops and removes the service
 -->
-<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
+
   <Product
     Id="*"
     Name="Ozma Agent"
     Language="1033"
     Version="!(bind.FileVersion.OzmaAgentEXE)"
-    Manufacturer="Ozma Labs"
+    Manufacturer="Ozma Labs Pty Ltd"
     UpgradeCode="4F8A2C1D-3B7E-4F9A-8C2D-1E5F6A7B8C9D">
 
     <Package
       InstallerVersion="450"
       Compressed="yes"
       InstallScope="perMachine"
-      Description="Ozma desktop seat agent"
+      Description="Ozma Agent — connects this machine to your ozma mesh"
+      Manufacturer="Ozma Labs Pty Ltd"
       Comments="https://ozma.dev" />
 
     <MajorUpgrade DowngradeErrorMessage="A newer version of Ozma Agent is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
+    <!-- ── Version info ──────────────────────────────────────────────────── -->
+
+    <Property Id="ARPURLINFOABOUT"   Value="https://ozma.dev" />
+    <Property Id="ARPHELPLINK"       Value="https://ozma.dev/docs/agent" />
+    <Property Id="ARPNOMODIFY"       Value="1" />
+
+    <!-- ── Configuration properties (set via installer dialog) ───────────── -->
+
+    <Property Id="CONTROLLER_URL" Value="http://localhost:7380" />
+    <Property Id="MACHINE_NAME"   Value="[ComputerName]" />
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+
+    <!-- ── Features ─────────────────────────────────────────────────────── -->
+
     <Feature Id="ProductFeature" Title="Ozma Agent" Level="1">
       <ComponentGroupRef Id="ProductComponents" />
       <ComponentRef Id="ApplicationShortcut" />
+      <ComponentRef Id="RegistryEntries" />
+      <ComponentRef Id="ProgramDataConfig" />
     </Feature>
 
+    <!-- ── Directory tree ───────────────────────────────────────────────── -->
+
     <Directory Id="TARGETDIR" Name="SourceDir">
+      <!-- %ProgramFiles64%\Ozma\Agent\ -->
       <Directory Id="ProgramFiles64Folder">
-        <Directory Id="INSTALLFOLDER" Name="Ozma Agent" />
+        <Directory Id="OzmaInstallFolder" Name="Ozma">
+          <Directory Id="INSTALLFOLDER" Name="Agent" />
+        </Directory>
       </Directory>
+
+      <!-- Start Menu -->
       <Directory Id="ProgramMenuFolder">
         <Directory Id="ApplicationProgramsFolder" Name="Ozma" />
       </Directory>
+
+      <!-- %ProgramData%\Ozma\ — for the JSON config (system service can read it) -->
+      <Directory Id="CommonAppDataFolder">
+        <Directory Id="OzmaProgramDataFolder" Name="Ozma" />
+      </Directory>
     </Directory>
 
+    <!-- ── Components ────────────────────────────────────────────────────── -->
+
     <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+
+      <!-- Main binary + Windows service registration -->
       <Component Id="OzmaAgentBinary" Guid="*">
         <File
           Id="OzmaAgentEXE"
+          Name="ozma-agent.exe"
           Source="$(var.CargoTargetBinDir)\ozma-agent.exe"
           KeyPath="yes" />
-        <!-- Register as a Windows service so the agent starts at boot. -->
+
+        <!-- Register as a Windows service. Arguments use [CONTROLLER_URL] which
+             WiX resolves as a Formatted property at install time. -->
         <ServiceInstall
-          Id="OzmaAgentService"
+          Id="OzmaAgentSvcInstall"
           Name="OzmaAgent"
           DisplayName="Ozma Agent"
-          Description="Ozma desktop seat agent — screen capture, HID routing, WireGuard mesh."
+          Description="Ozma Agent — screen capture, HID routing, WireGuard mesh, controller registration."
           Type="ownProcess"
           Start="auto"
           ErrorControl="normal"
-          Account="LocalSystem" />
+          Account="LocalSystem"
+          Arguments="--controller-url &quot;[CONTROLLER_URL]&quot;" />
+
+        <!-- Start on install, stop+delete on uninstall -->
         <ServiceControl
-          Id="StartOzmaAgentService"
+          Id="OzmaAgentSvcControl"
           Name="OzmaAgent"
           Start="install"
           Stop="both"
           Remove="uninstall"
           Wait="yes" />
+
+        <!-- Auto-restart on failure: 3 attempts, 5-second delay, reset after 1 day -->
+        <util:ServiceConfig
+          ServiceName="OzmaAgent"
+          FirstFailureActionType="restart"
+          SecondFailureActionType="restart"
+          ThirdFailureActionType="none"
+          RestartServiceDelayInSeconds="5"
+          ResetPeriodInDays="1" />
       </Component>
+
     </ComponentGroup>
 
+    <!-- Start Menu shortcuts -->
     <Component Id="ApplicationShortcut" Directory="ApplicationProgramsFolder" Guid="*">
       <Shortcut
         Id="AppStartMenuShortcut"
         Name="Ozma Agent"
-        Description="Ozma desktop seat agent"
+        Description="Ozma Agent — connects this machine to your ozma mesh"
         Target="[INSTALLFOLDER]ozma-agent.exe"
+        Arguments="--controller-url &quot;[CONTROLLER_URL]&quot;"
         WorkingDirectory="INSTALLFOLDER" />
-      <RemoveFolder Id="CleanUpShortCut" Directory="ApplicationProgramsFolder" On="uninstall" />
+      <Shortcut
+        Id="UninstallShortcut"
+        Name="Uninstall Ozma Agent"
+        Target="[SystemFolder]msiexec.exe"
+        Arguments="/x [ProductCode]" />
+      <RemoveFolder Id="CleanUpShortcut" Directory="ApplicationProgramsFolder" On="uninstall" />
       <RegistryValue
         Root="HKCU"
         Key="Software\OzmaLabs\OzmaAgent"
-        Name="installed"
+        Name="shortcuts"
         Type="integer"
         Value="1"
         KeyPath="yes" />
     </Component>
 
+    <!--
+      Registry entries:
+        HKLM\SOFTWARE\Ozma\Agent          — canonical location
+        HKLM\SOFTWARE\OzmaLabs\Agent      — legacy compat (matches Python NSIS installer)
+    -->
+    <Component Id="RegistryEntries" Directory="INSTALLFOLDER" Guid="*">
+      <!-- Canonical -->
+      <RegistryValue Root="HKLM" Key="SOFTWARE\Ozma\Agent" Name="Version"
+                     Type="string" Value="!(bind.FileVersion.OzmaAgentEXE)" />
+      <RegistryValue Root="HKLM" Key="SOFTWARE\Ozma\Agent" Name="InstallDir"
+                     Type="string" Value="[INSTALLFOLDER]" />
+      <RegistryValue Root="HKLM" Key="SOFTWARE\Ozma\Agent" Name="ControllerURL"
+                     Type="string" Value="[CONTROLLER_URL]" />
+      <RegistryValue Root="HKLM" Key="SOFTWARE\Ozma\Agent" Name="MachineName"
+                     Type="string" Value="[MACHINE_NAME]" />
+      <!-- Legacy compat -->
+      <RegistryValue Root="HKLM" Key="SOFTWARE\OzmaLabs\Agent" Name="InstallDir"
+                     Type="string" Value="[INSTALLFOLDER]" />
+      <RegistryValue Root="HKLM" Key="SOFTWARE\OzmaLabs\Agent" Name="ControllerURL"
+                     Type="string" Value="[CONTROLLER_URL]" />
+      <RegistryValue Root="HKLM" Key="SOFTWARE\OzmaLabs\Agent" Name="MachineName"
+                     Type="string" Value="[MACHINE_NAME]" />
+      <!-- Key path marker -->
+      <RegistryValue Root="HKLM" Key="SOFTWARE\Ozma\Agent" Name="installed"
+                     Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <!--
+      Write %ProgramData%\Ozma\agent.json — the agent reads this on startup
+      as an alternative to passing flags on the command line.  Written via a
+      deferred PowerShell custom action so property values are available.
+    -->
+    <Component Id="ProgramDataConfig" Directory="OzmaProgramDataFolder" Guid="*">
+      <CreateFolder />
+      <RegistryValue Root="HKCU" Key="SOFTWARE\OzmaLabs\OzmaAgent" Name="config"
+                     Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <!-- ── Custom actions ────────────────────────────────────────────────── -->
+
+    <!--
+      Pass CONTROLLER_URL and MACHINE_NAME into the deferred CA via a property
+      setter.  Deferred CAs can only see properties that were explicitly set
+      with SetProperty actions before them.
+    -->
+    <SetProperty
+      Id="WriteAgentConfig"
+      Before="WriteAgentConfig"
+      Sequence="execute"
+      Value="[CONTROLLER_URL]|[MACHINE_NAME]|[CommonAppDataFolder]Ozma\" />
+
+    <!--
+      Deferred CA: write agent.json using powershell embedded in the Arguments.
+      The pipe-delimited value set above is available as [WriteAgentConfig].
+    -->
+    <CustomAction
+      Id="WriteAgentConfig"
+      Directory="INSTALLFOLDER"
+      ExeCommand="powershell.exe -NoProfile -NonInteractive -Command &quot;$p='[WriteAgentConfig]'.Split('|'); $url=$p[0]; $name=$p[1]; $dir=$p[2]; New-Item -ItemType Directory -Force -Path $dir | Out-Null; Set-Content -Path ($dir+'agent.json') -Value ('{&quot;controller_url&quot;:&quot;'+$url+'&quot;,&quot;machine_name&quot;:&quot;'+$name+'&quot;}')&quot;"
+      Execute="deferred"
+      Return="ignore"
+      Impersonate="no" />
+
+    <InstallExecuteSequence>
+      <Custom Action="WriteAgentConfig" After="InstallFiles">NOT Installed</Custom>
+    </InstallExecuteSequence>
+
+    <!-- ── UI ────────────────────────────────────────────────────────────── -->
+
+    <!--
+      WixUI_InstallDir provides: Welcome → InstallDir → VerifyReady → Progress → Finish.
+      We inject a custom "Ozma Configuration" page between InstallDir and VerifyReady
+      to collect the controller URL and machine name.
+    -->
+    <UIRef Id="WixUI_OzmaAgent" />
+
+    <!--
+      Optional: replace these bitmap placeholders with real brand images at build time.
+      If the files don't exist, comment out the WixVariable lines and WiX uses defaults.
+    -->
+    <!-- <WixVariable Id="WixUIBannerBmp"  Value="wix\banner.bmp"  /> -->
+    <!-- <WixVariable Id="WixUIDialogBmp"  Value="wix\dialog.bmp"  /> -->
+    <WixVariable Id="WixUILicenseRtf" Value="wix\license.rtf" />
+
   </Product>
+
+  <!-- ── Custom UI: WixUI_InstallDir + Ozma Configuration page ────────────── -->
+
+  <Fragment>
+    <UI Id="WixUI_OzmaAgent">
+
+      <TextStyle Id="WixUI_Font_Normal" FaceName="Tahoma" Size="8" />
+      <TextStyle Id="WixUI_Font_Bigger" FaceName="Tahoma" Size="12" />
+      <TextStyle Id="WixUI_Font_Title"  FaceName="Tahoma" Size="9" Bold="yes" />
+
+      <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
+      <Property Id="WixUI_Mode"    Value="InstallDir" />
+
+      <!-- Standard dialog references (provided by WixUI_Common) -->
+      <DialogRef Id="BrowseDlg" />
+      <DialogRef Id="DiskCostDlg" />
+      <DialogRef Id="ErrorDlg" />
+      <DialogRef Id="FatalError" />
+      <DialogRef Id="FilesInUse" />
+      <DialogRef Id="MsiRMFilesInUse" />
+      <DialogRef Id="PrepareDlg" />
+      <DialogRef Id="ProgressDlg" />
+      <DialogRef Id="ResumeDlg" />
+      <DialogRef Id="UserExit" />
+      <DialogRef Id="WelcomeDlg" />
+      <DialogRef Id="InstallDirDlg" />
+      <DialogRef Id="VerifyReadyDlg" />
+      <DialogRef Id="MaintenanceWelcomeDlg" />
+      <DialogRef Id="MaintenanceTypeDlg" />
+
+      <!-- ── Ozma Configuration dialog ───────────────────────────────────── -->
+
+      <Dialog Id="OzmaConfigDlg" Width="370" Height="270"
+              Title="[ProductName] — [WindowTitle]">
+
+        <!-- Banner area -->
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44"
+                 TabSkip="no" Text="!(loc.InstallDirDlgBannerBitmap)" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+
+        <!-- Title + description -->
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="200" Height="15"
+                 Transparent="yes" NoPrefix="yes">
+          <Text>{\WixUI_Font_Title}Controller Configuration</Text>
+        </Control>
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="320" Height="15"
+                 Transparent="yes" NoPrefix="yes">
+          <Text>Configure how this machine connects to your Ozma controller.</Text>
+        </Control>
+
+        <!-- Body -->
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+
+        <Control Id="ControllerURLLabel" Type="Text"
+                 X="25" Y="65" Width="110" Height="15" NoPrefix="yes">
+          <Text>Controller URL:</Text>
+        </Control>
+        <Control Id="ControllerURLEdit" Type="Edit"
+                 X="140" Y="62" Width="205" Height="18"
+                 Property="CONTROLLER_URL" Text="{200}" />
+
+        <Control Id="MachineNameLabel" Type="Text"
+                 X="25" Y="90" Width="110" Height="15" NoPrefix="yes">
+          <Text>Machine name:</Text>
+        </Control>
+        <Control Id="MachineNameEdit" Type="Edit"
+                 X="140" Y="87" Width="205" Height="18"
+                 Property="MACHINE_NAME" Text="{200}" />
+
+        <Control Id="HintText" Type="Text"
+                 X="25" Y="120" Width="320" Height="50" NoPrefix="yes">
+          <Text>The controller URL is where your Ozma controller is running, e.g. http://ozma.local:7380. The machine name appears in the Ozma dashboard and defaults to your computer name.</Text>
+        </Control>
+
+        <!-- Navigation -->
+        <Control Id="Back" Type="PushButton"
+                 X="180" Y="243" Width="56" Height="17" Text="&amp;Back">
+          <Publish Event="NewDialog" Value="InstallDirDlg">1</Publish>
+        </Control>
+        <Control Id="Next" Type="PushButton"
+                 X="236" Y="243" Width="56" Height="17" Default="yes" Text="&amp;Next">
+          <Publish Event="NewDialog" Value="VerifyReadyDlg">1</Publish>
+        </Control>
+        <Control Id="Cancel" Type="PushButton"
+                 X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="Cancel">
+          <Publish Event="SpawnDialog" Value="CancelDlg">1</Publish>
+        </Control>
+
+      </Dialog>
+
+      <!-- ── Dialog flow ────────────────────────────────────────────────── -->
+
+      <InstallUISequence>
+        <Show Dialog="WelcomeDlg"              Before="ProgressDlg">NOT Installed</Show>
+        <Show Dialog="ResumeDlg"               Before="ProgressDlg">Installed AND RESUME</Show>
+        <Show Dialog="MaintenanceWelcomeDlg"   Before="ProgressDlg">Installed AND NOT RESUME AND NOT PATCH</Show>
+      </InstallUISequence>
+
+      <!-- Welcome → InstallDir → OzmaConfig → VerifyReady (→ Progress → Finish via WixUI_Common) -->
+      <Publish Dialog="WelcomeDlg"      Control="Next"   Event="NewDialog" Value="InstallDirDlg"  Order="2">1</Publish>
+      <Publish Dialog="InstallDirDlg"   Control="Next"   Event="NewDialog" Value="OzmaConfigDlg"  Order="2">1</Publish>
+      <Publish Dialog="InstallDirDlg"   Control="Back"   Event="NewDialog" Value="WelcomeDlg"     Order="2">1</Publish>
+      <Publish Dialog="OzmaConfigDlg"   Control="Back"   Event="NewDialog" Value="InstallDirDlg"  Order="2">1</Publish>
+      <Publish Dialog="OzmaConfigDlg"   Control="Next"   Event="NewDialog" Value="VerifyReadyDlg" Order="2">1</Publish>
+      <Publish Dialog="VerifyReadyDlg"  Control="Back"   Event="NewDialog" Value="OzmaConfigDlg"  Order="2">NOT Installed</Publish>
+      <Publish Dialog="VerifyReadyDlg"  Control="Back"   Event="NewDialog" Value="MaintenanceTypeDlg" Order="2">Installed</Publish>
+
+      <!-- Maintenance flow -->
+      <Publish Dialog="MaintenanceWelcomeDlg" Control="Next" Event="NewDialog" Value="MaintenanceTypeDlg" Order="2">1</Publish>
+      <Publish Dialog="MaintenanceTypeDlg"    Control="Back" Event="NewDialog" Value="MaintenanceWelcomeDlg" Order="2">1</Publish>
+      <Publish Dialog="MaintenanceTypeDlg"    Control="RepairButton" Event="NewDialog" Value="VerifyReadyDlg" Order="2">1</Publish>
+      <Publish Dialog="MaintenanceTypeDlg"    Control="RemoveButton" Event="NewDialog" Value="VerifyReadyDlg" Order="2">1</Publish>
+
+    </UI>
+
+    <UIRef Id="WixUI_Common" />
+  </Fragment>
+
 </Wix>
