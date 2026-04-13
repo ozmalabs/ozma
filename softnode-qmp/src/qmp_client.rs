@@ -539,7 +539,7 @@ impl QmpClient {
     pub async fn connected(&self) -> bool {
         if self.dual {
             self.ctrl.connected().await && 
-                self.input.as_ref().map(|i| futures::future::BoxFuture::from(async { i.connected().await })).is_some()
+                self.input.as_ref().map_or(false, |i| i.connected().await)
         } else {
             self.ctrl.connected().await
         }
