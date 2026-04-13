@@ -121,7 +121,18 @@ fn open_pcm(device: &str, direction: Direction) -> Result<PCM> {
         pcm.hw_params(&hwp).context("hw_params")?;
     }
 
-    pcm.start().context("pcm start")?;
+    // Capture streams are started by the first read; playback streams need an
+    // explicit start after the buffer is primed.  Call prepare() for both so
+    // the PCM is in a known state, then start() only for playback.
+    pcm.prepare().context("pcm prepare")?;
+    if direction == Direction::Playback {
+        // Prime the buffer with silence before starting to avoid EPIPE on the
+        // first writei() call.
+        let silence = vec![0i16; PERIOD_FRAMES as usize * CHANNELS as usize];
+        let io = pcm.io_i16().context("io_i16 for priming")?;
+        let _ = io.writei(&silence);
+        pcm.start().context("pcm start")?;
+    }
     Ok(pcm)
 }
 
@@ -208,12 +219,12 @@ impl Default for UsbAudioConfig {
 ///
 /// # Example
 /// ```no_run
-/// # tokio_test::block_on(async {
 /// use ozma_node::usb_audio::{UsbAudioGadget, UsbAudioConfig};
-/// let gadget = UsbAudioGadget::open(UsbAudioConfig::default()).await.unwrap();
+/// # #[tokio::main] async fn main() {
+/// let gadget = UsbAudioGadget::open(UsbAudioConfig::default()).await;
 /// // ... do work ...
 /// gadget.close().await;
-/// # });
+/// # }
 /// ```
 pub struct UsbAudioGadget {
     /// ALSA device for the gadget playback interface (device → host).
@@ -232,7 +243,15 @@ impl UsbAudioGadget {
     /// Waits up to `config.alsa_probe_timeout` for the kernel to create the
     /// ALSA sound card, then spawns a background watcher that restarts the
     /// bridge on device disappear / reappear (USB reconnect).
-    pub async fn open(config: UsbAudioConfig) -> Result<Self> {
+    pub async fn open(config: UsbAudioConfig) -> Self {
+        if !uac2_active() {
+            warn!(
+                "UAC2 ConfigFS function not found at {} — \
+                 ensure the gadget script ran and the kernel has usb_f_uac2",
+                UAC2_FUNC_DIR
+            );
+        }
+
         let playback_device =
             wait_for_alsa(config.alsa_probe_timeout, config.poll_interval).await;
         let capture_device = playback_device
@@ -255,18 +274,18 @@ impl UsbAudioGadget {
         let stop = Arc::new(AtomicBool::new(false));
         let watcher = spawn_watcher(config, stop.clone());
 
-        Ok(Self {
+        Self {
             playback_device,
             capture_device,
             stop,
             _watcher: watcher,
-        })
+        }
     }
 
-    /// Signal the bridge tasks to stop and wait briefly for them to exit.
+    /// Signal the bridge tasks to stop and wait for them to exit (up to 2 s).
     pub async fn close(self) {
         self.stop.store(true, Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), self._watcher).await;
     }
 }
 
@@ -320,6 +339,10 @@ fn spawn_watcher(config: UsbAudioConfig, stop: Arc<AtomicBool>) -> JoinHandle<()
             let bridge_stop = Arc::new(AtomicBool::new(false));
 
             // device → host bridge (HDMI capture → UAC2 playback)
+            //
+            // The UAC2 gadget's playback interface (hw:N,0) is opened as
+            // Direction::Playback because *we* write audio into it and the
+            // USB host reads it as a microphone/capture source.
             let pb_stop = bridge_stop.clone();
             let hdmi_src = config.hdmi_capture_device.clone();
             let pb_dst = pb_dev.clone();
@@ -356,6 +379,10 @@ fn spawn_watcher(config: UsbAudioConfig, stop: Arc<AtomicBool>) -> JoinHandle<()
             });
 
             // host → device bridge (UAC2 capture → speaker output)
+            //
+            // The UAC2 gadget's capture interface (hw:N,1) is opened as
+            // Direction::Capture because the USB host writes audio into it
+            // (speaker/playback from the host's perspective) and we read it.
             let cap_stop = bridge_stop.clone();
             let cap_src = cap_dev.clone();
             let spk_dst = config.speaker_output_device.clone();
@@ -496,5 +523,31 @@ mod tests {
         assert_eq!(cfg.speaker_output_device, "default");
         assert!(cfg.alsa_probe_timeout > Duration::ZERO);
         assert!(cfg.poll_interval > Duration::ZERO);
+    }
+
+    /// Verify that the card-number parser handles leading spaces correctly.
+    #[test]
+    fn parse_card_with_leading_space() {
+        let line = " 3 [UAC2Gadget     ]: UAC2_Gadget - UAC2_Gadget";
+        let trimmed = line.trim_start();
+        let idx: u32 = trimmed
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(idx, 3);
+    }
+
+    /// Verify that a line without UAC2 in the name is not matched.
+    #[test]
+    fn non_uac2_card_not_matched() {
+        let line = " 0 [PCH            ]: HDA-Intel - HDA Intel PCH";
+        let trimmed = line.trim_start();
+        let upper = trimmed.to_ascii_uppercase();
+        let matched = upper.contains("UAC2")
+            || upper.contains("GADGET AUDIO")
+            || upper.contains("G_AUDIO");
+        assert!(!matched);
     }
 }

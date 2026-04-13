@@ -36,3 +36,6 @@ hostname         = "0.4"
 [lib]
 name = "ozma_node"
 path = "src/lib.rs"
+
+[dev-dependencies]
+tokio = { workspace = true }
