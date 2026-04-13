@@ -7,7 +7,7 @@ import logging
 import strawberry
 from strawberry.types import Info
 
-from controller.graphql.types.controls import (
+from controller.gql.types.controls import (
     ControlBindingType,
     ControlType,
     ControlSurfaceType,

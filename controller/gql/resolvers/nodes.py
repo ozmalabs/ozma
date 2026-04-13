@@ -26,7 +26,7 @@ class QueryNodes:
         nodes_list = []
         for node_id in sorted(app_state.nodes.keys()):
             node = app_state.nodes[node_id]
-            from controller.graphql.types.nodes import NodeType
+            from controller.gql.types.nodes import NodeType
 
             nodes_list.append(NodeType.from_nodeinfo(node))
         return nodes_list
@@ -42,7 +42,7 @@ class QueryNodes:
         if not node:
             return None
 
-        from controller.graphql.types.nodes import NodeType
+        from controller.gql.types.nodes import NodeType
 
         return NodeType.from_nodeinfo(node)
 
@@ -61,10 +61,10 @@ class QueryNodes:
         if not node:
             return None
 
-        from controller.graphql.types.nodes import NodeType
+        from controller.gql.types.nodes import NodeType
 
         return NodeType.from_nodeinfo(node)
 
 
 # Import NodeType after class definition to avoid circular import
-from controller.graphql.types.nodes import NodeType
+from controller.gql.types.nodes import NodeType

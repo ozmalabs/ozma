@@ -52,7 +52,7 @@ def alert_mgr():
 
 class TestNodeType:
     def test_from_node_creates_type(self):
-        from controller.graphql.subscriptions import NodeType
+        from controller.gql.subscriptions import NodeType
         from controller.state import NodeInfo
 
         node = NodeInfo(
@@ -81,7 +81,7 @@ class TestNodeType:
         assert node_type.active is True
 
     def test_from_node_with_optional_fields(self):
-        from controller.graphql.subscriptions import NodeType
+        from controller.gql.subscriptions import NodeType
         from controller.state import NodeInfo
 
         node = NodeInfo(
@@ -125,7 +125,7 @@ class TestNodeType:
 
 class TestScenarioType:
     def test_from_scenario_creates_type(self):
-        from controller.graphql.subscriptions import ScenarioType
+        from controller.gql.subscriptions import ScenarioType
         from controller.scenarios import Scenario
 
         scenario = Scenario(
@@ -148,7 +148,7 @@ class TestScenarioType:
 
 class TestAlertType:
     def test_from_alert_dict(self):
-        from controller.graphql.subscriptions import AlertType
+        from controller.gql.subscriptions import AlertType
 
         alert_dict = {
             "id": "alert1",
@@ -176,7 +176,7 @@ class TestAlertType:
         assert alert_type.timeout_s == 30
 
     def test_from_alert_dict_fallback_fields(self):
-        from controller.graphql.subscriptions import AlertType
+        from controller.gql.subscriptions import AlertType
 
         # Test with old field name (created_at instead of started_at)
         alert_dict = {
@@ -192,7 +192,7 @@ class TestAlertType:
         assert alert_type.created_at == 1234567890.0
 
     def test_from_alert_object(self, state):
-        from controller.graphql.subscriptions import AlertType
+        from controller.gql.subscriptions import AlertType
         from controller.alerts import AlertSession
 
         alert = AlertSession(
@@ -219,7 +219,7 @@ class TestAlertType:
 
 class TestSubscriptionRegistry:
     async def test_register_and_unregister(self):
-        from controller.graphql.subscriptions import _subscription_registry
+        from controller.gql.subscriptions import _subscription_registry
 
         subscription_id = "test-sub"
         queue = asyncio.Queue()
@@ -237,7 +237,7 @@ class TestSubscriptionRegistry:
         assert removed_queue is None
 
     async def test_matches_filter_exact(self):
-        from controller.graphql.subscriptions import _subscription_registry
+        from controller.gql.subscriptions import _subscription_registry
 
         subscription_id = "test-sub"
         queue = asyncio.Queue()
@@ -252,7 +252,7 @@ class TestSubscriptionRegistry:
         await _subscription_registry.unregister(subscription_id)
 
     async def test_matches_filter_no_filter(self):
-        from controller.graphql.subscriptions import _subscription_registry
+        from controller.gql.subscriptions import _subscription_registry
 
         subscription_id = "test-sub"
         queue = asyncio.Queue()
@@ -268,7 +268,7 @@ class TestSubscriptionRegistry:
 
 class TestEventRouter:
     async def test_start_and_stop_event_router(self, state):
-        from controller.graphql.subscriptions import start_event_router, stop_event_router
+        from controller.gql.subscriptions import start_event_router, stop_event_router
 
         start_event_router(state)
         assert state.events.qsize() == 0
@@ -280,7 +280,7 @@ class TestEventRouter:
 
     async def test_event_routing(self, state):
         """Test that events are routed to subscription queues."""
-        from controller.graphql.subscriptions import _subscription_registry, _event_router_task
+        from controller.gql.subscriptions import _subscription_registry, _event_router_task
 
         # Start event router
         start_event_router(state)
@@ -310,7 +310,7 @@ class TestEventRouter:
 class TestNodeStateChanged:
     async def test_node_state_subscription_yields_initial_nodes(self, state):
         """Test that nodeStateChanged yields initial node state on subscription."""
-        from controller.graphql.subscriptions import Subscription, start_event_router, stop_event_router
+        from controller.gql.subscriptions import Subscription, start_event_router, stop_event_router
         from controller.state import NodeInfo
 
         # Add a node to state
@@ -351,7 +351,7 @@ class TestNodeStateChanged:
 
     async def test_node_state_subscription_yields_new_node(self, state):
         """Test that nodeStateChanged yields new nodes as they come online."""
-        from controller.graphql.subscriptions import (
+        from controller.gql.subscriptions import (
             Subscription, start_event_router, stop_event_router,
             EVENT_NODE_ONLINE, _subscription_registry
         )
@@ -408,7 +408,7 @@ class TestNodeStateChanged:
 class TestScenarioActivated:
     async def test_scenario_activated_subscription_yields_initial_scenarios(self, state, scenario_mgr):
         """Test that scenarioActivated yields initial scenarios on subscription."""
-        from controller.graphql.subscriptions import Subscription, start_event_router, stop_event_router
+        from controller.gql.subscriptions import Subscription, start_event_router, stop_event_router
 
         start_event_router(state)
 
@@ -437,7 +437,7 @@ class TestScenarioActivated:
 
     async def test_scenario_activated_subscription_yields_new_activation(self, state, scenario_mgr):
         """Test that scenarioActivated yields scenario activation events."""
-        from controller.graphql.subscriptions import (
+        from controller.gql.subscriptions import (
             Subscription, start_event_router, stop_event_router,
             EVENT_SCENARIO_ACTIVATED
         )
@@ -486,7 +486,7 @@ class TestScenarioActivated:
 class TestAudioLevelUpdate:
     async def test_audio_level_subscription_yields_levels(self, state):
         """Test that audioLevelUpdate yields audio level updates."""
-        from controller.graphql.subscriptions import (
+        from controller.gql.subscriptions import (
             Subscription, start_event_router, stop_event_router,
             EVENT_AUDIO_LEVELS
         )
@@ -537,7 +537,7 @@ class TestAudioLevelUpdate:
 class TestAlertFired:
     async def test_alert_fired_subscription_yields_initial_alerts(self, state, alert_mgr):
         """Test that alertFired yields initial alerts on subscription."""
-        from controller.graphql.subscriptions import Subscription, start_event_router, stop_event_router
+        from controller.gql.subscriptions import Subscription, start_event_router, stop_event_router
         from controller.alerts import AlertSession
 
         start_event_router(state)
@@ -574,7 +574,7 @@ class TestAlertFired:
 
     async def test_alert_fired_subscription_yields_new_alert(self, state):
         """Test that alertFired yields new alert events."""
-        from controller.graphql.subscriptions import (
+        from controller.gql.subscriptions import (
             Subscription, start_event_router, stop_event_router,
             EVENT_ALERT_FIRED
         )
@@ -624,7 +624,7 @@ class TestAlertFired:
 
     async def test_alert_fired_subscription_yields_updated_alert(self, state, alert_mgr):
         """Test that alertFired yields updated alert events."""
-        from controller.graphql.subscriptions import (
+        from controller.gql.subscriptions import (
             Subscription, start_event_router, stop_event_router,
             EVENT_ALERT_UPDATED
         )

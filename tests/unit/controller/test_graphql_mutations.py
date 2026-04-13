@@ -9,7 +9,7 @@ import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from controller.graphql import (
+from controller.gql import (
     Mutation,
     GraphQLError,
     Node,
@@ -199,8 +199,8 @@ class TestWakeOnLanMutation:
     @pytest.mark.asyncio
     async def test_wake_on_lan_success(self, auth_info, app_state):
         """Test successful Wake-on-LAN."""
-        with patch('controller.graphql.get_mac_from_arp', return_value="aa:bb:cc:dd:ee:ff"):
-            with patch('controller.graphql.send_wol', return_value=True):
+        with patch('controller.gql.get_mac_from_arp', return_value="aa:bb:cc:dd:ee:ff"):
+            with patch('controller.gql.send_wol', return_value=True):
                 mutation = Mutation()
 
                 result = await mutation.wake_on_lan(auth_info, id="node-1._ozma._udp.local.")
@@ -212,7 +212,7 @@ class TestWakeOnLanMutation:
     @pytest.mark.asyncio
     async def test_wake_on_lan_no_mac(self, auth_info):
         """Test Wake-on-LAN when MAC is not available."""
-        with patch('controller.graphql.get_mac_from_arp', return_value=None):
+        with patch('controller.gql.get_mac_from_arp', return_value=None):
             mutation = Mutation()
 
             result = await mutation.wake_on_lan(auth_info, id="node-1._ozma._udp.local.")
@@ -224,7 +224,7 @@ class TestWakeOnLanMutation:
     @pytest.mark.asyncio
     async def test_wake_on_lan_not_found(self, auth_info):
         """Test Wake-on-LAN for non-existent node."""
-        with patch('controller.graphql.get_mac_from_arp', return_value=None):
+        with patch('controller.gql.get_mac_from_arp', return_value=None):
             mutation = Mutation()
 
             with pytest.raises(GraphQLError) as exc_info:

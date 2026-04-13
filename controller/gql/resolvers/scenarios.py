@@ -25,7 +25,7 @@ class QueryScenarios:
         scenarios_list = []
         for scenario_id in sorted(scenario_manager._scenarios.keys()):
             scenario = scenario_manager._scenarios[scenario_id]
-            from controller.graphql.types.scenarios import ScenarioType
+            from controller.gql.types.scenarios import ScenarioType
 
             scenarios_list.append(ScenarioType.from_scenario(scenario))
         return scenarios_list
@@ -41,7 +41,7 @@ class QueryScenarios:
         if not scenario:
             return None
 
-        from controller.graphql.types.scenarios import ScenarioType
+        from controller.gql.types.scenarios import ScenarioType
 
         return ScenarioType.from_scenario(scenario)
 
@@ -60,10 +60,10 @@ class QueryScenarios:
         if not scenario:
             return None
 
-        from controller.graphql.types.scenarios import ScenarioType
+        from controller.gql.types.scenarios import ScenarioType
 
         return ScenarioType.from_scenario(scenario)
 
 
 # Import ScenarioType after class definition to avoid circular import
-from controller.graphql.types.scenarios import ScenarioType
+from controller.gql.types.scenarios import ScenarioType
