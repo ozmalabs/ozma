@@ -11,7 +11,7 @@ default = []
 evdev-test = ["dep:evdev"]
 
 [dependencies]
-enigo   = { version = "0.2", features = ["with_serde"] }
+enigo   = { version = "0.2" }
 thiserror = "1"
 log     = "0.4"
 tokio   = { version = "1", features = ["time", "rt"] }

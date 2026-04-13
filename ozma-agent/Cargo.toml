@@ -22,6 +22,8 @@ thiserror          = { workspace = true }
 ozma-proto         = { path = "../ozma-proto" }
 ozma-mesh          = { path = "../ozma-mesh" }
 ozma-crypto        = { path = "../ozma-crypto" }
+backoff            = { version = "0.4", features = ["tokio"] }
+hostname           = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.56", features = [

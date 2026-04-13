@@ -8,7 +8,7 @@
 //! the plaintext side is inspected directly.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use boringtun::noise::{Tunn, TunnResult};
 use tokio::net::UdpSocket;
@@ -24,7 +24,7 @@ const WG_BUF_SIZE: usize = 65535;
 /// A single WireGuard peer tunnel (one per remote peer).
 pub struct WgTunnel {
     /// boringtun tunnel state machine.
-    inner: Box<Tunn>,
+    inner: Arc<Mutex<Tunn>>,
     /// Shared UDP socket (all peers share one socket on the local node).
     socket: Arc<UdpSocket>,
     /// Remote endpoint address.
@@ -57,7 +57,7 @@ impl WgTunnel {
         .map_err(|e| MeshError::TunnelError(format!("boringtun init: {e}")))?;
 
         Ok(Self {
-            inner: tunn,
+            inner: Arc::new(Mutex::new(tunn)),
             socket,
             peer_addr,
             peer,
@@ -67,7 +67,7 @@ impl WgTunnel {
     /// Encapsulate a plaintext IP packet and send it to the peer.
     pub async fn send_plaintext(&mut self, plaintext: &[u8]) -> Result<(), MeshError> {
         let mut dst = vec![0u8; WG_BUF_SIZE];
-        match self.inner.encapsulate(plaintext, &mut dst) {
+        match self.inner.lock().unwrap().encapsulate(plaintext, &mut dst) {
             TunnResult::WriteToNetwork(packet) => {
                 self.socket.send_to(packet, self.peer_addr).await?;
                 trace!(peer = %self.peer.id, bytes = packet.len(), "WG encapsulated → sent");
@@ -93,13 +93,13 @@ impl WgTunnel {
         let mut dst = vec![0u8; WG_BUF_SIZE];
         let mut out_buf = vec![0u8; WG_BUF_SIZE];
 
-        match self.inner.decapsulate(None, udp_packet, &mut dst) {
+        match self.inner.lock().unwrap().decapsulate(None, udp_packet, &mut dst) {
             TunnResult::WriteToNetwork(reply) => {
                 // Handshake response — send it back, no plaintext yet.
                 self.socket.send_to(reply, self.peer_addr).await?;
                 // Drain any queued packets now that the handshake completed.
                 loop {
-                    match self.inner.decapsulate(None, &[], &mut out_buf) {
+                    match self.inner.lock().unwrap().decapsulate(None, &[], &mut out_buf) {
                         TunnResult::WriteToTunnelV4(pkt, _) | TunnResult::WriteToTunnelV6(pkt, _) => {
                             return Ok(Some(pkt.to_vec()));
                         }
@@ -132,7 +132,7 @@ impl WgTunnel {
     /// Sends keepalive / handshake-initiation packets as needed.
     pub async fn tick(&mut self) -> Result<(), MeshError> {
         let mut dst = vec![0u8; WG_BUF_SIZE];
-        match self.inner.update_timers(&mut dst) {
+        match self.inner.lock().unwrap().update_timers(&mut dst) {
             TunnResult::WriteToNetwork(pkt) => {
                 self.socket.send_to(pkt, self.peer_addr).await?;
             }

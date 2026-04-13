@@ -16,7 +16,7 @@ libmdns      = "0.7"
 tokio        = { version = "1", features = ["full"] }
 
 # Crypto: X25519 key generation
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+x25519-dalek = { version = "=2.0.0-rc.3", features = ["static_secrets"] }
 rand         = "0.8"
 
 # Base64 for WireGuard key encoding/decoding

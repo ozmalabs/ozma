@@ -1,0 +1,70 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Contains functions to control the mouse and to get the size of the display. Enigo uses a cartesian coordinate system for specifying coordinates. The origin in this system is located in the top-left corner of the current screen, with positive values extending along the axes down and to the right of the origin point and it is measured in pixels. The same coordinate system is used on all operating systems."><title>Mouse in enigo - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2" crossorigin href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-916cea96.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="enigo" data-themes="" data-resource-suffix="" data-rustdoc-version="1.87.0 (17067e9ac 2025-05-09) (Homebrew)" data-channel="1.87.0" data-search-js="search-e7298875.js" data-settings-js="settings-d72f25bb.js" ><script src="../static.files/storage-82c7156e.js"></script><script defer src="sidebar-items.js"></script><script defer src="../static.files/main-fb8c74a8.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-893ab5e7.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-6580c154.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc trait"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="mobile-topbar"><button class="sidebar-menu-toggle" title="show sidebar"></button></nav><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../enigo/index.html">enigo</a><span class="version">0.2.1</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Mouse</a></h2><h3><a href="#required-methods">Required Methods</a></h3><ul class="block"><li><a href="#tymethod.button" title="button">button</a></li><li><a href="#tymethod.location" title="location">location</a></li><li><a href="#tymethod.main_display" title="main_display">main_display</a></li><li><a href="#tymethod.move_mouse" title="move_mouse">move_mouse</a></li><li><a href="#tymethod.scroll" title="scroll">scroll</a></li></ul><h3><a href="#implementors">Implementors</a></h3></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="index.html">In crate enigo</a></h2></div></div></nav><div class="sidebar-resizer"></div><main><div class="width-limiter"><rustdoc-search></rustdoc-search><section id="main-content" class="content"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="index.html">enigo</a></div><h1>Trait <span class="trait">Mouse</span><button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/enigo/lib.rs.html#287-352">Source</a> </span></div><pre class="rust item-decl"><code>pub trait Mouse {
+    // Required methods
+    fn <a href="#tymethod.button" class="fn">button</a>(
+        &amp;mut self,
+        button: <a class="enum" href="enum.Button.html" title="enum enigo::Button">Button</a>,
+        direction: <a class="enum" href="enum.Direction.html" title="enum enigo::Direction">Direction</a>,
+    ) -&gt; <a class="type" href="type.InputResult.html" title="type enigo::InputResult">InputResult</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.87.0/std/primitive.unit.html">()</a>&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.move_mouse" class="fn">move_mouse</a>(
+        &amp;mut self,
+        x: <a class="primitive" href="https://doc.rust-lang.org/1.87.0/std/primitive.i32.html">i32</a>,
+        y: <a class="primitive" href="https://doc.rust-lang.org/1.87.0/std/primitive.i32.html">i32</a>,
+        coordinate: <a class="enum" href="enum.Coordinate.html" title="enum enigo::Coordinate">Coordinate</a>,
+    ) -&gt; <a class="type" href="type.InputResult.html" title="type enigo::InputResult">InputResult</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.87.0/std/primitive.unit.html">()</a>&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.scroll" class="fn">scroll</a>(&amp;mut self, length: <a class="primitive" href="https://doc.rust-lang.org/1.87.0/std/primitive.i32.html">i32</a>, axis: <a class="enum" href="enum.Axis.html" title="enum enigo::Axis">Axis</a>) -&gt; <a class="type" href="type.InputResult.html" title="type enigo::InputResult">InputResult</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.87.0/std/primitive.unit.html">()</a>&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.main_display" class="fn">main_display</a>(&amp;self) -&gt; <a class="type" href="type.InputResult.html" title="type enigo::InputResult">InputResult</a>&lt;(<a class="primitive" href="https://doc.rust-lang.org/1.87.0/std/primitive.i32.html">i32</a>, <a class="primitive" href="https://doc.rust-lang.org/1.87.0/std/primitive.i32.html">i32</a>)&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.location" class="fn">location</a>(&amp;self) -&gt; <a class="type" href="type.InputResult.html" title="type enigo::InputResult">InputResult</a>&lt;(<a class="primitive" href="https://doc.rust-lang.org/1.87.0/std/primitive.i32.html">i32</a>, <a class="primitive" href="https://doc.rust-lang.org/1.87.0/std/primitive.i32.html">i32</a>)&gt;;
+}</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Contains functions to control the mouse and to get the size of the display.
+Enigo uses a cartesian coordinate system for specifying coordinates. The
+origin in this system is located in the top-left corner of the current
+screen, with positive values extending along the axes down and to the
+right of the origin point and it is measured in pixels. The same coordinate
+system is used on all operating systems.</p>
+</div></details><h2 id="required-methods" class="section-header">Required Methods<a href="#required-methods" class="anchor">§</a></h2><div class="methods"><details class="toggle method-toggle" open><summary><section id="tymethod.button" class="method"><a class="src rightside" href="../src/enigo/lib.rs.html#296">Source</a><h4 class="code-header">fn <a href="#tymethod.button" class="fn">button</a>(&amp;mut self, button: <a class="enum" href="enum.Button.html" title="enum enigo::Button">Button</a>, direction: <a class="enum" href="enum.Direction.html" title="enum enigo::Direction">Direction</a>) -&gt; <a class="type" href="type.InputResult.html" title="type enigo::InputResult">InputResult</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.87.0/std/primitive.unit.html">()</a>&gt;</h4></section></summary><div class="docblock"><p>Sends an individual mouse button event. You can use this for example to
+simulate a click of the left mouse key. Some of the buttons are specific
+to a platform.</p>
+<h5 id="errors"><a class="doc-anchor" href="#errors">§</a>Errors</h5>
+<p>Have a look at the documentation of <a href="enum.InputError.html" title="enum enigo::InputError"><code>InputError</code></a> to see under which
+conditions an error will be returned.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.move_mouse" class="method"><a class="src rightside" href="../src/enigo/lib.rs.html#316">Source</a><h4 class="code-header">fn <a href="#tymethod.move_mouse" class="fn">move_mouse</a>(
+    &amp;mut self,
+    x: <a class="primitive" href="https://doc.rust-lang.org/1.87.0/std/primitive.i32.html">i32</a>,
+    y: <a class="primitive" href="https://doc.rust-lang.org/1.87.0/std/primitive.i32.html">i32</a>,
+    coordinate: <a class="enum" href="enum.Coordinate.html" title="enum enigo::Coordinate">Coordinate</a>,
+) -&gt; <a class="type" href="type.InputResult.html" title="type enigo::InputResult">InputResult</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.87.0/std/primitive.unit.html">()</a>&gt;</h4></section></summary><div class="docblock"><p>Move the mouse cursor to the specified x and y coordinates.</p>
+<p>You can specify absolute coordinates or relative from the current
+position.</p>
+<p>If you use absolute coordinates, the top left corner of your monitor
+screen is x=0 y=0. Move the cursor down the screen by increasing the y
+and to the right by increasing x coordinate.</p>
+<p>If you use relative coordinates, a positive x value moves the mouse
+cursor <code>x</code> pixels to the right. A negative value for <code>x</code> moves the mouse
+cursor to the left. A positive value of y moves the mouse cursor down, a
+negative one moves the mouse cursor up.</p>
+<h5 id="errors-1"><a class="doc-anchor" href="#errors-1">§</a>Errors</h5>
+<p>Have a look at the documentation of <a href="enum.InputError.html" title="enum enigo::InputError"><code>InputError</code></a> to see under which
+conditions an error will be returned.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.scroll" class="method"><a class="src rightside" href="../src/enigo/lib.rs.html#334">Source</a><h4 class="code-header">fn <a href="#tymethod.scroll" class="fn">scroll</a>(&amp;mut self, length: <a class="primitive" href="https://doc.rust-lang.org/1.87.0/std/primitive.i32.html">i32</a>, axis: <a class="enum" href="enum.Axis.html" title="enum enigo::Axis">Axis</a>) -&gt; <a class="type" href="type.InputResult.html" title="type enigo::InputResult">InputResult</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.87.0/std/primitive.unit.html">()</a>&gt;</h4></section></summary><div class="docblock"><p>Send a mouse scroll event</p>
+<h5 id="arguments"><a class="doc-anchor" href="#arguments">§</a>Arguments</h5>
+<ul>
+<li><code>axis</code> - The axis to scroll on</li>
+<li><code>length</code> - Number of 15° (click) rotations of the mouse wheel to
+scroll. How many lines will be scrolled depends on the current setting
+of the operating system.</li>
+</ul>
+<p>With <a href="enum.Axis.html#variant.Vertical" title="variant enigo::Axis::Vertical"><code>Axis::Vertical</code></a>, a positive length will result in scrolling down
+and negative ones up. With <a href="enum.Axis.html#variant.Horizontal" title="variant enigo::Axis::Horizontal"><code>Axis::Horizontal</code></a>, a positive length
+will result in scrolling to the right and negative ones to the left</p>
+<h5 id="errors-2"><a class="doc-anchor" href="#errors-2">§</a>Errors</h5>
+<p>Have a look at the documentation of <a href="enum.InputError.html" title="enum enigo::InputError"><code>InputError</code></a> to see under which
+conditions an error will be returned.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.main_display" class="method"><a class="src rightside" href="../src/enigo/lib.rs.html#343">Source</a><h4 class="code-header">fn <a href="#tymethod.main_display" class="fn">main_display</a>(&amp;self) -&gt; <a class="type" href="type.InputResult.html" title="type enigo::InputResult">InputResult</a>&lt;(<a class="primitive" href="https://doc.rust-lang.org/1.87.0/std/primitive.i32.html">i32</a>, <a class="primitive" href="https://doc.rust-lang.org/1.87.0/std/primitive.i32.html">i32</a>)&gt;</h4></section></summary><div class="docblock"><p>Get the (width, height) of the main display in pixels. This currently
+only works on the main display</p>
+<h5 id="errors-3"><a class="doc-anchor" href="#errors-3">§</a>Errors</h5>
+<p>Have a look at the documentation of <a href="enum.InputError.html" title="enum enigo::InputError"><code>InputError</code></a> to see under which
+conditions an error will be returned.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.location" class="method"><a class="src rightside" href="../src/enigo/lib.rs.html#351">Source</a><h4 class="code-header">fn <a href="#tymethod.location" class="fn">location</a>(&amp;self) -&gt; <a class="type" href="type.InputResult.html" title="type enigo::InputResult">InputResult</a>&lt;(<a class="primitive" href="https://doc.rust-lang.org/1.87.0/std/primitive.i32.html">i32</a>, <a class="primitive" href="https://doc.rust-lang.org/1.87.0/std/primitive.i32.html">i32</a>)&gt;</h4></section></summary><div class="docblock"><p>Get the location of the mouse in pixels</p>
+<h5 id="errors-4"><a class="doc-anchor" href="#errors-4">§</a>Errors</h5>
+<p>Have a look at the documentation of <a href="enum.InputError.html" title="enum enigo::InputError"><code>InputError</code></a> to see under which
+conditions an error will be returned.</p>
+</div></details></div><h2 id="implementors" class="section-header">Implementors<a href="#implementors" class="anchor">§</a></h2><div id="implementors-list"><section id="impl-Mouse-for-Enigo" class="impl"><a class="src rightside" href="../src/enigo/linux/mod.rs.html#161-297">Source</a><a href="#impl-Mouse-for-Enigo" class="anchor">§</a><h3 class="code-header">impl <a class="trait" href="trait.Mouse.html" title="trait enigo::Mouse">Mouse</a> for <a class="struct" href="struct.Enigo.html" title="struct enigo::Enigo">Enigo</a></h3></section></div><script src="../trait.impl/enigo/trait.Mouse.js" async></script></section></div></main></body></html>

@@ -137,7 +137,7 @@ fn open_pcm(device: &str, direction: Direction) -> Result<PCM> {
         // Prime the buffer with silence before starting to avoid EPIPE on the
         // first writei() call.
         let silence = vec![0i16; PERIOD_FRAMES as usize * CHANNELS as usize];
-        let io = pcm.io_i16();
+        let io = pcm.io_i16().context("pcm io_i16")?;
         let _ = io.writei(&silence);
         pcm.start().context("pcm start")?;
     }
@@ -154,8 +154,8 @@ fn open_pcm(device: &str, direction: Direction) -> Result<PCM> {
 fn bridge_loop(src: &PCM, dst: &PCM, stop: &AtomicBool) -> Result<()> {
     let mut buf = vec![0i16; PERIOD_FRAMES as usize * CHANNELS as usize];
 
-    let src_io = src.io_i16();
-    let dst_io = dst.io_i16();
+    let src_io = src.io_i16().context("src io_i16")?;
+    let dst_io = dst.io_i16().context("dst io_i16")?;
 
     loop {
         if stop.load(Ordering::Relaxed) {

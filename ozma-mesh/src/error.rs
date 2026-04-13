@@ -3,7 +3,7 @@
 use thiserror::Error;
 
 /// All errors that can be produced by the ozma-mesh crate.
-#[derive(Debug, Error, PartialEq)]
+#[derive(Debug, Error)]
 pub enum MeshError {
     #[error("WireGuard key error: {0}")]
     KeyError(String),

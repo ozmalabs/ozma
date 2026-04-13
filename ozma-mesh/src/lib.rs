@@ -39,10 +39,13 @@
 //! ```
 
 pub mod error;
+pub mod keys;
 pub mod manager;
 pub mod node;
+pub mod tunnel;
 
 // Convenience re-exports — `use ozma_mesh::{MeshManager, MeshNode, ...}`.
 pub use error::{MeshError, Result};
 pub use manager::MeshManager;
 pub use node::{MeshNode, WgPrivateKey, WgPublicKey};
+pub use tunnel::WgTunnel;

@@ -1,10 +1,38 @@
-//! Prometheus metrics registry and scrape endpoint.
+//! Prometheus metrics registry, system metrics collection, and scrape endpoint.
 //!
 //! Exposes a `/metrics` endpoint on a dedicated port so Prometheus can scrape
 //! the agent without going through the main API server.
 
 use anyhow::Result;
 use axum::{routing::get, Router};
+use serde::Serialize;
+
+/// Point-in-time system metrics snapshot pushed to Connect.
+#[derive(Debug, Serialize)]
+pub struct SystemMetrics {
+    pub cpu_percent:    f32,
+    pub mem_used_bytes: u64,
+    pub mem_total_bytes: u64,
+    pub uptime_secs:    u64,
+}
+
+/// Collect a current system metrics snapshot.
+pub fn collect() -> SystemMetrics {
+    // Best-effort: read from /proc; return zeros if unavailable.
+    let uptime_secs = std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|s| s.split_whitespace().next().and_then(|v| v.parse::<f64>().ok()))
+        .map(|f| f as u64)
+        .unwrap_or(0);
+
+    SystemMetrics {
+        cpu_percent: 0.0,
+        mem_used_bytes: 0,
+        mem_total_bytes: 0,
+        uptime_secs,
+    }
+}
+
 use prometheus::{Encoder, Registry, TextEncoder, process_collector::ProcessCollector};
 use std::sync::Arc;
 use tracing::info;

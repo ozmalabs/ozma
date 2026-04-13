@@ -1,0 +1,9 @@
+(function() {
+    var implementors = Object.fromEntries([["enigo",[["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.87.0/core/marker/trait.Copy.html\" title=\"trait core::marker::Copy\">Copy</a> for <a class=\"enum\" href=\"enigo/enum.Axis.html\" title=\"enum enigo::Axis\">Axis</a>"],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.87.0/core/marker/trait.Copy.html\" title=\"trait core::marker::Copy\">Copy</a> for <a class=\"enum\" href=\"enigo/enum.Button.html\" title=\"enum enigo::Button\">Button</a>"],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.87.0/core/marker/trait.Copy.html\" title=\"trait core::marker::Copy\">Copy</a> for <a class=\"enum\" href=\"enigo/enum.Coordinate.html\" title=\"enum enigo::Coordinate\">Coordinate</a>"],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.87.0/core/marker/trait.Copy.html\" title=\"trait core::marker::Copy\">Copy</a> for <a class=\"enum\" href=\"enigo/enum.Direction.html\" title=\"enum enigo::Direction\">Direction</a>"],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.87.0/core/marker/trait.Copy.html\" title=\"trait core::marker::Copy\">Copy</a> for <a class=\"enum\" href=\"enigo/enum.Key.html\" title=\"enum enigo::Key\">Key</a>"],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.87.0/core/marker/trait.Copy.html\" title=\"trait core::marker::Copy\">Copy</a> for <a class=\"enum\" href=\"enigo/enum.NewConError.html\" title=\"enum enigo::NewConError\">NewConError</a>"]]]]);
+    if (window.register_implementors) {
+        window.register_implementors(implementors);
+    } else {
+        window.pending_implementors = implementors;
+    }
+})()
+//{"start":57,"fragment_lengths":[1448]}

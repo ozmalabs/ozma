@@ -103,7 +103,7 @@ impl HidInjector {
     /// Press and immediately release a single key (with optional shift/altgr).
     pub fn tap_key(&mut self, key: Key, shift: bool, altgr: bool) -> Result<(), InjectorError> {
         if altgr {
-            self.enigo.key(Key::RightAlt, Direction::Press)
+            self.enigo.key(Key::Alt, Direction::Press)
                 .map_err(|e| InjectorError::Key(e.to_string()))?;
         }
         if shift {
@@ -117,7 +117,7 @@ impl HidInjector {
                 .map_err(|e| InjectorError::Key(e.to_string()))?;
         }
         if altgr {
-            self.enigo.key(Key::RightAlt, Direction::Release)
+            self.enigo.key(Key::Alt, Direction::Release)
                 .map_err(|e| InjectorError::Key(e.to_string()))?;
         }
         Ok(())
@@ -265,12 +265,12 @@ fn modifier_keys(modifier: u8) -> Vec<Key> {
     let mut keys = Vec::new();
     if modifier & 0x01 != 0 { keys.push(Key::LControl); }
     if modifier & 0x02 != 0 { keys.push(Key::LShift); }
-    if modifier & 0x04 != 0 { keys.push(Key::LAlt); }
-    if modifier & 0x08 != 0 { keys.push(Key::LMeta); }
+    if modifier & 0x04 != 0 { keys.push(Key::Alt); }
+    if modifier & 0x08 != 0 { keys.push(Key::Meta); }
     if modifier & 0x10 != 0 { keys.push(Key::RControl); }
     if modifier & 0x20 != 0 { keys.push(Key::RShift); }
-    if modifier & 0x40 != 0 { keys.push(Key::RightAlt); }  // AltGr
-    if modifier & 0x80 != 0 { keys.push(Key::RMeta); }
+    if modifier & 0x40 != 0 { keys.push(Key::Alt); }  // AltGr
+    if modifier & 0x80 != 0 { keys.push(Key::Meta); }
     keys
 }
 
@@ -300,7 +300,7 @@ mod tests {
     fn modifier_byte_expansion() {
         let mods = modifier_keys(0x02 | 0x40); // LShift + AltGr
         assert!(mods.contains(&Key::LShift));
-        assert!(mods.contains(&Key::RightAlt));
+        assert!(mods.contains(&Key::Alt));
         assert!(!mods.contains(&Key::LControl));
     }
 }

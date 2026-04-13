@@ -17,7 +17,7 @@ tracing      = { workspace = true }
 anyhow       = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-pipewire     = { version = "0.9.2", optional = true }
+pipewire     = { version = "0.9.2" }
 libc         = { workspace = true }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]

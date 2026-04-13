@@ -1,0 +1,11 @@
+/applications/data/ozma-dev-manager/repos/ozma/target/debug/deps/libproc_mounts-39a9f195e2800c80.rmeta: /home/matt/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-mounts-0.3.0/src/lib.rs /home/matt/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-mounts-0.3.0/src/mounts/mod.rs /home/matt/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-mounts-0.3.0/src/mounts/info.rs /home/matt/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-mounts-0.3.0/src/mounts/iter.rs /home/matt/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-mounts-0.3.0/src/mounts/list.rs /home/matt/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-mounts-0.3.0/src/mounts/tab.rs /home/matt/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-mounts-0.3.0/src/swaps.rs
+
+/applications/data/ozma-dev-manager/repos/ozma/target/debug/deps/proc_mounts-39a9f195e2800c80.d: /home/matt/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-mounts-0.3.0/src/lib.rs /home/matt/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-mounts-0.3.0/src/mounts/mod.rs /home/matt/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-mounts-0.3.0/src/mounts/info.rs /home/matt/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-mounts-0.3.0/src/mounts/iter.rs /home/matt/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-mounts-0.3.0/src/mounts/list.rs /home/matt/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-mounts-0.3.0/src/mounts/tab.rs /home/matt/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-mounts-0.3.0/src/swaps.rs
+
+/home/matt/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-mounts-0.3.0/src/lib.rs:
+/home/matt/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-mounts-0.3.0/src/mounts/mod.rs:
+/home/matt/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-mounts-0.3.0/src/mounts/info.rs:
+/home/matt/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-mounts-0.3.0/src/mounts/iter.rs:
+/home/matt/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-mounts-0.3.0/src/mounts/list.rs:
+/home/matt/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-mounts-0.3.0/src/mounts/tab.rs:
+/home/matt/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-mounts-0.3.0/src/swaps.rs:
