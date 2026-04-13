@@ -23,7 +23,27 @@ import platform
 import sys
 from pathlib import Path
 
-CONFIG_DIR = Path.home() / ".config" / "ozma"
+
+def get_config_dir() -> Path:
+    """Return platform-specific config directory.
+
+    - macOS: ~/Library/Application Support/Ozma
+    - Windows: %LOCALAPPDATA%/Ozma (fallback to ~/AppData/Local/Ozma)
+    - Linux/other: ~/.config/ozma
+    """
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Ozma"
+    elif sys.platform == "win32":
+        # Use %LOCALAPPDATA% for Windows, falling back to ~/AppData/Local
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            return Path(local_app_data) / "Ozma"
+        return Path.home() / "AppData" / "Local" / "Ozma"
+    else:
+        return Path.home() / ".config" / "ozma"
+
+
+CONFIG_DIR = get_config_dir()
 CONFIG_FILE = CONFIG_DIR / "agent.json"
 LOG_FILE = CONFIG_DIR / "agent.log"
 
