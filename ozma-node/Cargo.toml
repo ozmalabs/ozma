@@ -12,60 +12,56 @@ path = "src/main.rs"
 
 [dependencies]
 # CLI
-clap = { version = "4", features = ["derive", "env"] }
+clap = { workspace = true, features = ["env"] }
 
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { workspace = true }
 
 # HTTP server (HLS + REST)
-axum        = { version = "0.7", features = ["tokio"] }
-tower       = "0.4"
-tower-http  = { version = "0.5", features = ["fs", "trace"] }
+axum       = { workspace = true }
+tower      = { workspace = true }
+tower-http = { workspace = true }
 
 # HTTP client (registration + heartbeat)
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { workspace = true }
 
 # mDNS advertisement
-mdns-sd = "0.11"
+mdns-sd = { workspace = true }
 
 # Serialisation
-serde      = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde      = { workspace = true }
+serde_json = { workspace = true }
 
 # Logging
-tracing            = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 # Error handling
-anyhow    = "1"
-thiserror = "1"
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
 
 # Misc
-uuid       = { version = "1", features = ["v4"] }
+uuid       = { workspace = true }
 tokio-util = { version = "0.7", features = ["codec", "sync"] }
-bytes      = "1"
-hostname   = "0.4"
-
-[profile.release]
-opt-level     = 3
-lto           = true
-codegen-units = 1
-strip         = true
+bytes      = { workspace = true }
+hostname   = { workspace = true }
 
 # ── cargo-deb metadata ────────────────────────────────────────────────────────
 [package.metadata.deb]
 name        = "ozma-node"
 maintainer  = "Ozma Contributors <hello@ozma.dev>"
 copyright   = "2024 Ozma Contributors"
-license-file = ["LICENSE", "4"]
+license-file = ["../../LICENSE", "0"]
 extended-description = """\
-Ozma node agent. Receives HID events over UDP, serves HLS video,
-advertises itself via mDNS, and sends heartbeats to the controller."""
-depends = "$auto"
+ozma-node is the lightweight KVM node agent that runs on each managed \
+machine (Raspberry Pi 4, Milk-V Duo S, x86 workstation). It exposes \
+HID injection over UDP, an HLS/REST API, mDNS advertisement, and \
+controller registration/heartbeat in a single statically-linked binary."""
+depends  = "$auto"
 section  = "net"
 priority = "optional"
 assets = [
-    ["target/release/ozma-node", "usr/bin/",             "755"],
-    ["ozma-node.service",        "lib/systemd/system/",  "644"],
+    ["target/aarch64-unknown-linux-gnu/release/ozma-node", "usr/bin/ozma-node",                "755"],
+    ["systemd/ozma-node.service",                          "lib/systemd/system/ozma-node.service", "644"],
 ]
 systemd-units = { enable = true }

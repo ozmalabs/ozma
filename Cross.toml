@@ -1,0 +1,11 @@
+# Cross.toml — configuration for `cross` (cross-compilation helper)
+# https://github.com/cross-rs/cross
+
+[target.aarch64-unknown-linux-gnu]
+# Uncomment to pin a specific cross image:
+# image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:edge"
+
+# Environment variables forwarded into the cross container at build time.
+passthrough = [
+    "CARGO_TERM_COLOR",
+]
