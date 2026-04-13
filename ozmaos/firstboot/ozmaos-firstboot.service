@@ -1,0 +1,21 @@
+[Unit]
+Description=OzmaOS First-Boot Wizard
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=!/etc/ozmaos/firstboot-complete
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -m ozmaos.firstboot.wizard
+RemainAfterExit=no
+StandardInput=tty
+StandardOutput=tty
+TTYPath=/dev/tty1
+TimeoutSec=3600
+Environment=HOME=/root
+
+# Ensure we have a proper terminal
+ExecStartPre=/usr/bin/chvt 1
+
+[Install]
+WantedBy=multi-user.target
