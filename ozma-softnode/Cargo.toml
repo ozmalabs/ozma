@@ -18,6 +18,10 @@ serde              = { version = "1", features = ["derive"] }
 serde_json         = "1"
 clap               = { version = "4", features = ["derive"] }
 glob               = "0.3"
+# Add dependencies needed for softnode functionality
+# zeroconf          = "0.7"          # for mDNS
+# evdev             = "0.11"          # for evdev input
+# rumqttc           = "0.24"          # for MQTT if needed
 ozma-proto         = { path = "../ozma-proto" }
 ozma-mesh          = { path = "../ozma-mesh" }
 ozma-crypto        = { path = "../ozma-crypto" }
