@@ -155,6 +155,27 @@ log = logging.getLogger("ozma")
 async def run(config: Config) -> None:
     state = AppState()
 
+    # Network backend integration
+    if config.network_backend:
+        try:
+            from net_integrations.provisioner import make_backend, NetworkProvisioner
+            _net_backend = make_backend(
+                config.network_backend,
+                host=config.network_backend_host,
+                username=config.network_backend_username,
+                password=config.network_backend_password,
+                site=config.network_backend_site,
+                api_key=config.network_unifi_api_key,
+                transport=config.network_mikrotik_transport,
+            )
+            state.network_provisioner = NetworkProvisioner(_net_backend)
+            log.info("Network backend: %s @ %s", config.network_backend, config.network_backend_host)
+        except Exception as e:
+            log.warning("Failed to initialise network backend (%s): %s", config.network_backend, e)
+            state.network_provisioner = None
+    else:
+        state.network_provisioner = None
+
     scenarios_path = Path(__file__).parent / "scenarios.json"
     _yaml_path = Path(__file__).parent / "scenarios.yaml"
     if not scenarios_path.exists() and _yaml_path.exists():
@@ -826,17 +847,17 @@ async def run(config: Config) -> None:
 
     # Auto-link LAN peer controllers discovered via mDNS
     async def _on_peer_found(info: dict) -> None:
-        if not sharing:
+        if not sharing_mgr:
             return
-        existing = sharing.get_peer(info["id"])
+        existing = sharing_mgr.get_peer(info["id"])
         if existing:
             # Update address in case it changed; mark online
             was_online = existing.online
-            updated = sharing.mark_peer_online(info["id"], info["host"], info["api_port"])
+            updated = sharing_mgr.mark_peer_online(info["id"], info["host"], info["api_port"])
             if updated and not was_online:
                 await state.events.put({"type": "peer.online", "controller_id": info["id"]})
         else:
-            peer = sharing.add_peer(
+            peer = sharing_mgr.add_peer(
                 controller_id=info["id"],
                 owner_user_id="",
                 name=info["id"],
@@ -854,9 +875,9 @@ async def run(config: Config) -> None:
             )
 
     async def _on_peer_lost(ctrl_id: str) -> None:
-        if not sharing:
+        if not sharing_mgr:
             return
-        peer = sharing.mark_peer_offline(ctrl_id)
+        peer = sharing_mgr.mark_peer_offline(ctrl_id)
         if peer:
             await state.events.put({"type": "peer.offline", "controller_id": ctrl_id})
 

@@ -175,6 +175,9 @@ class AppState:
         # Vaultwarden manager — set by main.py if OZMA_VAULTWARDEN=1
         self.vaultwarden_manager: Any | None = None
 
+        # Network provisioner — set by main.py if OZMA_NETWORK_BACKEND is set
+        self.network_provisioner: Any | None = None
+
         # Routing graph (Phase 1: observational)
         from routing import RoutingGraph, GraphBuilder
         self.routing_graph: RoutingGraph = RoutingGraph()
