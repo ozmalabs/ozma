@@ -242,7 +242,7 @@ impl GamepadDriver {
     ///
     /// Silently ignores gamepads that don't support force feedback.
     pub fn rumble(&mut self, id: GamepadId, strong: f32, weak: f32) {
-        use gilrs::ff::{BaseEffect, BaseEffectType, Effect, EffectBuilder, Replay, Ticks};
+        use gilrs::ff::{BaseEffect, BaseEffectType, EffectBuilder, Replay, Ticks};
 
         let gamepad = match self.gilrs.connected_gamepad(id) {
             Some(g) => g,
