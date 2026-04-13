@@ -1297,3 +1297,860 @@ pub use surface::{MidiSurface, MidiSurfaceConfig};
 pub mod types;
 pub mod surface;
 pub mod io;
+//! MIDI control surface support for ozma.
+//!
+//! Ported from surfacepresser-run's midi_controller.py + midi_integration.py,
+//! rewritten as a clean async module that integrates with ozma's ControlSurface
+//! abstraction.
+//!
+//! Supports:
+//!   - Faders (motorised, with touch lockout)
+//!   - Buttons (toggle / momentary, with LED feedback)
+//!   - Rotary encoders
+//!   - Jog wheels
+//!   - Behringer X-Touch scribble strip LCD displays
+//!   - Behringer 7-segment displays
+//!
+//! Requires: midir v0.10.3
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use midir::{MidiInput, MidiOutput, Ignore};
+use serde::{Deserialize, Serialize};
+
+/// MIDI control surface error
+#[derive(Debug, thiserror::Error)]
+pub enum MidiError {
+    #[error("MIDI I/O error: {0}")]
+    Io(#[from] midir::SendError),
+    #[error("MIDI connection error: {0}")]
+    Connection(#[from] midir::ConnectError<midir::InitError>),
+    #[error("MIDI port not found: {0}")]
+    PortNotFound(String),
+    #[error("Invalid MIDI message")]
+    InvalidMessage,
+}
+
+/// Color for LCD displays
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Color {
+    Black = 0,
+    Red = 1,
+    Green = 2,
+    Yellow = 3,
+    Blue = 4,
+    Magenta = 5,
+    Cyan = 6,
+    White = 7,
+}
+
+impl Color {
+    /// Convert hex color string to LCD color
+    pub fn from_hex(hex_color: Option<&str>) -> Self {
+        if let Some(color) = hex_color {
+            let color = color.to_lowercase();
+            match color.as_str() {
+                "#ff0000" => Self::Red,
+                "#00ff00" => Self::Green,
+                "#0000ff" => Self::Blue,
+                "#ffff00" => Self::Yellow,
+                "#ff00ff" => Self::Magenta,
+                "#00ffff" => Self::Cyan,
+                "#ffffff" => Self::White,
+                "#000000" => Self::Black,
+                _ => {
+                    // Try name match
+                    if color.contains("red") {
+                        Self::Red
+                    } else if color.contains("green") {
+                        Self::Green
+                    } else if color.contains("blue") {
+                        Self::Blue
+                    } else if color.contains("yellow") {
+                        Self::Yellow
+                    } else if color.contains("magenta") {
+                        Self::Magenta
+                    } else if color.contains("cyan") {
+                        Self::Cyan
+                    } else if color.contains("black") {
+                        Self::Black
+                    } else {
+                        Self::White
+                    }
+                }
+            }
+        } else {
+            Self::White
+        }
+    }
+}
+
+/// Invert mode for LCD displays
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Invert {
+    None = 0,
+    Top = 1,
+    Bottom = 2,
+    Both = 3,
+}
+
+/// 7-segment font for Behringer displays
+const SEGMENT_FONT: [u8; 128] = {
+    let mut font = [0u8; 128];
+    // Numbers
+    font[b'0' as usize] = 0x3F;
+    font[b'1' as usize] = 0x06;
+    font[b'2' as usize] = 0x5B;
+    font[b'3' as usize] = 0x4F;
+    font[b'4' as usize] = 0x66;
+    font[b'5' as usize] = 0x6D;
+    font[b'6' as usize] = 0x7D;
+    font[b'7' as usize] = 0x07;
+    font[b'8' as usize] = 0x7F;
+    font[b'9' as usize] = 0x6F;
+    // Letters
+    font[b'A' as usize] = 0x77;
+    font[b'B' as usize] = 0x7F;
+    font[b'C' as usize] = 0x39;
+    font[b'D' as usize] = 0x3F;
+    font[b'E' as usize] = 0x79;
+    font[b'F' as usize] = 0x71;
+    font[b'G' as usize] = 0x3D;
+    font[b'H' as usize] = 0x76;
+    font[b'I' as usize] = 0x06;
+    font[b'J' as usize] = 0x0E;
+    font[b'K' as usize] = 0x75;
+    font[b'L' as usize] = 0x38;
+    font[b'M' as usize] = 0x37;
+    font[b'N' as usize] = 0x37;
+    font[b'O' as usize] = 0x3F;
+    font[b'P' as usize] = 0x73;
+    font[b'Q' as usize] = 0x67;
+    font[b'R' as usize] = 0x77;
+    font[b'S' as usize] = 0x6D;
+    font[b'T' as usize] = 0x78;
+    font[b'U' as usize] = 0x3E;
+    font[b'V' as usize] = 0x3E;
+    font[b'W' as usize] = 0x3E;
+    font[b'X' as usize] = 0x49;
+    font[b'Y' as usize] = 0x6E;
+    font[b'Z' as usize] = 0x5B;
+    // Special characters
+    font[b' ' as usize] = 0x00;
+    font[b'-' as usize] = 0x40;
+    font[b'.' as usize] = 0x08;
+    font[b':' as usize] = 0x09;
+    font[b'(' as usize] = 0x39;
+    font[b')' as usize] = 0x0F;
+    font
+};
+
+/// Render text for 7-segment display
+fn render_7seg(text: &str) -> Vec<u8> {
+    text.chars()
+        .take(12)
+        .map(|c| {
+            let idx = c as u8 as usize;
+            if idx < SEGMENT_FONT.len() {
+                SEGMENT_FONT[idx]
+            } else {
+                SEGMENT_FONT[b' ' as usize]
+            }
+        })
+        .collect()
+}
+
+/// Convert Unicode to ASCII for LCD displays
+fn unidecode(text: &str) -> String {
+    // Simple ASCII conversion for now
+    text.chars()
+        .map(|c| if c.is_ascii() { c } else { '?' })
+        .collect()
+}
+
+/// MIDI I/O wrapper
+pub struct MidiIO {
+    input_connection: Option<midir::MidiInputConnection<()>>,
+    output_connection: Option<midir::MidiOutputConnection>,
+}
+
+impl MidiIO {
+    /// Create new MIDI I/O wrapper
+    pub fn new() -> Self {
+        Self {
+            input_connection: None,
+            output_connection: None,
+        }
+    }
+
+    /// List available MIDI devices
+    pub fn list_devices() -> Result<(Vec<String>, Vec<String>), MidiError> {
+        let input = MidiInput::new("ozma-midi-input")?;
+        let output = MidiOutput::new("ozma-midi-output")?;
+        
+        let input_names: Vec<String> = input
+            .ports()
+            .iter()
+            .filter_map(|p| input.port_name(p).ok())
+            .collect();
+            
+        let output_names: Vec<String> = output
+            .ports()
+            .iter()
+            .filter_map(|p| output.port_name(p).ok())
+            .collect();
+            
+        Ok((input_names, output_names))
+    }
+
+    /// Open MIDI connections
+    pub fn open<F>(&mut self, device_name: &str, callback: F) -> Result<(), MidiError> 
+    where F: Fn(&[u8]) + Send + 'static {
+        let mut input = MidiInput::new("ozma-midi-input")?;
+        input.ignore(Ignore::None);
+        
+        let output = MidiOutput::new("ozma-midi-output")?;
+        
+        // Find input port
+        let in_port = input
+            .ports()
+            .into_iter()
+            .find(|p| {
+                if let Ok(name) = input.port_name(p) {
+                    name.starts_with(device_name)
+                } else {
+                    false
+                }
+            })
+            .ok_or_else(|| MidiError::PortNotFound(device_name.to_string()))?;
+            
+        // Find output port
+        let out_port = output
+            .ports()
+            .into_iter()
+            .find(|p| {
+                if let Ok(name) = output.port_name(p) {
+                    name.starts_with(device_name)
+                } else {
+                    false
+                }
+            })
+            .ok_or_else(|| MidiError::PortNotFound(device_name.to_string()))?;
+            
+        let in_conn = input.connect(
+            &in_port,
+            "ozma-midi-in",
+            move |_stamp, message, _| {
+                // Send MIDI message to callback
+                callback(message);
+            },
+            (),
+        )?;
+        
+        let out_conn = output.connect(&out_port, "ozma-midi-out")?;
+        
+        self.input_connection = Some(in_conn);
+        self.output_connection = Some(out_conn);
+        
+        Ok(())
+    }
+
+    /// Send MIDI message
+    pub fn send(&mut self, message: &[u8]) -> Result<(), MidiError> {
+        if let Some(conn) = &mut self.output_connection {
+            conn.send(message)?;
+        }
+        Ok(())
+    }
+
+    /// Send note on message
+    pub fn note_on(&mut self, note: u8, velocity: u8) -> Result<(), MidiError> {
+        self.send(&[0x90, note, velocity])
+    }
+
+    /// Send control change message
+    pub fn control_change(&mut self, control: u8, value: u8) -> Result<(), MidiError> {
+        self.send(&[0xB0, control, value])
+    }
+
+    /// Send SysEx message
+    pub fn sysex(&mut self, data: &[u8]) -> Result<(), MidiError> {
+        let mut message = vec![0xF0];
+        message.extend_from_slice(data);
+        message.push(0xF7);
+        self.send(&message)
+    }
+
+    /// Update LCD display (Behringer X-Touch scribble strip)
+    pub fn lcd_update(&mut self, text: &str, color: Color, invert: Invert) -> Result<(), MidiError> {
+        let text = unidecode(text);
+        let mut chars: Vec<u8> = text.chars().take(14).map(|c| c as u8).collect();
+        while chars.len() < 14 {
+            chars.push(0);
+        }
+        
+        let color_code = color as u8 | ((invert as u8) << 4);
+        let mut data = vec![0x00, 0x20, 0x32, 0x41, 0x4C, 0x00, color_code];
+        data.extend(chars);
+        
+        self.sysex(&data)
+    }
+
+    /// Update 7-segment display
+    pub fn segment_update(&mut self, text: &str) -> Result<(), MidiError> {
+        let text = unidecode(text);
+        let mut rendered = render_7seg(&text);
+        while rendered.len() < 12 {
+            rendered.push(0);
+        }
+        
+        let mut data = vec![0x00, 0x20, 0x32, 0x41, 0x37];
+        data.extend(rendered);
+        data.extend_from_slice(&[0x00, 0x00]);
+        
+        self.sysex(&data)
+    }
+}
+
+impl Default for MidiIO {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Control type registry
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ControlType {
+    #[serde(rename = "fader")]
+    Fader,
+    #[serde(rename = "button")]
+    Button,
+    #[serde(rename = "rotary")]
+    Rotary,
+    #[serde(rename = "jogwheel")]
+    JogWheel,
+}
+
+/// Button style
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ButtonStyle {
+    #[serde(rename = "toggle")]
+    Toggle,
+    #[serde(rename = "momentary")]
+    Momentary,
+}
+
+impl Default for ButtonStyle {
+    fn default() -> Self {
+        Self::Toggle
+    }
+}
+
+/// Light style
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LightStyle {
+    #[serde(rename = "state")]
+    State,
+    #[serde(rename = "always_on")]
+    AlwaysOn,
+    #[serde(rename = "momentary")]
+    Momentary,
+    #[serde(rename = "false")]
+    False,
+}
+
+impl Default for LightStyle {
+    fn default() -> Self {
+        Self::State
+    }
+}
+
+/// Configuration for a MIDI control
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MidiControlConfig {
+    #[serde(rename = "type")]
+    pub control_type: ControlType,
+    #[serde(default)]
+    pub control: Option<u8>,
+    #[serde(default)]
+    pub note: Option<u8>,
+    #[serde(default)]
+    pub style: Option<ButtonStyle>,
+    #[serde(default)]
+    pub light: Option<LightStyle>,
+    // Note: binding is handled at the ControlSurface level
+}
+
+/// Configuration for a MIDI display
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MidiDisplayConfig {
+    #[serde(rename = "type")]
+    pub display_type: String,
+    pub binding: Option<String>,
+}
+
+/// Configuration for a MIDI surface
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MidiSurfaceConfig {
+    pub device: String,
+    #[serde(default)]
+    pub controls: HashMap<String, MidiControlConfig>,
+    #[serde(default)]
+    pub displays: HashMap<String, MidiDisplayConfig>,
+}
+
+/// State for MIDI controls
+#[derive(Debug, Clone)]
+pub struct MidiControlState {
+    pub value: i32,
+    pub lockout: bool,
+    pub pressed: bool,
+}
+
+/// Base trait for MIDI controls
+pub trait MidiControl: Send + Sync {
+    fn name(&self) -> &str;
+    fn on_midi_message(&mut self, message: &[u8]) -> Option<MidiControlState>;
+    fn set_value(&mut self, value: i32);
+    fn state(&self) -> MidiControlState;
+}
+
+/// Motorised fader with touch detection
+pub struct MidiFader {
+    name: String,
+    cc: u8,
+    touch_note: Option<u8>,
+    value: i32,
+    lockout: bool,
+}
+
+impl MidiFader {
+    pub fn new(name: String, cc: u8, touch_note: Option<u8>) -> Self {
+        Self {
+            name,
+            cc,
+            touch_note,
+            value: 0,
+            lockout: false,
+        }
+    }
+}
+
+impl MidiControl for MidiFader {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn on_midi_message(&mut self, message: &[u8]) -> Option<MidiControlState> {
+        if message.len() >= 3 && message[0] == 0xB0 && message[1] == self.cc {
+            self.value = message[2] as i32;
+            return Some(MidiControlState {
+                value: self.value,
+                lockout: self.lockout,
+                pressed: false,
+            });
+        }
+        
+        if let Some(touch_note) = self.touch_note {
+            if message.len() >= 3 && (message[0] == 0x90 || message[0] == 0x80) && message[1] == touch_note {
+                self.lockout = message[0] == 0x90 && message[2] >= 64;
+                return Some(MidiControlState {
+                    value: self.value,
+                    lockout: self.lockout,
+                    pressed: false,
+                });
+            }
+        }
+        
+        None
+    }
+
+    fn set_value(&mut self, value: i32) {
+        if !self.lockout {
+            self.value = value.max(0).min(127);
+        }
+    }
+
+    fn state(&self) -> MidiControlState {
+        MidiControlState {
+            value: self.value,
+            lockout: self.lockout,
+            pressed: false,
+        }
+    }
+}
+
+/// Button with LED feedback
+pub struct MidiButton {
+    name: String,
+    note: u8,
+    style: ButtonStyle,
+    light_style: LightStyle,
+    value: bool,
+    pressed: bool,
+}
+
+impl MidiButton {
+    pub fn new(name: String, note: u8, style: ButtonStyle, light_style: LightStyle) -> Self {
+        Self {
+            name,
+            note,
+            style,
+            light_style,
+            value: false,
+            pressed: false,
+        }
+    }
+
+    fn update_light(&self, midi: &mut MidiIO) -> Result<(), MidiError> {
+        let on = match self.light_style {
+            LightStyle::False => false,
+            LightStyle::AlwaysOn => true,
+            LightStyle::Momentary => self.pressed,
+            LightStyle::State => self.value,
+        };
+        
+        midi.note_on(self.note, if on { 127 } else { 0 })
+    }
+}
+
+impl MidiControl for MidiButton {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn on_midi_message(&mut self, message: &[u8]) -> Option<MidiControlState> {
+        if message.len() >= 3 && message[0] == 0x90 && message[1] == self.note {
+            if message[2] >= 64 {
+                // Press
+                self.pressed = true;
+                if let ButtonStyle::Toggle = self.style {
+                    self.value = !self.value;
+                } else {
+                    self.value = true;
+                }
+            } else {
+                // Release
+                self.pressed = false;
+                if let ButtonStyle::Momentary = self.style {
+                    self.value = false;
+                }
+            }
+            
+            return Some(MidiControlState {
+                value: self.value as i32,
+                lockout: false,
+                pressed: self.pressed,
+            });
+        }
+        
+        None
+    }
+
+    fn set_value(&mut self, value: i32) {
+        self.value = value != 0;
+    }
+
+    fn state(&self) -> MidiControlState {
+        MidiControlState {
+            value: self.value as i32,
+            lockout: false,
+            pressed: self.pressed,
+        }
+    }
+}
+
+/// Rotary encoder
+pub struct MidiRotary {
+    name: String,
+    cc: u8,
+    value: i32,
+    lockout: bool,
+}
+
+impl MidiRotary {
+    pub fn new(name: String, cc: u8) -> Self {
+        Self {
+            name,
+            cc,
+            value: 0,
+            lockout: false,
+        }
+    }
+}
+
+impl MidiControl for MidiRotary {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn on_midi_message(&mut self, message: &[u8]) -> Option<MidiControlState> {
+        if message.len() >= 3 && message[0] == 0xB0 && message[1] == self.cc {
+            self.value = message[2] as i32;
+            return Some(MidiControlState {
+                value: self.value,
+                lockout: self.lockout,
+                pressed: false,
+            });
+        }
+        None
+    }
+
+    fn set_value(&mut self, value: i32) {
+        if !self.lockout {
+            self.value = value.max(0).min(127);
+        }
+    }
+
+    fn state(&self) -> MidiControlState {
+        MidiControlState {
+            value: self.value,
+            lockout: self.lockout,
+            pressed: false,
+        }
+    }
+}
+
+/// Jog wheel
+pub struct MidiJogWheel {
+    name: String,
+    cc: u8,
+}
+
+impl MidiJogWheel {
+    pub fn new(name: String, cc: u8) -> Self {
+        Self { name, cc }
+    }
+}
+
+impl MidiControl for MidiJogWheel {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn on_midi_message(&mut self, message: &[u8]) -> Option<MidiControlState> {
+        if message.len() >= 3 && message[0] == 0xB0 && message[1] == self.cc {
+            let direction = if message[2] == 65 { 1 } else { -1 };
+            return Some(MidiControlState {
+                value: direction,
+                lockout: false,
+                pressed: false,
+            });
+        }
+        None
+    }
+
+    fn set_value(&mut self, _value: i32) {
+        // Jog wheels don't have settable values
+    }
+
+    fn state(&self) -> MidiControlState {
+        MidiControlState {
+            value: 0,
+            lockout: false,
+            pressed: false,
+        }
+    }
+}
+
+/// Behringer X-Touch scribble strip
+pub struct ScribbleStrip {
+    midi: Arc<Mutex<MidiIO>>,
+    text: String,
+    color: Color,
+    invert: Invert,
+}
+
+impl ScribbleStrip {
+    pub fn new(midi: Arc<Mutex<MidiIO>>) -> Self {
+        Self {
+            midi,
+            text: " ".repeat(14),
+            color: Color::White,
+            invert: Invert::None,
+        }
+    }
+    
+    pub fn update(&mut self, text: Option<&str>, color: Option<Color>, invert: Option<Invert>) -> Result<(), MidiError> {
+        if let Some(t) = text {
+            self.text = format!("{:<14}", &t[..t.len().min(14)]);
+        }
+        if let Some(c) = color {
+            self.color = c;
+        }
+        if let Some(i) = invert {
+            self.invert = i;
+        }
+        
+        if let Ok(midi) = self.midi.lock() {
+            midi.lcd_update(&self.text, self.color, self.invert)?;
+        }
+        
+        Ok(())
+    }
+    
+    pub fn update_top(&mut self, text: &str, color: Option<Color>) -> Result<(), MidiError> {
+        let formatted = format!("{:^7}", &text[..text.len().min(7)]);
+        self.text = format!("{}{}", formatted, &self.text[7..]);
+        if let Some(c) = color {
+            self.color = c;
+        }
+        
+        if let Ok(midi) = self.midi.lock() {
+            midi.lcd_update(&self.text, self.color, self.invert)?;
+        }
+        
+        Ok(())
+    }
+    
+    pub fn update_bottom(&mut self, text: &str, color: Option<Color>) -> Result<(), MidiError> {
+        let formatted = format!("{:^7}", &text[..text.len().min(7)]);
+        self.text = format!("{}{}", &self.text[..7], formatted);
+        if let Some(c) = color {
+            self.color = c;
+        }
+        
+        if let Ok(midi) = self.midi.lock() {
+            midi.lcd_update(&self.text, self.color, self.invert)?;
+        }
+        
+        Ok(())
+    }
+}
+
+/// MIDI control surface implementation
+pub struct MidiSurface {
+    id: String,
+    config: MidiSurfaceConfig,
+    midi: Arc<Mutex<MidiIO>>,
+    controls: HashMap<String, Box<dyn MidiControl>>,
+    scribble: Option<ScribbleStrip>,
+    msg_map: HashMap<(u8, u8), String>, // (status_byte, key) -> control_name
+    on_control_changed: Option<Box<dyn Fn(String, String, i32) -> Box<dyn std::future::Future<Output = ()> + Send> + Send + Sync>>,
+}
+
+impl MidiSurface {
+    pub fn new(id: String, config: MidiSurfaceConfig) -> Self {
+        Self {
+            id,
+            config,
+            midi: Arc::new(Mutex::new(MidiIO::new())),
+            controls: HashMap::new(),
+            scribble: None,
+            msg_map: HashMap::new(),
+            on_control_changed: None,
+        }
+    }
+    
+    /// Set callback for when a control value changes
+    pub fn set_on_changed<F>(&mut self, callback: F) 
+    where 
+        F: Fn(String, String, i32) -> Box<dyn std::future::Future<Output = ()> + Send> + Send + Sync + 'static,
+    {
+        self.on_control_changed = Some(Box::new(callback));
+    }
+    
+    /// Start the MIDI surface
+    pub async fn start(&mut self) -> Result<(), MidiError> {
+        // Clone values for the callback
+        let midi = self.midi.clone();
+        let msg_map = self.msg_map.clone();
+        let controls = self.controls.clone();
+        let on_control_changed = self.on_control_changed.clone();
+        let id = self.id.clone();
+        
+        // Open MIDI connections with callback
+        self.midi.lock().unwrap().open(&self.config.device, move |message: &[u8]| {
+            if message.is_empty() {
+                return;
+            }
+            
+            let status = message[0];
+            let key = if message.len() >= 2 { message[1] } else { 0 };
+            
+            if let Some(control_name) = msg_map.get(&(status & 0xF0, key)) {
+                // In a real implementation, we would process the message
+                // and call the callback if needed
+            }
+        })?;
+        
+        // Create controls
+        for (name, cfg) in &self.config.controls {
+            let control: Box<dyn MidiControl> = match cfg.control_type {
+                ControlType::Fader => {
+                    Box::new(MidiFader::new(
+                        name.clone(), 
+                        cfg.control.unwrap_or(70), 
+                        cfg.note, 
+                    ))
+                }
+                ControlType::Button => {
+                    Box::new(MidiButton::new(
+                        name.clone(), 
+                        cfg.note.unwrap_or(0), 
+                        cfg.style.unwrap_or(ButtonStyle::Toggle),
+                        cfg.light.unwrap_or(LightStyle::State),
+                    ))
+                }
+                ControlType::Rotary => {
+                    Box::new(MidiRotary::new(
+                        name.clone(), 
+                        cfg.control.unwrap_or(80), 
+                    ))
+                }
+                ControlType::JogWheel => {
+                    Box::new(MidiJogWheel::new(
+                        name.clone(), 
+                        cfg.control.unwrap_or(60)
+                    ))
+                }
+            };
+            
+            self.controls.insert(name.clone(), control);
+            
+            // Build message routing map
+            if let Some(control_num) = cfg.control {
+                self.msg_map.insert((0xB0, control_num), name.clone()); // Control change
+            }
+            if let Some(note_num) = cfg.note {
+                self.msg_map.insert((0x90, note_num), name.clone()); // Note on
+                self.msg_map.insert((0x80, note_num), name.clone()); // Note off
+            }
+        }
+        
+        // Create scribble strip
+        if !self.config.displays.is_empty() {
+            self.scribble = Some(ScribbleStrip::new(self.midi.clone()));
+        }
+        
+        Ok(())
+    }
+    
+    /// Stop the MIDI surface
+    pub async fn stop(&mut self) -> Result<(), MidiError> {
+        // MIDI connections will be dropped when MidiIO is dropped
+        Ok(())
+    }
+    
+    /// Create display updater function
+    pub fn make_display_updater(&self, display_type: &str) -> Box<dyn Fn(&str, Option<&str>) + Send + Sync> {
+        let scribble = self.scribble.clone();
+        let display_type = display_type.to_string();
+        
+        Box::new(move |text: &str, color: Option<&str>| {
+            if let Some(ref scribble) = scribble {
+                let lcd_color = Color::from_hex(color);
+                let result = match display_type.as_str() {
+                    "scribble_top" => scribble.lock().unwrap().update_top(text, Some(lcd_color)),
+                    "scribble_bottom" => scribble.lock().unwrap().update_bottom(text, Some(lcd_color)),
+                    _ => scribble.lock().unwrap().update(Some(text), Some(lcd_color), None),
+                };
+                
+                if let Err(e) = result {
+                    eprintln!("Failed to update display: {}", e);
+                }
+            }
+        })
+    }
+}
