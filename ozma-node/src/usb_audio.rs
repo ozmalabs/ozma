@@ -50,6 +50,10 @@ const OZMA_GADGET_NAME: &str = "ozma";
 /// Name of the UAC2 function within the Ozma gadget.
 const UAC2_FUNC_NAME: &str = "uac2.usb0";
 
+/// Sysfs path for the UAC2 function directory (used in warning messages only).
+const UAC2_FUNC_DIR: &str =
+    "/sys/kernel/config/usb_gadget/ozma/functions/uac2.usb0";
+
 const PROC_ASOUND_CARDS: &str = "/proc/asound/cards";
 
 /// Sample rate used for both playback and capture streams.
@@ -247,11 +251,10 @@ impl Default for UsbAudioConfig {
 ///
 /// # Example
 /// ```no_run
-/// use ozma_node::usb_audio::{UsbAudioGadget, UsbAudioConfig};
+/// use ozma_node::usb_audio::UsbAudioGadget;
 /// # #[tokio::main] async fn main() {
-/// let gadget = UsbAudioGadget::open(UsbAudioConfig::default()).await;
-/// // ... do work ...
-/// gadget.close().await;
+/// let gadget = UsbAudioGadget::open(true).await.unwrap();
+/// gadget.run_bridge().await.ok();
 /// # }
 /// ```
 pub struct UsbAudioGadget {
@@ -268,23 +271,33 @@ pub struct UsbAudioGadget {
 impl UsbAudioGadget {
     /// Detect the UAC2 ALSA interface and start the bridge tasks.
     ///
-    /// Waits up to `config.alsa_probe_timeout` for the kernel to create the
-    /// ALSA sound card, then spawns a background watcher that restarts the
-    /// bridge on device disappear / reappear (USB reconnect).
-    pub async fn open(config: UsbAudioConfig) -> Self {
+    /// `auto_setup` mirrors the Python `USBAudioGadget.open(auto_setup=True)`
+    /// parameter.  When `true` and the UAC2 ConfigFS function is absent, a
+    /// warning is logged.  The Rust port does not shell out to the gadget setup
+    /// script; gadget setup is expected to have been performed by the init
+    /// system before this process starts.
+    ///
+    /// A missing UAC2 card is non-fatal: `playback_device` will be `None` and
+    /// the watcher will keep polling until the card appears.
+    pub async fn open(auto_setup: bool) -> anyhow::Result<Self> {
+        let config = UsbAudioConfig::default();
+
         if !uac2_active() {
-            warn!(
-                "UAC2 ConfigFS function not found at {} — \
-                 ensure the gadget script ran and the kernel has usb_f_uac2",
-                UAC2_FUNC_DIR
-            );
+            if auto_setup {
+                warn!(
+                    "UAC2 ConfigFS function not found at {} — \
+                     ensure the gadget setup script ran and the kernel has \
+                     usb_f_uac2 loaded",
+                    UAC2_FUNC_DIR
+                );
+            } else {
+                info!("UAC2 ConfigFS function not present (auto_setup disabled)");
+            }
         }
 
         let playback_device =
             wait_for_alsa(config.alsa_probe_timeout, config.poll_interval).await;
-        let capture_device = playback_device
-            .as_deref()
-            .map(|d| d.replace(",0", ",1"));
+        let capture_device = playback_device.as_deref().map(|d| d.replace(",0", ",1"));
 
         if let Some(ref pb) = playback_device {
             info!(
@@ -302,12 +315,22 @@ impl UsbAudioGadget {
         let stop = Arc::new(AtomicBool::new(false));
         let watcher = spawn_watcher(config, stop.clone());
 
-        Self {
+        Ok(Self {
             playback_device,
             capture_device,
             stop,
             _watcher: watcher,
-        }
+        })
+    }
+
+    /// Block until the internal watcher task finishes (i.e. until `close()` is
+    /// called or the process shuts down).
+    ///
+    /// This is the primary entry-point used by `main.rs` after `open()`.
+    pub async fn run_bridge(self) -> anyhow::Result<()> {
+        self._watcher
+            .await
+            .map_err(|e| anyhow::anyhow!("UAC2 watcher task panicked: {e}"))
     }
 
     /// Signal the bridge tasks to stop and wait for them to exit (up to 2 s).

@@ -155,7 +155,7 @@ async fn main() {
 
     // Start UAC2 audio gadget bridge if the "audio" capability is requested.
     if args.cap.split(',').any(|c| c.trim() == "audio") {
-        tokio::spawn(async {
+        tokio::spawn(async move {
             match usb_audio::UsbAudioGadget::open(true).await {
                 Ok(gadget) => {
                     if let Err(e) = gadget.run_bridge().await {

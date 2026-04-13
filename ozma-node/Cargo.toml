@@ -8,6 +8,11 @@ description = "Ozma hardware KVM node — mDNS advertisement, controller registr
 name = "ozma-node"
 path = "src/main.rs"
 
+[features]
+# Enable to compile without a real ConfigFS/USB gadget subsystem (e.g. CI).
+# When set, uac2_active() always returns false without touching the kernel.
+stub-gadget = []
+
 [dependencies]
 # Workspace-shared
 tokio              = { workspace = true }
@@ -19,11 +24,6 @@ anyhow             = { workspace = true }
 thiserror          = { workspace = true }
 usb-gadget         = { workspace = true }
 alsa               = { workspace = true }
-
-[features]
-# Enable to compile without a real ConfigFS/USB gadget subsystem (e.g. CI).
-# When set, uac2_active() always returns false without touching the kernel.
-stub-gadget = []
 
 # CLI
 clap = { version = "4", features = ["derive"] }
