@@ -19,15 +19,20 @@
 //!   writes to this ALSA playback interface; the host captures it.
 //! * **c_\*** (capture)  — audio flowing **from host to device**.  The host
 //!   writes to this endpoint; the device reads it as ALSA capture.
+//!
+//! # UAC2 detection
+//!
+//! [`uac2_active`] uses [`usb_gadget::RegGadget::list`] to inspect the
+//! kernel's ConfigFS gadget registry rather than checking a hard-coded sysfs
+//! path.  This is more robust across kernel versions and gadget naming
+//! conventions.  On systems without ConfigFS (CI, non-Linux) it returns
+//! `false` gracefully.
 
-use std::{
-    path::Path,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::Duration,
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
 };
+use std::time::Duration;
 
 use alsa::{
     pcm::{Access, Format, HwParams, PCM},
@@ -39,8 +44,11 @@ use tracing::{debug, info, warn};
 
 // ── constants ────────────────────────────────────────────────────────────────
 
-/// Path to the UAC2 ConfigFS function directory created by the gadget script.
-const UAC2_FUNC_DIR: &str = "/sys/kernel/config/usb_gadget/ozma/functions/uac2.usb0";
+/// Name of the Ozma USB gadget as registered in ConfigFS.
+const OZMA_GADGET_NAME: &str = "ozma";
+
+/// Name of the UAC2 function within the Ozma gadget.
+const UAC2_FUNC_NAME: &str = "uac2.usb0";
 
 const PROC_ASOUND_CARDS: &str = "/proc/asound/cards";
 
@@ -95,9 +103,29 @@ pub fn find_uac2_capture_device() -> Option<String> {
     find_uac2_playback_device().map(|d| d.replace(",0", ",1"))
 }
 
-/// Return `true` if the UAC2 ConfigFS function directory exists and is linked.
+/// Return `true` if the UAC2 function is present in the Ozma gadget.
+///
+/// Uses [`usb_gadget::RegGadget::list`] to enumerate registered gadgets via
+/// the kernel's ConfigFS interface.  Returns `false` (never panics) when
+/// ConfigFS is unavailable (CI, non-Linux, missing `usb_gadget` module).
 pub fn uac2_active() -> bool {
-    Path::new(UAC2_FUNC_DIR).exists()
+    match usb_gadget::RegGadget::list() {
+        Ok(gadgets) => gadgets.iter().any(|g| {
+            // RegGadget::name() returns the gadget's ConfigFS directory name.
+            g.name().to_string_lossy() == OZMA_GADGET_NAME
+                && g.functions()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|f| f.name().to_string_lossy() == UAC2_FUNC_NAME)
+        }),
+        Err(e) => {
+            debug!(
+                "usb_gadget::RegGadget::list() failed: {:#} — assuming UAC2 inactive",
+                e
+            );
+            false
+        }
+    }
 }
 
 // ── ALSA PCM helpers ──────────────────────────────────────────────────────────
@@ -420,32 +448,38 @@ fn spawn_watcher(config: UsbAudioConfig, stop: Arc<AtomicBool>) -> JoinHandle<()
 
             // Poll until the card disappears, we are asked to stop, or a
             // bridge thread exits unexpectedly.
-            loop {
+            //
+            // Collect the stop reason before awaiting the handles so that
+            // each handle is consumed exactly once (fixes borrow-after-move).
+            enum WatchOutcome { Shutdown, Restart }
+
+            let outcome = loop {
                 sleep(config.poll_interval).await;
 
                 if stop.load(Ordering::Relaxed) {
-                    bridge_stop.store(true, Ordering::Relaxed);
-                    let _ = pb_handle.await;
-                    let _ = cap_handle.await;
-                    return;
+                    break WatchOutcome::Shutdown;
                 }
 
                 if find_uac2_playback_device().is_none() {
                     warn!("UAC2 card disappeared — stopping bridge");
-                    bridge_stop.store(true, Ordering::Relaxed);
-                    let _ = pb_handle.await;
-                    let _ = cap_handle.await;
-                    break; // outer loop will wait for card to reappear
+                    break WatchOutcome::Restart;
                 }
 
                 if pb_handle.is_finished() || cap_handle.is_finished() {
                     warn!("Bridge thread exited unexpectedly — restarting");
-                    bridge_stop.store(true, Ordering::Relaxed);
-                    let _ = pb_handle.await;
-                    let _ = cap_handle.await;
-                    break;
+                    break WatchOutcome::Restart;
                 }
+            };
+
+            bridge_stop.store(true, Ordering::Relaxed);
+            let _ = pb_handle.await;
+            let _ = cap_handle.await;
+
+            if matches!(outcome, WatchOutcome::Shutdown) {
+                return;
             }
+            // WatchOutcome::Restart — fall through; outer loop waits for the
+            // card to reappear.
         }
     })
 }
@@ -499,10 +533,12 @@ mod tests {
         assert_eq!(cap, "hw:2,1");
     }
 
-    /// `uac2_active()` must return false in a normal test environment where
-    /// the ConfigFS path does not exist.
+    /// `uac2_active()` must return false in a normal test / CI environment
+    /// where no USB gadget subsystem is available.  The usb_gadget crate will
+    /// either return an empty list or an Err; both map to `false`.
     #[test]
-    fn uac2_active_returns_false_when_path_absent() {
+    fn uac2_active_returns_false_when_no_gadget_registered() {
+        // In CI there is no ConfigFS / USB gadget subsystem.
         assert!(!uac2_active());
     }
 
