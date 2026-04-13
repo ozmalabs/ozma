@@ -11,7 +11,14 @@ members = [
     "ozma-pipewire",
 ]
 
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+strip         = "symbols"
+
 [workspace.dependencies]
+sd-notify          = { version = "0.4" }
 tokio              = { version = "1", features = ["full"] }
 serde              = { version = "1", features = ["derive"] }
 serde_json         = "1"
@@ -23,3 +30,17 @@ bytes              = "1"
 async-trait        = "0.1"
 libc               = "0.2"
 uuid               = { version = "1", features = ["v4"] }
+# HTTP server (used by ozma-node HLS server)
+axum               = { version = "0.7", features = ["tokio"] }
+tower-http         = { version = "0.5", features = ["fs", "cors"] }
+tower              = { version = "0.4" }
+# HTTP client (used by ozma-node registration + heartbeat)
+reqwest            = { version = "0.12", features = ["json"] }
+# CLI
+clap               = { version = "4", features = ["derive"] }
+# mDNS
+mdns-sd            = "0.11"
+# Networking helpers
+hostname           = "0.4"
+# Shared state
+arc-swap           = "1"

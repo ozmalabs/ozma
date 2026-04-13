@@ -1,0 +1,126 @@
+name: ozma-node
+
+on:
+  push:
+    paths:
+      - 'ozma-node/**'
+      - 'ozma-proto/**'
+      - 'ozma-mesh/**'
+      - 'ozma-crypto/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Cross.toml'
+      - '.github/workflows/ozma-node.yml'
+  pull_request:
+    paths:
+      - 'ozma-node/**'
+      - 'ozma-proto/**'
+      - 'ozma-mesh/**'
+      - 'ozma-crypto/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Cross.toml'
+      - '.github/workflows/ozma-node.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+  CROSS_VERSION: "0.2.5"
+
+jobs:
+  # ── Native x86-64 build + test ──────────────────────────────────────────
+  build-native:
+    name: Build & test (x86-64)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + build artefacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Build ozma-node (native)
+        run: cargo build -p ozma-node --release
+
+      - name: Run unit tests
+        run: cargo test -p ozma-node
+
+  # ── aarch64 cross-compile (Pi4 / Milk-V Duo S) ─────────────────────────
+  build-aarch64:
+    name: Cross-compile aarch64
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable + aarch64 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cache cargo registry + build artefacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: aarch64
+
+      - name: Install cross ${{ env.CROSS_VERSION }}
+        run: cargo install cross --version ${{ env.CROSS_VERSION }} --locked
+
+      - name: Cross-compile ozma-node for aarch64
+        run: |
+          cross build -p ozma-node --release \
+            --target aarch64-unknown-linux-gnu
+
+      - name: Upload aarch64 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ozma-node-aarch64
+          path: target/aarch64-unknown-linux-gnu/release/ozma-node
+          if-no-files-found: error
+
+  # ── Debian package (aarch64) ────────────────────────────────────────────
+  deb-aarch64:
+    name: Build .deb (aarch64)
+    runs-on: ubuntu-22.04
+    needs: build-aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable + aarch64 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cache cargo registry + build artefacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: aarch64-deb
+
+      - name: Download aarch64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ozma-node-aarch64
+          path: target/aarch64-unknown-linux-gnu/release/
+
+      - name: Fix binary permissions
+        run: chmod +x target/aarch64-unknown-linux-gnu/release/ozma-node
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build Debian package
+        run: |
+          cargo deb -p ozma-node \
+            --no-build \
+            --target aarch64-unknown-linux-gnu
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ozma-node-aarch64-deb
+          path: target/aarch64-unknown-linux-gnu/debian/*.deb
+          if-no-files-found: error

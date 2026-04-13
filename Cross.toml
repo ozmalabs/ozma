@@ -1,0 +1,16 @@
+# Cross.toml — configuration for `cross` (cross-compilation helper)
+# https://github.com/cross-rs/cross
+#
+# Install:  cargo install cross --git https://github.com/cross-rs/cross
+# Build:    cross build -p ozma-node --release --target aarch64-unknown-linux-gnu
+
+[build.env]
+passthrough = [
+    "CARGO_TERM_COLOR",
+    "RUST_LOG",
+]
+
+[target.aarch64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:edge"
+# Mount the host Cargo registry cache so crates aren't re-downloaded each run.
+volumes = ["$CARGO_HOME/registry:/root/.cargo/registry"]
