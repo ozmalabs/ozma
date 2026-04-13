@@ -60,6 +60,10 @@ class SlackChannel:
 
     def set_oauth_credentials(self, token: str, team_id: str):
         """Set OAuth credentials received from Connect."""
+        # Validate token format (should start with xoxb- for bot tokens or xoxp- for user tokens)
+        if not token.startswith(('xoxb-', 'xoxp-')):
+            log.warning("Slack OAuth token format appears invalid: %s", token[:10] + "..." if len(token) > 10 else token)
+        
         self.oauth_token = token
         self.oauth_team_id = team_id
         self._init_client()
@@ -84,6 +88,11 @@ class SlackChannel:
         # Require signing secret for signature verification
         if not self.signing_secret:
             log.warning("Slack signing secret not configured")
+            return False
+            
+        # Validate request body
+        if not request_body:
+            log.warning("Slack request body is empty")
             return False
             
         # Create the signed string
@@ -148,6 +157,15 @@ class SlackChannel:
 
     async def send_message(self, channel: str, text: str, thread_ts: Optional[str] = None):
         """Send a message to a Slack channel."""
+        # Validate required parameters
+        if not channel:
+            log.warning("Slack channel parameter is required")
+            return None
+            
+        if not text:
+            log.warning("Slack text parameter is required")
+            return None
+            
         # Initialize client if not already done
         async with self._client_lock:
             if not self.client and (self.oauth_token or self.bot_token):
@@ -182,6 +200,19 @@ class SlackChannel:
 
     async def update_message(self, channel: str, ts: str, text: str):
         """Update an existing message in Slack."""
+        # Validate required parameters
+        if not channel:
+            log.warning("Slack channel parameter is required")
+            return None
+            
+        if not ts:
+            log.warning("Slack ts parameter is required")
+            return None
+            
+        if not text:
+            log.warning("Slack text parameter is required")
+            return None
+            
         # Initialize client if not already done
         async with self._client_lock:
             if not self.client and (self.oauth_token or self.bot_token):
