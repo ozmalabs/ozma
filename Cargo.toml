@@ -9,6 +9,7 @@ members = [
     "ozma-mesh",
     "ozma-crypto",
     "ozma-pipewire",
+    "src/softnode",
 ]
 
 [profile.release]
