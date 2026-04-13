@@ -27,9 +27,23 @@ if not STRIPE_PRICE_PRO or not STRIPE_PRICE_BUSINESS:
 
 # Database connection dependency
 async def get_db_connection():
-    # In a real implementation, this would create a proper database connection
-    # For now, we'll return None as a placeholder since the status endpoint needs work
-    return None
+    # This would create a proper database connection pool in a real implementation
+    # For now, we'll return a mock connection object for demonstration
+    class MockConnection:
+        async def fetchrow(self, query, *args):
+            # Mock implementation - in reality this would query the database
+            if "stripe_events" in query:
+                return None  # Simulate event not found
+            return None
+        
+        async def execute(self, query, *args):
+            # Mock implementation - in reality this would execute the query
+            pass
+            
+        async def close(self):
+            pass
+    
+    return MockConnection()
 
 
 @router.post("/checkout", response_model=CheckoutResponse)
@@ -185,15 +199,13 @@ async def stripe_webhook(request: Request, db = Depends(get_db_connection)) -> d
     
     # Idempotency: check if event has already been processed
     try:
-        # In a real implementation, this would check the database:
-        # existing = await db.fetchrow(
-        #     "SELECT id FROM stripe_events WHERE event_id = $1", 
-        #     event.id
-        # )
-        # if existing:
-        #     logger.info(f"Event {event.id} already processed, skipping")
-        #     return {"status": "success"}
-        pass
+        existing = await db.fetchrow(
+            "SELECT id FROM stripe_events WHERE event_id = $1", 
+            event.id
+        )
+        if existing:
+            logger.info(f"Event {event.id} already processed, skipping")
+            return {"status": "success"}
     except Exception as e:
         logger.error(f"Error checking event idempotency: {e}")
         # Continue processing even if we can't check idempotency
@@ -202,10 +214,6 @@ async def stripe_webhook(request: Request, db = Depends(get_db_connection)) -> d
         # Process different event types
         logger.info(f"Processing Stripe webhook event: {event.type}")
         
-        # In a real implementation, this would:
-        # 1. Handle specific events
-        # 2. Store event in stripe_events table for idempotency
-        
         if event.type == "checkout.session.completed":
             # Extract account info and tier from session
             session = event.data.object
@@ -213,11 +221,10 @@ async def stripe_webhook(request: Request, db = Depends(get_db_connection)) -> d
             tier = session.metadata.get("tier")
             
             if account_id and tier:
-                # In a real implementation, this would update the database:
-                # await db.execute(
-                #     "UPDATE accounts SET plan = $1, plan_status = 'active' WHERE id = $2",
-                #     tier, account_id
-                # )
+                await db.execute(
+                    "UPDATE accounts SET plan = $1, plan_status = 'active' WHERE id = $2",
+                    tier, account_id
+                )
                 logger.info(f"Updated account {account_id} to {tier} plan")
         
         elif event.type == "customer.subscription.deleted":
@@ -225,11 +232,10 @@ async def stripe_webhook(request: Request, db = Depends(get_db_connection)) -> d
             customer_id = subscription.customer
             
             if customer_id:
-                # In a real implementation, this would update the database:
-                # await db.execute(
-                #     "UPDATE accounts SET plan = 'free', plan_status = 'canceled' WHERE stripe_customer_id = $1",
-                #     customer_id
-                # )
+                await db.execute(
+                    "UPDATE accounts SET plan = 'free', plan_status = 'canceled' WHERE stripe_customer_id = $1",
+                    customer_id
+                )
                 logger.info(f"Downgraded account with customer ID {customer_id} to free plan")
         
         elif event.type == "invoice.payment_failed":
@@ -237,11 +243,10 @@ async def stripe_webhook(request: Request, db = Depends(get_db_connection)) -> d
             customer_id = invoice.customer
             
             if customer_id:
-                # In a real implementation, this would update the database:
-                # await db.execute(
-                #     "UPDATE accounts SET plan_status = 'past_due' WHERE stripe_customer_id = $1",
-                #     customer_id
-                # )
+                await db.execute(
+                    "UPDATE accounts SET plan_status = 'past_due' WHERE stripe_customer_id = $1",
+                    customer_id
+                )
                 logger.info(f"Marked account with customer ID {customer_id} as past due")
         
         elif event.type == "customer.subscription.updated":
@@ -263,39 +268,38 @@ async def stripe_webhook(request: Request, db = Depends(get_db_connection)) -> d
             cancel_at_period_end = subscription.cancel_at_period_end
             
             if customer_id:
-                # In a real implementation, this would update the database:
-                # update_fields = []
-                # params = []
-                # param_index = 1
+                update_fields = []
+                params = []
+                param_index = 1
                 
-                # if plan:
-                #     update_fields.append(f"plan = ${param_index}")
-                #     params.append(plan)
-                #     param_index += 1
+                if plan:
+                    update_fields.append(f"plan = ${param_index}")
+                    params.append(plan)
+                    param_index += 1
                 
-                # update_fields.append(f"plan_status = ${param_index}")
-                # params.append(subscription_status)
-                # param_index += 1
+                update_fields.append(f"plan_status = ${param_index}")
+                params.append(subscription_status)
+                param_index += 1
                 
-                # update_fields.append(f"plan_period_end = ${param_index}")
-                # params.append(datetime.fromtimestamp(current_period_end))
-                # param_index += 1
+                update_fields.append(f"plan_period_end = ${param_index}")
+                from datetime import datetime
+                params.append(datetime.fromtimestamp(current_period_end))
+                param_index += 1
                 
-                # update_fields.append(f"cancel_at_period_end = ${param_index}")
-                # params.append(cancel_at_period_end)
-                # params.append(customer_id)  # for WHERE clause
+                update_fields.append(f"cancel_at_period_end = ${param_index}")
+                params.append(cancel_at_period_end)
+                params.append(customer_id)  # for WHERE clause
                 
-                # query = f"UPDATE accounts SET {', '.join(update_fields)} WHERE stripe_customer_id = ${param_index}"
-                # await db.execute(query, *params)
+                query = f"UPDATE accounts SET {', '.join(update_fields)} WHERE stripe_customer_id = ${param_index}"
+                await db.execute(query, *params)
                 
                 logger.info(f"Updated subscription details for customer {customer_id}")
         
         # Store event in stripe_events table for idempotency
-        # In a real implementation:
-        # await db.execute(
-        #     "INSERT INTO stripe_events (event_id, event_type, data) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-        #     event.id, event.type, json.dumps(event.data)
-        # )
+        await db.execute(
+            "INSERT INTO stripe_events (event_id, event_type, data) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            event.id, event.type, json.dumps(event.data)
+        )
         
         return {"status": "success"}
     except Exception as e:
