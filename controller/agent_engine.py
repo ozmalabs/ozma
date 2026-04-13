@@ -187,6 +187,9 @@ class AgentEngine:
         self._approval_timeout = 120.0  # seconds
         # Context sources for platform integrations
         self._context_sources = context_sources or {}
+        # Pre-populate with built-in context sources
+        if self._context_sources is None:
+            self._context_sources = {}
 
     # ── Approval management ───────────────────────────────────────────
 
