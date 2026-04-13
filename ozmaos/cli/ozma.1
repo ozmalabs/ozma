@@ -1,0 +1,99 @@
+.TH OZMA 1 "2024" "1.0.0" "ozmaos"
+.SH NAME
+ozma \\- OzmaOS management CLI
+.SH SYNOPSIS
+.B ozma
+[\\fIOPTIONS\\fR] \\fICOMMAND\\fR [\\fIARGS\\fR]
+.SH DESCRIPTION
+.B ozma
+is the command-line management interface for OzmaOS. It provides system health monitoring,
+update management, service control, and Ozma Connect integration.
+.SH COMMANDS
+.TP
+.B ozma status
+Display system health summary including controller status, services, network,
+ZFS pools, and storage usage.
+.TP
+.B ozma update [\\fB--check\\fR] [\\fB--apply\\fR]
+Check for and apply operating system and controller updates.
+.TP
+.B ozma service enable \\fINAME\\fR
+Enable and start a managed service.
+.TP
+.B ozma service disable \\fINAME\\fR
+Disable and stop a managed service.
+.TP
+.B ozma service restart \\fINAME\\fR
+Restart a managed service.
+.TP
+.B ozma connect link \\fIEMAIL\\fR
+Link the controller to an Ozma Connect account.
+.TP
+.B ozma connect unlink
+Unlink the controller from Ozma Connect.
+.TP
+.B ozma connect status
+Show Ozma Connect relay and backup status.
+.TP
+.B ozma logs [\\fISERVICE\\fR]
+Display logs for a service (defaults to ozma-controller).
+.TP
+.B ozma backup now
+Trigger an immediate encrypted backup to Ozma Connect.
+.TP
+.B ozma zfs status
+Display ZFS pool health and scrub status.
+.TP
+.B ozma diagnose [\\fB--output FILE\\fR]
+Run health checks and create a gzipped support bundle.
+.SH MANAGED SERVICES
+The following services can be managed:
+.IR frigate ,
+.IR vaultwarden ,
+.IR parsec ,
+.IR tailscale ,
+.IR nginx ,
+.IR ozma-controller ,
+.IR ozma-node .
+.SH OPTIONS
+.TP
+.B \\fB--version\\fR
+Show the program version and exit.
+.TP
+.B \\fB--help\\fR
+Show this help message and exit.
+.SH FILES
+.TP
+.I /var/ozma/
+OzmaOS data directory.
+.TP
+.I /etc/ozma/
+OzmaOS configuration directory.
+.TP
+.I ~/.config/ozma/
+User-specific OzmaOS configuration.
+.SH EXAMPLES
+.TP
+Check system status:
+.B ozma status
+.TP
+Check for updates without applying:
+.B ozma update --check
+.TP
+Enable Frigate service:
+.B ozma service enable frigate
+.TP
+Create a support bundle:
+.B ozma diagnose --output /tmp/support-bundle.tar.gz
+.SH SEE ALSO
+.BR ozmaos (7),
+.BR ozma-controller (8),
+.BR ozma-node (8)
+.SH AUTHOR
+Written by Ozma Labs.
+.SH REPORTING BUGS
+Report bugs at <https://github.com/ozmalabs/ozma/issues>
+.SH COPYRIGHT
+Copyright \\(co 2024 Ozma Labs. AGPL-3.0 license.
+.SH DISCLAIMER
+This is free software: you are free to change and redistribute it.
