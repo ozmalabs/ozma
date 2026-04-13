@@ -11002,6 +11002,213 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         dns_verifier.guard.remove_allowlist(set(entries))
         return {"ok": True, "removed": entries}
 
+    # ── Network backend integration ───────────────────────────────────────────
+
+    def _net() -> Any:
+        if state.network_provisioner is None:
+            raise HTTPException(503, "No network backend configured")
+        return state.network_provisioner
+
+    @app.get("/api/v1/network/backend")
+    async def network_backend_status() -> dict[str, Any]:
+        """Return network backend configuration status (no auth required)."""
+        if state.network_provisioner is None:
+            return {"configured": False, "backend_type": None, "connected": False}
+        prov = state.network_provisioner
+        backend_type = getattr(getattr(prov, "_backend", None), "backend_type", None)
+        connected = False
+        try:
+            connected = bool(getattr(prov, "is_connected", lambda: False)())
+        except Exception:
+            pass
+        return {
+            "configured": True,
+            "backend_type": backend_type,
+            "connected": connected,
+        }
+
+    @app.get("/api/v1/network/topology")
+    async def network_topology(request: Request) -> dict[str, Any]:
+        """Return the current network topology (devices, VLANs, ports)."""
+        _require_scope(request, SCOPE_READ)
+        prov = _net()
+        try:
+            topology = await prov.get_topology()
+        except Exception as e:
+            raise HTTPException(502, f"Failed to fetch topology: {e}")
+        return topology.to_dict() if hasattr(topology, "to_dict") else topology
+
+    @app.post("/api/v1/network/topology/refresh")
+    async def network_topology_refresh(request: Request) -> dict[str, Any]:
+        """Clear cached topology and force a re-read from the backend."""
+        _require_scope(request, SCOPE_WRITE)
+        prov = _net()
+        try:
+            if hasattr(prov, "invalidate_cache"):
+                prov.invalidate_cache()
+            topology = await prov.get_topology()
+        except Exception as e:
+            raise HTTPException(502, f"Failed to refresh topology: {e}")
+        return topology.to_dict() if hasattr(topology, "to_dict") else topology
+
+    @app.post("/api/v1/network/vlans")
+    async def network_create_vlan(request: Request, body: dict = {}) -> dict[str, Any]:
+        """
+        Create or update a VLAN on the network backend.
+
+        Body: {vlan_id, name, subnet, gateway, dhcp_enabled, dhcp_start, dhcp_end, purpose}
+        """
+        _require_scope(request, SCOPE_WRITE)
+        prov = _net()
+        try:
+            from net_integrations.base import VLANSpec
+            spec = VLANSpec(
+                vlan_id=int(body.get("vlan_id", 0)),
+                name=body.get("name", ""),
+                subnet=body.get("subnet", ""),
+                gateway=body.get("gateway", ""),
+                dhcp_enabled=bool(body.get("dhcp_enabled", True)),
+                dhcp_start=body.get("dhcp_start", ""),
+                dhcp_end=body.get("dhcp_end", ""),
+                purpose=body.get("purpose", ""),
+            )
+            result = await prov.create_vlan(spec)
+        except ImportError:
+            raise HTTPException(503, "net_integrations not available")
+        except Exception as e:
+            raise HTTPException(502, f"VLAN creation failed: {e}")
+        return result.to_dict() if hasattr(result, "to_dict") else {"ok": True, "result": str(result)}
+
+    @app.post("/api/v1/network/ports/{device_id}/{port_id}")
+    async def network_configure_port(
+        request: Request, device_id: str, port_id: str, body: dict = {}
+    ) -> dict[str, Any]:
+        """
+        Configure a switch port.
+
+        Body: {mode: "access"|"trunk", native_vlan: int, tagged_vlans: list[int]}
+        """
+        _require_scope(request, SCOPE_WRITE)
+        prov = _net()
+        mode = body.get("mode", "access")
+        if mode not in ("access", "trunk"):
+            raise HTTPException(400, "mode must be 'access' or 'trunk'")
+        try:
+            result = await prov.configure_port(
+                device_id=device_id,
+                port_id=port_id,
+                mode=mode,
+                native_vlan=int(body.get("native_vlan", 1)),
+                tagged_vlans=[int(v) for v in body.get("tagged_vlans", [])],
+            )
+        except Exception as e:
+            raise HTTPException(502, f"Port configuration failed: {e}")
+        return result.to_dict() if hasattr(result, "to_dict") else {"ok": True, "result": str(result)}
+
+    @app.post("/api/v1/network/provision/lab")
+    async def network_provision_lab(request: Request, body: dict = {}) -> dict[str, Any]:
+        """
+        Apply the lab network configuration to the backend.
+
+        Body (optional): {port_assignments: [{device_id, port_id, mode, native_vlan, tagged_vlans}]}
+        Emits WS event: {"type": "network.provisioned", "changes": [...], "errors": [...]}
+        """
+        _require_scope(request, SCOPE_WRITE)
+        prov = _net()
+        try:
+            from net_integrations.provisioner import LabNetworkConfig
+            lab_cfg = LabNetworkConfig.lab_default()
+            # Apply any port assignment overrides from the request body
+            port_assignments = body.get("port_assignments", [])
+            if port_assignments:
+                lab_cfg.port_assignments = port_assignments
+            result = await prov.provision(lab_cfg)
+        except ImportError:
+            raise HTTPException(503, "net_integrations not available")
+        except Exception as e:
+            raise HTTPException(502, f"Lab provisioning failed: {e}")
+        result_dict = result.to_dict() if hasattr(result, "to_dict") else {"ok": True}
+        await state.events.put({
+            "type": "network.provisioned",
+            "changes": result_dict.get("changes", []),
+            "errors": result_dict.get("errors", []),
+        })
+        return result_dict
+
+    @app.get("/api/v1/network/provision/lab/diff")
+    async def network_provision_lab_diff(request: Request) -> dict[str, Any]:
+        """
+        Return what WOULD change if the lab config were applied (dry-run).
+
+        Returns a diff dict without making any changes.
+        """
+        _require_scope(request, SCOPE_READ)
+        prov = _net()
+        try:
+            from net_integrations.provisioner import LabNetworkConfig
+            lab_cfg = LabNetworkConfig.lab_default()
+            if hasattr(prov, "diff"):
+                diff = await prov.diff(lab_cfg)
+            else:
+                # Fallback: return current topology vs desired config
+                topology = await prov.get_topology()
+                diff = {
+                    "topology": topology.to_dict() if hasattr(topology, "to_dict") else {},
+                    "desired": lab_cfg.to_dict() if hasattr(lab_cfg, "to_dict") else {},
+                    "note": "diff not supported by this backend — showing current vs desired",
+                }
+        except ImportError:
+            raise HTTPException(503, "net_integrations not available")
+        except Exception as e:
+            raise HTTPException(502, f"Diff failed: {e}")
+        return diff if isinstance(diff, dict) else (diff.to_dict() if hasattr(diff, "to_dict") else {"diff": str(diff)})
+
+    @app.post("/api/v1/network/wg/sync")
+    async def network_wg_sync(request: Request, body: dict = {}) -> dict[str, Any]:
+        """
+        Sync Ozma mesh WireGuard peers to the MikroTik router.
+
+        Body: {interface: "wireguard1"}
+        MikroTik only — reads mesh peers from state and pushes missing ones to the router.
+        Returns: {added: int, skipped: int, errors: list[str]}
+        """
+        _require_scope(request, SCOPE_ADMIN)
+        prov = _net()
+        backend = getattr(prov, "_backend", None)
+        backend_type = getattr(backend, "backend_type", "") if backend else ""
+        if backend_type != "mikrotik":
+            raise HTTPException(400, "WireGuard sync is only supported for MikroTik backends")
+        interface = body.get("interface", "wireguard1")
+        # Collect mesh peers from state
+        peers = []
+        if wg:
+            wg_status = wg.status()
+            peers = wg_status.get("peers", [])
+        added = 0
+        skipped = 0
+        errors: list[str] = []
+        for peer in peers:
+            public_key = peer.get("public_key", "")
+            endpoint = peer.get("endpoint", "")
+            allowed_ips = peer.get("overlay_ip", "")
+            if not public_key:
+                skipped += 1
+                continue
+            try:
+                ok = await backend.add_wg_peer(
+                    interface=interface,
+                    public_key=public_key,
+                    endpoint=endpoint,
+                    allowed_ips=allowed_ips,
+                )
+                if ok:
+                    added += 1
+                else:
+                    skipped += 1
+            except Exception as e:
+                errors.append(f"peer {public_key[:16]}…: {e}")
+        return {"added": added, "skipped": skipped, "errors": errors}
+
     # GraphQL API (optional — requires strawberry-graphql)
     if _GRAPHQL_AVAILABLE and _gql_create_router is not None:
         graphql_router = _gql_create_router(state, _auth, mesh_ca)

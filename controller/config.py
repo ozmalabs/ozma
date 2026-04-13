@@ -61,6 +61,15 @@ class Config:
     vaultwarden_port: int = 8222
     vaultwarden_admin_token: str = ""  # auto-generated if empty
 
+    # Network backend integration (MikroTik / UniFi / Omada)
+    network_backend: str = ""                  # "mikrotik" | "unifi" | "omada" | ""
+    network_backend_host: str = ""
+    network_backend_username: str = ""
+    network_backend_password: str = ""
+    network_backend_site: str = "default"
+    network_unifi_api_key: str = ""
+    network_mikrotik_transport: str = "auto"   # "auto" | "api" | "ssh"
+
     # Logging
     debug: bool = False
 
@@ -92,4 +101,11 @@ class Config:
             vaultwarden_data_dir=os.environ.get("OZMA_VAULTWARDEN_DATA", ""),
             vaultwarden_port=int(os.environ.get("OZMA_VAULTWARDEN_PORT", "8222")),
             vaultwarden_admin_token=os.environ.get("OZMA_VAULTWARDEN_ADMIN_TOKEN", ""),
+            network_backend=os.environ.get("OZMA_NETWORK_BACKEND", ""),
+            network_backend_host=os.environ.get("OZMA_NETWORK_HOST", ""),
+            network_backend_username=os.environ.get("OZMA_NETWORK_USERNAME", ""),
+            network_backend_password=os.environ.get("OZMA_NETWORK_PASSWORD", ""),
+            network_backend_site=os.environ.get("OZMA_NETWORK_SITE", "default"),
+            network_unifi_api_key=os.environ.get("OZMA_UNIFI_API_KEY", ""),
+            network_mikrotik_transport=os.environ.get("OZMA_MIKROTIK_TRANSPORT", "auto"),
         )
