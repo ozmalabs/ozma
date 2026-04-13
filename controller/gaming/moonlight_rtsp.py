@@ -17,6 +17,7 @@ import logging
 import secrets
 import socket
 import struct
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Optional
@@ -60,7 +61,7 @@ class MoonlightSession:
     control_port: int
     config: SessionConfig
     state: SessionState = SessionState.INIT
-    last_activity: float = field(default_factory=lambda: asyncio.get_event_loop().time())
+    last_activity: float = field(default_factory=lambda: time.time())
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -131,7 +132,7 @@ class MoonlightRTSPServer:
             await self._server.wait_closed()
             
         # Close all sessions
-        for session in self._sessions.values():
+        for session in list(self._sessions.values()):
             await self._teardown_session(session)
             
         log.info("Moonlight RTSP server stopped")
@@ -273,6 +274,7 @@ class MoonlightRTSPServer:
         
         self._sessions[session_id] = session
         session.state = SessionState.DESCRIBED
+        session.last_activity = time.time()
         
         # Generate SDP
         sdp = self._generate_sdp(session)
@@ -304,7 +306,7 @@ class MoonlightRTSPServer:
             return self._build_response(403, "Forbidden")
             
         session.state = SessionState.SETUP
-        session.last_activity = asyncio.get_event_loop().time()
+        session.last_activity = time.time()
         
         # Extract transport parameters
         transport = headers.get('transport', '')
@@ -336,7 +338,7 @@ class MoonlightRTSPServer:
             
         session = self._sessions[session_id]
         session.state = SessionState.PLAYING
-        session.last_activity = asyncio.get_event_loop().time()
+        session.last_activity = time.time()
         
         response_headers = {
             'Session': session_id,
@@ -475,7 +477,7 @@ class MoonlightRTSPServer:
             for key, value in headers.items():
                 response_lines.append(f"{key}: {value}")
                 
-        response_lines.append(f"Date: {asyncio.get_event_loop().time()}")
+        response_lines.append(f"Date: {time.time()}")
         response_lines.append("")
         
         if body:
@@ -502,7 +504,7 @@ class MoonlightRTSPServer:
         while True:
             try:
                 await asyncio.sleep(10)  # Check every 10 seconds
-                current_time = asyncio.get_event_loop().time()
+                current_time = time.time()
                 
                 expired_sessions = []
                 for session in self._sessions.values():
