@@ -41,7 +41,7 @@ class SlackChannel:
         self.oauth_team_id = None
         
         self._on_message_callback = None
-        self._init_client()
+        self.client = None
 
     def _init_client(self):
         """Initialize the HTTP client with available token."""
@@ -61,10 +61,13 @@ class SlackChannel:
     async def start(self, on_message_callback):
         """Initialize the Slack channel."""
         self._on_message_callback = on_message_callback
+        # Initialize client if we have credentials
+        if self.oauth_token or self.bot_token:
+            self._init_client()
 
     async def stop(self):
         """Clean up the Slack channel."""
-        if hasattr(self, 'client'):
+        if self.client:
             await self.client.aclose()
 
     async def verify_signature(self, request_body: bytes, timestamp: str, signature: str) -> bool:
@@ -136,10 +139,13 @@ class SlackChannel:
 
     async def send_message(self, channel: str, text: str, thread_ts: Optional[str] = None):
         """Send a message to a Slack channel."""
-        token = self.oauth_token or self.bot_token
-        if not token:
-            log.warning("Slack bot token not configured")
-            return
+        # Initialize client if not already done
+        if not self.client and (self.oauth_token or self.bot_token):
+            self._init_client()
+            
+        if not self.client:
+            log.warning("Slack client not initialized - missing token")
+            return None
             
         data = {
             "channel": channel,
@@ -159,10 +165,13 @@ class SlackChannel:
 
     async def update_message(self, channel: str, ts: str, text: str):
         """Update an existing message in Slack."""
-        token = self.oauth_token or self.bot_token
-        if not token:
-            log.warning("Slack bot token not configured")
-            return
+        # Initialize client if not already done
+        if not self.client and (self.oauth_token or self.bot_token):
+            self._init_client()
+            
+        if not self.client:
+            log.warning("Slack client not initialized - missing token")
+            return None
             
         data = {
             "channel": channel,
