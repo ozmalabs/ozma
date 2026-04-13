@@ -258,7 +258,7 @@ async def stripe_webhook(request: Request, db = Depends(get_db_connection)) -> d
                     plan = "business"
             
             # Extract subscription details
-            status = subscription.status
+            subscription_status = subscription.status
             current_period_end = subscription.current_period_end
             cancel_at_period_end = subscription.cancel_at_period_end
             
@@ -274,7 +274,7 @@ async def stripe_webhook(request: Request, db = Depends(get_db_connection)) -> d
                 #     param_index += 1
                 
                 # update_fields.append(f"plan_status = ${param_index}")
-                # params.append(status)
+                # params.append(subscription_status)
                 # param_index += 1
                 
                 # update_fields.append(f"plan_period_end = ${param_index}")
