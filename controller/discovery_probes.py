@@ -3,9 +3,10 @@
 import asyncio
 import json
 import logging
+import socket
+import struct
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
-from urllib.parse import urljoin
 import aiohttp
 from xml.etree import ElementTree as ET
 
@@ -115,13 +116,67 @@ class DiscoveryProber:
             logger.debug(f"TCP probe failed for {ip}:{port}: {e}")
             return False
     
+    async def probe_mqtt_connect(self, ip: str, port: int = 1883) -> bool:
+        """Probe MQTT CONNECT handshake."""
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, port),
+                timeout=self.timeout
+            )
+            # Send CONNECT packet (minimal MQTT CONNECT)
+            connect_packet = bytes([
+                0x10,  # CONNECT
+                0x0C,  # Remaining length
+                0x00, 0x04, ord('M'), ord('Q'), ord('T'), ord('T'),  # Protocol name
+                0x04,  # Protocol level
+                0x02,  # Connect flags
+                0x00, 0x3C,  # Keep alive
+                0x00, 0x03, ord('c'), ord('l'), ord('i')  # Client ID
+            ])
+            writer.write(connect_packet)
+            await writer.drain()
+            
+            # Read response
+            response = await asyncio.wait_for(reader.read(1024), timeout=self.timeout)
+            writer.close()
+            await writer.wait_closed()
+            
+            # Check if we got a CONNACK response (first byte should be 0x20)
+            return len(response) > 0 and response[0] == 0x20
+        except Exception as e:
+            logger.debug(f"MQTT CONNECT probe failed for {ip}:{port}: {e}")
+            return False
+    
+    async def probe_nut_hello(self, ip: str, port: int = 3493) -> bool:
+        """Probe NUT HELLO handshake."""
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, port),
+                timeout=self.timeout
+            )
+            # Send HELLO command
+            writer.write(b"HELLO\n")
+            await writer.drain()
+            
+            # Read response
+            response = await asyncio.wait_for(reader.read(1024), timeout=self.timeout)
+            writer.close()
+            await writer.wait_closed()
+            
+            # Check if we got a proper NUT response
+            return b"OK" in response or b"NAK" in response
+        except Exception as e:
+            logger.debug(f"NUT HELLO probe failed for {ip}:{port}: {e}")
+            return False
+    
     async def probe_device(self, ip: str, spec: ProbeSpec) -> Optional[Dict[str, Any]]:
         """Probe a single device with a specific fingerprint."""
         if spec.method in ['http', 'https']:
             data = await self.probe_http(ip, spec.port, spec.method, spec.path)
             if data:
-                # Check if expected keys are present
-                if not spec.expected_keys or all(key in str(data) for key in spec.expected_keys):
+                # Check if expected keys are present in the actual data structure
+                if not spec.expected_keys:
+                    # No specific keys required
                     return {
                         "ip": ip,
                         "port": spec.port,
@@ -129,15 +184,47 @@ class DiscoveryProber:
                         "subtype": spec.subtype,
                         "data": data
                     }
+                else:
+                    # Check if all expected keys are present in the data
+                    data_str = json.dumps(data) if isinstance(data, (dict, list)) else str(data)
+                    if all(key in data_str for key in spec.expected_keys):
+                        return {
+                            "ip": ip,
+                            "port": spec.port,
+                            "device_type": spec.device_type,
+                            "subtype": spec.subtype,
+                            "data": data
+                        }
         elif spec.method == 'tcp':
-            if await self.probe_tcp(ip, spec.port):
-                return {
-                    "ip": ip,
-                    "port": spec.port,
-                    "device_type": spec.device_type,
-                    "subtype": spec.subtype,
-                    "data": {}
-                }
+            # Special handling for specific TCP probes
+            if spec.subtype == 'MQTT':
+                if await self.probe_mqtt_connect(ip, spec.port):
+                    return {
+                        "ip": ip,
+                        "port": spec.port,
+                        "device_type": spec.device_type,
+                        "subtype": spec.subtype,
+                        "data": {}
+                    }
+            elif spec.subtype == 'NUT':
+                if await self.probe_nut_hello(ip, spec.port):
+                    return {
+                        "ip": ip,
+                        "port": spec.port,
+                        "device_type": spec.device_type,
+                        "subtype": spec.subtype,
+                        "data": {}
+                    }
+            else:
+                # Generic TCP port check
+                if await self.probe_tcp(ip, spec.port):
+                    return {
+                        "ip": ip,
+                        "port": spec.port,
+                        "device_type": spec.device_type,
+                        "subtype": spec.subtype,
+                        "data": {}
+                    }
         
         return None
     
@@ -155,10 +242,59 @@ class DiscoveryProber:
 
 async def probe_onvif_discovery(ip_range: List[str]) -> List[Dict[str, Any]]:
     """Probe for ONVIF devices using WS-Discovery."""
-    # This would implement multicast UDP probe to 239.255.255.250:3702
-    # and parse ProbeMatch responses
     results = []
-    # Implementation would go here
+    try:
+        # Create UDP socket for multicast
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.settimeout(5)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        
+        # Enable multicast
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        
+        # WS-Discovery probe message
+        probe_message = '''<?xml version="1.0" encoding="utf-8"?>
+        <soap:Envelope 
+            xmlns:soap="http://www.w3.org/2003/05/soap-envelope" 
+            xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing" 
+            xmlns:tns="http://schemas.xmlsoap.org/ws/2005/04/discovery">
+            <soap:Header>
+                <wsa:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</wsa:Action>
+                <wsa:MessageID>uuid:42a55bf9-1853-4540-b6a7-11b2c0545281</wsa:MessageID>
+                <wsa:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</wsa:To>
+            </soap:Header>
+            <soap:Body>
+                <tns:Probe/>
+            </soap:Body>
+        </soap:Envelope>'''
+        
+        # Send multicast probe
+        sock.sendto(probe_message.encode(), ("239.255.255.250", 3702))
+        
+        # Collect responses
+        try:
+            while True:
+                data, addr = sock.recvfrom(4096)
+                # Parse the response
+                try:
+                    root = ET.fromstring(data)
+                    # Extract device info from XML
+                    device_info = {
+                        "ip": addr[0],
+                        "port": addr[1],
+                        "device_type": "onvif",
+                        "data": str(data)
+                    }
+                    results.append(device_info)
+                except ET.ParseError:
+                    continue
+        except socket.timeout:
+            pass
+        finally:
+            sock.close()
+    except Exception as e:
+        logger.debug(f"ONVIF discovery failed: {e}")
+    
     return results
 
 async def probe_rtsp_stream(ip: str, port: int = 554) -> bool:
@@ -178,8 +314,9 @@ async def probe_rtsp_stream(ip: str, port: int = 554) -> bool:
         writer.close()
         await writer.wait_closed()
         
-        # Check if we got a 200 OK response
-        return b"200 OK" in response
+        # Check if we got a valid RTSP response with 200 OK
+        response_str = response.decode('utf-8', errors='ignore')
+        return "RTSP/1.0 200 OK" in response_str or "200 OK" in response_str
     except Exception as e:
         logger.debug(f"RTSP probe failed for {ip}:{port}: {e}")
         return False
@@ -195,13 +332,36 @@ async def probe_mqtt_devices(mqtt_client, timeout: int = 10) -> List[Dict[str, A
             "esphome/#"
         ]
         
+        discovered_devices = []
+        
+        def on_message(client, userdata, msg):
+            try:
+                payload = json.loads(msg.payload.decode())
+                discovered_devices.append({
+                    "topic": msg.topic,
+                    "payload": payload
+                })
+            except Exception as e:
+                logger.debug(f"MQTT message parsing failed: {e}")
+        
+        # Set up message handler
+        mqtt_client.on_message = on_message
+        
+        # Subscribe to topics
         for topic in topics:
-            # This would implement actual MQTT subscription and message parsing
-            pass
-            
+            mqtt_client.subscribe(topic)
+        
         # Wait for messages with timeout
         await asyncio.sleep(timeout)
         
+        # Process discovered devices
+        for device in discovered_devices:
+            devices.append({
+                "device_type": "mqtt_device",
+                "topic": device["topic"],
+                "data": device["payload"]
+            })
+            
     except Exception as e:
         logger.error(f"MQTT device enumeration failed: {e}")
     
