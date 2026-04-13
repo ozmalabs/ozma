@@ -11,6 +11,7 @@ Configuration:
 - MESSAGING_DISCORD_TOKEN
 """
 
+import asyncio
 import logging
 import os
 import re
