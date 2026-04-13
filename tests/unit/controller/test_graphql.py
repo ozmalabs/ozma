@@ -70,7 +70,7 @@ class TestRequireWritePermission:
 
         perm = RequireWritePermission()
         assert perm is not None
-        assert hasattr(perm, "get_unauthenticated_message")
+        assert hasattr(perm, "message")
         assert hasattr(perm, "has_permission")
 
     def test_permission_message(self):
@@ -78,7 +78,7 @@ class TestRequireWritePermission:
         from gql_router import RequireWritePermission
 
         perm = RequireWritePermission()
-        assert perm.get_unauthenticated_message(None) == "Write scope required for this mutation"
+        assert perm.message == "Write scope required for this mutation"
 
 
 class TestGraphQLContext:

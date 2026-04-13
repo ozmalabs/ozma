@@ -260,16 +260,13 @@ class MoonlightAppMapper:
             try:
                 # Check if Sunshine is already enabled for this node
                 current_config = self._sunshine.get_config(scenario.node_id)
-                if current_config and not current_config.enabled:
-                    # Enable streaming for this node
-                    await self._sunshine.enable_node(scenario.node_id)
-                    result["streaming_enabled"] = True
-                elif current_config and current_config.enabled:
+                if current_config and current_config.enabled:
                     result["streaming_enabled"] = False
                     result["reason"] = "Streaming already enabled"
                 else:
-                    result["streaming_enabled"] = False
-                    result["reason"] = "No Sunshine config for node"
+                    # No config or streaming not enabled — enable it
+                    await self._sunshine.enable_node(scenario.node_id)
+                    result["streaming_enabled"] = True
             except Exception as e:
                 log.warning("Failed to enable streaming for %s: %s", scenario.node_id, e)
                 result["streaming_warning"] = str(e)

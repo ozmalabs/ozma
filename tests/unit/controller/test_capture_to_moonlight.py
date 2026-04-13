@@ -296,17 +296,19 @@ class TestListMoonlightApps:
         mock_display_source.card = mock_card
         mock_display_source.id = "hdmi-0"
 
-        with patch.object(manager._display_capture, 'get_sources', return_value={
-            "hdmi-0": mock_display_source,
-        }):
-            with patch.object(manager._display_capture, 'get_source', return_value=mock_display_source):
-                apps = await manager.list_moonlight_apps()
+        with patch("gaming.capture_to_moonlight.Path") as mock_path_cls:
+            mock_path_cls.return_value.exists.return_value = True
+            with patch.object(manager._display_capture, 'get_sources', return_value={
+                "hdmi-0": mock_display_source,
+            }):
+                with patch.object(manager._display_capture, 'get_source', return_value=mock_display_source):
+                    apps = await manager.list_moonlight_apps()
 
-                assert len(apps) == 1
-                assert apps[0]["id"] == "capture:hdmi-0"
-                assert apps[0]["name"] == "HDMI Capture: HDMI Capture Card"
-                assert apps[0]["capture_source_id"] == "hdmi-0"
-                assert apps[0]["max_sessions"] == MAX_CONCURRENT_SESSIONS
+                    assert len(apps) == 1
+                    assert apps[0]["id"] == "capture:hdmi-0"
+                    assert apps[0]["name"] == "HDMI Capture: HDMI Capture Card"
+                    assert apps[0]["capture_source_id"] == "hdmi-0"
+                    assert apps[0]["max_sessions"] == MAX_CONCURRENT_SESSIONS
 
     async def test_excludes_missing_device(self, tmp_path):
         manager = self._make_manager(tmp_path)
@@ -392,17 +394,26 @@ class TestLaunchMoonlightApp:
         mock_session.stream_port = 47984
         mock_session.control_port = 47985
         manager._moonlight.create_session = AsyncMock(return_value=mock_session)
+        manager._moonlight.register_input_handler = AsyncMock()
 
-        # Mock pipeline manager
-        manager._pipeline_manager.create_pipeline = AsyncMock()
+        # Mock pipeline manager — return a plain MagicMock so set_on_error/set_on_stats are sync
+        mock_pipeline = MagicMock()
+        mock_pipeline._running = True
+        manager._pipeline_manager.create_pipeline = AsyncMock(return_value=mock_pipeline)
 
-        with patch.object(manager._display_capture, 'get_sources', return_value={
-            "hdmi-0": mock_display_source,
-        }):
-            with patch.object(manager._display_capture, 'get_source', return_value=mock_display_source):
-                result = await manager.launch_moonlight_app("capture:hdmi-0", "client-1")
-                # Session was created
-                assert result is True
+        with patch("gaming.capture_to_moonlight.Path") as mock_path_cls:
+            mock_path_cls.return_value.exists.return_value = True
+            with patch("gaming.capture_to_moonlight.MoonlightInputHandler") as mock_input_cls:
+                mock_input = AsyncMock()
+                mock_input.start = AsyncMock()
+                mock_input_cls.return_value = mock_input
+                with patch.object(manager._display_capture, 'get_sources', return_value={
+                    "hdmi-0": mock_display_source,
+                }):
+                    with patch.object(manager._display_capture, 'get_source', return_value=mock_display_source):
+                        result = await manager.launch_moonlight_app("capture:hdmi-0", "client-1")
+                        # Session was created
+                        assert result is True
 
     async def test_launch_with_invalid_app_id(self, tmp_path):
         manager = self._make_manager(tmp_path)
