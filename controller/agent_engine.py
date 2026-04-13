@@ -48,6 +48,12 @@ _READ_ONLY_ACTIONS = frozenset({
 
 _DEFAULT_APPROVAL: dict[str, str] = {}  # populated in AgentEngine.__init__
 
+# ── Context sources ───────────────────────────────────────────────────────────
+
+CONTEXT_SOURCES = frozenset({
+    "slack", "microsoft_graph", "google_workspace"
+})
+
 
 @dataclass
 class PendingAction:
@@ -160,7 +166,8 @@ class AgentEngine:
     def __init__(self, state: Any, screen_reader: Any = None,
                  text_capture: Any = None,
                  evdev_kbd_path: str = "", evdev_mouse_path: str = "",
-                 notifier: Any = None, event_queue: asyncio.Queue | None = None) -> None:
+                 notifier: Any = None, event_queue: asyncio.Queue | None = None,
+                 context_sources: dict[str, Any] | None = None) -> None:
         self._state = state
         self._screen_reader = screen_reader
         self._text_capture = text_capture
@@ -178,6 +185,15 @@ class AgentEngine:
         self._approval_config: dict[str, str] = {}  # action → mode
         self._pending: dict[str, PendingAction] = {}
         self._approval_timeout = 120.0  # seconds
+        # Context sources for platform integrations
+        self._context_sources = context_sources or {}
+        # Pre-populate with built-in context sources
+        if self._context_sources is None:
+            self._context_sources = {}
+        # Add built-in context sources if not already present
+        for source in CONTEXT_SOURCES:
+            if source not in self._context_sources:
+                self._context_sources[source] = None  # Will be populated externally
 
     # ── Approval management ───────────────────────────────────────────
 
@@ -330,6 +346,8 @@ class AgentEngine:
                     await self._do_assert_element(result, node, **kwargs)
                 case "get_cursor_position":
                     result.success = True  # Would need mouse tracking
+                case "get_context":
+                    await self._do_get_context(result, **kwargs)
                 case _:
                     result.success = False
                     result.error = f"Unknown action: {action}"
@@ -1031,6 +1049,36 @@ class AgentEngine:
         result.success = False
         result.error = f"Element not found: {description or element_type}"
         result.screenshot_base64 = self._frame_to_base64(img)
+
+    async def _do_get_context(self, result: ActionResult, **kw) -> None:
+        """Get context from platform integrations."""
+        source = kw.get("source", "")
+        query = kw.get("query", "")
+        
+        if not source:
+            # List available sources if none specified
+            result.success = True
+            result.screen_text = f"Available context sources: {', '.join(self._context_sources.keys())}"
+            return
+            
+        if source not in self._context_sources:
+            result.success = False
+            result.error = f"Context source '{source}' not available. Available sources: {', '.join(self._context_sources.keys())}"
+            return
+            
+        context_provider = self._context_sources[source]
+        if context_provider is None:
+            result.success = False
+            result.error = f"Context source '{source}' not configured or not available"
+            return
+            
+        try:
+            context_data = await context_provider.get_context(query)
+            result.success = True
+            result.screen_text = str(context_data)
+        except Exception as e:
+            result.success = False
+            result.error = f"Failed to get context from {source}: {str(e)}"
 
 
 # ── MCP tool definition ───────────────────────────────────────────────────────

@@ -40,6 +40,8 @@ class ScheduleRule:
     days: str          # "mon,tue,wed" or "*" for every day
     scenario: str      # scenario ID to activate
     enabled: bool = True
+    trigger_type: str = "time"  # "time" or "calendar"
+    calendar_query: str = ""    # For calendar-based triggers
 
     def matches_now(self) -> bool:
         if not self.enabled:
@@ -54,15 +56,40 @@ class ScheduleRule:
         day_names = [d.strip().lower()[:3] for d in self.days.split(",")]
         return now.weekday() in [_DAY_MAP.get(d, -1) for d in day_names]
 
+    async def check_calendar_trigger(self, calendar_reader: Any) -> bool:
+        """Check if calendar-based trigger should fire."""
+        if self.trigger_type != "calendar" or not self.calendar_query:
+            return False
+            
+        if not calendar_reader:
+            return False
+            
+        try:
+            context = await calendar_reader.get_context(self.calendar_query)
+            # Simple heuristic: if context contains relevant keywords, trigger
+            if "meeting" in context.lower() or "event" in context.lower():
+                return True
+        except Exception as e:
+            log.warning("Failed to check calendar trigger: %s", e)
+        return False
+
     def to_dict(self) -> dict[str, Any]:
-        return {"time": self.time, "days": self.days, "scenario": self.scenario, "enabled": self.enabled}
+        return {
+            "time": self.time, 
+            "days": self.days, 
+            "scenario": self.scenario, 
+            "enabled": self.enabled,
+            "trigger_type": self.trigger_type,
+            "calendar_query": self.calendar_query
+        }
 
 
 class Scheduler:
     """Cron-like scheduler for automatic scenario switching."""
 
-    def __init__(self, scenarios: Any) -> None:
+    def __init__(self, scenarios: Any, calendar_reader: Any = None) -> None:
         self._scenarios = scenarios
+        self._calendar_reader = calendar_reader
         self._rules: list[ScheduleRule] = []
         self._task: asyncio.Task | None = None
         self._path = Path(__file__).parent / "schedule.json"
@@ -80,8 +107,14 @@ class Scheduler:
     def list_rules(self) -> list[dict[str, Any]]:
         return [r.to_dict() for i, r in enumerate(self._rules)]
 
-    def add_rule(self, time: str, days: str, scenario: str) -> dict[str, Any]:
-        rule = ScheduleRule(time=time, days=days, scenario=scenario)
+    def add_rule(self, time: str, days: str, scenario: str, trigger_type: str = "time", calendar_query: str = "") -> dict[str, Any]:
+        rule = ScheduleRule(
+            time=time, 
+            days=days, 
+            scenario=scenario,
+            trigger_type=trigger_type,
+            calendar_query=calendar_query
+        )
         self._rules.append(rule)
         self._save()
         return rule.to_dict()
@@ -99,17 +132,32 @@ class Scheduler:
                 now_key = datetime.now().strftime("%Y-%m-%d %H:%M")
                 if now_key != self._last_fired:
                     for rule in self._rules:
-                        if rule.matches_now():
+                        should_trigger = False
+                        
+                        # Time-based trigger
+                        if rule.trigger_type == "time" and rule.matches_now():
+                            should_trigger = True
+                            
+                        # Calendar-based trigger
+                        elif rule.trigger_type == "calendar":
+                            should_trigger = await rule.check_calendar_trigger(self._calendar_reader)
+                        
+                        if should_trigger:
                             self._last_fired = now_key
-                            log.info("Schedule trigger: %s → scenario %s", rule.time, rule.scenario)
+                            log.info("Schedule trigger: %s → scenario %s", rule.time or rule.calendar_query, rule.scenario)
                             try:
                                 await self._scenarios.activate(rule.scenario)
                             except KeyError:
                                 log.warning("Scheduled scenario not found: %s", rule.scenario)
+                            except Exception as e:
+                                log.error("Failed to activate scheduled scenario %s: %s", rule.scenario, e)
                             break  # Only fire one rule per minute
                 await asyncio.sleep(15)  # Check 4× per minute
             except asyncio.CancelledError:
                 return
+            except Exception as e:
+                log.error("Scheduler loop error: %s", e)
+                await asyncio.sleep(15)
 
     def _save(self) -> None:
         try:
