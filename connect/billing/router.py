@@ -11,6 +11,7 @@ from connect.billing.models import (
 )
 from connect.billing.stripe_client import StripeClient
 from connect.auth.dependencies import get_current_account
+import asyncpg
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/billing", tags=["billing"], dependencies=[Depends(get_current_account)])
@@ -18,6 +19,11 @@ router = APIRouter(prefix="/billing", tags=["billing"], dependencies=[Depends(ge
 # Get price IDs from environment
 STRIPE_PRICE_PRO = os.getenv("STRIPE_PRICE_PRO")
 STRIPE_PRICE_BUSINESS = os.getenv("STRIPE_PRICE_BUSINESS")
+
+# Database connection (in a real implementation, this would be injected)
+async def get_db_connection():
+    # This is a placeholder - in reality would use dependency injection
+    pass
 
 
 @router.post("/checkout", response_model=CheckoutResponse)
