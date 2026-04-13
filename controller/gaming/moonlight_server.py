@@ -21,14 +21,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from scenarios import ScenarioManager
-from state import AppState, NodeInfo
 
 from .moonlight_protocol import (
     MoonlightProtocol,
     PairingManager,
     SessionData,
 )
-from .scenario_app_mapping import ScenarioAppMapper, HybridStreamingManager
 
 log = logging.getLogger("ozma.moonlight.server")
 
@@ -40,9 +38,6 @@ class MoonlightApp:
     name: str
     description: str
     icon: str
-    scenario_id: str | None = None
-    node_id: str | None = None
-    capture_source_id: str | None = None
     active: bool = False
     active_client_id: str | None = None
 
@@ -62,14 +57,10 @@ class MoonlightServer:
         self,
         scenario_manager: ScenarioManager,
         moonlight_protocol: MoonlightProtocol,
-        scenario_app_mapper: ScenarioAppMapper,
-        hybrid_streaming: HybridStreamingManager | None = None,
         data_dir: Path | None = None,
     ) -> None:
         self._scenario_manager = scenario_manager
         self._moonlight = moonlight_protocol
-        self._scenario_app_mapper = scenario_app_mapper
-        self._hybrid_streaming = hybrid_streaming
 
         self._data_dir = data_dir or Path("/var/lib/ozma/moonlight")
         self._data_dir.mkdir(parents=True, exist_ok=True)
@@ -115,49 +106,24 @@ class MoonlightServer:
 
     async def _update_apps(self) -> None:
         """Update the app list from scenarios."""
-        apps = await self._scenario_app_mapper.list_moonlight_apps()
-
+        scenarios = self._scenario_manager.list()
         self._apps = [
             MoonlightApp(
-                id=app["id"],
-                name=app["name"],
-                description=app.get("description", ""),
-                icon=app.get("icon", "computer"),
-                scenario_id=app.get("scenario_id"),
-                node_id=app.get("node_id"),
-                capture_source_id=app.get("capture_source_id"),
+                id=s["id"],
+                name=s.get("name", s["id"]),
+                description=s.get("description", ""),
+                icon="computer",
             )
-            for app in apps
+            for s in scenarios
         ]
 
     async def _on_launch_app(self, app_id: str, client_id: str) -> None:
         """Handle app launch request from Moonlight client."""
-        success = await self._scenario_app_mapper.launch_app(app_id, client_id)
-
-        if success:
-            # Find the app and mark as active
-            for app in self._apps:
-                if app.id == app_id:
-                    app.active = True
-                    app.active_client_id = client_id
-                    break
-
-            if self._on_app_launch:
-                self._on_app_launch(app_id, client_id)
+        await self.launch_app(app_id, client_id)
 
     async def _on_quit_app(self, app_id: str, client_id: str) -> None:
         """Handle app quit request from Moonlight client."""
-        await self._scenario_app_mapper.quit_app(app_id, client_id)
-
-        # Find the app and mark as inactive
-        for app in self._apps:
-            if app.id == app_id:
-                app.active = False
-                app.active_client_id = None
-                break
-
-        if self._on_app_quit:
-            self._on_app_quit(app_id, client_id)
+        await self.quit_app(app_id, client_id)
 
     def set_on_app_launch(self, callback: Callable[[str, str], None]) -> None:
         """Set callback for app launch."""
@@ -194,6 +160,7 @@ class MoonlightServer:
 
     async def get_apps(self) -> list[dict[str, Any]]:
         """Get the current app list."""
+        await self._update_apps()
         return [app.__dict__ for app in self._apps]
 
     async def get_app(self, app_id: str) -> dict[str, Any] | None:
@@ -205,11 +172,40 @@ class MoonlightServer:
 
     async def launch_app(self, app_id: str, client_id: str) -> bool:
         """Launch an app for a client."""
-        return await self._scenario_app_mapper.launch_app(app_id, client_id)
+        try:
+            # This assumes an `activate` method exists on ScenarioManager.
+            await self._scenario_manager.activate(app_id)
+            success = True
+        except Exception as e:
+            log.error("Failed to activate scenario for app %s: %s", app_id, e)
+            success = False
+
+        if success:
+            # Find the app and mark as active
+            for app in self._apps:
+                if app.id == app_id:
+                    app.active = True
+                    app.active_client_id = client_id
+                    break
+
+            if self._on_app_launch:
+                self._on_app_launch(app_id, client_id)
+
+        return success
 
     async def quit_app(self, app_id: str, client_id: str) -> bool:
         """Quit an app for a client."""
-        return await self._scenario_app_mapper.quit_app(app_id, client_id)
+        # Find the app and mark as inactive
+        for app in self._apps:
+            if app.id == app_id and app.active_client_id == client_id:
+                app.active = False
+                app.active_client_id = None
+
+                if self._on_app_quit:
+                    self._on_app_quit(app_id, client_id)
+
+                return True
+        return False
 
     def get_active_sessions(self) -> list[dict[str, Any]]:
         """Get all active sessions."""
@@ -325,14 +321,11 @@ class MoonlightAPI:
 def create_moonlight_server(
     scenario_manager: ScenarioManager,
     moonlight_protocol: MoonlightProtocol,
-    scenario_app_mapper: ScenarioAppMapper,
-    hybrid_streaming: HybridStreamingManager | None = None,
     data_dir: Path | None = None,
 ) -> MoonlightServer:
     """
     Factory function to create a MoonlightServer.
     """
     return MoonlightServer(
-        scenario_manager, moonlight_protocol, scenario_app_mapper,
-        hybrid_streaming, data_dir
+        scenario_manager, moonlight_protocol, data_dir
     )
