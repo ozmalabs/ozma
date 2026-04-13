@@ -1,5 +1,11 @@
+//! Stream Deck driver for elgato-streamdeck 0.5+ API.
+//!
+//! This module provides a wrapper around elgato-streamdeck devices with a
+//! consistent interface. It uses the 0.5 API which removed DeviceManager and
+//! DeviceType in favor of direct device enumeration via HidApi.
+
 use anyhow::{anyhow, Context, Result};
-use elgato_streamdeck::{list_devices, hidapi::HidApi, StreamDeck};
+use elgato_streamdeck::{hidapi::HidApi, list_devices, StreamDeck};
 use std::sync::{Arc, Mutex};
 
 /// Wrapper around an elgato-streamdeck device with a consistent interface.
@@ -12,6 +18,8 @@ pub struct StreamDeckDevice {
 
 impl StreamDeckDevice {
     /// Opens the first available Stream Deck device.
+    ///
+    /// Uses elgato-streamdeck 0.5 API: `list_devices()` + `StreamDeck::open()`.
     pub fn open_first() -> Result<Self> {
         let hidapi = HidApi::new()
             .context("Failed to initialize HID API")?;
@@ -22,8 +30,13 @@ impl StreamDeckDevice {
         }
 
         let info = &devices[0];
-        let device = StreamDeck::open_first_device(&hidapi)
-            .with_context(|| format!("Failed to open Stream Deck device: {}", info.product_string.as_deref().unwrap_or("unknown")))?;
+        let device = StreamDeck::open(&hidapi, &info.path)
+            .with_context(|| {
+                format!(
+                    "Failed to open Stream Deck device: {}",
+                    info.product_string.as_deref().unwrap_or("unknown")
+                )
+            })?;
 
         let key_count = device.key_count();
         let device = Arc::new(Mutex::new(device));
@@ -56,7 +69,8 @@ impl StreamDeckDevice {
     /// Fills the key at `index` with the given RGB color.
     pub fn fill_key_color(&self, index: u8, r: u8, g: u8, b: u8) -> Result<()> {
         let mut device = self.device.lock().unwrap();
-        device.set_key_color(index, r, g, b)
+        device
+            .set_key_color(index, r, g, b)
             .with_context(|| format!("Failed to set color for key {}", index))?;
         Ok(())
     }
@@ -64,15 +78,15 @@ impl StreamDeckDevice {
     /// Clears all keys.
     pub fn clear_keys(&self) -> Result<()> {
         let mut device = self.device.lock().unwrap();
-        device.reset()
-            .context("Failed to reset device")?;
+        device.reset().context("Failed to reset device")?;
         Ok(())
     }
 
     /// Sets the brightness (0-100).
     pub fn set_brightness(&self, percentage: u8) -> Result<()> {
         let mut device = self.device.lock().unwrap();
-        device.set_brightness(percentage)
+        device
+            .set_brightness(percentage)
             .context("Failed to set brightness")?;
         Ok(())
     }
