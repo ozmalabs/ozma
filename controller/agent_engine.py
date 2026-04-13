@@ -1049,13 +1049,14 @@ class AgentEngine:
         query = kw.get("query", "")
         
         if not source:
-            result.success = False
-            result.error = "No context source specified"
+            # List available sources if none specified
+            result.success = True
+            result.screen_text = f"Available context sources: {', '.join(self._context_sources.keys())}"
             return
             
         if source not in self._context_sources:
             result.success = False
-            result.error = f"Context source '{source}' not available"
+            result.error = f"Context source '{source}' not available. Available sources: {', '.join(self._context_sources.keys())}"
             return
             
         try:

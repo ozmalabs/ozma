@@ -90,7 +90,8 @@ class SlackReader:
     def _extract_channel_name(self, query: str) -> Optional[str]:
         """Extract channel name from query."""
         import re
-        match = re.search(r"#([a-zA-Z0-9\-_]+)", query)
+        # Match #channel-name or channel-name
+        match = re.search(r"#?([a-zA-Z0-9\-_]+)", query)
         return match.group(1) if match else None
     
     def _extract_message_limit(self, query: str) -> Optional[int]:
@@ -122,14 +123,18 @@ class SlackReader:
             week_ago = datetime.now() - timedelta(weeks=1)
             oldest = week_ago.timestamp()
             
-        result = await self._client.conversations_history(
-            channel=channel_id,
-            limit=limit,
-            oldest=oldest,
-            inclusive=True
-        )
-        
-        return result.get("messages", [])
+        try:
+            result = await self._client.conversations_history(
+                channel=channel_id,
+                limit=limit,
+                oldest=oldest,
+                inclusive=True
+            )
+            
+            return result.get("messages", [])
+        except Exception as e:
+            log.error("Failed to fetch messages from channel %s: %s", channel_id, e)
+            return []
     
     def _format_context(self, messages: List[Dict], channel_name: str) -> str:
         """Format messages as context string."""

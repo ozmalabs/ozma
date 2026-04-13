@@ -138,10 +138,15 @@ class Scheduler:
                                 await self._scenarios.activate(rule.scenario)
                             except KeyError:
                                 log.warning("Scheduled scenario not found: %s", rule.scenario)
+                            except Exception as e:
+                                log.error("Failed to activate scheduled scenario %s: %s", rule.scenario, e)
                             break  # Only fire one rule per minute
                 await asyncio.sleep(15)  # Check 4× per minute
             except asyncio.CancelledError:
                 return
+            except Exception as e:
+                log.error("Scheduler loop error: %s", e)
+                await asyncio.sleep(15)
 
     def _save(self) -> None:
         try:
