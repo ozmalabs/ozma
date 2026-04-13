@@ -170,6 +170,23 @@ class AuditLogger:
         }
         self.log_event("messaging.webhook", "messaging_bridge", event_data, "info")
 
+    def log_messaging_event(self, direction: str, channel: str, sender: str, 
+                           message_hash: str, data: dict = None) -> None:
+        """Log messaging events when MESSAGING_AUDIT is enabled."""
+        if not self._enabled or os.getenv("MESSAGING_AUDIT") != "1":
+            return
+            
+        event_data = {
+            "channel": channel,
+            "sender": sender,
+            "message_hash": message_hash,
+            "direction": direction
+        }
+        if data:
+            event_data["data"] = data
+            
+        self.log_event("messaging.message", "messaging_bridge", event_data, "info")
+
     # Convenience methods for common event types
     def log_scenario_switch(self, from_id: str, to_id: str, source: str = "controller") -> None:
         self.log_event("scenario", source, {"from": from_id, "to": to_id})

@@ -22,8 +22,11 @@ Configurable triggers:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
+import os
 import time
 import urllib.request
 import urllib.error
@@ -293,3 +296,47 @@ class NotificationManager:
         except Exception as e:
             log.debug("Notification send failed (%s): %s", url[:50], e)
             return {}
+
+    # Webhook validation methods
+    def _validate_slack_signature(self, body: bytes, headers: dict, dest: NotifyDestination) -> bool:
+        """Validate Slack webhook signature."""
+        try:
+            timestamp = headers.get("X-Slack-Request-Timestamp", "")
+            signature = headers.get("X-Slack-Signature", "")
+            
+            # Check timestamp (prevent replay attacks)
+            if not timestamp or abs(time.time() - int(timestamp)) > 60 * 5:  # 5 minutes
+                return False
+                
+            # Validate signature
+            sig_basestring = f"v0:{timestamp}:{body.decode('utf-8')}"
+            request_hash = hmac.new(
+                dest.url.split("https://hooks.slack.com/services/")[-1].encode(),
+                sig_basestring.encode(),
+                hashlib.sha256
+            ).hexdigest()
+            expected_signature = f"v0={request_hash}"
+            
+            return hmac.compare_digest(expected_signature, signature)
+        except Exception as e:
+            log.warning("Slack signature validation failed: %s", e)
+            return False
+
+    def _validate_discord_signature(self, body: bytes, headers: dict, dest: NotifyDestination) -> bool:
+        """Validate Discord webhook signature."""
+        # Discord doesn't provide signature validation for incoming webhooks
+        # This is a placeholder - in practice, you'd need to implement verification
+        # based on your specific Discord integration setup
+        return True
+
+    def _get_sender_from_webhook(self, channel: str, body: bytes) -> str:
+        """Extract sender identifier from webhook body."""
+        try:
+            data = json.loads(body)
+            if channel == "slack" and "event" in data:
+                return data["event"].get("user", "unknown")
+            elif channel == "discord" and "author" in data:
+                return data["author"].get("id", "unknown")
+        except Exception:
+            pass
+        return "unknown"

@@ -4161,11 +4161,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         try:
             if channel == "slack":
                 # Validate Slack signature
-                if not _validate_slack_signature(body, headers, dest):
+                if not notifier._validate_slack_signature(body, headers, dest):
                     raise HTTPException(status_code=401, detail="Invalid signature")
             elif channel == "discord":
                 # Validate Discord signature
-                if not _validate_discord_signature(body, headers, dest):
+                if not notifier._validate_discord_signature(body, headers, dest):
                     raise HTTPException(status_code=401, detail="Invalid signature")
             # Add other platform validations as needed
         except Exception as e:
@@ -4188,7 +4188,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
                 body_hash = hashlib.sha256(body).hexdigest()[:16]
                 audit_log.log_webhook_event(
                     channel, 
-                    _get_sender_from_webhook(channel, body), 
+                    notifier._get_sender_from_webhook(channel, body), 
                     body_hash
                 )
             
@@ -4202,23 +4202,6 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
                     severity="error"
                 )
             raise HTTPException(status_code=500, detail=f"Webhook processing failed: {e}")
-
-    def _validate_slack_signature(body: bytes, headers: dict, dest: NotifyDestination) -> bool:
-        """Validate Slack webhook signature."""
-        # Implementation would use dest.url (signing secret) to validate
-        # This is a placeholder - real implementation depends on Slack SDK
-        return True
-
-    def _validate_discord_signature(body: bytes, headers: dict, dest: NotifyDestination) -> bool:
-        """Validate Discord webhook signature."""
-        # Implementation would use dest.url (webhook URL) to validate
-        # This is a placeholder - real implementation depends on Discord SDK
-        return True
-
-    def _get_sender_from_webhook(channel: str, body: bytes) -> str:
-        """Extract sender identifier from webhook body."""
-        # Implementation depends on channel type
-        return "unknown"
 
     @app.get("/api/v1/messaging/channels")
     async def list_messaging_channels(request: Request) -> dict[str, Any]:
