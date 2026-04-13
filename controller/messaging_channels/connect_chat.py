@@ -19,10 +19,11 @@ import asyncio
 import json
 import logging
 import re
+import html
 import websockets
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from ..notifications import NotificationManager
 
@@ -35,6 +36,10 @@ MAX_RESPONSE_QUEUE_SIZE = 100
 # WebSocket connection parameters
 WEBSOCKET_RECONNECT_DELAY = 5  # seconds
 WEBSOCKET_TIMEOUT = 30  # seconds
+# Session timeout
+SESSION_TIMEOUT = timedelta(hours=1)
+# Rate limiting
+MAX_MESSAGES_PER_MINUTE = 10
 
 
 @dataclass
@@ -68,6 +73,7 @@ class ChatContext:
     message: ChatMessage
     response_stream: asyncio.Queue
     websocket: Any = None
+    last_activity: datetime = None
 
 
 class ConnectChatAdapter:
@@ -90,10 +96,13 @@ class ConnectChatAdapter:
         self._connected = False
         self._reconnect_attempts = 0
         self._max_reconnect_attempts = 10
+        self._message_counts: dict[str, list[datetime]] = {}  # user_id -> list of message timestamps
         
     async def start(self) -> None:
         """Start the WebSocket connection to Connect relay."""
         self._websocket_task = asyncio.create_task(self._websocket_handler())
+        # Start session cleanup task
+        asyncio.create_task(self._cleanup_sessions())
         
     async def stop(self) -> None:
         """Stop the WebSocket connection."""
@@ -129,28 +138,37 @@ class ConnectChatAdapter:
     async def _connect_websocket(self) -> None:
         """Connect to the Connect relay WebSocket."""
         log.info(f"Connecting to Connect relay at {self.relay_url}")
-        self._websocket = await websockets.connect(
-            self.relay_url,
-            timeout=WEBSOCKET_TIMEOUT
-        )
-        self._connected = True
-        self._reconnect_attempts = 0
-        log.info("Connected to Connect relay")
-        
+        try:
+            self._websocket = await websockets.connect(
+                self.relay_url,
+                timeout=WEBSOCKET_TIMEOUT
+            )
+            self._connected = True
+            self._reconnect_attempts = 0
+            log.info("Connected to Connect relay")
+        except Exception as e:
+            log.error(f"Failed to connect to Connect relay: {e}")
+            self._connected = False
+            raise
+            
     async def _listen_websocket(self) -> None:
         """Listen for incoming WebSocket messages."""
         if not self._websocket:
             return
             
-        async for message in self._websocket:
-            try:
-                data = json.loads(message)
-                await self._process_websocket_message(data)
-            except json.JSONDecodeError as e:
-                log.warning(f"Invalid JSON message received: {e}")
-            except Exception as e:
-                log.error(f"Error processing WebSocket message: {e}")
-                
+        try:
+            async for message in self._websocket:
+                try:
+                    data = json.loads(message)
+                    await self._process_websocket_message(data)
+                except json.JSONDecodeError as e:
+                    log.warning(f"Invalid JSON message received: {e}")
+                except Exception as e:
+                    log.error(f"Error processing WebSocket message: {e}")
+        except Exception as e:
+            log.error(f"WebSocket connection error: {e}")
+            self._connected = False
+            
     async def _process_websocket_message(self, message: dict) -> None:
         """
         Process an incoming WebSocket message.
@@ -158,6 +176,9 @@ class ConnectChatAdapter:
         Args:
             message: Parsed WebSocket message
         """
+        # Log the message for debugging (sanitized)
+        log.debug(f"Received WebSocket message: {str(message)[:200]}...")
+        
         # Validate message structure
         if not isinstance(message, dict):
             log.warning("Received invalid message format")
@@ -234,58 +255,26 @@ class ConnectChatAdapter:
             
     def list_sessions(self) -> list[dict]:
         """List active chat sessions."""
+        now = datetime.now()
+        # Clean up expired sessions first
+        expired_sessions = [
+            session_id for session_id, ctx in self._active_sessions.items()
+            if now - ctx.last_activity > SESSION_TIMEOUT
+        ]
+        for session_id in expired_sessions:
+            self._active_sessions.pop(session_id, None)
+            
         return [
             {
                 "user_id": ctx.user.user_id,
                 "username": ctx.user.username,
                 "plan": ctx.user.plan,
                 "message_count": ctx.response_stream.qsize(),
+                "last_activity": ctx.last_activity.isoformat() if ctx.last_activity else None,
             }
             for ctx in self._active_sessions.values()
         ]
         
-    async def handle_websocket_message(self, message: dict, user: ConnectUser) -> None:
-        """
-        Handle incoming WebSocket message from Connect relay.
-        
-        Args:
-            message: Parsed WebSocket message
-            user: Authenticated Connect user
-        """
-        # Validate user authentication
-        if not user.is_authenticated():
-            log.warning("Received message from unauthenticated user")
-            return
-            
-        # Validate message structure
-        if not isinstance(message, dict):
-            log.warning("Received invalid message format from user %s", user.user_id)
-            return
-            
-        msg_type = message.get("type")
-        if not msg_type:
-            log.warning("Received WebSocket message without type from user %s", user.user_id)
-            return
-            
-        # Validate message type
-        if not isinstance(msg_type, str):
-            log.warning("Received invalid message type from user %s", user.user_id)
-            return
-            
-        handler = self._message_handlers.get(msg_type)
-        if not handler:
-            log.warning("Unknown WebSocket message type: %s from user %s", msg_type, user.user_id)
-            return
-            
-        try:
-            await handler(message, user)
-        except asyncio.CancelledError:
-            # Handle task cancellation gracefully
-            log.debug("WebSocket message handling cancelled for user %s", user.user_id)
-            raise
-        except Exception as e:
-            log.error("Error handling WebSocket message from user %s: %s", user.user_id, e, exc_info=True)
-            
     async def _handle_agent_message(self, message: dict, user: ConnectUser) -> None:
         """
         Handle agent_message from Connect user.
@@ -294,10 +283,17 @@ class ConnectChatAdapter:
             message: {type: 'agent_message', text: str, node_id?: str}
             user: Authenticated Connect user
         """
+        # Rate limiting check
+        if not self._check_rate_limit(user.user_id):
+            log.warning("Rate limit exceeded for user %s", user.user_id)
+            await self._send_error_response(user, "Rate limit exceeded. Please wait before sending more messages.")
+            return
+            
         # Validate message content
         text = message.get("text", "")
         if not isinstance(text, str):
             log.warning("Received agent_message with invalid text from user %s", user.user_id)
+            await self._send_error_response(user, "Invalid message format")
             return
             
         # Check message length
@@ -326,11 +322,21 @@ class ConnectChatAdapter:
                 log.warning("Received agent_message with invalid node_id from user %s", user.user_id)
                 await self._send_error_response(user, "Invalid node_id")
                 return
+            # Validate node_id format (alphanumeric, hyphens, underscores)
+            if not re.match(r'^[a-zA-Z0-9\-_]+$', node_id):
+                log.warning("Received agent_message with invalid node_id format from user %s", user.user_id)
+                await self._send_error_response(user, "Invalid node_id format")
+                return
             
         if thread_id is not None:
             if not isinstance(thread_id, str) or not thread_id:
                 log.warning("Received agent_message with invalid thread_id from user %s", user.user_id)
                 await self._send_error_response(user, "Invalid thread_id")
+                return
+            # Validate thread_id format
+            if not re.match(r'^[a-zA-Z0-9\-_]+$', thread_id):
+                log.warning("Received agent_message with invalid thread_id format from user %s", user.user_id)
+                await self._send_error_response(user, "Invalid thread_id format")
                 return
         
         # Generate secure message ID
@@ -360,6 +366,7 @@ class ConnectChatAdapter:
             user=user,
             message=chat_msg,
             response_stream=response_stream,
+            last_activity=datetime.now(),
         )
         
         session_id = f"{user.user_id}_{chat_msg.id}"
@@ -385,8 +392,9 @@ class ConnectChatAdapter:
             except Exception:
                 log.error("Failed to send error response to user %s", user.user_id)
         finally:
-            # Clean up session
-            self._active_sessions.pop(session_id, None)
+            # Update last activity
+            if session_id in self._active_sessions:
+                self._active_sessions[session_id].last_activity = datetime.now()
             
     async def _handle_free_user(self, context: ChatContext) -> None:
         """
@@ -476,6 +484,7 @@ class ConnectChatAdapter:
                 timestamp=datetime.now(),
             ),
             response_stream=asyncio.Queue(maxsize=MAX_RESPONSE_QUEUE_SIZE),
+            last_activity=datetime.now(),
         )
         
         try:
@@ -501,21 +510,95 @@ class ConnectChatAdapter:
             return False
             
         # More comprehensive pattern checks for potentially malicious content
-        malicious_patterns = [
-            r'<\s*script[^>]*>.*?<\s*/\s*script\s*>',  # XSS script tags
+        # Using html.escape to prevent XSS
+        escaped_text = html.escape(text)
+        if escaped_text != text:
+            # If text was changed by escaping, it contained HTML entities
+            return False
+            
+        # Check for common XSS patterns
+        xss_patterns = [
+            r'<\s*script',  # script tags
             r'javascript\s*:',  # JavaScript URLs
-            r'on\w+\s*=\s*["\'][^"\']*["\']',  # HTML event handlers
-            r'<\s*iframe[^>]*>.*?<\s*/\s*iframe\s*>',  # iframe injection
-            r'<\s*object[^>]*>.*?<\s*/\s*object\s*>',  # object injection
-            r'<\s*embed[^>]*>.*?<\s*/\s*embed\s*>',  # embed injection
+            r'on\w+\s*=',  # HTML event handlers
+            r'<\s*iframe',  # iframe injection
+            r'<\s*object',  # object injection
+            r'<\s*embed',  # embed injection
+            r'eval\s*\(',  # eval function
+            r'document\.cookie',  # cookie access
+            r'document\.write',  # document write
+            r'\.innerHTML',  # innerHTML access
+            r'expression\s*\(',  # CSS expressions
         ]
         
         text_lower = text.lower()
-        for pattern in malicious_patterns:
-            if re.search(pattern, text_lower, re.IGNORECASE | re.DOTALL):
+        for pattern in xss_patterns:
+            if re.search(pattern, text_lower, re.IGNORECASE):
                 return False
                 
         return True
+        
+    def _check_rate_limit(self, user_id: str) -> bool:
+        """
+        Check if user has exceeded rate limit.
+        
+        Args:
+            user_id: The user ID to check
+            
+        Returns:
+            bool: True if user is within rate limit, False otherwise
+        """
+        now = datetime.now()
+        one_minute_ago = now - timedelta(minutes=1)
+        
+        # Clean up old entries
+        if user_id in self._message_counts:
+            self._message_counts[user_id] = [
+                timestamp for timestamp in self._message_counts[user_id]
+                if timestamp > one_minute_ago
+            ]
+        else:
+            self._message_counts[user_id] = []
+            
+        # Check if user is within rate limit
+        if len(self._message_counts[user_id]) >= MAX_MESSAGES_PER_MINUTE:
+            return False
+            
+        # Add current message to count
+        self._message_counts[user_id].append(now)
+        return True
+        
+    async def _cleanup_sessions(self) -> None:
+        """
+        Periodically clean up expired sessions.
+        """
+        while True:
+            try:
+                now = datetime.now()
+                expired_sessions = [
+                    session_id for session_id, ctx in self._active_sessions.items()
+                    if now - ctx.last_activity > SESSION_TIMEOUT
+                ]
+                for session_id in expired_sessions:
+                    self._active_sessions.pop(session_id, None)
+                    log.debug(f"Cleaned up expired session: {session_id}")
+                    
+                # Clean up old rate limit entries
+                one_minute_ago = now - timedelta(minutes=1)
+                for user_id in list(self._message_counts.keys()):
+                    self._message_counts[user_id] = [
+                        timestamp for timestamp in self._message_counts[user_id]
+                        if timestamp > one_minute_ago
+                    ]
+                    # Remove empty entries
+                    if not self._message_counts[user_id]:
+                        del self._message_counts[user_id]
+                        
+                await asyncio.sleep(60)  # Check every minute
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.error(f"Error in session cleanup: {e}")
                  
     async def send_proactive_alert(self, user_id: str, alert_text: str, 
                                  thread_id: Optional[str] = None) -> None:
@@ -542,6 +625,10 @@ class ConnectChatAdapter:
             if not isinstance(thread_id, str) or not thread_id:
                 log.warning("Invalid thread_id for proactive alert")
                 return
+            # Validate thread_id format
+            if not re.match(r'^[a-zA-Z0-9\-_]+$', thread_id):
+                log.warning("Invalid thread_id format for proactive alert")
+                thread_id = f"alert_{int(datetime.now().timestamp())}"  # Generate new one
             
         # Truncate alert text if too long
         if len(alert_text) > MAX_MESSAGE_LENGTH:
