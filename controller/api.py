@@ -92,6 +92,7 @@ from iot_network import (
     IoTNetworkManager, IoTDevice, DeviceCategory, InternetAccess,
     VLANConfig, OnboardingSession,
 )
+from discovery import DiscoveryManager, DiscoveredDevice
 from wg_peering import WGPeeringManager, WGPeer
 from license_manager import (
     LicenseManager, LicensedProduct, SaaSApplication, LicenseType, SaaSCategory,
@@ -124,6 +125,16 @@ log = logging.getLogger("ozma.api")
 class CreateScenarioRequest(BaseModel):
     name: str
     node_id: str | None = None
+
+
+class DiscoverDeviceRequest(BaseModel):
+    device_id: str
+    config: dict[str, Any]
+
+
+class ScanRequest(BaseModel):
+    network_range: str = "192.168.1.0/24"
+    scan_type: str = "quick"  # quick | full
 
 
 class BindNodeRequest(BaseModel):
@@ -11383,6 +11394,69 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         graphql_router = _gql_create_router(state, _auth, mesh_ca)
         _gql_add_graphiql_route(graphql_router, state, _auth)
         app.include_router(graphql_router, prefix="")
+
+    # Discovery endpoints
+    if discovery:
+        @app.post("/api/v1/discover/scan")
+        async def discover_scan(request: Request, body: ScanRequest) -> dict[str, Any]:
+            """Trigger a network discovery scan."""
+            _require_scope(request, SCOPE_WRITE)
+            try:
+                scan_id = await discovery.start_scan(
+                    network_range=body.network_range,
+                    scan_type=body.scan_type
+                )
+                return {"scan_id": scan_id, "status": "started"}
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Scan failed: {str(e)}")
+
+        @app.get("/api/v1/discover/devices")
+        async def discover_list_devices(request: Request) -> dict[str, Any]:
+            """List all discovered devices."""
+            _require_scope(request, SCOPE_READ)
+            devices = discovery.list_devices()
+            return {"devices": [d.to_dict() for d in devices]}
+
+        @app.get("/api/v1/discover/devices/{device_id}")
+        async def discover_get_device(request: Request, device_id: str) -> dict[str, Any]:
+            """Get details for a specific discovered device."""
+            _require_scope(request, SCOPE_READ)
+            device = discovery.get_device(device_id)
+            if not device:
+                raise HTTPException(status_code=404, detail="Device not found")
+            return device.to_dict()
+
+        @app.post("/api/v1/discover/devices/{device_id}/configure")
+        async def discover_configure_device(request: Request, device_id: str, body: DiscoverDeviceRequest) -> dict[str, Any]:
+            """Configure a discovered device."""
+            _require_scope(request, SCOPE_WRITE)
+            try:
+                result = await discovery.configure_device(device_id, body.config)
+                return {"ok": True, "result": result}
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Configuration failed: {str(e)}")
+
+        @app.get("/api/v1/discover/stream")
+        async def discover_stream(request: Request):
+            """Server-Sent Events stream for discovery updates."""
+            _require_scope(request, SCOPE_READ)
+            
+            async def event_generator():
+                while True:
+                    # In a real implementation, this would listen to discovery events
+                    # For now, we'll just send a keepalive
+                    yield f"data: {{\"type\": \"keepalive\", \"timestamp\": {time.time()}}}\n\n"
+                    await asyncio.sleep(30)  # Keepalive every 30 seconds
+                    
+            return StreamingResponse(
+                event_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "Access-Control-Allow-Origin": "*",
+                }
+            )
 
     # Static files — mounted last so they don't shadow API routes
     static_dir = Path(__file__).parent / "static"
