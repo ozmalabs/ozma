@@ -1,49 +1,59 @@
 [package]
-name        = "ozma-agent"
-version     = "0.1.0"
-edition     = "2021"
-description = "Ozma Connect client — registration, heartbeat, relay tunnel, metrics push"
-license     = "AGPL-3.0-only"
+name    = "ozma-agent"
+version = "0.1.0"
+edition = "2021"
 
 [[bin]]
 name = "ozma-agent"
 path = "src/main.rs"
 
-[lib]
-name = "ozma_agent"
-path = "src/lib.rs"
-
 [dependencies]
-# Workspace
 tokio              = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow             = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
+axum               = { workspace = true }
 uuid               = { workspace = true }
+prometheus         = { workspace = true }
+clap               = { workspace = true }
+thiserror          = { workspace = true }
+ozma-proto         = { path = "../ozma-proto" }
+ozma-mesh          = { path = "../ozma-mesh" }
+ozma-crypto        = { path = "../ozma-crypto" }
 
-# HTTP client — rustls only, no OpenSSL
-reqwest = { version = "0.12", default-features = false, features = [
-    "json",
-    "rustls-tls",
-    "rustls-tls-native-roots",
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.56", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
-# Exponential backoff
-backoff = { version = "0.4", features = ["tokio"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
-# System metrics
-sysinfo = "0.30"
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.9"
 
-# Misc
-hostname = "0.3"
+[build-dependencies]
+# cargo-wix reads wix/main.wxs on Windows; no extra build-dep needed here.
 
-# ozma workspace crates
-ozma-proto  = { path = "../ozma-proto" }
-ozma-mesh   = { path = "../ozma-mesh" }
-ozma-crypto = { path = "../ozma-crypto" }
+[package.metadata.deb]
+maintainer       = "Ozma Labs <hello@ozma.dev>"
+copyright        = "2024 Ozma Labs"
+license-file     = ["../LICENSE", "0"]
+extended-description = """\
+ozma-agent is the desktop seat agent daemon for the Ozma KVM-over-IP platform.
+It handles screen capture, HID routing, audio, and WireGuard mesh connectivity."""
+depends          = "$auto"
+section          = "utils"
+priority         = "optional"
+assets           = [
+    ["target/release/ozma-agent", "usr/bin/", "755"],
+]
 
-[dev-dependencies]
-tokio-test = "0.4"
-wiremock   = "0.6"
+[package.metadata.wix]
+upgrade-guid     = "4F8A2C1D-3B7E-4F9A-8C2D-1E5F6A7B8C9D"
+path-guid        = "B1C2D3E4-F5A6-7B8C-9D0E-1F2A3B4C5D6E"
+license          = false
+eula             = false

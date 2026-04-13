@@ -1,60 +1,87 @@
-//! ozma-agent binary entry point.
+//! ozma-agent — desktop seat agent daemon.
 //!
-//! Reads configuration from environment variables, registers with Connect,
-//! and runs until SIGTERM / Ctrl-C.
+//! Spawns four long-running tasks:
+//!   • API server   — axum HTTP on `--api-port` (default 7381)
+//!   • Capture task — screen / audio capture loop
+//!   • Metrics task — Prometheus scrape endpoint on `--metrics-port` (default 9101)
+//!   • Mesh task    — WireGuard peer management
 
-use std::path::PathBuf;
+mod api;
+mod capture;
+mod mesh;
+mod metrics;
 
 use anyhow::Result;
-use tracing::info;
-use tracing_subscriber::EnvFilter;
+use clap::Parser;
+use tracing::{error, info};
 
-use ozma_agent::{AgentConfig, ConnectClient};
+/// ozma-agent: desktop seat agent daemon.
+#[derive(Parser, Debug)]
+#[command(name = "ozma-agent", version, about)]
+struct Cli {
+    /// Host/IP to bind the API server on.
+    #[arg(long, env = "OZMA_API_HOST", default_value = "0.0.0.0")]
+    api_host: String,
+
+    /// TCP port for the HTTP API server.
+    #[arg(long, env = "OZMA_API_PORT", default_value_t = 7381)]
+    api_port: u16,
+
+    /// TCP port for the Prometheus metrics scrape endpoint.
+    #[arg(long, env = "OZMA_METRICS_PORT", default_value_t = 9101)]
+    metrics_port: u16,
+
+    /// WireGuard UDP listen port.
+    #[arg(long, env = "OZMA_WG_PORT", default_value_t = 51820)]
+    wg_port: u16,
+
+    /// Controller URL (used by mesh task to fetch peer list).
+    #[arg(long, env = "OZMA_CONTROLLER_URL", default_value = "http://localhost:7380")]
+    controller_url: String,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::from_default_env()
+            tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("ozma_agent=debug".parse()?),
         )
         .init();
 
-    info!("ozma-agent starting");
+    let cli = Cli::parse();
 
-    let cfg = AgentConfig {
-        api_base: std::env::var("OZMA_CONNECT_API")
-            .unwrap_or_else(|_| "https://connect.ozma.dev/api/v1".into()),
-        token: std::env::var("OZMA_CONNECT_TOKEN").unwrap_or_default(),
-        machine_id: std::env::var("OZMA_MACHINE_ID")
-            .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string()),
-        capabilities: std::env::var("OZMA_CAPABILITIES")
-            .unwrap_or_else(|_| "hid,stream".into())
-            .split(',')
-            .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty())
-            .collect(),
-        version: env!("CARGO_PKG_VERSION").to_owned(),
-        client_cert_pem: PathBuf::from(
-            std::env::var("OZMA_CLIENT_CERT")
-                .unwrap_or_else(|_| "/etc/ozma/agent.crt".into()),
-        ),
-        client_key_pem: PathBuf::from(
-            std::env::var("OZMA_CLIENT_KEY")
-                .unwrap_or_else(|_| "/etc/ozma/agent.key".into()),
-        ),
-        ca_cert_pem: std::env::var("OZMA_CA_CERT").ok().map(PathBuf::from),
-        wg_private_key: std::env::var("OZMA_WG_PRIVATE_KEY").unwrap_or_default(),
-        wg_public_key: std::env::var("OZMA_WG_PUBLIC_KEY").unwrap_or_default(),
-    };
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        api_port = cli.api_port,
+        metrics_port = cli.metrics_port,
+        wg_port = cli.wg_port,
+        "ozma-agent starting",
+    );
 
-    let client = ConnectClient::new(cfg)?;
-    client.start().await?;
+    // Shared Prometheus registry.
+    let registry = metrics::build_registry();
 
-    info!("ozma-agent running — waiting for shutdown signal");
-    tokio::signal::ctrl_c().await?;
-    info!("Shutdown signal received");
+    let api_addr = format!("{}:{}", cli.api_host, cli.api_port);
+    let metrics_addr = format!("{}:{}", cli.api_host, cli.metrics_port);
+    let controller_url = cli.controller_url.clone();
+    let wg_port = cli.wg_port;
 
-    client.stop().await;
+    // Spawn all tasks concurrently; if any exits with an error, propagate it.
+    let (r1, r2, r3, r4) = tokio::join!(
+        tokio::spawn(api::serve(api_addr)),
+        tokio::spawn(capture::run()),
+        tokio::spawn(metrics::serve(metrics_addr, registry)),
+        tokio::spawn(mesh::run(controller_url, wg_port)),
+    );
+
+    for result in [r1, r2, r3, r4] {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => error!("task error: {e:#}"),
+            Err(e)     => error!("task panicked: {e}"),
+        }
+    }
+
     Ok(())
 }
