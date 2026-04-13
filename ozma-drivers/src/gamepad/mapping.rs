@@ -32,7 +32,7 @@ pub struct ControlEvent {
 }
 
 /// Deadzone for analog triggers (0 → 1 range after normalisation).
-const TRIGGER_DEADZONE: f32 = 0.15;
+pub(crate) const TRIGGER_DEADZONE: f32 = 0.15;
 
 /// Map a gilrs button press to a `ControlEvent`, if any default binding exists.
 ///

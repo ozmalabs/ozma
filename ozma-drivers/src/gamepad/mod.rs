@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use gilrs::{
     ev::filter::{axis_dpad_to_button, deadzone, Jitter},
-    EventType, Filter, Gilrs, GamepadId,
+    Axis, EventType, Filter, Gilrs, GamepadId,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
