@@ -20,10 +20,10 @@ tokio = { workspace = true }
 # HTTP server (HLS + REST)
 axum       = { workspace = true }
 tower      = { workspace = true }
-tower-http = { workspace = true }
+tower-http = { workspace = true, features = ["fs", "trace"] }
 
 # HTTP client (registration + heartbeat)
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["json", "rustls-tls"], default-features = false }
 
 # mDNS advertisement
 mdns-sd = { workspace = true }
@@ -42,9 +42,13 @@ thiserror = { workspace = true }
 
 # Misc
 uuid       = { workspace = true }
-tokio-util = { version = "0.7", features = ["codec", "sync"] }
+tokio-util = { version = "0.7", features = ["sync"] }
 bytes      = { workspace = true }
 hostname   = { workspace = true }
+
+# Systemd watchdog / READY notification (Linux only)
+[target.'cfg(target_os = "linux")'.dependencies]
+sd-notify = { workspace = true }
 
 # ── cargo-deb metadata ────────────────────────────────────────────────────────
 [package.metadata.deb]
@@ -61,7 +65,9 @@ depends  = "$auto"
 section  = "net"
 priority = "optional"
 assets = [
-    ["target/aarch64-unknown-linux-gnu/release/ozma-node", "usr/bin/ozma-node",                "755"],
+    ["target/aarch64-unknown-linux-gnu/release/ozma-node", "usr/bin/ozma-node",                    "755"],
     ["systemd/ozma-node.service",                          "lib/systemd/system/ozma-node.service", "644"],
+    ["debian/env.example",                                 "etc/ozma-node/env.example",             "644"],
 ]
+maintainer-scripts = "debian/"
 systemd-units = { enable = true }

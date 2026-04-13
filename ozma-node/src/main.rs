@@ -8,7 +8,7 @@
 //!   - Display capture pipeline (optional, requires ffmpeg + V4L2 device)
 //!
 //! Cross-compile for aarch64 (Pi4, Milk-V Duo S):
-//!   cross build --release --target aarch64-unknown-linux-gnu
+//!   cross build -p ozma-node --release --target aarch64-unknown-linux-gnu
 
 mod tasks;
 
@@ -16,7 +16,7 @@ use anyhow::Result;
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{fmt, EnvFilter, prelude::*};
 
 use tasks::{capture, heartbeat, hls, mdns, udp};
 
@@ -122,6 +122,12 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| EnvFilter::new(log_level)),
         )
         .init();
+
+    // Notify systemd that initialisation is complete (no-op on non-Linux).
+    #[cfg(target_os = "linux")]
+    {
+        let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
+    }
 
     info!(
         name      = %cli.name,

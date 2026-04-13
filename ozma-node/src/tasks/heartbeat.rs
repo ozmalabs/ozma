@@ -13,7 +13,7 @@ use reqwest::Client;
 use serde_json::json;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{info, warn, debug};
 
 use crate::Cli;
 
@@ -109,13 +109,15 @@ async fn register(client: &Client, cli: &Cli, local_ip: &str, base_url: &str) ->
 }
 
 async fn heartbeat(client: &Client, cli: &Cli, base_url: &str) -> Result<()> {
-    let url = format!("{}/api/v1/nodes/heartbeat", base_url);
-    let body = json!({"node_id": cli.node_id()});
+    let url  = format!("{}/api/v1/nodes/heartbeat", base_url);
+    let body = json!({ "node_id": cli.node_id() });
     let resp = client.post(&url).json(&body).send().await?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        anyhow::bail!("Heartbeat HTTP {status}");
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Heartbeat HTTP {status}: {text}");
     }
+    debug!("Heartbeat OK ({status})");
     Ok(())
 }
 
