@@ -2,7 +2,10 @@ import asyncio
 import json
 import os
 from pathlib import Path
-from typing import Dict, AsyncIterator
+from typing import Dict, AsyncIterator, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from controller.state import AppState
 
 from controller.messaging_channels.base import ChannelAdapter, InboundMessage
 
@@ -10,7 +13,7 @@ from controller.messaging_channels.base import ChannelAdapter, InboundMessage
 class MessagingBridge:
     """Central messaging bridge that routes messages between platforms and Ozma."""
     
-    def __init__(self, state: "AppState"):  # type: ignore[name-defined]
+    def __init__(self, state: "AppState"):
         self.state = state
         self.channels: Dict[str, ChannelAdapter] = {}
         self.identity_map_path = Path(os.environ.get("OZMA_DATA_DIR", ".")) / "messaging_identity_map.json"
