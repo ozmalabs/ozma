@@ -1,0 +1,25 @@
+[package]
+name        = "ozma-hid"
+version     = "0.1.0"
+edition     = "2021"
+description = "Cross-platform HID injection for the Ozma agent (keyboard + mouse via enigo)"
+license     = "AGPL-3.0-only"
+
+[features]
+default = []
+# Enable the evdev readback test helper (Linux only, dev/test use)
+evdev-test = ["dep:evdev"]
+
+[dependencies]
+enigo   = { version = "0.2", features = ["with_serde"] }
+thiserror = "1"
+log     = "0.4"
+tokio   = { version = "1", features = ["time", "rt"] }
+
+# Linux: evdev for the integration test helper
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = { version = "0.12", optional = true }
+
+[dev-dependencies]
+tokio   = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+evdev   = "0.12"
