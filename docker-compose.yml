@@ -1,45 +1,53 @@
-# SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
-# Ozma Controller — Docker Compose
-#
-# Quick start:
-#   docker compose up
-#
-# Then open http://localhost:7380 in your browser.
-#
-# Install soft nodes on target machines:
-#   uv pip install ozma-softnode
-#   ozma-softnode --name my-desktop --controller http://<this-machine>:7380
+# OzmaOS — Frigate NVR + MQTT Broker
+version: "3.8"
 
 services:
-  controller:
-    image: ghcr.io/ozmalabs/ozma:main
-    build: .  # falls back to local build if image not available
-    container_name: ozma-controller
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: ozmaos-frigate-mqtt
     restart: unless-stopped
-
-    # Host networking required for:
-    #   - mDNS multicast (node discovery)
-    #   - UDP HID packets to nodes on the LAN
-    #   - PipeWire audio (host socket)
-    network_mode: host
-
+    ports:
+      - "1883:1883"
+      - "9001:9001"
     volumes:
-      # Persist scenarios, mesh registry, and configuration across restarts
-      - ozma-data:/opt/ozma/controller/data
-      # PipeWire socket for audio routing (Linux only)
-      - /run/user/${UID:-1000}/pipewire-0:/run/user/1000/pipewire-0:ro
-      # Optional: mount your own scenarios.json
-      # - ./my-scenarios.json:/opt/ozma/controller/scenarios.json
-
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mqtt-data:/mosquitto/data
+      - mqtt-logs:/mosquitto/log
     environment:
-      - OZMA_API_HOST=0.0.0.0
-      - OZMA_API_PORT=7380
-      # Set to 1 to enable WirePlumber-based audio (faster switching)
-      - OZMA_AUDIO_WIREPLUMBER=0
-      # Set to 1 for debug logging
-      - OZMA_DEBUG=0
-      # PipeWire runtime directory
-      - XDG_RUNTIME_DIR=/run/user/1000
+      - TZ=${TZ:-UTC}
+
+  frigate:
+    image: ghcr.io/blakeblackshear/frigate:stable
+    container_name: ozmaos-frigate
+    restart: unless-stopped
+    privileged: true
+    ports:
+      - "5000:5000"
+      - "8554:8554"
+      - "8555:8555/tcp"
+      - "8555:8555/udp"
+    volumes:
+      - ./config:/config
+      - ./media:/media/frigate
+      - /etc/localtime:/etc/localtime:ro
+      - type: tmpfs
+        target: /tmp/cache
+        tmpfs:
+          size: 1000000000
+    environment:
+      - FRIGATE_RTSP_PASSWORD=${FRIGATE_RTSP_PASSWORD:-frigate}
+      - TZ=${TZ:-UTC}
+    # Auto-detect Hailo-8L or GPU inference
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    depends_on:
+      - mosquitto
 
 volumes:
-  ozma-data:
+  mqtt-data:
+  mqtt-logs:
