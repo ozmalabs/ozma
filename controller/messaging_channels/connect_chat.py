@@ -158,20 +158,39 @@ class ConnectChatAdapter:
         Args:
             message: Parsed WebSocket message
         """
-        # Extract user information from message (in real implementation, this would come from auth)
-        # For now, we'll create a mock user for demonstration
-        user = ConnectUser(
-            user_id=message.get("user_id", "unknown"),
-            username=message.get("username", "Unknown User"),
-            plan=message.get("plan", "free"),
-            active=True
-        )
-        
         # Validate message structure
         if not isinstance(message, dict):
-            log.warning("Received invalid message format from user %s", user.user_id)
+            log.warning("Received invalid message format")
             return
             
+        # Extract and validate user information
+        user_id = message.get("user_id")
+        if not isinstance(user_id, str) or not user_id:
+            log.warning("Received message without valid user_id")
+            return
+            
+        username = message.get("username", "Unknown User")
+        if not isinstance(username, str):
+            log.warning("Invalid username format for user %s", user_id)
+            return
+            
+        plan = message.get("plan", "free")
+        if not isinstance(plan, str) or plan not in ["free", "pro", "enterprise"]:
+            log.warning("Invalid plan for user %s: %s", user_id, plan)
+            return
+            
+        active = message.get("active", True)
+        if not isinstance(active, bool):
+            log.warning("Invalid active flag for user %s", user_id)
+            return
+            
+        user = ConnectUser(
+            user_id=user_id,
+            username=username,
+            plan=plan,
+            active=active
+        )
+        
         msg_type = message.get("type")
         if not msg_type:
             log.warning("Received WebSocket message without type from user %s", user.user_id)
@@ -292,27 +311,40 @@ class ConnectChatAdapter:
             log.warning("Received agent_message with invalid content from user %s", user.user_id)
             await self._send_error_response(user, "Invalid message content")
             return
-            
-        node_id = message.get("node_id")
-        thread_id = message.get("thread_id")
-        
-        # Validate optional fields
-        if node_id is not None and not isinstance(node_id, str):
-            log.warning("Received agent_message with invalid node_id from user %s", user.user_id)
-            return
-            
-        if thread_id is not None and not isinstance(thread_id, str):
-            log.warning("Received agent_message with invalid thread_id from user %s", user.user_id)
-            return
         
         if not text.strip():
             log.warning("Received agent_message without text from user %s", user.user_id)
             await self._send_error_response(user, "Message text is required")
             return
             
+        node_id = message.get("node_id")
+        thread_id = message.get("thread_id")
+        
+        # Validate optional fields
+        if node_id is not None:
+            if not isinstance(node_id, str) or not node_id:
+                log.warning("Received agent_message with invalid node_id from user %s", user.user_id)
+                await self._send_error_response(user, "Invalid node_id")
+                return
+            
+        if thread_id is not None:
+            if not isinstance(thread_id, str) or not thread_id:
+                log.warning("Received agent_message with invalid thread_id from user %s", user.user_id)
+                await self._send_error_response(user, "Invalid thread_id")
+                return
+        
+        # Generate secure message ID
+        timestamp = int(datetime.now().timestamp() * 1000000)
+        message_id = f"msg_{user.user_id[:8]}_{timestamp}"
+        
+        # Validate message ID format
+        if not re.match(r'^[a-zA-Z0-9_\-]+$', message_id):
+            log.warning("Generated invalid message ID for user %s", user.user_id)
+            message_id = f"msg_{timestamp}"  # Fallback to timestamp-only ID
+            
         # Create chat message
         chat_msg = ChatMessage(
-            id=f"msg_{int(datetime.now().timestamp() * 1000000)}",
+            id=message_id,
             user_id=user.user_id,
             text=text.strip(),
             timestamp=datetime.now(),
@@ -468,17 +500,19 @@ class ConnectChatAdapter:
         if len(text) > 100 and text.count(' ') > len(text) * 0.5:
             return False
             
-        # Basic pattern checks for potentially malicious content
-        # Note: This is not comprehensive security validation
+        # More comprehensive pattern checks for potentially malicious content
         malicious_patterns = [
-            r'<script.*?>',  # Basic XSS patterns
-            r'javascript:',  # JavaScript URLs
-            r'on\w+\s*=',    # HTML event handlers
+            r'<\s*script[^>]*>.*?<\s*/\s*script\s*>',  # XSS script tags
+            r'javascript\s*:',  # JavaScript URLs
+            r'on\w+\s*=\s*["\'][^"\']*["\']',  # HTML event handlers
+            r'<\s*iframe[^>]*>.*?<\s*/\s*iframe\s*>',  # iframe injection
+            r'<\s*object[^>]*>.*?<\s*/\s*object\s*>',  # object injection
+            r'<\s*embed[^>]*>.*?<\s*/\s*embed\s*>',  # embed injection
         ]
         
         text_lower = text.lower()
         for pattern in malicious_patterns:
-            if re.search(pattern, text_lower, re.IGNORECASE):
+            if re.search(pattern, text_lower, re.IGNORECASE | re.DOTALL):
                 return False
                 
         return True
@@ -504,20 +538,30 @@ class ConnectChatAdapter:
             log.warning("Invalid alert_text for proactive alert")
             return
             
-        if thread_id is not None and not isinstance(thread_id, str):
-            log.warning("Invalid thread_id for proactive alert")
-            return
+        if thread_id is not None:
+            if not isinstance(thread_id, str) or not thread_id:
+                log.warning("Invalid thread_id for proactive alert")
+                return
             
         # Truncate alert text if too long
         if len(alert_text) > MAX_MESSAGE_LENGTH:
             alert_text = alert_text[:MAX_MESSAGE_LENGTH] + "..."
+            
+        # Generate thread ID if not provided
+        if not thread_id:
+            thread_id = f"alert_{int(datetime.now().timestamp())}"
+            
+        # Validate thread ID format
+        if not re.match(r'^[a-zA-Z0-9_\-]+$', thread_id):
+            log.warning("Invalid thread_id format for proactive alert")
+            thread_id = f"alert_{int(datetime.now().timestamp())}"  # Generate new one
             
         alert_msg = {
             "type": "agent_chunk",
             "text": f"🚨 Alert: {alert_text}",
             "done": True,
             "proactive": True,
-            "thread_id": thread_id or f"alert_{int(datetime.now().timestamp())}",
+            "thread_id": thread_id,
             "user_id": user_id,
         }
         
@@ -537,7 +581,7 @@ class ConnectChatAdapter:
                 {
                     "user_id": user_id,
                     "text": alert_text,
-                    "thread_id": alert_msg["thread_id"],
+                    "thread_id": thread_id,
                 }
             )
         except Exception as e:
