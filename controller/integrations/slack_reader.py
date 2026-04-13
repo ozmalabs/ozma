@@ -102,11 +102,12 @@ class SlackReader:
     
     def _extract_time_range(self, query: str) -> Optional[str]:
         """Extract time range from query."""
-        if "today" in query:
+        query_lower = query.lower()
+        if "today" in query_lower:
             return "today"
-        elif "yesterday" in query:
+        elif "yesterday" in query_lower:
             return "yesterday"
-        elif "week" in query:
+        elif "week" in query_lower:
             return "week"
         return None
     

@@ -50,26 +50,39 @@ class MicrosoftGraphReader:
         """Get calendar context."""
         try:
             # Get today's date range
-            now = datetime.now()
+            now = datetime.utcnow()
             start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
             end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=999999)
             
             # Query calendar events
-            events = await self._client.me.calendar_view.get(
-                start=start_of_day.isoformat(),
-                end=end_of_day.isoformat()
+            events_result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self._client.me.calendar_view.list(
+                    start_datetime=start_of_day.isoformat() + 'Z',
+                    end_datetime=end_of_day.isoformat() + 'Z'
+                )
             )
+            events = events_result.value
             
             if not events:
                 return "No calendar events today"
                 
             formatted = ["Today's calendar events:"]
             for event in events:
-                subject = event.subject or "No subject"
-                start_time = event.start.get("dateTime", "") if event.start else ""
-                end_time = event.end.get("dateTime", "") if event.end else ""
-                location = event.location.display_name if event.location else ""
-                attendees = [attendee.email_address.name for attendee in event.attendees[:3]] if event.attendees else []
+                subject = getattr(event, 'subject', None) or "No subject"
+                start_time = ""
+                end_time = ""
+                if hasattr(event, 'start') and event.start:
+                    start_time = getattr(event.start, 'date_time', '') or ''
+                if hasattr(event, 'end') and event.end:
+                    end_time = getattr(event.end, 'date_time', '') or ''
+                location = ""
+                if hasattr(event, 'location') and event.location:
+                    location = getattr(event.location, 'display_name', '') or ""
+                attendees = []
+                if hasattr(event, 'attendees') and event.attendees:
+                    attendees = [getattr(getattr(attendee, 'email_address', ''), 'name', 'Unknown') 
+                               for attendee in event.attendees[:3] if hasattr(attendee, 'email_address')]
                 
                 formatted.append(f"- {subject}")
                 if start_time and end_time:
@@ -90,25 +103,39 @@ class MicrosoftGraphReader:
             # Search for emails based on query keywords
             search_query = self._extract_search_terms(query)
             query_params = {
-                '$top': 5,
-                '$orderby': 'receivedDateTime DESC'
+                'top': 5,
+                'orderby': 'receivedDateTime DESC'
             }
             if search_query:
-                query_params['$search'] = f'"{search_query}"'
+                query_params['search'] = search_query
             
-            messages = await self._client.me.messages.get(
-                **query_params
+            messages_result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self._client.me.messages.get(**query_params)
             )
+            messages = messages_result.value
             
             if not messages:
                 return "No recent emails found"
                 
             formatted = ["Recent emails:"]
             for msg in messages:
-                subject = msg.subject or "No subject"
-                sender = msg.sender.email_address.name if msg.sender and msg.sender.email_address else "Unknown"
-                received = msg.received_date_time.strftime("%H:%M") if msg.received_date_time else ""
-                preview = (msg.body.content[:100] + "...") if msg.body and msg.body.content else ""
+                subject = getattr(msg, 'subject', None) or "No subject"
+                sender = "Unknown"
+                if hasattr(msg, 'sender') and msg.sender:
+                    if hasattr(msg.sender, 'email_address') and msg.sender.email_address:
+                        sender = getattr(msg.sender.email_address, 'name', 'Unknown') or "Unknown"
+                received = ""
+                if hasattr(msg, 'received_date_time') and msg.received_date_time:
+                    try:
+                        received = msg.received_date_time.strftime("%H:%M")
+                    except:
+                        received = ""
+                preview = ""
+                if hasattr(msg, 'body') and msg.body:
+                    content = getattr(msg.body, 'content', '') or ''
+                    if content:
+                        preview = (content[:100] + "...") if len(content) > 100 else content
                 
                 formatted.append(f"- [{received}] {sender}: {subject}")
                 if preview:
@@ -123,22 +150,42 @@ class MicrosoftGraphReader:
         """Get chat context."""
         try:
             # Get recent chat messages
-            chats = await self._client.me.chats.get(top=3)
+            chats_result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self._client.me.chats.get(top=3)
+            )
+            chats = chats_result.value
             
             if not chats:
                 return "No recent chat conversations"
                 
             formatted = ["Recent chat conversations:"]
             for chat in chats:
-                chat_name = chat.topic or " ".join([p.display_name for p in chat.members[:2]]) if chat.members else "Unknown"
+                chat_name = getattr(chat, 'topic', None) or "Unknown"
+                if chat_name == "Unknown" and hasattr(chat, 'members') and chat.members:
+                    member_names = [getattr(member, 'display_name', 'Unknown') for member in chat.members[:2]]
+                    chat_name = " ".join(member_names) if member_names else "Unknown"
                 formatted.append(f"- {chat_name}")
                 
                 # Get recent messages in this chat
-                messages = await self._client.me.chats[chat.id].messages.get(top=3)
+                messages_result = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda cid=chat.id: self._client.me.chats.by_chat_id(cid).messages.get(top=3)
+                )
+                messages = messages_result.value
                 for msg in messages:
-                    sender = msg.sender.display_name if msg.sender else "Unknown"
-                    content = msg.body.content if msg.body else ""
-                    time = msg.created_date_time.strftime("%H:%M") if msg.created_date_time else ""
+                    sender = "Unknown"
+                    if hasattr(msg, 'sender') and msg.sender:
+                        sender = getattr(msg.sender, 'display_name', 'Unknown') or "Unknown"
+                    content = ""
+                    if hasattr(msg, 'body') and msg.body:
+                        content = getattr(msg.body, 'content', '') or ""
+                    time = ""
+                    if hasattr(msg, 'created_date_time') and msg.created_date_time:
+                        try:
+                            time = msg.created_date_time.strftime("%H:%M")
+                        except:
+                            time = ""
                     formatted.append(f"  [{time}] {sender}: {content}")
                     
             return "\n".join(formatted)

@@ -55,13 +55,17 @@ class GoogleWorkspaceReader:
             end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=999999)
             
             # Query calendar events
-            events_result = await self._calendar.events().list(
-                calendarId='primary',
-                timeMin=start_of_day.isoformat() + 'Z',
-                timeMax=end_of_day.isoformat() + 'Z',
-                singleEvents=True,
-                orderBy='startTime'
-            ).execute()
+            loop = asyncio.get_event_loop()
+            events_result = await loop.run_in_executor(
+                None,
+                lambda: self._calendar.events().list(
+                    calendarId='primary',
+                    timeMin=start_of_day.isoformat() + 'Z',
+                    timeMax=end_of_day.isoformat() + 'Z',
+                    singleEvents=True,
+                    orderBy='startTime'
+                ).execute()
+            )
             
             events = events_result.get('items', [])
             
@@ -108,7 +112,8 @@ class GoogleWorkspaceReader:
                 query_param = "is:important OR is:unread"
                 
             # Query Gmail
-            results = await asyncio.get_event_loop().run_in_executor(
+            loop = asyncio.get_event_loop()
+            results = await loop.run_in_executor(
                 None, 
                 lambda: self._gmail.users().messages().list(
                     userId='me',
