@@ -1,15 +1,17 @@
 //! ozma-agent — desktop seat agent daemon.
 //!
-//! Spawns four long-running tasks:
-//!   • API server   — axum HTTP on `--api-port` (default 7381)
-//!   • Capture task — screen / audio capture loop
-//!   • Metrics task — Prometheus scrape endpoint on `--metrics-port` (default 9101)
-//!   • Mesh task    — WireGuard peer management
+//! Spawns five long-running tasks:
+//!   • API server        — axum HTTP on `--api-port` (default 7381)
+//!   • Capture task      — screen / audio capture loop
+//!   • Metrics task      — Prometheus scrape endpoint on `--metrics-port` (default 9101)
+//!   • Mesh task         — WireGuard peer management
+//!   • Registration task — controller registration + heartbeat
 
 mod api;
 mod capture;
 mod mesh;
 mod metrics;
+mod register;
 
 use anyhow::Result;
 use clap::Parser;
@@ -56,6 +58,7 @@ async fn main() -> Result<()> {
         api_port = cli.api_port,
         metrics_port = cli.metrics_port,
         wg_port = cli.wg_port,
+        node_id = register::node_id().as_str(),
         "ozma-agent starting",
     );
 
@@ -66,16 +69,18 @@ async fn main() -> Result<()> {
     let metrics_addr = format!("{}:{}", cli.api_host, cli.metrics_port);
     let controller_url = cli.controller_url.clone();
     let wg_port = cli.wg_port;
+    let api_port = cli.api_port;
 
     // Spawn all tasks concurrently; if any exits with an error, propagate it.
-    let (r1, r2, r3, r4) = tokio::join!(
+    let (r1, r2, r3, r4, r5) = tokio::join!(
         tokio::spawn(api::serve(api_addr)),
         tokio::spawn(capture::run()),
         tokio::spawn(metrics::serve(metrics_addr, registry)),
-        tokio::spawn(mesh::run(controller_url, wg_port)),
+        tokio::spawn(mesh::run(controller_url.clone(), wg_port)),
+        tokio::spawn(register::run(controller_url, api_port, wg_port)),
     );
 
-    for result in [r1, r2, r3, r4] {
+    for result in [r1, r2, r3, r4, r5] {
         match result {
             Ok(Ok(())) => {}
             Ok(Err(e)) => error!("task error: {e:#}"),
