@@ -4137,6 +4137,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         Public endpoint for receiving platform webhooks.
         No authentication required - each adapter validates its own HMAC/signature.
         """
+        import os
+        import hashlib
+        
         if not notifier:
             raise HTTPException(status_code=503, detail="Messaging bridge not available")
         
