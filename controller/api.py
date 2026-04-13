@@ -1450,7 +1450,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         
         # Get discovery manager from state if available
         discovery_mgr = getattr(state, 'discovery_manager', None)
-        if not discovery_mgr:
+        if not discovery_mgr or not hasattr(discovery_mgr, 'list_devices'):
             raise HTTPException(status_code=503, detail="Discovery manager not available")
         
         # Get all discovered devices
@@ -1473,28 +1473,56 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         
         # Get discovery manager from state if available
         discovery_mgr = getattr(state, 'discovery_manager', None)
-        if not discovery_mgr:
+        if not discovery_mgr or not hasattr(discovery_mgr, 'start_scan'):
             raise HTTPException(status_code=503, detail="Discovery manager not available")
         
         # Start scan and return scan ID
-        scan_id = await discovery_mgr.start_scan()
-        return {"scan_id": scan_id, "status": "started"}
+        try:
+            scan_id = await discovery_mgr.start_scan()
+            return {"scan_id": scan_id, "status": "started"}
+        except Exception as e:
+            log.error(f"Discovery scan failed: {e}")
+            raise HTTPException(status_code=500, detail=f"Discovery scan failed: {e}")
 
     @app.get("/api/v1/discover/stream")
     async def discovery_stream(request: Request) -> StreamingResponse:
         """SSE stream for discovery events."""
         _require_scope(request, SCOPE_READ)
         
+        # Get discovery manager from state if available
+        discovery_mgr = getattr(state, 'discovery_manager', None)
+        if not discovery_mgr:
+            raise HTTPException(status_code=503, detail="Discovery manager not available")
+        
         async def event_generator():
-            # This would connect to a discovery event stream
-            # For now, we'll simulate with a simple example
-            try:
-                while True:
-                    # In a real implementation, this would listen for discovery events
-                    # and yield them as SSE events
-                    await asyncio.sleep(1)
-            except asyncio.CancelledError:
-                pass
+            """Generate SSE events from discovery manager."""
+            # Check if discovery manager supports event streaming
+            if not hasattr(discovery_mgr, 'stream_events'):
+                # Fallback to basic event listening
+                queue = asyncio.Queue()
+                
+                # Subscribe to discovery events through state events
+                def subscribe_handler(event):
+                    if event.get("type", "").startswith("device_"):
+                        asyncio.create_task(queue.put(event))
+                
+                # Add temporary subscription
+                if hasattr(state, 'events') and hasattr(state.events, 'subscribe'):
+                    subscription_id = await state.events.subscribe(subscribe_handler)
+                
+                try:
+                    while True:
+                        event = await queue.get()
+                        yield f"data: {json.dumps(event)}\n\n"
+                except asyncio.CancelledError:
+                    # Clean up subscription
+                    if hasattr(state, 'events') and hasattr(state.events, 'unsubscribe'):
+                        await state.events.unsubscribe(subscription_id)
+                    raise
+            else:
+                # Use discovery manager's built-in streaming
+                async for event in discovery_mgr.stream_events():
+                    yield f"data: {json.dumps(event)}\n\n"
         
         return StreamingResponse(
             event_generator(),
@@ -1513,7 +1541,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         
         # Get discovery manager from state if available
         discovery_mgr = getattr(state, 'discovery_manager', None)
-        if not discovery_mgr:
+        if not discovery_mgr or not hasattr(discovery_mgr, 'get_device'):
             raise HTTPException(status_code=503, detail="Discovery manager not available")
         
         device = discovery_mgr.get_device(device_id)
@@ -1533,7 +1561,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         
         # Get discovery manager from state if available
         discovery_mgr = getattr(state, 'discovery_manager', None)
-        if not discovery_mgr:
+        if not discovery_mgr or not hasattr(discovery_mgr, 'configure_device'):
             raise HTTPException(status_code=503, detail="Discovery manager not available")
         
         credentials = body.get("credentials", {})
@@ -1544,7 +1572,8 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             
             if result.get("success"):
                 # Mark device as configured
-                await discovery_mgr.mark_configured(device_id)
+                if hasattr(discovery_mgr, 'mark_configured'):
+                    await discovery_mgr.mark_configured(device_id)
                 
                 # Emit event for WebSocket clients
                 await state.events.put({
@@ -1552,6 +1581,14 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
                     "device_id": device_id,
                     "device": result.get("device_info", {})
                 })
+                
+                # Integrate with onboarding system if available
+                onboarding_mgr = getattr(state, 'onboarding_manager', None)
+                if onboarding_mgr and hasattr(onboarding_mgr, 'create_task_for_device'):
+                    try:
+                        await onboarding_mgr.create_task_for_device(device_id, result.get("device_info", {}))
+                    except Exception as e:
+                        log.warning(f"Failed to create onboarding task for device {device_id}: {e}")
                 
                 return {"ok": True, "message": "Device configured successfully"}
             else:
