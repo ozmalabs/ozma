@@ -55,11 +55,16 @@ pub struct ScenarioInfo {
 }
 
 impl StreamDeckSurface {
-    /// Create a new StreamDeckSurface from a connected device
-    pub async fn new(deck: StreamDeck) -> Result<Self> {
+    /// Create a new StreamDeckSurface by opening the first available device
+    pub async fn new_first_device() -> Result<Self> {
+        let hidapi = HidApi::new()?;
+        
+        // Open first Stream Deck device using 0.5 API
+        let deck = StreamDeck::open_first_device(&hidapi)?;
+        
         let key_count = deck.key_count();
         
-        // Determine device type from key count for surface_id
+        // Determine surface_id from key count (0.5 API removed DeviceType)
         let surface_id = match key_count {
             6 => "streamdeck-mini".to_string(),
             15 => "streamdeck-original".to_string(),
@@ -83,7 +88,7 @@ impl StreamDeckSurface {
 
         // Build controls based on device type
         if !is_visual {
-            // Pedal mode: 3 keys → prev / next / mute
+            // Pedal mode: 3 keys → prev / mute / next
             surface.build_pedal_controls();
         } else {
             // Visual mode: keys map to scenarios
