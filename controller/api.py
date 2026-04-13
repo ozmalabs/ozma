@@ -63,7 +63,7 @@ from paste_typing import PasteTyper
 from keyboard_manager import KeyboardManager
 from macros import MacroManager, Macro
 from scheduler import Scheduler
-from notifications import NotificationManager, NotifyDestination
+from notifications import NotificationManager
 from session_recording import SessionRecorder
 from network_health import NetworkHealthMonitor
 from wol import send_wol, get_mac_from_arp
@@ -92,7 +92,6 @@ from iot_network import (
     IoTNetworkManager, IoTDevice, DeviceCategory, InternetAccess,
     VLANConfig, OnboardingSession,
 )
-from discovery import DiscoveryManager, DiscoveredDevice
 from wg_peering import WGPeeringManager, WGPeer
 from license_manager import (
     LicenseManager, LicensedProduct, SaaSApplication, LicenseType, SaaSCategory,
@@ -125,16 +124,6 @@ log = logging.getLogger("ozma.api")
 class CreateScenarioRequest(BaseModel):
     name: str
     node_id: str | None = None
-
-
-class DiscoverDeviceRequest(BaseModel):
-    device_id: str
-    config: dict[str, Any]
-
-
-class ScanRequest(BaseModel):
-    network_range: str = "192.168.1.0/24"
-    scan_type: str = "quick"  # quick | full
 
 
 class BindNodeRequest(BaseModel):
@@ -240,7 +229,7 @@ class DirectRegisterRequest(BaseModel):
     pci_devices: str = ""     # JSON-encoded list of PCI addresses (GPU passthrough)
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None, sunshine: Any | None = None, msp_mgr: MSPDashboardManager | None = None, msp_portal: MSPPortalManager | None = None, auto_configure: Any | None = None, cam_connect: Any | None = None, grid: Any | None = None, parental: ParentalControlsManager | None = None, backup_nudge: BackupNudgeService | None = None, dns_filter: Any | None = None, local_proxy: Any | None = None, file_sharing: Any | None = None, zfs: Any | None = None, failover: Any | None = None, ups_monitor: Any | None = None, ddns: Any | None = None, speedtest: Any | None = None, dns_verifier: Any | None = None, audit_log: Any = None) -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None, sunshine: Any | None = None, msp_mgr: MSPDashboardManager | None = None, msp_portal: MSPPortalManager | None = None, auto_configure: Any | None = None, cam_connect: Any | None = None, grid: Any | None = None, parental: ParentalControlsManager | None = None, backup_nudge: BackupNudgeService | None = None, dns_filter: Any | None = None, local_proxy: Any | None = None, file_sharing: Any | None = None, zfs: Any | None = None, failover: Any | None = None, ups_monitor: Any | None = None, ddns: Any | None = None, speedtest: Any | None = None, dns_verifier: Any | None = None) -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -262,6 +251,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         "/api/v1/enroll",
         "/api/v1/nodes/register",
         "/api/v1/nodes/heartbeat",
+        "/api/v1/connect/status",
         "/health",
         "/docs",
         "/openapi.json",
@@ -274,7 +264,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         "/auth/userinfo",
     }
 
-    _AUTH_EXEMPT_PREFIXES = ("/auth/login/", "/auth/callback/", "/console/", "/terminal/")
+    _AUTH_EXEMPT_PREFIXES = ("/auth/login/", "/auth/callback/", "/console/", "/terminal/", "/.well-known/")
 
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
@@ -533,48 +523,25 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if not service_proxy:
             raise HTTPException(503, "Service proxy not enabled")
         name = body.get("name", "").strip()
+        target_host = body.get("target_host", "127.0.0.1")
+        target_port = int(body.get("target_port", 0))
+        if not name or not target_port:
+            raise HTTPException(400, "name and target_port are required")
         try:
-            target_host = body.get("target_host", "127.0.0.1")
-            try:
-                target_port = int(body.get("target_port", 0))
-            except (TypeError, ValueError):
-                raise HTTPException(400, "target_port must be an integer")
-            if not name:
-                raise HTTPException(400, "name is required")
-            if not target_port:
-                raise HTTPException(400, "target_port is required and must be non-zero")
-            # Validate name length and characters to prevent injection
-            if len(name) > 128:
-                raise HTTPException(400, "name must be 128 characters or fewer")
-            # Check for duplicate before attempting registration
-            existing = next(
-                (s for s in service_proxy.list_services() if s.name == name), None
+            s = service_proxy.register_service(
+                name=name,
+                owner_user_id=ctx.user_id,
+                target_host=target_host,
+                target_port=target_port,
+                subdomain=body.get("subdomain", ""),
+                protocol=body.get("protocol", "http"),
+                service_type=body.get("service_type", ""),
+                auth_required=body.get("auth_required", True),
+                health_path=body.get("health_path", "/health"),
+                icon=body.get("icon", ""),
             )
-            if existing:
-                raise HTTPException(409, f"Service with name '{name}' already exists")
-            try:
-                s = service_proxy.register_service(
-                    name=name,
-                    owner_user_id=ctx.user_id,
-                    target_host=target_host,
-                    target_port=target_port,
-                    subdomain=body.get("subdomain", ""),
-                    protocol=body.get("protocol", "http"),
-                    service_type=body.get("service_type", ""),
-                    auth_required=body.get("auth_required", True),
-                    health_path=body.get("health_path", "/health"),
-                    icon=body.get("icon", ""),
-                )
-            except ValueError as e:
-                raise HTTPException(409, str(e))
-            except Exception as e:
-                log.exception("register_service failed for name=%r: %s", name, e)
-                raise HTTPException(500, f"Service registration failed: {e}")
-        except HTTPException:
-            raise
-        except Exception as e:
-            log.exception("register_service unexpected error for name=%r: %s", name, e)
-            raise HTTPException(500, f"Service registration failed: {e}")
+        except ValueError as e:
+            raise HTTPException(409, str(e))
         await state.events.put({"type": "service.registered", "service": s.to_dict()})
         return s.to_dict()
 
@@ -648,10 +615,13 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     @app.get("/.well-known/openid-configuration")
     async def oidc_discovery(request: Request) -> dict:
+        # OpenID Connect spec requires this endpoint to be publicly accessible
+        # (no authentication required). The auth middleware exempts /.well-known/
+        # paths, but we also set the response here unconditionally.
         if idp and idp.enabled:
             return idp.oidc_discovery()
         # Minimal OIDC discovery for the built-in JWT issuer
-        base = f"{request.base_url.scheme}://{request.base_url.netloc}"
+        base = str(request.base_url).rstrip("/")
         return {
             "issuer": base,
             "authorization_endpoint": f"{base}/auth/login",
@@ -1448,175 +1418,6 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(status_code=404, detail="Node not found")
         return {"ok": True, "active_node_id": node_id}
 
-    # ── Universal Discovery endpoints ─────────────────────────────────────────
-
-    @app.get("/api/v1/discover")
-    async def list_discovered_devices(
-        request: Request,
-        type_filter: str = "",
-        configured: bool | None = None
-    ) -> dict[str, Any]:
-        """Return all discovered devices with optional filtering."""
-        _require_scope(request, SCOPE_READ)
-        
-        # Get discovery manager from state if available
-        discovery_mgr = getattr(state, 'discovery_manager', None)
-        if not discovery_mgr or not hasattr(discovery_mgr, 'list_devices'):
-            raise HTTPException(status_code=503, detail="Discovery manager not available")
-        
-        # Get all discovered devices
-        devices = discovery_mgr.list_devices()
-        
-        # Apply filters
-        if type_filter:
-            types = type_filter.split(',')
-            devices = [d for d in devices if d.get('type') in types]
-        
-        if configured is not None:
-            devices = [d for d in devices if d.get('configured', False) == configured]
-        
-        return {"devices": devices}
-
-    @app.post("/api/v1/discover/scan")
-    async def trigger_discovery_scan(request: Request) -> dict[str, Any]:
-        """Trigger an on-demand discovery scan."""
-        _require_scope(request, SCOPE_WRITE)
-        
-        # Get discovery manager from state if available
-        discovery_mgr = getattr(state, 'discovery_manager', None)
-        if not discovery_mgr or not hasattr(discovery_mgr, 'start_scan'):
-            raise HTTPException(status_code=503, detail="Discovery manager not available")
-        
-        # Start scan and return scan ID
-        try:
-            scan_id = await discovery_mgr.start_scan()
-            return {"scan_id": scan_id, "status": "started"}
-        except Exception as e:
-            log.error(f"Discovery scan failed: {e}")
-            raise HTTPException(status_code=500, detail=f"Discovery scan failed: {e}")
-
-    @app.get("/api/v1/discover/stream")
-    async def discovery_stream(request: Request) -> StreamingResponse:
-        """SSE stream for discovery events."""
-        _require_scope(request, SCOPE_READ)
-        
-        # Get discovery manager from state if available
-        discovery_mgr = getattr(state, 'discovery_manager', None)
-        if not discovery_mgr:
-            raise HTTPException(status_code=503, detail="Discovery manager not available")
-        
-        async def event_generator():
-            """Generate SSE events from discovery manager."""
-            # Check if discovery manager supports event streaming
-            if not hasattr(discovery_mgr, 'stream_events'):
-                # Fallback to basic event listening
-                queue = asyncio.Queue()
-                
-                # Subscribe to discovery events through state events
-                def subscribe_handler(event):
-                    if event.get("type", "").startswith("device_"):
-                        asyncio.create_task(queue.put(event))
-                
-                # Add temporary subscription
-                if hasattr(state, 'events') and hasattr(state.events, 'subscribe'):
-                    subscription_id = await state.events.subscribe(subscribe_handler)
-                
-                try:
-                    while True:
-                        event = await queue.get()
-                        yield f"data: {json.dumps(event)}\n\n"
-                except asyncio.CancelledError:
-                    # Clean up subscription
-                    if hasattr(state, 'events') and hasattr(state.events, 'unsubscribe'):
-                        await state.events.unsubscribe(subscription_id)
-                    raise
-            else:
-                # Use discovery manager's built-in streaming
-                async for event in discovery_mgr.stream_events():
-                    yield f"data: {json.dumps(event)}\n\n"
-        
-        return StreamingResponse(
-            event_generator(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "Access-Control-Allow-Origin": "*",
-            }
-        )
-
-    @app.get("/api/v1/discover/{device_id}")
-    async def get_discovered_device(request: Request, device_id: str) -> dict[str, Any]:
-        """Get full details for a specific discovered device."""
-        _require_scope(request, SCOPE_READ)
-        
-        # Get discovery manager from state if available
-        discovery_mgr = getattr(state, 'discovery_manager', None)
-        if not discovery_mgr or not hasattr(discovery_mgr, 'get_device'):
-            raise HTTPException(status_code=503, detail="Discovery manager not available")
-        
-        device = discovery_mgr.get_device(device_id)
-        if not device:
-            raise HTTPException(status_code=404, detail="Device not found")
-        
-        return device
-
-    @app.post("/api/v1/discover/{device_id}/configure")
-    async def configure_discovered_device(
-        request: Request, 
-        device_id: str, 
-        body: dict
-    ) -> dict[str, Any]:
-        """Attempt to configure a discovered device with provided credentials."""
-        _require_scope(request, SCOPE_WRITE)
-        
-        # Get discovery manager from state if available
-        discovery_mgr = getattr(state, 'discovery_manager', None)
-        if not discovery_mgr or not hasattr(discovery_mgr, 'configure_device'):
-            raise HTTPException(status_code=503, detail="Discovery manager not available")
-        
-        credentials = body.get("credentials", {})
-        
-        try:
-            # Attempt configuration
-            result = await discovery_mgr.configure_device(device_id, credentials)
-            
-            if result.get("success"):
-                # Mark device as configured
-                if hasattr(discovery_mgr, 'mark_configured'):
-                    await discovery_mgr.mark_configured(device_id)
-                
-                # Emit event for WebSocket clients
-                await state.events.put({
-                    "type": "device_configured",
-                    "device_id": device_id,
-                    "device": result.get("device_info", {})
-                })
-                
-                # Integrate with onboarding system if available
-                onboarding_mgr = getattr(state, 'onboarding_manager', None)
-                if onboarding_mgr and hasattr(onboarding_mgr, 'create_task_for_device'):
-                    try:
-                        await onboarding_mgr.create_task_for_device(device_id, result.get("device_info", {}))
-                    except Exception as e:
-                        log.warning(f"Failed to create onboarding task for device {device_id}: {e}")
-                
-                return {"ok": True, "message": "Device configured successfully"}
-            else:
-                return {
-                    "ok": False, 
-                    "error": result.get("error", "Configuration failed"),
-                    "manual_steps": result.get("manual_steps", [])
-                }
-                
-        except Exception as e:
-            log.error(f"Device configuration failed for {device_id}: {e}")
-            return {
-                "ok": False,
-                "error": str(e),
-                "manual_steps": ["Check device connectivity", "Verify credentials", "Review device logs"]
-            }
-
     @app.get("/api/v1/nodes/{node_id}/usb")
     async def node_usb(node_id: str) -> dict[str, Any]:
         """Proxy /usb from the node's HTTP API."""
@@ -2268,22 +2069,25 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     # --- Audio endpoints ---
 
     @app.get("/api/v1/audio/nodes")
-    async def list_audio_nodes() -> dict[str, Any]:
+    async def list_audio_nodes(request: Request) -> dict[str, Any]:
         """List PipeWire audio nodes (sinks + sources) with volume/mute state."""
+        _require_scope(request, SCOPE_READ)
         if not audio:
             return {"nodes": {}, "links": []}
         return audio.watcher.snapshot()
 
     @app.get("/api/v1/audio/links")
-    async def list_audio_links() -> dict[str, Any]:
+    async def list_audio_links(request: Request) -> dict[str, Any]:
         """List current PipeWire audio links."""
+        _require_scope(request, SCOPE_READ)
         if not audio:
             return {"links": []}
         return {"links": audio.watcher.snapshot()["links"]}
 
     @app.get("/api/v1/audio/routes")
-    async def list_audio_routes() -> dict[str, Any]:
+    async def list_audio_routes(request: Request) -> dict[str, Any]:
         """List active PipeWire audio routes (nodes + links combined view)."""
+        _require_scope(request, SCOPE_READ)
         if not audio:
             return {"routes": [], "nodes": {}, "links": []}
         snap = audio.watcher.snapshot()
@@ -2297,13 +2101,29 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
                 "link_id": lnk.get("id"),
             }
             for lnk in links
-            if isinstance(lnk, dict) and lnk.get("out_node") and lnk.get("in_node")
+            if isinstance(lnk, dict)
         ]
         return {"routes": routes, "nodes": nodes, "links": links}
 
+    @app.get("/api/v1/audio/volume")
+    async def get_audio_volume(request: Request, node_name: str = "") -> dict[str, Any]:
+        """Get volume state for a PipeWire node (or all nodes if node_name omitted)."""
+        _require_scope(request, SCOPE_READ)
+        if not audio:
+            raise HTTPException(status_code=503, detail="Audio routing disabled")
+        snap = audio.watcher.snapshot()
+        nodes = snap.get("nodes", {})
+        if node_name:
+            node = nodes.get(node_name)
+            if node is None:
+                raise HTTPException(status_code=404, detail=f"PW node '{node_name}' not found")
+            return {"node_name": node_name, "volume": node.get("volume", 1.0), "mute": node.get("mute", False)}
+        return {"nodes": {n: {"volume": v.get("volume", 1.0), "mute": v.get("mute", False)} for n, v in nodes.items()}}
+
     @app.post("/api/v1/audio/volume")
-    async def set_audio_volume(req: VolumeRequest) -> dict[str, Any]:
+    async def set_audio_volume(request: Request, req: VolumeRequest) -> dict[str, Any]:
         """Set volume (linear 0.0-1.0+) on a PipeWire node."""
+        _require_scope(request, SCOPE_WRITE)
         if not audio:
             raise HTTPException(status_code=503, detail="Audio routing disabled")
         ok = await audio.set_volume(req.node_name, req.volume)
@@ -2311,9 +2131,25 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(status_code=404, detail=f"PW node '{req.node_name}' not found")
         return {"ok": True, "node_name": req.node_name, "volume": req.volume}
 
+    @app.get("/api/v1/audio/mute")
+    async def get_audio_mute(request: Request, node_name: str = "") -> dict[str, Any]:
+        """Get mute state for a PipeWire node (or all nodes if node_name omitted)."""
+        _require_scope(request, SCOPE_READ)
+        if not audio:
+            raise HTTPException(status_code=503, detail="Audio routing disabled")
+        snap = audio.watcher.snapshot()
+        nodes = snap.get("nodes", {})
+        if node_name:
+            node = nodes.get(node_name)
+            if node is None:
+                raise HTTPException(status_code=404, detail=f"PW node '{node_name}' not found")
+            return {"node_name": node_name, "mute": node.get("mute", False)}
+        return {"nodes": {n: {"mute": v.get("mute", False)} for n, v in nodes.items()}}
+
     @app.post("/api/v1/audio/mute")
-    async def set_audio_mute(req: MuteRequest) -> dict[str, Any]:
+    async def set_audio_mute(request: Request, req: MuteRequest) -> dict[str, Any]:
         """Set mute state on a PipeWire node."""
+        _require_scope(request, SCOPE_WRITE)
         if not audio:
             raise HTTPException(status_code=503, detail="Audio routing disabled")
         ok = await audio.set_mute(req.node_name, req.mute)
@@ -2747,12 +2583,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if enabled:
             if port is None:
                 raise HTTPException(400, "port is required to enable VBAN")
-            try:
-                port_int = int(port)
-            except (TypeError, ValueError):
-                raise HTTPException(400, "port must be a valid integer")
-            if not (1024 <= port_int <= 65535):
-                raise HTTPException(400, "port must be between 1024 and 65535")
+            port_int = int(port)
+            if not (1 <= port_int <= 65535):
+                raise HTTPException(400, "port must be between 1 and 65535")
             node.audio_vban_port = port_int
         else:
             node.audio_vban_port = None
@@ -2962,8 +2795,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     # --- Audio output endpoints ---
 
     @app.get("/api/v1/audio/outputs")
-    async def list_audio_outputs() -> dict[str, Any]:
+    async def list_audio_outputs(request: Request) -> dict[str, Any]:
         """List available audio output targets (local, AirPlay, RTP, etc.)."""
+        _require_scope(request, SCOPE_READ)
         if not audio:
             return {"outputs": []}
         return {"outputs": audio.outputs.list_outputs()}
@@ -2994,10 +2828,6 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         _require_scope(request, SCOPE_WRITE)
         if not audio:
             raise HTTPException(status_code=503, detail="Audio routing disabled")
-        if body.delay_ms < 0:
-            raise HTTPException(status_code=400, detail="delay_ms must be non-negative")
-        if body.delay_ms > 10_000:
-            raise HTTPException(status_code=400, detail="delay_ms must not exceed 10000 ms")
         ok = await audio.outputs.set_delay(output_id, body.delay_ms)
         if not ok:
             raise HTTPException(status_code=404, detail=f"Output '{output_id}' not found")
@@ -3196,6 +3026,17 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     # --- Paste typing endpoints ---
 
+    @app.get("/api/v1/paste-typing")
+    async def paste_typing_status(request: Request) -> dict[str, Any]:
+        """Return paste-typing availability and supported keyboard layouts."""
+        _require_scope(request, SCOPE_READ)
+        if not paste_typer:
+            return {"available": False, "layouts": []}
+        return {
+            "available": True,
+            "layouts": PasteTyper.available_layouts(),
+        }
+
     @app.post("/api/v1/paste")
     async def paste_text(request: Request, body: PasteTextRequest) -> dict[str, Any]:
         """Type text to the active node via HID keystrokes.
@@ -3206,8 +3047,6 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(status_code=503, detail="Paste typing not available")
         if not body.text:
             raise HTTPException(status_code=400, detail="No text provided")
-        if not (1 <= body.rate <= 200):
-            raise HTTPException(status_code=400, detail="rate must be between 1 and 200 characters per second")
         result = await paste_typer.type_text(
             body.text,
             layout=body.layout,
@@ -3742,16 +3581,29 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(status_code=503, detail="OCR triggers not available")
         return {"patterns": ocr_triggers.list_patterns()}
 
+    @app.get("/api/v1/ocr-triggers")
+    async def list_ocr_triggers_alias(request: Request) -> dict[str, Any]:
+        """Alias for GET /api/v1/ocr/triggers."""
+        _require_scope(request, SCOPE_READ)
+        if not ocr_triggers:
+            raise HTTPException(status_code=503, detail="OCR triggers not available")
+        return {"patterns": ocr_triggers.list_patterns()}
+
+    @app.post("/api/v1/ocr-triggers")
+    async def add_ocr_trigger_alias(request: Request, body: TriggerPattern) -> dict[str, Any]:
+        """Alias for POST /api/v1/ocr/triggers."""
+        _require_scope(request, SCOPE_WRITE)
+        if not ocr_triggers:
+            raise HTTPException(status_code=503, detail="OCR triggers not available")
+        ocr_triggers.add_pattern(body)
+        return {"ok": True, "pattern": body.to_dict()}
+
     @app.post("/api/v1/ocr/triggers")
     async def add_ocr_trigger(request: Request, body: TriggerPattern) -> dict[str, Any]:
         """Add a custom OCR trigger pattern."""
         _require_scope(request, SCOPE_WRITE)
         if not ocr_triggers:
             raise HTTPException(status_code=503, detail="OCR triggers not available")
-        # Prevent overwriting built-in patterns
-        existing = {p.get("id") for p in ocr_triggers.list_patterns() if p.get("builtin")}
-        if getattr(body, "id", None) and body.id in existing:
-            raise HTTPException(status_code=409, detail=f"Cannot overwrite built-in pattern '{body.id}'")
         ocr_triggers.add_pattern(body)
         return {"ok": True, "pattern": body.to_dict()}
 
@@ -3778,6 +3630,14 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if not run_id:
             return result  # error (no active node)
         return result
+
+    @app.get("/api/v1/automation")
+    async def list_automation_runs(request: Request) -> dict[str, Any]:
+        """List all active and recent background automation runs."""
+        _require_scope(request, SCOPE_READ)
+        if not auto_engine:
+            raise HTTPException(status_code=503, detail="Automation engine not available")
+        return {"runs": auto_engine.list_runs() if hasattr(auto_engine, "list_runs") else []}
 
     @app.get("/api/v1/automation/{run_id}/status")
     async def automation_status(run_id: str) -> dict[str, Any]:
@@ -4201,6 +4061,14 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(status_code=503, detail="Scheduler not available")
         return {"rules": sched.list_rules()}
 
+    @app.get("/api/v1/scheduler/rules")
+    async def list_scheduler_rules_alias(request: Request) -> dict[str, Any]:
+        """Alias for GET /api/v1/schedule."""
+        _require_scope(request, SCOPE_READ)
+        if not sched:
+            raise HTTPException(status_code=503, detail="Scheduler not available")
+        return {"rules": sched.list_rules()}
+
     @app.post("/api/v1/schedule")
     async def add_schedule_rule(request: Request, body: AddScheduleRuleRequest) -> dict[str, Any]:
         _require_scope(request, SCOPE_WRITE)
@@ -4229,127 +4097,6 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if not notifier:
             return {"destinations": [], "rules": []}
         return {"destinations": notifier.list_destinations(), "rules": notifier.list_rules()}
-
-    # --- Messaging Bridge endpoints ---
-
-    @app.post("/api/v1/messaging/webhook/{channel}")
-    async def messaging_webhook(channel: str, request: Request) -> dict[str, Any]:
-        """
-        Public endpoint for receiving platform webhooks.
-        No authentication required - each adapter validates its own HMAC/signature.
-        """
-        import os
-        import hashlib
-        
-        if not notifier:
-            raise HTTPException(status_code=503, detail="Messaging bridge not available")
-        
-        # Get raw body for signature validation
-        body = await request.body()
-        headers = dict(request.headers)
-        
-        # Find the destination for this channel
-        dest = None
-        for d in notifier._destinations.values():
-            if d.dest_type == channel:
-                dest = d
-                break
-        
-        if not dest:
-            raise HTTPException(status_code=404, detail="Channel not found")
-        
-        # Validate webhook signature (implementation depends on channel type)
-        try:
-            if channel == "slack":
-                # Validate Slack signature
-                if not notifier._validate_slack_signature(body, headers, dest):
-                    raise HTTPException(status_code=401, detail="Invalid signature")
-            elif channel == "discord":
-                # Validate Discord signature
-                if not notifier._validate_discord_signature(body, headers, dest):
-                    raise HTTPException(status_code=401, detail="Invalid signature")
-            # Add other platform validations as needed
-        except Exception as e:
-            # Log security event
-            if audit_log and audit_log.enabled:
-                audit_log.log_event(
-                    "messaging.webhook.auth_failed", 
-                    "controller", 
-                    {"channel": channel, "error": str(e)},
-                    severity="warning"
-                )
-            raise HTTPException(status_code=401, detail="Authentication failed")
-        
-        # Process the webhook
-        try:
-            result = await notifier.process_webhook(channel, body, headers)
-            
-            # Audit log if enabled
-            if audit_log and audit_log.enabled and os.getenv("MESSAGING_AUDIT") == "1":
-                body_hash = hashlib.sha256(body).hexdigest()[:16]
-                audit_log.log_webhook_event(
-                    channel, 
-                    notifier._get_sender_from_webhook(channel, body), 
-                    body_hash
-                )
-            
-            return result
-        except Exception as e:
-            if audit_log and audit_log.enabled:
-                audit_log.log_event(
-                    "messaging.webhook.error",
-                    "controller",
-                    {"channel": channel, "error": str(e)},
-                    severity="error"
-                )
-            raise HTTPException(status_code=500, detail=f"Webhook processing failed: {e}")
-
-    @app.get("/api/v1/messaging/channels")
-    async def list_messaging_channels(request: Request) -> dict[str, Any]:
-        """List configured channels with status."""
-        _require_scope(request, SCOPE_READ)
-        if not notifier:
-            return {"channels": []}
-        return {"channels": notifier.list_messaging_channels()}
-
-    @app.post("/api/v1/messaging/channels/{channel}/test")
-    async def test_messaging_channel(request: Request, channel: str) -> dict[str, Any]:
-        """Send test message to configured channel."""
-        _require_scope(request, SCOPE_WRITE)
-        if not notifier:
-            raise HTTPException(status_code=503, detail="Messaging bridge not available")
-        result = await notifier.send_test_message(channel)
-        return {"ok": result is not None, "result": result}
-
-    @app.get("/api/v1/messaging/channels/{channel}/identity-map")
-    async def list_identity_map(request: Request, channel: str) -> dict[str, Any]:
-        """List platform_id → user_id mappings for this channel."""
-        _require_scope(request, SCOPE_READ)
-        if not notifier:
-            return {"mappings": []}
-        return {"mappings": notifier.list_identity_mappings(channel)}
-
-    @app.post("/api/v1/messaging/channels/{channel}/identity-map")
-    async def add_identity_mapping(request: Request, channel: str, body: dict) -> dict[str, Any]:
-        """Add or update platform_id → ozma_user_id mapping."""
-        _require_scope(request, SCOPE_WRITE)
-        if not notifier:
-            raise HTTPException(status_code=503, detail="Messaging bridge not available")
-        platform_id = body.get("platform_id", "")
-        ozma_user_id = body.get("ozma_user_id", "")
-        if not platform_id or not ozma_user_id:
-            raise HTTPException(status_code=400, detail="platform_id and ozma_user_id required")
-        notifier.add_identity_mapping(channel, platform_id, ozma_user_id)
-        return {"ok": True, "platform_id": platform_id, "ozma_user_id": ozma_user_id}
-
-    @app.delete("/api/v1/messaging/channels/{channel}/identity-map/{platform_id}")
-    async def remove_identity_mapping(request: Request, channel: str, platform_id: str) -> dict[str, Any]:
-        """Remove platform_id → ozma_user_id mapping."""
-        _require_scope(request, SCOPE_WRITE)
-        if not notifier:
-            raise HTTPException(status_code=503, detail="Messaging bridge not available")
-        notifier.remove_identity_mapping(channel, platform_id)
-        return {"ok": True, "platform_id": platform_id}
 
     # --- Session recording endpoints ---
 
@@ -6005,6 +5752,34 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         "screens": [],
     }
 
+    @app.get("/api/v1/display-topology")
+    async def get_display_topology(request: Request) -> dict[str, Any]:
+        """
+        Return the display topology for all nodes.
+
+        Each node reports its display outputs (width, height, name).
+        This endpoint aggregates them into a flat topology map.
+        """
+        _require_scope(request, SCOPE_READ)
+        topology = []
+        for nid, node in state.nodes.items():
+            outputs = getattr(node, "display_outputs", []) or []
+            topology.append({
+                "node_id": nid,
+                "host": node.host,
+                "machine_class": getattr(node, "machine_class", "workstation"),
+                "displays": [
+                    {
+                        "index": i,
+                        "name": o.get("name", f"display{i}"),
+                        "width": o.get("width", 0),
+                        "height": o.get("height", 0),
+                    }
+                    for i, o in enumerate(outputs)
+                ],
+            })
+        return {"topology": topology, "node_count": len(topology)}
+
     @app.get("/api/v1/edge-crossing")
     async def edge_crossing_get(request: Request) -> dict[str, Any]:
         """Return edge-crossing configuration."""
@@ -6012,9 +5787,10 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return dict(_edge_crossing_config)
 
     @app.put("/api/v1/edge-crossing")
-    async def edge_crossing_update(request: Request, body: dict = {}) -> dict[str, Any]:
+    async def edge_crossing_update(request: Request) -> dict[str, Any]:
         """Update edge-crossing configuration."""
         _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
         for k in ("enabled", "sticky_ms", "screens"):
             if k in body:
                 _edge_crossing_config[k] = body[k]
@@ -11404,281 +11180,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         dns_verifier.guard.remove_allowlist(set(entries))
         return {"ok": True, "removed": entries}
 
-    # ── Network backend integration ───────────────────────────────────────────
-
-    def _net() -> Any:
-        if state.network_provisioner is None:
-            raise HTTPException(503, "No network backend configured")
-        return state.network_provisioner
-
-    @app.get("/api/v1/network/backend")
-    async def network_backend_status() -> dict[str, Any]:
-        """Return network backend configuration status (no auth required)."""
-        if state.network_provisioner is None:
-            return {"configured": False, "backend_type": None, "connected": False}
-        prov = state.network_provisioner
-        backend_type = getattr(getattr(prov, "_backend", None), "backend_type", None)
-        connected = False
-        try:
-            connected = bool(getattr(prov, "is_connected", lambda: False)())
-        except Exception:
-            pass
-        return {
-            "configured": True,
-            "backend_type": backend_type,
-            "connected": connected,
-        }
-
-    @app.get("/api/v1/network/topology")
-    async def network_topology(request: Request) -> dict[str, Any]:
-        """Return the current network topology (devices, VLANs, ports)."""
-        _require_scope(request, SCOPE_READ)
-        prov = _net()
-        try:
-            topology = await prov.get_topology()
-        except Exception as e:
-            raise HTTPException(502, f"Failed to fetch topology: {e}")
-        return topology.to_dict() if hasattr(topology, "to_dict") else topology
-
-    @app.post("/api/v1/network/topology/refresh")
-    async def network_topology_refresh(request: Request) -> dict[str, Any]:
-        """Clear cached topology and force a re-read from the backend."""
-        _require_scope(request, SCOPE_WRITE)
-        prov = _net()
-        try:
-            if hasattr(prov, "invalidate_cache"):
-                prov.invalidate_cache()
-            topology = await prov.get_topology()
-        except Exception as e:
-            raise HTTPException(502, f"Failed to refresh topology: {e}")
-        return topology.to_dict() if hasattr(topology, "to_dict") else topology
-
-    @app.post("/api/v1/network/vlans")
-    async def network_create_vlan(request: Request, body: dict = {}) -> dict[str, Any]:
-        """
-        Create or update a VLAN on the network backend.
-
-        Body: {vlan_id, name, subnet, gateway, dhcp_enabled, dhcp_start, dhcp_end, purpose}
-        """
-        _require_scope(request, SCOPE_WRITE)
-        prov = _net()
-        try:
-            from net_integrations.base import VLANSpec
-            spec = VLANSpec(
-                vlan_id=int(body.get("vlan_id", 0)),
-                name=body.get("name", ""),
-                subnet=body.get("subnet", ""),
-                gateway=body.get("gateway", ""),
-                dhcp_enabled=bool(body.get("dhcp_enabled", True)),
-                dhcp_start=body.get("dhcp_start", ""),
-                dhcp_end=body.get("dhcp_end", ""),
-                purpose=body.get("purpose", ""),
-            )
-            result = await prov.create_vlan(spec)
-        except ImportError:
-            raise HTTPException(503, "net_integrations not available")
-        except Exception as e:
-            raise HTTPException(502, f"VLAN creation failed: {e}")
-        return result.to_dict() if hasattr(result, "to_dict") else {"ok": True, "result": str(result)}
-
-    @app.post("/api/v1/network/ports/{device_id}/{port_id}")
-    async def network_configure_port(
-        request: Request, device_id: str, port_id: str, body: dict = {}
-    ) -> dict[str, Any]:
-        """
-        Configure a switch port.
-
-        Body: {mode: "access"|"trunk", native_vlan: int, tagged_vlans: list[int]}
-        """
-        _require_scope(request, SCOPE_WRITE)
-        prov = _net()
-        mode = body.get("mode", "access")
-        if mode not in ("access", "trunk"):
-            raise HTTPException(400, "mode must be 'access' or 'trunk'")
-        try:
-            result = await prov.configure_port(
-                device_id=device_id,
-                port_id=port_id,
-                mode=mode,
-                native_vlan=int(body.get("native_vlan", 1)),
-                tagged_vlans=[int(v) for v in body.get("tagged_vlans", [])],
-            )
-        except Exception as e:
-            raise HTTPException(502, f"Port configuration failed: {e}")
-        return result.to_dict() if hasattr(result, "to_dict") else {"ok": True, "result": str(result)}
-
-    @app.post("/api/v1/network/provision/lab")
-    async def network_provision_lab(request: Request, body: dict = {}) -> dict[str, Any]:
-        """
-        Apply the lab network configuration to the backend.
-
-        Body (optional): {port_assignments: [{device_id, port_id, mode, native_vlan, tagged_vlans}]}
-        Emits WS event: {"type": "network.provisioned", "changes": [...], "errors": [...]}
-        """
-        _require_scope(request, SCOPE_WRITE)
-        prov = _net()
-        try:
-            from net_integrations.provisioner import LabNetworkConfig
-            lab_cfg = LabNetworkConfig.lab_default()
-            # Apply any port assignment overrides from the request body
-            port_assignments = body.get("port_assignments", [])
-            if port_assignments:
-                lab_cfg.port_assignments = port_assignments
-            result = await prov.provision(lab_cfg)
-        except ImportError:
-            raise HTTPException(503, "net_integrations not available")
-        except Exception as e:
-            raise HTTPException(502, f"Lab provisioning failed: {e}")
-        result_dict = result.to_dict() if hasattr(result, "to_dict") else {"ok": True}
-        await state.events.put({
-            "type": "network.provisioned",
-            "changes": result_dict.get("changes", []),
-            "errors": result_dict.get("errors", []),
-        })
-        return result_dict
-
-    @app.get("/api/v1/network/provision/lab/diff")
-    async def network_provision_lab_diff(request: Request) -> dict[str, Any]:
-        """
-        Return what WOULD change if the lab config were applied (dry-run).
-
-        Returns a diff dict without making any changes.
-        """
-        _require_scope(request, SCOPE_READ)
-        prov = _net()
-        try:
-            from net_integrations.provisioner import LabNetworkConfig
-            lab_cfg = LabNetworkConfig.lab_default()
-            if hasattr(prov, "diff"):
-                diff = await prov.diff(lab_cfg)
-            else:
-                # Fallback: return current topology vs desired config
-                topology = await prov.get_topology()
-                diff = {
-                    "topology": topology.to_dict() if hasattr(topology, "to_dict") else {},
-                    "desired": lab_cfg.to_dict() if hasattr(lab_cfg, "to_dict") else {},
-                    "note": "diff not supported by this backend — showing current vs desired",
-                }
-        except ImportError:
-            raise HTTPException(503, "net_integrations not available")
-        except Exception as e:
-            raise HTTPException(502, f"Diff failed: {e}")
-        return diff if isinstance(diff, dict) else (diff.to_dict() if hasattr(diff, "to_dict") else {"diff": str(diff)})
-
-    @app.post("/api/v1/network/wg/sync")
-    async def network_wg_sync(request: Request, body: dict = {}) -> dict[str, Any]:
-        """
-        Sync Ozma mesh WireGuard peers to the MikroTik router.
-
-        Body: {interface: "wireguard1"}
-        MikroTik only — reads mesh peers from state and pushes missing ones to the router.
-        Returns: {added: int, skipped: int, errors: list[str]}
-        """
-        _require_scope(request, SCOPE_ADMIN)
-        prov = _net()
-        backend = getattr(prov, "_backend", None)
-        backend_type = getattr(backend, "backend_type", "") if backend else ""
-        if backend_type != "mikrotik":
-            raise HTTPException(400, "WireGuard sync is only supported for MikroTik backends")
-        interface = body.get("interface", "wireguard1")
-        # Collect mesh peers from state
-        peers = []
-        if wg:
-            wg_status = wg.status()
-            peers = wg_status.get("peers", [])
-        added = 0
-        skipped = 0
-        errors: list[str] = []
-        for peer in peers:
-            public_key = peer.get("public_key", "")
-            endpoint = peer.get("endpoint", "")
-            allowed_ips = peer.get("overlay_ip", "")
-            if not public_key:
-                skipped += 1
-                continue
-            try:
-                ok = await backend.add_wg_peer(
-                    interface=interface,
-                    public_key=public_key,
-                    endpoint=endpoint,
-                    allowed_ips=allowed_ips,
-                )
-                if ok:
-                    added += 1
-                else:
-                    skipped += 1
-            except Exception as e:
-                errors.append(f"peer {public_key[:16]}…: {e}")
-        return {"added": added, "skipped": skipped, "errors": errors}
-
     # GraphQL API (optional — requires strawberry-graphql)
     if _GRAPHQL_AVAILABLE and _gql_create_router is not None:
         graphql_router = _gql_create_router(state, _auth, mesh_ca)
         _gql_add_graphiql_route(graphql_router, state, _auth)
         app.include_router(graphql_router, prefix="")
-
-    # Discovery endpoints
-    if discovery:
-        @app.post("/api/v1/discover/scan")
-        async def discover_scan(request: Request, body: ScanRequest) -> dict[str, Any]:
-            """Trigger a network discovery scan."""
-            _require_scope(request, SCOPE_WRITE)
-            try:
-                scan_id = await discovery.start_scan(
-                    network_range=body.network_range,
-                    scan_type=body.scan_type
-                )
-                return {"scan_id": scan_id, "status": "started"}
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Scan failed: {str(e)}")
-
-        @app.get("/api/v1/discover/devices")
-        async def discover_list_devices(request: Request) -> dict[str, Any]:
-            """List all discovered devices."""
-            _require_scope(request, SCOPE_READ)
-            devices = discovery.list_devices()
-            return {"devices": [d.to_dict() for d in devices]}
-
-        @app.get("/api/v1/discover/devices/{device_id}")
-        async def discover_get_device(request: Request, device_id: str) -> dict[str, Any]:
-            """Get details for a specific discovered device."""
-            _require_scope(request, SCOPE_READ)
-            device = discovery.get_device(device_id)
-            if not device:
-                raise HTTPException(status_code=404, detail="Device not found")
-            return device.to_dict()
-
-        @app.post("/api/v1/discover/devices/{device_id}/configure")
-        async def discover_configure_device(request: Request, device_id: str, body: DiscoverDeviceRequest) -> dict[str, Any]:
-            """Configure a discovered device."""
-            _require_scope(request, SCOPE_WRITE)
-            try:
-                result = await discovery.configure_device(device_id, body.config)
-                return {"ok": True, "result": result}
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Configuration failed: {str(e)}")
-
-        @app.get("/api/v1/discover/stream")
-        async def discover_stream(request: Request):
-            """Server-Sent Events stream for discovery updates."""
-            _require_scope(request, SCOPE_READ)
-            
-            async def event_generator():
-                while True:
-                    # In a real implementation, this would listen to discovery events
-                    # For now, we'll just send a keepalive
-                    yield f"data: {{\"type\": \"keepalive\", \"timestamp\": {time.time()}}}\n\n"
-                    await asyncio.sleep(30)  # Keepalive every 30 seconds
-                    
-            return StreamingResponse(
-                event_generator(),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "Access-Control-Allow-Origin": "*",
-                }
-            )
 
     # Static files — mounted last so they don't shadow API routes
     static_dir = Path(__file__).parent / "static"
