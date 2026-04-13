@@ -10,7 +10,8 @@
 //! - Stream Deck Pedal (3 foot switches, no display)
 
 use anyhow::Result;
-use elgato_streamdeck::{DeviceManager, DeviceType, StreamDeck};
+use elgato_streamdeck::{list_devices, StreamDeck};
+use hidapi::HidApi;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -56,17 +57,19 @@ pub struct ScenarioInfo {
 impl StreamDeckSurface {
     /// Create a new StreamDeckSurface from a connected device
     pub async fn new(deck: StreamDeck) -> Result<Self> {
-        let device_type = deck.device_type();
-        let is_visual = matches!(
-            device_type,
-            DeviceType::Original | DeviceType::OriginalV2 | DeviceType::Xl | DeviceType::Mini
-        );
         let key_count = deck.key_count();
         
-        let surface_id = format!(
-            "streamdeck-{}",
-            device_type.to_string().to_lowercase().replace(" ", "-")
-        );
+        // Determine device type from key count for surface_id
+        let surface_id = match key_count {
+            6 => "streamdeck-mini".to_string(),
+            15 => "streamdeck-original".to_string(),
+            32 => "streamdeck-xl".to_string(),
+            3 => "streamdeck-pedal".to_string(),
+            _ => format!("streamdeck-{}", key_count),
+        };
+
+        // Visual devices have displays (Mini, Original, XL), Pedal does not
+        let is_visual = key_count != 3;
 
         let mut surface = Self {
             deck: Arc::new(Mutex::new(deck)),
@@ -105,10 +108,9 @@ impl StreamDeckSurface {
     pub async fn start(&mut self) -> Result<()> {
         let deck = self.deck.clone();
         
-        // Open and initialize the device
+        // Initialize and reset the device
         tokio::task::spawn_blocking(move || {
             let mut deck = deck.blocking_lock();
-            deck.open()?;
             deck.reset()?;
             deck.set_brightness(60)?;
             Ok::<(), anyhow::Error>(())
@@ -116,7 +118,7 @@ impl StreamDeckSurface {
 
         tracing::info!(
             "Stream Deck started: {} ({} keys, visual={})",
-            self.deck.blocking_lock().device_type(),
+            self.surface_id,
             self.key_count,
             self.is_visual
         );
@@ -130,7 +132,6 @@ impl StreamDeckSurface {
         tokio::task::spawn_blocking(move || {
             let mut deck = deck.blocking_lock();
             deck.reset().ok(); // Ignore errors on reset
-            deck.close().ok(); // Ignore errors on close
             Ok::<(), anyhow::Error>(())
         }).await??;
         
@@ -213,7 +214,6 @@ impl StreamDeckSurface {
     pub fn to_dict(&self) -> serde_json::Value {
         serde_json::json!({
             "id": self.surface_id,
-            "deck_type": format!("{:?}", self.deck.blocking_lock().device_type()),
             "key_count": self.key_count,
             "visual": self.is_visual,
             "controls": self.controls
@@ -221,22 +221,25 @@ impl StreamDeckSurface {
     }
 }
 
-/// Discover connected Stream Deck devices
+/// Discover and connect to Stream Deck devices
 pub fn discover_streamdecks() -> Result<Vec<StreamDeck>> {
     let mut devices = Vec::new();
     
-    match DeviceManager::init() {
-        Ok(dm) => {
-            match dm.enumerate_devices() {
-                Ok(deck_devices) => {
-                    for deck in deck_devices {
-                        devices.push(deck);
-                    }
-                }
-                Err(e) => tracing::debug!("Stream Deck enumeration failed: {}", e),
+    let hidapi = match HidApi::new() {
+        Ok(api) => api,
+        Err(e) => {
+            tracing::debug!("Failed to initialize HID API: {}", e);
+            return Ok(devices);
+        }
+    };
+    
+    match list_devices(&hidapi) {
+        Ok(deck_devices) => {
+            for deck in deck_devices {
+                devices.push(deck);
             }
         }
-        Err(e) => tracing::debug!("Stream Deck device manager init failed: {}", e),
+        Err(e) => tracing::debug!("Stream Deck enumeration failed: {}", e),
     }
     
     Ok(devices)
