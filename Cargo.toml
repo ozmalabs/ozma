@@ -27,6 +27,7 @@ uuid        = { version = "1.0", features = ["v4"] }
 axum        = { version = "0.7", features = ["json"] }
 prometheus  = { version = "0.13", features = ["process"] }
 alsa        = "0.9"
-usb-gadget  = "0.5"
 async-trait = "0.1"
 libc        = "0.2"
+reqwest     = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart"] }
+backoff     = "0.4"
