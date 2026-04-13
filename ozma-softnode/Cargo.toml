@@ -9,6 +9,10 @@ license     = "AGPL-3.0-only"
 name = "ozma-virtual-node"
 path = "src/main.rs"
 
+[[bin]]
+name = "ozma-meeting-detect"
+path = "src/meeting_main.rs"
+
 [dependencies]
 tokio              = { workspace = true }
 tracing            = { workspace = true }
@@ -25,3 +29,9 @@ glob               = "0.3"
 ozma-proto         = { path = "../ozma-proto" }
 ozma-mesh          = { path = "../ozma-mesh" }
 ozma-crypto        = { path = "../ozma-crypto" }
+
+# Meeting detection
+sysinfo    = { version = "0.30", default-features = false, features = ["system"] }
+icalendar  = "0.15"
+chrono     = { version = "0.4", features = ["serde"] }
+uuid       = { version = "1", features = ["v4"] }
