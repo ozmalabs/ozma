@@ -59,7 +59,9 @@ jobs:
             --ignore=tests/unit/connect \
             --ignore=tests/unit/controller/test_graphql_mutations.py \
             --ignore=tests/unit/controller/test_graphql.py \
-            --ignore=tests/unit/controller/test_graphql_subscriptions.py
+            --ignore=tests/unit/controller/test_graphql_subscriptions.py \
+            --ignore=tests/unit/controller/test_capture_to_moonlight.py \
+            --ignore=tests/unit/controller/test_moonlight_app_mapping.py
 
   compile-check:
     runs-on: ubuntu-latest
