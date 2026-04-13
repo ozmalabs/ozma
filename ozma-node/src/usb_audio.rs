@@ -22,11 +22,9 @@
 //!
 //! # UAC2 detection
 //!
-//! [`uac2_active`] uses [`usb_gadget::RegGadget::list`] to inspect the
-//! kernel's ConfigFS gadget registry rather than checking a hard-coded sysfs
-//! path.  This is more robust across kernel versions and gadget naming
-//! conventions.  On systems without ConfigFS (CI, non-Linux) it returns
-//! `false` gracefully.
+//! [`uac2_active`] checks the ConfigFS sysfs path directly to determine
+//! whether the UAC2 function is present in the Ozma gadget.  On systems
+//! without ConfigFS (CI, non-Linux) it returns `false` gracefully.
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -35,7 +33,7 @@ use std::sync::{
 use std::time::Duration;
 
 use alsa::{
-    pcm::{Access, Format, HwParams, PCM},
+    pcm::{Access, Format, HwParams, Frames, PCM},
     Direction, ValueOr,
 };
 use anyhow::{bail, Context, Result};
@@ -44,15 +42,9 @@ use tracing::{debug, info, warn};
 
 // ── constants ────────────────────────────────────────────────────────────────
 
-/// Name of the Ozma USB gadget as registered in ConfigFS.
-const OZMA_GADGET_NAME: &str = "ozma";
-
-/// Name of the UAC2 function within the Ozma gadget.
-const UAC2_FUNC_NAME: &str = "uac2.usb0";
-
-/// Sysfs path for the UAC2 function directory (used in warning messages only).
-const UAC2_FUNC_DIR: &str =
-    "/sys/kernel/config/usb_gadget/ozma/functions/uac2.usb0";
+/// Sysfs path for the UAC2 function directory — used for active-detection
+/// and in warning messages.
+const UAC2_FUNC_DIR: &str = "/sys/kernel/config/usb_gadget/ozma/functions/uac2.usb0";
 
 const PROC_ASOUND_CARDS: &str = "/proc/asound/cards";
 
@@ -109,27 +101,11 @@ pub fn find_uac2_capture_device() -> Option<String> {
 
 /// Return `true` if the UAC2 function is present in the Ozma gadget.
 ///
-/// Uses [`usb_gadget::RegGadget::list`] to enumerate registered gadgets via
-/// the kernel's ConfigFS interface.  Returns `false` (never panics) when
+/// Checks the ConfigFS sysfs path directly, which is the most reliable
+/// approach across kernel versions.  Returns `false` (never panics) when
 /// ConfigFS is unavailable (CI, non-Linux, missing `usb_gadget` module).
 pub fn uac2_active() -> bool {
-    match usb_gadget::RegGadget::list() {
-        Ok(gadgets) => gadgets.iter().any(|g| {
-            // RegGadget::name() returns the gadget's ConfigFS directory name.
-            g.name().to_string_lossy() == OZMA_GADGET_NAME
-                && g.functions()
-                    .unwrap_or_default()
-                    .iter()
-                    .any(|f| f.name().to_string_lossy() == UAC2_FUNC_NAME)
-        }),
-        Err(e) => {
-            debug!(
-                "usb_gadget::RegGadget::list() failed: {:#} — assuming UAC2 inactive",
-                e
-            );
-            false
-        }
-    }
+    std::path::Path::new(UAC2_FUNC_DIR).exists()
 }
 
 // ── ALSA PCM helpers ──────────────────────────────────────────────────────────
@@ -144,11 +120,11 @@ fn open_pcm(device: &str, direction: Direction) -> Result<PCM> {
         hwp.set_channels(CHANNELS).context("set_channels")?;
         hwp.set_rate(SAMPLE_RATE, ValueOr::Nearest)
             .context("set_rate")?;
-        hwp.set_format(Format::s16()).context("set_format")?;
+        hwp.set_format(Format::S16LE).context("set_format")?;
         hwp.set_access(Access::RWInterleaved).context("set_access")?;
-        hwp.set_period_size(PERIOD_FRAMES as alsa::pcm::Frames, ValueOr::Nearest)
+        hwp.set_period_size(PERIOD_FRAMES as Frames, ValueOr::Nearest)
             .context("set_period_size")?;
-        hwp.set_buffer_size((PERIOD_FRAMES * BUFFER_PERIODS) as alsa::pcm::Frames)
+        hwp.set_buffer_size((PERIOD_FRAMES * BUFFER_PERIODS) as Frames)
             .context("set_buffer_size")?;
         pcm.hw_params(&hwp).context("hw_params")?;
     }
@@ -161,7 +137,7 @@ fn open_pcm(device: &str, direction: Direction) -> Result<PCM> {
         // Prime the buffer with silence before starting to avoid EPIPE on the
         // first writei() call.
         let silence = vec![0i16; PERIOD_FRAMES as usize * CHANNELS as usize];
-        let io = pcm.io_i16().context("io_i16 for priming")?;
+        let io = pcm.io_i16();
         let _ = io.writei(&silence);
         pcm.start().context("pcm start")?;
     }
@@ -178,8 +154,8 @@ fn open_pcm(device: &str, direction: Direction) -> Result<PCM> {
 fn bridge_loop(src: &PCM, dst: &PCM, stop: &AtomicBool) -> Result<()> {
     let mut buf = vec![0i16; PERIOD_FRAMES as usize * CHANNELS as usize];
 
-    let src_io = src.io_i16().context("src io_i16")?;
-    let dst_io = dst.io_i16().context("dst io_i16")?;
+    let src_io = src.io_i16();
+    let dst_io = dst.io_i16();
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -557,11 +533,11 @@ mod tests {
     }
 
     /// `uac2_active()` must return false in a normal test / CI environment
-    /// where no USB gadget subsystem is available.  The usb_gadget crate will
-    /// either return an empty list or an Err; both map to `false`.
+    /// where the UAC2 ConfigFS sysfs path does not exist.
     #[test]
     fn uac2_active_returns_false_when_no_gadget_registered() {
-        // In CI there is no ConfigFS / USB gadget subsystem.
+        // In CI there is no ConfigFS / USB gadget subsystem, so the sysfs
+        // path will not exist and uac2_active() returns false.
         assert!(!uac2_active());
     }
 
