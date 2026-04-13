@@ -2,72 +2,33 @@
 name        = "ozma-node"
 version     = "0.1.0"
 edition     = "2021"
-description = "Ozma KVM node agent — UDP HID receiver, HLS server, mDNS, heartbeat"
-license     = "AGPL-3.0-only"
-authors     = ["Ozma Contributors"]
+description = "Ozma hardware node: V4L2 capture → ffmpeg HLS pipeline"
+
+[lib]
+name = "ozma_node"
+path = "src/lib.rs"
 
 [[bin]]
 name = "ozma-node"
 path = "src/main.rs"
 
 [dependencies]
-# CLI
-clap = { workspace = true, features = ["env"] }
-
-# Async runtime
-tokio = { workspace = true }
-
-# HTTP server (HLS + REST)
-axum       = { workspace = true }
-tower      = { workspace = true }
-tower-http = { workspace = true, features = ["fs", "trace"] }
-
-# HTTP client (registration + heartbeat)
-reqwest = { workspace = true, features = ["json", "rustls-tls"], default-features = false }
-
-# mDNS advertisement
-mdns-sd = { workspace = true }
-
-# Serialisation
-serde      = { workspace = true }
-serde_json = { workspace = true }
-
-# Logging
+tokio              = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
+anyhow             = { workspace = true }
+thiserror          = { workspace = true }
+axum               = { workspace = true }
+tower-http         = { workspace = true }
+notify             = { workspace = true }
+v4l                = { workspace = true }
+ffmpeg-sidecar     = { workspace = true }
+ozma-proto         = { path = "../ozma-proto" }
+ozma-mesh          = { path = "../ozma-mesh" }
+ozma-crypto        = { path = "../ozma-crypto" }
 
-# Error handling
-anyhow    = { workspace = true }
-thiserror = { workspace = true }
-
-# Misc
-uuid       = { workspace = true }
-tokio-util = { version = "0.7" }
-bytes      = { workspace = true }
-hostname   = { workspace = true }
-
-# Systemd watchdog / READY notification (Linux only)
-[target.'cfg(target_os = "linux")'.dependencies]
-sd-notify = { workspace = true }
-
-# ── cargo-deb metadata ────────────────────────────────────────────────────────
-[package.metadata.deb]
-name        = "ozma-node"
-maintainer  = "Ozma Contributors <hello@ozma.dev>"
-copyright   = "2024 Ozma Contributors"
-license-file = ["../../LICENSE", "0"]
-extended-description = """\
-ozma-node is the lightweight KVM node agent that runs on each managed \
-machine (Raspberry Pi 4, Milk-V Duo S, x86 workstation). It exposes \
-HID injection over UDP, an HLS/REST API, mDNS advertisement, and \
-controller registration/heartbeat in a single statically-linked binary."""
-depends  = "$auto"
-section  = "net"
-priority = "optional"
-assets = [
-    ["target/aarch64-unknown-linux-gnu/release/ozma-node", "usr/bin/ozma-node",                    "755"],
-    ["systemd/ozma-node.service",                          "lib/systemd/system/ozma-node.service", "644"],
-    ["debian/env.example",                                 "etc/ozma-node/env.example",             "644"],
-]
-maintainer-scripts = "debian/"
-systemd-units = { enable = true }
+[dev-dependencies]
+tempfile  = "3"
+tokio     = { workspace = true }

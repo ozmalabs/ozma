@@ -1,230 +1,166 @@
-//! ozma-node — single binary node agent
+//! ozma-node — V4L2 capture → ffmpeg-sidecar → HLS, served on port 7382.
 //!
-//! Spawns independent tokio tasks for:
-//!   - UDP HID receiver  (port 7331)
-//!   - HLS / REST server (port 7382)
-//!   - mDNS advertisement
-//!   - Controller registration + heartbeat
-//!   - Display capture pipeline (optional, requires ffmpeg + V4L2 device)
-//!
-//! Cross-compile for aarch64 (Pi4, Milk-V Duo S):
-//!   cross build -p ozma-node --release --target aarch64-unknown-linux-gnu
+//! Routes
+//! ------
+//! GET /stream/stream.m3u8        — HLS manifest
+//! GET /stream/seg_NNNNN.ts       — HLS segments
+//! GET /health                    — liveness probe
+//! GET /api/v1/devices            — list detected V4L2 devices (JSON)
 
-mod tasks;
+mod capture;
+mod hotplug;
+
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::Result;
-use clap::Parser;
-use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
-use tracing_subscriber::{fmt, EnvFilter, prelude::*};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::get,
+    Json, Router,
+};
+use capture::{enumerate_v4l2_devices, CaptureDevice, EncoderConfig, MediaCapture};
+use hotplug::{watch_v4l2_hotplug, HotplugEvent};
+use serde_json::json;
+use tokio::sync::mpsc;
+use tower_http::{cors::CorsLayer, services::ServeDir};
+use tracing::{error, info, warn};
 
-use tasks::{capture, heartbeat, hls, mdns, udp};
+// ── Application state ─────────────────────────────────────────────────────────
 
-/// Ozma KVM node agent
-#[derive(Parser, Debug, Clone)]
-#[command(author, version, about, long_about = None)]
-pub struct Cli {
-    /// Node name / mDNS instance name (default: hostname)
-    #[arg(long, env = "OZMA_NODE_NAME", default_value_t = default_node_id())]
-    pub name: String,
-
-    /// UDP port for HID event reception
-    #[arg(long, env = "OZMA_UDP_PORT", default_value_t = 7331)]
-    pub hid_udp_port: u16,
-
-    /// TCP port for HLS / REST API (matches node.py default)
-    #[arg(long, env = "OZMA_HTTP_PORT", default_value_t = 7382)]
-    pub http_port: u16,
-
-    /// Comma-separated capability list advertised in mDNS TXT and registration
-    /// Example: `hid,video,audio`
-    #[arg(long, env = "OZMA_CAP", default_value = "hid")]
-    pub cap: String,
-
-    /// Hardware identifier string (e.g. rpi4, milkv-duos)
-    #[arg(long, env = "OZMA_HW", default_value_t = default_hw())]
-    pub hw: String,
-
-    /// Firmware / software version string
-    #[arg(long, env = "OZMA_FW", default_value = env!("CARGO_PKG_VERSION"))]
-    pub fw: String,
-
-    /// POST registration directly to this controller URL instead of relying on
-    /// mDNS multicast.  Required in QEMU/SLIRP environments.
-    /// Example: `http://10.0.2.2:7380`
-    #[arg(long, env = "OZMA_REGISTER_URL")]
-    pub register_url: Option<String>,
-
-    /// Override the host IP reported to the controller.
-    /// Useful with SLIRP port-forwarding where the controller sees `localhost`
-    /// but the node's real LAN IP is different.
-    #[arg(long, env = "OZMA_REGISTER_HOST")]
-    pub register_host: Option<String>,
-
-    /// Heartbeat interval in seconds
-    #[arg(long, env = "OZMA_HEARTBEAT_SECS", default_value_t = 30)]
-    pub heartbeat_secs: u64,
-
-    /// V4L2 capture device path (empty = disabled)
-    #[arg(long, env = "OZMA_CAPTURE_DEVICE", default_value = "")]
-    pub capture_device: String,
-
-    /// Node role advertised via mDNS TXT record
-    #[arg(long, env = "OZMA_ROLE", default_value = "compute")]
-    pub role: String,
-
-    /// Enable verbose debug logging
-    #[arg(long, env = "OZMA_DEBUG")]
-    pub debug: bool,
+#[derive(Clone)]
+struct AppState {
+    out_dir: PathBuf,
+    devices: Arc<Mutex<Vec<CaptureDevice>>>,
 }
 
-impl Cli {
-    /// The mDNS instance name, matching node.py: `<name>._ozma._udp.local.`
-    pub fn node_id(&self) -> String {
-        format!("{}.{}.", self.name, SERVICE_TYPE.trim_end_matches('.'))
-    }
+// ── Route handlers ────────────────────────────────────────────────────────────
+
+async fn health() -> impl IntoResponse {
+    (StatusCode::OK, "ok")
 }
 
-pub const SERVICE_TYPE: &str = "_ozma._udp.local.";
-
-fn default_node_id() -> String {
-    hostname::get()
-        .ok()
-        .and_then(|h| h.into_string().ok())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+async fn list_devices(State(state): State<AppState>) -> impl IntoResponse {
+    let devs = state.devices.lock().unwrap();
+    let list: Vec<serde_json::Value> = devs
+        .iter()
+        .map(|d| {
+            json!({
+                "path": d.path,
+                "max_width": d.max_width,
+                "max_height": d.max_height,
+                "formats": d.formats,
+                "audio_device": d.audio_device,
+            })
+        })
+        .collect();
+    Json(json!({ "devices": list }))
 }
 
-fn default_hw() -> String {
-    // Best-effort: read /proc/device-tree/model (Raspberry Pi, Milk-V etc.)
-    if let Ok(model) = std::fs::read_to_string("/proc/device-tree/model") {
-        let model = model.trim_end_matches('\0').trim();
-        if !model.is_empty() {
-            return model
-                .chars()
-                .take(32)
-                .collect::<String>()
-                .to_lowercase()
-                .replace(' ', "-");
-        }
-    }
-    std::env::consts::ARCH.to_string()
-}
+// ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    let log_level = if cli.debug { "debug" } else { "info" };
-    tracing_subscriber::registry()
-        .with(fmt::layer())
-        .with(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(log_level)),
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("ozma_node=debug".parse()?),
         )
         .init();
 
-    // Notify systemd that initialisation is complete (no-op on non-Linux).
-    #[cfg(target_os = "linux")]
-    {
-        let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
-    }
+    // Ensure ffmpeg-sidecar can locate (or download) an ffmpeg binary.
+    ffmpeg_sidecar::download::auto_download().ok();
 
-    info!(
-        name      = %cli.name,
-        node_id   = %cli.node_id(),
-        udp_port  = cli.hid_udp_port,
-        http_port = cli.http_port,
-        cap       = %cli.cap,
-        hw        = %cli.hw,
-        fw        = %cli.fw,
-        "ozma-node starting"
+    let out_dir = PathBuf::from(
+        std::env::var("OZMA_STREAM_DIR").unwrap_or_else(|_| "/tmp/ozma-stream".into()),
     );
+    std::fs::create_dir_all(&out_dir)?;
 
-    // Shared cancellation token — cancelled on Ctrl-C / SIGTERM
-    let token = CancellationToken::new();
-    let mut handles = Vec::new();
+    // Initial device enumeration.
+    let devices = enumerate_v4l2_devices();
+    info!("Found {} V4L2 device(s)", devices.len());
 
-    // ── UDP HID receiver ──────────────────────────────────────────────────
-    {
-        let (port, tok) = (cli.hid_udp_port, token.clone());
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = udp::run(port, tok).await {
-                error!("UDP task exited: {e:#}");
+    let state = AppState {
+        out_dir: out_dir.clone(),
+        devices: Arc::new(Mutex::new(devices.clone())),
+    };
+
+    // Start capture on the first available device (if any).
+    let mut capture: Option<MediaCapture> = None;
+    if let Some(dev) = devices.into_iter().next() {
+        let enc = EncoderConfig::software_h264();
+        let mut mc = MediaCapture::new(dev, enc, out_dir.clone());
+        mc.start().await?;
+        capture = Some(mc);
+    } else {
+        warn!("No V4L2 devices found at startup — waiting for hot-plug");
+    }
+
+    // Hot-plug watcher.
+    let (hp_tx, mut hp_rx) = mpsc::channel::<HotplugEvent>(16);
+    watch_v4l2_hotplug(hp_tx).await?;
+
+    let state_hp = state.clone();
+    let out_dir_hp = out_dir.clone();
+    tokio::spawn(async move {
+        while let Some(event) = hp_rx.recv().await {
+            match event {
+                HotplugEvent::Added(path) => {
+                    info!("Hot-plug: device added {path}");
+                    let new_devs = enumerate_v4l2_devices();
+                    *state_hp.devices.lock().unwrap() = new_devs.clone();
+
+                    if capture.as_ref().map(|c| !c.is_active()).unwrap_or(true) {
+                        if let Some(dev) = new_devs.into_iter().find(|d| d.path == path) {
+                            let enc = EncoderConfig::software_h264();
+                            let mut mc = MediaCapture::new(dev, enc, out_dir_hp.clone());
+                            match mc.start().await {
+                                Ok(()) => capture = Some(mc),
+                                Err(e) => error!("Failed to start capture on {path}: {e}"),
+                            }
+                        }
+                    }
+                }
+                HotplugEvent::Removed(path) => {
+                    info!("Hot-plug: device removed {path}");
+                    let new_devs = enumerate_v4l2_devices();
+                    *state_hp.devices.lock().unwrap() = new_devs;
+
+                    if let Some(ref mc) = capture {
+                        if !mc.is_active() {
+                            capture = None;
+                        }
+                    }
+                }
             }
-        }));
-    }
+        }
+    });
 
-    // ── HLS / REST server ─────────────────────────────────────────────────
-    {
-        let (port, tok) = (cli.http_port, token.clone());
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = hls::run(port, tok).await {
-                error!("HLS task exited: {e:#}");
-            }
-        }));
-    }
+    // Axum router — serve HLS files from out_dir under /stream/.
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/api/v1/devices", get(list_devices))
+        .nest_service("/stream", ServeDir::new(&out_dir))
+        .layer(CorsLayer::permissive())
+        .with_state(state);
 
-    // ── mDNS advertisement ────────────────────────────────────────────────
-    {
-        let (cfg, tok) = (cli.clone(), token.clone());
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = mdns::run(cfg, tok).await {
-                error!("mDNS task exited: {e:#}");
-            }
-        }));
-    }
+    let addr: SocketAddr = "0.0.0.0:7382".parse()?;
+    info!("ozma-node listening on {addr}");
+    let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    // ── Controller registration + heartbeat ───────────────────────────────
-    {
-        let (cfg, tok) = (cli.clone(), token.clone());
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = heartbeat::run(cfg, tok).await {
-                error!("Heartbeat task exited: {e:#}");
-            }
-        }));
-    }
-
-    // ── Display capture pipeline (optional) ───────────────────────────────
-    if !cli.capture_device.is_empty() || cli.cap.split(',').any(|c| c.trim() == "video") {
-        let dev = if cli.capture_device.is_empty() {
-            "/dev/video0".to_string()
-        } else {
-            cli.capture_device.clone()
-        };
-        let (dev, tok) = (dev, token.clone());
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = capture::run(dev, tok).await {
-                error!("Capture task exited: {e:#}");
-            }
-        }));
-    }
-
-    // ── Shutdown ──────────────────────────────────────────────────────────
-    wait_for_shutdown().await;
-    info!("Shutdown signal received — stopping all tasks");
-    token.cancel();
-
-    for h in handles {
-        let _ = h.await;
-    }
-
-    info!("ozma-node stopped");
-    Ok(())
-}
-
-async fn wait_for_shutdown() {
-    use tokio::signal;
-    #[cfg(unix)]
-    {
-        let mut sigterm =
-            signal::unix::signal(signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
-        tokio::select! {
-            _ = signal::ctrl_c() => {},
-            _ = sigterm.recv() => {},
+    tokio::select! {
+        res = axum::serve(listener, app) => {
+            if let Err(e) = res { error!("HTTP server error: {e}"); }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("Shutting down…");
         }
     }
-    #[cfg(not(unix))]
-    {
-        signal::ctrl_c().await.expect("Ctrl-C handler");
-    }
+
+    Ok(())
 }
