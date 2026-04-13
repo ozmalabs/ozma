@@ -19,13 +19,43 @@ pub struct StreamDeckDevice {
 impl StreamDeckDevice {
     /// Opens the first available Stream Deck device.
     ///
-    /// Uses elgato-streamdeck 0.5 API: `StreamDeck::open_first_device()`.
+    /// Uses elgato-streamdeck 0.5 API: `list_devices()` + `StreamDeck::open_first_device()`.
     pub fn open_first() -> Result<Self> {
         let hidapi = HidApi::new()
             .context("Failed to initialize HID API")?;
 
+        // List available devices (0.5 API requirement)
+        let devices = StreamDeck::list_devices(&hidapi)
+            .context("Failed to enumerate Stream Deck devices")?;
+
+        if devices.is_empty() {
+            return Err(anyhow!("No Stream Deck devices found"));
+        }
+
         let device = StreamDeck::open_first_device(&hidapi)
             .context("Failed to open Stream Deck device")?;
+
+        let key_count = device.key_count();
+        let device = Arc::new(Mutex::new(device));
+
+        Ok(Self { device, key_count })
+    }
+
+    /// Opens a specific Stream Deck device by index.
+    ///
+    /// Uses elgato-streamdeck 0.5 API: `list_devices()` + `StreamDeck::open()`.
+    pub fn open_index(index: usize) -> Result<Self> {
+        let hidapi = HidApi::new()
+            .context("Failed to initialize HID API")?;
+
+        let devices = StreamDeck::list_devices(&hidapi)
+            .context("Failed to enumerate Stream Deck devices")?;
+
+        let device_info = devices.get(index)
+            .ok_or_else(|| anyhow!("No Stream Deck device at index {}", index))?;
+
+        let device = StreamDeck::open(device_info)
+            .with_context(|| format!("Failed to open Stream Deck device at index {}", index))?;
 
         let key_count = device.key_count();
         let device = Arc::new(Mutex::new(device));
@@ -77,6 +107,15 @@ impl StreamDeckDevice {
         device
             .set_brightness(percentage)
             .context("Failed to set brightness")?;
+        Ok(())
+    }
+
+    /// Closes the underlying device.
+    ///
+    /// Uses elgato-streamdeck 0.5 API: `StreamDeck::close()`.
+    pub fn close(self) -> Result<()> {
+        let mut device = self.device.lock().unwrap();
+        device.close().context("Failed to close device")?;
         Ok(())
     }
 }
