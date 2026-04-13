@@ -19,6 +19,7 @@ Configuration (manual - backward compatibility):
 - MESSAGING_SLACK_SIGNING_SECRET
 """
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -42,11 +43,16 @@ class SlackChannel:
         
         self._on_message_callback = None
         self.client = None
+        self._client_lock = asyncio.Lock()
 
     def _init_client(self):
         """Initialize the HTTP client with available token."""
         token = self.oauth_token or self.bot_token
         if token:
+            # Validate token format (should start with xoxb- for bot tokens)
+            if not token.startswith(('xoxb-', 'xoxp-')):
+                log.warning("Slack token format appears invalid")
+            
             self.client = httpx.AsyncClient(
                 base_url="https://slack.com/api/",
                 headers={"Authorization": f"Bearer {token}"}
@@ -63,12 +69,15 @@ class SlackChannel:
         self._on_message_callback = on_message_callback
         # Initialize client if we have credentials
         if self.oauth_token or self.bot_token:
-            self._init_client()
+            async with self._client_lock:
+                if not self.client:
+                    self._init_client()
 
     async def stop(self):
         """Clean up the Slack channel."""
         if self.client:
             await self.client.aclose()
+            self.client = None
 
     async def verify_signature(self, request_body: bytes, timestamp: str, signature: str) -> bool:
         """Verify the Slack request signature."""
@@ -140,8 +149,9 @@ class SlackChannel:
     async def send_message(self, channel: str, text: str, thread_ts: Optional[str] = None):
         """Send a message to a Slack channel."""
         # Initialize client if not already done
-        if not self.client and (self.oauth_token or self.bot_token):
-            self._init_client()
+        async with self._client_lock:
+            if not self.client and (self.oauth_token or self.bot_token):
+                self._init_client()
             
         if not self.client:
             log.warning("Slack client not initialized - missing token")
@@ -158,7 +168,14 @@ class SlackChannel:
         try:
             response = await self.client.post("chat.postMessage", json=data)
             response.raise_for_status()
-            return response.json()
+            result = response.json()
+            if not result.get('ok'):
+                log.error("Slack API error: %s", result.get('error'))
+                return None
+            return result
+        except httpx.HTTPStatusError as e:
+            log.error("Slack HTTP error %s: %s", e.response.status_code, e.response.text)
+            return None
         except Exception as e:
             log.error("Failed to send Slack message: %s", e)
             return None
@@ -166,8 +183,9 @@ class SlackChannel:
     async def update_message(self, channel: str, ts: str, text: str):
         """Update an existing message in Slack."""
         # Initialize client if not already done
-        if not self.client and (self.oauth_token or self.bot_token):
-            self._init_client()
+        async with self._client_lock:
+            if not self.client and (self.oauth_token or self.bot_token):
+                self._init_client()
             
         if not self.client:
             log.warning("Slack client not initialized - missing token")
@@ -182,7 +200,14 @@ class SlackChannel:
         try:
             response = await self.client.post("chat.update", json=data)
             response.raise_for_status()
-            return response.json()
+            result = response.json()
+            if not result.get('ok'):
+                log.error("Slack API error: %s", result.get('error'))
+                return None
+            return result
+        except httpx.HTTPStatusError as e:
+            log.error("Slack HTTP error %s: %s", e.response.status_code, e.response.text)
+            return None
         except Exception as e:
             log.error("Failed to update Slack message: %s", e)
             return None
