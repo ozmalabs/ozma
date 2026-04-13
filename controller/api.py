@@ -29,6 +29,11 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import asyncio
+import json
+import logging
+from typing import Any
+
 from auth import (
     AuthConfig, AuthContext, create_jwt, verify_jwt, verify_password,
     has_scope, is_wireguard_source, SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN, ALL_SCOPES,
@@ -898,9 +903,68 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
                 if event_type:
                     await controls.on_event(event_type, event)
 
+    async def _ipc_reader(ipc_path: str) -> None:
+        """Read events from the Rust drivers daemon via Unix domain socket."""
+        import socket
+        import os
+        from pathlib import Path
+        
+        # Ensure the socket directory exists
+        socket_path = Path(ipc_path)
+        socket_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Remove existing socket if it exists
+        if socket_path.exists():
+            socket_path.unlink()
+            
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.bind(ipc_path)
+            sock.listen(1)
+            log.info("IPC server listening on %s", ipc_path)
+            
+            while True:
+                try:
+                    conn, addr = sock.accept()
+                    log.info("IPC client connected from %s", addr)
+                    
+                    # Read JSON events from the connection
+                    data = b""
+                    while True:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            break
+                        data += chunk
+                        
+                        # Process complete JSON messages
+                        while b"\n" in data:
+                            line, data = data.split(b"\n", 1)
+                            try:
+                                event = json.loads(line.decode("utf-8"))
+                                log.debug("Received IPC event: %s", event)
+                                await state.events.put(event)
+                            except json.JSONDecodeError as e:
+                                log.warning("Invalid JSON from IPC: %s", e)
+                                
+                except Exception as e:
+                    log.error("IPC connection error: %s", e)
+                finally:
+                    conn.close()
+                    
+        except Exception as e:
+            log.error("IPC server error: %s", e)
+        finally:
+            sock.close()
+            if socket_path.exists():
+                socket_path.unlink()
+
     @app.on_event("startup")
     async def _startup() -> None:
         asyncio.create_task(_event_pump(), name="event-pump")
+        # Start IPC reader if ipc_path is provided in the app state
+        ipc_path = getattr(app.state, "ipc_path", None)
+        if ipc_path:
+            asyncio.create_task(_ipc_reader(ipc_path), name="ipc-reader")
 
     # --- WebSocket endpoint ---
 
