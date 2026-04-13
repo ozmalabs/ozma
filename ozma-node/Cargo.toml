@@ -42,7 +42,7 @@ thiserror = { workspace = true }
 
 # Misc
 uuid       = { workspace = true }
-tokio-util = { version = "0.7", features = ["sync"] }
+tokio-util = { version = "0.7" }
 bytes      = { workspace = true }
 hostname   = { workspace = true }
 

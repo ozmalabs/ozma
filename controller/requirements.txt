@@ -35,3 +35,6 @@ httpx>=0.27
 
 # YAML config (optional — for controls.yaml)
 pyyaml>=6.0
+
+# TOML (gaming config)
+toml>=0.10
