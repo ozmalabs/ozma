@@ -1258,3 +1258,25 @@ pub fn list_devices() -> Result<(Vec<String>, Vec<String>)> {
     
     Ok((input_names, output_names))
 }
+//! MIDI control surface support for ozma.
+//!
+//! Ported from surfacepresser-run's midi_controller.py + midi_integration.py,
+//! rewritten as a clean async module that integrates with ozma's ControlSurface
+//! abstraction.
+//!
+//! Supports:
+//!   - Faders (motorised, with touch lockout)
+//!   - Buttons (toggle / momentary, with LED feedback)
+//!   - Rotary encoders
+//!   - Jog wheels
+//!   - Behringer X-Touch scribble strip LCD displays
+//!   - Behringer 7-segment displays
+//!
+//! Requires: midir v0.10.3
+
+pub mod surface;
+pub mod controls;
+pub mod display;
+pub mod types;
+
+pub use surface::{MidiSurface, MidiSurfaceConfig};
