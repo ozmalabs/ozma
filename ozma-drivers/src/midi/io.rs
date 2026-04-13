@@ -500,3 +500,169 @@ impl Drop for MidiIO {
         self.close();
     }
 }
+//! Low-level MIDI I/O using midir crate
+
+use midir::{MidiInput, MidiOutput, MidiInputConnection};
+use std::sync::{Arc, Mutex};
+use crate::midi::types::{Color, Invert, SegmentFont};
+
+/// MIDI I/O wrapper using midir
+pub struct MidiIO {
+    input_connection: Option<MidiInputConnection<()>>,
+    output_connection: Option<midir::MidiOutputConnection>,
+    device_name: String,
+}
+
+impl MidiIO {
+    pub fn new(device_name: String) -> Self {
+        Self {
+            input_connection: None,
+            output_connection: None,
+            device_name,
+        }
+    }
+
+    /// Check if MIDI support is available
+    pub fn available() -> bool {
+        true // midir is compiled in
+    }
+
+    /// List available MIDI devices
+    pub fn list_devices() -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let mut devices = std::collections::HashSet::new();
+        
+        // Get input devices
+        let input = MidiInput::new("ozma-midi-input")?;
+        for port in input.ports() {
+            if let Ok(name) = input.port_name(&port) {
+                devices.insert(name);
+            }
+        }
+        
+        // Get output devices
+        let output = MidiOutput::new("ozma-midi-output")?;
+        for port in output.ports() {
+            if let Ok(name) = output.port_name(&port) {
+                devices.insert(name);
+            }
+        }
+        
+        Ok(devices.into_iter().collect())
+    }
+
+    /// Open MIDI ports
+    pub fn open<F>(&mut self, callback: F) -> Result<(), Box<dyn std::error::Error>>
+    where
+        F: Fn(&[u8]) + Send + 'static,
+    {
+        // Open input
+        let mut input = MidiInput::new("ozma-midi-input")?;
+        let in_ports = input.ports();
+        
+        for port in &in_ports {
+            if let Ok(name) = input.port_name(port) {
+                if name.starts_with(&self.device_name) {
+                    let conn = input.connect(
+                        port,
+                        "ozma-midi-input-connection",
+                        move |_stamp, message, _| {
+                            callback(message);
+                        },
+                        ()
+                    )?;
+                    self.input_connection = Some(conn);
+                    break;
+                }
+            }
+        }
+        
+        // Open output
+        let output = MidiOutput::new("ozma-midi-output")?;
+        let out_ports = output.ports();
+        
+        for port in &out_ports {
+            if let Ok(name) = output.port_name(port) {
+                if name.starts_with(&self.device_name) {
+                    let conn = output.connect(port, "ozma-midi-output-connection")?;
+                    self.output_connection = Some(conn);
+                    break;
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Close MIDI ports
+    pub fn close(&mut self) {
+        self.input_connection = None;
+        self.output_connection = None;
+    }
+
+    /// Send a raw MIDI message
+    pub fn send(&mut self, message: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(conn) = &mut self.output_connection {
+            conn.send(message)?;
+        }
+        Ok(())
+    }
+
+    /// Send note on message
+    pub fn note_on(&mut self, note: u8, velocity: u8) -> Result<(), Box<dyn std::error::Error>> {
+        self.send(&[0x90, note, velocity])
+    }
+
+    /// Send control change message
+    pub fn control_change(&mut self, control: u8, value: u8) -> Result<(), Box<dyn std::error::Error>> {
+        self.send(&[0xB0, control, value])
+    }
+
+    /// Send SysEx message
+    pub fn sysex(&mut self, data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+        let mut message = vec![0xF0];
+        message.extend_from_slice(data);
+        message.push(0xF7);
+        self.send(&message)
+    }
+
+    /// Update LCD display on Behringer X-Touch
+    pub fn lcd_update(
+        &mut self,
+        text: &str,
+        color: Color,
+        invert: Invert,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Convert text to ASCII
+        let ascii_text = text.chars()
+            .map(|c| if c.is_ascii() { c as u8 } else { b'?' })
+            .take(14)
+            .collect::<Vec<u8>>();
+        
+        // Pad to 14 characters
+        let mut chars = ascii_text;
+        while chars.len() < 14 {
+            chars.push(0);
+        }
+        
+        let color_code = (color as u8) | ((invert as u8) << 4);
+        
+        let mut data = vec![0x00, 0x20, 0x32, 0x41, 0x4C, 0x00, color_code];
+        data.extend_from_slice(&chars);
+        
+        self.sysex(&data)
+    }
+
+    /// Update 7-segment display
+    pub fn segment_update(&mut self, text: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let rendered = SegmentFont::render_text(text);
+        let mut data = vec![0x00, 0x20, 0x32, 0x41, 0x37];
+        data.extend_from_slice(&rendered);
+        
+        // Pad to 12 characters + 2 zero bytes
+        while data.len() < 19 {
+            data.push(0);
+        }
+        
+        self.sysex(&data)
+    }
+}

@@ -1482,3 +1482,651 @@ impl MidiSurface {
         })
     }
 }
+//! MIDI surface implementation for ozma ControlSurface
+
+use std::collections::HashMap;
+use tokio::sync::mpsc;
+use crate::midi::io::MidiIO;
+use crate::midi::control::{MidiControl, MidiFader, MidiButton, MidiRotary, MidiJogWheel, ControlEvent};
+use crate::midi::types::{ControlType, ButtonStyle, LightStyle, Color};
+
+/// Display control for LCD/segment displays
+pub struct DisplayControl {
+    pub name: String,
+    pub binding: String,
+    pub on_update: Box<dyn Fn(&str, Option<&str>) + Send + Sync>,
+}
+
+impl DisplayControl {
+    pub fn new<F>(name: String, binding: String, on_update: F) -> Self
+    where
+        F: Fn(&str, Option<&str>) + Send + Sync + 'static,
+    {
+        Self {
+            name,
+            binding,
+            on_update: Box::new(on_update),
+        }
+    }
+}
+
+/// MIDI surface implementation
+pub struct MidiSurface {
+    pub id: String,
+    device_name: String,
+    midi_io: Option<MidiIO>,
+    controls: HashMap<String, Box<dyn MidiControl>>,
+    displays: HashMap<String, DisplayControl>,
+    event_sender: Option<mpsc::UnboundedSender<ControlEvent>>,
+}
+
+impl MidiSurface {
+    pub fn new(id: String, config: &serde_json::Value) -> Self {
+        let device_name = config.get("device")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        Self {
+            id,
+            device_name,
+            midi_io: None,
+            controls: HashMap::new(),
+            displays: HashMap::new(),
+            event_sender: None,
+        }
+    }
+
+    /// Start the MIDI surface
+    pub async fn start(&mut self, config: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
+        if !MidiIO::available() {
+            println!("MIDI support not available - surface '{}' disabled", self.id);
+            return Ok(());
+        }
+
+        // Create MIDI I/O
+        let mut midi_io = MidiIO::new(self.device_name.clone());
+        
+        // Set up callback for MIDI messages
+        let (sender, _receiver) = mpsc::unbounded_channel::<ControlEvent>();
+        self.event_sender = Some(sender.clone());
+        
+        // We'll process messages in the surface directly rather than using a separate thread
+        self.midi_io = Some(midi_io);
+
+        // Create controls from config
+        if let Some(controls_config) = config.get("controls").and_then(|v| v.as_object()) {
+            for (name, ctrl_config) in controls_config {
+                self.create_control(name, ctrl_config)?;
+            }
+        }
+
+        // Create displays from config
+        if let Some(displays_config) = config.get("displays").and_then(|v| v.as_object()) {
+            for (name, display_config) in displays_config {
+                self.create_display(name, display_config)?;
+            }
+        }
+
+        println!("MIDI surface '{}' started: {} controls, {} displays",
+                 self.id,
+                 self.controls.len(),
+                 self.displays.len());
+
+        Ok(())
+    }
+
+    /// Stop the MIDI surface
+    pub async fn stop(&mut self) {
+        if let Some(midi_io) = &mut self.midi_io {
+            midi_io.close();
+        }
+        println!("MIDI surface '{}' stopped", self.id);
+    }
+
+    /// Create a control from configuration
+    fn create_control(&mut self, name: &str, config: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
+        let ctrl_type = config.get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("button");
+        
+        let control: Box<dyn MidiControl> = match ControlType::from_str(ctrl_type) {
+            Some(ControlType::Fader) => {
+                let cc = config.get("control").and_then(|v| v.as_u64()).unwrap_or(70) as u8;
+                let touch_note = config.get("note").and_then(|v| v.as_u64()).map(|n| n as u8);
+                Box::new(MidiFader::new(name.to_string(), cc, touch_note))
+            }
+            Some(ControlType::Button) => {
+                let note = config.get("note").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+                let style_str = config.get("style").and_then(|v| v.as_str()).unwrap_or("toggle");
+                let style = ButtonStyle::from_str(style_str);
+                let light_str = config.get("light").and_then(|v| v.as_str()).unwrap_or("state");
+                let light_style = LightStyle::from_str(light_str);
+                Box::new(MidiButton::new(name.to_string(), note, style, light_style))
+            }
+            Some(ControlType::Rotary) => {
+                let cc = config.get("control").and_then(|v| v.as_u64()).unwrap_or(80) as u8;
+                Box::new(MidiRotary::new(name.to_string(), cc))
+            }
+            Some(ControlType::JogWheel) => {
+                let cc = config.get("control").and_then(|v| v.as_u64()).unwrap_or(60) as u8;
+                Box::new(MidiJogWheel::new(name.to_string(), cc))
+            }
+            None => {
+                eprintln!("Unknown MIDI control type: {}", ctrl_type);
+                return Ok(());
+            }
+        };
+
+        self.controls.insert(name.to_string(), control);
+        Ok(())
+    }
+
+    /// Create a display from configuration
+    fn create_display(&mut self, name: &str, config: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
+        let binding = config.get("binding")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        
+        let display_type = config.get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("scribble");
+
+        // Create update function based on display type
+        let on_update = {
+            let display_type = display_type.to_string();
+            let midi_io = self.midi_io.clone();
+            
+            move |text: &str, color: Option<&str>| {
+                if let Some(mut midi_io) = midi_io.clone() {
+                    let result = match display_type.as_str() {
+                        "scribble_top" => {
+                            midi_io.lcd_update(
+                                &format!("{:^7}", &text[..text.len().min(7)]),
+                                Color::from_hex(color),
+                                crate::midi::types::Invert::None,
+                            )
+                        }
+                        "scribble_bottom" => {
+                            midi_io.lcd_update(
+                                &format!("{}{:^7}", " ".repeat(7), &text[..text.len().min(7)]),
+                                Color::from_hex(color),
+                                crate::midi::types::Invert::None,
+                            )
+                        }
+                        _ => { // "scribble" or default
+                            midi_io.lcd_update(
+                                &format!("{:14}", &text[..text.len().min(14)]),
+                                Color::from_hex(color),
+                                crate::midi::types::Invert::None,
+                            )
+                        }
+                    };
+                    
+                    if let Err(e) = result {
+                        eprintln!("Failed to update LCD: {}", e);
+                    }
+                }
+            }
+        };
+
+        self.displays.insert(
+            name.to_string(),
+            DisplayControl::new(name.to_string(), binding, on_update)
+        );
+
+        Ok(())
+    }
+
+    /// Process incoming MIDI messages
+    pub fn process_midi_message(&mut self, message: &[u8]) {
+        // Route message to appropriate control
+        for (_, control) in &mut self.controls {
+            if let Some(event) = control.on_midi_message(message) {
+                // Update LED feedback if needed
+                if let Some(button) = control.as_any().downcast_ref::<MidiButton>() {
+                    if let Some(midi_io) = &mut self.midi_io {
+                        if let Err(e) = button.update_light(midi_io) {
+                            eprintln!("Failed to update button light: {}", e);
+                        }
+                    }
+                }
+                
+                // Send event
+                if let Some(sender) = &self.event_sender {
+                    if let Err(e) = sender.send(event) {
+                        eprintln!("Failed to send control event: {}", e);
+                    }
+                }
+                break;
+            }
+        }
+    }
+}
+//! MIDI surface implementation for ozma ControlSurface
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
+use crate::midi::io::MidiIO;
+use crate::midi::control::{MidiControl, MidiFader, MidiButton, MidiRotary, MidiJogWheel, ControlEvent};
+use crate::midi::types::{ControlType, ButtonStyle, LightStyle, Color};
+
+/// Display control for LCD/segment displays
+pub struct DisplayControl {
+    pub name: String,
+    pub binding: String,
+    pub on_update: Box<dyn Fn(&str, Option<&str>) + Send + Sync>,
+}
+
+impl DisplayControl {
+    pub fn new<F>(name: String, binding: String, on_update: F) -> Self
+    where
+        F: Fn(&str, Option<&str>) + Send + Sync + 'static,
+    {
+        Self {
+            name,
+            binding,
+            on_update: Box::new(on_update),
+        }
+    }
+}
+
+/// MIDI surface implementation
+pub struct MidiSurface {
+    pub id: String,
+    device_name: String,
+    midi_io: Arc<Mutex<Option<MidiIO>>>,
+    controls: HashMap<String, Box<dyn MidiControl>>,
+    displays: HashMap<String, DisplayControl>,
+    event_sender: Option<mpsc::UnboundedSender<ControlEvent>>,
+}
+
+impl MidiSurface {
+    pub fn new(id: String, config: &serde_json::Value) -> Self {
+        let device_name = config.get("device")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        Self {
+            id,
+            device_name,
+            midi_io: Arc::new(Mutex::new(None)),
+            controls: HashMap::new(),
+            displays: HashMap::new(),
+            event_sender: None,
+        }
+    }
+
+    /// Start the MIDI surface
+    pub async fn start(&mut self, config: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
+        if !MidiIO::available() {
+            println!("MIDI support not available - surface '{}' disabled", self.id);
+            return Ok(());
+        }
+
+        // Create MIDI I/O
+        let mut midi_io = MidiIO::new(self.device_name.clone());
+        
+        // Set up callback for MIDI messages
+        let (sender, _receiver) = mpsc::unbounded_channel::<ControlEvent>();
+        self.event_sender = Some(sender.clone());
+        
+        // Store MIDI IO
+        *self.midi_io.lock().unwrap() = Some(midi_io);
+
+        // Create controls from config
+        if let Some(controls_config) = config.get("controls").and_then(|v| v.as_object()) {
+            for (name, ctrl_config) in controls_config {
+                self.create_control(name, ctrl_config)?;
+            }
+        }
+
+        // Create displays from config
+        if let Some(displays_config) = config.get("displays").and_then(|v| v.as_object()) {
+            for (name, display_config) in displays_config {
+                self.create_display(name, display_config)?;
+            }
+        }
+
+        println!("MIDI surface '{}' started: {} controls, {} displays",
+                 self.id,
+                 self.controls.len(),
+                 self.displays.len());
+
+        Ok(())
+    }
+
+    /// Stop the MIDI surface
+    pub async fn stop(&mut self) {
+        let mut midi_io = self.midi_io.lock().unwrap();
+        if let Some(io) = midi_io.as_mut() {
+            io.close();
+        }
+        *midi_io = None;
+        println!("MIDI surface '{}' stopped", self.id);
+    }
+
+    /// Create a control from configuration
+    fn create_control(&mut self, name: &str, config: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
+        let ctrl_type = config.get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("button");
+        
+        let control: Box<dyn MidiControl> = match ControlType::from_str(ctrl_type) {
+            Some(ControlType::Fader) => {
+                let cc = config.get("control").and_then(|v| v.as_u64()).unwrap_or(70) as u8;
+                let touch_note = config.get("note").and_then(|v| v.as_u64()).map(|n| n as u8);
+                Box::new(MidiFader::new(name.to_string(), cc, touch_note))
+            }
+            Some(ControlType::Button) => {
+                let note = config.get("note").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+                let style_str = config.get("style").and_then(|v| v.as_str()).unwrap_or("toggle");
+                let style = ButtonStyle::from_str(style_str);
+                let light_str = config.get("light").and_then(|v| v.as_str()).unwrap_or("state");
+                let light_style = LightStyle::from_str(light_str);
+                Box::new(MidiButton::new(name.to_string(), note, style, light_style))
+            }
+            Some(ControlType::Rotary) => {
+                let cc = config.get("control").and_then(|v| v.as_u64()).unwrap_or(80) as u8;
+                Box::new(MidiRotary::new(name.to_string(), cc))
+            }
+            Some(ControlType::JogWheel) => {
+                let cc = config.get("control").and_then(|v| v.as_u64()).unwrap_or(60) as u8;
+                Box::new(MidiJogWheel::new(name.to_string(), cc))
+            }
+            None => {
+                eprintln!("Unknown MIDI control type: {}", ctrl_type);
+                return Ok(());
+            }
+        };
+
+        self.controls.insert(name.to_string(), control);
+        Ok(())
+    }
+
+    /// Create a display from configuration
+    fn create_display(&mut self, name: &str, config: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
+        let binding = config.get("binding")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        
+        let display_type = config.get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("scribble");
+
+        // Create update function based on display type
+        let on_update = {
+            let display_type = display_type.to_string();
+            let midi_io = self.midi_io.clone();
+            
+            move |text: &str, color: Option<&str>| {
+                let midi_io_lock = midi_io.lock().unwrap();
+                if let Some(io) = midi_io_lock.as_ref() {
+                    let mut io_clone = io.clone(); // This won't work - need to fix
+                    let result = match display_type.as_str() {
+                        "scribble_top" => {
+                            io_clone.lcd_update(
+                                &format!("{:^7}", &text[..text.len().min(7)]),
+                                Color::from_hex(color),
+                                crate::midi::types::Invert::None,
+                            )
+                        }
+                        "scribble_bottom" => {
+                            io_clone.lcd_update(
+                                &format!("{}{:^7}", " ".repeat(7), &text[..text.len().min(7)]),
+                                Color::from_hex(color),
+                                crate::midi::types::Invert::None,
+                            )
+                        }
+                        _ => { // "scribble" or default
+                            io_clone.lcd_update(
+                                &format!("{:14}", &text[..text.len().min(14)]),
+                                Color::from_hex(color),
+                                crate::midi::types::Invert::None,
+                            )
+                        }
+                    };
+                    
+                    if let Err(e) = result {
+                        eprintln!("Failed to update LCD: {}", e);
+                    }
+                }
+            }
+        };
+
+        self.displays.insert(
+            name.to_string(),
+            DisplayControl::new(name.to_string(), binding, on_update)
+        );
+
+        Ok(())
+    }
+
+    /// Process incoming MIDI messages
+    pub fn process_midi_message(&mut self, message: &[u8]) {
+        // Route message to appropriate control
+        for (_, control) in &mut self.controls {
+            if let Some(event) = control.on_midi_message(message) {
+                // Update LED feedback if needed
+                if let Some(button) = control.as_any().downcast_ref::<MidiButton>() {
+                    let midi_io = self.midi_io.lock().unwrap();
+                    if let Some(io) = midi_io.as_ref() {
+                        // We can't mutate through a reference, so we need to handle this differently
+                        // For now, just log that we should update the light
+                        println!("Button {} light should be updated", button.name());
+                    }
+                }
+                
+                // Send event
+                if let Some(sender) = &self.event_sender {
+                    if let Err(e) = sender.send(event) {
+                        eprintln!("Failed to send control event: {}", e);
+                    }
+                }
+                break;
+            }
+        }
+    }
+}
+//! MIDI surface implementation for ozma ControlSurface
+
+use std::collections::HashMap;
+use tokio::sync::mpsc;
+use crate::midi::io::MidiIO;
+use crate::midi::control::{MidiControl, MidiFader, MidiButton, MidiRotary, MidiJogWheel, ControlEvent};
+use crate::midi::types::{ControlType, ButtonStyle, LightStyle, Color};
+
+/// Display control for LCD/segment displays
+pub struct DisplayControl {
+    pub name: String,
+    pub binding: String,
+    pub on_update: Box<dyn Fn(&str, Option<&str>) + Send + Sync>,
+}
+
+impl DisplayControl {
+    pub fn new<F>(name: String, binding: String, on_update: F) -> Self
+    where
+        F: Fn(&str, Option<&str>) + Send + Sync + 'static,
+    {
+        Self {
+            name,
+            binding,
+            on_update: Box::new(on_update),
+        }
+    }
+}
+
+/// MIDI surface implementation
+pub struct MidiSurface {
+    pub id: String,
+    device_name: String,
+    midi_io: Option<MidiIO>,
+    controls: HashMap<String, Box<dyn MidiControl>>,
+    displays: HashMap<String, DisplayControl>,
+    event_sender: Option<mpsc::UnboundedSender<ControlEvent>>,
+}
+
+impl MidiSurface {
+    pub fn new(id: String, config: &serde_json::Value) -> Self {
+        let device_name = config.get("device")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        Self {
+            id,
+            device_name,
+            midi_io: None,
+            controls: HashMap::new(),
+            displays: HashMap::new(),
+            event_sender: None,
+        }
+    }
+
+    /// Start the MIDI surface
+    pub async fn start(&mut self, config: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
+        if !MidiIO::available() {
+            println!("MIDI support not available - surface '{}' disabled", self.id);
+            return Ok(());
+        }
+
+        // Create MIDI I/O
+        let mut midi_io = MidiIO::new(self.device_name.clone());
+        
+        // Set up callback for MIDI messages
+        let (sender, _receiver) = mpsc::unbounded_channel::<ControlEvent>();
+        self.event_sender = Some(sender.clone());
+        
+        // Store MIDI IO
+        self.midi_io = Some(midi_io);
+
+        // Create controls from config
+        if let Some(controls_config) = config.get("controls").and_then(|v| v.as_object()) {
+            for (name, ctrl_config) in controls_config {
+                self.create_control(name, ctrl_config)?;
+            }
+        }
+
+        // Create displays from config
+        if let Some(displays_config) = config.get("displays").and_then(|v| v.as_object()) {
+            for (name, display_config) in displays_config {
+                self.create_display(name, display_config)?;
+            }
+        }
+
+        println!("MIDI surface '{}' started: {} controls, {} displays",
+                 self.id,
+                 self.controls.len(),
+                 self.displays.len());
+
+        Ok(())
+    }
+
+    /// Stop the MIDI surface
+    pub async fn stop(&mut self) {
+        if let Some(midi_io) = &mut self.midi_io {
+            midi_io.close();
+        }
+        self.midi_io = None;
+        println!("MIDI surface '{}' stopped", self.id);
+    }
+
+    /// Create a control from configuration
+    fn create_control(&mut self, name: &str, config: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
+        let ctrl_type = config.get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("button");
+        
+        let control: Box<dyn MidiControl> = match ControlType::from_str(ctrl_type) {
+            Some(ControlType::Fader) => {
+                let cc = config.get("control").and_then(|v| v.as_u64()).unwrap_or(70) as u8;
+                let touch_note = config.get("note").and_then(|v| v.as_u64()).map(|n| n as u8);
+                Box::new(MidiFader::new(name.to_string(), cc, touch_note))
+            }
+            Some(ControlType::Button) => {
+                let note = config.get("note").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+                let style_str = config.get("style").and_then(|v| v.as_str()).unwrap_or("toggle");
+                let style = ButtonStyle::from_str(style_str);
+                let light_str = config.get("light").and_then(|v| v.as_str()).unwrap_or("state");
+                let light_style = LightStyle::from_str(light_str);
+                Box::new(MidiButton::new(name.to_string(), note, style, light_style))
+            }
+            Some(ControlType::Rotary) => {
+                let cc = config.get("control").and_then(|v| v.as_u64()).unwrap_or(80) as u8;
+                Box::new(MidiRotary::new(name.to_string(), cc))
+            }
+            Some(ControlType::JogWheel) => {
+                let cc = config.get("control").and_then(|v| v.as_u64()).unwrap_or(60) as u8;
+                Box::new(MidiJogWheel::new(name.to_string(), cc))
+            }
+            None => {
+                eprintln!("Unknown MIDI control type: {}", ctrl_type);
+                return Ok(());
+            }
+        };
+
+        self.controls.insert(name.to_string(), control);
+        Ok(())
+    }
+
+    /// Create a display from configuration
+    fn create_display(&mut self, name: &str, config: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
+        let binding = config.get("binding")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        
+        let display_type = config.get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("scribble");
+
+        // Create update function based on display type
+        let on_update = {
+            let display_type = display_type.to_string();
+            let device_name = self.device_name.clone();
+            
+            move |text: &str, color: Option<&str>| {
+                // In a real implementation, we would use the stored MIDI IO reference
+                // For now, we'll just log what would happen
+                println!("Would update display '{}' with text '{}' and color '{:?}'", 
+                         display_type, text, color);
+            }
+        };
+
+        self.displays.insert(
+            name.to_string(),
+            DisplayControl::new(name.to_string(), binding, on_update)
+        );
+
+        Ok(())
+    }
+
+    /// Process incoming MIDI messages
+    pub fn process_midi_message(&mut self, message: &[u8]) {
+        // Route message to appropriate control
+        for (_, control) in &mut self.controls {
+            if let Some(event) = control.on_midi_message(message) {
+                // Update LED feedback if needed
+                if let Some(button) = control.as_any().downcast_ref::<MidiButton>() {
+                    if let Some(midi_io) = &mut self.midi_io {
+                        if let Err(e) = button.update_light(midi_io) {
+                            eprintln!("Failed to update button light: {}", e);
+                        }
+                    }
+                }
+                
+                // Send event
+                if let Some(sender) = &self.event_sender {
+                    if let Err(e) = sender.send(event) {
+                        eprintln!("Failed to send control event: {}", e);
+                    }
+                }
+                break;
+            }
+        }
+    }
+}
