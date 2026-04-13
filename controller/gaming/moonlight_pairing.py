@@ -232,8 +232,10 @@ class MoonlightPairingServer:
         return web.json_response(info)
 
     async def _handle_applist(self, request: web.Request) -> web.Response:
-        """Handle /applist endpoint - stub returning empty list."""
-        return web.json_response([])
+        """Handle /applist endpoint - returns empty list for now."""
+        return web.json_response({
+            "apps": []
+        })
 
     async def _handle_pair(self, request: web.Request) -> web.Response:
         """Handle /pair endpoint - PIN-based pairing flow."""
@@ -331,3 +333,7 @@ class MoonlightPairingServer:
     async def revoke_client(self, client_id: str) -> bool:
         """Revoke a paired client."""
         return self._pairing_db.remove_client(client_id)
+
+    async def get_all_clients(self) -> list[dict[str, Any]]:
+        """Get all paired clients (async wrapper)."""
+        return self.get_paired_clients()
