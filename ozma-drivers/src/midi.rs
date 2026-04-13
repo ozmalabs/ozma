@@ -622,7 +622,7 @@ pub fn create_midi_control(
     name: String,
     config: &MidiControlConfig,
     midi: Arc<Mutex<MidiIO>>,
-) ) -> Option<Box<dyn MidiControl>> {
+) -> Option<Box<dyn MidiControl>> {
     match control_type {
         "fader" => Some(Box::new(MidiFader::new(name, config, midi))),
         "button" => Some(Box::new(MidiButton::new(name, config, midi))),
