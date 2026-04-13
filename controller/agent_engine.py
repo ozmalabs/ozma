@@ -190,6 +190,10 @@ class AgentEngine:
         # Pre-populate with built-in context sources
         if self._context_sources is None:
             self._context_sources = {}
+        # Add built-in context sources if not already present
+        for source in CONTEXT_SOURCES:
+            if source not in self._context_sources:
+                self._context_sources[source] = None  # Will be populated externally
 
     # ── Approval management ───────────────────────────────────────────
 
