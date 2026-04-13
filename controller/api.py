@@ -1714,6 +1714,107 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     async def list_graph_links() -> dict[str, Any]:
         return {"links": [l.to_dict() for l in state.routing_graph.links()]}
 
+    @app.get("/api/v1/graph/topology")
+    async def get_graph_topology(request: Request) -> dict[str, Any]:
+        """
+        Lightweight topology snapshot for the routing graph visualizer.
+
+        Returns devices (summary), links (with live_metrics), and a
+        generation counter so the UI can detect topology changes cheaply.
+
+        Query params:
+          include_metrics=1  — embed live scalar metrics on each link (default: true)
+          include_ports=1    — include port lists on each device node (default: true)
+        """
+        _require_scope(request, SCOPE_READ)
+        include_metrics = request.query_params.get("include_metrics", "1") != "0"
+        include_ports = request.query_params.get("include_ports", "1") != "0"
+
+        devices = []
+        for d in state.routing_graph.devices():
+            if include_ports:
+                devices.append(d.to_summary_dict())
+            else:
+                devices.append({
+                    "id": d.id,
+                    "name": d.name,
+                    "type": d.type.value,
+                    "assurance_level": d.assurance_level,
+                })
+
+        links = []
+        for lnk in state.routing_graph.links():
+            entry: dict[str, Any] = {
+                "id": lnk.id,
+                "source_device": lnk.source.device_id,
+                "source_port": lnk.source.port_id,
+                "sink_device": lnk.sink.device_id,
+                "sink_port": lnk.sink.port_id,
+                "transport": lnk.transport,
+                "status": lnk.state.status.value,
+                "bidirectional": lnk.bidirectional,
+            }
+            if include_metrics and lnk.state.live_metrics:
+                entry["live_metrics"] = lnk.state.live_metrics
+            links.append(entry)
+
+        generation = getattr(state.routing_graph, "_generation", 0)
+        return {
+            "generation": generation,
+            "device_count": len(devices),
+            "link_count": len(links),
+            "devices": devices,
+            "links": links,
+        }
+
+    @app.get("/api/v1/graph/links/{link_id}/metrics")
+    async def get_link_live_metrics(request: Request, link_id: str) -> dict[str, Any]:
+        """
+        Return live scalar metrics and recent sparkline history for a single link.
+
+        Query params:
+          tier    — time-series tier: 1 (1s/1h), 2 (1m/24h), 3 (15m/30d). Default 1.
+          limit   — max sparkline points. Default 60.
+          metrics — comma-separated metric keys to include. Default: all available.
+        """
+        _require_scope(request, SCOPE_READ)
+        link = state.routing_graph.get_link(link_id)
+        if link is None:
+            raise HTTPException(status_code=404, detail=f"Link not found: {link_id}")
+
+        tier = int(request.query_params.get("tier", "1"))
+        if tier not in (1, 2, 3):
+            raise HTTPException(400, "tier must be 1, 2, or 3")
+        limit = int(request.query_params.get("limit", "60"))
+        metrics_filter_raw = request.query_params.get("metrics", "")
+        metrics_filter = set(metrics_filter_raw.split(",")) if metrics_filter_raw else None
+
+        live = dict(link.state.live_metrics)
+        if metrics_filter:
+            live = {k: v for k, v in live.items() if k in metrics_filter}
+
+        # Pull sparkline history from the metric store if available
+        sparklines: dict[str, list[dict]] = {}
+        metric_store = getattr(state, "metric_store", None)
+        if metric_store is not None:
+            dev_id = link.source.device_id
+            for metric_key in (metrics_filter or {"latency_ms", "loss_rate", "jitter_p99_ms"}):
+                full_key = f"link.{link_id}.{metric_key}"
+                series = metric_store.get_series(dev_id, full_key)
+                if series is not None:
+                    sparklines[metric_key] = [
+                        p.to_dict() for p in series.history(tier=tier, limit=limit)
+                    ]
+
+        return {
+            "link_id": link_id,
+            "status": link.state.status.value,
+            "last_measured": link.state.last_measured,
+            "live_metrics": live,
+            "sparklines": sparklines,
+            "tier": tier,
+        }
+
     # --- Routing engine endpoints (Phase 2–6) ---
 
     @app.get("/api/v1/routing/intents")

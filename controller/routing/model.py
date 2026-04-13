@@ -357,6 +357,9 @@ class LinkState:
     loss: LossSpec | None = None
     activation_time: ActivationTimeSpec | None = None
     last_measured: float = field(default_factory=time.monotonic)
+    # Live scalar metrics updated by the measurement engine (Phase 5/6).
+    # Keys: "latency_ms", "loss_rate", "jitter_p99_ms", "bandwidth_bps", etc.
+    live_metrics: dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {
@@ -367,6 +370,8 @@ class LinkState:
             v = getattr(self, k)
             if v is not None:
                 d[k] = v.to_dict()
+        if self.live_metrics:
+            d["live_metrics"] = self.live_metrics
         return d
 
 
@@ -419,6 +424,27 @@ class Device:
 
     def ports_by_media(self, media_type: MediaType) -> list[Port]:
         return [p for p in self.ports if p.media_type == media_type]
+
+    def to_summary_dict(self) -> dict:
+        """Lightweight dict for topology payloads (no internal links / identity)."""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "type": self.type.value,
+            "location": self.location.to_dict(),
+            "assurance_level": self.assurance_level,
+            "port_count": len(self.ports),
+            "ports": [
+                {
+                    "id": p.id,
+                    "direction": p.direction.value,
+                    "media_type": p.media_type.value,
+                    "active": p.current_state.active,
+                    "label": p.label,
+                }
+                for p in self.ports
+            ],
+        }
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {

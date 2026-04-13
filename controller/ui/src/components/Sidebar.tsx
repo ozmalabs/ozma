@@ -14,8 +14,9 @@ const NAV_ITEMS: NavItem[] = [
   { to: '/streams',   label: 'Streams & Cameras' },
   { to: '/audio',     label: 'Audio' },
   { to: '/rgb',       label: 'RGB' },
-  { to: '/controls',  label: 'Controls' },
-  { to: '/settings',  label: 'Settings' },
+  { to: '/controls',       label: 'Controls' },
+  { to: '/routing-graph',  label: 'Routing Graph' },
+  { to: '/settings',       label: 'Settings' },
 ];
 
 interface SidebarProps {
