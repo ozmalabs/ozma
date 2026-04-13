@@ -57,7 +57,7 @@ async def create_checkout_session(
             )
             customer_id = customer.id
             # TODO: Update account with customer_id in DB
-            
+                
         # Create checkout session
         session = stripe.checkout.Session.create(
             customer=customer_id,
