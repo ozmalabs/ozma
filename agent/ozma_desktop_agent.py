@@ -504,20 +504,30 @@ class AudioBackendLinux:
 
     async def start(self) -> str | None:
         """Create a null sink. Returns the sink name or None."""
-        import subprocess
+        # Use Rust PipeWire implementation
         try:
-            result = subprocess.run(
-                ["pactl", "load-module", "module-null-sink",
-                 f"sink_name={self._sink_name}",
-                 f"sink_properties=device.description=Ozma-{self._name}"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0:
-                self._module_id = int(result.stdout.strip())
-                log.info("Audio sink created: %s (module %d)", self._sink_name, self._module_id)
-                return self._sink_name
+            from pipewire_audio import PipeWireAudioManager
+            pw_manager = PipeWireAudioManager()
+            sink_id = pw_manager.create_null_sink(self._sink_name, f"Ozma-{self._name}")
+            log.info("Audio sink created: %s (id %d)", self._sink_name, sink_id)
+            return self._sink_name
         except Exception as e:
-            log.warning("Failed to create audio sink: %s", e)
+            log.warning("Failed to create audio sink with Rust implementation: %s", e)
+            # Fallback to PulseAudio pactl method
+            import subprocess
+            try:
+                result = subprocess.run(
+                    ["pactl", "load-module", "module-null-sink",
+                     f"sink_name={self._sink_name}",
+                     f"sink_properties=device.description=Ozma-{self._name}"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0:
+                    self._module_id = int(result.stdout.strip())
+                    log.info("Audio sink created: %s (module %d)", self._sink_name, self._module_id)
+                    return self._sink_name
+            except Exception as e2:
+                log.warning("Failed to create audio sink: %s", e2)
         return None
 
     async def stop(self) -> None:
@@ -1222,56 +1232,75 @@ class DesktopSoftNode:
         log.info("mDNS announced: %s @ %s:%d", self._name, local_ip, self._port)
 
     async def _get_pw_nodes(self) -> list[dict]:
-        """List PipeWire audio sources and sinks via pw-dump."""
+        """List PipeWire audio sources and sinks."""
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "pw-dump", "-N",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            if not stdout:
-                return []
-            import json as _json
-            objects = _json.loads(stdout)
-            nodes = []
-
-            # Find default sink/source names from metadata
-            default_sink = ""
-            default_source = ""
-            for obj in objects:
-                if obj.get("type") == "PipeWire:Interface:Metadata":
-                    for entry in obj.get("metadata", []):
-                        key = entry.get("key", "")
-                        val = entry.get("value", {})
-                        name = val.get("name", "") if isinstance(val, dict) else ""
-                        if key == "default.audio.sink":
-                            default_sink = name
-                        elif key == "default.audio.source":
-                            default_source = name
-
-            for obj in objects:
-                if obj.get("type") != "PipeWire:Interface:Node":
-                    continue
-                info = obj.get("info", {})
-                props = info.get("props", {})
-                media_class = props.get("media.class", "")
-                if not media_class or "Audio" not in media_class:
-                    continue
-                name = props.get("node.name", "")
-                desc = props.get("node.description", props.get("node.nick", name))
-                is_default = (name == default_sink and "Sink" in media_class) or \
-                             (name == default_source and "Source" in media_class)
-                nodes.append({
-                    "id": obj.get("id", 0),
-                    "name": name,
-                    "description": desc,
-                    "media_class": media_class,
-                    "default": is_default,
+            from pipewire_audio import PipeWireAudioManager
+            pw_manager = PipeWireAudioManager()
+            pw_manager.start_monitoring()
+            nodes = pw_manager.list_audio_nodes()
+            
+            result = []
+            for node in nodes:
+                result.append({
+                    "id": node.id,
+                    "name": node.name,
+                    "description": node.description,
+                    "media_class": node.media_class,
+                    "default": node.is_default,
                 })
-            return nodes
-        except Exception:
-            return []
+            return result
+        except Exception as e:
+            log.warning("Failed to get PipeWire nodes with Rust implementation: %s", e)
+            # Fallback to pw-dump method
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "pw-dump", "-N",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+                if not stdout:
+                    return []
+                import json as _json
+                objects = _json.loads(stdout)
+                nodes = []
+
+                # Find default sink/source names from metadata
+                default_sink = ""
+                default_source = ""
+                for obj in objects:
+                    if obj.get("type") == "PipeWire:Interface:Metadata":
+                        for entry in obj.get("metadata", []):
+                            key = entry.get("key", "")
+                            val = entry.get("value", {})
+                            name = val.get("name", "") if isinstance(val, dict) else ""
+                            if key == "default.audio.sink":
+                                default_sink = name
+                            elif key == "default.audio.source":
+                                default_source = name
+
+                for obj in objects:
+                    if obj.get("type") != "PipeWire:Interface:Node":
+                        continue
+                    info = obj.get("info", {})
+                    props = info.get("props", {})
+                    media_class = props.get("media.class", "")
+                    if not media_class or "Audio" not in media_class:
+                        continue
+                    name = props.get("node.name", "")
+                    desc = props.get("node.description", props.get("node.nick", name))
+                    is_default = (name == default_sink and "Sink" in media_class) or \
+                                (name == default_source and "Source" in media_class)
+                    nodes.append({
+                        "id": obj.get("id", 0),
+                        "name": name,
+                        "description": desc,
+                        "media_class": media_class,
+                        "default": is_default,
+                    })
+                return nodes
+            except Exception:
+                return []
 
     async def _direct_register(self) -> None:
         """Register directly with the controller via HTTP."""
