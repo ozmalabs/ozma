@@ -1,97 +1,68 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! ozma-drivers binary entry point.
+//! ozma-drivers — standalone binary entry point.
 //!
-//! Run with `RUST_LOG=ozma_drivers=debug` for verbose output.
-//!
-//! Usage:
-//!   ozma-drivers kbd                   # list detected keyboard devices
-//!   ozma-drivers mouse                 # list detected mouse devices
-//!   ozma-drivers surface <config.json> # run a config-driven evdev surface
+//! In production the driver surfaces are embedded in the controller process.
+//! This binary is useful for hardware bring-up and manual testing.
 
-use anyhow::{Context, Result};
-use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive("ozma_drivers=debug".parse()?),
-        )
+        .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let args: Vec<String> = std::env::args().collect();
-    let cmd = args.get(1).map(String::as_str).unwrap_or("help");
+    #[cfg(feature = "streamdeck")]
+    {
+        use ozma_drivers::{
+            control_surface::{ControlEvent, ControlSurface, ScenarioInfo},
+            streamdeck::StreamDeckSurface,
+        };
+        use tokio::sync::mpsc;
 
-    match cmd {
-        "kbd" => {
-            let devices = ozma_drivers::find_keyboard_devices(false);
-            println!("Detected keyboard devices ({}):", devices.len());
-            for dev in &devices {
-                println!("  {} — {}", dev.physical_path().map(|p| p.display().to_string()).unwrap_or_default(), dev.name().unwrap_or("?"));
-            }
+        let mut surfaces = StreamDeckSurface::discover().await;
+        if surfaces.is_empty() {
+            tracing::warn!("No Stream Deck devices found.");
+            return;
         }
 
-        "mouse" => {
-            let devices = ozma_drivers::find_mouse_devices(false);
-            println!("Detected mouse devices ({}):", devices.len());
-            for dev in &devices {
-                println!("  {} — {}", dev.physical_path().map(|p| p.display().to_string()).unwrap_or_default(), dev.name().unwrap_or("?"));
-            }
-        }
+        let (tx, mut rx) = mpsc::channel::<ControlEvent>(64);
 
-        "surface" => {
-            use ozma_drivers::control_surface::ControlSurface;
-            use ozma_drivers::evdev_capture::{EvdevSurface, EvdevSurfaceConfig};
+        for surface in &mut surfaces {
+            tracing::info!("Starting: {}", surface.description());
+            surface.start(tx.clone()).await.expect("start failed");
 
-            let config_path = args.get(2).context("missing <config.json>")?;
-            let raw = std::fs::read_to_string(config_path)
-                .with_context(|| format!("reading {config_path}"))?;
-            let cfg: EvdevSurfaceConfig =
-                serde_json::from_str(&raw).context("parsing config JSON")?;
-
-            let surface_id = cfg.device.clone();
-            let mut surface = EvdevSurface::new(surface_id, cfg);
-            let mut rx = surface
-                .start()
+            let scenarios = vec![
+                ScenarioInfo { id: "s1".into(), name: "Gaming".into(), color: "#ff4400".into() },
+                ScenarioInfo { id: "s2".into(), name: "Work".into(),   color: "#0044ff".into() },
+                ScenarioInfo { id: "s3".into(), name: "Media".into(),  color: "#00cc44".into() },
+            ];
+            surface
+                .update_scenarios(&scenarios, Some("s1"))
                 .await
-                .context("starting surface")?;
-
-            info!("Surface running — press Ctrl-C to stop");
-            loop {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => break,
-                    evt = rx.recv() => {
-                        match evt {
-                            Some(e) => info!(
-                                surface = %e.surface_id,
-                                control = %e.control_name,
-                                value   = %e.value,
-                                "control event"
-                            ),
-                            None => {
-                                info!("Surface shut down");
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            surface.stop().await;
-            info!("stopped");
+                .expect("update_scenarios failed");
         }
 
-        _ => {
-            eprintln!("ozma-drivers — evdev capture and uinput virtual devices");
-            eprintln!();
-            eprintln!("Commands:");
-            eprintln!("  kbd                    List detected keyboard devices");
-            eprintln!("  mouse                  List detected mouse devices");
-            eprintln!("  surface <config.json>  Run a config-driven evdev control surface");
+        tracing::info!("Listening for key events (Ctrl-C to quit)…");
+        loop {
+            tokio::select! {
+                Some(ev) = rx.recv() => {
+                    tracing::info!(
+                        surface = %ev.surface_id,
+                        control = %ev.control_name,
+                        payload = %ev.payload,
+                        "key event"
+                    );
+                }
+                _ = tokio::signal::ctrl_c() => break,
+            }
+        }
+
+        for surface in &mut surfaces {
+            surface.stop().await.ok();
         }
     }
 
-    Ok(())
+    #[cfg(not(feature = "streamdeck"))]
+    tracing::warn!("Built without streamdeck feature — nothing to do.");
 }
