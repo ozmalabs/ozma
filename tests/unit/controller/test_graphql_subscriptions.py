@@ -688,7 +688,7 @@ class TestAlertFired:
 class TestGraphQLSchemaIntegration:
     def test_schema_has_all_subscription_fields(self):
         """Test that the GraphQL schema includes all subscription fields."""
-        from graphql.schema import schema
+        from gql.schema import schema
 
         schema_dict = schema.introspect()
         subscription_type = None

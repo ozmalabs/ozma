@@ -14,14 +14,14 @@ class TestGraphQLSchema:
 
     def test_create_schema(self):
         """Test that the schema can be created."""
-        from graphql import create_schema
+        from gql_router import create_schema
 
         schema = create_schema()
         assert schema is not None
 
     def test_node_info_type(self):
         """Test NodeInfo type has all required fields."""
-        from graphql import NodeInfo
+        from gql_router import NodeInfo
         import strawberry
 
         # Check that NodeInfo is a strawberry type
@@ -40,7 +40,7 @@ class TestGraphQLSchema:
 
     def test_query_type(self):
         """Test Query type has all required fields."""
-        from graphql import Query
+        from gql_router import Query
         import strawberry
 
         assert hasattr(Query, "__strawberry_definition__")
@@ -52,7 +52,7 @@ class TestGraphQLSchema:
 
     def test_mutation_type(self):
         """Test Mutation type has required fields."""
-        from graphql import Mutation
+        from gql_router import Mutation
         import strawberry
 
         assert hasattr(Mutation, "__strawberry_definition__")
@@ -66,7 +66,7 @@ class TestRequireWritePermission:
 
     def test_has_permission_class(self):
         """Test that permission class exists."""
-        from graphql import RequireWritePermission
+        from gql_router import RequireWritePermission
 
         perm = RequireWritePermission()
         assert perm is not None
@@ -75,7 +75,7 @@ class TestRequireWritePermission:
 
     def test_permission_message(self):
         """Test permission message."""
-        from graphql import RequireWritePermission
+        from gql_router import RequireWritePermission
 
         perm = RequireWritePermission()
         assert perm.get_unauthenticated_message(None) == "Write scope required for this mutation"
@@ -86,13 +86,13 @@ class TestGraphQLContext:
 
     def test_context_builder_exists(self):
         """Test that GraphQLContext class exists."""
-        from graphql import GraphQLContext
+        from gql_router import GraphQLContext
 
         assert GraphQLContext is not None
 
     def test_context_builder_init(self, app_state, auth_config):
         """Test GraphQLContext initialization."""
-        from graphql import GraphQLContext
+        from gql_router import GraphQLContext
 
         ctx = GraphQLContext(app_state, auth_config)
         assert ctx.app_state == app_state
@@ -105,7 +105,7 @@ class TestShouldEnableGraphiql:
     def test_graphiql_enabled_when_auth_disabled(self):
         """GraphiQL is enabled when auth is disabled."""
         from auth import AuthConfig
-        from graphql import should_enable_graphiql
+        from gql_router import should_enable_graphiql
         from auth import AuthContext
 
         auth_cfg = AuthConfig(enabled=False)
@@ -121,7 +121,7 @@ class TestShouldEnableGraphiql:
     def test_graphiql_enabled_with_valid_jwt(self):
         """GraphiQL is enabled when valid JWT is present."""
         from auth import AuthConfig
-        from graphql import should_enable_graphiql
+        from gql_router import should_enable_graphiql
         from auth import AuthContext
 
         auth_cfg = AuthConfig(enabled=True)
@@ -137,7 +137,7 @@ class TestShouldEnableGraphiql:
     def test_graphiql_enabled_with_write_scope(self):
         """GraphiQL is enabled when write scope is present."""
         from auth import AuthConfig
-        from graphql import should_enable_graphiql
+        from gql_router import should_enable_graphiql
         from auth import AuthContext
 
         auth_cfg = AuthConfig(enabled=True)
@@ -153,7 +153,7 @@ class TestShouldEnableGraphiql:
     def test_graphiql_disabled_without_auth(self):
         """GraphiQL is disabled when no auth context."""
         from auth import AuthConfig
-        from graphql import should_enable_graphiql
+        from gql_router import should_enable_graphiql
 
         auth_cfg = AuthConfig(enabled=True)
         auth_ctx = None
@@ -163,7 +163,7 @@ class TestShouldEnableGraphiql:
     def test_graphiql_disabled_with_no_scopes(self):
         """GraphiQL is disabled when auth enabled but no valid scopes."""
         from auth import AuthConfig
-        from graphql import should_enable_graphiql
+        from gql_router import should_enable_graphiql
         from auth import AuthContext
 
         auth_cfg = AuthConfig(enabled=True)
