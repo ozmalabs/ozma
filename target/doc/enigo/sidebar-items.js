@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"constant":["EVENT_MARKER"],"enum":["Axis","Button","Coordinate","Direction","InputError","Key","NewConError"],"mod":["agent"],"struct":["Enigo","Settings"],"trait":["Keyboard","Mouse"],"type":["InputResult"]};
