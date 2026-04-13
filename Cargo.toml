@@ -19,4 +19,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 anyhow             = "1"
 thiserror          = "1"
 bytes              = "1"
-icalendar          = "0.15"
+usb-gadget         = { version = "0.7", features = ["tokio"] }
+alsa               = "0.9"

@@ -1,166 +1,224 @@
-//! ozma-node — V4L2 capture → ffmpeg-sidecar → HLS, served on port 7382.
+//! Ozma Node — mDNS advertisement and controller registration.
 //!
-//! Routes
-//! ------
-//! GET /stream/stream.m3u8        — HLS manifest
-//! GET /stream/seg_NNNNN.ts       — HLS segments
-//! GET /health                    — liveness probe
-//! GET /api/v1/devices            — list detected V4L2 devices (JSON)
+//! Ports the mDNS + direct-registration logic from `node/node.py` to Rust.
+//!
+//! # What this binary does
+//!
+//! 1. Resolves the local LAN IP (or uses `--register-host` override).
+//! 2. Advertises `<name>._ozma._udp.local.` via mDNS (libmdns).
+//! 3. If `--register-url` is set, POSTs to `<url>/api/v1/nodes/register`
+//!    (SLIRP / QEMU workaround — mDNS multicast can't cross the SLIRP boundary).
+//! 4. Runs a heartbeat loop that POSTs to `<url>/api/v1/nodes/heartbeat`
+//!    every 30 seconds so the controller keeps the node marked online.
 
-mod capture;
-mod hotplug;
+mod mdns;
+mod registration;
+mod usb_audio;
 
-use std::{
-    net::SocketAddr,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use clap::Parser;
+use tracing::{error, info};
 
-use anyhow::Result;
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    routing::get,
-    Json, Router,
-};
-use capture::{enumerate_v4l2_devices, CaptureDevice, EncoderConfig, MediaCapture};
-use hotplug::{watch_v4l2_hotplug, HotplugEvent};
-use serde_json::json;
-use tokio::sync::mpsc;
-use tower_http::{cors::CorsLayer, services::ServeDir};
-use tracing::{error, info, warn};
+/// Ozma hardware KVM node process.
+#[derive(Parser, Debug)]
+#[command(author, version, about)]
+pub struct Args {
+    /// Node name (default: system hostname).
+    #[arg(long, default_value_t = default_hostname())]
+    pub name: String,
 
-// ── Application state ─────────────────────────────────────────────────────────
+    /// UDP port for HID packets.
+    #[arg(long, default_value_t = 7331)]
+    pub hid_udp_port: u16,
 
-#[derive(Clone)]
-struct AppState {
-    out_dir: PathBuf,
-    devices: Arc<Mutex<Vec<CaptureDevice>>>,
+    /// HTTP port for the node's local API / HLS stream.
+    #[arg(long, default_value_t = 7382)]
+    pub http_port: u16,
+
+    /// Comma-separated capability list advertised in mDNS TXT and registration.
+    /// Example: `hid,video,audio`
+    #[arg(long, default_value = "hid")]
+    pub cap: String,
+
+    /// Hardware platform string (e.g. `rpi4`, `x86_64`).
+    #[arg(long, default_value_t = default_hw())]
+    pub hw: String,
+
+    /// Firmware / software version string.
+    #[arg(long, default_value = "1.0.0")]
+    pub fw: String,
+
+    /// POST registration directly to this controller URL instead of relying on
+    /// mDNS multicast.  Required in QEMU/SLIRP environments.
+    /// Example: `http://10.0.2.2:7380`
+    #[arg(long)]
+    pub register_url: Option<String>,
+
+    /// Override the host IP reported to the controller.
+    /// Useful with SLIRP port-forwarding where the controller sees `localhost`
+    /// but the node's real LAN IP is different.
+    /// Example: `localhost`
+    #[arg(long)]
+    pub register_host: Option<String>,
+
+    /// Heartbeat interval in seconds (default 30).
+    #[arg(long, default_value_t = 30)]
+    pub heartbeat_interval: u64,
+
+    /// Enable verbose debug logging.
+    #[arg(long)]
+    pub debug: bool,
 }
 
-// ── Route handlers ────────────────────────────────────────────────────────────
-
-async fn health() -> impl IntoResponse {
-    (StatusCode::OK, "ok")
+fn default_hostname() -> String {
+    hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_else(|| "ozma-node".to_string())
 }
 
-async fn list_devices(State(state): State<AppState>) -> impl IntoResponse {
-    let devs = state.devices.lock().unwrap();
-    let list: Vec<serde_json::Value> = devs
-        .iter()
-        .map(|d| {
-            json!({
-                "path": d.path,
-                "max_width": d.max_width,
-                "max_height": d.max_height,
-                "formats": d.formats,
-                "audio_device": d.audio_device,
-            })
-        })
-        .collect();
-    Json(json!({ "devices": list }))
+fn default_hw() -> String {
+    // Best-effort: read /proc/device-tree/model (Raspberry Pi etc.)
+    if let Ok(model) = std::fs::read_to_string("/proc/device-tree/model") {
+        let model = model.trim_end_matches('\0').trim();
+        if !model.is_empty() {
+            return model
+                .chars()
+                .take(32)
+                .collect::<String>()
+                .to_lowercase()
+                .replace(' ', "-");
+        }
+    }
+    std::env::consts::ARCH.to_string()
 }
-
-// ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    let args = Args::parse();
+
+    // Initialise logging.
+    let level = if args.debug { "debug" } else { "info" };
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("ozma_node=debug".parse()?),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level)),
         )
         .init();
 
-    // Ensure ffmpeg-sidecar can locate (or download) an ffmpeg binary.
-    ffmpeg_sidecar::download::auto_download().ok();
-
-    let out_dir = PathBuf::from(
-        std::env::var("OZMA_STREAM_DIR").unwrap_or_else(|_| "/tmp/ozma-stream".into()),
+    info!(
+        name = %args.name,
+        hid_udp_port = args.hid_udp_port,
+        http_port = args.http_port,
+        cap = %args.cap,
+        hw = %args.hw,
+        "Ozma node starting"
     );
-    std::fs::create_dir_all(&out_dir)?;
 
-    // Initial device enumeration.
-    let devices = enumerate_v4l2_devices();
-    info!("Found {} V4L2 device(s)", devices.len());
+    // Resolve local IP (or use override).
+    let local_ip = resolve_local_ip(&args);
+    info!(ip = %local_ip, "Resolved local IP");
 
-    let state = AppState {
-        out_dir: out_dir.clone(),
-        devices: Arc::new(Mutex::new(devices.clone())),
+    // Build the TXT record map (mirrors node.py's `txt` dict).
+    let txt = build_txt(&args, &local_ip);
+
+    // Start mDNS advertisement.
+    let _mdns_handle = match mdns::advertise(&args.name, args.hid_udp_port, &txt) {
+        Ok(h) => {
+            info!("mDNS advertising {}.{}", args.name, mdns::SERVICE_TYPE);
+            mdns::Handle::Real(h)
+        }
+        Err(e) => {
+            error!("mDNS advertisement failed: {e}");
+            // Non-fatal — direct registration may still work.
+            mdns::Handle::Dummy
+        }
     };
 
-    // Start capture on the first available device (if any).
-    let mut capture: Option<MediaCapture> = None;
-    if let Some(dev) = devices.into_iter().next() {
-        let enc = EncoderConfig::software_h264();
-        let mut mc = MediaCapture::new(dev, enc, out_dir.clone());
-        mc.start().await?;
-        capture = Some(mc);
-    } else {
-        warn!("No V4L2 devices found at startup — waiting for hot-plug");
+    // Direct registration (SLIRP / QEMU workaround).
+    if let Some(ref url) = args.register_url {
+        // node_id mirrors the mDNS instance name used by node.py:
+        //   "<name>._ozma._udp.local."
+        let node_id = format!("{}.{}.", args.name, mdns::SERVICE_TYPE.trim_end_matches('.'));
+        match registration::register(url, &node_id, &local_ip, args.hid_udp_port, &txt).await {
+            Ok(()) => info!("Direct registration succeeded → {url}"),
+            Err(e) => error!("Direct registration failed: {e}"),
+        }
+
+        // Heartbeat loop — keeps the node marked online in the controller.
+        let url_clone = url.clone();
+        let node_id_clone = node_id.clone();
+        let interval = args.heartbeat_interval;
+        tokio::spawn(async move {
+            registration::heartbeat_loop(&url_clone, &node_id_clone, interval).await;
+        });
     }
 
-    // Hot-plug watcher.
-    let (hp_tx, mut hp_rx) = mpsc::channel::<HotplugEvent>(16);
-    watch_v4l2_hotplug(hp_tx).await?;
-
-    let state_hp = state.clone();
-    let out_dir_hp = out_dir.clone();
-    tokio::spawn(async move {
-        while let Some(event) = hp_rx.recv().await {
-            match event {
-                HotplugEvent::Added(path) => {
-                    info!("Hot-plug: device added {path}");
-                    let new_devs = enumerate_v4l2_devices();
-                    *state_hp.devices.lock().unwrap() = new_devs.clone();
-
-                    if capture.as_ref().map(|c| !c.is_active()).unwrap_or(true) {
-                        if let Some(dev) = new_devs.into_iter().find(|d| d.path == path) {
-                            let enc = EncoderConfig::software_h264();
-                            let mut mc = MediaCapture::new(dev, enc, out_dir_hp.clone());
-                            match mc.start().await {
-                                Ok(()) => capture = Some(mc),
-                                Err(e) => error!("Failed to start capture on {path}: {e}"),
-                            }
-                        }
+    // Start UAC2 audio gadget bridge if the "audio" capability is requested.
+    if args.cap.split(',').any(|c| c.trim() == "audio") {
+        tokio::spawn(async move {
+            match usb_audio::UsbAudioGadget::open(true).await {
+                Ok(gadget) => {
+                    if let Err(e) = gadget.run_bridge().await {
+                        tracing::error!("UAC2 bridge exited with error: {:#}", e);
                     }
                 }
-                HotplugEvent::Removed(path) => {
-                    info!("Hot-plug: device removed {path}");
-                    let new_devs = enumerate_v4l2_devices();
-                    *state_hp.devices.lock().unwrap() = new_devs;
-
-                    if let Some(ref mc) = capture {
-                        if !mc.is_active() {
-                            capture = None;
-                        }
-                    }
-                }
+                Err(e) => tracing::error!("UAC2 gadget init failed: {:#}", e),
             }
-        }
-    });
-
-    // Axum router — serve HLS files from out_dir under /stream/.
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/api/v1/devices", get(list_devices))
-        .nest_service("/stream", ServeDir::new(&out_dir))
-        .layer(CorsLayer::permissive())
-        .with_state(state);
-
-    let addr: SocketAddr = "0.0.0.0:7382".parse()?;
-    info!("ozma-node listening on {addr}");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-
-    tokio::select! {
-        res = axum::serve(listener, app) => {
-            if let Err(e) = res { error!("HTTP server error: {e}"); }
-        }
-        _ = tokio::signal::ctrl_c() => {
-            info!("Shutting down…");
-        }
+        });
     }
 
-    Ok(())
+    // Block until SIGINT / SIGTERM.
+    wait_for_shutdown().await;
+    info!("Ozma node shutting down");
+}
+
+/// Resolve the IP address to advertise / register.
+///
+/// Priority:
+///   1. `--register-host` CLI override (used for SLIRP: "localhost")
+///   2. Best local LAN IP via `local-ip-address`
+///   3. Fallback: "127.0.0.1"
+fn resolve_local_ip(args: &Args) -> String {
+    if let Some(ref host) = args.register_host {
+        return host.clone();
+    }
+    local_ip_address::local_ip()
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|_| "127.0.0.1".to_string())
+}
+
+/// Build the TXT record map that mirrors `node.py`'s `txt` dict.
+fn build_txt(args: &Args, local_ip: &str) -> std::collections::HashMap<String, String> {
+    let mut txt = std::collections::HashMap::new();
+    txt.insert("proto".into(), "1".into());
+    txt.insert("role".into(), "compute".into());
+    txt.insert("hw".into(), args.hw.clone());
+    txt.insert("fw".into(), args.fw.clone());
+    txt.insert("cap".into(), args.cap.clone());
+    txt.insert("api_port".into(), args.http_port.to_string());
+    // Advertise stream info if video capability is present.
+    if args.cap.split(',').any(|c| c.trim() == "video") {
+        txt.insert("stream_port".into(), args.http_port.to_string());
+        txt.insert("stream_path".into(), "/stream/stream.m3u8".into());
+    }
+    // Include the resolved IP so the controller can use it directly.
+    txt.insert("host".into(), local_ip.to_string());
+    txt
+}
+
+async fn wait_for_shutdown() {
+    use tokio::signal;
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            signal::unix::signal(signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
+        tokio::select! {
+            _ = signal::ctrl_c() => {},
+            _ = sigterm.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        signal::ctrl_c().await.expect("Ctrl-C handler");
+    }
 }
