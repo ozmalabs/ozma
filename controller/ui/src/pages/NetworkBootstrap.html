@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Network Bootstrap - Ozma Controller</title>
+    <script src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+    <style>
+        :root {
+            --primary: #3b82f6;
+            --success: #10b981;
+            --danger: #ef4444;
+            --warning: #f59e0b;
+            --dark: #1f2937;
+            --light: #f9fafb;
+            --gray: #6b7280;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f3f4f6;
+            color: #374151;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        .card {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            padding: 24px;
+            margin-bottom: 20px;
+        }
+        
+        .btn {
+            padding: 8px 16px;
+            border-radius: 4px;
+            border: none;
+            cursor: pointer;
+            font-weight: 500;
+            transition: background-color 0.2s;
+        }
+        
+        .btn-primary {
+            background-color: var(--primary);
+            color: white;
+        }
+        
+        .btn-primary:hover {
+            background-color: #2563eb;
+        }
+        
+        .btn-success {
+            background-color: var(--success);
+            color: white;
+        }
+        
+        .btn-danger {
+            background-color: var(--danger);
+            color: white;
+        }
+        
+        .btn-outline {
+            background-color: transparent;
+            border: 1px solid var(--primary);
+            color: var(--primary);
+        }
+        
+        .btn-outline:hover {
+            background-color: var(--primary);
+            color: white;
+        }
+        
+        .wizard-step {
+            display: none;
+        }
+        
+        .wizard-step.active {
+            display: block;
+        }
+        
+        .device-list {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 16px;
+            margin: 20px 0;
+        }
+        
+        .device-card {
+            border: 1px solid #e5e7eb;
+            border-radius: 6px;
+            padding: 16px;
+            background: white;
+        }
+        
+        .device-card h4 {
+            margin-top: 0;
+            margin-bottom: 8px;
+        }
+        
+        .device-card p {
+            margin: 4px 0;
+            color: var(--gray);
+        }
+        
+        .form-group {
+            margin-bottom: 16px;
+        }
+        
+        .form-group label {
+            display: block;
+            margin-bottom: 4px;
+            font-weight: 500;
+        }
+        
+        .form-group input {
+            width: 100%;
+            padding: 8px 12px;
+            border: 1px solid #d1d5db;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        
+        .status-badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        
+        .status-success {
+            background-color: #dcfce7;
+            color: #15803d;
+        }
+        
+        .status-error {
+            background-color: #fee2e2;
+            color: #b91c1c;
+        }
+        
+        .status-warning {
+            background-color: #fef3c7;
+            color: #b45309;
+        }
+        
+        .task-list {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+            gap: 16px;
+        }
+        
+        .task-card {
+            border: 1px solid #e5e7eb;
+            border-radius: 6px;
+            padding: 16px;
+            background: white;
+            display: flex;
+            align-items: center;
+        }
+        
+        .task-icon {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 12px;
+            font-weight: bold;
+            color: white;
+        }
+        
+        .task-icon.mikrotik { background-color: #ff6b35; }
+        .task-icon.unifi { background-color: #055c9d; }
+        .task-icon.node { background-color: #8b5cf6; }
+        
+        .task-content {
+            flex: 1;
+        }
+        
+        .task-content h4 {
+            margin: 0 0 4px 0;
+        }
+        
+        .task-content p {
+            margin: 0;
+            color: var(--gray);
+            font-size: 14px;
+        }
+        
+        .task-actions {
+            display: flex;
+            gap: 8px;
+        }
+        
+        .code-block {
+            background: #1f2937;
+            color: #f9fafb;
+            padding: 16px;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            overflow-x: auto;
+            margin: 16px 0;
+        }
+        
+        .copy-btn {
+            background: #4b5563;
+            color: white;
+            border: none;
+            padding: 4px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            margin-top: 8px;
+        }
+        
+        .topology-viewer {
+            background: #1f2937;
+            color: #f9fafb;
+            padding: 16px;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            overflow-x: auto;
+            max-height: 400px;
+            margin: 16px 0;
+        }
+        
+        .nav-badge {
+            background-color: var(--danger);
+            color: white;
+            border-radius: 50%;
+            width: 20px;
+            height: 20px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+            margin-left: 8px;
+        }
+        
+        .wizard-nav {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 24px;
+        }
+        
+        .step-indicator {
+            display: flex;
+            justify-content: center;
+            margin-bottom: 24px;
+        }
+        
+        .step {
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            background: #e5e7eb;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 8px;
+            font-weight: bold;
+        }
+        
+        .step.active {
+            background: var(--primary);
+            color: white;
+        }
+        
+        .step.completed {
+            background: var(--success);
+            color: white;
+        }
+    </style>
+</head>
+<body>
+    <div class="container" x-data="networkBootstrap()">
+        <!-- Onboarding Task Panel -->
+        <div class="card" x-show="onboardingTasks.length > 0">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h2>Network Onboarding Tasks <span class="nav-badge" x-text="onboardingTasks.length"></span></h2>
+            </div>
+            <div class="task-list">
+                <template x-for="task in onboardingTasks" :key="task.id">
+                    <div class="task-card">
+                        <div class="task-icon" :class="task.type">
+                            <span x-text="task.type.charAt(0).toUpperCase()"></span>
+                        </div>
+                        <div class="task-content">
+                            <h4 x-text="task.title"></h4>
+                            <p x-text="task.description"></p>
+                            <p><span class="status-badge" :class="'status-' + task.status" x-text="task.status"></span></p>
+                        </div>
+                        <div class="task-actions">
+                            <button class="btn btn-primary" @click="startBootstrapWizard(task)">Configure</button>
+                            <button class="btn btn-outline" @click="dismissTask(task.id)">Dismiss</button>
+                        </div>
+                    </div>
+                </template>
+            </div>
+        </div>
+
+        <!-- Network Bootstrap Wizard -->
+        <div class="card" x-show="showWizard" style="position: relative;">
+            <button @click="showWizard = false" style="position: absolute; top: 16px; right: 16px; background: none; border: none; font-size: 20px; cursor: pointer;">&times;</button>
+            
+            <h2>Network Bootstrap Wizard</h2>
+            
+            <div class="step-indicator">
+                <div class="step" :class="{'active': currentStep === 1, 'completed': currentStep > 1}">1</div>
+                <div class="step" :class="{'active': currentStep === 2, 'completed': currentStep > 2}">2</div>
+                <div class="step" :class="{'active': currentStep === 3, 'completed': currentStep > 3}">3</div>
+            </div>
+            
+            <!-- Step 1: Discover -->
+            <div class="wizard-step" :class="{'active': currentStep === 1}">
+                <h3>Discover Network Devices</h3>
+                <div x-show="!discoveryComplete">
+                    <p>Searching for network devices on your network...</p>
+                    <div style="text-align: center; padding: 20px;">
+                        <div style="border: 4px solid #e5e7eb; border-top: 4px solid var(--primary); border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 0 auto;"></div>
+                    </div>
+                    <button class="btn btn-outline" @click="skipDiscovery">Skip Discovery</button>
+                </div>
+                
+                <div x-show="discoveryComplete && discoveredDevices.length > 0">
+                    <p>Found <span x-text="discoveredDevices.length"></span> device(s):</p>
+                    <div class="device-list">
+                        <template x-for="device in discoveredDevices" :key="device.id">
+                            <div class="device-card">
+                                <h4 x-text="device.model || device.type"></h4>
+                                <p><strong>IP:</strong> <span x-text="device.ip"></span></p>
+                                <p><strong>Type:</strong> <span x-text="device.type"></span></p>
+                                <button class="btn btn-primary" @click="selectDevice(device)">Configure</button>
+                            </div>
+                        </template>
+                    </div>
+                    <button class="btn btn-outline" @click="skipDiscovery">Enter IP Manually</button>
+                </div>
+                
+                <div x-show="discoveryComplete && discoveredDevices.length === 0">
+                    <p>No devices found. You can enter device details manually.</p>
+                    <button class="btn btn-primary" @click="skipDiscovery">Enter IP Manually</button>
+                </div>
+            </div>
+            
+            <!-- Step 2: Credentials -->
+            <div class="wizard-step" :class="{'active': currentStep === 2}">
+                <h3>Enter Device Credentials</h3>
+                <div x-show="selectedDevice.type === 'mikrotik'">
+                    <div class="form-group">
+                        <label for="username">Username</label>
+                        <input type="text" id="username" x-model="credentials.username">
+                    </div>
+                    <div class="form-group">
+                        <label for="password">Password</label>
+                        <input type="password" id="password" x-model="credentials.password">
+                    </div>
+                </div>
+                
+                <div x-show="selectedDevice.type === 'unifi'">
+                    <div class="form-group">
+                        <label for="email">Email / Username</label>
+                        <input type="text" id="email" x-model="credentials.email">
+                    </div>
+                    <div class="form-group">
+                        <label for="password">Password</label>
+                        <input type="password" id="password" x-model="credentials.password">
+                    </div>
+                </div>
+                
+                <div x-show="selectedDevice.type === 'omada'">
+                    <div class="form-group">
+                        <label for="username">Username</label>
+                        <input type="text" id="username" x-model="credentials.username">
+                    </div>
+                    <div class="form-group">
+                        <label for="password">Password</label>
+                        <input type="password" id="password" x-model="credentials.password">
+                    </div>
+                    <div class="form-group">
+                        <label for="controllerUrl">Controller URL</label>
+                        <input type="text" id="controllerUrl" x-model="credentials.controllerUrl">
+                    </div>
+                </div>
+                
+                <div x-show="selectedDevice.type === 'node'">
+                    <div class="form-group">
+                        <label for="ipAddress">IP Address</label>
+                        <input type="text" id="ipAddress" x-model="credentials.ipAddress">
+                    </div>
+                    <div class="form-group">
+                        <label for="port">Port</label>
+                        <input type="text" id="port" x-model="credentials.port">
+                    </div>
+                </div>
+                
+                <button class="btn btn-primary" @click="submitCredentials">Continue</button>
+            </div>
+            
+            <!-- Step 3: Bootstrap Result -->
+            <div class="wizard-step" :class="{'active': currentStep === 3}">
+                <h3>Bootstrap Result</h3>
+                
+                <div x-show="bootstrapResult.success">
+                    <div style="text-align: center; color: var(--success); margin: 20px 0;">
+                        <h1 style="font-size: 48px;">✓</h1>
+                        <h4>Device successfully configured!</h4>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Credentials</label>
+                        <div class="code-block" x-text="JSON.stringify(bootstrapResult.credentials, null, 2)"></div>
+                        <button class="copy-btn" @click="copyToClipboard(JSON.stringify(bootstrapResult.credentials, null, 2))">Copy</button>
+                    </div>
+                    
+                    <button class="btn btn-success" @click="setAsActiveBackend">Set as Active Backend</button>
+                </div>
+                
+                <div x-show="!bootstrapResult.success">
+                    <div style="text-align: center; color: var(--danger); margin: 20px 0;">
+                        <h1 style="font-size: 48px;">✗</h1>
+                        <h4>Bootstrap failed</h4>
+                    </div>
+                    
+                    <p x-text="bootstrapResult.error"></p>
+                    
+                    <div class="form-group">
+                        <label>Manual Steps</label>
+                        <div class="code-block" x-text="bootstrapResult.manualSteps"></div>
+                        <button class="copy-btn" @click="copyToClipboard(bootstrapResult.manualSteps)">Copy</button>
+                    </div>
+                    
+                    <button class="btn btn-outline" @click="retryWithDifferentCredentials">Retry with Different Credentials</button>
+                </div>
+            </div>
+            
+            <div class="wizard-nav">
+                <button class="btn" @click="previousStep" x-show="currentStep > 1">Previous</button>
+                <button class="btn btn-primary" @click="nextStep" x-show="currentStep < 3 && currentStep > 1">Next</button>
+            </div>
+        </div>
+
+        <!-- Network Status Widget -->
+        <div class="card">
+            <h2>Network Status</h2>
+            
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px;">
+                <div class="device-card">
+                    <h4>Routing Backend</h4>
+                    <p><strong>Type:</strong> <span x-text="networkStatus.routing.type || 'Not configured'"></span></p>
+                    <p><strong>Host:</strong> <span x-text="networkStatus.routing.host || 'N/A'"></span></p>
+                    <p><strong>Status:</strong> 
+                        <span class="status-badge" :class="'status-' + (networkStatus.routing.connected ? 'success' : 'error')">
+                            <span x-text="networkStatus.routing.connected ? 'Connected' : 'Disconnected'"></span>
+                        </span>
+                    </p>
+                </div>
+                
+                <div class="device-card">
+                    <h4>Switching Backend</h4>
+                    <p><strong>Type:</strong> <span x-text="networkStatus.switching.type || 'Not configured'"></span></p>
+                    <p><strong>Host:</strong> <span x-text="networkStatus.switching.host || 'N/A'"></span></p>
+                    <p><strong>Status:</strong> 
+                        <span class="status-badge" :class="'status-' + (networkStatus.switching.connected ? 'success' : 'error')">
+                            <span x-text="networkStatus.switching.connected ? 'Connected' : 'Disconnected'"></span>
+                        </span>
+                    </p>
+                </div>
+            </div>
+            
+            <div style="display: flex; gap: 10px;">
+                <button class="btn btn-primary" @click="runDiscovery">Run Discovery</button>
+                <button class="btn" @click="viewTopology">View Topology</button>
+                <button class="btn" @click="provisionLab">Provision Lab</button>
+            </div>
+            
+            <div x-show="showTopology" class="topology-viewer" x-text="JSON.stringify(topologyData, null, 2)"></div>
+        </div>
+    </div>
+
+    <script>
+        function networkBootstrap() {
+            return {
+                // Onboarding tasks
+                onboardingTasks: [
+                    {
+                        id: 'task-1',
+                        type: 'mikrotik',
+                        title: 'Configure MikroTik Router',
+                        description: 'Router needs initial configuration',
+                        status: 'pending'
+                    },
+                    {
+                        id: 'task-2',
+                        type: 'unifi',
+                        title: 'Setup UniFi Controller',
+                        description: 'UniFi controller requires credentials',
+                        status: 'pending'
+                    }
+                ],
+                
+                // Wizard state
+                showWizard: false,
+                currentStep: 1,
+                discoveryComplete: false,
+                discoveredDevices: [],
+                selectedDevice: {},
+                credentials: {},
+                bootstrapResult: {},
+                
+                // Network status
+                networkStatus: {
+                    routing: {
+                        type: 'MikroTik',
+                        host: '192.168.1.1',
+                        connected: true
+                    },
+                    switching: {
+                        type: 'UniFi',
+                        host: '192.168.1.2',
+                        connected: false
+                    }
+                },
+                showTopology: false,
+                topologyData: {},
+                
+                // Methods
+                startBootstrapWizard(task) {
+                    this.selectedDevice = {
+                        id: task.id,
+                        type: task.type,
+                        model: task.title
+                    };
+                    this.showWizard = true;
+                    this.currentStep = 1;
+                    this.runDiscovery();
+                },
+                
+                dismissTask(taskId) {
+                    this.onboardingTasks = this.onboardingTasks.filter(task => task.id !== taskId);
+                },
+                
+                runDiscovery() {
+                    this.discoveryComplete = false;
+                    // Simulate API call
+                    setTimeout(() => {
+                        this.discoveredDevices = [
+                            {
+                                id: 'device-1',
+                                ip: '192.168.1.10',
+                                type: 'mikrotik',
+                                model: 'RB4011iGS+'
+                            },
+                            {
+                                id: 'device-2',
+                                ip: '192.168.1.11',
+                                type: 'unifi',
+                                model: 'UniFi Dream Machine'
+                            }
+                        ];
+                        this.discoveryComplete = true;
+                    }, 2000);
+                },
+                
+                skipDiscovery() {
+                    this.discoveredDevices = [];
+                    this.discoveryComplete = true;
+                    this.selectedDevice = {
+                        id: 'manual',
+                        type: 'mikrotik',
+                        ip: ''
+                    };
+                    this.currentStep = 2;
+                },
+                
+                selectDevice(device) {
+                    this.selectedDevice = device;
+                    this.currentStep = 2;
+                },
+                
+                submitCredentials() {
+                    // Simulate API call
+                    setTimeout(() => {
+                        this.bootstrapResult = {
+                            success: Math.random() > 0.5, // Random success/failure for demo
+                            credentials: {
+                                username: 'admin',
+                                password: 'securePassword123',
+                                host: this.selectedDevice.ip || '192.168.1.10'
+                            },
+                            error: 'Authentication failed',
+                            manualSteps: '1. SSH to device\n2. Run command: /system identity set name="Ozma"\n3. Reboot device'
+                        };
+                        this.currentStep = 3;
+                    }, 1500);
+                },
+                
+                retryWithDifferentCredentials() {
+                    this.currentStep = 2;
+                },
+                
+                setAsActiveBackend() {
+                    alert('Backend set as active!');
+                    this.showWizard = false;
+                    // Remove task from onboarding
+                    this.onboardingTasks = this.onboardingTasks.filter(task => task.id !== this.selectedDevice.id);
+                },
+                
+                nextStep() {
+                    if (this.currentStep < 3) {
+                        this.currentStep++;
+                    }
+                },
+                
+                previousStep() {
+                    if (this.currentStep > 1) {
+                        this.currentStep--;
+                    }
+                },
+                
+                viewTopology() {
+                    this.showTopology = !this.showTopology;
+                    if (this.showTopology) {
+                        // Simulate API call
+                        this.topologyData = {
+                            devices: [
+                                {
+                                    id: 'router-1',
+                                    type: 'mikrotik',
+                                    model: 'RB4011iGS+',
+                                    ip: '192.168.1.1',
+                                    ports: [
+                                        {id: 'ether1', status: 'up', speed: '1000Mbps'},
+                                        {id: 'ether2', status: 'down', speed: '0Mbps'}
+                                    ]
+                                },
+                                {
+                                    id: 'switch-1',
+                                    type: 'unifi',
+                                    model: 'USW-Lite-8-PoE',
+                                    ip: '192.168.1.2',
+                                    ports: [
+                                        {id: 'port1', status: 'up', speed: '1000Mbps', device: 'PC-1'},
+                                        {id: 'port2', status: 'up', speed: '100Mbps', device: 'IP-Camera-1'}
+                                    ]
+                                }
+                            ]
+                        };
+                    }
+                },
+                
+                provisionLab() {
+                    if (confirm('This will provision your network with the lab configuration. Continue?')) {
+                        // Simulate API call
+                        alert('Lab provisioning started!');
+                    }
+                },
+                
+                copyToClipboard(text) {
+                    navigator.clipboard.writeText(text).then(() => {
+                        alert('Copied to clipboard!');
+                    });
+                }
+            }
+        }
+    </script>
+</body>
+</html>
