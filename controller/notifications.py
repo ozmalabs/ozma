@@ -253,7 +253,13 @@ class NotificationManager:
         icon = {"info": "ℹ️", "warning": "⚠️", "critical": "🚨"}.get(level, "📢")
         text = f"{icon} *Ozma {level.upper()}*: `{event}`\n```{json.dumps(data, indent=2)[:500]}```"
         payload = json.dumps({"text": text}).encode()
-        return await self._http_post_with_response(url, payload, "application/json")
+        response = await self._http_post_with_response(url, payload, "application/json")
+        # Store thread ID for context matching
+        if response and 'ts' in response:
+            task = asyncio.current_task()
+            if task:
+                setattr(task, '_thread_id', response['ts'])
+        return response
 
     async def _send_discord(self, url: str, event: str, data: dict, level: str) -> None:
         color = {"info": 3447003, "warning": 16776960, "critical": 15158332}.get(level, 0)

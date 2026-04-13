@@ -4186,12 +4186,10 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             # Audit log if enabled
             if audit_log and audit_log.enabled and os.getenv("MESSAGING_AUDIT") == "1":
                 body_hash = hashlib.sha256(body).hexdigest()[:16]
-                audit_log.log_event(
-                    "messaging.webhook.received",
-                    "controller",
-                    {"channel": channel, "sender": _get_sender_from_webhook(channel, body), 
-                     "body_hash": body_hash},
-                    severity="info"
+                audit_log.log_webhook_event(
+                    channel, 
+                    _get_sender_from_webhook(channel, body), 
+                    body_hash
                 )
             
             return result
