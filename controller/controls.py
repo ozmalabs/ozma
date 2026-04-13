@@ -170,6 +170,8 @@ class ControlManager:
         self._trigger_rules: list[EventTriggerRule] = []
         self._rust_driver_reader: asyncio.StreamReader | None = None
         self._rust_driver_task: asyncio.Task | None = None
+        self._rust_driver_reader: asyncio.StreamReader | None = None
+        self._rust_driver_task: asyncio.Task | None = None
 
     def register_surface(self, surface: ControlSurface) -> None:
         self._surfaces[surface.id] = surface
@@ -182,10 +184,21 @@ class ControlManager:
         
         # Start Rust driver reader
         await self._start_rust_driver_reader()
+        
+        # Start Rust driver reader
+        await self._start_rust_driver_reader()
 
     async def stop(self) -> None:
         for surface in self._surfaces.values():
             await surface.stop()
+        
+        # Stop Rust driver reader
+        if self._rust_driver_task:
+            self._rust_driver_task.cancel()
+            try:
+                await self._rust_driver_task
+            except asyncio.CancelledError:
+                pass
         
         # Stop Rust driver reader
         if self._rust_driver_task:
@@ -219,6 +232,47 @@ class ControlManager:
 
         async with self._action_lock:
             await self._execute_action(binding.action, binding.target, action_value)
+
+    async def _start_rust_driver_reader(self) -> None:
+        """Start reading control events from the Rust driver Unix socket."""
+        try:
+            reader, writer = await asyncio.open_unix_connection("/tmp/ozma-drivers.sock")
+            self._rust_driver_reader = reader
+            
+            async def read_rust_events():
+                try:
+                    while True:
+                        line = await reader.readline()
+                        if not line:
+                            break
+                        try:
+                            event = json.loads(line.decode().strip())
+                            await self._handle_rust_event(event)
+                        except json.JSONDecodeError:
+                            log.warning("Invalid JSON from Rust driver: %s", line)
+                        except Exception as e:
+                            log.warning("Error handling Rust event: %s", e)
+                except Exception as e:
+                    log.warning("Rust driver connection error: %s", e)
+                finally:
+                    if self._rust_driver_reader == reader:
+                        self._rust_driver_reader = None
+            
+            self._rust_driver_task = asyncio.create_task(read_rust_events())
+            log.info("Connected to Rust driver Unix socket")
+        except Exception as e:
+            log.warning("Failed to connect to Rust driver: %s", e)
+
+    async def _handle_rust_event(self, event: dict) -> None:
+        """Handle an event from the Rust driver."""
+        event_type = event.get("type")
+        if event_type == "control_changed":
+            surface_id = event.get("surface_id", "rust-driver")
+            control_name = event.get("control_name")
+            value = event.get("value")
+            if control_name and value is not None:
+                await self.on_control_changed(surface_id, control_name, value)
+        # Add other event types as needed
 
     async def _start_rust_driver_reader(self) -> None:
         """Start reading control events from the Rust driver Unix socket."""
