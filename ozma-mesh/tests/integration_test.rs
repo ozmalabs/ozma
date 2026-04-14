@@ -21,8 +21,7 @@ const IP_B: &str = "10.200.2.1";
 /// Build a `MeshNode` whose `mesh_ip` is overridden to `127.0.0.1` so that
 /// UDP packets actually reach the loopback socket.
 fn loopback_peer(id: &str, port: u16) -> MeshNode {
-    let mut node = MeshNode::new(id);
-    node.port = port;
+    let mut node = MeshNode::new(id, port);
     // mesh_ip is set to 127.0.0.1 for loopback.
     node.mesh_ip = "127.0.0.1".to_string();
     node
@@ -37,20 +36,12 @@ fn loopback_peer(id: &str, port: u16) -> MeshNode {
 async fn two_managers_handshake() -> Result<()> {
     // ── Build node identities ─────────────────────────────────────────────
     let sk_a = WgPrivateKey::generate();
-    let node_a = {
-        let mut node = MeshNode::new("node-a");
-        node.port = PORT_A;
-        node.mesh_ip = "127.0.0.1".to_string();
-        node
-    };
+    let node_a = MeshNode::new("node-a", PORT_A);
+    node_a.mesh_ip = "127.0.0.1".to_string();
 
     let sk_b = WgPrivateKey::generate();
-    let node_b = {
-        let mut node = MeshNode::new("node-b");
-        node.port = PORT_B;
-        node.mesh_ip = "127.0.0.1".to_string();
-        node
-    };
+    let node_b = MeshNode::new("node-b", PORT_B);
+    node_b.mesh_ip = "127.0.0.1".to_string();
 
     let pubkey_a = node_a.wg_pubkey();
     let pubkey_b = node_b.wg_pubkey();
@@ -95,34 +86,25 @@ async fn two_managers_handshake() -> Result<()> {
     Ok(())
 }
 
-/// Adding the same peer twice must return an error.
+/// Adding the same peer twice must return DuplicatePeer error.
 #[tokio::test]
 async fn add_duplicate_peer_returns_error() -> Result<()> {
     let sk = WgPrivateKey::generate();
-    let node = {
-        let mut n = MeshNode::new("mgr");
-        n.port = 59_102;
-        n.mesh_ip = "127.0.0.1".to_string();
-        n
-    };
+    let node = MeshNode::new("mgr", 59_102);
+    node.mesh_ip = "127.0.0.1".to_string();
     let mgr = MeshManager::new(node, sk).await?;
 
-    let peer_node = {
-        let mut n = MeshNode::new("peer-x");
-        n.port = 59_103;
-        n.mesh_ip = "127.0.0.1".to_string();
-        n
-    };
+    let peer_node = MeshNode::new("peer-x", 59_103);
+    peer_node.mesh_ip = "127.0.0.1".to_string();
     let peer_node2 = peer_node.clone();
 
     mgr.add_peer(peer_node).await?;
 
-    // Adding the same peer again must return an error.
+    // Adding the same peer again must return DuplicatePeer.
     let err = mgr.add_peer(peer_node2).await.unwrap_err();
-    // Verify it's some kind of error (具体 variant depends on actual impl)
     assert!(
-        !err.to_string().is_empty(),
-        "expected an error, got nothing"
+        matches!(err, MeshError::DuplicatePeer(_)),
+        "expected DuplicatePeer, got {err:?}"
     );
 
     Ok(())
@@ -132,12 +114,8 @@ async fn add_duplicate_peer_returns_error() -> Result<()> {
 #[tokio::test]
 async fn remove_nonexistent_peer_returns_error() -> Result<()> {
     let sk = WgPrivateKey::generate();
-    let node = {
-        let mut n = MeshNode::new("mgr2");
-        n.port = 59_104;
-        n.mesh_ip = "127.0.0.1".to_string();
-        n
-    };
+    let node = MeshNode::new("mgr2", 59_104);
+    node.mesh_ip = "127.0.0.1".to_string();
     let mgr = MeshManager::new(node, sk).await?;
 
     let err = mgr.remove_peer("ghost").await.unwrap_err();
@@ -153,24 +131,16 @@ async fn remove_nonexistent_peer_returns_error() -> Result<()> {
 #[tokio::test]
 async fn local_node_and_peer_ids_accessors() -> Result<()> {
     let sk_a = WgPrivateKey::generate();
-    let node_a = {
-        let mut n = MeshNode::new("node-a");
-        n.port = PORT_A;
-        n.mesh_ip = "127.0.0.1".to_string();
-        n
-    };
+    let node_a = MeshNode::new("node-a", PORT_A);
+    node_a.mesh_ip = "127.0.0.1".to_string();
     let sk_b = WgPrivateKey::generate();
-    let node_b = {
-        let mut n = MeshNode::new("node-b");
-        n.port = PORT_B;
-        n.mesh_ip = "127.0.0.1".to_string();
-        n
-    };
+    let node_b = MeshNode::new("node-b", PORT_B);
+    node_b.mesh_ip = "127.0.0.1".to_string();
 
     let mgr_a = MeshManager::new(node_a.clone(), sk_a).await?;
 
     // Verify the local node matches what we passed in.
-    let local = mgr_a.node();
+    let local = mgr_a.local_node();
     assert_eq!(local.id, "node-a");
 
     // Initially no peers
