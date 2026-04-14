@@ -14,8 +14,8 @@ use std::{
     time::Duration,
 };
 
-use chrono::Utc;
-use icalendar::{properties::DtEnd, properties::DtStart, Component, DatetimeProperties};
+use chrono::{DateTime, Utc};
+use icalendar::{parser::properties::ParsedProperty, Component, Property};
 use sysinfo::{ProcessRefreshKind, RefreshKind, System};
 use tracing::{debug, info};
 
@@ -125,6 +125,14 @@ fn find_ics_files(extra_paths: &[PathBuf]) -> Vec<PathBuf> {
     files
 }
 
+/// Extract a datetime from a property, handling both DATE and DATETIME formats.
+fn extract_datetime(prop: Option<&Property>) -> Option<DateTime<Utc>> {
+    prop.and_then(|p| {
+        p.get_date_time()
+            .or_else(|| p.get_date())
+    })
+}
+
 /// Parse a single ICS file and return events whose time window contains now.
 fn parse_active_events(path: &Path) -> Vec<CalendarEvent> {
     let Ok(content) = std::fs::read_to_string(path) else {
@@ -147,41 +155,49 @@ fn parse_active_events(path: &Path) -> Vec<CalendarEvent> {
         };
 
         // Only include events whose window contains now.
-        // Use typed_property API (icalendar 0.15)
-        let start_dt = ev.typed_property::<DtStart>();
-        let end_dt   = ev.typed_property::<DtEnd>();
+        // Use get_property() API (icalendar 0.15)
+        let start_dt = extract_datetime(ev.get_property("DTSTART"));
+        let end_dt   = extract_datetime(ev.get_property("DTEND"));
 
         let active = match (start_dt, end_dt) {
-            (Some(start), Some(end)) => {
-                let s = start.datetime();
-                let e = end.datetime();
-                matches!((s, e), (Some(s), Some(e)) if s <= now && now <= e)
-            }
+            (Some(s), Some(e)) => s <= now && now <= e,
             _ => false,
         };
         if !active {
             continue;
         }
 
+        // Use get_property() for UID (icalendar 0.15)
         let uid = ev
-            .property_value("UID")
+            .get_property("UID")
+            .and_then(|p| p.get_value().as_str())
             .unwrap_or("")
             .to_string();
+
+        // Use get_summary() with proper value extraction (icalendar 0.15)
         let summary = ev
             .get_summary()
-            .map(|s| s.to_string())
-            .unwrap_or_default();
+            .and_then(|s| s.get_value().as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        // Use get_property() for ORGANIZER (icalendar 0.15)
         let organizer = ev
-            .property_value("ORGANIZER")
+            .get_property("ORGANIZER")
+            .and_then(|p| p.get_value().as_str())
             .unwrap_or("")
             .trim_start_matches("mailto:")
             .to_string();
 
-        // Use iter() method on Property iterable (icalendar 0.15)
+        // Use iter_properties() method on Event (icalendar 0.15)
         let attendees: Vec<String> = ev
-            .iter()
+            .iter_properties()
             .filter(|p| p.get_key().eq_ignore_ascii_case("ATTENDEE"))
-            .filter_map(|p| p.get_value().as_str().map(|v| v.trim_start_matches("mailto:").to_string()))
+            .filter_map(|p| {
+                p.get_value()
+                    .as_str()
+                    .map(|v| v.trim_start_matches("mailto:").to_string())
+            })
             .collect();
 
         events.push(CalendarEvent { uid, summary, organizer, attendees });
