@@ -125,17 +125,17 @@ fn find_ics_files(extra_paths: &[PathBuf]) -> Vec<PathBuf> {
     files
 }
 
-/// Extract string value from a PropertyValue (icalendar 0.15)
+/// Extract string value from a &PropertyValue (icalendar 0.15)
 fn extract_property_string(value: &icalendar::PropertyValue) -> Option<String> {
     match value {
-        icalendar::PropertyValue::Text(s) => Some(s.clone()),
-        icalendar::PropertyValue::CalAddress(s) => Some(s.clone()),
-        icalendar::PropertyValue::Uri(s) => Some(s.clone()),
+        icalendar::PropertyValue::Text(s) => Some(s.to_string()),
+        icalendar::PropertyValue::CalAddress(s) => Some(s.to_string()),
+        icalendar::PropertyValue::Uri(s) => Some(s.to_string()),
         _ => None,
     }
 }
 
-/// Extract datetime from PropertyValue (icalendar 0.15)
+/// Extract datetime from &PropertyValue (icalendar 0.15)
 fn extract_datetime(value: &icalendar::PropertyValue) -> Option<DateTime<Utc>> {
     match value {
         icalendar::PropertyValue::DateTime(dt) => Some(*dt),
@@ -167,9 +167,9 @@ fn parse_active_events(path: &Path) -> Vec<CalendarEvent> {
             None => continue,
         };
 
-        // icalendar 0.15: get_start/get_end return Option<DateTime<Utc>>
-        let start_dt = ev.get_start();
-        let end_dt   = ev.get_end();
+        // icalendar 0.15: start_datetime()/end_datetime() return Option<DateTime<Utc>>
+        let start_dt = ev.start_datetime();
+        let end_dt   = ev.end_datetime();
 
         let active = match (start_dt, end_dt) {
             (Some(s), Some(e)) => s <= now && now <= e,
@@ -179,36 +179,36 @@ fn parse_active_events(path: &Path) -> Vec<CalendarEvent> {
             continue;
         }
 
-        // icalendar 0.15: get_property returns Option<&Property>
+        // icalendar 0.15: property() returns Option<&Property>
+        // Property has value() returning &PropertyValue
         let uid = ev
-            .get_property("UID")
+            .property("UID")
             .and_then(|p| {
-                // Property has get_value() returning &PropertyValue
-                extract_property_string(p.get_value())
+                extract_property_string(p.value())
             })
             .unwrap_or_default();
 
-        // icalendar 0.15: get_summary() returns Option<&Summary>
+        // icalendar 0.15: summary() returns Option<&Summary>
         // Summary implements Display
         let summary = ev
-            .get_summary()
+            .summary()
             .map(|s| s.to_string())
             .unwrap_or_default();
 
-        // icalendar 0.15: get_property for ORGANIZER
+        // icalendar 0.15: property() for ORGANIZER
         let organizer = ev
-            .get_property("ORGANIZER")
+            .property("ORGANIZER")
             .and_then(|p| {
-                extract_property_string(p.get_value())
+                extract_property_string(p.value())
             })
             .map(|s| s.trim_start_matches("mailto:").to_string())
             .unwrap_or_default();
 
-        // icalendar 0.15: get_properties returns iterator over &Property
+        // icalendar 0.15: properties() returns iterator over &Property
         let attendees: Vec<String> = ev
-            .get_properties("ATTENDEE")
+            .properties("ATTENDEE")
             .filter_map(|p| {
-                extract_property_string(p.get_value())
+                extract_property_string(p.value())
                     .map(|s| s.trim_start_matches("mailto:").to_string())
             })
             .collect();
