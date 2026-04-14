@@ -15,7 +15,7 @@ use std::{
 };
 
 use chrono::Utc;
-use icalendar::{CalendarDateTime, Component, DatePerhapsTime};
+use icalendar::{properties::DtEnd, properties::DtStart, Component, DatetimeProperties};
 use sysinfo::{ProcessRefreshKind, RefreshKind, System};
 use tracing::{debug, info};
 
@@ -125,19 +125,6 @@ fn find_ics_files(extra_paths: &[PathBuf]) -> Vec<PathBuf> {
     files
 }
 
-/// Convert a `DatePerhapsTime` to a UTC `DateTime`, best-effort.
-fn dpt_to_utc(dpt: DatePerhapsTime) -> Option<chrono::DateTime<Utc>> {
-    match dpt {
-        DatePerhapsTime::DateTime(CalendarDateTime::Utc(dt)) => Some(dt),
-        DatePerhapsTime::DateTime(CalendarDateTime::Floating(ndt)) => Some(ndt.and_utc()),
-        DatePerhapsTime::DateTime(CalendarDateTime::WithTimezone { date_time, .. }) => {
-            // Best effort: treat floating datetime as UTC when no tz lookup available.
-            Some(date_time.and_utc())
-        }
-        DatePerhapsTime::Date(nd) => nd.and_hms_opt(0, 0, 0).map(|ndt| ndt.and_utc()),
-    }
-}
-
 /// Parse a single ICS file and return events whose time window contains now.
 fn parse_active_events(path: &Path) -> Vec<CalendarEvent> {
     let Ok(content) = std::fs::read_to_string(path) else {
@@ -160,11 +147,15 @@ fn parse_active_events(path: &Path) -> Vec<CalendarEvent> {
         };
 
         // Only include events whose window contains now.
-        let active = match (ev.get_start(), ev.get_end()) {
-            (Some(s), Some(e)) => {
-                let s_dt = dpt_to_utc(s);
-                let e_dt = dpt_to_utc(e);
-                matches!((s_dt, e_dt), (Some(s), Some(e)) if s <= now && now <= e)
+        // Use typed_property API (icalendar 0.15)
+        let start_dt = ev.typed_property::<DtStart>();
+        let end_dt   = ev.typed_property::<DtEnd>();
+
+        let active = match (start_dt, end_dt) {
+            (Some(start), Some(end)) => {
+                let s = start.datetime();
+                let e = end.datetime();
+                matches!((s, e), (Some(s), Some(e)) if s <= now && now <= e)
             }
             _ => false,
         };
@@ -174,19 +165,23 @@ fn parse_active_events(path: &Path) -> Vec<CalendarEvent> {
 
         let uid = ev
             .property_value("UID")
-            .unwrap_or_default()
+            .unwrap_or("")
             .to_string();
-        let summary   = ev.get_summary().unwrap_or_default().to_string();
+        let summary = ev
+            .get_summary()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
         let organizer = ev
             .property_value("ORGANIZER")
-            .unwrap_or_default()
+            .unwrap_or("")
             .trim_start_matches("mailto:")
             .to_string();
+
+        // Use iter() method on Property iterable (icalendar 0.15)
         let attendees: Vec<String> = ev
-            .multi_properties()
             .iter()
-            .filter(|p| p.key().eq_ignore_ascii_case("ATTENDEE"))
-            .map(|p| p.value().trim_start_matches("mailto:").to_string())
+            .filter(|p| p.get_key().eq_ignore_ascii_case("ATTENDEE"))
+            .filter_map(|p| p.get_value().as_str().map(|v| v.trim_start_matches("mailto:").to_string()))
             .collect();
 
         events.push(CalendarEvent { uid, summary, organizer, attendees });
@@ -323,8 +318,9 @@ impl MeetingDetector {
     /// Returns `true` if any running process name contains one of `names`
     /// (case-insensitive substring match).
     fn process_running(&self, names: &[&str]) -> bool {
-        self.sys.processes().values().any(|proc| {
-            let pname = proc.name().to_lowercase();
+        // sysinfo 0.30: processes() returns an iterator directly
+        self.sys.processes().any(|(_, proc)| {
+            let pname = proc.name().to_string_lossy().to_lowercase();
             names.iter().any(|n| pname.contains(*n))
         })
     }
