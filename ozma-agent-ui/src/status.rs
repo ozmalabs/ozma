@@ -194,14 +194,21 @@ pub struct StatusWindow {
     shared: std::sync::Arc<tokio::sync::RwLock<SharedState>>,
     /// Last time we polled /api/v1/status.
     last_poll: Instant,
+    /// Last time we measured latency (ping).
+    last_latency_check: Instant,
     /// Collapsed state for mesh peers section.
     mesh_peers_open: bool,
     /// Uptime start time.
     start_time: Instant,
+    /// Latest status response for extracting mesh peers.
+    latest_status: std::sync::Arc<tokio::sync::RwLock<Option<StatusResponse>>>,
 }
 
 impl StatusWindow {
-    pub fn new(cc: &eframe::CreationContext<'_>, shared: std::sync::Arc<tokio::sync::RwLock<SharedState>>) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        shared: std::sync::Arc<tokio::sync::RwLock<SharedState>>,
+    ) -> Self {
         let fonts = &mut cc.egui_ctx.memory().fonts;
         fonts
             .definitely_add_font(&include_bytes!("../assets/Inter-SemiBold.ttf")[..]);
@@ -211,8 +218,10 @@ impl StatusWindow {
         Self {
             shared,
             last_poll: Instant::now() - Duration::from_secs(5), // poll immediately on first frame
+            last_latency_check: Instant::now() - Duration::from_secs(6), // ping immediately
             mesh_peers_open: false,
             start_time: Instant::now(),
+            latest_status: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
@@ -228,29 +237,101 @@ impl StatusWindow {
             s.controller_url.clone()
         };
 
-        // Spawn HTTP GET — we do a simple blocking req in this context
-        // but in a real app you'd use tokio::spawn + channel.
-        let url_clone = url.clone();
+        let status_store = self.latest_status.clone();
+        let shared_clone = std::sync::Arc::clone(&self.shared);
+
+        // Spawn HTTP GET for status — use tokio runtime from the app
         std::thread::spawn(move || {
             let client = reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(3))
                 .build()
-                .ok()?;
-            let resp: StatusResponse = client
-                .get(format!("{}/api/v1/status", url_clone))
-                .send()
-                .ok()?
-                .json()
-                .ok()?;
-            Some(resp)
+                .ok();
+            let client = match client {
+                Some(c) => c,
+                None => return,
+            };
+
+            // Fetch status
+            if let Ok(resp) = client.get(format!("{}/api/v1/status", url)).send() {
+                if let Ok(status) = resp.json::<StatusResponse>() {
+                    // Store the status for mesh peers
+                    let status_store2 = status_store.clone();
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build();
+                        if let Ok(rt) = rt {
+                            rt.block_on(async {
+                                let mut guard = status_store2.write().await;
+                                *guard = Some(status);
+                            });
+                        }
+                    });
+
+                    // Update mesh peers in shared state
+                    let peers = status.mesh_peers.unwrap_or_default();
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build();
+                    if let Ok(rt) = rt {
+                        rt.block_on(async {
+                            let mut shared = shared_clone.write().await;
+                            shared.mesh_peers = peers;
+                        });
+                    }
+                }
+            }
+        });
+    }
+
+    fn measure_latency(&mut self) {
+        let now = Instant::now();
+        if now.duration_since(self.last_latency_check) < Duration::from_secs(5) {
+            return;
+        }
+        self.last_latency_check = now;
+
+        let url = {
+            let s = self.shared.blocking_read();
+            s.controller_url.clone()
+        };
+
+        let shared_clone = std::sync::Arc::clone(&self.shared);
+
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            let client = reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .ok();
+            let client = match client else { return };
+
+            if client.get(format!("{}/health", url)).send().is_ok() {
+                let latency = start.elapsed().as_millis() as u32;
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build();
+                if let Ok(rt) = rt {
+                    rt.block_on(async {
+                        let mut shared = shared_clone.write().await;
+                        shared.latency_ms = Some(latency);
+                    });
+                }
+            }
         });
     }
 }
 
 impl eframe::App for StatusWindow {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Measure latency every 5s
+        self.measure_latency();
+
         // Refresh every 5s even if no user interaction.
         self.poll_status(ctx);
+
+        // Update uptime in shared state
+        let uptime = self.start_time.elapsed();
 
         // ── Top bar ──────────────────────────────────────────────────────────────
         TopBottomPanel::top("connection_banner")
@@ -258,24 +339,32 @@ impl eframe::App for StatusWindow {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     // Status dot
-                    let shared = self.shared.blocking_read();
                     let (dot_color, label, latency_str, uptime_str) = {
-                        let s = &*shared;
+                        let s = self.shared.blocking_read();
                         (
                             s.tray_state.color(),
                             s.tray_state.label(),
                             s.latency_ms.map(|ms| format!("{ms}ms")).unwrap_or_else(|| "—".into()),
-                            format_uptime(s.uptime),
+                            format_uptime(uptime),
                         )
                     };
-                    drop(shared);
 
-                    let dot = eframe::egui::widgets::CircleShape::filled(6.0, dot_color);
-                    ui.add(egui:: widgets::Indicator::new(dot));
+                    // Use a filled circle as the status indicator
+                    let dot = egui::paint::CircleShape::filled(6.0, dot_color);
+                    ui.add(egui::widgets::Image::new(
+                        egui::include_image!("../assets/status_dot.png"),
+                        egui::Vec2::splat(12.0),
+                    ));
+
+                    let controller_url = {
+                        let s = self.shared.blocking_read();
+                        s.controller_url.clone()
+                    };
 
                     let text = format!(
-                        "🟢 {}  |  Latency: {}  |  Uptime: {}",
+                        "🟢 {} to {}  |  Latency: {}  |  Uptime: {}",
                         label,
+                        controller_url,
                         latency_str,
                         uptime_str,
                     );
@@ -536,19 +625,20 @@ impl StatusWindow {
             if btn(pause_label, pause_hover).clicked() {
                 let mut s = self.shared.blocking_write();
                 s.paused = !s.paused;
-                s.tray_state = if s.paused { TrayState::Paused } else { TrayState::Connecting };
+                s.tray_state = if s.paused { TrayState::Paused } else { TrayState::Connected };
+                // Request repaint to update UI immediately
+                ctx.request_repaint();
             }
 
             ui.add_space(8.0);
 
             // Reconnect
             if btn("⟳ Reconnect", "Force reconnect to the controller").clicked() {
-                // Trigger reconnect in app
-                let _ = ctx
-                    .memory()
-                    .data
-                    .get::<()>("reconnect_tx")
-                    .map(|tx: &tokio::sync::mpsc::Sender<()>| tx.try_send(()));
+                // Reset state to connecting
+                let mut s = self.shared.blocking_write();
+                s.tray_state = TrayState::Connecting;
+                s.latency_ms = None;
+                ctx.request_repaint();
             }
 
             ui.add_space(8.0);
