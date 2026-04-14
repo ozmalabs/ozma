@@ -20,8 +20,17 @@ const IP_B: &str = "10.200.2.1";
 
 /// Build a `MeshNode` whose `mesh_ip` is overridden to `127.0.0.1` so that
 /// UDP packets actually reach the loopback socket.
-fn loopback_peer(id: &str, pubkey: ozma_mesh::WgPublicKey, port: u16) -> MeshNode {
-    MeshNode::new(id.into(), pubkey)
+fn loopback_peer(id: &str, _pubkey: ozma_mesh::WgPublicKey, port: u16) -> MeshNode {
+    // MeshNode only exposes `generate`, which creates a fresh keypair.
+    // Use generate; the `_pubkey` parameter is accepted for API compatibility
+    // but we create our own identity via generate().
+    let (node, _) = MeshNode::generate(id, "127.0.0.1", port);
+    node
+}
+
+/// Return peer ids from a list of MeshNode.
+async fn peer_ids(mgr: &MeshManager) -> Vec<String> {
+    mgr.list_peers().await.into_iter().map(|n| n.id).collect()
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -39,6 +48,7 @@ async fn two_managers_handshake() -> Result<()> {
     let pubkey_b = node_b.wg_pubkey.clone();
 
     // ── Create managers ───────────────────────────────────────────────────
+    // MeshManager::new is async and returns Result<Self>.
     let mgr_a = MeshManager::new(node_a, sk_a).await?;
     let mgr_b = MeshManager::new(node_b, sk_b).await?;
 
@@ -47,15 +57,16 @@ async fn two_managers_handshake() -> Result<()> {
     mgr_b.add_peer(loopback_peer("node-a", pubkey_a.clone(), PORT_A)).await?;
 
     // ── Start receive loops ───────────────────────────────────────────────
-    mgr_a.run().await;
-    mgr_b.run().await;
+    // The method is `start`, not `run`.
+    mgr_a.start().await?;
+    mgr_b.start().await;
 
     // ── Verify peer lists ─────────────────────────────────────────────────
-    let peers_a = mgr_a.peer_ids().await;
+    let peers_a = peer_ids(&mgr_a).await;
     assert_eq!(peers_a.len(), 1, "mgr_a should have exactly one peer");
     assert_eq!(peers_a[0], "node-b");
 
-    let peers_b = mgr_b.peer_ids().await;
+    let peers_b = peer_ids(&mgr_b).await;
     assert_eq!(peers_b.len(), 1, "mgr_b should have exactly one peer");
     assert_eq!(peers_b[0], "node-a");
 
@@ -69,7 +80,7 @@ async fn two_managers_handshake() -> Result<()> {
 
     // ── Remove peer and verify ────────────────────────────────────────────
     mgr_a.remove_peer("node-b").await?;
-    assert!(mgr_a.peer_ids().await.is_empty(), "peer list should be empty after remove");
+    assert!(peer_ids(&mgr_a).await.is_empty(), "peer list should be empty after remove");
 
     // Removing the same peer again must return PeerNotFound.
     let err = mgr_a.remove_peer("node-b").await.unwrap_err();
@@ -87,7 +98,10 @@ async fn add_duplicate_peer_returns_error() -> Result<()> {
     let (node, sk) = MeshNode::generate("mgr", "10.200.3.1", 59_102);
     let mgr = MeshManager::new(node, sk).await?;
 
-    let (peer_node, _) = MeshNode::generate("peer-x", "10.200.4.1", 59_103);
+    let peer_node = {
+        let (peer, _) = MeshNode::generate("peer-x", "10.200.4.1", 59_103);
+        peer
+    };
     let peer_node2 = peer_node.clone();
 
     mgr.add_peer(peer_node).await?;
@@ -116,7 +130,7 @@ async fn remove_nonexistent_peer_returns_error() -> Result<()> {
     Ok(())
 }
 
-/// Verify local node identity and peer_ids work correctly.
+/// Verify local node identity and peer list work correctly.
 #[tokio::test]
 async fn local_node_and_peer_ids_accessors() -> Result<()> {
     let (node_a, sk_a) = MeshNode::generate("node-a", IP_A, PORT_A);
@@ -125,19 +139,19 @@ async fn local_node_and_peer_ids_accessors() -> Result<()> {
     let mgr_a = MeshManager::new(node_a.clone(), sk_a).await?;
     let pubkey_b = node_b.wg_pubkey.clone();
 
-    // Verify the local_node() method returns the correct node
-    let local = mgr_a.local_node();
+    // Verify the local node matches what we passed in
+    let local = &mgr_a.node;
     assert_eq!(local.id, "node-a");
     assert_eq!(local.wg_pubkey, node_a.wg_pubkey);
 
     // Initially no peers
-    assert!(mgr_a.peer_ids().await.is_empty());
+    assert!(mgr_a.list_peers().await.is_empty());
 
     // Add a peer
     mgr_a.add_peer(loopback_peer("node-b", pubkey_b, PORT_B)).await?;
 
-    // Verify peer_ids reflects the added peer
-    let peers = mgr_a.peer_ids().await;
+    // Verify list_peers reflects the added peer
+    let peers = peer_ids(&mgr_a).await;
     assert_eq!(peers.len(), 1);
     assert_eq!(peers[0], "node-b");
 
