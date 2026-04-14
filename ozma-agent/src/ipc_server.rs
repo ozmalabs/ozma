@@ -3,7 +3,7 @@
 //! This server uses OS-specific mechanisms (Unix sockets on Linux/macOS, Named Pipes on Windows)
 //! to provide a secure channel for approval and event traffic.
 
-use crate::approvals::{ActionType, ApprovalConfig, ApprovalQueue, ApprovalRequest, ApprovalState, AgentEvent};
+use crate::approvals::{ActionType, AgentEvent, ApprovalConfig, ApprovalQueue, ApprovalRequest, ApprovalState};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
@@ -17,7 +17,7 @@ enum IpcRequest {
     Approve { id: Uuid },
     Deny { id: Uuid },
     GetConfig,
-    SetConfig { modes: HashMap<ActionType, String> },
+    SetConfig { modes: HashMap<String, String> },
     Subscribe,
 }
 
@@ -26,13 +26,14 @@ enum IpcRequest {
 enum IpcResponse {
     Approvals { approvals: Vec<ApprovalRequest> },
     Ok { ok: bool },
-    Config { modes: HashMap<ActionType, String> },
+    Config { modes: HashMap<String, String> },
     Error { error: String },
 }
 
 /// Starts the privileged IPC socket/pipe server.
 pub async fn serve(queue: Arc<ApprovalQueue>) -> Result<()> {
     let path = socket_path();
+
     #[cfg(unix)]
     {
         let listener = bind_socket(&path).await?;
@@ -79,6 +80,11 @@ pub async fn serve(queue: Arc<ApprovalQueue>) -> Result<()> {
         }
     }
 
+    #[cfg(not(any(unix, windows)))]
+    {
+        anyhow::bail!("Unsupported platform for IPC server");
+    }
+
     Ok(())
 }
 
@@ -120,9 +126,6 @@ async fn bind_socket(path: &std::path::Path) -> Result<tokio::net::UnixListener>
 
     // Set group ownership to "ozma" and mode 0660 so any user in the ozma group
     // can connect, but others cannot.
-    // NOTE: In a real deployment, the systemd unit would handle RuntimeDirectory=ozma
-    // and permissions would be managed by the service manager.
-    // We look up the "ozma" group by name; if it doesn't exist, skip chown.
     if let Ok(ozma_gid) = lookup_ozma_gid() {
         use std::os::unix::fs::PermissionsExt;
         nix::unistd::chown(path, None, Some(ozma_gid)).context("Failed to chown socket")?;
@@ -142,7 +145,6 @@ async fn bind_socket(path: &std::path::Path) -> Result<tokio::net::UnixListener>
 #[cfg(unix)]
 fn lookup_ozma_gid() -> Result<nix::unistd::Gid, std::io::Error> {
     use std::ffi::CString;
-    // getgrnam_r is thread-safe; fall back to getgrnam if unavailable
     let cstr = CString::new("ozma").map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid group name")
     })?;
@@ -168,6 +170,51 @@ fn lookup_ozma_gid() -> Result<nix::unistd::Gid, std::io::Error> {
     }
 }
 
+async fn send_response<S>(stream: &mut S, response: IpcResponse) -> Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    let json = serde_json::to_vec(&response)?;
+    let len = (json.len() as u32).to_le_bytes();
+    stream.write_all(&len).await?;
+    stream.write_all(&json).await?;
+    Ok(())
+}
+
+fn parse_request_type(modes: HashMap<String, String>) -> HashMap<ActionType, String> {
+    modes
+        .into_iter()
+        .filter_map(|(k, v)| {
+            let action = match k.as_str() {
+                "screen_capture" => ActionType::ScreenCapture,
+                "keyboard_input" => ActionType::KeyboardInput,
+                "mouse_click" => ActionType::MouseClick,
+                "file_access" => ActionType::FileAccess,
+                "network_request" => ActionType::NetworkRequest,
+                _ => return None,
+            };
+            Some((action, v))
+        })
+        .collect()
+}
+
+fn serialize_config(config: ApprovalConfig) -> HashMap<String, String> {
+    config
+        .modes
+        .into_iter()
+        .map(|(k, v)| {
+            let key = match k {
+                ActionType::ScreenCapture => "screen_capture",
+                ActionType::KeyboardInput => "keyboard_input",
+                ActionType::MouseClick => "mouse_click",
+                ActionType::FileAccess => "file_access",
+                ActionType::NetworkRequest => "network_request",
+            };
+            (key.to_string(), v)
+        })
+        .collect()
+}
+
 async fn handle_client<S>(mut stream: S, queue: Arc<ApprovalQueue>) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -177,8 +224,10 @@ where
     loop {
         // Read 4-byte length prefix
         let mut len_buf = [0u8; 4];
-        if stream.read_exact(&mut len_buf).await.is_err() {
-            break; // Client disconnected
+        match stream.read_exact(&mut len_buf).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
         }
         let len = u32::from_le_bytes(len_buf) as usize;
 
@@ -210,10 +259,14 @@ where
             }
             IpcRequest::GetConfig => {
                 let config = queue.get_config().await;
-                send_response(&mut stream, IpcResponse::Config { modes: config.modes }).await?;
+                let modes = serialize_config(config);
+                send_response(&mut stream, IpcResponse::Config { modes }).await?;
             }
             IpcRequest::SetConfig { modes } => {
-                queue.set_config(ApprovalConfig { modes }).await;
+                let config = ApprovalConfig {
+                    modes: parse_request_type(modes),
+                };
+                queue.set_config(config).await;
                 send_response(&mut stream, IpcResponse::Ok { ok: true }).await?;
             }
             IpcRequest::Subscribe => {
@@ -291,10 +344,14 @@ async fn handle_windows_client(
             }
             IpcRequest::GetConfig => {
                 let config = queue.get_config().await;
-                send_response_win(&mut server, IpcResponse::Config { modes: config.modes }).await?;
+                let modes = serialize_config(config);
+                send_response_win(&mut server, IpcResponse::Config { modes }).await?;
             }
             IpcRequest::SetConfig { modes } => {
-                queue.set_config(ApprovalConfig { modes }).await;
+                let config = ApprovalConfig {
+                    modes: parse_request_type(modes),
+                };
+                queue.set_config(config).await;
                 send_response_win(&mut server, IpcResponse::Ok { ok: true }).await?;
             }
             IpcRequest::Subscribe => {
@@ -322,17 +379,6 @@ async fn handle_windows_client(
 
 #[cfg(windows)]
 async fn send_response_win<S>(stream: &mut S, response: IpcResponse) -> Result<()>
-where
-    S: tokio::io::AsyncWrite + Unpin,
-{
-    let json = serde_json::to_vec(&response)?;
-    let len = (json.len() as u32).to_le_bytes();
-    stream.write_all(&len).await?;
-    stream.write_all(&json).await?;
-    Ok(())
-}
-
-async fn send_response<S>(stream: &mut S, response: IpcResponse) -> Result<()>
 where
     S: tokio::io::AsyncWrite + Unpin,
 {

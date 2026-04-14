@@ -18,7 +18,10 @@ mod register;
 
 use anyhow::Result;
 use clap::Parser;
+use std::sync::Arc;
 use tracing::{error, info};
+
+use approvals::ApprovalQueue;
 
 /// ozma-agent: desktop seat agent daemon.
 #[derive(Parser, Debug)]
@@ -69,7 +72,7 @@ async fn main() -> Result<()> {
     let registry = metrics::build_registry();
 
     // Approval queue — shared by IPC server and future capture/RPA code.
-    let queue = approvals::ApprovalQueue::new();
+    let queue: Arc<ApprovalQueue> = ApprovalQueue::new();
 
     let api_addr = format!("{}:{}", cli.api_host, cli.api_port);
     let metrics_addr = format!("{}:{}", cli.api_host, cli.metrics_port);
@@ -78,7 +81,7 @@ async fn main() -> Result<()> {
 
     // Spawn all tasks concurrently; if any exits with an error, propagate it.
     let (r1, r2, r3, r4, r5, r6) = tokio::join!(
-        tokio::spawn(api::serve(api_addr)),
+        tokio::spawn(api::serve_with_queue(api_addr, queue.clone())),
         tokio::spawn(ipc_server::serve(queue.clone())),
         tokio::spawn(capture::run()),
         tokio::spawn(metrics::serve(metrics_addr, registry)),
@@ -90,7 +93,7 @@ async fn main() -> Result<()> {
         match result {
             Ok(Ok(())) => {}
             Ok(Err(e)) => error!("task error: {e:#}"),
-            Err(e)     => error!("task panicked: {e}"),
+            Err(e) => error!("task panicked: {e}"),
         }
     }
 

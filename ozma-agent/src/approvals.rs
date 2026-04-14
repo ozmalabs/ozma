@@ -105,3 +105,15 @@ impl ApprovalQueue {
         *cfg = config;
     }
 }
+
+impl Default for ApprovalQueue {
+    fn default() -> Self {
+        Self {
+            pending: RwLock::new(HashMap::new()),
+            tx: broadcast::channel(100).0,
+            config: RwLock::new(ApprovalConfig {
+                modes: HashMap::new(),
+            }),
+        }
+    }
+}
