@@ -128,9 +128,9 @@ fn find_ics_files(extra_paths: &[PathBuf]) -> Vec<PathBuf> {
 /// Extract string value from a &PropertyValue (icalendar 0.15)
 fn extract_property_string(value: &icalendar::PropertyValue) -> Option<String> {
     match value {
-        icalendar::PropertyValue::Text(s) => Some(s.to_string()),
-        icalendar::PropertyValue::CalAddress(s) => Some(s.to_string()),
-        icalendar::PropertyValue::Uri(s) => Some(s.to_string()),
+        icalendar::PropertyValue::Text(s) => Some(s.clone()),
+        icalendar::PropertyValue::CalAddress(s) => Some(s.clone()),
+        icalendar::PropertyValue::Uri(s) => Some(s.clone()),
         _ => None,
     }
 }
@@ -167,9 +167,9 @@ fn parse_active_events(path: &Path) -> Vec<CalendarEvent> {
             None => continue,
         };
 
-        // icalendar 0.15: start() and end() return Option<&DateTime<Utc>>
-        let start_dt = ev.start();
-        let end_dt   = ev.end();
+        // icalendar 0.15: use get_start() and get_end() methods
+        let start_dt = ev.get_start();
+        let end_dt   = ev.get_end();
 
         let active = match (start_dt, end_dt) {
             (Some(s), Some(e)) => {
@@ -184,41 +184,41 @@ fn parse_active_events(path: &Path) -> Vec<CalendarEvent> {
             continue;
         }
 
-        // icalendar 0.15: get_property("UID") returns Option<&Property>
-        // Property has get_value() returning &PropertyValue
+        // icalendar 0.15: use property_value() to get the raw value and extract
         let uid = ev
-            .get_property("UID")
-            .and_then(|p| p.get_value())
-            .and_then(extract_property_string)
-            .unwrap_or_default();
+            .property_value("UID")
+            .and_then(|v| extract_property_string(v));
 
-        // icalendar 0.15: summary() returns Option<&Summary>
-        // Summary implements Display, so use Display trait to_string()
-        let summary = ev
-            .summary()
+        // icalendar 0.15: use get_summary() or summary() with the correct API
+        // Summary is returned as &str via get_summary()
+        let summary = ev.get_summary()
             .map(|s| s.to_string())
             .unwrap_or_default();
 
-        // icalendar 0.15: get_property("ORGANIZER")
+        // icalendar 0.15: use property_value() for ORGANIZER
         let organizer = ev
-            .get_property("ORGANIZER")
-            .and_then(|p| p.get_value())
+            .property_value("ORGANIZER")
             .and_then(extract_property_string)
             .map(|s| s.trim_start_matches("mailto:").to_string())
             .unwrap_or_default();
 
-        // icalendar 0.15: iterate properties manually for ATTENDEE
+        // icalendar 0.15: iterate properties() to find ATTENDEE values
         let attendees: Vec<String> = ev
             .properties()
             .filter(|p| p.get_key() == "ATTENDEE")
             .filter_map(|p| {
-                p.get_value()
+                p.property_value()
                     .and_then(extract_property_string)
                     .map(|s| s.trim_start_matches("mailto:").to_string())
             })
             .collect();
 
-        events.push(CalendarEvent { uid, summary, organizer, attendees });
+        events.push(CalendarEvent { 
+            uid: uid.unwrap_or_default(), 
+            summary, 
+            organizer, 
+            attendees 
+        });
     }
 
     events
@@ -352,10 +352,15 @@ impl MeetingDetector {
     /// Returns `true` if any running process name contains one of `names`
     /// (case-insensitive substring match).
     fn process_running(&self, names: &[&str]) -> bool {
-        // sysinfo 0.30: processes() returns ProcessesToUpdate, use .iter()
-        self.sys.processes().iter().any(|(pid, proc)| {
-            let pname = proc.name();
-            names.iter().any(|n| pname.contains(n))
+        // sysinfo 0.30: processes() returns ProcessesToUpdate, use .by_pid() for iteration
+        // We iterate by PID and check process names
+        self.sys.processes().keys().any(|&pid| {
+            if let Some(proc) = self.sys.process(*pid) {
+                let pname = proc.name().to_string_lossy();
+                names.iter().any(|n| pname.contains(n))
+            } else {
+                false
+            }
         })
     }
 
@@ -373,7 +378,7 @@ impl MeetingDetector {
                 let summary_lower = ev.summary.to_lowercase();
                 let platform_str  = meeting.platform.to_string();
                 // Match if the event mentions the platform or common call keywords.
-                if summary_lower.contains(&platform_str)
+                if summary_lower.contains(&platform_str.to_lowercase())
                     || summary_lower.contains("call")
                     || summary_lower.contains("meeting")
                     || summary_lower.contains("standup")
