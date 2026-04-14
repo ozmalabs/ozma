@@ -12,6 +12,7 @@ fn main() {
     }
     
     // Create necessary directories
+    fs::create_dir_all("assets").unwrap();
     fs::create_dir_all("target/dist").unwrap();
     
     println!("cargo:rerun-if-changed=build.rs");

@@ -1,11 +1,14 @@
-/// Green tray icon (16x16 PNG - solid color placeholder)
-pub static GREEN_ICON: &[u8] = include_bytes!("../icons/green.png");
+/// Placeholder tray icons (16x16 solid color PNGs)
+/// In production, replace with actual branded icons
 
-/// Yellow tray icon (16x16 PNG - solid color placeholder)
-pub static YELLOW_ICON: &[u8] = include_bytes!("../icons/yellow.png");
+/// Grey icon - not connected
+pub static GREY_ICON: &[u8] = include_bytes!("../assets/grey.png");
 
-/// Red tray icon (16x16 PNG - solid color placeholder)
-pub static RED_ICON: &[u8] = include_bytes!("../icons/red.png");
+/// Yellow icon - connecting
+pub static YELLOW_ICON: &[u8] = include_bytes!("../assets/yellow.png");
 
-/// Grey tray icon (16x16 PNG - solid color placeholder)
-pub static GREY_ICON: &[u8] = include_bytes!("../icons/grey.png");
+/// Green icon - connected
+pub static GREEN_ICON: &[u8] = include_bytes!("../assets/green.png");
+
+/// Red icon - error
+pub static RED_ICON: &[u8] = include_bytes!("../assets/red.png");
