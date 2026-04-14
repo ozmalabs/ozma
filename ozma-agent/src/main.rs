@@ -68,23 +68,22 @@ async fn main() -> Result<()> {
     // Shared Prometheus registry.
     let registry = metrics::build_registry();
 
-    // Approval queue.
+    // Approval queue — shared by IPC server and future capture/RPA code.
     let queue = approvals::ApprovalQueue::new();
 
     let api_addr = format!("{}:{}", cli.api_host, cli.api_port);
     let metrics_addr = format!("{}:{}", cli.api_host, cli.metrics_port);
     let controller_url = cli.controller_url.clone();
     let wg_port = cli.wg_port;
-    let api_port = cli.api_port;
 
     // Spawn all tasks concurrently; if any exits with an error, propagate it.
     let (r1, r2, r3, r4, r5, r6) = tokio::join!(
-        tokio::spawn(api::serve(api_addr, queue.clone())),
+        tokio::spawn(api::serve(api_addr)),
         tokio::spawn(ipc_server::serve(queue.clone())),
         tokio::spawn(capture::run()),
         tokio::spawn(metrics::serve(metrics_addr, registry)),
         tokio::spawn(mesh::run(controller_url.clone(), wg_port)),
-        tokio::spawn(register::run(controller_url, api_port, wg_port)),
+        tokio::spawn(register::run(controller_url, cli.api_port, wg_port)),
     );
 
     for result in [r1, r2, r3, r4, r5, r6] {

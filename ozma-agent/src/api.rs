@@ -1,17 +1,11 @@
 //! Axum HTTP API server.
 //!
-//! Endpoints
-//! ---------
-//! GET  /healthz          — liveness probe (200 OK)
-//! GET  /api/v1/status    — agent status JSON
-//! GET  /api/v1/version   — version string
+//! Public read-only endpoints only — sensitive approval/event traffic
+//! goes through the privileged IPC socket (ipc_server.rs).
 
 use anyhow::Result;
 use axum::{routing::get, Json, Router};
 use serde::Serialize;
-use std::sync::Arc;
-use tracing::info;
-use crate::approvals::ApprovalQueue;
 
 #[derive(Serialize)]
 struct Status {
@@ -34,15 +28,16 @@ async fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// Start the API server and block until it exits.
-pub async fn serve(addr: String, _queue: Arc<ApprovalQueue>) -> Result<()> {
+/// Start the public read-only HTTP API server and block until it exits.
+/// Approval endpoints are NOT exposed here — see ipc_server.rs for that traffic.
+pub async fn serve(addr: String) -> Result<()> {
     let app = Router::new()
-        .route("/healthz",         get(healthz))
-        .route("/api/v1/status",   get(status))
-        .route("/api/v1/version",  get(version));
+        .route("/healthz",        get(healthz))
+        .route("/api/v1/status",  get(status))
+        .route("/api/v1/version", get(version));
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    info!(addr, "API server listening");
+    tracing::info!(addr, "API server listening");
     axum::serve(listener, app).await?;
     Ok(())
 }
