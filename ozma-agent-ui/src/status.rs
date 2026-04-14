@@ -12,12 +12,15 @@
 //! Live events: WS channel updates action log immediately.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self, Color32, Grid, RichText, ScrollArea, TopBottomPanel, Ui, Vec2, Widget,
 };
 use serde::Deserialize;
+use tokio::sync::RwLock;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -147,7 +150,7 @@ pub struct NodeInfo {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// State
+// Shared State (for integration with main app)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Stored by the app; shared between tray, status window, etc.
@@ -182,13 +185,52 @@ impl Default for SharedState {
     }
 }
 
+/// Thread-safe shared state wrapper for async access.
+pub type SharedStateHandle = Arc<RwLock<SharedState>>;
+
+/// Create a new shared state handle.
+pub fn create_shared_state() -> SharedStateHandle {
+    Arc::new(RwLock::new(SharedState::default()))
+}
+
+/// Add an action log entry to the shared state.
+pub async fn push_action_log(
+    shared: &SharedStateHandle,
+    action_type: String,
+    description: String,
+    result: ActionResult,
+) {
+    let entry = ActionLogEntry {
+        action_type,
+        description,
+        result,
+        timestamp: Instant::now(),
+    };
+    
+    let mut state = shared.write().await;
+    if state.action_log.len() >= 20 {
+        state.action_log.pop_front();
+    }
+    state.action_log.push_back(entry);
+}
+
+/// Create a synthetic test approval entry.
+pub async fn inject_test_approval(shared: &SharedStateHandle) {
+    push_action_log(
+        shared,
+        "Screen Capture".to_string(),
+        "Machine A full desktop".to_string(),
+        ActionResult::Approved,
+    ).await;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // StatusWindow
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub struct StatusWindow {
     /// Shared mutable state (set by app, read by UI).
-    shared: std::sync::Arc<tokio::sync::RwLock<SharedState>>,
+    shared: SharedStateHandle,
     /// Last time we polled /api/v1/status.
     last_poll: Instant,
     /// Last time we measured latency (ping).
@@ -198,13 +240,15 @@ pub struct StatusWindow {
     /// Uptime start time.
     start_time: Instant,
     /// Latest status response for extracting mesh peers.
-    latest_status: std::sync::Arc<tokio::sync::RwLock<Option<StatusResponse>>>,
+    latest_status: Arc<RwLock<Option<StatusResponse>>>,
+    /// Flag indicating if window should close (set by close button).
+    should_close: Arc<AtomicBool>,
 }
 
 impl StatusWindow {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
-        shared: std::sync::Arc<tokio::sync::RwLock<SharedState>>,
+        shared: SharedStateHandle,
     ) -> Self {
         // Load custom fonts if the embedded bytes are available.
         // When assets are bundled (build.rs copies them to OUT_DIR),
@@ -218,11 +262,12 @@ impl StatusWindow {
             last_latency_check: Instant::now() - Duration::from_secs(6),
             mesh_peers_open: false,
             start_time: Instant::now(),
-            latest_status: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            latest_status: Arc::new(RwLock::new(None)),
+            should_close: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    fn poll_status(&mut self, _ctx: &egui::Context) {
+    fn poll_status(&mut self) {
         let now = Instant::now();
         if now.duration_since(self.last_poll) < Duration::from_secs(5) {
             return;
@@ -234,8 +279,8 @@ impl StatusWindow {
             s.controller_url.clone()
         };
 
-        let status_store = self.latest_status.clone();
-        let shared_clone = std::sync::Arc::clone(&self.shared);
+        let status_store = Arc::clone(&self.latest_status);
+        let shared_clone = Arc::clone(&self.shared);
 
         // Spawn HTTP GET for status
         std::thread::spawn(move || {
@@ -245,6 +290,7 @@ impl StatusWindow {
                 .ok();
 
             if let Some(client) = client {
+                // Fetch status from /api/v1/status
                 if let Ok(resp) = client.get(format!("{}/api/v1/status", url)).send() {
                     if let Ok(status) = resp.json::<StatusResponse>() {
                         let status_store2 = status_store.clone();
@@ -288,7 +334,7 @@ impl StatusWindow {
             s.controller_url.clone()
         };
 
-        let shared_clone = std::sync::Arc::clone(&self.shared);
+        let shared_clone = Arc::clone(&self.shared);
 
         std::thread::spawn(move || {
             let start = Instant::now();
@@ -298,7 +344,8 @@ impl StatusWindow {
                 .ok();
 
             if let Some(client) = client {
-                if client.get(format!("{}/health", url)).send().is_ok() {
+                // Use /healthz endpoint for latency check as per spec
+                if client.get(format!("{}/healthz", url)).send().is_ok() {
                     let latency = start.elapsed().as_millis() as u32;
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -307,20 +354,48 @@ impl StatusWindow {
                         rt.block_on(async {
                             let mut shared = shared_clone.write().await;
                             shared.latency_ms = Some(latency);
+                            // Update tray state based on connectivity
+                            if shared.tray_state == TrayState::Connecting {
+                                shared.tray_state = TrayState::Connected;
+                            }
+                        });
+                    }
+                } else {
+                    // Mark as error if /healthz fails
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build();
+                    if let Ok(rt) = rt {
+                        rt.block_on(async {
+                            let mut shared = shared_clone.write().await;
+                            if !shared.paused {
+                                shared.tray_state = TrayState::Error;
+                            }
                         });
                     }
                 }
             }
         });
     }
+
+    fn update_tray_state(&self, ctx: &egui::Context) {
+        // This method can be called to trigger a tray state update
+        // The actual tray update is handled by the main app
+    }
 }
 
 impl eframe::App for StatusWindow {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Measure latency every 5s
+        // Check if we should close
+        if self.should_close.load(Ordering::Relaxed) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
+        // Measure latency every 5s using /healthz endpoint
         self.measure_latency();
 
-        // Refresh every 5s even if no user interaction.
+        // Refresh status every 5s
         self.poll_status(ctx);
 
         // Update uptime in shared state
@@ -331,7 +406,7 @@ impl eframe::App for StatusWindow {
             .frame(egui::Frame::dark_panel().fill(Color32::from_rgba_unmultiplied(18, 18, 28, 255)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    let (dot_color, label, latency_str, uptime_str) = {
+                    let (dot_color, label, latency_str, uptime_str, controller_url) = {
                         let s = self.shared.blocking_read();
                         (
                             s.tray_state.color(),
@@ -340,6 +415,7 @@ impl eframe::App for StatusWindow {
                                 .map(|ms| format!("{}ms", ms))
                                 .unwrap_or_else(|| "—".into()),
                             format_uptime(uptime),
+                            s.controller_url.clone(),
                         )
                     };
 
@@ -348,15 +424,10 @@ impl eframe::App for StatusWindow {
                     let pos = ui.cursor().min;
                     painter.circle(pos + egui::Vec2::new(8.0, 8.0), 6.0, dot_color, dot_color);
 
-                    let controller_url = {
-                        let s = self.shared.blocking_read();
-                        s.controller_url.clone()
-                    };
-
                     ui.add_space(16.0);
 
                     let text = format!(
-                        "{} to {}  |  Latency: {}  |  Uptime: {}",
+                        " {} to {}  |  Latency: {}  |  Uptime: {}",
                         label,
                         controller_url,
                         latency_str,
@@ -391,17 +462,17 @@ impl eframe::App for StatusWindow {
                         .on_hover_text("Click to push a synthetic ScreenCapture approval request")
                         .clicked()
                     {
-                        let entry = ActionLogEntry {
-                            action_type: "Screen Capture".into(),
-                            description: "Machine A full desktop".into(),
-                            result: ActionResult::Approved,
-                            timestamp: Instant::now(),
-                        };
-                        let mut s = self.shared.blocking_write();
-                        if s.action_log.len() >= 20 {
-                            s.action_log.pop_front();
-                        }
-                        s.action_log.push_back(entry);
+                        let shared_clone = Arc::clone(&self.shared);
+                        std::thread::spawn(move || {
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build();
+                            if let Ok(rt) = rt {
+                                rt.block_on(async {
+                                    inject_test_approval(&shared_clone).await;
+                                });
+                            }
+                        });
                     }
                 });
         }
@@ -422,9 +493,6 @@ impl eframe::App for StatusWindow {
 /// Load custom fonts from embedded bytes, if available.
 /// Falls back gracefully when assets aren't bundled (e.g. dev without assets).
 fn load_custom_fonts(cc: &eframe::CreationContext<'_>) {
-    // The #[allow(unused)] silences compile warnings for include_bytes! when
-    // the file doesn't exist — we use cfg guards so this only compiles when
-    // build.rs has placed the assets at these paths.
     #[cfg(feature = "embed-fonts")]
     {
         let fonts = cc.egui_ctx.memory().fonts_mut();
@@ -436,323 +504,4 @@ fn load_custom_fonts(cc: &eframe::CreationContext<'_>) {
 
         // Try to load JetBrains Mono
         if let Ok(data) = std::fs::read("assets/JetBrainsMono-Regular.ttf") {
-            fonts.definitely_add_font(&data);
-        }
-    }
-
-    // If the embed-fonts feature is not set, try reading from OUT_DIR
-    // (build.rs copies assets there so they can be accessed at runtime).
-    #[cfg(not(feature = "embed-fonts"))]
-    {
-        let out_dir = std::env::var("OUT_DIR").ok();
-        if let Some(base) = out_dir {
-            let embed_path = std::path::Path::new(&base).join("embedded_assets");
-            let fonts = cc.egui_ctx.memory().fonts_mut();
-
-            let inter = embed_path.join("Inter-SemiBold.ttf");
-            if inter.exists() {
-                if let Ok(data) = std::fs::read(&inter) {
-                    fonts.definitely_add_font(&data);
-                }
-            }
-
-            let mono = embed_path.join("JetBrainsMono-Regular.ttf");
-            if mono.exists() {
-                if let Ok(data) = std::fs::read(&mono) {
-                    fonts.definitely_add_font(&data);
-                }
-            }
-        }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Sections
-// ─────────────────────────────────────────────────────────────────────────────
-
-impl StatusWindow {
-    fn draw_agent_info(&self, ui: &mut Ui) {
-        let s = self.shared.blocking_read();
-        ui.horizontal(|ui| {
-            let version_text = format!("ozma-agent v{}", s.agent_version);
-            let node_text = format!("Node: {}", s.node_name.if_empty("—"));
-            let wg_text = format!("WG port: {}", s.wg_port);
-
-            ui.label(
-                RichText::new(format!("{}  |  {}  |  {}", version_text, node_text, wg_text))
-                    .size(13.0)
-                    .color(Color32::from_gray(180)),
-            );
-        });
-    }
-
-    fn draw_action_log(&self, ui: &mut Ui) {
-        ui.label(
-            RichText::new("Recent Actions")
-                .size(14.0)
-                .color(Color32::WHITE)
-                .strong(),
-        );
-        ui.add_space(4.0);
-
-        let log = {
-            let s = self.shared.blocking_read();
-            s.action_log.iter().rev().take(20).cloned().collect::<Vec<_>>()
-        };
-
-        if log.is_empty() {
-            ui.label(
-                RichText::new("No recent actions.")
-                    .size(12.0)
-                    .color(Color32::from_gray(120)),
-            );
-            return;
-        }
-
-        // Table header
-        ui.horizontal(|ui| {
-            ui.set_width(80.0);
-            ui.label(bold("Type"));
-            ui.add_space(8.0);
-            ui.set_width(200.0);
-            ui.label(bold("Description"));
-            ui.add_space(8.0);
-            ui.set_width(80.0);
-            ui.label(bold("Result"));
-            ui.add_space(8.0);
-            ui.label(bold("Time"));
-        });
-
-        ui.separator();
-
-        ScrollArea::vertical()
-            .max_height(160.0)
-            .show(ui, |ui| {
-                Grid::new("action_log_grid").show(ui, |ui| {
-                    for entry in &log {
-                        // Icon + type
-                        ui.horizontal(|ui| {
-                            ui.label(entry.icon());
-                            ui.label(format!(" {}", entry.action_type));
-                        });
-                        ui.next_column();
-
-                        // Description (truncated)
-                        let desc = if entry.description.len() > 35 {
-                            format!("{}…", &entry.description[..32])
-                        } else {
-                            entry.description.clone()
-                        };
-                        ui.label(
-                            RichText::new(desc).size(12.0).color(Color32::from_gray(200)),
-                        );
-                        ui.next_column();
-
-                        // Result with colour
-                        let result_text = format!(
-                            "{} {}",
-                            entry.result.icon(),
-                            format!("{:?}", entry.result)
-                        );
-                        ui.label(
-                            RichText::new(result_text)
-                                .size(12.0)
-                                .color(entry.result.color()),
-                        );
-                        ui.next_column();
-
-                        // Time ago
-                        ui.label(
-                            RichText::new(entry.time_ago())
-                                .size(11.0)
-                                .color(Color32::from_gray(140)),
-                        );
-                        ui.next_column();
-                    }
-                });
-            });
-    }
-
-    fn draw_mesh_peers(&self, ui: &mut Ui) {
-        let peers = {
-            let s = self.shared.blocking_read();
-            s.mesh_peers.clone()
-        };
-        let count = peers.len();
-
-        // Header with collapsible toggle
-        ui.horizontal(|ui| {
-            let label = format!("Mesh Peers ({})", count);
-            if ui
-                .selectable_label(self.mesh_peers_open, label)
-                .on_hover_text("Click to expand/collapse mesh peer list")
-                .clicked()
-            {
-                self.mesh_peers_open = !self.mesh_peers_open;
-            }
-
-            // Triangle indicator
-            let arrow = if self.mesh_peers_open { "▼" } else { "▶" };
-            ui.label(RichText::new(arrow).size(12.0).color(Color32::from_gray(150)));
-        });
-
-        if !self.mesh_peers_open {
-            return;
-        }
-
-        ui.add_space(4.0);
-
-        if peers.is_empty() {
-            ui.label(
-                RichText::new("No mesh peers connected.")
-                    .size(12.0)
-                    .color(Color32::from_gray(120)),
-            );
-            return;
-        }
-
-        ScrollArea::vertical()
-            .max_height(100.0)
-            .show(ui, |ui| {
-                for peer in &peers {
-                    ui.horizontal(|ui| {
-                        // Name
-                        ui.label(
-                            RichText::new(&peer.name)
-                                .size(12.0)
-                                .color(Color32::from_rgb(140, 180, 255)),
-                        );
-                        ui.add_space(12.0);
-
-                        // Host
-                        ui.label(
-                            RichText::new(&peer.host)
-                                .size(11.0)
-                                .color(Color32::from_gray(160)),
-                        );
-                        ui.add_space(12.0);
-
-                        // Latency
-                        if let Some(ms) = peer.latency_ms {
-                            ui.label(
-                                RichText::new(format!("↕ {}ms", ms))
-                                    .size(11.0)
-                                    .color(Color32::from_rgb(100, 220, 100)),
-                            );
-                        } else {
-                            ui.label(
-                                RichText::new("↕ —")
-                                    .size(11.0)
-                                    .color(Color32::from_gray(100)),
-                            );
-                        }
-                    });
-                }
-            });
-    }
-
-    fn draw_footer(&self, ui: &mut Ui, ctx: &egui::Context) {
-        ui.horizontal(|ui| {
-            let btn = |label: &str, hover: &str| -> egui::Response {
-                ui.add(
-                    egui::Button::new(label)
-                        .fill(Color32::from_rgba_unmultiplied(30, 30, 45, 255))
-                        .stroke(egui::Stroke::new(1.0, Color32::from_gray(80)))
-                        .rounding(6.0)
-                        .min_size(Vec2::new(110.0, 30.0)),
-                )
-                .on_hover_text(hover)
-            };
-
-            // Pause / Resume
-            let (pause_label, pause_hover) = {
-                let s = self.shared.blocking_read();
-                if s.paused {
-                    ("▶ Resume Agent", "Resume the agent (re-enables polling and actions)")
-                } else {
-                    ("⏸ Pause Agent", "Pause the agent (stops polling and action execution)")
-                }
-            };
-            if btn(pause_label, pause_hover).clicked() {
-                let mut s = self.shared.blocking_write();
-                s.paused = !s.paused;
-                s.tray_state = if s.paused { TrayState::Paused } else { TrayState::Connected };
-                ctx.request_repaint();
-            }
-
-            ui.add_space(8.0);
-
-            // Reconnect
-            if btn("⟳ Reconnect", "Force reconnect to the controller").clicked() {
-                let mut s = self.shared.blocking_write();
-                s.tray_state = TrayState::Connecting;
-                s.latency_ms = None;
-                ctx.request_repaint();
-            }
-
-            ui.add_space(8.0);
-
-            // Settings
-            if btn("⚙ Settings", "Open settings window").clicked() {
-                // TODO: open settings window
-            }
-        });
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-fn bold(text: &str) -> RichText {
-    RichText::new(text).size(12.0).color(Color32::from_gray(160)).strong()
-}
-
-fn format_uptime(d: Duration) -> String {
-    let total_secs = d.as_secs();
-    let hours = total_secs / 3600;
-    let mins = (total_secs % 3600) / 60;
-    let secs = total_secs % 60;
-    if hours > 0 {
-        format!("{}h {}m", hours, mins)
-    } else {
-        format!("{}m {}s", mins, secs)
-    }
-}
-
-trait StrExt {
-    fn if_empty(&self, fallback: &str) -> &str;
-}
-
-impl StrExt for String {
-    fn if_empty(&self, fallback: &str) -> &str {
-        if self.is_empty() {
-            fallback
-        } else {
-            self
-        }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Builder helper
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Open the status window as a new egui viewport.
-pub fn open_status_viewport(
-    app: std::sync::Arc<tokio::sync::RwLock<SharedState>>,
-) -> eframe::Result<()> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Ozma Agent — Status")
-            .with_inner_size([520.0, 400.0])
-            .with_min_inner_size([400.0, 300.0]),
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        "Ozma Agent — Status",
-        options,
-        Box::new(|cc| Ok(Box::new(StatusWindow::new(cc, app)))),
-    )
-}
+            fonts.definitely_add
