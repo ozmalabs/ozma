@@ -9,7 +9,9 @@
 use anyhow::Result;
 use axum::{routing::get, Json, Router};
 use serde::Serialize;
+use std::sync::Arc;
 use tracing::info;
+use crate::approvals::ApprovalQueue;
 
 #[derive(Serialize)]
 struct Status {
@@ -33,7 +35,7 @@ async fn version() -> &'static str {
 }
 
 /// Start the API server and block until it exits.
-pub async fn serve(addr: String) -> Result<()> {
+pub async fn serve(addr: String, _queue: Arc<ApprovalQueue>) -> Result<()> {
     let app = Router::new()
         .route("/healthz",         get(healthz))
         .route("/api/v1/status",   get(status))
