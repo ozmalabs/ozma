@@ -378,111 +378,9 @@ impl StatusWindow {
         });
     }
 
-    fn update_tray_state(&self, ctx: &egui::Context) {
+    fn update_tray_state(&self, _ctx: &egui::Context) {
         // This method can be called to trigger a tray state update
         // The actual tray update is handled by the main app
-    }
-}
-
-impl eframe::App for StatusWindow {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Check if we should close
-        if self.should_close.load(Ordering::Relaxed) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-        }
-
-        // Measure latency every 5s using /healthz endpoint
-        self.measure_latency();
-
-        // Refresh status every 5s
-        self.poll_status(ctx);
-
-        // Update uptime in shared state
-        let uptime = self.start_time.elapsed();
-
-        // ── Top bar ──────────────────────────────────────────────────────────────
-        TopBottomPanel::top("connection_banner")
-            .frame(egui::Frame::dark_panel().fill(Color32::from_rgba_unmultiplied(18, 18, 28, 255)))
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    let (dot_color, label, latency_str, uptime_str, controller_url) = {
-                        let s = self.shared.blocking_read();
-                        (
-                            s.tray_state.color(),
-                            s.tray_state.label(),
-                            s.latency_ms
-                                .map(|ms| format!("{}ms", ms))
-                                .unwrap_or_else(|| "—".into()),
-                            format_uptime(uptime),
-                            s.controller_url.clone(),
-                        )
-                    };
-
-                    // Status dot (small filled circle painted directly).
-                    let painter = ui.painter();
-                    let pos = ui.cursor().min;
-                    painter.circle(pos + egui::Vec2::new(8.0, 8.0), 6.0, dot_color, dot_color);
-
-                    ui.add_space(16.0);
-
-                    let text = format!(
-                        " {} to {}  |  Latency: {}  |  Uptime: {}",
-                        label,
-                        controller_url,
-                        latency_str,
-                        uptime_str,
-                    );
-                    ui.label(RichText::new(text).size(14.0).color(Color32::WHITE));
-                });
-            });
-
-        // ── Main panel ──────────────────────────────────────────────────────────
-        egui::CentralPanel::default()
-            .frame(egui::Frame::dark_panel().fill(Color32::from_rgba_unmultiplied(12, 12, 18, 255)))
-            .show(ctx, |ui| {
-                ui.set_width(ui.available_width());
-                self.draw_agent_info(ui);
-                ui.add_space(8.0);
-                self.draw_action_log(ui);
-                ui.add_space(8.0);
-                self.draw_mesh_peers(ui);
-                ui.add_space(8.0);
-                self.draw_footer(ui, ctx);
-            });
-
-        // ── Debug: test injection ───────────────────────────────────────────────
-        #[cfg(debug_assertions)]
-        {
-            egui::Area::new("debug_test_btn")
-                .anchor(egui::Align::BOTTOM_RIGHT, [-10.0, -10.0])
-                .show(ctx, |ui| {
-                    if ui
-                        .button("🧪 Inject Test Approval")
-                        .on_hover_text("Click to push a synthetic ScreenCapture approval request")
-                        .clicked()
-                    {
-                        let shared_clone = Arc::clone(&self.shared);
-                        std::thread::spawn(move || {
-                            let rt = tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build();
-                            if let Ok(rt) = rt {
-                                rt.block_on(async {
-                                    inject_test_approval(&shared_clone).await;
-                                });
-                            }
-                        });
-                    }
-                });
-        }
-
-        // Re-schedule in 5s.
-        let ctx2 = ctx.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(5));
-            ctx2.request_repaint();
-        });
     }
 }
 
@@ -497,11 +395,4 @@ fn load_custom_fonts(cc: &eframe::CreationContext<'_>) {
     {
         let fonts = cc.egui_ctx.memory().fonts_mut();
 
-        // Try to load Inter SemiBold
-        if let Ok(data) = std::fs::read("assets/Inter-SemiBold.ttf") {
-            fonts.definitely_add_font(&data);
-        }
-
-        // Try to load JetBrains Mono
-        if let Ok(data) = std::fs::read("assets/JetBrainsMono-Regular.ttf") {
-            fonts.definitely_add
+        // Try to load Inter
