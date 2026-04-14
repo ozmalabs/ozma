@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "ozma-node",
+    "ozma-softnode",
+    "ozma-agent",
+    "ozma-drivers",
+    "ozma-proto",
+    "ozma-mesh",
+    "ozma-crypto",
+    "ozma-hid",
+    "ozma-clipboard",
+    "ozma-pipewire",
+    "ozma-agent-ui",  // Add this line
+]
