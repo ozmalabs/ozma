@@ -168,11 +168,17 @@ fn parse_active_events(path: &Path) -> Vec<CalendarEvent> {
         };
 
         // icalendar 0.15: start_datetime()/end_datetime() return Option<DateTime<Utc>>
-        let start_dt = ev.start_datetime();
-        let end_dt   = ev.end_datetime();
+        // These methods return Option<&DateTime<Utc>>
+        let start_dt = ev.get_start();
+        let end_dt   = ev.get_end();
 
         let active = match (start_dt, end_dt) {
-            (Some(s), Some(e)) => s <= now && now <= e,
+            (Some(s), Some(e)) => {
+                let s_ts = s.timestamp();
+                let e_ts = e.timestamp();
+                let now_ts = now.timestamp();
+                s_ts <= now_ts && now_ts <= e_ts
+            }
             _ => false,
         };
         if !active {
@@ -183,9 +189,8 @@ fn parse_active_events(path: &Path) -> Vec<CalendarEvent> {
         // Property has value() returning &PropertyValue
         let uid = ev
             .property("UID")
-            .and_then(|p| {
-                extract_property_string(p.value())
-            })
+            .and_then(|p| p.value())
+            .and_then(extract_property_string)
             .unwrap_or_default();
 
         // icalendar 0.15: summary() returns Option<&Summary>
@@ -198,17 +203,16 @@ fn parse_active_events(path: &Path) -> Vec<CalendarEvent> {
         // icalendar 0.15: property() for ORGANIZER
         let organizer = ev
             .property("ORGANIZER")
-            .and_then(|p| {
-                extract_property_string(p.value())
-            })
+            .and_then(|p| p.value())
+            .and_then(extract_property_string)
             .map(|s| s.trim_start_matches("mailto:").to_string())
             .unwrap_or_default();
 
-        // icalendar 0.15: properties() returns iterator over &Property
+        // icalendar 0.15: get_property_values() returns iterator
         let attendees: Vec<String> = ev
-            .properties("ATTENDEE")
-            .filter_map(|p| {
-                extract_property_string(p.value())
+            .get_property_values("ATTENDEE")
+            .filter_map(|value| {
+                extract_property_string(value)
                     .map(|s| s.trim_start_matches("mailto:").to_string())
             })
             .collect();
@@ -349,7 +353,7 @@ impl MeetingDetector {
     fn process_running(&self, names: &[&str]) -> bool {
         // sysinfo 0.30: processes() returns ProcessesToUpdate, use .values().iter()
         self.sys.processes().values().any(|proc| {
-            let pname = proc.name().to_string_lossy().to_lowercase();
+            let pname = proc.name().to_string_lossy().into_owned();
             names.iter().any(|n| pname.contains(*n))
         })
     }
