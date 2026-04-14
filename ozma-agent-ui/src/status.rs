@@ -14,10 +14,8 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Local, Utc};
 use eframe::egui::{
-    self, Color32, FontId, Grid, Layout, RichText, ScrollArea, TextStyle,
-    TopBottomPanel, Ui, Vec2, Widget,
+    self, Color32, Grid, RichText, ScrollArea, TopBottomPanel, Ui, Vec2, Widget,
 };
 use serde::Deserialize;
 
@@ -145,7 +143,6 @@ pub struct NodeInfo {
     pub id: String,
     pub host: String,
     pub port: Option<u16>,
-    #[serde(rename = "role")]
     pub role: Option<String>,
 }
 
@@ -209,23 +206,23 @@ impl StatusWindow {
         cc: &eframe::CreationContext<'_>,
         shared: std::sync::Arc<tokio::sync::RwLock<SharedState>>,
     ) -> Self {
-        let fonts = &mut cc.egui_ctx.memory().fonts;
-        fonts
-            .definitely_add_font(&include_bytes!("../assets/Inter-SemiBold.ttf")[..]);
-        fonts
-            .definitely_add_font(&include_bytes!("../assets/JetBrainsMono-Regular.ttf")[..]);
+        // Load custom fonts if the embedded bytes are available.
+        // When assets are bundled (build.rs copies them to OUT_DIR),
+        // include_bytes! resolves at compile time.  If not bundled,
+        // we skip gracefully — the default egui font is still usable.
+        load_custom_fonts(cc);
 
         Self {
             shared,
-            last_poll: Instant::now() - Duration::from_secs(5), // poll immediately on first frame
-            last_latency_check: Instant::now() - Duration::from_secs(6), // ping immediately
+            last_poll: Instant::now() - Duration::from_secs(5),
+            last_latency_check: Instant::now() - Duration::from_secs(6),
             mesh_peers_open: false,
             start_time: Instant::now(),
             latest_status: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
-    fn poll_status(&mut self, ui: &mut Ui) {
+    fn poll_status(&mut self, _ctx: &egui::Context) {
         let now = Instant::now();
         if now.duration_since(self.last_poll) < Duration::from_secs(5) {
             return;
@@ -240,44 +237,39 @@ impl StatusWindow {
         let status_store = self.latest_status.clone();
         let shared_clone = std::sync::Arc::clone(&self.shared);
 
-        // Spawn HTTP GET for status — use tokio runtime from the app
+        // Spawn HTTP GET for status
         std::thread::spawn(move || {
             let client = reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(3))
                 .build()
                 .ok();
-            let client = match client {
-                Some(c) => c,
-                None => return,
-            };
 
-            // Fetch status
-            if let Ok(resp) = client.get(format!("{}/api/v1/status", url)).send() {
-                if let Ok(status) = resp.json::<StatusResponse>() {
-                    // Store the status for mesh peers
-                    let status_store2 = status_store.clone();
-                    std::thread::spawn(move || {
+            if let Some(client) = client {
+                if let Ok(resp) = client.get(format!("{}/api/v1/status", url)).send() {
+                    if let Ok(status) = resp.json::<StatusResponse>() {
+                        let status_store2 = status_store.clone();
+                        std::thread::spawn(move || {
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build();
+                            if let Ok(rt) = rt {
+                                rt.block_on(async {
+                                    let mut guard = status_store2.write().await;
+                                    *guard = Some(status);
+                                });
+                            }
+                        });
+
+                        let peers = status.mesh_peers.unwrap_or_default();
                         let rt = tokio::runtime::Builder::new_current_thread()
                             .enable_all()
                             .build();
                         if let Ok(rt) = rt {
                             rt.block_on(async {
-                                let mut guard = status_store2.write().await;
-                                *guard = Some(status);
+                                let mut shared = shared_clone.write().await;
+                                shared.mesh_peers = peers;
                             });
                         }
-                    });
-
-                    // Update mesh peers in shared state
-                    let peers = status.mesh_peers.unwrap_or_default();
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build();
-                    if let Ok(rt) = rt {
-                        rt.block_on(async {
-                            let mut shared = shared_clone.write().await;
-                            shared.mesh_peers = peers;
-                        });
                     }
                 }
             }
@@ -304,18 +296,19 @@ impl StatusWindow {
                 .timeout(Duration::from_secs(2))
                 .build()
                 .ok();
-            let client = match client else { return };
 
-            if client.get(format!("{}/health", url)).send().is_ok() {
-                let latency = start.elapsed().as_millis() as u32;
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build();
-                if let Ok(rt) = rt {
-                    rt.block_on(async {
-                        let mut shared = shared_clone.write().await;
-                        shared.latency_ms = Some(latency);
-                    });
+            if let Some(client) = client {
+                if client.get(format!("{}/health", url)).send().is_ok() {
+                    let latency = start.elapsed().as_millis() as u32;
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build();
+                    if let Ok(rt) = rt {
+                        rt.block_on(async {
+                            let mut shared = shared_clone.write().await;
+                            shared.latency_ms = Some(latency);
+                        });
+                    }
                 }
             }
         });
@@ -338,31 +331,32 @@ impl eframe::App for StatusWindow {
             .frame(egui::Frame::dark_panel().fill(Color32::from_rgba_unmultiplied(18, 18, 28, 255)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    // Status dot
                     let (dot_color, label, latency_str, uptime_str) = {
                         let s = self.shared.blocking_read();
                         (
                             s.tray_state.color(),
                             s.tray_state.label(),
-                            s.latency_ms.map(|ms| format!("{ms}ms")).unwrap_or_else(|| "—".into()),
+                            s.latency_ms
+                                .map(|ms| format!("{}ms", ms))
+                                .unwrap_or_else(|| "—".into()),
                             format_uptime(uptime),
                         )
                     };
 
-                    // Use a filled circle as the status indicator
-                    let dot = egui::paint::CircleShape::filled(6.0, dot_color);
-                    ui.add(egui::widgets::Image::new(
-                        egui::include_image!("../assets/status_dot.png"),
-                        egui::Vec2::splat(12.0),
-                    ));
+                    // Status dot (small filled circle painted directly).
+                    let painter = ui.painter();
+                    let pos = ui.cursor().min;
+                    painter.circle(pos + egui::Vec2::new(8.0, 8.0), 6.0, dot_color, dot_color);
 
                     let controller_url = {
                         let s = self.shared.blocking_read();
                         s.controller_url.clone()
                     };
 
+                    ui.add_space(16.0);
+
                     let text = format!(
-                        "🟢 {} to {}  |  Latency: {}  |  Uptime: {}",
+                        "{} to {}  |  Latency: {}  |  Uptime: {}",
                         label,
                         controller_url,
                         latency_str,
@@ -397,7 +391,7 @@ impl eframe::App for StatusWindow {
                         .on_hover_text("Click to push a synthetic ScreenCapture approval request")
                         .clicked()
                     {
-                        let mut entry = ActionLogEntry {
+                        let entry = ActionLogEntry {
                             action_type: "Screen Capture".into(),
                             description: "Machine A full desktop".into(),
                             result: ActionResult::Approved,
@@ -422,6 +416,57 @@ impl eframe::App for StatusWindow {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Font loading helper
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Load custom fonts from embedded bytes, if available.
+/// Falls back gracefully when assets aren't bundled (e.g. dev without assets).
+fn load_custom_fonts(cc: &eframe::CreationContext<'_>) {
+    // The #[allow(unused)] silences compile warnings for include_bytes! when
+    // the file doesn't exist — we use cfg guards so this only compiles when
+    // build.rs has placed the assets at these paths.
+    #[cfg(feature = "embed-fonts")]
+    {
+        let fonts = cc.egui_ctx.memory().fonts_mut();
+
+        // Try to load Inter SemiBold
+        if let Ok(data) = std::fs::read("assets/Inter-SemiBold.ttf") {
+            fonts.definitely_add_font(&data);
+        }
+
+        // Try to load JetBrains Mono
+        if let Ok(data) = std::fs::read("assets/JetBrainsMono-Regular.ttf") {
+            fonts.definitely_add_font(&data);
+        }
+    }
+
+    // If the embed-fonts feature is not set, try reading from OUT_DIR
+    // (build.rs copies assets there so they can be accessed at runtime).
+    #[cfg(not(feature = "embed-fonts"))]
+    {
+        let out_dir = std::env::var("OUT_DIR").ok();
+        if let Some(base) = out_dir {
+            let embed_path = std::path::Path::new(&base).join("embedded_assets");
+            let fonts = cc.egui_ctx.memory().fonts_mut();
+
+            let inter = embed_path.join("Inter-SemiBold.ttf");
+            if inter.exists() {
+                if let Ok(data) = std::fs::read(&inter) {
+                    fonts.definitely_add_font(&data);
+                }
+            }
+
+            let mono = embed_path.join("JetBrainsMono-Regular.ttf");
+            if mono.exists() {
+                if let Ok(data) = std::fs::read(&mono) {
+                    fonts.definitely_add_font(&data);
+                }
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Sections
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -430,7 +475,7 @@ impl StatusWindow {
         let s = self.shared.blocking_read();
         ui.horizontal(|ui| {
             let version_text = format!("ozma-agent v{}", s.agent_version);
-            let node_text = format!("Node: {}", s.node_name.if_empty(|| "—"));
+            let node_text = format!("Node: {}", s.node_name.if_empty("—"));
             let wg_text = format!("WG port: {}", s.wg_port);
 
             ui.label(
@@ -498,11 +543,17 @@ impl StatusWindow {
                         } else {
                             entry.description.clone()
                         };
-                        ui.label(RichText::new(desc).size(12.0).color(Color32::from_gray(200)));
+                        ui.label(
+                            RichText::new(desc).size(12.0).color(Color32::from_gray(200)),
+                        );
                         ui.next_column();
 
                         // Result with colour
-                        let result_text = format!("{} {}", entry.result.icon(), format!("{:?}", entry.result));
+                        let result_text = format!(
+                            "{} {}",
+                            entry.result.icon(),
+                            format!("{:?}", entry.result)
+                        );
                         ui.label(
                             RichText::new(result_text)
                                 .size(12.0)
@@ -626,7 +677,6 @@ impl StatusWindow {
                 let mut s = self.shared.blocking_write();
                 s.paused = !s.paused;
                 s.tray_state = if s.paused { TrayState::Paused } else { TrayState::Connected };
-                // Request repaint to update UI immediately
                 ctx.request_repaint();
             }
 
@@ -634,7 +684,6 @@ impl StatusWindow {
 
             // Reconnect
             if btn("⟳ Reconnect", "Force reconnect to the controller").clicked() {
-                // Reset state to connecting
                 let mut s = self.shared.blocking_write();
                 s.tray_state = TrayState::Connecting;
                 s.latency_ms = None;
@@ -671,14 +720,17 @@ fn format_uptime(d: Duration) -> String {
     }
 }
 
-// Needed because we can't borrow NodeInfo.name as mut
 trait StrExt {
     fn if_empty(&self, fallback: &str) -> &str;
 }
 
 impl StrExt for String {
     fn if_empty(&self, fallback: &str) -> &str {
-        if self.is_empty() { fallback } else { self }
+        if self.is_empty() {
+            fallback
+        } else {
+            self
+        }
     }
 }
 
