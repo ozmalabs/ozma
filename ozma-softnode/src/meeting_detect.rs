@@ -189,7 +189,7 @@ fn parse_active_events(path: &Path) -> Vec<CalendarEvent> {
             .unwrap_or_default();
 
         // icalendar 0.15: summary() returns Option<&Summary>
-        // Summary implements Display
+        // Summary implements Display, so use Display trait to_string()
         let summary = ev
             .summary()
             .map(|s| s.to_string())
@@ -347,8 +347,8 @@ impl MeetingDetector {
     /// Returns `true` if any running process name contains one of `names`
     /// (case-insensitive substring match).
     fn process_running(&self, names: &[&str]) -> bool {
-        // sysinfo 0.30: processes() returns Iterator<Item = (&Pid, &Process)>
-        self.sys.processes().iter().any(|(_, proc)| {
+        // sysinfo 0.30: processes() returns ProcessesToUpdate, use .values().iter()
+        self.sys.processes().values().any(|proc| {
             let pname = proc.name().to_string_lossy().to_lowercase();
             names.iter().any(|n| pname.contains(*n))
         })
