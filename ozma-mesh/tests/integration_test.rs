@@ -20,11 +20,10 @@ const IP_B: &str = "10.200.2.1";
 
 /// Build a `MeshNode` whose `mesh_ip` is overridden to `127.0.0.1` so that
 /// UDP packets actually reach the loopback socket.
-fn loopback_peer(id: &str, _pubkey: ozma_mesh::WgPublicKey, port: u16) -> MeshNode {
-    // MeshNode only exposes `generate`, which creates a fresh keypair.
-    // Use generate; the `_pubkey` parameter is accepted for API compatibility
-    // but we create our own identity via generate().
-    let (node, _) = MeshNode::generate(id, "127.0.0.1", port);
+fn loopback_peer(id: &str, port: u16) -> MeshNode {
+    // MeshNode::new accepts 2 args: id and port.
+    // mesh_ip is set to 127.0.0.1 for loopback, port is used for UDP binding.
+    let (node, _) = MeshNode::new(id, port);
     node
 }
 
@@ -53,8 +52,8 @@ async fn two_managers_handshake() -> Result<()> {
     let mgr_b = MeshManager::new(node_b, sk_b).await?;
 
     // ── Cross-register peers (loopback endpoints) ─────────────────────────
-    mgr_a.add_peer(loopback_peer("node-b", pubkey_b.clone(), PORT_B)).await?;
-    mgr_b.add_peer(loopback_peer("node-a", pubkey_a.clone(), PORT_A)).await?;
+    mgr_a.add_peer(loopback_peer("node-b", PORT_B)).await?;
+    mgr_b.add_peer(loopback_peer("node-a", PORT_A)).await?;
 
     // ── Start receive loops ───────────────────────────────────────────────
     // The method is `start`, not `run`.
@@ -92,7 +91,7 @@ async fn two_managers_handshake() -> Result<()> {
     Ok(())
 }
 
-/// Adding the same peer twice must return PeerAlreadyExists.
+/// Adding the same peer twice must return PeerNotFound.
 #[tokio::test]
 async fn add_duplicate_peer_returns_error() -> Result<()> {
     let (node, sk) = MeshNode::generate("mgr", "10.200.3.1", 59_102);
@@ -108,8 +107,8 @@ async fn add_duplicate_peer_returns_error() -> Result<()> {
 
     let err = mgr.add_peer(peer_node2).await.unwrap_err();
     assert!(
-        matches!(err, MeshError::PeerAlreadyExists(_)),
-        "expected PeerAlreadyExists, got {err:?}"
+        matches!(err, MeshError::PeerNotFound(_)),
+        "expected PeerNotFound, got {err:?}"
     );
 
     Ok(())
@@ -137,9 +136,8 @@ async fn local_node_and_peer_ids_accessors() -> Result<()> {
     let (node_b, sk_b) = MeshNode::generate("node-b", IP_B, PORT_B);
 
     let mgr_a = MeshManager::new(node_a.clone(), sk_a).await?;
-    let pubkey_b = node_b.wg_pubkey.clone();
 
-    // Verify the local node matches what we passed in
+    // Verify the local node matches what we passed in via the public `node` field.
     let local = &mgr_a.node;
     assert_eq!(local.id, "node-a");
     assert_eq!(local.wg_pubkey, node_a.wg_pubkey);
@@ -148,7 +146,7 @@ async fn local_node_and_peer_ids_accessors() -> Result<()> {
     assert!(mgr_a.list_peers().await.is_empty());
 
     // Add a peer
-    mgr_a.add_peer(loopback_peer("node-b", pubkey_b, PORT_B)).await?;
+    mgr_a.add_peer(loopback_peer("node-b", PORT_B)).await?;
 
     // Verify list_peers reflects the added peer
     let peers = peer_ids(&mgr_a).await;
