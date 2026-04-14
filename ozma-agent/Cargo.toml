@@ -40,6 +40,9 @@ windows = { version = "0.56", features = [
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.9"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+notify-rust = { version = "4", features = ["zbus"] }
+
 [dev-dependencies]
 reqwest    = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio      = { workspace = true }
@@ -54,13 +57,14 @@ maintainer       = "Ozma Labs <hello@ozma.dev>"
 copyright        = "2024 Ozma Labs"
 license-file     = ["../LICENSE", "0"]
 extended-description = """\
-ozma-agent is the desktop seat agent daemon for the Ozma KVM-over-IP platform.
+ozma-agent is the desktop seat agent daemon for the Ozma KVM-over-IP platform.\
 It handles screen capture, HID routing, audio, and WireGuard mesh connectivity."""
-depends          = "$auto"
+depends          = "$auto, libdbus-1-3"
 section          = "utils"
 priority         = "optional"
 assets           = [
     ["target/release/ozma-agent", "usr/bin/", "755"],
+    ["ozma-agent/installer/ozma-agent.service", "lib/systemd/system/", "644"],
 ]
 
 [package.metadata.wix]
