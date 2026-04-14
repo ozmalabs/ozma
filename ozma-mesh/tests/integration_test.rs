@@ -140,7 +140,7 @@ async fn local_node_and_peer_ids_accessors() -> Result<()> {
     let mgr_a = MeshManager::new(node_a.clone(), sk_a).await?;
 
     // Verify the local node matches what we passed in.
-    let local = mgr_a.local_node();
+    let local = mgr_a.local_node().await;
     assert_eq!(local.id, "node-a");
 
     // Initially no peers
