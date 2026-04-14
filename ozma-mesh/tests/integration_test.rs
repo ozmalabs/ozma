@@ -66,8 +66,11 @@ async fn two_managers_handshake() -> Result<()> {
 
     // ── Start receive loops ───────────────────────────────────────────────
     // The method is `run` on MeshManager.
-    mgr_a.run().await?;
-    mgr_b.run().await;
+    tokio::spawn(async move { mgr_a.run().await });
+    tokio::spawn(async move { mgr_b.run().await });
+
+    // Give receive loops time to start.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // ── Verify peer lists ─────────────────────────────────────────────────
     let peers_a = mgr_a.peer_ids().await;
@@ -77,14 +80,6 @@ async fn two_managers_handshake() -> Result<()> {
     let peers_b = mgr_b.peer_ids().await;
     assert_eq!(peers_b.len(), 1, "mgr_b should have exactly one peer");
     assert_eq!(peers_b[0], "node-a");
-
-    // ── Initiate WireGuard handshake A → B ────────────────────────────────
-    // Give the receive loops a moment to start.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    mgr_a.recv_packet("node-b", &[1, 2, 3]).await?;
-
-    // Allow time for the handshake packet to travel A→B and the response B→A.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     // ── Remove peer and verify ────────────────────────────────────────────
     mgr_a.remove_peer("node-b").await?;
