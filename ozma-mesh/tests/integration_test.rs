@@ -5,7 +5,7 @@
 //! loopback UDP sockets using boringtun's userspace WireGuard implementation.
 
 use ozma_mesh::error::{MeshError, Result};
-use ozma_mesh::{MeshManager, MeshNode};
+use ozma_mesh::{MeshManager, MeshNode, WgPrivateKey};
 
 /// Two ephemeral loopback ports.  If these happen to be in use the test will
 /// fail with a bind error; pick different values if that occurs.
@@ -21,15 +21,10 @@ const IP_B: &str = "10.200.2.1";
 /// Build a `MeshNode` whose `mesh_ip` is overridden to `127.0.0.1` so that
 /// UDP packets actually reach the loopback socket.
 fn loopback_peer(id: &str, port: u16) -> MeshNode {
-    // MeshNode::new accepts 2 args: id and port.
-    // mesh_ip is set to 127.0.0.1 for loopback, port is used for UDP binding.
-    let (node, _) = MeshNode::new(id, port);
+    let mut node = MeshNode::new(id, port);
+    // mesh_ip is set to 127.0.0.1 for loopback.
+    node.mesh_ip = "127.0.0.1".to_string();
     node
-}
-
-/// Return peer ids from a list of MeshNode.
-fn peer_ids(peers: Vec<MeshNode>) -> Vec<String> {
-    peers.into_iter().map(|n| n.id).collect()
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -40,11 +35,22 @@ fn peer_ids(peers: Vec<MeshNode>) -> Vec<String> {
 #[tokio::test]
 async fn two_managers_handshake() -> Result<()> {
     // ── Build node identities ─────────────────────────────────────────────
-    let (node_a, sk_a) = MeshNode::new("node-a", PORT_A);
-    let (node_b, sk_b) = MeshNode::new("node-b", PORT_B);
+    let sk_a = WgPrivateKey::generate();
+    let node_a = {
+        let mut node = MeshNode::new("node-a", PORT_A);
+        node.mesh_ip = "127.0.0.1".to_string();
+        node
+    };
 
-    let pubkey_a = node_a.wg_pubkey.clone();
-    let pubkey_b = node_b.wg_pubkey.clone();
+    let sk_b = WgPrivateKey::generate();
+    let node_b = {
+        let mut node = MeshNode::new("node-b", PORT_B);
+        node.mesh_ip = "127.0.0.1".to_string();
+        node
+    };
+
+    let pubkey_a = node_a.wg_pubkey();
+    let pubkey_b = node_b.wg_pubkey();
 
     // ── Create managers ───────────────────────────────────────────────────
     // MeshManager::new is async and returns Result<Self>.
@@ -56,30 +62,30 @@ async fn two_managers_handshake() -> Result<()> {
     mgr_b.add_peer(loopback_peer("node-a", PORT_A)).await?;
 
     // ── Start receive loops ───────────────────────────────────────────────
-    // The method is `start`, not `run`.
-    mgr_a.start().await?;
-    mgr_b.start().await;
+    // The method is `run` on MeshManager.
+    mgr_a.run().await?;
+    mgr_b.run().await;
 
     // ── Verify peer lists ─────────────────────────────────────────────────
-    let peers_a = mgr_a.list_peers().await;
+    let peers_a = mgr_a.peer_ids().await;
     assert_eq!(peers_a.len(), 1, "mgr_a should have exactly one peer");
-    assert_eq!(peer_ids(peers_a)[0], "node-b");
+    assert_eq!(peers_a[0], "node-b");
 
-    let peers_b = mgr_b.list_peers().await;
+    let peers_b = mgr_b.peer_ids().await;
     assert_eq!(peers_b.len(), 1, "mgr_b should have exactly one peer");
-    assert_eq!(peer_ids(peers_b)[0], "node-a");
+    assert_eq!(peers_b[0], "node-a");
 
     // ── Initiate WireGuard handshake A → B ────────────────────────────────
     // Give the receive loops a moment to start.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    mgr_a.initiate_handshake("node-b").await?;
+    mgr_a.recv_packet("node-b", &[1, 2, 3]).await?;
 
     // Allow time for the handshake packet to travel A→B and the response B→A.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     // ── Remove peer and verify ────────────────────────────────────────────
     mgr_a.remove_peer("node-b").await?;
-    assert!(mgr_a.list_peers().await.is_empty(), "peer list should be empty after remove");
+    assert!(mgr_a.peer_ids().await.is_empty(), "peer list should be empty after remove");
 
     // Removing the same peer again must return PeerNotFound.
     let err = mgr_a.remove_peer("node-b").await.unwrap_err();
@@ -91,15 +97,21 @@ async fn two_managers_handshake() -> Result<()> {
     Ok(())
 }
 
-/// Adding the same peer twice must return PeerNotFound.
+/// Adding the same peer twice must return DuplicatePeer.
 #[tokio::test]
 async fn add_duplicate_peer_returns_error() -> Result<()> {
-    let (node, sk) = MeshNode::new("mgr", 59_102);
+    let sk = WgPrivateKey::generate();
+    let node = {
+        let mut n = MeshNode::new("mgr", 59_102);
+        n.mesh_ip = "127.0.0.1".to_string();
+        n
+    };
     let mgr = MeshManager::new(node, sk).await?;
 
     let peer_node = {
-        let (peer, _) = MeshNode::new("peer-x", 59_103);
-        peer
+        let mut n = MeshNode::new("peer-x", 59_103);
+        n.mesh_ip = "127.0.0.1".to_string();
+        n
     };
     let peer_node2 = peer_node.clone();
 
@@ -107,8 +119,8 @@ async fn add_duplicate_peer_returns_error() -> Result<()> {
 
     let err = mgr.add_peer(peer_node2).await.unwrap_err();
     assert!(
-        matches!(err, MeshError::PeerNotFound(_)),
-        "expected PeerNotFound, got {err:?}"
+        matches!(err, MeshError::DuplicatePeer(_)),
+        "expected DuplicatePeer, got {err:?}"
     );
 
     Ok(())
@@ -117,7 +129,12 @@ async fn add_duplicate_peer_returns_error() -> Result<()> {
 /// Removing a peer that was never added must return PeerNotFound.
 #[tokio::test]
 async fn remove_nonexistent_peer_returns_error() -> Result<()> {
-    let (node, sk) = MeshNode::new("mgr2", 59_104);
+    let sk = WgPrivateKey::generate();
+    let node = {
+        let mut n = MeshNode::new("mgr2", 59_104);
+        n.mesh_ip = "127.0.0.1".to_string();
+        n
+    };
     let mgr = MeshManager::new(node, sk).await?;
 
     let err = mgr.remove_peer("ghost").await.unwrap_err();
@@ -132,24 +149,33 @@ async fn remove_nonexistent_peer_returns_error() -> Result<()> {
 /// Verify local node identity and peer list work correctly.
 #[tokio::test]
 async fn local_node_and_peer_ids_accessors() -> Result<()> {
-    let (node_a, sk_a) = MeshNode::new("node-a", PORT_A);
-    let (node_b, sk_b) = MeshNode::new("node-b", PORT_B);
+    let sk_a = WgPrivateKey::generate();
+    let node_a = {
+        let mut n = MeshNode::new("node-a", PORT_A);
+        n.mesh_ip = "127.0.0.1".to_string();
+        n
+    };
+    let sk_b = WgPrivateKey::generate();
+    let node_b = {
+        let mut n = MeshNode::new("node-b", PORT_B);
+        n.mesh_ip = "127.0.0.1".to_string();
+        n
+    };
 
     let mgr_a = MeshManager::new(node_a.clone(), sk_a).await?;
 
-    // Verify the local node matches what we passed in via the public `node` field.
-    let local = &mgr_a.node;
+    // Verify the local node matches what we passed in via local_node().
+    let local = mgr_a.local_node();
     assert_eq!(local.id, "node-a");
-    assert_eq!(local.wg_pubkey, node_a.wg_pubkey);
 
     // Initially no peers
-    assert!(mgr_a.list_peers().await.is_empty());
+    assert!(mgr_a.peer_ids().await.is_empty());
 
     // Add a peer
     mgr_a.add_peer(loopback_peer("node-b", PORT_B)).await?;
 
-    // Verify list_peers reflects the added peer
-    let peers = peer_ids(mgr_a.list_peers().await);
+    // Verify peer_ids reflects the added peer
+    let peers = mgr_a.peer_ids().await;
     assert_eq!(peers.len(), 1);
     assert_eq!(peers[0], "node-b");
 
@@ -160,7 +186,6 @@ async fn local_node_and_peer_ids_accessors() -> Result<()> {
 /// public key must match the original.
 #[tokio::test]
 async fn private_key_base64_round_trip() -> Result<()> {
-    use ozma_mesh::WgPrivateKey;
     let sk = WgPrivateKey::generate();
     let pk_original = sk.public_key();
 
