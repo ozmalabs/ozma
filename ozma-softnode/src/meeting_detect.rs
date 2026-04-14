@@ -125,15 +125,6 @@ fn find_ics_files(extra_paths: &[PathBuf]) -> Vec<PathBuf> {
     files
 }
 
-/// Extract a datetime from a property using icalendar 0.15 API.
-fn extract_datetime(prop: Option<&Property>) -> Option<DateTime<Utc>> {
-    prop.and_then(|p| {
-        // In icalendar 0.15, use property_value() to get the raw value string
-        // then parse it manually
-        p.property_value().to_string().parse::<DateTime<Utc>>().ok()
-    })
-}
-
 /// Parse a single ICS file and return events whose time window contains now.
 fn parse_active_events(path: &Path) -> Vec<CalendarEvent> {
     let Ok(content) = std::fs::read_to_string(path) else {
@@ -155,10 +146,9 @@ fn parse_active_events(path: &Path) -> Vec<CalendarEvent> {
             continue;
         };
 
-        // Only include events whose window contains now.
-        // Use get_property() API (icalendar 0.15)
-        let start_dt = extract_datetime(ev.get_property("DTSTART"));
-        let end_dt   = extract_datetime(ev.get_property("DTEND"));
+        // Use icalendar 0.15 API: get_start() and get_end() return Option<DateTime<Utc>>
+        let start_dt = ev.get_start();
+        let end_dt   = ev.get_end();
 
         let active = match (start_dt, end_dt) {
             (Some(s), Some(e)) => s <= now && now <= e,
@@ -169,39 +159,38 @@ fn parse_active_events(path: &Path) -> Vec<CalendarEvent> {
         }
 
         // Use get_property() for UID (icalendar 0.15)
-        // property_value() returns a String-like value
+        // property_value() returns a PropertyValue which we convert to string
         let uid = ev
             .get_property("UID")
-            .map(|p| p.property_value().to_string())
+            .and_then(|p| {
+                // In icalendar 0.15, Property has a value() method returning &str
+                std::str::from_utf8(p.value().as_bytes()).ok().map(|s| s.to_string())
+            })
             .unwrap_or_default();
 
-        // Use summary() method (icalendar 0.15)
+        // Use get_summary() method (icalendar 0.15)
         let summary = ev
-            .summary()
+            .get_summary()
             .map(|s| s.to_string())
             .unwrap_or_default();
 
         // Use get_property() for ORGANIZER (icalendar 0.15)
         let organizer = ev
             .get_property("ORGANIZER")
-            .map(|p| {
-                p.property_value()
-                    .to_string()
-                    .trim_start_matches("mailto:")
-                    .to_string()
+            .and_then(|p| {
+                std::str::from_utf8(p.value().as_bytes())
+                    .ok()
+                    .map(|s| s.trim_start_matches("mailto:").to_string())
             })
             .unwrap_or_default();
 
-        // Use properties() method to iterate over all properties (icalendar 0.15)
+        // Use get_properties() for ATTENDEE (icalendar 0.15)
         let attendees: Vec<String> = ev
-            .properties()
-            .iter()
-            .filter(|p| p.get_key().eq_ignore_ascii_case("ATTENDEE"))
-            .map(|p| {
-                p.property_value()
-                    .to_string()
-                    .trim_start_matches("mailto:")
-                    .to_string()
+            .get_properties("ATTENDEE")
+            .filter_map(|p| {
+                std::str::from_utf8(p.value().as_bytes())
+                    .ok()
+                    .map(|s| s.trim_start_matches("mailto:").to_string())
             })
             .collect();
 
@@ -340,7 +329,7 @@ impl MeetingDetector {
     /// (case-insensitive substring match).
     fn process_running(&self, names: &[&str]) -> bool {
         // sysinfo 0.30: processes() returns an iterator of (Pid, &Process)
-        self.sys.processes().any(|(_, proc)| {
+        self.sys.processes().values().any(|proc| {
             let pname = proc.name().to_string_lossy().to_lowercase();
             names.iter().any(|n| pname.contains(*n))
         })
