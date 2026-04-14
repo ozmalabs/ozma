@@ -5,7 +5,7 @@
 //! loopback UDP sockets using boringtun's userspace WireGuard implementation.
 
 use ozma_mesh::error::{MeshError, Result};
-use ozma_mesh::{MeshManager, MeshNode, WgPublicKey};
+use ozma_mesh::{MeshManager, MeshNode};
 
 /// Two ephemeral loopback ports.  If these happen to be in use the test will
 /// fail with a bind error; pick different values if that occurs.
@@ -119,6 +119,33 @@ async fn remove_nonexistent_peer_returns_error() -> Result<()> {
         matches!(err, MeshError::PeerNotFound(_)),
         "expected PeerNotFound, got {err:?}"
     );
+
+    Ok(())
+}
+
+/// Verify local node identity and list_peers work correctly.
+#[tokio::test]
+async fn local_node_and_list_peers_accessors() -> Result<()> {
+    let (node_a, sk_a) = MeshNode::generate("node-a", IP_A, PORT_A);
+    let (node_b, sk_b) = MeshNode::generate("node-b", IP_B, PORT_B);
+
+    let mgr_a = MeshManager::new(node_a.clone(), sk_a).await?;
+    let pubkey_b = node_b.wg_pubkey.clone();
+
+    // Verify the public `node` field returns the correct node
+    assert_eq!(mgr_a.node.id, "node-a");
+    assert_eq!(mgr_a.node.wg_pubkey, node_a.wg_pubkey);
+
+    // Initially no peers
+    assert!(mgr_a.list_peers().await.is_empty());
+
+    // Add a peer
+    mgr_a.add_peer(loopback_peer("node-b", pubkey_b, PORT_B)).await?;
+
+    // Verify list_peers reflects the added peer
+    let peers = mgr_a.list_peers().await;
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].id, "node-b");
 
     Ok(())
 }
