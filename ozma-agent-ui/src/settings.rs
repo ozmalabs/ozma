@@ -1,6 +1,10 @@
 use crate::config::{ActionType, AppConfig, ApprovalMode, Theme};
 use egui::{ComboBox, Grid, RadioButton, Ui, Widget};
 
+// ============================================================================
+// Settings Window UI
+// ============================================================================
+
 /// Connection test result
 #[derive(Default, Clone)]
 pub enum ConnectionStatus {
@@ -14,28 +18,34 @@ pub enum ConnectionStatus {
 /// Thread-local storage for connection test results (used by background thread)
 mod connection_result {
     use std::sync::Mutex;
-    
+
     struct TestResult {
         success: bool,
         error: Option<String>,
     }
-    
+
     thread_local! {
         static RESULT: Mutex<Option<TestResult>> = Mutex::new(None);
     }
-    
+
     pub fn set_success() {
         RESULT.with(|r| {
-            *r.lock().unwrap() = Some(TestResult { success: true, error: None });
+            *r.lock().unwrap() = Some(TestResult {
+                success: true,
+                error: None,
+            });
         });
     }
-    
+
     pub fn set_error(msg: String) {
         RESULT.with(|r| {
-            *r.lock().unwrap() = Some(TestResult { success: false, error: Some(msg) });
+            *r.lock().unwrap() = Some(TestResult {
+                success: false,
+                error: Some(msg),
+            });
         });
     }
-    
+
     pub fn take() -> Option<TestResult> {
         RESULT.with(|r| r.lock().unwrap().take())
     }
@@ -68,9 +78,9 @@ impl SettingsWindow {
         }
     }
 
-    /// Check if settings window is open
+    /// Check if settings window is open (has pending changes or messages)
     pub fn is_open(&self) -> bool {
-        self.config != self.working 
+        self.config != self.working
             || self.connection_status != ConnectionStatus::NotTested
             || self.save_message.is_some()
     }
@@ -86,7 +96,9 @@ impl SettingsWindow {
             self.connection_status = if result.success {
                 ConnectionStatus::Success
             } else {
-                ConnectionStatus::Error(result.error.unwrap_or_else(|| "Unknown error".to_string()))
+                ConnectionStatus::Error(
+                    result.error.unwrap_or_else(|| "Unknown error".to_string()),
+                )
             };
         }
 
@@ -139,8 +151,8 @@ impl SettingsWindow {
                     .hint_text("http://localhost:7381")
                     .desired_width(300.0),
             );
-            
-            // Validate on change
+
+            // Mark dirty on change
             if response.changed() {
                 self.is_dirty = true;
                 self.save_message = None;
@@ -156,14 +168,19 @@ impl SettingsWindow {
         ui.horizontal(|ui| {
             let is_testing = matches!(self.connection_status, ConnectionStatus::Testing);
             let button_enabled = !is_testing && !self.working.agent_url.trim().is_empty();
-            
-            if ui.add_enabled(button_enabled, egui::Button::new("Test Connection")).clicked() {
+
+            if ui
+                .add_enabled(button_enabled, egui::Button::new("Test Connection"))
+                .clicked()
+            {
                 self.test_connection();
             }
 
             match &self.connection_status {
                 ConnectionStatus::NotTested => {
-                    ui.label("").on_hover_text("Click 'Test Connection' to verify agent is reachable");
+                    ui.label("").on_hover_text(
+                        "Click 'Test Connection' to verify agent is reachable",
+                    );
                 }
                 ConnectionStatus::Testing => {
                     ui.spinner();
@@ -185,49 +202,55 @@ impl SettingsWindow {
 
         ui.add_space(8.0);
 
-        Grid::new("approval_grid").num_columns(2).spacing([20.0, 8.0]).show(ui, |ui| {
-            for action in [
-                ActionType::ScreenCapture,
-                ActionType::KeyboardInput,
-                ActionType::MouseClick,
-                ActionType::FileAccess,
-                ActionType::NetworkRequest,
-            ] {
-                ui.label(action.display_name());
+        Grid::new("approval_grid")
+            .num_columns(2)
+            .spacing([20.0, 8.0])
+            .show(ui, |ui| {
+                for action in [
+                    ActionType::ScreenCapture,
+                    ActionType::KeyboardInput,
+                    ActionType::MouseClick,
+                    ActionType::FileAccess,
+                    ActionType::NetworkRequest,
+                ] {
+                    ui.label(action.display_name());
 
-                let current_mode = self
-                    .working
-                    .approval_modes
-                    .get(&action)
-                    .cloned()
-                    .unwrap_or_default();
+                    let current_mode = self
+                        .working
+                        .approval_modes
+                        .get(&action)
+                        .cloned()
+                        .unwrap_or_default();
 
-                let mut selected = current_mode;
-                
-                ComboBox::from_id_salt(format!("approval_{:?}", action))
-                    .selected_text(selected.as_str())
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut selected, ApprovalMode::Auto, "Auto");
-                        ui.selectable_value(&mut selected, ApprovalMode::Notify, "Notify");
-                        ui.selectable_value(&mut selected, ApprovalMode::Approve, "Approve");
-                    });
+                    let mut selected = current_mode;
 
-                if selected != current_mode {
-                    self.working.approval_modes.insert(action, selected);
-                    self.is_dirty = true;
-                    self.save_message = None;
+                    ComboBox::from_id_salt(format!("approval_{:?}", action))
+                        .selected_text(selected.as_str())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut selected, ApprovalMode::Auto, "Auto");
+                            ui.selectable_value(&mut selected, ApprovalMode::Notify, "Notify");
+                            ui.selectable_value(&mut selected, ApprovalMode::Approve, "Approve");
+                        });
+
+                    if selected != current_mode {
+                        self.working.approval_modes.insert(action, selected);
+                        self.is_dirty = true;
+                        self.save_message = None;
+                    }
+
+                    ui.end_row();
                 }
-
-                ui.end_row();
-            }
-        });
+            });
     }
 
     fn draw_startup_section(&mut self, ui: &mut Ui) {
         ui.heading("Startup");
 
         ui.horizontal(|ui| {
-            if ui.checkbox(&mut self.working.launch_at_login, "Launch at login").clicked() {
+            if ui
+                .checkbox(&mut self.working.launch_at_login, "Launch at login")
+                .clicked()
+            {
                 self.is_dirty = true;
                 self.save_message = None;
             }
@@ -238,17 +261,13 @@ impl SettingsWindow {
         ui.label("Notification sound:");
 
         ui.horizontal(|ui| {
-            if RadioButton::new(self.working.notification_sound, "On")
-                .clicked()
-            {
+            if RadioButton::new(self.working.notification_sound, "On").clicked() {
                 self.working.notification_sound = true;
                 self.is_dirty = true;
                 self.save_message = None;
             }
 
-            if RadioButton::new(!self.working.notification_sound, "Off")
-                .clicked()
-            {
+            if RadioButton::new(!self.working.notification_sound, "Off").clicked() {
                 self.working.notification_sound = false;
                 self.is_dirty = true;
                 self.save_message = None;
@@ -262,11 +281,7 @@ impl SettingsWindow {
         ui.label("Theme:");
 
         ui.horizontal(|ui| {
-            if RadioButton::new(
-                matches!(self.working.theme, Theme::System),
-                "System",
-            )
-            .clicked()
+            if RadioButton::new(matches!(self.working.theme, Theme::System), "System").clicked()
             {
                 self.working.theme = Theme::System;
                 self.apply_theme(ui.ctx());
@@ -274,24 +289,14 @@ impl SettingsWindow {
                 self.save_message = None;
             }
 
-            if RadioButton::new(
-                matches!(self.working.theme, Theme::Light),
-                "Light",
-            )
-            .clicked()
-            {
+            if RadioButton::new(matches!(self.working.theme, Theme::Light), "Light").clicked() {
                 self.working.theme = Theme::Light;
                 self.apply_theme(ui.ctx());
                 self.is_dirty = true;
                 self.save_message = None;
             }
 
-            if RadioButton::new(
-                matches!(self.working.theme, Theme::Dark),
-                "Dark",
-            )
-            .clicked()
-            {
+            if RadioButton::new(matches!(self.working.theme, Theme::Dark), "Dark").clicked() {
                 self.working.theme = Theme::Dark;
                 self.apply_theme(ui.ctx());
                 self.is_dirty = true;
@@ -306,7 +311,7 @@ impl SettingsWindow {
         // Show save result message
         if let Some(msg) = &self.save_message {
             ui.colored_label(
-                if msg.starts_with("✗") {
+                if msg.starts_with('✗') {
                     egui::Color32::RED
                 } else {
                     egui::Color32::GREEN
@@ -323,11 +328,7 @@ impl SettingsWindow {
                 }
 
                 let has_changes = self.is_dirty || self.working != self.config;
-                if ui
-                    .button("Save")
-                    .enabled(has_changes)
-                    .clicked()
-                {
+                if ui.button("Save").enabled(has_changes).clicked() {
                     self.save();
                 }
             });
@@ -349,14 +350,14 @@ impl SettingsWindow {
         // Perform HTTP request in background thread to avoid blocking UI
         // Results are communicated back via thread-local storage
         let url_clone = url.clone();
-        
+
         std::thread::spawn(move || {
             // Use ureq with timeouts to prevent hanging
             // 5s connect timeout, 5s read timeout
             let request = ureq::get(&url_clone)
                 .timeout_connect(5_000)
                 .timeout_read(5_000);
-            
+
             match request.call() {
                 Ok(response) if response.status() == 200 => {
                     log::info!("Connection test successful");
@@ -393,7 +394,7 @@ impl SettingsWindow {
     fn save(&mut self) {
         log::info!("Saving settings...");
 
-        // Validate URL before saving or making HTTP requests
+        // Validate URL before saving
         if let Err(e) = self.working.validate_agent_url() {
             self.save_message = Some(format!("✗ {}", e));
             return;
@@ -444,16 +445,19 @@ impl SettingsWindow {
         // Using a simple fire-and-forget approach with error logging
         let url_clone = url.clone();
         let payload_clone = payload.clone();
-        
+
         std::thread::spawn(move || {
             let request = ureq::put(&url_clone)
                 .timeout_connect(5_000)
                 .timeout_read(10_000)
                 .set("Content-Type", "application/json");
-            
+
             match request.send_json(&payload_clone) {
                 Ok(response) => {
-                    log::info!("Approval config pushed successfully: {}", response.status());
+                    log::info!(
+                        "Approval config pushed successfully: {}",
+                        response.status()
+                    );
                 }
                 Err(e) => {
                     log::warn!("Failed to push approval config: {}", e);
@@ -468,15 +472,5 @@ impl SettingsWindow {
         self.connection_status = ConnectionStatus::NotTested;
         self.save_message = None;
         log::info!("Settings cancelled, reverted to saved state");
-    }
-}
-
-impl ApprovalMode {
-    fn as_str(&self) -> &'static str {
-        match self {
-            ApprovalMode::Auto => "Auto",
-            ApprovalMode::Notify => "Notify",
-            ApprovalMode::Approve => "Approve",
-        }
     }
 }
