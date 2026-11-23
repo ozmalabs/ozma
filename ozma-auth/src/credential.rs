@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Extension point for local OS authentication.
 //!
-//! PAM and SSH-key verification are deliberately **not** implemented in this
-//! pass. Platform adapters (M2) should implement [`LocalAuthenticator`] in
-//! their own crate behind an optional feature so the default build does not
-//! link PAM or a native crypto library.
+//! Two adapters live in this crate: [`crate::pam::PamAuthenticator`] for a
+//! local password on Linux, and [`crate::ssh::SshKeyAuthenticator`] for an
+//! OpenSSH key plus an SSHSIG challenge. The SSH adapter needs a signature and
+//! therefore exposes its own challenge API; the trait method alone always
+//! reports `auth.ssh_challenge_required` instead of treating a bare public key
+//! as proof.
 //!
 //! Nothing here fakes an authentication result: a node without a configured
 //! backend simply has no authenticator.
@@ -48,9 +50,10 @@ pub struct AuthenticatedIdentity {
 /// Platform authentication backend.
 ///
 /// Implementations must be cheap to share across the session manager and must
-/// not hold a lock while blocking. A future PAM adapter can use a dedicated
-/// worker; an SSH-key adapter can parse `authorized_keys` from a configured
-/// file. Neither belongs in this crate.
+/// not hold a lock while blocking. The PAM adapter calls into libpam on the
+/// caller's thread; a node that authenticates interactively should run it on a
+/// dedicated worker. The SSH adapter parses `authorized_keys` from a configured
+/// file on each verification so revocation is immediate.
 pub trait LocalAuthenticator: Send + Sync {
     /// Verify `credential` for `principal`.
     ///
