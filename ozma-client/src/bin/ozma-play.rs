@@ -139,11 +139,30 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
         Box::new(NullVideoSink::new())
     };
     let audio: Option<Box<dyn AudioSink>> = if cli.audio {
-        Some(Box::new(
-            AlsaAudioSink::connect(AlsaAudioSinkConfig::default()).map_err(|error| {
-                api_error(ozma_client::codes::CLIENT_CONFIG, error.to_string())
-            })?,
-        ))
+        #[cfg(target_os = "linux")]
+        {
+            match ozma_playback::PipeWireAudioSink::default_sink().await {
+                Ok(sink) => Some(Box::new(sink)),
+                Err(error) => {
+                    tracing::warn!(error = %error, "PipeWire playback unavailable; trying ALSA");
+                    Some(Box::new(
+                        AlsaAudioSink::connect(AlsaAudioSinkConfig::default()).map_err(
+                            |error| {
+                                api_error(ozma_client::codes::CLIENT_CONFIG, error.to_string())
+                            },
+                        )?,
+                    ))
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Some(Box::new(
+                AlsaAudioSink::connect(AlsaAudioSinkConfig::default()).map_err(|error| {
+                    api_error(ozma_client::codes::CLIENT_CONFIG, error.to_string())
+                })?,
+            ))
+        }
     } else {
         None
     };

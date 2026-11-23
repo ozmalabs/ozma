@@ -1,6 +1,6 @@
 //! # ozma-pipewire
 //!
-//! PipeWire audio routing for the Ozma agent.
+//! PipeWire audio routing and native audio streams for the Ozma agent.
 //!
 //! ## Platform support
 //!
@@ -10,7 +10,7 @@
 //! | Windows  | CPAL              | ✗ (enumerate only) |
 //! | macOS    | CPAL              | ✗ (enumerate only) |
 //!
-//! ## Quick start
+//! ## Graph routing
 //!
 //! ```rust,no_run
 //! use ozma_pipewire::build_router;
@@ -24,11 +24,43 @@
 //!     }
 //! }
 //! ```
+//!
+//! ## Native capture and playback (Linux)
+//!
+//! [`PipeWireAudioSource`] and [`PipeWireAudioSink`] open their own PipeWire
+//! `Stream` on a dedicated OS thread, independent of the graph router.  Both
+//! target 48 kHz stereo and accept `S16LE` or `F32LE`; capture always exposes
+//! interleaved `i16`.
+//!
+//! ```rust,no_run
+//! use ozma_pipewire::{CaptureConfig, PcmFrame, PipeWireAudioSource};
+//! use std::time::Duration;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let mut source = PipeWireAudioSource::new(CaptureConfig::default()).await?;
+//!     let frame: PcmFrame = tokio::time::timeout(Duration::from_secs(2), source.next_frame()).await??;
+//!     println!("{} Hz, {} ch, {} samples", frame.sample_rate, frame.channels, frame.samples.len());
+//!     let status = ozma_pipewire::probe(Duration::from_secs(2)).await?;
+//!     println!("{}", status.summary());
+//!     Ok(())
+//! }
+//! ```
 
+pub mod error;
+pub mod pcm;
 pub mod types;
 
 #[cfg(target_os = "linux")]
+mod capture;
+#[cfg(target_os = "linux")]
 mod pipewire_backend;
+#[cfg(target_os = "linux")]
+mod pw_common;
+#[cfg(target_os = "linux")]
+mod sink;
+#[cfg(target_os = "linux")]
+mod status;
 
 #[cfg(not(target_os = "linux"))]
 mod cpal_backend;
@@ -37,7 +69,21 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
+pub use error::PipeWireError;
+pub use pcm::{
+    convert_to_s16, f32_to_i16, s16_to_f32_le_bytes, s16_to_le_bytes, NegotiatedFormat, PcmFrame,
+    PcmQueue, SampleFormat,
+};
 pub use types::{AudioEvent, AudioLink, AudioNode, GraphSnapshot, LinkRequest};
+
+#[cfg(target_os = "linux")]
+pub use capture::{CaptureConfig, CaptureStats, PipeWireAudioSource};
+#[cfg(target_os = "linux")]
+pub use pw_common::StreamTarget;
+#[cfg(target_os = "linux")]
+pub use sink::{PipeWireAudioSink, SinkConfig, SinkStats};
+#[cfg(target_os = "linux")]
+pub use status::{probe, probe_status, probe_with, PipeWireStatus, ProbeConfig, StatusError};
 
 /// Core trait implemented by every audio routing backend.
 #[async_trait]

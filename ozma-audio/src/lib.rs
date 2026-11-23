@@ -56,6 +56,8 @@
 #![forbid(unsafe_code)]
 
 pub mod alsa;
+#[cfg(target_os = "linux")]
+pub mod pipewire;
 pub mod error;
 pub mod fake;
 pub mod frame;
@@ -66,6 +68,8 @@ pub use alsa::{
     AlsaCapture, AlsaCaptureConfig, DEFAULT_BUFFER_PERIODS, DEFAULT_PERIOD_FRAMES,
     DEFAULT_START_TIMEOUT, FRAME_CHANNEL_CAPACITY,
 };
+#[cfg(target_os = "linux")]
+pub use pipewire::PipeWireCapture;
 pub use error::{audio_codes, AudioError};
 pub use fake::{FakeAudioSource, DEFAULT_FRAME_LIMIT, DEFAULT_TONE_HZ};
 pub use frame::{

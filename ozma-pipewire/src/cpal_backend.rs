@@ -27,12 +27,8 @@ impl CpalRouter {
     fn enumerate_nodes() -> anyhow::Result<(Vec<AudioNode>, Option<String>, Option<String>)> {
         let host = cpal::default_host();
 
-        let default_out = host
-            .default_output_device()
-            .and_then(|d| d.name().ok());
-        let default_in = host
-            .default_input_device()
-            .and_then(|d| d.name().ok());
+        let default_out = host.default_output_device().and_then(|d| d.name().ok());
+        let default_in = host.default_input_device().and_then(|d| d.name().ok());
 
         let mut nodes = Vec::new();
         let mut id: u32 = 0;

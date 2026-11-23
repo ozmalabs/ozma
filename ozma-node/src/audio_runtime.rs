@@ -12,6 +12,8 @@ use ozma_audio::{
     AlsaCapture, AlsaCaptureConfig, AudioEncoder, AudioSource, EncodedAudio, EncoderConfig,
     FakeAudioSource, OpusEncoder,
 };
+#[cfg(target_os = "linux")]
+use ozma_audio::PipeWireCapture;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
@@ -24,24 +26,69 @@ pub struct AudioRuntime {
 }
 
 impl AudioRuntime {
-    /// Start the real ALSA path, falling back to the fake source.
-    pub fn start() -> Self {
-        let source: Box<dyn AudioSource> = match AlsaCapture::open(AlsaCaptureConfig::default()) {
-            Ok(capture) => Box::new(capture),
+    /// Start the best native audio source: PipeWire first, then ALSA, then the
+    /// deterministic fake source.
+    pub async fn start() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            match PipeWireCapture::default_source().await {
+                Ok(mut capture) => {
+                    // A suspended/idle PipeWire source may negotiate a format
+                    // but not deliver a frame. Do not let that stall a session;
+                    // fall back to ALSA/fake after a short probe.
+                    match tokio::time::timeout(Duration::from_millis(1500), capture.next_frame())
+                        .await
+                    {
+                        Ok(Ok(first)) => {
+                            tracing::info!("Using PipeWire audio capture");
+                            return Self::spawn(Box::new(capture), Some(first));
+                        }
+                        Ok(Err(error)) => {
+                            warn!(error = %error, "PipeWire capture produced no frame; trying ALSA");
+                        }
+                        Err(_) => {
+                            warn!("PipeWire capture produced no frame in time; trying ALSA");
+                        }
+                    }
+                    let _ = capture.stop().await;
+                }
+                Err(error) => {
+                    warn!(error = %error, "PipeWire capture unavailable; trying ALSA");
+                }
+            }
+        }
+        match AlsaCapture::open(AlsaCaptureConfig::default()) {
+            Ok(mut capture) => {
+                match tokio::time::timeout(Duration::from_millis(1500), capture.next_frame()).await {
+                    Ok(Ok(first)) => {
+                        tracing::info!("Using ALSA audio capture");
+                        return Self::spawn(Box::new(capture), Some(first));
+                    }
+                    Ok(Err(error)) => {
+                        warn!(error = %error, "ALSA capture produced no frame; using fake source");
+                    }
+                    Err(_) => {
+                        warn!("ALSA capture produced no frame in time; using fake source");
+                    }
+                }
+                let _ = capture.stop().await;
+            }
             Err(error) => {
                 warn!(error = %error, "ALSA capture unavailable; using fake audio source");
-                Box::new(FakeAudioSource::new().unlimited())
             }
-        };
-        Self::spawn(source)
+        }
+        Self::spawn(Box::new(FakeAudioSource::new().unlimited()), None)
     }
 
     /// Start with the deterministic fake source, for tests and local harnesses.
     pub fn fake() -> Self {
-        Self::spawn(Box::new(FakeAudioSource::new().unlimited()))
+        Self::spawn(Box::new(FakeAudioSource::new().unlimited()), None)
     }
 
-    fn spawn(mut source: Box<dyn AudioSource>) -> Self {
+    fn spawn(
+        mut source: Box<dyn AudioSource>,
+        first: Option<ozma_audio::AudioFrame>,
+    ) -> Self {
         let source_id = source.id().to_owned();
         let (tx, rx) = mpsc::channel(32);
         let task = tokio::spawn(async move {
@@ -52,8 +99,12 @@ impl AudioRuntime {
                     return;
                 }
             };
+            let mut pending = first;
             loop {
-                let frame = match source.next_frame().await {
+                let frame = match match pending.take() {
+                    Some(frame) => Ok(frame),
+                    None => source.next_frame().await,
+                } {
                     Ok(frame) => frame,
                     Err(error) => {
                         debug!(error = %error, "audio source ended");
@@ -67,6 +118,7 @@ impl AudioRuntime {
                         continue;
                     }
                 };
+                eprintln!("AUDIO: packet {}", packet.data.len());
                 if tx.send(packet).await.is_err() {
                     break;
                 }
@@ -138,3 +190,4 @@ mod tests {
         assert_eq!(packet.channels, 2);
     }
 }
+

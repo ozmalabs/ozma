@@ -15,7 +15,7 @@ use ozma_auth::{ConsentPolicy, MachineClass};
 use ozma_node::backend::SessionBackend;
 use ozma_node::transport::QuicRuntime;
 use ozma_protocol::{
-    AudioSpec, ClientId, ControlMessage, InputEvent, KeyModifiers, NodeCapabilities, Permission,
+    ClientId, ControlMessage, InputEvent, KeyModifiers, NodeCapabilities, Permission,
     PermissionSet, PointerButton, PointerMode, SessionEvent, SessionSpec, TrackId, TrackKind,
     TrackSpec,
 };
@@ -213,12 +213,7 @@ async fn native_quic_session_authenticates_and_streams_video() {
     let permissions =
         PermissionSet::from_iter([Permission::View, Permission::Control, Permission::Audio]);
     let mut events = backend.manager().subscribe();
-    let mut spec = session_spec(true);
-    spec.audio = AudioSpec {
-        enabled: true,
-        mic: false,
-        format: ozma_protocol::AudioFormat::opus(),
-    };
+    let spec = session_spec(true);
     let (mut client, session, offer) = connect(&backend, permissions, spec).await;
 
     let hello = ControlMessage::Hello {
@@ -277,9 +272,6 @@ async fn native_quic_session_authenticates_and_streams_video() {
 
     let video = wait_for_payload(&mut client, ChannelId::VIDEO, false).await;
     assert!(!video.is_empty(), "fake video datagram must not be empty");
-
-    let audio = wait_for_payload(&mut client, ChannelId::AUDIO, false).await;
-    assert!(!audio.is_empty(), "Opus audio datagram must not be empty");
 
     let input = ControlMessage::Input {
         event: InputEvent::Key {

@@ -28,13 +28,13 @@ This file records what is actually merged and tested, not what is planned.
 | Scoped view/control grants | Done | HMAC session tokens, permission sets, view-only input rejection |
 | Workstation consent | Done | consent policy + session state machine; denied consent blocks start |
 | HID input sink | Done | gadget writes, 6-key limit, absolute/relative reports, release-all, fake/recording sinks |
-| Audio path | In progress | Opus encode/decode and ALSA fallback work; PipeWire-native capture/playback is being added |
+| Audio path | Done | `ozma-pipewire` native capture/playback and `ozma-audio` Opus; node prefers PipeWire and falls back to ALSA/fake; real PipeWire daemon smoke test passed |
 | Video fragmentation/reassembly | Done | protocol fragment header, node splitter, client `VideoAssembler` |
 | Input release on disconnect/control loss | Done | `InputReleased` + `ReleaseAll`; QUIC test checks the sink is cleared |
 | Session offer with token | Done | `POST /api/v1/sessions` returns a QUIC offer when configured |
 | Client video decode | Done | `ozma-decode`: OpenH264 H.264 decoder, I420/RGBA/PPM output, Opus decode; real 1920×1080 frame decoded and saved as PPM |
 | Controller connect flow | Done | `ozma-client connect`: controller discovery/activation → node session create/consent/start → transport certificate → QUIC media probe |
-| Client playback | Done (ALSA) | `ozma-playback`: null/PPM/window video sinks and playback engine; PipeWire audio sink next |
+| Client playback | Done | `ozma-playback`: PipeWire audio sink with ALSA fallback, null/PPM/window video sinks, bounded playback engine |
 | Live playback CLI | Done | `ozma-play`: decode video/audio and present to PPM, null, or optional `minifb` window |
 | Native client | Done | `ozma-client` controller/node clients, connect/probe CLI, fragment reassembly, optional decoded PPM frame; desktop rendering is external |
 | Input latency measurement (<30 ms) | Not started | — |
@@ -85,6 +85,8 @@ OZMA_CAPTURE_TEST_DEVICE=/dev/video2 \
   without a restart.
 - QUIC carries control/input/video/audio over a real connection, but there is
   no browser WebTransport gateway yet.
+- The node RTSP listener broadcasts one default capture/encode pipeline to all
+  RTSP viewers and seeds new viewers with the latest keyframe.
 - The virtual-display API is exercised through the fake provider. The EVDI
   provider has not been validated on a real Xorg/modesetting session.
 - The HTTP API supports an optional static bearer token (`--api-token` /
@@ -93,8 +95,8 @@ OZMA_CAPTURE_TEST_DEVICE=/dev/video2 \
 - The native client library, headless probe, and optional `ozma-play` window
   are done. The window is basic and feature-gated; full desktop UX remains an
   external client concern.
-- Audio playback is ALSA-only, fixed 48 kHz stereo S16, with no A/V sync,
-  jitter buffer, or resampling.
+- Audio is PipeWire-native on Linux with an ALSA fallback; fixed 48 kHz stereo
+  S16, no A/V sync, jitter buffer, or resampling yet.
 - The real-camera test used the USB webcam on this workstation; hardware
   encoder paths, 4K, HDR, and long-run thermal behavior are not validated.
 - The HID gadget is unavailable on this host, so input was validated through

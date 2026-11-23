@@ -7,6 +7,7 @@ license = "AGPL-3.0-only"
 
 [dependencies]
 ozma-protocol = { path = "../ozma-protocol" }
+ozma-pipewire = { path = "../ozma-pipewire" }
 alsa = { workspace = true }
 async-trait = "0.1"
 audiopus = "0.3.0-rc.0"

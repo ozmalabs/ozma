@@ -229,7 +229,7 @@ async fn handle_connection(
     };
 
     let mut audio = if session.spec.audio.enabled {
-        Some(AudioRuntime::start())
+        Some(AudioRuntime::start().await)
     } else {
         None
     };

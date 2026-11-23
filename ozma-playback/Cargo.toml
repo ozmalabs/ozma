@@ -12,6 +12,7 @@ window = ["dep:minifb"]
 [dependencies]
 ozma-decode = { path = "../ozma-decode" }
 ozma-audio = { path = "../ozma-audio" }
+ozma-pipewire = { path = "../ozma-pipewire" }
 alsa = { workspace = true }
 thiserror = "1"
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }

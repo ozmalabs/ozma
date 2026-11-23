@@ -110,7 +110,11 @@ impl PipeWireRouter {
         ready_rx.await??;
 
         info!("PipeWire audio router ready");
-        Ok(Self { cmd_tx, event_tx, state })
+        Ok(Self {
+            cmd_tx,
+            event_tx,
+            state,
+        })
     }
 }
 
@@ -133,7 +137,8 @@ impl AudioRouter for PipeWireRouter {
 
     async fn destroy_link(&self, link_id: u32) -> anyhow::Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx.send(PwCommand::DestroyLink { link_id, reply: tx })?;
+        self.cmd_tx
+            .send(PwCommand::DestroyLink { link_id, reply: tx })?;
         rx.await?
     }
 
@@ -242,7 +247,11 @@ fn handle_command(cmd: PwCommand, core: &Core, state: &Arc<Mutex<GraphState>>) {
             let snap = state.lock().unwrap().snapshot();
             let _ = reply.send(snap);
         }
-        PwCommand::CreateLink { output_node, input_node, reply } => {
+        PwCommand::CreateLink {
+            output_node,
+            input_node,
+            reply,
+        } => {
             let result = create_link_sync(core, state, output_node, input_node);
             let _ = reply.send(result);
         }
@@ -323,9 +332,7 @@ fn handle_link_global(
     state: &Arc<Mutex<GraphState>>,
     event_tx: &broadcast::Sender<AudioEvent>,
 ) {
-    let parse = |key: &str| -> u32 {
-        props.get(key).and_then(|v| v.parse().ok()).unwrap_or(0)
-    };
+    let parse = |key: &str| -> u32 { props.get(key).and_then(|v| v.parse().ok()).unwrap_or(0) };
 
     let link = AudioLink {
         id,
@@ -340,11 +347,7 @@ fn handle_link_global(
     debug!("PW link added: id={id}");
 }
 
-fn handle_port_global(
-    id: u32,
-    props: &DictRef,
-    state: &Arc<Mutex<GraphState>>,
-) {
+fn handle_port_global(id: u32, props: &DictRef, state: &Arc<Mutex<GraphState>>) {
     let node_id: u32 = props
         .get("node.id")
         .and_then(|v| v.parse().ok())
