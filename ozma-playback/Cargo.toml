@@ -1,0 +1,22 @@
+[package]
+name = "ozma-playback"
+version = "0.1.0"
+edition = "2021"
+description = "Audio and video playback sinks for Ozma clients."
+license = "AGPL-3.0-only"
+
+[features]
+default = []
+window = ["dep:minifb"]
+
+[dependencies]
+ozma-decode = { path = "../ozma-decode" }
+ozma-audio = { path = "../ozma-audio" }
+alsa = { workspace = true }
+thiserror = "1"
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+tracing = "0.1"
+minifb = { version = "0.27", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

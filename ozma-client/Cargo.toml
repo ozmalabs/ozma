@@ -9,10 +9,19 @@ license = "AGPL-3.0-only"
 name = "ozma-client"
 path = "src/main.rs"
 
+[[bin]]
+name = "ozma-play"
+path = "src/bin/ozma-play.rs"
+
+[features]
+default = []
+window = ["ozma-playback/window"]
+
 [dependencies]
 ozma-protocol = { path = "../ozma-protocol" }
 ozma-transport = { path = "../ozma-transport" }
 ozma-decode = { path = "../ozma-decode" }
+ozma-playback = { path = "../ozma-playback" }
 png = "0.17"
 anyhow = { workspace = true }
 base64 = "0.22"
