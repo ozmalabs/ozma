@@ -22,6 +22,11 @@
 //!   ([`QmpDisplaySource`]). It is a polling path, not a real-time framebuffer
 //!   subscription. Register it explicitly with
 //!   [`CaptureRegistry::with_qmp_display`] or from the VM profile.
+//! * [`vnc_display`] reads QEMU's VNC display through ffmpeg's VNC input and
+//!   returns packed RGB24 frames ([`VncDisplaySource`]). It is the transition
+//!   path until the D-Bus framebuffer provider exists; it needs no
+//!   v4l2loopback device. Register it with
+//!   [`CaptureRegistry::with_vnc_display`].
 //! * [`lookingglass`] parses Looking Glass KVMFR shared memory into owned
 //!   frames ([`LookingGlassSource`]). [`LookingGlassProvider`] advertises the
 //!   region as [`CaptureKind::LookingGlass`] by reading only the KVMFR header;
@@ -51,6 +56,7 @@ pub mod v4l2;
 // `virtual` is a reserved Rust keyword; the raw identifier keeps the intended
 // module name and file (`virtual.rs`) while still compiling.
 pub mod r#virtual;
+pub mod vnc_display;
 
 pub use fake::FakeCaptureProvider;
 pub use lookingglass::{
@@ -81,6 +87,12 @@ pub use v4l2::{
     is_capture_like_name, keyframe_for, monotonic_pts, next_sequence, parse_video_index,
     preferred_fourcc, timestamp_micros, V4l2Capture, V4l2Node, V4l2Provider, DEFAULT_FRAME_TIMEOUT,
     DEFAULT_MAX_HEIGHT, DEFAULT_MAX_WIDTH, PREFERRED_FOURCCS,
+};
+pub use vnc_display::{
+    ffmpeg_argv, ProcessVncSpawner, VncChild, VncDisplayConfig, VncDisplayProvider,
+    VncDisplaySource, VncSpawner, MAX_STDERR_BYTES, MAX_VNC_DIMENSION, VNC_DEFAULT_CONNECT_TIMEOUT,
+    VNC_DEFAULT_FFMPEG_BIN, VNC_DEFAULT_FPS, VNC_DEFAULT_HEIGHT, VNC_DEFAULT_HOST, VNC_DEFAULT_ID,
+    VNC_DEFAULT_NAME, VNC_DEFAULT_PORT, VNC_DEFAULT_WIDTH,
 };
 
 /// Re-export of the capture vocabulary callers need alongside this crate.
@@ -264,5 +276,26 @@ mod tests {
             .scan()
             .iter()
             .all(|scan| scan.kind != CaptureKind::LookingGlass));
+    }
+
+    #[test]
+    fn vnc_display_is_opt_in_and_registry_driven() {
+        let registry = CaptureRegistry::new()
+            .with_vnc_display(VncDisplayConfig::new("127.0.0.1", 5901).with_dimensions(640, 480));
+        assert_eq!(registry.provider_count(), 1);
+        let scans = registry.scan();
+        assert_eq!(scans[0].kind, CaptureKind::Vnc);
+        assert_eq!(scans[0].capabilities.len(), 1);
+        assert_eq!(scans[0].capabilities[0].id, VNC_DEFAULT_ID);
+        assert_eq!(scans[0].capabilities[0].formats, vec!["rgb24".to_owned()]);
+
+        assert!(CaptureRegistry::system()
+            .scan()
+            .iter()
+            .all(|scan| scan.kind != CaptureKind::Vnc));
+        assert!(CaptureRegistry::system_with_pipewire()
+            .scan()
+            .iter()
+            .all(|scan| scan.kind != CaptureKind::Vnc));
     }
 }

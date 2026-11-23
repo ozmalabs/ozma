@@ -2,8 +2,8 @@
 
 Status: **Phase 0 implemented; Phase 1 core and the Phase 2 VM-provider, HLS,
 controller-input, softnode-supervisor, and helper-first WebRTC work implemented.
-Native/live WebRTC validation, D-Bus/VNC capture, full VM provisioning, and
-Phases 3–5 remain plans.** See
+Native/live WebRTC validation, D-Bus capture, live VNC validation, full VM
+provisioning, and Phases 3–5 remain plans.** See
 [`plan-execution-status.md`](plan-execution-status.md) and
 [`parity-matrix.md`](parity-matrix.md) for the evidence and remaining gaps.
 Scope: the Python `softnode/`, `node/`, and `agent/` processes are replaced by the

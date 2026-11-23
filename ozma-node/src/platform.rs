@@ -8,19 +8,47 @@ use ozma_protocol::{
     UsbCapability, VirtualDisplayCaps,
 };
 
-use ozma_capture::{CaptureRegistry, QmpDisplayConfig, QMP_DEFAULT_ID, QMP_DEFAULT_MAX_FPS};
+use ozma_capture::{
+    CaptureRegistry, QmpDisplayConfig, VncDisplayConfig, QMP_DEFAULT_ID, QMP_DEFAULT_MAX_FPS,
+    VNC_DEFAULT_ID,
+};
 
 use crate::config::{NodeConfig, NodeProfile};
 
 /// Build the capture registry for this node.
 ///
-/// Hardware keeps V4L2+PipeWire discovery. A VM only ever advertises its QMP
-/// display: advertising the host's V4L2/PipeWire devices on a guest would claim
-/// hardware the VM does not own. A VM without a configured QMP socket gets an
-/// empty registry.
+/// Hardware keeps V4L2+PipeWire discovery. A VM only ever advertises its own
+/// display: either the QMP `screendump` path or the ffmpeg-backed VNC path
+/// selected by the provider resolver. Advertising the host's V4L2/PipeWire
+/// devices on a guest would claim hardware the VM does not own. A VM with no
+/// configured display gets an empty registry.
 pub fn capture_registry(config: &NodeConfig) -> CaptureRegistry {
     match config.profile {
-        NodeProfile::Vm => match &config.qmp_socket {
+        NodeProfile::Vm => vm_capture_registry(config),
+        NodeProfile::Hardware | NodeProfile::Desktop => CaptureRegistry::system_with_pipewire(),
+    }
+}
+
+fn vm_capture_registry(config: &NodeConfig) -> CaptureRegistry {
+    let capture = config
+        .vm_providers()
+        .ok()
+        .and_then(|providers| providers.capture);
+
+    match capture.as_deref() {
+        Some("vnc") => match (config.vnc_host.as_deref(), config.vnc_port) {
+            (Some(host), Some(port)) => CaptureRegistry::new().with_vnc_display(
+                VncDisplayConfig::new(host, port)
+                    .with_identity(VNC_DEFAULT_ID, format!("{} VNC display", config.name))
+                    .with_dimensions(config.vnc_width, config.vnc_height)
+                    .with_fps(config.vnc_fps)
+                    .with_ffmpeg_bin(config.ffmpeg_bin.clone()),
+            ),
+            // `NodeConfig::validate` and the resolver reject a partial
+            // endpoint; never invent one here.
+            _ => CaptureRegistry::new(),
+        },
+        Some("qmp") => match &config.qmp_socket {
             Some(socket) => CaptureRegistry::new().with_qmp_display(
                 QmpDisplayConfig::new(socket.clone())
                     .with_identity(QMP_DEFAULT_ID, format!("{} VM display", config.name))
@@ -28,7 +56,7 @@ pub fn capture_registry(config: &NodeConfig) -> CaptureRegistry {
             ),
             None => CaptureRegistry::new(),
         },
-        NodeProfile::Hardware | NodeProfile::Desktop => CaptureRegistry::system_with_pipewire(),
+        _ => CaptureRegistry::new(),
     }
 }
 
@@ -154,6 +182,12 @@ mod tests {
             libvirt_domain: None,
             qmp_connect_timeout: std::time::Duration::from_millis(3_000),
             qmp_command_timeout: std::time::Duration::from_millis(5_000),
+            vnc_host: None,
+            vnc_port: None,
+            vnc_width: ozma_capture::VNC_DEFAULT_WIDTH,
+            vnc_height: ozma_capture::VNC_DEFAULT_HEIGHT,
+            vnc_fps: ozma_capture::VNC_DEFAULT_FPS,
+            ffmpeg_bin: std::path::PathBuf::from("ffmpeg"),
             audio_sink: None,
             vm_guest_ip: None,
             display_outputs_json: "[]".into(),
@@ -199,5 +233,47 @@ mod tests {
         let scans = registry.scan();
         assert_eq!(scans.len(), 1);
         assert_eq!(scans[0].kind, ozma_protocol::CaptureKind::Qmp);
+    }
+
+    #[test]
+    fn vm_profile_uses_only_the_vnc_capture_source_when_selected() {
+        let mut vm = config("hid,video,audio");
+        vm.profile = crate::config::NodeProfile::Vm;
+        vm.vnc_host = Some("127.0.0.1".into());
+        vm.vnc_port = Some(5901);
+        vm.vnc_width = 1280;
+        vm.vnc_height = 720;
+        vm.vnc_fps = 15;
+
+        let registry = capture_registry(&vm);
+        assert_eq!(registry.provider_count(), 1);
+        let scans = registry.scan();
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].kind, ozma_protocol::CaptureKind::Vnc);
+        assert_eq!(scans[0].capabilities.len(), 1);
+        let capability = &scans[0].capabilities[0];
+        assert_eq!(capability.id, ozma_capture::VNC_DEFAULT_ID);
+        assert_eq!((capability.max_width, capability.max_height), (1280, 720));
+        assert_eq!(capability.max_fps, 15);
+        assert_eq!(capability.formats, vec!["rgb24".to_owned()]);
+
+        // The advertised capability reaches NodeCapabilities unchanged.
+        let caps = detect_with_registry(&vm, &registry);
+        assert_eq!(caps.capture.len(), 1);
+        assert_eq!(caps.capture[0].kind, ozma_protocol::CaptureKind::Vnc);
+
+        // An incomplete endpoint never becomes a registry source.
+        vm.vnc_port = None;
+        assert_eq!(capture_registry(&vm).provider_count(), 0);
+    }
+
+    #[test]
+    fn hardware_profile_never_advertises_vnc() {
+        let hardware = config("hid,video,audio");
+        let registry = capture_registry(&hardware);
+        assert!(registry
+            .scan()
+            .iter()
+            .all(|scan| scan.kind != ozma_protocol::CaptureKind::Vnc));
     }
 }

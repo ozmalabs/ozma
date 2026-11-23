@@ -310,24 +310,72 @@ impl VmProviderConfig {
 }
 
 fn resolve_capture(config: &NodeConfig) -> Result<Option<String>, String> {
+    let vnc_requested = config.vnc_host.is_some() || config.vnc_port.is_some();
+
     if let Some(value) = &config.provider_overrides.capture {
-        if value.eq_ignore_ascii_case("qmp") && config.qmp_socket.is_none() {
-            return Err("--capture-provider qmp requires --qmp-socket".to_owned());
+        let name = value.trim().to_ascii_lowercase();
+        return match name.as_str() {
+            "qmp" => {
+                if config.qmp_socket.is_none() {
+                    return Err("--capture-provider qmp requires --qmp-socket".to_owned());
+                }
+                Ok(Some("qmp".to_owned()))
+            }
+            "vnc" => {
+                if config.profile != NodeProfile::Vm {
+                    return Err("--capture-provider vnc requires --profile vm".to_owned());
+                }
+                validate_vnc_flags(config, true)?;
+                Ok(Some("vnc".to_owned()))
+            }
+            _ if config.profile == NodeProfile::Vm => Err(format!(
+                "unknown capture provider {value:?} for the vm profile; expected qmp or vnc"
+            )),
+            _ if vnc_requested => Err(format!(
+                "--capture-provider {value:?} conflicts with --vnc-host/--vnc-port; \
+                 select --capture-provider vnc or remove the VNC flags"
+            )),
+            _ => Ok(Some(value.clone())),
+        };
+    }
+
+    if config.profile == NodeProfile::Vm {
+        if vnc_requested {
+            validate_vnc_flags(config, false)?;
+            return Ok(Some("vnc".to_owned()));
         }
-        return Ok(Some(value.clone()));
+        // QMP keeps precedence when no VNC endpoint and no provider was asked
+        // for. A VM with neither configured gets no capture source.
+        return Ok(if config.qmp_socket.is_some() {
+            Some("qmp".to_owned())
+        } else {
+            None
+        });
+    }
+
+    if vnc_requested {
+        return Err(
+            "--vnc-host/--vnc-port select VNC capture, which requires --profile vm".to_owned(),
+        );
     }
 
     Ok(match config.profile {
         NodeProfile::Hardware => Some("v4l2".to_owned()),
         NodeProfile::Desktop => Some("pipewire".to_owned()),
-        NodeProfile::Vm => {
-            if config.qmp_socket.is_some() {
-                Some("qmp".to_owned())
-            } else {
-                None
-            }
-        }
+        NodeProfile::Vm => unreachable!("vm profile handled above"),
     })
+}
+
+/// VNC capture needs both endpoint flags. A partial endpoint is an error rather
+/// than an invitation to invent a host or port from the defaults.
+fn validate_vnc_flags(config: &NodeConfig, explicit_provider: bool) -> Result<(), String> {
+    match (&config.vnc_host, config.vnc_port) {
+        (Some(_), Some(_)) => Ok(()),
+        (None, None) if explicit_provider => {
+            Err("--capture-provider vnc requires --vnc-host and --vnc-port".to_owned())
+        }
+        _ => Err("--vnc-host and --vnc-port must be provided together for VNC capture".to_owned()),
+    }
 }
 
 fn resolve_input_chain(config: &NodeConfig) -> Result<Vec<SinkKind>, String> {
@@ -434,6 +482,18 @@ pub struct NodeConfig {
     pub qmp_connect_timeout: Duration,
     /// QMP command timeout.
     pub qmp_command_timeout: Duration,
+    /// QEMU VNC host for VM display capture.
+    pub vnc_host: Option<String>,
+    /// QEMU VNC port for VM display capture.
+    pub vnc_port: Option<u16>,
+    /// Scaled VNC output width.
+    pub vnc_width: u32,
+    /// Scaled VNC output height.
+    pub vnc_height: u32,
+    /// VNC output frame rate.
+    pub vnc_fps: u32,
+    /// ffmpeg executable used by VNC capture and HLS.
+    pub ffmpeg_bin: PathBuf,
     /// Audio sink name advertised to the controller.
     pub audio_sink: Option<String>,
     /// Guest IP advertised by VM soft nodes.
@@ -470,6 +530,24 @@ impl NodeConfig {
         validate_json_array("pci_devices", &self.pci_devices_json)?;
         validate_path("--qmp-socket", self.qmp_socket.as_deref())?;
         validate_path("--qmp-input-socket", self.qmp_input_socket.as_deref())?;
+        validate_path("--ffmpeg-bin", Some(self.ffmpeg_bin.as_path()))?;
+        if let Some(host) = &self.vnc_host {
+            if host.trim().is_empty() {
+                return Err("--vnc-host must not be empty".to_owned());
+            }
+        }
+        if self.vnc_port == Some(0) {
+            return Err("--vnc-port must be greater than zero".to_owned());
+        }
+        if self.vnc_width == 0 {
+            return Err("--vnc-width must be greater than zero".to_owned());
+        }
+        if self.vnc_height == 0 {
+            return Err("--vnc-height must be greater than zero".to_owned());
+        }
+        if self.vnc_fps == 0 {
+            return Err("--vnc-fps must be greater than zero".to_owned());
+        }
         if let Some(domain) = &self.libvirt_domain {
             if domain.trim().is_empty() {
                 return Err("--libvirt-domain must not be empty".to_owned());
@@ -653,6 +731,12 @@ mod tests {
             libvirt_domain: None,
             qmp_connect_timeout: Duration::from_millis(DEFAULT_QMP_CONNECT_TIMEOUT_MS),
             qmp_command_timeout: Duration::from_millis(DEFAULT_QMP_COMMAND_TIMEOUT_MS),
+            vnc_host: None,
+            vnc_port: None,
+            vnc_width: ozma_capture::VNC_DEFAULT_WIDTH,
+            vnc_height: ozma_capture::VNC_DEFAULT_HEIGHT,
+            vnc_fps: ozma_capture::VNC_DEFAULT_FPS,
+            ffmpeg_bin: PathBuf::from("ffmpeg"),
             audio_sink: None,
             vm_guest_ip: None,
             display_outputs_json: "[]".into(),
@@ -812,6 +896,114 @@ mod tests {
 
         let mut config = test_config(NodeProfile::Vm);
         config.qmp_command_timeout = Duration::ZERO;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn vm_with_vnc_flags_selects_vnc_capture() {
+        let mut config = test_config(NodeProfile::Vm);
+        config.vnc_host = Some("127.0.0.1".into());
+        config.vnc_port = Some(5901);
+
+        let resolved = config.vm_providers().unwrap();
+        assert_eq!(resolved.capture.as_deref(), Some("vnc"));
+        assert!(resolved.has_capture());
+
+        // An explicit provider is accepted with a complete endpoint.
+        let mut config = vm_config_with_overrides("vnc", "", "");
+        config.vnc_host = Some("127.0.0.1".into());
+        config.vnc_port = Some(5901);
+        assert_eq!(
+            config.vm_providers().unwrap().capture.as_deref(),
+            Some("vnc")
+        );
+
+        // Either flag alone is enough to select VNC, but then the endpoint is
+        // incomplete and resolution must fail instead of inventing a value.
+        let mut config = test_config(NodeProfile::Vm);
+        config.vnc_port = Some(5901);
+        let error = config.vm_providers().unwrap_err();
+        assert!(error.contains("--vnc-host"), "{error}");
+
+        let mut config = test_config(NodeProfile::Vm);
+        config.vnc_host = Some("127.0.0.1".into());
+        let error = config.vm_providers().unwrap_err();
+        assert!(error.contains("--vnc-port"), "{error}");
+    }
+
+    #[test]
+    fn explicit_vnc_provider_requires_both_endpoint_flags() {
+        let config = vm_config_with_overrides("vnc", "", "");
+        let error = config.vm_providers().unwrap_err();
+        assert!(error.contains("--vnc-host"), "{error}");
+        assert!(error.contains("--vnc-port"), "{error}");
+    }
+
+    #[test]
+    fn vnc_flags_take_precedence_over_qmp_when_no_provider_is_explicit() {
+        let mut config = test_config(NodeProfile::Vm);
+        config.qmp_socket = Some(PathBuf::from("/run/ozma/ctrl.qmp"));
+        config.vnc_host = Some("127.0.0.1".into());
+        config.vnc_port = Some(5901);
+
+        assert_eq!(
+            config.vm_providers().unwrap().capture.as_deref(),
+            Some("vnc")
+        );
+
+        // Without VNC flags the QMP socket keeps its existing precedence.
+        config.vnc_host = None;
+        config.vnc_port = None;
+        assert_eq!(
+            config.vm_providers().unwrap().capture.as_deref(),
+            Some("qmp")
+        );
+    }
+
+    #[test]
+    fn vnc_capture_is_vm_only_and_vm_rejects_unknown_providers() {
+        let mut hardware = test_config(NodeProfile::Hardware);
+        hardware.vnc_host = Some("127.0.0.1".into());
+        hardware.vnc_port = Some(5901);
+        let error = hardware.vm_providers().unwrap_err();
+        assert!(error.contains("--profile vm"), "{error}");
+
+        let mut hardware = vm_config_with_overrides("vnc", "", "");
+        hardware.profile = NodeProfile::Hardware;
+        hardware.vnc_host = Some("127.0.0.1".into());
+        hardware.vnc_port = Some(5901);
+        let error = hardware.vm_providers().unwrap_err();
+        assert!(error.contains("--profile vm"), "{error}");
+
+        let config = vm_config_with_overrides("v4l2", "", "");
+        let error = config.vm_providers().unwrap_err();
+        assert!(error.contains("expected qmp or vnc"), "{error}");
+    }
+
+    #[test]
+    fn invalid_vnc_values_are_rejected() {
+        let mut config = test_config(NodeProfile::Vm);
+        config.vnc_host = Some("   ".into());
+        assert!(config.validate().is_err());
+
+        let mut config = test_config(NodeProfile::Vm);
+        config.vnc_port = Some(0);
+        assert!(config.validate().is_err());
+
+        let mut config = test_config(NodeProfile::Vm);
+        config.vnc_width = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = test_config(NodeProfile::Vm);
+        config.vnc_height = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = test_config(NodeProfile::Vm);
+        config.vnc_fps = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = test_config(NodeProfile::Vm);
+        config.ffmpeg_bin = PathBuf::new();
         assert!(config.validate().is_err());
     }
 }

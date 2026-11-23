@@ -26,9 +26,9 @@ row itself is the Rust behavior under test.
   `ozma-node/tests/parity/`. It runs without a HID gadget, hypervisor, QMP
   socket, Python process, or privileged port.
 - Current run (2026-11-24): `cargo test -p ozma-node --test parity` →
-  **14 passed, 0 failed**; `cargo test -p ozma-node` → **150 passed,
-  0 failed, 2 ignored**; `cargo test --workspace` → **1183 passed, 0 failed,
-  12 ignored**.
+  **14 passed, 0 failed**; `cargo test -p ozma-node` → **158 passed,
+  0 failed, 2 ignored**; `cargo test --workspace` → **1205 passed, 0 failed,
+  13 ignored**.
 - Fake QMP support: `ozma-qmp/tests/common/` provides a greeting/capabilities
   server and an SCM_RIGHTS `getfd` peer. `ozma-capture/tests/qmp_display.rs`
   and `ozma-power/tests/qmp_power.rs` reuse the same protocol shape for their
@@ -49,10 +49,11 @@ row itself is the Rust behavior under test.
 | Input — release on disconnect | `partial` | The `InputSink::release_all` contract clears held keys/buttons and records `ReleaseAll` for the gadget, uinput, QMP, and recording sinks; this is the call a disconnect handler must make. | `cargo test -p ozma-node --test parity release_on_disconnect_contract_clears_held_input`, `cargo test -p ozma-input` | No session/transport disconnect handler is wired to the compat UDP listener yet, so "release on disconnect" is not end-to-end asserted. |
 | Input — Linux uinput sink | `partial` | HID→Linux keycode mapping (letters, digits, controls, F1–F24, keypad, media, modifiers), absolute/relative pointer modes, buttons/wheel, duplicate suppression, `ReleaseAll`, and rejection of touch/pen/clipboard. | `cargo test -p ozma-input` (70 passed, 1 ignored) | Real `/dev/uinput` test is `#[ignore]` and needs `OZMA_UINPUT_TEST=1` plus group/udev access. |
 | Input — QMP sink | `partial` | `InputEvent` → QMP `input-send-event` translation, modifier diffing, buttons, wheel press/release pairs, `ReleaseAll`, selection-chain fallback, and a fake-QMP socket integration test. | `cargo test -p ozma-input`, `cargo test -p ozma-qmp` | Horizontal wheel, touch/pen, and clipboard are rejected rather than faked; no real QEMU input test in CI. |
-| Capture — QMP screendump | `partial` | `QmpDisplayProvider` enumerates a socket, polls `screendump`, parses binary P6 PPM to RGB24, paces at `max_fps`, and returns typed errors; provider is registered by the VM profile when `--qmp-socket` is set. | `cargo test -p ozma-capture` (87 unit + 5 QMP integration) | Polling path with file I/O latency; captures QEMU's default console only (no `device` argument yet). |
+| Capture — QMP screendump | `partial` | `QmpDisplayProvider` enumerates a socket, polls `screendump`, parses binary P6 PPM to RGB24, paces at `max_fps`, and returns typed errors; provider is registered by the VM profile when `--qmp-socket` is set. | `cargo test -p ozma-capture` (100 unit + 5 QMP integration) | Polling path with file I/O latency; captures QEMU's default console only (no `device` argument yet). |
 | Capture — Looking Glass KVMFR | `partial` | KVMFR header/frame parsing, format conversion (BGRA/RGBA/RGB24/NV12), geometry/bounds rejection, `LookingGlassSource`, and a side-effect-free `LookingGlassProvider` with a temp-file fixture. | `cargo test -p ozma-capture` | No real `/dev/shm/looking-glass` test; provider is opt-in, not in `system*`. |
 | Capture — v4l2loopback VirtualCapture | `partial` | Side-effect-free sysfs label discovery, `VirtualCapture` command/lifecycle with injected runner, provider open/rollback, and stop cleanup. | `cargo test -p ozma-capture` | Real v4l2loopback/ffmpeg test is `#[ignore]`; provider is opt-in. |
-| Capture — D-Bus framebuffer / VNC | `not-implemented` | No Rust D-Bus or VNC display source. | — | Add `DBusDisplayProvider`/`VncDisplayProvider` in a later Phase 1/2 slice. |
+| Capture — VNC display (ffmpeg transition) | `partial` | `VncDisplayProvider` advertises one `CaptureKind::Vnc` source (`rgb24`, uncompressed, no HDR) from validated `--vnc-host`/`--vnc-port` without connecting. `open` returns `VncDisplaySource`, which lazily spawns ffmpeg with `-f vnc -i <host>:<port> -vf scale=<w>:<h> -pix_fmt rgb24 -f rawvideo -r <fps> -`, reads exactly `width*height*3` bytes per frame, paces PTS/sequence monotonically, bounds stderr to 4 KiB, applies a first-frame startup timeout, and maps EOF/short frames to `EndOfStream`/typed errors. The VM profile selects it from `--capture-provider vnc` or the VNC flags; HLS/WebRTC open the first registry source and accept `rgb24` unchanged. | `cargo test -p ozma-capture` (VNC argv/config/enumerate/fake-child/EOF/short-frame/stop/spawn-failure/timeout tests), `cargo test -p ozma-node` (resolver precedence + VNC registry kind) | ffmpeg VNC is a transition path, not the destination. Unauthenticated loopback VNC only (no VNC password/TLS); every frame is scaled to the configured size; no VNC audio or input; no live VNC/ffmpeg run in CI (this host's ffmpeg reports `Unknown format 'vnc'`). The `#[ignore]`d real test needs `OZMA_VNC_TEST=1`. |
+| Capture — D-Bus framebuffer | `not-implemented` | No Rust D-Bus framebuffer source. | — | Add `DBusDisplayProvider` in a later Phase 1/2 slice; it remains the lower-latency VM display path. |
 | VM display model | `partial` | `VmConsole`/`VmDisplayTopology` model for QMP/D-Bus/VNC/Looking Glass consoles, primary selection, left-to-right placements, validation, and `Console_N` ids. | `cargo test -p ozma-display` (58 passed, 14 VM tests) | Model only; not wired to a provider/API yet. |
 | Stream — HLS `/stream/*` | `partial` | `--hls` starts a real capture → ffmpeg `rawvideo` → HLS pipeline (`ozma-node/src/hls.rs`) and serves the output directory at `/stream/*`. `rgb24` is passed through and `bgra` is converted; other formats are rejected with a typed error. `/api/v1/connection` reports `hls: "running"` only once `stream.m3u8` exists, otherwise `"not-configured"` or `"failed"` plus `hls_error`. `/stream` is mounted outside the bearer guard (after the guard layer is applied) because `controller/api.py::stream_hls_proxy` fetches it without credentials; control endpoints stay guarded and `ServeDir` rejects path traversal. | `cargo test -p ozma-node --test parity health_and_connection_surface_match_baseline connection_reports_a_failed_hls_pipeline_with_an_error stream_files_are_served_only_from_the_configured_directory`, `cargo test -p ozma-node --lib hls::`, `cargo test -p ozma-node api::tests::hls_is_served_without_bearer_but_control_stays_guarded` | No real ffmpeg or live controller proxy in the default suite (real-ffmpeg test is `#[ignore]`, `OZMA_FFMPEG_TEST=1`). HLS playlist advance/segment rotation against a live QEMU VM is not asserted; the fixed argv does not pass `-hls_flags delete_segments`, so retained segments stay on disk. |
 | Stream — WebRTC `/webrtc/offer`, `/webrtc/bitrate` (external helper) | `partial` | `--webrtc-helper` supervises the existing GStreamer/Python worker: argv `[program] [script] --sock --shm --width --height --fps`, a bounded wait for the Unix socket, newline-delimited JSON signaling (`{"type":"offer","sdp":...}` → `{"type":"answer","sdp":...}`), and an fps-paced feeder that converts `rgb24`/`bgra` frames to packed BGRA and replaces `shm_path` atomically. Other formats are typed errors. WebRTC is disabled without a helper (`not-configured`); a configured helper that fails is `failed` with `webrtc_error`, never `running`. `/webrtc/offer` and `/webrtc/bitrate` are mounted through the compat extra router behind the bearer guard; without a helper they answer typed 503s. `bitrate` sends `{"type":"bitrate","bitrate":<bps>}` and requires an acknowledgement: the current worker sends none, so the route returns a typed 502 rather than a fake success. | `cargo test -p ozma-node --lib webrtc::`, `cargo test -p ozma-node --test parity webrtc_`, `cargo test -p ozma-node --lib controller_compat::tests::webrtc_` | Helper-first only: no native `webrtc-rs`/`str0m`, no WebRTC audio, no RTCP/ICE tuning. WebRTC opens its own source from the same capture registry, so a device that cannot be opened twice alongside HLS reports `failed` rather than sharing a frame tap. No live GStreamer/Python helper or controller `/api/v1/streams/{node}/webrtc` run in CI; the real-helper test is `#[ignore]` and gated by `OZMA_WEBRTC_GS_SCRIPT`. |
@@ -61,7 +62,7 @@ row itself is the Rust behavior under test.
 | Audio — per-VM sink monitor, non-silent decode, mic path | `not-implemented` | Only registration fields (`audio_type`, `audio_sink`) are asserted. The UAC2 gadget bridge is not a VM audio-routing parity test. | `cargo test -p ozma-node --test parity registration_payload_matches_python_controller_baseline` (fields only) | Phase 2: per-VM sink routing, decoded-audio assertion, mic path. |
 | VM supervision — per-VM `ozma-node` process, ports, restart | `partial` | `ozma-softnode` supervises real `ozma-node --profile vm` subprocesses: deterministic HID/HTTP ports, QMP/capture/power/input flags, single-socket QMP input fallback, start/stop/restart with bounded backoff, unchanged-VM reuse, and shutdown/reap. | `cargo test -p ozma-softnode` (20 passed) | Subprocess transition only; no real QEMU/libvirt test. |
 | VM provisioning — QMP/D-Bus/evdev/audio, managed without edits | `not-implemented` | No QMP/display socket creation, libvirt XML edits, D-Bus p2p, evdev `input-linux`, or per-VM audio routing. | — | Port `_provision_vm` and the remaining device/audio provisioning into `ozma-softnode`. |
-| Native plane — workspace, QUIC/WebTransport | `green` | Full workspace test suite, including existing QUIC/WebTransport and browser-capture tests, passed. | `cargo test --workspace` (1183 passed, 0 failed, 12 ignored) | Keep green. Hardware-dependent tests remain `#[ignore]`/opt-in. |
+| Native plane — workspace, QUIC/WebTransport | `green` | Full workspace test suite, including existing QUIC/WebTransport and browser-capture tests, passed. | `cargo test --workspace` (1205 passed, 0 failed, 13 ignored) | Keep green. Hardware-dependent tests remain `#[ignore]`/opt-in. |
 | Regression — controller pytest, demo scenario, clean-host install | `not-run` | Not executed in this Phase 0 work. | — | Run the unmodified controller pytest suite, the demo, and a clean-host install before claiming Gate 2/3. |
 
 ## How to run
@@ -83,10 +84,10 @@ Phase 1/2 additions and their evidence:
 | `ozma-qmp` dual-socket client + HID→QMP | `cargo test -p ozma-qmp` (62 passed, 1 ignored) |
 | `ozma-input` uinput + QMP sinks + selection chain + reverse keymap | `cargo test -p ozma-input` (64 unit + 14 integration + 2 doctests, 1 ignored) |
 | `ozma-power` QMP + libvirt backends | `cargo test -p ozma-power` (34 passed, 1 ignored) |
-| `ozma-capture` QMP/LookingGlass/VirtualCapture | `cargo test -p ozma-capture` (87 unit + 5 QMP integration) |
+| `ozma-capture` QMP/LookingGlass/VirtualCapture/VNC | `cargo test -p ozma-capture` (100 unit + 5 QMP integration) |
 | `ozma-display` VM console model | `cargo test -p ozma-display` (58 passed) |
 | `ozma-audio` named PipeWire target | `cargo test -p ozma-audio -p ozma-pipewire` (92 passed, 1 ignored) |
-| `ozma-node` VM profile + `/power/*` + compat input/codec | `cargo test -p ozma-node` (150 passed, 2 ignored) |
+| `ozma-node` VM profile + `/power/*` + compat input/codec | `cargo test -p ozma-node` (158 passed, 2 ignored) |
 | `ozma-node` local HLS pipeline + `/stream/*` | `cargo test -p ozma-node --lib hls::` (11 passed, 1 ignored); `cargo test -p ozma-node --test parity` (14 passed) |
 | `ozma-node` WebRTC external-helper surface | `cargo test -p ozma-node --lib webrtc::` (17 passed, 1 ignored); `cargo test -p ozma-node --test parity webrtc_` (4 passed) |
 | `ozma-softnode` per-VM subprocess supervisor | `cargo test -p ozma-softnode` (20 passed) |
@@ -143,6 +144,10 @@ external processes:
 - **Real QEMU/libvirt:** QMP sockets, D-Bus framebuffer, VNC, KVMFR. Phase 1
   tests should be marked `#[ignore]` or environment-gated, with a fake-QMP
   fixture for the default run.
+- **Real VNC:** ffmpeg must be built with the VNC demuxer (the host ffmpeg used
+  for this slice reports `Unknown format 'vnc'`) and a QEMU VNC endpoint must be
+  listening. Run `OZMA_VNC_TEST=1 [OZMA_VNC_HOST=…] [OZMA_VNC_PORT=…] cargo
+  test -p ozma-capture -- --ignored real_vnc_ffmpeg_captures_a_frame`.
 - **Real WebRTC helper:** GStreamer + the Python worker from `softnode/`. Set
   `OZMA_WEBRTC_GS_SCRIPT=/path/to/gst_webrtc_worker.py` (and optionally
   `OZMA_WEBRTC_GS_PYTHON`) and run the `#[ignore]`d
@@ -178,7 +183,9 @@ remain `#[ignore]`/environment-gated.
   (`/audio/apply`, `/audio/remove`, `/audio/play`, `/audio/stop`). `GET /codec`
   and the input compatibility routes are wired; the remaining endpoints answer
   typed 501s until a real encode/restart and PipeWire path exist.
-- D-Bus framebuffer and VNC display providers.
+- D-Bus framebuffer display provider. The ffmpeg VNC path is implemented but is
+  a transition path: unauthenticated loopback VNC only, scaled output, no VNC
+  audio/input, and no live VNC validation in CI.
 - `ozma-softnode` provisioning: QMP/display socket creation, libvirt XML edits,
   D-Bus p2p, evdev `input-linux`, per-VM audio routing, and status/metrics
   aggregation. The subprocess supervisor, port allocation, and restart/backoff

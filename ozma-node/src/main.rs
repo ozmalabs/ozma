@@ -121,6 +121,28 @@ pub struct Args {
     )]
     pub qmp_command_timeout_ms: u64,
 
+    /// QEMU VNC host for VM display capture. Setting this (or `--vnc-port`)
+    /// selects the ffmpeg-backed VNC provider when no capture provider is
+    /// named explicitly.
+    #[arg(long, env = "OZMA_VNC_HOST")]
+    pub vnc_host: Option<String>,
+
+    /// QEMU VNC port for VM display capture (must be non-zero).
+    #[arg(long, env = "OZMA_VNC_PORT")]
+    pub vnc_port: Option<u16>,
+
+    /// Scaled VNC output width in pixels (must be non-zero).
+    #[arg(long, env = "OZMA_VNC_WIDTH", default_value_t = ozma_capture::VNC_DEFAULT_WIDTH)]
+    pub vnc_width: u32,
+
+    /// Scaled VNC output height in pixels (must be non-zero).
+    #[arg(long, env = "OZMA_VNC_HEIGHT", default_value_t = ozma_capture::VNC_DEFAULT_HEIGHT)]
+    pub vnc_height: u32,
+
+    /// VNC output frame rate (must be non-zero).
+    #[arg(long, env = "OZMA_VNC_FPS", default_value_t = ozma_capture::VNC_DEFAULT_FPS)]
+    pub vnc_fps: u32,
+
     /// Node role advertised to the controller.
     #[arg(long, default_value = "compute")]
     pub role: String,
@@ -335,6 +357,12 @@ async fn main() {
             .map(|domain| domain.trim().to_owned()),
         qmp_connect_timeout: std::time::Duration::from_millis(args.qmp_connect_timeout_ms),
         qmp_command_timeout: std::time::Duration::from_millis(args.qmp_command_timeout_ms),
+        vnc_host: args.vnc_host.clone(),
+        vnc_port: args.vnc_port,
+        vnc_width: args.vnc_width,
+        vnc_height: args.vnc_height,
+        vnc_fps: args.vnc_fps,
+        ffmpeg_bin: args.ffmpeg_bin.clone(),
         audio_sink: args.audio_sink.clone(),
         vm_guest_ip: args.vm_guest_ip.clone(),
         display_outputs_json: args.display_outputs_json.clone(),
@@ -354,14 +382,14 @@ async fn main() {
         }
     };
 
-    // Capture: hardware keeps V4L2/PipeWire; a VM uses only its QMP display.
-    // A VM without a QMP socket gets an empty registry so it never advertises
-    // host hardware it does not own.
+    // Capture: hardware keeps V4L2/PipeWire; a VM uses only its QMP or VNC
+    // display. A VM without either flag gets an empty registry so it never
+    // advertises host hardware it does not own.
     let capture_registry = platform::capture_registry(&config);
     if config.profile == NodeProfile::Vm && !vm_providers.has_capture() {
         warn!(
-            "vm profile has no --qmp-socket: no capture source is configured. \
-             Hardware capture is not advertised on a VM."
+            "vm profile has no --qmp-socket or --vnc-host/--vnc-port: no capture \
+             source is configured. Hardware capture is not advertised on a VM."
         );
     }
     let capabilities = platform::detect_with_registry(&config, &capture_registry);
@@ -967,6 +995,42 @@ mod tests {
         assert_eq!(args.webrtc_bitrate_kbps, 4_000);
         assert!(args.webrtc_socket.is_none());
         assert!(args.webrtc_shm.is_none());
+    }
+
+    #[test]
+    fn vnc_capture_flags_parse_with_vm_defaults() {
+        let defaults = Args::parse_from(["ozma-node"]);
+        assert!(defaults.vnc_host.is_none());
+        assert!(defaults.vnc_port.is_none());
+        assert_eq!(defaults.vnc_width, ozma_capture::VNC_DEFAULT_WIDTH);
+        assert_eq!(defaults.vnc_height, ozma_capture::VNC_DEFAULT_HEIGHT);
+        assert_eq!(defaults.vnc_fps, ozma_capture::VNC_DEFAULT_FPS);
+        assert_eq!(defaults.ffmpeg_bin, std::path::PathBuf::from("ffmpeg"));
+
+        let args = Args::parse_from([
+            "ozma-node",
+            "--profile",
+            "vm",
+            "--vnc-host",
+            "127.0.0.1",
+            "--vnc-port",
+            "5901",
+            "--vnc-width",
+            "1280",
+            "--vnc-height",
+            "720",
+            "--vnc-fps",
+            "15",
+            "--ffmpeg-bin",
+            "/usr/bin/ffmpeg",
+        ]);
+        assert_eq!(args.vnc_host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(args.vnc_port, Some(5901));
+        assert_eq!(
+            (args.vnc_width, args.vnc_height, args.vnc_fps),
+            (1280, 720, 15)
+        );
+        assert_eq!(args.ffmpeg_bin, std::path::PathBuf::from("/usr/bin/ffmpeg"));
     }
 
     #[test]

@@ -39,19 +39,20 @@ power, VM provisioning, or real EVDI. Those remain Phase 1–3 work and are mark
 | QMP capture provider | Done (polling) | `QmpDisplayProvider` PPM screendump → RGB24, fps pacing, typed errors, fake-QMP integration; opt-in registry |
 | Looking Glass provider | Done (fixture) | KVMFR parser/source/provider, RGBA/I420 conversion, temp shared-memory fixture; opt-in registry |
 | VirtualCapture provider | Done (fake runner) | side-effect-free sysfs discovery, v4l2loopback/ffmpeg lifecycle, rollback/stop; real test ignored |
+| VNC display provider | Partial (ffmpeg transition) | `VncDisplayProvider`/`VncDisplaySource` enumerate without I/O, spawn ffmpeg `-f vnc` lazily, read raw RGB24 frames with monotonic PTS/sequence, bound stderr, and map EOF/short frames to typed errors; fake-child tests; real VNC test ignored (`OZMA_VNC_TEST=1`) |
+| D-Bus framebuffer provider | Not started | QMP screendump and the ffmpeg VNC transition path are the VM display capture paths today |
 | VM display model | Done (model) | `VmConsole`/`VmDisplayTopology`, placements, primary/validation, `Console_N` ids; 14 tests |
 | Audio target selection | Done (model) | `AudioTarget`, `<sink>.monitor` naming, `PipeWireCapture::open_target/open_sink_monitor`; no routing yet |
-| VM profile wiring | Partial | `--qmp-socket`/`--qmp-input-socket`/`--libvirt-domain`, QMP capture registry, input sink chain (single-socket QMP fallback), QMP/libvirt power, `/power/state`, `/power/{action}`, connection power summary; 126 `ozma-node` tests |
+| VM profile wiring | Partial | `--qmp-socket`/`--qmp-input-socket`/`--libvirt-domain`, QMP capture registry, `--vnc-host`/`--vnc-port`/`--vnc-width`/`--vnc-height`/`--vnc-fps` with VNC-over-QMP precedence and explicit-provider resolution, input sink chain (single-socket QMP fallback), QMP/libvirt power, `/power/state`, `/power/{action}`, connection power summary; 123 `ozma-node` lib tests |
 | HLS pipeline | Partial | `HlsPipeline` reads RGB24/BGRA `CaptureSource` frames into ffmpeg HLS, `/stream/*` serves the output dir, connection reports `running`/`failed`/`not-configured`; 112 `ozma-node` tests before the compat additions |
 | Controller input compat | Done (recording/fake in CI) | `/input/key`, `/input/mouse`, `/input/type`, `GET/POST /codec`, honest `/audio/*` 501s, bearer-guarded; real injection is hardware/QMP opt-in |
 | WebRTC compat | Partial (helper-first) | `WebRtcHelper` supervises an external GStreamer/Python worker over a Unix socket, feeds BGRA frames from a capture source, and proxies `/webrtc/offer`/`/webrtc/bitrate`; connection reports `running`/`not-configured`/`failed`. No native WebRTC, no WebRTC audio, no live helper in CI |
-| D-Bus framebuffer / VNC | Not started | QMP screendump is the only VM display capture path today |
 | `ozma-softnode` per-VM supervisor | Partial | supervises real `ozma-node --profile vm` subprocesses with deterministic ports, restart/backoff, stop/reap, and QMP input fallback; 20 tests |
 | `ozma-softnode` provisioning | Not started | QMP/display socket creation, libvirt XML edits, D-Bus p2p, evdev `input-linux`, and per-VM audio routing remain deferred |
 
-Gate 2 is **not** met: native/live WebRTC validation, D-Bus/VNC capture, full VM
-provisioning, and a real-QEMU/controller demo remain. The parity matrix lists
-the remaining rows.
+Gate 2 is **not** met: native/live WebRTC validation, D-Bus framebuffer
+capture, live VNC validation, full VM provisioning, and a real-QEMU/controller
+demo remain. The parity matrix lists the remaining rows.
 
 ## M0 — Contract and cleanup
 
@@ -123,7 +124,7 @@ authentication, and Xpra video are being extended in separate workstreams.
 ## Verification
 
 ```bash
-cargo test --workspace                                   # 1183 passed, 12 ignored (current)
+cargo test --workspace                                   # 1205 passed, 13 ignored (current)
 cargo test -p ozma-node --test parity                    # Python/controller parity baseline
 cargo test -p ozma-node --lib                            # node API, compat, session unit tests (69)
 cargo test -p ozma-qmp -p ozma-input -p ozma-power       # QMP, uinput/QMP sinks, power (166)
@@ -134,6 +135,8 @@ cargo test -p ozma-node --test m0_acceptance
 cargo test -p ozma-capture                               # opt-in real camera/v4l2loopback tests are ignored
 OZMA_CAPTURE_TEST_DEVICE=/dev/video2 \
   cargo test -p ozma-capture -- --ignored real_v4l2_capture
+OZMA_VNC_TEST=1 OZMA_VNC_HOST=127.0.0.1 OZMA_VNC_PORT=5901 \
+  cargo test -p ozma-capture -- --ignored real_vnc_ffmpeg_captures_a_frame
 OZMA_TEST_CAPTURE_DEVICE=/dev/video0 \
   cargo test -p ozma-client --lib -- --ignored real_camera_publishes_frames
 ```
@@ -142,7 +145,10 @@ OZMA_TEST_CAPTURE_DEVICE=/dev/video0 \
 
 - QMP display capture is a polling `screendump` path: every frame costs a QMP
   round trip plus a PPM write/read, and it captures QEMU's default console only.
-  The D-Bus framebuffer and VNC providers are not implemented.
+  VNC capture is implemented only as an ffmpeg transition path: unauthenticated
+  loopback VNC, every frame scaled to the configured size, no VNC audio/input,
+  and no live VNC/ffmpeg run in CI. The D-Bus framebuffer provider is still not
+  implemented.
 - The uinput sink is unit-tested but its real `/dev/uinput` test is ignored; the
   host user is not in the `input` group. QMP sinks are tested against a fake
   server, not a real QEMU. QMP has no horizontal wheel, touch, or pen event, and
@@ -156,9 +162,9 @@ OZMA_TEST_CAPTURE_DEVICE=/dev/video0 \
   WebRTC is helper-first only: it supervises the external GStreamer/Python
   worker, has no native stack or audio, and the current worker does not
   acknowledge bitrate changes. No live helper or controller negotiation has run
-  in CI. D-Bus/VNC capture, runtime codec override, audio routing, and full
-  `ozma-softnode` provisioning remain unimplemented. Gate 2 is not met until
-  live validation and those remaining pieces land.
+  in CI. D-Bus framebuffer capture, live VNC validation, runtime codec override,
+  audio routing, and full `ozma-softnode` provisioning remain unimplemented.
+  Gate 2 is not met until live validation and those remaining pieces land.
 - `ozma-softnode` supervises `ozma-node --profile vm` subprocesses and allocates
   ports, but it does not create QMP/display sockets, edit libvirt XML, provision
   evdev/PulseAudio devices, or aggregate status/metrics yet.

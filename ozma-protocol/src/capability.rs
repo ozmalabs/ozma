@@ -21,6 +21,8 @@ pub enum CaptureKind {
     Qmp,
     /// Looking Glass KVMFR shared-memory framebuffer.
     LookingGlass,
+    /// VM display read through the VNC/RFB protocol (ffmpeg transition path).
+    Vnc,
     X11,
     Dxgi,
     HdmiSink,
@@ -244,6 +246,22 @@ impl NodeCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_kinds_serialize_with_stable_names() {
+        assert_eq!(
+            serde_json::to_string(&CaptureKind::Vnc).unwrap(),
+            r#""vnc""#
+        );
+        assert_eq!(
+            serde_json::from_str::<CaptureKind>(r#""vnc""#).unwrap(),
+            CaptureKind::Vnc
+        );
+        assert_eq!(
+            serde_json::to_string(&CaptureKind::LookingGlass).unwrap(),
+            r#""looking_glass""#
+        );
+    }
 
     #[test]
     fn fake_capabilities_are_consistent() {

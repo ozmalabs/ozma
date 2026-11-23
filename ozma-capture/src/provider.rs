@@ -128,6 +128,16 @@ impl CaptureRegistry {
         self
     }
 
+    /// Add an ffmpeg-backed VNC display provider.
+    ///
+    /// This is opt-in for the same reason as [`CaptureRegistry::with_qmp_display`]:
+    /// a hardware/desktop node has no QEMU VNC endpoint. Enumeration only
+    /// validates the configuration; it does not connect or spawn ffmpeg.
+    pub fn with_vnc_display(mut self, config: crate::vnc_display::VncDisplayConfig) -> Self {
+        self.register(crate::vnc_display::VncDisplayProvider::new(config));
+        self
+    }
+
     /// Add a Looking Glass KVMFR provider.
     ///
     /// Like the QMP provider, this is opt-in: a hardware node has no IVSHMEM
