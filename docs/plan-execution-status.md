@@ -31,7 +31,7 @@ This file records what is actually merged and tested, not what is planned.
 | HID input sink | Done | gadget writes, 6-key limit, absolute/relative reports, release-all, fake/recording sinks |
 | Audio path | Done | `ozma-pipewire` native capture/playback and `ozma-audio` Opus; node prefers PipeWire and falls back to ALSA/fake; real PipeWire daemon smoke test passed |
 | Video fragmentation/reassembly | Done | protocol fragment header, node splitter, client `VideoAssembler` |
-| Client camera/mic uplink | In progress | `ChannelKind::Camera` + `CaptureStart/Stop/State` + `KeyframeRequest`; node decodes H.264/Opus into a bounded per-session hub with `/api/v1/sessions/{id}/capture` and a PPM proof endpoint; `RunningPipeline::request_keyframe` is real. Browser (`getUserMedia` + WebCodecs) and native (`ozma-capture`/`ozma-encode`/Opus) uplink clients are being implemented |
+| Client camera/mic uplink | Browser done; native in progress | `ChannelKind::Camera` + `CaptureStart/Stop/State` + `KeyframeRequest`; node decodes H.264/Opus into a bounded hub with `/api/v1/sessions/{id}/capture` and a PPM proof endpoint. Browser `getUserMedia` + WebCodecs verified in Chromium and Firefox: node decoded 1280x720 camera frames and 376,320 mic samples, PPM valid. Native `ozma-capture`/`ozma-encode` uplink is being added |
 | Input release on disconnect/control loss | Done | `InputReleased` + `ReleaseAll`; QUIC test checks the sink is cleared |
 | Session offer with token | Done | `POST /api/v1/sessions` returns a QUIC offer when configured |
 | Client video decode | Done | `ozma-decode`: OpenH264 H.264 decoder, I420/RGBA/PPM output, Opus decode; real 1920×1080 frame decoded and saved as PPM |
@@ -62,7 +62,7 @@ This file records what is actually merged and tested, not what is planned.
 | SPICE | Direct surfaces + auth validated | QXL secondary surfaces for image placements, damage rectangles, TLS-only ticket auth, PCM playback channel. `spicy`/screenshot tests verified movement, removal, damage, auth rejection, and playback channel init. One viewer; no SPICE video codec/A-V sync. |
 | Xpra | Video path validated at wire level | Handshake fields, PNG delivery, draw acknowledgement, placement-only updates, codec negotiation, and encoded H.264/VP8/VP9/JPEG frames. Stock Xpra remains unverified; compressed hello records are not accepted. |
 | Browser scene producer | Live bridge | WebSocket `/api/v1/browser/scene/ws` ingests browser-painted scenes; bounded resource/commit/video hub, `live.mjs` fixture bridge; browser video is metadata-only. This is a producer path, not the viewer. |
-| Web viewer | Done (H.264, Chromium + Firefox) | Native Ozma client compiled to wasm32 (`ozma-web`): WebTransport session, shared `ozma-client-core` framing/`VideoAssembler`, WebCodecs H.264, canvas, Opus/Web Audio, pointer/keyboard (USB HID) input. Headless Chromium rendered live 1920x1080 video and Firefox 159 rendered live 320x240; both decode a paced Opus stream with no errors |
+| Web viewer | Done (H.264, Chromium + Firefox) | Native Ozma client compiled to wasm32 (`ozma-web`): WebTransport session, shared `ozma-client-core` framing/`VideoAssembler`, WebCodecs H.264, canvas, Opus/Web Audio, pointer/keyboard (USB HID) input, and camera/mic uplink. Chromium and Firefox both rendered live video, decoded a paced Opus stream, published a 1280x720 fake camera (node decoded 117/78 frames) and 376,320 microphone samples, and measured a non-zero analyser level |
 | VNC | Development output | RFB 3.8 framebuffer server with damage updates; viewer input discarded. |
 | Google Cast | Development output | Live HLS composed output with local playback validation; physical receiver and controller integration remain open. |
 
@@ -95,7 +95,11 @@ OZMA_CAPTURE_TEST_DEVICE=/dev/video2 \
   WebTransport and rendered live 1920x1080 H.264 frames on a canvas; Firefox
   159 rendered live 320x240 frames and both decoded a paced Opus stream. Wrong
   certificate hashes are rejected. Client camera/microphone uplink is being
-  added; audible-output level, lip sync, HEVC/AV1/AAC, and Safari remain open.
+  added and verified in Chromium/Firefox with fake devices: the node decoded
+  camera H.264 and microphone Opus, returned a valid PPM frame, and the
+  analyser reported non-silent audio. A/V drift is measured but not corrected;
+  Firefox loses whole access units when a camera fragment is dropped; USB
+  UVC/UAC2 injection, HEVC/AV1/AAC, and Safari remain open.
 - PipeWire video capture is opt-in through `CaptureRegistry::system_with_pipewire()`;
   `system()` stays V4L2-only. Portal ScreenCast selection is an adapter point,
   not an implemented consent flow.

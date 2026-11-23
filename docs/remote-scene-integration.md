@@ -142,9 +142,12 @@ each implement their own protocol role.
   `ozma-client-core` channel framing and video reassembler, connects over
   WebTransport (HTTP/3) with a pinned SHA-256 certificate, decodes H.264 with
   WebCodecs, presents on a canvas, decodes Opus for Web Audio, and maps DOM
-  input to USB HID usage ids. Headless Chromium connected and rendered live
-  1920x1080 frames; audio output, A/V sync, and non-Chromium engines are not
-  yet verified. See `web/README.md`.
+  input to USB HID usage ids. It can also publish the browser camera and
+  microphone: `getUserMedia` -> WebCodecs H.264/Opus -> the node's camera/mic
+  channels, which the node decodes into its capture hub. Chromium and Firefox
+  both rendered live video, decoded a paced Opus stream, and published
+  1280x720 camera frames and microphone audio that the node decoded. A/V drift
+  is measured, not corrected. See `web/README.md`.
 
 - **Browser scene producer.** Serve `ozma-protocol/examples/browser-scene` on localhost. Start
   the fixture, scroll, then download its JSONL scene replay. Run
