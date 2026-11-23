@@ -207,6 +207,48 @@ impl fmt::Display for PowerProvider {
     }
 }
 
+/// Audio routing backend selected by `--audio-router`.
+///
+/// `None` keeps the controller compatibility `/audio/*` routes at their honest
+/// typed 501. The two real options construct a router over an **existing**
+/// PipeWire/PulseAudio server; they do not start an audio server.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioRouterKind {
+    /// No audio router; `/audio/*` reports unsupported.
+    #[default]
+    #[value(name = "none")]
+    None,
+    /// `pactl` graph control plus `pw-play` reference tracks.
+    #[value(name = "pipewire")]
+    PipeWire,
+    /// `pactl` graph control plus `paplay` reference tracks.
+    #[value(name = "pulseaudio")]
+    PulseAudio,
+}
+
+impl AudioRouterKind {
+    /// Stable configuration/API name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::PipeWire => "pipewire",
+            Self::PulseAudio => "pulseaudio",
+        }
+    }
+
+    /// Whether a router is configured.
+    pub const fn is_configured(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+impl fmt::Display for AudioRouterKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// The VM profile's resolved capture/input/power selection.
 ///
 /// This is deliberately separate from [`ProviderSelection`]: the nominal
@@ -311,6 +353,7 @@ impl VmProviderConfig {
 
 fn resolve_capture(config: &NodeConfig) -> Result<Option<String>, String> {
     let vnc_requested = config.vnc_host.is_some() || config.vnc_port.is_some();
+    let dbus_requested = config.dbus_requested;
 
     if let Some(value) = &config.provider_overrides.capture {
         let name = value.trim().to_ascii_lowercase();
@@ -328,24 +371,62 @@ fn resolve_capture(config: &NodeConfig) -> Result<Option<String>, String> {
                 validate_vnc_flags(config, true)?;
                 Ok(Some("vnc".to_owned()))
             }
+            "dbus" => {
+                if config.profile != NodeProfile::Vm {
+                    return Err("--capture-provider dbus requires --profile vm".to_owned());
+                }
+                if config.qmp_socket.is_none() {
+                    return Err("--capture-provider dbus requires --qmp-socket".to_owned());
+                }
+                if vnc_requested {
+                    return Err(
+                        "--capture-provider dbus conflicts with --vnc-host/--vnc-port; \
+                         select one VM display capture provider"
+                            .to_owned(),
+                    );
+                }
+                Ok(Some("dbus".to_owned()))
+            }
             _ if config.profile == NodeProfile::Vm => Err(format!(
-                "unknown capture provider {value:?} for the vm profile; expected qmp or vnc"
+                "unknown capture provider {value:?} for the vm profile; expected qmp, dbus, or vnc"
             )),
             _ if vnc_requested => Err(format!(
                 "--capture-provider {value:?} conflicts with --vnc-host/--vnc-port; \
                  select --capture-provider vnc or remove the VNC flags"
+            )),
+            _ if dbus_requested => Err(format!(
+                "--capture-provider {value:?} conflicts with the D-Bus display flags; \
+                 select --capture-provider dbus or remove --dbus-console/--dbus-width/\
+                 --dbus-height/--dbus-fps"
             )),
             _ => Ok(Some(value.clone())),
         };
     }
 
     if config.profile == NodeProfile::Vm {
+        if vnc_requested && dbus_requested {
+            return Err(
+                "--vnc-host/--vnc-port and the D-Bus display flags are both set; \
+                 select exactly one VM display capture provider"
+                    .to_owned(),
+            );
+        }
+        if dbus_requested {
+            if config.qmp_socket.is_none() {
+                return Err(
+                    "the QEMU D-Bus display flags (--dbus-console/--dbus-width/--dbus-height/\
+                     --dbus-fps) require --qmp-socket"
+                        .to_owned(),
+                );
+            }
+            return Ok(Some("dbus".to_owned()));
+        }
         if vnc_requested {
             validate_vnc_flags(config, false)?;
             return Ok(Some("vnc".to_owned()));
         }
-        // QMP keeps precedence when no VNC endpoint and no provider was asked
-        // for. A VM with neither configured gets no capture source.
+        // QMP keeps precedence when no VNC/D-Bus endpoint and no provider was
+        // asked for. A VM with neither configured gets no capture source.
         return Ok(if config.qmp_socket.is_some() {
             Some("qmp".to_owned())
         } else {
@@ -356,6 +437,12 @@ fn resolve_capture(config: &NodeConfig) -> Result<Option<String>, String> {
     if vnc_requested {
         return Err(
             "--vnc-host/--vnc-port select VNC capture, which requires --profile vm".to_owned(),
+        );
+    }
+    if dbus_requested {
+        return Err(
+            "the QEMU D-Bus display flags select D-Bus capture, which requires --profile vm"
+                .to_owned(),
         );
     }
 
@@ -492,6 +579,21 @@ pub struct NodeConfig {
     pub vnc_height: u32,
     /// VNC output frame rate.
     pub vnc_fps: u32,
+    /// Effective D-Bus console index (`Console_N`).
+    pub dbus_console: u32,
+    /// Largest D-Bus scanout width accepted.
+    pub dbus_width: u32,
+    /// Largest D-Bus scanout height accepted.
+    pub dbus_height: u32,
+    /// D-Bus frame-rate ceiling.
+    pub dbus_fps: u32,
+    /// True when any D-Bus display flag was supplied explicitly. A default
+    /// console index of 0 must not select D-Bus capture on its own.
+    pub dbus_requested: bool,
+    /// Audio routing backend. `none` leaves `/audio/*` at typed 501.
+    pub audio_router: AudioRouterKind,
+    /// Directory containing reference tracks for `POST /audio/play`.
+    pub audio_track_root: Option<PathBuf>,
     /// ffmpeg executable used by VNC capture and HLS.
     pub ffmpeg_bin: PathBuf,
     /// Audio sink name advertised to the controller.
@@ -548,6 +650,24 @@ impl NodeConfig {
         if self.vnc_fps == 0 {
             return Err("--vnc-fps must be greater than zero".to_owned());
         }
+        if self.dbus_width == 0 {
+            return Err("--dbus-width must be greater than zero".to_owned());
+        }
+        if self.dbus_height == 0 {
+            return Err("--dbus-height must be greater than zero".to_owned());
+        }
+        if self.dbus_fps == 0 {
+            return Err("--dbus-fps must be greater than zero".to_owned());
+        }
+        if self.dbus_width > ozma_capture::MAX_DBUS_DIMENSION
+            || self.dbus_height > ozma_capture::MAX_DBUS_DIMENSION
+        {
+            return Err(format!(
+                "--dbus-width/--dbus-height exceed the {}-pixel bound",
+                ozma_capture::MAX_DBUS_DIMENSION
+            ));
+        }
+        validate_path("--audio-track-root", self.audio_track_root.as_deref())?;
         if let Some(domain) = &self.libvirt_domain {
             if domain.trim().is_empty() {
                 return Err("--libvirt-domain must not be empty".to_owned());
@@ -736,6 +856,13 @@ mod tests {
             vnc_width: ozma_capture::VNC_DEFAULT_WIDTH,
             vnc_height: ozma_capture::VNC_DEFAULT_HEIGHT,
             vnc_fps: ozma_capture::VNC_DEFAULT_FPS,
+            dbus_console: ozma_capture::DBUS_DEFAULT_CONSOLE_INDEX,
+            dbus_width: ozma_capture::DBUS_DEFAULT_WIDTH,
+            dbus_height: ozma_capture::DBUS_DEFAULT_HEIGHT,
+            dbus_fps: ozma_capture::DBUS_DEFAULT_FPS,
+            dbus_requested: false,
+            audio_router: AudioRouterKind::None,
+            audio_track_root: None,
             ffmpeg_bin: PathBuf::from("ffmpeg"),
             audio_sink: None,
             vm_guest_ip: None,
@@ -977,7 +1104,7 @@ mod tests {
 
         let config = vm_config_with_overrides("v4l2", "", "");
         let error = config.vm_providers().unwrap_err();
-        assert!(error.contains("expected qmp or vnc"), "{error}");
+        assert!(error.contains("expected qmp, dbus, or vnc"), "{error}");
     }
 
     #[test]
@@ -1004,6 +1131,106 @@ mod tests {
 
         let mut config = test_config(NodeProfile::Vm);
         config.ffmpeg_bin = PathBuf::new();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn dbus_flags_select_dbus_only_on_a_vm_with_a_qmp_socket() {
+        let mut config = test_config(NodeProfile::Vm);
+        config.dbus_requested = true;
+        let error = config.vm_providers().unwrap_err();
+        assert!(error.contains("--qmp-socket"), "{error}");
+
+        config.qmp_socket = Some(PathBuf::from("/run/ozma/ctrl.qmp"));
+        assert_eq!(
+            config.vm_providers().unwrap().capture.as_deref(),
+            Some("dbus")
+        );
+
+        // A non-VM profile must not turn host hardware into D-Bus capture.
+        let mut hardware = test_config(NodeProfile::Hardware);
+        hardware.dbus_requested = true;
+        let error = hardware.vm_providers().unwrap_err();
+        assert!(error.contains("--profile vm"), "{error}");
+    }
+
+    #[test]
+    fn explicit_dbus_provider_requires_vm_profile_and_qmp_socket() {
+        let config = vm_config_with_overrides("dbus", "", "");
+        let error = config.vm_providers().unwrap_err();
+        assert!(error.contains("--qmp-socket"), "{error}");
+
+        let mut config = vm_config_with_overrides("dbus", "", "");
+        config.qmp_socket = Some(PathBuf::from("/run/ozma/ctrl.qmp"));
+        assert_eq!(
+            config.vm_providers().unwrap().capture.as_deref(),
+            Some("dbus")
+        );
+
+        let mut hardware = vm_config_with_overrides("dbus", "", "");
+        hardware.profile = NodeProfile::Hardware;
+        hardware.qmp_socket = Some(PathBuf::from("/run/ozma/ctrl.qmp"));
+        let error = hardware.vm_providers().unwrap_err();
+        assert!(error.contains("--profile vm"), "{error}");
+    }
+
+    #[test]
+    fn dbus_and_vnc_flags_are_ambiguous_without_an_explicit_provider() {
+        let mut config = test_config(NodeProfile::Vm);
+        config.qmp_socket = Some(PathBuf::from("/run/ozma/ctrl.qmp"));
+        config.dbus_requested = true;
+        config.vnc_host = Some("127.0.0.1".into());
+        config.vnc_port = Some(5901);
+        let error = config.vm_providers().unwrap_err();
+        assert!(error.contains("exactly one"), "{error}");
+
+        // An explicit provider is accepted, but the conflicting VNC flags are
+        // rejected rather than silently ignored.
+        let mut config = vm_config_with_overrides("dbus", "", "");
+        config.qmp_socket = Some(PathBuf::from("/run/ozma/ctrl.qmp"));
+        config.vnc_host = Some("127.0.0.1".into());
+        config.vnc_port = Some(5901);
+        let error = config.vm_providers().unwrap_err();
+        assert!(error.contains("conflicts"), "{error}");
+    }
+
+    #[test]
+    fn qmp_remains_the_default_and_vnc_still_wins_over_qmp() {
+        let mut config = test_config(NodeProfile::Vm);
+        config.qmp_socket = Some(PathBuf::from("/run/ozma/ctrl.qmp"));
+        assert_eq!(
+            config.vm_providers().unwrap().capture.as_deref(),
+            Some("qmp")
+        );
+
+        config.vnc_host = Some("127.0.0.1".into());
+        config.vnc_port = Some(5901);
+        assert_eq!(
+            config.vm_providers().unwrap().capture.as_deref(),
+            Some("vnc")
+        );
+    }
+
+    #[test]
+    fn audio_router_names_and_track_root_validate() {
+        assert_eq!(AudioRouterKind::default(), AudioRouterKind::None);
+        assert_eq!(AudioRouterKind::None.as_str(), "none");
+        assert_eq!(AudioRouterKind::PipeWire.as_str(), "pipewire");
+        assert_eq!(AudioRouterKind::PulseAudio.as_str(), "pulseaudio");
+        assert!(!AudioRouterKind::None.is_configured());
+        assert!(AudioRouterKind::PipeWire.is_configured());
+        assert_eq!(
+            <AudioRouterKind as ValueEnum>::from_str("pipewire", false).unwrap(),
+            AudioRouterKind::PipeWire
+        );
+        assert_eq!(
+            <AudioRouterKind as ValueEnum>::from_str("pulseaudio", false).unwrap(),
+            AudioRouterKind::PulseAudio
+        );
+        assert!(<AudioRouterKind as ValueEnum>::from_str("pipe-wire", false).is_err());
+
+        let mut config = test_config(NodeProfile::Vm);
+        config.audio_track_root = Some(PathBuf::new());
         assert!(config.validate().is_err());
     }
 }

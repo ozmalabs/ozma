@@ -304,7 +304,9 @@ impl AudioReframer {
                 samples,
             )?);
             self.next_sequence += 1;
-            self.next_pts_micros = self.next_pts_micros.saturating_add(u64::from(self.frame_micros));
+            self.next_pts_micros = self
+                .next_pts_micros
+                .saturating_add(u64::from(self.frame_micros));
         }
         Ok(frames)
     }
@@ -326,7 +328,9 @@ impl AudioReframer {
         )
         .ok()?;
         self.next_sequence += 1;
-        self.next_pts_micros = self.next_pts_micros.saturating_add(u64::from(self.frame_micros));
+        self.next_pts_micros = self
+            .next_pts_micros
+            .saturating_add(u64::from(self.frame_micros));
         Some(frame)
     }
 }
@@ -360,9 +364,7 @@ mod reframer_tests {
     #[test]
     fn upmixes_mono_to_stereo() {
         let mut reframer = AudioReframer::new(48_000, 2, 20_000).unwrap();
-        let frames = reframer
-            .push(frame(48_000, 1, vec![7; 960], 5))
-            .unwrap();
+        let frames = reframer.push(frame(48_000, 1, vec![7; 960], 5)).unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].samples.len(), 1920);
         assert_eq!(&frames[0].samples[..4], &[7, 7, 7, 7]);

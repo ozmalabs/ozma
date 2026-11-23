@@ -8,14 +8,17 @@
 //! failed children restart with bounded exponential backoff and all children
 //! are stopped on shutdown.
 //!
-//! This is the subprocess transition, not the full VM provisioning story. QMP
-//! and display socket creation, libvirt XML edits, D-Bus p2p display, evdev
-//! `input-linux`, PulseAudio routing, and libvirt power control remain separate
-//! work. Use `--no-auto-manage` for discovery/agent-only operation.
+//! This is the subprocess transition plus opt-in libvirt provisioning. With
+//! `--provision`, a libvirt domain without a QMP socket gets an injected
+//! qemu command line for QMP/display sockets and optional evdev/audio
+//! environment, defined through `virsh define /dev/stdin`. A restart is never
+//! performed unless `--provision-restart` is also passed. Use
+//! `--no-auto-manage` for discovery/agent-only operation.
 
 mod agent;
 mod discovery;
 mod manager;
+mod provisioning;
 mod supervisor;
 mod vm_info;
 
@@ -25,14 +28,15 @@ use std::time::Duration;
 
 use clap::Parser;
 use manager::{ManagerOptions, VirtualNodeManager};
+use provisioning::{ProvisionConfig, DEFAULT_QMP_DIR};
 use tracing::info;
 
 /// Ozma Virtual Node — discover VMs and supervise one `ozma-node` per VM.
 ///
 /// Discovery, status, agent provisioning, per-VM port allocation, subprocess
-/// start/stop/restart, and shutdown are implemented here. QMP/display socket
-/// provisioning, libvirt XML edits, D-Bus p2p display, evdev `input-linux`,
-/// PulseAudio routing, and libvirt power remain separate work.
+/// start/stop/restart, shutdown, and opt-in libvirt QMP/display provisioning
+/// are implemented here. Editing libvirt XML is off by default; restarting a VM
+/// is a second explicit opt-in.
 #[derive(Parser, Debug)]
 #[command(
     name = "ozma-virtual-node",
@@ -43,10 +47,14 @@ use tracing::info;
                   Each child gets a stable HID UDP port and HTTP port. New VMs start, \
                   removed VMs stop, unchanged VMs are left alone, failed children restart \
                   with bounded exponential backoff, and shutdown stops every child.\n\n\
-                  QMP/display socket provisioning, libvirt XML edits, D-Bus p2p display, \
-                  evdev input-linux, PulseAudio routing, and libvirt power are not part of \
-                  this supervisor yet. VMs without a discovered QMP socket are skipped with \
-                  a warning; no socket path is fabricated. Use --no-auto-manage for \
+                  With --provision, a libvirt domain that has no QMP socket gets an ozma \
+                  qemu command line (QMP control/input/display sockets, D-Bus p2p display, \
+                  optional operator-supplied evdev and PulseAudio environment) defined \
+                  through `virsh define /dev/stdin`. Editing libvirt XML is opt-in. The VM \
+                  must usually be restarted for the new sockets to exist; that only happens \
+                  with the second opt-in, --provision-restart. Proxmox configuration is never \
+                  edited. VMs without a discovered or provisioned QMP socket are skipped \
+                  with a warning; no socket path is fabricated. Use --no-auto-manage for \
                   discovery/agent-only operation."
 )]
 struct Args {
@@ -56,7 +64,10 @@ struct Args {
     #[arg(long, default_value = "")]
     controller: String,
 
-    /// Directory to scan for QMP sockets (fallback discovery)
+    /// Directory to scan for QMP sockets, and for provisioned sockets when --provision is on
+    ///
+    /// Discovery falls back to `/tmp` when this is empty; provisioning uses
+    /// `/run/ozma/qmp` when this is empty.
     #[arg(long, default_value = "")]
     qmp_dir: String,
 
@@ -86,6 +97,35 @@ struct Args {
     /// Maximum restart delay after repeated per-VM node failures, in milliseconds
     #[arg(long, default_value_t = 30000)]
     restart_backoff_max_ms: u64,
+
+    /// Opt in to defining ozma QMP/display XML on libvirt domains
+    ///
+    /// Proxmox configuration is never edited.
+    #[arg(long)]
+    provision: bool,
+
+    /// Allow the provisioner to run `virsh destroy` and `virsh start`
+    ///
+    /// Requires --provision. Off by default; without it the new XML is defined
+    /// and the VM must be restarted by the operator.
+    #[arg(long)]
+    provision_restart: bool,
+
+    /// PULSE_SERVER value injected into QEMU's environment when --provision is on
+    #[arg(long, value_name = "VALUE")]
+    pulse_server: Option<String>,
+
+    /// XDG_RUNTIME_DIR value injected into QEMU's environment when --provision is on
+    #[arg(long, value_name = "PATH")]
+    xdg_runtime_dir: Option<String>,
+
+    /// evdev keyboard path injected as input-linux when --provision is on
+    #[arg(long, value_name = "PATH")]
+    evdev_kbd: Option<PathBuf>,
+
+    /// evdev mouse path injected as input-linux when --provision is on
+    #[arg(long, value_name = "PATH")]
+    evdev_mouse: Option<PathBuf>,
 
     /// Discovery-only mode: report VMs and provision agents without starting nodes
     #[arg(long)]
@@ -123,6 +163,21 @@ async fn main() -> anyhow::Result<()> {
             .collect()
     };
 
+    let provision_qmp_dir = if args.qmp_dir.trim().is_empty() {
+        PathBuf::from(DEFAULT_QMP_DIR)
+    } else {
+        PathBuf::from(args.qmp_dir.trim())
+    };
+    let provision_config = ProvisionConfig {
+        qmp_dir: provision_qmp_dir,
+        restart_vm: args.provision_restart,
+        pulse_server: args.pulse_server,
+        xdg_runtime_dir: args.xdg_runtime_dir,
+        evdev_keyboard: args.evdev_kbd,
+        evdev_mouse: args.evdev_mouse,
+        ..ProvisionConfig::default()
+    };
+
     let options = ManagerOptions {
         controller_url: args.controller,
         qmp_dir: args.qmp_dir,
@@ -134,6 +189,8 @@ async fn main() -> anyhow::Result<()> {
         node_http_base: args.node_http_base,
         restart_backoff: Duration::from_millis(args.restart_backoff_ms),
         restart_backoff_max: Duration::from_millis(args.restart_backoff_max_ms),
+        provision: args.provision,
+        provision_config,
         ..ManagerOptions::default()
     };
 
@@ -184,6 +241,43 @@ mod tests {
         assert_eq!(args.restart_backoff_max_ms, 30000);
         assert!(!args.no_auto_manage);
         assert!(!args.no_auto_agent);
+        assert!(!args.provision);
+        assert!(!args.provision_restart);
+        assert!(args.pulse_server.is_none());
+        assert!(args.xdg_runtime_dir.is_none());
+        assert!(args.evdev_kbd.is_none());
+        assert!(args.evdev_mouse.is_none());
+    }
+
+    #[test]
+    fn provisioning_flags_parse() {
+        let args = Args::try_parse_from([
+            "ozma-virtual-node",
+            "--provision",
+            "--provision-restart",
+            "--qmp-dir",
+            "/run/ozma/qmp",
+            "--pulse-server",
+            "unix:/run/user/1000/pulse/native",
+            "--xdg-runtime-dir",
+            "/run/user/1000",
+            "--evdev-kbd",
+            "/dev/input/event5",
+            "--evdev-mouse",
+            "/dev/input/event6",
+        ])
+        .expect("parse provisioning flags");
+
+        assert!(args.provision);
+        assert!(args.provision_restart);
+        assert_eq!(args.qmp_dir, "/run/ozma/qmp");
+        assert_eq!(
+            args.pulse_server.as_deref(),
+            Some("unix:/run/user/1000/pulse/native")
+        );
+        assert_eq!(args.xdg_runtime_dir.as_deref(), Some("/run/user/1000"));
+        assert_eq!(args.evdev_kbd, Some(PathBuf::from("/dev/input/event5")));
+        assert_eq!(args.evdev_mouse, Some(PathBuf::from("/dev/input/event6")));
     }
 
     #[test]

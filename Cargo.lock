@@ -3025,12 +3025,14 @@ name = "ozma-capture"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "nix 0.30.1",
  "ozma-media",
  "ozma-pipewire",
  "ozma-protocol",
  "ozma-qmp",
  "serde_json",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
  "v4l",
@@ -3176,6 +3178,8 @@ dependencies = [
  "openh264",
  "ozma-media",
  "ozma-protocol",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]
@@ -3412,6 +3416,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sysinfo",
+ "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
  "tracing-subscriber",

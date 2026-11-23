@@ -19,6 +19,8 @@ pub enum CaptureKind {
     PipeWire,
     /// QEMU display captured through QMP `screendump`.
     Qmp,
+    /// QEMU display pushed over the `org.qemu.Display1` D-Bus interface.
+    Dbus,
     /// Looking Glass KVMFR shared-memory framebuffer.
     LookingGlass,
     /// VM display read through the VNC/RFB protocol (ffmpeg transition path).
@@ -260,6 +262,14 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&CaptureKind::LookingGlass).unwrap(),
             r#""looking_glass""#
+        );
+        assert_eq!(
+            serde_json::to_string(&CaptureKind::Dbus).unwrap(),
+            r#""dbus""#
+        );
+        assert_eq!(
+            serde_json::from_str::<CaptureKind>(r#""dbus""#).unwrap(),
+            CaptureKind::Dbus
         );
     }
 

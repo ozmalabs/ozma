@@ -23,6 +23,7 @@ serde_json         = "1"
 clap               = { version = "4", features = ["derive"] }
 glob               = "0.3"
 async-trait        = { workspace = true }
+thiserror          = { workspace = true }
 libc               = { workspace = true }
 # Add dependencies needed for softnode functionality
 # zeroconf          = "0.7"          # for mDNS
@@ -37,3 +38,6 @@ sysinfo    = { version = "0.30" }
 icalendar  = "0.15"
 chrono     = { version = "0.4", features = ["serde"] }
 uuid       = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

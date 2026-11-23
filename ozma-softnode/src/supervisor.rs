@@ -7,10 +7,10 @@
 //! * build the exact `ozma-node --profile vm` argv for a discovered VM,
 //! * spawn, poll, restart, and stop child processes.
 //!
-//! QMP/display socket provisioning, libvirt XML edits, D-Bus p2p display,
-//! evdev `input-linux`, PulseAudio routing, and libvirt power remain separate
-//! workstreams. In particular, a VM without a QMP socket discovered by the
-//! backend is skipped rather than given a fabricated path.
+//! QMP/display socket provisioning lives in the `provisioning` module. This
+//! module only consumes a QMP path that discovery or the provisioner proved
+//! usable. A VM without such a socket is skipped rather than given a fabricated
+//! path.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

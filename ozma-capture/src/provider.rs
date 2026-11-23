@@ -138,6 +138,16 @@ impl CaptureRegistry {
         self
     }
 
+    /// Add a QEMU D-Bus display provider.
+    ///
+    /// Like [`CaptureRegistry::with_qmp_display`], this is opt-in: the QMP
+    /// socket and `-display dbus,p2p=yes` belong to VM profile configuration,
+    /// not a hardware node. Enumeration only checks the socket path.
+    pub fn with_dbus_display(mut self, config: crate::dbus_display::DBusDisplayConfig) -> Self {
+        self.register(crate::dbus_display::DBusDisplayProvider::new(config));
+        self
+    }
+
     /// Add a Looking Glass KVMFR provider.
     ///
     /// Like the QMP provider, this is opt-in: a hardware node has no IVSHMEM

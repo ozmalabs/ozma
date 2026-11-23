@@ -32,6 +32,22 @@ pub mod audio_codes {
     pub const AUDIO_CLOSED: &str = "audio.closed";
     /// The source produced its last frame.
     pub const AUDIO_END_OF_STREAM: &str = "audio.end_of_stream";
+    /// A routing spec (sink, stream, profile, or playback) is malformed.
+    pub const AUDIO_INVALID_SPEC: &str = "audio.invalid_spec";
+    /// The helper command for routing/playback is not installed.
+    pub const AUDIO_MISSING_COMMAND: &str = "audio.missing_command";
+    /// The helper command for routing/playback exited with a non-zero status.
+    pub const AUDIO_COMMAND_FAILED: &str = "audio.command_failed";
+    /// A helper command succeeded but printed output this crate cannot parse.
+    pub const AUDIO_OUTPUT_PARSE: &str = "audio.output_parse";
+    /// The command process could not be spawned, killed, or reaped.
+    pub const AUDIO_PROCESS_FAILED: &str = "audio.process_failed";
+    /// The requested routing feature is not implemented by this crate.
+    pub const AUDIO_UNSUPPORTED: &str = "audio.unsupported";
+    /// A destructive operation was refused to avoid damaging a non-Ozma sink.
+    pub const AUDIO_REFUSED: &str = "audio.refused";
+    /// A reference track could not be found on the node.
+    pub const AUDIO_TRACK_NOT_FOUND: &str = "audio.track_not_found";
 }
 
 /// Errors produced by audio sources and encoders.
@@ -96,6 +112,78 @@ pub enum AudioError {
     /// A channel closed while a stage still expected it.
     #[error("audio channel closed")]
     ChannelClosed,
+    /// A routing spec is malformed.
+    #[error("invalid audio routing {field}: {reason}")]
+    InvalidSpec {
+        /// The offending field, for example `sink name` or `volume`.
+        field: String,
+        /// What is wrong and how a valid value looks.
+        reason: String,
+    },
+    /// A helper binary such as `pactl` or `pw-play` is not installed.
+    #[error("audio routing command `{command}` was not found")]
+    MissingCommand {
+        /// Binary name as it appeared in argv[0].
+        command: String,
+        /// Operator-facing next step.
+        remediation: String,
+    },
+    /// A helper command exited with a non-zero status.
+    #[error("audio routing command `{command}` failed with status {status}: {stderr}")]
+    CommandFailed {
+        /// Rendered argv, display-only and never passed to a shell.
+        command: String,
+        /// Exit status (`-1` when the process was killed by a signal).
+        status: i32,
+        /// Captured standard error, trimmed.
+        stderr: String,
+    },
+    /// A helper command's output could not be parsed.
+    #[error("could not parse output of `{command}`: {reason} (output: {output:?})")]
+    OutputParse {
+        /// Rendered argv, display-only.
+        command: String,
+        /// Captured standard output.
+        output: String,
+        /// What was expected.
+        reason: String,
+    },
+    /// A child process could not be spawned, killed, or reaped.
+    #[error("audio routing process `{command}` failed: {message}")]
+    Process {
+        /// Binary name or rendered argv, display-only.
+        command: String,
+        /// Underlying I/O error text.
+        message: String,
+    },
+    /// A requested routing feature is not implemented.
+    #[error("unsupported audio routing feature `{feature}`")]
+    Unsupported {
+        /// Feature name.
+        feature: String,
+        /// What the caller can do instead.
+        remediation: String,
+    },
+    /// A destructive operation was refused.
+    #[error("refused audio routing operation `{operation}`: {reason}")]
+    Refused {
+        /// Operation name, for example `remove_sink`.
+        operation: String,
+        /// Why it was refused.
+        reason: String,
+        /// What the operator can do instead.
+        remediation: String,
+    },
+    /// A reference track does not exist.
+    #[error("audio reference track `{track}` was not found at {path}")]
+    TrackNotFound {
+        /// Track name or path as supplied by the caller.
+        track: String,
+        /// Resolved path that was checked.
+        path: String,
+        /// Operator-facing next step.
+        remediation: String,
+    },
 }
 
 impl AudioError {
@@ -189,6 +277,85 @@ impl AudioError {
                 audio_codes::AUDIO_CAPTURE_FAILED,
                 "The audio capture channel closed unexpectedly.",
             ),
+            Self::InvalidSpec { field, reason } => ApiError::new(
+                audio_codes::AUDIO_INVALID_SPEC,
+                format!("Invalid audio routing {field}: {reason}."),
+            )
+            .with_details(field.clone())
+            .with_remediation(
+                "Supply a non-empty single-token name (letters, digits, `.`, `_`, `-`) and a \
+                 supported rate/channel/volume value.",
+            ),
+            Self::MissingCommand {
+                command,
+                remediation,
+            } => ApiError::new(
+                audio_codes::AUDIO_MISSING_COMMAND,
+                format!("Audio routing command `{command}` was not found."),
+            )
+            .with_details(command.clone())
+            .with_remediation(remediation.clone()),
+            Self::CommandFailed {
+                command,
+                status,
+                stderr,
+            } => ApiError::new(
+                audio_codes::AUDIO_COMMAND_FAILED,
+                format!("Audio routing command `{command}` failed with status {status}."),
+            )
+            .with_details(stderr.clone())
+            .with_remediation(
+                "Check that the PipeWire/PulseAudio server is running and that the target sink, \
+                 stream, or track exists, then retry.",
+            ),
+            Self::OutputParse {
+                command,
+                output,
+                reason,
+            } => ApiError::new(
+                audio_codes::AUDIO_OUTPUT_PARSE,
+                format!("Could not parse the output of `{command}`: {reason}."),
+            )
+            .with_details(output.clone())
+            .with_remediation(
+                "Check the installed `pactl` version; this crate expects `pactl` to print a \
+                 module id or the tab-separated `list short` format.",
+            ),
+            Self::Process { command, message } => ApiError::new(
+                audio_codes::AUDIO_PROCESS_FAILED,
+                format!("Audio routing process `{command}` failed: {message}"),
+            )
+            .with_details(command.clone())
+            .retryable(),
+            Self::Unsupported {
+                feature,
+                remediation,
+            } => ApiError::new(
+                audio_codes::AUDIO_UNSUPPORTED,
+                format!("Unsupported audio routing feature: {feature}."),
+            )
+            .with_details(feature.clone())
+            .with_remediation(remediation.clone()),
+            Self::Refused {
+                operation,
+                reason,
+                remediation,
+            } => ApiError::new(
+                audio_codes::AUDIO_REFUSED,
+                format!("Refused audio routing operation `{operation}`: {reason}."),
+            )
+            .with_details(reason.clone())
+            .with_remediation(remediation.clone()),
+            Self::TrackNotFound {
+                track,
+                path,
+                remediation,
+            } => ApiError::new(
+                audio_codes::AUDIO_TRACK_NOT_FOUND,
+                format!("Audio reference track `{track}` was not found at {path}."),
+            )
+            .with_details(path.clone())
+            .with_remediation(remediation.clone()),
         }
     }
 }

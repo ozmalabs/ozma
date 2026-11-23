@@ -9,8 +9,8 @@ use ozma_protocol::{
 };
 
 use ozma_capture::{
-    CaptureRegistry, QmpDisplayConfig, VncDisplayConfig, QMP_DEFAULT_ID, QMP_DEFAULT_MAX_FPS,
-    VNC_DEFAULT_ID,
+    CaptureRegistry, DBusDisplayConfig, QmpDisplayConfig, VncDisplayConfig, DBUS_DEFAULT_ID,
+    QMP_DEFAULT_ID, QMP_DEFAULT_MAX_FPS, VNC_DEFAULT_ID,
 };
 
 use crate::config::{NodeConfig, NodeProfile};
@@ -53,6 +53,16 @@ fn vm_capture_registry(config: &NodeConfig) -> CaptureRegistry {
                 QmpDisplayConfig::new(socket.clone())
                     .with_identity(QMP_DEFAULT_ID, format!("{} VM display", config.name))
                     .with_max_fps(QMP_DEFAULT_MAX_FPS),
+            ),
+            None => CaptureRegistry::new(),
+        },
+        Some("dbus") => match &config.qmp_socket {
+            Some(socket) => CaptureRegistry::new().with_dbus_display(
+                DBusDisplayConfig::new(socket.clone())
+                    .with_console_index(config.dbus_console)
+                    .with_identity(DBUS_DEFAULT_ID, format!("{} D-Bus display", config.name))
+                    .with_limits(config.dbus_width, config.dbus_height)
+                    .with_fps(config.dbus_fps),
             ),
             None => CaptureRegistry::new(),
         },
@@ -187,6 +197,13 @@ mod tests {
             vnc_width: ozma_capture::VNC_DEFAULT_WIDTH,
             vnc_height: ozma_capture::VNC_DEFAULT_HEIGHT,
             vnc_fps: ozma_capture::VNC_DEFAULT_FPS,
+            dbus_console: 0,
+            dbus_width: ozma_capture::DBUS_DEFAULT_WIDTH,
+            dbus_height: ozma_capture::DBUS_DEFAULT_HEIGHT,
+            dbus_fps: ozma_capture::DBUS_DEFAULT_FPS,
+            dbus_requested: false,
+            audio_router: crate::config::AudioRouterKind::None,
+            audio_track_root: None,
             ffmpeg_bin: std::path::PathBuf::from("ffmpeg"),
             audio_sink: None,
             vm_guest_ip: None,
@@ -265,6 +282,44 @@ mod tests {
         // An incomplete endpoint never becomes a registry source.
         vm.vnc_port = None;
         assert_eq!(capture_registry(&vm).provider_count(), 0);
+    }
+
+    #[test]
+    fn vm_profile_uses_only_the_dbus_capture_source_when_selected() {
+        let mut vm = config("hid,video,audio");
+        vm.profile = crate::config::NodeProfile::Vm;
+        vm.qmp_socket = Some(std::path::PathBuf::from("/run/ozma/ctrl.qmp"));
+        vm.dbus_requested = true;
+        vm.dbus_console = 2;
+        vm.dbus_width = 1280;
+        vm.dbus_height = 720;
+        vm.dbus_fps = 15;
+
+        let socket = std::env::temp_dir().join(format!(
+            "ozma-dbus-registry-{}-{}.qmp",
+            std::process::id(),
+            "platform"
+        ));
+        std::fs::write(&socket, b"").unwrap();
+        vm.qmp_socket = Some(socket.clone());
+
+        let registry = capture_registry(&vm);
+        assert_eq!(registry.provider_count(), 1);
+        let scans = registry.scan();
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].kind, ozma_protocol::CaptureKind::Dbus);
+        assert_eq!(scans[0].capabilities.len(), 1);
+        let capability = &scans[0].capabilities[0];
+        assert_eq!(capability.id, ozma_capture::DBUS_DEFAULT_ID);
+        assert_eq!((capability.max_width, capability.max_height), (1280, 720));
+        assert_eq!(capability.max_fps, 15);
+        assert_eq!(capability.formats, vec!["bgra".to_owned()]);
+
+        let caps = detect_with_registry(&vm, &registry);
+        assert_eq!(caps.capture.len(), 1);
+        assert_eq!(caps.capture[0].kind, ozma_protocol::CaptureKind::Dbus);
+
+        let _ = std::fs::remove_file(socket);
     }
 
     #[test]

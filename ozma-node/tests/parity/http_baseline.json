@@ -1,5 +1,5 @@
 {
-  "_baseline": "Current compatibility surface expected by the Python controller. /health mirrors the node's native health document consumed by the controller's node probes; /api/v1/connection mirrors the controller-facing compatibility status endpoint. Type names are checked by ozma-node/tests/parity.rs. The connection document also reports input sink availability/injection, read-only codec state, and 'audio: not-implemented'. HLS is opt-in and honest: 'not-configured' without --hls, 'running' only once stream.m3u8 exists, 'failed' plus hls_error otherwise. WebRTC is helper-first: 'not-configured' without --webrtc-helper, 'running' only after the helper socket connects, 'failed' plus webrtc_error otherwise; /webrtc/offer and /webrtc/bitrate answer typed 503s rather than 404s.",
+  "_baseline": "Current compatibility surface expected by the Python controller. /health mirrors the node's native health document consumed by the controller's node probes; /api/v1/connection mirrors the controller-facing compatibility status endpoint. Type names are checked by ozma-node/tests/parity.rs. The connection document also reports input sink availability/injection, codec state (current_encoder, override, available, receipt, pending_restart), and audio routing state: 'not-configured' without --audio-router, 'running' with a healthy router, 'failed' plus audio_error when the backend could not initialise. HLS is opt-in and honest: 'not-configured' without --hls, 'running' only once stream.m3u8 exists, 'failed' plus hls_error otherwise. WebRTC is helper-first: 'not-configured' without --webrtc-helper, 'running' only after the helper socket connects, 'failed' plus webrtc_error otherwise; /webrtc/offer and /webrtc/bitrate answer typed 503s rather than 404s. POST /codec stores a validated override and always reports applied:false/pending_restart:true because the running pipeline has not restarted.",
   "health": {
     "ok": "bool",
     "node_id": "string",
@@ -22,7 +22,8 @@
     "hls_error": "string-or-null",
     "webrtc": "string",
     "webrtc_error": "string-or-null",
-    "audio": "string"
+    "audio": "string",
+    "audio_error": "string-or-null"
   },
   "input": {
     "sink_kind": "string",
@@ -31,8 +32,16 @@
   },
   "codec": {
     "current_encoder": "string-or-null",
-    "override": "string-or-null",
-    "available": "array"
+    "override": "object-or-null",
+    "available": "array",
+    "receipt": "object-or-null",
+    "pending_restart": "bool"
+  },
+  "codec_apply": {
+    "ok": "bool",
+    "applied": "bool",
+    "pending_restart": "bool",
+    "receipt": "object"
   },
   "hid": {
     "status": "string",
@@ -47,6 +56,9 @@
     "hls_not_configured": "not-configured",
     "webrtc_not_configured": "not-configured",
     "webrtc_failed": "failed",
-    "webrtc_running": "running"
+    "webrtc_running": "running",
+    "audio_not_configured": "not-configured",
+    "audio_running": "running",
+    "audio_failed": "failed"
   }
 }

@@ -22,8 +22,8 @@ use ozma_input::{FakeInputSink, InputSink, RecordingSink, SharedSink};
 use ozma_media::{CaptureSource, Frame, FrameFormat, MediaError};
 use ozma_node::api;
 use ozma_node::controller_compat::{
-    compat_router, connection_router, CompatStats, ConnectionInfo, ConnectionState,
-    HidPacketDecoder, HidUdpListener, SINK_FAKE_RECORDING,
+    audio_router, codec_router, compat_router, connection_router, CodecControl, CompatStats,
+    ConnectionInfo, ConnectionState, HidPacketDecoder, HidUdpListener, SINK_FAKE_RECORDING,
 };
 use ozma_node::hls::{stream_router, HlsStatus};
 use ozma_node::webrtc::{
@@ -31,6 +31,7 @@ use ozma_node::webrtc::{
 };
 use ozma_node::{platform, registration};
 use ozma_protocol::input::{InputEvent, KeyModifiers, PointerButton};
+use ozma_protocol::{Codec, MediaFormat};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -468,6 +469,7 @@ fn assert_shape(value: &Value, shape: &Value, context: &str) {
             "object" => field.is_object(),
             "array" => field.is_array(),
             "string-or-null" => field.is_string() || field.is_null(),
+            "object-or-null" => field.is_object() || field.is_null(),
             other => panic!("{context}.{name} has unknown shape {other:?}"),
         };
         assert!(
@@ -562,7 +564,14 @@ async fn health_and_connection_surface_match_baseline() {
     assert!(connection["codec"]["current_encoder"].is_null());
     assert!(connection["codec"]["override"].is_null());
     assert_eq!(connection["codec"]["available"], json!([]));
-    assert_eq!(connection["audio"], "not-implemented");
+    assert!(connection["codec"]["receipt"].is_null());
+    assert_eq!(connection["codec"]["pending_restart"], false);
+    assert_eq!(
+        connection["audio"],
+        baseline["stream_states"]["audio_not_configured"]
+    );
+    assert_eq!(connection["audio"], "not-configured");
+    assert!(connection["audio_error"].is_null());
 
     // HLS is no longer "not-implemented": when `--hls` is off the honest state
     // is "not-configured". WebRTC is still absent and must stay so.
@@ -600,6 +609,92 @@ async fn connection_reports_a_failed_hls_pipeline_with_an_error() {
     assert_eq!(connection["hls"], "failed");
     assert_eq!(connection["hls_error"], "no capture source is available");
     assert_eq!(connection["webrtc"], "not-configured");
+}
+
+#[tokio::test]
+async fn codec_override_shape_matches_baseline_and_reports_pending_restart() {
+    let baseline = baseline(include_str!("parity/http_baseline.json"));
+    let control = CodecControl::new(
+        ozma_encode::EncoderRegistry::from_capabilities([
+            ozma_encode::H264SoftwareEncoder::capability(),
+        ]),
+        MediaFormat::new(Codec::H264, 1280, 720, 30, 4_000),
+    );
+    let state = ConnectionState::new(
+        ConnectionInfo::new(
+            NODE_ID,
+            "vm",
+            HTTP_PORT,
+            QUIC_PORT,
+            HID_PORT,
+            SINK_FAKE_RECORDING,
+        ),
+        CompatStats::default(),
+    )
+    .with_codec_control(Some(control));
+    let app = codec_router(state.clone());
+
+    let (status, before) = get_json(&app, "/codec").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_shape(&before, &baseline["codec"], "codec");
+    assert_eq!(before["current_encoder"], "h264");
+    assert_eq!(before["available"], json!(["h264"]));
+    assert_eq!(before["pending_restart"], false);
+
+    let (status, applied) = post_json(
+        &app,
+        "/codec",
+        json!({"codec": "h264", "bitrate": "8M", "hw_accel": "software"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_shape(&applied, &baseline["codec_apply"], "codec_apply");
+    // The pipeline did not restart, so no live switch is claimed.
+    assert_eq!(applied["applied"], false);
+    assert_eq!(applied["pending_restart"], true);
+    assert_eq!(applied["receipt"]["requested"]["bitrate_kbps"], 8_000);
+
+    let (_, after) = get_json(&app, "/codec").await;
+    assert_shape(&after, &baseline["codec"], "codec");
+    assert_eq!(after["override"]["preference"]["codec"], "h264");
+    assert_eq!(after["receipt"]["selected"]["backend"], "software");
+    assert_eq!(after["pending_restart"], true);
+
+    let (status, connection) = get_json(&connection_router(state), "/api/v1/connection").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_shape(&connection["codec"], &baseline["codec"], "connection.codec");
+    assert_eq!(connection["codec"]["pending_restart"], true);
+    assert_eq!(connection["audio"], "not-configured");
+    assert!(connection["audio_error"].is_null());
+}
+
+#[tokio::test]
+async fn audio_routes_remain_typed_501_without_a_router() {
+    let state = ConnectionState::new(
+        ConnectionInfo::new(
+            NODE_ID,
+            "vm",
+            HTTP_PORT,
+            QUIC_PORT,
+            HID_PORT,
+            SINK_FAKE_RECORDING,
+        ),
+        CompatStats::default(),
+    );
+    let app = audio_router(state);
+
+    for path in [
+        "/audio/apply",
+        "/audio/remove",
+        "/audio/play",
+        "/audio/stop",
+    ] {
+        let (status, body) = post_json(&app, path, json!({})).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{path}");
+        assert_eq!(body["ok"], false, "{path}");
+        assert_eq!(body["code"], "audio-routing-unsupported", "{path}");
+        assert!(body["remediation"].is_string(), "{path}");
+    }
 }
 
 #[tokio::test]

@@ -17,14 +17,19 @@
 //! VM display paths live in provider modules that are not registered in
 //! [`CaptureRegistry::system`] by default:
 //!
+//! * [`dbus_display`] is the low-latency VM path: it hands a socket to QEMU
+//!   over QMP, authenticates the peer-to-peer D-Bus display, registers a
+//!   listener with SCM_RIGHTS, and turns `Scanout`/`Update` pushes into owned
+//!   BGRA frames ([`DBusDisplaySource`]). Register it with
+//!   [`CaptureRegistry::with_dbus_display`] or from the VM profile.
 //! * [`qmp_display`] polls QEMU's display through QMP `screendump`, parses the
 //!   P6 PPM into owned RGB24 frames, and enforces frame-rate pacing
 //!   ([`QmpDisplaySource`]). It is a polling path, not a real-time framebuffer
 //!   subscription. Register it explicitly with
 //!   [`CaptureRegistry::with_qmp_display`] or from the VM profile.
 //! * [`vnc_display`] reads QEMU's VNC display through ffmpeg's VNC input and
-//!   returns packed RGB24 frames ([`VncDisplaySource`]). It is the transition
-//!   path until the D-Bus framebuffer provider exists; it needs no
+//!   returns packed RGB24 frames ([`VncDisplaySource`]). It is a transition
+//!   path for hosts where the D-Bus display is unavailable; it needs no
 //!   v4l2loopback device. Register it with
 //!   [`CaptureRegistry::with_vnc_display`].
 //! * [`lookingglass`] parses Looking Glass KVMFR shared memory into owned
@@ -46,6 +51,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod dbus_display;
 pub mod fake;
 pub mod lookingglass;
 #[cfg(target_os = "linux")]
@@ -58,6 +64,14 @@ pub mod v4l2;
 pub mod r#virtual;
 pub mod vnc_display;
 
+pub use dbus_display::{
+    DBusDisplayConfig, DBusDisplayProvider, DBusDisplaySource, DBusError, DBusHeader, DBusMessage,
+    DBusTransport, DBusValue, Framebuffer, UnixDBusTransport, DBUS_ADD_CLIENT_PROTOCOL,
+    DBUS_CONSOLE_INTERFACE, DBUS_CONSOLE_PATH_PREFIX, DBUS_DEFAULT_CONNECT_TIMEOUT,
+    DBUS_DEFAULT_CONSOLE_INDEX, DBUS_DEFAULT_FPS, DBUS_DEFAULT_HEIGHT, DBUS_DEFAULT_ID,
+    DBUS_DEFAULT_NAME, DBUS_DEFAULT_WIDTH, DBUS_FD_NAME, DBUS_LISTENER_INTERFACE,
+    DBUS_PROPERTIES_INTERFACE, MAX_DBUS_BODY_BYTES, MAX_DBUS_DIMENSION,
+};
 pub use fake::FakeCaptureProvider;
 pub use lookingglass::{
     extract_frame, frame_format, parse_frame_header, parse_header, requires_conversion,

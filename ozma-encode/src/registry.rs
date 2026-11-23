@@ -42,6 +42,9 @@ pub enum SelectionReason {
     SoftwareFallback,
     /// Only one class of encoder could satisfy the request.
     OnlyCandidate,
+    /// A caller pinned this exact backend through
+    /// [`crate::CodecPreference`].
+    OverrideRequested,
 }
 
 /// A chosen encoder plus the evidence and request it came from.

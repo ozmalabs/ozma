@@ -12,6 +12,9 @@
 use std::sync::Arc;
 
 use clap::Parser;
+use ozma_audio::{
+    AudioRouter, PipeWireAudioRouter, PulseAudioAudioRouter, RouterConfig, TokioCommandRunner,
+};
 use ozma_input::SinkKind;
 use ozma_power::{LibvirtPower, PowerBackend, QmpPower};
 use ozma_protocol::NodeId;
@@ -20,10 +23,11 @@ use tracing::{error, info, warn};
 use ozma_node::{
     api,
     config::{
-        NodeConfig, NodeProfile, PowerProvider, ProviderOverrides, ProviderSelection,
-        VmProviderConfig, DEFAULT_QMP_COMMAND_TIMEOUT_MS, DEFAULT_QMP_CONNECT_TIMEOUT_MS,
+        AudioRouterKind, NodeConfig, NodeProfile, PowerProvider, ProviderOverrides,
+        ProviderSelection, VmProviderConfig, DEFAULT_QMP_COMMAND_TIMEOUT_MS,
+        DEFAULT_QMP_CONNECT_TIMEOUT_MS,
     },
-    controller_compat,
+    controller_compat::{self, AudioControl, CodecControl},
     hls::{HlsConfig, HlsPipeline, HlsStatus},
     input_select, mdns, platform, registration, usb_audio,
     webrtc::{WebRtcConfig, WebRtcControl, WebRtcHelper},
@@ -142,6 +146,40 @@ pub struct Args {
     /// VNC output frame rate (must be non-zero).
     #[arg(long, env = "OZMA_VNC_FPS", default_value_t = ozma_capture::VNC_DEFAULT_FPS)]
     pub vnc_fps: u32,
+
+    /// QEMU D-Bus console index (`Console_N`). Supplying any D-Bus display
+    /// flag selects D-Bus capture on a VM node; the effective default is 0.
+    #[arg(long, env = "OZMA_DBUS_CONSOLE", value_name = "INDEX")]
+    pub dbus_console: Option<u32>,
+
+    /// Largest D-Bus scanout width accepted (effective default 1920). Supplying
+    /// this flag selects D-Bus capture on a VM node.
+    #[arg(long, env = "OZMA_DBUS_WIDTH", value_name = "PIXELS")]
+    pub dbus_width: Option<u32>,
+
+    /// Largest D-Bus scanout height accepted (effective default 1080). Supplying
+    /// this flag selects D-Bus capture on a VM node.
+    #[arg(long, env = "OZMA_DBUS_HEIGHT", value_name = "PIXELS")]
+    pub dbus_height: Option<u32>,
+
+    /// D-Bus frame-rate ceiling (effective default 30). Supplying this flag
+    /// selects D-Bus capture on a VM node.
+    #[arg(long, env = "OZMA_DBUS_FPS", value_name = "FPS")]
+    pub dbus_fps: Option<u32>,
+
+    /// Audio routing backend for `/audio/*`: `none`, `pipewire`, or
+    /// `pulseaudio`. It controls an existing audio server; it never starts one.
+    #[arg(
+        long,
+        env = "OZMA_AUDIO_ROUTER",
+        value_enum,
+        default_value_t = AudioRouterKind::None
+    )]
+    pub audio_router: AudioRouterKind,
+
+    /// Directory containing reference tracks for `POST /audio/play`.
+    #[arg(long, env = "OZMA_AUDIO_TRACK_ROOT", value_name = "PATH")]
+    pub audio_track_root: Option<std::path::PathBuf>,
 
     /// Node role advertised to the controller.
     #[arg(long, default_value = "compute")]
@@ -362,6 +400,20 @@ async fn main() {
         vnc_width: args.vnc_width,
         vnc_height: args.vnc_height,
         vnc_fps: args.vnc_fps,
+        dbus_console: args
+            .dbus_console
+            .unwrap_or(ozma_capture::DBUS_DEFAULT_CONSOLE_INDEX),
+        dbus_width: args.dbus_width.unwrap_or(ozma_capture::DBUS_DEFAULT_WIDTH),
+        dbus_height: args
+            .dbus_height
+            .unwrap_or(ozma_capture::DBUS_DEFAULT_HEIGHT),
+        dbus_fps: args.dbus_fps.unwrap_or(ozma_capture::DBUS_DEFAULT_FPS),
+        dbus_requested: args.dbus_console.is_some()
+            || args.dbus_width.is_some()
+            || args.dbus_height.is_some()
+            || args.dbus_fps.is_some(),
+        audio_router: args.audio_router,
+        audio_track_root: args.audio_track_root.clone(),
         ffmpeg_bin: args.ffmpeg_bin.clone(),
         audio_sink: args.audio_sink.clone(),
         vm_guest_ip: args.vm_guest_ip.clone(),
@@ -388,8 +440,8 @@ async fn main() {
     let capture_registry = platform::capture_registry(&config);
     if config.profile == NodeProfile::Vm && !vm_providers.has_capture() {
         warn!(
-            "vm profile has no --qmp-socket or --vnc-host/--vnc-port: no capture \
-             source is configured. Hardware capture is not advertised on a VM."
+            "vm profile has no --qmp-socket, --vnc-host/--vnc-port, or D-Bus display flags: \
+             no capture source is configured. Hardware capture is not advertised on a VM."
         );
     }
     let capabilities = platform::detect_with_registry(&config, &capture_registry);
@@ -408,6 +460,21 @@ async fn main() {
     info!(sink = sink_kind, "Input sink ready");
 
     let power = build_power(&vm_providers).await;
+
+    // Audio routing controls an existing PipeWire/PulseAudio graph. `none`
+    // leaves /audio/* at typed 501. A missing `pactl` marks the backend failed
+    // (reported on /api/v1/connection) instead of claiming success later.
+    let audio_control = build_audio_control(&config).await;
+    if let Some(control) = audio_control.as_ref() {
+        match control.error() {
+            Some(error) => warn!(
+                backend = control.backend(),
+                error = %error,
+                "Audio routing unavailable: no success will be claimed on /audio/*"
+            ),
+            None => info!(backend = control.backend(), "Audio router ready"),
+        }
+    }
 
     // Local HLS compatibility pipeline. HLS is opt-in; a missing source or
     // ffmpeg leaves it unavailable and reported as `failed`, never as running.
@@ -532,6 +599,23 @@ async fn main() {
         config.hid_udp_port,
         sink_kind,
     );
+    // Runtime codec override control. Probed against the host exactly like the
+    // session backend, but it only stores the request/receipt: the running
+    // HLS/WebRTC pipeline cannot switch until it is restarted, so POST /codec
+    // always reports pending_restart. No video -> no control -> typed 503.
+    let codec_control = if config.has_capability("video") && !capabilities.encode.is_empty() {
+        let registry = ozma_encode::EncoderRegistry::with_detected_encoders().await;
+        let format = ozma_protocol::MediaFormat::new(
+            ozma_protocol::Codec::H264,
+            1920,
+            1080,
+            args.hls_fps.max(1),
+            args.hls_bitrate_kbps.max(1),
+        );
+        Some(CodecControl::new(registry, format))
+    } else {
+        None
+    };
     let codec_status = controller_compat::CodecStatus::from_codecs(
         capabilities.encode.iter().map(|encode| encode.codec),
     );
@@ -541,6 +625,8 @@ async fn main() {
             .with_hls(Some(hls_status))
             .with_input_sink(Some(input_sink.clone()))
             .with_codecs(codec_status)
+            .with_codec_control(codec_control)
+            .with_audio(audio_control)
             .with_webrtc(webrtc_control.clone()),
     );
 
@@ -590,15 +676,18 @@ async fn main() {
             capture = %capture,
             input = ?vm_providers.input_chain_names(),
             audio = %config.providers.audio,
+            audio_router = %config.audio_router,
             display = %config.providers.display,
             power = %power,
-            "Profile '{}' is PARTIALLY WIRED: QMP capture, uinput/QMP input injection, and \
-             QMP/libvirt power control start when their flags are configured. Local HLS is \
-             opt-in via `--hls` and feeds `/stream/*` from the first capture source. WebRTC \
-             runs only through an external helper and only when `--webrtc-helper` is set. \
-             Still not implemented: native WebRTC, the QEMU D-Bus framebuffer capture path, \
-             per-VM provisioning (ozma-softnode supervisor), and WebRTC audio. Do not treat \
-             WebRTC as functional without a configured helper.",
+            "Profile '{}' is PARTIALLY WIRED: QMP/D-Bus/VNC capture, uinput/QMP input \
+             injection, QMP/libvirt power control, and optional PipeWire/PulseAudio routing \
+             start when their flags are configured. Local HLS is opt-in via `--hls` and feeds \
+             `/stream/*` from the first capture source. WebRTC runs only through an external \
+             helper and only when `--webrtc-helper` is set. POST /codec stores a validated \
+             override but does not restart the pipeline (pending_restart). Still not \
+             implemented: native WebRTC, live D-Bus/VNC validation in CI, per-VM provisioning \
+             (ozma-softnode supervisor), and WebRTC audio. Do not treat WebRTC as functional \
+             without a configured helper.",
             config.profile
         );
     }
@@ -610,6 +699,7 @@ async fn main() {
         capture_provider = %vm_providers.capture.as_deref().unwrap_or("none"),
         input_provider = ?vm_providers.input_chain_names(),
         audio_provider = %config.providers.audio,
+        audio_router = %config.audio_router,
         display_provider = %config.providers.display,
         power_provider = %vm_providers.power.map(PowerProvider::as_str).unwrap_or("none"),
         hid_udp_port = config.hid_udp_port,
@@ -863,6 +953,91 @@ where
     Arc::new(tokio::sync::Mutex::new(
         Box::new(backend) as Box<dyn PowerBackend>
     ))
+}
+
+/// Build the optional audio routing control.
+///
+/// `none` keeps the honest 501 surface. A configured backend is marked
+/// unavailable (never crashed) when `pactl` is missing or `pactl info` cannot
+/// reach the audio server; the connection endpoint then reports `failed` plus
+/// `audio_error`, and every `/audio/*` route answers a typed 503 without
+/// claiming success.
+async fn build_audio_control(config: &NodeConfig) -> Option<AudioControl> {
+    let kind = config.audio_router;
+    if !kind.is_configured() {
+        return None;
+    }
+    if !command_on_path("pactl") {
+        return Some(AudioControl::failed(format!(
+            "`pactl` was not found on PATH; {kind} audio routing requires \
+             pulseaudio-utils or pipewire-pulse"
+        )));
+    }
+    if let Err(error) = probe_audio_server().await {
+        return Some(AudioControl::failed(format!(
+            "{kind} audio server is unavailable: {error}"
+        )));
+    }
+
+    let router_config = RouterConfig {
+        track_root: config.audio_track_root.clone(),
+    };
+    let runner = Arc::new(TokioCommandRunner::new());
+    let router: Arc<dyn AudioRouter> = match kind {
+        AudioRouterKind::PipeWire => {
+            Arc::new(PipeWireAudioRouter::with_config(runner, router_config))
+        }
+        AudioRouterKind::PulseAudio => {
+            Arc::new(PulseAudioAudioRouter::with_config(runner, router_config))
+        }
+        AudioRouterKind::None => return None,
+    };
+    Some(AudioControl::configured(
+        router,
+        config.audio_sink.clone(),
+        kind.as_str(),
+    ))
+}
+
+/// Ask `pactl` for server information with a bounded timeout.
+///
+/// This is a health check, not a routing command: it changes nothing and is
+/// only run when `--audio-router` is configured.
+async fn probe_audio_server() -> Result<(), String> {
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+    let output = tokio::time::timeout(
+        PROBE_TIMEOUT,
+        tokio::process::Command::new("pactl").arg("info").output(),
+    )
+    .await
+    .map_err(|_| "`pactl info` timed out".to_owned())?
+    .map_err(|error| format!("`pactl info` could not run: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    let detail = if stderr.is_empty() {
+        format!("exit status {}", output.status)
+    } else {
+        format!("exit status {}: {stderr}", output.status)
+    };
+    Err(format!("`pactl info` failed with {detail}"))
+}
+
+/// Whether an executable named `name` exists on `PATH`.
+fn command_on_path(name: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|directory| {
+        let candidate = directory.join(name);
+        std::fs::metadata(&candidate)
+            .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    })
 }
 
 /// Controller-facing name for a selected input sink kind.

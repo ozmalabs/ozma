@@ -10,9 +10,11 @@ ozma-protocol = { path = "../ozma-protocol" }
 ozma-media = { path = "../ozma-media" }
 ozma-qmp = { path = "../ozma-qmp" }
 async-trait = "0.1"
-tokio = { version = "1", features = ["fs", "sync", "time", "rt", "process", "io-util"] }
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["fs", "sync", "time", "rt", "process", "io-util", "net"] }
 tracing = "0.1"
 v4l = "0.14"
+nix = { version = "0.30", features = ["socket", "uio", "user"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ozma-pipewire = { path = "../ozma-pipewire" }

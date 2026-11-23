@@ -28,6 +28,18 @@
 //!   [`VaapiProbe`] passes, and keeps [`H264SoftwareEncoder`] as the fallback.
 //!   [`EncoderSelection::build_encoder`] builds the real encoder for software,
 //!   VAAPI, and fake selections.
+//! * [`CodecPreference`] / [`EncoderOverride`] express a runtime codec
+//!   preference, and [`EncoderRegistry::select_with_override`] resolves it
+//!   against the advertised capabilities. The policy is pure and honest: an
+//!   explicit hardware request is honoured only when the registry advertises
+//!   that exact backend, a software result is never reported as hardware, and
+//!   software fallback happens only when
+//!   [`CodecPreference::allow_software_fallback`] is set. Unavailable requests
+//!   return a typed error listing the capabilities that really exist.
+//!   [`EncoderRegistry::evaluate_override`] and
+//!   [`EncoderRegistry::codec_state`] produce [`OverrideReceipt`] /
+//!   [`CodecOverrideState`] values that a node can store and expose on
+//!   `GET /codec`.
 //!
 //! # What is still not implemented
 //!
@@ -37,6 +49,12 @@
 //! [`ozma_media::FakeEncoder`] and [`FakeProbe`] stay available for CI and
 //! onboarding tests, but are never substituted for a hardware claim.
 //!
+//! The override policy in this crate only describes and validates a requested
+//! selection. It does not restart an encode pipeline, and it does not open an
+//! HTTP endpoint: `POST /codec` and the pipeline restart are the node's
+//! responsibility, and a node must not report an override as live until the
+//! real encoder has restarted with the selected capability.
+//!
 //! The crate stays `#![forbid(unsafe_code)]`: the OpenH264 binding and the
 //! `ffmpeg` process boundary are the only places native work happens, and both
 //! are dependencies or subprocesses rather than unsafe Rust in this crate.
@@ -44,12 +62,17 @@
 #![forbid(unsafe_code)]
 
 pub mod ffmpeg;
+pub mod override_policy;
 pub mod probe;
 pub mod registry;
 pub mod software;
 pub mod vaapi;
 
 pub use ffmpeg::{detect_ffmpeg, FfmpegStatus};
+pub use override_policy::{
+    backend_is_hardware, backend_supports_codec, CodecOverrideState, CodecPreference,
+    EncoderOverride, FallbackReason, OverrideReceipt, OverrideResult,
+};
 pub use probe::{EncoderProbe, FakeProbe, ProbeResult, SoftwareProbe};
 pub use registry::{
     backend_name, EncoderRegistry, EncoderSelection, SelectedEncoder, SelectionPolicy,

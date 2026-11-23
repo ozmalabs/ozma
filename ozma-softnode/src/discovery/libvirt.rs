@@ -64,15 +64,25 @@ async fn parse_domain(name: &str) -> Result<VMInfo> {
     let mut vm = VMInfo::new(name);
 
     // ── QMP socket ────────────────────────────────────────────────────────
-    // Look for: <qemu:arg value='socket,id=ozma-mon,path=...'/>
-    for line in xml.lines() {
-        let line = line.trim();
-        if line.contains("qemu:arg") && line.contains("socket") && line.contains("qmp") {
-            if let Some(value) = extract_attr(line, "value") {
-                if let Some(p) = value.split("path=").nth(1) {
-                    let sock = p.split(',').next().unwrap_or("").trim_matches('\'');
-                    if !sock.is_empty() {
-                        vm.qmp_path = sock.to_owned();
+    // Provisioned XML uses: <qemu:arg value='socket,id=ozma-mon,path=...'/>
+    // with sibling ozma-input/ozma-display chardevs. Parse those first; fall
+    // back to older/hand-written qmp chardevs.
+    if let Some(path) = chardev_path(&xml, "ozma-mon") {
+        vm.qmp_path = path;
+    }
+    if let Some(path) = chardev_path(&xml, "ozma-input") {
+        vm.qmp_input_path = Some(path);
+    }
+    if vm.qmp_path.is_empty() {
+        for line in xml.lines() {
+            let line = line.trim();
+            if line.contains("qemu:arg") && line.contains("socket") && line.contains("qmp") {
+                if let Some(value) = extract_attr(line, "value") {
+                    if let Some(p) = value.split("path=").nth(1) {
+                        let sock = p.split(',').next().unwrap_or("").trim_matches('\'');
+                        if !sock.is_empty() {
+                            vm.qmp_path = sock.to_owned();
+                        }
                     }
                 }
             }
@@ -147,6 +157,37 @@ async fn parse_domain(name: &str) -> Result<VMInfo> {
     Ok(vm)
 }
 
+/// Extract the socket path from a `<qemu:arg value='socket,id=<id>,path=...'/>`
+/// line. Returns `None` when the chardev is absent.
+fn chardev_path(xml: &str, id: &str) -> Option<String> {
+    let needle = format!("id={id},");
+    for line in xml.lines() {
+        let line = line.trim();
+        if !line.contains("qemu:arg") || !line.contains("socket,") {
+            continue;
+        }
+        let Some(value) = extract_attr(line, "value") else {
+            continue;
+        };
+        if !value.contains(&needle) {
+            continue;
+        }
+        let Some(path) = value.split("path=").nth(1) else {
+            continue;
+        };
+        let path = path
+            .split(',')
+            .next()
+            .unwrap_or("")
+            .trim_matches('\'')
+            .trim_matches('"');
+        if !path.is_empty() {
+            return Some(path.to_owned());
+        }
+    }
+    None
+}
+
 /// Extract `key='value'` or `key="value"` from an XML line.
 fn extract_attr<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     let sq = format!("{key}='");
@@ -198,4 +239,46 @@ fn check_vfio_sysfs(xml: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PROVISIONED: &str = r#"<domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>
+  <devices/>
+  <qemu:commandline>
+    <qemu:arg value='-chardev'/>
+    <qemu:arg value='socket,id=ozma-mon,path=/run/ozma/qmp/vm-a.sock,server=on,wait=off'/>
+    <qemu:arg value='-mon'/>
+    <qemu:arg value='chardev=ozma-mon,mode=control'/>
+    <qemu:arg value='-chardev'/>
+    <qemu:arg value='socket,id=ozma-input,path=/run/ozma/qmp/vm-a-input.sock,server=on,wait=off'/>
+    <qemu:arg value='-mon'/>
+    <qemu:arg value='chardev=ozma-input,mode=control'/>
+    <qemu:arg value='-chardev'/>
+    <qemu:arg value='socket,id=ozma-display,path=/run/ozma/qmp/vm-a-display.sock,server=on,wait=off'/>
+  </qemu:commandline>
+</domain>"#;
+
+    #[test]
+    fn parses_ozma_control_and_input_chardevs() {
+        assert_eq!(
+            chardev_path(PROVISIONED, "ozma-mon").as_deref(),
+            Some("/run/ozma/qmp/vm-a.sock")
+        );
+        assert_eq!(
+            chardev_path(PROVISIONED, "ozma-input").as_deref(),
+            Some("/run/ozma/qmp/vm-a-input.sock")
+        );
+        assert_eq!(
+            chardev_path(PROVISIONED, "ozma-display").as_deref(),
+            Some("/run/ozma/qmp/vm-a-display.sock")
+        );
+    }
+
+    #[test]
+    fn missing_chardev_is_none() {
+        assert!(chardev_path("<domain/>", "ozma-mon").is_none());
+    }
 }

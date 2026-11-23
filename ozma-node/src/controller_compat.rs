@@ -37,10 +37,15 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use ozma_audio::{AudioError, AudioPlaybackSpec, AudioProfile, AudioRouter};
+use ozma_encode::{
+    CodecOverrideState, CodecPreference, EncoderOverride, EncoderRegistry, OverrideReceipt,
+};
 use ozma_input::{linux_keycode_to_hid_usage, SharedSink, SubmitReport};
 use ozma_protocol::input::{InputEvent, KeyModifiers, PointerButton};
-use ozma_protocol::Codec;
+use ozma_protocol::{codes, ApiError, Codec, EncoderBackend, MediaFormat};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
@@ -487,20 +492,26 @@ pub async fn run_hid_listener(
 
 /// Honest codec information exposed by `GET /codec`.
 ///
-/// The node does not apply a runtime encoder override, so `override` is always
-/// `null`. `current_encoder` and `available` are derived from the advertised
-/// video encode capabilities; a node with no video capability reports
-/// `current_encoder: null` and an empty list rather than inventing an encoder.
+/// Controller-facing codec state.
+///
+/// `current_encoder` and `available` describe the encoders the node can
+/// actually run. `override` is the accepted request, `receipt` is the policy
+/// evaluation that was stored with it, and `pending_restart` says the running
+/// HLS/WebRTC pipeline has **not** restarted into that selection yet. The node
+/// never reports an override as live.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct CodecStatus {
-    /// The encoder currently in use, or `null` when video is not configured.
+    /// The encoder currently used by the pipeline, or `null` with no video.
     pub current_encoder: Option<String>,
-    /// The controller's requested override; always `null` until overrides are
-    /// actually applied to the encode pipeline.
+    /// The controller's accepted override, or `null` for automatic selection.
     #[serde(rename = "override")]
-    pub override_setting: Option<String>,
-    /// Video encoders the node advertises, in capability order.
+    pub override_setting: Option<EncoderOverride>,
+    /// Video codecs the node advertises, in capability order.
     pub available: Vec<String>,
+    /// The last stored policy receipt, or `null` when none was evaluated.
+    pub receipt: Option<OverrideReceipt>,
+    /// True while a stored override has not been applied by a pipeline restart.
+    pub pending_restart: bool,
 }
 
 impl CodecStatus {
@@ -511,22 +522,372 @@ impl CodecStatus {
 
     /// Build status from the codecs in [`ozma_protocol::NodeCapabilities`].
     pub fn from_codecs(codecs: impl IntoIterator<Item = Codec>) -> Self {
-        let mut available: Vec<String> = Vec::new();
-        for codec in codecs {
-            if !codec.is_video() {
-                continue;
-            }
-            let name = codec.as_str().to_owned();
-            if !available.contains(&name) {
-                available.push(name);
-            }
-        }
+        let available = video_codec_names(codecs);
         let current_encoder = available.first().cloned();
         Self {
             current_encoder,
             override_setting: None,
             available,
+            receipt: None,
+            pending_restart: false,
         }
+    }
+}
+
+fn video_codec_names(codecs: impl IntoIterator<Item = Codec>) -> Vec<String> {
+    let mut available: Vec<String> = Vec::new();
+    for codec in codecs {
+        if !codec.is_video() {
+            continue;
+        }
+        let name = codec.as_str().to_owned();
+        if !available.contains(&name) {
+            available.push(name);
+        }
+    }
+    available
+}
+
+/// Runtime codec override control for `GET`/`POST /codec`.
+///
+/// Holds the real [`EncoderRegistry`] and the last accepted
+/// [`CodecOverrideState`]. Applying an override stores the request and its
+/// receipt; it deliberately does **not** restart the HLS/WebRTC pipeline, so
+/// every mutation response reports `applied: false` and
+/// `pending_restart: true`.
+#[derive(Clone)]
+pub struct CodecControl {
+    registry: EncoderRegistry,
+    state: Arc<Mutex<CodecOverrideState>>,
+    format: MediaFormat,
+}
+
+impl CodecControl {
+    /// Build a control from a probed/registered encoder set.
+    pub fn new(registry: EncoderRegistry, format: MediaFormat) -> Self {
+        Self {
+            registry,
+            state: Arc::new(Mutex::new(CodecOverrideState::empty())),
+            format,
+        }
+    }
+
+    /// A control with no registry and no video capability.
+    pub fn not_configured() -> Self {
+        Self::new(
+            EncoderRegistry::new(),
+            MediaFormat::new(Codec::H264, 1920, 1080, 30, 4_000),
+        )
+    }
+
+    /// The registry this control evaluates against.
+    pub fn registry(&self) -> &EncoderRegistry {
+        &self.registry
+    }
+
+    /// True when at least one real video encoder is advertised.
+    pub fn is_available(&self) -> bool {
+        self.registry
+            .capabilities()
+            .iter()
+            .any(|capability| capability.codec.is_video())
+    }
+
+    /// Status derived from the registry plus the stored override state.
+    pub fn status(&self) -> CodecStatus {
+        let available = video_codec_names(
+            self.registry
+                .capabilities()
+                .iter()
+                .map(|capability| capability.codec),
+        );
+        let current_encoder = available.first().cloned();
+        let state = lock(&self.state).clone();
+        let pending_restart = state.requested.is_some();
+        CodecStatus {
+            current_encoder,
+            override_setting: state.requested,
+            available,
+            receipt: state.receipt,
+            pending_restart,
+        }
+    }
+
+    /// Evaluate and store a controller codec request.
+    ///
+    /// # Errors
+    ///
+    /// A malformed request, an unknown codec/backend/bitrate, or a selection
+    /// the registry cannot honour returns a typed [`ApiError`] whose `details`
+    /// list the real capabilities. No state is stored on error.
+    pub fn apply(&self, request: &CodecRequest) -> Result<serde_json::Value, ApiError> {
+        let preference = self.preference_from_request(request)?;
+        let request = EncoderOverride::new(preference).with_source("controller");
+        let receipt = self.registry.override_receipt(&request, &self.format)?;
+        let state = CodecOverrideState::from_receipt(request, receipt.clone());
+        *lock(&self.state) = state;
+        Ok(serde_json::json!({
+            "ok": true,
+            "applied": false,
+            "pending_restart": true,
+            "receipt": receipt,
+        }))
+    }
+
+    fn preference_from_request(&self, request: &CodecRequest) -> Result<CodecPreference, ApiError> {
+        let codec_text = request
+            .codec
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| self.invalid_request("missing `codec` (for example `h264`)"))?;
+        let codec =
+            parse_video_codec(codec_text).map_err(|message| self.invalid_request(message))?;
+
+        let mut preference = CodecPreference::new(codec);
+        if let Some(bitrate) = &request.bitrate {
+            preference = preference.with_bitrate_kbps(
+                parse_bitrate_kbps(bitrate).map_err(|message| self.invalid_request(message))?,
+            );
+        }
+
+        let hw_accel = request
+            .hw_accel
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("auto");
+        let backend =
+            parse_encoder_backend(hw_accel).map_err(|message| self.invalid_request(message))?;
+        let automatic = backend.is_none();
+        preference = match backend {
+            Some(backend) => preference.with_backend(backend),
+            None => preference,
+        };
+        // An explicit hardware backend is a hardware claim unless the caller
+        // explicitly allows a software fallback. Automatic selection may use
+        // whatever the registry really has.
+        preference = preference.with_software_fallback(
+            request
+                .allow_software_fallback
+                .unwrap_or(automatic || backend == Some(EncoderBackend::Software)),
+        );
+        preference
+            .validate()
+            .map_err(|error| self.invalid_request_with_details(error.message, error.details))?;
+        Ok(preference)
+    }
+
+    fn invalid_request(&self, message: impl Into<String>) -> ApiError {
+        self.invalid_request_with_details(message, Value::Null)
+    }
+
+    fn invalid_request_with_details(&self, message: impl Into<String>, extra: Value) -> ApiError {
+        let mut details = serde_json::json!({
+            "available": self.registry.capabilities(),
+        });
+        if let Value::Object(extra) = extra {
+            if let Value::Object(details) = &mut details {
+                for (key, value) in extra {
+                    details.insert(key, value);
+                }
+            }
+        }
+        ApiError::new(codes::INVALID_REQUEST, message)
+            .with_details(details)
+            .with_remediation(
+                "Use a video codec the node advertises on GET /codec, an optional bitrate such \
+                 as `8M` or `8000k`, and `auto`, `software`, `vaapi`, `nvenc`, `qsv`, or \
+                 `v4l2m2m` for hw_accel.",
+            )
+    }
+}
+
+/// Controller `POST /codec` body, matching `CodecConfig.to_dict()`.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct CodecRequest {
+    #[serde(default)]
+    pub codec: Option<String>,
+    #[serde(default)]
+    pub bitrate: Option<Value>,
+    #[serde(default)]
+    pub hw_accel: Option<String>,
+    /// Allow a software encoder when an explicit hardware backend is missing.
+    #[serde(default)]
+    pub allow_software_fallback: Option<bool>,
+}
+
+fn parse_video_codec(value: &str) -> Result<Codec, String> {
+    let codec = match value.trim().to_ascii_lowercase().as_str() {
+        "h264" | "avc" | "h.264" => Codec::H264,
+        "h265" | "hevc" | "h.265" => Codec::Hevc,
+        "av1" => Codec::Av1,
+        "mjpeg" | "jpeg" | "mjpg" => Codec::Mjpeg,
+        other => {
+            return Err(format!(
+                "codec `{other}` is not a supported video encoder on this node"
+            ))
+        }
+    };
+    Ok(codec)
+}
+
+fn parse_bitrate_kbps(value: &Value) -> Result<u32, String> {
+    let text = match value {
+        Value::Number(number) => number
+            .as_u64()
+            .ok_or_else(|| format!("bitrate `{number}` must be a positive integer"))?
+            .to_string(),
+        Value::String(text) => text.trim().to_owned(),
+        other => {
+            return Err(format!(
+                "bitrate must be a string like `8M`/`8000k` or a positive number, got {other}"
+            ))
+        }
+    };
+    if text.is_empty() {
+        return Err("bitrate must not be empty".to_owned());
+    }
+    let lower = text.to_ascii_lowercase();
+    let (digits, multiplier) = if let Some(prefix) = lower.strip_suffix("kbps") {
+        (prefix, 1u64)
+    } else if let Some(prefix) = lower.strip_suffix("mbps") {
+        (prefix, 1_000u64)
+    } else if let Some(prefix) = lower.strip_suffix('m') {
+        (prefix, 1_000u64)
+    } else if let Some(prefix) = lower.strip_suffix('k') {
+        (prefix, 1u64)
+    } else {
+        (lower.as_str(), 1u64)
+    };
+    let value: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|_| format!("bitrate `{text}` is not a number (expected e.g. `8M` or `8000k`)"))?;
+    if value == 0 {
+        return Err("bitrate must be greater than zero".to_owned());
+    }
+    let kbps = value
+        .checked_mul(multiplier)
+        .filter(|kbps| *kbps <= u64::from(u32::MAX))
+        .ok_or_else(|| format!("bitrate `{text}` is too large"))?;
+    u32::try_from(kbps).map_err(|_| format!("bitrate `{text}` is too large"))
+}
+
+fn parse_encoder_backend(value: &str) -> Result<Option<EncoderBackend>, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "auto" => Ok(None),
+        "vaapi" => Ok(Some(EncoderBackend::Vaapi)),
+        "nvenc" => Ok(Some(EncoderBackend::Nvenc)),
+        "qsv" => Ok(Some(EncoderBackend::Qsv)),
+        "v4l2m2m" | "v4l2-m2m" => Ok(Some(EncoderBackend::V4l2M2m)),
+        "software" | "sw" => Ok(Some(EncoderBackend::Software)),
+        other => Err(format!(
+            "hw_accel `{other}` is not supported; expected auto, nvenc, vaapi, qsv, \
+             v4l2m2m, or software"
+        )),
+    }
+}
+
+/// Runtime audio routing control for the `/audio/*` compatibility routes.
+///
+/// `router` is `None` when the configured backend failed its startup check
+/// (for example `pactl` is missing); `error` then carries the reason and the
+/// routes answer a typed 503. A node with no `--audio-router` does not build a
+/// control at all and keeps the typed 501 surface.
+#[derive(Clone)]
+pub struct AudioControl {
+    router: Option<Arc<dyn AudioRouter>>,
+    default_sink: Option<String>,
+    backend: String,
+    error: Option<String>,
+    /// Last successfully applied profile, used to preserve the Python
+    /// controller's empty-body `/audio/remove` call.
+    last_profile: Arc<Mutex<Option<String>>>,
+}
+
+impl AudioControl {
+    /// A healthy control over a real router.
+    pub fn configured(
+        router: Arc<dyn AudioRouter>,
+        default_sink: Option<String>,
+        backend: impl Into<String>,
+    ) -> Self {
+        Self {
+            router: Some(router),
+            default_sink: default_sink.filter(|sink| !sink.trim().is_empty()),
+            backend: backend.into(),
+            error: None,
+            last_profile: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// A configured backend that failed to initialise.
+    pub fn failed(reason: impl Into<String>) -> Self {
+        Self {
+            router: None,
+            default_sink: None,
+            backend: "none".to_owned(),
+            error: Some(reason.into()),
+            last_profile: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Stable backend name (`pipewire`, `pulseaudio`, or `none`).
+    pub fn backend(&self) -> &str {
+        &self.backend
+    }
+
+    /// The startup error, when the backend could not be used.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// True when a router is present and usable.
+    pub fn is_available(&self) -> bool {
+        self.router.is_some() && self.error.is_none()
+    }
+
+    /// Connection status token.
+    pub fn status_name(&self) -> &'static str {
+        if self.is_available() {
+            "running"
+        } else {
+            "failed"
+        }
+    }
+
+    fn router(&self) -> Result<&Arc<dyn AudioRouter>, Response> {
+        match (&self.router, &self.error) {
+            (Some(router), None) => Ok(router),
+            (_, Some(error)) => Err(audio_unavailable(error)),
+            (None, None) => Err(audio_not_implemented()),
+        }
+    }
+
+    fn sink_or_default(&self, sink: Option<String>) -> Result<String, Response> {
+        sink.map(|sink| sink.trim().to_owned())
+            .filter(|sink| !sink.is_empty())
+            .or_else(|| self.default_sink.clone())
+            .ok_or_else(|| {
+                compat_error_with_remediation(
+                    StatusCode::BAD_REQUEST,
+                    "audio-missing-sink",
+                    "missing `sink` and no default sink is configured",
+                    Some(
+                        "Pass a sink name in the request, or start ozma-node with \
+                         --audio-sink <name>.",
+                    ),
+                )
+            })
+    }
+
+    fn remember_profile(&self, profile_id: &str) {
+        *lock(&self.last_profile) = Some(profile_id.to_owned());
+    }
+
+    fn last_profile(&self) -> Option<String> {
+        lock(&self.last_profile).clone()
     }
 }
 
@@ -589,7 +950,13 @@ pub struct ConnectionState {
     pub hls: Option<HlsStatus>,
     /// The one sink shared with session input and the UDP HID listener.
     pub input_sink: Option<SharedSink>,
+    /// Base status derived from the advertised capabilities. When a
+    /// [`CodecControl`] is attached its live status replaces this value.
     pub codecs: CodecStatus,
+    /// Runtime codec override control, when the node has a video encoder.
+    pub codec_control: Option<CodecControl>,
+    /// Runtime audio routing control. `None` leaves `/audio/*` at typed 501.
+    pub audio: Option<AudioControl>,
     /// External WebRTC helper. `None` means no `--webrtc-helper` was given;
     /// `Some(control)` may be a configured-but-failed helper.
     pub webrtc: Option<WebRtcControl>,
@@ -604,6 +971,8 @@ impl ConnectionState {
             hls: None,
             input_sink: None,
             codecs: CodecStatus::not_configured(),
+            codec_control: None,
+            audio: None,
             webrtc: None,
         }
     }
@@ -636,6 +1005,27 @@ impl ConnectionState {
     /// Attach codec status derived from the node's advertised capabilities.
     pub fn with_codecs(mut self, codecs: CodecStatus) -> Self {
         self.codecs = codecs;
+        self
+    }
+
+    /// Attach a runtime codec override control.
+    ///
+    /// Its live status (including stored override/receipt) replaces the
+    /// capability-derived base status on `/api/v1/connection` and `GET /codec`.
+    pub fn with_codec_control(mut self, control: Option<CodecControl>) -> Self {
+        if let Some(control) = control.as_ref() {
+            self.codecs = control.status();
+        }
+        self.codec_control = control;
+        self
+    }
+
+    /// Attach the runtime audio routing control.
+    ///
+    /// `None` keeps `audio: "not-configured"` and typed 501s. A configured but
+    /// failed control reports `failed` plus `audio_error`.
+    pub fn with_audio(mut self, audio: Option<AudioControl>) -> Self {
+        self.audio = audio;
         self
     }
 
@@ -689,8 +1079,10 @@ pub struct ConnectionResponse {
     pub webrtc: &'static str,
     /// Why WebRTC is not `running`, when it is configured and failing.
     pub webrtc_error: Option<String>,
-    /// Room-correction / audio-routing compatibility routes are not implemented.
+    /// Audio routing status: `running`, `not-configured`, or `failed`.
     pub audio: &'static str,
+    /// Why audio routing is `failed` (for example a missing `pactl`).
+    pub audio_error: Option<String>,
 }
 
 /// Build the compatibility router. Mount it before the node API auth layer so
@@ -741,17 +1133,18 @@ pub fn codec_router(state: ConnectionState) -> Router {
         .with_state(state)
 }
 
-/// Room-correction / audio-routing compatibility routes.
+/// Controller audio-routing compatibility routes.
 ///
-/// The agent and desktop node implement these; `ozma-node` does not yet own a
-/// PipeWire routing or correction pipeline, so every route answers 501 rather
-/// than returning a success-shaped no-op.
+/// With `--audio-router pipewire|pulseaudio` these drive a real
+/// [`AudioRouter`] (`pactl` graph control plus `pw-play`/`paplay`) and return
+/// typed 200/400/502/503 results. Without a router every route answers a typed
+/// 501 rather than a success-shaped no-op.
 pub fn audio_router(state: ConnectionState) -> Router {
     Router::new()
-        .route("/audio/apply", post(audio_not_implemented))
-        .route("/audio/remove", post(audio_not_implemented))
-        .route("/audio/play", post(audio_not_implemented))
-        .route("/audio/stop", post(audio_not_implemented))
+        .route("/audio/apply", post(audio_apply))
+        .route("/audio/remove", post(audio_remove))
+        .route("/audio/play", post(audio_play))
+        .route("/audio/stop", post(audio_stop))
         .with_state(state)
 }
 
@@ -800,6 +1193,15 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
         available: state.input_sink.is_some(),
         injecting: state.input_sink.is_some() && !state.input_is_recording_only(),
     };
+    let (audio, audio_error) = match &state.audio {
+        None => ("not-configured", None),
+        Some(control) => (control.status_name(), control.error().map(str::to_owned)),
+    };
+    let codec = state
+        .codec_control
+        .as_ref()
+        .map(CodecControl::status)
+        .unwrap_or_else(|| state.codecs.clone());
     Json(ConnectionResponse {
         ok: true,
         node_id: info.node_id.clone(),
@@ -811,12 +1213,13 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
         hid: state.stats.snapshot(),
         power,
         input,
-        codec: state.codecs.clone(),
+        codec,
         hls,
         hls_error,
         webrtc,
         webrtc_error,
-        audio: "not-implemented",
+        audio,
+        audio_error,
     })
 }
 
@@ -1329,32 +1732,340 @@ async fn input_type(
 // ---------------------------------------------------------------------------
 
 async fn codec_get(State(state): State<ConnectionState>) -> Json<CodecStatus> {
-    Json(state.codecs.clone())
+    let status = state
+        .codec_control
+        .as_ref()
+        .map(CodecControl::status)
+        .unwrap_or_else(|| state.codecs.clone());
+    Json(status)
 }
 
-async fn codec_set() -> Response {
+async fn codec_set(
+    State(state): State<ConnectionState>,
+    payload: Result<Json<CodecRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(error) => return json_rejection(error),
+    };
+    let Some(control) = state.codec_control.as_ref() else {
+        return codec_unavailable();
+    };
+    if !control.is_available() {
+        return codec_unavailable();
+    }
+    match control.apply(&request) {
+        Ok(body) => Json(body).into_response(),
+        Err(error) => api_error_response(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+fn codec_unavailable() -> Response {
     compat_error_with_remediation(
-        StatusCode::NOT_IMPLEMENTED,
-        "codec-override-unsupported",
-        "codec override is not implemented",
+        StatusCode::SERVICE_UNAVAILABLE,
+        "codec-video-unavailable",
+        "no video encoder is available on this node",
         Some(
-            "The node advertises its encode capabilities on GET /codec; applying an encoder \
-             preference requires restarting the capture/encode pipeline and is not wired yet.",
+            "Enable the video capability and a capture source so the node advertises a video \
+             encoder on GET /codec; a node without video cannot accept a codec override.",
         ),
     )
 }
 
-async fn audio_not_implemented() -> Response {
+#[derive(Debug, Default, Deserialize)]
+struct AudioApplyRequest {
+    #[serde(default)]
+    profile_id: Option<String>,
+    #[serde(default)]
+    sink: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    /// Kept as `i64` so an out-of-range value is a typed 400 rather than a
+    /// generic extractor rejection.
+    #[serde(default)]
+    volume: Option<i64>,
+    #[serde(default)]
+    muted: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AudioRemoveRequest {
+    #[serde(default)]
+    profile_id: Option<String>,
+    #[serde(default)]
+    sink: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AudioPlayRequest {
+    #[serde(default)]
+    track: Option<String>,
+    #[serde(default)]
+    sink: Option<String>,
+}
+
+async fn audio_apply(
+    State(state): State<ConnectionState>,
+    payload: Result<Json<AudioApplyRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(error) => return json_rejection(error),
+    };
+    let Some(control) = state.audio.as_ref() else {
+        return audio_not_implemented();
+    };
+    let router = match control.router() {
+        Ok(router) => router.clone(),
+        Err(response) => return response,
+    };
+    if request
+        .source
+        .as_deref()
+        .is_some_and(|source| !source.trim().is_empty())
+    {
+        return compat_error_with_remediation(
+            StatusCode::NOT_IMPLEMENTED,
+            "audio-source-unsupported",
+            "audio source routing unsupported",
+            Some(
+                "This node routes playback sinks only. Microphone/source routing needs an \
+                 explicit source-output index and is not implemented.",
+            ),
+        );
+    }
+    let profile_id = match required_profile_id(request.profile_id.as_deref()) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let sink = match control.sink_or_default(request.sink) {
+        Ok(sink) => sink,
+        Err(response) => return response,
+    };
+    let mut profile = match AudioProfile::new(profile_id.clone(), sink.clone()) {
+        Ok(profile) => profile,
+        Err(error) => return audio_error_response(error),
+    };
+    if let Some(volume) = request.volume {
+        if !(0..=100).contains(&volume) {
+            return compat_error(
+                StatusCode::BAD_REQUEST,
+                "audio-invalid-volume",
+                format!("volume {volume} is outside 0..=100"),
+            );
+        }
+        profile = match profile.with_volume(volume as u8) {
+            Ok(profile) => profile,
+            Err(error) => return audio_error_response(error),
+        };
+    }
+    if let Some(muted) = request.muted {
+        profile = profile.with_muted(muted);
+    }
+
+    match router.apply_profile(profile).await {
+        Ok(()) => {
+            control.remember_profile(&profile_id);
+            Json(serde_json::json!({
+                "ok": true,
+                "profile_id": profile_id,
+                "sink": sink,
+                "backend": control.backend(),
+            }))
+            .into_response()
+        }
+        Err(error) => audio_error_response(error),
+    }
+}
+
+async fn audio_remove(
+    State(state): State<ConnectionState>,
+    payload: Result<Json<AudioRemoveRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(error) => return json_rejection(error),
+    };
+    let Some(control) = state.audio.as_ref() else {
+        return audio_not_implemented();
+    };
+    let router = match control.router() {
+        Ok(router) => router.clone(),
+        Err(response) => return response,
+    };
+    let profile_id = match request
+        .profile_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+    {
+        Some(value) => value,
+        None => match control.last_profile() {
+            // Preserve the Python controller's empty-body remove: it targets the
+            // profile most recently applied through this control.
+            Some(value) => value,
+            // `None` is always an error here, and carries the typed 400.
+            None => return required_profile_id(None).unwrap_err(),
+        },
+    };
+    let _ = request.sink;
+
+    match router.remove_profile(&profile_id).await {
+        Ok(()) => Json(serde_json::json!({
+            "ok": true,
+            "profile_id": profile_id,
+            "backend": control.backend(),
+        }))
+        .into_response(),
+        Err(error) => audio_error_response(error),
+    }
+}
+
+async fn audio_play(
+    State(state): State<ConnectionState>,
+    payload: Result<Json<AudioPlayRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(error) => return json_rejection(error),
+    };
+    let Some(control) = state.audio.as_ref() else {
+        return audio_not_implemented();
+    };
+    let router = match control.router() {
+        Ok(router) => router.clone(),
+        Err(response) => return response,
+    };
+    let track = request
+        .track
+        .as_deref()
+        .map(str::trim)
+        .filter(|track| !track.is_empty());
+    let Some(track) = track else {
+        return compat_error(
+            StatusCode::BAD_REQUEST,
+            "audio-missing-track",
+            "missing `track` (a single file name such as `sweep.flac`)",
+        );
+    };
+    let sink = match control.sink_or_default(request.sink) {
+        Ok(sink) => sink,
+        Err(response) => return response,
+    };
+    let spec = match AudioPlaybackSpec::new(track, sink.clone()) {
+        Ok(spec) => spec,
+        Err(error) => return audio_error_response(error),
+    };
+
+    match router.play_reference(spec).await {
+        Ok(()) => Json(serde_json::json!({
+            "ok": true,
+            "track": track,
+            "sink": sink,
+            "backend": control.backend(),
+        }))
+        .into_response(),
+        Err(error) => audio_error_response(error),
+    }
+}
+
+async fn audio_stop(State(state): State<ConnectionState>) -> Response {
+    let Some(control) = state.audio.as_ref() else {
+        return audio_not_implemented();
+    };
+    let router = match control.router() {
+        Ok(router) => router.clone(),
+        Err(response) => return response,
+    };
+
+    match router.stop_playback().await {
+        Ok(()) => {
+            Json(serde_json::json!({"ok": true, "backend": control.backend()})).into_response()
+        }
+        Err(error) => audio_error_response(error),
+    }
+}
+
+fn required_profile_id(value: Option<&str>) -> Result<String, Response> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            compat_error(
+                StatusCode::BAD_REQUEST,
+                "audio-missing-profile",
+                "missing `profile_id`",
+            )
+        })
+}
+
+fn audio_not_implemented() -> Response {
     compat_error_with_remediation(
         StatusCode::NOT_IMPLEMENTED,
         "audio-routing-unsupported",
         "audio routing is not implemented on this node",
         Some(
-            "Room correction and per-sink routing remain controller/agent features. The node's \
-             UAC2 gadget bridge is not a substitute for /audio/apply, /audio/remove, \
-             /audio/play, or /audio/stop; see docs/parity-matrix.md.",
+            "Start ozma-node with --audio-router pipewire or --audio-router pulseaudio to \
+             control an existing PipeWire/PulseAudio graph. The UAC2 gadget bridge is not a \
+             substitute for /audio/apply, /audio/remove, /audio/play, or /audio/stop; see \
+             docs/parity-matrix.md.",
         ),
     )
+}
+
+fn audio_unavailable(reason: &str) -> Response {
+    compat_error_with_remediation(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "audio-routing-unavailable",
+        format!("audio routing is unavailable: {reason}"),
+        Some(
+            "Check the node log and /api/v1/connection.audio_error. The configured audio \
+             backend did not initialise; no command was run and no success is claimed.",
+        ),
+    )
+}
+
+fn audio_error_response(error: AudioError) -> Response {
+    let status = match &error {
+        AudioError::InvalidSpec { .. } | AudioError::InvalidTarget(_) => StatusCode::BAD_REQUEST,
+        AudioError::Refused { .. } => StatusCode::BAD_REQUEST,
+        AudioError::TrackNotFound { .. } => StatusCode::BAD_REQUEST,
+        AudioError::Unsupported { .. } => StatusCode::NOT_IMPLEMENTED,
+        AudioError::MissingCommand { .. }
+        | AudioError::Unavailable { .. }
+        | AudioError::Process { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        AudioError::Capture { .. }
+        | AudioError::Closed { .. }
+        | AudioError::EndOfStream
+        | AudioError::InvalidFrame(_)
+        | AudioError::FormatMismatch { .. }
+        | AudioError::Encode { .. }
+        | AudioError::Decode { .. }
+        | AudioError::ChannelClosed
+        | AudioError::CommandFailed { .. }
+        | AudioError::OutputParse { .. } => StatusCode::BAD_GATEWAY,
+    };
+    api_error_response(status, error.to_api_error())
+}
+
+fn api_error_response(status: StatusCode, error: ApiError) -> Response {
+    let mut body = serde_json::json!({
+        "ok": false,
+        "code": error.code,
+        "error": error.message,
+    });
+    if !error.details.is_null() {
+        body["details"] = error.details;
+    }
+    if let Some(remediation) = error.remediation {
+        body["remediation"] = Value::String(remediation);
+    }
+    if error.retryable {
+        body["retryable"] = Value::Bool(true);
+    }
+    (status, Json(body)).into_response()
 }
 
 /// `POST /webrtc/offer` body, matching the controller/soft-node shape.
@@ -1611,6 +2322,80 @@ mod tests {
 
         async fn stop(&mut self) -> Result<(), PowerError> {
             self.record("force-off")
+        }
+    }
+
+    use ozma_audio::{audio_codes, AudioSinkSpec, AudioSinkState, AudioStreamRef};
+
+    struct FakeAudioRouter {
+        calls: Arc<Mutex<Vec<String>>>,
+        failure: Option<AudioError>,
+    }
+
+    impl FakeAudioRouter {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                failure: None,
+            }
+        }
+
+        fn failing(error: AudioError) -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                failure: Some(error),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            lock(&self.calls).clone()
+        }
+
+        fn record(&self, entry: String) -> Result<(), AudioError> {
+            if let Some(error) = &self.failure {
+                return Err(error.clone());
+            }
+            lock(&self.calls).push(entry);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl AudioRouter for FakeAudioRouter {
+        async fn ensure_sink(&self, spec: AudioSinkSpec) -> Result<AudioSinkState, AudioError> {
+            self.record(format!("ensure:{}", spec.name))?;
+            Ok(AudioSinkState {
+                monitor_target: format!("{}.monitor", spec.name),
+                name: spec.name,
+                created: false,
+            })
+        }
+
+        async fn remove_sink(&self, name: &str) -> Result<(), AudioError> {
+            self.record(format!("remove-sink:{name}"))
+        }
+
+        async fn move_stream(&self, stream: AudioStreamRef, sink: &str) -> Result<(), AudioError> {
+            self.record(format!("move:{}:{sink}", stream.index))
+        }
+
+        async fn apply_profile(&self, profile: AudioProfile) -> Result<(), AudioError> {
+            self.record(format!(
+                "apply:{}:{}:{:?}:{:?}",
+                profile.id, profile.sink, profile.volume, profile.muted
+            ))
+        }
+
+        async fn remove_profile(&self, profile_id: &str) -> Result<(), AudioError> {
+            self.record(format!("remove:{profile_id}"))
+        }
+
+        async fn play_reference(&self, spec: AudioPlaybackSpec) -> Result<(), AudioError> {
+            self.record(format!("play:{}:{}", spec.track, spec.sink))
+        }
+
+        async fn stop_playback(&self) -> Result<(), AudioError> {
+            self.record("stop".to_owned())
         }
     }
 
@@ -2062,13 +2847,14 @@ mod tests {
         assert_eq!(json["input"]["available"], false);
         assert_eq!(json["input"]["injecting"], false);
         assert!(json["codec"]["current_encoder"].is_null());
-        assert!(json["codec"]["override"].is_null());
-        assert_eq!(json["codec"]["available"], serde_json::json!([]));
+        assert!(json["codec"]["receipt"].is_null());
+        assert_eq!(json["codec"]["pending_restart"], false);
         assert_eq!(json["hls"], "not-configured");
         assert!(json["hls_error"].is_null());
         assert_eq!(json["webrtc"], "not-configured");
         assert!(json["webrtc_error"].is_null());
-        assert_eq!(json["audio"], "not-implemented");
+        assert_eq!(json["audio"], "not-configured");
+        assert!(json["audio_error"].is_null());
     }
 
     #[tokio::test]
@@ -2786,37 +3572,18 @@ mod tests {
         assert_eq!(body["events"], 0);
     }
 
-    #[tokio::test]
-    async fn codec_route_reports_advertised_video_and_refuses_overrides() {
-        let state = ConnectionState::new(
-            ConnectionInfo::new(
-                "node-a._ozma._udp.local.",
-                "hardware",
-                7382,
-                7384,
-                7331,
-                SINK_FAKE_RECORDING,
-            ),
-            CompatStats::default(),
+    fn codec_control(registry: EncoderRegistry) -> CodecControl {
+        CodecControl::new(
+            registry,
+            MediaFormat::new(Codec::H264, 1280, 720, 30, 4_000),
         )
-        .with_codecs(CodecStatus::from_codecs([Codec::H264, Codec::Opus]));
-        let app = codec_router(state);
-
-        let (status, body) = get_json(&app, "/codec").await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["current_encoder"], "h264");
-        assert!(body["override"].is_null());
-        assert_eq!(body["available"], serde_json::json!(["h264"]));
-
-        let (status, body) = post_json(&app, "/codec", serde_json::json!({})).await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        assert_eq!(body["ok"], false);
-        assert_eq!(body["error"], "codec override is not implemented");
-        assert!(body["remediation"].is_string());
     }
 
-    #[tokio::test]
-    async fn codec_route_is_empty_without_a_video_capability() {
+    fn h264_registry() -> EncoderRegistry {
+        EncoderRegistry::from_capabilities([ozma_encode::H264SoftwareEncoder::capability()])
+    }
+
+    fn codec_state(control: Option<CodecControl>) -> ConnectionState {
         let state = ConnectionState::new(
             ConnectionInfo::new(
                 "node-a._ozma._udp.local.",
@@ -2828,15 +3595,204 @@ mod tests {
             ),
             CompatStats::default(),
         );
-        let (status, body) = get_json(&codec_router(state), "/codec").await;
+        match control {
+            Some(control) => state
+                .with_codecs(control.status())
+                .with_codec_control(Some(control)),
+            None => state.with_codecs(CodecStatus::from_codecs([Codec::H264, Codec::Opus])),
+        }
+    }
+
+    #[tokio::test]
+    async fn codec_route_reports_real_encoders_and_stores_a_pending_override() {
+        let app = codec_router(codec_state(Some(codec_control(h264_registry()))));
+
+        let (status, body) = get_json(&app, "/codec").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["current_encoder"], "h264");
+        assert!(body["override"].is_null());
+        assert_eq!(body["available"], serde_json::json!(["h264"]));
+        assert!(body["receipt"].is_null());
+        assert_eq!(body["pending_restart"], false);
+
+        let (status, body) = post_json(
+            &app,
+            "/codec",
+            serde_json::json!({"codec": "h264", "bitrate": "8M", "hw_accel": "software"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ok"], true);
+        // The pipeline did not restart: never claim the override is live.
+        assert_eq!(body["applied"], false);
+        assert_eq!(body["pending_restart"], true);
+        assert_eq!(body["receipt"]["requested"]["codec"], "h264");
+        assert_eq!(body["receipt"]["requested"]["bitrate_kbps"], 8_000);
+        assert_eq!(body["receipt"]["requested"]["backend"], "software");
+        assert_eq!(body["receipt"]["applied"], true);
+        assert_eq!(body["receipt"]["selected"]["backend"], "software");
+
+        let (status, body) = get_json(&app, "/codec").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["current_encoder"], "h264");
+        assert_eq!(body["override"]["preference"]["codec"], "h264");
+        assert_eq!(body["override"]["source"], "controller");
+        assert_eq!(body["receipt"]["requested"]["bitrate_kbps"], 8_000);
+        assert_eq!(body["pending_restart"], true);
+        assert_eq!(body["available"], serde_json::json!(["h264"]));
+    }
+
+    #[tokio::test]
+    async fn codec_route_maps_controller_bitrate_and_backend_names() {
+        let app = codec_router(codec_state(Some(codec_control(h264_registry()))));
+
+        for (body, expected_kbps) in [
+            (
+                serde_json::json!({"codec": "h264", "bitrate": "8000k"}),
+                8_000,
+            ),
+            (
+                serde_json::json!({"codec": "h264", "bitrate": 8_000}),
+                8_000,
+            ),
+            (serde_json::json!({"codec": "h264", "bitrate": "8M"}), 8_000),
+            (
+                serde_json::json!({"codec": "H264", "bitrate": "8Mbps"}),
+                8_000,
+            ),
+        ] {
+            let (status, response) = post_json(&app, "/codec", body).await;
+            assert_eq!(status, StatusCode::OK, "{response}");
+            assert_eq!(
+                response["receipt"]["requested"]["bitrate_kbps"],
+                expected_kbps
+            );
+        }
+
+        for (hw, backend) in [
+            ("vaapi", "vaapi"),
+            ("nvenc", "nvenc"),
+            ("qsv", "qsv"),
+            ("v4l2m2m", "v4l2m2m"),
+        ] {
+            let (status, response) = post_json(
+                &app,
+                "/codec",
+                serde_json::json!({"codec": "h264", "hw_accel": hw}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+            assert_eq!(response["code"], codes::ENCODER_UNAVAILABLE);
+            assert_eq!(
+                response["details"]["requested_backend"].as_str(),
+                Some(backend)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn codec_route_rejects_unknown_codec_bitrate_and_backend() {
+        let app = codec_router(codec_state(Some(codec_control(h264_registry()))));
+
+        for (body, needle) in [
+            (serde_json::json!({}), "missing `codec`"),
+            (serde_json::json!({"codec": "vp9"}), "vp9"),
+            (
+                serde_json::json!({"codec": "h264", "bitrate": "fast"}),
+                "bitrate",
+            ),
+            (
+                serde_json::json!({"codec": "h264", "hw_accel": "warp"}),
+                "hw_accel",
+            ),
+        ] {
+            let (status, response) = post_json(&app, "/codec", body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+            assert_eq!(response["ok"], false);
+            assert!(
+                response["error"].as_str().unwrap().contains(needle),
+                "{response}"
+            );
+            assert!(response["details"]["available"].is_array(), "{response}");
+            assert_eq!(response["details"]["available"][0]["backend"], "software");
+        }
+
+        // No state was stored after any rejected request.
+        let (status, body) = get_json(&app, "/codec").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["override"].is_null());
+        assert_eq!(body["pending_restart"], false);
+    }
+
+    #[tokio::test]
+    async fn codec_route_honours_or_denies_software_fallback() {
+        let app = codec_router(codec_state(Some(codec_control(h264_registry()))));
+
+        let (status, body) = post_json(
+            &app,
+            "/codec",
+            serde_json::json!({"codec": "h264", "hw_accel": "nvenc"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], codes::ENCODER_UNAVAILABLE);
+        assert_eq!(body["details"]["available"][0]["backend"], "software");
+
+        let (status, body) = post_json(
+            &app,
+            "/codec",
+            serde_json::json!({
+                "codec": "h264",
+                "hw_accel": "nvenc",
+                "allow_software_fallback": true,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["applied"], false);
+        assert_eq!(body["pending_restart"], true);
+        assert_eq!(body["receipt"]["applied"], false);
+        assert_eq!(
+            body["receipt"]["fallback_reason"],
+            "requested_backend_unavailable"
+        );
+        assert_eq!(body["receipt"]["selected"]["backend"], "software");
+    }
+
+    #[tokio::test]
+    async fn codec_route_is_empty_and_503_without_a_video_capability() {
+        let app = codec_router(codec_state(None));
+
+        let (status, body) = get_json(&app, "/codec").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["current_encoder"], "h264");
+        assert!(body["override"].is_null());
+        assert_eq!(body["available"], serde_json::json!(["h264"]));
+
+        let (status, body) = post_json(&app, "/codec", serde_json::json!({"codec": "h264"})).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "codec-video-unavailable");
+
+        // A node with no video capability at all stays empty.
+        let empty = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        );
+        let (status, body) = get_json(&codec_router(empty), "/codec").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body["current_encoder"].is_null());
-        assert!(body["override"].is_null());
         assert_eq!(body["available"], serde_json::json!([]));
     }
 
     #[tokio::test]
-    async fn audio_routes_are_explicitly_not_implemented() {
+    async fn audio_routes_are_explicitly_not_implemented_without_a_router() {
         let (state, _) = input_state(SINK_FAKE_RECORDING);
         let app = audio_router(state);
 
@@ -2849,6 +3805,7 @@ mod tests {
             let (status, body) = post_json(&app, path, serde_json::json!({})).await;
             assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{path}");
             assert_eq!(body["ok"], false, "{path}");
+            assert_eq!(body["code"], "audio-routing-unsupported", "{path}");
             assert!(
                 body["error"]
                     .as_str()
@@ -2858,6 +3815,163 @@ mod tests {
             );
             assert!(body["remediation"].is_string(), "{path}");
         }
+    }
+
+    fn audio_state(
+        router: Option<Arc<FakeAudioRouter>>,
+        default_sink: Option<&str>,
+    ) -> ConnectionState {
+        let (state, _) = input_state(SINK_FAKE_RECORDING);
+        let audio = router.map(|router| {
+            AudioControl::configured(router, default_sink.map(str::to_owned), "pipewire")
+        });
+        state.with_audio(audio)
+    }
+
+    #[tokio::test]
+    async fn audio_routes_apply_remove_play_and_stop_through_the_router() {
+        let router = Arc::new(FakeAudioRouter::new());
+        let app = audio_router(audio_state(Some(router.clone()), Some("ozma-default")));
+
+        let (status, body) = post_json(
+            &app,
+            "/audio/apply",
+            serde_json::json!({
+                "profile_id": "profile-a",
+                "sink": "ozma-vm1",
+                "volume": 42,
+                "muted": true,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["profile_id"], "profile-a");
+        assert_eq!(body["sink"], "ozma-vm1");
+        assert_eq!(body["backend"], "pipewire");
+
+        // A missing sink derives the configured default sink.
+        let (status, body) = post_json(
+            &app,
+            "/audio/apply",
+            serde_json::json!({"profile_id": "profile-b", "volume": 0}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["sink"], "ozma-default");
+
+        let (status, body) = post_json(
+            &app,
+            "/audio/remove",
+            serde_json::json!({"profile_id": "profile-a", "sink": "ozma-vm1"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["profile_id"], "profile-a");
+
+        // The Python controller proxies an empty body; remove the profile most
+        // recently applied instead of failing.
+        let (status, body) = post_json(&app, "/audio/remove", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["profile_id"], "profile-b");
+
+        let (status, body) = post_json(
+            &app,
+            "/audio/play",
+            serde_json::json!({"track": "sweep.flac", "sink": "ozma-vm1"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["track"], "sweep.flac");
+
+        let (status, body) = post_json(&app, "/audio/stop", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ok"], true);
+
+        assert_eq!(
+            router.calls(),
+            vec![
+                "apply:profile-a:ozma-vm1:Some(42):Some(true)",
+                "apply:profile-b:ozma-default:Some(0):None",
+                "remove:profile-a",
+                "remove:profile-b",
+                "play:sweep.flac:ozma-vm1",
+                "stop",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn audio_routes_reject_invalid_bodies_without_calling_the_router() {
+        let router = Arc::new(FakeAudioRouter::new());
+        let app = audio_router(audio_state(Some(router.clone()), None));
+
+        for (path, body, code) in [
+            (
+                "/audio/apply",
+                serde_json::json!({"profile_id": "p", "sink": "s", "volume": 101}),
+                "audio-invalid-volume",
+            ),
+            (
+                "/audio/apply",
+                serde_json::json!({"profile_id": "p"}),
+                "audio-missing-sink",
+            ),
+            (
+                "/audio/apply",
+                serde_json::json!({"sink": "s"}),
+                "audio-missing-profile",
+            ),
+            (
+                "/audio/apply",
+                serde_json::json!({"profile_id": "p", "sink": "s", "source": "mic"}),
+                "audio-source-unsupported",
+            ),
+            (
+                "/audio/play",
+                serde_json::json!({"sink": "s"}),
+                "audio-missing-track",
+            ),
+            (
+                "/audio/play",
+                serde_json::json!({"track": "../evil.flac", "sink": "s"}),
+                audio_codes::AUDIO_INVALID_SPEC,
+            ),
+        ] {
+            let (status, response) = post_json(&app, path, body).await;
+            assert_eq!(
+                status,
+                if code == "audio-source-unsupported" {
+                    StatusCode::NOT_IMPLEMENTED
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                "{path}: {response}"
+            );
+            assert_eq!(response["code"], code, "{path}: {response}");
+        }
+        assert!(router.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn audio_routes_report_backend_failures_typed() {
+        let router = Arc::new(FakeAudioRouter::failing(AudioError::CommandFailed {
+            command: "pactl set-sink-volume".to_owned(),
+            status: 1,
+            stderr: "no such sink".to_owned(),
+        }));
+        let app = audio_router(audio_state(Some(router), None));
+
+        let (status, body) = post_json(
+            &app,
+            "/audio/apply",
+            serde_json::json!({"profile_id": "p", "sink": "missing"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["code"], audio_codes::AUDIO_COMMAND_FAILED);
+        assert!(body["details"].as_str().unwrap().contains("no such sink"));
     }
 
     #[tokio::test]
@@ -2872,7 +3986,36 @@ mod tests {
         assert_eq!(body["input"]["injecting"], false);
         assert_eq!(body["codec"]["current_encoder"], "h264");
         assert_eq!(body["codec"]["available"], serde_json::json!(["h264"]));
-        assert_eq!(body["audio"], "not-implemented");
+        assert_eq!(body["codec"]["pending_restart"], false);
+        assert_eq!(body["audio"], "not-configured");
+        assert!(body["audio_error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn connection_reports_audio_running_and_failed_states() {
+        let router = Arc::new(FakeAudioRouter::new());
+        let running = audio_state(Some(router), Some("ozma"));
+        let (status, body) = get_json(&connection_router(running), "/api/v1/connection").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["audio"], "running");
+        assert!(body["audio_error"].is_null());
+
+        let failed = audio_state(None, None)
+            .with_audio(Some(AudioControl::failed("pactl is not installed")));
+        let (status, body) =
+            get_json(&connection_router(failed.clone()), "/api/v1/connection").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["audio"], "failed");
+        assert_eq!(body["audio_error"], "pactl is not installed");
+
+        let (status, body) = post_json(
+            &audio_router(failed),
+            "/audio/apply",
+            serde_json::json!({"profile_id": "p", "sink": "s"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "audio-routing-unavailable");
     }
 
     #[tokio::test]
@@ -2894,6 +4037,7 @@ mod tests {
 
         for (method, uri, body) in [
             ("GET", "/codec", None),
+            ("POST", "/codec", Some(serde_json::json!({"codec": "h264"}))),
             (
                 "POST",
                 "/input/key",
@@ -2950,6 +4094,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+
+        let response = app
+            .clone()
+            .oneshot(authorized("POST", "/codec"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         let response = app
             .oneshot(

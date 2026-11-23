@@ -17,6 +17,27 @@
 //! | [`AudioEncoder`] | async encode boundary |
 //! | [`OpusEncoder`] | libopus, 20 ms 48 kHz stereo, one packet per frame |
 //! | [`OpusDecoder`] | small libopus decoder for tests and local checks |
+//! | [`AudioRouter`] | per-VM/seat sink, monitor, stream, profile, and playback control |
+//!
+//! # Routing scope
+//!
+//! [`AudioRouter`] controls an **existing** PipeWire/PulseAudio graph. It does
+//! not start or replace the audio server, and it does not implement room
+//! correction, equalisation, convolution, or any other DSP. Concretely, the
+//! router can:
+//!
+//! - create or reuse a named `module-null-sink` and report its
+//!   `<sink>.monitor` capture target,
+//! - remove a null sink it owns (and refuse to unload a non-Ozma sink),
+//! - move a playback stream onto a sink,
+//! - apply sink volume/mute presets, and
+//! - play and stop a reference track.
+//!
+//! Graph commands go through an injectable [`CommandRunner`] that takes an
+//! argv vector and optional stdin, never a shell. Default tests use a fake
+//! runner, so they need no live PipeWire or PulseAudio session. A missing
+//! helper binary or a non-zero exit is a typed [`AudioError`], never a silent
+//! success.
 //!
 //! # Interactivity choices
 //!
@@ -37,9 +58,13 @@
 //!   without `stop` is best-effort and does not join.
 //! - No resampling or downmixing: a frame with the wrong rate, channels, or
 //!   sample count is rejected rather than silently reinterpreted.
-//! - [`AudioTarget::SinkMonitor`] names `<sink>.monitor`, but the monitor node
-//!   must already exist in the PipeWire graph. Selection does not create a
-//!   null sink, move streams, or provision per-VM routing (Phase 2).
+//! - [`AudioTarget::SinkMonitor`] names `<sink>.monitor` but does not create
+//!   it. Use [`AudioRouter::ensure_sink`] to create the null sink and monitor,
+//!   then hand [`AudioSinkState::monitor_target`] back to
+//!   [`PipeWireCapture::open_sink_monitor`].
+//! - The router is not a room-correction engine: [`AudioProfile`] carries
+//!   only sink, volume, and mute. Source routing is rejected with a typed
+//!   error instead of being ignored.
 //! - `audiopus` and `alsa` are native dependencies (libopus, ALSA). No OpenSSL
 //!   or other TLS stack is involved. On non-Linux platforms the
 //!   [`PipeWireCapture`] constructors fail with `AudioError::Unavailable`
@@ -68,6 +93,7 @@ pub mod fake;
 pub mod frame;
 pub mod opus;
 pub mod pipewire;
+pub mod router;
 pub mod target;
 pub mod traits;
 
@@ -83,6 +109,13 @@ pub use frame::{
 };
 pub use opus::{default_config, OpusDecoder, OpusEncoder, MAX_OPUS_PACKET_BYTES, OPUS_ENCODER_ID};
 pub use pipewire::PipeWireCapture;
+pub use router::{
+    AudioPlaybackSpec, AudioProfile, AudioRouter, AudioSinkSpec, AudioSinkState, AudioStreamRef,
+    ChildId, CommandOutput, CommandRunner, PipeWireAudioRouter, PulseAudioAudioRouter,
+    RouterConfig, TokioCommandRunner, DEFAULT_SINK_CHANNELS, DEFAULT_SINK_RATE,
+    DEFAULT_VOLUME_PERCENT, MAX_SINK_CHANNELS, MAX_SINK_RATE, MIN_SINK_RATE, NULL_SINK_MODULE,
+    PACTL, PAPLAY, PW_PLAY,
+};
 pub use target::{AudioTarget, MONITOR_PREFIX, NODE_PREFIX, OBJECT_PREFIX};
 pub use traits::{AudioEncoder, AudioSource, EncodedAudio, EncoderConfig};
 
