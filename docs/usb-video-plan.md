@@ -1,4 +1,4 @@
-# Video over USB: UVC basic mode + raw Ozma vendor mode (both directions)
+# Video over USB: virtual display sink, UVC camera, and raw Ozma link
 
 Status: **design/plan** (not implementation).
 Related: [`rust-reconciliation-plan.md`](rust-reconciliation-plan.md),
@@ -7,43 +7,88 @@ Related: [`rust-reconciliation-plan.md`](rust-reconciliation-plan.md),
 
 ## 1. Goal
 
-The node's USB device port carries video in **both directions**:
+The node's USB device port can carry video in several roles. They are not the
+same device:
 
+- **USB display sink (host → node).** The dongle enumerates as a **display
+  adapter**. The host's OS sees an extra monitor with an EDID and renders its
+  desktop to it; the dongle receives the framebuffer over USB and streams it to
+  the controller/client. This is a capture path for the node and a display
+  output for the host. It can replace an HDMI capture card for any target that
+  can run the host driver, and it gives headless machines a display.
+  - **Basic mode** — a small open-source virtual-display driver plus a
+    documented baseline protocol (raw/RLE or MJPEG), standard EDID modes, one
+    display. No Ozma viewer required on the host.
+  - **Raw Ozma mode** — the full host agent negotiates H.264/HEVC (hardware
+    encode when available), multi-display, adaptive bitrate, audio, and
+    control.
 - **USB video output (node → host).** The host sees a camera/capture device:
-  - **Basic mode** — standard UVC. Any OS or app sees a webcam with no driver
-    or Ozma software: MJPEG/YUY2 (and H.264 UVC where the host supports it).
-    This covers OS installers, video-call apps, browsers, and quick tests.
-  - **Raw Ozma mode** — a vendor interface carrying H.264/HEVC/Opus with
-    sequence numbers, keyframe flags, timestamps, metadata, and control. Used
-    when Ozma host software is running. Higher resolution/fps, lower latency,
-    multiple streams/displays, and explicit flow control.
-- **USB video input (host → node).** The vendor interface is full-duplex: a
-  local client can publish its camera/microphone over USB, and the node forwards
-  it to the target (via the target-facing UVC/UAC2 functions), to the
-  controller, or to both. This is the USB equivalent of the browser/native
-  camera uplink already implemented over WebTransport.
+  - **Basic mode** — standard UVC: MJPEG/YUY2 (and H.264 UVC where supported).
+    Works with any camera app, no driver.
+  - **Raw Ozma mode** — vendor interface carrying H.264/HEVC/Opus with
+    sequence, keyframe, timestamp, and flow control.
+- **Host media input (host → node).** The vendor interface is full-duplex: a
+  host can publish camera/mic over USB, and the node forwards it to the
+  target-facing UVC/UAC2 functions, the controller, or both.
 
-The output role serves two deployments:
+The source/sink is otherwise source-agnostic: local camera, client-published
+camera, network feed, captured display, or a virtual monitor.
 
-1. **Target-facing camera** — the port faces the target; the target sees a
-   webcam (remote camera, client-published camera, or network feed).
-2. **Local-client display** — the port faces a local client machine; the client
-   sees the node's captured target video as a UVC camera (basic) or a raw Ozma
-   device (software). This is a USB console path with no network.
+### 1.1 USB display sink: design constraints
 
-The video source/sink is otherwise source-agnostic.
+**There is no open, cross-OS USB display class.** DisplayLink is proprietary
+and patent-encumbered; Synaptics has actively enforced its DisplayLink patents
+against open-source implementations. Do **not** implement DisplayLink protocol
+compatibility, reuse its VID/PID, or ship a "DisplayLink-compatible" claim.
 
-The video source is source-agnostic:
+Instead:
 
-- a local camera on the node (Camera Node / USB camera),
-- a client-published camera (the browser/native camera uplink already
-  implemented; `ClientCaptureHub`),
-- a network/controller feed,
-- optionally a captured display, if a deployment wants screen video as a
-  webcam.
+| Path | Host driver | Software on host | Notes |
+|---|---|---|---|
+| Basic virtual display | our open driver (evdi / IddCx / CGVirtualDisplay) | yes, the basic driver | True monitor; standard EDID modes; baseline codec |
+| Raw Ozma display | same driver + agent | yes, the full agent | H.264/HEVC, multi-display, adaptive bitrate |
+| DP alt mode (hardware option) | none | none | True monitor over USB-C DP lanes; dongle captures DP; video is not on USB data lanes |
+| UVC camera fallback | standard UVC | none | Not a monitor; apps see a camera |
 
-The same gadget can expose UAC2 audio (already present) so the target sees a
-webcam + microphone as one composite device.
+Recommended sequence: **basic virtual display on Linux first** (open driver,
+real monitor), then raw Ozma, then Windows IddCx, then evaluate macOS and the
+DP-alt-mode hardware option. Avoid DisplayLink entirely.
+
+Host driver matrix:
+
+- **Linux:** `evdi` (open-source DRM virtual display used by DisplayLink's
+  Linux product) plus a user-space daemon. Ship evdi as DKMS/source and respect
+  the GPL kernel boundary; the daemon uses the user-space API.
+- **Windows:** IddCx indirect display driver plus a user-mode companion over
+  WinUSB (Microsoft OS 2.0 descriptors). Test-sign for development; WHQL
+  signing is a later step.
+- **macOS:** `CGVirtualDisplay` (private API) or a ScreenCaptureKit fallback.
+  Treat macOS as a phase/risk, not a first-release guarantee.
+
+Basic EDID modes: 1280×720@60, 1920×1080@60, 1920×1200@60, 2560×1440@60 where
+bandwidth allows; 30 Hz variants for USB 2.0. One display in basic mode;
+multiple display IDs in raw mode.
+
+Encoding location: **the host**, not the dongle. The host has the GPU
+(VAAPI/NVENC/QSV/VideoToolbox); the dongle forwards the encoded stream to the
+controller or client without re-encoding. Basic mode uses a cheap baseline
+(RLE/MJPEG) when no hardware encoder is available. This keeps dongle CPU free
+and preserves quality.
+
+Data path:
+
+```text
+host compositor
+  → virtual display driver (damage rects)
+  → baseline MJPEG/RLE  or  H.264/HEVC hardware encode
+  → USB vendor bulk IN
+  → dongle (forward, or local decode/record)
+  → controller/client session
+```
+
+Bandwidth: USB 2.0 high-speed cannot carry 1080p60 raw; use MJPEG/H.264.
+USB 3.x allows higher fps, raw/RLE, and multiple displays. Negotiate on the
+vendor channel; advertise only modes the bus and host encoder sustain.
 
 ## 2. Current state
 
@@ -105,13 +150,16 @@ A USB device port faces exactly one host. Choose the role per port:
 
 | Role | Port faces | Node sends | Node receives |
 |---|---|---|---|
+| Virtual monitor (capture) | target | HID/UAC2 | raw display frames (host → node) |
 | Target camera | target | UVC + raw video/audio | — (input stays on HID/UAC2) |
-| Local-client display | client laptop/PC | UVC + raw video/audio | raw control; optional client camera/mic |
-| Full local console | client | UVC + raw video/audio | raw control, keyboard/mouse, client camera/mic |
+| Local-client display | client laptop/PC | UVC camera + raw video/audio | raw display frames if the client is also a capture target |
+| Full local console | client | UVC + raw video/audio | display frames, control, keyboard/mouse, camera/mic |
 
 - If the board has **one** device-capable OTG port (e.g. RK3588S USB-C), it can
   serve one role at a time. The Magic Dock use case (USB-C to the laptop,
-  HDMI capture from it) is the **target camera** role.
+  HDMI capture from it) can be either the **virtual monitor** role (laptop
+  renders to the dongle) or the **target camera** role (laptop sees a webcam),
+  selected in software; it cannot be both simultaneously on one port.
 - A **local-client display** role needs a second device-capable port or a
   deliberate role switch; it cannot share the same port with target HID/audio.
   Validate the board's OTG/host mux before promising both simultaneously.
@@ -201,6 +249,10 @@ New crate `ozma-usb` (or `ozma-node/src/usb/`) with:
 - `gadget.rs` — configfs composition: create functions, link to a
   configuration, set strings/IDs, bind the UDC; idempotent teardown; clear
   errors; retries while the UDC is muxed away (RK3588S OTG/host mux).
+- `display.rs` — vendor display sink: FunctionFS/descriptor set for a virtual
+  display, EDID and mode management, damage/frame reassembly from the host,
+  multi-display IDs, hotplug, bandwidth/rate negotiation, forwarding to the
+  controller/client.
 - `uvc.rs` — V4L2 output feeder: enumerate formats, handle UVC events
   (probe/commit/stream-on/off), buffer management, frame pacing, format
   conversion (I420/NV12 → MJPEG/YUY2/H.264), frame timestamps.
@@ -209,10 +261,13 @@ New crate `ozma-usb` (or `ozma-node/src/usb/`) with:
 - `source.rs` — select a video source: `LocalCamera`, `ClientCaptureHub`
   (browser/native uplink), `NetworkFeed`, `DisplayCapture`; source changes are
   allowed while running.
-- `sink.rs` — accept host-published camera/mic from the vendor OUT endpoint and
-  route it to the target-facing UVC/UAC2 functions, `ClientCaptureHub`, the
-  controller, or a combination. Apply the same authorization and bounds as the
-  network camera uplink.
+- `sink.rs` — accept host-published media from the vendor OUT endpoint and
+  route it:
+  - display frames → the capture/session pipeline (and optionally a local
+    preview);
+  - camera/mic → target-facing UVC/UAC2 functions, `ClientCaptureHub`, the
+    controller, or a combination.
+  Apply the same authorization and bounds as the network camera uplink.
 - `encode.rs` — MJPEG encoder (ffmpeg initially, then a Rust/V4L2 M2M path) and
   reuse of the existing H.264/Opus encoders.
 - `config.rs` — `--usb-video`, mode list, max fps, source selection, UDC name,
@@ -235,7 +290,11 @@ The kernel build script gains UVC options and V4L2/media dependencies.
 
 ## 5. Host/client software
 
-- **No software:** the target sees a UVC camera. Validate with
+- **Display host driver (Linux first):** a user-space daemon using evdi:
+  create the virtual monitor, receive damage/frame updates, encode with
+  VAAPI when raw mode is selected, send the vendor protocol. A minimal
+  "basic" mode uses MJPEG/RLE and no Ozma viewer.
+- **No software (UVC only):** the target sees a UVC camera. Validate with
   `v4l2-ctl --list-formats-ext`, `ffmpeg -f v4l2`, `guvcview`, Chrome
   `getUserMedia`, the Windows Camera app, macOS Photo Booth/FaceTime.
 - **Rust host transport:** new `ozma-transport-usb` using `nusb` (preferred,
@@ -297,8 +356,13 @@ CONFIG_USB_F_UAC2=y
 ## 8. Tests
 
 - **dummy_hcd:** the existing dev harness can create a gadget and a host
-  controller. Validate descriptors, UVC formats, stream-on/off, and the vendor
-  interface without hardware.
+  controller. Validate descriptors, UVC formats, stream-on/off, the vendor
+  display sink, and the vendor interface without hardware.
+- **Linux virtual display:** evdi creates an Ozma monitor visible in
+  `xrandr`/DRM; move windows/change resolution and assert frames arrive; measure
+  glass-to-glass latency and CPU; compare against HDMI capture.
+- **Multi-display:** two virtual monitors, independent EDIDs, display IDs in
+  the protocol.
 - **UVC compatibility:**
   - `v4l2-ctl --list-formats-ext` shows exactly the advertised modes;
   - `ffmpeg -f v4l2 -i /dev/videoN -t 10` decodes 720p30/1080p30 with no
@@ -322,10 +386,10 @@ CONFIG_USB_F_UAC2=y
 
 | Phase | Deliverable | Estimate |
 |---|---|---|
-| A | Kernel config + configfs composition + UVC feeder (output); MJPEG 720p30 from the local camera; dummy_hcd and real UDC tests | 2–3 wk |
-| B | FunctionFS vendor interface (output) + raw protocol + Rust host transport; H.264 1080p30; mode negotiation and UVC fallback | 3–4 wk |
-| C | Bidirectional vendor: host camera/mic input, node routing to target UVC/UAC2 or controller; UAC2 audio; reconnect; Windows WinUSB descriptors; macOS/Linux validation | 3–4 wk |
-| D | Hardware integration (OPi5/Zero 3), PD/mux validation, packaging, docs, CI | 2 wk |
+| A | Kernel config + configfs composition; **Linux virtual display sink** (evdi daemon + vendor bulk + basic MJPEG/RLE 1080p30); dummy_hcd and real UDC tests | 3–4 wk |
+| B | Raw display mode: host-side VAAPI/NVENC encode, H.264/HEVC, multi-display, adaptive bitrate; UVC camera output and fallback | 3–4 wk |
+| C | Windows IddCx driver + WinUSB; host camera/mic input; UAC2; reconnect; macOS spike; packaging/signing | 4–5 wk |
+| D | Hardware integration (OPi5/Zero 3), PD/mux, optional DP-alt-mode sink, docs, CI | 2–3 wk |
 
 Roughly **9–12 engineer-weeks** for one contributor; A and B can overlap once
 the gadget composition is stable.
@@ -345,6 +409,14 @@ the gadget composition is stable.
   as the network camera uplink.
 - **U4:** Windows auto-binds WinUSB (no driver install) and macOS/Linux clients
   work; install docs and CI cover the supported matrix.
+- **D1:** on Linux, the host sees an Ozma virtual monitor in `xrandr`, renders
+  to it, and the captured desktop appears in the client at 1080p30 with stable
+  frame rate and bounded latency. No DisplayLink code or IDs are used.
+- **D2:** raw display mode carries H.264/HEVC 1080p30 over USB 2.0 and
+  1080p60 over USB 3.x; multi-display works; adaptive bitrate responds to
+  congestion.
+- **D3:** Windows IddCx virtual monitor works in a VM with test signing;
+  macOS has a documented decision (supported path or deferral).
 
 ## 11. Risks
 
@@ -360,6 +432,11 @@ the gadget composition is stable.
 | Host→node video path increases descriptor/bandwidth pressure | Separate vendor OUT endpoint; explicit `directions` capability; reject unsupported sinks |
 | Raw protocol drift | Versioned header; reuse `ozma-protocol` types; fuzz and golden tests |
 | Security of a local USB channel | Handshake/token, bounded lengths, no cross-session access, no HID tunneling by default |
+| DisplayLink patents and enforcement | Do not implement or claim DisplayLink compatibility; clean-room open protocol/driver; legal review before release |
+| Host driver signing (Windows) | Test-sign for development; budget WHQL signing and CI |
+| macOS virtual display APIs are private/restricted | Spike early; ScreenCaptureKit fallback or defer macOS |
+| evdi GPL/kernel boundary | Keep the kernel module GPL and the daemon user-space; ship source/DKMS |
+| USB2 bandwidth for a display | Host-side encode; advertise only sustainable modes; USB3 for 60 fps/multi-display |
 
 ## 12. Relationship to the Rust migration
 
