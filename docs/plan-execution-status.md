@@ -21,6 +21,7 @@ This file records what is actually merged and tested, not what is planned.
 |---|---|---|
 | V4L2 discovery | Done | `/dev` + sysfs; no C deps for discovery |
 | V4L2 MMAP capture | Done | real single-plane MMAP worker; tested against a real MJPEG camera (1920x1080) |
+| PipeWire video capture | Done | `ozma-pipewire` `PipeWireVideoSource` (BGRA/BGRx/RGBx/I420/NV12/YUYV, explicit MemFd buffer params) and `ozma-capture::PipeWireCaptureProvider`; real camera captured 1920x1080 YUYV through PipeWire with 0 dropped. `CaptureRegistry::system_with_pipewire()` keeps V4L2 registered. Portal ScreenCast node adapter point documented; portal consent flow not run |
 | Encoder selection/probe | Done | hardware preference, software fallback, probe records |
 | Real H.264 encode | Done | `ozma-encode` OpenH264 software backend: MJPEG/NV12/YUYV/RGB/BGRA → I420 → Annex-B, real probe, keyframes |
 | Real-camera end-to-end | Validated | `/dev/video0` 1920×1080 MJPEG → VAAPI High-profile H.264 → QUIC fragments → client reassembled and decoded a 45 KB keyframe to 1920×1080 PPM |
@@ -49,7 +50,7 @@ This file records what is actually merged and tested, not what is planned.
 | API display create/list/destroy/mode/DPMS/topology | Done | backed by the fake provider; real provider gated |
 | Xorg + modesetting + EVDI + libevdi spike | Documented, not run | `docs/remote-display-evdi-spike.md` |
 | Real EVDI provider | Scaffold only | `EvdiProvider` detects prerequisites and refuses unsupported |
-| Browser WebTransport | In progress | The web client is the native client in Rust/wasm32 (`ozma-web`), sharing `ozma-client-core` framing and video reassembly; node-side WebTransport (HTTP/3) and the browser transport are being implemented |
+| Browser WebTransport | Node done; browser in progress | Node `wtransport` listener with ECDSA/14-day certificate pinning, session offers, uni-stream resources, and native proof-client tests. The viewer is the native client in Rust/wasm32 (`ozma-web`) over the browser's WebTransport API; browser interop is still being implemented and not yet run |
 | SSH/Unix fallback, passkeys | Not started | — |
 
 ## Remote scene outputs (development, loopback)
@@ -86,9 +87,14 @@ OZMA_CAPTURE_TEST_DEVICE=/dev/video2 \
   pretend a software result is hardware.
 - VAAPI forced keyframes restart the FFmpeg sidecar; periodic GOP works
   without a restart.
-- QUIC carries control/input/video/audio over a real connection. The browser
-  path is a Rust/wasm32 build of the same client over WebTransport; it is being
-  implemented and has not yet been validated in a real browser on this host.
+- QUIC carries control/input/video/audio over a real connection. A second
+  WebTransport (HTTP/3) listener carries the same framing for browsers; it is
+  covered by a native `wtransport` proof client. The browser path is a
+  Rust/wasm32 build of the same client and has not yet been run in a real
+  browser on this host.
+- PipeWire video capture is opt-in through `CaptureRegistry::system_with_pipewire()`;
+  `system()` stays V4L2-only. Portal ScreenCast selection is an adapter point,
+  not an implemented consent flow.
 - The node RTSP listener broadcasts one default capture/encode pipeline to all
   RTSP viewers and seeds new viewers with the latest keyframe.
 - The virtual-display API is exercised through the fake provider. The EVDI
