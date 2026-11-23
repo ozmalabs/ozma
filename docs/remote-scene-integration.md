@@ -147,20 +147,26 @@ each implement their own protocol role.
   record is `OZFR`, three big-endian u32 values for width, height and stride,
   then `stride × height` RGBA8 bytes. The development bridges use fixed
   dimensions per connection.
-- **Outbound RDP.** The `rdp_output` example pipes the composed frames to an
-  isolated Xvfb display and exposes that display with FreeRDP shadow. It is
-  loopback-only and view-only. A stock FreeRDP viewer displayed the scene
-  overlay. A direct graphics-surface adapter remains open.
-- **Outbound SPICE.** The development bridge feeds composed frames to
-  libspice-server's QXL display interface. It binds to loopback and exposes
-  a fixed-size, view-only display. The stock SPICE screenshot client showed
-  the Ozma overlay and successive frame changes. Structured drawing, audio,
-  and managed authentication remain open. [SPICE protocol](https://spice-space.org/spice-protocol.html)
-- **Outbound Xpra.** The `xpra_output` example forwards native scene placements
-  and cached PNGs to a loopback, view-only TCP peer. Wire tests cover hello,
-  draw acknowledgement, and a placement-only move. The adapter currently
-  exposes the structured image layer. Video, compressed records, and stock
-  client interoperability remain open. [Xpra handshake](https://xpra-org.github.io/xpra/Porting/Handshake.html)
+- **Outbound RDP.** `rdp_output --direct-surface` writes composed OZFR frames
+  into a FreeRDP shadow primary surface on a dedicated FreeRDP subsystem; no
+  Xvfb or ffplay sits in the path. TLS-only viewer authentication uses a
+  user/token file, loopback defaults, a viewer limit, and read-only sessions.
+  Stock `xfreerdp3` verified frame updates and rejection paths. The scene is
+  still flattened to OZFR before the bridge; RDPEGFX/AVC/H.264 surfaces remain
+  open.
+- **Outbound SPICE.** The bridge now maps OZSC image placements onto QXL
+  secondary surfaces, moves/removes them without resending pixels, and sends
+  damage rectangles for composed video. TLS and ticket authentication are
+  mandatory; playback uses a registered PCM channel. Stock `spicy`/screenshot
+  tests verified movement, removal, damage, auth rejection, and playback
+  channel initialization. SPICE video codecs, A/V sync, and multi-viewer
+  isolation remain open. [SPICE protocol](https://spice-space.org/spice-protocol.html)
+- **Outbound Xpra.** The peer negotiates `h264`/`vp8`/`vp9`/`jpeg` video
+  alongside PNG scene placements, sends encoded access units with IDR/I/P
+  metadata, and keeps placement-only updates pixel-free. Wire tests cover
+  codec negotiation, video packets, PNG-only clients, version rejection, and
+  compressed/unknown records. Compressed hello records and stock Xpra client
+  interoperability remain unverified. [Xpra handshake](https://xpra-org.github.io/xpra/Porting/Handshake.html)
 - **Outbound VNC.** The `vnc_output` example consumes a native QUIC
   session, decodes H.264, composites scene overlays, and serves the latest
   framebuffer over loopback RFB 3.8. It responds to raw framebuffer
