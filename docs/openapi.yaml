@@ -60,6 +60,28 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/TransportInfo" }
         "501": { $ref: "#/components/responses/Error" }
+  /api/v1/webtransport:
+    get:
+      summary: Browser WebTransport endpoint and pinned certificate
+      description: |
+        Present only for a loopback/dev node without an API token. The
+        certificate is an ECDSA P-256 identity valid for 14 days, suitable for
+        the browser `serverCertificateHashes` pinning path. The same endpoint
+        is also advertised in session offers as a `quic` transport with
+        `alpn: h3`.
+      security: []
+      responses:
+        "200":
+          description: WebTransport endpoint, SHA-256 fingerprint, and DER certificate
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  endpoint: { type: string }
+                  fingerprint: { type: string, description: Lowercase hex SHA-256 of the DER certificate }
+                  certificate_der_base64: { type: string }
+        "404": { description: WebTransport listener is disabled }
   /api/v1/diagnostics:
     get:
       summary: Readiness and diagnostic checks
