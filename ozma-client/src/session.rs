@@ -29,6 +29,9 @@ use ozma_transport::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::capture::{
+    mic_channel_missing, ClientCapture, ClientCaptureOptions, ClientCaptureState,
+};
 use crate::cert;
 use crate::error;
 use crate::node_api::NodeApiClient;
@@ -213,6 +216,8 @@ pub struct NativeSessionClient {
     close_grace: Duration,
     scene: Option<SceneReceiver>,
     resources: Option<tokio::sync::mpsc::Receiver<Result<Bytes, ApiError>>>,
+    capture: Option<ClientCapture>,
+    captured: Option<ClientCaptureState>,
 }
 
 impl std::fmt::Debug for NativeSessionClient {
@@ -299,6 +304,8 @@ impl NativeSessionClient {
             close_grace: config.close_grace,
             scene: None,
             resources: None,
+            capture: None,
+            captured: None,
         };
 
         let display = config.scene_cache_bytes.map(|_| DisplayCapabilities {
@@ -653,11 +660,170 @@ impl NativeSessionClient {
         self.send_control(&ControlMessage::Ping { nonce }).await
     }
 
+    /// Start publishing this client's camera (and optionally microphone).
+    ///
+    /// `CaptureStart` is sent before the media pipeline starts so the node has
+    /// created its decode workers. A negotiated `CaptureState` with the chosen
+    /// codec and size follows, or an error state when startup fails.
+    ///
+    /// [`ClientCaptureOptions::camera`] is always opened; `None` means the first
+    /// available capture source. Audio is enabled only when
+    /// [`ClientCaptureOptions::mic`] is `Some`. A microphone request without a
+    /// negotiated `Mic` channel returns `client.config` and starts nothing.
+    pub async fn start_capture(&mut self, options: ClientCaptureOptions) -> Result<(), ApiError> {
+        self.start_capture_with_media(options, None, None).await
+    }
+
+    /// Start capture with injected media components.
+    ///
+    /// Passing `video`/`audio` as `None` uses the real capture path for that
+    /// half only when both are `None`; otherwise a `None` half is disabled.
+    /// This is the integration-test seam and is not part of the stable API.
+    #[doc(hidden)]
+    pub async fn start_capture_with_media(
+        &mut self,
+        options: ClientCaptureOptions,
+        video: Option<(
+            Box<dyn ozma_media::CaptureSource>,
+            Box<dyn ozma_media::Encoder>,
+        )>,
+        audio: Option<(
+            Box<dyn ozma_audio::AudioSource>,
+            Box<dyn ozma_audio::AudioEncoder>,
+        )>,
+    ) -> Result<(), ApiError> {
+        self.ensure_open()?;
+        if let Some(error) = &self.server_error {
+            return Err(error.clone());
+        }
+        if let Some(session) = &self.session {
+            if session.state.is_terminal() {
+                return Err(error::disconnected(format!("{:?}", session.state)));
+            }
+        }
+        self.stop_capture().await?;
+
+        let use_real_media = video.is_none() && audio.is_none();
+        let wants_video = use_real_media || video.is_some();
+        let wants_audio = options.mic.is_some() || audio.is_some();
+
+        if !use_real_media && options.mic.is_some() && audio.is_none() {
+            let error =
+                error::config("Microphone capture was requested but no audio source was supplied");
+            let _ = self
+                .send_capture_state(false, false, None, None, None, Some(error.clone()))
+                .await;
+            return Err(error);
+        }
+
+        if wants_audio && self.channels.channel_for_kind(ChannelKind::Mic).is_none() {
+            let error = mic_channel_missing();
+            let _ = self
+                .send_capture_state(false, false, None, None, None, Some(error.clone()))
+                .await;
+            return Err(error);
+        }
+
+        self.send_control(&ControlMessage::CaptureStart {
+            video: wants_video,
+            audio: wants_audio,
+        })
+        .await?;
+
+        let started = if use_real_media {
+            ClientCapture::start(self.transport.sender(), options).await
+        } else {
+            ClientCapture::start_with_media(self.transport.sender(), options, video, audio).await
+        };
+
+        match started {
+            Ok(capture) => {
+                let state = capture.state();
+                self.send_capture_state(
+                    state.video,
+                    state.audio,
+                    state.video_codec.clone(),
+                    state.width,
+                    state.height,
+                    None,
+                )
+                .await?;
+                self.captured = Some(state);
+                self.capture = Some(capture);
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self
+                    .send_capture_state(false, false, None, None, None, Some(error.clone()))
+                    .await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Stop the capture pipeline and tell the node to release its decode
+    /// workers. Idempotent: calling it with no active capture does nothing.
+    pub async fn stop_capture(&mut self) -> Result<(), ApiError> {
+        let Some(mut capture) = self.capture.take() else {
+            return Ok(());
+        };
+        let running = capture.state();
+        if self.closed.is_none() {
+            let _ = self
+                .send_control(&ControlMessage::CaptureStop {
+                    video: running.video,
+                    audio: running.audio,
+                })
+                .await;
+        }
+        capture.shutdown().await;
+        self.captured = Some(capture.state());
+        Ok(())
+    }
+
+    /// The capture counters, including after a stop.
+    pub fn capture_state(&self) -> Option<ClientCaptureState> {
+        self.capture
+            .as_ref()
+            .map(ClientCapture::state)
+            .or_else(|| self.captured.clone())
+    }
+
+    async fn send_capture_state(
+        &self,
+        video: bool,
+        audio: bool,
+        video_codec: Option<String>,
+        width: Option<u16>,
+        height: Option<u16>,
+        error: Option<ApiError>,
+    ) -> Result<(), ApiError> {
+        self.send_control(&ControlMessage::CaptureState {
+            video,
+            audio,
+            video_codec,
+            width,
+            height,
+            error,
+        })
+        .await
+    }
+
+    /// Feed one raw control payload through the normal event handler.
+    ///
+    /// Integration tests use this to deliver a node-side `KeyframeRequest`
+    /// without a second connection. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn handle_control_for_test(&mut self, payload: &[u8]) -> Result<ClientEvent, ApiError> {
+        self.handle_control_payload(payload)
+    }
+
     /// Send `ReleaseAll`, send `Bye`, and close the QUIC connection.
     pub async fn close(&mut self) -> Result<(), ApiError> {
         if self.closed.is_some() {
             return Ok(());
         }
+        let _ = self.stop_capture().await;
         let _ = self.release_all().await;
         let _ = self
             .send_control(&ControlMessage::Bye {
@@ -678,6 +844,7 @@ impl NativeSessionClient {
         if self.closed.is_some() {
             return Ok(());
         }
+        let _ = self.stop_capture().await;
         let result = self.transport.close_with_reason(CloseReason::Normal).await;
         self.closed = Some(CloseReason::Normal);
         result
@@ -836,6 +1003,17 @@ impl NativeSessionClient {
                 }),
             },
             "input_latency_ack" => parse_input_latency_ack(&value),
+            "keyframe_request" => {
+                // A node-side keyframe request targets the camera uplink. It is
+                // deliberately reported as an unknown control message so this
+                // client does not grow a breaking public variant.
+                if let Some(capture) = &self.capture {
+                    capture.request_keyframe();
+                }
+                Ok(ClientEvent::UnknownControl {
+                    kind: "keyframe_request".to_string(),
+                })
+            }
             "bye" => {
                 let reason = parse_bye(&value)?;
                 self.end_reason = Some(reason);

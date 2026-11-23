@@ -80,3 +80,4 @@ path = "src/lib.rs"
 tokio = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+ozma-client = { path = "../ozma-client" }

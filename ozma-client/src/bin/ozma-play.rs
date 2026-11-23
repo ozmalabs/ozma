@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use ozma_client::{
-    fetch_transport_info, load_certificate, ClientEvent, NativeSessionClient, VideoAssembler,
+    fetch_transport_info, load_certificate, ClientCaptureOptions, ClientEvent, NativeSessionClient,
+    VideoAssembler,
 };
 use ozma_decode::{AudioDecoder, DecodeMeta, H264Decoder, VideoDecoder};
 use ozma_playback::{
@@ -51,6 +52,14 @@ struct Cli {
     /// Write decoded frames here instead of a window/null sink.
     #[arg(long)]
     frame_dir: Option<PathBuf>,
+    /// Publish this client's camera. Optionally name a source; a bare flag uses
+    /// the first available source.
+    #[arg(long, value_name = "SOURCE", num_args = 0..=1, default_missing_value = "")]
+    camera: Option<String>,
+    /// Publish this client's microphone. The session offer must include a mic
+    /// channel, which means the session was created with `audio.mic = true`.
+    #[arg(long, value_name = "SOURCE", num_args = 0..=1, default_missing_value = "")]
+    mic: Option<String>,
 }
 
 fn api_error(code: &str, message: impl Into<String>) -> ApiError {
@@ -114,6 +123,45 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
         }
     };
     let mut client = NativeSessionClient::connect(&offer, &certificate).await?;
+
+    let capture_requested = cli.camera.is_some() || cli.mic.is_some();
+    if capture_requested {
+        if cli.mic.is_some()
+            && client
+                .channel_map()
+                .channel_for_kind(ChannelKind::Mic)
+                .is_none()
+        {
+            return Err(api_error(
+                ozma_client::codes::CLIENT_CONFIG,
+                "the session offer has no microphone channel",
+            )
+            .with_remediation(
+                "Create the session with `audio.mic = true`, then reconnect and retry.",
+            ));
+        }
+        let options = ClientCaptureOptions {
+            camera: cli.camera.as_ref().map(|source| {
+                if source.is_empty() {
+                    "default".to_owned()
+                } else {
+                    source.clone()
+                }
+            }),
+            mic: cli.mic.as_ref().map(|source| {
+                if source.is_empty() {
+                    "default".to_owned()
+                } else {
+                    source.clone()
+                }
+            }),
+            width: 1_280,
+            height: 720,
+            fps: 30,
+            bitrate_kbps: 4_000,
+        };
+        client.start_capture(options).await?;
+    }
 
     let video: Box<dyn VideoSink> = if cli.window {
         #[cfg(feature = "window")]
@@ -230,6 +278,10 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
         }
     }
 
+    if capture_requested {
+        let _ = client.stop_capture().await;
+    }
+    let capture_state = client.capture_state();
     let _ = client.release_all().await;
     let _ = client.close().await;
     engine
@@ -244,5 +296,18 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
         stats.audio_dropped,
         stats.errors
     );
+    if let Some(state) = &capture_state {
+        println!(
+            "captured: video {} ({} frames, {} bytes, {} dropped), mic {} ({} packets, {} bytes), errors {}",
+            state.video_codec.as_deref().unwrap_or("off"),
+            state.frames_sent,
+            state.bytes_sent,
+            state.dropped,
+            if state.audio { "on" } else { "off" },
+            state.mic_packets,
+            state.mic_bytes,
+            state.errors
+        );
+    }
     Ok(())
 }

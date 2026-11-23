@@ -40,7 +40,9 @@ pub use loopback::{LoopbackConfig, LoopbackTransport};
 pub use metrics::TransportMetrics;
 pub use offer::{session_offer, SessionOfferBuilder, TransportDescriptorBuilder};
 #[cfg(feature = "quic")]
-pub use quic::{QuicClient, QuicConfig, QuicServer, QuicTransport, SelfSignedCertificate, ALPN};
+pub use quic::{
+    QuicClient, QuicConfig, QuicSender, QuicServer, QuicTransport, SelfSignedCertificate, ALPN,
+};
 pub use transport::SessionTransport;
 #[cfg(feature = "webtransport")]
 pub use webtransport::{

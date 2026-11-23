@@ -21,6 +21,10 @@ window = ["ozma-playback/window"]
 ozma-protocol = { path = "../ozma-protocol" }
 ozma-client-core = { path = "../ozma-client-core" }
 ozma-transport = { path = "../ozma-transport" }
+ozma-media = { path = "../ozma-media" }
+ozma-capture = { path = "../ozma-capture" }
+ozma-encode = { path = "../ozma-encode" }
+ozma-audio = { path = "../ozma-audio" }
 ozma-decode = { path = "../ozma-decode" }
 ozma-playback = { path = "../ozma-playback" }
 png = "0.17"

@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use ozma_protocol::{codes, ApiError, Result, TransportMode};
+use ozma_protocol::{codes, ApiError, ChannelKind, Result, TransportMode};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{
     Connection, ConnectionError, Endpoint, IdleTimeout, ReadError, ReadExactError, RecvStream,
@@ -242,6 +242,18 @@ impl QuicTransport {
         Ok(rx)
     }
 
+    /// A cloneable, send-only handle to this connection.
+    ///
+    /// Capture producers and other background tasks use this instead of
+    /// borrowing the [`SessionTransport`], so they can send media concurrently
+    /// with the session loop without holding `&mut self` for `recv`.
+    pub fn sender(&self) -> QuicSender {
+        QuicSender {
+            inner: Arc::clone(&self.inner),
+            map: self.map.clone(),
+        }
+    }
+
     async fn start(
         conn: Connection,
         map: ChannelMap,
@@ -319,71 +331,7 @@ impl SessionTransport for QuicTransport {
     }
 
     async fn send(&self, channel: ChannelId, payload: Bytes) -> Result<()> {
-        if self.inner.closed.load(Ordering::SeqCst) {
-            self.inner.metrics.record_send_error();
-            return Err(crate::error::channel_closed(
-                Some(channel),
-                CloseReason::LocalShutdown,
-            ));
-        }
-        let descriptor = self.map.require(channel)?;
-        self.map.check_payload(channel, payload.len())?;
-
-        if descriptor.reliable {
-            let mut frame = Vec::with_capacity(5 + payload.len());
-            frame.push(channel.raw());
-            frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-            frame.extend_from_slice(&payload);
-            let mut send = self.inner.send.lock().await;
-            if let Err(error) = send.write_all(&frame).await {
-                self.inner.metrics.record_send_error();
-                self.inner.metrics.mark_closed();
-                return Err(transport_unavailable(format!(
-                    "QUIC stream send failed: {error}"
-                )));
-            }
-            self.inner.metrics.record_sent(payload.len(), false);
-            return Ok(());
-        }
-
-        let max = self.inner.conn.max_datagram_size().ok_or_else(|| {
-            ApiError::new(codes::UNSUPPORTED, "peer does not support QUIC datagrams")
-                .with_remediation(
-                    "Advertise RFC 9221 datagram support or use a reliable transport.",
-                )
-        })?;
-        let capacity = max.saturating_sub(1);
-        if payload.len() > capacity {
-            self.inner.metrics.record_send_error();
-            return Err(payload_too_large(channel, payload.len(), capacity));
-        }
-        let mut datagram = Vec::with_capacity(1 + payload.len());
-        datagram.push(channel.raw());
-        datagram.extend_from_slice(&payload);
-        match self.inner.conn.send_datagram(Bytes::from(datagram)) {
-            Ok(()) => {
-                self.inner.metrics.record_sent(payload.len(), true);
-                Ok(())
-            }
-            Err(SendDatagramError::TooLarge) => {
-                self.inner.metrics.record_send_error();
-                Err(payload_too_large(channel, payload.len(), capacity))
-            }
-            Err(SendDatagramError::UnsupportedByPeer | SendDatagramError::Disabled) => {
-                self.inner.metrics.record_send_error();
-                Err(ApiError::new(
-                    codes::UNSUPPORTED,
-                    "QUIC datagrams are not available on this connection",
-                ))
-            }
-            Err(SendDatagramError::ConnectionLost(error)) => {
-                self.inner.metrics.record_send_error();
-                self.inner.metrics.mark_closed();
-                Err(transport_unavailable(format!(
-                    "QUIC datagram send failed: {error}"
-                )))
-            }
-        }
+        send_payload(&self.inner, &self.map, channel, payload).await
     }
 
     async fn recv(&mut self) -> TransportEvent {
@@ -443,6 +391,130 @@ impl Drop for QuicTransport {
             self.inner
                 .conn
                 .close(VarInt::from_u32(0), b"transport dropped");
+        }
+    }
+}
+
+/// A cloneable, send-only handle to a live QUIC session.
+///
+/// Every clone shares the same connection, reliable-stream writer, and metrics.
+/// Reliable frames are written while holding the shared send mutex, so two
+/// senders can never interleave bytes from different frames. Unreliable
+/// channels go out as one datagram per payload.
+#[derive(Clone)]
+pub struct QuicSender {
+    inner: Arc<QuicInner>,
+    map: ChannelMap,
+}
+
+impl fmt::Debug for QuicSender {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QuicSender")
+            .field("remote_address", &self.inner.conn.remote_address())
+            .field("channels", &self.map.len())
+            .finish()
+    }
+}
+
+impl QuicSender {
+    /// Send one payload on `channel`.
+    ///
+    /// The channel must be part of the negotiated map. Reliable payloads are
+    /// framed on the shared control stream; unreliable payloads are sent as
+    /// datagrams, matching [`SessionTransport::send`].
+    pub async fn send(&self, channel: ChannelId, payload: Bytes) -> Result<()> {
+        send_payload(&self.inner, &self.map, channel, payload).await
+    }
+
+    /// The first negotiated channel of `kind`, if this session carries it.
+    pub fn channel_for_kind(&self, kind: ChannelKind) -> Option<ChannelId> {
+        self.map.channel_for_kind(kind)
+    }
+
+    /// The peer's maximum QUIC datagram size, or `None` when datagrams are not
+    /// available on this connection.
+    pub fn max_datagram_size(&self) -> Option<usize> {
+        self.inner.conn.max_datagram_size()
+    }
+
+    /// The negotiated channel map this sender enforces.
+    pub fn channel_map(&self) -> &ChannelMap {
+        &self.map
+    }
+}
+
+/// The single implementation of channel framing shared by
+/// [`SessionTransport::send`] and [`QuicSender::send`].
+///
+/// Keeping this in one place is what guarantees that a cloneable sender cannot
+/// drift from the transport's typed errors, payload limits, or metrics.
+async fn send_payload(
+    inner: &QuicInner,
+    map: &ChannelMap,
+    channel: ChannelId,
+    payload: Bytes,
+) -> Result<()> {
+    if inner.closed.load(Ordering::SeqCst) {
+        inner.metrics.record_send_error();
+        return Err(crate::error::channel_closed(
+            Some(channel),
+            CloseReason::LocalShutdown,
+        ));
+    }
+    let descriptor = map.require(channel)?;
+    map.check_payload(channel, payload.len())?;
+
+    if descriptor.reliable {
+        let mut frame = Vec::with_capacity(5 + payload.len());
+        frame.push(channel.raw());
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        let mut send = inner.send.lock().await;
+        if let Err(error) = send.write_all(&frame).await {
+            inner.metrics.record_send_error();
+            inner.metrics.mark_closed();
+            return Err(transport_unavailable(format!(
+                "QUIC stream send failed: {error}"
+            )));
+        }
+        inner.metrics.record_sent(payload.len(), false);
+        return Ok(());
+    }
+
+    let max = inner.conn.max_datagram_size().ok_or_else(|| {
+        ApiError::new(codes::UNSUPPORTED, "peer does not support QUIC datagrams")
+            .with_remediation("Advertise RFC 9221 datagram support or use a reliable transport.")
+    })?;
+    let capacity = max.saturating_sub(1);
+    if payload.len() > capacity {
+        inner.metrics.record_send_error();
+        return Err(payload_too_large(channel, payload.len(), capacity));
+    }
+    let mut datagram = Vec::with_capacity(1 + payload.len());
+    datagram.push(channel.raw());
+    datagram.extend_from_slice(&payload);
+    match inner.conn.send_datagram(Bytes::from(datagram)) {
+        Ok(()) => {
+            inner.metrics.record_sent(payload.len(), true);
+            Ok(())
+        }
+        Err(SendDatagramError::TooLarge) => {
+            inner.metrics.record_send_error();
+            Err(payload_too_large(channel, payload.len(), capacity))
+        }
+        Err(SendDatagramError::UnsupportedByPeer | SendDatagramError::Disabled) => {
+            inner.metrics.record_send_error();
+            Err(ApiError::new(
+                codes::UNSUPPORTED,
+                "QUIC datagrams are not available on this connection",
+            ))
+        }
+        Err(SendDatagramError::ConnectionLost(error)) => {
+            inner.metrics.record_send_error();
+            inner.metrics.mark_closed();
+            Err(transport_unavailable(format!(
+                "QUIC datagram send failed: {error}"
+            )))
         }
     }
 }
@@ -896,5 +968,79 @@ mod tests {
         frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         frame.extend_from_slice(payload);
         assert_eq!(&frame[..5], &[0, 0, 0, 0, 5]);
+    }
+
+    #[tokio::test]
+    async fn cloned_senders_cannot_interleave_reliable_frames() {
+        const PER_SENDER: u32 = 20;
+        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = server.local_addr().unwrap();
+        let certificate = server.certificate_der().to_vec();
+
+        let server_task = tokio::spawn(async move {
+            let mut transport = server.accept().await.unwrap();
+            let mut frames = Vec::new();
+            while frames.len() < (PER_SENDER * 2) as usize {
+                match transport.recv().await {
+                    TransportEvent::Payload { channel, payload } => {
+                        assert_eq!(channel, ChannelId::CONTROL);
+                        assert!(payload.len() >= 5, "a frame must be whole");
+                        let tag = payload[0];
+                        let index = u32::from_le_bytes(payload[1..5].try_into().unwrap());
+                        // Every payload repeats its tag so spliced bytes from
+                        // another frame would fail this check.
+                        assert!(
+                            payload[5..].iter().all(|byte| *byte == tag),
+                            "frame contents were interleaved"
+                        );
+                        frames.push((tag, index));
+                    }
+                    TransportEvent::Closed { .. } => break,
+                    TransportEvent::Error { error } => panic!("transport error: {error}"),
+                    _ => {}
+                }
+            }
+            frames
+        });
+
+        let client = QuicClient::connect(
+            address,
+            "localhost",
+            certificate,
+            ChannelMap::default_session(),
+        )
+        .await
+        .unwrap();
+        let first = client.sender();
+        let second = client.sender();
+
+        let send = |sender: QuicSender, tag: u8| async move {
+            for index in 0..PER_SENDER {
+                let mut payload = vec![tag; 32 + (index as usize % 7)];
+                payload[1..5].copy_from_slice(&index.to_le_bytes());
+                sender
+                    .send(ChannelId::CONTROL, Bytes::from(payload))
+                    .await
+                    .unwrap();
+            }
+        };
+        let (a, b) = tokio::join!(send(first, 1), send(second, 2));
+        let _ = (a, b);
+
+        let frames = tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("timed out receiving reliable frames")
+            .unwrap();
+        assert_eq!(frames.len(), (PER_SENDER * 2) as usize);
+        let mut next = std::collections::HashMap::new();
+        for (tag, index) in frames {
+            let expected = next.entry(tag).or_insert(0u32);
+            assert_eq!(index, *expected, "a sender's frames must stay ordered");
+            *expected += 1;
+        }
+        assert_eq!(next.get(&1), Some(&PER_SENDER));
+        assert_eq!(next.get(&2), Some(&PER_SENDER));
+
+        client.close_with_reason(CloseReason::Normal).await.unwrap();
     }
 }

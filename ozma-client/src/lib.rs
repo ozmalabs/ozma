@@ -23,6 +23,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod capture;
 pub mod cert;
 mod controller;
 pub mod error;
@@ -36,6 +37,10 @@ pub mod video;
 pub mod vnc;
 pub mod xpra_peer;
 
+pub use capture::{
+    ClientCapture, ClientCaptureOptions, ClientCaptureState, CAMERA_FRAGMENT_PAYLOAD,
+    CAMERA_TRACK_ID,
+};
 pub use cert::{
     certificate_der_from_base64, certificate_fingerprint, load_certificate, normalize_fingerprint,
     parse_certificate, verify_certificate_fingerprint,

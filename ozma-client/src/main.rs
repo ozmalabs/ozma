@@ -20,11 +20,12 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
-use ozma_decode::VideoDecoder as _;
 use ozma_client::{
-    codes, fetch_transport_info, load_certificate, ClientEvent, ControllerClient, ControllerNode,
-    NativeClientConfig, NativeSessionClient, NodeApiClient, VideoAssembler, VideoFrame,
+    codes, fetch_transport_info, load_certificate, ClientCaptureOptions, ClientCaptureState,
+    ClientEvent, ControllerClient, ControllerNode, NativeClientConfig, NativeSessionClient,
+    NodeApiClient, VideoAssembler, VideoFrame,
 };
+use ozma_decode::VideoDecoder as _;
 use ozma_protocol::{
     ApiError, AudioSpec, ChannelKind, ClientId, ConsentRequirement, DisplayMode, InputEvent,
     InputSpec, LocalDisplayAction, PointerMode, PrivacyPolicy, Session, SessionOffer, SessionSpec,
@@ -115,6 +116,17 @@ enum Command {
         #[arg(long, value_name = "PATH|ID")]
         source: Option<String>,
 
+        /// Publish this client's camera to the node. Optionally name a capture
+        /// source; a bare flag uses the first available source.
+        #[arg(long, value_name = "SOURCE", num_args = 0..=1, default_missing_value = "")]
+        camera: Option<String>,
+
+        /// Publish this client's microphone. Optionally name an ALSA device or
+        /// `default`; a bare flag uses the default source. This also requests
+        /// `audio.mic = true` when the session is created.
+        #[arg(long, value_name = "SOURCE", num_args = 0..=1, default_missing_value = "")]
+        mic: Option<String>,
+
         /// Requested capture width (with --height/--fps).
         #[arg(long, default_value_t = 1920, value_parser = clap::value_parser!(u32).range(1..))]
         width: u32,
@@ -153,6 +165,9 @@ enum Command {
     },
 
     /// Connect to a node and measure receipt of a complete video frame.
+    ///
+    /// `--camera`/`--mic` are intentionally not accepted here: `probe` only
+    /// receives, and the node owns capture in that flow.
     Probe {
         /// A SessionOffer JSON file, or inline JSON beginning with `{`.
         #[arg(long, value_name = "JSON|PATH")]
@@ -247,6 +262,8 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
         Command::Connect {
             node_id,
             source,
+            camera,
+            mic,
             width,
             height,
             fps,
@@ -260,6 +277,8 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             let args = ConnectArgs {
                 node_id,
                 source,
+                camera,
+                mic,
                 width,
                 height,
                 fps,
@@ -397,6 +416,8 @@ async fn get(options: &GlobalOptions, node_id: &str) -> Result<(), ApiError> {
 struct ConnectArgs {
     node_id: String,
     source: Option<String>,
+    camera: Option<String>,
+    mic: Option<String>,
     width: u32,
     height: u32,
     fps: u32,
@@ -595,7 +616,26 @@ async fn connect(options: &GlobalOptions, args: ConnectArgs) -> Result<(), ApiEr
         .clone()
         .unwrap_or_else(|| transport.endpoint().to_string());
 
+    let capture_requested = args.camera.is_some() || args.mic.is_some();
+    if capture_requested {
+        let options = capture_options(&args);
+        client.start_capture(options).await.map_err(|error| {
+            step_error(
+                &format!("start camera/microphone capture for session '{session_id}'"),
+                error,
+            )
+        })?;
+    }
+
     let measurement = wait_for_probe(&mut client, timeout, started, None).await;
+
+    // Stop publishing before releasing input and closing on every path.
+    let stop_capture = if capture_requested {
+        client.stop_capture().await
+    } else {
+        Ok(())
+    };
+    let capture_state = client.capture_state();
 
     // Release before closing on every path. Input may be view-only, in which
     // case release_all is a no-op.
@@ -617,6 +657,7 @@ async fn connect(options: &GlobalOptions, args: ConnectArgs) -> Result<(), ApiEr
             error,
         )
     })?;
+    stop_capture?;
     release?;
     close?;
 
@@ -658,7 +699,8 @@ async fn connect(options: &GlobalOptions, args: ConnectArgs) -> Result<(), ApiEr
                     "height": decoded.height,
                     "frame_saved_to": outputs.frame_path,
                 })),
-            }
+            },
+            "capture": capture_state,
         });
         print_json(&report)?;
     } else {
@@ -700,6 +742,9 @@ async fn connect(options: &GlobalOptions, args: ConnectArgs) -> Result<(), ApiEr
                 "decoded:      {}x{} ({} bytes YUV)",
                 decoded.width, decoded.height, decoded.yuv_len
             );
+        }
+        if let Some(state) = &capture_state {
+            print_capture_state(state);
         }
         println!("released all held input and closed the session.");
     }
@@ -761,6 +806,48 @@ fn node_api_url(node: &ControllerNode) -> Result<String, ApiError> {
     Ok(url.to_string().trim_end_matches('/').to_string())
 }
 
+/// Map CLI capture flags onto runtime options. A bare flag produces an empty
+/// string, which means "default source" for both camera and microphone.
+fn capture_options(args: &ConnectArgs) -> ClientCaptureOptions {
+    ClientCaptureOptions {
+        camera: args.camera.as_ref().map(|source| {
+            if source.is_empty() {
+                "default".to_owned()
+            } else {
+                source.clone()
+            }
+        }),
+        mic: args.mic.as_ref().map(|source| {
+            if source.is_empty() {
+                "default".to_owned()
+            } else {
+                source.clone()
+            }
+        }),
+        width: args.width,
+        height: args.height,
+        fps: args.fps,
+        bitrate_kbps: 4_000,
+    }
+}
+
+fn print_capture_state(state: &ClientCaptureState) {
+    println!(
+        "capture:      video {} ({} frames, {} bytes, {} dropped), mic {} ({} packets, {} bytes), errors {}",
+        state.video_codec.as_deref().unwrap_or("off"),
+        state.frames_sent,
+        state.bytes_sent,
+        state.dropped,
+        if state.audio { "on" } else { "off" },
+        state.mic_packets,
+        state.mic_bytes,
+        state.errors
+    );
+    if let (Some(width), Some(height)) = (state.width, state.height) {
+        println!("capture size: {width}x{height}");
+    }
+}
+
 fn build_session_spec(args: &ConnectArgs) -> SessionSpec {
     let mode = DisplayMode::new(args.width, args.height, args.fps);
     let track = TrackSpec {
@@ -778,7 +865,7 @@ fn build_session_spec(args: &ConnectArgs) -> SessionSpec {
         tracks: vec![track],
         audio: AudioSpec {
             enabled: args.audio,
-            mic: false,
+            mic: args.mic.is_some(),
             ..Default::default()
         },
         input: InputSpec {
