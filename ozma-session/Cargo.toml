@@ -1,0 +1,15 @@
+[package]
+name = "ozma-session"
+version = "0.1.0"
+edition = "2021"
+description = "Session lifecycle, consent gating, participants, and input release."
+license = "AGPL-3.0-only"
+
+[dependencies]
+ozma-protocol = { path = "../ozma-protocol" }
+ozma-auth = { path = "../ozma-auth" }
+thiserror = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+serde_json = "1"

@@ -1,0 +1,16 @@
+[package]
+name = "ozma-encode"
+version = "0.1.0"
+edition = "2021"
+description = "Encoder selection and probe results for Ozma, with a fake backend for CI."
+license = "AGPL-3.0-only"
+
+[dependencies]
+ozma-protocol = { path = "../ozma-protocol" }
+ozma-media = { path = "../ozma-media" }
+async-trait = "0.1"
+tokio = { version = "1", features = ["sync", "time", "rt"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

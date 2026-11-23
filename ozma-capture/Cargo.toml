@@ -1,0 +1,16 @@
+[package]
+name = "ozma-capture"
+version = "0.1.0"
+edition = "2021"
+description = "Capture-source providers for Ozma, starting with a deterministic fake and V4L2 discovery."
+license = "AGPL-3.0-only"
+
+[dependencies]
+ozma-protocol = { path = "../ozma-protocol" }
+ozma-media = { path = "../ozma-media" }
+async-trait = "0.1"
+tokio = { version = "1", features = ["sync", "time", "rt"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

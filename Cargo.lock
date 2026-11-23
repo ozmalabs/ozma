@@ -175,6 +175,7 @@ checksum = "edca88bc138befd0323b20752846e6587272d3b03b0343c8ea28a6f819e6e71f"
 dependencies = [
  "async-trait",
  "axum-core",
+ "base64 0.22.1",
  "bytes 1.11.1",
  "futures-util",
  "http",
@@ -193,8 +194,10 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
+ "sha1",
  "sync_wrapper",
  "tokio",
+ "tokio-tungstenite",
  "tower",
  "tower-layer",
  "tower-service",
@@ -828,6 +831,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
 
 [[package]]
+name = "data-encoding"
+version = "2.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
+
+[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1159,6 +1168,7 @@ checksum = "389ca41296e6190b48053de0321d02a77f32f8a5d2461dd38762c0593805c6d6"
 dependencies = [
  "futures-core",
  "futures-macro",
+ "futures-sink",
  "futures-task",
  "pin-project-lite",
  "slab",
@@ -2638,6 +2648,7 @@ dependencies = [
  "clap",
  "core-foundation 0.9.4",
  "hostname 0.4.2",
+ "libc",
  "ozma-crypto",
  "ozma-mesh",
  "ozma-proto",
@@ -2651,6 +2662,48 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "windows 0.56.0",
+]
+
+[[package]]
+name = "ozma-api"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "http-body-util",
+ "ozma-display",
+ "ozma-media",
+ "ozma-protocol",
+ "ozma-session",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
+name = "ozma-auth"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "hmac",
+ "ozma-protocol",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "ozma-capture"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ozma-media",
+ "ozma-protocol",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2687,6 +2740,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ozma-display"
+version = "0.1.0"
+dependencies = [
+ "ozma-protocol",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ozma-drivers"
 version = "0.1.0"
 dependencies = [
@@ -2708,6 +2772,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ozma-encode"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ozma-media",
+ "ozma-protocol",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ozma-hid"
 version = "0.1.0"
 dependencies = [
@@ -2716,6 +2791,19 @@ dependencies = [
  "log",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "ozma-media"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes 1.11.1",
+ "ozma-protocol",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2781,6 +2869,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ozma-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "ozma-session"
+version = "0.1.0"
+dependencies = [
+ "ozma-auth",
+ "ozma-protocol",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "ozma-softnode"
 version = "0.1.0"
 dependencies = [
@@ -2799,6 +2907,18 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "ozma-transport"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes 1.11.1",
+ "ozma-protocol",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3544,6 +3664,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if 1.0.4",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3928,6 +4059,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-tungstenite"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edc5f74e248dc973e0dbb7b74c7e0d6fcc301c694ff50049504004ef4d0cdcd9"
+dependencies = [
+ "futures-util",
+ "log",
+ "tokio",
+ "tungstenite",
+]
+
+[[package]]
 name = "tokio-util"
 version = "0.7.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4106,6 +4249,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
+name = "tungstenite"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18e5b8366ee7a95b16d32197d0b2604b43a0be89dc5fac9f8e96ccafbaedda8a"
+dependencies = [
+ "byteorder",
+ "bytes 1.11.1",
+ "data-encoding",
+ "http",
+ "httparse",
+ "log",
+ "rand 0.8.5",
+ "sha1",
+ "thiserror 1.0.69",
+ "utf-8",
+]
+
+[[package]]
 name = "typenum"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4210,6 +4371,12 @@ dependencies = [
  "strum",
  "uuid",
 ]
+
+[[package]]
+name = "utf-8"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09cc8ee72d2a9becf2f2febe0205bbed8fc6615b7cb429ad062dc7b7ddd036a9"
 
 [[package]]
 name = "utf8_iter"

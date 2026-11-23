@@ -1,0 +1,17 @@
+[package]
+name = "ozma-transport"
+version = "0.1.0"
+edition = "2021"
+description = "Channel model and transport adapters for Ozma sessions."
+license = "AGPL-3.0-only"
+
+[dependencies]
+ozma-protocol = { path = "../ozma-protocol" }
+async-trait = "0.1"
+bytes = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["sync", "time", "rt", "net", "io-util"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
