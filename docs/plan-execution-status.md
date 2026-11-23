@@ -51,6 +51,20 @@ This file records what is actually merged and tested, not what is planned.
 | Real EVDI provider | Scaffold only | `EvdiProvider` detects prerequisites and refuses unsupported |
 | Browser WebTransport, SSH/Unix fallback, passkeys | Not started | QUIC is native raw QUIC, not WebTransport |
 
+## Remote scene outputs (development, loopback)
+
+| Output | Status | Evidence / limit |
+|---|---|---|
+| RDP | Loopback prototype validated | FreeRDP shadow on an isolated Xvfb display; stock FreeRDP viewer showed the Ozma overlay. Direct graphics surfaces and managed viewer auth are active work. |
+| SPICE | Loopback prototype validated | libspice-server QXL interface; stock SPICE screenshot client captured the overlay and successive changes. Structured drawing and managed auth are active work. |
+| Xpra | Wire-level validated | Handshake, original PNG delivery, draw acknowledgement, and placement-only update. Video and stock-client interoperability are active work. |
+| VNC | Development output | RFB 3.8 framebuffer server with damage updates; viewer input discarded. |
+| Google Cast | Development output | Live HLS composed output with local playback validation; physical receiver and controller integration remain open. |
+
+These are **development outputs**, not the native Ozma session protocol. RDP and
+SPICE currently receive composed pixels; direct graphics surfaces, viewer
+authentication, and Xpra video are being extended in separate workstreams.
+
 ## Verification
 
 ```bash
