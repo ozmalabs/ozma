@@ -5,6 +5,19 @@ Related: [`rust-reconciliation-plan.md`](rust-reconciliation-plan.md),
 [`routing/node-definition.md`](routing/node-definition.md) §4.4,
 [`architecture.md`](architecture.md).
 
+## 0. Decision record
+
+- **DisplayLink compatibility is a non-goal.** No DisplayLink protocol, VID/PID,
+  descriptor clone, or "compatible" claim. It is proprietary, patent-encumbered,
+  and actively enforced.
+- The display path is an **open vendor device + open host driver + documented
+  protocol**. The basic mode is our driver with standard EDID modes; the raw mode
+  is the same driver plus the full agent.
+- The only standard, driver-free "true monitor" option is **DP alt mode over
+  USB-C** (video on DP lanes, not USB data). Keep it as a hardware option, not
+  the default.
+- UVC remains the driver-free camera path; it is not a monitor.
+
 ## 1. Goal
 
 The node's USB device port can carry video in several roles. They are not the
