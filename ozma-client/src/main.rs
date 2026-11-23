@@ -7,6 +7,9 @@
 //! against the live session. `probe` remains the lower-level M1 acceptance
 //! harness: it takes an existing offer, performs `Hello`/`HelloAck`, waits for
 //! one video datagram, sends `ReleaseAll`, and closes.
+//! `probe --input-latency` additionally measures client send to the first
+//! client-visible encoded frame. It does not measure decode, display scanout,
+//! or input-to-photon latency.
 //!
 //! Neither command decodes live video or needs a GUI.
 
@@ -23,8 +26,8 @@ use ozma_client::{
     NativeClientConfig, NativeSessionClient, NodeApiClient, VideoAssembler, VideoFrame,
 };
 use ozma_protocol::{
-    ApiError, AudioSpec, ChannelKind, ClientId, ConsentRequirement, DisplayMode, InputSpec,
-    LocalDisplayAction, PointerMode, PrivacyPolicy, Session, SessionOffer, SessionSpec,
+    ApiError, AudioSpec, ChannelKind, ClientId, ConsentRequirement, DisplayMode, InputEvent,
+    InputSpec, LocalDisplayAction, PointerMode, PrivacyPolicy, Session, SessionOffer, SessionSpec,
     SessionState, TrackId, TrackKind, TrackSpec, TransportPreference,
 };
 use serde_json::json;
@@ -186,6 +189,14 @@ enum Command {
         /// Negotiate scene support and wait for at least this overlay revision.
         #[arg(long, value_name = "REVISION", value_parser = clap::value_parser!(u64).range(1..))]
         scene_revision: Option<u64>,
+
+        /// Measure input-to-encoded-frame latency with a harmless ReleaseAll
+        /// probe instead of only waiting for the first video frame.
+        ///
+        /// This measures client send to client-visible encoded frame arrival,
+        /// not decode, display scanout, or photon latency.
+        #[arg(long)]
+        input_latency: bool,
     },
 }
 
@@ -271,6 +282,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             save_video,
             save_frame,
             scene_revision,
+            input_latency,
         } => {
             probe(
                 &options,
@@ -283,6 +295,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
                 save_video,
                 save_frame,
                 scene_revision,
+                input_latency,
             )
             .await
         }
@@ -913,6 +926,7 @@ async fn probe(
     save_video: Option<PathBuf>,
     save_frame: Option<PathBuf>,
     scene_revision: Option<u64>,
+    input_latency: bool,
 ) -> Result<(), ApiError> {
     let mut offer = load_offer(offer_input)?;
     if let Some(token) = token {
@@ -983,6 +997,60 @@ async fn probe(
                 .join(",")
         );
         println!("endpoint:     {endpoint}");
+    }
+
+    if input_latency {
+        // Wait for one live frame first so the probe starts from a warm media
+        // path rather than racing session startup. Then send a harmless
+        // ReleaseAll through the latency path. This measures client send to
+        // client-visible encoded frame, not decode/scanout/display latency.
+        let readiness = wait_for_probe(&mut client, timeout, started, scene_revision).await;
+        let measurement = match readiness {
+            Ok(_) => {
+                client
+                    .measure_input_latency(&InputEvent::ReleaseAll, timeout)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+
+        // Release before closing on every path. Input may be view-only, in
+        // which case release_all is a no-op.
+        let release = client.release_all().await;
+        let close = client.close().await;
+        let report = measurement?;
+        release?;
+        close?;
+
+        if options.json {
+            print_json(&json!({
+                "session_id": session_id,
+                "state": state,
+                "permissions": permissions,
+                "endpoint": endpoint,
+                "input_latency": report,
+            }))?;
+        } else {
+            println!("ack RTT:      {:.3} ms", report.ack_rtt_ms);
+            println!(
+                "input->frame: {:.3} ms (encoded frame, not display scanout)",
+                report.input_to_frame_ms
+            );
+            match report.server_to_frame_ms {
+                Some(ms) => println!("server->frame:{ms:.3} ms"),
+                None => println!("server->frame: unavailable (client/server clocks are skewed)"),
+            }
+            println!(
+                "frame:        sequence {} (latest at ack {})",
+                report.frame_sequence, report.latest_frame_sequence
+            );
+            println!("accepted:     {}", report.event_accepted);
+            println!(
+                "note:         send -> client-visible encoded frame; decode, presentation, \
+                 scanout, and panel latency are not included."
+            );
+        }
+        return Ok(());
     }
 
     let measurements = wait_for_probe(&mut client, timeout, started, scene_revision).await;

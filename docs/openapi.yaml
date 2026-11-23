@@ -1,0 +1,405 @@
+openapi: 3.1.0
+info:
+  title: Ozma Node API
+  version: 0.1.0
+  description: |
+    Versioned HTTP surface of an Ozma node. Media travels on the native QUIC
+    transport or the RTSP compatibility listener; this API creates sessions,
+    exposes capabilities, and carries control-plane events.
+servers:
+  - url: http://{host}:{port}
+    variables:
+      host:
+        default: 127.0.0.1
+      port:
+        default: "7382"
+security:
+  - bearerAuth: []
+paths:
+  /health:
+    get:
+      summary: Compatibility health check
+      security: []
+      responses:
+        "200": { description: Node is alive }
+  /api/v1/health:
+    get:
+      summary: Node health and protocol
+      security: []
+      responses:
+        "200":
+          description: Health summary
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/v1/node:
+    get:
+      summary: Node identity and capabilities
+      responses:
+        "200":
+          $ref: "#/components/responses/Node"
+  /api/v1/capabilities:
+    get:
+      summary: Node capabilities
+      security: []
+      responses:
+        "200":
+          description: Capability document
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NodeCapabilities" }
+  /api/v1/transport:
+    get:
+      summary: Native QUIC endpoint and certificate
+      responses:
+        "200":
+          description: Transport information
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TransportInfo" }
+        "501": { $ref: "#/components/responses/Error" }
+  /api/v1/diagnostics:
+    get:
+      summary: Readiness and diagnostic checks
+      responses:
+        "200":
+          description: Diagnostic report
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DiagnosticReport" }
+  /api/v1/diagnostics/report:
+    get:
+      summary: Diagnostic report bundle
+      responses:
+        "200":
+          description: Report with capabilities and transport
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/v1/metrics:
+    get:
+      summary: Runtime metrics as JSON
+      responses:
+        "200":
+          description: Runtime metrics
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /metrics:
+    get:
+      summary: Prometheus text metrics
+      responses:
+        "200":
+          description: Prometheus exposition
+          content:
+            text/plain:
+              schema: { type: string }
+  /api/v1/sessions:
+    get:
+      summary: List sessions
+      responses:
+        "200":
+          description: Sessions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessions:
+                    type: array
+                    items: { $ref: "#/components/schemas/Session" }
+    post:
+      summary: Create and prepare a session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SessionSpec" }
+      responses:
+        "201":
+          description: Created session and optional transport offer
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session: { $ref: "#/components/schemas/Session" }
+                  offer: { $ref: "#/components/schemas/SessionOffer" }
+        "400": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+  /api/v1/sessions/{id}:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      summary: Get a session
+      responses:
+        "200":
+          description: Session
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session: { $ref: "#/components/schemas/Session" }
+        "404": { $ref: "#/components/responses/Error" }
+    delete:
+      summary: Stop a session
+      responses:
+        "200": { description: Stopped session }
+        "404": { $ref: "#/components/responses/Error" }
+  /api/v1/sessions/{id}/start:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      summary: Start a prepared session
+      responses:
+        "200": { description: Ready/streaming session }
+        "409": { $ref: "#/components/responses/Error" }
+        "412": { $ref: "#/components/responses/Error" }
+  /api/v1/sessions/{id}/stop:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      summary: Stop a session
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string }
+      responses:
+        "200": { description: Stopped session }
+  /api/v1/sessions/{id}/approve:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      summary: Approve a pending consent request
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                by: { type: string }
+      responses:
+        "200": { description: Session preparing }
+  /api/v1/sessions/{id}/deny:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      summary: Deny consent
+      responses:
+        "200": { description: Session rejected }
+  /api/v1/sessions/{id}/resume:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      summary: Restore a participant after a brief disconnect
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [client_id]
+              properties:
+                client_id: { type: string }
+      responses:
+        "200": { description: Session with the client reconnected }
+  /api/v1/sessions/{id}/events:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      summary: Session events over WebSocket
+      responses:
+        "101": { description: WebSocket upgrade }
+  /api/v1/displays:
+    get:
+      summary: List attached virtual/remote displays
+      responses:
+        "200": { description: Display list }
+    post:
+      summary: Attach a remote display
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/VirtualDisplaySpec" }
+      responses:
+        "201": { description: Created display }
+        "501": { $ref: "#/components/responses/Error" }
+  /api/v1/displays/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    delete:
+      summary: Detach a display
+      responses:
+        "204": { description: Removed }
+        "404": { $ref: "#/components/responses/Error" }
+  /api/v1/displays/{id}/mode:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      summary: Select a display mode
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DisplayMode" }
+      responses:
+        "204": { description: Mode selected }
+  /api/v1/displays/{id}/dpms:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      summary: Set DPMS state
+      responses:
+        "204": { description: DPMS applied }
+  /api/v1/displays/topology:
+    get:
+      summary: Read display topology
+      responses:
+        "200": { description: Topology }
+    put:
+      summary: Replace display topology
+      responses:
+        "204": { description: Topology applied }
+  /api/hestia/v1/capabilities:
+    get:
+      summary: Hestia capability discovery
+      security: []
+      responses:
+        "200": { description: Hestia-shaped capabilities }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    SessionId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+  responses:
+    Error:
+      description: Structured error
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+    Node:
+      description: Node identity and capabilities
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: true
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string }
+        message: { type: string }
+        details: {}
+        remediation: { type: string }
+        retryable: { type: boolean }
+    ErrorResponse:
+      type: object
+      required: [ok, error]
+      properties:
+        ok: { type: boolean, const: false }
+        error: { $ref: "#/components/schemas/Error" }
+    NodeCapabilities:
+      type: object
+      additionalProperties: true
+      properties:
+        protocol: { type: object }
+        node_id: { type: string }
+        name: { type: string }
+        platform: { type: string }
+        capture: { type: array, items: { type: object } }
+        encode: { type: array, items: { type: object } }
+        audio: { type: object }
+        input: { type: object }
+        transport: { type: array, items: { type: string } }
+        display: { type: object }
+        budget: { type: object }
+    SessionSpec:
+      type: object
+      required: [client_id, principal]
+      properties:
+        client_id: { type: string }
+        principal: { type: string }
+        tracks: { type: array, items: { type: object } }
+        audio: { type: object }
+        input: { type: object }
+        privacy: { type: object }
+        transport: { type: string }
+        ttl_seconds: { type: integer, minimum: 1 }
+    Session:
+      type: object
+      additionalProperties: true
+      properties:
+        id: { type: string }
+        state:
+          type: string
+          enum: [created, offered, pending_consent, preparing, ready, streaming, degraded, draining, ended, rejected, timed_out, failed]
+        permissions: { type: array, items: { type: string } }
+        participants: { type: array, items: { type: object } }
+    SessionOffer:
+      type: object
+      properties:
+        session_id: { type: string }
+        token: { type: string }
+        transports: { type: array, items: { type: object } }
+        expires_at: { type: integer }
+    TransportInfo:
+      type: object
+      properties:
+        endpoint: { type: string }
+        fingerprint: { type: string }
+        certificate_der_base64: { type: string }
+    DisplayMode:
+      type: object
+      required: [width, height, refresh_hz]
+      properties:
+        width: { type: integer }
+        height: { type: integer }
+        refresh_hz: { type: integer }
+        hdr: { type: string }
+        reduced_blanking: { type: boolean }
+    VirtualDisplaySpec:
+      type: object
+      required: [id, name, modes, preferred]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        edid_serial: { type: string }
+        physical_mm:
+          type: array
+          items: { type: integer }
+        modes: { type: array, items: { $ref: "#/components/schemas/DisplayMode" } }
+        preferred: { $ref: "#/components/schemas/DisplayMode" }
+    DiagnosticReport:
+      type: object
+      properties:
+        ok: { type: boolean }
+        generated_at: { type: integer }
+        checks: { type: array, items: { type: object } }

@@ -9,8 +9,9 @@
 //! control contract.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -22,7 +23,7 @@ use ozma_media::{
 };
 use ozma_protocol::scene::{DisplayCapabilities, DisplayProfile};
 use ozma_protocol::{
-    ClientId, ControlMessage, DisplayId, InputEvent, Permission, SessionEvent, SessionId,
+    ApiError, ClientId, ControlMessage, DisplayId, InputEvent, Permission, SessionEvent, SessionId,
 };
 use ozma_transport::{
     ChannelId, CloseReason, QuicServer, QuicTransport, SessionTransport, TransportEvent,
@@ -94,6 +95,13 @@ fn advertised_address(local: SocketAddr) -> SocketAddr {
 fn hex_sha256(data: &[u8]) -> String {
     let digest = Sha256::digest(data);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn now_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_micros().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 /// Accept QUIC sessions until the listener fails. Each accepted connection
@@ -235,6 +243,10 @@ async fn handle_connection(
     };
 
     let mut events = backend.manager().subscribe();
+    // Shared with control handling so an input-latency ack can name the most
+    // recent encoded frame without blocking the media loop. This tracks the
+    // encoded frame sequence sent to the client, not display scanout.
+    let latest_frame_sequence = AtomicU64::new(0);
     let result = session_loop(
         &mut transport,
         &backend,
@@ -243,6 +255,7 @@ async fn handle_connection(
         &mut pipeline,
         &mut audio,
         &mut events,
+        &latest_frame_sequence,
         matches!(selected_display, Some(DisplayProfile::Scene { .. })).then(|| SceneStream {
             session: &session,
             last_revision: 0,
@@ -439,6 +452,7 @@ async fn session_loop(
     pipeline: &mut RunningPipeline,
     audio: &mut Option<AudioRuntime>,
     events: &mut broadcast::Receiver<SessionEvent>,
+    latest_frame_sequence: &AtomicU64,
     mut scene_stream: Option<SceneStream<'_>>,
 ) -> Result<()> {
     loop {
@@ -447,7 +461,7 @@ async fn session_loop(
                 match event {
                     TransportEvent::Payload { channel, payload } => {
                         if channel == ChannelId::CONTROL {
-                            if let Err(error) = handle_control(backend, session_id, client_id, transport, &payload).await {
+                            if let Err(error) = handle_control(backend, session_id, client_id, latest_frame_sequence, transport, &payload).await {
                                 let _ = send_control(transport, &ControlMessage::Error { error }).await;
                             }
                         }
@@ -467,6 +481,7 @@ async fn session_loop(
                             debug!(error = %error, "sending video frame failed");
                             break;
                         }
+                        latest_frame_sequence.store(frame.sequence(), Ordering::Relaxed);
                         if let Some(scene) = scene_stream.as_mut().filter(|scene| !scene.initialized) {
                             match send_initial_scene(transport, backend, scene.session).await {
                                 Ok(revision) => {
@@ -532,9 +547,13 @@ async fn handle_control(
     backend: &Arc<SessionBackend>,
     session_id: &SessionId,
     client_id: &ClientId,
+    latest_frame_sequence: &AtomicU64,
     transport: &QuicTransport,
     payload: &[u8],
 ) -> Result<(), ozma_protocol::ApiError> {
+    // Capture receive time before parsing so the ack measures the node's
+    // handling path rather than serde's cost.
+    let server_received_micros = now_micros();
     let message: ControlMessage = serde_json::from_slice(payload).map_err(|error| {
         ozma_protocol::ApiError::new(
             ozma_protocol::error::codes::INVALID_REQUEST,
@@ -557,6 +576,29 @@ async fn handle_control(
                 }
             }
         }
+        ControlMessage::InputLatency {
+            event,
+            client_sent_micros,
+            nonce,
+        } => {
+            // The same authorization and sink path as ordinary input; only a
+            // successful submission produces an ack. Unauthorized probes use
+            // the existing structured Error, so a view-only client cannot tell
+            // whether the event would have been accepted.
+            match authorize_latency_event(
+                backend,
+                session_id,
+                client_id,
+                &event,
+                nonce,
+                client_sent_micros,
+                server_received_micros,
+                latest_frame_sequence.load(Ordering::Relaxed),
+            ) {
+                Ok(ack) => send_control(transport, &ack).await?,
+                Err(error) => send_control(transport, &ControlMessage::Error { error }).await?,
+            }
+        }
         ControlMessage::Ping { nonce } => {
             send_control(transport, &ControlMessage::Pong { nonce }).await?;
         }
@@ -568,10 +610,36 @@ async fn handle_control(
         | ControlMessage::HelloAck { .. }
         | ControlMessage::SceneCommit { .. } => {}
         ControlMessage::Pong { .. } => {}
+        ControlMessage::InputLatencyAck { .. } => {}
         ControlMessage::Event { .. } => {}
         ControlMessage::Error { .. } => {}
     }
     Ok(())
+}
+
+/// Authorize and apply one latency-probe event, then build the ack. Split out
+/// from the transport loop so the authorization/ack contract is unit-testable
+/// without a QUIC connection.
+fn authorize_latency_event(
+    backend: &SessionBackend,
+    session_id: &SessionId,
+    client_id: &ClientId,
+    event: &InputEvent,
+    nonce: u64,
+    client_sent_micros: u64,
+    server_received_micros: u64,
+    latest_frame_sequence: u64,
+) -> Result<ControlMessage, ApiError> {
+    backend
+        .manager()
+        .submit_input(session_id, client_id, event)?;
+    backend.input_sink().submit(event)?;
+    Ok(ControlMessage::InputLatencyAck {
+        nonce,
+        client_sent_micros,
+        server_received_micros,
+        latest_frame_sequence,
+    })
 }
 
 async fn read_hello(
@@ -651,3 +719,106 @@ pub fn input_display(event: &InputEvent) -> Option<&DisplayId> {
 
 /// Keep the control task handle type visible to future extensions.
 pub type ControlTask = JoinHandle<()>;
+
+#[cfg(test)]
+mod latency_tests {
+    use super::*;
+    use ozma_auth::{ConsentPolicy, MachineClass};
+    use ozma_protocol::{ClientId, NodeCapabilities, Permission, PermissionSet, SessionSpec};
+
+    fn fixture(permissions: PermissionSet) -> (Arc<SessionBackend>, SessionId, ClientId) {
+        let backend = Arc::new(SessionBackend::new(
+            NodeCapabilities::fake("latency-test"),
+            ConsentPolicy::for_machine(MachineClass::Server),
+        ));
+        let client_id = ClientId::new("client-1");
+        let spec = SessionSpec {
+            client_id: client_id.clone(),
+            principal: "alice".into(),
+            tracks: Vec::new(),
+            audio: Default::default(),
+            input: Default::default(),
+            privacy: Default::default(),
+            transport: Default::default(),
+            ttl_seconds: 60,
+        };
+        let now = now_micros() / 1_000_000;
+        let session = backend
+            .manager()
+            .create(spec, permissions.clone(), now)
+            .unwrap();
+        backend.manager().start(&session.id).unwrap();
+        backend.manager().mark_streaming(&session.id).unwrap();
+        backend.manager().join(&session.id, &client_id).unwrap();
+        if permissions.contains(Permission::Control) {
+            backend
+                .manager()
+                .claim_control(&session.id, &client_id)
+                .unwrap();
+        }
+        (backend, session.id, client_id)
+    }
+
+    #[test]
+    fn input_latency_applies_the_event_and_acks_with_timing_and_frame_sequence() {
+        let permissions = PermissionSet::from_iter([Permission::View, Permission::Control]);
+        let (backend, session_id, client_id) = fixture(permissions);
+        let latest = AtomicU64::new(37);
+        let event = InputEvent::Key {
+            code: 0x04,
+            down: true,
+            modifiers: Default::default(),
+        };
+
+        let ack = authorize_latency_event(
+            &backend,
+            &session_id,
+            &client_id,
+            &event,
+            99,
+            1_700_000_000_000_123,
+            1_700_000_000_000_456,
+            latest.load(Ordering::Relaxed),
+        )
+        .unwrap();
+
+        match ack {
+            ControlMessage::InputLatencyAck {
+                nonce,
+                client_sent_micros,
+                server_received_micros,
+                latest_frame_sequence,
+            } => {
+                assert_eq!(nonce, 99);
+                assert_eq!(client_sent_micros, 1_700_000_000_000_123);
+                assert_eq!(server_received_micros, 1_700_000_000_000_456);
+                assert_eq!(latest_frame_sequence, 37);
+            }
+            other => panic!("expected InputLatencyAck, got {other:?}"),
+        }
+        assert!(
+            backend.input_sink().held().has_key(0x04),
+            "the probe event must reach the same input sink as ordinary input"
+        );
+    }
+
+    #[test]
+    fn unauthorized_input_latency_returns_the_existing_error_instead_of_an_ack() {
+        let permissions = PermissionSet::from_iter([Permission::View]);
+        let (backend, session_id, client_id) = fixture(permissions);
+        let event = InputEvent::Button {
+            button: ozma_protocol::PointerButton::Left,
+            down: true,
+        };
+
+        let error =
+            authorize_latency_event(&backend, &session_id, &client_id, &event, 1, 10, 20, 0)
+                .unwrap_err();
+
+        assert_eq!(error.code, ozma_protocol::codes::FORBIDDEN);
+        assert!(
+            backend.input_sink().held().is_empty(),
+            "an unauthorized probe must not reach the input sink"
+        );
+    }
+}

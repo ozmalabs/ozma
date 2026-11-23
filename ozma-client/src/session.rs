@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use ozma_protocol::scene::{
@@ -26,11 +26,13 @@ use ozma_transport::{
     ChannelId, ChannelMap, CloseReason, QuicClient, QuicConfig, QuicTransport, SessionTransport,
     TransportEvent,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::cert;
 use crate::error;
 use crate::node_api::NodeApiClient;
+use crate::video::VideoAssembler;
 
 /// Client-side connection policy.
 #[derive(Clone, Debug)]
@@ -114,6 +116,39 @@ impl MediaPacket {
     }
 }
 
+/// Result of [`NativeSessionClient::measure_input_latency`].
+///
+/// The timings cover the client's send call through arrival of the first
+/// complete **encoded** access unit at or after the node's ack sequence. They
+/// deliberately do not include decode, compositor presentation, display
+/// scanout, or monitor latency, so they are not a photon-latency SLO.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct InputLatencyReport {
+    /// Nonce echoed by the matching ack.
+    pub nonce: u64,
+    /// True when the node accepted and applied the probe event. An unauthorized
+    /// probe is reported as an error instead of a successful report.
+    pub event_accepted: bool,
+    /// Local round trip from sending `InputLatency` to receiving its ack.
+    pub ack_rtt_ms: f64,
+    /// Ack's server-receive time to local frame arrival, when both wall clocks
+    /// are close enough for the difference to be meaningful. `None` when the
+    /// clocks are skewed or the timestamps are not ordered.
+    pub server_to_frame_ms: Option<f64>,
+    /// Local input send to local arrival of a complete encoded access unit.
+    /// This is the primary measurement and is independent of clock sync.
+    pub input_to_frame_ms: f64,
+    /// Highest encoded frame sequence the node had sent when it received the
+    /// probe.
+    pub latest_frame_sequence: u64,
+    /// Sequence of the first complete frame at or above `latest_frame_sequence`.
+    pub frame_sequence: u64,
+    /// Raw client send timestamp from the ack, for diagnostics.
+    pub client_sent_micros: u64,
+    /// Raw server receive timestamp from the ack, for diagnostics.
+    pub server_received_micros: u64,
+}
+
 /// An event received from a native session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClientEvent {
@@ -129,6 +164,13 @@ pub enum ClientEvent {
     ScenePending,
     /// Reply to a client `Ping`.
     Pong { nonce: u64 },
+    /// Reply to a client `InputLatency` probe.
+    InputLatencyAck {
+        nonce: u64,
+        client_sent_micros: u64,
+        server_received_micros: u64,
+        latest_frame_sequence: u64,
+    },
     /// A non-terminal error from the node. The same error is retained and
     /// returned by later input calls, which is how view-only/control denial is
     /// surfaced.
@@ -164,6 +206,7 @@ pub struct NativeSessionClient {
     session: Option<Session>,
     pending: VecDeque<ClientEvent>,
     media_sequence: u64,
+    latency_nonce: u64,
     server_error: Option<ApiError>,
     end_reason: Option<EndReason>,
     closed: Option<CloseReason>,
@@ -249,6 +292,7 @@ impl NativeSessionClient {
             session: None,
             pending: VecDeque::new(),
             media_sequence: 0,
+            latency_nonce: 0,
             server_error: None,
             end_reason: None,
             closed: None,
@@ -437,6 +481,151 @@ impl NativeSessionClient {
             event: event.clone(),
         })
         .await
+    }
+
+    /// Measure send-to-client-visible-encoded-frame latency for one input event.
+    ///
+    /// The event is sent as `InputLatency`, which the node authorizes and
+    /// applies through the same session manager and input sink as ordinary
+    /// input. This method then waits for the matching `InputLatencyAck`, and
+    /// reassembles video until the first complete access unit with a sequence
+    /// at or above the ack's `latest_frame_sequence` arrives.
+    ///
+    /// `input_to_frame_ms` measures client send to **encoded frame arrival**.
+    /// It does not include decode, presentation, display scanout, or panel
+    /// latency, so it must not be reported as input-to-photon latency or used
+    /// to claim a display-latency SLO. `server_to_frame_ms` additionally
+    /// depends on server/client wall clocks being close and is `None` when they
+    /// are not.
+    ///
+    /// Use a harmless event such as [`InputEvent::ReleaseAll`] for a probe. An
+    /// unauthorized event returns the node's structured error instead of a
+    /// report.
+    pub async fn measure_input_latency(
+        &mut self,
+        event: &InputEvent,
+        timeout: Duration,
+    ) -> Result<InputLatencyReport, ApiError> {
+        if let Some(error) = &self.server_error {
+            return Err(error.clone());
+        }
+        self.ensure_open()?;
+        if let Some(session) = &self.session {
+            if session.state.is_terminal() {
+                return Err(error::disconnected(format!("{:?}", session.state)));
+            }
+        }
+
+        self.latency_nonce = self.latency_nonce.wrapping_add(1);
+        let nonce = self.latency_nonce;
+        let started = Instant::now();
+        let client_sent_micros = now_micros();
+        self.send_control(&ControlMessage::InputLatency {
+            event: event.clone(),
+            client_sent_micros,
+            nonce,
+        })
+        .await?;
+
+        let mut assembler = VideoAssembler::default();
+        let mut ack: Option<AckSample> = None;
+        let mut last_completed: Option<CompletedFrame> = None;
+
+        let report = tokio::time::timeout(timeout, async {
+            loop {
+                match self.recv_event().await? {
+                    ClientEvent::Media(packet) if packet.kind == ChannelKind::Video => {
+                        let frame =
+                            assembler
+                                .push_or_complete(&packet.payload)
+                                .map_err(|error| {
+                                    ApiError::new(
+                                        error::codes::CLIENT_PROTOCOL,
+                                        format!(
+                                        "invalid video fragment during the latency probe: {error}"
+                                    ),
+                                    )
+                                })?;
+                        let Some(frame) = frame else { continue };
+                        let at = Instant::now();
+                        let at_micros = now_micros();
+                        if let Some(sample) = ack.as_ref() {
+                            if frame.sequence >= sample.latest_frame_sequence {
+                                return Ok(latency_report(
+                                    nonce,
+                                    started,
+                                    sample,
+                                    frame.sequence,
+                                    at,
+                                    at_micros,
+                                ));
+                            }
+                        }
+                        last_completed = Some(CompletedFrame {
+                            sequence: frame.sequence,
+                            at,
+                            at_micros,
+                        });
+                    }
+                    ClientEvent::InputLatencyAck {
+                        nonce: ack_nonce,
+                        client_sent_micros,
+                        server_received_micros,
+                        latest_frame_sequence,
+                    } if ack_nonce == nonce => {
+                        let sample = AckSample {
+                            client_sent_micros,
+                            server_received_micros,
+                            latest_frame_sequence,
+                            received: Instant::now(),
+                        };
+                        if let Some(frame) = last_completed.as_ref() {
+                            if frame.sequence >= latest_frame_sequence {
+                                return Ok(latency_report(
+                                    nonce,
+                                    started,
+                                    &sample,
+                                    frame.sequence,
+                                    frame.at,
+                                    frame.at_micros,
+                                ));
+                            }
+                        }
+                        ack = Some(sample);
+                    }
+                    ClientEvent::Error { error } => return Err(error),
+                    ClientEvent::Closed { reason } => {
+                        return Err(error::disconnected(reason.as_str()))
+                    }
+                    ClientEvent::Bye { reason } => {
+                        return Err(ApiError::new(
+                            error::codes::CLIENT_DISCONNECTED,
+                            format!(
+                            "The node ended the session while measuring input latency ({reason:?})"
+                        ),
+                        ))
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                error::codes::CLIENT_TIMEOUT,
+                format!(
+                    "Timed out measuring input latency after {} ms",
+                    timeout.as_millis()
+                ),
+            )
+            .with_details(json!({ "nonce": nonce }))
+            .with_remediation(
+                "Check that the session is streaming and that the node supports InputLatency.",
+            )
+            .retryable()
+        })?;
+
+        report
     }
 
     /// Release every held key/button/contact. Idempotent and safe to call on
@@ -646,6 +835,7 @@ impl NativeSessionClient {
                     kind: "pong".to_string(),
                 }),
             },
+            "input_latency_ack" => parse_input_latency_ack(&value),
             "bye" => {
                 let reason = parse_bye(&value)?;
                 self.end_reason = Some(reason);
@@ -656,6 +846,62 @@ impl NativeSessionClient {
             }),
         }
     }
+}
+
+struct AckSample {
+    client_sent_micros: u64,
+    server_received_micros: u64,
+    latest_frame_sequence: u64,
+    received: Instant,
+}
+
+struct CompletedFrame {
+    sequence: u64,
+    at: Instant,
+    at_micros: u64,
+}
+
+fn latency_report(
+    nonce: u64,
+    started: Instant,
+    ack: &AckSample,
+    frame_sequence: u64,
+    frame_at: Instant,
+    frame_micros: u64,
+) -> InputLatencyReport {
+    // The raw timestamps come from different machines. Only use them for
+    // server-to-frame when they agree to within a second; otherwise report
+    // the clock-independent local measurements and leave this as `None`.
+    let clock_skew = ack.server_received_micros.abs_diff(ack.client_sent_micros);
+    let server_to_frame_ms =
+        if clock_skew <= 1_000_000 && frame_micros >= ack.server_received_micros {
+            Some((frame_micros - ack.server_received_micros) as f64 / 1000.0)
+        } else {
+            None
+        };
+
+    InputLatencyReport {
+        nonce,
+        event_accepted: true,
+        ack_rtt_ms: ack
+            .received
+            .saturating_duration_since(started)
+            .as_secs_f64()
+            * 1000.0,
+        server_to_frame_ms,
+        input_to_frame_ms: frame_at.saturating_duration_since(started).as_secs_f64() * 1000.0,
+        latest_frame_sequence: ack.latest_frame_sequence,
+        frame_sequence,
+        client_sent_micros: ack.client_sent_micros,
+        server_received_micros: ack.server_received_micros,
+    }
+}
+
+fn now_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_micros().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 fn select_quic_transport(
@@ -769,6 +1015,22 @@ fn parse_pong(value: &Value) -> Option<u64> {
     nonce.as_u64().or_else(|| nonce.as_str()?.parse().ok())
 }
 
+fn parse_input_latency_ack(value: &Value) -> Result<ClientEvent, ApiError> {
+    let data = control_data(value);
+    let integer = |field: &str| {
+        data.get(field).and_then(Value::as_u64).ok_or_else(|| {
+            error::protocol(format!("InputLatencyAck has no unsigned integer '{field}'"))
+                .with_details(json!({ "message": value }))
+        })
+    };
+    Ok(ClientEvent::InputLatencyAck {
+        nonce: integer("nonce")?,
+        client_sent_micros: integer("client_sent_micros")?,
+        server_received_micros: integer("server_received_micros")?,
+        latest_frame_sequence: integer("latest_frame_sequence")?,
+    })
+}
+
 fn parse_bye(value: &Value) -> Result<EndReason, ApiError> {
     let reason = control_data(value).get("reason").ok_or_else(|| {
         error::protocol("Bye control message has no 'reason'")
@@ -778,4 +1040,189 @@ fn parse_bye(value: &Value) -> Result<EndReason, ApiError> {
         error::protocol(format!("The node sent an unknown end reason: {error}"))
             .with_details(json!({ "reason": reason }))
     })
+}
+
+#[cfg(test)]
+mod latency_tests {
+    use super::*;
+    use crate::cert::certificate_fingerprint;
+    use ozma_protocol::media::VideoFragmentHeader;
+    use ozma_protocol::{
+        ClientId, Participant, ParticipantRole, Permission, PermissionSet, Session, SessionId,
+        SessionSpec, SessionState,
+    };
+    use ozma_transport::offer::{SessionOfferBuilder, TransportDescriptorBuilder};
+    use ozma_transport::{QuicServer, TransportEvent};
+
+    fn session() -> Session {
+        let spec = SessionSpec {
+            client_id: ClientId::new("client-test"),
+            principal: "probe".to_string(),
+            tracks: Vec::new(),
+            audio: Default::default(),
+            input: Default::default(),
+            privacy: Default::default(),
+            transport: Default::default(),
+            ttl_seconds: 60,
+        };
+        let mut session = Session::new(
+            SessionId::new("session-test"),
+            spec,
+            PermissionSet::from_iter([Permission::View, Permission::Control]),
+            1,
+        );
+        session.state = SessionState::Streaming;
+        session.started_at = Some(1);
+        session.updated_at = 2;
+        session.participants = vec![Participant {
+            client_id: ClientId::new("client-test"),
+            role: ParticipantRole::Controller,
+            connected: true,
+            last_seen: 2,
+        }];
+        session
+    }
+
+    fn offer_for(address: SocketAddr, fingerprint: &str) -> SessionOffer {
+        let descriptor = TransportDescriptorBuilder::quic(address.to_string())
+            .certificate_fingerprint(fingerprint)
+            .build();
+        SessionOfferBuilder::new("session-test")
+            .token("token-test")
+            .expires_at(1_700_000_000_000)
+            .transport(descriptor)
+            .build()
+            .unwrap()
+    }
+
+    async fn recv_message(transport: &mut QuicTransport) -> ControlMessage {
+        loop {
+            match transport.recv().await {
+                TransportEvent::Payload { channel, payload } if channel == ChannelId::CONTROL => {
+                    return serde_json::from_slice(&payload).unwrap();
+                }
+                TransportEvent::Payload { .. } | TransportEvent::Datagram { .. } => continue,
+                TransportEvent::Error { error } => panic!("transport error: {error}"),
+                TransportEvent::Closed { reason } => {
+                    panic!("transport closed before control: {reason:?}")
+                }
+            }
+        }
+    }
+
+    async fn send_control(transport: &QuicTransport, message: &ControlMessage) {
+        transport
+            .send(
+                ChannelId::CONTROL,
+                Bytes::from(serde_json::to_vec(message).unwrap()),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn drain_until_close(transport: &mut QuicTransport) {
+        loop {
+            match transport.recv().await {
+                TransportEvent::Payload { channel, payload } if channel == ChannelId::CONTROL => {
+                    let value: Value = serde_json::from_slice(&payload).unwrap();
+                    if value["type"] == "bye" {
+                        break;
+                    }
+                }
+                TransportEvent::Payload { .. } | TransportEvent::Datagram { .. } => continue,
+                TransportEvent::Error { .. } | TransportEvent::Closed { .. } => break,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn measurement_matches_its_ack_and_waits_for_a_frame_at_the_ack_sequence() {
+        let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = server.local_addr().unwrap();
+        let certificate = server.certificate_der().to_vec();
+        let offer = offer_for(address, &certificate_fingerprint(&certificate));
+
+        let server_task = tokio::spawn(async move {
+            let mut transport = server.accept().await.unwrap();
+            let ControlMessage::Hello { .. } = recv_message(&mut transport).await else {
+                panic!("expected Hello");
+            };
+            send_control(
+                &transport,
+                &ControlMessage::HelloAck {
+                    session: session(),
+                    display: None,
+                },
+            )
+            .await;
+
+            let ControlMessage::InputLatency {
+                event,
+                client_sent_micros,
+                nonce,
+            } = recv_message(&mut transport).await
+            else {
+                panic!("expected InputLatency");
+            };
+            assert_eq!(event, InputEvent::ReleaseAll);
+
+            // An ack for another nonce must be ignored by the client.
+            send_control(
+                &transport,
+                &ControlMessage::InputLatencyAck {
+                    nonce: nonce.wrapping_add(1),
+                    client_sent_micros,
+                    server_received_micros: client_sent_micros,
+                    latest_frame_sequence: 99,
+                },
+            )
+            .await;
+            send_control(
+                &transport,
+                &ControlMessage::InputLatencyAck {
+                    nonce,
+                    client_sent_micros,
+                    server_received_micros: client_sent_micros,
+                    latest_frame_sequence: 10,
+                },
+            )
+            .await;
+
+            // A complete frame below the ack sequence is not the answer.
+            let stale = VideoFragmentHeader::new(false, 0, 9, 0, 1).encode_into(b"stale");
+            transport
+                .send(ChannelId::VIDEO, Bytes::from(stale))
+                .await
+                .unwrap();
+            let frame = VideoFragmentHeader::new(true, 0, 12, 0, 1).encode_into(b"live");
+            transport
+                .send(ChannelId::VIDEO, Bytes::from(frame))
+                .await
+                .unwrap();
+
+            drain_until_close(&mut transport).await;
+            let _ = transport.close_with_reason(CloseReason::Normal).await;
+        });
+
+        let mut client = NativeSessionClient::connect(&offer, &certificate)
+            .await
+            .unwrap();
+        let report = client
+            .measure_input_latency(&InputEvent::ReleaseAll, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(report.nonce, 1);
+        assert!(report.event_accepted);
+        assert_eq!(report.latest_frame_sequence, 10);
+        assert_eq!(report.frame_sequence, 12);
+        assert!(report.ack_rtt_ms >= 0.0);
+        assert!(report.input_to_frame_ms >= 0.0);
+        assert!(report.server_to_frame_ms.is_some());
+
+        client.close().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server_task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 }
