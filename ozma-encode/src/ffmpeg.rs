@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Optional, non-fatal detection of an `ffmpeg` binary.
 //!
-//! FFmpeg is a useful practical backend, but a node must start and advertise
-//! software/fake capability even when it is absent. Detection therefore never
-//! panics and never makes a missing binary an error.
+//! FFmpeg is **not** used for encoding in this crate: the real software
+//! backend is OpenH264 (see [`crate::software`]). This module is only a
+//! capability hint for diagnostics and future sidecar support. A node must
+//! start and advertise software capability even when FFmpeg is absent, so
+//! detection never panics and never makes a missing binary an error.
 
 use std::path::PathBuf;
 use std::process::Command;

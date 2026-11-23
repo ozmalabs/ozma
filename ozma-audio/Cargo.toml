@@ -1,0 +1,18 @@
+[package]
+name = "ozma-audio"
+version = "0.1.0"
+edition = "2021"
+description = "ALSA audio capture and Opus encoding for Ozma nodes."
+license = "AGPL-3.0-only"
+
+[dependencies]
+ozma-protocol = { path = "../ozma-protocol" }
+alsa = { workspace = true }
+async-trait = "0.1"
+audiopus = "0.3.0-rc.0"
+thiserror = "1"
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

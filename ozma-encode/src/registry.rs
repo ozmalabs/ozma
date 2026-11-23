@@ -9,12 +9,12 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
 
-use ozma_protocol::{
-    codes, ApiError, Codec, EncodeCapability, EncoderBackend, MediaFormat,
-};
-use ozma_media::{FakeEncoder, FrameFormat};
+use async_trait::async_trait;
+use ozma_media::{EncodedFrame, Encoder, FakeEncoder, Frame, FrameFormat, MediaError};
+use ozma_protocol::{codes, ApiError, Codec, EncodeCapability, EncoderBackend, MediaFormat};
 
 use crate::probe::{EncoderProbe, ProbeResult};
+use crate::software::H264SoftwareEncoder;
 
 fn probe_key(capability: &EncodeCapability) -> (Codec, EncoderBackend) {
     (capability.codec, capability.backend)
@@ -86,6 +86,117 @@ impl EncoderSelection {
             ))
             .with_keyframe_interval(u64::from(self.requested.fps.max(1)))
     }
+
+    /// Build the concrete software H.264 encoder this selection refers to.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured [`ApiError`] when the selection is not backed by
+    /// [`EncoderBackend::Software`], or when the encoder cannot accept `input`.
+    pub fn software_encoder(&self, input: FrameFormat) -> Result<H264SoftwareEncoder, ApiError> {
+        if self.capability.backend != EncoderBackend::Software {
+            return Err(ApiError::new(
+                codes::ENCODER_UNAVAILABLE,
+                format!(
+                    "Selection `{}` is backed by {} ({}), not the software H.264 encoder.",
+                    self.requested.label(),
+                    self.capability.codec.as_str(),
+                    backend_name(self.capability.backend)
+                ),
+            )
+            .with_details(backend_name(self.capability.backend).to_owned())
+            .with_remediation(
+                "Select a software capability, or use a backend adapter for this hardware.",
+            ));
+        }
+        H264SoftwareEncoder::new(input, self.requested.clone())
+    }
+
+    /// Build the encoder for this selection.
+    ///
+    /// Software selections produce a real [`H264SoftwareEncoder`]; fake
+    /// selections produce [`FakeEncoder`] for CI. Hardware selections return a
+    /// structured error because this crate does not implement VAAPI, NVENC,
+    /// QSV, or V4L2M2M yet; it never silently substitutes a fake backend for a
+    /// hardware claim.
+    pub fn build_encoder(&self, input: FrameFormat) -> Result<SelectedEncoder, ApiError> {
+        match self.capability.backend {
+            EncoderBackend::Software => {
+                Ok(SelectedEncoder::Software(self.software_encoder(input)?))
+            }
+            EncoderBackend::Fake => Ok(SelectedEncoder::Fake(self.fake_encoder(input))),
+            other => Err(ApiError::new(
+                codes::ENCODER_UNAVAILABLE,
+                format!(
+                    "The `{}` backend is advertised but not implemented by `ozma-encode`.",
+                    backend_name(other)
+                ),
+            )
+            .with_details(backend_name(other).to_owned())
+            .with_remediation(
+                "Use the software H.264 fallback, or add a backend adapter for this hardware.",
+            )),
+        }
+    }
+}
+
+/// The concrete encoder produced by [`EncoderSelection::build_encoder`].
+///
+/// This is an enum rather than a boxed trait object so it satisfies
+/// `ozma_media::Pipeline::start`'s `E: Encoder + 'static` bound directly. A
+/// caller that only needs the real backend can use
+/// [`EncoderSelection::software_encoder`] instead.
+#[derive(Debug)]
+pub enum SelectedEncoder {
+    /// A real OpenH264 software H.264 encoder.
+    Software(H264SoftwareEncoder),
+    /// The deterministic CI encoder.
+    Fake(FakeEncoder),
+}
+
+#[async_trait]
+impl Encoder for SelectedEncoder {
+    fn id(&self) -> &str {
+        match self {
+            Self::Software(encoder) => encoder.id(),
+            Self::Fake(encoder) => encoder.id(),
+        }
+    }
+
+    fn input_format(&self) -> FrameFormat {
+        match self {
+            Self::Software(encoder) => encoder.input_format(),
+            Self::Fake(encoder) => encoder.input_format(),
+        }
+    }
+
+    fn output_format(&self) -> MediaFormat {
+        match self {
+            Self::Software(encoder) => encoder.output_format(),
+            Self::Fake(encoder) => encoder.output_format(),
+        }
+    }
+
+    async fn encode(&mut self, frame: Frame) -> Result<EncodedFrame, MediaError> {
+        match self {
+            Self::Software(encoder) => encoder.encode(frame).await,
+            Self::Fake(encoder) => encoder.encode(frame).await,
+        }
+    }
+
+    async fn request_keyframe(&mut self) -> Result<(), MediaError> {
+        match self {
+            Self::Software(encoder) => encoder.request_keyframe().await,
+            Self::Fake(encoder) => encoder.request_keyframe().await,
+        }
+    }
+
+    async fn flush(&mut self) -> Result<Vec<EncodedFrame>, MediaError> {
+        match self {
+            Self::Software(encoder) => encoder.flush().await,
+            Self::Fake(encoder) => encoder.flush().await,
+        }
+    }
 }
 
 /// Selection constraints.
@@ -138,10 +249,18 @@ impl EncoderRegistry {
         Self::default()
     }
 
+    /// A registry containing only the real software H.264 fallback.
+    ///
+    /// This is the useful default on a node without hardware encoder adapters:
+    /// it advertises exactly what `ozma-encode` can actually run, and
+    /// [`EncoderRegistry::select`] therefore returns a software selection whose
+    /// [`EncoderSelection::build_encoder`] is a working OpenH264 encoder.
+    pub fn with_software_h264() -> Self {
+        Self::from_capabilities([H264SoftwareEncoder::capability()])
+    }
+
     /// Build a registry from advertised capabilities.
-    pub fn from_capabilities(
-        capabilities: impl IntoIterator<Item = EncodeCapability>,
-    ) -> Self {
+    pub fn from_capabilities(capabilities: impl IntoIterator<Item = EncodeCapability>) -> Self {
         let mut registry = Self::new();
         for capability in capabilities {
             registry.register(capability);
@@ -178,11 +297,7 @@ impl EncoderRegistry {
     }
 
     /// Latest probe result for a codec/backend pair.
-    pub fn probe_result(
-        &self,
-        codec: Codec,
-        backend: EncoderBackend,
-    ) -> Option<&ProbeResult> {
+    pub fn probe_result(&self, codec: Codec, backend: EncoderBackend) -> Option<&ProbeResult> {
         self.probes.get(&(codec, backend))
     }
 
@@ -239,9 +354,7 @@ impl EncoderRegistry {
             if capability.hardware {
                 had_hardware_candidate = true;
             }
-            if capability.max_width < requested.width
-                || capability.max_height < requested.height
-            {
+            if capability.max_width < requested.width || capability.max_height < requested.height {
                 continue;
             }
             if requested.fps > 0 && capability.max_fps < requested.fps {
@@ -259,11 +372,7 @@ impl EncoderRegistry {
         }
 
         if eligible.is_empty() {
-            return Err(self.no_candidate_error(
-                requested,
-                codec_matches,
-                had_hardware_candidate,
-            ));
+            return Err(self.no_candidate_error(requested, codec_matches, had_hardware_candidate));
         }
 
         let hardware: Vec<&EncodeCapability> = eligible
@@ -417,7 +526,15 @@ mod tests {
     }
 
     fn h264_vaapi() -> EncodeCapability {
-        capability(Codec::H264, EncoderBackend::Vaapi, true, 3840, 2160, 60, false)
+        capability(
+            Codec::H264,
+            EncoderBackend::Vaapi,
+            true,
+            3840,
+            2160,
+            60,
+            false,
+        )
     }
 
     fn h264_software() -> EncodeCapability {
@@ -434,8 +551,7 @@ mod tests {
 
     #[test]
     fn hardware_is_preferred_over_software() {
-        let registry =
-            EncoderRegistry::from_capabilities([h264_software(), h264_vaapi()]);
+        let registry = EncoderRegistry::from_capabilities([h264_software(), h264_vaapi()]);
         let selection = registry.select(&h264_request()).unwrap();
         assert_eq!(selection.backend(), EncoderBackend::Vaapi);
         assert!(selection.is_hardware());
@@ -444,8 +560,7 @@ mod tests {
 
     #[tokio::test]
     async fn software_is_chosen_after_hardware_probe_failure() {
-        let mut registry =
-            EncoderRegistry::from_capabilities([h264_vaapi(), h264_software()]);
+        let mut registry = EncoderRegistry::from_capabilities([h264_vaapi(), h264_software()]);
         registry
             .probe_all(&FakeProbe::passing().fail_for(Codec::H264, EncoderBackend::Vaapi))
             .await;
@@ -455,18 +570,15 @@ mod tests {
         assert!(!selection.is_hardware());
         assert_eq!(selection.reason, SelectionReason::SoftwareFallback);
         assert!(selection.probe.as_ref().unwrap().is_ok());
-        assert!(
-            !registry
-                .probe_result(Codec::H264, EncoderBackend::Vaapi)
-                .unwrap()
-                .is_ok()
-        );
+        assert!(!registry
+            .probe_result(Codec::H264, EncoderBackend::Vaapi)
+            .unwrap()
+            .is_ok());
     }
 
     #[tokio::test]
     async fn all_failed_probes_report_a_probe_error() {
-        let mut registry =
-            EncoderRegistry::from_capabilities([h264_vaapi(), h264_software()]);
+        let mut registry = EncoderRegistry::from_capabilities([h264_vaapi(), h264_software()]);
         registry.probe_all(&FakeProbe::failing()).await;
         let error = registry.select(&h264_request()).unwrap_err();
         assert_eq!(error.code, codes::ENCODER_PROBE_FAILED);
@@ -507,8 +619,7 @@ mod tests {
 
     #[tokio::test]
     async fn hardware_only_policy_refuses_software() {
-        let mut registry =
-            EncoderRegistry::from_capabilities([h264_vaapi(), h264_software()]);
+        let mut registry = EncoderRegistry::from_capabilities([h264_vaapi(), h264_software()]);
         registry
             .probe_all(&FakeProbe::passing().fail_for(Codec::H264, EncoderBackend::Vaapi))
             .await;
@@ -520,8 +631,7 @@ mod tests {
 
     #[tokio::test]
     async fn selection_builds_a_working_fake_encoder() {
-        let registry =
-            EncoderRegistry::from_capabilities([h264_software()]);
+        let registry = EncoderRegistry::from_capabilities([h264_software()]);
         let request = MediaFormat::new(Codec::H264, 320, 240, 30, 2_000);
         let selection = registry.select(&request).unwrap();
         assert_eq!(selection.reason, SelectionReason::OnlyCandidate);
