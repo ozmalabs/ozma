@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Optional, non-fatal detection of an `ffmpeg` binary.
 //!
-//! FFmpeg is **not** used for encoding in this crate: the real software
-//! backend is OpenH264 (see [`crate::software`]). This module is only a
-//! capability hint for diagnostics and future sidecar support. A node must
-//! start and advertise software capability even when FFmpeg is absent, so
-//! detection never panics and never makes a missing binary an error.
+//! The software backend is OpenH264 (see [`crate::software`]); the VAAPI
+//! backend runs the `ffmpeg` binary as a supervised child process (see
+//! [`crate::vaapi`]). This module is the non-fatal capability hint used for
+//! diagnostics. A node must start and advertise software capability even when
+//! FFmpeg is absent, so detection never panics and never makes a missing
+//! binary an error.
+//!
+//! `OZMA_FFMPEG` overrides the binary, matching the VAAPI backend.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -33,7 +36,9 @@ impl FfmpegStatus {
 /// This is a best-effort capability hint. Callers must not require it, and
 /// tests must not assume ffmpeg is installed.
 pub fn detect_ffmpeg() -> FfmpegStatus {
-    let output = match Command::new("ffmpeg").arg("-version").output() {
+    let binary = std::env::var_os(crate::vaapi::FFMPEG_ENV)
+        .unwrap_or_else(|| std::ffi::OsString::from("ffmpeg"));
+    let output = match Command::new(&binary).arg("-version").output() {
         Ok(output) => output,
         Err(_) => return FfmpegStatus::unavailable(),
     };
@@ -54,7 +59,7 @@ pub fn detect_ffmpeg() -> FfmpegStatus {
 
     FfmpegStatus {
         available: true,
-        path: Some(PathBuf::from("ffmpeg")),
+        path: Some(PathBuf::from(binary)),
         version,
     }
 }

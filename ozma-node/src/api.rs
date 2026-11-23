@@ -6,6 +6,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use ozma_api::NodeBackend;
 use ozma_auth::{ConsentPolicy, MachineClass};
+use ozma_encode::EncoderRegistry;
 use ozma_input::HidGadgetSink;
 use ozma_protocol::NodeCapabilities;
 use tokio::net::TcpListener;
@@ -21,7 +22,18 @@ pub async fn serve(
     capabilities: NodeCapabilities,
     consent_policy: ConsentPolicy,
 ) -> Result<()> {
-    let backend = SessionBackend::new(capabilities, consent_policy);
+    serve_with_scene_replay(port, quic_port, capabilities, consent_policy, None).await
+}
+
+pub async fn serve_with_scene_replay(
+    port: u16,
+    quic_port: u16,
+    capabilities: NodeCapabilities,
+    consent_policy: ConsentPolicy,
+    scene_replay: Option<crate::scene_replay::JsonlSceneProducer>,
+) -> Result<()> {
+    let encoders = EncoderRegistry::with_detected_encoders().await;
+    let backend = SessionBackend::new(capabilities, consent_policy).with_encoder_registry(encoders);
     let backend = match HidGadgetSink::open() {
         Ok(sink) => backend.with_input_sink(Arc::new(sink)),
         Err(error) => {
@@ -29,7 +41,10 @@ pub async fn serve(
             backend
         }
     };
-    let backend = Arc::new(backend);
+    let backend = Arc::new(match scene_replay {
+        Some(replay) => backend.with_scene_producer(Arc::new(replay)),
+        None => backend,
+    });
 
     // Bind the HTTP listener first: a node that cannot serve its API must not
     // leave a QUIC listener behind on a half-started process.

@@ -17,6 +17,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
+use ozma_decode::VideoDecoder as _;
 use ozma_client::{
     codes, fetch_transport_info, load_certificate, ClientEvent, ControllerClient, ControllerNode,
     NativeClientConfig, NativeSessionClient, NodeApiClient, VideoAssembler, VideoFrame,
@@ -839,19 +840,31 @@ async fn write_outputs(
                 format!("could not start the H.264 decoder: {error}"),
             )
         })?;
-        let decoded = ozma_decode::VideoDecoder::decode(
-            &mut decoder,
-            &frame.data,
-            ozma_decode::DecodeMeta::new(0, frame.sequence, frame.keyframe),
-        )
-        .await
-        .map_err(|error| {
-            ApiError::new(
-                codes::CLIENT_PROTOCOL,
-                format!("could not decode the first video frame: {error}"),
-            )
-        })?
-        .ok_or_else(|| {
+        let meta = ozma_decode::DecodeMeta::new(0, frame.sequence, frame.keyframe);
+        let mut decoded = ozma_decode::VideoDecoder::decode(&mut decoder, &frame.data, meta)
+            .await
+            .map_err(|error| {
+                ApiError::new(
+                    codes::CLIENT_PROTOCOL,
+                    format!("could not decode the first video frame: {error}"),
+                )
+            })?;
+        if decoded.is_none() {
+            // Some hardware encoders emit a picture the decoder holds until
+            // flush (for example a High-profile first frame).
+            decoded = decoder
+                .flush()
+                .await
+                .map_err(|error| {
+                    ApiError::new(
+                        codes::CLIENT_PROTOCOL,
+                        format!("could not flush the first video frame: {error}"),
+                    )
+                })?
+                .into_iter()
+                .next();
+        }
+        let decoded = decoded.ok_or_else(|| {
             ApiError::new(
                 codes::CLIENT_PROTOCOL,
                 "the decoder did not produce a picture for the first access unit",
@@ -995,19 +1008,31 @@ async fn probe(
                 format!("could not start the H.264 decoder: {error}"),
             )
         })?;
-        let decoded = ozma_decode::VideoDecoder::decode(
-            &mut decoder,
-            &frame.data,
-            ozma_decode::DecodeMeta::new(0, frame.sequence, frame.keyframe),
-        )
-        .await
-        .map_err(|error| {
-            ApiError::new(
-                codes::CLIENT_PROTOCOL,
-                format!("could not decode the first video frame: {error}"),
-            )
-        })?
-        .ok_or_else(|| {
+        let meta = ozma_decode::DecodeMeta::new(0, frame.sequence, frame.keyframe);
+        let mut decoded = ozma_decode::VideoDecoder::decode(&mut decoder, &frame.data, meta)
+            .await
+            .map_err(|error| {
+                ApiError::new(
+                    codes::CLIENT_PROTOCOL,
+                    format!("could not decode the first video frame: {error}"),
+                )
+            })?;
+        if decoded.is_none() {
+            // Some hardware encoders emit a picture the decoder holds until
+            // flush (for example a High-profile first frame).
+            decoded = decoder
+                .flush()
+                .await
+                .map_err(|error| {
+                    ApiError::new(
+                        codes::CLIENT_PROTOCOL,
+                        format!("could not flush the first video frame: {error}"),
+                    )
+                })?
+                .into_iter()
+                .next();
+        }
+        let decoded = decoded.ok_or_else(|| {
             ApiError::new(
                 codes::CLIENT_PROTOCOL,
                 "the decoder did not produce a picture for the first access unit",

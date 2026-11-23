@@ -23,7 +23,7 @@ This file records what is actually merged and tested, not what is planned.
 | V4L2 MMAP capture | Done | real single-plane MMAP worker; tested against a real MJPEG camera (1920x1080) |
 | Encoder selection/probe | Done | hardware preference, software fallback, probe records |
 | Real H.264 encode | Done | `ozma-encode` OpenH264 software backend: MJPEG/NV12/YUYV/RGB/BGRA → I420 → Annex-B, real probe, keyframes |
-| Real-camera end-to-end | Validated | `/dev/video0` 1920×1080 MJPEG → OpenH264 → QUIC fragments → `ozma-client probe` reassembled a 33 KB H.264 keyframe |
+| Real-camera end-to-end | Validated | `/dev/video0` 1920×1080 MJPEG → VAAPI High-profile H.264 → QUIC fragments → client reassembled and decoded a 45 KB keyframe to 1920×1080 PPM |
 | Native QUIC session | Done | real QUIC + rustls, ALPN `ozma/1`, control stream + datagrams |
 | Scoped view/control grants | Done | HMAC session tokens, permission sets, view-only input rejection |
 | Workstation consent | Done | consent policy + session state machine; denied consent blocks start |
@@ -62,9 +62,11 @@ OZMA_CAPTURE_TEST_DEVICE=/dev/video2 \
 
 ## Deliberate limitations
 
-- Video uses the OpenH264 software encoder. VAAPI/NVENC/QSV/V4L2M2M hardware
-  adapters are not implemented yet; the selection policy refuses to pretend a
-  software result is hardware.
+- Video uses VAAPI when its real probe passes and OpenH264 otherwise.
+  NVENC/QSV/V4L2M2M are not implemented; the selection policy refuses to
+  pretend a software result is hardware.
+- VAAPI forced keyframes restart the FFmpeg sidecar; periodic GOP works
+  without a restart.
 - QUIC carries control/input/video/audio over a real connection, but there is
   no browser WebTransport gateway yet.
 - The virtual-display API is exercised through the fake provider. The EVDI

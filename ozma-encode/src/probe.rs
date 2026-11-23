@@ -66,9 +66,10 @@ impl ProbeResult {
 
 /// Something that can probe encoder capabilities.
 ///
-/// The M1 implementation will feed a real captured frame through the backend,
-/// verify a decodable keyframe, and return a [`ProbeResult`]. Tests use
-/// [`FakeProbe`].
+/// [`SoftwareProbe`] feeds a synthetic frame through OpenH264 and verifies a
+/// decodable IDR. [`crate::vaapi::VaapiProbe`] initialises the VAAPI device and
+/// really encodes a frame with `h264_vaapi`. Both return a [`ProbeResult`];
+/// tests use [`FakeProbe`].
 #[async_trait]
 pub trait EncoderProbe: Send + Sync {
     /// Probe one capability.

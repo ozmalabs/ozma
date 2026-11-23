@@ -88,13 +88,13 @@ const DEFAULT_GOP: u32 = 30;
 /// advertised in the SPS; it is still the caller's responsibility to capture a
 /// stream whose matrix matches the mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ColorMatrix {
+pub(crate) enum ColorMatrix {
     Bt601,
     Bt709,
 }
 
 impl ColorMatrix {
-    fn for_frame(width: usize, height: usize) -> Self {
+    pub(crate) fn for_frame(width: usize, height: usize) -> Self {
         if height >= 720 || width >= 1280 {
             Self::Bt709
         } else {
@@ -573,7 +573,7 @@ fn dimension_error(input: FrameFormat) -> ApiError {
     ))
 }
 
-fn encode_failed(message: impl Into<String>, details: impl Into<String>) -> MediaError {
+pub(crate) fn encode_failed(message: impl Into<String>, details: impl Into<String>) -> MediaError {
     let message = message.into();
     MediaError::Api(
         ApiError::new(ENCODE_FAILED, message)
@@ -584,8 +584,11 @@ fn encode_failed(message: impl Into<String>, details: impl Into<String>) -> Medi
     )
 }
 
-/// Even dimensions OpenH264 can encode.
-fn coded_dimensions(input: FrameFormat) -> Result<(usize, usize), ApiError> {
+/// Even dimensions an H.264 encoder can encode for `input`.
+///
+/// Shared with the VAAPI backend so both backends crop and reject the same
+/// layouts instead of drifting apart.
+pub(crate) fn coded_dimensions(input: FrameFormat) -> Result<(usize, usize), ApiError> {
     let width = usize::try_from(input.width).map_err(|_| dimension_error(input))?;
     let height = usize::try_from(input.height).map_err(|_| dimension_error(input))?;
 
@@ -628,10 +631,10 @@ fn coded_dimensions(input: FrameFormat) -> Result<(usize, usize), ApiError> {
 
 /// I420 planes with tightly packed rows.
 #[derive(Debug)]
-struct I420Frame {
-    data: Vec<u8>,
-    width: usize,
-    height: usize,
+pub(crate) struct I420Frame {
+    pub(crate) data: Vec<u8>,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
 }
 
 impl I420Frame {
@@ -672,11 +675,13 @@ impl I420Frame {
     }
 }
 
-/// Convert one captured payload to I420 for OpenH264.
+/// Convert one captured payload to tightly packed I420.
 ///
-/// Kept private so the public contract stays the [`ozma_media::Encoder`] trait;
-/// unit tests exercise the individual layouts directly.
-fn convert_to_i420(format: FrameFormat, data: &[u8]) -> Result<I420Frame, String> {
+/// Kept crate-private so the public contract stays the
+/// [`ozma_media::Encoder`] trait, and shared with the VAAPI backend so both
+/// backends accept exactly the same capture layouts. Unit tests exercise the
+/// individual layouts directly.
+pub(crate) fn convert_to_i420(format: FrameFormat, data: &[u8]) -> Result<I420Frame, String> {
     let width = usize::try_from(format.width).map_err(|_| "width is too large".to_owned())?;
     let height = usize::try_from(format.height).map_err(|_| "height is too large".to_owned())?;
     let matrix = ColorMatrix::for_frame(width, height);

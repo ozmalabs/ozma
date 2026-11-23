@@ -15,6 +15,7 @@ use ozma_protocol::{codes, ApiError, Codec, EncodeCapability, EncoderBackend, Me
 
 use crate::probe::{EncoderProbe, ProbeResult};
 use crate::software::H264SoftwareEncoder;
+use crate::vaapi::{unix_now, VaapiH264Encoder, VaapiProbe};
 
 fn probe_key(capability: &EncodeCapability) -> (Codec, EncoderBackend) {
     (capability.codec, capability.backend)
@@ -112,18 +113,43 @@ impl EncoderSelection {
         H264SoftwareEncoder::new(input, self.requested.clone())
     }
 
+    /// Build the concrete VAAPI H.264 encoder this selection refers to.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured [`ApiError`] when the selection is not backed by
+    /// [`EncoderBackend::Vaapi`], or when the render node or `ffmpeg` cannot
+    /// be used.
+    pub fn vaapi_encoder(&self, input: FrameFormat) -> Result<VaapiH264Encoder, ApiError> {
+        if self.capability.backend != EncoderBackend::Vaapi {
+            return Err(ApiError::new(
+                codes::ENCODER_UNAVAILABLE,
+                format!(
+                    "Selection `{}` is backed by {} ({}), not VAAPI.",
+                    self.requested.label(),
+                    self.capability.codec.as_str(),
+                    backend_name(self.capability.backend)
+                ),
+            )
+            .with_details(backend_name(self.capability.backend).to_owned())
+            .with_remediation("Select a VAAPI capability, or use the software encoder."));
+        }
+        VaapiH264Encoder::new(input, self.requested.clone())
+    }
+
     /// Build the encoder for this selection.
     ///
-    /// Software selections produce a real [`H264SoftwareEncoder`]; fake
-    /// selections produce [`FakeEncoder`] for CI. Hardware selections return a
-    /// structured error because this crate does not implement VAAPI, NVENC,
-    /// QSV, or V4L2M2M yet; it never silently substitutes a fake backend for a
-    /// hardware claim.
+    /// Software selections produce a real [`H264SoftwareEncoder`]; VAAPI
+    /// selections produce a real [`VaapiH264Encoder`]; fake selections produce
+    /// [`FakeEncoder`] for CI. NVENC, QSV, and V4L2M2M return a structured error
+    /// because this crate does not implement them; it never silently
+    /// substitutes a fake backend for a hardware claim.
     pub fn build_encoder(&self, input: FrameFormat) -> Result<SelectedEncoder, ApiError> {
         match self.capability.backend {
             EncoderBackend::Software => {
                 Ok(SelectedEncoder::Software(self.software_encoder(input)?))
             }
+            EncoderBackend::Vaapi => Ok(SelectedEncoder::Vaapi(self.vaapi_encoder(input)?)),
             EncoderBackend::Fake => Ok(SelectedEncoder::Fake(self.fake_encoder(input))),
             other => Err(ApiError::new(
                 codes::ENCODER_UNAVAILABLE,
@@ -150,6 +176,8 @@ impl EncoderSelection {
 pub enum SelectedEncoder {
     /// A real OpenH264 software H.264 encoder.
     Software(H264SoftwareEncoder),
+    /// A real VAAPI H.264 encoder.
+    Vaapi(VaapiH264Encoder),
     /// The deterministic CI encoder.
     Fake(FakeEncoder),
 }
@@ -159,6 +187,7 @@ impl Encoder for SelectedEncoder {
     fn id(&self) -> &str {
         match self {
             Self::Software(encoder) => encoder.id(),
+            Self::Vaapi(encoder) => encoder.id(),
             Self::Fake(encoder) => encoder.id(),
         }
     }
@@ -166,6 +195,7 @@ impl Encoder for SelectedEncoder {
     fn input_format(&self) -> FrameFormat {
         match self {
             Self::Software(encoder) => encoder.input_format(),
+            Self::Vaapi(encoder) => encoder.input_format(),
             Self::Fake(encoder) => encoder.input_format(),
         }
     }
@@ -173,6 +203,7 @@ impl Encoder for SelectedEncoder {
     fn output_format(&self) -> MediaFormat {
         match self {
             Self::Software(encoder) => encoder.output_format(),
+            Self::Vaapi(encoder) => encoder.output_format(),
             Self::Fake(encoder) => encoder.output_format(),
         }
     }
@@ -180,6 +211,7 @@ impl Encoder for SelectedEncoder {
     async fn encode(&mut self, frame: Frame) -> Result<EncodedFrame, MediaError> {
         match self {
             Self::Software(encoder) => encoder.encode(frame).await,
+            Self::Vaapi(encoder) => encoder.encode(frame).await,
             Self::Fake(encoder) => encoder.encode(frame).await,
         }
     }
@@ -187,6 +219,7 @@ impl Encoder for SelectedEncoder {
     async fn request_keyframe(&mut self) -> Result<(), MediaError> {
         match self {
             Self::Software(encoder) => encoder.request_keyframe().await,
+            Self::Vaapi(encoder) => encoder.request_keyframe().await,
             Self::Fake(encoder) => encoder.request_keyframe().await,
         }
     }
@@ -194,6 +227,7 @@ impl Encoder for SelectedEncoder {
     async fn flush(&mut self) -> Result<Vec<EncodedFrame>, MediaError> {
         match self {
             Self::Software(encoder) => encoder.flush().await,
+            Self::Vaapi(encoder) => encoder.flush().await,
             Self::Fake(encoder) => encoder.flush().await,
         }
     }
@@ -257,6 +291,41 @@ impl EncoderRegistry {
     /// [`EncoderSelection::build_encoder`] is a working OpenH264 encoder.
     pub fn with_software_h264() -> Self {
         Self::from_capabilities([H264SoftwareEncoder::capability()])
+    }
+
+    /// A registry with the software fallback plus VAAPI H.264 only when a real
+    /// VAAPI probe succeeds.
+    ///
+    /// This is the production default for the M1 media path. On a host without
+    /// a render node, without `ffmpeg`, or without a libva encoder entrypoint
+    /// it returns exactly [`EncoderRegistry::with_software_h264`] and records
+    /// the failed VAAPI probe for diagnostics; it never advertises a hardware
+    /// backend that was not proven by encoding a frame. Selection therefore
+    /// prefers VAAPI when it is proven and otherwise selects
+    /// [`H264SoftwareEncoder`].
+    pub async fn with_detected_encoders() -> Self {
+        let mut registry = Self::with_software_h264();
+        registry.detect_vaapi().await;
+        registry
+    }
+
+    /// Probe VAAPI and advertise it only if the probe passed.
+    ///
+    /// Returns the probe result for logging or diagnostics. A failed probe is
+    /// recorded but does not register the capability, so it cannot be
+    /// selected.
+    pub async fn detect_vaapi(&mut self) -> ProbeResult {
+        let capability = VaapiH264Encoder::capability();
+        let result = VaapiProbe::new()
+            .with_checked_at(unix_now())
+            .probe(&capability)
+            .await;
+        let ok = result.is_ok();
+        self.register_probe(result.clone());
+        if ok {
+            self.register(capability);
+        }
+        result
     }
 
     /// Build a registry from advertised capabilities.
@@ -625,6 +694,47 @@ mod tests {
             .await;
         let error = registry
             .select_with(&h264_request(), SelectionPolicy::new().hardware_only())
+            .unwrap_err();
+        assert_eq!(error.code, codes::ENCODER_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn detected_registry_only_advertises_proven_vaapi() {
+        let registry = EncoderRegistry::with_detected_encoders().await;
+        let advertised = registry
+            .capabilities()
+            .iter()
+            .any(|capability| capability.backend == EncoderBackend::Vaapi);
+        let probe = registry.probe_result(Codec::H264, EncoderBackend::Vaapi);
+        assert_eq!(
+            advertised,
+            probe.map(ProbeResult::is_ok).unwrap_or(false),
+            "VAAPI advertisement and probe evidence must agree"
+        );
+        assert!(
+            registry
+                .capabilities()
+                .iter()
+                .any(|capability| capability.backend == EncoderBackend::Software),
+            "the software fallback must always be advertised"
+        );
+
+        let selection = registry.select(&h264_request()).unwrap();
+        if advertised {
+            assert_eq!(selection.backend(), EncoderBackend::Vaapi);
+            assert!(selection.is_hardware());
+        } else {
+            assert_eq!(selection.backend(), EncoderBackend::Software);
+            assert!(!selection.is_hardware());
+        }
+    }
+
+    #[test]
+    fn vaapi_encoder_builder_rejects_software_selection() {
+        let registry = EncoderRegistry::from_capabilities([h264_software()]);
+        let selection = registry.select(&h264_request()).unwrap();
+        let error = selection
+            .vaapi_encoder(FrameFormat::rgb24(320, 240))
             .unwrap_err();
         assert_eq!(error.code, codes::ENCODER_UNAVAILABLE);
     }

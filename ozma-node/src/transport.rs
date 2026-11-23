@@ -15,10 +15,10 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use ozma_encode::{H264SoftwareEncoder, SelectedEncoder};
+use ozma_encode::SelectedEncoder;
 use ozma_media::{
-    CaptureSource, Codec, FakeCapture, FakeEncoder, Frame, FrameFormat, MediaError, MediaFormat,
-    Pipeline, PipelineConfig, RunningPipeline,
+    CaptureSource, FakeCapture, FakeEncoder, Frame, FrameFormat, MediaError, Pipeline,
+    PipelineConfig, RunningPipeline,
 };
 use ozma_protocol::scene::{DisplayCapabilities, DisplayProfile};
 use ozma_protocol::{
@@ -290,20 +290,17 @@ async fn start_media(
         }
     };
     let input = source.format();
-    let request = MediaFormat::new(
-        Codec::H264,
-        input.width.max(2),
-        input.height.max(2),
-        30,
-        2_000,
-    );
-    let encoder = match H264SoftwareEncoder::new(input, request) {
+    let encoder = match backend.build_encoder(input) {
         Ok(encoder) => {
-            tracing::info!(input = %input, "Using software H.264 encoder");
-            SelectedEncoder::Software(encoder.with_keyframe_interval(60))
+            tracing::info!(
+                input = %input,
+                encoder = ozma_media::Encoder::id(&encoder),
+                "Using selected H.264 encoder"
+            );
+            encoder
         }
         Err(error) => {
-            tracing::warn!(error = %error, "Software H.264 encoder unavailable; using fake encoder");
+            tracing::warn!(error = %error, "No real H.264 encoder available; using fake encoder");
             SelectedEncoder::Fake(FakeEncoder::h264(input, 2_000))
         }
     };

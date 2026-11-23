@@ -7,7 +7,7 @@
 use jpeg_encoder::{ColorType, Encoder as JpegEncoder};
 use ozma_encode::{
     annex_b_is_keyframe, annex_b_nal_types, EncoderProbe, EncoderRegistry, H264SoftwareEncoder,
-    SoftwareProbe, ENCODE_FAILED,
+    SelectedEncoder, SoftwareProbe, ENCODE_FAILED,
 };
 use ozma_media::{
     Encoder, FakeCapture, Frame, FrameFormat, MediaError, Pipeline, PipelineConfig, PixelFormat,
@@ -443,7 +443,7 @@ async fn software_probe_reports_that_it_cannot_validate_hardware() {
 }
 
 #[tokio::test]
-async fn hardware_selection_does_not_build_a_fake_encoder() {
+async fn hardware_selection_never_builds_a_fake_or_software_encoder() {
     let capability = EncodeCapability {
         codec: Codec::H264,
         backend: EncoderBackend::Vaapi,
@@ -456,10 +456,19 @@ async fn hardware_selection_does_not_build_a_fake_encoder() {
     };
     let registry = EncoderRegistry::from_capabilities([capability]);
     let selection = registry.select(&request(64, 64)).unwrap();
-    let error = selection
-        .build_encoder(FrameFormat::rgb24(64, 64))
-        .err()
-        .expect("hardware backend must not silently fall back");
-    assert_eq!(error.code, codes::ENCODER_UNAVAILABLE);
-    assert!(error.remediation.is_some());
+    assert_eq!(selection.backend(), EncoderBackend::Vaapi);
+    match selection.build_encoder(FrameFormat::rgb24(64, 64)) {
+        Ok(SelectedEncoder::Vaapi(encoder)) => {
+            // A real VAAPI encoder was built; it must identify itself as such
+            // and never as the fake or software backend.
+            assert_eq!(encoder.id(), "vaapi-h264");
+        }
+        Ok(other) => panic!("hardware selection built {other:?}, not a VAAPI encoder"),
+        Err(error) => {
+            // Hosts without a render node or ffmpeg must fail loudly with a
+            // remediation instead of silently substituting software.
+            assert_eq!(error.code, codes::ENCODER_UNAVAILABLE);
+            assert!(error.remediation.is_some());
+        }
+    }
 }

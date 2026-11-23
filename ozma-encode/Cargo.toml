@@ -2,7 +2,7 @@
 name = "ozma-encode"
 version = "0.1.0"
 edition = "2021"
-description = "Encoder selection, probing, and a real software H.264 backend for Ozma."
+description = "Encoder selection, probing, and real software and VAAPI H.264 backends for Ozma."
 license = "AGPL-3.0-only"
 
 [dependencies]
@@ -12,7 +12,7 @@ async-trait = "0.1"
 bytes = "1"
 jpeg-decoder = "0.3"
 openh264 = "0.9"
-tokio = { version = "1", features = ["sync", "time", "rt"] }
+tokio = { version = "1", features = ["sync", "time", "rt", "process", "io-util"] }
 tracing = "0.1"
 
 [dev-dependencies]

@@ -8,14 +8,15 @@ use ozma_api::NodeBackend;
 use ozma_auth::{ConsentPolicy, TokenClaims, TokenIssuer, TokenVerifier};
 use ozma_capture::CaptureRegistry;
 use ozma_display::{FakeVirtualDisplayProvider, VirtualDisplayProvider};
+use ozma_encode::{EncoderRegistry, SelectedEncoder};
 use ozma_input::{FakeInputSink, InputSink, SharedSink};
+use ozma_protocol::scene::SceneCommit;
 use ozma_protocol::{
     transport::TransportInfo, ApiError, CheckStatus, DiagnosticCheck, DiagnosticReport, DisplayId,
     DisplayMode, DisplayTopology, DpmsState, EndReason, NodeCapabilities, PermissionSet,
     RuntimeMetrics, Session, SessionEvent, SessionId, SessionOffer, SessionSpec, SessionState,
     TransportMode, VirtualDisplaySpec,
 };
-use ozma_protocol::scene::SceneCommit;
 use ozma_session::SessionManager;
 use ozma_transport::offer::{SessionOfferBuilder, TransportDescriptorBuilder};
 use rand::RngCore;
@@ -45,6 +46,16 @@ pub struct SceneUpdate {
 
 pub trait SceneProducer: Send + Sync {
     fn updates(&self, session: &Session) -> Vec<SceneUpdate>;
+
+    /// Return updates newer than the last revision sent on a connection.
+    /// Producers that have a live queue can override this without rebuilding
+    /// the complete snapshot on every poll.
+    fn updates_since(&self, session: &Session, revision: u64) -> Vec<SceneUpdate> {
+        self.updates(session)
+            .into_iter()
+            .filter(|update| update.commit.revision > revision)
+            .collect()
+    }
 }
 
 /// The node's production backend: the session manager plus display state and
@@ -54,6 +65,7 @@ pub struct SessionBackend {
     capabilities: NodeCapabilities,
     displays: FakeVirtualDisplayProvider,
     captures: CaptureRegistry,
+    encoders: EncoderRegistry,
     token_issuer: TokenIssuer,
     token_verifier: TokenVerifier,
     transport: Mutex<Option<TransportOffer>>,
@@ -71,6 +83,7 @@ impl SessionBackend {
             capabilities,
             displays,
             captures: CaptureRegistry::system(),
+            encoders: EncoderRegistry::with_software_h264(),
             token_issuer: TokenIssuer::new(secret),
             token_verifier: TokenVerifier::new(secret),
             transport: Mutex::new(None),
@@ -100,8 +113,39 @@ impl SessionBackend {
             .unwrap_or_default()
     }
 
+    pub fn scene_updates_since(&self, session: &Session, revision: u64) -> Vec<SceneUpdate> {
+        self.scene_producer
+            .as_ref()
+            .map(|producer| producer.updates_since(session, revision))
+            .unwrap_or_default()
+    }
+
     pub fn input_sink(&self) -> &dyn InputSink {
         self.input.as_ref()
+    }
+
+    /// Replace the encoder registry with one that has been probed against the
+    /// host. The advertised capabilities are updated to match.
+    pub fn with_encoder_registry(mut self, encoders: EncoderRegistry) -> Self {
+        self.capabilities.encode = encoders.capabilities().to_vec();
+        self.encoders = encoders;
+        self
+    }
+
+    /// Select and construct an encoder for a raw capture format.
+    pub fn build_encoder(
+        &self,
+        input: ozma_media::FrameFormat,
+    ) -> Result<SelectedEncoder, ApiError> {
+        let request = ozma_protocol::MediaFormat::new(
+            ozma_protocol::Codec::H264,
+            input.width.max(2),
+            input.height.max(2),
+            30,
+            2_000,
+        );
+        let selection = self.encoders.select(&request)?;
+        selection.build_encoder(input)
     }
 
     pub fn manager(&self) -> &SessionManager {
@@ -122,12 +166,17 @@ impl SessionBackend {
         match id {
             Some(id) => self.captures.open_id(id),
             None => {
-                let first = self.captures.enumerate()?.into_iter().next().ok_or_else(|| {
-                    ApiError::new(
-                        ozma_protocol::error::codes::CAPTURE_UNAVAILABLE,
-                        "No capture source is available",
-                    )
-                })?;
+                let first = self
+                    .captures
+                    .enumerate()?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        ApiError::new(
+                            ozma_protocol::error::codes::CAPTURE_UNAVAILABLE,
+                            "No capture source is available",
+                        )
+                    })?;
                 self.captures.open(&first)
             }
         }
@@ -153,7 +202,8 @@ impl SessionBackend {
         *self.transport.lock().expect("transport lock") = Some(TransportOffer {
             endpoint: endpoint.into(),
             certificate_fingerprint: certificate_fingerprint.into(),
-            certificate_der_base64: base64::engine::general_purpose::STANDARD.encode(certificate_der),
+            certificate_der_base64: base64::engine::general_purpose::STANDARD
+                .encode(certificate_der),
         });
     }
 
@@ -184,7 +234,9 @@ impl NodeBackend for SessionBackend {
         if self.capabilities.capture.is_empty() {
             checks.push(
                 DiagnosticCheck::warn("capture", "No capture source is available")
-                    .with_remediation("Attach an HDMI capture device or enable the video capability."),
+                    .with_remediation(
+                        "Attach an HDMI capture device or enable the video capability.",
+                    ),
             );
         } else {
             checks.push(DiagnosticCheck::ok(
@@ -194,8 +246,9 @@ impl NodeBackend for SessionBackend {
         }
         if self.capabilities.encode.is_empty() {
             checks.push(
-                DiagnosticCheck::fail("encoder", "No encoder is available")
-                    .with_remediation("Install a hardware encoder or enable the software fallback."),
+                DiagnosticCheck::fail("encoder", "No encoder is available").with_remediation(
+                    "Install a hardware encoder or enable the software fallback.",
+                ),
             );
         } else {
             checks.push(DiagnosticCheck::ok(
@@ -235,7 +288,10 @@ impl NodeBackend for SessionBackend {
             active_streams: sessions
                 .iter()
                 .filter(|session| {
-                    matches!(session.state, SessionState::Streaming | SessionState::Degraded)
+                    matches!(
+                        session.state,
+                        SessionState::Streaming | SessionState::Degraded
+                    )
                 })
                 .count() as u32,
             ..RuntimeMetrics::default()
