@@ -121,6 +121,7 @@ mod tests {
             role: "compute".into(),
             machine_class: ozma_auth::MachineClass::Server,
             workstation_consent: false,
+            api_token: None,
         }
     }
 

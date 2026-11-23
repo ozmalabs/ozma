@@ -21,11 +21,14 @@ pub struct NodeConfig {
     pub role: String,
     pub machine_class: MachineClass,
     pub workstation_consent: bool,
+    pub api_token: Option<String>,
 }
 
 impl NodeConfig {
     pub fn has_capability(&self, capability: &str) -> bool {
-        self.capabilities.iter().any(|value| value.trim() == capability)
+        self.capabilities
+            .iter()
+            .any(|value| value.trim() == capability)
     }
 
     pub fn node_id_from_name(name: &str) -> NodeId {

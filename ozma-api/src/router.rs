@@ -5,9 +5,10 @@
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path as AxumPath, State};
-use axum::http::header;
-use axum::response::IntoResponse;
+use axum::extract::{Path as AxumPath, Request, State};
+use axum::http::{header, HeaderMap};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use ozma_protocol::{
@@ -24,6 +25,65 @@ type Backend = Arc<dyn NodeBackend>;
 type ApiResult<T> = Result<Json<T>, ApiFailure>;
 
 /// Build the native API router.
+/// Build the native API router with an optional static bearer token.
+///
+/// Health, capabilities, and Hestia capability discovery stay readable so a
+/// controller or client can identify the node before it has credentials.
+pub fn router_with_token(backend: Backend, token: Option<String>) -> Router {
+    let router = router(backend);
+    match token {
+        Some(token) if !token.is_empty() => router.layer(middleware::from_fn_with_state(
+            std::sync::Arc::new(token),
+            require_bearer,
+        )),
+        _ => router,
+    }
+}
+
+async fn require_bearer(
+    State(token): State<std::sync::Arc<String>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiFailure> {
+    let path = request.uri().path();
+    if path == "/health"
+        || path == "/api/v1/health"
+        || path == "/api/v1/capabilities"
+        || path == "/api/hestia/v1"
+        || path == "/api/hestia/v1/capabilities"
+    {
+        return Ok(next.run(request).await);
+    }
+    if bearer_matches(request.headers(), &token) {
+        return Ok(next.run(request).await);
+    }
+    Err(ApiFailure(ApiError::new(
+        ozma_protocol::error::codes::UNAUTHORIZED,
+        "A bearer token is required",
+    )
+    .with_remediation("Pass Authorization: Bearer <token> from the controller or local configuration.")))
+}
+
+fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()))
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (a, b) in left.iter().zip(right) {
+        difference |= a ^ b;
+    }
+    difference == 0
+}
+
+/// Build the native API router.
 pub fn router(backend: Backend) -> Router {
     Router::new()
         .route("/api/v1/health", get(health))
@@ -38,7 +98,10 @@ pub fn router(backend: Backend) -> Router {
         .route("/api/v1/transport", get(transport_info))
         .route("/metrics", get(metrics_text))
         .route("/api/v1/sessions", get(list_sessions).post(create_session))
-        .route("/api/v1/sessions/:id", get(get_session).delete(delete_session))
+        .route(
+            "/api/v1/sessions/:id",
+            get(get_session).delete(delete_session),
+        )
         .route("/api/v1/sessions/:id/start", post(start_session))
         .route("/api/v1/sessions/:id/stop", post(stop_session))
         .route("/api/v1/sessions/:id/approve", post(approve_session))
@@ -213,10 +276,7 @@ async fn metrics_text(State(backend): State<Backend>) -> impl IntoResponse {
         metrics.jitter_ms,
         metrics.loss_percent
     );
-    (
-        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-        body,
-    )
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }
 
 #[derive(Serialize)]
@@ -259,9 +319,9 @@ async fn get_session(
     State(backend): State<Backend>,
     AxumPath(id): AxumPath<String>,
 ) -> ApiResult<SessionResponse> {
-    let session = backend
-        .get_session(&session_id(id))
-        .ok_or_else(|| ApiError::new(ozma_protocol::error::codes::NOT_FOUND, "Session not found"))?;
+    let session = backend.get_session(&session_id(id)).ok_or_else(|| {
+        ApiError::new(ozma_protocol::error::codes::NOT_FOUND, "Session not found")
+    })?;
     Ok(Json(session_response(&backend, session)))
 }
 
@@ -472,7 +532,12 @@ mod tests {
         let app = router(backend());
         let response = app
             .clone()
-            .oneshot(Request::builder().uri("/api/v1/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -549,6 +614,44 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_json(response).await;
         assert_eq!(json["session"]["state"], "streaming");
+    }
+
+    #[tokio::test]
+    async fn token_guard_requires_bearer_for_sessions() {
+        let app = router_with_token(backend(), Some("secret-token".to_owned()));
+        let health = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/v1/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let allowed = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/sessions")
+                    .header("authorization", "Bearer secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
     }
 
     #[tokio::test]

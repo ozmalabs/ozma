@@ -49,7 +49,7 @@ rand = "0.8"
 sha2 = "0.10"
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # HTTP client (registration + heartbeat). rustls keeps the node portable and
 # avoids a system OpenSSL/native-tls dependency.

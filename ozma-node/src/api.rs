@@ -21,8 +21,17 @@ pub async fn serve(
     quic_port: u16,
     capabilities: NodeCapabilities,
     consent_policy: ConsentPolicy,
+    api_token: Option<String>,
 ) -> Result<()> {
-    serve_with_scene_replay(port, quic_port, capabilities, consent_policy, None).await
+    serve_with_scene_replay(
+        port,
+        quic_port,
+        capabilities,
+        consent_policy,
+        None,
+        api_token,
+    )
+    .await
 }
 
 pub async fn serve_with_scene_replay(
@@ -31,6 +40,7 @@ pub async fn serve_with_scene_replay(
     capabilities: NodeCapabilities,
     consent_policy: ConsentPolicy,
     scene_replay: Option<crate::scene_replay::JsonlSceneProducer>,
+    api_token: Option<String>,
 ) -> Result<()> {
     let encoders = EncoderRegistry::with_detected_encoders().await;
     let backend = SessionBackend::new(capabilities, consent_policy).with_encoder_registry(encoders);
@@ -78,7 +88,7 @@ pub async fn serve_with_scene_replay(
     });
 
     let dynamic: Arc<dyn NodeBackend> = backend;
-    let app = ozma_api::router(dynamic);
+    let app = ozma_api::router_with_token(dynamic, api_token);
     info!(port, "Node API listening");
     axum::serve(listener, app)
         .await

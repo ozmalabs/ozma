@@ -71,8 +71,9 @@ OZMA_CAPTURE_TEST_DEVICE=/dev/video2 \
   no browser WebTransport gateway yet.
 - The virtual-display API is exercised through the fake provider. The EVDI
   provider has not been validated on a real Xorg/modesetting session.
-- The HTTP API is a local/trusted surface; the QUIC session path is the first
-  one to enforce controller-issued tokens and consent. HTTP bearer auth is next.
+- The HTTP API supports an optional static bearer token (`--api-token` /
+  `OZMA_API_TOKEN`). Controller-issued short-lived HTTP credentials and
+  passkey pairing are still future work.
 - The native client library and headless probe are done; the full desktop
   renderer is still an external client concern.
 - Video fragments are reassembled by `ozma_client::VideoAssembler`; the CLI

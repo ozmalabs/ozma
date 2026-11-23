@@ -73,6 +73,14 @@ pub struct Args {
     #[arg(long, default_value_t = 30)]
     pub heartbeat_interval: u64,
 
+    /// Replay a trusted local browser scene fixture in scene-capable sessions.
+    #[arg(long)]
+    pub scene_replay: Option<std::path::PathBuf>,
+
+    /// Require this bearer token for the node's HTTP API.
+    #[arg(long, env = "OZMA_API_TOKEN")]
+    pub api_token: Option<String>,
+
     /// Enable verbose debug logging.
     #[arg(long)]
     pub debug: bool,
@@ -134,6 +142,7 @@ async fn main() {
         machine_class: ozma_auth::MachineClass::parse(&args.machine_class)
             .unwrap_or(ozma_auth::MachineClass::Workstation),
         workstation_consent: args.workstation_consent,
+        api_token: args.api_token.clone(),
     };
 
     let capabilities = platform::detect(&config);
@@ -166,14 +175,8 @@ async fn main() {
     };
 
     if let Some(ref url) = config.register_url {
-        match registration::register(
-            url,
-            node_id.as_str(),
-            &local_ip,
-            config.hid_udp_port,
-            &txt,
-        )
-        .await
+        match registration::register(url, node_id.as_str(), &local_ip, config.hid_udp_port, &txt)
+            .await
         {
             Ok(()) => info!("Direct registration succeeded → {url}"),
             Err(error) => error!("Direct registration failed: {error}"),
@@ -202,10 +205,32 @@ async fn main() {
 
     let http_port = config.http_port;
     let quic_port = http_port.saturating_add(2);
+    let scene_replay = match args
+        .scene_replay
+        .as_ref()
+        .map(|path| ozma_node::scene_replay::JsonlSceneProducer::from_path(path, 4 * 1024 * 1024))
+        .transpose()
+    {
+        Ok(replay) => replay,
+        Err(error) => {
+            error!("Scene replay could not be loaded: {error}");
+            std::process::exit(1);
+        }
+    };
     let api_capabilities = capabilities.clone();
     let consent_policy = config.consent_policy();
+    let api_token = config.api_token.clone();
     tokio::spawn(async move {
-        if let Err(error) = api::serve(http_port, quic_port, api_capabilities, consent_policy).await {
+        if let Err(error) = api::serve_with_scene_replay(
+            http_port,
+            quic_port,
+            api_capabilities,
+            consent_policy,
+            scene_replay,
+            api_token,
+        )
+        .await
+        {
             error!("Node API exited: {error:#}");
         }
     });

@@ -9,9 +9,9 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
-pub mod state;
 pub mod router;
+pub mod state;
 
 pub use error::ApiFailure;
-pub use router::router;
+pub use router::{router, router_with_token};
 pub use state::{MemoryBackend, NodeBackend};
