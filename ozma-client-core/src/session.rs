@@ -246,6 +246,26 @@ impl<T: ChannelTransport> ClientDriver<T> {
         &self.channels
     }
 
+    /// Resolve the first channel of `kind` from the negotiated map.
+    ///
+    /// Returns `None` when the offer did not negotiate that kind. This is the
+    /// driver-owned counterpart of [`channel_for_kind`], for callers that want
+    /// to send on an adapter handle without borrowing the whole driver.
+    pub fn channel_for(&self, kind: ChannelKind) -> Option<ChannelId> {
+        self.channels
+            .iter()
+            .find(|descriptor| descriptor.kind == kind)
+            .map(|descriptor| ChannelId::new(descriptor.id))
+    }
+
+    /// The reliable control channel selected during the handshake.
+    ///
+    /// Connecting requires a control channel, so this is always `Some` for a
+    /// constructed driver; the `Option` shape matches [`ClientDriver::channel_for`].
+    pub fn control_channel(&self) -> Option<ChannelId> {
+        Some(self.control)
+    }
+
     /// Borrow the underlying adapter.
     ///
     /// This lets a platform crate reach adapter-only features (for example the
@@ -368,9 +388,7 @@ impl<T: ChannelTransport> ClientDriver<T> {
 
     /// Send any control message on the reliable control channel.
     pub async fn send_control(&self, message: ControlMessage) -> Result<(), ApiError> {
-        let payload = serde_json::to_vec(&message).map_err(|error| {
-            protocol_error(format!("Could not encode a control message: {error}"))
-        })?;
+        let payload = encode_control(&message)?;
         self.transport
             .send(self.control, Bytes::from(payload))
             .await
@@ -608,6 +626,16 @@ impl<T: ChannelTransport> ClientDriver<T> {
     }
 }
 
+/// Serialize a control message for the reliable control channel.
+///
+/// Exposed so a platform facade can send a control frame through a cloned
+/// transport handle without borrowing the driver. [`ClientDriver::send_control`]
+/// uses the same encoding.
+pub fn encode_control(message: &ControlMessage) -> Result<Vec<u8>, ApiError> {
+    serde_json::to_vec(message)
+        .map_err(|error| protocol_error(format!("Could not encode a control message: {error}")))
+}
+
 /// Find the first channel of `kind` in a negotiated map.
 pub fn channel_for_kind(map: &ChannelMap, kind: ChannelKind) -> Result<ChannelId, ApiError> {
     map.iter()
@@ -710,9 +738,12 @@ mod tests {
     }
 
     fn pair() -> (MemoryTransport, MemoryTransport) {
+        pair_with_map(ChannelMap::default_session())
+    }
+
+    fn pair_with_map(map: ChannelMap) -> (MemoryTransport, MemoryTransport) {
         let (a_tx, b_rx) = tokio::sync::mpsc::unbounded_channel();
         let (b_tx, a_rx) = tokio::sync::mpsc::unbounded_channel();
-        let map = ChannelMap::default_session();
         (
             MemoryTransport {
                 map: map.clone(),
@@ -1253,7 +1284,58 @@ mod tests {
         );
 
         let descriptor = TransportDescriptorBuilder::quic("127.0.0.1:1").build();
-        assert_eq!(channel_map_for(&descriptor).unwrap().len(), 7);
+        assert_eq!(
+            channel_map_for(&descriptor).unwrap(),
+            ChannelMap::default_session()
+        );
+    }
+
+    #[tokio::test]
+    async fn driver_channel_lookups_use_the_negotiated_map() {
+        let (driver, _server) = connected().await;
+        assert_eq!(
+            driver.channel_for(ChannelKind::Control),
+            Some(ChannelId::CONTROL)
+        );
+        assert_eq!(
+            driver.channel_for(ChannelKind::Input),
+            Some(ChannelId::INPUT)
+        );
+        assert_eq!(
+            driver.channel_for(ChannelKind::Video),
+            Some(ChannelId::VIDEO)
+        );
+        assert_eq!(driver.channel_for(ChannelKind::Mic), Some(ChannelId::MIC));
+        assert!(driver.channel_for(ChannelKind::Camera).is_some());
+        assert_eq!(driver.control_channel(), Some(ChannelId::CONTROL));
+    }
+
+    #[tokio::test]
+    async fn driver_channel_lookup_returns_none_for_unnegotiated_kinds() {
+        let map = ChannelMap::for_tracks(&[TrackId::new("video0")], false, false).unwrap();
+        let (client, mut server) = pair_with_map(map);
+        let offer = offer();
+        let (driver, ()) = tokio::join!(ClientDriver::connect(client, &offer), async {
+            let _ = server.recv_control().await;
+            server
+                .send_control(ControlMessage::HelloAck {
+                    session: session(),
+                    display: None,
+                })
+                .await;
+        });
+        let driver = driver.unwrap();
+        assert_eq!(driver.channel_for(ChannelKind::Audio), None);
+        assert_eq!(driver.channel_for(ChannelKind::Mic), None);
+        assert!(driver.channel_for(ChannelKind::Telemetry).is_some());
+    }
+
+    #[test]
+    fn encode_control_matches_send_control_wire_format() {
+        let message = ControlMessage::Ping { nonce: 7 };
+        let encoded = encode_control(&message).unwrap();
+        let decoded: ControlMessage = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, message);
     }
 
     #[test]

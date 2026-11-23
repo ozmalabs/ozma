@@ -3209,6 +3209,7 @@ dependencies = [
  "ozma-auth",
  "ozma-capture",
  "ozma-client-core",
+ "ozma-decode",
  "ozma-display",
  "ozma-encode",
  "ozma-input",

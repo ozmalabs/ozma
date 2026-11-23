@@ -22,8 +22,8 @@ pub mod video;
 
 pub use framing::{encode_datagram, encode_reliable, FrameDecoder, FRAME_HEADER_LEN};
 pub use session::{
-    channel_for_kind, channel_map_for, channels_for_kind, webtransport_descriptor, ClientDriver,
-    ClientEvent, InputLatencySample, MediaPacket,
+    channel_for_kind, channel_map_for, channels_for_kind, encode_control, webtransport_descriptor,
+    ClientDriver, ClientEvent, InputLatencySample, MediaPacket,
 };
 pub use transport::{ChannelTransport, TransportError};
 pub use video::{VideoAssembler, VideoAssemblyError, VideoFrame};
