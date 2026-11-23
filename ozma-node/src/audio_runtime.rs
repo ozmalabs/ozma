@@ -28,7 +28,33 @@ pub struct AudioRuntime {
 impl AudioRuntime {
     /// Start the best native audio source: PipeWire first, then ALSA, then the
     /// deterministic fake source.
+    ///
+    /// `OZMA_AUDIO_SOURCE` overrides the choice for diagnostics and browser
+    /// tests: `fake` emits a deterministic tone, `pipewire`/`alsa` disable the
+    /// fallback chain. Any other value means `auto`.
     pub async fn start() -> Self {
+        match std::env::var("OZMA_AUDIO_SOURCE")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "fake" => {
+                tracing::info!("Using paced deterministic fake audio source (OZMA_AUDIO_SOURCE=fake)");
+                return Self::spawn(
+                    Box::new(PacedFakeAudioSource::new(FakeAudioSource::new().unlimited())),
+                    None,
+                );
+            }
+            "alsa" => {
+                tracing::info!("Using ALSA audio source only (OZMA_AUDIO_SOURCE=alsa)");
+                return Self::start_alsa();
+            }
+            "pipewire" => {
+                tracing::info!("Using PipeWire audio source only (OZMA_AUDIO_SOURCE=pipewire)");
+                return Self::start_pipewire().await;
+            }
+            _ => {}
+        }
         #[cfg(target_os = "linux")]
         {
             match PipeWireCapture::default_source().await {
@@ -81,7 +107,31 @@ impl AudioRuntime {
         Self::spawn(Box::new(FakeAudioSource::new().unlimited()), None)
     }
 
+    async fn start_pipewire() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            match PipeWireCapture::default_source().await {
+                Ok(capture) => return Self::spawn(Box::new(capture), None),
+                Err(error) => warn!(error = %error, "PipeWire audio capture unavailable"),
+            }
+        }
+        Self::spawn(Box::new(FakeAudioSource::new().unlimited()), None)
+    }
+
+    fn start_alsa() -> Self {
+        match AlsaCapture::open(AlsaCaptureConfig::default()) {
+            Ok(capture) => Self::spawn(Box::new(capture), None),
+            Err(error) => {
+                warn!(error = %error, "ALSA capture unavailable; using fake audio source");
+                Self::spawn(Box::new(FakeAudioSource::new().unlimited()), None)
+            }
+        }
+    }
+
     /// Start with the deterministic fake source, for tests and local harnesses.
+    ///
+    /// This source emits frames as fast as the consumer polls. Use
+    /// `OZMA_AUDIO_SOURCE=fake` for a real-time-paced tone.
     pub fn fake() -> Self {
         Self::spawn(Box::new(FakeAudioSource::new().unlimited()), None)
     }
@@ -186,5 +236,47 @@ mod tests {
         assert!(packet.is_independent());
         assert_eq!(packet.sample_rate, 48_000);
         assert_eq!(packet.channels, 2);
+    }
+}
+
+/// A deterministic tone paced at the Opus 20 ms frame interval.
+///
+/// `FakeAudioSource` is intentionally unpaced so unit tests run instantly. A
+/// real session must not receive thousands of fake packets per second, so this
+/// wrapper sleeps between frames. Used by `OZMA_AUDIO_SOURCE=fake`.
+struct PacedFakeAudioSource {
+    inner: FakeAudioSource,
+    interval: Duration,
+}
+
+impl PacedFakeAudioSource {
+    fn new(inner: FakeAudioSource) -> Self {
+        Self {
+            inner,
+            interval: Duration::from_micros(u64::from(
+                EncoderConfig::opus().frame_micros,
+            )),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AudioSource for PacedFakeAudioSource {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+
+    fn format(&self) -> ozma_audio::AudioFormat {
+        self.inner.format()
+    }
+
+    async fn next_frame(&mut self) -> Result<ozma_audio::AudioFrame, ozma_audio::AudioError> {
+        let frame = self.inner.next_frame().await?;
+        tokio::time::sleep(self.interval).await;
+        Ok(frame)
+    }
+
+    async fn stop(&mut self) -> Result<(), ozma_audio::AudioError> {
+        self.inner.stop().await
     }
 }
