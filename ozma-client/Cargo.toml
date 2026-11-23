@@ -1,0 +1,29 @@
+[package]
+name = "ozma-client"
+version = "0.1.0"
+edition = "2021"
+description = "Native Ozma client library and headless session probe."
+license = "AGPL-3.0-only"
+
+[[bin]]
+name = "ozma-client"
+path = "src/main.rs"
+
+[dependencies]
+ozma-protocol = { path = "../ozma-protocol" }
+ozma-transport = { path = "../ozma-transport" }
+anyhow = { workspace = true }
+base64 = "0.22"
+bytes = { workspace = true }
+clap = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = "0.10"
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+urlencoding = "2"
+
+[dev-dependencies]
+tokio = { workspace = true }

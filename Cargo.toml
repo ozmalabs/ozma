@@ -16,6 +16,7 @@ members = [
     "ozma-display",
     "ozma-input",
     "ozma-audio",
+    "ozma-client",
     "ozma-api",
     "ozma-mesh",
     "ozma-crypto",
