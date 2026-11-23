@@ -1,22 +1,19 @@
-//! Ozma Node — mDNS advertisement and controller registration.
+// SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
+//! Ozma Node — discovery, registration, session API, and UAC2 bridge.
 //!
-//! Ports the mDNS + direct-registration logic from `node/node.py` to Rust.
-//!
-//! # What this binary does
-//!
-//! 1. Resolves the local LAN IP (or uses `--register-host` override).
-//! 2. Advertises `<name>._ozma._udp.local.` via mDNS (libmdns).
-//! 3. If `--register-url` is set, POSTs to `<url>/api/v1/nodes/register`
-//!    (SLIRP / QEMU workaround — mDNS multicast can't cross the SLIRP boundary).
-//! 4. Runs a heartbeat loop that POSTs to `<url>/api/v1/nodes/heartbeat`
-//!    every 30 seconds so the controller keeps the node marked online.
-
-mod mdns;
-mod registration;
-mod usb_audio;
+//! The node is a device, not a desktop app:
+//! 1. resolve the local LAN address (or use `--register-host`);
+//! 2. advertise `_ozma._udp.local.` over mDNS;
+//! 3. optionally register directly with a controller (SLIRP/QEMU, or a
+//!    controller that does not browse mDNS);
+//! 4. serve the versioned node API;
+//! 5. run the UAC2 audio bridge when the `audio` capability is present.
 
 use clap::Parser;
+use ozma_protocol::NodeId;
 use tracing::{error, info};
+
+use ozma_node::{api, config::NodeConfig, mdns, platform, registration, usb_audio};
 
 /// Ozma hardware KVM node process.
 #[derive(Parser, Debug)]
@@ -30,25 +27,29 @@ pub struct Args {
     #[arg(long, default_value_t = 7331)]
     pub hid_udp_port: u16,
 
-    /// HTTP port for the node's local API / HLS stream.
+    /// HTTP port for the node API, HLS fallback, and snapshots.
     #[arg(long, default_value_t = 7382)]
     pub http_port: u16,
 
     /// Comma-separated capability list advertised in mDNS TXT and registration.
     /// Example: `hid,video,audio`
-    #[arg(long, default_value = "hid")]
+    #[arg(long, default_value = "hid,video,audio")]
     pub cap: String,
+
+    /// Node role advertised to the controller.
+    #[arg(long, default_value = "compute")]
+    pub role: String,
 
     /// Hardware platform string (e.g. `rpi4`, `x86_64`).
     #[arg(long, default_value_t = default_hw())]
     pub hw: String,
 
     /// Firmware / software version string.
-    #[arg(long, default_value = "1.0.0")]
+    #[arg(long, default_value = "0.1.0")]
     pub fw: String,
 
-    /// POST registration directly to this controller URL instead of relying on
-    /// mDNS multicast.  Required in QEMU/SLIRP environments.
+    /// POST registration directly to this controller URL instead of relying
+    /// on mDNS multicast. Required in QEMU/SLIRP environments.
     /// Example: `http://10.0.2.2:7380`
     #[arg(long)]
     pub register_url: Option<String>,
@@ -96,7 +97,6 @@ fn default_hw() -> String {
 async fn main() {
     let args = Args::parse();
 
-    // Initialise logging.
     let level = if args.debug { "debug" } else { "info" };
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -105,69 +105,98 @@ async fn main() {
         )
         .init();
 
+    let node_id = NodeConfig::node_id_from_name(&args.name);
+    let config = NodeConfig {
+        name: args.name.clone(),
+        node_id: node_id.clone(),
+        hid_udp_port: args.hid_udp_port,
+        http_port: args.http_port,
+        capabilities: args
+            .cap
+            .split(',')
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .collect(),
+        hw: args.hw.clone(),
+        fw: args.fw.clone(),
+        register_url: args.register_url.clone(),
+        register_host: args.register_host.clone(),
+        heartbeat_interval_secs: args.heartbeat_interval,
+        role: args.role.clone(),
+    };
+
+    let capabilities = platform::detect(&config);
+
     info!(
-        name = %args.name,
-        hid_udp_port = args.hid_udp_port,
-        http_port = args.http_port,
+        name = %config.name,
+        node_id = %node_id,
+        hid_udp_port = config.hid_udp_port,
+        http_port = config.http_port,
         cap = %args.cap,
-        hw = %args.hw,
+        hw = %config.hw,
+        platform = %capabilities.platform,
         "Ozma node starting"
     );
 
-    // Resolve local IP (or use override).
     let local_ip = resolve_local_ip(&args);
     info!(ip = %local_ip, "Resolved local IP");
 
-    // Build the TXT record map (mirrors node.py's `txt` dict).
     let txt = build_txt(&args, &local_ip);
 
-    // Start mDNS advertisement.
-    let _mdns_handle = match mdns::advertise(&args.name, args.hid_udp_port, &txt) {
-        Ok(h) => {
-            info!("mDNS advertising {}.{}", args.name, mdns::SERVICE_TYPE);
-            mdns::Handle::Real(h)
+    let _mdns_handle = match mdns::advertise(&config.name, config.hid_udp_port, &txt) {
+        Ok(handle) => {
+            info!("mDNS advertising {}.{}", config.name, mdns::SERVICE_TYPE);
+            mdns::Handle::Real(handle)
         }
-        Err(e) => {
-            error!("mDNS advertisement failed: {e}");
-            // Non-fatal — direct registration may still work.
+        Err(error) => {
+            error!("mDNS advertisement failed: {error}");
             mdns::Handle::Dummy
         }
     };
 
-    // Direct registration (SLIRP / QEMU workaround).
-    if let Some(ref url) = args.register_url {
-        // node_id mirrors the mDNS instance name used by node.py:
-        //   "<name>._ozma._udp.local."
-        let node_id = format!("{}.{}.", args.name, mdns::SERVICE_TYPE.trim_end_matches('.'));
-        match registration::register(url, &node_id, &local_ip, args.hid_udp_port, &txt).await {
+    if let Some(ref url) = config.register_url {
+        match registration::register(
+            url,
+            node_id.as_str(),
+            &local_ip,
+            config.hid_udp_port,
+            &txt,
+        )
+        .await
+        {
             Ok(()) => info!("Direct registration succeeded → {url}"),
-            Err(e) => error!("Direct registration failed: {e}"),
+            Err(error) => error!("Direct registration failed: {error}"),
         }
 
-        // Heartbeat loop — keeps the node marked online in the controller.
-        let url_clone = url.clone();
-        let node_id_clone = node_id.clone();
-        let interval = args.heartbeat_interval;
+        let url = url.clone();
+        let node_id = node_id.clone();
+        let interval = config.heartbeat_interval_secs;
         tokio::spawn(async move {
-            registration::heartbeat_loop(&url_clone, &node_id_clone, interval).await;
+            registration::heartbeat_loop(&url, node_id.as_str(), interval).await;
         });
     }
 
-    // Start UAC2 audio gadget bridge if the "audio" capability is requested.
-    if args.cap.split(',').any(|c| c.trim() == "audio") {
+    if config.has_capability("audio") {
         tokio::spawn(async move {
             match usb_audio::UsbAudioGadget::open(true).await {
                 Ok(gadget) => {
-                    if let Err(e) = gadget.run_bridge().await {
-                        tracing::error!("UAC2 bridge exited with error: {:#}", e);
+                    if let Err(error) = gadget.run_bridge().await {
+                        tracing::error!("UAC2 bridge exited with error: {error:#}");
                     }
                 }
-                Err(e) => tracing::error!("UAC2 gadget init failed: {:#}", e),
+                Err(error) => tracing::error!("UAC2 gadget init failed: {error:#}"),
             }
         });
     }
 
-    // Block until SIGINT / SIGTERM.
+    let http_port = config.http_port;
+    let api_capabilities = capabilities.clone();
+    tokio::spawn(async move {
+        if let Err(error) = api::serve(http_port, api_capabilities).await {
+            error!("Node API exited: {error:#}");
+        }
+    });
+
     wait_for_shutdown().await;
     info!("Ozma node shutting down");
 }
@@ -191,17 +220,17 @@ fn resolve_local_ip(args: &Args) -> String {
 fn build_txt(args: &Args, local_ip: &str) -> std::collections::HashMap<String, String> {
     let mut txt = std::collections::HashMap::new();
     txt.insert("proto".into(), "1".into());
-    txt.insert("role".into(), "compute".into());
+    txt.insert("role".into(), args.role.clone());
     txt.insert("hw".into(), args.hw.clone());
     txt.insert("fw".into(), args.fw.clone());
     txt.insert("cap".into(), args.cap.clone());
     txt.insert("api_port".into(), args.http_port.to_string());
-    // Advertise stream info if video capability is present.
-    if args.cap.split(',').any(|c| c.trim() == "video") {
+    txt.insert("quic_port".into(), (args.http_port + 2).to_string());
+    txt.insert("rtsp_port".into(), "48010".into());
+    if args.cap.split(',').any(|value| value.trim() == "video") {
         txt.insert("stream_port".into(), args.http_port.to_string());
         txt.insert("stream_path".into(), "/stream/stream.m3u8".into());
     }
-    // Include the resolved IP so the controller can use it directly.
     txt.insert("host".into(), local_ip.to_string());
     txt
 }
@@ -221,4 +250,10 @@ async fn wait_for_shutdown() {
     {
         signal::ctrl_c().await.expect("Ctrl-C handler");
     }
+}
+
+/// Keep `NodeId` imported in the binary's public surface for integrations that
+/// build a node id from the same convention.
+pub fn node_id_for(name: &str) -> NodeId {
+    NodeConfig::node_id_from_name(name)
 }

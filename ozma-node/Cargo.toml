@@ -2,7 +2,7 @@
 name        = "ozma-node"
 version     = "0.1.0"
 edition     = "2021"
-description = "Ozma hardware KVM node — mDNS advertisement, controller registration, UAC2 audio bridge"
+description = "Ozma hardware KVM node — mDNS, controller registration, session API, UAC2 bridge"
 
 [[bin]]
 name = "ozma-node"
@@ -25,11 +25,26 @@ thiserror          = { workspace = true }
 usb-gadget         = { workspace = true }
 alsa               = { workspace = true }
 
+# Ozma plan crates
+ozma-protocol = { path = "../ozma-protocol" }
+ozma-api      = { path = "../ozma-api" }
+ozma-media    = { path = "../ozma-media" }
+ozma-capture  = { path = "../ozma-capture" }
+ozma-encode   = { path = "../ozma-encode" }
+ozma-session  = { path = "../ozma-session" }
+ozma-auth     = { path = "../ozma-auth" }
+ozma-transport = { path = "../ozma-transport" }
+ozma-display  = { path = "../ozma-display" }
+
+# HTTP API
+axum = { version = "0.7", features = ["json", "ws"] }
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 
-# HTTP client (registration + heartbeat)
-reqwest = { version = "0.12", features = ["json"] }
+# HTTP client (registration + heartbeat). rustls keeps the node portable and
+# avoids a system OpenSSL/native-tls dependency.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # mDNS advertisement
 libmdns = "0.9"
@@ -44,3 +59,5 @@ path = "src/lib.rs"
 
 [dev-dependencies]
 tokio = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

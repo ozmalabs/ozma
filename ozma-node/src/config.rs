@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
+//! Node configuration derived from the CLI. The node deliberately keeps
+//! configuration small: capability detection and profiles do the rest.
+
+use ozma_protocol::NodeId;
+
+/// Effective node configuration.
+#[derive(Clone, Debug)]
+pub struct NodeConfig {
+    pub name: String,
+    pub node_id: NodeId,
+    pub hid_udp_port: u16,
+    pub http_port: u16,
+    pub capabilities: Vec<String>,
+    pub hw: String,
+    pub fw: String,
+    pub register_url: Option<String>,
+    pub register_host: Option<String>,
+    pub heartbeat_interval_secs: u64,
+    pub role: String,
+}
+
+impl NodeConfig {
+    pub fn has_capability(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|value| value.trim() == capability)
+    }
+
+    pub fn node_id_from_name(name: &str) -> NodeId {
+        NodeId::new(format!("{name}._ozma._udp.local."))
+    }
+}
