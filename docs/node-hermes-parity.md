@@ -96,7 +96,7 @@ rendering, and the config surface. Ozma should not copy those weaknesses.
 | Audio capture/encode/transport | Not implemented (only the gadget bridge) |
 | RTP/RTCP/FEC | Not implemented |
 | RTSP server | Not implemented |
-| QUIC/HTTP3/WebTransport | Not implemented |
+| QUIC/HTTP3/WebTransport | Implemented (native QUIC + WebTransport; Chromium verified) |
 | Session API/state machine | Not implemented |
 | Pairing/auth/permissions | Not implemented |
 | Multi-track video | Not implemented |

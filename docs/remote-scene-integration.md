@@ -140,8 +140,11 @@ each implement their own protocol role.
 - **Browser viewer.** The viewer is the native Ozma client compiled to wasm32
   (`ozma-web`), not a JavaScript reimplementation. It reuses the shared
   `ozma-client-core` channel framing and video reassembler, connects over
-  WebTransport (HTTP/3), decodes H.264/Opus with WebCodecs, presents on a
-  canvas, and plays audio through Web Audio. See `web/README.md`.
+  WebTransport (HTTP/3) with a pinned SHA-256 certificate, decodes H.264 with
+  WebCodecs, presents on a canvas, decodes Opus for Web Audio, and maps DOM
+  input to USB HID usage ids. Headless Chromium connected and rendered live
+  1920x1080 frames; audio output, A/V sync, and non-Chromium engines are not
+  yet verified. See `web/README.md`.
 
 - **Browser scene producer.** Serve `ozma-protocol/examples/browser-scene` on localhost. Start
   the fixture, scroll, then download its JSONL scene replay. Run

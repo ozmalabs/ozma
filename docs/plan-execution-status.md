@@ -50,7 +50,7 @@ This file records what is actually merged and tested, not what is planned.
 | API display create/list/destroy/mode/DPMS/topology | Done | backed by the fake provider; real provider gated |
 | Xorg + modesetting + EVDI + libevdi spike | Documented, not run | `docs/remote-display-evdi-spike.md` |
 | Real EVDI provider | Scaffold only | `EvdiProvider` detects prerequisites and refuses unsupported |
-| Browser WebTransport | Node verified with Chromium; wasm viewer in progress | Node `wtransport` listener with ECDSA/14-day certificate pinning, session offers, and uni-stream resources. A real headless Chromium completed CORS session create/start, hash-pinned WebTransport, Hello/HelloAck, and received a live video datagram; a flipped hash failed the handshake. The wasm viewer (`ozma-web`) is still being completed |
+| Browser WebTransport | Done (Chromium) | Node `wtransport` listener with ECDSA/14-day certificate pinning, session offers, and uni-stream resources. Headless Chromium ran the full path: CORS session create/start, hash-pinned WebTransport, Hello/HelloAck, live video, and the Rust/wasm viewer rendered 1920x1080 frames. A flipped certificate hash failed the handshake. Firefox/Chrome/Safari matrix and audio are not yet exercised |
 | SSH/Unix fallback, passkeys | Not started | — |
 
 ## Remote scene outputs (development, loopback)
@@ -61,7 +61,7 @@ This file records what is actually merged and tested, not what is planned.
 | SPICE | Direct surfaces + auth validated | QXL secondary surfaces for image placements, damage rectangles, TLS-only ticket auth, PCM playback channel. `spicy`/screenshot tests verified movement, removal, damage, auth rejection, and playback channel init. One viewer; no SPICE video codec/A-V sync. |
 | Xpra | Video path validated at wire level | Handshake fields, PNG delivery, draw acknowledgement, placement-only updates, codec negotiation, and encoded H.264/VP8/VP9/JPEG frames. Stock Xpra remains unverified; compressed hello records are not accepted. |
 | Browser scene producer | Live bridge | WebSocket `/api/v1/browser/scene/ws` ingests browser-painted scenes; bounded resource/commit/video hub, `live.mjs` fixture bridge; browser video is metadata-only. This is a producer path, not the viewer. |
-| Web viewer | In progress | Native Ozma client compiled to wasm32 (`ozma-web`): WebTransport session, shared channel framing, `VideoAssembler`, WebCodecs H.264/Opus, canvas, Web Audio, pointer/keyboard input |
+| Web viewer | Done (H.264, Chromium) | Native Ozma client compiled to wasm32 (`ozma-web`): WebTransport session, shared `ozma-client-core` framing/`VideoAssembler`, WebCodecs H.264, canvas, Opus/Web Audio, pointer/keyboard (USB HID) input. Headless Chromium connected and rendered live 1920x1080 video (11 frames, 0 dropped, 0 errors). Audio and non-Chromium browsers remain unverified |
 | VNC | Development output | RFB 3.8 framebuffer server with damage updates; viewer input discarded. |
 | Google Cast | Development output | Live HLS composed output with local playback validation; physical receiver and controller integration remain open. |
 
@@ -90,9 +90,11 @@ OZMA_CAPTURE_TEST_DEVICE=/dev/video2 \
 - QUIC carries control/input/video/audio over a real connection. A second
   WebTransport (HTTP/3) listener carries the same framing for browsers; it is
   covered by a native `wtransport` proof client and by a real headless Chromium
-  run (session create/start, certificate-hash pinning, Hello/HelloAck, video
-  datagram; wrong hash rejected). The Rust/wasm32 viewer itself (`ozma-web`)
-  has not yet been run in a browser.
+  run and by the wasm viewer itself: headless Chromium connected through
+  WebTransport and rendered live 1920x1080 H.264 frames on a canvas. Wrong
+  certificate hashes are rejected. Audio output and other browser engines are
+  not yet verified; there is no A/V sync, no HEVC/AV1/AAC, and the protocol has
+  no client keyframe-request message.
 - PipeWire video capture is opt-in through `CaptureRegistry::system_with_pipewire()`;
   `system()` stays V4L2-only. Portal ScreenCast selection is an adapter point,
   not an implemented consent flow.
