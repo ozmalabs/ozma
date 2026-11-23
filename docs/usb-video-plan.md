@@ -103,6 +103,41 @@ Bandwidth: USB 2.0 high-speed cannot carry 1080p60 raw; use MJPEG/H.264.
 USB 3.x allows higher fps, raw/RLE, and multiple displays. Negotiate on the
 vendor channel; advertise only modes the bus and host encoder sustain.
 
+### 1.2 Aperture policy
+
+Every mode/format/stream decision in this plan is an **aperture** decision, not
+an ad-hoc flag comparison. See [`aperture-policy.md`](aperture-policy.md).
+
+- **Physiology:** the device's maximum (resolutions, fps, codecs, displays,
+  endpoints, payload).
+- **Forced frames:** USB2/USB3 isochronous budget, UDC endpoint budget, thermal
+  and power limits, privacy/consent, protected content. These cannot be lifted
+  by the requester.
+- **Chosen frames:** the user/controller/agent preference (e.g. 1080p60 H.264,
+  lowest latency, battery saving). These can be relaxed unilaterally.
+- **Negotiated frames:** host-driver and node agree on codec, resolution, fps,
+  bitrate, display count. Adoption/retraction requires every bound party.
+- **Effective aperture = meet.** The narrowest frame wins.
+- **Residual + recourse.** A request outside the meet returns a typed residual
+  naming the limiting frame and provenance: `relax` (chosen), `escalate`
+  (forced), or `propose` (negotiated). No silent downgrade to a camera or a
+  different source.
+- **Receipts.** Every decision is logged and exposed through diagnostics:
+  requested, effective, limiting frame, policy version, input hash.
+
+This applies to the UVC basic formats, the raw vendor stream selection, the
+virtual-display EDID/mode set, and the network transports. The same policy core
+answers “why can't this host have 1440p60?” with evidence.
+
+Ocelot is the inspiration for this model: aperture as a frame with provenance,
+the effective aperture as a meet, and the same residual with different recourse
+(`af_effective_aperture`, `af_relax_chosen`,
+`af_forced_residual_is_a_concern`,
+`af_adopt_when_every_party_accepts`). We borrow the model, not Ocelot's
+cognitive engine or graph runtime. Its measurement discipline also applies:
+pre-register throughput/latency/quality thresholds, record build/hardware
+provenance, and do not tune a threshold to manufacture a pass.
+
 ## 2. Current state
 
 Exists:
@@ -399,7 +434,8 @@ CONFIG_USB_F_UAC2=y
 
 | Phase | Deliverable | Estimate |
 |---|---|---|
-| A | Kernel config + configfs composition; **Linux virtual display sink** (evdi daemon + vendor bulk + basic MJPEG/RLE 1080p30); dummy_hcd and real UDC tests | 3–4 wk |
+| A0 | `ozma-aperture` crate: meet, chosen/forced/negotiated frames, residual/recourse, receipts, policy loader, tests | 1 wk |
+| A | Kernel config + configfs composition; **Linux virtual display sink** (evdi daemon + vendor bulk + basic MJPEG/RLE 1080p30); aperture-driven mode negotiation; dummy_hcd and real UDC tests | 3–4 wk |
 | B | Raw display mode: host-side VAAPI/NVENC encode, H.264/HEVC, multi-display, adaptive bitrate; UVC camera output and fallback | 3–4 wk |
 | C | Windows IddCx driver + WinUSB; host camera/mic input; UAC2; reconnect; macOS spike; packaging/signing | 4–5 wk |
 | D | Hardware integration (OPi5/Zero 3), PD/mux, optional DP-alt-mode sink, docs, CI | 2–3 wk |
@@ -422,9 +458,14 @@ the gadget composition is stable.
   as the network camera uplink.
 - **U4:** Windows auto-binds WinUSB (no driver install) and macOS/Linux clients
   work; install docs and CI cover the supported matrix.
+- **A0:** aperture meet is commutative/idempotent/order-independent; the same
+  residual under chosen/forced/negotiated frames yields different recourse; a
+  negotiated frame requires every party; receipts name the limiting frame and
+  policy version.
 - **D1:** on Linux, the host sees an Ozma virtual monitor in `xrandr`, renders
   to it, and the captured desktop appears in the client at 1080p30 with stable
-  frame rate and bounded latency. No DisplayLink code or IDs are used.
+  frame rate and bounded latency. No DisplayLink code or IDs are used, and mode
+  selection goes through the aperture (no hardcoded resolution branch).
 - **D2:** raw display mode carries H.264/HEVC 1080p30 over USB 2.0 and
   1080p60 over USB 3.x; multi-display works; adaptive bitrate responds to
   congestion.
