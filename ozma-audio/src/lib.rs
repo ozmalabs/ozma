@@ -71,8 +71,8 @@ pub use alsa::{
 pub use error::{audio_codes, AudioError};
 pub use fake::{FakeAudioSource, DEFAULT_FRAME_LIMIT, DEFAULT_TONE_HZ};
 pub use frame::{
-    format_label, opus_format, samples_per_frame, AudioFormat, AudioFrame, CHANNELS, FRAME_MICROS,
-    FRAME_SAMPLES, SAMPLE_RATE,
+    format_label, opus_format, samples_per_frame, AudioFormat, AudioFrame, AudioReframer, CHANNELS,
+    FRAME_MICROS, FRAME_SAMPLES, SAMPLE_RATE,
 };
 pub use opus::{default_config, OpusDecoder, OpusEncoder, MAX_OPUS_PACKET_BYTES, OPUS_ENCODER_ID};
 #[cfg(target_os = "linux")]

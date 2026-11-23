@@ -144,10 +144,18 @@ impl AudioRuntime {
         let source_id = source.id().to_owned();
         let (tx, rx) = mpsc::channel(32);
         let task = tokio::spawn(async move {
-            let mut encoder = match OpusEncoder::new(EncoderConfig::opus()) {
+            let config = EncoderConfig::opus();
+            let mut encoder = match OpusEncoder::new(config.clone()) {
                 Ok(encoder) => encoder,
                 Err(error) => {
                     warn!(error = %error, "Opus encoder unavailable");
+                    return;
+                }
+            };
+            let mut reframer = match ozma_audio::AudioReframer::from_config(&config) {
+                Ok(reframer) => reframer,
+                Err(error) => {
+                    warn!(error = %error, "Opus frame reframer unavailable");
                     return;
                 }
             };
@@ -163,16 +171,24 @@ impl AudioRuntime {
                         break;
                     }
                 };
-                let packet = match encoder.encode(frame).await {
-                    Ok(packet) => packet,
+                let frames = match reframer.push(frame) {
+                    Ok(frames) => frames,
                     Err(error) => {
-                        warn!(error = %error, "audio encode failed");
+                        warn!(error = %error, "audio capture buffer cannot be reframed");
                         continue;
                     }
                 };
-                eprintln!("AUDIO: packet {}", packet.data.len());
-                if tx.send(packet).await.is_err() {
-                    break;
+                for frame in frames {
+                    let packet = match encoder.encode(frame).await {
+                        Ok(packet) => packet,
+                        Err(error) => {
+                            warn!(error = %error, "audio encode failed");
+                            continue;
+                        }
+                    };
+                    if tx.send(packet).await.is_err() {
+                        return;
+                    }
                 }
             }
             let _ = source.stop().await;

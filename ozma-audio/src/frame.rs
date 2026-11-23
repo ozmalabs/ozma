@@ -203,3 +203,174 @@ mod tests {
         assert_eq!(format_label(&format), "opus 48000 Hz 2 ch 128 kbps");
     }
 }
+
+/// Re-blocks capture frames into fixed encoder-sized frames.
+///
+/// PipeWire and ALSA deliver whatever buffer size the graph or device chose
+/// (commonly 1024 samples), while Opus is configured for 960-sample (20 ms)
+/// packets. This adapter buffers interleaved samples and emits exact frames;
+/// it also upmixes mono to stereo. A sample-rate mismatch is rejected rather
+/// than silently resampled.
+#[derive(Debug)]
+pub struct AudioReframer {
+    sample_rate: u32,
+    channels: u8,
+    frame_samples: usize,
+    frame_micros: u32,
+    pending: Vec<i16>,
+    next_pts_micros: u64,
+    next_sequence: u64,
+}
+
+impl AudioReframer {
+    /// Create a reframer for `sample_rate`/`channels` and `frame_micros`
+    /// packets.
+    pub fn new(sample_rate: u32, channels: u8, frame_micros: u32) -> Result<Self, AudioError> {
+        let frame_samples = samples_per_frame(sample_rate, frame_micros)
+            .filter(|samples| *samples > 0)
+            .ok_or_else(|| {
+                AudioError::InvalidFrame(format!(
+                    "invalid audio frame size for {sample_rate} Hz / {frame_micros} us"
+                ))
+            })?;
+        if channels == 0 {
+            return Err(AudioError::InvalidFrame(
+                "channel count must be non-zero".to_owned(),
+            ));
+        }
+        Ok(Self {
+            sample_rate,
+            channels,
+            frame_samples,
+            frame_micros,
+            pending: Vec::new(),
+            next_pts_micros: 0,
+            next_sequence: 0,
+        })
+    }
+
+    /// Create a reframer matching an encoder's configured format.
+    pub fn from_config(config: &crate::traits::EncoderConfig) -> Result<Self, AudioError> {
+        Self::new(
+            config.format.sample_rate,
+            config.format.channels,
+            config.frame_micros,
+        )
+    }
+
+    /// Number of interleaved samples held for the next frame.
+    pub fn buffered_samples(&self) -> usize {
+        self.pending.len() / usize::from(self.channels)
+    }
+
+    /// Append a capture frame and return every complete encoder frame.
+    pub fn push(&mut self, frame: AudioFrame) -> Result<Vec<AudioFrame>, AudioError> {
+        if frame.sample_rate != self.sample_rate {
+            return Err(AudioError::InvalidFrame(format!(
+                "cannot reframe {} Hz audio for a {} Hz encoder",
+                frame.sample_rate, self.sample_rate
+            )));
+        }
+        let was_empty = self.pending.is_empty();
+        if was_empty {
+            self.next_pts_micros = frame.pts_micros;
+        }
+        match (frame.channels, self.channels) {
+            (source, target) if source == target => {
+                self.pending.extend_from_slice(&frame.samples);
+            }
+            (1, 2) => {
+                for sample in frame.samples {
+                    self.pending.push(sample);
+                    self.pending.push(sample);
+                }
+            }
+            (source, target) => {
+                return Err(AudioError::InvalidFrame(format!(
+                    "cannot convert {source}-channel audio to {target} channels"
+                )));
+            }
+        }
+
+        let frame_len = self.frame_samples * usize::from(self.channels);
+        let mut frames = Vec::new();
+        while self.pending.len() >= frame_len {
+            let samples: Vec<i16> = self.pending.drain(..frame_len).collect();
+            frames.push(AudioFrame::new(
+                self.next_pts_micros,
+                self.next_sequence,
+                self.sample_rate,
+                self.channels,
+                samples,
+            )?);
+            self.next_sequence += 1;
+            self.next_pts_micros = self.next_pts_micros.saturating_add(u64::from(self.frame_micros));
+        }
+        Ok(frames)
+    }
+
+    /// Zero-pad and emit the remaining partial frame, if any.
+    pub fn flush(&mut self) -> Option<AudioFrame> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let frame_len = self.frame_samples * usize::from(self.channels);
+        self.pending.resize(frame_len, 0);
+        let samples: Vec<i16> = std::mem::take(&mut self.pending);
+        let frame = AudioFrame::new(
+            self.next_pts_micros,
+            self.next_sequence,
+            self.sample_rate,
+            self.channels,
+            samples,
+        )
+        .ok()?;
+        self.next_sequence += 1;
+        self.next_pts_micros = self.next_pts_micros.saturating_add(u64::from(self.frame_micros));
+        Some(frame)
+    }
+}
+
+#[cfg(test)]
+mod reframer_tests {
+    use super::*;
+
+    fn frame(sample_rate: u32, channels: u8, samples: Vec<i16>, pts: u64) -> AudioFrame {
+        AudioFrame::new(pts, 0, sample_rate, channels, samples).unwrap()
+    }
+
+    #[test]
+    fn rebocks_1024_into_960() {
+        let mut reframer = AudioReframer::new(48_000, 2, 20_000).unwrap();
+        let first: Vec<i16> = (0..1024).flat_map(|value| [value, value]).collect();
+        let frames = reframer.push(frame(48_000, 2, first, 100)).unwrap();
+        // 1024 samples per channel is one 960 frame plus 64 buffered.
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].samples.len(), 960 * 2);
+        assert_eq!(frames[0].pts_micros, 100);
+        assert_eq!(reframer.buffered_samples(), 64);
+
+        let second: Vec<i16> = (0..1024).flat_map(|value| [value + 1, value + 1]).collect();
+        let frames = reframer.push(frame(48_000, 2, second, 20_100)).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].pts_micros, 20_100);
+        assert_eq!(reframer.buffered_samples(), 128);
+    }
+
+    #[test]
+    fn upmixes_mono_to_stereo() {
+        let mut reframer = AudioReframer::new(48_000, 2, 20_000).unwrap();
+        let frames = reframer
+            .push(frame(48_000, 1, vec![7; 960], 5))
+            .unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].samples.len(), 1920);
+        assert_eq!(&frames[0].samples[..4], &[7, 7, 7, 7]);
+    }
+
+    #[test]
+    fn rejects_a_sample_rate_change() {
+        let mut reframer = AudioReframer::new(48_000, 2, 20_000).unwrap();
+        assert!(reframer.push(frame(44_100, 2, vec![0; 882], 0)).is_err());
+    }
+}
