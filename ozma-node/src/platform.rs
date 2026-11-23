@@ -112,6 +112,7 @@ mod tests {
             node_id: NodeId::new("node._ozma._udp.local."),
             hid_udp_port: 7331,
             http_port: 7382,
+            rtsp_port: 0,
             capabilities: caps.split(',').map(str::to_owned).collect(),
             hw: "test".into(),
             fw: "0.1.0".into(),

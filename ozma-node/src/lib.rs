@@ -9,6 +9,8 @@ pub mod config;
 pub mod mdns;
 pub mod platform;
 pub mod registration;
+pub mod rtsp_runtime;
+pub mod scene_replay;
 pub mod transport;
 pub mod usb_audio;
 

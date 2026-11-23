@@ -34,6 +34,7 @@ ozma-encode   = { path = "../ozma-encode" }
 ozma-session  = { path = "../ozma-session" }
 ozma-auth     = { path = "../ozma-auth" }
 ozma-transport = { path = "../ozma-transport" }
+ozma-rtsp     = { path = "../ozma-rtsp" }
 ozma-display  = { path = "../ozma-display" }
 ozma-input    = { path = "../ozma-input" }
 ozma-audio    = { path = "../ozma-audio" }

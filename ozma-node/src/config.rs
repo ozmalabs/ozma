@@ -12,6 +12,7 @@ pub struct NodeConfig {
     pub node_id: NodeId,
     pub hid_udp_port: u16,
     pub http_port: u16,
+    pub rtsp_port: u16,
     pub capabilities: Vec<String>,
     pub hw: String,
     pub fw: String,

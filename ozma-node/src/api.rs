@@ -22,6 +22,7 @@ pub async fn serve(
     capabilities: NodeCapabilities,
     consent_policy: ConsentPolicy,
     api_token: Option<String>,
+    rtsp_port: u16,
 ) -> Result<()> {
     serve_with_scene_replay(
         port,
@@ -30,6 +31,7 @@ pub async fn serve(
         consent_policy,
         None,
         api_token,
+        rtsp_port,
     )
     .await
 }
@@ -41,6 +43,7 @@ pub async fn serve_with_scene_replay(
     consent_policy: ConsentPolicy,
     scene_replay: Option<crate::scene_replay::JsonlSceneProducer>,
     api_token: Option<String>,
+    rtsp_port: u16,
 ) -> Result<()> {
     let encoders = EncoderRegistry::with_detected_encoders().await;
     let backend = SessionBackend::new(capabilities, consent_policy).with_encoder_registry(encoders);
@@ -74,6 +77,15 @@ pub async fn serve_with_scene_replay(
             error!("Native QUIC listener exited: {error:#}");
         }
     });
+
+    if rtsp_port != 0 {
+        let rtsp_backend = backend.clone();
+        tokio::spawn(async move {
+            if let Err(error) = crate::rtsp_runtime::run(rtsp_port, rtsp_backend).await {
+                error!("RTSP listener exited: {error:#}");
+            }
+        });
+    }
 
     let expiry_backend = backend.clone();
     tokio::spawn(async move {

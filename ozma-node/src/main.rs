@@ -31,6 +31,10 @@ pub struct Args {
     #[arg(long, default_value_t = 7382)]
     pub http_port: u16,
 
+    /// RTSP listener port (0 disables the compatibility listener).
+    #[arg(long, env = "OZMA_RTSP_PORT", default_value_t = 0)]
+    pub rtsp_port: u16,
+
     /// Comma-separated capability list advertised in mDNS TXT and registration.
     /// Example: `hid,video,audio`
     #[arg(long, default_value = "hid,video,audio")]
@@ -127,6 +131,7 @@ async fn main() {
         node_id: node_id.clone(),
         hid_udp_port: args.hid_udp_port,
         http_port: args.http_port,
+        rtsp_port: args.rtsp_port,
         capabilities: args
             .cap
             .split(',')
@@ -228,6 +233,7 @@ async fn main() {
             consent_policy,
             scene_replay,
             api_token,
+            config.rtsp_port,
         )
         .await
         {
@@ -264,7 +270,9 @@ fn build_txt(args: &Args, local_ip: &str) -> std::collections::HashMap<String, S
     txt.insert("cap".into(), args.cap.clone());
     txt.insert("api_port".into(), args.http_port.to_string());
     txt.insert("quic_port".into(), (args.http_port + 2).to_string());
-    txt.insert("rtsp_port".into(), "48010".into());
+    if args.rtsp_port != 0 {
+        txt.insert("rtsp_port".into(), args.rtsp_port.to_string());
+    }
     if args.cap.split(',').any(|value| value.trim() == "video") {
         txt.insert("stream_port".into(), args.http_port.to_string());
         txt.insert("stream_path".into(), "/stream/stream.m3u8".into());

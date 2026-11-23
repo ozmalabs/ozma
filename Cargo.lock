@@ -3029,6 +3029,7 @@ dependencies = [
  "ozma-input",
  "ozma-media",
  "ozma-protocol",
+ "ozma-rtsp",
  "ozma-session",
  "ozma-transport",
  "rand 0.8.5",
