@@ -85,6 +85,15 @@ pub struct TransportDescriptor {
     pub channels: Vec<ChannelDescriptor>,
 }
 
+/// How a client obtains the native transport endpoint and the certificate it
+/// must pin. The certificate is base64 DER so the response is plain JSON.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportInfo {
+    pub endpoint: String,
+    pub fingerprint: String,
+    pub certificate_der_base64: String,
+}
+
 /// What a client receives after creating a session and before it connects
 /// media. The token is scoped to the session and short-lived.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

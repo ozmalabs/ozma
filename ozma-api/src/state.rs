@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ozma_protocol::{
-    ApiError, DiagnosticReport, DisplayId, DisplayMode, DisplayTopology, DpmsState, EndReason,
-    NodeCapabilities, NodeId, RuntimeMetrics, Session, SessionEvent, SessionId, SessionOffer,
-    SessionSpec, SessionState, VirtualDisplaySpec,
+    transport::TransportInfo, ApiError, DiagnosticReport, DisplayId, DisplayMode, DisplayTopology,
+    DpmsState, EndReason, NodeCapabilities, NodeId, RuntimeMetrics, Session, SessionEvent,
+    SessionId, SessionOffer, SessionSpec, SessionState, VirtualDisplaySpec,
 };
 use tokio::sync::broadcast;
 
@@ -29,6 +29,13 @@ pub trait NodeBackend: Send + Sync + 'static {
     fn stop_session(&self, id: &SessionId, reason: EndReason) -> Result<Session, ApiError>;
     fn approve_consent(&self, id: &SessionId, by: &str) -> Result<Session, ApiError>;
     fn deny_consent(&self, id: &SessionId, by: &str) -> Result<Session, ApiError>;
+    fn resume_session(&self, id: &SessionId, client_id: &ozma_protocol::ClientId)
+        -> Result<Session, ApiError>;
+
+    /// Native transport endpoint, certificate fingerprint, and certificate.
+    fn transport_info(&self) -> Option<TransportInfo> {
+        None
+    }
 
     /// Build the short-lived transport offer for a newly prepared session.
     /// Backends without a media transport return `unsupported`.
@@ -295,6 +302,36 @@ impl NodeBackend for MemoryBackend {
             approved: false,
             by: by.to_owned(),
         });
+        Ok(session.clone())
+    }
+
+    fn resume_session(
+        &self,
+        id: &SessionId,
+        client_id: &ozma_protocol::ClientId,
+    ) -> Result<Session, ApiError> {
+        let mut state = self.inner.lock().expect("backend lock");
+        let session = state.sessions.get_mut(id).ok_or_else(|| {
+            ApiError::new(ozma_protocol::error::codes::NOT_FOUND, "Session not found")
+        })?;
+        if session.state.is_terminal() {
+            return Err(ApiError::new(
+                ozma_protocol::error::codes::SESSION_STATE,
+                "A terminal session cannot be resumed",
+            ));
+        }
+        if !session.participants.iter().any(|p| &p.client_id == client_id) {
+            return Err(ApiError::new(
+                ozma_protocol::error::codes::NOT_FOUND,
+                "The client is not a participant in this session",
+            ));
+        }
+        for participant in &mut session.participants {
+            if &participant.client_id == client_id {
+                participant.connected = true;
+                participant.last_seen = unix_now();
+            }
+        }
         Ok(session.clone())
     }
 

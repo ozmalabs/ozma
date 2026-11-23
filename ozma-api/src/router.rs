@@ -33,7 +33,9 @@ pub fn router(backend: Backend) -> Router {
         .route("/api/hestia/v1", get(hestia_capabilities))
         .route("/api/hestia/v1/capabilities", get(hestia_capabilities))
         .route("/api/v1/diagnostics", get(diagnostics))
+        .route("/api/v1/diagnostics/report", get(diagnostics_report))
         .route("/api/v1/metrics", get(metrics_json))
+        .route("/api/v1/transport", get(transport_info))
         .route("/metrics", get(metrics_text))
         .route("/api/v1/sessions", get(list_sessions).post(create_session))
         .route("/api/v1/sessions/:id", get(get_session).delete(delete_session))
@@ -41,6 +43,7 @@ pub fn router(backend: Backend) -> Router {
         .route("/api/v1/sessions/:id/stop", post(stop_session))
         .route("/api/v1/sessions/:id/approve", post(approve_session))
         .route("/api/v1/sessions/:id/deny", post(deny_session))
+        .route("/api/v1/sessions/:id/resume", post(resume_session))
         .route("/api/v1/sessions/:id/events", get(session_events))
         .route("/api/v1/displays", get(list_displays).post(create_display))
         .route("/api/v1/displays/:id", delete(delete_display))
@@ -142,8 +145,36 @@ async fn diagnostics(State(backend): State<Backend>) -> Json<DiagnosticReport> {
     Json(backend.diagnostics())
 }
 
+#[derive(Serialize)]
+struct DiagnosticsReportResponse {
+    report: DiagnosticReport,
+    capabilities: NodeCapabilities,
+    transport: Option<ozma_protocol::transport::TransportInfo>,
+    version: &'static str,
+}
+
+async fn diagnostics_report(State(backend): State<Backend>) -> Json<DiagnosticsReportResponse> {
+    Json(DiagnosticsReportResponse {
+        report: backend.diagnostics(),
+        capabilities: backend.capabilities(),
+        transport: backend.transport_info(),
+        version: backend.version(),
+    })
+}
+
 async fn metrics_json(State(backend): State<Backend>) -> Json<RuntimeMetrics> {
     Json(backend.metrics())
+}
+
+async fn transport_info(
+    State(backend): State<Backend>,
+) -> Result<Json<ozma_protocol::transport::TransportInfo>, ApiFailure> {
+    backend.transport_info().map(Json).ok_or_else(|| {
+        ApiFailure(ApiError::new(
+            ozma_protocol::error::codes::TRANSPORT_UNAVAILABLE,
+            "This node has no native transport configured",
+        ))
+    })
 }
 
 async fn metrics_text(State(backend): State<Backend>) -> impl IntoResponse {
@@ -291,6 +322,20 @@ async fn deny_session(
 ) -> ApiResult<SessionResponse> {
     let by = request.by.unwrap_or_else(|| "local".to_owned());
     let session = backend.deny_consent(&session_id(id), &by)?;
+    Ok(Json(session_response(&backend, session)))
+}
+
+#[derive(Debug, Deserialize)]
+struct ResumeRequest {
+    client_id: ozma_protocol::ClientId,
+}
+
+async fn resume_session(
+    State(backend): State<Backend>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<ResumeRequest>,
+) -> ApiResult<SessionResponse> {
+    let session = backend.resume_session(&session_id(id), &request.client_id)?;
     Ok(Json(session_response(&backend, session)))
 }
 

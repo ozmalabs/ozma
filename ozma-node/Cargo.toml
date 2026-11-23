@@ -43,6 +43,7 @@ async-trait = { workspace = true }
 
 # Native QUIC/control transport
 bytes = { workspace = true }
+base64 = "0.22"
 rand = "0.8"
 sha2 = "0.10"
 

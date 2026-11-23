@@ -10,10 +10,10 @@ use ozma_capture::CaptureRegistry;
 use ozma_display::{FakeVirtualDisplayProvider, VirtualDisplayProvider};
 use ozma_input::{FakeInputSink, InputSink, SharedSink};
 use ozma_protocol::{
-    ApiError, CheckStatus, DiagnosticCheck, DiagnosticReport, DisplayId, DisplayMode,
-    DisplayTopology, DpmsState, EndReason, NodeCapabilities, PermissionSet, RuntimeMetrics, Session,
-    SessionEvent, SessionId, SessionOffer, SessionSpec, SessionState, TransportMode,
-    VirtualDisplaySpec,
+    transport::TransportInfo, ApiError, CheckStatus, DiagnosticCheck, DiagnosticReport, DisplayId,
+    DisplayMode, DisplayTopology, DpmsState, EndReason, NodeCapabilities, PermissionSet,
+    RuntimeMetrics, Session, SessionEvent, SessionId, SessionOffer, SessionSpec, SessionState,
+    TransportMode, VirtualDisplaySpec,
 };
 use ozma_session::SessionManager;
 use ozma_transport::offer::{SessionOfferBuilder, TransportDescriptorBuilder};
@@ -31,6 +31,7 @@ fn now() -> u64 {
 struct TransportOffer {
     endpoint: String,
     certificate_fingerprint: String,
+    certificate_der_base64: String,
 }
 
 /// The node's production backend: the session manager plus display state and
@@ -104,10 +105,26 @@ impl SessionBackend {
     }
 
     /// Configure the native transport endpoint advertised in session offers.
-    pub fn configure_transport(&self, endpoint: impl Into<String>, certificate_fingerprint: impl Into<String>) {
+    pub fn configure_transport(
+        &self,
+        endpoint: impl Into<String>,
+        certificate_fingerprint: impl Into<String>,
+    ) {
+        self.configure_transport_with_certificate(endpoint, certificate_fingerprint, &[]);
+    }
+
+    /// Configure the native endpoint and publish the certificate clients pin.
+    pub fn configure_transport_with_certificate(
+        &self,
+        endpoint: impl Into<String>,
+        certificate_fingerprint: impl Into<String>,
+        certificate_der: &[u8],
+    ) {
+        use base64::Engine as _;
         *self.transport.lock().expect("transport lock") = Some(TransportOffer {
             endpoint: endpoint.into(),
             certificate_fingerprint: certificate_fingerprint.into(),
+            certificate_der_base64: base64::engine::general_purpose::STANDARD.encode(certificate_der),
         });
     }
 
@@ -232,6 +249,26 @@ impl NodeBackend for SessionBackend {
 
     fn deny_consent(&self, id: &SessionId, by: &str) -> Result<Session, ApiError> {
         self.manager.deny_consent(id, by)
+    }
+
+    fn resume_session(
+        &self,
+        id: &SessionId,
+        client_id: &ozma_protocol::ClientId,
+    ) -> Result<Session, ApiError> {
+        self.manager.resume(id, client_id)
+    }
+
+    fn transport_info(&self) -> Option<TransportInfo> {
+        self.transport
+            .lock()
+            .expect("transport lock")
+            .as_ref()
+            .map(|transport| TransportInfo {
+                endpoint: transport.endpoint.clone(),
+                fingerprint: transport.certificate_fingerprint.clone(),
+                certificate_der_base64: transport.certificate_der_base64.clone(),
+            })
     }
 
     fn session_offer(&self, session: &Session) -> Result<SessionOffer, ApiError> {

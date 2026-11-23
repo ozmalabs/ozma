@@ -32,7 +32,7 @@ pub async fn serve(
     let backend = Arc::new(backend);
 
     let quic = QuicRuntime::bind(quic_port).context("binding native QUIC service")?;
-    backend.configure_transport(quic.endpoint(), quic.fingerprint());
+    backend.configure_transport_with_certificate(quic.endpoint(), quic.fingerprint(), quic.certificate_der());
     let quic_backend = backend.clone();
     tokio::spawn(async move {
         if let Err(error) = crate::transport::run(quic, quic_backend).await {
