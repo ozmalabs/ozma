@@ -49,7 +49,8 @@ This file records what is actually merged and tested, not what is planned.
 | API display create/list/destroy/mode/DPMS/topology | Done | backed by the fake provider; real provider gated |
 | Xorg + modesetting + EVDI + libevdi spike | Documented, not run | `docs/remote-display-evdi-spike.md` |
 | Real EVDI provider | Scaffold only | `EvdiProvider` detects prerequisites and refuses unsupported |
-| Browser WebTransport, SSH/Unix fallback, passkeys | Not started | QUIC is native raw QUIC, not WebTransport |
+| Browser WebTransport | In progress | The web client is the native client in Rust/wasm32 (`ozma-web`), sharing `ozma-client-core` framing and video reassembly; node-side WebTransport (HTTP/3) and the browser transport are being implemented |
+| SSH/Unix fallback, passkeys | Not started | — |
 
 ## Remote scene outputs (development, loopback)
 
@@ -58,7 +59,8 @@ This file records what is actually merged and tested, not what is planned.
 | RDP | Direct surface + auth validated | FreeRDP shadow subsystem writes OZFR frames into its own primary surface (no Xvfb/ffplay); TLS-only, token/user auth, viewer limit. Stock `xfreerdp3` verified frames and rejection paths. RDPEGFX/H.264 and scene flattening remain. |
 | SPICE | Direct surfaces + auth validated | QXL secondary surfaces for image placements, damage rectangles, TLS-only ticket auth, PCM playback channel. `spicy`/screenshot tests verified movement, removal, damage, auth rejection, and playback channel init. One viewer; no SPICE video codec/A-V sync. |
 | Xpra | Video path validated at wire level | Handshake fields, PNG delivery, draw acknowledgement, placement-only updates, codec negotiation, and encoded H.264/VP8/VP9/JPEG frames. Stock Xpra remains unverified; compressed hello records are not accepted. |
-| Browser | Live scene bridge | WebSocket `/api/v1/browser/scene/ws`, bounded resource/commit/video hub, `live.mjs` fixture bridge; video is metadata-only |
+| Browser scene producer | Live bridge | WebSocket `/api/v1/browser/scene/ws` ingests browser-painted scenes; bounded resource/commit/video hub, `live.mjs` fixture bridge; browser video is metadata-only. This is a producer path, not the viewer. |
+| Web viewer | In progress | Native Ozma client compiled to wasm32 (`ozma-web`): WebTransport session, shared channel framing, `VideoAssembler`, WebCodecs H.264/Opus, canvas, Web Audio, pointer/keyboard input |
 | VNC | Development output | RFB 3.8 framebuffer server with damage updates; viewer input discarded. |
 | Google Cast | Development output | Live HLS composed output with local playback validation; physical receiver and controller integration remain open. |
 
@@ -84,8 +86,9 @@ OZMA_CAPTURE_TEST_DEVICE=/dev/video2 \
   pretend a software result is hardware.
 - VAAPI forced keyframes restart the FFmpeg sidecar; periodic GOP works
   without a restart.
-- QUIC carries control/input/video/audio over a real connection, but there is
-  no browser WebTransport gateway yet.
+- QUIC carries control/input/video/audio over a real connection. The browser
+  path is a Rust/wasm32 build of the same client over WebTransport; it is being
+  implemented and has not yet been validated in a real browser on this host.
 - The node RTSP listener broadcasts one default capture/encode pipeline to all
   RTSP viewers and seeds new viewers with the latest keyframe.
 - The virtual-display API is exercised through the fake provider. The EVDI

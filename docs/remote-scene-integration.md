@@ -137,7 +137,13 @@ each implement their own protocol role.
   emits geometry, PNG draws, and removals. It has per-viewer window state
   and omits PNG data when only an image placement moves. Wire round trips
   exercise the Xpra packet mapper. [Xpra record format](https://xpra-org.github.io/xpra/Network/Protocol.html)
-- **Browser.** Serve `ozma-protocol/examples/browser-scene` on localhost. Start
+- **Browser viewer.** The viewer is the native Ozma client compiled to wasm32
+  (`ozma-web`), not a JavaScript reimplementation. It reuses the shared
+  `ozma-client-core` channel framing and video reassembler, connects over
+  WebTransport (HTTP/3), decodes H.264/Opus with WebCodecs, presents on a
+  canvas, and plays audio through Web Audio. See `web/README.md`.
+
+- **Browser scene producer.** Serve `ozma-protocol/examples/browser-scene` on localhost. Start
   the fixture, scroll, then download its JSONL scene replay. Run
   `ozma-node --scene-replay ozma-scene.jsonl` on a development node to replay
   that trusted fixture to scene-capable sessions. The node uses its own video
