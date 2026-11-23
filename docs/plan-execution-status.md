@@ -29,9 +29,9 @@ This file records what is actually merged and tested, not what is planned.
 | Scoped view/control grants | Done | HMAC session tokens, permission sets, view-only input rejection |
 | Workstation consent | Done | consent policy + session state machine; denied consent blocks start |
 | HID input sink | Done | gadget writes, 6-key limit, absolute/relative reports, release-all, fake/recording sinks |
-| Audio path | Done | `ozma-pipewire` native capture/playback and `ozma-audio` Opus; node prefers PipeWire and falls back to ALSA/fake; real PipeWire daemon smoke test passed |
+| Audio path | Done | `ozma-pipewire` native capture/playback and `ozma-audio` Opus; node prefers PipeWire and falls back to ALSA/fake. `AudioReframer` re-blocks 1024-sample PipeWire buffers into 960-sample Opus frames; real PipeWire capture now encodes without errors. `OZMA_AUDIO_SOURCE=fake` provides a paced tone |
 | Video fragmentation/reassembly | Done | protocol fragment header, node splitter, client `VideoAssembler` |
-| Client camera/mic uplink | Browser done; native in progress | `ChannelKind::Camera` + `CaptureStart/Stop/State` + `KeyframeRequest`; node decodes H.264/Opus into a bounded hub with `/api/v1/sessions/{id}/capture` and a PPM proof endpoint. Browser `getUserMedia` + WebCodecs verified in Chromium and Firefox: node decoded 1280x720 camera frames and 376,320 mic samples, PPM valid. Native `ozma-capture`/`ozma-encode` uplink is being added |
+| Client camera/mic uplink | Done (browser + native) | `ChannelKind::Camera` + `CaptureStart/Stop/State` + `KeyframeRequest`; node decodes H.264/Opus into a bounded hub with `/api/v1/sessions/{id}/capture` and a PPM proof endpoint. Chromium/Firefox published 1280x720 camera + mic (node decoded both, PPM valid). Native `ozma-client`/`ozma-play` published a real `/dev/video0` (VAAPI/OpenH264, 1920x1080) and PipeWire microphone (499 packets, 958,080 samples); `--camera`/`--mic` flags |
 | Input release on disconnect/control loss | Done | `InputReleased` + `ReleaseAll`; QUIC test checks the sink is cleared |
 | Session offer with token | Done | `POST /api/v1/sessions` returns a QUIC offer when configured |
 | Client video decode | Done | `ozma-decode`: OpenH264 H.264 decoder, I420/RGBA/PPM output, Opus decode; real 1920×1080 frame decoded and saved as PPM |
@@ -79,6 +79,8 @@ cargo test -p ozma-node --test m0_acceptance
 cargo test -p ozma-capture                               # opt-in real camera test is ignored
 OZMA_CAPTURE_TEST_DEVICE=/dev/video2 \
   cargo test -p ozma-capture -- --ignored real_v4l2_capture
+OZMA_TEST_CAPTURE_DEVICE=/dev/video0 \
+  cargo test -p ozma-client --lib -- --ignored real_camera_publishes_frames
 ```
 
 ## Deliberate limitations
@@ -97,9 +99,12 @@ OZMA_CAPTURE_TEST_DEVICE=/dev/video2 \
   certificate hashes are rejected. Client camera/microphone uplink is being
   added and verified in Chromium/Firefox with fake devices: the node decoded
   camera H.264 and microphone Opus, returned a valid PPM frame, and the
-  analyser reported non-silent audio. A/V drift is measured but not corrected;
-  Firefox loses whole access units when a camera fragment is dropped; USB
-  UVC/UAC2 injection, HEVC/AV1/AAC, and Safari remain open.
+  analyser reported non-silent audio. The native client can publish its own
+  camera and microphone with `--camera`/`--mic`. A/V drift is measured but not
+  corrected; Firefox loses whole access units when a camera fragment is
+  dropped; USB UVC/UAC2 injection, HEVC/AV1/AAC, and Safari remain open.
+- Native microphone capture requires a session created with `audio.mic = true`;
+  `ozma-play` cannot add the channel to an existing offer.
 - PipeWire video capture is opt-in through `CaptureRegistry::system_with_pipewire()`;
   `system()` stays V4L2-only. Portal ScreenCast selection is an adapter point,
   not an implemented consent flow.
