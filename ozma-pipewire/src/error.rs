@@ -14,6 +14,12 @@ pub enum PipeWireError {
     Unavailable { detail: String },
     /// The stream negotiated a sample format/rate/layout we cannot represent.
     FormatMismatch { got: String, expected: String },
+    /// The stream negotiated a raw video layout OZMA cannot carry.
+    VideoFormatUnsupported { got: String, expected: String },
+    /// The graph offered a compressed video stream, which raw capture cannot use.
+    CompressedVideoUnsupported { format: String },
+    /// No `Video/Source` node matched the requested target.
+    NoVideoSource { detail: String },
     /// A stream or probe did not reach its ready state within the timeout.
     StartTimeout { detail: String },
     /// A status probe timed out without a definitive answer from the server.
@@ -40,6 +46,9 @@ impl PipeWireError {
         match self {
             Self::Unavailable { .. } => "pipewire.unavailable",
             Self::FormatMismatch { .. } => "pipewire.format_mismatch",
+            Self::VideoFormatUnsupported { .. } => "pipewire.video_format_unsupported",
+            Self::CompressedVideoUnsupported { .. } => "pipewire.compressed_video",
+            Self::NoVideoSource { .. } => "pipewire.no_video_source",
             Self::StartTimeout { .. } => "pipewire.start_timeout",
             Self::ProbeTimeout { .. } => "pipewire.probe_timeout",
             Self::Disconnected { .. } => "pipewire.disconnected",
@@ -58,8 +67,22 @@ impl PipeWireError {
                  XDG_RUNTIME_DIR (or PIPEWIRE_REMOTE) points at the live session."
             }
             Self::FormatMismatch { .. } => {
-                "Ask the graph for 48 kHz stereo S16LE or F32LE, or let PipeWire \
-                 insert its converter by not using the NO_CONVERT stream flag."
+                "Ask the graph for a format the pipeline carries (audio: 48 kHz \
+                 stereo S16LE/F32LE; video: raw BGRA/BGRx/RGBx/I420/NV12/YUYV), or let \
+                 PipeWire insert its converter by not using the NO_CONVERT flag."
+            }
+            Self::VideoFormatUnsupported { .. } => {
+                "Select a raw video layout (BGRA, BGRx, RGBx, I420, NV12, or YUYV). \
+                 Compressed camera formats such as MJPEG/H.264 must be decoded by \
+                 a codec path, not opened as a raw PipeWire video stream."
+            }
+            Self::CompressedVideoUnsupported { .. } => {
+                "This stream only offers compressed video. Capture through the \
+                 V4L2/MJPEG path or add a decoder node before the raw capture stream."
+            }
+            Self::NoVideoSource { .. } => {
+                "Start a screen-cast portal session or connect a camera so the \
+                 graph exposes a Video/Source node, then refresh capture discovery."
             }
             Self::StartTimeout { .. } => {
                 "The server accepted the connection but no stream format was \
@@ -132,6 +155,22 @@ impl PipeWireError {
             expected: expected.into(),
         }
     }
+
+    pub(crate) fn video_format_unsupported(
+        got: impl Into<String>,
+        expected: impl Into<String>,
+    ) -> Self {
+        Self::VideoFormatUnsupported {
+            got: got.into(),
+            expected: expected.into(),
+        }
+    }
+
+    pub(crate) fn compressed_video(format: impl Into<String>) -> Self {
+        Self::CompressedVideoUnsupported {
+            format: format.into(),
+        }
+    }
 }
 
 impl fmt::Display for PipeWireError {
@@ -139,7 +178,16 @@ impl fmt::Display for PipeWireError {
         match self {
             Self::Unavailable { detail } => write!(f, "PipeWire is unavailable: {detail}"),
             Self::FormatMismatch { got, expected } => {
-                write!(f, "unsupported audio format {got} (expected {expected})")
+                write!(f, "unsupported media format {got} (expected {expected})")
+            }
+            Self::VideoFormatUnsupported { got, expected } => {
+                write!(f, "unsupported video format {got} (expected {expected})")
+            }
+            Self::CompressedVideoUnsupported { format } => {
+                write!(f, "compressed video stream {format} cannot be captured raw")
+            }
+            Self::NoVideoSource { detail } => {
+                write!(f, "no PipeWire video source: {detail}")
             }
             Self::StartTimeout { detail } => {
                 write!(f, "PipeWire stream startup timed out: {detail}")
@@ -172,6 +220,11 @@ mod tests {
         let errors = [
             PipeWireError::unavailable("x"),
             PipeWireError::format_mismatch("u8", "s16le"),
+            PipeWireError::video_format_unsupported("mjpeg", "bgra"),
+            PipeWireError::compressed_video("video/encoded"),
+            PipeWireError::NoVideoSource {
+                detail: "x".to_owned(),
+            },
             PipeWireError::StartTimeout { detail: "x".into() },
             PipeWireError::ProbeTimeout { detail: "x".into() },
             PipeWireError::disconnected("x"),

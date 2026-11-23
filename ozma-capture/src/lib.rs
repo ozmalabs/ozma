@@ -9,14 +9,25 @@
 //! the async [`ozma_media::CaptureSource`] remains responsive. Tests use
 //! [`FakeCaptureProvider`] for CI; the real capture test is opt-in because it
 //! needs `/dev/video*` hardware.
+//!
+//! On Linux the optional [`PipeWireCaptureProvider`] adds graph-native video
+//! capture without replacing V4L2. [`CaptureRegistry::system`] remains
+//! V4L2-only; [`CaptureRegistry::system_with_pipewire`] registers both.
 
 #![forbid(unsafe_code)]
 
 pub mod fake;
+#[cfg(target_os = "linux")]
+pub mod pipewire;
 pub mod provider;
 pub mod v4l2;
 
 pub use fake::FakeCaptureProvider;
+#[cfg(target_os = "linux")]
+pub use pipewire::{
+    capability_for, capability_id, map_pipewire_error, target_for_capability, target_matches,
+    PipeWireCaptureProvider, PipeWireCaptureSource, PipeWireOptions,
+};
 pub use provider::{CaptureProvider, CaptureRegistry, CaptureScan};
 pub use v4l2::{
     choose_resolution, discover_v4l2, fourcc_to_pixel_format, h264_access_unit_contains_idr,
@@ -124,5 +135,31 @@ mod tests {
         // Discovery on the build host is allowed to return any number of
         // devices, including none; it must not error for a normal host.
         assert!(registry.enumerate().is_ok());
+    }
+
+    #[test]
+    fn system_with_pipewire_registers_both_backends() {
+        let registry = CaptureRegistry::system_with_pipewire();
+        #[cfg(target_os = "linux")]
+        assert_eq!(registry.provider_count(), 2);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(registry.provider_count(), 1);
+        // V4L2 must still be present; a missing PipeWire session is reported
+        // as an empty source list, not a discovery failure.
+        let scans = registry.scan();
+        assert!(scans.iter().any(|scan| scan.kind == CaptureKind::V4l2));
+        #[cfg(target_os = "linux")]
+        {
+            let pipewire = scans
+                .iter()
+                .find(|scan| scan.kind == CaptureKind::PipeWire)
+                .expect("PipeWire provider is registered");
+            assert_eq!(pipewire.kind, CaptureKind::PipeWire);
+            assert!(
+                pipewire.is_ok(),
+                "a missing PipeWire session must not fail the scan: {:?}",
+                pipewire.error
+            );
+        }
     }
 }

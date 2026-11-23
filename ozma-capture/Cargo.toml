@@ -2,7 +2,7 @@
 name = "ozma-capture"
 version = "0.1.0"
 edition = "2021"
-description = "Capture-source providers for Ozma: deterministic fake, V4L2 discovery, and single-plane MMAP capture."
+description = "Capture-source providers for Ozma: deterministic fake, V4L2 discovery/MMAP capture, and PipeWire video capture."
 license = "AGPL-3.0-only"
 
 [dependencies]
@@ -12,6 +12,9 @@ async-trait = "0.1"
 tokio = { version = "1", features = ["sync", "time", "rt"] }
 tracing = "0.1"
 v4l = "0.14"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ozma-pipewire = { path = "../ozma-pipewire" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

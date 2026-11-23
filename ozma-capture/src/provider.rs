@@ -79,6 +79,27 @@ impl CaptureRegistry {
         Self::new().with(crate::v4l2::V4l2Provider::new())
     }
 
+    /// A registry with the host's V4L2 provider and, on Linux, the PipeWire
+    /// video provider.
+    ///
+    /// V4L2 stays registered: HDMI grabbers, MJPEG devices, and codec
+    /// pass-through still belong to the kernel path, while PipeWire covers
+    /// cameras and portal/screen-cast nodes.  On other platforms this is the
+    /// same as [`CaptureRegistry::system`].
+    pub fn system_with_pipewire() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            Self::new()
+                .with(crate::v4l2::V4l2Provider::new())
+                .with(crate::pipewire::PipeWireCaptureProvider::new())
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self::system()
+        }
+    }
+
     /// Add a provider. Providers are consulted in registration order.
     pub fn register<P>(&mut self, provider: P)
     where

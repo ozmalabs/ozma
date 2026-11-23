@@ -2,7 +2,7 @@
 name        = "ozma-pipewire"
 version     = "0.1.0"
 edition     = "2021"
-description = "PipeWire audio routing for the Ozma agent (Linux) with CPAL fallback (Windows/macOS)"
+description = "PipeWire audio/video routing and native capture for the Ozma agent (Linux) with CPAL audio fallback (Windows/macOS)"
 license     = "AGPL-3.0-only"
 
 [features]

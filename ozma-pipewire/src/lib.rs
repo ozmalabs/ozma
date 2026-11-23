@@ -32,6 +32,12 @@
 //! target 48 kHz stereo and accept `S16LE` or `F32LE`; capture always exposes
 //! interleaved `i16`.
 //!
+//! [`PipeWireVideoSource`] is the video equivalent: a raw `Video/Capture`
+//! stream that negotiates `BGRA`, `BGRx`, `RGBx`, `I420`, or `NV12` (with
+//! `YUYV` as a UVC compatibility fallback) and yields owned [`VideoFrame`]s.
+//! [`probe_video_sources`] lists the graph's `Video/Source` nodes without
+//! opening a stream.
+//!
 //! ```rust,no_run
 //! use ozma_pipewire::{CaptureConfig, PcmFrame, PipeWireAudioSource};
 //! use std::time::Duration;
@@ -61,6 +67,8 @@ mod pw_common;
 mod sink;
 #[cfg(target_os = "linux")]
 mod status;
+#[cfg(target_os = "linux")]
+mod video;
 
 #[cfg(not(target_os = "linux"))]
 mod cpal_backend;
@@ -84,6 +92,13 @@ pub use pw_common::StreamTarget;
 pub use sink::{PipeWireAudioSink, SinkConfig, SinkStats};
 #[cfg(target_os = "linux")]
 pub use status::{probe, probe_status, probe_with, PipeWireStatus, ProbeConfig, StatusError};
+#[cfg(target_os = "linux")]
+pub use video::{
+    build_buffer_pod, build_video_format_pod, parse_video_format, probe_video_sources,
+    probe_video_sources_blocking, probe_video_sources_with, probe_video_status,
+    NegotiatedVideoFormat, PipeWireVideoSource, PlaneLayout, VideoCaptureConfig, VideoCaptureStats,
+    VideoFrame, VideoNode, VideoPixelFormat, VideoProbeConfig, VideoStatus,
+};
 
 /// Core trait implemented by every audio routing backend.
 #[async_trait]
