@@ -26,6 +26,7 @@ For every discovered VM with a usable QMP socket:
     --capture-provider qmp \
     --input-provider qmp \
     --power-provider qmp \
+    [--audio-sink <provisioned sink>] \
     [--register-url <controller>]
   ```
 
@@ -69,15 +70,68 @@ flag is set, otherwise `/run/ozma/qmp`.
 Optional operator-supplied values:
 
 * `--evdev-kbd <path>` **and** `--evdev-mouse <path>` add two QEMU
-  `input-linux` objects (`ozma-kbd`, `ozma-mouse`). One path alone is rejected;
-  the supervisor does not create or claim evdev devices.
+  `input-linux` objects (`ozma-kbd`, `ozma-mouse`). One path alone is rejected.
+* `--provision-evdev` asks the supervisor to create those two devices itself
+  from `/dev/uinput` and pass the real event paths. It conflicts with explicit
+  `--evdev-kbd`/`--evdev-mouse` and requires `--provision`. See
+  [Opt-in evdev device creation](#opt-in-evdev-device-creation).
 * `--pulse-server <value>` adds a `PULSE_SERVER` `qemu:env` entry and replaces
   an exact `<audio id='1' type='none'/>` with `type='pulseaudio'`.
 * `--xdg-runtime-dir <path>` adds an `XDG_RUNTIME_DIR` `qemu:env` entry.
+* A successfully provisioned per-VM sink is injected as `PULSE_SINK` (and also
+  replaces the `none` audio device). See
+  [Opt-in per-VM audio sinks](#opt-in-per-vm-audio-sinks).
 
-These flags only inject what the operator configured. The supervisor does not
-create PulseAudio/PipeWire sinks, evdev devices, USB/media devices, or audio
-routes.
+These flags only inject what actually exists. An explicit operator path is
+used unchanged; a created device/sink is passed only after creation succeeded.
+The supervisor does not create USB/media devices, grab host input devices, or
+use the libvirt API.
+
+### Opt-in evdev device creation
+
+`--provision --provision-evdev` creates one virtual keyboard
+(`ozma-kbd-<vm>`, vendor `0x1209`, product `0x0001`) and pointer
+(`ozma-mouse-<vm>`, vendor `0x1209`, product `0x0002`) per VM with the Linux
+`uinput` API. The devices stay open in the supervisor for the VM lifetime, so
+QEMU's `input-linux` objects can open the real `/dev/input/eventN` paths.
+
+* `--evdev-marker-dir <path>` (default `/run/ozma/evdev`) receives
+  `<vm>.kbd` / `<vm>.mouse` files containing those event paths.
+* A best-effort `ozma-kbd-<vm>` / `ozma-mouse-<vm>` symlink is created under
+  `/dev/input/by-id`. Failure to create the symlink is logged; the marker and
+  returned event path still refer to the real device.
+* Devices are closed and markers/symlinks removed when the VM is removed or the
+  supervisor shuts down.
+* Creation needs a loaded `uinput` module and write access to `/dev/uinput`.
+  If anything fails, the supervisor logs a warning, omits the `input-linux`
+  block, and still provisions QMP/display normally. No path is fabricated.
+
+### Opt-in per-VM audio sinks
+
+`--provision-audio --audio-backend pipewire|pulseaudio` (default off) creates
+one null sink per VM through `ozma-audio`'s `AudioRouter` (`pactl`, including
+`pipewire-pulse` on PipeWire hosts):
+
+* sink name `<prefix><vm>` with `--audio-sink-prefix` (default `ozma-`);
+* description `Ozma-<vm>`, 2 channels, 48 kHz, monitor target
+  `<sink>.monitor`;
+* the sink is created before the per-VM `ozma-node` starts and its name is
+  passed as `--audio-sink`;
+* when libvirt XML is being provisioned, the same sink is injected as
+  `PULSE_SINK` and the `none` audio device is switched to `pulseaudio`;
+* on VM removal, only a sink this process created is unloaded. A pre-existing
+  sink with the same name is reused and left alone.
+* `--audio-track-root` is passed to the router as its reference-track root and
+  requires `--provision-audio`.
+
+`ozma-node` currently has `--audio-sink` but no `--audio-type` flag: a
+non-empty sink is advertised as `audio_type=pipewire` even on the PulseAudio
+backend. That is a known registration gap. Sink creation failure is non-fatal;
+the node starts without `--audio-sink` and no sink is reported as ready.
+
+The supervisor records sink ownership only for its own process lifetime. If it
+is restarted after creating a sink, the sink is reused but treated as
+externally owned, so it is not unloaded later.
 
 ### Restart semantics
 
@@ -118,11 +172,15 @@ deliberately **not** implemented here:
   libvirt devices outside the `qemu:commandline` block;
 * D-Bus framebuffer capture: the display socket is provisioned, but
   `ozma-capture` does not consume it yet;
-* creating/attaching evdev `input-linux` devices, and grabbing them safely;
-* per-VM PulseAudio/PipeWire sink routing or verifying that audio is non-silent;
-* USB/media, Looking Glass, and audio routing;
+* validating that QEMU actually opened the created evdev devices, that they are
+  grabbed safely, or that input reaches the guest end to end;
+* validating that a created sink is audible/non-silent, routing QEMU playback
+  beyond `PULSE_SINK`, native PipeWire node creation, or persisting sink
+  ownership across supervisor restarts;
+* USB/media, Looking Glass, and VBAN/UAC2 audio;
 * a real libvirt/QEMU restart integration test (default tests use a fake
-  command runner and XML fixtures);
+  command runner, fake evdev/audio provisioners, and XML fixtures; no test
+  opens `/dev/uinput` or runs `pactl`);
 * status and metrics aggregation.
 
 Those remain separate Phase 2 workstreams in

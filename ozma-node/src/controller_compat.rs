@@ -43,13 +43,13 @@ use ozma_encode::{
 };
 use ozma_input::{linux_keycode_to_hid_usage, SharedSink, SubmitReport};
 use ozma_protocol::input::{InputEvent, KeyModifiers, PointerButton};
-use ozma_protocol::{codes, ApiError, Codec, EncoderBackend, MediaFormat};
+use ozma_protocol::{codes, ApiError, Codec, EncodeCapability, EncoderBackend, MediaFormat};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
-use crate::hls::HlsStatus;
+use crate::hls::{HlsController, HlsEncoder, HlsStatus};
 use crate::webrtc::{WebRtcControl, WebRtcError};
 
 /// HID packet type for an 8-byte boot keyboard report.
@@ -497,11 +497,12 @@ pub async fn run_hid_listener(
 /// `current_encoder` and `available` describe the encoders the node can
 /// actually run. `override` is the accepted request, `receipt` is the policy
 /// evaluation that was stored with it, and `pending_restart` says the running
-/// HLS/WebRTC pipeline has **not** restarted into that selection yet. The node
-/// never reports an override as live.
+/// HLS pipeline has **not** restarted into that selection yet. `applied` is
+/// true only after a real HLS restart succeeded. WebRTC keeps its existing
+/// encoder; neither `applied` nor `current_encoder` claims a WebRTC switch.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct CodecStatus {
-    /// The encoder currently used by the pipeline, or `null` with no video.
+    /// The encoder currently used by the HLS pipeline, or `null` with no video.
     pub current_encoder: Option<String>,
     /// The controller's accepted override, or `null` for automatic selection.
     #[serde(rename = "override")]
@@ -512,6 +513,8 @@ pub struct CodecStatus {
     pub receipt: Option<OverrideReceipt>,
     /// True while a stored override has not been applied by a pipeline restart.
     pub pending_restart: bool,
+    /// True only when the HLS pipeline restarted with the selected encoder.
+    pub applied: bool,
 }
 
 impl CodecStatus {
@@ -530,6 +533,7 @@ impl CodecStatus {
             available,
             receipt: None,
             pending_restart: false,
+            applied: false,
         }
     }
 }
@@ -550,16 +554,26 @@ fn video_codec_names(codecs: impl IntoIterator<Item = Codec>) -> Vec<String> {
 
 /// Runtime codec override control for `GET`/`POST /codec`.
 ///
-/// Holds the real [`EncoderRegistry`] and the last accepted
-/// [`CodecOverrideState`]. Applying an override stores the request and its
-/// receipt; it deliberately does **not** restart the HLS/WebRTC pipeline, so
-/// every mutation response reports `applied: false` and
-/// `pending_restart: true`.
+/// Holds the real [`EncoderRegistry`], the last accepted
+/// [`CodecOverrideState`], and an optional [`HlsController`]. When HLS is
+/// running, applying an override stops that pipeline and restarts it with the
+/// mapped software encoder; only then is `applied: true` returned. When HLS is
+/// not running the override is stored for a future start and the response keeps
+/// `applied: false, pending_restart: true`. WebRTC is never restarted by this
+/// path and keeps its existing encoder.
 #[derive(Clone)]
 pub struct CodecControl {
     registry: EncoderRegistry,
-    state: Arc<Mutex<CodecOverrideState>>,
+    state: Arc<Mutex<StoredCodecState>>,
     format: MediaFormat,
+    hls: Option<HlsController>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct StoredCodecState {
+    override_state: CodecOverrideState,
+    /// The HLS encoder the running pipeline was actually restarted into.
+    applied_encoder: Option<HlsEncoder>,
 }
 
 impl CodecControl {
@@ -567,8 +581,9 @@ impl CodecControl {
     pub fn new(registry: EncoderRegistry, format: MediaFormat) -> Self {
         Self {
             registry,
-            state: Arc::new(Mutex::new(CodecOverrideState::empty())),
+            state: Arc::new(Mutex::new(StoredCodecState::default())),
             format,
+            hls: None,
         }
     }
 
@@ -578,6 +593,14 @@ impl CodecControl {
             EncoderRegistry::new(),
             MediaFormat::new(Codec::H264, 1920, 1080, 30, 4_000),
         )
+    }
+
+    /// Attach the HLS controller that `POST /codec` may restart.
+    ///
+    /// `None` keeps every mutation pending for a future pipeline start.
+    pub fn with_hls(mut self, hls: Option<HlsController>) -> Self {
+        self.hls = hls;
+        self
     }
 
     /// The registry this control evaluates against.
@@ -593,7 +616,8 @@ impl CodecControl {
             .any(|capability| capability.codec.is_video())
     }
 
-    /// Status derived from the registry plus the stored override state.
+    /// Status derived from the registry, stored override state, and applied HLS
+    /// encoder.
     pub fn status(&self) -> CodecStatus {
         let available = video_codec_names(
             self.registry
@@ -601,35 +625,110 @@ impl CodecControl {
                 .iter()
                 .map(|capability| capability.codec),
         );
-        let current_encoder = available.first().cloned();
+        let fallback_encoder = available.first().cloned();
         let state = lock(&self.state).clone();
-        let pending_restart = state.requested.is_some();
+        let applied = state
+            .applied_encoder
+            .map(|encoder| encoder.ffmpeg_name().to_owned());
+        let pending_restart =
+            state.override_state.requested.is_some() && state.applied_encoder.is_none();
         CodecStatus {
-            current_encoder,
-            override_setting: state.requested,
+            current_encoder: applied.clone().or(fallback_encoder),
+            override_setting: state.override_state.requested,
             available,
-            receipt: state.receipt,
+            receipt: state.override_state.receipt,
             pending_restart,
+            applied: applied.is_some(),
         }
     }
 
-    /// Evaluate and store a controller codec request.
+    /// Evaluate and store a controller codec request, restarting HLS when it is
+    /// running.
     ///
     /// # Errors
     ///
     /// A malformed request, an unknown codec/backend/bitrate, or a selection
-    /// the registry cannot honour returns a typed [`ApiError`] whose `details`
-    /// list the real capabilities. No state is stored on error.
-    pub fn apply(&self, request: &CodecRequest) -> Result<serde_json::Value, ApiError> {
-        let preference = self.preference_from_request(request)?;
-        let request = EncoderOverride::new(preference).with_source("controller");
-        let receipt = self.registry.override_receipt(&request, &self.format)?;
-        let state = CodecOverrideState::from_receipt(request, receipt.clone());
-        *lock(&self.state) = state;
+    /// the registry cannot honour returns a typed 400 [`ApiError`] whose
+    /// `details` list the real capabilities. A selection the HLS ffmpeg path
+    /// cannot run (for example a hardware backend), or a failed HLS restart,
+    /// returns a typed 502 [`CodecApplyError`]. No state is stored on error.
+    pub async fn apply(
+        &self,
+        request: &CodecRequest,
+    ) -> Result<serde_json::Value, CodecApplyError> {
+        let preference = self
+            .preference_from_request(request)
+            .map_err(CodecApplyError::invalid)?;
+        let request = EncoderOverride::new(preference.clone()).with_source("controller");
+        let receipt = self
+            .registry
+            .override_receipt(&request, &self.format)
+            .map_err(CodecApplyError::invalid)?;
+
+        // HLS is the only pipeline this control can restart. WebRTC keeps its
+        // existing encoder and is never claimed as switched.
+        let running = self.hls.as_ref().is_some_and(HlsController::is_running);
+        if !running {
+            let hls_status = self
+                .hls
+                .as_ref()
+                .map(|hls| hls.status().status_name())
+                .unwrap_or("not-configured");
+            *lock(&self.state) = StoredCodecState {
+                override_state: CodecOverrideState::from_receipt(request, receipt.clone()),
+                applied_encoder: None,
+            };
+            return Ok(serde_json::json!({
+                "ok": true,
+                "applied": false,
+                "pending_restart": true,
+                "encoder": Value::Null,
+                "hls": hls_status,
+                "receipt": receipt,
+            }));
+        }
+
+        let selected = receipt.selected.as_ref().ok_or_else(|| {
+            CodecApplyError::pipeline(ApiError::new(
+                codes::ENCODER_UNAVAILABLE,
+                "the codec policy accepted the request without selecting an encoder",
+            ))
+        })?;
+        let encoder = hls_encoder_for_selection(selected).map_err(CodecApplyError::pipeline)?;
+        let hls = self
+            .hls
+            .as_ref()
+            .expect("running implies an HLS controller");
+        let status = hls
+            .restart_with_encoder(encoder, preference.bitrate_kbps)
+            .await
+            .map_err(|error| {
+                CodecApplyError::pipeline(
+                    ApiError::new(
+                        codes::INTERNAL,
+                        format!("HLS pipeline could not apply the codec override: {error}"),
+                    )
+                    .with_details(serde_json::json!({
+                        "encoder": encoder.ffmpeg_name(),
+                        "hls_error": error.to_string(),
+                    }))
+                    .with_remediation(
+                        "The previous HLS pipeline was restored when possible. Check that ffmpeg \
+                         has the selected encoder, or choose a software codec the node advertises.",
+                    ),
+                )
+            })?;
+
+        *lock(&self.state) = StoredCodecState {
+            override_state: CodecOverrideState::from_receipt(request, receipt.clone()),
+            applied_encoder: Some(encoder),
+        };
         Ok(serde_json::json!({
             "ok": true,
-            "applied": false,
-            "pending_restart": true,
+            "applied": true,
+            "pending_restart": false,
+            "encoder": encoder.ffmpeg_name(),
+            "hls": status.status_name(),
             "receipt": receipt,
         }))
     }
@@ -700,6 +799,74 @@ impl CodecControl {
                  as `8M` or `8000k`, and `auto`, `software`, `vaapi`, `nvenc`, `qsv`, or \
                  `v4l2m2m` for hw_accel.",
             )
+    }
+}
+
+/// A failed codec mutation plus the HTTP status it should produce.
+#[derive(Debug)]
+pub struct CodecApplyError {
+    /// Status for the response (400 for bad requests, 502 for HLS failures).
+    pub status: StatusCode,
+    /// Structured error body.
+    pub error: ApiError,
+}
+
+impl CodecApplyError {
+    fn invalid(error: ApiError) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            error,
+        }
+    }
+
+    fn pipeline(error: ApiError) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            error,
+        }
+    }
+}
+
+/// Map a policy-selected capability to the ffmpeg encoder the HLS path can run.
+///
+/// Only software encoders are accepted: the HLS pipeline feeds raw RGB24 over
+/// stdin and has no upload/hwaccel filter chain. A hardware selection is a
+/// typed error rather than a software substitution.
+fn hls_encoder_for_selection(capability: &EncodeCapability) -> Result<HlsEncoder, ApiError> {
+    if capability.hardware || capability.backend != EncoderBackend::Software {
+        return Err(ApiError::new(
+            codes::UNSUPPORTED,
+            format!(
+                "The HLS ffmpeg path cannot run the selected {}/{:?} encoder.",
+                capability.codec.as_str(),
+                capability.backend
+            ),
+        )
+        .with_details(serde_json::json!({
+            "codec": capability.codec,
+            "backend": capability.backend,
+            "hardware": capability.hardware,
+        }))
+        .with_remediation(
+            "Choose a software codec (`hw_accel: software` or `auto` with software fallback). \
+             Hardware encoders need a native upload/hwaccel pipeline that HLS does not use.",
+        ));
+    }
+
+    match capability.codec {
+        Codec::H264 => Ok(HlsEncoder::H264),
+        Codec::Hevc => Ok(HlsEncoder::Hevc),
+        Codec::Av1 => Ok(HlsEncoder::Av1Svt),
+        Codec::Mjpeg => Ok(HlsEncoder::Mjpeg),
+        other => Err(ApiError::new(
+            codes::UNSUPPORTED,
+            format!(
+                "The HLS ffmpeg path has no encoder for codec `{}`.",
+                other.as_str()
+            ),
+        )
+        .with_details(serde_json::json!({ "codec": other }))
+        .with_remediation("Use h264, hevc, av1, or mjpeg for the HLS stream.")),
     }
 }
 
@@ -948,6 +1115,8 @@ pub struct ConnectionState {
     pub stats: CompatStats,
     pub power: Option<SharedPower>,
     pub hls: Option<HlsStatus>,
+    /// Restartable HLS pipeline, when `--hls` started a controller.
+    pub hls_control: Option<HlsController>,
     /// The one sink shared with session input and the UDP HID listener.
     pub input_sink: Option<SharedSink>,
     /// Base status derived from the advertised capabilities. When a
@@ -969,6 +1138,7 @@ impl ConnectionState {
             stats,
             power: None,
             hls: None,
+            hls_control: None,
             input_sink: None,
             codecs: CodecStatus::not_configured(),
             codec_control: None,
@@ -990,6 +1160,19 @@ impl ConnectionState {
     /// playlist exists.
     pub fn with_hls(mut self, hls: Option<HlsStatus>) -> Self {
         self.hls = hls;
+        self
+    }
+
+    /// Attach a restartable HLS controller.
+    ///
+    /// Its current status wins over the static [`HlsStatus`] passed to
+    /// [`ConnectionState::with_hls`], so `/api/v1/connection` reflects a
+    /// pipeline that `POST /codec` restarted.
+    pub fn with_hls_controller(mut self, hls: Option<HlsController>) -> Self {
+        if let Some(controller) = hls.as_ref() {
+            self.hls = Some(controller.status());
+        }
+        self.hls_control = hls;
         self
     }
 
@@ -1125,8 +1308,8 @@ pub fn input_router(state: ConnectionState) -> Router {
         .with_state(state)
 }
 
-/// Codec status routes. `POST /codec` is explicit about not being wired to the
-/// encode pipeline yet.
+/// Codec status routes. `POST /codec` restarts the local HLS pipeline when it
+/// is running; WebRTC is never switched by this route.
 pub fn codec_router(state: ConnectionState) -> Router {
     Router::new()
         .route("/codec", get(codec_get).post(codec_set))
@@ -1180,9 +1363,13 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
             }
         }
     };
-    let (hls, hls_error) = match &state.hls {
-        None => ("not-configured", None),
-        Some(status) => (status.status_name(), status.error()),
+    let (hls, hls_error) = match (&state.hls_control, &state.hls) {
+        (Some(controller), _) => {
+            let status = controller.status();
+            (status.status_name(), status.error())
+        }
+        (None, None) => ("not-configured", None),
+        (None, Some(status)) => (status.status_name(), status.error()),
     };
     let (webrtc, webrtc_error) = match &state.webrtc {
         None => ("not-configured", None),
@@ -1754,9 +1941,9 @@ async fn codec_set(
     if !control.is_available() {
         return codec_unavailable();
     }
-    match control.apply(&request) {
+    match control.apply(&request).await {
         Ok(body) => Json(body).into_response(),
-        Err(error) => api_error_response(StatusCode::BAD_REQUEST, error),
+        Err(error) => api_error_response(error.status, error.error),
     }
 }
 
@@ -2250,11 +2437,16 @@ fn webrtc_bitrate_failure(error: WebRtcError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hls::{
+        ffmpeg_argv, FfmpegSpawner, FrameSink, HlsConfig, HlsController, HlsError,
+        HlsSourceFactory, SpawnedFfmpeg,
+    };
     use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use ozma_input::{FakeInputSink, InputSink, RecordingSink};
+    use ozma_media::{CaptureSource, Frame, FrameFormat, MediaError};
     use ozma_power::{PowerBackend, PowerError, PowerState};
     use serde_json::Value;
     use std::time::Duration;
@@ -3572,6 +3764,127 @@ mod tests {
         assert_eq!(body["events"], 0);
     }
 
+    struct PendingCapture {
+        format: FrameFormat,
+        stopped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl CaptureSource for PendingCapture {
+        fn id(&self) -> &str {
+            "compat-pending"
+        }
+
+        fn format(&self) -> FrameFormat {
+            self.format
+        }
+
+        async fn next_frame(&mut self) -> Result<Frame, MediaError> {
+            std::future::pending().await
+        }
+
+        async fn stop(&mut self) -> Result<(), MediaError> {
+            self.stopped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct NullSink;
+
+    #[async_trait]
+    impl FrameSink for NullSink {
+        async fn write(&mut self, _bytes: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct CodecSpawner {
+        calls: std::sync::atomic::AtomicUsize,
+        fail_on: Mutex<Vec<usize>>,
+        spawns: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl CodecSpawner {
+        fn new(fail_on: Vec<usize>) -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fail_on: Mutex::new(fail_on),
+                spawns: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn spawns(&self) -> Vec<Vec<String>> {
+            lock(&self.spawns).clone()
+        }
+    }
+
+    impl FfmpegSpawner for CodecSpawner {
+        fn spawn(
+            &self,
+            config: &HlsConfig,
+            width: u32,
+            height: u32,
+        ) -> Result<SpawnedFfmpeg, HlsError> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if lock(&self.fail_on).contains(&call) {
+                return Err(HlsError::Spawn {
+                    bin: config.ffmpeg_bin.clone(),
+                    message: format!("fake ffmpeg spawn failure #{call}"),
+                });
+            }
+            lock(&self.spawns).push(ffmpeg_argv(config, width, height));
+            Ok(SpawnedFfmpeg {
+                sink: Box::new(NullSink),
+                child: None,
+            })
+        }
+    }
+
+    fn pending_factory() -> HlsSourceFactory {
+        Arc::new(|| {
+            Ok(Box::new(PendingCapture {
+                format: FrameFormat::rgb24(320, 240),
+                stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }) as Box<dyn CaptureSource>)
+        })
+    }
+
+    fn controller_with(
+        directory: &std::path::Path,
+        spawner: Arc<dyn FfmpegSpawner>,
+    ) -> HlsController {
+        HlsController::with_spawner(
+            pending_factory(),
+            HlsConfig {
+                output_dir: directory.to_path_buf(),
+                ..HlsConfig::default()
+            },
+            spawner,
+        )
+    }
+
+    fn codec_test_dir(label: &str) -> std::path::PathBuf {
+        let directory =
+            std::env::temp_dir().join(format!("ozma-codec-restart-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create codec test directory");
+        directory
+    }
+
+    fn software_capability(codec: Codec) -> EncodeCapability {
+        EncodeCapability {
+            codec,
+            backend: EncoderBackend::Software,
+            hardware: false,
+            max_width: 1920,
+            max_height: 1080,
+            max_fps: 30,
+            hdr: false,
+            profiles: Vec::new(),
+        }
+    }
+
     fn codec_control(registry: EncoderRegistry) -> CodecControl {
         CodecControl::new(
             registry,
@@ -3614,6 +3927,7 @@ mod tests {
         assert_eq!(body["available"], serde_json::json!(["h264"]));
         assert!(body["receipt"].is_null());
         assert_eq!(body["pending_restart"], false);
+        assert_eq!(body["applied"], false);
 
         let (status, body) = post_json(
             &app,
@@ -3623,9 +3937,11 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["ok"], true);
-        // The pipeline did not restart: never claim the override is live.
+        // HLS is not running: never claim the override is live.
         assert_eq!(body["applied"], false);
         assert_eq!(body["pending_restart"], true);
+        assert!(body["encoder"].is_null());
+        assert_eq!(body["hls"], "not-configured");
         assert_eq!(body["receipt"]["requested"]["codec"], "h264");
         assert_eq!(body["receipt"]["requested"]["bitrate_kbps"], 8_000);
         assert_eq!(body["receipt"]["requested"]["backend"], "software");
@@ -3639,6 +3955,7 @@ mod tests {
         assert_eq!(body["override"]["source"], "controller");
         assert_eq!(body["receipt"]["requested"]["bitrate_kbps"], 8_000);
         assert_eq!(body["pending_restart"], true);
+        assert_eq!(body["applied"], false);
         assert_eq!(body["available"], serde_json::json!(["h264"]));
     }
 
@@ -3757,6 +4074,199 @@ mod tests {
             "requested_backend_unavailable"
         );
         assert_eq!(body["receipt"]["selected"]["backend"], "software");
+    }
+
+    #[tokio::test]
+    async fn codec_route_applies_an_encoder_change_by_restarting_hls() {
+        let directory = codec_test_dir("applied");
+        std::fs::write(directory.join("stream.m3u8"), "#EXTM3U\n").expect("manifest");
+        let spawner = Arc::new(CodecSpawner::new(Vec::new()));
+        let controller = controller_with(&directory, spawner.clone());
+        controller.start().await.expect("start HLS");
+
+        let control = CodecControl::new(
+            EncoderRegistry::from_capabilities([software_capability(Codec::Hevc)]),
+            MediaFormat::new(Codec::H264, 320, 240, 30, 4_000),
+        )
+        .with_hls(Some(controller.clone()));
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_hls_controller(Some(controller.clone()))
+        .with_codec_control(Some(control));
+        let app = codec_router(state.clone());
+
+        let (status, body) = post_json(
+            &app,
+            "/codec",
+            serde_json::json!({"codec": "hevc", "bitrate": "2M", "hw_accel": "software"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["applied"], true);
+        assert_eq!(body["pending_restart"], false);
+        assert_eq!(body["encoder"], "libx265");
+        assert_eq!(body["hls"], "running");
+        assert_eq!(body["receipt"]["selected"]["codec"], "hevc");
+        assert_eq!(body["receipt"]["selected"]["backend"], "software");
+        assert_eq!(controller.config().video_encoder, HlsEncoder::Hevc);
+        assert_eq!(controller.config().bitrate_kbps, 2_000);
+
+        let spawns = spawner.spawns();
+        assert_eq!(spawns.len(), 2, "initial generation plus restarted one");
+        assert!(spawns[1]
+            .windows(2)
+            .any(|window| window == ["-c:v", "libx265"]));
+        assert!(spawns[1].contains(&"2000k".to_owned()));
+
+        let (status, body) = get_json(&app, "/codec").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["applied"], true);
+        assert_eq!(body["pending_restart"], false);
+        assert_eq!(body["current_encoder"], "libx265");
+        assert_eq!(body["override"]["preference"]["codec"], "hevc");
+        assert_eq!(body["receipt"]["selected"]["codec"], "hevc");
+        assert_eq!(body["available"], serde_json::json!(["hevc"]));
+
+        let (status, connection) = get_json(&connection_router(state), "/api/v1/connection").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(connection["codec"]["applied"], true);
+        assert_eq!(connection["codec"]["pending_restart"], false);
+        assert_eq!(connection["codec"]["current_encoder"], "libx265");
+        assert_eq!(connection["hls"], "running");
+
+        controller.stop().await.expect("stop HLS");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn codec_route_returns_502_and_keeps_the_previous_pipeline_on_restart_failure() {
+        let directory = codec_test_dir("restart-failure");
+        std::fs::write(directory.join("stream.m3u8"), "#EXTM3U\n").expect("manifest");
+        // Generation 2 is the requested HEVC pipeline; generation 3 is the
+        // restoration of the original H.264 pipeline.
+        let spawner = Arc::new(CodecSpawner::new(vec![2]));
+        let controller = controller_with(&directory, spawner.clone());
+        controller.start().await.expect("start HLS");
+
+        let control = CodecControl::new(
+            EncoderRegistry::from_capabilities([software_capability(Codec::Hevc)]),
+            MediaFormat::new(Codec::H264, 320, 240, 30, 4_000),
+        )
+        .with_hls(Some(controller.clone()));
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_hls_controller(Some(controller.clone()))
+        .with_codec_control(Some(control));
+        let app = codec_router(state);
+
+        let (status, body) = post_json(
+            &app,
+            "/codec",
+            serde_json::json!({"codec": "hevc", "hw_accel": "software"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["code"], codes::INTERNAL);
+        assert_eq!(body["details"]["encoder"], "libx265");
+        assert!(
+            body.get("applied").is_none(),
+            "a failed restart must not report applied"
+        );
+        assert!(controller.is_running(), "the old pipeline must be restored");
+        assert_eq!(controller.config().video_encoder, HlsEncoder::H264);
+
+        let spawns = spawner.spawns();
+        assert_eq!(spawns.len(), 2, "initial plus restored generation");
+        assert!(spawns[1]
+            .windows(2)
+            .any(|window| window == ["-c:v", "libx264"]));
+
+        let (status, body) = get_json(&app, "/codec").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["applied"], false);
+        assert_eq!(body["pending_restart"], false);
+        assert!(body["override"].is_null());
+        assert!(body["receipt"].is_null());
+
+        controller.stop().await.expect("stop HLS");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn codec_route_rejects_a_hardware_selection_it_cannot_run_in_hls() {
+        let directory = codec_test_dir("hardware");
+        std::fs::write(directory.join("stream.m3u8"), "#EXTM3U\n").expect("manifest");
+        let spawner = Arc::new(CodecSpawner::new(Vec::new()));
+        let controller = controller_with(&directory, spawner.clone());
+        controller.start().await.expect("start HLS");
+
+        let vaapi = EncodeCapability {
+            codec: Codec::H264,
+            backend: EncoderBackend::Vaapi,
+            hardware: true,
+            max_width: 1920,
+            max_height: 1080,
+            max_fps: 30,
+            hdr: false,
+            profiles: Vec::new(),
+        };
+        let control = CodecControl::new(
+            EncoderRegistry::from_capabilities([vaapi]),
+            MediaFormat::new(Codec::H264, 320, 240, 30, 4_000),
+        )
+        .with_hls(Some(controller.clone()));
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_hls_controller(Some(controller.clone()))
+        .with_codec_control(Some(control));
+        let app = codec_router(state);
+
+        let (status, body) = post_json(
+            &app,
+            "/codec",
+            serde_json::json!({"codec": "h264", "hw_accel": "vaapi"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["code"], codes::UNSUPPORTED);
+        assert_eq!(body["details"]["backend"], "vaapi");
+        assert_eq!(spawner.spawns().len(), 1, "no restart was attempted");
+
+        let (status, body) = get_json(&app, "/codec").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["applied"], false);
+        assert!(body["override"].is_null());
+
+        controller.stop().await.expect("stop HLS");
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[tokio::test]

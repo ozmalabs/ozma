@@ -57,6 +57,9 @@ pub struct NodeSpec {
     pub hid_udp_port: u16,
     pub http_port: u16,
     pub qmp_socket: String,
+    /// Sink name passed as `--audio-sink`, when per-VM audio provisioning
+    /// succeeded. `None` means the node reports no sink.
+    pub audio_sink: Option<String>,
 }
 
 impl NodeSpec {
@@ -81,6 +84,7 @@ pub fn build_node_spec(
     ports: NodePorts,
     node_bin: &Path,
     register_url: &str,
+    audio_sink: Option<&str>,
 ) -> NodeSpec {
     let mut args = vec![
         "--profile".to_owned(),
@@ -122,6 +126,18 @@ pub fn build_node_spec(
         args.push(register_url.to_owned());
     }
 
+    let audio_sink = audio_sink
+        .map(str::trim)
+        .filter(|sink| !sink.is_empty())
+        .map(str::to_owned);
+    if let Some(sink) = audio_sink.as_deref() {
+        // `ozma-node` has `--audio-sink` but no `--audio-type` flag: the node
+        // derives `audio_type=pipewire` from a non-empty sink. A PulseAudio
+        // backend therefore still advertises `pipewire` until that flag grows.
+        args.push("--audio-sink".to_owned());
+        args.push(sink.to_owned());
+    }
+
     NodeSpec {
         vm_name: vm.name.clone(),
         program: node_bin.to_path_buf(),
@@ -129,6 +145,7 @@ pub fn build_node_spec(
         hid_udp_port: ports.hid_udp,
         http_port: ports.http,
         qmp_socket: vm.qmp_path.clone(),
+        audio_sink,
     }
 }
 
@@ -589,6 +606,7 @@ mod tests {
             ports,
             Path::new("/usr/bin/ozma-node"),
             "http://10.0.0.1:7380",
+            None,
         );
 
         assert_eq!(
@@ -619,7 +637,7 @@ mod tests {
         );
 
         let without_input = vm("vm-b", "/run/ozma/b.qmp");
-        let spec = build_node_spec(&without_input, ports, Path::new("ozma-node"), "");
+        let spec = build_node_spec(&without_input, ports, Path::new("ozma-node"), "", None);
         let argv = spec.argv();
         assert!(!argv.iter().any(|arg| arg == "--qmp-input-socket"));
         let input = argv
@@ -629,5 +647,37 @@ mod tests {
         // No dedicated input socket: `ozma-qmp` uses the control socket.
         assert_eq!(argv[input + 1], "qmp");
         assert!(!argv.iter().any(|arg| arg == "--register-url"));
+    }
+
+    #[test]
+    fn argv_passes_audio_sink_only_when_provisioned() {
+        let ports = NodePorts {
+            hid_udp: 7332,
+            http: 7382,
+        };
+        let spec = build_node_spec(
+            &vm("vm-a", "/run/ozma/a.qmp"),
+            ports,
+            Path::new("ozma-node"),
+            "",
+            Some("ozma-vm-a"),
+        );
+        let argv = spec.argv();
+        let sink = argv
+            .iter()
+            .position(|arg| arg == "--audio-sink")
+            .expect("audio sink flag");
+        assert_eq!(argv[sink + 1], "ozma-vm-a");
+        assert_eq!(spec.audio_sink.as_deref(), Some("ozma-vm-a"));
+
+        let none = build_node_spec(
+            &vm("vm-a", "/run/ozma/a.qmp"),
+            ports,
+            Path::new("ozma-node"),
+            "",
+            None,
+        );
+        assert!(!none.argv().iter().any(|arg| arg == "--audio-sink"));
+        assert!(none.audio_sink.is_none());
     }
 }

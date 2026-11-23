@@ -44,15 +44,15 @@ power, VM provisioning, or real EVDI. Those remain Phase 1–3 work and are mark
 | VM display model | Done (model) | `VmConsole`/`VmDisplayTopology`, placements, primary/validation, `Console_N` ids; 14 tests |
 | Audio target selection | Done (model + routing) | `AudioTarget`, `<sink>.monitor` naming, `PipeWireCapture::open_target/open_sink_monitor`; `AudioRouter`/`PipeWireAudioRouter`/`PulseAudioAudioRouter` create/remove null sinks, apply profiles, move streams, and play reference tracks through `pactl`/`pw-play`/`paplay` with a fake command runner in tests |
 | VM profile wiring | Partial | `--qmp-socket`/`--qmp-input-socket`/`--libvirt-domain`, QMP capture registry, `--vnc-host`/`--vnc-port`/`--vnc-width`/`--vnc-height`/`--vnc-fps`, D-Bus display flags/`--capture-provider dbus`, input sink chain (single-socket QMP fallback), QMP/libvirt power, `--audio-router`/`--audio-track-root`, `/power/state`, `/power/{action}`, `/codec`, `/audio/*`, and connection summaries; 136 `ozma-node` lib tests |
-| HLS pipeline | Partial | `HlsPipeline` reads RGB24/BGRA `CaptureSource` frames into ffmpeg HLS, `/stream/*` serves the output dir, connection reports `running`/`failed`/`not-configured`; 112 `ozma-node` tests before the compat additions |
-| Controller input compat | Done (recording/fake in CI) | `/input/key`, `/input/mouse`, `/input/type`, `GET/POST /codec`, `/audio/apply|remove|play|stop`, bearer-guarded; codec overrides are stored with a receipt and `pending_restart`, audio routes call a real router when configured; real injection/audio is hardware/QMP/audio-server opt-in |
+| HLS pipeline | Partial | `HlsPipeline` reads RGB24/BGRA `CaptureSource` frames into ffmpeg HLS with software encoders (`libx264`, `libx265`, `libsvtav1`, `libaom-av1`, `mjpeg`), `-hls_flags delete_segments`, and a restartable controller that swaps encoders; `/stream/*` serves the output dir; connection reports `running`/`failed`/`not-configured` |
+| Controller input compat | Done (recording/fake in CI) | `/input/key`, `/input/mouse`, `/input/type`, `GET/POST /codec`, `/audio/apply|remove|play|stop`, bearer-guarded; HLS codec overrides restart the real HLS pipeline and report `applied: true` only on success, while WebRTC keeps its encoder; audio routes call a real router when configured; real injection/audio is hardware/QMP/audio-server opt-in |
 | WebRTC compat | Partial (helper-first) | `WebRtcHelper` supervises an external GStreamer/Python worker over a Unix socket, feeds BGRA frames from a capture source, and proxies `/webrtc/offer`/`/webrtc/bitrate`; connection reports `running`/`not-configured`/`failed`. No native WebRTC, no WebRTC audio, no live helper in CI |
 | `ozma-softnode` per-VM supervisor | Partial | supervises real `ozma-node --profile vm` subprocesses with deterministic ports, restart/backoff, stop/reap, and QMP input fallback; 20 tests |
-| `ozma-softnode` provisioning | Partial (opt-in) | `--provision` injects QMP control/input and D-Bus display chardevs plus optional evdev/PulseAudio env into libvirt XML, defines via stdin, and optionally restarts with a bounded socket wait; idempotent, Proxmox-safe, fake-runner/XML tests. Device creation, libvirt API use, and real-QEMU validation remain deferred |
+| `ozma-softnode` provisioning | Partial (opt-in) | `--provision` injects QMP control/input and D-Bus display chardevs into libvirt XML, defines via stdin, and optionally restarts with a bounded socket wait; `--provision-evdev` creates uinput evdev devices and marker/symlink paths, `--provision-audio` creates/reuses `ozma-<vm>` sinks and injects `PULSE_SINK`/`--audio-sink`; both are non-fatal and released on stop. Idempotent, Proxmox-safe, fake-runner/XML/device/sink tests. Real libvirt/uinput/audio validation remains deferred |
 
-Gate 2 is **not** met: live D-Bus/VNC/audio validation, a real pipeline restart
-for codec overrides, the remaining device/audio provisioning, and a
-real-QEMU/controller demo remain.
+Gate 2 is **not** met: live D-Bus/VNC/audio validation, WebRTC codec/audio
+switching, real evdev/audio device grabs, and a real-QEMU/controller demo
+remain.
 The parity matrix lists the remaining rows.
 
 ## M0 — Contract and cleanup
@@ -125,7 +125,7 @@ authentication, and Xpra video are being extended in separate workstreams.
 ## Verification
 
 ```bash
-cargo test --workspace                                   # 1310 passed, 15 ignored (current)
+cargo test --workspace                                   # 1348 passed, 15 ignored (current)
 cargo test -p ozma-node --test parity                    # Python/controller parity baseline (16)
 cargo test -p ozma-node --lib                            # node API, compat, session unit tests (136, 2 ignored)
 cargo test -p ozma-qmp -p ozma-input -p ozma-power       # QMP, uinput/QMP sinks, power (166)

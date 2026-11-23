@@ -8,10 +8,12 @@
 //! * QMP input socket (`ozma-input`),
 //! * QMP display/D-Bus setup socket (`ozma-display`),
 //! * `-display dbus,p2p=yes`,
-//! * optional `input-linux` evdev objects, but only when the operator supplied
-//!   **both** an evdev keyboard and mouse path,
-//! * optional `PULSE_SERVER` / `XDG_RUNTIME_DIR` environment entries and an
-//!   `<audio type='pulseaudio'/>` replacement when a Pulse server is given.
+//! * optional `input-linux` evdev objects. Paths come either from explicitly
+//!   configured keyboard/mouse paths or from the opt-in
+//!   [`crate::evdev_provisioning`] devices (both are still required together),
+//! * optional `PULSE_SERVER` / `XDG_RUNTIME_DIR` / `PULSE_SINK` environment
+//!   entries and an `<audio type='pulseaudio'/>` replacement when Pulse audio
+//!   is configured.
 //!
 //! The XML is fed to `virsh define /dev/stdin`; this module never writes it to
 //! a user path. If a restart is explicitly requested it runs
@@ -32,6 +34,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::{debug, info};
 
+use crate::evdev_provisioning::{EvdevPaths, EvdevProvisionConfig};
 use crate::vm_info::VMInfo;
 
 /// Default directory for the QMP sockets created by provisioning.
@@ -54,10 +57,14 @@ pub struct ProvisionConfig {
     pub pulse_server: Option<String>,
     /// `XDG_RUNTIME_DIR` value injected into QEMU's environment, when configured.
     pub xdg_runtime_dir: Option<String>,
+    /// `PULSE_SINK` value injected into QEMU's environment, when configured.
+    pub pulse_sink: Option<String>,
     /// evdev keyboard path. Ignored unless `evdev_mouse` is also set.
     pub evdev_keyboard: Option<PathBuf>,
     /// evdev mouse path. Ignored unless `evdev_keyboard` is also set.
     pub evdev_mouse: Option<PathBuf>,
+    /// Opt-in creation of evdev devices before XML injection.
+    pub evdev: EvdevProvisionConfig,
     /// How long to wait for the control socket after `virsh destroy`/`start`.
     pub restart_wait: Duration,
 }
@@ -69,8 +76,10 @@ impl Default for ProvisionConfig {
             restart_vm: false,
             pulse_server: None,
             xdg_runtime_dir: None,
+            pulse_sink: None,
             evdev_keyboard: None,
             evdev_mouse: None,
+            evdev: EvdevProvisionConfig::default(),
             restart_wait: DEFAULT_RESTART_WAIT,
         }
     }
@@ -92,8 +101,31 @@ impl ProvisionConfig {
         if let Some(value) = &self.xdg_runtime_dir {
             validate_text("xdg_runtime_dir", value)?;
         }
+        if let Some(value) = &self.pulse_sink {
+            validate_text("pulse_sink", value)?;
+        }
+        if self.evdev.enabled {
+            self.evdev
+                .validate()
+                .map_err(|error| ProvisionError::InvalidConfig {
+                    detail: error.to_string(),
+                })?;
+        }
         Ok(())
     }
+}
+
+/// Extra device/audio facts discovered before XML injection.
+///
+/// The manager supplies these from the opt-in evdev/audio provisioners. A
+/// provisioner failure is represented as `None`, never as a path or sink that
+/// was not actually created.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProvisionHints {
+    /// Real evdev event paths created for this VM.
+    pub evdev: Option<EvdevPaths>,
+    /// Per-VM sink name that QEMU should route its PulseAudio stream to.
+    pub pulse_sink: Option<String>,
 }
 
 /// Result of ensuring the QMP/display plumbing for one VM.
@@ -244,6 +276,21 @@ impl CommandRunner for TokioCommandRunner {
 #[async_trait]
 pub trait VmProvisioner: Send + Sync {
     async fn ensure(&self, vm: &VMInfo) -> Result<ProvisionedVm, ProvisionError>;
+
+    /// Provision with optional real evdev paths / audio sink discovered by the
+    /// manager. The default ignores hints so simple test provisioners keep
+    /// working.
+    async fn ensure_with_hints(
+        &self,
+        vm: &VMInfo,
+        _hints: &ProvisionHints,
+    ) -> Result<ProvisionedVm, ProvisionError> {
+        self.ensure(vm).await
+    }
+
+    /// Release any resources tied to a stopped/removed VM. The libvirt path
+    /// owns no devices itself; the manager releases evdev/audio separately.
+    async fn release(&self, _vm_name: &str) {}
 }
 
 /// Alias kept for the plan's `VmLiber` naming.
@@ -326,9 +373,34 @@ impl LibvirtProvisioner {
     }
 }
 
+impl LibvirtProvisioner {
+    /// Merge operator configuration with real devices supplied by the manager.
+    fn config_with_hints(&self, hints: &ProvisionHints) -> ProvisionConfig {
+        let mut config = self.config.clone();
+        if let Some(paths) = &hints.evdev {
+            config.evdev_keyboard = Some(paths.keyboard.clone());
+            config.evdev_mouse = Some(paths.mouse.clone());
+        }
+        if let Some(sink) = hints.pulse_sink.as_deref().map(str::trim) {
+            if !sink.is_empty() {
+                config.pulse_sink = Some(sink.to_owned());
+            }
+        }
+        config
+    }
+}
+
 #[async_trait]
 impl VmProvisioner for LibvirtProvisioner {
     async fn ensure(&self, vm: &VMInfo) -> Result<ProvisionedVm, ProvisionError> {
+        self.ensure_with_hints(vm, &ProvisionHints::default()).await
+    }
+
+    async fn ensure_with_hints(
+        &self,
+        vm: &VMInfo,
+        hints: &ProvisionHints,
+    ) -> Result<ProvisionedVm, ProvisionError> {
         // A discovered socket is the strongest signal. Use it untouched.
         let discovered = vm.qmp_path.trim();
         if !discovered.is_empty() {
@@ -363,13 +435,14 @@ impl VmProvisioner for LibvirtProvisioner {
         }
 
         validate_domain(&vm.name)?;
-        self.config.validate()?;
-        let (qmp_socket, input_socket, display_socket) = socket_paths(&self.config, &vm.name)?;
+        let config = self.config_with_hints(hints);
+        config.validate()?;
+        let (qmp_socket, input_socket, display_socket) = socket_paths(&config, &vm.name)?;
 
-        tokio::fs::create_dir_all(&self.config.qmp_dir)
+        tokio::fs::create_dir_all(&config.qmp_dir)
             .await
             .map_err(|error| ProvisionError::PrepareDir {
-                path: self.config.qmp_dir.display().to_string(),
+                path: config.qmp_dir.display().to_string(),
                 detail: sanitize_detail(error.to_string().as_bytes()),
             })?;
 
@@ -410,7 +483,7 @@ impl VmProvisioner for LibvirtProvisioner {
             });
         }
 
-        let new_xml = inject_ozma_commandline(&xml, &self.config, &vm.name)?;
+        let new_xml = inject_ozma_commandline(&xml, &config, &vm.name)?;
         let defined = self
             .runner
             .run(
@@ -434,7 +507,7 @@ impl VmProvisioner for LibvirtProvisioner {
             display_socket.display()
         );
 
-        if !self.config.restart_vm {
+        if !config.restart_vm {
             info!(
                 "VM {}: XML defined; restart required before the QMP socket exists",
                 vm.name
@@ -522,7 +595,7 @@ pub fn inject_ozma_commandline(
         document = updated;
     }
 
-    if has_pulse_server(config) {
+    if has_pulse_audio(config) {
         document = replace_audio_none_with_pulseaudio(&document);
     }
 
@@ -609,6 +682,9 @@ fn render_qemu_args(
     if let Some(value) = non_empty(config.pulse_server.as_deref()) {
         push_env(&mut args, "PULSE_SERVER", value);
     }
+    if let Some(value) = non_empty(config.pulse_sink.as_deref()) {
+        push_env(&mut args, "PULSE_SINK", value);
+    }
     if let Some(value) = non_empty(config.xdg_runtime_dir.as_deref()) {
         push_env(&mut args, "XDG_RUNTIME_DIR", value);
     }
@@ -678,8 +754,9 @@ fn replace_audio_none_with_pulseaudio(xml: &str) -> String {
     updated
 }
 
-fn has_pulse_server(config: &ProvisionConfig) -> bool {
+fn has_pulse_audio(config: &ProvisionConfig) -> bool {
     non_empty(config.pulse_server.as_deref()).is_some()
+        || non_empty(config.pulse_sink.as_deref()).is_some()
 }
 
 fn non_empty(value: Option<&str>) -> Option<&str> {
@@ -1163,6 +1240,59 @@ mod tests {
         assert!(stdin.contains("value='dbus,p2p=yes'"));
         assert!(!calls.iter().any(|call| call.args[0] == "destroy"));
         assert!(!calls.iter().any(|call| call.args[0] == "start"));
+    }
+
+    #[tokio::test]
+    async fn ensure_with_hints_injects_created_evdev_paths_and_pulse_sink() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.qmp_dir = dir.path().join("qmp");
+
+        let (provisioner, runner) = provisioner(
+            vec![FakeStep::ok(DOMAIN_KVM), FakeStep::ok("")],
+            config,
+            missing_marker(),
+        );
+        let hints = ProvisionHints {
+            evdev: Some(EvdevPaths {
+                keyboard: PathBuf::from("/dev/input/event101"),
+                mouse: PathBuf::from("/dev/input/event102"),
+            }),
+            pulse_sink: Some("ozma-vm-a".to_owned()),
+        };
+
+        provisioner
+            .ensure_with_hints(&vm("vm-a", ""), &hints)
+            .await
+            .unwrap();
+
+        let calls = runner.calls();
+        let stdin = calls[1].stdin.as_deref().unwrap();
+        let stdin = std::str::from_utf8(stdin).unwrap();
+        assert!(stdin.contains("input-linux,id=ozma-kbd,evdev=/dev/input/event101"));
+        assert!(stdin.contains("input-linux,id=ozma-mouse,evdev=/dev/input/event102,grab_all=on"));
+        assert!(stdin.contains("<qemu:env name='PULSE_SINK' value='ozma-vm-a'/>"));
+        assert!(stdin.contains("<audio id='1' type='pulseaudio'/>"));
+    }
+
+    #[tokio::test]
+    async fn ensure_without_hints_does_not_inject_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.qmp_dir = dir.path().join("qmp");
+
+        let (provisioner, runner) = provisioner(
+            vec![FakeStep::ok(DOMAIN_KVM), FakeStep::ok("")],
+            config,
+            missing_marker(),
+        );
+
+        provisioner.ensure(&vm("vm-a", "")).await.unwrap();
+
+        let stdin = runner.calls()[1].stdin.clone().unwrap();
+        let stdin = std::str::from_utf8(&stdin).unwrap();
+        assert!(!stdin.contains("input-linux"));
+        assert!(!stdin.contains("PULSE_SINK"));
     }
 
     #[tokio::test]

@@ -10,13 +10,16 @@
 //!
 //! This is the subprocess transition plus opt-in libvirt provisioning. With
 //! `--provision`, a libvirt domain without a QMP socket gets an injected
-//! qemu command line for QMP/display sockets and optional evdev/audio
-//! environment, defined through `virsh define /dev/stdin`. A restart is never
-//! performed unless `--provision-restart` is also passed. Use
+//! qemu command line for QMP/display sockets; `--provision-evdev` may create
+//! uinput devices and `--provision-audio` may create per-VM PipeWire/PulseAudio
+//! null sinks. XML is defined through `virsh define /dev/stdin`. A restart is
+//! never performed unless `--provision-restart` is also passed. Use
 //! `--no-auto-manage` for discovery/agent-only operation.
 
 mod agent;
+mod audio_provisioning;
 mod discovery;
+mod evdev_provisioning;
 mod manager;
 mod provisioning;
 mod supervisor;
@@ -26,7 +29,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use audio_provisioning::AudioProvisionConfig;
 use clap::Parser;
+use evdev_provisioning::EvdevProvisionConfig;
 use manager::{ManagerOptions, VirtualNodeManager};
 use provisioning::{ProvisionConfig, DEFAULT_QMP_DIR};
 use tracing::info;
@@ -49,11 +54,14 @@ use tracing::info;
                   with bounded exponential backoff, and shutdown stops every child.\n\n\
                   With --provision, a libvirt domain that has no QMP socket gets an ozma \
                   qemu command line (QMP control/input/display sockets, D-Bus p2p display, \
-                  optional operator-supplied evdev and PulseAudio environment) defined \
-                  through `virsh define /dev/stdin`. Editing libvirt XML is opt-in. The VM \
-                  must usually be restarted for the new sockets to exist; that only happens \
-                  with the second opt-in, --provision-restart. Proxmox configuration is never \
-                  edited. VMs without a discovered or provisioned QMP socket are skipped \
+                  optional evdev and PulseAudio environment) defined through \
+                  `virsh define /dev/stdin`. Editing libvirt XML is opt-in. --provision-evdev \
+                  may create virtual keyboard/pointer devices with uinput; --provision-audio \
+                  may create one null sink per VM through PipeWire/PulseAudio's pactl. Both \
+                  device paths are non-fatal and are only passed on when creation succeeded. \
+                  The VM must usually be restarted for the new sockets to exist; that only \
+                  happens with the second opt-in, --provision-restart. Proxmox configuration is \
+                  never edited. VMs without a discovered or provisioned QMP socket are skipped \
                   with a warning; no socket path is fabricated. Use --no-auto-manage for \
                   discovery/agent-only operation."
 )]
@@ -127,6 +135,34 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     evdev_mouse: Option<PathBuf>,
 
+    /// Create per-VM evdev keyboard/pointer devices with uinput when --provision is on
+    ///
+    /// Requires --provision. Conflicts with --evdev-kbd/--evdev-mouse.
+    /// Requires access to /dev/uinput on Linux; creation is skipped with a
+    /// warning otherwise.
+    #[arg(long)]
+    provision_evdev: bool,
+
+    /// Directory for per-VM evdev marker files
+    #[arg(long, default_value = evdev_provisioning::DEFAULT_EVDEV_MARKER_DIR, value_name = "PATH")]
+    evdev_marker_dir: PathBuf,
+
+    /// Opt in to creating one audio sink per VM
+    #[arg(long)]
+    provision_audio: bool,
+
+    /// Audio backend for per-VM sinks
+    #[arg(long, value_enum, default_value_t = audio_provisioning::AudioBackend::None)]
+    audio_backend: audio_provisioning::AudioBackend,
+
+    /// Prefix for per-VM audio sink names (`<prefix><vm>`)
+    #[arg(long, default_value = audio_provisioning::DEFAULT_AUDIO_SINK_PREFIX)]
+    audio_sink_prefix: String,
+
+    /// Directory containing reference tracks for the per-VM audio router
+    #[arg(long, value_name = "PATH")]
+    audio_track_root: Option<PathBuf>,
+
     /// Discovery-only mode: report VMs and provision agents without starting nodes
     #[arg(long)]
     no_auto_manage: bool,
@@ -175,7 +211,19 @@ async fn main() -> anyhow::Result<()> {
         xdg_runtime_dir: args.xdg_runtime_dir,
         evdev_keyboard: args.evdev_kbd,
         evdev_mouse: args.evdev_mouse,
+        evdev: EvdevProvisionConfig {
+            marker_dir: args.evdev_marker_dir,
+            enabled: args.provision_evdev,
+            ..EvdevProvisionConfig::default()
+        },
         ..ProvisionConfig::default()
+    };
+
+    let audio = AudioProvisionConfig {
+        enabled: args.provision_audio,
+        backend: args.audio_backend,
+        sink_prefix: args.audio_sink_prefix,
+        track_root: args.audio_track_root,
     };
 
     let options = ManagerOptions {
@@ -191,6 +239,7 @@ async fn main() -> anyhow::Result<()> {
         restart_backoff_max: Duration::from_millis(args.restart_backoff_max_ms),
         provision: args.provision,
         provision_config,
+        audio,
         ..ManagerOptions::default()
     };
 
@@ -247,6 +296,18 @@ mod tests {
         assert!(args.xdg_runtime_dir.is_none());
         assert!(args.evdev_kbd.is_none());
         assert!(args.evdev_mouse.is_none());
+        assert!(!args.provision_evdev);
+        assert_eq!(
+            args.evdev_marker_dir,
+            PathBuf::from(evdev_provisioning::DEFAULT_EVDEV_MARKER_DIR)
+        );
+        assert!(!args.provision_audio);
+        assert_eq!(args.audio_backend, audio_provisioning::AudioBackend::None);
+        assert_eq!(
+            args.audio_sink_prefix,
+            audio_provisioning::DEFAULT_AUDIO_SINK_PREFIX
+        );
+        assert!(args.audio_track_root.is_none());
     }
 
     #[test]
@@ -278,6 +339,49 @@ mod tests {
         assert_eq!(args.xdg_runtime_dir.as_deref(), Some("/run/user/1000"));
         assert_eq!(args.evdev_kbd, Some(PathBuf::from("/dev/input/event5")));
         assert_eq!(args.evdev_mouse, Some(PathBuf::from("/dev/input/event6")));
+    }
+
+    #[test]
+    fn device_and_audio_provisioning_flags_parse() {
+        let args = Args::try_parse_from([
+            "ozma-virtual-node",
+            "--provision",
+            "--provision-evdev",
+            "--evdev-marker-dir",
+            "/run/ozma/markers",
+            "--provision-audio",
+            "--audio-backend",
+            "pulseaudio",
+            "--audio-sink-prefix",
+            "ozma-vm-",
+            "--audio-track-root",
+            "/srv/tracks",
+        ])
+        .expect("parse device/audio provisioning flags");
+
+        assert!(args.provision_evdev);
+        assert_eq!(args.evdev_marker_dir, PathBuf::from("/run/ozma/markers"));
+        assert!(args.provision_audio);
+        assert_eq!(
+            args.audio_backend,
+            audio_provisioning::AudioBackend::PulseAudio
+        );
+        assert_eq!(args.audio_sink_prefix, "ozma-vm-");
+        assert_eq!(args.audio_track_root, Some(PathBuf::from("/srv/tracks")));
+    }
+
+    #[test]
+    fn audio_backend_accepts_only_documented_names() {
+        for (value, expected) in [
+            ("none", audio_provisioning::AudioBackend::None),
+            ("pipewire", audio_provisioning::AudioBackend::PipeWire),
+            ("pulseaudio", audio_provisioning::AudioBackend::PulseAudio),
+        ] {
+            let args = Args::try_parse_from(["ozma-virtual-node", "--audio-backend", value])
+                .expect("documented backend");
+            assert_eq!(args.audio_backend, expected);
+        }
+        assert!(Args::try_parse_from(["ozma-virtual-node", "--audio-backend", "alsa"]).is_err());
     }
 
     #[test]

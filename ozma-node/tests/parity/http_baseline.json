@@ -1,5 +1,5 @@
 {
-  "_baseline": "Current compatibility surface expected by the Python controller. /health mirrors the node's native health document consumed by the controller's node probes; /api/v1/connection mirrors the controller-facing compatibility status endpoint. Type names are checked by ozma-node/tests/parity.rs. The connection document also reports input sink availability/injection, codec state (current_encoder, override, available, receipt, pending_restart), and audio routing state: 'not-configured' without --audio-router, 'running' with a healthy router, 'failed' plus audio_error when the backend could not initialise. HLS is opt-in and honest: 'not-configured' without --hls, 'running' only once stream.m3u8 exists, 'failed' plus hls_error otherwise. WebRTC is helper-first: 'not-configured' without --webrtc-helper, 'running' only after the helper socket connects, 'failed' plus webrtc_error otherwise; /webrtc/offer and /webrtc/bitrate answer typed 503s rather than 404s. POST /codec stores a validated override and always reports applied:false/pending_restart:true because the running pipeline has not restarted.",
+  "_baseline": "Current compatibility surface expected by the Python controller. /health mirrors the node's native health document consumed by the controller's node probes; /api/v1/connection mirrors the controller-facing compatibility status endpoint. Type names are checked by ozma-node/tests/parity.rs. The connection document also reports input sink availability/injection, codec state (current_encoder, override, available, receipt, pending_restart, applied), and audio routing state: 'not-configured' without --audio-router, 'running' with a healthy router, 'failed' plus audio_error when the backend could not initialise. HLS is opt-in and honest: 'not-configured' without --hls, 'running' only once stream.m3u8 exists, 'failed' plus hls_error otherwise. WebRTC is helper-first: 'not-configured' without --webrtc-helper, 'running' only after the helper socket connects, 'failed' plus webrtc_error otherwise; /webrtc/offer and /webrtc/bitrate answer typed 503s rather than 404s. POST /codec restarts the running HLS pipeline with the selected software encoder and reports applied:true only after that restart; with HLS off it stores the override and reports applied:false/pending_restart:true. WebRTC keeps its existing encoder and is never reported as switched.",
   "health": {
     "ok": "bool",
     "node_id": "string",
@@ -35,12 +35,15 @@
     "override": "object-or-null",
     "available": "array",
     "receipt": "object-or-null",
-    "pending_restart": "bool"
+    "pending_restart": "bool",
+    "applied": "bool"
   },
   "codec_apply": {
     "ok": "bool",
     "applied": "bool",
     "pending_restart": "bool",
+    "encoder": "string-or-null",
+    "hls": "string",
     "receipt": "object"
   },
   "hid": {

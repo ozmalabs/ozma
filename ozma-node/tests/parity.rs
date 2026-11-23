@@ -25,7 +25,10 @@ use ozma_node::controller_compat::{
     audio_router, codec_router, compat_router, connection_router, CodecControl, CompatStats,
     ConnectionInfo, ConnectionState, HidPacketDecoder, HidUdpListener, SINK_FAKE_RECORDING,
 };
-use ozma_node::hls::{stream_router, HlsStatus};
+use ozma_node::hls::{
+    ffmpeg_argv, stream_router, FfmpegSpawner, FrameSink, HlsConfig, HlsController, HlsEncoder,
+    HlsSourceFactory, HlsStatus, SpawnedFfmpeg,
+};
 use ozma_node::webrtc::{
     HelperSpawner, Signaler, SpawnedHelper, WebRtcConfig, WebRtcControl, WebRtcError, WebRtcHelper,
 };
@@ -640,6 +643,7 @@ async fn codec_override_shape_matches_baseline_and_reports_pending_restart() {
     assert_eq!(before["current_encoder"], "h264");
     assert_eq!(before["available"], json!(["h264"]));
     assert_eq!(before["pending_restart"], false);
+    assert_eq!(before["applied"], false);
 
     let (status, applied) = post_json(
         &app,
@@ -652,6 +656,8 @@ async fn codec_override_shape_matches_baseline_and_reports_pending_restart() {
     // The pipeline did not restart, so no live switch is claimed.
     assert_eq!(applied["applied"], false);
     assert_eq!(applied["pending_restart"], true);
+    assert!(applied["encoder"].is_null());
+    assert_eq!(applied["hls"], "not-configured");
     assert_eq!(applied["receipt"]["requested"]["bitrate_kbps"], 8_000);
 
     let (_, after) = get_json(&app, "/codec").await;
@@ -659,6 +665,7 @@ async fn codec_override_shape_matches_baseline_and_reports_pending_restart() {
     assert_eq!(after["override"]["preference"]["codec"], "h264");
     assert_eq!(after["receipt"]["selected"]["backend"], "software");
     assert_eq!(after["pending_restart"], true);
+    assert_eq!(after["applied"], false);
 
     let (status, connection) = get_json(&connection_router(state), "/api/v1/connection").await;
     assert_eq!(status, StatusCode::OK);
@@ -666,6 +673,143 @@ async fn codec_override_shape_matches_baseline_and_reports_pending_restart() {
     assert_eq!(connection["codec"]["pending_restart"], true);
     assert_eq!(connection["audio"], "not-configured");
     assert!(connection["audio_error"].is_null());
+}
+
+#[tokio::test]
+async fn codec_override_applies_to_hls_and_reports_applied() {
+    let baseline = baseline(include_str!("parity/http_baseline.json"));
+    let directory = std::env::temp_dir().join(format!(
+        "ozma-parity-codec-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).expect("create HLS directory");
+    std::fs::write(directory.join("stream.m3u8"), "#EXTM3U\n").expect("manifest");
+
+    let spawner = Arc::new(ParityHlsSpawner::default());
+    let factory: HlsSourceFactory = Arc::new(|| {
+        Ok(Box::new(PendingSource::new(FrameFormat::rgb24(320, 240))) as Box<dyn CaptureSource>)
+    });
+    let controller = HlsController::with_spawner(
+        factory,
+        HlsConfig {
+            output_dir: directory.clone(),
+            ..HlsConfig::default()
+        },
+        spawner.clone(),
+    );
+    controller.start().await.expect("start HLS");
+
+    let control = CodecControl::new(
+        ozma_encode::EncoderRegistry::from_capabilities([parity_software_capability(Codec::Hevc)]),
+        MediaFormat::new(Codec::H264, 320, 240, 30, 4_000),
+    )
+    .with_hls(Some(controller.clone()));
+    let state = ConnectionState::new(
+        ConnectionInfo::new(
+            NODE_ID,
+            "hardware",
+            HTTP_PORT,
+            QUIC_PORT,
+            HID_PORT,
+            SINK_FAKE_RECORDING,
+        ),
+        CompatStats::default(),
+    )
+    .with_hls_controller(Some(controller.clone()))
+    .with_codec_control(Some(control));
+    let app = codec_router(state.clone());
+
+    let (status, applied) = post_json(
+        &app,
+        "/codec",
+        json!({"codec": "hevc", "bitrate": "2M", "hw_accel": "software"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{applied}");
+    assert_shape(&applied, &baseline["codec_apply"], "codec_apply");
+    assert_eq!(applied["applied"], true);
+    assert_eq!(applied["pending_restart"], false);
+    assert_eq!(applied["encoder"], "libx265");
+    assert_eq!(applied["hls"], "running");
+    assert_eq!(applied["receipt"]["selected"]["codec"], "hevc");
+    assert_eq!(controller.config().video_encoder, HlsEncoder::Hevc);
+
+    let spawns = spawner.spawns.lock().unwrap().clone();
+    assert_eq!(spawns.len(), 2);
+    assert!(spawns[1]
+        .windows(2)
+        .any(|window| window == ["-c:v", "libx265"]));
+    assert!(spawns[1]
+        .windows(2)
+        .any(|window| window == ["-hls_flags", "delete_segments"]));
+
+    let (status, after) = get_json(&app, "/codec").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_shape(&after, &baseline["codec"], "codec");
+    assert_eq!(after["applied"], true);
+    assert_eq!(after["pending_restart"], false);
+    assert_eq!(after["current_encoder"], "libx265");
+    assert_eq!(after["override"]["preference"]["codec"], "hevc");
+    assert_eq!(after["receipt"]["selected"]["codec"], "hevc");
+
+    let (status, connection) = get_json(&connection_router(state), "/api/v1/connection").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_shape(&connection["codec"], &baseline["codec"], "connection.codec");
+    assert_eq!(connection["codec"]["applied"], true);
+    assert_eq!(connection["codec"]["pending_restart"], false);
+    assert_eq!(connection["hls"], "running");
+
+    controller.stop().await.expect("stop HLS");
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+struct ParityHlsSink;
+
+#[async_trait]
+impl FrameSink for ParityHlsSink {
+    async fn write(&mut self, _bytes: &[u8]) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct ParityHlsSpawner {
+    spawns: Mutex<Vec<Vec<String>>>,
+}
+
+impl FfmpegSpawner for ParityHlsSpawner {
+    fn spawn(
+        &self,
+        config: &HlsConfig,
+        width: u32,
+        height: u32,
+    ) -> Result<SpawnedFfmpeg, ozma_node::hls::HlsError> {
+        self.spawns
+            .lock()
+            .unwrap()
+            .push(ffmpeg_argv(config, width, height));
+        Ok(SpawnedFfmpeg {
+            sink: Box::new(ParityHlsSink),
+            child: None,
+        })
+    }
+}
+
+fn parity_software_capability(codec: Codec) -> ozma_encode::EncodeCapability {
+    ozma_encode::EncodeCapability {
+        codec,
+        backend: ozma_protocol::EncoderBackend::Software,
+        hardware: false,
+        max_width: 1920,
+        max_height: 1080,
+        max_fps: 30,
+        hdr: false,
+        profiles: Vec::new(),
+    }
 }
 
 #[tokio::test]

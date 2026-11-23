@@ -13,10 +13,12 @@
 //!
 //! This is the subprocess transition plus the safe, opt-in libvirt provisioning
 //! core. `--provision` can inject QMP/display chardevs, D-Bus p2p display,
-//! optional evdev `input-linux` objects, and PulseAudio environment into libvirt
-//! XML; `--provision-restart` separately allows the destroy/start cycle. Device
-//! creation, per-VM audio routing, libvirt power, and USB/media remain separate
-//! work.
+//! evdev `input-linux` objects, and PulseAudio environment into libvirt XML;
+//! `--provision-restart` separately allows the destroy/start cycle.
+//! `--provision-evdev` can create Linux uinput devices and `--provision-audio`
+//! can create per-VM null sinks. Failure of either device/sink creation is
+//! non-fatal and falls back to no injected path. libvirt power, USB/media, and
+//! Looking Glass remain separate work.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -28,8 +30,15 @@ use tokio::sync::{watch, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::agent::AgentProvisioner;
+use crate::audio_provisioning::{
+    provisioner_from_config as audio_provisioner_from_config, AudioProvisionConfig,
+    AudioSinkProvisioner, ProvisionedSink,
+};
 use crate::discovery;
-use crate::provisioning::{LibvirtProvisioner, ProvisionConfig, TokioCommandRunner, VmProvisioner};
+use crate::evdev_provisioning::{EvdevPaths, EvdevProvisioner, UinputEvdevProvisioner};
+use crate::provisioning::{
+    LibvirtProvisioner, ProvisionConfig, ProvisionHints, TokioCommandRunner, VmProvisioner,
+};
 use crate::supervisor::{
     build_node_spec, restart_delay, NodeHandle, NodeLauncher, NodeSpec, PortAllocator,
     ProcessNodeLauncher, DEFAULT_BASE_PORT, DEFAULT_NODE_BIN, DEFAULT_NODE_HTTP_BASE,
@@ -68,6 +77,8 @@ pub struct ManagerOptions {
     pub provision: bool,
     /// Provisioning paths, environment, and restart behaviour.
     pub provision_config: ProvisionConfig,
+    /// Opt-in per-VM audio sink provisioning.
+    pub audio: AudioProvisionConfig,
 }
 
 impl Default for ManagerOptions {
@@ -87,6 +98,7 @@ impl Default for ManagerOptions {
             supervision_tick: DEFAULT_SUPERVISION_TICK,
             provision: false,
             provision_config: ProvisionConfig::default(),
+            audio: AudioProvisionConfig::default(),
         }
     }
 }
@@ -150,6 +162,8 @@ struct ManagerInner {
     launcher: Arc<dyn NodeLauncher>,
     provisioner: Arc<AgentProvisioner>,
     vm_provisioner: Arc<dyn VmProvisioner>,
+    evdev_provisioner: Option<Arc<dyn EvdevProvisioner>>,
+    audio_provisioner: Option<Arc<dyn AudioSinkProvisioner>>,
     state: Mutex<SupervisorState>,
 }
 
@@ -169,10 +183,33 @@ impl VirtualNodeManager {
     }
 
     /// Constructor with both seams injected, used by provisioning tests.
+    ///
+    /// Production evdev/audio provisioners are built from the options when
+    /// those opt-ins are on. Defaults keep both disabled.
     pub fn with_launcher_and_provisioner(
         options: ManagerOptions,
         launcher: Arc<dyn NodeLauncher>,
         vm_provisioner: Arc<dyn VmProvisioner>,
+    ) -> Self {
+        let evdev = if options.provision_config.evdev.enabled {
+            Some(Arc::new(UinputEvdevProvisioner::new(
+                options.provision_config.evdev.clone(),
+            )) as Arc<dyn EvdevProvisioner>)
+        } else {
+            None
+        };
+        let audio = audio_provisioner_from_config(&options.audio).ok().flatten();
+        Self::with_all_provisioners(options, launcher, vm_provisioner, evdev, audio)
+    }
+
+    /// Constructor with every provisioning seam injected. Tests use fakes;
+    /// production callers normally use [`Self::with_launcher`].
+    pub fn with_all_provisioners(
+        options: ManagerOptions,
+        launcher: Arc<dyn NodeLauncher>,
+        vm_provisioner: Arc<dyn VmProvisioner>,
+        evdev_provisioner: Option<Arc<dyn EvdevProvisioner>>,
+        audio_provisioner: Option<Arc<dyn AudioSinkProvisioner>>,
     ) -> Self {
         let options = Arc::new(options);
         let (stop_tx, stop_rx) = watch::channel(false);
@@ -181,6 +218,8 @@ impl VirtualNodeManager {
             launcher,
             provisioner: Arc::new(AgentProvisioner::new(options.controller_url.clone())),
             vm_provisioner,
+            evdev_provisioner,
+            audio_provisioner,
             state: Mutex::new(SupervisorState {
                 vms: HashMap::new(),
                 ports: PortAllocator::new(options.base_port, options.node_http_base),
@@ -233,7 +272,20 @@ impl VirtualNodeManager {
                      (input-linux is only injected when both are set)"
                 );
             }
+            if self.options.provision_config.evdev.enabled && (keyboard || mouse) {
+                anyhow::bail!(
+                    "--provision-evdev conflicts with --evdev-kbd/--evdev-mouse; \
+                     choose device creation or operator-supplied paths"
+                );
+            }
         }
+        if self.options.provision_config.evdev.enabled && !self.options.provision {
+            anyhow::bail!("--provision-evdev requires --provision");
+        }
+        self.options
+            .audio
+            .validate()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
         Ok(())
     }
 
@@ -354,6 +406,32 @@ impl VirtualNodeManager {
                     mouse.display()
                 );
             }
+            if self.options.provision_config.evdev.enabled {
+                info!(
+                    "  evdev create: on (markers {}, devices {})",
+                    self.options.provision_config.evdev.marker_dir.display(),
+                    self.options.provision_config.evdev.device_dir.display()
+                );
+            }
+        }
+        if self.options.audio.enabled {
+            info!(
+                "  Audio sink:  {} backend, prefix {:?}, track root {}",
+                self.options.audio.backend,
+                self.options.audio.sink_prefix,
+                self.options
+                    .audio
+                    .track_root
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "(none)".to_owned())
+            );
+            info!(
+                "  Audio type:  ozma-node has no --audio-type flag; a non-empty \
+                 --audio-sink is advertised as pipewire"
+            );
+        } else {
+            info!("  Audio sink:  off (no per-VM sink provisioning)");
         }
         if !self.options.exclude_patterns.is_empty() {
             info!(
@@ -403,6 +481,74 @@ impl ManagerInner {
         }
     }
 
+    /// Create or reuse evdev devices. Returns `None` on any failure so XML
+    /// injection falls back to no `input-linux` block.
+    fn ensure_evdev(&self, vm_name: &str) -> Option<EvdevPaths> {
+        let provisioner = self.evdev_provisioner.as_ref()?;
+        match provisioner.ensure(vm_name) {
+            Ok(paths) => {
+                info!(
+                    "VM {}: evdev devices ready (keyboard {}, mouse {})",
+                    vm_name,
+                    paths.keyboard.display(),
+                    paths.mouse.display()
+                );
+                Some(paths)
+            }
+            Err(error) => {
+                warn!(
+                    "VM {}: evdev device provisioning failed: {}; continuing \
+                     without input-linux devices",
+                    vm_name, error
+                );
+                None
+            }
+        }
+    }
+
+    /// Create or reuse the per-VM audio sink. Returns `None` on failure so the
+    /// node starts without `--audio-sink` rather than reporting a false sink.
+    async fn ensure_audio_sink(&self, vm_name: &str) -> Option<ProvisionedSink> {
+        let provisioner = self.audio_provisioner.as_ref()?;
+        match provisioner.ensure(vm_name).await {
+            Ok(sink) => {
+                info!(
+                    "VM {}: audio sink {} ({}) {}",
+                    vm_name,
+                    sink.name,
+                    sink.monitor_target,
+                    if sink.created { "created" } else { "reused" }
+                );
+                Some(sink)
+            }
+            Err(error) => {
+                warn!(
+                    "VM {}: per-VM audio sink provisioning failed: {}; \
+                     continuing without audio",
+                    vm_name, error
+                );
+                None
+            }
+        }
+    }
+
+    /// Release evdev devices and the sink (if this process created it) for a
+    /// stopped or removed VM.
+    async fn release_vm_resources(&self, vm_name: &str) {
+        if let Some(provisioner) = &self.evdev_provisioner {
+            provisioner.release(vm_name);
+        }
+        if let Some(provisioner) = &self.audio_provisioner {
+            if let Err(error) = provisioner.release(vm_name).await {
+                warn!(
+                    "VM {}: could not remove per-VM audio sink: {}",
+                    vm_name, error
+                );
+            }
+        }
+        self.vm_provisioner.release(vm_name).await;
+    }
+
     /// Ask the provisioner for a QMP socket when the VM has none. This is the
     /// only place libvirt XML may be touched, and only when `--provision` is on.
     async fn provision_for_node(&self, vm: &VMInfo) -> ProvisionOutcome {
@@ -437,7 +583,12 @@ impl ManagerInner {
             return ProvisionOutcome::NoQmp;
         }
 
-        match self.vm_provisioner.ensure(vm).await {
+        let hints = ProvisionHints {
+            evdev: self.ensure_evdev(&vm.name),
+            pulse_sink: self.ensure_audio_sink(&vm.name).await.map(|sink| sink.name),
+        };
+
+        match self.vm_provisioner.ensure_with_hints(vm, &hints).await {
             Ok(provisioned) if provisioned.needs_restart => ProvisionOutcome::NeedsRestart {
                 qmp_socket: provisioned.qmp_socket,
                 display_socket: provisioned.display_socket,
@@ -460,6 +611,7 @@ impl ManagerInner {
 
         let current: HashSet<String> = vms.iter().map(|vm| vm.name.clone()).collect();
         let mut to_stop: Vec<NodeHandle> = Vec::new();
+        let mut removed_names: Vec<String> = Vec::new();
         let mut candidates: Vec<(VMInfo, bool)> = Vec::new();
 
         {
@@ -479,6 +631,7 @@ impl ManagerInner {
                         }
                     }
                     state.ports.release(&name);
+                    removed_names.push(name.clone());
                     info!("VM no longer running: {}", name);
                 }
             }
@@ -543,6 +696,10 @@ impl ManagerInner {
             }
         }
 
+        for name in removed_names {
+            self.release_vm_resources(&name).await;
+        }
+
         // Provisioning can take seconds (a requested restart waits for the
         // socket), so never hold the state lock across it.
         for (vm, is_new) in candidates {
@@ -566,13 +723,26 @@ impl ManagerInner {
                     ready.qmp_path = qmp_socket;
                     ready.qmp_input_path = qmp_input_socket;
 
-                    let node = if self.options.auto_manage && !node_present {
+                    let need_node = self.options.auto_manage && !node_present;
+                    // The state lock is held by this match arm; drop it before
+                    // awaiting the router so a slow `pactl` cannot stall
+                    // discovery/status readers.
+                    drop(state);
+                    let audio_sink = if need_node {
+                        self.ensure_audio_sink(&ready.name).await
+                    } else {
+                        None
+                    };
+                    let mut state = self.state.lock().await;
+
+                    let node = if need_node {
                         match state.ports.allocate(&ready.name) {
                             Ok(ports) => Some(NodeState::new(build_node_spec(
                                 &ready,
                                 ports,
                                 &self.options.node_bin,
                                 &self.options.controller_url,
+                                audio_sink.as_ref().map(|sink| sink.name.as_str()),
                             ))),
                             Err(error) => {
                                 warn!("VM {}: cannot allocate per-VM ports: {}", ready.name, error);
@@ -917,15 +1087,15 @@ impl ManagerInner {
 
     /// Stop every tracked child and wait for it. Used on shutdown.
     async fn shutdown(&self) {
-        let handles = {
+        let (names, handles) = {
             let mut state = self.state.lock().await;
             let mut names: Vec<String> = state.vms.keys().cloned().collect();
             names.sort();
 
             let mut handles = Vec::new();
-            for name in names {
-                if let Some(mut managed) = state.vms.remove(&name) {
-                    state.ports.release(&name);
+            for name in &names {
+                if let Some(mut managed) = state.vms.remove(name) {
+                    state.ports.release(name);
                     if let Some(node) = managed.node.take() {
                         if let Some(handle) = node.handle {
                             handles.push(handle);
@@ -934,7 +1104,7 @@ impl ManagerInner {
                 }
             }
             state.ports.clear();
-            handles
+            (names, handles)
         };
 
         for handle in handles {
@@ -943,6 +1113,9 @@ impl ManagerInner {
             if let Err(error) = self.launcher.stop(handle).await {
                 warn!("Failed to stop ozma-node for VM {}: {}", name, error);
             }
+        }
+        for name in names {
+            self.release_vm_resources(&name).await;
         }
         debug!("All per-VM ozma-node children stopped");
     }
@@ -1040,6 +1213,8 @@ fn glob_match_inner(pat: &[char], txt: &[char]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio_provisioning::{AudioBackend, FakeAudioSinkProvisioner};
+    use crate::evdev_provisioning::{EvdevProvisionConfig, FakeEvdevProvisioner};
     use crate::provisioning::{ProvisionError, ProvisionedVm, VmProvisioner};
     use crate::supervisor::testing::FakeNodeLauncher;
     use crate::supervisor::NodePorts;
@@ -1074,6 +1249,22 @@ mod tests {
         VirtualNodeManager::with_launcher_and_provisioner(options, launcher, provisioner)
     }
 
+    fn manager_with_device_provisioners(
+        options: ManagerOptions,
+        launcher: Arc<FakeNodeLauncher>,
+        vm_provisioner: Arc<FakeVmProvisioner>,
+        evdev: Option<Arc<FakeEvdevProvisioner>>,
+        audio: Option<Arc<FakeAudioSinkProvisioner>>,
+    ) -> VirtualNodeManager {
+        VirtualNodeManager::with_all_provisioners(
+            options,
+            launcher,
+            vm_provisioner,
+            evdev.map(|provisioner| provisioner as Arc<dyn EvdevProvisioner>),
+            audio.map(|provisioner| provisioner as Arc<dyn AudioSinkProvisioner>),
+        )
+    }
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum FakeOutcome {
         Ready,
@@ -1083,6 +1274,7 @@ mod tests {
 
     struct FakeVmProvisioner {
         calls: std::sync::Mutex<Vec<String>>,
+        hints: std::sync::Mutex<Vec<ProvisionHints>>,
         outcome: std::sync::Mutex<FakeOutcome>,
     }
 
@@ -1090,6 +1282,7 @@ mod tests {
         fn new(outcome: FakeOutcome) -> Self {
             Self {
                 calls: std::sync::Mutex::new(Vec::new()),
+                hints: std::sync::Mutex::new(Vec::new()),
                 outcome: std::sync::Mutex::new(outcome),
             }
         }
@@ -1098,14 +1291,15 @@ mod tests {
             self.calls.lock().unwrap().clone()
         }
 
+        fn hints(&self) -> Vec<ProvisionHints> {
+            self.hints.lock().unwrap().clone()
+        }
+
         fn set_outcome(&self, outcome: FakeOutcome) {
             *self.outcome.lock().unwrap() = outcome;
         }
-    }
 
-    #[async_trait::async_trait]
-    impl VmProvisioner for FakeVmProvisioner {
-        async fn ensure(&self, vm: &VMInfo) -> Result<ProvisionedVm, ProvisionError> {
+        async fn provision(&self, vm: &VMInfo) -> Result<ProvisionedVm, ProvisionError> {
             self.calls.lock().unwrap().push(vm.name.clone());
             let outcome = *self.outcome.lock().unwrap();
             if outcome == FakeOutcome::Failed {
@@ -1122,6 +1316,22 @@ mod tests {
                 changed: true,
                 needs_restart: outcome == FakeOutcome::NeedsRestart,
             })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VmProvisioner for FakeVmProvisioner {
+        async fn ensure(&self, vm: &VMInfo) -> Result<ProvisionedVm, ProvisionError> {
+            self.provision(vm).await
+        }
+
+        async fn ensure_with_hints(
+            &self,
+            vm: &VMInfo,
+            hints: &ProvisionHints,
+        ) -> Result<ProvisionedVm, ProvisionError> {
+            self.hints.lock().unwrap().push(hints.clone());
+            self.provision(vm).await
         }
     }
 
@@ -1385,6 +1595,180 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn evdev_hints_flow_into_provisioning_and_are_released_on_removal() {
+        let launcher = Arc::new(FakeNodeLauncher::new());
+        let provisioner = Arc::new(FakeVmProvisioner::new(FakeOutcome::Ready));
+        let evdev = Arc::new(FakeEvdevProvisioner::new("/run/ozma/fake-evdev"));
+        let mgr = manager_with_device_provisioners(
+            ManagerOptions {
+                provision: true,
+                ..options(true)
+            },
+            Arc::clone(&launcher),
+            Arc::clone(&provisioner),
+            Some(Arc::clone(&evdev)),
+            None,
+        );
+
+        mgr.inner.reconcile(vec![vm("vm-a", "")]).await;
+        mgr.inner.supervise().await;
+
+        assert_eq!(evdev.ensured(), vec!["vm-a".to_owned()]);
+        let hints = provisioner.hints();
+        assert_eq!(hints.len(), 1);
+        let paths = hints[0].evdev.as_ref().expect("evdev hint");
+        assert_eq!(
+            paths.keyboard,
+            PathBuf::from("/run/ozma/fake-evdev/vm-a-kbd")
+        );
+        assert_eq!(
+            paths.mouse,
+            PathBuf::from("/run/ozma/fake-evdev/vm-a-mouse")
+        );
+        assert_eq!(launcher.spawns().len(), 1);
+
+        mgr.inner.reconcile(Vec::new()).await;
+        assert_eq!(evdev.released(), vec!["vm-a".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn evdev_failure_falls_back_and_still_starts_the_node() {
+        let launcher = Arc::new(FakeNodeLauncher::new());
+        let provisioner = Arc::new(FakeVmProvisioner::new(FakeOutcome::Ready));
+        let evdev = Arc::new(FakeEvdevProvisioner::new("/run/ozma/fake-evdev"));
+        evdev.set_fail(true);
+        let mgr = manager_with_device_provisioners(
+            ManagerOptions {
+                provision: true,
+                ..options(true)
+            },
+            Arc::clone(&launcher),
+            Arc::clone(&provisioner),
+            Some(evdev),
+            None,
+        );
+
+        mgr.inner.reconcile(vec![vm("vm-a", "")]).await;
+        mgr.inner.supervise().await;
+
+        assert!(provisioner.hints()[0].evdev.is_none());
+        assert_eq!(launcher.spawns().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn audio_sink_is_created_before_spawn_and_removed_on_removal() {
+        let launcher = Arc::new(FakeNodeLauncher::new());
+        let provisioner = Arc::new(FakeVmProvisioner::new(FakeOutcome::Ready));
+        let audio = Arc::new(FakeAudioSinkProvisioner::new("ozma-"));
+        let mgr = manager_with_device_provisioners(
+            ManagerOptions {
+                provision: true,
+                audio: AudioProvisionConfig {
+                    enabled: true,
+                    backend: AudioBackend::PipeWire,
+                    ..AudioProvisionConfig::default()
+                },
+                ..options(true)
+            },
+            Arc::clone(&launcher),
+            Arc::clone(&provisioner),
+            None,
+            Some(Arc::clone(&audio)),
+        );
+
+        mgr.inner.reconcile(vec![vm("vm-a", "")]).await;
+        assert!(
+            audio.ensured().contains(&"vm-a".to_owned()),
+            "sink must be created during reconcile"
+        );
+        assert!(
+            launcher.spawns().is_empty(),
+            "sink creation precedes the supervised spawn"
+        );
+        mgr.inner.supervise().await;
+
+        assert!(audio.ensured().contains(&"vm-a".to_owned()));
+        let spawns = launcher.spawns();
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].audio_sink.as_deref(), Some("ozma-vm-a"));
+        let argv = spawns[0].argv();
+        let sink = argv
+            .iter()
+            .position(|arg| arg == "--audio-sink")
+            .expect("audio sink flag");
+        assert_eq!(argv[sink + 1], "ozma-vm-a");
+        assert_eq!(
+            provisioner.hints()[0].pulse_sink.as_deref(),
+            Some("ozma-vm-a")
+        );
+
+        mgr.inner.reconcile(Vec::new()).await;
+        assert_eq!(audio.released(), vec!["vm-a".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn audio_failure_falls_back_without_the_sink_flag() {
+        let launcher = Arc::new(FakeNodeLauncher::new());
+        let provisioner = Arc::new(FakeVmProvisioner::new(FakeOutcome::Ready));
+        let audio = Arc::new(FakeAudioSinkProvisioner::new("ozma-"));
+        audio.set_fail(true);
+        let mgr = manager_with_device_provisioners(
+            ManagerOptions {
+                provision: true,
+                audio: AudioProvisionConfig {
+                    enabled: true,
+                    backend: AudioBackend::PulseAudio,
+                    ..AudioProvisionConfig::default()
+                },
+                ..options(true)
+            },
+            Arc::clone(&launcher),
+            Arc::clone(&provisioner),
+            None,
+            Some(audio),
+        );
+
+        mgr.inner.reconcile(vec![vm("vm-a", "")]).await;
+        mgr.inner.supervise().await;
+
+        let spawns = launcher.spawns();
+        assert_eq!(spawns.len(), 1);
+        assert!(spawns[0].audio_sink.is_none());
+        assert!(!spawns[0].argv().iter().any(|arg| arg == "--audio-sink"));
+        assert!(provisioner.hints()[0].pulse_sink.is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_evdev_and_audio_resources() {
+        let launcher = Arc::new(FakeNodeLauncher::new());
+        let provisioner = Arc::new(FakeVmProvisioner::new(FakeOutcome::Ready));
+        let evdev = Arc::new(FakeEvdevProvisioner::new("/run/ozma/fake-evdev"));
+        let audio = Arc::new(FakeAudioSinkProvisioner::new("ozma-"));
+        let mgr = manager_with_device_provisioners(
+            ManagerOptions {
+                provision: true,
+                audio: AudioProvisionConfig {
+                    enabled: true,
+                    backend: AudioBackend::PipeWire,
+                    ..AudioProvisionConfig::default()
+                },
+                ..options(true)
+            },
+            Arc::clone(&launcher),
+            Arc::clone(&provisioner),
+            Some(Arc::clone(&evdev)),
+            Some(Arc::clone(&audio)),
+        );
+
+        mgr.inner.reconcile(vec![vm("vm-a", "")]).await;
+        mgr.inner.supervise().await;
+        mgr.inner.shutdown().await;
+
+        assert_eq!(evdev.released(), vec!["vm-a".to_owned()]);
+        assert_eq!(audio.released(), vec!["vm-a".to_owned()]);
+    }
+
+    #[tokio::test]
     async fn restart_success_promotes_a_tracked_vm_to_a_child() {
         let launcher = Arc::new(FakeNodeLauncher::new());
         let provisioner = Arc::new(FakeVmProvisioner::new(FakeOutcome::NeedsRestart));
@@ -1638,6 +2022,69 @@ mod tests {
             launcher,
         );
         assert!(one_evdev.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_new_device_and_audio_combinations() {
+        let launcher = Arc::new(FakeNodeLauncher::new());
+
+        let evdev_without_provision = manager(
+            ManagerOptions {
+                provision: false,
+                provision_config: ProvisionConfig {
+                    evdev: EvdevProvisionConfig {
+                        enabled: true,
+                        ..EvdevProvisionConfig::default()
+                    },
+                    ..ProvisionConfig::default()
+                },
+                ..options(true)
+            },
+            Arc::clone(&launcher),
+        );
+        assert!(evdev_without_provision.validate().is_err());
+
+        let conflicting_evdev = manager(
+            ManagerOptions {
+                provision: true,
+                provision_config: ProvisionConfig {
+                    evdev_keyboard: Some(PathBuf::from("/dev/input/event5")),
+                    evdev_mouse: Some(PathBuf::from("/dev/input/event6")),
+                    evdev: EvdevProvisionConfig {
+                        enabled: true,
+                        ..EvdevProvisionConfig::default()
+                    },
+                    ..ProvisionConfig::default()
+                },
+                ..options(true)
+            },
+            Arc::clone(&launcher),
+        );
+        assert!(conflicting_evdev.validate().is_err());
+
+        let audio_without_backend = manager(
+            ManagerOptions {
+                audio: AudioProvisionConfig {
+                    enabled: true,
+                    ..AudioProvisionConfig::default()
+                },
+                ..options(true)
+            },
+            Arc::clone(&launcher),
+        );
+        assert!(audio_without_backend.validate().is_err());
+
+        let backend_without_enable = manager(
+            ManagerOptions {
+                audio: AudioProvisionConfig {
+                    backend: AudioBackend::PipeWire,
+                    ..AudioProvisionConfig::default()
+                },
+                ..options(true)
+            },
+            launcher,
+        );
+        assert!(backend_without_enable.validate().is_err());
     }
 
     #[test]

@@ -32,12 +32,17 @@ libc               = { workspace = true }
 ozma-proto         = { path = "../ozma-proto" }
 ozma-mesh          = { path = "../ozma-mesh" }
 ozma-crypto        = { path = "../ozma-crypto" }
+ozma-audio         = { path = "../ozma-audio" }
 
 # Meeting detection
 sysinfo    = { version = "0.30" }
 icalendar  = "0.15"
 chrono     = { version = "0.4", features = ["serde"] }
 uuid       = { version = "1", features = ["v4"] }
+
+# Linux evdev/uinput device creation for per-VM input-linux objects.
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.12"
 
 [dev-dependencies]
 tempfile = "3"

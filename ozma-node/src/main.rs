@@ -28,7 +28,7 @@ use ozma_node::{
         DEFAULT_QMP_CONNECT_TIMEOUT_MS,
     },
     controller_compat::{self, AudioControl, CodecControl},
-    hls::{HlsConfig, HlsPipeline, HlsStatus},
+    hls::{HlsConfig, HlsController, HlsEncoder, HlsError, HlsSourceFactory, HlsStatus},
     input_select, mdns, platform, registration, usb_audio,
     webrtc::{WebRtcConfig, WebRtcControl, WebRtcHelper},
 };
@@ -265,6 +265,18 @@ pub struct Args {
     #[arg(long, env = "OZMA_HLS_BITRATE_KBPS", default_value_t = 4000)]
     pub hls_bitrate_kbps: u32,
 
+    /// HLS video encoder: libx264, libx265, libsvtav1, libaom-av1, or mjpeg.
+    ///
+    /// Hardware encoder names are rejected: the HLS raw-frame path has no
+    /// upload/hwaccel filter chain.
+    #[arg(
+        long,
+        env = "OZMA_HLS_ENCODER",
+        default_value = "libx264",
+        value_name = "ENCODER"
+    )]
+    pub hls_encoder: String,
+
     /// ffmpeg executable used by the HLS pipeline.
     #[arg(
         long,
@@ -478,17 +490,27 @@ async fn main() {
 
     // Local HLS compatibility pipeline. HLS is opt-in; a missing source or
     // ffmpeg leaves it unavailable and reported as `failed`, never as running.
+    // The controller owns the live pipeline so POST /codec can restart it with
+    // a newly selected software encoder.
     let hls_output_dir = args.hls.then(|| {
         args.hls_dir
             .clone()
             .unwrap_or_else(|| default_hls_dir(&config.name))
     });
-    let mut hls_pipeline: Option<HlsPipeline> = None;
+    let mut hls_controller: Option<HlsController> = None;
     let hls_status = if let Some(directory) = hls_output_dir.as_ref() {
+        let encoder = match HlsEncoder::parse(&args.hls_encoder) {
+            Ok(encoder) => encoder,
+            Err(error) => {
+                error!("Invalid HLS encoder: {error}");
+                std::process::exit(2);
+            }
+        };
         let hls_config = HlsConfig {
             output_dir: directory.clone(),
             fps: args.hls_fps,
             bitrate_kbps: args.hls_bitrate_kbps,
+            video_encoder: encoder,
             ffmpeg_bin: args.ffmpeg_bin.clone(),
             ..HlsConfig::default()
         };
@@ -500,15 +522,20 @@ async fn main() {
             warn!("--hls was requested but the video capability is disabled; HLS is unavailable");
             HlsStatus::failed("video capability is disabled")
         } else {
-            match start_hls(&capture_registry, hls_config) {
-                Ok(pipeline) => {
-                    let status = pipeline.status();
+            let registry = capture_registry.clone();
+            let source_factory: HlsSourceFactory = std::sync::Arc::new(move || {
+                open_first_capture_source(&registry).map_err(|message| HlsError::Source { message })
+            });
+            let controller = HlsController::new(source_factory, hls_config);
+            match controller.start().await {
+                Ok(status) => {
                     info!(
-                        dir = %pipeline.output_dir().display(),
-                        manifest = %pipeline.manifest_path().display(),
+                        dir = %directory.display(),
+                        manifest = %controller.config().manifest_path().display(),
+                        encoder = controller.config().video_encoder.ffmpeg_name(),
                         "HLS pipeline started (status becomes running when the manifest exists)"
                     );
-                    hls_pipeline = Some(pipeline);
+                    hls_controller = Some(controller);
                     status
                 }
                 Err(error) => {
@@ -516,6 +543,7 @@ async fn main() {
                         error = %error,
                         "HLS unavailable: the local stream pipeline did not start"
                     );
+                    hls_controller = Some(controller);
                     HlsStatus::failed(format!("HLS unavailable: {error}"))
                 }
             }
@@ -600,9 +628,9 @@ async fn main() {
         sink_kind,
     );
     // Runtime codec override control. Probed against the host exactly like the
-    // session backend, but it only stores the request/receipt: the running
-    // HLS/WebRTC pipeline cannot switch until it is restarted, so POST /codec
-    // always reports pending_restart. No video -> no control -> typed 503.
+    // session backend. When HLS is running, POST /codec restarts the HLS
+    // pipeline with the selected software encoder; when HLS is off the override
+    // is stored for a future start. WebRTC keeps its existing encoder.
     let codec_control = if config.has_capability("video") && !capabilities.encode.is_empty() {
         let registry = ozma_encode::EncoderRegistry::with_detected_encoders().await;
         let format = ozma_protocol::MediaFormat::new(
@@ -612,7 +640,7 @@ async fn main() {
             args.hls_fps.max(1),
             args.hls_bitrate_kbps.max(1),
         );
-        Some(CodecControl::new(registry, format))
+        Some(CodecControl::new(registry, format).with_hls(hls_controller.clone()))
     } else {
         None
     };
@@ -623,6 +651,7 @@ async fn main() {
         controller_compat::ConnectionState::new(connection_info, compat_stats.clone())
             .with_power(power)
             .with_hls(Some(hls_status))
+            .with_hls_controller(hls_controller.clone())
             .with_input_sink(Some(input_sink.clone()))
             .with_codecs(codec_status)
             .with_codec_control(codec_control)
@@ -813,8 +842,8 @@ async fn main() {
     });
 
     wait_for_shutdown().await;
-    if let Some(pipeline) = hls_pipeline.as_mut() {
-        if let Err(error) = pipeline.stop().await {
+    if let Some(controller) = hls_controller.as_ref() {
+        if let Err(error) = controller.stop().await {
             warn!(error = %error, "HLS pipeline did not stop cleanly");
         }
     }
@@ -860,15 +889,6 @@ fn open_first_capture_source(
     registry
         .open(&source)
         .map_err(|error| format!("opening capture source `{id}` failed: {}", error.message))
-}
-
-/// Open the first registry source and start the HLS pipeline.
-fn start_hls(
-    registry: &ozma_capture::CaptureRegistry,
-    hls_config: HlsConfig,
-) -> Result<HlsPipeline, String> {
-    let source = open_first_capture_source(registry)?;
-    HlsPipeline::start(source, hls_config).map_err(|error| error.to_string())
 }
 
 /// Default WebRTC signaling socket. `/tmp` is writable without extra

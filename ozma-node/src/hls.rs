@@ -43,10 +43,97 @@ pub const DEFAULT_SEGMENT_SECONDS: f32 = 1.0;
 pub const DEFAULT_PLAYLIST_SIZE: u32 = 4;
 /// Default capture/encode frame rate.
 pub const DEFAULT_FPS: u32 = 30;
-/// Default H.264 bitrate in kbps (4 Mbps).
+/// Default video bitrate in kbps (4 Mbps).
 pub const DEFAULT_BITRATE_KBPS: u32 = 4_000;
 /// Largest error string retained for `/api/v1/connection`.
 const MAX_STATUS_ERROR_CHARS: usize = 512;
+
+/// Video encoder used by the HLS ffmpeg pipeline.
+///
+/// Only encoders this module can invoke directly are represented. Hardware
+/// encoders are deliberately absent: the HLS path feeds raw RGB24 frames over
+/// stdin, which requires an explicit upload/hwaccel filter chain that this
+/// compatibility pipeline does not implement. Naming `h264_nvenc` (or any other
+/// `*_nvenc`/`*_vaapi`/`*_qsv`/`*_v4l2m2m` encoder) is a typed error rather
+/// than a silent software substitution.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HlsEncoder {
+    /// Software H.264 through `libx264` (the historical default).
+    #[default]
+    H264,
+    /// Software HEVC through `libx265`.
+    Hevc,
+    /// Software AV1 through `libsvtav1`.
+    Av1Svt,
+    /// Software AV1 through `libaom-av1`.
+    Av1Aom,
+    /// Motion JPEG through `mjpeg`.
+    Mjpeg,
+}
+
+impl HlsEncoder {
+    /// Every encoder this pipeline supports, in preference order.
+    pub const ALL: [Self; 5] = [
+        Self::H264,
+        Self::Hevc,
+        Self::Av1Svt,
+        Self::Av1Aom,
+        Self::Mjpeg,
+    ];
+
+    /// The exact `ffmpeg -c:v` value.
+    pub fn ffmpeg_name(self) -> &'static str {
+        match self {
+            Self::H264 => "libx264",
+            Self::Hevc => "libx265",
+            Self::Av1Svt => "libsvtav1",
+            Self::Av1Aom => "libaom-av1",
+            Self::Mjpeg => "mjpeg",
+        }
+    }
+
+    /// Parse a controller/CLI encoder name.
+    ///
+    /// Hardware encoder names and unknown values return
+    /// [`HlsError::UnsupportedEncoder`]. The error never falls back to a
+    /// different encoder, so a caller cannot mistake a rejected hardware
+    /// request for a working software one.
+    pub fn parse(value: &str) -> Result<Self, HlsError> {
+        let normalized = value.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "libx264" | "x264" | "h264" | "avc" | "h.264" => Ok(Self::H264),
+            "libx265" | "x265" | "h265" | "hevc" | "h.265" => Ok(Self::Hevc),
+            "libsvtav1" | "svtav1" | "av1" => Ok(Self::Av1Svt),
+            "libaom-av1" | "aom-av1" | "libaom" => Ok(Self::Av1Aom),
+            "mjpeg" | "mjpg" | "jpeg" => Ok(Self::Mjpeg),
+            hardware
+                if hardware.ends_with("_nvenc")
+                    || hardware.ends_with("_vaapi")
+                    || hardware.ends_with("_qsv")
+                    || hardware.ends_with("_v4l2m2m")
+                    || hardware.ends_with("_videotoolbox") =>
+            {
+                Err(HlsError::UnsupportedEncoder {
+                    encoder: value.trim().to_owned(),
+                    message: "hardware encoders need an upload/hwaccel filter chain that this \
+                              HLS ffmpeg path does not implement"
+                        .to_owned(),
+                })
+            }
+            _ => Err(HlsError::UnsupportedEncoder {
+                encoder: value.trim().to_owned(),
+                message: format!(
+                    "expected one of {}",
+                    Self::ALL
+                        .iter()
+                        .map(|encoder| encoder.ffmpeg_name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }),
+        }
+    }
+}
 
 /// Configuration for the ffmpeg-backed HLS pipeline.
 ///
@@ -64,8 +151,10 @@ pub struct HlsConfig {
     pub playlist_size: u32,
     /// Input frame rate advertised to ffmpeg.
     pub fps: u32,
-    /// H.264 bitrate in kbps.
+    /// Video bitrate in kbps (ignored by the constant-quality MJPEG path).
     pub bitrate_kbps: u32,
+    /// Video encoder selected for this pipeline generation.
+    pub video_encoder: HlsEncoder,
     /// Optional input width override.
     pub width: Option<u32>,
     /// Optional input height override.
@@ -82,6 +171,7 @@ impl Default for HlsConfig {
             playlist_size: DEFAULT_PLAYLIST_SIZE,
             fps: DEFAULT_FPS,
             bitrate_kbps: DEFAULT_BITRATE_KBPS,
+            video_encoder: HlsEncoder::default(),
             width: None,
             height: None,
             ffmpeg_bin: PathBuf::from("ffmpeg"),
@@ -164,6 +254,29 @@ pub enum HlsError {
     /// The configuration cannot be used.
     #[error("invalid HLS configuration: {0}")]
     InvalidConfig(String),
+    /// The selected ffmpeg encoder is not supported by this pipeline.
+    #[error("HLS encoder `{encoder}` is not supported: {message}")]
+    UnsupportedEncoder {
+        /// Encoder name as supplied.
+        encoder: String,
+        /// Why it cannot be used.
+        message: String,
+    },
+    /// A fresh capture source could not be opened for a pipeline generation.
+    #[error("could not open an HLS capture source: {message}")]
+    Source {
+        /// Underlying failure.
+        message: String,
+    },
+    /// There is no running pipeline to restart.
+    #[error("the HLS pipeline is not running")]
+    NotRunning,
+    /// A restart failed and the previous pipeline was not restored.
+    #[error("HLS restart failed: {message}")]
+    Restart {
+        /// What failed, including the restoration outcome.
+        message: String,
+    },
     /// A pixel format cannot be fed to ffmpeg's raw RGB24 input.
     #[error(
         "HLS cannot feed `{0}` frames to ffmpeg as raw RGB24; only rgb24 and bgra are supported"
@@ -399,6 +512,12 @@ fn bounded(message: String) -> String {
     let mut truncated: String = message.chars().take(MAX_STATUS_ERROR_CHARS).collect();
     truncated.push('…');
     truncated
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Destination for converted raw frames.
@@ -646,6 +765,174 @@ impl Drop for HlsPipeline {
     }
 }
 
+/// Factory that opens a fresh capture source for a new pipeline generation.
+///
+/// A restart must not reuse a source that the old frame task owned: capture
+/// backends release their device/socket in `stop()`, so a new source is opened
+/// from the same registry after the old pipeline has stopped.
+pub type HlsSourceFactory = Arc<dyn Fn() -> Result<Box<dyn CaptureSource>, HlsError> + Send + Sync>;
+
+/// Owns the current [`HlsPipeline`] so it can be stopped and restarted.
+///
+/// `POST /codec` uses [`HlsController::restart_with_encoder`] to apply a codec
+/// override to the running HLS stream. The controller is cloneable; every
+/// clone shares the same pipeline slot, configuration, and status.
+#[derive(Clone)]
+pub struct HlsController {
+    pipeline: Arc<tokio::sync::Mutex<Option<HlsPipeline>>>,
+    config: Arc<Mutex<HlsConfig>>,
+    status: Arc<Mutex<HlsStatus>>,
+    source_factory: HlsSourceFactory,
+    spawner: Arc<dyn FfmpegSpawner>,
+}
+
+impl HlsController {
+    /// Build a controller that spawns the system ffmpeg for each generation.
+    pub fn new(source_factory: HlsSourceFactory, config: HlsConfig) -> Self {
+        Self::with_spawner(source_factory, config, Arc::new(SystemFfmpegSpawner))
+    }
+
+    /// Build a controller with an injected process factory, for tests.
+    pub fn with_spawner(
+        source_factory: HlsSourceFactory,
+        config: HlsConfig,
+        spawner: Arc<dyn FfmpegSpawner>,
+    ) -> Self {
+        Self {
+            pipeline: Arc::new(tokio::sync::Mutex::new(None)),
+            config: Arc::new(Mutex::new(config)),
+            status: Arc::new(Mutex::new(HlsStatus::not_configured())),
+            source_factory,
+            spawner,
+        }
+    }
+
+    /// Configuration of the current (or next) pipeline generation.
+    pub fn config(&self) -> HlsConfig {
+        lock(&self.config).clone()
+    }
+
+    /// Cloneable status of the current pipeline generation.
+    pub fn status(&self) -> HlsStatus {
+        lock(&self.status).clone()
+    }
+
+    /// True while the current pipeline is starting or running.
+    pub fn is_running(&self) -> bool {
+        matches!(
+            self.status().state(),
+            HlsState::Starting | HlsState::Running
+        )
+    }
+
+    /// Open a source and start a pipeline without touching controller state.
+    fn open_and_start(&self, config: HlsConfig) -> Result<HlsPipeline, HlsError> {
+        let source = (self.source_factory)()?;
+        HlsPipeline::start_with_spawner(source, config, self.spawner.clone())
+    }
+
+    /// Start the pipeline if it is not already running.
+    ///
+    /// A source or spawn failure returns a typed error and stores `failed`
+    /// status; no success is claimed.
+    pub async fn start(&self) -> Result<HlsStatus, HlsError> {
+        let mut pipeline = self.pipeline.lock().await;
+        if pipeline.is_some() {
+            return Ok(self.status());
+        }
+        let config = self.config();
+        match self.open_and_start(config) {
+            Ok(started) => {
+                let status = started.status();
+                *lock(&self.status) = status.clone();
+                *pipeline = Some(started);
+                Ok(status)
+            }
+            Err(error) => {
+                *lock(&self.status) = HlsStatus::failed(error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    /// Stop and drop the current pipeline.
+    ///
+    /// Idempotent when no pipeline is running. The status is updated from the
+    /// pipeline's final state (normally `stopped`/`failed`).
+    pub async fn stop(&self) -> Result<(), HlsError> {
+        let mut pipeline = self.pipeline.lock().await;
+        let Some(mut current) = pipeline.take() else {
+            return Ok(());
+        };
+        let result = current.stop().await;
+        *lock(&self.status) = current.status();
+        result
+    }
+
+    /// Restart HLS with a different ffmpeg encoder.
+    ///
+    /// The old pipeline is stopped before the new source is opened. If the new
+    /// generation cannot start, the previous configuration is restored with a
+    /// fresh source. When restoration also fails, HLS is left stopped and the
+    /// status/error reports both failures rather than claiming success.
+    pub async fn restart_with_encoder(
+        &self,
+        encoder: HlsEncoder,
+        bitrate_kbps: Option<u32>,
+    ) -> Result<HlsStatus, HlsError> {
+        let mut pipeline = self.pipeline.lock().await;
+        let Some(mut previous) = pipeline.take() else {
+            return Err(HlsError::NotRunning);
+        };
+
+        let previous_config = self.config();
+        // Stop before opening a second source: capture devices are exclusive and
+        // the old frame task owns the current one.
+        let _ = previous.stop().await;
+
+        let mut next_config = previous_config.clone();
+        next_config.video_encoder = encoder;
+        if let Some(bitrate) = bitrate_kbps {
+            next_config.bitrate_kbps = bitrate;
+        }
+
+        match self.open_and_start(next_config.clone()) {
+            Ok(started) => {
+                *lock(&self.config) = next_config;
+                let status = started.status();
+                *lock(&self.status) = status.clone();
+                *pipeline = Some(started);
+                Ok(status)
+            }
+            Err(start_error) => {
+                let start_message = start_error.to_string();
+                match self.open_and_start(previous_config.clone()) {
+                    Ok(restored) => {
+                        let status = restored.status();
+                        *lock(&self.status) = status.clone();
+                        *pipeline = Some(restored);
+                        Err(HlsError::Restart {
+                            message: format!(
+                                "{start_message}; restored the previous pipeline with encoder `{}`",
+                                previous_config.video_encoder.ffmpeg_name()
+                            ),
+                        })
+                    }
+                    Err(restore_error) => {
+                        let message = format!(
+                            "{start_message}; restoring the previous pipeline with encoder `{}` \
+                             also failed: {restore_error}",
+                            previous_config.video_encoder.ffmpeg_name()
+                        );
+                        *lock(&self.status) = HlsStatus::failed(message.clone());
+                        Err(HlsError::Restart { message })
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn kill_child(child: &Arc<Mutex<Option<Child>>>) {
     let child = child
         .lock()
@@ -859,7 +1146,8 @@ fn create_output_dir(config: &HlsConfig) -> Result<(), HlsError> {
 /// The binary itself is the first element. Tests assert this list directly; the
 /// system spawner uses the same function, so argv and behavior cannot drift.
 pub fn ffmpeg_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String> {
-    vec![
+    let bitrate = format!("{}k", config.bitrate_kbps);
+    let mut argv = vec![
         config.ffmpeg_bin.display().to_string(),
         "-hide_banner".to_owned(),
         "-loglevel".to_owned(),
@@ -876,23 +1164,59 @@ pub fn ffmpeg_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String> {
         "-".to_owned(),
         "-an".to_owned(),
         "-c:v".to_owned(),
-        "libx264".to_owned(),
-        "-preset".to_owned(),
-        "veryfast".to_owned(),
-        "-tune".to_owned(),
-        "zerolatency".to_owned(),
-        "-b:v".to_owned(),
-        format!("{}k", config.bitrate_kbps),
+        config.video_encoder.ffmpeg_name().to_owned(),
+    ];
+
+    match config.video_encoder {
+        HlsEncoder::H264 => argv.extend([
+            "-preset".to_owned(),
+            "veryfast".to_owned(),
+            "-tune".to_owned(),
+            "zerolatency".to_owned(),
+            "-b:v".to_owned(),
+            bitrate,
+        ]),
+        HlsEncoder::Hevc => argv.extend([
+            "-preset".to_owned(),
+            "ultrafast".to_owned(),
+            "-tune".to_owned(),
+            "zerolatency".to_owned(),
+            "-b:v".to_owned(),
+            bitrate,
+        ]),
+        HlsEncoder::Av1Svt => argv.extend([
+            "-preset".to_owned(),
+            "10".to_owned(),
+            "-b:v".to_owned(),
+            bitrate,
+        ]),
+        HlsEncoder::Av1Aom => argv.extend([
+            "-cpu-used".to_owned(),
+            "8".to_owned(),
+            "-row-mt".to_owned(),
+            "1".to_owned(),
+            "-b:v".to_owned(),
+            bitrate,
+        ]),
+        HlsEncoder::Mjpeg => argv.extend(["-q:v".to_owned(), "5".to_owned()]),
+    }
+
+    argv.extend([
         "-f".to_owned(),
         "hls".to_owned(),
         "-hls_time".to_owned(),
         format_seconds(config.segment_seconds),
         "-hls_list_size".to_owned(),
         config.playlist_size.to_string(),
+        // Remove segments that fall out of the rolling playlist. Without this
+        // flag the output directory grows without bound.
+        "-hls_flags".to_owned(),
+        "delete_segments".to_owned(),
         "-hls_segment_filename".to_owned(),
         config.segment_pattern().display().to_string(),
         config.manifest_path().display().to_string(),
-    ]
+    ]);
+    argv
 }
 
 fn format_seconds(value: f32) -> String {
@@ -916,7 +1240,7 @@ pub fn stream_router(output_dir: impl Into<PathBuf>) -> Router {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use ozma_media::Frame;
@@ -1073,6 +1397,35 @@ mod tests {
         assert!(condition(), "condition was not met before the timeout");
     }
 
+    fn controller_factory(
+        calls: Arc<AtomicUsize>,
+        fail_on: Arc<Mutex<Vec<usize>>>,
+        stopped: Arc<Mutex<Vec<Arc<AtomicBool>>>>,
+    ) -> HlsSourceFactory {
+        Arc::new(move || {
+            let call = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if fail_on
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(&call)
+            {
+                return Err(HlsError::Source {
+                    message: format!("fake source open failure #{call}"),
+                });
+            }
+            let (source, flag) = FakeSource::new(
+                FrameFormat::rgb24(2, 2),
+                vec![Ok(rgb_frame(2, 2, 0, 0x55))],
+                true,
+            );
+            stopped
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(flag);
+            Ok(Box::new(source))
+        })
+    }
+
     #[test]
     fn defaults_are_the_documented_pipeline() {
         let config = HlsConfig::default();
@@ -1080,6 +1433,7 @@ mod tests {
         assert_eq!(config.playlist_size, 4);
         assert_eq!(config.fps, 30);
         assert_eq!(config.bitrate_kbps, 4_000);
+        assert_eq!(config.video_encoder, HlsEncoder::H264);
         assert_eq!(config.ffmpeg_bin, PathBuf::from("ffmpeg"));
         assert_eq!(config.width, None);
         assert_eq!(config.height, None);
@@ -1152,6 +1506,8 @@ mod tests {
                 "1",
                 "-hls_list_size",
                 "4",
+                "-hls_flags",
+                "delete_segments",
                 "-hls_segment_filename",
                 "/tmp/ozma-stream-node/seg_%05d.ts",
                 "/tmp/ozma-stream-node/stream.m3u8",
@@ -1172,6 +1528,244 @@ mod tests {
         assert!(fractional.contains(&"15".to_owned()));
         assert!(fractional.contains(&"1500k".to_owned()));
         assert!(fractional.contains(&"1280x720".to_owned()));
+    }
+
+    #[test]
+    fn ffmpeg_argv_selects_each_supported_encoder_and_prunes_segments() {
+        let base = HlsConfig {
+            output_dir: PathBuf::from("/tmp/ozma-stream-encoders"),
+            ..HlsConfig::default()
+        };
+
+        for (encoder, expected_name, expected_codec_args) in [
+            (
+                HlsEncoder::H264,
+                "libx264",
+                vec!["-preset", "veryfast", "-tune", "zerolatency"],
+            ),
+            (
+                HlsEncoder::Hevc,
+                "libx265",
+                vec!["-preset", "ultrafast", "-tune", "zerolatency"],
+            ),
+            (HlsEncoder::Av1Svt, "libsvtav1", vec!["-preset", "10"]),
+            (
+                HlsEncoder::Av1Aom,
+                "libaom-av1",
+                vec!["-cpu-used", "8", "-row-mt", "1"],
+            ),
+            (HlsEncoder::Mjpeg, "mjpeg", vec!["-q:v", "5"]),
+        ] {
+            let argv = ffmpeg_argv(
+                &HlsConfig {
+                    video_encoder: encoder,
+                    ..base.clone()
+                },
+                320,
+                240,
+            );
+            let codec_index = argv
+                .iter()
+                .position(|argument| argument == "-c:v")
+                .unwrap_or_else(|| panic!("{encoder:?} argv has no -c:v"));
+            assert_eq!(argv[codec_index + 1], expected_name, "{encoder:?}");
+            for pair in expected_codec_args.chunks(2) {
+                let index = argv
+                    .iter()
+                    .position(|argument| argument == pair[0])
+                    .unwrap_or_else(|| panic!("{encoder:?} argv is missing {}", pair[0]));
+                assert_eq!(argv[index + 1], pair[1], "{encoder:?}");
+            }
+            assert!(
+                argv.windows(2)
+                    .any(|window| window == ["-hls_flags", "delete_segments"]),
+                "{encoder:?} argv must prune segments"
+            );
+        }
+    }
+
+    #[test]
+    fn encoder_names_are_parsed_and_hardware_is_rejected() {
+        assert_eq!(HlsEncoder::parse("libx264").unwrap(), HlsEncoder::H264);
+        assert_eq!(HlsEncoder::parse("hevc").unwrap(), HlsEncoder::Hevc);
+        assert_eq!(HlsEncoder::parse("libsvtav1").unwrap(), HlsEncoder::Av1Svt);
+        assert_eq!(HlsEncoder::parse("libaom-av1").unwrap(), HlsEncoder::Av1Aom);
+        assert_eq!(HlsEncoder::parse("mjpeg").unwrap(), HlsEncoder::Mjpeg);
+
+        for hardware in [
+            "h264_nvenc",
+            "h264_vaapi",
+            "h264_qsv",
+            "h264_v4l2m2m",
+            "hevc_videotoolbox",
+        ] {
+            let error = HlsEncoder::parse(hardware).expect_err("hardware must be rejected");
+            assert!(
+                matches!(error, HlsError::UnsupportedEncoder { .. }),
+                "{hardware}: {error}"
+            );
+        }
+        assert!(matches!(
+            HlsEncoder::parse("vp9"),
+            Err(HlsError::UnsupportedEncoder { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn controller_restart_stops_the_old_source_and_applies_the_selected_encoder() {
+        let directory = temp_dir("controller-restart");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fail_on = Arc::new(Mutex::new(Vec::new()));
+        let stopped = Arc::new(Mutex::new(Vec::new()));
+        let recording = RecordingSpawner::default();
+        let writes = recording.writes.clone();
+        let spawns = recording.spawns.clone();
+        let controller = HlsController::with_spawner(
+            controller_factory(calls, fail_on, stopped.clone()),
+            HlsConfig {
+                output_dir: directory.clone(),
+                ..HlsConfig::default()
+            },
+            spawner(recording),
+        );
+
+        let status = controller.start().await.expect("start controller");
+        assert!(matches!(
+            status.state(),
+            HlsState::Starting | HlsState::Running
+        ));
+        assert!(controller.is_running());
+        wait_until(|| writes.lock().unwrap().len() == 1).await;
+
+        let status = controller
+            .restart_with_encoder(HlsEncoder::Hevc, Some(1_500))
+            .await
+            .expect("restart");
+        assert!(matches!(
+            status.state(),
+            HlsState::Starting | HlsState::Running
+        ));
+        assert_eq!(controller.config().video_encoder, HlsEncoder::Hevc);
+        assert_eq!(controller.config().bitrate_kbps, 1_500);
+
+        let spawns = spawns.lock().unwrap().clone();
+        assert_eq!(spawns.len(), 2, "one spawn per generation");
+        let argv = &spawns[1].2;
+        assert!(argv.windows(2).any(|window| window == ["-c:v", "libx265"]));
+        assert!(argv.contains(&"1500k".to_owned()));
+        assert!(argv
+            .windows(2)
+            .any(|window| window == ["-hls_flags", "delete_segments"]));
+        assert!(
+            stopped.lock().unwrap()[0].load(Ordering::SeqCst),
+            "the old pipeline source must stop before the restart completes"
+        );
+
+        wait_until(|| writes.lock().unwrap().len() == 2).await;
+        controller.stop().await.expect("stop");
+        assert_eq!(controller.status().state(), HlsState::Stopped);
+        assert!(!controller.is_running());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn controller_restart_failure_restores_the_previous_encoder() {
+        let directory = temp_dir("controller-restore");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fail_on = Arc::new(Mutex::new(vec![2]));
+        let stopped = Arc::new(Mutex::new(Vec::new()));
+        let recording = RecordingSpawner::default();
+        let spawns = recording.spawns.clone();
+        let controller = HlsController::with_spawner(
+            controller_factory(calls, fail_on, stopped.clone()),
+            HlsConfig {
+                output_dir: directory.clone(),
+                ..HlsConfig::default()
+            },
+            spawner(recording),
+        );
+        controller.start().await.expect("start controller");
+
+        let error = controller
+            .restart_with_encoder(HlsEncoder::Hevc, None)
+            .await
+            .expect_err("new source cannot open");
+        assert!(matches!(error, HlsError::Restart { .. }), "{error}");
+        assert!(error.to_string().contains("restored the previous pipeline"));
+        assert!(controller.is_running(), "the old encoder must be restored");
+        assert_eq!(controller.config().video_encoder, HlsEncoder::H264);
+
+        let spawns = spawns.lock().unwrap().clone();
+        assert_eq!(spawns.len(), 2, "initial generation plus restored one");
+        assert!(spawns[1]
+            .2
+            .windows(2)
+            .any(|window| window == ["-c:v", "libx264"]));
+        assert!(stopped.lock().unwrap()[0].load(Ordering::SeqCst));
+        controller.stop().await.expect("stop");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn controller_restart_failure_without_restoration_leaves_hls_stopped() {
+        let directory = temp_dir("controller-stopped");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fail_on = Arc::new(Mutex::new(vec![2, 3]));
+        let stopped = Arc::new(Mutex::new(Vec::new()));
+        let controller = HlsController::with_spawner(
+            controller_factory(calls, fail_on, stopped),
+            HlsConfig {
+                output_dir: directory.clone(),
+                ..HlsConfig::default()
+            },
+            spawner(RecordingSpawner::default()),
+        );
+        controller.start().await.expect("start controller");
+
+        let error = controller
+            .restart_with_encoder(HlsEncoder::Hevc, None)
+            .await
+            .expect_err("both generations fail");
+        assert!(matches!(error, HlsError::Restart { .. }), "{error}");
+        assert!(error.to_string().contains("also failed"));
+        assert!(!controller.is_running());
+        assert_eq!(controller.status().state(), HlsState::Failed);
+        assert!(controller
+            .status()
+            .error()
+            .unwrap_or_default()
+            .contains("restoring the previous pipeline"));
+
+        controller.stop().await.expect("stop is a no-op");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn controller_start_reports_a_typed_source_error_and_restart_requires_a_pipeline() {
+        let directory = temp_dir("controller-source-error");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fail_on = Arc::new(Mutex::new(vec![1]));
+        let stopped = Arc::new(Mutex::new(Vec::new()));
+        let controller = HlsController::with_spawner(
+            controller_factory(calls, fail_on, stopped),
+            HlsConfig {
+                output_dir: directory.clone(),
+                ..HlsConfig::default()
+            },
+            spawner(RecordingSpawner::default()),
+        );
+
+        let error = controller.start().await.expect_err("no source");
+        assert!(matches!(error, HlsError::Source { .. }), "{error}");
+        assert_eq!(controller.status().state(), HlsState::Failed);
+        assert!(!controller.is_running());
+
+        let error = controller
+            .restart_with_encoder(HlsEncoder::Hevc, None)
+            .await
+            .expect_err("nothing to restart");
+        assert!(matches!(error, HlsError::NotRunning), "{error}");
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[tokio::test]
