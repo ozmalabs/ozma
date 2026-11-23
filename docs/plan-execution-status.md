@@ -50,7 +50,7 @@ This file records what is actually merged and tested, not what is planned.
 | API display create/list/destroy/mode/DPMS/topology | Done | backed by the fake provider; real provider gated |
 | Xorg + modesetting + EVDI + libevdi spike | Documented, not run | `docs/remote-display-evdi-spike.md` |
 | Real EVDI provider | Scaffold only | `EvdiProvider` detects prerequisites and refuses unsupported |
-| Browser WebTransport | Node done; browser in progress | Node `wtransport` listener with ECDSA/14-day certificate pinning, session offers, uni-stream resources, and native proof-client tests. The viewer is the native client in Rust/wasm32 (`ozma-web`) over the browser's WebTransport API; browser interop is still being implemented and not yet run |
+| Browser WebTransport | Node verified with Chromium; wasm viewer in progress | Node `wtransport` listener with ECDSA/14-day certificate pinning, session offers, and uni-stream resources. A real headless Chromium completed CORS session create/start, hash-pinned WebTransport, Hello/HelloAck, and received a live video datagram; a flipped hash failed the handshake. The wasm viewer (`ozma-web`) is still being completed |
 | SSH/Unix fallback, passkeys | Not started | — |
 
 ## Remote scene outputs (development, loopback)
@@ -89,9 +89,10 @@ OZMA_CAPTURE_TEST_DEVICE=/dev/video2 \
   without a restart.
 - QUIC carries control/input/video/audio over a real connection. A second
   WebTransport (HTTP/3) listener carries the same framing for browsers; it is
-  covered by a native `wtransport` proof client. The browser path is a
-  Rust/wasm32 build of the same client and has not yet been run in a real
-  browser on this host.
+  covered by a native `wtransport` proof client and by a real headless Chromium
+  run (session create/start, certificate-hash pinning, Hello/HelloAck, video
+  datagram; wrong hash rejected). The Rust/wasm32 viewer itself (`ozma-web`)
+  has not yet been run in a browser.
 - PipeWire video capture is opt-in through `CaptureRegistry::system_with_pipewire()`;
   `system()` stays V4L2-only. Portal ScreenCast selection is an adapter point,
   not an implemented consent flow.
