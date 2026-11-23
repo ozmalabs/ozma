@@ -14,7 +14,7 @@ use crate::config::NodeConfig;
 
 /// Build the capability set advertised by this node, probing the host.
 pub fn detect(config: &NodeConfig) -> NodeCapabilities {
-    detect_with_registry(config, &CaptureRegistry::system())
+    detect_with_registry(config, &CaptureRegistry::system_with_pipewire())
 }
 
 /// Build capabilities with an injected capture registry, for tests and

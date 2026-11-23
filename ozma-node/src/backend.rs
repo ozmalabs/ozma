@@ -99,7 +99,7 @@ impl SessionBackend {
             manager: SessionManager::new(consent_policy),
             capabilities,
             displays,
-            captures: CaptureRegistry::system(),
+            captures: CaptureRegistry::system_with_pipewire(),
             encoders: EncoderRegistry::with_software_h264(),
             token_issuer: TokenIssuer::new(secret),
             token_verifier: TokenVerifier::new(secret),
