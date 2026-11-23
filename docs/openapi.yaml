@@ -236,6 +236,56 @@ paths:
                 client_id: { type: string }
       responses:
         "200": { description: Session with the client reconnected }
+  /api/v1/sessions/{id}/capture:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      summary: Browser camera and microphone uplink statistics
+      description: |
+        Counters for the client-to-node camera (H.264) and microphone (Opus)
+        channels. The browser starts them with `CaptureStart` on the control
+        channel; the node decodes into a bounded per-session hub.
+      responses:
+        "200":
+          description: Decoded capture counters
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  video:
+                    type: object
+                    properties:
+                      started: { type: boolean }
+                      packets: { type: integer }
+                      frames: { type: integer }
+                      bytes: { type: integer }
+                      width: { type: integer, nullable: true }
+                      height: { type: integer, nullable: true }
+                      codec: { type: string, nullable: true }
+                      decode_errors: { type: integer }
+                      last_sequence: { type: integer }
+                  audio:
+                    type: object
+                    properties:
+                      started: { type: boolean }
+                      packets: { type: integer }
+                      bytes: { type: integer }
+                      samples: { type: integer }
+                      decode_errors: { type: integer }
+  /api/v1/sessions/{id}/capture/frame.ppm:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      summary: Latest decoded browser camera frame
+      description: Returns the most recent decoded frame as a binary PPM (`P6`).
+      responses:
+        "200":
+          description: Portable pixmap
+          content:
+            image/x-portable-pixmap:
+              schema: { type: string, format: binary }
+        "404": { description: No camera frame has been decoded yet }
   /api/v1/sessions/{id}/events:
     parameters:
       - $ref: "#/components/parameters/SessionId"
