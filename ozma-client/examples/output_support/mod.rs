@@ -34,20 +34,27 @@ pub async fn connect(args: &SourceArgs) -> Result<NativeSessionClient> {
     Ok(NativeSessionClient::connect_with_node_api(&offer, &node, config).await?)
 }
 
-/// Decode the current video background and re-emit it on scene changes.
-/// Receivers get an opaque RGBA8 frame and the current scene snapshot.
-pub async fn consume(
+/// Consume video and Opus packets. Audio is passed through with its packet
+/// metadata intact so an output can mux it into a receiver-native stream.
+pub async fn consume_av(
     client: &mut NativeSessionClient,
     mut send: impl FnMut(u32, u32, &[u8], Option<&ozma_protocol::scene::SceneReceiver>) -> Result<()>,
+    mut send_audio: impl FnMut(&[u8], u64, u32, u8) -> Result<()>,
 ) -> Result<()> {
     let mut assembler = VideoAssembler::default();
     let mut decoder = Decoder::new()?;
     let mut rgba = Vec::new();
     let mut dimensions = None;
     let mut last_sequence = None;
+    let mut audio_pts = 0u64;
 
     loop {
         match client.recv_event().await? {
+            ClientEvent::Media(packet) if packet.kind == ChannelKind::Audio => {
+                let pts = audio_pts;
+                audio_pts = audio_pts.saturating_add(20_000);
+                send_audio(&packet.payload, pts, 48_000, 2)?;
+            }
             ClientEvent::Media(packet) if packet.kind == ChannelKind::Video => {
                 let Some(frame) = assembler.push(&packet.payload)? else {
                     continue;

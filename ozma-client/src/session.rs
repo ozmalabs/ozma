@@ -481,6 +481,14 @@ impl NativeSessionClient {
             // to flush so a node can release held input deterministically.
             tokio::time::sleep(self.close_grace).await;
         }
+        self.disconnect().await
+    }
+
+    /// Detach this transport without asking the node to end the session.
+    pub async fn disconnect(&mut self) -> Result<(), ApiError> {
+        if self.closed.is_some() {
+            return Ok(());
+        }
         let result = self.transport.close_with_reason(CloseReason::Normal).await;
         self.closed = Some(CloseReason::Normal);
         result

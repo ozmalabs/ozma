@@ -30,13 +30,13 @@ async fn main() -> Result<()> {
     eprintln!("VNC listening on {}", server.local_addr()?);
 
     let result = tokio::select! {
-        result = output_support::consume(&mut client, |width, height, video, scene| {
+        result = output_support::consume_av(&mut client, |width, height, video, scene| {
             revision += 1;
             let frame = output_support::compose(revision, width, height, video, scene)?;
             let framebuffer = RfbFrame::new(frame.width.try_into()?, frame.height.try_into()?, frame.rgba)?;
             send.send_replace(Some(Arc::new(framebuffer)));
             Ok(())
-        }) => result,
+        }, |_, _, _, _| Ok(())) => result,
         result = async {
             while receive.borrow().is_none() {
                 receive.changed().await?;
@@ -49,6 +49,6 @@ async fn main() -> Result<()> {
         } => result,
         signal = tokio::signal::ctrl_c() => signal.map_err(Into::into),
     };
-    let _ = client.close().await;
+    let _ = client.disconnect().await;
     result
 }

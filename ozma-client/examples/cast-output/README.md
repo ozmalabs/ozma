@@ -1,7 +1,8 @@
 # Ozma Cast output fixture
 
 Run the HLS output example with a native session offer and the node API URL.
-Append `--scene` to include overlays from a scene-capable node.
+Append `--scene` to include overlays. Append `--audio` when the offer enables
+audio capture and grants audio access.
 
 ```sh
 cargo run -p ozma-client --example cast_hls -- \
@@ -9,18 +10,30 @@ cargo run -p ozma-client --example cast_hls -- \
   --output ./private-cast-media
 ```
 
-The example uses FFmpeg with libx264 to write `live.m3u8` and a rolling set of
-H.264 MPEG-TS segments. It produces video only. Host the playlist and segments
-with a receiver-reachable HTTPS endpoint that provides Cast-compatible CORS.
-The output directory contains session pixels. Use a private media origin and
-authorize access to both the manifest and each segment before sharing it.
-A token on the manifest URL alone does not authorize relative segment URLs.
+The example uses FFmpeg with libx264 to write `live.m3u8`. With `--audio`, it
+also writes an AAC rendition and publishes `master.m3u8` when both tracks
+are ready. Use an empty private output directory for each session.
+
+Start the loopback media origin in another terminal.
+
+```sh
+cargo run -p ozma-client --example cast_media_server -- ./private-cast-media
+```
+
+The development origin prints URLs with a five-minute playback grant.
+Reverse-proxy `/cast/` through a receiver-reachable HTTPS origin, preserving the
+path and forwarding GET, HEAD, OPTIONS, and DELETE. Keep grant-bearing paths
+out of proxy logs. Use the printed `live.m3u8` path for video only or
+`master.m3u8` for audio and video, with the HTTPS origin in place of loopback.
+Manifest and segment requests use the same grant.
 
 Serve this sender directory over HTTPS. Open `index.html` in a Cast-capable
-browser, enter the authorized playlist URL, and choose a receiver. **Stop
-casting** ends the receiver session. Playback grants and revocation belong to
-the media server. The example does not issue or revoke them.
+browser, enter the grant-bearing HTTPS playlist URL, and choose a receiver.
+**Stop casting** ends the receiver session and revokes the development grant.
+The media origin also expires it automatically. Production integration still
+needs controller-issued grants and lifecycle handling.
 
-Use a registered Custom Web Receiver for retained scene overlays or custom
-receiver authentication. [Google Cast receiver options](https://developers.google.com/cast/docs/web_receiver) ·
+Physical receiver playback and audio sync need validation. A registered
+Custom Web Receiver would allow retained scene overlays or custom receiver
+behavior. [Google Cast receiver options](https://developers.google.com/cast/docs/web_receiver) ·
 [Google Cast sender integration](https://developers.google.com/cast/docs/web_sender/integrate)

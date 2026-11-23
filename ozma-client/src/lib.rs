@@ -10,10 +10,13 @@
 //!   transport, sends `Hello`, consumes `HelloAck`, receives opaque video
 //!   datagrams and session events, and sends input or `ReleaseAll`.
 //!
-//! [`NodeApiClient`] fetches `GET /api/v1/transport` from a node so a headless
-//! client can obtain the self-signed certificate's DER (base64 in JSON) and use
-//! it to pin the QUIC connection. A local `--cert` file remains a supported
-//! override.
+//! [`NodeApiClient`] is the node control plane: it creates sessions
+//! (`POST /api/v1/sessions`), approves consent
+//! (`POST /api/v1/sessions/{id}/approve`), starts them
+//! (`POST /api/v1/sessions/{id}/start`), and fetches
+//! `GET /api/v1/transport` so a headless client can obtain the self-signed
+//! certificate's DER (base64 in JSON) and use it to pin the QUIC connection. A
+//! local `--cert` file remains a supported override.
 //!
 //! The library never decodes video and never requires a controller or capture
 //! hardware for its tests.
@@ -24,9 +27,11 @@ pub mod cert;
 mod controller;
 pub mod error;
 pub mod frame_output;
+pub mod rdp;
 mod http;
 mod node_api;
 pub mod scene_render;
+pub mod spice;
 mod session;
 pub mod video;
 pub mod vnc;

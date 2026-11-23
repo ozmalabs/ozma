@@ -9,7 +9,13 @@ use std::sync::Arc;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use ozma_client::{certificate_fingerprint, codes, ControllerClient, NodeApiClient};
-use serde_json::json;
+use ozma_protocol::{
+    AudioSpec, ClientId, DisplayMode, InputSpec, Permission, PermissionSet, PointerMode,
+    PrivacyPolicy, Session, SessionId, SessionSpec, SessionState, TrackId, TrackKind, TrackSpec,
+    TransportPreference,
+};
+use ozma_transport::offer::{SessionOfferBuilder, TransportDescriptorBuilder};
+use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -19,6 +25,7 @@ struct RecordedRequest {
     method: String,
     path: String,
     authorization: Option<String>,
+    body: String,
 }
 
 struct Response {
@@ -64,35 +71,51 @@ async fn mock_server(responses: Vec<Response>) -> (String, Arc<Mutex<Vec<Recorde
 async fn read_request(socket: &mut TcpStream) -> RecordedRequest {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 1024];
-    loop {
+    let header_end = loop {
         let read = socket.read(&mut chunk).await.unwrap();
         if read == 0 {
-            break;
+            break buffer.len();
         }
         buffer.extend_from_slice(&chunk[..read]);
-        if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
+        if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
         }
-    }
+    };
 
-    let text = String::from_utf8_lossy(&buffer);
-    let mut lines = text.split("\r\n");
+    let header_text = String::from_utf8_lossy(&buffer[..header_end.min(buffer.len())]);
+    let mut lines = header_text.split("\r\n");
     let request_line = lines.next().unwrap_or_default();
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_string();
     let path = parts.next().unwrap_or_default().to_string();
     let mut authorization = None;
+    let mut content_length = 0usize;
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
             if name.eq_ignore_ascii_case("authorization") {
                 authorization = Some(value.trim().to_string());
             }
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse().unwrap_or(0);
+            }
         }
     }
+
+    let expected = header_end.saturating_add(content_length).min(1024 * 1024);
+    while buffer.len() < expected {
+        let read = socket.read(&mut chunk).await.unwrap();
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+    let body = String::from_utf8_lossy(&buffer[header_end.min(buffer.len())..]).to_string();
+
     RecordedRequest {
         method,
         path,
         authorization,
+        body,
     }
 }
 
@@ -293,6 +316,181 @@ async fn node_transport_info_rejects_a_bad_fingerprint() {
     let error = client.transport_info().await.unwrap_err();
     assert_eq!(error.code, codes::CLIENT_CERTIFICATE);
     assert_eq!(error.details["fingerprint"], "00".repeat(32));
+}
+
+fn session_json(id: &str, state: SessionState) -> Value {
+    let spec = SessionSpec {
+        client_id: ClientId::new("client-test"),
+        principal: "test".to_string(),
+        tracks: Vec::new(),
+        audio: Default::default(),
+        input: Default::default(),
+        privacy: Default::default(),
+        transport: Default::default(),
+        ttl_seconds: 60,
+    };
+    let permissions = PermissionSet::from_iter([Permission::View, Permission::Control]);
+    let mut session = Session::new(SessionId::new(id), spec, permissions, 1);
+    session.state = state;
+    serde_json::to_value(session).unwrap()
+}
+
+#[tokio::test]
+async fn node_session_create_approve_start_and_get_use_the_real_api() {
+    let offer = SessionOfferBuilder::new("sess-1")
+        .token("session-token")
+        .expires_at(1_700_000_000_000)
+        .transport(
+            TransportDescriptorBuilder::quic("127.0.0.1:4433")
+                .certificate_fingerprint("00".repeat(32))
+                .build(),
+        )
+        .build()
+        .unwrap();
+
+    let (base_url, recorded) = mock_server(vec![
+        Response::status(
+            201,
+            json!({
+                "session": session_json("sess-1", SessionState::Created),
+                "offer": serde_json::to_value(&offer).unwrap(),
+            })
+            .to_string(),
+        ),
+        Response::ok(
+            json!({ "session": session_json("sess-1", SessionState::Preparing) }).to_string(),
+        ),
+        Response::ok(
+            json!({ "session": session_json("sess-1", SessionState::Streaming) }).to_string(),
+        ),
+        Response::ok(
+            json!({ "session": session_json("sess-1", SessionState::Streaming) }).to_string(),
+        ),
+    ])
+    .await;
+
+    let spec = SessionSpec {
+        client_id: ClientId::new("client-test"),
+        principal: "ozma-client".to_string(),
+        tracks: vec![TrackSpec {
+            track_id: TrackId::new("video0"),
+            kind: TrackKind::Capture,
+            source_id: Some("/dev/video0".to_string()),
+            display: None,
+            format: None,
+            mode: Some(DisplayMode::new(1920, 1080, 30)),
+            hdr: false,
+        }],
+        audio: AudioSpec {
+            enabled: true,
+            mic: false,
+            ..Default::default()
+        },
+        input: InputSpec {
+            keyboard: true,
+            pointer: PointerMode::Absolute,
+            owner_only: true,
+            ..Default::default()
+        },
+        privacy: PrivacyPolicy {
+            consent: ozma_protocol::ConsentRequirement::Never,
+            indicate: true,
+            ..Default::default()
+        },
+        transport: TransportPreference::Quic,
+        ttl_seconds: 300,
+    };
+
+    let client = NodeApiClient::builder(&base_url)
+        .token("secret-token")
+        .no_proxy(true)
+        .build()
+        .unwrap();
+
+    let (created, returned_offer) = client.create_session(&spec).await.unwrap();
+    assert_eq!(created.id.as_str(), "sess-1");
+    assert_eq!(created.state, SessionState::Created);
+    assert_eq!(returned_offer.as_ref().unwrap().token, "session-token");
+
+    let approved = client
+        .approve_consent(&SessionId::new("sess-1"), "ozma-client")
+        .await
+        .unwrap();
+    assert_eq!(approved.state, SessionState::Preparing);
+
+    let started = client
+        .start_session(&SessionId::new("sess-1"))
+        .await
+        .unwrap();
+    assert_eq!(started.state, SessionState::Streaming);
+
+    let fetched = client.get_session(&SessionId::new("sess-1")).await.unwrap();
+    assert_eq!(fetched.id.as_str(), "sess-1");
+
+    let requests = recorded.lock().await;
+    assert_eq!(requests.len(), 4);
+
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[0].path, "/api/v1/sessions");
+    assert_eq!(
+        requests[0].authorization.as_deref(),
+        Some("Bearer secret-token")
+    );
+    let create_body: Value = serde_json::from_str(&requests[0].body).unwrap();
+    assert_eq!(create_body["client_id"], "client-test");
+    assert_eq!(create_body["tracks"][0]["track_id"], "video0");
+    assert_eq!(create_body["tracks"][0]["kind"], "capture");
+    assert_eq!(create_body["tracks"][0]["source_id"], "/dev/video0");
+    assert_eq!(create_body["tracks"][0]["mode"]["width"], 1920);
+    assert_eq!(create_body["tracks"][0]["mode"]["height"], 1080);
+    assert_eq!(create_body["tracks"][0]["mode"]["refresh_hz"], 30);
+    assert_eq!(create_body["input"]["keyboard"], true);
+    assert_eq!(create_body["input"]["pointer"], "absolute");
+    assert_eq!(create_body["privacy"]["consent"], "never");
+    assert_eq!(create_body["audio"]["enabled"], true);
+    assert_eq!(create_body["transport"], "quic");
+
+    assert_eq!(requests[1].method, "POST");
+    assert_eq!(requests[1].path, "/api/v1/sessions/sess-1/approve");
+    let approve_body: Value = serde_json::from_str(&requests[1].body).unwrap();
+    assert_eq!(approve_body, json!({ "by": "ozma-client" }));
+
+    assert_eq!(requests[2].method, "POST");
+    assert_eq!(requests[2].path, "/api/v1/sessions/sess-1/start");
+    assert_eq!(requests[2].body, "");
+
+    assert_eq!(requests[3].method, "GET");
+    assert_eq!(requests[3].path, "/api/v1/sessions/sess-1");
+}
+
+#[tokio::test]
+async fn node_session_errors_and_bare_session_payloads_are_typed() {
+    let (base_url, recorded) = mock_server(vec![
+        Response::status(404, r#"{"detail":"Session not found"}"#),
+        Response::ok(
+            serde_json::to_string(&session_json("sess-2", SessionState::Created)).unwrap(),
+        ),
+    ])
+    .await;
+
+    let client = NodeApiClient::builder(&base_url)
+        .no_proxy(true)
+        .build()
+        .unwrap();
+
+    let error = client
+        .start_session(&SessionId::new("missing"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ozma_protocol::codes::NOT_FOUND);
+    assert_eq!(error.message, "Session not found");
+
+    let fetched = client.get_session(&SessionId::new("sess-2")).await.unwrap();
+    assert_eq!(fetched.state, SessionState::Created);
+
+    let requests = recorded.lock().await;
+    assert_eq!(requests[0].path, "/api/v1/sessions/missing/start");
+    assert_eq!(requests[1].path, "/api/v1/sessions/sess-2");
 }
 
 #[tokio::test]

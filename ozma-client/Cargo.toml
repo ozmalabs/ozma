@@ -29,5 +29,7 @@ tracing-subscriber = { workspace = true }
 urlencoding = "2"
 
 [dev-dependencies]
+axum = "0.7"
 openh264 = "0.9"
 tokio = { workspace = true }
+tower = { version = "0.5", features = ["util"] }

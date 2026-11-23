@@ -1,16 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Client for the node's own HTTP API.
 //!
-//! The only endpoint this crate needs today is `GET /api/v1/transport`, which
-//! returns the native QUIC endpoint, the SHA-256 certificate fingerprint, and
-//! the DER certificate as base64. Fetching it is the headless equivalent of
-//! copying a certificate file: the DER is decoded and checked against the
-//! advertised fingerprint before it is used to pin the QUIC connection.
+//! The session control plane is `POST /api/v1/sessions` (create),
+//! `POST /api/v1/sessions/{id}/start`, `POST /api/v1/sessions/{id}/approve`,
+//! and `GET /api/v1/sessions/{id}`. Each returns the same `{session, offer}`
+//! envelope, where the offer carries the short-lived session token and the
+//! QUIC transport descriptor.
+//!
+//! `GET /api/v1/transport` returns the native QUIC endpoint, the SHA-256
+//! certificate fingerprint, and the DER certificate as base64. Fetching it is
+//! the headless equivalent of copying a certificate file: the DER is decoded
+//! and checked against the advertised fingerprint before it is used to pin the
+//! QUIC connection.
 
 use std::time::Duration;
 
 use ozma_protocol::transport::TransportInfo;
-use ozma_protocol::ApiError;
+use ozma_protocol::{ApiError, Session, SessionId, SessionOffer, SessionSpec};
 use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -38,6 +44,28 @@ impl FetchedTransportInfo {
     /// The advertised SHA-256 fingerprint.
     pub fn fingerprint(&self) -> &str {
         &self.info.fingerprint
+    }
+}
+
+/// Session responses are `{session, offer?}` today. A bare session object is
+/// accepted too so that older nodes and fixtures keep working.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum SessionPayload {
+    Wrapped {
+        session: Session,
+        #[serde(default)]
+        offer: Option<SessionOffer>,
+    },
+    Bare(Session),
+}
+
+impl SessionPayload {
+    fn into_parts(self) -> (Session, Option<SessionOffer>) {
+        match self {
+            SessionPayload::Wrapped { session, offer } => (session, offer),
+            SessionPayload::Bare(session) => (session, None),
+        }
     }
 }
 
@@ -116,6 +144,74 @@ impl NodeApiClient {
         &self.base_url
     }
 
+    /// Create a session with `POST /api/v1/sessions`.
+    ///
+    /// Returns the session record and, when the node has a native transport,
+    /// the short-lived [`SessionOffer`] that is used to connect over QUIC.
+    pub async fn create_session(
+        &self,
+        spec: &SessionSpec,
+    ) -> Result<(Session, Option<SessionOffer>), ApiError> {
+        let url = http::join_url(&self.base_url, "/api/v1/sessions")?;
+        let request = self.http.request(Method::POST, url).json(spec);
+        let payload: SessionPayload = http::send_json(request, "node session creation").await?;
+        Ok(payload.into_parts())
+    }
+
+    /// Start a created or consented session with
+    /// `POST /api/v1/sessions/{id}/start`.
+    pub async fn start_session(&self, id: &SessionId) -> Result<Session, ApiError> {
+        Ok(self.start_session_with_offer(id).await?.0)
+    }
+
+    /// Start a session and keep the returned transport offer.
+    pub async fn start_session_with_offer(
+        &self,
+        id: &SessionId,
+    ) -> Result<(Session, Option<SessionOffer>), ApiError> {
+        let url = http::join_url(&self.base_url, &format!("{}/start", self.session_path(id)))?;
+        let payload: SessionPayload =
+            http::send_json(self.http.request(Method::POST, url), "node session start").await?;
+        Ok(payload.into_parts())
+    }
+
+    /// Fetch one session with `GET /api/v1/sessions/{id}`.
+    pub async fn get_session(&self, id: &SessionId) -> Result<Session, ApiError> {
+        Ok(self.get_session_with_offer(id).await?.0)
+    }
+
+    /// Fetch one session and its current transport offer, if any.
+    pub async fn get_session_with_offer(
+        &self,
+        id: &SessionId,
+    ) -> Result<(Session, Option<SessionOffer>), ApiError> {
+        let url = http::join_url(&self.base_url, &self.session_path(id))?;
+        let payload: SessionPayload =
+            http::send_json(self.http.request(Method::GET, url), "node session lookup").await?;
+        Ok(payload.into_parts())
+    }
+
+    /// Approve a session waiting in `pending_consent` with
+    /// `POST /api/v1/sessions/{id}/approve` and a `{"by": ...}` body.
+    pub async fn approve_consent(&self, id: &SessionId, by: &str) -> Result<Session, ApiError> {
+        let url = http::join_url(
+            &self.base_url,
+            &format!("{}/approve", self.session_path(id)),
+        )?;
+        let request = self
+            .http
+            .request(Method::POST, url)
+            .json(&json!({ "by": by }));
+        let payload: SessionPayload =
+            http::send_json(request, "node session consent approval").await?;
+        Ok(payload.into_parts().0)
+    }
+
+    /// Path for one session, with the id percent-encoded as a single segment.
+    pub(crate) fn session_path(&self, id: &SessionId) -> String {
+        format!("/api/v1/sessions/{}", urlencoding::encode(id.as_str()))
+    }
+
     /// Fetch `/api/v1/transport` and decode + verify the certificate.
     pub async fn transport_info(&self) -> Result<FetchedTransportInfo, ApiError> {
         let url = http::join_url(&self.base_url, "/api/v1/transport")?;
@@ -166,6 +262,52 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
     use ozma_transport::SelfSignedCertificate;
+
+    #[test]
+    fn session_path_encodes_the_id_as_one_segment() {
+        let client = NodeApiClient::new("http://127.0.0.1:7390").unwrap();
+        assert_eq!(
+            client.session_path(&SessionId::new("sess a/b")),
+            "/api/v1/sessions/sess%20a%2Fb"
+        );
+    }
+
+    #[test]
+    fn session_payload_accepts_wrapped_and_bare_sessions() {
+        use ozma_protocol::{ClientId, SessionId, SessionSpec};
+
+        let spec = SessionSpec {
+            client_id: ClientId::new("client-test"),
+            principal: "test".to_string(),
+            tracks: Vec::new(),
+            audio: Default::default(),
+            input: Default::default(),
+            privacy: Default::default(),
+            transport: Default::default(),
+            ttl_seconds: 60,
+        };
+        let session = Session::new(
+            SessionId::new("sess-1"),
+            spec,
+            ozma_protocol::PermissionSet::all(),
+            1,
+        );
+
+        let bare: SessionPayload =
+            serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+        let (parsed, offer) = bare.into_parts();
+        assert_eq!(parsed.id.as_str(), "sess-1");
+        assert!(offer.is_none());
+
+        let wrapped: SessionPayload = serde_json::from_value(json!({
+            "session": session,
+            "offer": null,
+        }))
+        .unwrap();
+        let (parsed, offer) = wrapped.into_parts();
+        assert_eq!(parsed.id.as_str(), "sess-1");
+        assert!(offer.is_none());
+    }
 
     #[test]
     fn fetched_info_exposes_the_advertised_values() {

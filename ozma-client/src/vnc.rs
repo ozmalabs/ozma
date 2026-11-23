@@ -164,7 +164,7 @@ async fn serve(
         .await
         .map_err(|_| VncError::TimedOut)??;
     let mut format = PixelFormat::parse(&DEFAULT_FORMAT)?;
-    let mut previous: Option<Arc<RfbFrame>> = None;
+    let mut previous: Option<(Rect, Arc<RfbFrame>)> = None;
     loop {
         let kind = match stream.read_u8().await {
             Ok(kind) => kind,
@@ -187,31 +187,29 @@ async fn serve(
             3 => {
                 let mut request = [0; 9];
                 stream.read_exact(&mut request).await?;
-                let frame = loop {
-                    let latest = frames
-                        .borrow_and_update()
-                        .clone()
-                        .unwrap_or_else(|| initial.clone());
-                    if request[0] == 0
-                        || previous
-                            .as_ref()
-                            .is_none_or(|old| !Arc::ptr_eq(old, &latest))
-                    {
-                        break latest;
-                    }
-                    if frames.changed().await.is_err() {
+                let rect = Rect::requested(&request, &initial);
+                let baseline = previous
+                    .as_ref()
+                    .filter(|(area, _)| request[0] != 0 && *area == rect)
+                    .map(|(_, frame)| frame);
+                let next = timeout(
+                    Duration::from_secs(1),
+                    next_update(&mut frames, &initial, rect, baseline),
+                )
+                .await;
+                if let Ok(result) = next {
+                    let Some((frame, changed)) = result? else {
                         return Ok(());
-                    }
-                };
-                if (frame.width, frame.height) != (initial.width, initial.height) {
-                    return Err(VncError::Protocol(
-                        "frame size changed; reconnect the viewer",
-                    ));
+                    };
+                    timeout(IO_TIMEOUT, send_update(stream, &frame, changed, &format))
+                        .await
+                        .map_err(|_| VncError::TimedOut)??;
+                    previous = Some((rect, frame));
+                } else {
+                    timeout(IO_TIMEOUT, stream.write_u32(0))
+                        .await
+                        .map_err(|_| VncError::TimedOut)??;
                 }
-                timeout(IO_TIMEOUT, send_update(stream, &frame, &request, &format))
-                    .await
-                    .map_err(|_| VncError::TimedOut)??;
-                previous = Some(frame);
             }
             4 => stream.read_exact(&mut [0; 7]).await.map(|_| ())?,
             5 => stream.read_exact(&mut [0; 5]).await.map(|_| ())?,
@@ -230,16 +228,106 @@ async fn serve(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Rect {
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+}
+
+impl Rect {
+    fn requested(request: &[u8; 9], frame: &RfbFrame) -> Self {
+        let x = word(request, 1).min(frame.width);
+        let y = word(request, 3).min(frame.height);
+        Self {
+            x,
+            y,
+            width: word(request, 5).min(frame.width - x),
+            height: word(request, 7).min(frame.height - y),
+        }
+    }
+}
+
+async fn next_update(
+    frames: &mut watch::Receiver<Option<Arc<RfbFrame>>>,
+    initial: &Arc<RfbFrame>,
+    rect: Rect,
+    baseline: Option<&Arc<RfbFrame>>,
+) -> Result<Option<(Arc<RfbFrame>, Rect)>, VncError> {
+    loop {
+        let latest = frames
+            .borrow_and_update()
+            .clone()
+            .unwrap_or_else(|| initial.clone());
+        if (latest.width, latest.height) != (initial.width, initial.height) {
+            return Err(VncError::Protocol(
+                "frame size changed; reconnect the viewer",
+            ));
+        }
+        match baseline {
+            None => return Ok(Some((latest, rect))),
+            Some(previous) if !Arc::ptr_eq(previous, &latest) => {
+                if let Some(changed) = damage(rect, previous, &latest) {
+                    return Ok(Some((latest, changed)));
+                }
+            }
+            Some(_) => {}
+        }
+        if frames.changed().await.is_err() {
+            return Ok(None);
+        }
+    }
+}
+
+fn damage(rect: Rect, previous: &RfbFrame, latest: &RfbFrame) -> Option<Rect> {
+    let mut left = rect.x + rect.width;
+    let mut top = rect.y + rect.height;
+    let mut right = rect.x;
+    let mut bottom = rect.y;
+    let stride = usize::from(latest.width) * 4;
+    let len = usize::from(rect.width) * 4;
+    for y in rect.y..rect.y + rect.height {
+        let start = usize::from(y) * stride + usize::from(rect.x) * 4;
+        let old = &previous.rgba[start..start + len];
+        let new = &latest.rgba[start..start + len];
+        if old == new {
+            continue;
+        }
+        for (index, (a, b)) in old.chunks_exact(4).zip(new.chunks_exact(4)).enumerate() {
+            if a[..3] != b[..3] {
+                let x = rect.x + index as u16;
+                left = left.min(x);
+                right = right.max(x + 1);
+                top = top.min(y);
+                bottom = bottom.max(y + 1);
+            }
+        }
+    }
+    if left < right && top < bottom {
+        Some(Rect {
+            x: left,
+            y: top,
+            width: right - left,
+            height: bottom - top,
+        })
+    } else {
+        None
+    }
+}
+
 async fn send_update(
     stream: &mut TcpStream,
     frame: &RfbFrame,
-    request: &[u8; 9],
+    rect: Rect,
     format: &PixelFormat,
 ) -> Result<(), VncError> {
-    let x = word(request, 1).min(frame.width);
-    let y = word(request, 3).min(frame.height);
-    let width = word(request, 5).min(frame.width - x);
-    let height = word(request, 7).min(frame.height - y);
+    let Rect {
+        x,
+        y,
+        width,
+        height,
+    } = rect;
     stream.write_u16(0).await?; // FramebufferUpdate and padding.
     stream
         .write_u16(u16::from(width != 0 && height != 0))
@@ -266,6 +354,31 @@ async fn send_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn damage_is_bounded_by_the_requested_area_and_ignores_alpha() {
+        let previous = RfbFrame::new(3, 2, vec![0; 24]).unwrap();
+        let mut pixels = previous.rgba.clone();
+        pixels[3] = 255; // Alpha only.
+        pixels[4] = 255; // Changed RGB inside request.
+        pixels[20] = 255; // Changed RGB outside request.
+        let latest = RfbFrame::new(3, 2, pixels).unwrap();
+        let requested = Rect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        };
+        assert_eq!(
+            damage(requested, &previous, &latest),
+            Some(Rect {
+                x: 1,
+                y: 0,
+                width: 1,
+                height: 1
+            })
+        );
+    }
 
     #[tokio::test]
     async fn viewer_gets_live_frames_and_input_is_ignored() {
