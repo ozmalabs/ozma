@@ -195,6 +195,27 @@ impl QuicTransport {
         self.inner.conn.remote_address()
     }
 
+    /// Transfer one bounded resource over a dedicated stream so a stalled
+    /// resource does not block the reliable control stream.
+    pub async fn send_resource(&self, payload: Bytes) -> Result<()> {
+        self.map.check_payload(ChannelId::BULK, payload.len())?;
+        let mut stream = self.inner.conn.open_uni().await.map_err(resource_stream_error)?;
+        stream.write_all(&payload).await.map_err(resource_stream_error)?;
+        stream.finish().map_err(resource_stream_error)?;
+        self.inner.metrics.record_sent(payload.len(), false);
+        Ok(())
+    }
+
+    /// Receive one resource. Call this only after negotiating the scene
+    /// profile. Callers can receive resources and control messages concurrently.
+    pub async fn recv_resource(&self) -> Result<Bytes> {
+        let limit = self.map.require(ChannelId::BULK)?.max_payload as usize;
+        let mut stream = self.inner.conn.accept_uni().await.map_err(resource_stream_error)?;
+        let payload = stream.read_to_end(limit).await.map_err(resource_stream_error)?;
+        self.inner.metrics.record_received(payload.len(), false);
+        Ok(Bytes::from(payload))
+    }
+
     async fn start(
         conn: Connection,
         map: ChannelMap,
@@ -593,7 +614,12 @@ fn transport_config(config: &QuicConfig) -> Result<TransportConfig> {
     transport.keep_alive_interval(config.keep_alive_interval);
     // The control stream plus a little headroom for future channels.
     transport.max_concurrent_bidi_streams(8u8.into());
+    transport.max_concurrent_uni_streams(4u8.into());
     Ok(transport)
+}
+
+fn resource_stream_error(error: impl std::fmt::Display) -> ApiError {
+    transport_unavailable(format!("QUIC resource stream failed: {error}"))
 }
 
 fn timeout_error(what: &str, duration: Duration) -> ApiError {

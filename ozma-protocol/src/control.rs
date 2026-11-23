@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::ApiError;
 use crate::ids::SessionId;
 use crate::input::InputEvent;
+use crate::scene::{DisplayCapabilities, DisplayProfile, SceneCommit};
 use crate::session::{EndReason, Session, SessionEvent};
 
 /// A JSON control frame on the reliable channel.
@@ -16,8 +17,18 @@ use crate::session::{EndReason, Session, SessionEvent};
 pub enum ControlMessage {
     /// First message from a client. The token carries the client identity and
     /// scoped permissions; the server must not trust a client id sent beside it.
-    Hello { session_id: SessionId, token: String },
-    HelloAck { session: Session },
+    Hello {
+        session_id: SessionId,
+        token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display: Option<DisplayCapabilities>,
+    },
+    HelloAck {
+        session: Session,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display: Option<DisplayProfile>,
+    },
+    SceneCommit { commit: SceneCommit },
     Input { event: InputEvent },
     Event { event: SessionEvent },
     Ping { nonce: u64 },

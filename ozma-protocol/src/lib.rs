@@ -18,8 +18,11 @@ pub mod ids;
 pub mod input;
 pub mod media;
 pub mod permission;
+pub mod scene;
+pub mod scene_execution;
 pub mod session;
 pub mod transport;
+pub mod xpra;
 pub mod version;
 
 pub use capability::{
