@@ -129,6 +129,14 @@ This applies to the UVC basic formats, the raw vendor stream selection, the
 virtual-display EDID/mode set, and the network transports. The same policy core
 answers “why can't this host have 1440p60?” with evidence.
 
+**Security is the same aperture.** Permissions, consent, grants, pairing, and
+revocation fold through the same meet with the same provenance rules: a forced
+machine policy cannot be relaxed by the requester, a chosen permission can be
+dropped, and a negotiated grant/pairing requires every party. USB privacy
+(`display_capture = deny`), raw-client admission, and camera/mic permission are
+security frames; their receipts are audit records. See
+[`aperture-policy.md`](aperture-policy.md) §3.
+
 Ocelot is the inspiration for this model: aperture as a frame with provenance,
 the effective aperture as a meet, and the same residual with different recourse
 (`af_effective_aperture`, `af_relax_chosen`,

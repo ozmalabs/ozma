@@ -3,7 +3,7 @@
 Tracking the implementation of [`node-hermes-parity.md`](node-hermes-parity.md).
 This file records what is actually merged and tested, not what is planned.
 
-Capability negotiation policy (aperture) is planned in [`aperture-policy.md`](aperture-policy.md).
+Capability and security policy (aperture) is planned in [`aperture-policy.md`](aperture-policy.md).
 
 USB video output (UVC basic + raw Ozma vendor mode) is planned in [`usb-video-plan.md`](usb-video-plan.md).
 

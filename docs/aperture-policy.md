@@ -1,4 +1,4 @@
-# Aperture policy for Ozma capability negotiation
+# Aperture policy for Ozma capability and security negotiation
 
 Status: **plan**.
 Inspiration: Ocelot's `observer_aperture` and `aperture_frame` seeds. We borrow
@@ -8,7 +8,8 @@ the *model*, not the cognitive engine or its graph runtime.
 
 Ozma negotiates capabilities in several places: USB display modes, UVC formats,
 the raw USB link, QUIC/WebTransport/RTSP codecs, capture source selection, and
-bandwidth/thermal limits. Today these are spread across ad-hoc flags and
+bandwidth/thermal limits. It also negotiates **security**: permissions, consent,
+grants, pairing, and revocation. Today these are spread across ad-hoc flags and
 `if` branches. An **aperture** makes them one declarative policy:
 
 > The effective aperture is the **meet** of what a device can do and every
@@ -48,6 +49,11 @@ Start with:
 | `audio` | channels/rate/codec |
 | `source` | `local-camera`, `client-camera`, `display`, `network` |
 | `privacy` | `allow`, `consent-required`, `deny` |
+| `permissions` | a `PermissionSet` |
+| `auth_strength` | `none`, `password`, `ssh-key`, `passkey`, `local` |
+| `trust` | `local`, `lan`, `wan`, `relay`, `untrusted` |
+| `consent` | `none`, `required`, `granted`, `denied` |
+| `zone` | `loopback`, `lan`, `vpn`, `public` |
 
 Dimensions are extensible; unknown dimensions are carried through untouched so
 a newer controller can add policy without breaking an older node.
@@ -103,7 +109,157 @@ Every evaluation produces a JSON receipt:
 Receipts are logged, attached to diagnostics, and exposed over the API. They are
 stable enough to diff between builds and hardware profiles.
 
-## 3. Policy data
+## 3. Security policy (the same model)
+
+Authentication answers **who**; the aperture answers **what may they do now, and
+why not more**. It does not replace `ozma-auth` — it is the authorization fold
+over the facts `ozma-auth` already produces.
+
+### 3.1 Frames
+
+- **Physiology** — the principal's account/role maximum permission set, and the
+  maximum a token could ever carry. A token is already an attenuated frame; the
+  physiology is the ceiling.
+- **Forced** — machine class (`workstation`, `server`, `kiosk`, `camera`),
+  local/node policy, legal or regulatory constraints, network zone, session
+  state (`not_ready`, `ended`, `revoked`), token expiry/revocation, device
+  capability, privacy/consent requirement, admin lockout. The subject cannot
+  lift these.
+- **Chosen** — the controller/user/session request: `view`, `control`, `audio`,
+  `mic`, `clipboard_read/write`, `file_transfer`, `usb`, `power`, `commands`,
+  `display_attach`, `admin`. Optional permissions can be dropped unilaterally.
+- **Negotiated** — controller grant ↔ node grant, local consent approval,
+  pairing (short code, QR, SSH challenge), multi-party approval. Adoption and
+  retraction require **every** bound party; a unilateral accept is a no-op.
+
+### 3.2 Meet
+
+```text
+effective = account_ceiling
+          ∩ token_scopes
+          ∩ session_required
+          ∩ machine_policy
+          ∩ consent
+          ∩ controller_grant
+          ∩ node_grant
+          ∩ revocation
+```
+
+`PermissionSet` in `ozma-protocol` already provides intersection, subset, and
+`missing_from`; the aperture uses those directly. Adding a frame can only narrow
+the result. An empty intersection is a valid, fail-closed result.
+
+### 3.3 Residual and recourse
+
+| Provenance | Example | Recourse |
+|---|---|---|
+| `chosen` | user asked for clipboard, policy allows view only | `relax`: drop clipboard, continue view-only |
+| `forced` | workstation consent required; token revoked; node policy | `escalate`: consent prompt, local approval, or deny; never silently grant |
+| `negotiated` | grant/pairing not yet agreed | `propose`: issue/accept a grant or pairing; adopt only when all parties accept |
+
+The same missing permission has different recourse. A denied `control` because
+the *user* didn't request it is `relax`; because *machine policy* forbids it is
+`escalate`; because a *grant* is pending is `propose`.
+
+### 3.4 Receipts = audit record
+
+Every authorization decision produces a redacted, tamper-evident receipt:
+
+```json
+{
+  "principal": "alice",
+  "client_id": "web-1",
+  "session_id": "sess-…",
+  "requested": ["view", "control", "audio"],
+  "effective": ["view"],
+  "missing": ["control", "audio"],
+  "limiting": [
+    {"dimension": "control", "frame": "workstation-consent", "provenance": "forced"},
+    {"dimension": "audio",   "frame": "session-spec",          "provenance": "chosen"}
+  ],
+  "recourse": {"control": "escalate", "audio": "relax"},
+  "token_claims_hash": "…",
+  "policy_version": "workstation-v3",
+  "consent": "pending",
+  "at_micros": 0
+}
+```
+
+Receipts are logged, exposed through diagnostics (with secrets removed), and
+kept with the audit log. They answer “why was this denied?” without exposing
+tokens, passwords, or pairing codes.
+
+### 3.5 Invariants
+
+1. **Monotonicity:** adding a frame never widens the effective aperture or
+   permission set. A derived token/grant is always a subset.
+2. **No subject relaxation of forced frames:** only an authorized policy change
+   or local consent can lift them.
+3. **All-party negotiation:** adoption/retraction of a negotiated frame requires
+   every bound party; a unilateral accept does nothing.
+4. **Fail closed:** unknown dimension, missing policy, expired/revoked token,
+   empty intersection, or malformed receipt → deny.
+5. **Authentication ≠ authorization:** the aperture never authenticates; it
+   consumes verified claims from `ozma-auth`.
+6. **No policy from untrusted input:** policy manifests are signed/versioned;
+   requests are data, never code.
+7. **Atomic revocation:** a revocation frame takes effect immediately for
+   in-flight sessions; no queued operation may widen after it.
+8. **Receipts are evidence, not secrets:** tokens, passwords, pairing codes,
+   and raw claims are hashed or redacted.
+
+### 3.6 Mapping to existing Ozma
+
+| Existing | Aperture role |
+|---|---|
+| `PermissionSet` | the meet operation and the result |
+| `TokenClaims` scopes | an attenuated chosen frame |
+| `ConsentPolicy` / `MachineClass` | forced frames |
+| `GrantStore` | negotiated frames with expiry/revocation |
+| `LocalAuthenticator` (PAM, SSH) | authentication; produces the principal/physiology |
+| `PairingStore` / `SshChallengeStore` | negotiated frames with expiry, single use, attempts |
+| Node API bearer token | transport authentication, not authorization |
+| WebTransport certificate pinning | transport authentication, not authorization |
+| Session spec (`audio.mic`, input modes) | chosen/forced session frames |
+
+### 3.7 Security examples
+
+1. **Control on a workstation.** Controller requests `view+control`; machine
+   policy requires consent. Effective `view`; residual `control`, forced
+   `workstation-consent`, recourse `escalate`. Local approval adds a negotiated
+   consent frame accepted by node and user; effective `view+control`. Denial
+   leaves `view` only — never a silent grant.
+2. **Admin token, restricted node.** Token carries `admin`; node policy caps
+   `view`. Effective `view`; residual `admin`, forced `node-policy`; no
+   escalation path for a remote requester. Receipt explains it.
+3. **Mic not negotiated.** Browser asks for mic but the session was created
+   without `audio.mic`. Effective no mic; residual forced `session-spec`; recourse
+   `propose` (recreate the session with mic), not a silent fallback.
+4. **Pairing.** A short-code/QR/SSH proposal binds node, controller, and user.
+   It is adopted only when all accept, expires quickly, is single-use, and is
+   attempt-limited. Unilateral acceptance is a no-op.
+5. **Revocation.** A forced revocation frame empties the aperture; the session
+   drops input/media immediately and emits a receipt.
+
+### 3.8 API shape
+
+```rust
+pub struct SecurityRequest {
+    pub permissions: PermissionSet,
+    pub action: SecurityAction,
+}
+
+pub fn authorize(
+    principal: &VerifiedPrincipal,
+    request: &SecurityRequest,
+    frames: &[Frame],          // chosen, forced, negotiated
+) -> Admission;                // effective + receipt, or Residual + recourse
+```
+
+The node calls this before every session operation that changes permissions or
+accepts media/input; the session manager applies the effective set.
+
+## 4. Policy data
 
 Policy is declarative data, versioned per hardware/profile, not code branches.
 
@@ -146,7 +302,7 @@ Host and controller policy are frames too: a controller may choose 1080p60, a
 host driver may force `codec = "mjpeg"`, and a USB bus frame may force 30 fps.
 The meet is computed, never hand-written.
 
-## 4. Integration
+## 5. Integration
 
 New crate `ozma-aperture`:
 
@@ -170,9 +326,11 @@ Consumers:
 | QUIC/WebTransport/RTSP | codec/resolution/bitrate selection and fallback |
 | Capture source | which source is admissible for a session |
 | Controller | policy frames, proposals, consent |
-| Diagnostics/UI | receipts and “why is this limited?” explanations |
+| Session/auth | permission meet, consent, grants, pairing, revocation |
+| Node API | authorize before session operations and media/input acceptance |
+| Diagnostics/UI | receipts and “why is this limited/denied?” explanations |
 
-## 5. Worked examples
+## 6. Worked examples
 
 1. **USB2 1440p60 requested.**
    Physiology allows 4K/60; `forced.usb2` caps 1080p30. Effective 1080p30,
@@ -192,7 +350,7 @@ Consumers:
    silent fallback to a camera. The node must not manufacture a different
    source to satisfy the request.
 
-## 6. Ocelot inspiration
+## 7. Ocelot inspiration
 
 Borrow:
 
@@ -217,7 +375,7 @@ Do not borrow:
 - The cognitive engine, graph runtime, seeds, or substrate.
 - Any Ocelot runtime dependency or data format wholesale.
 
-## 7. Tests and gates
+## 8. Tests and gates
 
 - `meet` is commutative, associative, idempotent, and order-independent
   (property tests).
@@ -232,21 +390,31 @@ Do not borrow:
 - Integration gate: the USB display negotiation uses the aperture for every
   mode/format decision; no hardcoded resolution/codec branch remains in the USB
   path.
+- Security: attenuation is monotonic (adding a frame never widens); forced
+  frames cannot be relaxed by the subject; negotiated adoption/retraction needs
+  every party; unknown dimension/empty meet/expired/revoked fails closed;
+  permission receipts redact secrets; revocation is immediate for in-flight
+  sessions.
 - Policy changes are versioned; a controller can add a dimension without
   breaking older nodes.
 
-## 8. Rollout
+## 9. Rollout
 
 1. `ozma-aperture` crate + policy loader + receipts + tests.
 2. Adopt in USB display/UVC/raw negotiation (Phase A of
    [`usb-video-plan.md`](usb-video-plan.md)).
 3. Adopt in network transport codec selection.
 4. Adopt in capture-source selection and controller policy.
-5. Publish receipts in diagnostics and the UI.
+5. Adopt in `ozma-auth`/session authorization: token scopes, machine policy,
+   consent, grants, pairing, revocation.
+6. Publish receipts in diagnostics, the audit log, and the UI.
 
-## 9. Non-goals
+## 10. Non-goals
 
 - DisplayLink compatibility (see the USB plan).
 - A general-purpose policy engine or graph database.
 - Encoding/decoding decisions that belong to the encoder registry; the aperture
   *selects* among real capabilities, it does not invent one.
+- Authentication itself. PAM/SSH/pairing/token verification stay in
+  `ozma-auth`; the aperture only folds verified claims into an effective policy.
+- Executing policy code or accepting unsigned manifests.
