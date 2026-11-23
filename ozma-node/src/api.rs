@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
 //! Node services: the versioned HTTP API and the native QUIC session listener.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use axum::extract::State;
+use axum::http::{header, Method, StatusCode};
+use axum::routing::get;
+use axum::{Json, Router};
 use ozma_api::state::BrowserSceneSink;
 use ozma_api::NodeBackend;
 use ozma_auth::{ConsentPolicy, MachineClass};
@@ -11,11 +16,14 @@ use ozma_encode::EncoderRegistry;
 use ozma_input::HidGadgetSink;
 use ozma_protocol::NodeCapabilities;
 use tokio::net::TcpListener;
+use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
-use crate::backend::SessionBackend;
+use crate::backend::{SessionBackend, WebTransportInfo};
 use crate::browser_scene::BrowserSceneHub;
 use crate::transport::QuicRuntime;
+#[cfg(feature = "webtransport")]
+use crate::transport::WebTransportRuntime;
 
 /// Run the node API and QUIC listener until either fails.
 pub async fn serve(
@@ -34,10 +42,13 @@ pub async fn serve(
         None,
         api_token,
         rtsp_port,
+        None,
     )
     .await
 }
 
+/// Run the node API, the native QUIC listener, and (when `webtransport` is
+/// `Some`) the browser WebTransport listener until the HTTP server exits.
 pub async fn serve_with_scene_replay(
     port: u16,
     quic_port: u16,
@@ -46,6 +57,7 @@ pub async fn serve_with_scene_replay(
     scene_replay: Option<crate::scene_replay::JsonlSceneProducer>,
     api_token: Option<String>,
     rtsp_port: u16,
+    webtransport: Option<SocketAddr>,
 ) -> Result<()> {
     let encoders = EncoderRegistry::with_detected_encoders().await;
     let backend = SessionBackend::new(capabilities, consent_policy).with_encoder_registry(encoders);
@@ -90,6 +102,41 @@ pub async fn serve_with_scene_replay(
         }
     });
 
+    // Browser WebTransport listener. Its ECDSA P-256 identity is separate from
+    // the raw QUIC certificate because browsers only accept certificates with a
+    // validity of at most two weeks through `serverCertificateHashes`.
+    match webtransport {
+        Some(bind) => {
+            #[cfg(feature = "webtransport")]
+            {
+                let runtime =
+                    WebTransportRuntime::bind_on(bind).context("binding WebTransport service")?;
+                backend.configure_webtransport_with_certificate(
+                    runtime.endpoint(),
+                    runtime.fingerprint(),
+                    runtime.certificate_der(),
+                );
+                let webtransport_backend = backend.clone();
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        crate::transport::run_webtransport(runtime, webtransport_backend).await
+                    {
+                        error!("WebTransport listener exited: {error:#}");
+                    }
+                });
+            }
+            #[cfg(not(feature = "webtransport"))]
+            {
+                let _ = bind;
+                error!(
+                    "--webtransport-port was set but this ozma-node build has no \
+                     `webtransport` feature; the browser listener is disabled"
+                );
+            }
+        }
+        None => {}
+    }
+
     if rtsp_port != 0 {
         let rtsp_backend = backend.clone();
         tokio::spawn(async move {
@@ -111,14 +158,63 @@ pub async fn serve_with_scene_replay(
         }
     });
 
+    let webtransport_info_backend = backend.clone();
     let dynamic: Arc<dyn NodeBackend> = backend;
     let scene_sink: Arc<dyn BrowserSceneSink> = browser_scene;
-    let app = ozma_api::router::router_with_token_and_scene(dynamic, Some(scene_sink), api_token);
+    let app =
+        ozma_api::router::router_with_token_and_scene(dynamic, Some(scene_sink), api_token.clone());
+    // Additive certificate endpoint for the browser client. It is public cert
+    // material, but it is only mounted on the unauthenticated local/dev surface;
+    // when a bearer token is configured, clients take the same values from the
+    // session offer instead of bypassing the guard here.
+    let app = if api_token.is_none() {
+        app.merge(webtransport_info_router(webtransport_info_backend))
+    } else {
+        app
+    };
+    let app = app.layer(dev_cors());
     info!(port, "Node API listening");
     axum::serve(listener, app)
         .await
         .context("serving node API")?;
     Ok(())
+}
+
+/// A deliberately permissive CORS layer for the local browser demo.
+///
+/// The wasm client is served from a separate dev origin (for example
+/// `http://localhost:8080`) and calls the node API cross-origin. Any origin is
+/// accepted **only** because this surface is loopback-oriented; tighten it to a
+/// fixed origin allow-list before exposing the API to a LAN or the internet.
+/// Credentials stay disabled so the bearer token must be sent explicitly, and
+/// `preflight` `OPTIONS` is answered by this layer before the inner bearer
+/// guard runs. The guard still protects the actual request.
+fn dev_cors() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+}
+
+#[derive(Clone)]
+struct WebTransportInfoState {
+    backend: Arc<SessionBackend>,
+}
+
+fn webtransport_info_router(backend: Arc<SessionBackend>) -> Router {
+    Router::new()
+        .route("/api/v1/webtransport", get(webtransport_info))
+        .with_state(WebTransportInfoState { backend })
+}
+
+async fn webtransport_info(
+    State(state): State<WebTransportInfoState>,
+) -> Result<Json<WebTransportInfo>, StatusCode> {
+    state
+        .backend
+        .webtransport_info()
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 /// Build the HTTP router without binding, for tests and embedding.
@@ -423,5 +519,135 @@ mod tests {
         })
         .await
         .expect("browser scene bearer test timed out");
+    }
+
+    #[tokio::test]
+    async fn webtransport_info_route_matches_the_configured_certificate() {
+        let backend = Arc::new(SessionBackend::new(
+            crate::platform::fake(),
+            ConsentPolicy::for_machine(MachineClass::Server),
+        ));
+
+        let empty = webtransport_info_router(backend.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/webtransport")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty.status(), StatusCode::NOT_FOUND);
+
+        backend.configure_webtransport_with_certificate(
+            "https://127.0.0.1:4443/session",
+            "fingerprint-fixture",
+            b"der-fixture",
+        );
+        let response = webtransport_info_router(backend)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/webtransport")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["endpoint"], "https://127.0.0.1:4443/session");
+        assert_eq!(json["fingerprint"], "fingerprint-fixture");
+        assert_eq!(
+            json["certificate_der_base64"],
+            base64::engine::general_purpose::STANDARD.encode(b"der-fixture")
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_is_answered_before_the_bearer_guard() {
+        let backend: Arc<dyn NodeBackend> = Arc::new(SessionBackend::new(
+            crate::platform::fake(),
+            ConsentPolicy::for_machine(MachineClass::Server),
+        ));
+        let app = ozma_api::router::router_with_token_and_scene(
+            backend,
+            None,
+            Some("secret-token".to_owned()),
+        )
+        .layer(dev_cors());
+
+        // The browser preflight must succeed without the bearer token; the
+        // layer answers it before the inner guard runs.
+        let preflight = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/api/v1/sessions")
+                    .header(header::ORIGIN, "http://localhost:8080")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                    .header(
+                        header::ACCESS_CONTROL_REQUEST_HEADERS,
+                        "authorization,content-type",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), StatusCode::OK);
+        assert_eq!(
+            preflight
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "*"
+        );
+        assert!(preflight
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_METHODS)
+            .is_some());
+        assert!(
+            preflight
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .is_none(),
+            "credentials must stay disabled"
+        );
+
+        // A real cross-origin request still needs the bearer token.
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/sessions")
+                    .header(header::ORIGIN, "http://localhost:8080")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let allowed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/sessions")
+                    .header(header::ORIGIN, "http://localhost:8080")
+                    .header(header::AUTHORIZATION, "Bearer secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+        assert_eq!(
+            allowed
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "*"
+        );
     }
 }

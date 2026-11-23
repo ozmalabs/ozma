@@ -9,9 +9,13 @@ name = "ozma-node"
 path = "src/main.rs"
 
 [features]
+default = ["webtransport"]
 # Enable to compile without a real ConfigFS/USB gadget subsystem (e.g. CI).
 # When set, uac2_active() always returns false without touching the kernel.
 stub-gadget = []
+# Browser-facing WebTransport (HTTP/3) listener. On by default for the desktop
+# node; disable for a build that must not carry the HTTP/3 stack.
+webtransport = ["ozma-transport/webtransport"]
 
 [dependencies]
 # Workspace-shared
@@ -42,6 +46,8 @@ ozma-audio    = { path = "../ozma-audio" }
 # HTTP API
 axum = { version = "0.7", features = ["json", "ws"] }
 async-trait = { workspace = true }
+# CORS for the local browser (wasm) dev origin.
+tower-http = { version = "0.6", features = ["cors"] }
 
 # Native QUIC/control transport
 bytes = { workspace = true }
@@ -71,3 +77,5 @@ path = "src/lib.rs"
 tokio = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# Video reassembly for the WebTransport media test.
+ozma-client-core = { path = "../ozma-client-core" }

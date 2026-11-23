@@ -2989,6 +2989,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "ozma-media",
+ "ozma-pipewire",
  "ozma-protocol",
  "tokio",
  "tracing",
@@ -3207,6 +3208,7 @@ dependencies = [
  "ozma-audio",
  "ozma-auth",
  "ozma-capture",
+ "ozma-client-core",
  "ozma-display",
  "ozma-encode",
  "ozma-input",
@@ -3223,6 +3225,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tower",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "usb-gadget",
@@ -3356,11 +3359,14 @@ name = "ozma-transport-web"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "bytes 1.11.1",
+ "futures",
  "js-sys",
  "ozma-client-core",
  "ozma-protocol",
  "ozma-transport",
+ "sha2 0.10.9",
  "thiserror 1.0.69",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -3371,6 +3377,7 @@ dependencies = [
 name = "ozma-web"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "bytes 1.11.1",
  "console_error_panic_hook",
  "js-sys",
@@ -3380,6 +3387,7 @@ dependencies = [
  "ozma-transport-web",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

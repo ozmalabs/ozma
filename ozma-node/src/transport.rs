@@ -25,9 +25,9 @@ use ozma_protocol::scene::{DisplayCapabilities, DisplayProfile};
 use ozma_protocol::{
     ApiError, ClientId, ControlMessage, DisplayId, InputEvent, Permission, SessionEvent, SessionId,
 };
-use ozma_transport::{
-    ChannelId, CloseReason, QuicServer, QuicTransport, SessionTransport, TransportEvent,
-};
+use ozma_transport::{ChannelId, CloseReason, QuicServer, SessionTransport, TransportEvent};
+#[cfg(feature = "webtransport")]
+use ozma_transport::{ChannelMap, WebTransportConfig, WebTransportServer};
 use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -92,6 +92,109 @@ fn advertised_address(local: SocketAddr) -> SocketAddr {
     local
 }
 
+/// A bound WebTransport (HTTP/3) listener for the browser client.
+///
+/// It carries the same channels as [`QuicRuntime`] but a separate ECDSA P-256
+/// certificate with a 14-day validity, because browsers only accept short-lived
+/// certificates through `serverCertificateHashes`. Clients pin
+/// [`Self::fingerprint`] (or the DER from [`Self::certificate_der`]).
+#[cfg(feature = "webtransport")]
+pub struct WebTransportRuntime {
+    server: WebTransportServer,
+    advertised: SocketAddr,
+    session_url: String,
+    certificate_der: Vec<u8>,
+    fingerprint: String,
+}
+
+#[cfg(feature = "webtransport")]
+impl WebTransportRuntime {
+    /// Bind the WebTransport listener on `port` (`0` for an ephemeral port).
+    /// The default bind address is loopback; use [`Self::bind_on`] for another.
+    pub fn bind(port: u16) -> Result<Self> {
+        Self::bind_on(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+    }
+
+    /// Bind on an explicit address. Tests use loopback with port 0.
+    pub fn bind_on(bind_addr: SocketAddr) -> Result<Self> {
+        // Resolve the address a LAN browser will dial *before* binding so the
+        // certificate's SANs cover it; the port comes from the bound socket.
+        let advertised_ip = if bind_addr.ip().is_unspecified() {
+            local_ip_address::local_ip().unwrap_or(bind_addr.ip())
+        } else {
+            bind_addr.ip()
+        };
+        let mut config = WebTransportConfig::default();
+        for address in [advertised_ip, bind_addr.ip()] {
+            let name = address.to_string();
+            if !config.certificate_names.contains(&name) {
+                config.certificate_names.push(name);
+            }
+        }
+        let server =
+            WebTransportServer::bind_with_config(bind_addr, config, ChannelMap::default_session())
+                .context("binding WebTransport listener")?;
+        let advertised = SocketAddr::new(advertised_ip, server.local_addr().port());
+        let session_url = webtransport_url(advertised, "/session");
+        let certificate_der = server.certificate_der().to_vec();
+        let fingerprint = server.fingerprint().to_string();
+        tracing::debug!(
+            local = %server.local_addr(),
+            advertised = %advertised,
+            url = %session_url,
+            "WebTransport listener bound"
+        );
+        Ok(Self {
+            server,
+            advertised,
+            session_url,
+            certificate_der,
+            fingerprint,
+        })
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.advertised
+    }
+
+    /// The `https://host:port/session` URL advertised to browsers.
+    pub fn endpoint(&self) -> String {
+        self.session_url.clone()
+    }
+
+    /// The same value as [`Self::endpoint`], for symmetry with the API field.
+    pub fn session_url(&self) -> &str {
+        &self.session_url
+    }
+
+    pub fn certificate_der(&self) -> &[u8] {
+        &self.certificate_der
+    }
+
+    /// Raw SHA-256 of the DER certificate, for `WebTransportClient` pinning.
+    pub fn certificate_sha256(&self) -> [u8; 32] {
+        self.server.certificate_sha256()
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+}
+
+#[cfg(feature = "webtransport")]
+fn webtransport_url(address: SocketAddr, path: &str) -> String {
+    let host = match address.ip() {
+        IpAddr::V6(ip) => format!("[{ip}]"),
+        IpAddr::V4(ip) => ip.to_string(),
+    };
+    let path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    format!("https://{host}:{}{path}", address.port())
+}
+
 fn hex_sha256(data: &[u8]) -> String {
     let digest = Sha256::digest(data);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -117,9 +220,7 @@ pub async fn run(runtime: QuicRuntime, backend: Arc<SessionBackend>) -> Result<(
             Ok(transport) => {
                 let backend = backend.clone();
                 tokio::spawn(async move {
-                    if let Err(error) =
-                        handle_connection(Box::new(transport), backend).await
-                    {
+                    if let Err(error) = handle_connection(Box::new(transport), backend).await {
                         debug!(error = %error, "QUIC session ended with error");
                     }
                 });
@@ -132,6 +233,42 @@ pub async fn run(runtime: QuicRuntime, backend: Arc<SessionBackend>) -> Result<(
                     return Err(error.into());
                 }
                 debug!(error = %error, "no QUIC client yet; continuing to listen");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+/// Accept WebTransport sessions until the listener fails. Each accepted
+/// connection runs the same [`handle_connection`] path as raw QUIC.
+#[cfg(feature = "webtransport")]
+pub async fn run_webtransport(
+    runtime: WebTransportRuntime,
+    backend: Arc<SessionBackend>,
+) -> Result<()> {
+    info!(
+        endpoint = %runtime.endpoint(),
+        fingerprint = %runtime.fingerprint(),
+        "WebTransport session listener ready"
+    );
+    loop {
+        match runtime.server.accept().await {
+            Ok(transport) => {
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = handle_connection(Box::new(transport), backend).await {
+                        debug!(error = %error, "WebTransport session ended with error");
+                    }
+                });
+            }
+            Err(error) => {
+                // `accept` uses the handshake timeout while waiting for a
+                // browser; an idle period is not a listener failure.
+                if error.message.contains("closed") {
+                    warn!(error = %error, "WebTransport listener closed");
+                    return Err(error.into());
+                }
+                debug!(error = %error, "no WebTransport client yet; continuing to listen");
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }

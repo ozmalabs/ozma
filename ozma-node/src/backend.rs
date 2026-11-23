@@ -19,6 +19,7 @@ use ozma_protocol::{
 };
 use ozma_session::SessionManager;
 use ozma_transport::offer::{SessionOfferBuilder, TransportDescriptorBuilder};
+use ozma_transport::ChannelMap;
 use rand::RngCore;
 use tokio::sync::broadcast;
 
@@ -34,6 +35,21 @@ struct TransportOffer {
     endpoint: String,
     certificate_fingerprint: String,
     certificate_der_base64: String,
+}
+
+/// The browser-facing WebTransport listener's public details.
+///
+/// `GET /api/v1/webtransport` returns this shape. It is additive to
+/// [`TransportInfo`], whose schema is owned by `ozma-protocol` and still
+/// describes the raw QUIC listener.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct WebTransportInfo {
+    /// `https://host:port/session`, exactly as advertised in the session offer.
+    pub endpoint: String,
+    /// Lowercase hex SHA-256 of the DER certificate the listener presents.
+    pub fingerprint: String,
+    /// Base64 DER certificate for `serverCertificateHashes` and diagnostics.
+    pub certificate_der_base64: String,
 }
 
 /// An optional new resource and the placement commit that references it. Producers
@@ -69,6 +85,7 @@ pub struct SessionBackend {
     token_issuer: TokenIssuer,
     token_verifier: TokenVerifier,
     transport: Mutex<Option<TransportOffer>>,
+    webtransport: Mutex<Option<TransportOffer>>,
     input: SharedSink,
     scene_producer: Option<Arc<dyn SceneProducer>>,
 }
@@ -87,6 +104,7 @@ impl SessionBackend {
             token_issuer: TokenIssuer::new(secret),
             token_verifier: TokenVerifier::new(secret),
             transport: Mutex::new(None),
+            webtransport: Mutex::new(None),
             input: Arc::new(FakeInputSink::default()),
             scene_producer: None,
         }
@@ -205,6 +223,46 @@ impl SessionBackend {
             certificate_der_base64: base64::engine::general_purpose::STANDARD
                 .encode(certificate_der),
         });
+    }
+
+    /// Configure the browser-facing WebTransport endpoint advertised in session
+    /// offers. The URL is the complete `https://host:port/session` address.
+    pub fn configure_webtransport(
+        &self,
+        endpoint: impl Into<String>,
+        certificate_fingerprint: impl Into<String>,
+    ) {
+        self.configure_webtransport_with_certificate(endpoint, certificate_fingerprint, &[]);
+    }
+
+    /// Configure the WebTransport endpoint and publish the certificate the
+    /// browser pins.
+    pub fn configure_webtransport_with_certificate(
+        &self,
+        endpoint: impl Into<String>,
+        certificate_fingerprint: impl Into<String>,
+        certificate_der: &[u8],
+    ) {
+        use base64::Engine as _;
+        *self.webtransport.lock().expect("webtransport lock") = Some(TransportOffer {
+            endpoint: endpoint.into(),
+            certificate_fingerprint: certificate_fingerprint.into(),
+            certificate_der_base64: base64::engine::general_purpose::STANDARD
+                .encode(certificate_der),
+        });
+    }
+
+    /// The WebTransport listener's public details, if one is configured.
+    pub fn webtransport_info(&self) -> Option<WebTransportInfo> {
+        self.webtransport
+            .lock()
+            .expect("webtransport lock")
+            .as_ref()
+            .map(|transport| WebTransportInfo {
+                endpoint: transport.endpoint.clone(),
+                fingerprint: transport.certificate_fingerprint.clone(),
+                certificate_der_base64: transport.certificate_der_base64.clone(),
+            })
     }
 
     /// Verify a controller-issued session token.
@@ -379,13 +437,30 @@ impl NodeBackend for SessionBackend {
         )?;
 
         let descriptor = TransportDescriptorBuilder::quic(transport.endpoint)
-            .certificate_fingerprint(transport.certificate_fingerprint)
+            .certificate_fingerprint(transport.certificate_fingerprint.clone())
             .build();
-        let offer = SessionOfferBuilder::new(session.id.clone())
+        let mut offer = SessionOfferBuilder::new(session.id.clone())
             .token(token)
             .expires_in(now().saturating_mul(1_000), ttl)
-            .transport(descriptor)
-            .build()?;
+            .transport(descriptor);
+
+        // A browser cannot speak the raw QUIC listener, so advertise the
+        // WebTransport endpoint as a second QUIC-family path. The raw
+        // `quic://` descriptor stays first so native clients are unaffected.
+        if let Some(webtransport) = self.webtransport.lock().expect("webtransport lock").clone() {
+            let mut descriptor = TransportDescriptorBuilder::new(TransportMode::Quic)
+                .endpoint(webtransport.endpoint)
+                .secure(true)
+                .alpn("h3")
+                .channels(ChannelMap::default_session());
+            if webtransport.certificate_fingerprint != transport.certificate_fingerprint {
+                descriptor =
+                    descriptor.certificate_fingerprint(webtransport.certificate_fingerprint);
+            }
+            offer = offer.transport(descriptor.build());
+        }
+
+        let offer = offer.build()?;
         if !offer
             .transports
             .iter()

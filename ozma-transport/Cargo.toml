@@ -7,9 +7,15 @@ license = "AGPL-3.0-only"
 
 [features]
 default = ["quic"]
-# Native QUIC/WebTransport adapter (quinn + rustls + rcgen). Disable this when
-# a dependent crate must build without a QUIC stack.
+# Native QUIC adapter (quinn + rustls + rcgen). Disable this when a dependent
+# crate must build without a QUIC stack.
 quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "tokio/net", "tokio/io-util"]
+# WebTransport (HTTP/3) listener and native proof client. Mirrors `quic` byte
+# for byte on the channel framing and is what a browser connects to.
+webtransport = ["dep:wtransport", "tokio/net", "tokio/io-util"]
+# Test/development only: lets `WebTransportClient` skip certificate validation
+# instead of pinning a SHA-256 hash. Never enable this for a shippable build.
+webtransport-insecure = ["webtransport", "wtransport/dangerous-configuration"]
 
 [dependencies]
 ozma-protocol = { path = "../ozma-protocol" }
@@ -24,6 +30,12 @@ tracing = "0.1"
 quinn = { version = "0.11", optional = true, default-features = false, features = ["rustls-ring", "runtime-tokio", "log"] }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rcgen = { version = "0.13", optional = true, default-features = false, features = ["crypto", "ring", "pem"] }
+
+# WebTransport is opt-in. Default features bring `self-signed` (ECDSA P-256,
+# <=14 day identities) and the ring crypto provider, matching the rest of the
+# workspace. `dangerous-configuration` is only reachable through
+# `webtransport-insecure` above.
+wtransport = { version = "0.7", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

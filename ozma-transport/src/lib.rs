@@ -24,6 +24,8 @@ pub mod offer;
 #[cfg(feature = "quic")]
 pub mod quic;
 pub mod transport;
+#[cfg(feature = "webtransport")]
+pub mod webtransport;
 
 pub use channel::{ChannelId, ChannelMap};
 pub use director::{
@@ -40,6 +42,10 @@ pub use offer::{session_offer, SessionOfferBuilder, TransportDescriptorBuilder};
 #[cfg(feature = "quic")]
 pub use quic::{QuicClient, QuicConfig, QuicServer, QuicTransport, SelfSignedCertificate, ALPN};
 pub use transport::SessionTransport;
+#[cfg(feature = "webtransport")]
+pub use webtransport::{
+    WebTransportClient, WebTransportConfig, WebTransportServer, WebTransportSession,
+};
 
 /// The protocol ALPN used by native Ozma sessions.
 pub const DEFAULT_ALPN: &str = "ozma/1";

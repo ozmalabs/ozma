@@ -35,6 +35,16 @@ pub struct Args {
     #[arg(long, env = "OZMA_RTSP_PORT", default_value_t = 0)]
     pub rtsp_port: u16,
 
+    /// WebTransport (HTTP/3) listener port for the browser client.
+    /// 0 disables the browser listener.
+    #[arg(long, env = "OZMA_WEBTRANSPORT_PORT", default_value_t = 0)]
+    pub webtransport_port: u16,
+
+    /// Bind address for the WebTransport listener. The default is loopback;
+    /// use `0.0.0.0` to accept browsers on the LAN.
+    #[arg(long, env = "OZMA_WEBTRANSPORT_BIND", default_value = "127.0.0.1")]
+    pub webtransport_bind: String,
+
     /// Comma-separated capability list advertised in mDNS TXT and registration.
     /// Example: `hid,video,audio`
     #[arg(long, default_value = "hid,video,audio")]
@@ -210,6 +220,25 @@ async fn main() {
 
     let http_port = config.http_port;
     let quic_port = http_port.saturating_add(2);
+    let webtransport = if args.webtransport_port == 0 {
+        None
+    } else {
+        match args
+            .webtransport_bind
+            .parse::<std::net::IpAddr>()
+            .map(|ip| std::net::SocketAddr::new(ip, args.webtransport_port))
+        {
+            Ok(address) => Some(address),
+            Err(error) => {
+                error!(
+                    bind = %args.webtransport_bind,
+                    error = %error,
+                    "Invalid --webtransport-bind; the WebTransport listener is disabled"
+                );
+                None
+            }
+        }
+    };
     let scene_replay = match args
         .scene_replay
         .as_ref()
@@ -234,6 +263,7 @@ async fn main() {
             scene_replay,
             api_token,
             config.rtsp_port,
+            webtransport,
         )
         .await
         {
