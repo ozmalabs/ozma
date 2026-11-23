@@ -40,6 +40,14 @@ pub struct Args {
     #[arg(long, default_value = "compute")]
     pub role: String,
 
+    /// Machine class: `workstation`, `server`, or `kiosk`.
+    #[arg(long, default_value = "workstation")]
+    pub machine_class: String,
+
+    /// Require local consent for workstation-class sessions.
+    #[arg(long)]
+    pub workstation_consent: bool,
+
     /// Hardware platform string (e.g. `rpi4`, `x86_64`).
     #[arg(long, default_value_t = default_hw())]
     pub hw: String,
@@ -123,6 +131,9 @@ async fn main() {
         register_host: args.register_host.clone(),
         heartbeat_interval_secs: args.heartbeat_interval,
         role: args.role.clone(),
+        machine_class: ozma_auth::MachineClass::parse(&args.machine_class)
+            .unwrap_or(ozma_auth::MachineClass::Workstation),
+        workstation_consent: args.workstation_consent,
     };
 
     let capabilities = platform::detect(&config);
@@ -191,8 +202,9 @@ async fn main() {
 
     let http_port = config.http_port;
     let api_capabilities = capabilities.clone();
+    let consent_policy = config.consent_policy();
     tokio::spawn(async move {
-        if let Err(error) = api::serve(http_port, api_capabilities).await {
+        if let Err(error) = api::serve(http_port, api_capabilities, consent_policy).await {
             error!("Node API exited: {error:#}");
         }
     });

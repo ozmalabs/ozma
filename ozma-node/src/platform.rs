@@ -120,6 +120,8 @@ mod tests {
             register_host: None,
             heartbeat_interval_secs: 30,
             role: "compute".into(),
+            machine_class: ozma_auth::MachineClass::Server,
+            workstation_consent: false,
         }
     }
 

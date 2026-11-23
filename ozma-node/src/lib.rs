@@ -3,10 +3,12 @@
 //! registration, API, and audio bridge used by the binary and tests.
 
 pub mod api;
+pub mod backend;
 pub mod config;
 pub mod mdns;
 pub mod platform;
 pub mod registration;
 pub mod usb_audio;
 
+pub use backend::SessionBackend;
 pub use config::NodeConfig;

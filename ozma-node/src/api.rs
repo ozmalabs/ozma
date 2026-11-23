@@ -4,14 +4,22 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use ozma_api::{NodeBackend, MemoryBackend};
+use ozma_api::NodeBackend;
+use ozma_auth::{ConsentPolicy, MachineClass};
 use ozma_protocol::NodeCapabilities;
 use tokio::net::TcpListener;
 use tracing::info;
 
+use crate::backend::SessionBackend;
+
 /// Run the node API until the task is cancelled or the listener fails.
-pub async fn serve(port: u16, capabilities: NodeCapabilities) -> Result<()> {
-    let backend: Arc<dyn NodeBackend> = Arc::new(MemoryBackend::new(capabilities));
+pub async fn serve(
+    port: u16,
+    capabilities: NodeCapabilities,
+    consent_policy: ConsentPolicy,
+) -> Result<()> {
+    let backend: Arc<dyn NodeBackend> =
+        Arc::new(SessionBackend::new(capabilities, consent_policy));
     let app = ozma_api::router(backend);
     let listener = TcpListener::bind(("0.0.0.0", port))
         .await
@@ -23,7 +31,19 @@ pub async fn serve(port: u16, capabilities: NodeCapabilities) -> Result<()> {
 
 /// Build the router without binding, for tests and embedding.
 pub fn router(capabilities: NodeCapabilities) -> axum::Router {
-    let backend: Arc<dyn NodeBackend> = Arc::new(MemoryBackend::new(capabilities));
+    router_with_policy(
+        capabilities,
+        ConsentPolicy::for_machine(MachineClass::Server),
+    )
+}
+
+/// Build the router with an explicit consent policy.
+pub fn router_with_policy(
+    capabilities: NodeCapabilities,
+    consent_policy: ConsentPolicy,
+) -> axum::Router {
+    let backend: Arc<dyn NodeBackend> =
+        Arc::new(SessionBackend::new(capabilities, consent_policy));
     ozma_api::router(backend)
 }
 
