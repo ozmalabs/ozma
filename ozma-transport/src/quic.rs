@@ -407,6 +407,10 @@ impl SessionTransport for QuicTransport {
         }
     }
 
+    async fn send_resource(&self, payload: Bytes) -> Result<()> {
+        QuicTransport::send_resource(self, payload).await
+    }
+
     async fn close_with_reason(&self, reason: CloseReason) -> Result<()> {
         if self.inner.closed.swap(true, Ordering::SeqCst) {
             return Ok(());

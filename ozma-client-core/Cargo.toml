@@ -1,0 +1,15 @@
+[package]
+name = "ozma-client-core"
+version = "0.1.0"
+edition = "2021"
+description = "Platform-neutral Ozma client logic: channel framing, video reassembly, and session state shared by native and WebAssembly clients."
+license = "AGPL-3.0-only"
+
+[dependencies]
+ozma-protocol = { path = "../ozma-protocol" }
+ozma-transport = { path = "../ozma-transport", default-features = false }
+async-trait = "0.1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"

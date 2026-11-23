@@ -19,6 +19,7 @@ window = ["ozma-playback/window"]
 
 [dependencies]
 ozma-protocol = { path = "../ozma-protocol" }
+ozma-client-core = { path = "../ozma-client-core" }
 ozma-transport = { path = "../ozma-transport" }
 ozma-decode = { path = "../ozma-decode" }
 ozma-playback = { path = "../ozma-playback" }

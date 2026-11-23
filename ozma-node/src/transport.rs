@@ -117,7 +117,9 @@ pub async fn run(runtime: QuicRuntime, backend: Arc<SessionBackend>) -> Result<(
             Ok(transport) => {
                 let backend = backend.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = handle_connection(transport, backend).await {
+                    if let Err(error) =
+                        handle_connection(Box::new(transport), backend).await
+                    {
                         debug!(error = %error, "QUIC session ended with error");
                     }
                 });
@@ -137,11 +139,12 @@ pub async fn run(runtime: QuicRuntime, backend: Arc<SessionBackend>) -> Result<(
 }
 
 async fn handle_connection(
-    mut transport: QuicTransport,
+    transport: Box<dyn SessionTransport>,
     backend: Arc<SessionBackend>,
 ) -> Result<()> {
+    let mut transport = transport;
     let (hello_session_id, hello_token, display) =
-        timeout(Duration::from_secs(10), read_hello(&mut transport))
+        timeout(Duration::from_secs(10), read_hello(&mut *transport))
             .await
             .context("timed out waiting for session Hello")??;
 
@@ -369,7 +372,7 @@ impl CaptureSource for SessionSource {
 const VIDEO_FRAGMENT_PAYLOAD: usize = 1_100;
 
 async fn send_video_frame(
-    transport: &QuicTransport,
+    transport: &dyn SessionTransport,
     frame: &ozma_media::EncodedFrame,
 ) -> Result<(), ozma_protocol::ApiError> {
     use ozma_protocol::media::VideoFragmentHeader;
@@ -391,7 +394,7 @@ async fn send_video_frame(
 }
 
 async fn send_initial_scene(
-    transport: &QuicTransport,
+    transport: &dyn SessionTransport,
     backend: &SessionBackend,
     session: &ozma_protocol::Session,
 ) -> Result<u64, ozma_protocol::ApiError> {
@@ -406,7 +409,7 @@ async fn send_initial_scene(
 }
 
 async fn send_scene_updates(
-    transport: &QuicTransport,
+    transport: &dyn SessionTransport,
     updates: Vec<crate::backend::SceneUpdate>,
     last_revision: &mut u64,
 ) -> Result<(), ozma_protocol::ApiError> {
@@ -445,7 +448,7 @@ struct SceneStream<'a> {
 }
 
 async fn session_loop(
-    transport: &mut QuicTransport,
+    transport: &mut dyn SessionTransport,
     backend: &Arc<SessionBackend>,
     session_id: &SessionId,
     client_id: &ClientId,
@@ -461,15 +464,15 @@ async fn session_loop(
                 match event {
                     TransportEvent::Payload { channel, payload } => {
                         if channel == ChannelId::CONTROL {
-                            if let Err(error) = handle_control(backend, session_id, client_id, latest_frame_sequence, transport, &payload).await {
-                                let _ = send_control(transport, &ControlMessage::Error { error }).await;
+                            if let Err(error) = handle_control(backend, session_id, client_id, latest_frame_sequence, &*transport, &payload).await {
+                                let _ = send_control(&*transport, &ControlMessage::Error { error }).await;
                             }
                         }
                     }
                     TransportEvent::Datagram { .. } => {}
                     TransportEvent::Closed { .. } => break,
                     TransportEvent::Error { error } => {
-                        let _ = send_control(transport, &ControlMessage::Error { error }).await;
+                        let _ = send_control(&*transport, &ControlMessage::Error { error }).await;
                         break;
                     }
                 }
@@ -477,13 +480,13 @@ async fn session_loop(
             frame = pipeline.recv() => {
                 match frame {
                     Some(frame) => {
-                        if let Err(error) = send_video_frame(transport, &frame).await {
+                        if let Err(error) = send_video_frame(&*transport, &frame).await {
                             debug!(error = %error, "sending video frame failed");
                             break;
                         }
                         latest_frame_sequence.store(frame.sequence(), Ordering::Relaxed);
                         if let Some(scene) = scene_stream.as_mut().filter(|scene| !scene.initialized) {
-                            match send_initial_scene(transport, backend, scene.session).await {
+                            match send_initial_scene(&*transport, backend, scene.session).await {
                                 Ok(revision) => {
                                     scene.last_revision = revision;
                                     scene.initialized = true;
@@ -530,7 +533,7 @@ async fn session_loop(
                 if let Some(scene) = scene_stream.as_mut().filter(|scene| scene.initialized) {
                     let updates = backend.scene_updates_since(scene.session, scene.last_revision);
                     if let Err(error) = send_scene_updates(
-                        transport,
+                        &*transport,
                         updates,
                         &mut scene.last_revision,
                     ).await {
@@ -548,7 +551,7 @@ async fn handle_control(
     session_id: &SessionId,
     client_id: &ClientId,
     latest_frame_sequence: &AtomicU64,
-    transport: &QuicTransport,
+    transport: &dyn SessionTransport,
     payload: &[u8],
 ) -> Result<(), ozma_protocol::ApiError> {
     // Capture receive time before parsing so the ack measures the node's
@@ -643,7 +646,7 @@ fn authorize_latency_event(
 }
 
 async fn read_hello(
-    transport: &mut QuicTransport,
+    transport: &mut dyn SessionTransport,
 ) -> Result<(SessionId, String, Option<DisplayCapabilities>), ozma_protocol::ApiError> {
     loop {
         match transport.recv().await {
@@ -684,7 +687,7 @@ async fn read_hello(
 }
 
 async fn send_control(
-    transport: &QuicTransport,
+    transport: &dyn SessionTransport,
     message: &ControlMessage,
 ) -> Result<(), ozma_protocol::ApiError> {
     let payload = serde_json::to_vec(message).map_err(|error| {
@@ -697,7 +700,7 @@ async fn send_control(
 
 /// A client-side helper used by tests and the native client crate.
 pub async fn send_input(
-    transport: &QuicTransport,
+    transport: &dyn SessionTransport,
     event: &InputEvent,
 ) -> Result<(), ozma_protocol::ApiError> {
     let message = ControlMessage::Input {

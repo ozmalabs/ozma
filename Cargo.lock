@@ -640,6 +640,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "console_error_panic_hook"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
+dependencies = [
+ "cfg-if 1.0.4",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2838,6 +2848,7 @@ dependencies = [
  "bytes 1.11.1",
  "clap",
  "openh264",
+ "ozma-client-core",
  "ozma-decode",
  "ozma-playback",
  "ozma-protocol",
@@ -2853,6 +2864,19 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "urlencoding",
+]
+
+[[package]]
+name = "ozma-client-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes 1.11.1",
+ "ozma-protocol",
+ "ozma-transport",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -3166,6 +3190,40 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "ozma-transport-web"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes 1.11.1",
+ "js-sys",
+ "ozma-client-core",
+ "ozma-protocol",
+ "ozma-transport",
+ "thiserror 1.0.69",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
+name = "ozma-web"
+version = "0.1.0"
+dependencies = [
+ "bytes 1.11.1",
+ "console_error_panic_hook",
+ "js-sys",
+ "ozma-client-core",
+ "ozma-protocol",
+ "ozma-transport",
+ "ozma-transport-web",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

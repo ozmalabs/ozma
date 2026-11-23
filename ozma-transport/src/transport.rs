@@ -39,6 +39,15 @@ pub trait SessionTransport: Send + Sync {
     /// Receive the next event. Waits until data, an error, or close arrives.
     async fn recv(&mut self) -> TransportEvent;
 
+    /// Send one bounded resource on a dedicated stream where the transport
+    /// supports it. Adapters without stream multiplexing return
+    /// `transport.unavailable` rather than silently dropping the resource.
+    async fn send_resource(&self, _payload: Bytes) -> Result<()> {
+        Err(crate::error::transport_unavailable(
+            "this transport does not support dedicated resource streams",
+        ))
+    }
+
     /// Close with an explicit reason. Idempotent.
     async fn close_with_reason(&self, reason: CloseReason) -> Result<()>;
 
@@ -53,5 +62,36 @@ pub trait SessionTransport: Send + Sync {
     /// Whether this endpoint has been closed or observed close.
     fn is_closed(&self) -> bool {
         self.metrics().closed
+    }
+}
+
+#[async_trait]
+impl SessionTransport for Box<dyn SessionTransport> {
+    fn mode(&self) -> TransportMode {
+        self.as_ref().mode()
+    }
+
+    fn channel_map(&self) -> &ChannelMap {
+        self.as_ref().channel_map()
+    }
+
+    async fn send(&self, channel: ChannelId, payload: Bytes) -> Result<()> {
+        self.as_ref().send(channel, payload).await
+    }
+
+    async fn recv(&mut self) -> TransportEvent {
+        self.as_mut().recv().await
+    }
+
+    async fn send_resource(&self, payload: Bytes) -> Result<()> {
+        self.as_ref().send_resource(payload).await
+    }
+
+    async fn close_with_reason(&self, reason: CloseReason) -> Result<()> {
+        self.as_ref().close_with_reason(reason).await
+    }
+
+    fn metrics(&self) -> TransportMetrics {
+        self.as_ref().metrics()
     }
 }

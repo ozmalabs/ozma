@@ -9,14 +9,14 @@ license = "AGPL-3.0-only"
 default = ["quic"]
 # Native QUIC/WebTransport adapter (quinn + rustls + rcgen). Disable this when
 # a dependent crate must build without a QUIC stack.
-quic = ["dep:quinn", "dep:rustls", "dep:rcgen"]
+quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "tokio/net", "tokio/io-util"]
 
 [dependencies]
 ozma-protocol = { path = "../ozma-protocol" }
 async-trait = "0.1"
 bytes = "1"
 thiserror = "1"
-tokio = { version = "1", features = ["sync", "time", "rt", "net", "io-util", "macros"] }
+tokio = { version = "1", default-features = false, features = ["sync", "time", "rt", "macros"] }
 tracing = "0.1"
 
 # QUIC is opt-in at crate-feature level and on by default. We deliberately use
