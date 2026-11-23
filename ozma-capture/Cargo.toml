@@ -2,7 +2,7 @@
 name = "ozma-capture"
 version = "0.1.0"
 edition = "2021"
-description = "Capture-source providers for Ozma, starting with a deterministic fake and V4L2 discovery."
+description = "Capture-source providers for Ozma: deterministic fake, V4L2 discovery, and single-plane MMAP capture."
 license = "AGPL-3.0-only"
 
 [dependencies]
@@ -11,6 +11,7 @@ ozma-media = { path = "../ozma-media" }
 async-trait = "0.1"
 tokio = { version = "1", features = ["sync", "time", "rt"] }
 tracing = "0.1"
+v4l = "0.14"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

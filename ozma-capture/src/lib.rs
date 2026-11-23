@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! `ozma-capture` — capture-source discovery and the deterministic fake path.
+//! `ozma-capture` — capture-source discovery, real V4L2 MMAP capture, and the
+//! deterministic fake path.
 //!
-//! No crate in this module links a C library or performs an unsafe `ioctl`.
-//! V4L2 discovery reads `/dev` and sysfs; frame streaming is represented by an
-//! explicit scaffold until the MMAP backend exists. Tests use
-//! [`FakeCaptureProvider`], which goes through the same registry and
-//! [`ozma_media::CaptureSource`] contract as a real provider.
+//! This crate contains no `unsafe` code. V4L2 discovery reads `/dev` and sysfs
+//! without opening a device; opening a source uses the safe [`v4l`] crate to
+//! query capabilities, negotiate a single-plane format, and stream MMAP
+//! buffers. A dedicated worker thread owns the blocking device/stream pair so
+//! the async [`ozma_media::CaptureSource`] remains responsive. Tests use
+//! [`FakeCaptureProvider`] for CI; the real capture test is opt-in because it
+//! needs `/dev/video*` hardware.
 
 #![forbid(unsafe_code)]
 
@@ -16,7 +19,10 @@ pub mod v4l2;
 pub use fake::FakeCaptureProvider;
 pub use provider::{CaptureProvider, CaptureRegistry, CaptureScan};
 pub use v4l2::{
-    discover_v4l2, is_capture_like_name, parse_video_index, V4l2Capture, V4l2Node, V4l2Provider,
+    choose_resolution, discover_v4l2, fourcc_to_pixel_format, h264_access_unit_contains_idr,
+    is_capture_like_name, keyframe_for, monotonic_pts, next_sequence, parse_video_index,
+    preferred_fourcc, timestamp_micros, V4l2Capture, V4l2Node, V4l2Provider, DEFAULT_FRAME_TIMEOUT,
+    DEFAULT_MAX_HEIGHT, DEFAULT_MAX_WIDTH, PREFERRED_FOURCCS,
 };
 
 /// Re-export of the capture vocabulary callers need alongside this crate.

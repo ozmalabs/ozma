@@ -39,6 +39,7 @@ ozma-input    = { path = "../ozma-input" }
 
 # HTTP API
 axum = { version = "0.7", features = ["json", "ws"] }
+async-trait = { workspace = true }
 
 # Native QUIC/control transport
 bytes = { workspace = true }

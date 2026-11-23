@@ -2767,6 +2767,7 @@ version = "0.1.0"
 dependencies = [
  "alsa",
  "anyhow",
+ "async-trait",
  "axum",
  "bytes 1.11.1",
  "clap",

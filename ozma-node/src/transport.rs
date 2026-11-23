@@ -14,7 +14,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use ozma_media::{FakeCapture, FakeEncoder, FrameFormat, Pipeline, PipelineConfig, RunningPipeline};
+use async_trait::async_trait;
+use ozma_media::{
+    CaptureSource, FakeCapture, FakeEncoder, Frame, FrameFormat, MediaError, Pipeline,
+    PipelineConfig, RunningPipeline,
+};
 use ozma_protocol::{
     ClientId, ControlMessage, DisplayId, InputEvent, Permission, SessionEvent, SessionId,
 };
@@ -180,9 +184,9 @@ async fn handle_connection(mut transport: QuicTransport, backend: Arc<SessionBac
         .manager()
         .get(&session_id)
         .unwrap_or_else(|_| session.clone());
-    send_control(&transport, &ControlMessage::HelloAck { session }).await?;
+    send_control(&transport, &ControlMessage::HelloAck { session: session.clone() }).await?;
 
-    let mut pipeline = match start_media(&session_id).await {
+    let mut pipeline = match start_media(&backend, &session).await {
         Ok(pipeline) => pipeline,
         Err(error) => {
             let _ = send_control(&transport, &ControlMessage::Error { error }).await;
@@ -211,11 +215,76 @@ async fn handle_connection(mut transport: QuicTransport, backend: Arc<SessionBac
     result
 }
 
-async fn start_media(session_id: &SessionId) -> Result<RunningPipeline, ozma_protocol::ApiError> {
-    let source = FakeCapture::default().with_id(format!("fake:{session_id}")).with_fps(30);
-    let input = FrameFormat::rgb24(320, 240);
+async fn start_media(
+    backend: &Arc<SessionBackend>,
+    session: &ozma_protocol::Session,
+) -> Result<RunningPipeline, ozma_protocol::ApiError> {
+    let source_id = session
+        .spec
+        .tracks
+        .first()
+        .and_then(|track| track.source_id.as_deref());
+    let source = match backend.open_capture(source_id) {
+        Ok(real) => {
+            tracing::info!(source = ?source_id, "Using real V4L2 capture for session");
+            SessionSource::Real(real)
+        }
+        Err(error) => {
+            tracing::debug!(error = %error, "No real capture available; using fake source");
+            SessionSource::Fake(
+                FakeCapture::default()
+                    .with_id(format!("fake:{}", session.id))
+                    .with_fps(30),
+            )
+        }
+    };
+    let input = source.format();
     let encoder = FakeEncoder::h264(input, 2_000);
     Pipeline::start(source, encoder, PipelineConfig::default()).map_err(Into::into)
+}
+
+/// The transport can use a real V4L2 source when one is present and the fake
+/// source otherwise, without making `Pipeline` generic over a boxed trait.
+enum SessionSource {
+    Real(Box<dyn CaptureSource>),
+    Fake(FakeCapture),
+}
+
+impl SessionSource {
+    fn format(&self) -> FrameFormat {
+        match self {
+            SessionSource::Real(source) => source.format(),
+            SessionSource::Fake(source) => source.format(),
+        }
+    }
+}
+
+#[async_trait]
+impl CaptureSource for SessionSource {
+    fn id(&self) -> &str {
+        match self {
+            SessionSource::Real(source) => source.id(),
+            SessionSource::Fake(source) => source.id(),
+        }
+    }
+
+    fn format(&self) -> FrameFormat {
+        SessionSource::format(self)
+    }
+
+    async fn next_frame(&mut self) -> Result<Frame, MediaError> {
+        match self {
+            SessionSource::Real(source) => source.next_frame().await,
+            SessionSource::Fake(source) => source.next_frame().await,
+        }
+    }
+
+    async fn stop(&mut self) -> Result<(), MediaError> {
+        match self {
+            SessionSource::Real(source) => source.stop().await,
+            SessionSource::Fake(source) => source.stop().await,
+        }
+    }
 }
 
 async fn session_loop(

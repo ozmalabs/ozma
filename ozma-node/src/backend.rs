@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ozma_api::NodeBackend;
 use ozma_auth::{ConsentPolicy, TokenClaims, TokenIssuer, TokenVerifier};
+use ozma_capture::CaptureRegistry;
 use ozma_display::{FakeVirtualDisplayProvider, VirtualDisplayProvider};
 use ozma_input::{FakeInputSink, InputSink, SharedSink};
 use ozma_protocol::{
@@ -38,6 +39,7 @@ pub struct SessionBackend {
     manager: SessionManager,
     capabilities: NodeCapabilities,
     displays: FakeVirtualDisplayProvider,
+    captures: CaptureRegistry,
     token_issuer: TokenIssuer,
     token_verifier: TokenVerifier,
     transport: Mutex<Option<TransportOffer>>,
@@ -53,6 +55,7 @@ impl SessionBackend {
             manager: SessionManager::new(consent_policy),
             capabilities,
             displays,
+            captures: CaptureRegistry::system(),
             token_issuer: TokenIssuer::new(secret),
             token_verifier: TokenVerifier::new(secret),
             transport: Mutex::new(None),
@@ -77,6 +80,27 @@ impl SessionBackend {
 
     pub fn display_provider(&self) -> &dyn VirtualDisplayProvider {
         &self.displays
+    }
+
+    /// Open a capture source by id, or the first discovered source. The
+    /// transport falls back to the deterministic fake source when no hardware
+    /// is present.
+    pub fn open_capture(
+        &self,
+        id: Option<&str>,
+    ) -> Result<Box<dyn ozma_media::CaptureSource>, ApiError> {
+        match id {
+            Some(id) => self.captures.open_id(id),
+            None => {
+                let first = self.captures.enumerate()?.into_iter().next().ok_or_else(|| {
+                    ApiError::new(
+                        ozma_protocol::error::codes::CAPTURE_UNAVAILABLE,
+                        "No capture source is available",
+                    )
+                })?;
+                self.captures.open(&first)
+            }
+        }
     }
 
     /// Configure the native transport endpoint advertised in session offers.
