@@ -3,6 +3,8 @@
 Tracking the implementation of [`node-hermes-parity.md`](node-hermes-parity.md).
 This file records what is actually merged and tested, not what is planned.
 
+The migration from the Python `softnode/`, `node/`, and `agent/` processes to the Rust stack is planned in [`rust-reconciliation-plan.md`](rust-reconciliation-plan.md).
+
 ## M0 — Contract and cleanup
 
 | Item | Status | Evidence |
