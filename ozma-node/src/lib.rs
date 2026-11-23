@@ -5,6 +5,7 @@
 pub mod api;
 pub mod audio_runtime;
 pub mod backend;
+pub mod browser_scene;
 pub mod config;
 pub mod mdns;
 pub mod platform;

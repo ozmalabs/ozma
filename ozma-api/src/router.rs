@@ -11,6 +11,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use ozma_protocol::scene::SceneCommit;
 use ozma_protocol::{
     ApiError, DiagnosticReport, DisplayId, DisplayMode, DisplayTopology, DpmsState, EndReason,
     NodeCapabilities, NodeId, RuntimeMetrics, Session, SessionEvent, SessionId, SessionOffer,
@@ -19,73 +20,39 @@ use ozma_protocol::{
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiFailure;
-use crate::state::NodeBackend;
+use crate::state::{BrowserSceneSink, NodeBackend, SceneSinkError};
 
 type Backend = Arc<dyn NodeBackend>;
 type ApiResult<T> = Result<Json<T>, ApiFailure>;
 
-/// Build the native API router.
+/// Largest browser scene message accepted before the socket is closed. Resource
+/// payloads also have a protocol-level resource limit enforced by the sink.
+const MAX_BROWSER_SCENE_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Give malformed messages a few chances to be corrected before treating a
+/// stream as protocol abuse.
+const MAX_BROWSER_SCENE_ERRORS: usize = 32;
+
+#[derive(Clone)]
+struct BrowserSceneState {
+    sink: Option<Arc<dyn BrowserSceneSink>>,
+}
+
 /// Build the native API router with an optional static bearer token.
 ///
 /// Health, capabilities, and Hestia capability discovery stay readable so a
 /// controller or client can identify the node before it has credentials.
 pub fn router_with_token(backend: Backend, token: Option<String>) -> Router {
-    let router = router(backend);
-    match token {
-        Some(token) if !token.is_empty() => router.layer(middleware::from_fn_with_state(
-            std::sync::Arc::new(token),
-            require_bearer,
-        )),
-        _ => router,
-    }
+    router_with_token_and_scene(backend, None, token)
 }
 
-async fn require_bearer(
-    State(token): State<std::sync::Arc<String>>,
-    request: Request,
-    next: Next,
-) -> Result<Response, ApiFailure> {
-    let path = request.uri().path();
-    if path == "/health"
-        || path == "/api/v1/health"
-        || path == "/api/v1/capabilities"
-        || path == "/api/hestia/v1"
-        || path == "/api/hestia/v1/capabilities"
-    {
-        return Ok(next.run(request).await);
-    }
-    if bearer_matches(request.headers(), &token) {
-        return Ok(next.run(request).await);
-    }
-    Err(ApiFailure(ApiError::new(
-        ozma_protocol::error::codes::UNAUTHORIZED,
-        "A bearer token is required",
-    )
-    .with_remediation("Pass Authorization: Bearer <token> from the controller or local configuration.")))
-}
+/// Build the native API router with an optional live browser scene sink.
+pub fn router_with_scene(backend: Backend, sink: Option<Arc<dyn BrowserSceneSink>>) -> Router {
+    let scene = Router::new()
+        .route("/api/v1/browser/scene/ws", get(browser_scene_ws))
+        .with_state(BrowserSceneState { sink });
 
-fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()))
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut difference = 0u8;
-    for (a, b) in left.iter().zip(right) {
-        difference |= a ^ b;
-    }
-    difference == 0
-}
-
-/// Build the native API router.
-pub fn router(backend: Backend) -> Router {
-    Router::new()
+    let api = Router::new()
         .route("/api/v1/health", get(health))
         .route("/health", get(health))
         .route("/api/v1/node", get(node))
@@ -116,7 +83,78 @@ pub fn router(backend: Backend) -> Router {
             "/api/v1/displays/topology",
             get(display_topology).put(set_display_topology),
         )
-        .with_state(backend)
+        .with_state(backend);
+
+    api.merge(scene)
+}
+
+/// Build the native API router with a live browser scene sink and optional
+/// static bearer token. The token guard also covers the browser scene socket.
+pub fn router_with_token_and_scene(
+    backend: Backend,
+    sink: Option<Arc<dyn BrowserSceneSink>>,
+    token: Option<String>,
+) -> Router {
+    let router = router_with_scene(backend, sink);
+    match token {
+        Some(token) if !token.is_empty() => router.layer(middleware::from_fn_with_state(
+            std::sync::Arc::new(token),
+            require_bearer,
+        )),
+        _ => router,
+    }
+}
+
+async fn require_bearer(
+    State(token): State<std::sync::Arc<String>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiFailure> {
+    let path = request.uri().path();
+    if path == "/health"
+        || path == "/api/v1/health"
+        || path == "/api/v1/capabilities"
+        || path == "/api/hestia/v1"
+        || path == "/api/hestia/v1/capabilities"
+    {
+        return Ok(next.run(request).await);
+    }
+    if bearer_matches(request.headers(), &token) {
+        return Ok(next.run(request).await);
+    }
+    Err(ApiFailure(
+        ApiError::new(
+            ozma_protocol::error::codes::UNAUTHORIZED,
+            "A bearer token is required",
+        )
+        .with_remediation(
+            "Pass Authorization: Bearer <token> from the controller or local configuration.",
+        ),
+    ))
+}
+
+fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()))
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (a, b) in left.iter().zip(right) {
+        difference |= a ^ b;
+    }
+    difference == 0
+}
+
+/// Build the native API router.
+pub fn router(backend: Backend) -> Router {
+    router_with_scene(backend, None)
 }
 
 #[derive(Serialize)]
@@ -509,6 +547,173 @@ async fn set_display_topology(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum BrowserSceneMessage {
+    Resource {
+        id: u64,
+        payload_base64: String,
+    },
+    SceneCommit {
+        commit: SceneCommit,
+    },
+    VideoFrame {
+        surface_id: u32,
+        frame: serde_json::Value,
+    },
+}
+
+/// Accept the browser's live resource, commit, and video-metadata stream.
+/// Invalid individual messages produce an error reply and keep the socket
+/// open; binary frames, oversized messages, and runaway malformed streams are
+/// treated as protocol abuse and close the connection.
+async fn browser_scene_ws(
+    State(state): State<BrowserSceneState>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.max_message_size(MAX_BROWSER_SCENE_MESSAGE_BYTES.saturating_mul(2))
+        .on_upgrade(move |socket| browser_scene_socket(socket, state.sink))
+}
+
+async fn browser_scene_socket(mut socket: WebSocket, sink: Option<Arc<dyn BrowserSceneSink>>) {
+    let Some(sink) = sink else {
+        let _ = send_scene_json(
+            &mut socket,
+            serde_json::json!({
+                "type": "error",
+                "code": "unavailable",
+                "message": "Browser scene ingest is not enabled on this node",
+            }),
+        )
+        .await;
+        let _ = socket.send(Message::Close(None)).await;
+        return;
+    };
+
+    let mut malformed = 0usize;
+    loop {
+        let incoming = match socket.recv().await {
+            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+            Some(Ok(message)) => message,
+        };
+        match incoming {
+            Message::Text(text) => {
+                if text.len() > MAX_BROWSER_SCENE_MESSAGE_BYTES {
+                    let _ = send_scene_json(
+                        &mut socket,
+                        scene_error_json(SceneSinkError::new(
+                            "message_too_large",
+                            format!(
+                                "Message exceeds the {MAX_BROWSER_SCENE_MESSAGE_BYTES} byte limit"
+                            ),
+                        )),
+                    )
+                    .await;
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
+
+                let message: BrowserSceneMessage = match serde_json::from_str(&text) {
+                    Ok(message) => {
+                        malformed = 0;
+                        message
+                    }
+                    Err(error) => {
+                        malformed += 1;
+                        if !send_scene_json(
+                            &mut socket,
+                            scene_error_json(SceneSinkError::new(
+                                "invalid_message",
+                                error.to_string(),
+                            )),
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                        if malformed >= MAX_BROWSER_SCENE_ERRORS {
+                            let _ = socket.send(Message::Close(None)).await;
+                            break;
+                        }
+                        continue;
+                    }
+                };
+
+                let response = match message {
+                    BrowserSceneMessage::Resource { id, payload_base64 } => {
+                        match sink.ingest_resource(id, &payload_base64) {
+                            Ok(()) => serde_json::json!({
+                                "type": "ack",
+                                "kind": "resource",
+                                "id": id,
+                            }),
+                            Err(error) => scene_error_json(error),
+                        }
+                    }
+                    BrowserSceneMessage::SceneCommit { commit } => {
+                        let revision = commit.revision;
+                        let images = commit.images.len();
+                        match sink.ingest_commit(commit) {
+                            Ok(()) => serde_json::json!({
+                                "type": "ack",
+                                "kind": "scene_commit",
+                                "revision": revision,
+                                "images": images,
+                            }),
+                            Err(error) => scene_error_json(error),
+                        }
+                    }
+                    BrowserSceneMessage::VideoFrame { surface_id, frame } => {
+                        match sink.ingest_video_frame(surface_id, frame.clone()) {
+                            Ok(()) => serde_json::json!({
+                                "type": "ack",
+                                "kind": "video_frame",
+                                "surface_id": surface_id,
+                                "frame": frame,
+                            }),
+                            Err(error) => scene_error_json(error),
+                        }
+                    }
+                };
+                if !send_scene_json(&mut socket, response).await {
+                    break;
+                }
+            }
+            Message::Binary(_) => {
+                let _ = send_scene_json(
+                    &mut socket,
+                    scene_error_json(SceneSinkError::new(
+                        "unsupported_binary",
+                        "Browser scene messages must be JSON text frames",
+                    )),
+                )
+                .await;
+                let _ = socket.send(Message::Close(None)).await;
+                break;
+            }
+            Message::Ping(payload) => {
+                if socket.send(Message::Pong(payload)).await.is_err() {
+                    break;
+                }
+            }
+            Message::Pong(_) => {}
+            Message::Close(_) => break,
+        }
+    }
+}
+
+fn scene_error_json(error: SceneSinkError) -> serde_json::Value {
+    serde_json::json!({
+        "type": "error",
+        "code": error.code,
+        "message": error.message,
+    })
+}
+
+async fn send_scene_json(socket: &mut WebSocket, value: serde_json::Value) -> bool {
+    socket.send(Message::Text(value.to_string())).await.is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,7 +826,12 @@ mod tests {
         let app = router_with_token(backend(), Some("secret-token".to_owned()));
         let health = app
             .clone()
-            .oneshot(Request::builder().uri("/api/v1/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(health.status(), StatusCode::OK);

@@ -5,6 +5,14 @@ const log = document.querySelector("#events");
 const start = document.querySelector("#start");
 const exportButton = document.querySelector("#export");
 
+// Optional live connection. Open the fixture with
+//   ?scene-ws=ws://127.0.0.1:7382/api/v1/browser/scene/ws
+// to forward the same events to the node WebSocket. The Node live.mjs bridge
+// is the alternative when the node requires a bearer token.
+const liveUrl = new URLSearchParams(location.search).get("scene-ws");
+let liveSocket;
+const liveQueue = [];
+
 const replay = [];
 const replayLimit = 4 * 1024 * 1024;
 let replayBytes = 0;
@@ -33,9 +41,52 @@ function emit(type, detail, summary = detail) {
     }
   }
   window.dispatchEvent(new CustomEvent("ozma-scene", { detail: event }));
+  sendLive(event);
   if (type !== "video_frame" || detail.frame % 15 === 1) {
     log.textContent = (JSON.stringify({ type, ...summary }) + "\n" + log.textContent).slice(0, 4096);
   }
+}
+
+function liveRecord(event) {
+  if (event.type === "resource" && event.payload_base64) {
+    return { type: "resource", id: event.id, payload_base64: event.payload_base64 };
+  }
+  if (event.type === "scene_commit") {
+    return { type: "scene_commit", commit: event.commit };
+  }
+  if (event.type === "video_frame") {
+    return { type: "video_frame", surface_id: event.surface_id, frame: event.frame };
+  }
+  return undefined;
+}
+
+function connectLive() {
+  if (!liveUrl || liveSocket) return;
+  liveSocket = new WebSocket(liveUrl);
+  liveSocket.addEventListener("open", () => {
+    log.textContent = (`live scene connected to ${liveUrl}\n` + log.textContent).slice(0, 4096);
+    for (const text of liveQueue.splice(0)) liveSocket.send(text);
+  });
+  liveSocket.addEventListener("message", message => {
+    log.textContent = (`${message.data}\n` + log.textContent).slice(0, 4096);
+  });
+  liveSocket.addEventListener("close", () => {
+    liveSocket = undefined;
+  });
+  liveSocket.addEventListener("error", () => {
+    log.textContent = ("live scene socket failed\n" + log.textContent).slice(0, 4096);
+  });
+}
+
+function sendLive(event) {
+  if (!liveUrl) return;
+  const record = liveRecord(event);
+  if (!record) return;
+  if (liveSocket && liveSocket.readyState === WebSocket.CLOSED) liveSocket = undefined;
+  if (!liveSocket) connectLive();
+  const text = JSON.stringify(record);
+  if (liveSocket.readyState === WebSocket.OPEN) liveSocket.send(text);
+  else liveQueue.push(text);
 }
 
 function placement() {

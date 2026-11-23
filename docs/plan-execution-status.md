@@ -58,6 +58,7 @@ This file records what is actually merged and tested, not what is planned.
 | RDP | Direct surface + auth validated | FreeRDP shadow subsystem writes OZFR frames into its own primary surface (no Xvfb/ffplay); TLS-only, token/user auth, viewer limit. Stock `xfreerdp3` verified frames and rejection paths. RDPEGFX/H.264 and scene flattening remain. |
 | SPICE | Direct surfaces + auth validated | QXL secondary surfaces for image placements, damage rectangles, TLS-only ticket auth, PCM playback channel. `spicy`/screenshot tests verified movement, removal, damage, auth rejection, and playback channel init. One viewer; no SPICE video codec/A-V sync. |
 | Xpra | Video path validated at wire level | Handshake fields, PNG delivery, draw acknowledgement, placement-only updates, codec negotiation, and encoded H.264/VP8/VP9/JPEG frames. Stock Xpra remains unverified; compressed hello records are not accepted. |
+| Browser | Live scene bridge | WebSocket `/api/v1/browser/scene/ws`, bounded resource/commit/video hub, `live.mjs` fixture bridge; video is metadata-only |
 | VNC | Development output | RFB 3.8 framebuffer server with damage updates; viewer input discarded. |
 | Google Cast | Development output | Live HLS composed output with local playback validation; physical receiver and controller integration remain open. |
 

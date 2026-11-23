@@ -30,6 +30,10 @@
   </div>
   <pre id="events" aria-live="polite"></pre>
   <p>For a local replay bridge, pipe JSONL events into <code>node bridge.mjs</code>.</p>
+  <p>For a live node connection, open this page with
+    <code>?scene-ws=ws://127.0.0.1:7382/api/v1/browser/scene/ws</code>, or forward the
+    downloaded JSONL with <code>node live.mjs --file ozma-scene.jsonl</code>.
+    WebCodecs video ingestion is not wired; video events are metadata-only.</p>
 </main>
 <script type="module" src="./producer.js"></script>
 </body>

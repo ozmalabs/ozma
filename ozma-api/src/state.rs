@@ -7,12 +7,61 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ozma_protocol::scene::SceneCommit;
 use ozma_protocol::{
     transport::TransportInfo, ApiError, DiagnosticReport, DisplayId, DisplayMode, DisplayTopology,
     DpmsState, EndReason, NodeCapabilities, NodeId, RuntimeMetrics, Session, SessionEvent,
     SessionId, SessionOffer, SessionSpec, SessionState, VirtualDisplaySpec,
 };
 use tokio::sync::broadcast;
+
+/// An ingest failure the browser WebSocket can report without tearing down the
+/// connection. Implementations choose stable, snake-case codes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SceneSinkError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl SceneSinkError {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// The node did not install a live browser scene sink.
+    pub fn unavailable() -> Self {
+        Self::new(
+            "unavailable",
+            "Browser scene ingest is not enabled on this node",
+        )
+    }
+}
+
+/// The optional live browser scene ingest surface used by the API router.
+///
+/// The router intentionally knows nothing about `ozma-node`: an embedding can
+/// provide any sink, and the default methods report `unavailable`. The node
+/// installs a hub here while using that same hub as its scene producer.
+pub trait BrowserSceneSink: Send + Sync + 'static {
+    fn ingest_resource(&self, _id: u64, _payload_base64: &str) -> Result<(), SceneSinkError> {
+        Err(SceneSinkError::unavailable())
+    }
+
+    fn ingest_commit(&self, _commit: SceneCommit) -> Result<(), SceneSinkError> {
+        Err(SceneSinkError::unavailable())
+    }
+
+    fn ingest_video_frame(
+        &self,
+        _surface_id: u32,
+        _frame: serde_json::Value,
+    ) -> Result<(), SceneSinkError> {
+        Err(SceneSinkError::unavailable())
+    }
+}
 
 /// Everything the HTTP layer needs from a node. Implementations may be the
 /// real supervisor or a test double.
