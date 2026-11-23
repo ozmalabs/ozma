@@ -19,18 +19,26 @@
 //!   `<name>.monitor`.
 //! * Only sinks this process created are removed on VM stop. A pre-existing
 //!   sink with the same name is reused and left in place.
+//! * Ownership is persisted to a small JSON file so a restarted supervisor can
+//!   still clean up sinks it created earlier. An existing sink that is not
+//!   recorded there is never claimed or removed.
 //! * It does not verify audible output or route QEMU streams beyond passing
 //!   the sink name to `ozma-node` and `PULSE_SINK` to the libvirt XML.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use chrono::Utc;
 use clap::ValueEnum;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::{debug, warn};
 
 use ozma_audio::{
     AudioError, AudioRouter, AudioSinkSpec, PipeWireAudioRouter, PulseAudioAudioRouter,
@@ -82,6 +90,8 @@ pub struct AudioProvisionConfig {
     pub sink_prefix: String,
     /// Directory used by the router for reference tracks.
     pub track_root: Option<PathBuf>,
+    /// JSON file that records sink ownership across supervisor restarts.
+    pub state_path: PathBuf,
 }
 
 impl Default for AudioProvisionConfig {
@@ -91,6 +101,7 @@ impl Default for AudioProvisionConfig {
             backend: AudioBackend::None,
             sink_prefix: DEFAULT_AUDIO_SINK_PREFIX.to_owned(),
             track_root: None,
+            state_path: default_state_path(),
         }
     }
 }
@@ -126,6 +137,18 @@ impl AudioProvisionConfig {
                         detail: "audio track_root contains a control character".to_owned(),
                     });
                 }
+            }
+        }
+        if self.state_path.as_os_str().is_empty() {
+            return Err(AudioProvisionError::InvalidConfig {
+                detail: "audio state_path must not be empty".to_owned(),
+            });
+        }
+        if let Some(text) = self.state_path.to_str() {
+            if text.contains('\0') || text.contains('\n') || text.contains('\r') {
+                return Err(AudioProvisionError::InvalidConfig {
+                    detail: "audio state_path contains a control character".to_owned(),
+                });
             }
         }
         Ok(())
@@ -205,21 +228,250 @@ pub trait AudioSinkProvisioner: Send + Sync {
     async fn release(&self, vm_name: &str) -> Result<(), AudioProvisionError>;
 }
 
+/// Version of the on-disk audio provisioning state schema.
+pub const AUDIO_PROVISION_STATE_VERSION: u32 = 1;
+/// State file name used under the runtime directory.
+pub const AUDIO_PROVISION_STATE_FILE: &str = "audio-provision.json";
+
+/// Default state file: `$XDG_RUNTIME_DIR/ozma/audio-provision.json`, falling
+/// back to `/run/ozma/audio-provision.json`.
+pub fn default_state_path() -> PathBuf {
+    match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir)
+            .join("ozma")
+            .join(AUDIO_PROVISION_STATE_FILE),
+        _ => PathBuf::from("/run/ozma").join(AUDIO_PROVISION_STATE_FILE),
+    }
+}
+
+/// One sink this tooling created, persisted across supervisor restarts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnedAudioSink {
+    /// VM name the sink belongs to.
+    pub vm: String,
+    /// Exact sink name reported by the router at creation time.
+    pub sink: String,
+    /// Always true for records this module writes. Kept in the schema so a
+    /// hand-edited or future record can be ignored without guessing.
+    pub created: bool,
+    /// RFC 3339 creation timestamp.
+    pub created_at: String,
+}
+
+/// On-disk state schema. Unknown fields are ignored; unsupported versions are
+/// discarded rather than guessed at.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioProvisionState {
+    pub version: u32,
+    pub sinks: Vec<OwnedAudioSink>,
+}
+
+/// Persistent ownership record for per-VM sinks.
+///
+/// Loading is best-effort: a missing file starts empty with a debug diagnostic;
+/// an unreadable, corrupt, or unsupported file starts empty and logs a warning.
+/// Saving writes a temporary file in the same directory and renames it into
+/// place, so a crash cannot leave a partially written JSON document.
+pub struct AudioProvisionStateStore {
+    path: PathBuf,
+    state: Mutex<AudioProvisionState>,
+}
+
+impl AudioProvisionStateStore {
+    /// Load the state at `path` (or start empty when it cannot be used).
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let state = load_state(&path);
+        Self {
+            path,
+            state: Mutex::new(state),
+        }
+    }
+
+    /// The state file this store reads and writes.
+    pub fn state_path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Whether `sink` is recorded as created by this tooling for `vm`.
+    pub fn is_owned(&self, vm: &str, sink: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .sinks
+            .iter()
+            .any(|record| record.created && record.vm == vm && record.sink == sink)
+    }
+
+    /// Sinks recorded as owned for a VM, in state-file order.
+    pub fn owned_sinks(&self, vm: &str) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .sinks
+            .iter()
+            .filter(|record| record.created && record.vm == vm)
+            .map(|record| record.sink.clone())
+            .collect()
+    }
+
+    /// Record a sink that the router reported creating. Repeated calls for the
+    /// same VM/sink are idempotent; a different sink for the same VM is kept
+    /// alongside the old record so both can be cleaned up.
+    pub fn record_created(&self, vm: &str, sink: &str) -> io::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        if state
+            .sinks
+            .iter()
+            .any(|record| record.created && record.vm == vm && record.sink == sink)
+        {
+            return Ok(());
+        }
+        state
+            .sinks
+            .retain(|record| !(record.vm == vm && record.sink == sink));
+        state.sinks.push(OwnedAudioSink {
+            vm: vm.to_owned(),
+            sink: sink.to_owned(),
+            created: true,
+            created_at: Utc::now().to_rfc3339(),
+        });
+        self.persist(&state)
+    }
+
+    /// Remove one ownership record. An unknown record is a successful no-op.
+    pub fn forget(&self, vm: &str, sink: &str) -> io::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        let before = state.sinks.len();
+        state
+            .sinks
+            .retain(|record| !(record.vm == vm && record.sink == sink));
+        if state.sinks.len() == before {
+            return Ok(());
+        }
+        self.persist(&state)
+    }
+
+    /// Persist the current state (also used after external reconciliation).
+    #[allow(dead_code)]
+    pub fn save(&self) -> io::Result<()> {
+        let state = self.state.lock().unwrap();
+        self.persist(&state)
+    }
+
+    fn persist(&self, state: &AudioProvisionState) -> io::Result<()> {
+        let mut snapshot = state.clone();
+        snapshot.version = AUDIO_PROVISION_STATE_VERSION;
+        snapshot
+            .sinks
+            .sort_by(|a, b| a.vm.cmp(&b.vm).then_with(|| a.sink.cmp(&b.sink)));
+
+        if let Some(parent) = self.path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+
+        let json = serde_json::to_vec_pretty(&snapshot)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let temp = self.temp_path();
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
+            file.write_all(&json)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temp, &self.path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        result
+    }
+
+    fn temp_path(&self) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(AUDIO_PROVISION_STATE_FILE);
+        let temp_name = format!(".{name}.tmp-{}-{sequence}", std::process::id());
+        match self.path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.join(temp_name),
+            _ => PathBuf::from(temp_name),
+        }
+    }
+}
+
+fn load_state(path: &Path) -> AudioProvisionState {
+    match fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str::<AudioProvisionState>(&text) {
+            Ok(mut state) if state.version == AUDIO_PROVISION_STATE_VERSION => {
+                state.sinks.retain(|record| {
+                    record.created && !record.vm.is_empty() && !record.sink.is_empty()
+                });
+                state
+            }
+            Ok(state) => {
+                warn!(
+                    "Audio provisioning state {} has unsupported version {}; \
+                     starting with no owned sinks",
+                    path.display(),
+                    state.version
+                );
+                AudioProvisionState::default()
+            }
+            Err(error) => {
+                warn!(
+                    "Could not parse audio provisioning state {}: {}; \
+                     starting with no owned sinks",
+                    path.display(),
+                    error
+                );
+                AudioProvisionState::default()
+            }
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            debug!(
+                "Audio provisioning state {} does not exist yet",
+                path.display()
+            );
+            AudioProvisionState::default()
+        }
+        Err(error) => {
+            warn!(
+                "Could not read audio provisioning state {}: {}; \
+                 starting with no owned sinks",
+                path.display(),
+                error
+            );
+            AudioProvisionState::default()
+        }
+    }
+}
+
 /// Real adapter over the crate's `AudioRouter`.
 pub struct RouterAudioProvisioner {
     router: Arc<dyn AudioRouter>,
     config: AudioProvisionConfig,
-    /// VM -> whether this process loaded the module. It survives repeated
-    /// `ensure` calls so a later reuse still belongs to us.
-    owned: Mutex<HashMap<String, bool>>,
+    /// Ownership loaded from disk at construction and updated on every
+    /// successful create/release.
+    state: AudioProvisionStateStore,
 }
 
 impl RouterAudioProvisioner {
     pub fn new(router: Arc<dyn AudioRouter>, config: AudioProvisionConfig) -> Self {
+        let state = AudioProvisionStateStore::new(config.state_path.clone());
         Self {
             router,
             config,
-            owned: Mutex::new(HashMap::new()),
+            state,
         }
     }
 }
@@ -247,9 +499,28 @@ impl AudioSinkProvisioner for RouterAudioProvisioner {
             .await
             .map_err(|error| AudioProvisionError::router(vm_name, error))?;
 
-        let mut owned = self.owned.lock().unwrap();
-        let owned_by_us = owned.get(vm_name).copied().unwrap_or(false) || state.created;
-        owned.insert(vm_name.to_owned(), owned_by_us);
+        if state.created {
+            // Only the router's created flag makes a sink ours. Persist it so a
+            // restarted supervisor can still clean it up.
+            if let Err(error) = self.state.record_created(vm_name, &state.name) {
+                warn!(
+                    "VM {}: created audio sink {} but could not persist ownership \
+                     to {}: {}; continuing",
+                    vm_name,
+                    state.name,
+                    self.state.state_path().display(),
+                    error
+                );
+            }
+        } else if !self.state.is_owned(vm_name, &state.name) {
+            // A pre-existing sink with the same name is reused but never
+            // claimed, even if this supervisor restarted after another process
+            // created it.
+            debug!(
+                "VM {}: reusing audio sink {} without claiming ownership",
+                vm_name, state.name
+            );
+        }
 
         Ok(ProvisionedSink {
             name: state.name,
@@ -259,23 +530,23 @@ impl AudioSinkProvisioner for RouterAudioProvisioner {
     }
 
     async fn release(&self, vm_name: &str) -> Result<(), AudioProvisionError> {
-        let owned = self
-            .owned
-            .lock()
-            .unwrap()
-            .get(vm_name)
-            .copied()
-            .unwrap_or(false);
-        if !owned {
-            return Ok(());
+        let owned = self.state.owned_sinks(vm_name);
+        for sink in owned {
+            self.router
+                .remove_sink(&sink)
+                .await
+                .map_err(|error| AudioProvisionError::router(vm_name, error))?;
+            if let Err(error) = self.state.forget(vm_name, &sink) {
+                warn!(
+                    "VM {}: removed audio sink {} but could not persist its \
+                     release to {}: {}; continuing",
+                    vm_name,
+                    sink,
+                    self.state.state_path().display(),
+                    error
+                );
+            }
         }
-
-        let name = self.config.sink_name(vm_name);
-        self.router
-            .remove_sink(&name)
-            .await
-            .map_err(|error| AudioProvisionError::router(vm_name, error))?;
-        self.owned.lock().unwrap().remove(vm_name);
         Ok(())
     }
 }
@@ -383,13 +654,18 @@ impl AudioSinkProvisioner for FakeAudioSinkProvisioner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+    use std::fs;
+    use std::path::Path;
+    use tempfile::{tempdir, TempDir};
+
     use ozma_audio::{AudioPlaybackSpec, AudioProfile, AudioSinkState, AudioStreamRef};
 
     #[derive(Default)]
     struct FakeRouter {
         sinks: Mutex<Vec<AudioSinkSpec>>,
+        existing: Mutex<HashSet<String>>,
         removed: Mutex<Vec<String>>,
-        existing: AtomicBool,
         fail: AtomicBool,
     }
 
@@ -401,27 +677,41 @@ mod tests {
         fn removed(&self) -> Vec<String> {
             self.removed.lock().unwrap().clone()
         }
+
+        /// Make a sink exist without recording it as created by this process.
+        fn precreate(&self, name: &str) {
+            self.existing.lock().unwrap().insert(name.to_owned());
+        }
+
+        /// Make a sink disappear without going through `remove_sink`.
+        fn forget_silently(&self, name: &str) {
+            self.existing.lock().unwrap().remove(name);
+        }
     }
 
     #[async_trait]
     impl AudioRouter for FakeRouter {
         async fn ensure_sink(&self, spec: AudioSinkSpec) -> Result<AudioSinkState, AudioError> {
-            self.sinks.lock().unwrap().push(spec.clone());
             if self.fail.load(Ordering::SeqCst) {
                 return Err(AudioError::Unsupported {
                     feature: "fake".to_owned(),
                     remediation: "do not fail".to_owned(),
                 });
             }
+            let created = self.existing.lock().unwrap().insert(spec.name.clone());
+            if created {
+                self.sinks.lock().unwrap().push(spec.clone());
+            }
             Ok(AudioSinkState {
                 monitor_target: format!("{}.monitor", spec.name),
                 name: spec.name,
-                created: !self.existing.load(Ordering::SeqCst),
+                created,
             })
         }
 
         async fn remove_sink(&self, name: &str) -> Result<(), AudioError> {
             self.removed.lock().unwrap().push(name.to_owned());
+            self.existing.lock().unwrap().remove(name);
             Ok(())
         }
 
@@ -458,12 +748,29 @@ mod tests {
         }
     }
 
+    fn config_at(state_path: &Path) -> AudioProvisionConfig {
+        AudioProvisionConfig {
+            state_path: state_path.to_path_buf(),
+            ..config()
+        }
+    }
+
+    fn state_path(dir: &TempDir) -> PathBuf {
+        dir.path().join(AUDIO_PROVISION_STATE_FILE)
+    }
+
+    fn read_state(path: &Path) -> AudioProvisionState {
+        let text = fs::read_to_string(path).expect("state file exists");
+        serde_json::from_str(&text).expect("state file is valid JSON")
+    }
+
     #[test]
     fn defaults_are_off() {
         let config = AudioProvisionConfig::default();
         assert!(!config.enabled);
         assert_eq!(config.backend, AudioBackend::None);
         assert_eq!(config.sink_prefix, DEFAULT_AUDIO_SINK_PREFIX);
+        assert!(config.state_path.ends_with(AUDIO_PROVISION_STATE_FILE));
     }
 
     #[test]
@@ -508,10 +815,24 @@ mod tests {
         assert!(config.validate().is_err());
     }
 
+    #[test]
+    fn validate_rejects_empty_state_path() {
+        let config = AudioProvisionConfig {
+            state_path: PathBuf::new(),
+            ..config()
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(AudioProvisionError::InvalidConfig { .. })
+        ));
+    }
+
     #[tokio::test]
-    async fn router_provisioner_creates_named_sink_and_monitor_target() {
+    async fn router_provisioner_creates_named_sink_and_persists_ownership() {
+        let dir = tempdir().unwrap();
+        let path = state_path(&dir);
         let router = Arc::new(FakeRouter::default());
-        let provisioner = RouterAudioProvisioner::new(router.clone(), config());
+        let provisioner = RouterAudioProvisioner::new(router.clone(), config_at(&path));
 
         let sink = provisioner.ensure("vm-a").await.unwrap();
         assert_eq!(sink.name, "ozma-vm-a");
@@ -525,41 +846,211 @@ mod tests {
         assert_eq!(specs[0].channels, 2);
         assert_eq!(specs[0].rate, 48_000);
         assert!(specs[0].monitor);
+
+        let state = read_state(&path);
+        assert_eq!(state.version, AUDIO_PROVISION_STATE_VERSION);
+        assert_eq!(state.sinks.len(), 1);
+        assert_eq!(state.sinks[0].vm, "vm-a");
+        assert_eq!(state.sinks[0].sink, "ozma-vm-a");
+        assert!(state.sinks[0].created);
+        assert!(!state.sinks[0].created_at.is_empty());
     }
 
     #[tokio::test]
-    async fn router_provisioner_reuses_an_existing_sink_without_removing_it() {
+    async fn router_provisioner_reuses_an_unrecorded_existing_sink_without_removing_it() {
+        let dir = tempdir().unwrap();
+        let path = state_path(&dir);
         let router = Arc::new(FakeRouter::default());
-        router.existing.store(true, Ordering::SeqCst);
-        let provisioner = RouterAudioProvisioner::new(router.clone(), config());
+        router.precreate("ozma-vm-a");
+        let provisioner = RouterAudioProvisioner::new(router.clone(), config_at(&path));
 
         let sink = provisioner.ensure("vm-a").await.unwrap();
         assert!(!sink.created);
+        assert!(!AudioProvisionStateStore::new(&path).is_owned("vm-a", "ozma-vm-a"));
+
         provisioner.release("vm-a").await.unwrap();
         assert!(router.removed().is_empty(), "externally-owned sink is kept");
+        assert!(AudioProvisionStateStore::new(&path)
+            .owned_sinks("vm-a")
+            .is_empty());
     }
 
     #[tokio::test]
     async fn router_provisioner_removes_a_sink_it_created() {
+        let dir = tempdir().unwrap();
+        let path = state_path(&dir);
         let router = Arc::new(FakeRouter::default());
-        let provisioner = RouterAudioProvisioner::new(router.clone(), config());
+        let provisioner = RouterAudioProvisioner::new(router.clone(), config_at(&path));
 
         provisioner.ensure("vm-a").await.unwrap();
         // A second ensure reuses it (the server already has the sink);
         // ownership must survive.
-        router.existing.store(true, Ordering::SeqCst);
         let reused = provisioner.ensure("vm-a").await.unwrap();
         assert!(!reused.created);
         provisioner.release("vm-a").await.unwrap();
 
         assert_eq!(router.removed(), vec!["ozma-vm-a".to_owned()]);
+        assert!(read_state(&path).sinks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn release_removes_only_owned_sinks() {
+        let dir = tempdir().unwrap();
+        let path = state_path(&dir);
+        let router = Arc::new(FakeRouter::default());
+        router.precreate("ozma-vm-b");
+        let provisioner = RouterAudioProvisioner::new(router.clone(), config_at(&path));
+
+        assert!(provisioner.ensure("vm-a").await.unwrap().created);
+        assert!(!provisioner.ensure("vm-b").await.unwrap().created);
+
+        provisioner.release("vm-a").await.unwrap();
+        provisioner.release("vm-b").await.unwrap();
+
+        assert_eq!(router.removed(), vec!["ozma-vm-a".to_owned()]);
+        assert!(read_state(&path).sinks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restarted_provisioner_reuses_recorded_sink_and_keeps_ownership() {
+        let dir = tempdir().unwrap();
+        let path = state_path(&dir);
+        let router = Arc::new(FakeRouter::default());
+
+        let first = RouterAudioProvisioner::new(router.clone(), config_at(&path));
+        assert!(first.ensure("vm-a").await.unwrap().created);
+        drop(first);
+
+        let restarted = RouterAudioProvisioner::new(router.clone(), config_at(&path));
+        let sink = restarted.ensure("vm-a").await.unwrap();
+        assert!(!sink.created, "restart must reuse the existing sink");
+        assert!(AudioProvisionStateStore::new(&path).is_owned("vm-a", "ozma-vm-a"));
+
+        restarted.release("vm-a").await.unwrap();
+        assert_eq!(router.removed(), vec!["ozma-vm-a".to_owned()]);
+        assert!(read_state(&path).sinks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restarted_provisioner_does_not_claim_an_unrecorded_existing_sink() {
+        let dir = tempdir().unwrap();
+        let path = state_path(&dir);
+        let router = Arc::new(FakeRouter::default());
+        router.precreate("ozma-vm-a");
+
+        let restarted = RouterAudioProvisioner::new(router.clone(), config_at(&path));
+        assert!(!restarted.ensure("vm-a").await.unwrap().created);
+        assert!(!AudioProvisionStateStore::new(&path).is_owned("vm-a", "ozma-vm-a"));
+
+        restarted.release("vm-a").await.unwrap();
+        assert!(
+            router.removed().is_empty(),
+            "an existing sink not recorded as owned must never be unloaded"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_and_corrupt_state_start_empty() {
+        let dir = tempdir().unwrap();
+        let path = state_path(&dir);
+
+        let missing = AudioProvisionStateStore::new(&path);
+        assert!(missing.owned_sinks("vm-a").is_empty());
+
+        fs::write(&path, "{ this is not json").unwrap();
+        let corrupt = AudioProvisionStateStore::new(&path);
+        assert!(corrupt.owned_sinks("vm-a").is_empty());
+
+        // A corrupt file must not turn an existing sink into an owned one.
+        let router = Arc::new(FakeRouter::default());
+        router.precreate("ozma-vm-a");
+        let provisioner = RouterAudioProvisioner::new(router.clone(), config_at(&path));
+        assert!(!provisioner.ensure("vm-a").await.unwrap().created);
+        provisioner.release("vm-a").await.unwrap();
+        assert!(router.removed().is_empty());
+    }
+
+    #[tokio::test]
+    async fn atomic_write_creates_parents_and_leaves_no_temp_file() {
+        let dir = tempdir().unwrap();
+        let nested = dir.path().join("runtime").join("ozma");
+        let path = nested.join(AUDIO_PROVISION_STATE_FILE);
+        let router = Arc::new(FakeRouter::default());
+        let provisioner = RouterAudioProvisioner::new(router, config_at(&path));
+
+        provisioner.ensure("vm-a").await.unwrap();
+
+        assert!(path.exists());
+        let names: Vec<String> = fs::read_dir(&nested)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, vec![AUDIO_PROVISION_STATE_FILE.to_owned()]);
+        assert!(!names.iter().any(|name| name.contains(".tmp")));
+        assert_eq!(read_state(&path).sinks[0].sink, "ozma-vm-a");
+    }
+
+    #[tokio::test]
+    async fn state_path_override_is_used_instead_of_the_default() {
+        let dir = tempdir().unwrap();
+        let custom = dir.path().join("custom").join("owned-sinks.json");
+        let router = Arc::new(FakeRouter::default());
+        let provisioner = RouterAudioProvisioner::new(router, config_at(&custom));
+
+        provisioner.ensure("vm-a").await.unwrap();
+
+        assert!(custom.exists());
+        let state = read_state(&custom);
+        assert_eq!(state.sinks.len(), 1);
+        assert_eq!(state.sinks[0].sink, "ozma-vm-a");
+        assert_eq!(
+            AudioProvisionStateStore::new(&custom).state_path(),
+            custom.as_path()
+        );
+    }
+
+    #[tokio::test]
+    async fn release_after_a_recorded_sink_is_gone_clears_the_record() {
+        let dir = tempdir().unwrap();
+        let path = state_path(&dir);
+        let router = Arc::new(FakeRouter::default());
+
+        let first = RouterAudioProvisioner::new(router.clone(), config_at(&path));
+        first.ensure("vm-a").await.unwrap();
+        router.forget_silently("ozma-vm-a");
+        drop(first);
+
+        let restarted = RouterAudioProvisioner::new(router.clone(), config_at(&path));
+        restarted.release("vm-a").await.unwrap();
+
+        assert_eq!(router.removed(), vec!["ozma-vm-a".to_owned()]);
+        let state = read_state(&path);
+        assert!(
+            state.sinks.is_empty(),
+            "a recorded sink that is gone must not stay owned"
+        );
+    }
+
+    #[tokio::test]
+    async fn state_write_failure_does_not_fail_ensure() {
+        let dir = tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        fs::write(&blocker, b"x").unwrap();
+        let path = blocker.join(AUDIO_PROVISION_STATE_FILE);
+        let router = Arc::new(FakeRouter::default());
+        let provisioner = RouterAudioProvisioner::new(router, config_at(&path));
+
+        let sink = provisioner.ensure("vm-a").await.unwrap();
+        assert!(sink.created);
     }
 
     #[tokio::test]
     async fn router_provisioner_maps_failure_without_returning_a_sink() {
+        let dir = tempdir().unwrap();
+        let path = state_path(&dir);
         let router = Arc::new(FakeRouter::default());
         router.fail.store(true, Ordering::SeqCst);
-        let provisioner = RouterAudioProvisioner::new(router, config());
+        let provisioner = RouterAudioProvisioner::new(router, config_at(&path));
 
         assert!(matches!(
             provisioner.ensure("vm-a").await,

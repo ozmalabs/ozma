@@ -782,4 +782,95 @@ mod tests {
             "*"
         );
     }
+
+    #[tokio::test]
+    async fn compat_display_and_legacy_routes_share_the_bearer_guard() {
+        use crate::controller_compat::{
+            compat_router, CompatStats, ConnectionInfo, ConnectionState, SINK_FAKE_RECORDING,
+        };
+
+        let backend: Arc<dyn NodeBackend> = Arc::new(SessionBackend::new(
+            NodeCapabilities::fake("compat-guard"),
+            ConsentPolicy::for_machine(MachineClass::Server),
+        ));
+        let extra = compat_router(ConnectionState::new(
+            ConnectionInfo::new(
+                "compat-guard._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        ));
+        let app = ozma_api::router::router_with_sinks_and_extra(
+            backend,
+            None,
+            None,
+            Some("secret".to_owned()),
+            Some(extra),
+        );
+
+        for uri in [
+            "/display/snapshot",
+            "/display/info",
+            "/node/status",
+            "/ui/hints",
+            "/agent/metrics",
+            "/usb",
+            "/rgb/state",
+            "/current",
+            "/serial/buffer?lines=50",
+        ] {
+            let denied = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(denied.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+
+        for uri in ["/session/init", "/rgb/effect"] {
+            let denied = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(denied.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+
+        let snapshot = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/display/snapshot")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The guard runs first; with no snapshot control the route is an honest
+        // typed 503, never an image.
+        assert_eq!(snapshot.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let status = app
+            .oneshot(
+                Request::builder()
+                    .uri("/node/status")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+    }
 }

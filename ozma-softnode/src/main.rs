@@ -163,6 +163,14 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     audio_track_root: Option<PathBuf>,
 
+    /// JSON file recording per-VM audio sink ownership across supervisor restarts
+    ///
+    /// Defaults to `$XDG_RUNTIME_DIR/ozma/audio-provision.json`, falling back
+    /// to `/run/ozma/audio-provision.json`. Only sinks recorded here are
+    /// unloaded; an existing sink this supervisor did not create is left alone.
+    #[arg(long, value_name = "PATH")]
+    audio_state_file: Option<PathBuf>,
+
     /// Discovery-only mode: report VMs and provision agents without starting nodes
     #[arg(long)]
     no_auto_manage: bool,
@@ -224,6 +232,9 @@ async fn main() -> anyhow::Result<()> {
         backend: args.audio_backend,
         sink_prefix: args.audio_sink_prefix,
         track_root: args.audio_track_root,
+        state_path: args
+            .audio_state_file
+            .unwrap_or_else(audio_provisioning::default_state_path),
     };
 
     let options = ManagerOptions {
@@ -308,6 +319,7 @@ mod tests {
             audio_provisioning::DEFAULT_AUDIO_SINK_PREFIX
         );
         assert!(args.audio_track_root.is_none());
+        assert!(args.audio_state_file.is_none());
     }
 
     #[test]
@@ -356,6 +368,8 @@ mod tests {
             "ozma-vm-",
             "--audio-track-root",
             "/srv/tracks",
+            "--audio-state-file",
+            "/run/ozma/custom-audio-provision.json",
         ])
         .expect("parse device/audio provisioning flags");
 
@@ -368,6 +382,10 @@ mod tests {
         );
         assert_eq!(args.audio_sink_prefix, "ozma-vm-");
         assert_eq!(args.audio_track_root, Some(PathBuf::from("/srv/tracks")));
+        assert_eq!(
+            args.audio_state_file,
+            Some(PathBuf::from("/run/ozma/custom-audio-provision.json"))
+        );
     }
 
     #[test]

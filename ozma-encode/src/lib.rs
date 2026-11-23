@@ -62,6 +62,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ffmpeg;
+pub mod jpeg;
 pub mod override_policy;
 pub mod probe;
 pub mod registry;
@@ -69,6 +70,7 @@ pub mod software;
 pub mod vaapi;
 
 pub use ffmpeg::{detect_ffmpeg, FfmpegStatus};
+pub use jpeg::{encode_jpeg_bgra, encode_jpeg_frame, encode_jpeg_rgb, JpegError};
 pub use override_policy::{
     backend_is_hardware, backend_supports_codec, CodecOverrideState, CodecPreference,
     EncoderOverride, FallbackReason, OverrideReceipt, OverrideResult,

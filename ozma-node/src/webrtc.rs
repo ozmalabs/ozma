@@ -23,12 +23,17 @@
 //! 503. A configured helper that cannot be spawned or connected is reported as
 //! `failed`, never `running`.
 //!
-//! Bitrate changes are attempted with `{"type":"bitrate","bitrate":<bps>}`.
-//! The current Python worker
-//! (`softnode/gst_webrtc_worker.py`) does not acknowledge that message, so
-//! [`WebRtcHelper::set_bitrate`] returns a typed timeout instead of claiming
-//! success. A helper that answers `{"ok":false,...}` or an unknown shape is a
-//! typed error too.
+//! Bitrate changes are sent as `{"type":"bitrate","bitrate":<bps>}`. The
+//! worker clamps the value to 500 kbps–50 Mbps, applies it to every live
+//! session's video encoder, and answers `{"ok":true,"bitrate":<bps>}`. Only
+//! that acknowledgement is success; a worker that ignores the message, answers
+//! `{"ok":false,...}`, or returns an unknown shape is a typed error.
+//!
+//! Audio is opt-in. When [`WebRtcConfig::audio_source`] is set, the helper is
+//! also given `--audio-source <monitor>` and `--audio-backend <auto|pulse|
+//! pipewire>`; the worker adds an Opus/`rtpopuspay` branch from that monitor
+//! only if the required GStreamer elements exist. Without it the helper argv
+//! and pipeline are unchanged, and video still runs if audio is unavailable.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -66,6 +71,30 @@ const STOP_TASK_TIMEOUT: Duration = Duration::from_secs(2);
 /// Poll interval while waiting for the helper's Unix socket.
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
+/// Audio capture backend requested from the external helper.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum WebRtcAudioBackend {
+    /// Prefer `pulsesrc`, falling back to `pipewiresrc` when only that exists.
+    #[default]
+    Auto,
+    /// Use PulseAudio's `pulsesrc` only.
+    Pulse,
+    /// Use PipeWire's `pipewiresrc` only.
+    #[value(name = "pipewire")]
+    PipeWire,
+}
+
+impl WebRtcAudioBackend {
+    /// Helper CLI token for this backend.
+    pub fn as_arg(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Pulse => "pulse",
+            Self::PipeWire => "pipewire",
+        }
+    }
+}
+
 /// Configuration for the external WebRTC helper.
 ///
 /// `helper_program` is required and has no default: WebRTC stays disabled
@@ -90,6 +119,13 @@ pub struct WebRtcConfig {
     pub fps: u32,
     /// Initial/target H.264 bitrate in kbps.
     pub bitrate_kbps: u32,
+    /// Optional PulseAudio/PipeWire monitor source, for example
+    /// `ozma-vm1.monitor` (the `<sink>.monitor` convention).
+    ///
+    /// `None` keeps the helper video-only; audio is never implied.
+    pub audio_source: Option<String>,
+    /// Capture backend for [`WebRtcConfig::audio_source`].
+    pub audio_backend: WebRtcAudioBackend,
     /// Bounded wait for the helper to create and accept its socket.
     pub startup_timeout: Duration,
     /// Bounded wait for one signaling response.
@@ -111,6 +147,15 @@ impl WebRtcConfig {
         if self.helper_script.as_deref().is_some_and(is_empty_path) {
             return Err(WebRtcError::InvalidConfig(
                 "the WebRTC helper script path must not be empty".to_owned(),
+            ));
+        }
+        if self
+            .audio_source
+            .as_deref()
+            .is_some_and(|source| source.trim().is_empty())
+        {
+            return Err(WebRtcError::InvalidConfig(
+                "the WebRTC audio source must not be empty when configured".to_owned(),
             ));
         }
         if is_empty_path(&self.socket_path) {
@@ -304,6 +349,7 @@ struct WebRtcStatusInner {
     state: WebRtcState,
     error: Option<String>,
     helper_pid: Option<u32>,
+    audio_configured: bool,
 }
 
 /// Cloneable, bounded helper status for `/api/v1/connection`.
@@ -336,6 +382,7 @@ impl WebRtcStatus {
                 state: WebRtcState::Starting,
                 error: None,
                 helper_pid: None,
+                audio_configured: false,
             })),
         }
     }
@@ -351,6 +398,10 @@ impl WebRtcStatus {
         inner.state = WebRtcState::Running;
         inner.error = None;
         inner.helper_pid = helper_pid;
+    }
+
+    fn set_audio_configured(&self, configured: bool) {
+        self.lock().audio_configured = configured;
     }
 
     fn set_failed(&self, message: impl Into<String>) {
@@ -380,6 +431,14 @@ impl WebRtcStatus {
     /// Helper process id, when one was spawned.
     pub fn helper_pid(&self) -> Option<u32> {
         self.lock().helper_pid
+    }
+
+    /// Whether an audio source was configured and handed to the helper.
+    ///
+    /// This is configuration intent, not proof that the worker found the
+    /// monitor or built the audio branch; the worker logs that separately.
+    pub fn audio_configured(&self) -> bool {
+        self.lock().audio_configured
     }
 
     /// Controller-facing status token.
@@ -599,8 +658,10 @@ fn connect_with_timeout(
 /// The program is first, then the optional script, then the worker's flags.
 /// Bitrate is intentionally not an argument: `gst_webrtc_worker.py` rejects
 /// unknown flags, so bitrate changes go through the signaling socket instead.
+/// Audio flags are appended only when [`WebRtcConfig::audio_source`] is set, so
+/// a video-only node produces exactly the historical argv.
 pub fn helper_argv(config: &WebRtcConfig) -> Vec<String> {
-    let mut argv = Vec::with_capacity(11);
+    let mut argv = Vec::with_capacity(15);
     argv.push(config.helper_program.display().to_string());
     if let Some(script) = &config.helper_script {
         argv.push(script.display().to_string());
@@ -615,6 +676,12 @@ pub fn helper_argv(config: &WebRtcConfig) -> Vec<String> {
     argv.push(config.height.to_string());
     argv.push("--fps".to_owned());
     argv.push(config.fps.to_string());
+    if let Some(source) = &config.audio_source {
+        argv.push("--audio-source".to_owned());
+        argv.push(source.clone());
+        argv.push("--audio-backend".to_owned());
+        argv.push(config.audio_backend.as_arg().to_owned());
+    }
     argv
 }
 
@@ -669,6 +736,7 @@ impl WebRtcHelper {
         }
 
         let status = WebRtcStatus::starting();
+        status.set_audio_configured(config.audio_source.is_some());
         let spawned = match spawner.spawn(&config) {
             Ok(spawned) => spawned,
             Err(error) => {
@@ -735,9 +803,10 @@ impl WebRtcHelper {
     /// Ask the helper to change its video bitrate.
     ///
     /// The outgoing message is `{"type":"bitrate","bitrate":<bps>}`. The
-    /// helper must acknowledge it; the current `gst_webrtc_worker.py` ignores
-    /// this message, which surfaces as [`WebRtcError::Timeout`] rather than a
-    /// fabricated success.
+    /// helper clamps it to 500 kbps–50 Mbps, applies it to every live video
+    /// encoder, and acknowledges with `{"ok":true,"bitrate":<bps>}`. A helper
+    /// that ignores the message is a typed timeout; `{"ok":false,...}` or an
+    /// unknown shape is a typed error, so success always means an ack.
     pub async fn set_bitrate(&mut self, bitrate_kbps: u32) -> Result<(), WebRtcError> {
         if bitrate_kbps == 0 {
             return Err(WebRtcError::InvalidConfig(
@@ -854,23 +923,36 @@ impl Drop for WebRtcHelper {
 pub struct WebRtcControl {
     status: WebRtcStatus,
     helper: Option<Arc<tokio::sync::Mutex<WebRtcHelper>>>,
+    /// Configured monitor source, retained even when the helper failed so the
+    /// connection endpoint can report configuration intent without claiming
+    /// that samples were produced.
+    audio_source: Option<String>,
 }
 
 impl WebRtcControl {
     /// Wrap a started helper.
     pub fn from_helper(helper: WebRtcHelper) -> Self {
         let status = helper.status();
+        let audio_source = helper.config().audio_source.clone();
         Self {
             status,
             helper: Some(Arc::new(tokio::sync::Mutex::new(helper))),
+            audio_source,
         }
     }
 
     /// A configured helper that could not be started.
     pub fn failed(message: impl Into<String>) -> Self {
+        Self::failed_with_audio(message, None)
+    }
+
+    /// A configured helper that could not be started, retaining the configured
+    /// audio monitor for `/api/v1/connection`.
+    pub fn failed_with_audio(message: impl Into<String>, audio_source: Option<String>) -> Self {
         Self {
             status: WebRtcStatus::failed(message),
             helper: None,
+            audio_source,
         }
     }
 
@@ -887,6 +969,19 @@ impl WebRtcControl {
     /// Why WebRTC is not running, when it is configured and failing.
     pub fn error(&self) -> Option<String> {
         self.status.error()
+    }
+
+    /// Whether the helper was configured with an audio monitor source.
+    pub fn audio_configured(&self) -> bool {
+        self.status.audio_configured() || self.audio_source.is_some()
+    }
+
+    /// The configured monitor source, when one was supplied.
+    ///
+    /// This is only the PulseAudio/PipeWire monitor name; it is not proof that
+    /// the worker opened the source or produced samples.
+    pub fn audio_source(&self) -> Option<&str> {
+        self.audio_source.as_deref()
     }
 
     /// True only when a helper is connected and the feeder is running.
@@ -914,8 +1009,9 @@ impl WebRtcControl {
 
     /// Request a bitrate change in bits per second.
     ///
-    /// The helper's signaling API takes kbps, so the controller's bps value is
-    /// converted before it is sent.
+    /// [`WebRtcHelper::set_bitrate`] is kbps-based, so the controller's bps
+    /// value is rounded down to a whole kbps before being sent back out as bps
+    /// on the signaling socket (the helper clamps to 500 kbps–50 Mbps).
     pub async fn set_bitrate_bps(&self, bitrate_bps: u32) -> Result<(), WebRtcError> {
         if bitrate_bps == 0 {
             return Err(WebRtcError::InvalidConfig(
@@ -1420,6 +1516,8 @@ mod tests {
             height: 2,
             fps: 30,
             bitrate_kbps: 4_000,
+            audio_source: None,
+            audio_backend: WebRtcAudioBackend::Auto,
             startup_timeout: Duration::from_millis(150),
             offer_timeout: Duration::from_millis(150),
         }
@@ -1475,6 +1573,38 @@ mod tests {
         let argv = helper_argv(&config);
         assert_eq!(argv[0], "/usr/local/bin/ozma-webrtc-helper");
         assert_eq!(argv[1], "--sock");
+    }
+
+    #[test]
+    fn argv_appends_audio_arguments_only_when_configured() {
+        let mut config = config("argv-audio");
+        config.audio_source = Some("ozma-vm1.monitor".to_owned());
+        config.audio_backend = WebRtcAudioBackend::PipeWire;
+        let argv = helper_argv(&config);
+        assert_eq!(
+            &argv[argv.len() - 4..],
+            [
+                "--audio-source",
+                "ozma-vm1.monitor",
+                "--audio-backend",
+                "pipewire",
+            ]
+        );
+
+        config.audio_source = None;
+        let argv = helper_argv(&config);
+        assert!(!argv.iter().any(|arg| arg == "--audio-source"));
+        assert!(!argv.iter().any(|arg| arg == "--audio-backend"));
+    }
+
+    #[test]
+    fn validation_rejects_an_empty_configured_audio_source() {
+        let mut config = config("validate-audio");
+        config.audio_source = Some("   ".to_owned());
+        assert!(matches!(
+            config.validate(),
+            Err(WebRtcError::InvalidConfig(_))
+        ));
     }
 
     #[test]
@@ -1673,6 +1803,24 @@ mod tests {
         helper.stop().await.unwrap();
     }
 
+    #[test]
+    fn bitrate_ack_parser_requires_an_explicit_acknowledgement() {
+        assert!(parse_bitrate_ack("{\"ok\":true}").is_ok());
+        assert!(parse_bitrate_ack("{\"ok\":true,\"bitrate\":8000000}").is_ok());
+        assert!(matches!(
+            parse_bitrate_ack("{\"ok\":false,\"error\":\"no video encoder\"}"),
+            Err(WebRtcError::HelperError(message)) if message == "no video encoder"
+        ));
+        assert!(matches!(
+            parse_bitrate_ack("{\"type\":\"answer\",\"sdp\":\"v=0\"}"),
+            Err(WebRtcError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_bitrate_ack("not json"),
+            Err(WebRtcError::MalformedResponse(_))
+        ));
+    }
+
     #[tokio::test]
     async fn bitrate_without_an_ack_is_not_a_fake_success() {
         // The real Python worker ignores `bitrate`, so no response arrives.
@@ -1707,7 +1855,10 @@ mod tests {
     async fn bitrate_ack_and_explicit_rejection_are_both_honest() {
         let (signaler, mut reader, mut writer) = pair();
         tokio::spawn(async move {
-            for response in [&b"{\"ok\":true}\n"[..], &b"{\"ok\":false}\n"[..]] {
+            for response in [
+                &b"{\"ok\":true}\n"[..],
+                &b"{\"ok\":false,\"error\":\"no video encoder\"}\n"[..],
+            ] {
                 let mut line = String::new();
                 reader.read_line(&mut line).await.unwrap();
                 writer.write_all(response).await.unwrap();
@@ -1868,11 +2019,13 @@ mod tests {
         let source = Box::new(PendingSource::new(FrameFormat::rgb24(2, 2)));
         let mut config = config("control");
         config.helper_program = PathBuf::from("/fake/helper");
+        config.audio_source = Some("ozma-vm1.monitor".to_owned());
         let spawner = Arc::new(RecordingSpawner::new(silent_signaler()));
         let helper = WebRtcHelper::start_with_spawner(source, config, spawner).unwrap();
 
         let control = WebRtcControl::from_helper(helper);
         assert!(control.available());
+        assert!(control.audio_configured());
         assert_eq!(control.status_name(), "running");
         assert!(control.error().is_none());
         assert!(control.unavailable_reason().is_none());
@@ -1917,6 +2070,44 @@ mod tests {
         let source = Box::new(PendingSource::new(FrameFormat::rgb24(320, 240)));
         let mut helper = WebRtcHelper::start(source, config).expect("helper starts");
         assert_eq!(helper.status().status_name(), "running");
+        helper.stop().await.expect("helper stops");
+    }
+
+    /// Real optional-audio check. This proves the helper accepts the audio
+    /// argv and stays up; it does not negotiate a browser and therefore does
+    /// not prove the monitor produced samples.
+    ///
+    /// ```text
+    /// OZMA_WEBRTC_GS_SCRIPT=/path/to/gst_webrtc_worker.py \
+    /// OZMA_WEBRTC_GS_AUDIO_SOURCE=ozma-vm1.monitor \
+    ///   cargo test -p ozma-node --lib webrtc::tests::real_gstreamer_audio_helper_starts_and_stops -- --ignored
+    /// ```
+    #[tokio::test]
+    #[ignore = "requires GStreamer + Python + a monitor source; set OZMA_WEBRTC_GS_SCRIPT and OZMA_WEBRTC_GS_AUDIO_SOURCE"]
+    async fn real_gstreamer_audio_helper_starts_and_stops() {
+        let Ok(script) = std::env::var("OZMA_WEBRTC_GS_SCRIPT") else {
+            return;
+        };
+        let Ok(audio_source) = std::env::var("OZMA_WEBRTC_GS_AUDIO_SOURCE") else {
+            return;
+        };
+        let program = std::env::var("OZMA_WEBRTC_GS_PYTHON")
+            .unwrap_or_else(|_| "/usr/bin/python3".to_owned());
+        let directory = temp_dir("real-audio-helper");
+        let mut config = config("real-audio-helper");
+        config.helper_program = PathBuf::from(program);
+        config.helper_script = Some(PathBuf::from(script));
+        config.socket_path = directory.join("helper.sock");
+        config.shm_path = directory.join("frame.bgra");
+        config.width = 320;
+        config.height = 240;
+        config.audio_source = Some(audio_source);
+        config.startup_timeout = Duration::from_secs(20);
+
+        let source = Box::new(PendingSource::new(FrameFormat::rgb24(320, 240)));
+        let mut helper = WebRtcHelper::start(source, config).expect("helper starts");
+        assert_eq!(helper.status().status_name(), "running");
+        assert!(helper.status().audio_configured());
         helper.stop().await.expect("helper stops");
     }
 }

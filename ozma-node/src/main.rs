@@ -28,9 +28,10 @@ use ozma_node::{
         DEFAULT_QMP_CONNECT_TIMEOUT_MS,
     },
     controller_compat::{self, AudioControl, CodecControl},
+    display_compat::SnapshotControl,
     hls::{HlsConfig, HlsController, HlsEncoder, HlsError, HlsSourceFactory, HlsStatus},
     input_select, mdns, platform, registration, usb_audio,
-    webrtc::{WebRtcConfig, WebRtcControl, WebRtcHelper},
+    webrtc::{WebRtcAudioBackend, WebRtcConfig, WebRtcControl, WebRtcHelper},
 };
 
 /// Ozma hardware KVM node process.
@@ -265,10 +266,12 @@ pub struct Args {
     #[arg(long, env = "OZMA_HLS_BITRATE_KBPS", default_value_t = 4000)]
     pub hls_bitrate_kbps: u32,
 
-    /// HLS video encoder: libx264, libx265, libsvtav1, libaom-av1, or mjpeg.
+    /// HLS video encoder: libx264, libx265, libsvtav1, libaom-av1, mjpeg, or a
+    /// hardware encoder such as h264_vaapi, hevc_vaapi, h264_nvenc, hevc_nvenc,
+    /// h264_qsv, hevc_qsv, h264_v4l2m2m, or hevc_v4l2m2m.
     ///
-    /// Hardware encoder names are rejected: the HLS raw-frame path has no
-    /// upload/hwaccel filter chain.
+    /// A hardware encoder is only started after `ffmpeg -encoders` confirms it
+    /// is available; naming one never silently falls back to software.
     #[arg(
         long,
         env = "OZMA_HLS_ENCODER",
@@ -276,6 +279,18 @@ pub struct Args {
         value_name = "ENCODER"
     )]
     pub hls_encoder: String,
+
+    /// VAAPI render node used by `h264_vaapi`/`hevc_vaapi` HLS encoders.
+    ///
+    /// The path is validated when a hardware pipeline starts or restarts, not
+    /// while building argv.
+    #[arg(
+        long,
+        env = "OZMA_VAAPI_DEVICE",
+        default_value = "/dev/dri/renderD128",
+        value_name = "PATH"
+    )]
+    pub vaapi_device: std::path::PathBuf,
 
     /// ffmpeg executable used by the HLS pipeline.
     #[arg(
@@ -322,6 +337,23 @@ pub struct Args {
     /// process).
     #[arg(long, env = "OZMA_WEBRTC_SHM", value_name = "PATH")]
     pub webrtc_shm: Option<std::path::PathBuf>,
+
+    /// Optional PulseAudio/PipeWire monitor source for WebRTC audio, for
+    /// example `ozma-vm1.monitor`. Audio stays disabled unless this is set.
+    #[arg(long, env = "OZMA_WEBRTC_AUDIO_SOURCE", value_name = "SOURCE")]
+    pub webrtc_audio_source: Option<String>,
+
+    /// WebRTC audio capture backend: `auto`, `pulse`, or `pipewire`.
+    ///
+    /// `auto` prefers `pulsesrc` and falls back to `pipewiresrc`. It only
+    /// applies when `--webrtc-audio-source` is set.
+    #[arg(
+        long,
+        env = "OZMA_WEBRTC_AUDIO_BACKEND",
+        value_enum,
+        default_value_t = WebRtcAudioBackend::Auto
+    )]
+    pub webrtc_audio_backend: WebRtcAudioBackend,
 
     /// Enable verbose debug logging.
     #[arg(long)]
@@ -428,6 +460,8 @@ async fn main() {
         audio_track_root: args.audio_track_root.clone(),
         ffmpeg_bin: args.ffmpeg_bin.clone(),
         audio_sink: args.audio_sink.clone(),
+        webrtc_audio_source: args.webrtc_audio_source.clone(),
+        webrtc_audio_backend: args.webrtc_audio_backend,
         vm_guest_ip: args.vm_guest_ip.clone(),
         display_outputs_json: args.display_outputs_json.clone(),
         pci_devices_json: args.pci_devices_json.clone(),
@@ -512,6 +546,7 @@ async fn main() {
             bitrate_kbps: args.hls_bitrate_kbps,
             video_encoder: encoder,
             ffmpeg_bin: args.ffmpeg_bin.clone(),
+            vaapi_device: args.vaapi_device.clone(),
             ..HlsConfig::default()
         };
         if let Err(error) = hls_config.validate() {
@@ -559,6 +594,7 @@ async fn main() {
     let webrtc_control: Option<WebRtcControl> = match args.webrtc_helper.clone() {
         None => None,
         Some(program) => {
+            let audio_source = args.webrtc_audio_source.clone();
             let webrtc_config = WebRtcConfig {
                 helper_program: program,
                 helper_script: args.webrtc_helper_script.clone(),
@@ -571,21 +607,25 @@ async fn main() {
                 height: args.webrtc_height,
                 fps: args.webrtc_fps,
                 bitrate_kbps: args.webrtc_bitrate_kbps,
+                audio_source: audio_source.clone(),
+                audio_backend: args.webrtc_audio_backend,
                 startup_timeout: std::time::Duration::from_secs(5),
                 offer_timeout: std::time::Duration::from_secs(10),
             };
             if let Err(error) = webrtc_config.validate() {
                 warn!(error = %error, "WebRTC unavailable: invalid helper configuration");
-                Some(WebRtcControl::failed(format!(
-                    "WebRTC unavailable: {error}"
-                )))
+                Some(WebRtcControl::failed_with_audio(
+                    format!("WebRTC unavailable: {error}"),
+                    audio_source,
+                ))
             } else if !config.has_capability("video") {
                 warn!(
                     "--webrtc-helper was configured but the video capability is disabled; \
                      WebRTC is unavailable"
                 );
-                Some(WebRtcControl::failed(
+                Some(WebRtcControl::failed_with_audio(
                     "WebRTC unavailable: the video capability is disabled".to_owned(),
+                    audio_source,
                 ))
             } else {
                 match open_first_capture_source(&capture_registry).and_then(|source| {
@@ -600,6 +640,8 @@ async fn main() {
                             width = webrtc_config.width,
                             height = webrtc_config.height,
                             fps = webrtc_config.fps,
+                            audio = ?webrtc_config.audio_source,
+                            audio_backend = webrtc_config.audio_backend.as_arg(),
                             "WebRTC helper started"
                         );
                         Some(WebRtcControl::from_helper(helper))
@@ -609,9 +651,10 @@ async fn main() {
                             error = %error,
                             "WebRTC unavailable: the external helper did not start"
                         );
-                        Some(WebRtcControl::failed(format!(
-                            "WebRTC unavailable: {error}"
-                        )))
+                        Some(WebRtcControl::failed_with_audio(
+                            format!("WebRTC unavailable: {error}"),
+                            audio_source,
+                        ))
                     }
                 }
             }
@@ -656,7 +699,8 @@ async fn main() {
             .with_codecs(codec_status)
             .with_codec_control(codec_control)
             .with_audio(audio_control)
-            .with_webrtc(webrtc_control.clone()),
+            .with_webrtc(webrtc_control.clone())
+            .with_snapshot(Some(SnapshotControl::new(capture_registry.clone()))),
     );
 
     // Start the controller-facing UDP HID listener only when the node
@@ -1190,6 +1234,36 @@ mod tests {
         assert_eq!(args.webrtc_bitrate_kbps, 4_000);
         assert!(args.webrtc_socket.is_none());
         assert!(args.webrtc_shm.is_none());
+        assert!(
+            args.webrtc_audio_source.is_none(),
+            "WebRTC audio must stay disabled unless a monitor source is supplied"
+        );
+        assert_eq!(args.webrtc_audio_backend, WebRtcAudioBackend::Auto);
+    }
+
+    #[test]
+    fn webrtc_audio_flags_parse_and_default_to_disabled() {
+        let args = Args::parse_from([
+            "ozma-node",
+            "--webrtc-audio-source",
+            "ozma-vm1.monitor",
+            "--webrtc-audio-backend",
+            "pipewire",
+        ]);
+        assert_eq!(
+            args.webrtc_audio_source.as_deref(),
+            Some("ozma-vm1.monitor")
+        );
+        assert_eq!(args.webrtc_audio_backend, WebRtcAudioBackend::PipeWire);
+
+        let pulse = Args::parse_from([
+            "ozma-node",
+            "--webrtc-audio-source=ozma-vm1.monitor",
+            "--webrtc-audio-backend=pulse",
+        ]);
+        assert_eq!(pulse.webrtc_audio_backend, WebRtcAudioBackend::Pulse);
+
+        assert!(Args::try_parse_from(["ozma-node", "--webrtc-audio-backend", "alsa"]).is_err());
     }
 
     #[test]

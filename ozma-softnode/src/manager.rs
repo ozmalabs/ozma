@@ -430,6 +430,10 @@ impl VirtualNodeManager {
                 "  Audio type:  ozma-node has no --audio-type flag; a non-empty \
                  --audio-sink is advertised as pipewire"
             );
+            info!(
+                "  Audio state: {} (ownership across supervisor restarts)",
+                self.options.audio.state_path.display()
+            );
         } else {
             info!("  Audio sink:  off (no per-VM sink provisioning)");
         }

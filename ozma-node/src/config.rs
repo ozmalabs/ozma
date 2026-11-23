@@ -14,6 +14,8 @@ use ozma_protocol::NodeId;
 use ozma_qmp::QmpConfig;
 use serde::{Deserialize, Serialize};
 
+use crate::webrtc::WebRtcAudioBackend;
+
 /// Default QMP connect/greeting timeout, matching `ozma-qmp`.
 pub const DEFAULT_QMP_CONNECT_TIMEOUT_MS: u64 = 3_000;
 /// Default QMP control-command timeout, matching `ozma-qmp`.
@@ -598,6 +600,10 @@ pub struct NodeConfig {
     pub ffmpeg_bin: PathBuf,
     /// Audio sink name advertised to the controller.
     pub audio_sink: Option<String>,
+    /// Optional PulseAudio/PipeWire monitor source for WebRTC audio.
+    pub webrtc_audio_source: Option<String>,
+    /// Capture backend requested for the WebRTC audio source.
+    pub webrtc_audio_backend: WebRtcAudioBackend,
     /// Guest IP advertised by VM soft nodes.
     pub vm_guest_ip: Option<String>,
     /// JSON-encoded display output list sent to the controller.
@@ -668,6 +674,13 @@ impl NodeConfig {
             ));
         }
         validate_path("--audio-track-root", self.audio_track_root.as_deref())?;
+        if self
+            .webrtc_audio_source
+            .as_deref()
+            .is_some_and(|source| source.trim().is_empty())
+        {
+            return Err("--webrtc-audio-source must not be empty or whitespace".to_owned());
+        }
         if let Some(domain) = &self.libvirt_domain {
             if domain.trim().is_empty() {
                 return Err("--libvirt-domain must not be empty".to_owned());
@@ -865,6 +878,8 @@ mod tests {
             audio_track_root: None,
             ffmpeg_bin: PathBuf::from("ffmpeg"),
             audio_sink: None,
+            webrtc_audio_source: None,
+            webrtc_audio_backend: WebRtcAudioBackend::Auto,
             vm_guest_ip: None,
             display_outputs_json: "[]".into(),
             pci_devices_json: "[]".into(),
@@ -1209,6 +1224,26 @@ mod tests {
             config.vm_providers().unwrap().capture.as_deref(),
             Some("vnc")
         );
+    }
+
+    #[test]
+    fn webrtc_audio_source_and_backend_validate() {
+        let mut config = test_config(NodeProfile::Vm);
+        assert!(config.webrtc_audio_source.is_none());
+        assert_eq!(config.webrtc_audio_backend, WebRtcAudioBackend::Auto);
+        assert!(config.validate().is_ok());
+
+        config.webrtc_audio_source = Some("   ".into());
+        assert!(config.validate().is_err());
+
+        config.webrtc_audio_source = Some("ozma-vm1.monitor".into());
+        config.webrtc_audio_backend = WebRtcAudioBackend::PipeWire;
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            <WebRtcAudioBackend as ValueEnum>::from_str("pipewire", false).unwrap(),
+            WebRtcAudioBackend::PipeWire
+        );
+        assert!(<WebRtcAudioBackend as ValueEnum>::from_str("alsa", false).is_err());
     }
 
     #[test]

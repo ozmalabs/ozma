@@ -206,6 +206,8 @@ mod tests {
             audio_track_root: None,
             ffmpeg_bin: std::path::PathBuf::from("ffmpeg"),
             audio_sink: None,
+            webrtc_audio_source: None,
+            webrtc_audio_backend: crate::webrtc::WebRtcAudioBackend::Auto,
             vm_guest_ip: None,
             display_outputs_json: "[]".into(),
             pci_devices_json: "[]".into(),

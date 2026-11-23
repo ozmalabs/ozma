@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""Pure tests for the GStreamer WebRTC worker helpers.
+
+These tests never import GStreamer.  Run with:
+
+    python3 softnode/gst_webrtc_worker_test.py
+"""
+
+import unittest
+
+import gst_webrtc_worker as worker
+
+
+class SyntaxTests(unittest.TestCase):
+    def test_worker_compiles(self):
+        import py_compile
+        from pathlib import Path
+
+        py_compile.compile(
+            str(Path(__file__).with_name("gst_webrtc_worker.py")),
+            doraise=True,
+        )
+
+
+class ClampBitrateTests(unittest.TestCase):
+    def test_clamps_below_minimum(self):
+        self.assertEqual(worker.clamp_bitrate_bps(100_000), 500_000)
+
+    def test_clamps_above_maximum(self):
+        self.assertEqual(worker.clamp_bitrate_bps(99_000_000), 50_000_000)
+
+    def test_keeps_in_range_value(self):
+        self.assertEqual(worker.clamp_bitrate_bps(8_000_000), 8_000_000)
+
+
+class AudioSelectionTests(unittest.TestCase):
+    def test_auto_prefers_pulsesrc(self):
+        self.assertEqual(
+            worker.select_audio_source_element(
+                "auto", {"pulsesrc", "pipewiresrc"}
+            ),
+            ("pulsesrc", "device"),
+        )
+
+    def test_auto_falls_back_to_pipewiresrc(self):
+        self.assertEqual(
+            worker.select_audio_source_element("auto", {"pipewiresrc"}),
+            ("pipewiresrc", "target-object"),
+        )
+
+    def test_explicit_backend_does_not_fall_back(self):
+        self.assertIsNone(
+            worker.select_audio_source_element("pulse", {"pipewiresrc"})
+        )
+
+    def test_no_capture_element(self):
+        self.assertIsNone(worker.select_audio_source_element("auto", set()))
+
+
+class PipelineStringTests(unittest.TestCase):
+    def test_video_only_pipeline_is_unchanged(self):
+        pipeline = worker.build_pipeline_string(
+            640, 480, 30, worker.video_encoder_description(False)
+        )
+        self.assertIn("appsrc name=src", pipeline)
+        self.assertIn("name=venc", pipeline)
+        self.assertTrue(
+            pipeline.endswith("! webrtcbin name=webrtc bundle-policy=max-bundle")
+        )
+        self.assertNotIn("opusenc", pipeline)
+        self.assertNotIn("pulsesrc", pipeline)
+
+    def test_audio_pipeline_adds_opus_branch(self):
+        pipeline = worker.build_pipeline_string(
+            640,
+            480,
+            30,
+            worker.video_encoder_description(True),
+            audio_element="pulsesrc",
+        )
+        self.assertIn("webrtcbin name=webrtc bundle-policy=max-bundle", pipeline)
+        self.assertIn("nvh264enc name=venc", pipeline)
+        self.assertIn("pulsesrc name=asrc", pipeline)
+        self.assertIn("opusenc name=aenc", pipeline)
+        self.assertIn("rtpopuspay pt=97", pipeline)
+        self.assertIn("application/x-rtp,media=audio,encoding-name=OPUS", pipeline)
+        self.assertIn("! webrtc.", pipeline)
+
+    def test_unsupported_audio_element_is_rejected(self):
+        with self.assertRaises(ValueError):
+            worker.build_pipeline_string(
+                640, 480, 30, worker.video_encoder_description(False), "alsasrc"
+            )
+
+
+class ArgumentTests(unittest.TestCase):
+    def test_audio_is_opt_in(self):
+        args = worker.build_arg_parser().parse_args(
+            ["--sock", "/tmp/x.sock", "--shm", "/tmp/frame.bgra"]
+        )
+        self.assertIsNone(args.audio_source)
+        self.assertEqual(args.audio_backend, "auto")
+
+    def test_audio_arguments_are_accepted(self):
+        args = worker.build_arg_parser().parse_args(
+            [
+                "--sock", "/tmp/x.sock",
+                "--shm", "/tmp/frame.bgra",
+                "--audio-source", "ozma-vm1.monitor",
+                "--audio-backend", "pipewire",
+            ]
+        )
+        self.assertEqual(args.audio_source, "ozma-vm1.monitor")
+        self.assertEqual(args.audio_backend, "pipewire")
+
+
+class FakeEncoder:
+    def __init__(self):
+        self.properties = {}
+
+    def set_property(self, name, value):
+        self.properties[name] = value
+
+
+class BitrateAckTests(unittest.TestCase):
+    def worker_with_sessions(self, *sessions):
+        instance = worker.WebRTCWorker.__new__(worker.WebRTCWorker)
+        instance.sessions = {
+            f"session-{index}": {"video_encoder": encoder}
+            for index, encoder in enumerate(sessions)
+        }
+        return instance
+
+    def test_ack_only_with_an_encoder(self):
+        encoder = FakeEncoder()
+        instance = self.worker_with_sessions(encoder)
+        self.assertEqual(
+            instance.set_bitrate(8_000_000), {"ok": True, "bitrate": 8_000_000}
+        )
+        # nvh264enc/x264enc expose the property in kbps.
+        self.assertEqual(encoder.properties["bitrate"], 8_000)
+
+    def test_clamped_value_is_reported(self):
+        instance = self.worker_with_sessions(FakeEncoder())
+        self.assertEqual(
+            instance.set_bitrate(100_000), {"ok": True, "bitrate": 500_000}
+        )
+
+    def test_no_session_is_an_explicit_failure(self):
+        instance = self.worker_with_sessions()
+        reply = instance.set_bitrate(4_000_000)
+        self.assertFalse(reply["ok"])
+        self.assertIn("no video encoder", reply["error"])
+
+    def test_garbage_is_an_explicit_failure(self):
+        instance = self.worker_with_sessions(FakeEncoder())
+        self.assertFalse(instance.set_bitrate("lots")["ok"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -33,13 +33,14 @@ use std::time::Duration;
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use ozma_audio::{AudioError, AudioPlaybackSpec, AudioProfile, AudioRouter};
 use ozma_encode::{
-    CodecOverrideState, CodecPreference, EncoderOverride, EncoderRegistry, OverrideReceipt,
+    backend_name, CodecOverrideState, CodecPreference, EncoderOverride, EncoderRegistry,
+    OverrideReceipt,
 };
 use ozma_input::{linux_keycode_to_hid_usage, SharedSink, SubmitReport};
 use ozma_protocol::input::{InputEvent, KeyModifiers, PointerButton};
@@ -49,7 +50,8 @@ use serde_json::Value;
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
-use crate::hls::{HlsController, HlsEncoder, HlsStatus};
+use crate::display_compat::{DisplayInfo, SnapshotControl, SnapshotError};
+use crate::hls::{HlsController, HlsEncoder, HlsError, HlsStatus};
 use crate::webrtc::{WebRtcControl, WebRtcError};
 
 /// HID packet type for an 8-byte boot keyboard report.
@@ -667,6 +669,12 @@ impl CodecControl {
 
         // HLS is the only pipeline this control can restart. WebRTC keeps its
         // existing encoder and is never claimed as switched.
+        let selected_capability = receipt.selected.as_ref();
+        let mapped_encoder =
+            selected_capability.and_then(|capability| hls_encoder_for_selection(capability).ok());
+        let selected_backend = selected_capability
+            .map(|capability| backend_name(capability.backend))
+            .unwrap_or("software");
         let running = self.hls.as_ref().is_some_and(HlsController::is_running);
         if !running {
             let hls_status = self
@@ -683,12 +691,17 @@ impl CodecControl {
                 "applied": false,
                 "pending_restart": true,
                 "encoder": Value::Null,
+                "requested_encoder": mapped_encoder.map(HlsEncoder::ffmpeg_name),
+                "backend": selected_backend,
+                "vaapi_device": Value::Null,
+                "fallback": false,
+                "fallback_reason": Value::Null,
                 "hls": hls_status,
                 "receipt": receipt,
             }));
         }
 
-        let selected = receipt.selected.as_ref().ok_or_else(|| {
+        let selected = selected_capability.ok_or_else(|| {
             CodecApplyError::pipeline(ApiError::new(
                 codes::ENCODER_UNAVAILABLE,
                 "the codec policy accepted the request without selecting an encoder",
@@ -699,36 +712,38 @@ impl CodecControl {
             .hls
             .as_ref()
             .expect("running implies an HLS controller");
-        let status = hls
-            .restart_with_encoder(encoder, preference.bitrate_kbps)
+        let vaapi_device = encoder
+            .is_vaapi()
+            .then(|| hls.config().vaapi_device.display().to_string());
+        let outcome = hls
+            .restart_with_encoder_fallback(
+                encoder,
+                preference.bitrate_kbps,
+                preference.allow_software_fallback,
+            )
             .await
-            .map_err(|error| {
-                CodecApplyError::pipeline(
-                    ApiError::new(
-                        codes::INTERNAL,
-                        format!("HLS pipeline could not apply the codec override: {error}"),
-                    )
-                    .with_details(serde_json::json!({
-                        "encoder": encoder.ffmpeg_name(),
-                        "hls_error": error.to_string(),
-                    }))
-                    .with_remediation(
-                        "The previous HLS pipeline was restored when possible. Check that ffmpeg \
-                         has the selected encoder, or choose a software codec the node advertises.",
-                    ),
-                )
-            })?;
+            .map_err(|error| CodecApplyError::pipeline(codec_pipeline_error(error, encoder)))?;
 
+        let applied = outcome.applied_encoder;
+        let fallback_reason = outcome
+            .fallback
+            .as_ref()
+            .map(|fallback| fallback.reason.clone());
         *lock(&self.state) = StoredCodecState {
             override_state: CodecOverrideState::from_receipt(request, receipt.clone()),
-            applied_encoder: Some(encoder),
+            applied_encoder: Some(applied),
         };
         Ok(serde_json::json!({
             "ok": true,
             "applied": true,
             "pending_restart": false,
-            "encoder": encoder.ffmpeg_name(),
-            "hls": status.status_name(),
+            "encoder": applied.ffmpeg_name(),
+            "requested_encoder": encoder.ffmpeg_name(),
+            "backend": backend_name(selected.backend),
+            "vaapi_device": vaapi_device,
+            "fallback": fallback_reason.is_some(),
+            "fallback_reason": fallback_reason,
+            "hls": outcome.status.status_name(),
             "receipt": receipt,
         }))
     }
@@ -829,44 +844,99 @@ impl CodecApplyError {
 
 /// Map a policy-selected capability to the ffmpeg encoder the HLS path can run.
 ///
-/// Only software encoders are accepted: the HLS pipeline feeds raw RGB24 over
-/// stdin and has no upload/hwaccel filter chain. A hardware selection is a
-/// typed error rather than a software substitution.
+/// Software and hardware backends both map to a real [`HlsEncoder`]. Hardware
+/// availability is still checked against the injected ffmpeg probe on restart;
+/// this function only refuses combinations the pipeline has no honest argv for
+/// (for example hardware AV1/MJPEG or `videotoolbox`).
 fn hls_encoder_for_selection(capability: &EncodeCapability) -> Result<HlsEncoder, ApiError> {
-    if capability.hardware || capability.backend != EncoderBackend::Software {
-        return Err(ApiError::new(
-            codes::UNSUPPORTED,
-            format!(
-                "The HLS ffmpeg path cannot run the selected {}/{:?} encoder.",
-                capability.codec.as_str(),
-                capability.backend
-            ),
+    let encoder = match (capability.codec, capability.backend) {
+        (Codec::H264, EncoderBackend::Software) => HlsEncoder::H264,
+        (Codec::Hevc, EncoderBackend::Software) => HlsEncoder::Hevc,
+        (Codec::Av1, EncoderBackend::Software) => HlsEncoder::Av1Svt,
+        (Codec::Mjpeg, EncoderBackend::Software) => HlsEncoder::Mjpeg,
+        (Codec::H264, EncoderBackend::Vaapi) => HlsEncoder::VaapiH264,
+        (Codec::Hevc, EncoderBackend::Vaapi) => HlsEncoder::VaapiHevc,
+        (Codec::H264, EncoderBackend::Nvenc) => HlsEncoder::NvencH264,
+        (Codec::Hevc, EncoderBackend::Nvenc) => HlsEncoder::NvencHevc,
+        (Codec::H264, EncoderBackend::Qsv) => HlsEncoder::QsvH264,
+        (Codec::Hevc, EncoderBackend::Qsv) => HlsEncoder::QsvHevc,
+        (Codec::H264, EncoderBackend::V4l2M2m) => HlsEncoder::V4l2m2mH264,
+        (Codec::Hevc, EncoderBackend::V4l2M2m) => HlsEncoder::V4l2m2mHevc,
+        (codec, backend) => {
+            return Err(ApiError::new(
+                codes::UNSUPPORTED,
+                format!(
+                    "The HLS ffmpeg path has no hardware encoder for {}/{:?}.",
+                    codec.as_str(),
+                    backend
+                ),
+            )
+            .with_details(serde_json::json!({
+                "codec": codec,
+                "backend": backend,
+                "hardware": capability.hardware,
+            }))
+            .with_remediation(
+                "Use H.264 or HEVC for a hardware HLS switch, or choose a software codec.",
+            ));
+        }
+    };
+    Ok(encoder)
+}
+
+/// Turn an HLS restart error into a typed 502 body.
+///
+/// Availability and VAAPI-device failures keep `encoder.unavailable` and carry
+/// the probe evidence/remediation; a generic spawn/restart failure remains
+/// `internal` with the previous-pipeline outcome.
+fn codec_pipeline_error(error: HlsError, encoder: HlsEncoder) -> ApiError {
+    match &error {
+        HlsError::EncoderUnavailable {
+            encoder: name,
+            backend,
+            remediation,
+            available,
+            ..
+        } => ApiError::new(
+            codes::ENCODER_UNAVAILABLE,
+            format!("The HLS pipeline could not start the requested encoder: {error}"),
         )
         .with_details(serde_json::json!({
-            "codec": capability.codec,
-            "backend": capability.backend,
-            "hardware": capability.hardware,
+            "encoder": name,
+            "backend": backend,
+            "available": available,
+        }))
+        .with_remediation(remediation.clone()),
+        HlsError::VaapiDevice {
+            path, remediation, ..
+        } => ApiError::new(
+            codes::ENCODER_UNAVAILABLE,
+            format!("The HLS pipeline could not start the requested encoder: {error}"),
+        )
+        .with_details(serde_json::json!({
+            "encoder": encoder.ffmpeg_name(),
+            "backend": encoder.backend_label(),
+            "vaapi_device": path,
+        }))
+        .with_remediation(remediation.clone()),
+        HlsError::UnsupportedEncoder { encoder: name, .. } => ApiError::new(
+            codes::UNSUPPORTED,
+            format!("The HLS pipeline cannot run `{name}`: {error}"),
+        )
+        .with_details(serde_json::json!({ "encoder": name }))
+        .with_remediation("Choose a hardware encoder this node advertises, or a software codec."),
+        _ => ApiError::new(
+            codes::INTERNAL,
+            format!("HLS pipeline could not apply the codec override: {error}"),
+        )
+        .with_details(serde_json::json!({
+            "encoder": encoder.ffmpeg_name(),
+            "hls_error": error.to_string(),
         }))
         .with_remediation(
-            "Choose a software codec (`hw_accel: software` or `auto` with software fallback). \
-             Hardware encoders need a native upload/hwaccel pipeline that HLS does not use.",
-        ));
-    }
-
-    match capability.codec {
-        Codec::H264 => Ok(HlsEncoder::H264),
-        Codec::Hevc => Ok(HlsEncoder::Hevc),
-        Codec::Av1 => Ok(HlsEncoder::Av1Svt),
-        Codec::Mjpeg => Ok(HlsEncoder::Mjpeg),
-        other => Err(ApiError::new(
-            codes::UNSUPPORTED,
-            format!(
-                "The HLS ffmpeg path has no encoder for codec `{}`.",
-                other.as_str()
-            ),
-        )
-        .with_details(serde_json::json!({ "codec": other }))
-        .with_remediation("Use h264, hevc, av1, or mjpeg for the HLS stream.")),
+            "The previous HLS pipeline was restored when possible. Check that ffmpeg has the \
+             selected encoder, or choose a software codec the node advertises.",
+        ),
     }
 }
 
@@ -1129,6 +1199,9 @@ pub struct ConnectionState {
     /// External WebRTC helper. `None` means no `--webrtc-helper` was given;
     /// `Some(control)` may be a configured-but-failed helper.
     pub webrtc: Option<WebRtcControl>,
+    /// One-shot display snapshot control. `None` leaves `/display/snapshot`
+    /// at a typed 503 rather than fabricating an image.
+    pub snapshot: Option<SnapshotControl>,
 }
 
 impl ConnectionState {
@@ -1144,6 +1217,7 @@ impl ConnectionState {
             codec_control: None,
             audio: None,
             webrtc: None,
+            snapshot: None,
         }
     }
 
@@ -1222,6 +1296,16 @@ impl ConnectionState {
         self
     }
 
+    /// Attach the one-shot display snapshot control.
+    ///
+    /// `None` keeps `GET /display/snapshot` at a typed 503; attaching an empty
+    /// registry is also honest (the route reports no source) and lets
+    /// `GET /display/info` describe the node.
+    pub fn with_snapshot(mut self, snapshot: Option<SnapshotControl>) -> Self {
+        self.snapshot = snapshot;
+        self
+    }
+
     /// True when the configured sink records without injecting.
     pub fn input_is_recording_only(&self) -> bool {
         matches!(
@@ -1266,6 +1350,13 @@ pub struct ConnectionResponse {
     pub audio: &'static str,
     /// Why audio routing is `failed` (for example a missing `pactl`).
     pub audio_error: Option<String>,
+    /// Whether a WebRTC audio monitor was configured for the helper.
+    ///
+    /// This is configuration intent only; it does not claim that the worker
+    /// opened the monitor or produced samples.
+    pub webrtc_audio_configured: bool,
+    /// Configured WebRTC audio monitor name, when one was supplied.
+    pub webrtc_audio_source: Option<String>,
 }
 
 /// Build the compatibility router. Mount it before the node API auth layer so
@@ -1276,7 +1367,9 @@ pub fn compat_router(state: ConnectionState) -> Router {
         .merge(input_router(state.clone()))
         .merge(codec_router(state.clone()))
         .merge(webrtc_router(state.clone()))
-        .merge(audio_router(state))
+        .merge(audio_router(state.clone()))
+        .merge(display_router(state.clone()))
+        .merge(legacy_router(state))
 }
 
 /// The original connection-only router, retained for callers that do not need
@@ -1346,6 +1439,42 @@ pub fn webrtc_router(state: ConnectionState) -> Router {
         .with_state(state)
 }
 
+/// Display compatibility routes.
+///
+/// `GET /display/snapshot` returns a real `image/jpeg` body from a one-shot
+/// capture. `GET /display/info` describes the source without opening it, and
+/// `GET /display/mjpeg` is a typed 501 because this node does not implement a
+/// multipart MJPEG stream. All three are mounted behind the node bearer guard
+/// with the rest of the compatibility surface.
+pub fn display_router(state: ConnectionState) -> Router {
+    Router::new()
+        .route("/display/snapshot", get(display_snapshot))
+        .route("/display/info", get(display_info))
+        .route("/display/mjpeg", get(display_mjpeg))
+        .with_state(state)
+}
+
+/// Legacy controller routes.
+///
+/// `/node/status` is an honest alias of the connection summary. `/ui/hints`
+/// returns the minimal empty hint shape the controller reads. Routes the Rust
+/// node does not implement answer a typed 501 with a code, error, and
+/// remediation instead of a success-shaped no-op.
+pub fn legacy_router(state: ConnectionState) -> Router {
+    Router::new()
+        .route("/node/status", get(node_status))
+        .route("/agent/metrics", get(agent_metrics))
+        .route("/ui/hints", get(ui_hints))
+        .route("/usb", get(legacy_stub))
+        .route("/rgb/state", get(legacy_stub))
+        .route("/rgb/effect", get(legacy_stub).post(legacy_stub))
+        .route("/rgb/set", post(legacy_stub))
+        .route("/current", get(legacy_stub))
+        .route("/session/init", post(legacy_stub))
+        .route("/serial/*rest", get(legacy_stub).post(legacy_stub))
+        .with_state(state)
+}
+
 async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResponse> {
     let info = &state.info;
     let power = match &state.power {
@@ -1374,6 +1503,13 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
     let (webrtc, webrtc_error) = match &state.webrtc {
         None => ("not-configured", None),
         Some(control) => (control.status_name(), control.error()),
+    };
+    let (webrtc_audio_configured, webrtc_audio_source) = match &state.webrtc {
+        None => (false, None),
+        Some(control) => (
+            control.audio_configured(),
+            control.audio_source().map(str::to_owned),
+        ),
     };
     let input = InputStatus {
         sink_kind: info.sink_kind.clone(),
@@ -1407,7 +1543,158 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
         webrtc_error,
         audio,
         audio_error,
+        webrtc_audio_configured,
+        webrtc_audio_source,
     })
+}
+
+async fn display_snapshot(State(state): State<ConnectionState>) -> Response {
+    let Some(control) = state.snapshot else {
+        return snapshot_error_response(SnapshotError::NotConfigured);
+    };
+    match control.capture().await {
+        Ok(snapshot) => (
+            [
+                (header::CONTENT_TYPE, "image/jpeg"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            snapshot.jpeg,
+        )
+            .into_response(),
+        Err(error) => snapshot_error_response(error),
+    }
+}
+
+fn snapshot_error_response(error: SnapshotError) -> Response {
+    let status = error.status();
+    let api = error.api_error();
+    let mut body = serde_json::json!({
+        "ok": false,
+        "code": api.code,
+        "error": api.message,
+        "retryable": api.retryable,
+    });
+    if !api.details.is_null() {
+        body["details"] = api.details;
+    }
+    if let Some(remediation) = api.remediation {
+        body["remediation"] = serde_json::Value::String(remediation);
+    }
+    (status, Json(body)).into_response()
+}
+
+async fn display_info(State(state): State<ConnectionState>) -> Json<DisplayInfo> {
+    let info = match state.snapshot {
+        Some(control) => control.info().await,
+        None => DisplayInfo {
+            ok: true,
+            source_id: None,
+            source_name: None,
+            width: 0,
+            height: 0,
+            pixel_format: None,
+            snapshot_available: false,
+            snapshot_encoding: "jpeg",
+            dimensions_source: "none",
+            last_error: Some("display snapshot support is not configured".to_owned()),
+        },
+    };
+    Json(info)
+}
+
+async fn display_mjpeg(State(_state): State<ConnectionState>) -> Response {
+    compat_error_with_remediation(
+        StatusCode::NOT_IMPLEMENTED,
+        "display.mjpeg_unsupported",
+        "This node does not provide a multipart MJPEG stream.",
+        Some(
+            "Use GET /display/snapshot for a single JPEG frame; the controller polls that \
+             endpoint for previews. A real MJPEG stream is not implemented.",
+        ),
+    )
+}
+
+async fn node_status(State(state): State<ConnectionState>) -> Json<ConnectionResponse> {
+    connection(State(state)).await
+}
+
+async fn agent_metrics(State(_state): State<ConnectionState>) -> Response {
+    compat_error_with_remediation(
+        StatusCode::NOT_IMPLEMENTED,
+        "agent.metrics_unsupported",
+        "This node has no host agent metrics document at /agent/metrics.",
+        Some(
+            "Use GET /api/v1/metrics for the native runtime metrics JSON or GET /metrics for \
+             Prometheus text. The controller's device-metrics fallback probes /current and \
+             /pd/state, which this node does not implement.",
+        ),
+    )
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct UiHintsQuery {
+    #[serde(default)]
+    level: Option<u8>,
+}
+
+async fn ui_hints(
+    State(_state): State<ConnectionState>,
+    axum::extract::Query(query): axum::extract::Query<UiHintsQuery>,
+) -> Json<serde_json::Value> {
+    // The controller reads these four keys and tolerates an empty result. This
+    // node has no in-guest accessibility agent, so the honest answer is an
+    // empty hint set rather than invented windows or controls.
+    Json(serde_json::json!({
+        "ok": true,
+        "available": false,
+        "level": query.level.unwrap_or(2),
+        "windows": [],
+        "focused_window": serde_json::Value::Null,
+        "controls": [],
+        "focused_control": serde_json::Value::Null,
+        "hint": "No in-guest UI hint agent is connected to this node.",
+    }))
+}
+
+async fn legacy_stub(State(_state): State<ConnectionState>, uri: Uri) -> Response {
+    let (code, error, remediation) = match uri.path() {
+        "/usb" => (
+            "usb.unsupported",
+            "USB passthrough/state is not implemented on this node.",
+            "Use a node build with USB gadget support or configure the feature outside /usb; \
+             no USB state is fabricated.",
+        ),
+        "/rgb/state" | "/rgb/effect" | "/rgb/set" => (
+            "rgb.unsupported",
+            "RGB lighting control is not implemented on this node.",
+            "Configure RGB control on the host that owns the lighting controller; this node \
+             does not claim an effect was applied.",
+        ),
+        "/current" => (
+            "power.current_unsupported",
+            "Power-rail current/voltage telemetry is not implemented on this node.",
+            "Attach a sensor driver that exposes /current before enabling the controller's \
+             USB power panel.",
+        ),
+        "/session/init" => (
+            "session.init_unsupported",
+            "The controller's encrypted /session/init handshake is not implemented on this node.",
+            "Use the node's native QUIC/WebTransport session API; do not treat this 501 as an \
+             established encrypted session.",
+        ),
+        path if path.starts_with("/serial") => (
+            "serial.unsupported",
+            "A serial console buffer is not implemented on this node.",
+            "Attach a serial console provider before enabling the controller's serial panel; \
+             no buffer is fabricated.",
+        ),
+        _ => (
+            "legacy.unsupported",
+            "This legacy controller route is not implemented on this node.",
+            "Use the native /api/v1 surface or a provider that implements this feature.",
+        ),
+    };
+    compat_error_with_remediation(StatusCode::NOT_IMPLEMENTED, code, error, Some(remediation))
 }
 
 async fn power_state(State(state): State<ConnectionState>) -> axum::response::Response {
@@ -2438,15 +2725,16 @@ fn webrtc_bitrate_failure(error: WebRtcError) -> Response {
 mod tests {
     use super::*;
     use crate::hls::{
-        ffmpeg_argv, FfmpegSpawner, FrameSink, HlsConfig, HlsController, HlsError,
-        HlsSourceFactory, SpawnedFfmpeg,
+        ffmpeg_argv, EncoderAvailability, EncoderProbe, FfmpegSpawner, FrameSink, HlsConfig,
+        HlsController, HlsEncoder, HlsError, HlsSourceFactory, SpawnedFfmpeg, StaticEncoderProbe,
     };
     use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
+    use ozma_capture::{CaptureRegistry, FakeCaptureProvider};
     use ozma_input::{FakeInputSink, InputSink, RecordingSink};
-    use ozma_media::{CaptureSource, Frame, FrameFormat, MediaError};
+    use ozma_media::{CaptureSource, Frame, FrameFormat, MediaError, PixelFormat};
     use ozma_power::{PowerBackend, PowerError, PowerState};
     use serde_json::Value;
     use std::time::Duration;
@@ -3106,6 +3394,250 @@ mod tests {
         assert_eq!(json["webrtc_error"], "helper program is missing");
         // A failed helper is not a running stream and must not claim to be.
         assert_eq!(json["hls"], "not-configured");
+    }
+
+    #[tokio::test]
+    async fn display_snapshot_returns_a_real_jpeg_with_no_store() {
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "vm",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_snapshot(Some(SnapshotControl::new(
+            CaptureRegistry::new().with(FakeCaptureProvider::new()),
+        )));
+        let app = display_router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/display/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/jpeg");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.starts_with(&[0xFF, 0xD8]));
+        let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(&body));
+        decoder.decode().expect("valid JPEG");
+        let info = decoder.info().expect("JPEG info");
+        assert_eq!((info.width, info.height), (320, 240));
+
+        let (status, info) = get_json(&app, "/display/info").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(info["ok"], true);
+        assert_eq!(info["source_id"], "fake0");
+        assert_eq!(info["width"], 320);
+        assert_eq!(info["height"], 240);
+        assert_eq!(info["pixel_format"], "rgb24");
+        assert_eq!(info["snapshot_available"], true);
+        assert_eq!(info["snapshot_encoding"], "jpeg");
+        assert_eq!(info["dimensions_source"], "last-frame");
+        assert!(info["last_error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn display_snapshot_without_a_source_is_a_typed_503() {
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "vm",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_snapshot(Some(SnapshotControl::new(CaptureRegistry::new())));
+        let app = display_router(state);
+
+        let (status, body) = get_json(&app, "/display/snapshot").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["code"], "capture.unavailable");
+        assert!(body["remediation"]
+            .as_str()
+            .unwrap()
+            .contains("--qmp-socket"));
+
+        let (status, info) = get_json(&app, "/display/info").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(info["snapshot_available"], false);
+        assert_eq!(info["dimensions_source"], "none");
+    }
+
+    #[tokio::test]
+    async fn display_snapshot_rejects_an_unsupported_frame_format() {
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_snapshot(Some(SnapshotControl::new(CaptureRegistry::new().with(
+            FakeCaptureProvider::new().with_format(FrameFormat::new(PixelFormat::Nv12, 4, 4)),
+        ))));
+        let (status, body) = get_json(&display_router(state), "/display/snapshot").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["code"], "display.unsupported_format");
+        assert!(body["error"].as_str().unwrap().contains("nv12"));
+        assert!(body["remediation"].as_str().unwrap().contains("rgb24"));
+    }
+
+    #[tokio::test]
+    async fn display_mjpeg_is_a_typed_501_not_a_fake_stream() {
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        );
+        let (status, body) = get_json(&display_router(state), "/display/mjpeg").await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["code"], "display.mjpeg_unsupported");
+        assert!(body["remediation"].is_string());
+    }
+
+    #[tokio::test]
+    async fn node_status_aliases_the_connection_summary() {
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        );
+        let app = legacy_router(state);
+        let (status, body) = get_json(&app, "/node/status").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["node_id"], "node-a._ozma._udp.local.");
+        assert_eq!(body["api_port"], 7382);
+        assert_eq!(body["hid_udp_port"], 7331);
+        assert_eq!(body["hls"], "not-configured");
+    }
+
+    #[tokio::test]
+    async fn ui_hints_returns_the_minimal_empty_shape() {
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        );
+        let (status, body) = get_json(&legacy_router(state), "/ui/hints?level=3").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["available"], false);
+        assert_eq!(body["level"], 3);
+        assert_eq!(body["windows"], serde_json::json!([]));
+        assert!(body["focused_window"].is_null());
+        assert_eq!(body["controls"], serde_json::json!([]));
+        assert!(body["focused_control"].is_null());
+    }
+
+    #[tokio::test]
+    async fn legacy_routes_are_typed_501s_with_remediation() {
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        );
+        let app = legacy_router(state);
+
+        for (uri, method, expected) in [
+            ("/agent/metrics", "GET", "agent.metrics_unsupported"),
+            ("/usb", "GET", "usb.unsupported"),
+            ("/rgb/state", "GET", "rgb.unsupported"),
+            ("/rgb/effect", "POST", "rgb.unsupported"),
+            ("/current", "GET", "power.current_unsupported"),
+            ("/session/init", "POST", "session.init_unsupported"),
+            ("/serial/buffer?lines=50", "GET", "serial.unsupported"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED, "{uri}");
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["ok"], false, "{uri}");
+            assert_eq!(body["code"], expected, "{uri}");
+            assert!(body["error"].is_string(), "{uri}");
+            assert!(body["remediation"].is_string(), "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_reports_webrtc_audio_configuration_without_claiming_samples() {
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "vm",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_webrtc(Some(WebRtcControl::failed_with_audio(
+            "helper did not start".to_owned(),
+            Some("ozma-vm1.monitor".to_owned()),
+        )));
+        let (status, body) = get_json(&connection_router(state), "/api/v1/connection").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["webrtc"], "failed");
+        assert_eq!(body["webrtc_audio_configured"], true);
+        assert_eq!(body["webrtc_audio_source"], "ozma-vm1.monitor");
+        // Audio configuration is not a claim that the helper produced samples.
+        assert_eq!(body["webrtc"], "failed");
     }
 
     #[tokio::test]
@@ -3864,6 +4396,24 @@ mod tests {
         )
     }
 
+    fn controller_with_probe(
+        directory: &std::path::Path,
+        vaapi_device: &std::path::Path,
+        spawner: Arc<dyn FfmpegSpawner>,
+        probe: Arc<dyn EncoderProbe>,
+    ) -> HlsController {
+        HlsController::with_spawner_and_probe(
+            pending_factory(),
+            HlsConfig {
+                output_dir: directory.to_path_buf(),
+                vaapi_device: vaapi_device.to_path_buf(),
+                ..HlsConfig::default()
+            },
+            spawner,
+            probe,
+        )
+    }
+
     fn codec_test_dir(label: &str) -> std::path::PathBuf {
         let directory =
             std::env::temp_dir().join(format!("ozma-codec-restart-{label}-{}", std::process::id()));
@@ -3877,6 +4427,19 @@ mod tests {
             codec,
             backend: EncoderBackend::Software,
             hardware: false,
+            max_width: 1920,
+            max_height: 1080,
+            max_fps: 30,
+            hdr: false,
+            profiles: Vec::new(),
+        }
+    }
+
+    fn hardware_capability(codec: Codec, backend: EncoderBackend) -> EncodeCapability {
+        EncodeCapability {
+            codec,
+            backend,
+            hardware: true,
             max_width: 1920,
             max_height: 1080,
             max_fps: 30,
@@ -4212,25 +4775,150 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codec_route_rejects_a_hardware_selection_it_cannot_run_in_hls() {
-        let directory = codec_test_dir("hardware");
+    async fn codec_route_reports_unavailable_hardware_as_typed_502_without_fallback() {
+        let directory = codec_test_dir("hardware-unavailable");
         std::fs::write(directory.join("stream.m3u8"), "#EXTM3U\n").expect("manifest");
         let spawner = Arc::new(CodecSpawner::new(Vec::new()));
         let controller = controller_with(&directory, spawner.clone());
         controller.start().await.expect("start HLS");
 
-        let vaapi = EncodeCapability {
-            codec: Codec::H264,
-            backend: EncoderBackend::Vaapi,
-            hardware: true,
-            max_width: 1920,
-            max_height: 1080,
-            max_fps: 30,
-            hdr: false,
-            profiles: Vec::new(),
-        };
         let control = CodecControl::new(
-            EncoderRegistry::from_capabilities([vaapi]),
+            EncoderRegistry::from_capabilities([hardware_capability(
+                Codec::H264,
+                EncoderBackend::Nvenc,
+            )]),
+            MediaFormat::new(Codec::H264, 320, 240, 30, 4_000),
+        )
+        .with_hls(Some(controller.clone()));
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_hls_controller(Some(controller.clone()))
+        .with_codec_control(Some(control));
+        let app = codec_router(state);
+
+        let (status, body) = post_json(
+            &app,
+            "/codec",
+            serde_json::json!({"codec": "h264", "hw_accel": "nvenc"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["code"], codes::ENCODER_UNAVAILABLE);
+        assert_eq!(body["details"]["encoder"], "h264_nvenc");
+        assert_eq!(body["details"]["backend"], "nvenc");
+        assert!(body.get("applied").is_none());
+        assert_eq!(
+            spawner.spawns().len(),
+            2,
+            "the initial generation plus the restored software generation"
+        );
+        assert!(spawner.spawns()[1]
+            .windows(2)
+            .any(|window| window == ["-c:v", "libx264"]));
+        assert!(controller.is_running(), "the old pipeline was restored");
+        assert_eq!(controller.config().video_encoder, HlsEncoder::H264);
+
+        let (status, body) = get_json(&app, "/codec").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["applied"], false);
+        assert!(body["override"].is_null());
+
+        controller.stop().await.expect("stop HLS");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn codec_route_honours_an_explicit_hardware_software_fallback() {
+        let directory = codec_test_dir("hardware-fallback");
+        std::fs::write(directory.join("stream.m3u8"), "#EXTM3U\n").expect("manifest");
+        let spawner = Arc::new(CodecSpawner::new(Vec::new()));
+        let controller = controller_with(&directory, spawner.clone());
+        controller.start().await.expect("start HLS");
+
+        let control = CodecControl::new(
+            EncoderRegistry::from_capabilities([hardware_capability(
+                Codec::H264,
+                EncoderBackend::Nvenc,
+            )]),
+            MediaFormat::new(Codec::H264, 320, 240, 30, 4_000),
+        )
+        .with_hls(Some(controller.clone()));
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_hls_controller(Some(controller.clone()))
+        .with_codec_control(Some(control));
+        let app = codec_router(state);
+
+        let (status, body) = post_json(
+            &app,
+            "/codec",
+            serde_json::json!({
+                "codec": "h264",
+                "hw_accel": "nvenc",
+                "allow_software_fallback": true,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["applied"], true);
+        assert_eq!(body["pending_restart"], false);
+        assert_eq!(body["encoder"], "libx264");
+        assert_eq!(body["requested_encoder"], "h264_nvenc");
+        assert_eq!(body["backend"], "nvenc");
+        assert_eq!(body["fallback"], true);
+        assert!(body["fallback_reason"].is_string(), "{body}");
+        assert_eq!(controller.config().video_encoder, HlsEncoder::H264);
+        assert_eq!(spawner.spawns().len(), 2);
+        assert!(spawner.spawns()[1]
+            .windows(2)
+            .any(|window| window == ["-c:v", "libx264"]));
+
+        controller.stop().await.expect("stop HLS");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn codec_route_maps_and_applies_verified_hardware() {
+        let directory = codec_test_dir("hardware-vaapi");
+        std::fs::write(directory.join("stream.m3u8"), "#EXTM3U\n").expect("manifest");
+        let device = directory.join("renderD128");
+        std::fs::write(&device, b"").expect("fake VAAPI device");
+        let spawner = Arc::new(CodecSpawner::new(Vec::new()));
+        let controller = controller_with_probe(
+            &directory,
+            &device,
+            spawner.clone(),
+            Arc::new(StaticEncoderProbe::new(EncoderAvailability::from_names([
+                HlsEncoder::H264.ffmpeg_name(),
+                HlsEncoder::VaapiH264.ffmpeg_name(),
+            ]))),
+        );
+        controller.start().await.expect("start HLS");
+
+        let control = CodecControl::new(
+            EncoderRegistry::from_capabilities([hardware_capability(
+                Codec::H264,
+                EncoderBackend::Vaapi,
+            )]),
             MediaFormat::new(Codec::H264, 320, 240, 30, 4_000),
         )
         .with_hls(Some(controller.clone()));
@@ -4255,15 +4943,37 @@ mod tests {
             serde_json::json!({"codec": "h264", "hw_accel": "vaapi"}),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
-        assert_eq!(body["code"], codes::UNSUPPORTED);
-        assert_eq!(body["details"]["backend"], "vaapi");
-        assert_eq!(spawner.spawns().len(), 1, "no restart was attempted");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["applied"], true);
+        assert_eq!(body["pending_restart"], false);
+        assert_eq!(body["encoder"], "h264_vaapi");
+        assert_eq!(body["requested_encoder"], "h264_vaapi");
+        assert_eq!(body["backend"], "vaapi");
+        assert_eq!(body["vaapi_device"], device.display().to_string());
+        assert_eq!(body["fallback"], false);
+        assert_eq!(body["receipt"]["selected"]["backend"], "vaapi");
+        assert_eq!(controller.config().video_encoder, HlsEncoder::VaapiH264);
+
+        let spawns = spawner.spawns();
+        assert_eq!(spawns.len(), 2);
+        let argv = &spawns[1];
+        assert!(argv
+            .windows(2)
+            .any(|window| window == ["-c:v", "h264_vaapi"]));
+        assert!(argv.windows(2).any(
+            |window| window[0] == "-vaapi_device" && window[1] == device.display().to_string()
+        ));
+        assert!(argv
+            .windows(2)
+            .any(|window| window == ["-vf", "format=nv12,hwupload"]));
+        assert!(argv
+            .windows(2)
+            .any(|window| window == ["-hls_flags", "delete_segments"]));
 
         let (status, body) = get_json(&app, "/codec").await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["applied"], false);
-        assert!(body["override"].is_null());
+        assert_eq!(body["applied"], true);
+        assert_eq!(body["current_encoder"], "h264_vaapi");
 
         controller.stop().await.expect("stop HLS");
         let _ = std::fs::remove_dir_all(directory);

@@ -3180,6 +3180,7 @@ dependencies = [
  "ozma-protocol",
  "serde",
  "serde_json",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
 ]
@@ -3253,6 +3254,7 @@ dependencies = [
  "clap",
  "hostname 0.4.2",
  "http-body-util",
+ "jpeg-decoder",
  "libmdns 0.9.1",
  "local-ip-address",
  "ozma-api",

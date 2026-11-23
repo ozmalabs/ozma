@@ -18,6 +18,7 @@ use axum::http::{Request, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
 use http_body_util::BodyExt;
+use ozma_capture::{CaptureRegistry, FakeCaptureProvider};
 use ozma_input::{FakeInputSink, InputSink, RecordingSink, SharedSink};
 use ozma_media::{CaptureSource, Frame, FrameFormat, MediaError};
 use ozma_node::api;
@@ -25,6 +26,7 @@ use ozma_node::controller_compat::{
     audio_router, codec_router, compat_router, connection_router, CodecControl, CompatStats,
     ConnectionInfo, ConnectionState, HidPacketDecoder, HidUdpListener, SINK_FAKE_RECORDING,
 };
+use ozma_node::display_compat::SnapshotControl;
 use ozma_node::hls::{
     ffmpeg_argv, stream_router, FfmpegSpawner, FrameSink, HlsConfig, HlsController, HlsEncoder,
     HlsSourceFactory, HlsStatus, SpawnedFfmpeg,
@@ -590,6 +592,112 @@ async fn health_and_connection_surface_match_baseline() {
     );
     assert_eq!(connection["webrtc"], "not-configured");
     assert!(connection["webrtc_error"].is_null());
+    assert_eq!(connection["webrtc_audio_configured"], false);
+    assert!(connection["webrtc_audio_source"].is_null());
+}
+
+#[tokio::test]
+async fn display_snapshot_and_info_match_baseline() {
+    let baseline = baseline(include_str!("parity/http_baseline.json"));
+    let state = ConnectionState::new(
+        ConnectionInfo::new(
+            NODE_ID,
+            "vm",
+            HTTP_PORT,
+            QUIC_PORT,
+            HID_PORT,
+            SINK_FAKE_RECORDING,
+        ),
+        CompatStats::default(),
+    )
+    .with_snapshot(Some(SnapshotControl::new(
+        CaptureRegistry::new().with(FakeCaptureProvider::new()),
+    )));
+    let app = compat_router(state);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/display/snapshot")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "image/jpeg");
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let jpeg = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(jpeg.starts_with(&[0xFF, 0xD8]));
+    let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(&jpeg));
+    decoder.decode().expect("snapshot is a valid JPEG");
+    let image = decoder.info().expect("JPEG info");
+    assert_eq!((image.width, image.height), (320, 240));
+
+    let (status, info) = get_json(&app, "/display/info").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_shape(&info, &baseline["display_info"], "display_info");
+    assert_eq!(info["ok"], true);
+    assert_eq!(info["source_id"], "fake0");
+    assert_eq!(info["source_name"], "Fake capture");
+    assert_eq!(info["width"], 320);
+    assert_eq!(info["height"], 240);
+    assert_eq!(info["pixel_format"], "rgb24");
+    assert_eq!(info["snapshot_available"], true);
+    assert_eq!(info["snapshot_encoding"], "jpeg");
+    assert_eq!(info["dimensions_source"], "last-frame");
+    assert!(info["last_error"].is_null());
+}
+
+#[tokio::test]
+async fn legacy_routes_report_typed_501s_and_minimal_hints() {
+    let baseline = baseline(include_str!("parity/http_baseline.json"));
+    let state = ConnectionState::new(
+        ConnectionInfo::new(
+            NODE_ID,
+            "hardware",
+            HTTP_PORT,
+            QUIC_PORT,
+            HID_PORT,
+            SINK_FAKE_RECORDING,
+        ),
+        CompatStats::default(),
+    );
+    let app = compat_router(state);
+
+    let (status, hints) = get_json(&app, "/ui/hints?level=2").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_shape(&hints, &baseline["ui_hints"], "ui_hints");
+    assert_eq!(hints["ok"], true);
+    assert_eq!(hints["available"], false);
+    assert_eq!(hints["windows"], json!([]));
+    assert!(hints["focused_window"].is_null());
+
+    let (status, node_status) = get_json(&app, "/node/status").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(node_status["ok"], true);
+    assert_eq!(node_status["node_id"], NODE_ID);
+    assert_eq!(node_status["api_port"], HTTP_PORT);
+
+    for (uri, code) in [
+        ("/agent/metrics", "agent.metrics_unsupported"),
+        ("/usb", "usb.unsupported"),
+        ("/current", "power.current_unsupported"),
+        ("/rgb/state", "rgb.unsupported"),
+        ("/serial/buffer?lines=50", "serial.unsupported"),
+    ] {
+        let (status, body) = get_json(&app, uri).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{uri}");
+        assert_shape(&body, &baseline["compat_error"], uri);
+        assert_eq!(body["ok"], false, "{uri}");
+        assert_eq!(body["code"], code, "{uri}");
+    }
+
+    let (status, body) = post_json(&app, "/session/init", json!({})).await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_shape(&body, &baseline["compat_error"], "session/init");
+    assert_eq!(body["code"], "session.init_unsupported");
 }
 
 #[tokio::test]
@@ -945,6 +1053,8 @@ async fn webrtc_offer_proxies_to_a_fake_unix_socket_helper() {
         height: 2,
         fps: 30,
         bitrate_kbps: 4_000,
+        audio_source: None,
+        audio_backend: Default::default(),
         startup_timeout: Duration::from_millis(50),
         offer_timeout: Duration::from_secs(1),
     };
@@ -1025,6 +1135,8 @@ async fn webrtc_bitrate_is_not_reported_as_success_without_an_ack() {
         height: 2,
         fps: 30,
         bitrate_kbps: 4_000,
+        audio_source: None,
+        audio_backend: Default::default(),
         startup_timeout: Duration::from_millis(50),
         offer_timeout: Duration::from_millis(100),
     };

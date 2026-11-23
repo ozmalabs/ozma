@@ -23,10 +23,12 @@
 //! temporary compatibility surface described in
 //! `docs/rust-reconciliation-plan.md` §3 Phase 2.
 
-use std::io;
+use std::collections::BTreeSet;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::Router;
@@ -50,12 +52,11 @@ const MAX_STATUS_ERROR_CHARS: usize = 512;
 
 /// Video encoder used by the HLS ffmpeg pipeline.
 ///
-/// Only encoders this module can invoke directly are represented. Hardware
-/// encoders are deliberately absent: the HLS path feeds raw RGB24 frames over
-/// stdin, which requires an explicit upload/hwaccel filter chain that this
-/// compatibility pipeline does not implement. Naming `h264_nvenc` (or any other
-/// `*_nvenc`/`*_vaapi`/`*_qsv`/`*_v4l2m2m` encoder) is a typed error rather
-/// than a silent software substitution.
+/// The software variants are the historical path. The hardware variants name
+/// the exact ffmpeg encoder and carry the honest upload/device options the raw
+/// RGB24 stdin path needs. They are never assumed to work: a hardware request
+/// is only started after an injected [`EncoderProbe`] confirms that ffmpeg
+/// advertises the encoder (see [`HlsController`] and [`HlsPipeline`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum HlsEncoder {
     /// Software H.264 through `libx264` (the historical default).
@@ -69,16 +70,47 @@ pub enum HlsEncoder {
     Av1Aom,
     /// Motion JPEG through `mjpeg`.
     Mjpeg,
+    /// VAAPI H.264 through `h264_vaapi` (uploads nv12 frames).
+    VaapiH264,
+    /// VAAPI HEVC through `hevc_vaapi` (uploads nv12 frames).
+    VaapiHevc,
+    /// NVENC H.264 through `h264_nvenc`.
+    NvencH264,
+    /// NVENC HEVC through `hevc_nvenc`.
+    NvencHevc,
+    /// Intel QSV H.264 through `h264_qsv`.
+    QsvH264,
+    /// Intel QSV HEVC through `hevc_qsv`.
+    QsvHevc,
+    /// V4L2 memory-to-memory H.264 through `h264_v4l2m2m`.
+    V4l2m2mH264,
+    /// V4L2 memory-to-memory HEVC through `hevc_v4l2m2m`.
+    V4l2m2mHevc,
+}
+
+/// Video codec family a hardware `hw_accel` alias can be paired with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HwCodec {
+    H264,
+    Hevc,
 }
 
 impl HlsEncoder {
     /// Every encoder this pipeline supports, in preference order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 13] = [
         Self::H264,
         Self::Hevc,
         Self::Av1Svt,
         Self::Av1Aom,
         Self::Mjpeg,
+        Self::VaapiH264,
+        Self::VaapiHevc,
+        Self::NvencH264,
+        Self::NvencHevc,
+        Self::QsvH264,
+        Self::QsvHevc,
+        Self::V4l2m2mH264,
+        Self::V4l2m2mHevc,
     ];
 
     /// The exact `ffmpeg -c:v` value.
@@ -89,41 +121,118 @@ impl HlsEncoder {
             Self::Av1Svt => "libsvtav1",
             Self::Av1Aom => "libaom-av1",
             Self::Mjpeg => "mjpeg",
+            Self::VaapiH264 => "h264_vaapi",
+            Self::VaapiHevc => "hevc_vaapi",
+            Self::NvencH264 => "h264_nvenc",
+            Self::NvencHevc => "hevc_nvenc",
+            Self::QsvH264 => "h264_qsv",
+            Self::QsvHevc => "hevc_qsv",
+            Self::V4l2m2mH264 => "h264_v4l2m2m",
+            Self::V4l2m2mHevc => "hevc_v4l2m2m",
+        }
+    }
+
+    /// True for every backend that needs a GPU/V4L2 encoder device.
+    pub fn is_hardware(self) -> bool {
+        !matches!(
+            self,
+            Self::H264 | Self::Hevc | Self::Av1Svt | Self::Av1Aom | Self::Mjpeg
+        )
+    }
+
+    /// True when this encoder requires a VAAPI render node.
+    pub fn is_vaapi(self) -> bool {
+        matches!(self, Self::VaapiH264 | Self::VaapiHevc)
+    }
+
+    /// Stable hardware-backend label (`vaapi`, `nvenc`, `qsv`, `v4l2m2m`).
+    pub fn backend_label(self) -> &'static str {
+        match self {
+            Self::VaapiH264 | Self::VaapiHevc => "vaapi",
+            Self::NvencH264 | Self::NvencHevc => "nvenc",
+            Self::QsvH264 | Self::QsvHevc => "qsv",
+            Self::V4l2m2mH264 | Self::V4l2m2mHevc => "v4l2m2m",
+            _ => "software",
+        }
+    }
+
+    /// The software encoder with the same codec family, when this is hardware.
+    ///
+    /// Only H.264/HEVC have a matching software encoder in this pipeline. A
+    /// caller must opt in explicitly (see
+    /// [`HlsController::restart_with_encoder_fallback`]); this method never
+    /// changes a selection on its own.
+    pub fn software_fallback(self) -> Option<Self> {
+        match self {
+            Self::VaapiH264 | Self::NvencH264 | Self::QsvH264 | Self::V4l2m2mH264 => {
+                Some(Self::H264)
+            }
+            Self::VaapiHevc | Self::NvencHevc | Self::QsvHevc | Self::V4l2m2mHevc => {
+                Some(Self::Hevc)
+            }
+            _ => None,
         }
     }
 
     /// Parse a controller/CLI encoder name.
     ///
-    /// Hardware encoder names and unknown values return
-    /// [`HlsError::UnsupportedEncoder`]. The error never falls back to a
-    /// different encoder, so a caller cannot mistake a rejected hardware
-    /// request for a working software one.
+    /// This accepts software names, the explicit hardware ffmpeg names
+    /// (`h264_vaapi`, `hevc_nvenc`, `h264_qsv`, `hevc_v4l2m2m`, ...), and a
+    /// bare `hw_accel` alias only when [`Self::parse_with_codec`] supplies the
+    /// codec. A bare alias is a typed error rather than a guess.
     pub fn parse(value: &str) -> Result<Self, HlsError> {
+        Self::parse_with_codec(value, None)
+    }
+
+    /// Resolve a controller `hw_accel` alias plus its codec in one call.
+    ///
+    /// Equivalent to [`Self::parse_with_codec`] with a required codec.
+    pub fn parse_hw_accel(alias: &str, codec: &str) -> Result<Self, HlsError> {
+        Self::parse_with_codec(alias, Some(codec))
+    }
+
+    /// Parse an encoder name with an optional codec hint.
+    ///
+    /// `hw_accel` aliases (`vaapi`, `nvenc`, `qsv`, `v4l2m2m`) are resolved
+    /// against `codec` (`h264`/`hevc`, including the usual aliases). An invalid
+    /// hardware/codec combination, a bare alias without a codec, and unknown
+    /// values all return [`HlsError::UnsupportedEncoder`].
+    pub fn parse_with_codec(value: &str, codec: Option<&str>) -> Result<Self, HlsError> {
         let normalized = value.trim().to_ascii_lowercase();
+        if let Some(alias) = hw_alias(&normalized) {
+            let codec = codec
+                .map(str::trim)
+                .filter(|codec| !codec.is_empty())
+                .ok_or_else(|| HlsError::UnsupportedEncoder {
+                    encoder: value.trim().to_owned(),
+                    message: format!(
+                        "hw_accel `{normalized}` needs a codec; pass h264 or hevc (for example \
+                         `--hls-encoder h264_{}` or a `/codec` request with `codec` set)",
+                        alias.ffmpeg_suffix()
+                    ),
+                })?;
+            return Self::from_hw_accel(alias, codec, value);
+        }
+
         match normalized.as_str() {
             "libx264" | "x264" | "h264" | "avc" | "h.264" => Ok(Self::H264),
             "libx265" | "x265" | "h265" | "hevc" | "h.265" => Ok(Self::Hevc),
             "libsvtav1" | "svtav1" | "av1" => Ok(Self::Av1Svt),
             "libaom-av1" | "aom-av1" | "libaom" => Ok(Self::Av1Aom),
             "mjpeg" | "mjpg" | "jpeg" => Ok(Self::Mjpeg),
-            hardware
-                if hardware.ends_with("_nvenc")
-                    || hardware.ends_with("_vaapi")
-                    || hardware.ends_with("_qsv")
-                    || hardware.ends_with("_v4l2m2m")
-                    || hardware.ends_with("_videotoolbox") =>
-            {
-                Err(HlsError::UnsupportedEncoder {
-                    encoder: value.trim().to_owned(),
-                    message: "hardware encoders need an upload/hwaccel filter chain that this \
-                              HLS ffmpeg path does not implement"
-                        .to_owned(),
-                })
-            }
+            "h264_vaapi" | "vaapi_h264" => Ok(Self::VaapiH264),
+            "hevc_vaapi" | "h265_vaapi" | "vaapi_hevc" => Ok(Self::VaapiHevc),
+            "h264_nvenc" | "nvenc_h264" => Ok(Self::NvencH264),
+            "hevc_nvenc" | "h265_nvenc" | "nvenc_hevc" => Ok(Self::NvencHevc),
+            "h264_qsv" | "qsv_h264" => Ok(Self::QsvH264),
+            "hevc_qsv" | "h265_qsv" | "qsv_hevc" => Ok(Self::QsvHevc),
+            "h264_v4l2m2m" | "v4l2m2m_h264" => Ok(Self::V4l2m2mH264),
+            "hevc_v4l2m2m" | "h265_v4l2m2m" | "v4l2m2m_hevc" => Ok(Self::V4l2m2mHevc),
             _ => Err(HlsError::UnsupportedEncoder {
                 encoder: value.trim().to_owned(),
                 message: format!(
-                    "expected one of {}",
+                    "expected one of {}, or a hw_accel alias (vaapi, nvenc, qsv, v4l2m2m) with \
+                     h264/hevc",
                     Self::ALL
                         .iter()
                         .map(|encoder| encoder.ffmpeg_name())
@@ -132,6 +241,73 @@ impl HlsEncoder {
                 ),
             }),
         }
+    }
+
+    /// Resolve a `hw_accel` alias plus a codec name.
+    pub fn from_hw_accel(alias: HwAccel, codec: &str, supplied: &str) -> Result<Self, HlsError> {
+        let codec = match codec.trim().to_ascii_lowercase().as_str() {
+            "h264" | "avc" | "h.264" => HwCodec::H264,
+            "h265" | "hevc" | "h.265" => HwCodec::Hevc,
+            other => {
+                return Err(HlsError::UnsupportedEncoder {
+                    encoder: supplied.trim().to_owned(),
+                    message: format!(
+                        "hw_accel `{alias}` only supports h264 or hevc in the HLS pipeline, not \
+                         `{other}`"
+                    ),
+                })
+            }
+        };
+        Ok(match (alias, codec) {
+            (HwAccel::Vaapi, HwCodec::H264) => Self::VaapiH264,
+            (HwAccel::Vaapi, HwCodec::Hevc) => Self::VaapiHevc,
+            (HwAccel::Nvenc, HwCodec::H264) => Self::NvencH264,
+            (HwAccel::Nvenc, HwCodec::Hevc) => Self::NvencHevc,
+            (HwAccel::Qsv, HwCodec::H264) => Self::QsvH264,
+            (HwAccel::Qsv, HwCodec::Hevc) => Self::QsvHevc,
+            (HwAccel::V4l2m2m, HwCodec::H264) => Self::V4l2m2mH264,
+            (HwAccel::V4l2m2m, HwCodec::Hevc) => Self::V4l2m2mHevc,
+        })
+    }
+}
+
+/// A controller/CLI hardware acceleration alias.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HwAccel {
+    /// VAAPI (`vaapi`).
+    Vaapi,
+    /// NVIDIA NVENC (`nvenc`).
+    Nvenc,
+    /// Intel Quick Sync (`qsv`).
+    Qsv,
+    /// V4L2 memory-to-memory (`v4l2m2m`).
+    V4l2m2m,
+}
+
+impl HwAccel {
+    fn ffmpeg_suffix(self) -> &'static str {
+        match self {
+            Self::Vaapi => "vaapi",
+            Self::Nvenc => "nvenc",
+            Self::Qsv => "qsv",
+            Self::V4l2m2m => "v4l2m2m",
+        }
+    }
+}
+
+impl std::fmt::Display for HwAccel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.ffmpeg_suffix())
+    }
+}
+
+fn hw_alias(value: &str) -> Option<HwAccel> {
+    match value {
+        "vaapi" => Some(HwAccel::Vaapi),
+        "nvenc" => Some(HwAccel::Nvenc),
+        "qsv" => Some(HwAccel::Qsv),
+        "v4l2m2m" | "v4l2-m2m" => Some(HwAccel::V4l2m2m),
+        _ => None,
     }
 }
 
@@ -161,6 +337,11 @@ pub struct HlsConfig {
     pub height: Option<u32>,
     /// ffmpeg executable to spawn (a bare `ffmpeg` uses `PATH`).
     pub ffmpeg_bin: PathBuf,
+    /// VAAPI render node used by the VAAPI encoder variants.
+    ///
+    /// Only checked for existence when a pipeline starts/restarts, never while
+    /// building argv, so tests can construct argv without a real GPU node.
+    pub vaapi_device: PathBuf,
 }
 
 impl Default for HlsConfig {
@@ -175,6 +356,7 @@ impl Default for HlsConfig {
             width: None,
             height: None,
             ffmpeg_bin: PathBuf::from("ffmpeg"),
+            vaapi_device: PathBuf::from("/dev/dri/renderD128"),
         }
     }
 }
@@ -261,6 +443,30 @@ pub enum HlsError {
         encoder: String,
         /// Why it cannot be used.
         message: String,
+    },
+    /// A hardware encoder was requested but ffmpeg does not advertise it.
+    #[error("HLS hardware encoder `{encoder}` ({backend}) is unavailable: {message}")]
+    EncoderUnavailable {
+        /// Exact ffmpeg encoder name.
+        encoder: String,
+        /// Hardware backend label (`vaapi`, `nvenc`, `qsv`, `v4l2m2m`).
+        backend: String,
+        /// What the probe found.
+        message: String,
+        /// What the operator can do about it.
+        remediation: String,
+        /// Encoder names ffmpeg actually advertised, when known.
+        available: Vec<String>,
+    },
+    /// A VAAPI encoder was requested but its render node does not exist.
+    #[error("VAAPI device `{path}` is unavailable: {message}")]
+    VaapiDevice {
+        /// Missing or unreadable device path.
+        path: PathBuf,
+        /// What the check found.
+        message: String,
+        /// What the operator can do about it.
+        remediation: String,
     },
     /// A fresh capture source could not be opened for a pipeline generation.
     #[error("could not open an HLS capture source: {message}")]
@@ -584,6 +790,268 @@ impl FfmpegSpawner for SystemFfmpegSpawner {
     }
 }
 
+/// Encoder names ffmpeg advertised, parsed once from `ffmpeg -encoders`.
+///
+/// This is evidence, not a guess: the HLS path never starts a hardware encoder
+/// just because its name was requested. Tests inject a static list through
+/// [`StaticEncoderProbe`]; production runs [`SystemEncoderProbe`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EncoderAvailability {
+    encoders: BTreeSet<String>,
+}
+
+impl EncoderAvailability {
+    /// Build availability from exact ffmpeg encoder names.
+    pub fn from_names(names: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            encoders: names.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// The software encoders this pipeline knows how to run.
+    pub fn software() -> Self {
+        Self::from_names(
+            [
+                HlsEncoder::H264,
+                HlsEncoder::Hevc,
+                HlsEncoder::Av1Svt,
+                HlsEncoder::Av1Aom,
+                HlsEncoder::Mjpeg,
+            ]
+            .map(HlsEncoder::ffmpeg_name),
+        )
+    }
+
+    /// True when ffmpeg advertised this encoder name.
+    pub fn contains(&self, encoder: HlsEncoder) -> bool {
+        self.encoders.contains(encoder.ffmpeg_name())
+    }
+
+    /// True when ffmpeg advertised `name`.
+    pub fn contains_name(&self, name: &str) -> bool {
+        self.encoders.contains(name)
+    }
+
+    /// Encoder names known to this pipeline that ffmpeg advertised.
+    pub fn known_encoders(&self) -> Vec<String> {
+        HlsEncoder::ALL
+            .iter()
+            .filter(|encoder| self.contains(**encoder))
+            .map(|encoder| encoder.ffmpeg_name().to_owned())
+            .collect()
+    }
+
+    /// Parse `ffmpeg -hide_banner -encoders` output.
+    ///
+    /// The table starts after a dashed separator; each row is
+    /// `<flags> <name> <description>`. Lines outside the table are ignored, so
+    /// a partial or unexpected stderr/stdout cannot invent an encoder.
+    pub fn parse_ffmpeg_encoders(output: &str) -> Self {
+        let mut encoders = BTreeSet::new();
+        let mut in_table = false;
+        for line in output.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.starts_with("------") {
+                in_table = true;
+                continue;
+            }
+            if !in_table {
+                continue;
+            }
+            let mut fields = trimmed.split_whitespace();
+            let flags = fields.next().unwrap_or_default();
+            if flags.len() < 5 {
+                continue;
+            }
+            if let Some(name) = fields.next() {
+                encoders.insert(name.to_owned());
+            }
+        }
+        Self { encoders }
+    }
+}
+
+impl FromIterator<String> for EncoderAvailability {
+    fn from_iter<T: IntoIterator<Item = String>>(iter: T) -> Self {
+        Self {
+            encoders: iter.into_iter().collect(),
+        }
+    }
+}
+
+/// Injectable encoder availability check.
+///
+/// A probe returns evidence; it never starts an encoder. The default
+/// implementation runs `ffmpeg -encoders` once (bounded and cached), while
+/// tests use [`StaticEncoderProbe`] so no real ffmpeg or GPU is needed.
+pub trait EncoderProbe: Send + Sync {
+    /// ffmpeg encoders available to `ffmpeg_bin`.
+    fn availability(&self, ffmpeg_bin: &Path) -> Result<EncoderAvailability, String>;
+}
+
+/// A deterministic probe over a fixed set of encoder names.
+#[derive(Clone, Debug, Default)]
+pub struct StaticEncoderProbe {
+    availability: EncoderAvailability,
+}
+
+impl StaticEncoderProbe {
+    /// A probe backed by an explicit availability set.
+    pub fn new(availability: EncoderAvailability) -> Self {
+        Self { availability }
+    }
+
+    /// A probe that knows only the software encoders (the conservative test
+    /// default).
+    pub fn software() -> Self {
+        Self::new(EncoderAvailability::software())
+    }
+
+    /// A probe that advertises exactly these encoders.
+    pub fn with_encoders(encoders: impl IntoIterator<Item = HlsEncoder>) -> Self {
+        Self::new(EncoderAvailability::from_names(
+            encoders.into_iter().map(HlsEncoder::ffmpeg_name),
+        ))
+    }
+}
+
+impl EncoderProbe for StaticEncoderProbe {
+    fn availability(&self, _ffmpeg_bin: &Path) -> Result<EncoderAvailability, String> {
+        Ok(self.availability.clone())
+    }
+}
+
+const ENCODER_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_ENCODER_PROBE_BYTES: u64 = 1024 * 1024;
+
+/// The production probe: run `ffmpeg -hide_banner -loglevel error -encoders`
+/// with a bounded wait and parse the table once.
+#[derive(Debug, Default)]
+pub struct SystemEncoderProbe {
+    cached: Mutex<Option<EncoderAvailability>>,
+}
+
+impl SystemEncoderProbe {
+    /// A fresh uncached probe.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl EncoderProbe for SystemEncoderProbe {
+    fn availability(&self, ffmpeg_bin: &Path) -> Result<EncoderAvailability, String> {
+        if let Some(cached) = self
+            .cached
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            return Ok(cached);
+        }
+
+        let mut child = std::process::Command::new(ffmpeg_bin)
+            .args(["-hide_banner", "-loglevel", "error", "-encoders"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("could not execute `{}`: {error}", ffmpeg_bin.display()))?;
+        let Some(mut stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "`{}` did not expose stdout for -encoders",
+                ffmpeg_bin.display()
+            ));
+        };
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = stdout
+                .by_ref()
+                .take(MAX_ENCODER_PROBE_BYTES)
+                .read_to_string(&mut text);
+            let _ = sender.send(text);
+        });
+
+        let text = match receiver.recv_timeout(ENCODER_PROBE_TIMEOUT) {
+            Ok(text) => text,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "`{} -encoders` did not finish within {}s",
+                    ffmpeg_bin.display(),
+                    ENCODER_PROBE_TIMEOUT.as_secs()
+                ));
+            }
+        };
+        let _ = child.wait();
+
+        let availability = EncoderAvailability::parse_ffmpeg_encoders(&text);
+        *self
+            .cached
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(availability.clone());
+        Ok(availability)
+    }
+}
+
+/// Check runtime-only requirements for the configured encoder.
+///
+/// VAAPI device existence is checked here, at start/restart, not in
+/// [`ffmpeg_argv`]. Hardware availability comes from the injected probe; a
+/// software encoder is not probed because its failure already surfaces as a
+/// typed spawn error.
+fn validate_encoder_runtime(config: &HlsConfig, probe: &dyn EncoderProbe) -> Result<(), HlsError> {
+    let encoder = config.video_encoder;
+    if encoder.is_vaapi() && !config.vaapi_device.exists() {
+        return Err(HlsError::VaapiDevice {
+            path: config.vaapi_device.clone(),
+            message: "the path does not exist".to_owned(),
+            remediation: format!(
+                "Pass --vaapi-device with an existing render node (default \
+                 /dev/dri/renderD128), or choose a software encoder."
+            ),
+        });
+    }
+    if !encoder.is_hardware() {
+        return Ok(());
+    }
+
+    let availability =
+        probe
+            .availability(&config.ffmpeg_bin)
+            .map_err(|message| HlsError::EncoderUnavailable {
+                encoder: encoder.ffmpeg_name().to_owned(),
+                backend: encoder.backend_label().to_owned(),
+                message: format!("could not probe ffmpeg encoders: {message}"),
+                remediation: format!(
+                    "Check that `{}` can run and lists encoders, or choose a software encoder.",
+                    config.ffmpeg_bin.display()
+                ),
+                available: Vec::new(),
+            })?;
+    if !availability.contains(encoder) {
+        return Err(HlsError::EncoderUnavailable {
+            encoder: encoder.ffmpeg_name().to_owned(),
+            backend: encoder.backend_label().to_owned(),
+            message: format!("ffmpeg does not advertise `{}`", encoder.ffmpeg_name()),
+            remediation: format!(
+                "Install or enable the {} encoder for ffmpeg and the matching driver, choose \
+                 another hardware backend, or explicitly allow a software fallback.",
+                encoder.backend_label()
+            ),
+            available: availability.known_encoders(),
+        });
+    }
+    Ok(())
+}
+
 struct ChildStdinSink {
     stdin: Option<ChildStdin>,
 }
@@ -627,12 +1095,35 @@ impl HlsPipeline {
     }
 
     /// Start with an injected process factory, for tests and embedding.
+    ///
+    /// The conservative probe knows only the software encoders, so a hardware
+    /// request on this constructor fails with a typed
+    /// [`HlsError::EncoderUnavailable`] instead of assuming the name works.
     pub fn start_with_spawner(
         source: Box<dyn CaptureSource>,
         config: HlsConfig,
         spawner: Arc<dyn FfmpegSpawner>,
     ) -> Result<Self, HlsError> {
+        Self::start_with_spawner_and_probe(
+            source,
+            config,
+            spawner,
+            Arc::new(StaticEncoderProbe::software()),
+        )
+    }
+
+    /// Start with an injected process factory and encoder probe.
+    ///
+    /// Production uses [`SystemEncoderProbe`]; tests inject a static list so
+    /// no real ffmpeg or GPU is required.
+    pub fn start_with_spawner_and_probe(
+        source: Box<dyn CaptureSource>,
+        config: HlsConfig,
+        spawner: Arc<dyn FfmpegSpawner>,
+        probe: Arc<dyn EncoderProbe>,
+    ) -> Result<Self, HlsError> {
         let config = config.validated()?;
+        validate_encoder_runtime(&config, probe.as_ref())?;
         if let Err(error) = ensure_supported(source.format().pixel_format) {
             return Err(error);
         }
@@ -772,6 +1263,30 @@ impl Drop for HlsPipeline {
 /// from the same registry after the old pipeline has stopped.
 pub type HlsSourceFactory = Arc<dyn Fn() -> Result<Box<dyn CaptureSource>, HlsError> + Send + Sync>;
 
+/// A hardware restart that was explicitly allowed to use software instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HlsEncoderFallback {
+    /// Hardware encoder the caller asked for.
+    pub requested: HlsEncoder,
+    /// Software encoder actually applied.
+    pub applied: HlsEncoder,
+    /// Why the hardware encoder could not start.
+    pub reason: String,
+}
+
+/// Result of a successful HLS restart.
+#[derive(Clone, Debug)]
+pub struct HlsRestartOutcome {
+    /// Live pipeline status.
+    pub status: HlsStatus,
+    /// Encoder the caller requested.
+    pub requested_encoder: HlsEncoder,
+    /// Encoder the new pipeline actually runs.
+    pub applied_encoder: HlsEncoder,
+    /// Present only when an explicit software fallback was used.
+    pub fallback: Option<HlsEncoderFallback>,
+}
+
 /// Owns the current [`HlsPipeline`] so it can be stopped and restarted.
 ///
 /// `POST /codec` uses [`HlsController::restart_with_encoder`] to apply a codec
@@ -784,19 +1299,47 @@ pub struct HlsController {
     status: Arc<Mutex<HlsStatus>>,
     source_factory: HlsSourceFactory,
     spawner: Arc<dyn FfmpegSpawner>,
+    probe: Arc<dyn EncoderProbe>,
 }
 
 impl HlsController {
     /// Build a controller that spawns the system ffmpeg for each generation.
+    ///
+    /// Hardware encoder requests are checked against `ffmpeg -encoders` before
+    /// any pipeline starts; nothing is assumed from the encoder name.
     pub fn new(source_factory: HlsSourceFactory, config: HlsConfig) -> Self {
-        Self::with_spawner(source_factory, config, Arc::new(SystemFfmpegSpawner))
+        Self::with_spawner_and_probe(
+            source_factory,
+            config,
+            Arc::new(SystemFfmpegSpawner),
+            Arc::new(SystemEncoderProbe::new()),
+        )
     }
 
     /// Build a controller with an injected process factory, for tests.
+    ///
+    /// The default probe knows only software encoders; tests that exercise a
+    /// hardware restart must inject an explicit probe with
+    /// [`Self::with_spawner_and_probe`].
     pub fn with_spawner(
         source_factory: HlsSourceFactory,
         config: HlsConfig,
         spawner: Arc<dyn FfmpegSpawner>,
+    ) -> Self {
+        Self::with_spawner_and_probe(
+            source_factory,
+            config,
+            spawner,
+            Arc::new(StaticEncoderProbe::software()),
+        )
+    }
+
+    /// Build a controller with an injected process factory and encoder probe.
+    pub fn with_spawner_and_probe(
+        source_factory: HlsSourceFactory,
+        config: HlsConfig,
+        spawner: Arc<dyn FfmpegSpawner>,
+        probe: Arc<dyn EncoderProbe>,
     ) -> Self {
         Self {
             pipeline: Arc::new(tokio::sync::Mutex::new(None)),
@@ -804,6 +1347,7 @@ impl HlsController {
             status: Arc::new(Mutex::new(HlsStatus::not_configured())),
             source_factory,
             spawner,
+            probe,
         }
     }
 
@@ -828,7 +1372,12 @@ impl HlsController {
     /// Open a source and start a pipeline without touching controller state.
     fn open_and_start(&self, config: HlsConfig) -> Result<HlsPipeline, HlsError> {
         let source = (self.source_factory)()?;
-        HlsPipeline::start_with_spawner(source, config, self.spawner.clone())
+        HlsPipeline::start_with_spawner_and_probe(
+            source,
+            config,
+            self.spawner.clone(),
+            self.probe.clone(),
+        )
     }
 
     /// Start the pipeline if it is not already running.
@@ -871,6 +1420,10 @@ impl HlsController {
 
     /// Restart HLS with a different ffmpeg encoder.
     ///
+    /// Hardware encoders are probed first. No software substitution happens on
+    /// this method; use [`Self::restart_with_encoder_fallback`] when a caller
+    /// has explicitly allowed a fallback.
+    ///
     /// The old pipeline is stopped before the new source is opened. If the new
     /// generation cannot start, the previous configuration is restored with a
     /// fresh source. When restoration also fails, HLS is left stopped and the
@@ -880,6 +1433,25 @@ impl HlsController {
         encoder: HlsEncoder,
         bitrate_kbps: Option<u32>,
     ) -> Result<HlsStatus, HlsError> {
+        self.restart_with_encoder_fallback(encoder, bitrate_kbps, false)
+            .await
+            .map(|outcome| outcome.status)
+    }
+
+    /// Restart HLS with an optional explicit software fallback.
+    ///
+    /// When `allow_software_fallback` is true and the requested hardware
+    /// encoder is unavailable (or its VAAPI device is missing), the matching
+    /// software encoder is started and the returned
+    /// [`HlsRestartOutcome::fallback`] records exactly what happened. Without
+    /// that opt-in the typed availability error is returned and the previous
+    /// pipeline is restored when possible.
+    pub async fn restart_with_encoder_fallback(
+        &self,
+        encoder: HlsEncoder,
+        bitrate_kbps: Option<u32>,
+        allow_software_fallback: bool,
+    ) -> Result<HlsRestartOutcome, HlsError> {
         let mut pipeline = self.pipeline.lock().await;
         let Some(mut previous) = pipeline.take() else {
             return Err(HlsError::NotRunning);
@@ -902,34 +1474,132 @@ impl HlsController {
                 let status = started.status();
                 *lock(&self.status) = status.clone();
                 *pipeline = Some(started);
-                Ok(status)
+                Ok(HlsRestartOutcome {
+                    status,
+                    requested_encoder: encoder,
+                    applied_encoder: encoder,
+                    fallback: None,
+                })
             }
             Err(start_error) => {
                 let start_message = start_error.to_string();
-                match self.open_and_start(previous_config.clone()) {
-                    Ok(restored) => {
-                        let status = restored.status();
-                        *lock(&self.status) = status.clone();
-                        *pipeline = Some(restored);
-                        Err(HlsError::Restart {
-                            message: format!(
-                                "{start_message}; restored the previous pipeline with encoder `{}`",
-                                previous_config.video_encoder.ffmpeg_name()
-                            ),
-                        })
-                    }
-                    Err(restore_error) => {
-                        let message = format!(
-                            "{start_message}; restoring the previous pipeline with encoder `{}` \
-                             also failed: {restore_error}",
-                            previous_config.video_encoder.ffmpeg_name()
-                        );
-                        *lock(&self.status) = HlsStatus::failed(message.clone());
-                        Err(HlsError::Restart { message })
+                if allow_software_fallback && is_encoder_availability_error(&start_error) {
+                    if let Some(fallback) = encoder.software_fallback() {
+                        let mut fallback_config = next_config.clone();
+                        fallback_config.video_encoder = fallback;
+                        match self.open_and_start(fallback_config.clone()) {
+                            Ok(started) => {
+                                *lock(&self.config) = fallback_config;
+                                let status = started.status();
+                                *lock(&self.status) = status.clone();
+                                *pipeline = Some(started);
+                                return Ok(HlsRestartOutcome {
+                                    status,
+                                    requested_encoder: encoder,
+                                    applied_encoder: fallback,
+                                    fallback: Some(HlsEncoderFallback {
+                                        requested: encoder,
+                                        applied: fallback,
+                                        reason: start_message,
+                                    }),
+                                });
+                            }
+                            Err(fallback_error) => {
+                                let fallback_message = format!(
+                                    "{start_message}; software fallback `{}` also failed: \
+                                     {fallback_error}",
+                                    fallback.ffmpeg_name()
+                                );
+                                return self
+                                    .restore_previous(
+                                        &mut pipeline,
+                                        previous_config,
+                                        HlsError::Restart {
+                                            message: fallback_message,
+                                        },
+                                    )
+                                    .await;
+                            }
+                        }
                     }
                 }
+
+                self.restore_previous(&mut pipeline, previous_config, start_error)
+                    .await
             }
         }
+    }
+
+    /// Restore the previous generation after a failed restart.
+    async fn restore_previous(
+        &self,
+        pipeline: &mut Option<HlsPipeline>,
+        previous_config: HlsConfig,
+        start_error: HlsError,
+    ) -> Result<HlsRestartOutcome, HlsError> {
+        let start_message = start_error.to_string();
+        match self.open_and_start(previous_config.clone()) {
+            Ok(restored) => {
+                let status = restored.status();
+                *lock(&self.status) = status.clone();
+                *pipeline = Some(restored);
+                Err(augment_restored_error(
+                    start_error,
+                    format!(
+                        "; restored the previous pipeline with encoder `{}`",
+                        previous_config.video_encoder.ffmpeg_name()
+                    ),
+                ))
+            }
+            Err(restore_error) => {
+                let message = format!(
+                    "{start_message}; restoring the previous pipeline with encoder `{}` also \
+                     failed: {restore_error}",
+                    previous_config.video_encoder.ffmpeg_name()
+                );
+                *lock(&self.status) = HlsStatus::failed(message.clone());
+                Err(HlsError::Restart { message })
+            }
+        }
+    }
+}
+
+fn is_encoder_availability_error(error: &HlsError) -> bool {
+    matches!(
+        error,
+        HlsError::EncoderUnavailable { .. } | HlsError::VaapiDevice { .. }
+    )
+}
+
+/// Keep the typed availability error while noting that the old pipeline was
+/// restored, instead of flattening it into a generic restart error.
+fn augment_restored_error(error: HlsError, suffix: String) -> HlsError {
+    match error {
+        HlsError::EncoderUnavailable {
+            encoder,
+            backend,
+            message,
+            remediation,
+            available,
+        } => HlsError::EncoderUnavailable {
+            encoder,
+            backend,
+            message: format!("{message}{suffix}"),
+            remediation,
+            available,
+        },
+        HlsError::VaapiDevice {
+            path,
+            message,
+            remediation,
+        } => HlsError::VaapiDevice {
+            path,
+            message: format!("{message}{suffix}"),
+            remediation,
+        },
+        other => HlsError::Restart {
+            message: format!("{other}{suffix}"),
+        },
     }
 }
 
@@ -1163,12 +1833,12 @@ pub fn ffmpeg_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String> {
         "-i".to_owned(),
         "-".to_owned(),
         "-an".to_owned(),
-        "-c:v".to_owned(),
-        config.video_encoder.ffmpeg_name().to_owned(),
     ];
 
     match config.video_encoder {
         HlsEncoder::H264 => argv.extend([
+            "-c:v".to_owned(),
+            "libx264".to_owned(),
             "-preset".to_owned(),
             "veryfast".to_owned(),
             "-tune".to_owned(),
@@ -1177,6 +1847,8 @@ pub fn ffmpeg_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String> {
             bitrate,
         ]),
         HlsEncoder::Hevc => argv.extend([
+            "-c:v".to_owned(),
+            "libx265".to_owned(),
             "-preset".to_owned(),
             "ultrafast".to_owned(),
             "-tune".to_owned(),
@@ -1185,12 +1857,16 @@ pub fn ffmpeg_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String> {
             bitrate,
         ]),
         HlsEncoder::Av1Svt => argv.extend([
+            "-c:v".to_owned(),
+            "libsvtav1".to_owned(),
             "-preset".to_owned(),
             "10".to_owned(),
             "-b:v".to_owned(),
             bitrate,
         ]),
         HlsEncoder::Av1Aom => argv.extend([
+            "-c:v".to_owned(),
+            "libaom-av1".to_owned(),
             "-cpu-used".to_owned(),
             "8".to_owned(),
             "-row-mt".to_owned(),
@@ -1198,7 +1874,48 @@ pub fn ffmpeg_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String> {
             "-b:v".to_owned(),
             bitrate,
         ]),
-        HlsEncoder::Mjpeg => argv.extend(["-q:v".to_owned(), "5".to_owned()]),
+        HlsEncoder::Mjpeg => argv.extend([
+            "-c:v".to_owned(),
+            "mjpeg".to_owned(),
+            "-q:v".to_owned(),
+            "5".to_owned(),
+        ]),
+        HlsEncoder::VaapiH264 | HlsEncoder::VaapiHevc => argv.extend([
+            "-vaapi_device".to_owned(),
+            config.vaapi_device.display().to_string(),
+            "-vf".to_owned(),
+            "format=nv12,hwupload".to_owned(),
+            "-c:v".to_owned(),
+            config.video_encoder.ffmpeg_name().to_owned(),
+            "-b:v".to_owned(),
+            bitrate,
+        ]),
+        HlsEncoder::NvencH264 | HlsEncoder::NvencHevc => argv.extend([
+            "-c:v".to_owned(),
+            config.video_encoder.ffmpeg_name().to_owned(),
+            "-preset".to_owned(),
+            "p4".to_owned(),
+            "-tune".to_owned(),
+            "ll".to_owned(),
+            "-rc".to_owned(),
+            "cbr".to_owned(),
+            "-b:v".to_owned(),
+            bitrate,
+        ]),
+        HlsEncoder::QsvH264 | HlsEncoder::QsvHevc => argv.extend([
+            "-c:v".to_owned(),
+            config.video_encoder.ffmpeg_name().to_owned(),
+            "-preset".to_owned(),
+            "veryfast".to_owned(),
+            "-b:v".to_owned(),
+            bitrate,
+        ]),
+        HlsEncoder::V4l2m2mH264 | HlsEncoder::V4l2m2mHevc => argv.extend([
+            "-c:v".to_owned(),
+            config.video_encoder.ffmpeg_name().to_owned(),
+            "-b:v".to_owned(),
+            bitrate,
+        ]),
     }
 
     argv.extend([
@@ -1585,21 +2302,147 @@ mod tests {
     }
 
     #[test]
-    fn encoder_names_are_parsed_and_hardware_is_rejected() {
+    fn ffmpeg_argv_carries_each_hardware_encoder_upload_and_rate_control() {
+        let base = HlsConfig {
+            output_dir: PathBuf::from("/tmp/ozma-stream-hw"),
+            vaapi_device: PathBuf::from("/dev/dri/renderD129"),
+            ..HlsConfig::default()
+        };
+
+        for (encoder, expected_name, expected_pairs, expected_vf) in [
+            (
+                HlsEncoder::VaapiH264,
+                "h264_vaapi",
+                vec![("-vaapi_device", "/dev/dri/renderD129")],
+                Some("format=nv12,hwupload"),
+            ),
+            (
+                HlsEncoder::VaapiHevc,
+                "hevc_vaapi",
+                vec![("-vaapi_device", "/dev/dri/renderD129")],
+                Some("format=nv12,hwupload"),
+            ),
+            (
+                HlsEncoder::NvencH264,
+                "h264_nvenc",
+                vec![("-preset", "p4"), ("-tune", "ll"), ("-rc", "cbr")],
+                None,
+            ),
+            (
+                HlsEncoder::NvencHevc,
+                "hevc_nvenc",
+                vec![("-preset", "p4"), ("-tune", "ll"), ("-rc", "cbr")],
+                None,
+            ),
+            (
+                HlsEncoder::QsvH264,
+                "h264_qsv",
+                vec![("-preset", "veryfast")],
+                None,
+            ),
+            (
+                HlsEncoder::QsvHevc,
+                "hevc_qsv",
+                vec![("-preset", "veryfast")],
+                None,
+            ),
+            (HlsEncoder::V4l2m2mH264, "h264_v4l2m2m", vec![], None),
+            (HlsEncoder::V4l2m2mHevc, "hevc_v4l2m2m", vec![], None),
+        ] {
+            let argv = ffmpeg_argv(
+                &HlsConfig {
+                    video_encoder: encoder,
+                    ..base.clone()
+                },
+                320,
+                240,
+            );
+            let codec_index = argv
+                .iter()
+                .position(|argument| argument == "-c:v")
+                .unwrap_or_else(|| panic!("{encoder:?} argv has no -c:v"));
+            assert_eq!(argv[codec_index + 1], expected_name, "{encoder:?}");
+            for (flag, value) in expected_pairs {
+                let index = argv
+                    .iter()
+                    .position(|argument| argument == flag)
+                    .unwrap_or_else(|| panic!("{encoder:?} argv is missing {flag}"));
+                assert_eq!(argv[index + 1], value, "{encoder:?}");
+            }
+            if let Some(vf) = expected_vf {
+                assert!(
+                    argv.windows(2).any(|window| window == ["-vf", vf]),
+                    "{encoder:?} argv must upload frames: {argv:?}"
+                );
+            }
+            assert!(argv.contains(&"4000k".to_owned()), "{encoder:?}");
+            assert!(
+                argv.windows(2)
+                    .any(|window| window == ["-hls_flags", "delete_segments"]),
+                "{encoder:?} argv must prune segments"
+            );
+        }
+    }
+
+    #[test]
+    fn encoder_names_and_hw_accel_aliases_are_parsed_honestly() {
         assert_eq!(HlsEncoder::parse("libx264").unwrap(), HlsEncoder::H264);
         assert_eq!(HlsEncoder::parse("hevc").unwrap(), HlsEncoder::Hevc);
         assert_eq!(HlsEncoder::parse("libsvtav1").unwrap(), HlsEncoder::Av1Svt);
         assert_eq!(HlsEncoder::parse("libaom-av1").unwrap(), HlsEncoder::Av1Aom);
         assert_eq!(HlsEncoder::parse("mjpeg").unwrap(), HlsEncoder::Mjpeg);
 
-        for hardware in [
-            "h264_nvenc",
-            "h264_vaapi",
-            "h264_qsv",
-            "h264_v4l2m2m",
-            "hevc_videotoolbox",
+        for (name, expected) in [
+            ("h264_vaapi", HlsEncoder::VaapiH264),
+            ("hevc_vaapi", HlsEncoder::VaapiHevc),
+            ("h264_nvenc", HlsEncoder::NvencH264),
+            ("hevc_nvenc", HlsEncoder::NvencHevc),
+            ("h264_qsv", HlsEncoder::QsvH264),
+            ("hevc_qsv", HlsEncoder::QsvHevc),
+            ("h264_v4l2m2m", HlsEncoder::V4l2m2mH264),
+            ("hevc_v4l2m2m", HlsEncoder::V4l2m2mHevc),
         ] {
-            let error = HlsEncoder::parse(hardware).expect_err("hardware must be rejected");
+            assert_eq!(HlsEncoder::parse(name).unwrap(), expected, "{name}");
+        }
+
+        for (alias, codec, expected) in [
+            ("vaapi", "h264", HlsEncoder::VaapiH264),
+            ("vaapi", "h265", HlsEncoder::VaapiHevc),
+            ("nvenc", "h264", HlsEncoder::NvencH264),
+            ("nvenc", "hevc", HlsEncoder::NvencHevc),
+            ("qsv", "h264", HlsEncoder::QsvH264),
+            ("qsv", "hevc", HlsEncoder::QsvHevc),
+            ("v4l2m2m", "h264", HlsEncoder::V4l2m2mH264),
+            ("v4l2m2m", "hevc", HlsEncoder::V4l2m2mHevc),
+        ] {
+            assert_eq!(
+                HlsEncoder::parse_hw_accel(alias, codec).unwrap(),
+                expected,
+                "{alias}/{codec}"
+            );
+        }
+
+        // A bare backend alias has no codec and is not guessed.
+        for alias in ["vaapi", "nvenc", "qsv", "v4l2m2m"] {
+            let error = HlsEncoder::parse(alias).expect_err("alias needs a codec");
+            assert!(
+                matches!(error, HlsError::UnsupportedEncoder { .. }),
+                "{alias}: {error}"
+            );
+        }
+
+        // Unsupported hardware codec combinations and foreign encoders are
+        // typed errors, never a silent software substitution.
+        for (alias, codec) in [("vaapi", "av1"), ("nvenc", "mjpeg"), ("qsv", "vp9")] {
+            let error = HlsEncoder::parse_with_codec(alias, Some(codec))
+                .expect_err("unsupported hardware codec");
+            assert!(
+                matches!(error, HlsError::UnsupportedEncoder { .. }),
+                "{alias}/{codec}: {error}"
+            );
+        }
+        for hardware in ["hevc_videotoolbox", "av1_nvenc", "vp9_vaapi"] {
+            let error = HlsEncoder::parse(hardware).expect_err("unsupported hardware");
             assert!(
                 matches!(error, HlsError::UnsupportedEncoder { .. }),
                 "{hardware}: {error}"
@@ -2000,6 +2843,204 @@ mod tests {
         .err()
         .expect("spawn must fail");
         assert!(matches!(error, HlsError::Spawn { .. }));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn hardware_start_reports_missing_vaapi_device_and_unavailable_encoder() {
+        let directory = temp_dir("hardware-availability");
+        let missing_device = directory.join("missing-renderD128");
+
+        let hardware_probe = Arc::new(StaticEncoderProbe::with_encoders([
+            HlsEncoder::H264,
+            HlsEncoder::VaapiH264,
+        ]));
+        let (source, _) = FakeSource::new(
+            FrameFormat::rgb24(2, 2),
+            vec![Ok(rgb_frame(2, 2, 0, 0))],
+            false,
+        );
+        let error = HlsPipeline::start_with_spawner_and_probe(
+            Box::new(source),
+            HlsConfig {
+                output_dir: directory.clone(),
+                video_encoder: HlsEncoder::VaapiH264,
+                vaapi_device: missing_device.clone(),
+                ..HlsConfig::default()
+            },
+            spawner(RecordingSpawner::default()),
+            hardware_probe.clone(),
+        )
+        .err()
+        .expect("missing VAAPI device must fail");
+        assert!(matches!(error, HlsError::VaapiDevice { .. }), "{error}");
+        assert!(error.to_string().contains("missing-renderD128"));
+
+        // With a device path present but no matching ffmpeg encoder, the probe
+        // evidence decides: no fallback, no spawn.
+        let device = directory.join("renderD128");
+        std::fs::write(&device, b"").expect("fake device file");
+        let recording = RecordingSpawner::default();
+        let spawns = recording.spawns.clone();
+        let (source, _) = FakeSource::new(
+            FrameFormat::rgb24(2, 2),
+            vec![Ok(rgb_frame(2, 2, 0, 0))],
+            false,
+        );
+        let error = HlsPipeline::start_with_spawner_and_probe(
+            Box::new(source),
+            HlsConfig {
+                output_dir: directory.clone(),
+                video_encoder: HlsEncoder::VaapiH264,
+                vaapi_device: device.clone(),
+                ..HlsConfig::default()
+            },
+            spawner(recording),
+            Arc::new(StaticEncoderProbe::software()),
+        )
+        .err()
+        .expect("unproven hardware must fail");
+        assert!(
+            matches!(error, HlsError::EncoderUnavailable { .. }),
+            "{error}"
+        );
+        assert!(spawns.lock().unwrap().is_empty(), "no ffmpeg spawn");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn hardware_start_uses_vaapi_argv_when_probe_confirms_the_encoder() {
+        let directory = temp_dir("hardware-start");
+        let device = directory.join("renderD128");
+        std::fs::write(&device, b"").expect("fake device file");
+        let recording = RecordingSpawner::default();
+        let spawns = recording.spawns.clone();
+        let (source, _) = FakeSource::new(
+            FrameFormat::rgb24(2, 2),
+            vec![Ok(rgb_frame(2, 2, 0, 0x33))],
+            false,
+        );
+        let mut pipeline = HlsPipeline::start_with_spawner_and_probe(
+            Box::new(source),
+            HlsConfig {
+                output_dir: directory.clone(),
+                video_encoder: HlsEncoder::VaapiH264,
+                vaapi_device: device.clone(),
+                ..HlsConfig::default()
+            },
+            spawner(recording),
+            Arc::new(StaticEncoderProbe::with_encoders([
+                HlsEncoder::H264,
+                HlsEncoder::VaapiH264,
+            ])),
+        )
+        .expect("proven hardware starts");
+
+        let spawns = spawns.lock().unwrap().clone();
+        assert_eq!(spawns.len(), 1);
+        let argv = &spawns[0].2;
+        assert!(argv
+            .windows(2)
+            .any(|window| window == ["-c:v", "h264_vaapi"]));
+        assert!(argv.windows(2).any(
+            |window| window[0] == "-vaapi_device" && window[1] == device.display().to_string()
+        ));
+        assert!(argv
+            .windows(2)
+            .any(|window| window == ["-vf", "format=nv12,hwupload"]));
+        pipeline.stop().await.expect("stop");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn hardware_restart_never_falls_back_without_explicit_permission() {
+        let directory = temp_dir("hardware-no-fallback");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fail_on = Arc::new(Mutex::new(Vec::new()));
+        let stopped = Arc::new(Mutex::new(Vec::new()));
+        let recording = RecordingSpawner::default();
+        let spawns = recording.spawns.clone();
+        let controller = HlsController::with_spawner(
+            controller_factory(calls, fail_on, stopped),
+            HlsConfig {
+                output_dir: directory.clone(),
+                ..HlsConfig::default()
+            },
+            spawner(recording),
+        );
+        controller.start().await.expect("start controller");
+
+        let error = controller
+            .restart_with_encoder_fallback(HlsEncoder::NvencH264, None, false)
+            .await
+            .expect_err("unproven NVENC must not be assumed");
+        assert!(
+            matches!(error, HlsError::EncoderUnavailable { .. }),
+            "{error}"
+        );
+        assert!(controller.is_running(), "previous pipeline restored");
+        assert_eq!(controller.config().video_encoder, HlsEncoder::H264);
+        assert_eq!(
+            spawns.lock().unwrap().len(),
+            2,
+            "initial generation plus the restoration"
+        );
+
+        let outcome = controller
+            .restart_with_encoder_fallback(HlsEncoder::NvencH264, None, true)
+            .await
+            .expect("explicit fallback is allowed");
+        assert_eq!(outcome.requested_encoder, HlsEncoder::NvencH264);
+        assert_eq!(outcome.applied_encoder, HlsEncoder::H264);
+        assert!(outcome.fallback.is_some());
+        assert_eq!(controller.config().video_encoder, HlsEncoder::H264);
+        controller.stop().await.expect("stop");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn controller_hardware_restart_applies_the_verified_encoder() {
+        let directory = temp_dir("hardware-restart");
+        let device = directory.join("renderD128");
+        std::fs::write(&device, b"").expect("fake device file");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fail_on = Arc::new(Mutex::new(Vec::new()));
+        let stopped = Arc::new(Mutex::new(Vec::new()));
+        let recording = RecordingSpawner::default();
+        let spawns = recording.spawns.clone();
+        let controller = HlsController::with_spawner_and_probe(
+            controller_factory(calls, fail_on, stopped),
+            HlsConfig {
+                output_dir: directory.clone(),
+                vaapi_device: device.clone(),
+                ..HlsConfig::default()
+            },
+            spawner(recording),
+            Arc::new(StaticEncoderProbe::with_encoders([
+                HlsEncoder::H264,
+                HlsEncoder::VaapiH264,
+            ])),
+        );
+        controller.start().await.expect("start controller");
+
+        let outcome = controller
+            .restart_with_encoder_fallback(HlsEncoder::VaapiH264, Some(3_000), false)
+            .await
+            .expect("verified hardware restarts");
+        assert_eq!(outcome.requested_encoder, HlsEncoder::VaapiH264);
+        assert_eq!(outcome.applied_encoder, HlsEncoder::VaapiH264);
+        assert!(outcome.fallback.is_none());
+        assert_eq!(controller.config().video_encoder, HlsEncoder::VaapiH264);
+        assert_eq!(controller.config().bitrate_kbps, 3_000);
+
+        let spawns = spawns.lock().unwrap().clone();
+        assert_eq!(spawns.len(), 2);
+        let argv = &spawns[1].2;
+        assert!(argv
+            .windows(2)
+            .any(|window| window == ["-c:v", "h264_vaapi"]));
+        assert!(argv.contains(&"3000k".to_owned()));
+        controller.stop().await.expect("stop");
         let _ = std::fs::remove_dir_all(directory);
     }
 
