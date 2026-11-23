@@ -13,27 +13,43 @@ ozma-protocol = { path = "../ozma-protocol" }
 ozma-transport = { path = "../ozma-transport", default-features = false }
 ozma-client-core = { path = "../ozma-client-core" }
 ozma-transport-web = { path = "../ozma-transport-web" }
+base64 = "0.22"
 bytes = "1"
 console_error_panic_hook = "0.1"
 js-sys = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
+    "AudioBuffer",
+    "AudioBufferOptions",
+    "AudioBufferSourceNode",
     "AudioContext",
+    "AudioContextState",
     "AudioData",
+    "AudioDataCopyToOptions",
+    "AudioDataInit",
     "AudioDecoder",
     "AudioDecoderConfig",
     "AudioDecoderInit",
     "AudioDecoderSupport",
-    "AudioDataInit",
+    "AudioDestinationNode",
+    "AudioNode",
+    "AudioSampleFormat",
+    "BaseAudioContext",
     "CanvasRenderingContext2d",
+    "CodecState",
+    "console",
     "Document",
     "EncodedAudioChunk",
     "EncodedAudioChunkInit",
+    "EncodedAudioChunkType",
     "EncodedVideoChunk",
     "EncodedVideoChunkInit",
+    "EncodedVideoChunkType",
+    "HardwareAcceleration",
     "HtmlCanvasElement",
     "HtmlElement",
     "HtmlVideoElement",

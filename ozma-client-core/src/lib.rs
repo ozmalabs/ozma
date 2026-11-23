@@ -10,13 +10,20 @@
 //! - [`video`] reassembles fragmented video access units from datagrams.
 //! - [`transport`] defines the small async transport contract a client driver
 //!   needs; adapters live in the platform-specific crates.
+//! - [`session`] is the platform-neutral session driver: handshake, control
+//!   messages, media reassembly, input, and close.
 
 #![forbid(unsafe_code)]
 
 pub mod framing;
+pub mod session;
 pub mod transport;
 pub mod video;
 
 pub use framing::{encode_datagram, encode_reliable, FrameDecoder, FRAME_HEADER_LEN};
+pub use session::{
+    channel_for_kind, channel_map_for, channels_for_kind, webtransport_descriptor, ClientDriver,
+    ClientEvent, InputLatencySample, MediaPacket,
+};
 pub use transport::{ChannelTransport, TransportError};
 pub use video::{VideoAssembler, VideoAssemblyError, VideoFrame};
