@@ -1,0 +1,16 @@
+[package]
+name = "ozma-rtp"
+version = "0.1.0"
+edition = "2021"
+description = "RTP packetization and depacketization for Ozma H.264 streams."
+license = "AGPL-3.0-only"
+
+[dependencies]
+ozma-protocol = { path = "../ozma-protocol" }
+ozma-media = { path = "../ozma-media" }
+bytes = "1"
+thiserror = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

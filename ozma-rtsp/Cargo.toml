@@ -1,0 +1,20 @@
+[package]
+name = "ozma-rtsp"
+version = "0.1.0"
+edition = "2021"
+description = "RTSP server and interleaved RTP transport for Ozma."
+license = "AGPL-3.0-only"
+
+[dependencies]
+ozma-protocol = { path = "../ozma-protocol" }
+ozma-media = { path = "../ozma-media" }
+ozma-rtp = { path = "../ozma-rtp" }
+async-trait = "0.1"
+bytes = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+
+[dev-dependencies]
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
