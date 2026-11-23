@@ -9,6 +9,7 @@ Technical documentation for the Ozma software-defined KVM fabric.
 - [Security](security.md) — device identity, WireGuard mesh, enrollment, OTA signing, threat model
 - [Getting Started](getting-started.md) — prerequisites, dev harness setup, first switch
 - [Node ↔ Hermes parity plan](node-hermes-parity.md) — Rust node feature parity, remote displays, session/media architecture, UX, roadmap
+- [Plan execution status](plan-execution-status.md) — what is merged and tested so far
 
 ## Protocol Specifications
 
