@@ -82,10 +82,7 @@ impl VideoAssembler {
     }
 
     /// Feed one datagram. Returns a frame once all its fragments are present.
-    pub fn push(
-        &mut self,
-        datagram: &[u8],
-    ) -> Result<Option<VideoFrame>, VideoAssemblyError> {
+    pub fn push(&mut self, datagram: &[u8]) -> Result<Option<VideoFrame>, VideoAssemblyError> {
         let (header, payload) =
             VideoFragmentHeader::parse(datagram).ok_or(VideoAssemblyError::InvalidFragment)?;
         let key = (header.track_id, header.frame_sequence);
@@ -142,13 +139,34 @@ impl VideoAssembler {
         for fragment in pending.fragments {
             data.extend_from_slice(&fragment.expect("all fragments present"));
         }
-        self.last_completed.insert(header.track_id, header.frame_sequence);
+        self.last_completed
+            .insert(header.track_id, header.frame_sequence);
         Ok(Some(VideoFrame {
             track_id: header.track_id,
             sequence: header.frame_sequence,
             keyframe: pending.keyframe,
             data,
         }))
+    }
+
+    /// Feed one datagram, treating a non-fragment payload as a complete frame.
+    ///
+    /// The fallback keeps the probe and older test fixtures compatible; a real
+    /// node always sends the fragment header.
+    pub fn push_or_complete(
+        &mut self,
+        datagram: &[u8],
+    ) -> Result<Option<VideoFrame>, VideoAssemblyError> {
+        match self.push(datagram) {
+            Ok(frame) => Ok(frame),
+            Err(VideoAssemblyError::InvalidFragment) => Ok(Some(VideoFrame {
+                track_id: 0,
+                sequence: 0,
+                keyframe: false,
+                data: datagram.to_vec(),
+            })),
+            Err(error) => Err(error),
+        }
     }
 
     /// Number of incomplete frames currently buffered.

@@ -15,7 +15,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use ozma_client::{
     codes, fetch_transport_info, load_certificate, ClientEvent, ControllerClient,
-    NativeClientConfig, NativeSessionClient,
+    NativeClientConfig, NativeSessionClient, VideoAssembler, VideoFrame,
 };
 use ozma_protocol::{ApiError, ChannelKind, SessionOffer};
 use serde_json::json;
@@ -343,19 +343,19 @@ async fn probe(
         println!("endpoint:     {endpoint}");
     }
 
-    let first_video = wait_for_video(&mut client, timeout).await;
+    let (packet, frame) = wait_for_video_frame(&mut client, timeout).await;
 
     // Release before closing on every path. Input may be view-only, in which
     // case release_all is a no-op.
     let release = client.release_all().await;
     let close = client.close().await;
 
-    let packet = first_video?;
+    let (packet, frame) = (packet?, frame?);
     release?;
     close?;
 
     if let Some(path) = save_video.as_deref() {
-        std::fs::write(path, &packet.payload).map_err(|error| {
+        std::fs::write(path, &frame.data).map_err(|error| {
             ApiError::new(
                 codes::CLIENT_CONFIG,
                 format!("Could not write '{}': {error}", path.display()),
@@ -373,15 +373,16 @@ async fn probe(
                 "channel": packet.channel.raw(),
                 "kind": packet.kind,
                 "track_id": packet.track_id,
-                "sequence": packet.sequence,
-                "payload_len": packet.len(),
+                "sequence": frame.sequence,
+                "keyframe": frame.keyframe,
+                "payload_len": frame.data.len(),
                 "saved_to": save_video.map(|path| path.display().to_string()),
             }
         });
         print_json(&report)?;
     } else {
         println!(
-            "video:        channel {} kind {:?} track {} sequence {} payload {} bytes",
+            "video:        channel {} kind {:?} track {} sequence {} payload {} bytes (keyframe {})",
             packet.channel.raw(),
             packet.kind,
             packet
@@ -389,8 +390,9 @@ async fn probe(
                 .as_ref()
                 .map(|track| track.as_str())
                 .unwrap_or("-"),
-            packet.sequence,
-            packet.len()
+            frame.sequence,
+            frame.data.len(),
+            frame.keyframe
         );
         if let Some(path) = save_video {
             println!("saved:        {}", path.display());
@@ -400,15 +402,28 @@ async fn probe(
     Ok(())
 }
 
-async fn wait_for_video(
+async fn wait_for_video_frame(
     client: &mut NativeSessionClient,
     timeout: Duration,
-) -> Result<ozma_client::MediaPacket, ApiError> {
-    tokio::time::timeout(timeout, async {
+) -> (
+    Result<ozma_client::MediaPacket, ApiError>,
+    Result<VideoFrame, ApiError>,
+) {
+    let mut assembler = VideoAssembler::default();
+    let result = tokio::time::timeout(timeout, async {
         loop {
             match client.recv_event().await? {
                 ClientEvent::Media(packet) if packet.kind == ChannelKind::Video => {
-                    return Ok(packet);
+                    match assembler.push_or_complete(&packet.payload) {
+                        Ok(Some(frame)) => return Ok((packet, frame)),
+                        Ok(None) => continue,
+                        Err(error) => {
+                            return Err(ApiError::new(
+                                codes::CLIENT_PROTOCOL,
+                                format!("invalid video fragment: {error}"),
+                            ))
+                        }
+                    }
                 }
                 ClientEvent::Media(_) => continue,
                 ClientEvent::Error { error } => return Err(error),
@@ -416,7 +431,7 @@ async fn wait_for_video(
                     return Err(ApiError::new(
                         codes::CLIENT_DISCONNECTED,
                         format!(
-                            "The session transport closed before video arrived ({})",
+                            "The session transport closed before a full video frame arrived ({})",
                             reason.as_str()
                         ),
                     )
@@ -437,7 +452,7 @@ async fn wait_for_video(
         ApiError::new(
             codes::CLIENT_TIMEOUT,
             format!(
-                "Timed out waiting for the first video datagram after {} ms",
+                "Timed out waiting for the first full video frame after {} ms",
                 timeout.as_millis()
             ),
         )
@@ -445,7 +460,12 @@ async fn wait_for_video(
             "Check that the node has a capture source and that the session is streaming.",
         )
         .retryable()
-    })?
+    });
+    match result {
+        Ok(Ok((packet, frame))) => (Ok(packet), Ok(frame)),
+        Ok(Err(error)) => (Err(error.clone()), Err(error)),
+        Err(error) => (Err(error.clone()), Err(error)),
+    }
 }
 
 fn load_offer(input: &str) -> Result<SessionOffer, ApiError> {

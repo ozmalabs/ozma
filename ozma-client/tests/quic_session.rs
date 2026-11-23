@@ -465,3 +465,93 @@ async fn connect_with_node_api_fetches_the_der_certificate() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test]
+async fn scene_client_receives_assets_and_presents_ordered_updates() {
+    use ozma_protocol::scene::{
+        DisplayCapabilities, ImagePlacement, ImageResource, SceneCommit, SCENE_VERSION,
+    };
+
+    let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let certificate = server.certificate_der().to_vec();
+    let offer = offer_for(
+        server.local_addr().unwrap(),
+        &certificate_fingerprint(&certificate),
+    );
+    let session = session_with(view_only_permissions());
+    let png = b"\x89PNG\r\n\x1a\nfixture";
+    let producer = tokio::spawn(async move {
+        let mut transport = server.accept().await.unwrap();
+        let hello = recv_control(&mut transport).await;
+        let capabilities: DisplayCapabilities =
+            serde_json::from_value(hello["data"]["display"].clone()).unwrap();
+        assert_eq!(capabilities.scene_versions, vec![SCENE_VERSION]);
+        send_control(
+            &transport,
+            &ControlMessage::HelloAck {
+                session,
+                display: Some(capabilities.select(ChannelId::VIDEO.raw())),
+            },
+        )
+        .await;
+
+        for (revision, y) in [(1, 40), (2, 10)] {
+            send_control(
+                &transport,
+                &ControlMessage::SceneCommit {
+                    commit: SceneCommit {
+                        revision,
+                        images: vec![ImagePlacement {
+                            node_id: 1,
+                            resource_id: 7,
+                            x: 20,
+                            y,
+                            width: 320,
+                            height: 180,
+                        }],
+                    },
+                },
+            )
+            .await;
+            let _ = recv_control(&mut transport).await;
+            if revision == 1 {
+                transport
+                    .send_resource(Bytes::from(ImageResource { id: 7, png }.encode()))
+                    .await
+                    .unwrap();
+                let _ = recv_control(&mut transport).await;
+            }
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let config = NativeClientConfig {
+            scene_cache_bytes: Some(png.len()),
+            ..NativeClientConfig::default()
+        };
+        let mut client = NativeSessionClient::connect_with_config(&offer, &certificate, config)
+            .await
+            .unwrap();
+        assert_eq!(
+            client.recv_event().await.unwrap(),
+            ClientEvent::ScenePending
+        );
+        assert_eq!(client.scene().unwrap().presented().revision, 0);
+        client.send_ping(1).await.unwrap();
+        assert_eq!(
+            client.recv_event().await.unwrap(),
+            ClientEvent::ScenePresented { revision: 1 }
+        );
+        assert_eq!(client.scene().unwrap().image(7), Some(png.as_slice()));
+        client.send_ping(2).await.unwrap();
+        assert_eq!(
+            client.recv_event().await.unwrap(),
+            ClientEvent::ScenePresented { revision: 2 }
+        );
+        assert_eq!(client.scene().unwrap().presented().images[0].y, 10);
+        client.send_ping(3).await.unwrap();
+        producer.await.unwrap();
+    })
+    .await
+    .expect("scene exchange timed out");
+}

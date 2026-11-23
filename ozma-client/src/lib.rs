@@ -25,6 +25,7 @@ mod controller;
 pub mod error;
 mod http;
 mod node_api;
+pub mod scene_render;
 mod session;
 pub mod video;
 

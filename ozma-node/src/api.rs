@@ -31,8 +31,18 @@ pub async fn serve(
     };
     let backend = Arc::new(backend);
 
+    // Bind the HTTP listener first: a node that cannot serve its API must not
+    // leave a QUIC listener behind on a half-started process.
+    let listener = TcpListener::bind(("0.0.0.0", port))
+        .await
+        .with_context(|| format!("binding node API on port {port}"))?;
+
     let quic = QuicRuntime::bind(quic_port).context("binding native QUIC service")?;
-    backend.configure_transport_with_certificate(quic.endpoint(), quic.fingerprint(), quic.certificate_der());
+    backend.configure_transport_with_certificate(
+        quic.endpoint(),
+        quic.fingerprint(),
+        quic.certificate_der(),
+    );
     let quic_backend = backend.clone();
     tokio::spawn(async move {
         if let Err(error) = crate::transport::run(quic, quic_backend).await {
@@ -54,11 +64,10 @@ pub async fn serve(
 
     let dynamic: Arc<dyn NodeBackend> = backend;
     let app = ozma_api::router(dynamic);
-    let listener = TcpListener::bind(("0.0.0.0", port))
-        .await
-        .with_context(|| format!("binding node API on port {port}"))?;
     info!(port, "Node API listening");
-    axum::serve(listener, app).await.context("serving node API")?;
+    axum::serve(listener, app)
+        .await
+        .context("serving node API")?;
     Ok(())
 }
 
@@ -75,8 +84,7 @@ pub fn router_with_policy(
     capabilities: NodeCapabilities,
     consent_policy: ConsentPolicy,
 ) -> axum::Router {
-    let backend: Arc<dyn NodeBackend> =
-        Arc::new(SessionBackend::new(capabilities, consent_policy));
+    let backend: Arc<dyn NodeBackend> = Arc::new(SessionBackend::new(capabilities, consent_policy));
     ozma_api::router(backend)
 }
 
@@ -92,7 +100,12 @@ mod tests {
     async fn health_route_is_served() {
         let app = router(crate::platform::fake());
         let response = app
-            .oneshot(Request::builder().uri("/api/v1/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);

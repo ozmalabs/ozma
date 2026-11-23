@@ -182,13 +182,7 @@ pub struct VideoFragmentHeader {
 
 impl VideoFragmentHeader {
     /// Build the header for `frame_sequence` fragment `index` of `count`.
-    pub fn new(
-        keyframe: bool,
-        track_id: u8,
-        frame_sequence: u64,
-        index: u16,
-        count: u16,
-    ) -> Self {
+    pub fn new(keyframe: bool, track_id: u8, frame_sequence: u64, index: u16, count: u16) -> Self {
         Self {
             version: VIDEO_FRAGMENT_VERSION,
             keyframe,
@@ -242,7 +236,6 @@ impl VideoFragmentHeader {
         ))
     }
 }
-
 
 #[cfg(test)]
 mod fragment_tests {

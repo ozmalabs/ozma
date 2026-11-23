@@ -4,8 +4,8 @@
 //! Real V4L2/encoder probes plug in here without changing the API.
 
 use ozma_protocol::{
-    AudioCapability, Codec, EncodeCapability, EncoderBackend, InputCapability, NodeCapabilities,
-    NodeId, ResourceBudget, TransportMode, UsbCapability, VirtualDisplayCaps,
+    AudioCapability, InputCapability, NodeCapabilities, NodeId, ResourceBudget, TransportMode,
+    UsbCapability, VirtualDisplayCaps,
 };
 
 use ozma_capture::CaptureRegistry;
@@ -54,28 +54,10 @@ pub fn detect_with_registry(config: &NodeConfig, capture: &CaptureRegistry) -> N
             caps.encode.clear();
             caps.display = VirtualDisplayCaps::none();
         } else {
-            caps.encode = vec![
-            EncodeCapability {
-                codec: Codec::H264,
-                backend: EncoderBackend::V4l2M2m,
-                hardware: true,
-                max_width: 1920,
-                max_height: 1080,
-                max_fps: 30,
-                hdr: false,
-                profiles: vec!["baseline".to_owned(), "main".to_owned()],
-            },
-            EncodeCapability {
-                codec: Codec::H264,
-                backend: EncoderBackend::Software,
-                hardware: false,
-                max_width: 1920,
-                max_height: 1080,
-                max_fps: 30,
-                hdr: false,
-                profiles: vec!["baseline".to_owned()],
-            },
-            ];
+            // Advertise only the encoder this build can actually run. A
+            // hardware adapter must be added here after its probe passes,
+            // never assumed from the platform name.
+            caps.encode = vec![ozma_encode::H264SoftwareEncoder::capability()];
         }
         // The real Linux EVDI/KMS provider is still gated on the M2 spike.
         // Reporting the fake provider here would claim a monitor the node
