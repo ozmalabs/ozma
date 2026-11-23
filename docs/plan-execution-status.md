@@ -32,8 +32,9 @@ This file records what is actually merged and tested, not what is planned.
 | Video fragmentation/reassembly | Done | protocol fragment header, node splitter, client `VideoAssembler` |
 | Input release on disconnect/control loss | Done | `InputReleased` + `ReleaseAll`; QUIC test checks the sink is cleared |
 | Session offer with token | Done | `POST /api/v1/sessions` returns a QUIC offer when configured |
-| Client video decode | Done | `ozma-decode`: OpenH264 H.264 decoder, I420/RGBA/PPM output, Opus decode; real 1920×1080 frame decoded |
-| Native client | Done | `ozma-client` controller/node clients, certificate fetch, QUIC session, fragment reassembly, headless `probe` CLI, optional decoded PPM frame; desktop rendering is external |
+| Client video decode | Done | `ozma-decode`: OpenH264 H.264 decoder, I420/RGBA/PPM output, Opus decode; real 1920×1080 frame decoded and saved as PPM |
+| Controller connect flow | Done | `ozma-client connect`: controller discovery/activation → node session create/consent/start → transport certificate → QUIC media probe |
+| Native client | Done | `ozma-client` controller/node clients, connect/probe CLI, fragment reassembly, optional decoded PPM frame; desktop rendering is external |
 | Input latency measurement (<30 ms) | Not started | — |
 
 ## M2 — Remote monitor spike
