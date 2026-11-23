@@ -205,6 +205,7 @@ async fn handle_connection(mut transport: QuicTransport, backend: Arc<SessionBac
     pipeline.cancel();
     let _ = pipeline.wait().await;
     let _ = backend.manager().on_client_disconnect(&session_id, &client_id);
+    let _ = backend.input_sink().release_all();
     let _ = transport.close_with_reason(CloseReason::Normal).await;
 
     result
@@ -284,8 +285,15 @@ async fn handle_control(
     })?;
     match message {
         ControlMessage::Input { event } => {
-            if let Err(error) = backend.manager().submit_input(session_id, client_id, &event) {
-                send_control(transport, &ControlMessage::Error { error }).await?;
+            match backend.manager().submit_input(session_id, client_id, &event) {
+                Ok(()) => {
+                    if let Err(error) = backend.input_sink().submit(&event) {
+                        send_control(transport, &ControlMessage::Error { error }).await?;
+                    }
+                }
+                Err(error) => {
+                    send_control(transport, &ControlMessage::Error { error }).await?;
+                }
             }
         }
         ControlMessage::Ping { nonce } => {
@@ -293,6 +301,7 @@ async fn handle_control(
         }
         ControlMessage::Bye { reason } => {
             let _ = backend.manager().stop(session_id, reason);
+            let _ = backend.input_sink().release_all();
         }
         ControlMessage::Hello { .. } | ControlMessage::HelloAck { .. } => {}
         ControlMessage::Pong { .. } => {}

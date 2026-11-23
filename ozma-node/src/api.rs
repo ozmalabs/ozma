@@ -6,6 +6,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use ozma_api::NodeBackend;
 use ozma_auth::{ConsentPolicy, MachineClass};
+use ozma_input::HidGadgetSink;
 use ozma_protocol::NodeCapabilities;
 use tokio::net::TcpListener;
 use tracing::{error, info};
@@ -20,7 +21,15 @@ pub async fn serve(
     capabilities: NodeCapabilities,
     consent_policy: ConsentPolicy,
 ) -> Result<()> {
-    let backend = Arc::new(SessionBackend::new(capabilities, consent_policy));
+    let backend = SessionBackend::new(capabilities, consent_policy);
+    let backend = match HidGadgetSink::open() {
+        Ok(sink) => backend.with_input_sink(Arc::new(sink)),
+        Err(error) => {
+            tracing::warn!(error = %error, "HID gadget unavailable; input will be recorded but not injected");
+            backend
+        }
+    };
+    let backend = Arc::new(backend);
 
     let quic = QuicRuntime::bind(quic_port).context("binding native QUIC service")?;
     backend.configure_transport(quic.endpoint(), quic.fingerprint());
@@ -28,6 +37,18 @@ pub async fn serve(
     tokio::spawn(async move {
         if let Err(error) = crate::transport::run(quic, quic_backend).await {
             error!("Native QUIC listener exited: {error:#}");
+        }
+    });
+
+    let expiry_backend = backend.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            let ended = expiry_backend.expire();
+            if ended > 0 {
+                info!(ended, "Expired idle sessions");
+            }
         }
     });
 

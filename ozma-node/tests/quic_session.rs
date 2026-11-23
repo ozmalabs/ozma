@@ -200,6 +200,10 @@ async fn native_quic_session_authenticates_and_streams_video() {
         .unwrap();
     let pong = next_control(&mut client).await;
     assert_eq!(pong, ControlMessage::Pong { nonce: 7 });
+    assert!(
+        backend.input_sink().held().keys.contains(&0x04),
+        "the key down must reach the node input sink"
+    );
 
     client.close().await.unwrap();
 
@@ -217,6 +221,10 @@ async fn native_quic_session_authenticates_and_streams_video() {
     .await
     .expect("timed out waiting for input release on disconnect");
     assert!(released);
+    assert!(
+        backend.input_sink().held().keys.is_empty(),
+        "disconnect must release held keys in the sink"
+    );
 }
 
 #[tokio::test]

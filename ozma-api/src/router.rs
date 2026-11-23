@@ -27,8 +27,11 @@ type ApiResult<T> = Result<Json<T>, ApiFailure>;
 pub fn router(backend: Backend) -> Router {
     Router::new()
         .route("/api/v1/health", get(health))
+        .route("/health", get(health))
         .route("/api/v1/node", get(node))
         .route("/api/v1/capabilities", get(capabilities))
+        .route("/api/hestia/v1", get(hestia_capabilities))
+        .route("/api/hestia/v1/capabilities", get(hestia_capabilities))
         .route("/api/v1/diagnostics", get(diagnostics))
         .route("/api/v1/metrics", get(metrics_json))
         .route("/metrics", get(metrics_text))
@@ -92,6 +95,47 @@ async fn node(State(backend): State<Backend>) -> Json<NodeResponse> {
 
 async fn capabilities(State(backend): State<Backend>) -> Json<NodeCapabilities> {
     Json(backend.capabilities())
+}
+
+/// A small Hestia-compatible capability document. It is derived from the same
+/// node capabilities as the native API, so an existing Hestia client can
+/// discover the host without a second configuration surface.
+async fn hestia_capabilities(State(backend): State<Backend>) -> Json<serde_json::Value> {
+    let caps = backend.capabilities();
+    let codecs: Vec<&str> = caps
+        .encode
+        .iter()
+        .map(|encoder| encoder.codec.as_str())
+        .collect();
+    Json(serde_json::json!({
+        "ok": true,
+        "server_name": caps.name,
+        "base": "ozma",
+        "hestia_protocol": 1,
+        "min_client_protocol": 1,
+        "max_client_protocol": 1,
+        "server_version": backend.version(),
+        "compatibility": {
+            "gamestream": false,
+            "moonlight": false,
+            "sunshine": false,
+        },
+        "features": {
+            "virtual_display": caps.display.supported,
+            "remote_display": caps.display.supported,
+            "clipboard_sync": caps.input.clipboard,
+            "permission_system": true,
+            "native_quic": caps.transport.contains(&ozma_protocol::TransportMode::Quic),
+            "multi_session": caps.budget.max_sessions > 1,
+            "multi_track": caps.budget.max_tracks > 1,
+        },
+        "limits": {
+            "max_width": caps.capture.iter().map(|capture| capture.max_width).max().unwrap_or(0),
+            "max_height": caps.capture.iter().map(|capture| capture.max_height).max().unwrap_or(0),
+            "max_fps": caps.capture.iter().map(|capture| capture.max_fps).max().unwrap_or(0),
+            "supported_codecs": codecs,
+        },
+    }))
 }
 
 async fn diagnostics(State(backend): State<Backend>) -> Json<DiagnosticReport> {

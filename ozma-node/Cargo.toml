@@ -35,6 +35,7 @@ ozma-session  = { path = "../ozma-session" }
 ozma-auth     = { path = "../ozma-auth" }
 ozma-transport = { path = "../ozma-transport" }
 ozma-display  = { path = "../ozma-display" }
+ozma-input    = { path = "../ozma-input" }
 
 # HTTP API
 axum = { version = "0.7", features = ["json", "ws"] }

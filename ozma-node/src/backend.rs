@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
 //! Adapter from the real session manager to the API backend contract.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ozma_api::NodeBackend;
 use ozma_auth::{ConsentPolicy, TokenClaims, TokenIssuer, TokenVerifier};
 use ozma_display::{FakeVirtualDisplayProvider, VirtualDisplayProvider};
+use ozma_input::{FakeInputSink, InputSink, SharedSink};
 use ozma_protocol::{
     ApiError, CheckStatus, DiagnosticCheck, DiagnosticReport, DisplayId, DisplayMode,
     DisplayTopology, DpmsState, EndReason, NodeCapabilities, PermissionSet, RuntimeMetrics, Session,
@@ -40,6 +41,7 @@ pub struct SessionBackend {
     token_issuer: TokenIssuer,
     token_verifier: TokenVerifier,
     transport: Mutex<Option<TransportOffer>>,
+    input: SharedSink,
 }
 
 impl SessionBackend {
@@ -54,7 +56,19 @@ impl SessionBackend {
             token_issuer: TokenIssuer::new(secret),
             token_verifier: TokenVerifier::new(secret),
             transport: Mutex::new(None),
+            input: Arc::new(FakeInputSink::default()),
         }
+    }
+
+    /// Replace the input sink. The node uses a HID gadget sink in production
+    /// and a fake/recording sink in CI and local bring-up.
+    pub fn with_input_sink(mut self, sink: SharedSink) -> Self {
+        self.input = sink;
+        self
+    }
+
+    pub fn input_sink(&self) -> &dyn InputSink {
+        self.input.as_ref()
     }
 
     pub fn manager(&self) -> &SessionManager {
