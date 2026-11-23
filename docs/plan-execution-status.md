@@ -32,7 +32,8 @@ This file records what is actually merged and tested, not what is planned.
 | Video fragmentation/reassembly | Done | protocol fragment header, node splitter, client `VideoAssembler` |
 | Input release on disconnect/control loss | Done | `InputReleased` + `ReleaseAll`; QUIC test checks the sink is cleared |
 | Session offer with token | Done | `POST /api/v1/sessions` returns a QUIC offer when configured |
-| Native client | Done | `ozma-client` controller/node clients, certificate fetch, QUIC session, fragment reassembly, headless `probe` CLI; desktop rendering is external |
+| Client video decode | Done | `ozma-decode`: OpenH264 H.264 decoder, I420/RGBA/PPM output, Opus decode; real 1920×1080 frame decoded |
+| Native client | Done | `ozma-client` controller/node clients, certificate fetch, QUIC session, fragment reassembly, headless `probe` CLI, optional decoded PPM frame; desktop rendering is external |
 | Input latency measurement (<30 ms) | Not started | — |
 
 ## M2 — Remote monitor spike
@@ -70,9 +71,10 @@ OZMA_CAPTURE_TEST_DEVICE=/dev/video2 \
 - The HTTP API is a local/trusted surface; the QUIC session path is the first
   one to enforce controller-issued tokens and consent. HTTP bearer auth is next.
 - The native client library and headless probe are done; the full desktop
-  renderer/decoder is still an external client concern.
+  renderer is still an external client concern.
 - Video fragments are reassembled by `ozma_client::VideoAssembler`; the CLI
-  probe saves a complete access unit but does not decode/display it.
+  probe can decode the first access unit to a PPM image, but does not present
+  a live window or play audio.
 - The real-camera test used the USB webcam on this workstation; hardware
   encoder paths, 4K, HDR, and long-run thermal behavior are not validated.
 - The HID gadget is unavailable on this host, so input was validated through

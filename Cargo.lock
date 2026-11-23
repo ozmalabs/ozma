@@ -2720,6 +2720,8 @@ dependencies = [
  "base64 0.22.1",
  "bytes 1.11.1",
  "clap",
+ "openh264",
+ "ozma-decode",
  "ozma-protocol",
  "ozma-transport",
  "png",
@@ -2765,6 +2767,23 @@ dependencies = [
  "sha2",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "ozma-decode"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes 1.11.1",
+ "openh264",
+ "ozma-audio",
+ "ozma-encode",
+ "ozma-media",
+ "ozma-protocol",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

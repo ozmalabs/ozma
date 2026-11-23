@@ -12,6 +12,8 @@ path = "src/main.rs"
 [dependencies]
 ozma-protocol = { path = "../ozma-protocol" }
 ozma-transport = { path = "../ozma-transport" }
+ozma-decode = { path = "../ozma-decode" }
+png = "0.17"
 anyhow = { workspace = true }
 base64 = "0.22"
 bytes = { workspace = true }
@@ -22,8 +24,10 @@ serde_json = { workspace = true }
 sha2 = "0.10"
 tokio = { workspace = true }
 tracing = { workspace = true }
+thiserror = { workspace = true }
 tracing-subscriber = { workspace = true }
 urlencoding = "2"
 
 [dev-dependencies]
+openh264 = "0.9"
 tokio = { workspace = true }

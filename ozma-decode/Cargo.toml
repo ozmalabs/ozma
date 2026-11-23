@@ -1,0 +1,21 @@
+[package]
+name = "ozma-decode"
+version = "0.1.0"
+edition = "2021"
+description = "H.264 and Opus decoding plus frame conversion for Ozma clients."
+license = "AGPL-3.0-only"
+
+[dependencies]
+ozma-protocol = { path = "../ozma-protocol" }
+ozma-media = { path = "../ozma-media" }
+ozma-audio = { path = "../ozma-audio" }
+async-trait = "0.1"
+bytes = "1"
+openh264 = "0.9"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+ozma-encode = { path = "../ozma-encode" }
+tokio = { version = "1", features = ["full"] }
