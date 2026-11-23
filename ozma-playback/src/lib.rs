@@ -52,10 +52,10 @@
 #![forbid(unsafe_code)]
 
 pub mod audio;
-#[cfg(target_os = "linux")]
-pub mod pipewire;
 pub mod engine;
 pub mod error;
+#[cfg(target_os = "linux")]
+pub mod pipewire;
 pub mod video;
 
 #[cfg(feature = "window")]
@@ -68,10 +68,10 @@ pub use audio::{
     DEFAULT_QUEUE_CAPACITY as DEFAULT_AUDIO_QUEUE_CAPACITY, PLAYBACK_CHANNELS,
     PLAYBACK_SAMPLE_RATE,
 };
-#[cfg(target_os = "linux")]
-pub use pipewire::PipeWireAudioSink;
 pub use engine::{EngineConfig, PlaybackEngine, PlaybackStats};
 pub use error::{playback_codes, PlaybackError};
+#[cfg(target_os = "linux")]
+pub use pipewire::PipeWireAudioSink;
 pub use video::{NullVideoSink, PpmMode, PpmVideoSink, VideoRecord, VideoSink};
 
 #[cfg(feature = "window")]

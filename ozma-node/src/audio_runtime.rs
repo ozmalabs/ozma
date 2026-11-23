@@ -8,12 +8,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+use ozma_audio::PipeWireCapture;
 use ozma_audio::{
     AlsaCapture, AlsaCaptureConfig, AudioEncoder, AudioSource, EncodedAudio, EncoderConfig,
     FakeAudioSource, OpusEncoder,
 };
-#[cfg(target_os = "linux")]
-use ozma_audio::PipeWireCapture;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
@@ -59,7 +59,8 @@ impl AudioRuntime {
         }
         match AlsaCapture::open(AlsaCaptureConfig::default()) {
             Ok(mut capture) => {
-                match tokio::time::timeout(Duration::from_millis(1500), capture.next_frame()).await {
+                match tokio::time::timeout(Duration::from_millis(1500), capture.next_frame()).await
+                {
                     Ok(Ok(first)) => {
                         tracing::info!("Using ALSA audio capture");
                         return Self::spawn(Box::new(capture), Some(first));
@@ -85,10 +86,7 @@ impl AudioRuntime {
         Self::spawn(Box::new(FakeAudioSource::new().unlimited()), None)
     }
 
-    fn spawn(
-        mut source: Box<dyn AudioSource>,
-        first: Option<ozma_audio::AudioFrame>,
-    ) -> Self {
+    fn spawn(mut source: Box<dyn AudioSource>, first: Option<ozma_audio::AudioFrame>) -> Self {
         let source_id = source.id().to_owned();
         let (tx, rx) = mpsc::channel(32);
         let task = tokio::spawn(async move {
@@ -190,4 +188,3 @@ mod tests {
         assert_eq!(packet.channels, 2);
     }
 }
-

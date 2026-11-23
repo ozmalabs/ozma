@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use ozma_media::{
-    CaptureSource, EncodedFrame, FakeCapture, FakeEncoder, Frame, FrameFormat, MediaError, Pipeline,
-    PipelineConfig,
+    CaptureSource, EncodedFrame, FakeCapture, FakeEncoder, Frame, FrameFormat, MediaError,
+    Pipeline, PipelineConfig,
 };
 use ozma_rtsp::{EncodedVideoSource, RtspConfig, RtspServer};
 use tokio::net::TcpListener;

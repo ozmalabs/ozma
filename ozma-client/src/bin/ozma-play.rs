@@ -118,11 +118,11 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
     let video: Box<dyn VideoSink> = if cli.window {
         #[cfg(feature = "window")]
         {
-            Box::new(ozma_playback::WindowVideoSink::new(
-                "Ozma session",
-                1280,
-                720,
-            ).map_err(|error| api_error(ozma_client::codes::CLIENT_PROTOCOL, error.to_string()))?)
+            Box::new(
+                ozma_playback::WindowVideoSink::new("Ozma session", 1280, 720).map_err(
+                    |error| api_error(ozma_client::codes::CLIENT_PROTOCOL, error.to_string()),
+                )?,
+            )
         }
         #[cfg(not(feature = "window"))]
         {
@@ -132,9 +132,10 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             ));
         }
     } else if let Some(directory) = cli.frame_dir {
-        Box::new(PpmVideoSink::new(directory).map_err(|error| {
-            api_error(ozma_client::codes::CLIENT_CONFIG, error.to_string())
-        })?)
+        Box::new(
+            PpmVideoSink::new(directory)
+                .map_err(|error| api_error(ozma_client::codes::CLIENT_CONFIG, error.to_string()))?,
+        )
     } else {
         Box::new(NullVideoSink::new())
     };
@@ -147,9 +148,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
                     tracing::warn!(error = %error, "PipeWire playback unavailable; trying ALSA");
                     Some(Box::new(
                         AlsaAudioSink::connect(AlsaAudioSinkConfig::default()).map_err(
-                            |error| {
-                                api_error(ozma_client::codes::CLIENT_CONFIG, error.to_string())
-                            },
+                            |error| api_error(ozma_client::codes::CLIENT_CONFIG, error.to_string()),
                         )?,
                     ))
                 }
@@ -189,19 +188,27 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
         };
         match event {
             ClientEvent::Media(packet) if packet.kind == ChannelKind::Video => {
-                if let Some(frame) = assembler
-                    .push_or_complete(&packet.payload)
-                    .map_err(|error| api_error(ozma_client::codes::CLIENT_PROTOCOL, error.to_string()))?
+                if let Some(frame) =
+                    assembler
+                        .push_or_complete(&packet.payload)
+                        .map_err(|error| {
+                            api_error(ozma_client::codes::CLIENT_PROTOCOL, error.to_string())
+                        })?
                 {
                     let meta = DecodeMeta::new(0, frame.sequence, frame.keyframe);
-                    if let Some(decoded) = video_decoder.decode(&frame.data, meta).await
-                        .map_err(|error| api_error(ozma_client::codes::CLIENT_PROTOCOL, error.to_string()))?
+                    if let Some(decoded) =
+                        video_decoder
+                            .decode(&frame.data, meta)
+                            .await
+                            .map_err(|error| {
+                                api_error(ozma_client::codes::CLIENT_PROTOCOL, error.to_string())
+                            })?
                     {
                         let _ = engine.play_video(decoded);
                     } else {
-                        for decoded in video_decoder.flush().await
-                            .map_err(|error| api_error(ozma_client::codes::CLIENT_PROTOCOL, error.to_string()))?
-                        {
+                        for decoded in video_decoder.flush().await.map_err(|error| {
+                            api_error(ozma_client::codes::CLIENT_PROTOCOL, error.to_string())
+                        })? {
                             let _ = engine.play_video(decoded);
                         }
                     }
@@ -210,7 +217,8 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             ClientEvent::Media(packet) if packet.kind == ChannelKind::Audio => {
                 if let Some(decoder) = audio_decoder.as_mut() {
                     let pts = audio_sequence.saturating_mul(20_000);
-                    if let Ok(decoded) = decoder.decode_bytes(&packet.payload, pts, audio_sequence) {
+                    if let Ok(decoded) = decoder.decode_bytes(&packet.payload, pts, audio_sequence)
+                    {
                         let _ = engine.play_audio(decoded);
                     }
                     audio_sequence += 1;
@@ -230,7 +238,10 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
     let stats = engine.stats();
     println!(
         "played: video {} (dropped {}), audio {} (dropped {}), errors {}",
-        stats.video_presented, stats.video_dropped, stats.audio_played, stats.audio_dropped,
+        stats.video_presented,
+        stats.video_dropped,
+        stats.audio_played,
+        stats.audio_dropped,
         stats.errors
     );
     Ok(())

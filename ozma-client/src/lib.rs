@@ -27,14 +27,14 @@ pub mod cert;
 mod controller;
 pub mod error;
 pub mod frame_output;
-pub mod rdp;
 mod http;
 mod node_api;
+pub mod rdp;
 pub mod scene_render;
-pub mod xpra_peer;
 mod session;
 pub mod video;
 pub mod vnc;
+pub mod xpra_peer;
 
 pub use cert::{
     certificate_der_from_base64, certificate_fingerprint, load_certificate, normalize_fingerprint,
