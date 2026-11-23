@@ -1,4 +1,4 @@
-# Video over USB: UVC basic mode + raw Ozma vendor mode
+# Video over USB: UVC basic mode + raw Ozma vendor mode (both directions)
 
 Status: **design/plan** (not implementation).
 Related: [`rust-reconciliation-plan.md`](rust-reconciliation-plan.md),
@@ -7,16 +7,31 @@ Related: [`rust-reconciliation-plan.md`](rust-reconciliation-plan.md),
 
 ## 1. Goal
 
-The node's USB device port presents video to the **target host**:
+The node's USB device port carries video in **both directions**:
 
-- **Basic mode** — a standard UVC camera. Any OS or app sees a webcam with no
-  driver or Ozma software: MJPEG/YUY2 (and H.264 UVC where the host supports
-  it). This covers OS installers, video-call apps, browsers, and quick tests.
-- **Raw Ozma mode** — a vendor-specific USB interface carrying an efficient
-  H.264/HEVC/Opus stream with sequence numbers, keyframe flags, timestamps,
-  metadata, and control. Used when Ozma host software is running on the target.
-  Higher resolution/fps, lower latency, multiple streams/displays, and explicit
-  flow control.
+- **USB video output (node → host).** The host sees a camera/capture device:
+  - **Basic mode** — standard UVC. Any OS or app sees a webcam with no driver
+    or Ozma software: MJPEG/YUY2 (and H.264 UVC where the host supports it).
+    This covers OS installers, video-call apps, browsers, and quick tests.
+  - **Raw Ozma mode** — a vendor interface carrying H.264/HEVC/Opus with
+    sequence numbers, keyframe flags, timestamps, metadata, and control. Used
+    when Ozma host software is running. Higher resolution/fps, lower latency,
+    multiple streams/displays, and explicit flow control.
+- **USB video input (host → node).** The vendor interface is full-duplex: a
+  local client can publish its camera/microphone over USB, and the node forwards
+  it to the target (via the target-facing UVC/UAC2 functions), to the
+  controller, or to both. This is the USB equivalent of the browser/native
+  camera uplink already implemented over WebTransport.
+
+The output role serves two deployments:
+
+1. **Target-facing camera** — the port faces the target; the target sees a
+   webcam (remote camera, client-published camera, or network feed).
+2. **Local-client display** — the port faces a local client machine; the client
+   sees the node's captured target video as a UVC camera (basic) or a raw Ozma
+   device (software). This is a USB console path with no network.
+
+The video source/sink is otherwise source-agnostic.
 
 The video source is source-agnostic:
 
@@ -62,13 +77,16 @@ Configuration 1
   ├─ HID keyboard  (/dev/hidg0)          existing
   ├─ HID mouse     (/dev/hidg1)          existing
   ├─ UAC2 speaker/mic                    existing
-  ├─ UVC camera                          new (basic mode)
-  └─ Vendor (FunctionFS)                 new (raw mode)
-       EP IN  bulk   video
-       EP IN  bulk   audio/events
-       EP OUT bulk   control/input
+  ├─ UVC camera                          output (basic mode, device → host)
+  └─ Vendor (FunctionFS)                 bidirectional (raw mode)
+       EP IN  bulk   video / audio / events      node → host (output)
+       EP OUT bulk   control / input / camera    host → node (input)
        EP IN  interrupt (optional events)
 ```
+
+UVC is inherently one-way (device → host). Anything the host must send —
+client camera, microphone, control, input — uses the vendor OUT endpoint. This
+keeps one descriptor set for both the output and input roles.
 
 - UVC is an IAD group with a streaming interface and alternate settings.
 - UVC creates a V4L2 **output** node (`/dev/videoN`); a userspace feeder owns
@@ -80,6 +98,27 @@ Configuration 1
   macOS uses IOKit/libusb on the unclaimed vendor interface.
 - VID/PID, serial, and strings are stable and documented. A device serial is
   required for multi-node hosts.
+
+### 3.0 Port roles and topology
+
+A USB device port faces exactly one host. Choose the role per port:
+
+| Role | Port faces | Node sends | Node receives |
+|---|---|---|---|
+| Target camera | target | UVC + raw video/audio | — (input stays on HID/UAC2) |
+| Local-client display | client laptop/PC | UVC + raw video/audio | raw control; optional client camera/mic |
+| Full local console | client | UVC + raw video/audio | raw control, keyboard/mouse, client camera/mic |
+
+- If the board has **one** device-capable OTG port (e.g. RK3588S USB-C), it can
+  serve one role at a time. The Magic Dock use case (USB-C to the laptop,
+  HDMI capture from it) is the **target camera** role.
+- A **local-client display** role needs a second device-capable port or a
+  deliberate role switch; it cannot share the same port with target HID/audio.
+  Validate the board's OTG/host mux before promising both simultaneously.
+- With two device ports, one can face the target (HID/UAC2/UVC) and one the
+  client (UVC/raw), enabling a true no-network USB KVM console.
+- Document the supported topology per hardware model rather than implying all
+  roles are simultaneous.
 
 ### 3.1 UVC basic modes
 
@@ -121,10 +160,18 @@ UsbMessageHeader {
 Control messages (JSON payloads, or a compact binary form):
 
 - `hello { version, client, capabilities }`
-- `caps { codecs, modes, max_frame, displays, audio }`
+- `caps { codecs, modes, max_frame, displays, audio, directions }`
 - `select { stream, codec, width, height, fps, bitrate, display }`
 - `selected { ... }`, `start`, `stop`, `keyframe_request`, `stats`,
   `keepalive`, `error`
+- Host → node: `client_camera { codec, width, height, fps }`,
+  `client_mic { sample_rate, channels }`, `client_camera_stop`,
+  `client_mic_stop`, plus input/control messages when the host is an Ozma
+  client.
+
+`directions` advertises which media the host may send (`none`, `camera`,
+`camera+mic`). A node that cannot accept host video (no target UVC/UAC2 or no
+controller sink) rejects the request with a typed error.
 
 Media:
 
@@ -132,8 +179,11 @@ Media:
   over bulk). Chunk very large frames at ~1 MiB to keep latency bounded.
 - Video: H.264/HEVC/AV1 Annex B, keyframe flag and sequence preserved.
 - Audio: Opus packets.
-- Flow control: a bounded queue with credit/window feedback; drop non-keyframes
-  before keyframes; never block the encoder.
+- Host → node: framed camera access units and Opus packets on the OUT endpoint,
+  with the same header; the node validates codec/resolution and forwards them
+  to `ClientCaptureHub` or the target-facing UVC/UAC2 sink.
+- Flow control both ways: bounded queues with credit/window feedback; drop
+  non-keyframes before keyframes; never block the encoder or the host.
 - Reconnect: `hello` resets the stream; the sender starts with a keyframe.
 
 Mode arbitration:
@@ -159,6 +209,10 @@ New crate `ozma-usb` (or `ozma-node/src/usb/`) with:
 - `source.rs` — select a video source: `LocalCamera`, `ClientCaptureHub`
   (browser/native uplink), `NetworkFeed`, `DisplayCapture`; source changes are
   allowed while running.
+- `sink.rs` — accept host-published camera/mic from the vendor OUT endpoint and
+  route it to the target-facing UVC/UAC2 functions, `ClientCaptureHub`, the
+  controller, or a combination. Apply the same authorization and bounds as the
+  network camera uplink.
 - `encode.rs` — MJPEG encoder (ffmpeg initially, then a Rust/V4L2 M2M path) and
   reuse of the existing H.264/Opus encoders.
 - `config.rs` — `--usb-video`, mode list, max fps, source selection, UDC name,
@@ -169,8 +223,11 @@ New crate `ozma-usb` (or `ozma-node/src/usb/`) with:
 - `--profile hardware|vm|desktop` plus a `usb-video` feature.
 - The USB video output subscribes to the same encoded/raw frame stream as the
   network transports; it does not fork the capture pipeline.
-- The camera uplink path becomes end-to-end: browser/native camera →
-  `ClientCaptureHub` → USB UVC to the target (and/or controller stream).
+- The camera uplink path becomes end-to-end in either direction:
+  browser/native camera → `ClientCaptureHub` → USB UVC to the target, and
+  host camera over USB → `ClientCaptureHub` → target/controller.
+- The output path reuses the same capture/encode stream as the network
+  transports: target display/camera → UVC basic and/or raw vendor.
 - Metrics: UVC frames/drops, raw bytes/credits, reconnects, mode switches.
 
 Gadget setup is owned by the Rust service, not by an external missing script.
@@ -187,8 +244,10 @@ The kernel build script gains UVC options and V4L2/media dependencies.
   - `hello`/`caps`/`select`; receive frames; reuse `ozma-decode` and
     `ozma-playback`;
   - send input/control over the OUT endpoint when the host is an Ozma client;
+  - send host camera/mic (`client_camera`, `client_mic`) when requested and
+    permitted, reusing the existing camera/encoder code;
   - expose a `ChannelTransport`-like adapter so the existing session driver can
-    run over USB instead of QUIC.
+    run over USB instead of QUIC, in either direction.
 - **Optional browser path:** WebUSB on Chromium for the vendor interface, no
   native driver. Not required for the first release.
 - **Optional target-side agent:** an Ozma agent inside the target can select
@@ -249,8 +308,12 @@ CONFIG_USB_F_UAC2=y
 - **Raw protocol:** Rust host client over dummy_hcd; H.264 1080p30; sequence and
   keyframe continuity; credit/backpressure; reconnect; no-client fallback to
   UVC.
-- **End-to-end:** browser/native camera → node hub → UVC webcam visible inside
-  a QEMU target VM; audio via UAC2.
+- **End-to-end (output):** browser/native camera → node hub → UVC webcam
+  visible inside a QEMU target VM; audio via UAC2. Captured target display →
+  UVC/raw on a local-client port.
+- **End-to-end (input):** host camera/mic over the vendor OUT endpoint →
+  target-facing UVC/UAC2 visible inside a QEMU target VM; reject when the node
+  has no sink.
 - **Soak:** 1-hour streams for UVC and raw; memory/fd/handle leaks; UDC
   unbind/rebind.
 - **Security:** oversized length, unknown kind, bad version, fuzz corpus.
@@ -259,9 +322,9 @@ CONFIG_USB_F_UAC2=y
 
 | Phase | Deliverable | Estimate |
 |---|---|---|
-| A | Kernel config + configfs composition + UVC feeder; MJPEG 720p30 from the local camera; dummy_hcd and real UDC tests | 2–3 wk |
-| B | FunctionFS vendor interface + raw protocol + Rust host transport; H.264 1080p30; mode negotiation and UVC fallback | 3–4 wk |
-| C | Client-published camera source, UAC2 audio, reconnect, Windows WinUSB descriptors, macOS/Linux validation | 2–3 wk |
+| A | Kernel config + configfs composition + UVC feeder (output); MJPEG 720p30 from the local camera; dummy_hcd and real UDC tests | 2–3 wk |
+| B | FunctionFS vendor interface (output) + raw protocol + Rust host transport; H.264 1080p30; mode negotiation and UVC fallback | 3–4 wk |
+| C | Bidirectional vendor: host camera/mic input, node routing to target UVC/UAC2 or controller; UAC2 audio; reconnect; Windows WinUSB descriptors; macOS/Linux validation | 3–4 wk |
 | D | Hardware integration (OPi5/Zero 3), PD/mux validation, packaging, docs, CI | 2 wk |
 
 Roughly **9–12 engineer-weeks** for one contributor; A and B can overlap once
@@ -277,6 +340,9 @@ the gadget composition is stable.
   after 3 s still gives UVC.
 - **U3:** a browser-published camera appears as a webcam in a QEMU target VM
   and in Chrome inside that VM; UAC2 audio works alongside.
+- **U3b:** a host-published camera/mic over USB appears as a webcam/microphone
+  in the target (or in a second client), with the same authorization and bounds
+  as the network camera uplink.
 - **U4:** Windows auto-binds WinUSB (no driver install) and macOS/Linux clients
   work; install docs and CI cover the supported matrix.
 
@@ -290,6 +356,8 @@ the gadget composition is stable.
 | Windows vendor interface | Microsoft OS 2.0 descriptors for WinUSB; test on a clean Windows image |
 | Endpoint/interface budget with HID+UAC2 | Reserve a fixed composition; make functions configurable and validate descriptors on the UDC |
 | OTG/host mux on RK3588S | Per-board validation; fail clearly if the UDC disappears |
+| One device port cannot face target and client at once | Document role selection; require a second device port for simultaneous roles |
+| Host→node video path increases descriptor/bandwidth pressure | Separate vendor OUT endpoint; explicit `directions` capability; reject unsupported sinks |
 | Raw protocol drift | Versioned header; reuse `ozma-protocol` types; fuzz and golden tests |
 | Security of a local USB channel | Handshake/token, bounded lengths, no cross-session access, no HID tunneling by default |
 
