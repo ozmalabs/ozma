@@ -26,9 +26,9 @@ row itself is the Rust behavior under test.
   `ozma-node/tests/parity/`. It runs without a HID gadget, hypervisor, QMP
   socket, Python process, or privileged port.
 - Current run (2026-11-24): `cargo test -p ozma-node --test parity` →
-  **11 passed, 0 failed**; `cargo test -p ozma-node` → **126 passed,
-  0 failed, 1 ignored**; `cargo test --workspace` → **1159 passed, 0 failed,
-  11 ignored**.
+  **14 passed, 0 failed**; `cargo test -p ozma-node` → **150 passed,
+  0 failed, 2 ignored**; `cargo test --workspace` → **1183 passed, 0 failed,
+  12 ignored**.
 - Fake QMP support: `ozma-qmp/tests/common/` provides a greeting/capabilities
   server and an SCM_RIGHTS `getfd` peer. `ozma-capture/tests/qmp_display.rs`
   and `ozma-power/tests/qmp_power.rs` reuse the same protocol shape for their
@@ -40,7 +40,7 @@ row itself is the Rust behavior under test.
 |---|---|---|---|---|
 | Registration — mDNS TXT shape | `partial` | `registration_payload` produces the controller's `DirectRegisterRequest` fields from the mDNS TXT map: required `id`/`host`/`port`, string-typed controller fields, ports and JSON lists, `machine_class`, `capture_device`, `display_outputs`, `pci_devices`, `audio_type`, `audio_sink`, `vm_guest_ip`, `stream_port`/`stream_path`. TXT `host` cannot replace the resolved host. | `cargo test -p ozma-node --test parity registration_` (3 tests) | No test browses/advertises real mDNS. `mdns::advertise` and controller-side discovery remain untested here. |
 | Registration — direct POST + heartbeat | `green` | The real `registration::register` POSTs to an in-process axum fake controller; the captured JSON equals `tests/parity/registration_baseline.json`. The real `heartbeat_loop` sends `{"node_id": ...}` and the fake controller captures it. | `cargo test -p ozma-node --test parity fake_controller_receives_registration_and_heartbeat` | The peer is a fixture-shaped fake, not the live Python controller. Live controller POST is a later opt-in run. |
-| HTTP compat surface — `/health`, `/api/v1/connection`, `/power/*` | `green` | Keys and JSON types match `tests/parity/http_baseline.json`; health reports `ok`, node id, protocol major, session count; connection reports ports, sink kind, HID stats, power summary, input sink availability/injection, codec state, `hls` (`not-configured`/`running`/`failed`), `hls_error`, `audio`, and `webrtc`; `/power/state` and `/power/{action}` are bearer-guarded and covered with a fake backend. | `cargo test -p ozma-node --test parity health_and_connection_surface_match_baseline connection_reports_a_failed_hls_pipeline_with_an_error`, `cargo test -p ozma-node` (compat tests) | WebRTC routes remain absent. `/stream/*` auth behavior is asserted in the `ozma-node` API unit test, not yet against the live controller. |
+| HTTP compat surface — `/health`, `/api/v1/connection`, `/power/*` | `green` | Keys and JSON types match `tests/parity/http_baseline.json`; health reports `ok`, node id, protocol major, session count; connection reports ports, sink kind, HID stats, power summary, input sink availability/injection, codec state, `hls` (`not-configured`/`running`/`failed`), `hls_error`, `webrtc` (`not-configured`/`running`/`failed`), `webrtc_error`, and `audio`; `/power/state` and `/power/{action}` are bearer-guarded and covered with a fake backend. | `cargo test -p ozma-node --test parity health_and_connection_surface_match_baseline connection_reports_a_failed_hls_pipeline_with_an_error webrtc_routes_report_a_failed_helper_without_claiming_running`, `cargo test -p ozma-node` (compat tests) | WebRTC status is asserted with a fake helper, not a live GStreamer worker. `/stream/*` auth behavior is asserted in the `ozma-node` API unit test, not yet against the live controller. |
 | HTTP compat surface — `/input/key`, `/input/mouse`, `/input/type` | `green` | Key requests take Python-compatible Linux evdev `keycode` + `down` and map through `ozma_input::linux_keycode_to_hid_usage` into `InputEvent::Key` on the one shared sink; unknown/out-of-range keycodes are typed 400s and a duplicate press is accepted without changing held state. Mouse requests take `x`/`y` in `0..=32767`, `action` (`move`/`press`/`release`/`click`), and button `0`/`1`→left, `2`→right, `4`→middle, `8`→back, `16`→forward; click emits press, a 20 ms hold, and release. Typing maps printable ASCII, newline, and tab to HID usages with an explicit left shift, rejects non-ASCII/oversized text (4096 chars), and sleeps 15 ms between characters. Responses include `"injected": false` for a recording-only sink; a missing sink is 503. | `cargo test -p ozma-node --lib controller_compat::tests::input_`, `cargo test -p ozma-node --lib controller_compat::tests::text_mapping_` | No real QMP/uinput/gadget injection in CI; text is US-layout ASCII only; click/typing delays are fixed bounds rather than guest-acknowledged pacing. |
 | HTTP compat surface — `/codec` | `partial` | `GET /codec` reports `current_encoder`, `override: null`, and `available` derived from the node's advertised video encode capabilities; a node without video returns `null`/empty rather than inventing an encoder. `POST /codec` returns a typed 501 (`codec override is not implemented`) with remediation. | `cargo test -p ozma-node --lib controller_compat::tests::codec_route_` | No runtime encoder switching: applying an override requires restarting the capture/encode pipeline and is deliberately not faked. |
 | Audio — `/audio/apply`, `/audio/remove`, `/audio/play`, `/audio/stop` compatibility | `not-implemented` | Every route returns a typed 501 `{ok:false, code:"audio-routing-unsupported", error:"audio routing is not implemented on this node"}` plus remediation instead of a success-shaped no-op; `/api/v1/connection` reports `audio: "not-implemented"`. | `cargo test -p ozma-node --lib controller_compat::tests::audio_routes_are_explicitly_not_implemented` | PipeWire routing, room-correction profile apply/remove, reference-track playback, and per-VM audio remain unimplemented. The UAC2 gadget bridge is not this surface. |
@@ -54,13 +54,14 @@ row itself is the Rust behavior under test.
 | Capture — v4l2loopback VirtualCapture | `partial` | Side-effect-free sysfs label discovery, `VirtualCapture` command/lifecycle with injected runner, provider open/rollback, and stop cleanup. | `cargo test -p ozma-capture` | Real v4l2loopback/ffmpeg test is `#[ignore]`; provider is opt-in. |
 | Capture — D-Bus framebuffer / VNC | `not-implemented` | No Rust D-Bus or VNC display source. | — | Add `DBusDisplayProvider`/`VncDisplayProvider` in a later Phase 1/2 slice. |
 | VM display model | `partial` | `VmConsole`/`VmDisplayTopology` model for QMP/D-Bus/VNC/Looking Glass consoles, primary selection, left-to-right placements, validation, and `Console_N` ids. | `cargo test -p ozma-display` (58 passed, 14 VM tests) | Model only; not wired to a provider/API yet. |
-| Stream — HLS `/stream/*` and WebRTC controller proxy | `partial` | `--hls` starts a real capture → ffmpeg `rawvideo` → HLS pipeline (`ozma-node/src/hls.rs`) and serves the output directory at `/stream/*`. `rgb24` is passed through and `bgra` is converted; other formats are rejected with a typed error. `/api/v1/connection` reports `hls: "running"` only once `stream.m3u8` exists, otherwise `"not-configured"` or `"failed"` plus `hls_error`; WebRTC stays `"not-implemented"` and `/webrtc/*` stays 404. `/stream` is mounted outside the bearer guard (after the guard layer is applied) because `controller/api.py::stream_hls_proxy` fetches it without credentials; control endpoints stay guarded and `ServeDir` rejects path traversal. | `cargo test -p ozma-node --test parity health_and_connection_surface_match_baseline connection_reports_a_failed_hls_pipeline_with_an_error stream_files_are_served_only_from_the_configured_directory webrtc_routes_are_absent_rather_than_faked`, `cargo test -p ozma-node --lib hls::`, `cargo test -p ozma-node api::tests::hls_is_served_without_bearer_but_control_stays_guarded` | No real ffmpeg or live controller proxy in the default suite (real-ffmpeg test is `#[ignore]`, `OZMA_FFMPEG_TEST=1`). HLS playlist advance/segment rotation against a live QEMU VM is not asserted; the fixed argv does not pass `-hls_flags delete_segments`, so retained segments stay on disk. WebRTC (`/webrtc/offer`, `/webrtc/bitrate`) remains missing. |
+| Stream — HLS `/stream/*` | `partial` | `--hls` starts a real capture → ffmpeg `rawvideo` → HLS pipeline (`ozma-node/src/hls.rs`) and serves the output directory at `/stream/*`. `rgb24` is passed through and `bgra` is converted; other formats are rejected with a typed error. `/api/v1/connection` reports `hls: "running"` only once `stream.m3u8` exists, otherwise `"not-configured"` or `"failed"` plus `hls_error`. `/stream` is mounted outside the bearer guard (after the guard layer is applied) because `controller/api.py::stream_hls_proxy` fetches it without credentials; control endpoints stay guarded and `ServeDir` rejects path traversal. | `cargo test -p ozma-node --test parity health_and_connection_surface_match_baseline connection_reports_a_failed_hls_pipeline_with_an_error stream_files_are_served_only_from_the_configured_directory`, `cargo test -p ozma-node --lib hls::`, `cargo test -p ozma-node api::tests::hls_is_served_without_bearer_but_control_stays_guarded` | No real ffmpeg or live controller proxy in the default suite (real-ffmpeg test is `#[ignore]`, `OZMA_FFMPEG_TEST=1`). HLS playlist advance/segment rotation against a live QEMU VM is not asserted; the fixed argv does not pass `-hls_flags delete_segments`, so retained segments stay on disk. |
+| Stream — WebRTC `/webrtc/offer`, `/webrtc/bitrate` (external helper) | `partial` | `--webrtc-helper` supervises the existing GStreamer/Python worker: argv `[program] [script] --sock --shm --width --height --fps`, a bounded wait for the Unix socket, newline-delimited JSON signaling (`{"type":"offer","sdp":...}` → `{"type":"answer","sdp":...}`), and an fps-paced feeder that converts `rgb24`/`bgra` frames to packed BGRA and replaces `shm_path` atomically. Other formats are typed errors. WebRTC is disabled without a helper (`not-configured`); a configured helper that fails is `failed` with `webrtc_error`, never `running`. `/webrtc/offer` and `/webrtc/bitrate` are mounted through the compat extra router behind the bearer guard; without a helper they answer typed 503s. `bitrate` sends `{"type":"bitrate","bitrate":<bps>}` and requires an acknowledgement: the current worker sends none, so the route returns a typed 502 rather than a fake success. | `cargo test -p ozma-node --lib webrtc::`, `cargo test -p ozma-node --test parity webrtc_`, `cargo test -p ozma-node --lib controller_compat::tests::webrtc_` | Helper-first only: no native `webrtc-rs`/`str0m`, no WebRTC audio, no RTCP/ICE tuning. WebRTC opens its own source from the same capture registry, so a device that cannot be opened twice alongside HLS reports `failed` rather than sharing a frame tap. No live GStreamer/Python helper or controller `/api/v1/streams/{node}/webrtc` run in CI; the real-helper test is `#[ignore]` and gated by `OZMA_WEBRTC_GS_SCRIPT`. |
 | Power — state/action endpoints | `partial` | `ozma-power` `QmpPower` and `LibvirtPower` (virsh argv/status/fallbacks), `/power/state`, `/power/{action}`, `/api/v1/connection` power summary, bearer guard, and fake-backend/fake-QMP tests. | `cargo test -p ozma-power` (34 passed, 1 ignored), `cargo test -p ozma-node` | No real QEMU/libvirt test; QMP `stop` is a pause, so force-off falls back to ACPI powerdown. |
 | Audio — named PipeWire target/monitor | `partial` | `AudioTarget { Default, Object, NodeId, SinkMonitor }`, `<sink>.monitor` naming/validation, `PipeWireCapture::open_target/open_sink_monitor`, and `StreamTarget::monitor_for_sink`. | `cargo test -p ozma-audio -p ozma-pipewire` (92 passed, 1 ignored) | No sink/monitor creation or routing, no live PipeWire test, no per-VM audio provisioning. |
 | Audio — per-VM sink monitor, non-silent decode, mic path | `not-implemented` | Only registration fields (`audio_type`, `audio_sink`) are asserted. The UAC2 gadget bridge is not a VM audio-routing parity test. | `cargo test -p ozma-node --test parity registration_payload_matches_python_controller_baseline` (fields only) | Phase 2: per-VM sink routing, decoded-audio assertion, mic path. |
 | VM supervision — per-VM `ozma-node` process, ports, restart | `partial` | `ozma-softnode` supervises real `ozma-node --profile vm` subprocesses: deterministic HID/HTTP ports, QMP/capture/power/input flags, single-socket QMP input fallback, start/stop/restart with bounded backoff, unchanged-VM reuse, and shutdown/reap. | `cargo test -p ozma-softnode` (20 passed) | Subprocess transition only; no real QEMU/libvirt test. |
 | VM provisioning — QMP/D-Bus/evdev/audio, managed without edits | `not-implemented` | No QMP/display socket creation, libvirt XML edits, D-Bus p2p, evdev `input-linux`, or per-VM audio routing. | — | Port `_provision_vm` and the remaining device/audio provisioning into `ozma-softnode`. |
-| Native plane — workspace, QUIC/WebTransport | `green` | Full workspace test suite, including existing QUIC/WebTransport and browser-capture tests, passed. | `cargo test --workspace` (1159 passed, 0 failed, 11 ignored) | Keep green. Hardware-dependent tests remain `#[ignore]`/opt-in. |
+| Native plane — workspace, QUIC/WebTransport | `green` | Full workspace test suite, including existing QUIC/WebTransport and browser-capture tests, passed. | `cargo test --workspace` (1183 passed, 0 failed, 12 ignored) | Keep green. Hardware-dependent tests remain `#[ignore]`/opt-in. |
 | Regression — controller pytest, demo scenario, clean-host install | `not-run` | Not executed in this Phase 0 work. | — | Run the unmodified controller pytest suite, the demo, and a clean-host install before claiming Gate 2/3. |
 
 ## How to run
@@ -85,8 +86,9 @@ Phase 1/2 additions and their evidence:
 | `ozma-capture` QMP/LookingGlass/VirtualCapture | `cargo test -p ozma-capture` (87 unit + 5 QMP integration) |
 | `ozma-display` VM console model | `cargo test -p ozma-display` (58 passed) |
 | `ozma-audio` named PipeWire target | `cargo test -p ozma-audio -p ozma-pipewire` (92 passed, 1 ignored) |
-| `ozma-node` VM profile + `/power/*` + compat input/codec | `cargo test -p ozma-node` (126 passed, 1 ignored) |
-| `ozma-node` local HLS pipeline + `/stream/*` | `cargo test -p ozma-node --lib hls::` (11 passed, 1 ignored); `cargo test -p ozma-node --test parity` (11 passed) |
+| `ozma-node` VM profile + `/power/*` + compat input/codec | `cargo test -p ozma-node` (150 passed, 2 ignored) |
+| `ozma-node` local HLS pipeline + `/stream/*` | `cargo test -p ozma-node --lib hls::` (11 passed, 1 ignored); `cargo test -p ozma-node --test parity` (14 passed) |
+| `ozma-node` WebRTC external-helper surface | `cargo test -p ozma-node --lib webrtc::` (17 passed, 1 ignored); `cargo test -p ozma-node --test parity webrtc_` (4 passed) |
 | `ozma-softnode` per-VM subprocess supervisor | `cargo test -p ozma-softnode` (20 passed) |
 
 The parity target prints one test per row above:
@@ -101,15 +103,22 @@ udp_hid_listener_records_and_injects_baseline_events
 release_on_disconnect_contract_clears_held_input
 health_and_connection_surface_match_baseline
 connection_reports_a_failed_hls_pipeline_with_an_error
-webrtc_routes_are_absent_rather_than_faked
+webrtc_routes_report_not_configured_rather_than_404
+webrtc_routes_report_a_failed_helper_without_claiming_running
+webrtc_offer_proxies_to_a_fake_unix_socket_helper
+webrtc_bitrate_is_not_reported_as_success_without_an_ack
 stream_files_are_served_only_from_the_configured_directory
 ```
 
-The default parity target does not run ffmpeg. The HLS unit tests inject a
-recording `FrameSink`/`FfmpegSpawner`; the one real-ffmpeg test is `#[ignore]`:
+The default parity target does not run ffmpeg or a GStreamer/Python helper. The
+HLS unit tests inject a recording `FrameSink`/`FfmpegSpawner`; the WebRTC unit
+and parity tests inject a fake `HelperSpawner`/`Signaler`. The real-helper and
+real-ffmpeg tests are `#[ignore]`:
 
 ```bash
 OZMA_FFMPEG_TEST=1 cargo test -p ozma-node --lib hls::tests::real_ffmpeg_writes_a_playlist -- --ignored
+OZMA_WEBRTC_GS_SCRIPT=/path/to/gst_webrtc_worker.py \
+  cargo test -p ozma-node --lib webrtc::tests::real_gstreamer_helper_starts_and_stops -- --ignored
 ```
 
 Fixtures:
@@ -118,7 +127,7 @@ Fixtures:
 |---|---|
 | `ozma-node/tests/parity/registration_baseline.json` | `node/node.py` `run()` TXT and `_direct_register()`; `controller/api.py` `DirectRegisterRequest` and `register_node()` |
 | `ozma-node/tests/parity/hid_v1_baseline.json` | `softnode/evdev_input.py` `EvdevHIDTranslator.handle_keyboard` / `handle_mouse` / `handle_mouse_relative` |
-| `ozma-node/tests/parity/http_baseline.json` | Controller-facing `/health` and `/api/v1/connection` surface, including the opt-in HLS status tokens (`not-configured`/`running`/`failed`) and `hls_error` |
+| `ozma-node/tests/parity/http_baseline.json` | Controller-facing `/health` and `/api/v1/connection` surface, including the opt-in HLS and WebRTC status tokens (`not-configured`/`running`/`failed`) and their `*_error` fields |
 | `ozma-node/tests/parity/README.md` | Source notes and the future-work statement |
 
 The fixtures are hand-written from the Python baseline. They are **not**
@@ -134,6 +143,12 @@ external processes:
 - **Real QEMU/libvirt:** QMP sockets, D-Bus framebuffer, VNC, KVMFR. Phase 1
   tests should be marked `#[ignore]` or environment-gated, with a fake-QMP
   fixture for the default run.
+- **Real WebRTC helper:** GStreamer + the Python worker from `softnode/`. Set
+  `OZMA_WEBRTC_GS_SCRIPT=/path/to/gst_webrtc_worker.py` (and optionally
+  `OZMA_WEBRTC_GS_PYTHON`) and run the `#[ignore]`d
+  `webrtc::tests::real_gstreamer_helper_starts_and_stops` test. A live
+  controller negotiation (`POST /api/v1/streams/{node}/webrtc`) is not run in
+  CI.
 - **Live Python comparison:** start `node/node.py` (or the
   `softnode/evdev_input.py` translator) against the same fake controller and
   diff its captured JSON/events against these fixtures. This remains future
@@ -152,7 +167,10 @@ remain `#[ignore]`/environment-gated.
 
 ## Remaining Gate 2 gaps
 
-- WebRTC `/webrtc/offer`/`/webrtc/bitrate` (GStreamer helper first, native later).
+- Native WebRTC (`webrtc-rs`/`str0m`) and WebRTC audio. `/webrtc/offer` and
+  `/webrtc/bitrate` are implemented through a supervised external GStreamer
+  helper; bitrate changes are not honoured by the current worker and surface as
+  typed 502s. No live helper/controller negotiation is run in CI.
 - Live-controller HLS proxy run: the node pipeline and `/stream/*` are
   unit/route tested, but the unmodified controller has not proxied a Rust node's
   playlist in this workspace.

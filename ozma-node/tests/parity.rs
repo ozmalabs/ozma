@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
@@ -18,16 +19,23 @@ use axum::routing::post;
 use axum::{Json, Router};
 use http_body_util::BodyExt;
 use ozma_input::{FakeInputSink, InputSink, RecordingSink, SharedSink};
+use ozma_media::{CaptureSource, Frame, FrameFormat, MediaError};
 use ozma_node::api;
 use ozma_node::controller_compat::{
-    connection_router, CompatStats, ConnectionInfo, ConnectionState, HidPacketDecoder,
-    HidUdpListener, SINK_FAKE_RECORDING,
+    compat_router, connection_router, CompatStats, ConnectionInfo, ConnectionState,
+    HidPacketDecoder, HidUdpListener, SINK_FAKE_RECORDING,
 };
 use ozma_node::hls::{stream_router, HlsStatus};
+use ozma_node::webrtc::{
+    HelperSpawner, Signaler, SpawnedHelper, WebRtcConfig, WebRtcControl, WebRtcError, WebRtcHelper,
+};
 use ozma_node::{platform, registration};
 use ozma_protocol::input::{InputEvent, KeyModifiers, PointerButton};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::UnixStream;
 use tower::ServiceExt;
 
 const NODE_ID: &str = "parity-node._ozma._udp.local.";
@@ -566,9 +574,10 @@ async fn health_and_connection_surface_match_baseline() {
     assert!(connection["hls_error"].is_null());
     assert_eq!(
         connection["webrtc"],
-        baseline["stream_states"]["webrtc_not_implemented"]
+        baseline["stream_states"]["webrtc_not_configured"]
     );
-    assert_eq!(connection["webrtc"], "not-implemented");
+    assert_eq!(connection["webrtc"], "not-configured");
+    assert!(connection["webrtc_error"].is_null());
 }
 
 #[tokio::test]
@@ -590,31 +599,335 @@ async fn connection_reports_a_failed_hls_pipeline_with_an_error() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(connection["hls"], "failed");
     assert_eq!(connection["hls_error"], "no capture source is available");
-    assert_eq!(connection["webrtc"], "not-implemented");
+    assert_eq!(connection["webrtc"], "not-configured");
 }
 
 #[tokio::test]
-async fn webrtc_routes_are_absent_rather_than_faked() {
-    let app = api::router(platform::fake());
+async fn webrtc_routes_report_not_configured_rather_than_404() {
+    let state = ConnectionState::new(
+        ConnectionInfo::new(
+            NODE_ID,
+            "hardware",
+            HTTP_PORT,
+            QUIC_PORT,
+            HID_PORT,
+            SINK_FAKE_RECORDING,
+        ),
+        CompatStats::default(),
+    );
+    let app = compat_router(state);
 
-    for (method, uri) in [("POST", "/webrtc/offer"), ("GET", "/webrtc/bitrate")] {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(method)
-                    .uri(uri)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+    let (status, body) = post_json(
+        &app,
+        "/webrtc/offer",
+        json!({"sdp": "v=0 parity offer", "type": "offer"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["code"], "webrtc-not-configured");
+
+    let (status, body) = post_json(&app, "/webrtc/bitrate", json!({"bitrate": 4_000_000})).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["code"], "webrtc-not-configured");
+}
+
+#[tokio::test]
+async fn webrtc_routes_report_a_failed_helper_without_claiming_running() {
+    let state = ConnectionState::new(
+        ConnectionInfo::new(
+            NODE_ID,
+            "vm",
+            HTTP_PORT,
+            QUIC_PORT,
+            HID_PORT,
+            SINK_FAKE_RECORDING,
+        ),
+        CompatStats::default(),
+    )
+    .with_webrtc(Some(WebRtcControl::failed(
+        "WebRTC unavailable: helper program is missing",
+    )));
+    let app = compat_router(state);
+
+    let (status, connection) = get_json(&app, "/api/v1/connection").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(connection["webrtc"], "failed");
+    assert_eq!(
+        connection["webrtc_error"],
+        "WebRTC unavailable: helper program is missing"
+    );
+
+    let (status, body) = post_json(
+        &app,
+        "/webrtc/offer",
+        json!({"sdp": "v=0 parity offer", "type": "offer"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["code"], "webrtc-unavailable");
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("helper program is missing"));
+}
+
+#[tokio::test]
+async fn webrtc_offer_proxies_to_a_fake_unix_socket_helper() {
+    let (client, server) = UnixStream::pair().expect("unix stream pair");
+    let (client_reader, client_writer) = client.into_split();
+    let (server_reader, mut server_writer) = server.into_split();
+    let helper_task = tokio::spawn(async move {
+        let mut reader = BufReader::new(server_reader);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read offer");
+        let request: Value = serde_json::from_str(line.trim()).expect("offer JSON");
+        assert_eq!(request["type"], "offer");
+        assert_eq!(request["sdp"], "v=0 parity offer");
+        server_writer
+            .write_all(b"{\"type\":\"answer\",\"sdp\":\"v=0 parity answer\"}\n")
             .await
-            .expect("router response");
-        assert_eq!(
-            response.status(),
-            StatusCode::NOT_FOUND,
-            "{method} {uri} must stay absent until a real WebRTC pipeline exists"
-        );
+            .expect("write answer");
+        server_writer.flush().await.expect("flush answer");
+    });
+
+    let spawner = Arc::new(FakeHelperSpawner::new(Box::new(PairSignaler {
+        reader: BufReader::new(client_reader),
+        writer: client_writer,
+    })));
+    let directory = temp_dir("webrtc-offer");
+    let config = WebRtcConfig {
+        helper_program: std::path::PathBuf::from("/fake/helper"),
+        helper_script: None,
+        socket_path: directory.join("helper.sock"),
+        shm_path: directory.join("frame.bgra"),
+        width: 2,
+        height: 2,
+        fps: 30,
+        bitrate_kbps: 4_000,
+        startup_timeout: Duration::from_millis(50),
+        offer_timeout: Duration::from_secs(1),
+    };
+    let helper = WebRtcHelper::start_with_spawner(
+        Box::new(PendingSource::new(FrameFormat::rgb24(2, 2))),
+        config,
+        spawner,
+    )
+    .expect("fake helper starts");
+
+    let control = WebRtcControl::from_helper(helper);
+    let state = ConnectionState::new(
+        ConnectionInfo::new(
+            NODE_ID,
+            "vm",
+            HTTP_PORT,
+            QUIC_PORT,
+            HID_PORT,
+            SINK_FAKE_RECORDING,
+        ),
+        CompatStats::default(),
+    )
+    .with_webrtc(Some(control.clone()));
+    let app = compat_router(state);
+
+    // Running is claimed only because the fake socket is connected.
+    let (status, connection) = get_json(&app, "/api/v1/connection").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        connection["webrtc"],
+        baseline(include_str!("parity/http_baseline.json"))["stream_states"]["webrtc_running"]
+    );
+    assert_eq!(connection["webrtc"], "running");
+    assert!(connection["webrtc_error"].is_null());
+
+    let (status, body) = post_json(
+        &app,
+        "/webrtc/offer",
+        json!({"sdp": "v=0 parity offer", "type": "offer"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["type"], "answer");
+    assert_eq!(body["sdp"], "v=0 parity answer");
+
+    control.shutdown().await;
+    helper_task.await.expect("fake helper task");
+}
+
+#[tokio::test]
+async fn webrtc_bitrate_is_not_reported_as_success_without_an_ack() {
+    let (client, server) = UnixStream::pair().expect("unix stream pair");
+    let (client_reader, client_writer) = client.into_split();
+    let (server_reader, _server_writer) = server.into_split();
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(server_reader);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read bitrate");
+        let request: Value = serde_json::from_str(line.trim()).expect("bitrate JSON");
+        assert_eq!(request["type"], "bitrate");
+        assert_eq!(request["bitrate"], 4_000_000);
+        // The real worker sends no acknowledgement; keep the socket open so the
+        // node enforces its own bounded timeout instead of reading EOF.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    });
+
+    let spawner = Arc::new(FakeHelperSpawner::new(Box::new(PairSignaler {
+        reader: BufReader::new(client_reader),
+        writer: client_writer,
+    })));
+    let directory = temp_dir("webrtc-bitrate");
+    let config = WebRtcConfig {
+        helper_program: std::path::PathBuf::from("/fake/helper"),
+        helper_script: None,
+        socket_path: directory.join("helper.sock"),
+        shm_path: directory.join("frame.bgra"),
+        width: 2,
+        height: 2,
+        fps: 30,
+        bitrate_kbps: 4_000,
+        startup_timeout: Duration::from_millis(50),
+        offer_timeout: Duration::from_millis(100),
+    };
+    let helper = WebRtcHelper::start_with_spawner(
+        Box::new(PendingSource::new(FrameFormat::rgb24(2, 2))),
+        config,
+        spawner,
+    )
+    .expect("fake helper starts");
+    let control = WebRtcControl::from_helper(helper);
+    let state = ConnectionState::new(
+        ConnectionInfo::new(
+            NODE_ID,
+            "vm",
+            HTTP_PORT,
+            QUIC_PORT,
+            HID_PORT,
+            SINK_FAKE_RECORDING,
+        ),
+        CompatStats::default(),
+    )
+    .with_webrtc(Some(control.clone()));
+    let app = compat_router(state);
+
+    let (status, body) = post_json(&app, "/webrtc/bitrate", json!({"bitrate": 4_000_000})).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["code"], "webrtc-helper-timeout");
+    control.shutdown().await;
+}
+
+struct PendingSource {
+    format: FrameFormat,
+}
+
+impl PendingSource {
+    fn new(format: FrameFormat) -> Self {
+        Self { format }
     }
+}
+
+#[async_trait]
+impl CaptureSource for PendingSource {
+    fn id(&self) -> &str {
+        "parity-pending"
+    }
+
+    fn format(&self) -> FrameFormat {
+        self.format
+    }
+
+    async fn next_frame(&mut self) -> Result<Frame, MediaError> {
+        tokio::time::sleep(Duration::from_secs(3_600)).await;
+        Err(MediaError::EndOfStream)
+    }
+}
+
+struct FakeHelperSpawner {
+    spawned: Mutex<Option<SpawnedHelper>>,
+}
+
+impl FakeHelperSpawner {
+    fn new(signaler: Box<dyn Signaler>) -> Self {
+        Self {
+            spawned: Mutex::new(Some(SpawnedHelper {
+                child: None,
+                pid: Some(4_242),
+                signaler,
+            })),
+        }
+    }
+}
+
+impl HelperSpawner for FakeHelperSpawner {
+    fn spawn(&self, config: &WebRtcConfig) -> Result<SpawnedHelper, WebRtcError> {
+        self.spawned
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| WebRtcError::Spawn {
+                program: config.helper_program.clone(),
+                message: "fake spawner has no helper left".to_owned(),
+            })
+    }
+}
+
+struct PairSignaler {
+    reader: BufReader<OwnedReadHalf>,
+    writer: OwnedWriteHalf,
+}
+
+#[async_trait]
+impl Signaler for PairSignaler {
+    async fn write_line(&mut self, line: &str) -> Result<(), WebRtcError> {
+        self.writer
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .map_err(|error| WebRtcError::Io(error.to_string()))?;
+        self.writer
+            .flush()
+            .await
+            .map_err(|error| WebRtcError::Io(error.to_string()))
+    }
+
+    async fn read_line(&mut self) -> Result<Option<String>, WebRtcError> {
+        let mut line = String::new();
+        let read = self
+            .reader
+            .read_line(&mut line)
+            .await
+            .map_err(|error| WebRtcError::Io(error.to_string()))?;
+        if read == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(line))
+        }
+    }
+}
+
+async fn post_json(app: &Router, uri: &str, body: Value) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .expect("router response");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("response body")
+        .to_bytes();
+    let json = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|error| panic!("{uri} did not return JSON: {error}"));
+    (status, json)
 }
 
 fn temp_dir(label: &str) -> std::path::PathBuf {

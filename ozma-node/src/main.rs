@@ -26,6 +26,7 @@ use ozma_node::{
     controller_compat,
     hls::{HlsConfig, HlsPipeline, HlsStatus},
     input_select, mdns, platform, registration, usb_audio,
+    webrtc::{WebRtcConfig, WebRtcControl, WebRtcHelper},
 };
 
 /// Ozma hardware KVM node process.
@@ -67,7 +68,8 @@ pub struct Args {
     ///
     /// The vm profile wires QMP capture/input/power when the corresponding
     /// sockets/domain are configured. Local HLS is opt-in via `--hls`; WebRTC
-    /// and the per-VM supervisor remain later phases.
+    /// runs only through an external helper when `--webrtc-helper` is set. The
+    /// per-VM supervisor remains a later phase.
     #[arg(long, env = "OZMA_PROFILE", value_enum, default_value_t = NodeProfile::Hardware)]
     pub profile: NodeProfile,
 
@@ -211,6 +213,43 @@ pub struct Args {
         value_name = "PATH"
     )]
     pub ffmpeg_bin: std::path::PathBuf,
+
+    /// External WebRTC helper executable (for example `/usr/bin/python3`).
+    ///
+    /// WebRTC stays disabled (`not-configured`) unless this is set. The helper
+    /// is the existing GStreamer/Python worker; native WebRTC is future work.
+    #[arg(long, env = "OZMA_WEBRTC_HELPER", value_name = "PATH")]
+    pub webrtc_helper: Option<std::path::PathBuf>,
+
+    /// Optional first argument passed to `--webrtc-helper` (for example the
+    /// Python worker script; when absent the program is spawned directly).
+    #[arg(long, env = "OZMA_WEBRTC_HELPER_SCRIPT", value_name = "PATH")]
+    pub webrtc_helper_script: Option<std::path::PathBuf>,
+
+    /// WebRTC helper frame width (must be greater than zero).
+    #[arg(long, env = "OZMA_WEBRTC_WIDTH", default_value_t = 640)]
+    pub webrtc_width: u32,
+
+    /// WebRTC helper frame height (must be greater than zero).
+    #[arg(long, env = "OZMA_WEBRTC_HEIGHT", default_value_t = 480)]
+    pub webrtc_height: u32,
+
+    /// WebRTC helper frame rate (must be greater than zero).
+    #[arg(long, env = "OZMA_WEBRTC_FPS", default_value_t = 30)]
+    pub webrtc_fps: u32,
+
+    /// WebRTC H.264 bitrate in kbps (must be greater than zero).
+    #[arg(long, env = "OZMA_WEBRTC_BITRATE_KBPS", default_value_t = 4_000)]
+    pub webrtc_bitrate_kbps: u32,
+
+    /// WebRTC helper signaling Unix socket (default: temp dir, per process).
+    #[arg(long, env = "OZMA_WEBRTC_SOCKET", value_name = "PATH")]
+    pub webrtc_socket: Option<std::path::PathBuf>,
+
+    /// WebRTC helper shared-memory frame path (default: `/dev/shm`, per
+    /// process).
+    #[arg(long, env = "OZMA_WEBRTC_SHM", value_name = "PATH")]
+    pub webrtc_shm: Option<std::path::PathBuf>,
 
     /// Enable verbose debug logging.
     #[arg(long)]
@@ -390,6 +429,72 @@ async fn main() {
         HlsStatus::not_configured()
     };
 
+    // External WebRTC helper (GStreamer/Python first; native WebRTC is future
+    // work). WebRTC is disabled unless `--webrtc-helper` is configured. A
+    // configured helper that cannot start is reported as `failed`, never
+    // `running`, and never crashes the node.
+    let webrtc_control: Option<WebRtcControl> = match args.webrtc_helper.clone() {
+        None => None,
+        Some(program) => {
+            let webrtc_config = WebRtcConfig {
+                helper_program: program,
+                helper_script: args.webrtc_helper_script.clone(),
+                socket_path: args
+                    .webrtc_socket
+                    .clone()
+                    .unwrap_or_else(|| default_webrtc_socket(&config.name)),
+                shm_path: args.webrtc_shm.clone().unwrap_or_else(default_webrtc_shm),
+                width: args.webrtc_width,
+                height: args.webrtc_height,
+                fps: args.webrtc_fps,
+                bitrate_kbps: args.webrtc_bitrate_kbps,
+                startup_timeout: std::time::Duration::from_secs(5),
+                offer_timeout: std::time::Duration::from_secs(10),
+            };
+            if let Err(error) = webrtc_config.validate() {
+                warn!(error = %error, "WebRTC unavailable: invalid helper configuration");
+                Some(WebRtcControl::failed(format!(
+                    "WebRTC unavailable: {error}"
+                )))
+            } else if !config.has_capability("video") {
+                warn!(
+                    "--webrtc-helper was configured but the video capability is disabled; \
+                     WebRTC is unavailable"
+                );
+                Some(WebRtcControl::failed(
+                    "WebRTC unavailable: the video capability is disabled".to_owned(),
+                ))
+            } else {
+                match open_first_capture_source(&capture_registry).and_then(|source| {
+                    WebRtcHelper::start(source, webrtc_config.clone())
+                        .map_err(|error| error.to_string())
+                }) {
+                    Ok(helper) => {
+                        info!(
+                            pid = ?helper.status().helper_pid(),
+                            socket = %webrtc_config.socket_path.display(),
+                            shm = %webrtc_config.shm_path.display(),
+                            width = webrtc_config.width,
+                            height = webrtc_config.height,
+                            fps = webrtc_config.fps,
+                            "WebRTC helper started"
+                        );
+                        Some(WebRtcControl::from_helper(helper))
+                    }
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            "WebRTC unavailable: the external helper did not start"
+                        );
+                        Some(WebRtcControl::failed(format!(
+                            "WebRTC unavailable: {error}"
+                        )))
+                    }
+                }
+            }
+        }
+    };
+
     let compat_stats = controller_compat::CompatStats::default();
     let connection_info = controller_compat::ConnectionInfo::new(
         node_id.as_str(),
@@ -407,7 +512,8 @@ async fn main() {
             .with_power(power)
             .with_hls(Some(hls_status))
             .with_input_sink(Some(input_sink.clone()))
-            .with_codecs(codec_status),
+            .with_codecs(codec_status)
+            .with_webrtc(webrtc_control.clone()),
     );
 
     // Start the controller-facing UDP HID listener only when the node
@@ -460,11 +566,11 @@ async fn main() {
             power = %power,
             "Profile '{}' is PARTIALLY WIRED: QMP capture, uinput/QMP input injection, and \
              QMP/libvirt power control start when their flags are configured. Local HLS is \
-             opt-in via `--hls` and feeds `/stream/*` from the first capture source; it is \
-             not WebRTC. Still not implemented: WebRTC (`/webrtc/offer`, `/webrtc/bitrate`), \
-             the QEMU D-Bus framebuffer capture path, per-VM provisioning (ozma-softnode \
-             supervisor), and the controller WebRTC surface. Do not treat WebRTC as \
-             functional.",
+             opt-in via `--hls` and feeds `/stream/*` from the first capture source. WebRTC \
+             runs only through an external helper and only when `--webrtc-helper` is set. \
+             Still not implemented: native WebRTC, the QEMU D-Bus framebuffer capture path, \
+             per-VM provisioning (ozma-softnode supervisor), and WebRTC audio. Do not treat \
+             WebRTC as functional without a configured helper.",
             config.profile
         );
     }
@@ -594,6 +700,9 @@ async fn main() {
             warn!(error = %error, "HLS pipeline did not stop cleanly");
         }
     }
+    if let Some(control) = webrtc_control.as_ref() {
+        control.shutdown().await;
+    }
     info!("Ozma node shutting down");
 }
 
@@ -612,14 +721,13 @@ fn default_hls_dir(name: &str) -> std::path::PathBuf {
     std::path::PathBuf::from("/tmp").join(format!("ozma-stream-{safe}"))
 }
 
-/// Open the first registry source and start the HLS pipeline.
+/// Open the first registry source for a helper/pipeline.
 ///
 /// This uses the same registry as the VM/hardware profile: a VM node streams
 /// its QMP display and a hardware node streams its V4L2/PipeWire source.
-fn start_hls(
+fn open_first_capture_source(
     registry: &ozma_capture::CaptureRegistry,
-    hls_config: HlsConfig,
-) -> Result<HlsPipeline, String> {
+) -> Result<Box<dyn ozma_media::CaptureSource>, String> {
     let sources = registry.enumerate().map_err(|error| {
         format!(
             "capture discovery failed: {} ({})",
@@ -631,10 +739,45 @@ fn start_hls(
         .next()
         .ok_or_else(|| "no capture source is available".to_owned())?;
     let id = source.id.clone();
-    let opened = registry
+    registry
         .open(&source)
-        .map_err(|error| format!("opening capture source `{id}` failed: {}", error.message))?;
-    HlsPipeline::start(opened, hls_config).map_err(|error| error.to_string())
+        .map_err(|error| format!("opening capture source `{id}` failed: {}", error.message))
+}
+
+/// Open the first registry source and start the HLS pipeline.
+fn start_hls(
+    registry: &ozma_capture::CaptureRegistry,
+    hls_config: HlsConfig,
+) -> Result<HlsPipeline, String> {
+    let source = open_first_capture_source(registry)?;
+    HlsPipeline::start(source, hls_config).map_err(|error| error.to_string())
+}
+
+/// Default WebRTC signaling socket. `/tmp` is writable without extra
+/// privileges; the helper path is per-process so two nodes do not collide.
+fn default_webrtc_socket(name: &str) -> std::path::PathBuf {
+    let safe: String = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    std::env::temp_dir().join(format!("ozma-webrtc-{safe}-{}.sock", std::process::id()))
+}
+
+/// Default shared-memory frame path. `/dev/shm` is a tmpfs on Linux; fall back
+/// to the temp directory on systems that do not provide it.
+fn default_webrtc_shm() -> std::path::PathBuf {
+    let base = if std::path::Path::new("/dev/shm").is_dir() {
+        std::path::PathBuf::from("/dev/shm")
+    } else {
+        std::env::temp_dir()
+    };
+    base.join(format!("ozma-webrtc-fb-{}", std::process::id()))
 }
 
 /// Build the optional power backend. A connection failure is logged and leaves
@@ -809,6 +952,22 @@ pub fn node_id_for(name: &str) -> NodeId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn webrtc_is_disabled_by_default() {
+        let args = Args::parse_from(["ozma-node"]);
+        assert!(
+            args.webrtc_helper.is_none(),
+            "WebRTC must not default to an implicit Python helper"
+        );
+        assert!(args.webrtc_helper_script.is_none());
+        assert_eq!(args.webrtc_width, 640);
+        assert_eq!(args.webrtc_height, 480);
+        assert_eq!(args.webrtc_fps, 30);
+        assert_eq!(args.webrtc_bitrate_kbps, 4_000);
+        assert!(args.webrtc_socket.is_none());
+        assert!(args.webrtc_shm.is_none());
+    }
 
     #[test]
     fn txt_carries_registration_parity_fields() {

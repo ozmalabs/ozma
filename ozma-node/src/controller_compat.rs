@@ -45,6 +45,7 @@ use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
 use crate::hls::HlsStatus;
+use crate::webrtc::{WebRtcControl, WebRtcError};
 
 /// HID packet type for an 8-byte boot keyboard report.
 pub const PACKET_KEYBOARD: u8 = 0x01;
@@ -589,6 +590,9 @@ pub struct ConnectionState {
     /// The one sink shared with session input and the UDP HID listener.
     pub input_sink: Option<SharedSink>,
     pub codecs: CodecStatus,
+    /// External WebRTC helper. `None` means no `--webrtc-helper` was given;
+    /// `Some(control)` may be a configured-but-failed helper.
+    pub webrtc: Option<WebRtcControl>,
 }
 
 impl ConnectionState {
@@ -600,6 +604,7 @@ impl ConnectionState {
             hls: None,
             input_sink: None,
             codecs: CodecStatus::not_configured(),
+            webrtc: None,
         }
     }
 
@@ -634,6 +639,16 @@ impl ConnectionState {
         self
     }
 
+    /// Attach the external WebRTC helper control surface.
+    ///
+    /// `None` means WebRTC was not configured and reports `not-configured`.
+    /// `Some(WebRtcControl::failed(...))` is a configured helper that could
+    /// not start and reports `failed` plus `webrtc_error`.
+    pub fn with_webrtc(mut self, webrtc: Option<WebRtcControl>) -> Self {
+        self.webrtc = webrtc;
+        self
+    }
+
     /// True when the configured sink records without injecting.
     pub fn input_is_recording_only(&self) -> bool {
         matches!(
@@ -647,9 +662,10 @@ impl ConnectionState {
 ///
 /// `hls` is `"running"`, `"not-configured"`, or `"failed"`; `hls_error` carries
 /// the reason when it is `failed` (including a configured pipeline whose
-/// manifest does not exist yet). WebRTC is still explicitly not implemented.
-/// The endpoint must never imply a streaming capability the node does not
-/// have. `power` is either `"not-configured"` or
+/// manifest does not exist yet). `webrtc` is `"running"`, `"not-configured"`,
+/// or `"failed"`, with `webrtc_error` explaining a configured helper that did
+/// not start. The endpoint must never imply a streaming capability the node
+/// does not have. `power` is either `"not-configured"` or
 /// `{"status": "...", "available": true|false}`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ConnectionResponse {
@@ -671,6 +687,8 @@ pub struct ConnectionResponse {
     /// Why HLS is not `running`, when it is configured and failing.
     pub hls_error: Option<String>,
     pub webrtc: &'static str,
+    /// Why WebRTC is not `running`, when it is configured and failing.
+    pub webrtc_error: Option<String>,
     /// Room-correction / audio-routing compatibility routes are not implemented.
     pub audio: &'static str,
 }
@@ -682,6 +700,7 @@ pub fn compat_router(state: ConnectionState) -> Router {
         .merge(power_router(state.clone()))
         .merge(input_router(state.clone()))
         .merge(codec_router(state.clone()))
+        .merge(webrtc_router(state.clone()))
         .merge(audio_router(state))
 }
 
@@ -736,6 +755,21 @@ pub fn audio_router(state: ConnectionState) -> Router {
         .with_state(state)
 }
 
+/// Controller WebRTC signaling routes, proxied to the external helper.
+///
+/// `POST /webrtc/offer` accepts `{"sdp": "...", "type": "offer"}` and returns
+/// `{"sdp": "...", "type": "answer"}`. `POST /webrtc/bitrate` accepts
+/// `{"bitrate": <bps>}`. Both are mounted through [`compat_router`] before the
+/// node API's bearer guard. A node with no helper answers 503; a helper that
+/// does not acknowledge a bitrate change answers a typed 501/502 rather than a
+/// fake success.
+pub fn webrtc_router(state: ConnectionState) -> Router {
+    Router::new()
+        .route("/webrtc/offer", post(webrtc_offer))
+        .route("/webrtc/bitrate", post(webrtc_bitrate))
+        .with_state(state)
+}
+
 async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResponse> {
     let info = &state.info;
     let power = match &state.power {
@@ -757,6 +791,10 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
         None => ("not-configured", None),
         Some(status) => (status.status_name(), status.error()),
     };
+    let (webrtc, webrtc_error) = match &state.webrtc {
+        None => ("not-configured", None),
+        Some(control) => (control.status_name(), control.error()),
+    };
     let input = InputStatus {
         sink_kind: info.sink_kind.clone(),
         available: state.input_sink.is_some(),
@@ -776,7 +814,8 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
         codec: state.codecs.clone(),
         hls,
         hls_error,
-        webrtc: "not-implemented",
+        webrtc,
+        webrtc_error,
         audio: "not-implemented",
     })
 }
@@ -1318,6 +1357,185 @@ async fn audio_not_implemented() -> Response {
     )
 }
 
+/// `POST /webrtc/offer` body, matching the controller/soft-node shape.
+#[derive(Debug, Deserialize)]
+struct WebrtcOfferRequest {
+    sdp: String,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+}
+
+/// `POST /webrtc/offer` response, matching the soft node's answer shape.
+#[derive(Debug, Serialize)]
+struct WebrtcOfferResponse {
+    sdp: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+/// `POST /webrtc/bitrate` body; `bitrate` is bits per second.
+#[derive(Debug, Deserialize)]
+struct WebrtcBitrateRequest {
+    #[serde(default = "default_webrtc_bitrate_bps")]
+    bitrate: u64,
+}
+
+fn default_webrtc_bitrate_bps() -> u64 {
+    4_000_000
+}
+
+const WEBRTC_BITRATE_MIN_BPS: u64 = 500_000;
+const WEBRTC_BITRATE_MAX_BPS: u64 = 50_000_000;
+
+async fn webrtc_offer(
+    State(state): State<ConnectionState>,
+    payload: Result<Json<WebrtcOfferRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(error) => return json_rejection(error),
+    };
+    if let Some(kind) = request.kind.as_deref() {
+        if !kind.eq_ignore_ascii_case("offer") {
+            return compat_error(
+                StatusCode::BAD_REQUEST,
+                "invalid-offer-type",
+                format!("expected `type: \"offer\"`, got `{kind}`"),
+            );
+        }
+    }
+    if request.sdp.trim().is_empty() {
+        return compat_error(
+            StatusCode::BAD_REQUEST,
+            "invalid-sdp",
+            "the `sdp` field must not be empty",
+        );
+    }
+
+    let Some(control) = state.webrtc.as_ref() else {
+        return webrtc_not_configured();
+    };
+    if let Some(reason) = control.unavailable_reason() {
+        return webrtc_unavailable(&reason);
+    }
+
+    match control.offer(&request.sdp).await {
+        Ok(sdp) => Json(WebrtcOfferResponse {
+            sdp,
+            kind: "answer",
+        })
+        .into_response(),
+        Err(error) => webrtc_offer_failure(error),
+    }
+}
+
+async fn webrtc_bitrate(
+    State(state): State<ConnectionState>,
+    payload: Result<Json<WebrtcBitrateRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(error) => return json_rejection(error),
+    };
+    // The Python soft node clamps to this range for 4K60; mirror that so the
+    // controller sees the same accepted value. The helper may still refuse.
+    let bitrate = request
+        .bitrate
+        .clamp(WEBRTC_BITRATE_MIN_BPS, WEBRTC_BITRATE_MAX_BPS);
+
+    let Some(control) = state.webrtc.as_ref() else {
+        return webrtc_not_configured();
+    };
+    if let Some(reason) = control.unavailable_reason() {
+        return webrtc_unavailable(&reason);
+    }
+
+    match control.set_bitrate_bps(bitrate as u32).await {
+        Ok(()) => Json(serde_json::json!({"ok": true, "bitrate": bitrate})).into_response(),
+        Err(error) => webrtc_bitrate_failure(error),
+    }
+}
+
+fn webrtc_not_configured() -> Response {
+    compat_error_with_remediation(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "webrtc-not-configured",
+        "WebRTC is not configured on this node",
+        Some(
+            "Start ozma-node with --webrtc-helper (and optionally \
+             --webrtc-helper-script) pointing at the GStreamer WebRTC worker; see \
+             docs/parity-matrix.md.",
+        ),
+    )
+}
+
+fn webrtc_unavailable(reason: &str) -> Response {
+    compat_error_with_remediation(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "webrtc-unavailable",
+        reason.to_owned(),
+        Some(
+            "Check the node log and /api/v1/connection.webrtc_error; the external WebRTC \
+             helper did not start or has stopped.",
+        ),
+    )
+}
+
+fn webrtc_offer_failure(error: WebRtcError) -> Response {
+    match &error {
+        WebRtcError::InvalidConfig(_) => {
+            compat_error(StatusCode::BAD_REQUEST, "invalid-sdp", error.to_string())
+        }
+        _ => compat_error_with_remediation(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "webrtc-unavailable",
+            error.to_string(),
+            Some(
+                "The external helper did not answer the offer. Check that it is running and \
+                 still owns its signaling socket; see the node log.",
+            ),
+        ),
+    }
+}
+
+fn webrtc_bitrate_failure(error: WebRtcError) -> Response {
+    match &error {
+        WebRtcError::InvalidConfig(_) => compat_error(
+            StatusCode::BAD_REQUEST,
+            "invalid-bitrate",
+            error.to_string(),
+        ),
+        WebRtcError::Unsupported(_) => compat_error_with_remediation(
+            StatusCode::NOT_IMPLEMENTED,
+            "webrtc-bitrate-unsupported",
+            error.to_string(),
+            Some(
+                "The current GStreamer worker does not implement signaling bitrate changes. \
+                 Configure the encoder bitrate when starting the helper instead of claiming the \
+                 change was applied.",
+            ),
+        ),
+        WebRtcError::Timeout { .. } => compat_error_with_remediation(
+            StatusCode::BAD_GATEWAY,
+            "webrtc-helper-timeout",
+            error.to_string(),
+            Some(
+                "The helper did not acknowledge the bitrate request. \
+                 softnode/gst_webrtc_worker.py ignores it today, so this is an unsupported \
+                 operation rather than a successful change.",
+            ),
+        ),
+        WebRtcError::NotConfigured => webrtc_not_configured(),
+        WebRtcError::NotRunning => webrtc_unavailable(&error.to_string()),
+        _ => compat_error_with_remediation(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "webrtc-helper-error",
+            error.to_string(),
+            Some("Check the node log for the WebRTC helper's failure."),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1848,7 +2066,8 @@ mod tests {
         assert_eq!(json["codec"]["available"], serde_json::json!([]));
         assert_eq!(json["hls"], "not-configured");
         assert!(json["hls_error"].is_null());
-        assert_eq!(json["webrtc"], "not-implemented");
+        assert_eq!(json["webrtc"], "not-configured");
+        assert!(json["webrtc_error"].is_null());
         assert_eq!(json["audio"], "not-implemented");
     }
 
@@ -1883,7 +2102,96 @@ mod tests {
 
         assert_eq!(json["hls"], "failed");
         assert_eq!(json["hls_error"], "no capture source is available");
-        assert_eq!(json["webrtc"], "not-implemented");
+        assert_eq!(json["webrtc"], "not-configured");
+    }
+
+    #[tokio::test]
+    async fn connection_reports_a_failed_webrtc_helper_with_an_error() {
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "vm",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_webrtc(Some(WebRtcControl::failed(
+            "helper program is missing".to_owned(),
+        )));
+
+        let (status, json) = get_json(&connection_router(state), "/api/v1/connection").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["webrtc"], "failed");
+        assert_eq!(json["webrtc_error"], "helper program is missing");
+        // A failed helper is not a running stream and must not claim to be.
+        assert_eq!(json["hls"], "not-configured");
+    }
+
+    #[tokio::test]
+    async fn webrtc_routes_answer_typed_503_without_a_helper() {
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        );
+        let app = webrtc_router(state);
+
+        let (status, body) = post_json(
+            &app,
+            "/webrtc/offer",
+            serde_json::json!({"sdp": "v=0", "type": "offer"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["code"], "webrtc-not-configured");
+
+        let (status, body) = post_json(
+            &app,
+            "/webrtc/bitrate",
+            serde_json::json!({"bitrate": 4_000_000}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["code"], "webrtc-not-configured");
+    }
+
+    #[tokio::test]
+    async fn webrtc_offer_rejects_malformed_requests() {
+        let (state, _) = input_state(SINK_FAKE_RECORDING);
+        let app = webrtc_router(state);
+
+        let (status, body) = post_json(
+            &app,
+            "/webrtc/offer",
+            serde_json::json!({"sdp": "", "type": "offer"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "invalid-sdp");
+
+        let (status, body) = post_json(
+            &app,
+            "/webrtc/offer",
+            serde_json::json!({"sdp": "v=0", "type": "answer"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "invalid-offer-type");
+
+        let (status, body) = post_json(&app, "/webrtc/offer", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "invalid-json");
     }
 
     #[tokio::test]
@@ -2592,6 +2900,16 @@ mod tests {
                 Some(serde_json::json!({"keycode": 30, "down": true})),
             ),
             ("POST", "/audio/apply", Some(serde_json::json!({}))),
+            (
+                "POST",
+                "/webrtc/offer",
+                Some(serde_json::json!({"sdp": "v=0", "type": "offer"})),
+            ),
+            (
+                "POST",
+                "/webrtc/bitrate",
+                Some(serde_json::json!({"bitrate": 4_000_000})),
+            ),
         ] {
             let builder = Request::builder().method(method).uri(uri);
             let request = match body {

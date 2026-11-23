@@ -1,5 +1,5 @@
 {
-  "_baseline": "Current compatibility surface expected by the Python controller. /health mirrors the node's native health document consumed by the controller's node probes; /api/v1/connection mirrors the controller-facing compatibility status endpoint. Type names are checked by ozma-node/tests/parity.rs. The connection document also reports input sink availability/injection, read-only codec state, and 'audio: not-implemented'. HLS is opt-in and honest: 'not-configured' without --hls, 'running' only once stream.m3u8 exists, 'failed' plus hls_error otherwise. WebRTC is still not-implemented and is never faked.",
+  "_baseline": "Current compatibility surface expected by the Python controller. /health mirrors the node's native health document consumed by the controller's node probes; /api/v1/connection mirrors the controller-facing compatibility status endpoint. Type names are checked by ozma-node/tests/parity.rs. The connection document also reports input sink availability/injection, read-only codec state, and 'audio: not-implemented'. HLS is opt-in and honest: 'not-configured' without --hls, 'running' only once stream.m3u8 exists, 'failed' plus hls_error otherwise. WebRTC is helper-first: 'not-configured' without --webrtc-helper, 'running' only after the helper socket connects, 'failed' plus webrtc_error otherwise; /webrtc/offer and /webrtc/bitrate answer typed 503s rather than 404s.",
   "health": {
     "ok": "bool",
     "node_id": "string",
@@ -21,6 +21,7 @@
     "hls": "string",
     "hls_error": "string-or-null",
     "webrtc": "string",
+    "webrtc_error": "string-or-null",
     "audio": "string"
   },
   "input": {
@@ -44,6 +45,8 @@
   },
   "stream_states": {
     "hls_not_configured": "not-configured",
-    "webrtc_not_implemented": "not-implemented"
+    "webrtc_not_configured": "not-configured",
+    "webrtc_failed": "failed",
+    "webrtc_running": "running"
   }
 }

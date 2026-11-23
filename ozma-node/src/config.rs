@@ -23,7 +23,9 @@ pub const DEFAULT_QMP_COMMAND_TIMEOUT_MS: u64 = 5_000;
 ///
 /// Profiles select honest provider defaults. The hardware runtime and the VM
 /// profile's QMP capture/input/power wiring are implemented. Local HLS is
-/// opt-in via `--hls`; WebRTC and the per-VM supervisor remain later phases.
+/// opt-in via `--hls`; WebRTC runs through an external helper when
+/// `--webrtc-helper` is configured. The per-VM supervisor remains a later
+/// phase.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum NodeProfile {

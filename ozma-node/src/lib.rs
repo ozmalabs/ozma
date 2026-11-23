@@ -18,6 +18,7 @@ pub mod rtsp_runtime;
 pub mod scene_replay;
 pub mod transport;
 pub mod usb_audio;
+pub mod webrtc;
 
 pub use backend::SessionBackend;
 pub use client_capture::{ClientCaptureHub, ClientCaptureSource};
