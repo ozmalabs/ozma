@@ -23,11 +23,13 @@
 pub mod cert;
 mod controller;
 pub mod error;
+pub mod frame_output;
 mod http;
 mod node_api;
 pub mod scene_render;
 mod session;
 pub mod video;
+pub mod vnc;
 
 pub use cert::{
     certificate_der_from_base64, certificate_fingerprint, load_certificate, normalize_fingerprint,

@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ozma_client::certificate_fingerprint;
+use ozma_protocol::scene::{DisplayCapabilities, ImagePlacement, ImageResource, SceneCommit};
 use ozma_protocol::{
     ClientId, ControlMessage, Participant, ParticipantRole, Permission, PermissionSet, Session,
     SessionId, SessionOffer, SessionSpec, SessionState,
@@ -83,6 +84,15 @@ async fn send_control(transport: &QuicTransport, message: &ControlMessage) {
 
 #[tokio::test]
 async fn probe_cli_connects_receives_video_and_exits_cleanly() {
+    probe_cli(false).await;
+}
+
+#[tokio::test]
+async fn probe_cli_reports_scene_readiness() {
+    probe_cli(true).await;
+}
+
+async fn probe_cli(scene: bool) {
     let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let address = server.local_addr().unwrap();
     let certificate = server.certificate_der().to_vec();
@@ -90,7 +100,7 @@ async fn probe_cli_connects_receives_video_and_exits_cleanly() {
     let offer = offer_for(address, &fingerprint);
 
     let directory = PathBuf::from(format!(
-        "/tmp/opencode/ozma-client-probe-{}",
+        "/tmp/opencode/ozma-client-probe-{}-{scene}",
         std::process::id()
     ));
     std::fs::create_dir_all(&directory).unwrap();
@@ -104,11 +114,19 @@ async fn probe_cli_connects_receives_video_and_exits_cleanly() {
         let hello = recv_control(&mut transport).await;
         assert_eq!(hello["type"], "hello");
         assert_eq!(hello["data"]["token"], "token-test");
+        let display = if scene {
+            let capabilities: DisplayCapabilities =
+                serde_json::from_value(hello["data"]["display"].clone()).unwrap();
+            Some(capabilities.select(ChannelId::VIDEO.raw()))
+        } else {
+            assert!(hello["data"].get("display").is_none());
+            None
+        };
         send_control(
             &transport,
             &ControlMessage::HelloAck {
                 session: session_with(control_permissions()),
-                display: None,
+                display,
             },
         )
         .await;
@@ -116,6 +134,35 @@ async fn probe_cli_connects_receives_video_and_exits_cleanly() {
             .send(ChannelId::VIDEO, Bytes::from_static(b"probe-video!"))
             .await
             .unwrap();
+
+        if scene {
+            let resource = ImageResource {
+                id: 7,
+                png: b"\x89PNG\r\n\x1a\nfixture",
+            }
+            .encode();
+            transport
+                .send_resource(Bytes::from(resource))
+                .await
+                .unwrap();
+            send_control(
+                &transport,
+                &ControlMessage::SceneCommit {
+                    commit: SceneCommit {
+                        revision: 2,
+                        images: vec![ImagePlacement {
+                            node_id: 1,
+                            resource_id: 7,
+                            x: 0,
+                            y: 10,
+                            width: 320,
+                            height: 180,
+                        }],
+                    },
+                },
+            )
+            .await;
+        }
 
         let mut saw_release = false;
         loop {
@@ -138,22 +185,20 @@ async fn probe_cli_connects_receives_video_and_exits_cleanly() {
     });
 
     let binary = env!("CARGO_BIN_EXE_ozma-client");
-    let output = tokio::time::timeout(
-        Duration::from_secs(15),
-        tokio::process::Command::new(binary)
-            .arg("probe")
-            .arg("--offer")
-            .arg(&offer_path)
-            .arg("--cert")
-            .arg(&cert_path)
-            .arg("--timeout")
-            .arg("5")
-            .arg("--json")
-            .output(),
-    )
-    .await
-    .expect("probe timed out")
-    .expect("run probe");
+    let mut command = tokio::process::Command::new(binary);
+    command
+        .args(["probe", "--offer"])
+        .arg(&offer_path)
+        .arg("--cert")
+        .arg(&cert_path)
+        .args(["--timeout", "5", "--json"]);
+    if scene {
+        command.args(["--scene-revision", "2"]);
+    }
+    let output = tokio::time::timeout(Duration::from_secs(15), command.output())
+        .await
+        .expect("probe timed out")
+        .expect("run probe");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -167,6 +212,14 @@ async fn probe_cli_connects_receives_video_and_exits_cleanly() {
     assert_eq!(report["video"]["payload_len"], 12);
     assert_eq!(report["video"]["kind"], "video");
     assert_eq!(report["video"]["channel"], 2);
+
+    assert!(report["video"]["ready_ms"].is_u64());
+    if scene {
+        assert_eq!(report["scene"]["revision"], 2);
+        assert!(report["scene"]["ready_ms"].is_u64());
+    } else {
+        assert!(report["scene"].is_null());
+    }
 
     let saw_release = tokio::time::timeout(Duration::from_secs(2), server_task)
         .await

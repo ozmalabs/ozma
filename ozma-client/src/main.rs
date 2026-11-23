@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use ozma_client::{
@@ -72,7 +72,7 @@ enum Command {
         node: String,
     },
 
-    /// Connect to a node, hello, receive one video datagram, release, close.
+    /// Connect to a node and measure receipt of a complete video frame.
     Probe {
         /// A SessionOffer JSON file, or inline JSON beginning with `{`.
         #[arg(long, value_name = "JSON|PATH")]
@@ -101,6 +101,14 @@ enum Command {
         /// Write the first video payload to this file.
         #[arg(long, value_name = "FILE")]
         save_video: Option<PathBuf>,
+
+        /// Decode the first complete access unit and write a PPM image here.
+        #[arg(long, value_name = "FILE")]
+        save_frame: Option<PathBuf>,
+
+        /// Negotiate scene support and wait for at least this overlay revision.
+        #[arg(long, value_name = "REVISION", value_parser = clap::value_parser!(u64).range(1..))]
+        scene_revision: Option<u64>,
     },
 }
 
@@ -156,6 +164,8 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             server_name,
             timeout,
             save_video,
+            save_frame,
+            scene_revision,
         } => {
             probe(
                 &options,
@@ -166,6 +176,8 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
                 server_name,
                 timeout,
                 save_video,
+                save_frame,
+                scene_revision,
             )
             .await
         }
@@ -273,6 +285,8 @@ async fn probe(
     server_name: String,
     timeout_secs: u64,
     save_video: Option<PathBuf>,
+    save_frame: Option<PathBuf>,
+    scene_revision: Option<u64>,
 ) -> Result<(), ApiError> {
     let mut offer = load_offer(offer_input)?;
     if let Some(token) = token {
@@ -308,6 +322,8 @@ async fn probe(
     let mut config = NativeClientConfig::new().with_server_name(server_name);
     config.hello_timeout = timeout;
     config.handshake_timeout = timeout.min(Duration::from_secs(5));
+    config.scene_cache_bytes = scene_revision.map(|_| 4 * 1024 * 1024);
+    let started = Instant::now();
 
     let mut client =
         NativeSessionClient::connect_with_config(&offer, &certificate_der, config).await?;
@@ -343,16 +359,57 @@ async fn probe(
         println!("endpoint:     {endpoint}");
     }
 
-    let (packet, frame) = wait_for_video_frame(&mut client, timeout).await;
+    let measurements = wait_for_probe(&mut client, timeout, started, scene_revision).await;
 
     // Release before closing on every path. Input may be view-only, in which
     // case release_all is a no-op.
     let release = client.release_all().await;
     let close = client.close().await;
 
-    let (packet, frame) = (packet?, frame?);
+    let ProbeMeasurement {
+        packet,
+        frame,
+        video_ms,
+        scene,
+    } = measurements?;
     release?;
     close?;
+
+    let decoded = if let Some(path) = save_frame.as_deref() {
+        let mut decoder = ozma_decode::H264Decoder::new().map_err(|error| {
+            ApiError::new(
+                codes::CLIENT_PROTOCOL,
+                format!("could not start the H.264 decoder: {error}"),
+            )
+        })?;
+        let decoded = ozma_decode::VideoDecoder::decode(
+            &mut decoder,
+            &frame.data,
+            ozma_decode::DecodeMeta::new(0, frame.sequence, frame.keyframe),
+        )
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                codes::CLIENT_PROTOCOL,
+                format!("could not decode the first video frame: {error}"),
+            )
+        })?
+        .ok_or_else(|| {
+            ApiError::new(
+                codes::CLIENT_PROTOCOL,
+                "the decoder did not produce a picture for the first access unit",
+            )
+        })?;
+        decoded.write_ppm(path).map_err(|error| {
+            ApiError::new(
+                codes::CLIENT_CONFIG,
+                format!("Could not write '{}': {error}", path.display()),
+            )
+        })?;
+        Some(decoded)
+    } else {
+        None
+    };
 
     if let Some(path) = save_video.as_deref() {
         std::fs::write(path, &frame.data).map_err(|error| {
@@ -369,7 +426,9 @@ async fn probe(
             "state": state,
             "permissions": permissions,
             "endpoint": endpoint,
+            "scene": scene.map(|(revision, ready_ms)| json!({ "revision": revision, "ready_ms": ready_ms })),
             "video": {
+                "ready_ms": video_ms,
                 "channel": packet.channel.raw(),
                 "kind": packet.kind,
                 "track_id": packet.track_id,
@@ -377,6 +436,11 @@ async fn probe(
                 "keyframe": frame.keyframe,
                 "payload_len": frame.data.len(),
                 "saved_to": save_video.map(|path| path.display().to_string()),
+                "decoded": decoded.as_ref().map(|frame| json!({
+                    "width": frame.width,
+                    "height": frame.height,
+                    "frame_saved_to": save_frame.map(|path| path.display().to_string()),
+                })),
             }
         });
         print_json(&report)?;
@@ -394,56 +458,83 @@ async fn probe(
             frame.data.len(),
             frame.keyframe
         );
+        println!("video ready:  {video_ms} ms");
+        if let Some((revision, ready_ms)) = scene {
+            println!("scene ready:  revision {revision} after {ready_ms} ms");
+        }
         if let Some(path) = save_video {
             println!("saved:        {}", path.display());
+        }
+        if let Some(frame) = &decoded {
+            println!(
+                "decoded:      {}x{} ({} bytes YUV)",
+                frame.width,
+                frame.height,
+                frame.yuv_len()
+            );
         }
         println!("released all held input and closed the session.");
     }
     Ok(())
 }
 
-async fn wait_for_video_frame(
+struct ProbeMeasurement {
+    packet: ozma_client::MediaPacket,
+    frame: VideoFrame,
+    video_ms: u128,
+    scene: Option<(u64, u128)>,
+}
+
+async fn wait_for_probe(
     client: &mut NativeSessionClient,
     timeout: Duration,
-) -> (
-    Result<ozma_client::MediaPacket, ApiError>,
-    Result<VideoFrame, ApiError>,
-) {
+    started: Instant,
+    target_revision: Option<u64>,
+) -> Result<ProbeMeasurement, ApiError> {
+    if target_revision.is_some() && client.scene().is_none() {
+        return Err(ApiError::new(
+            codes::CLIENT_PROTOCOL,
+            "The node did not negotiate the requested scene profile",
+        ));
+    }
+
     let mut assembler = VideoAssembler::default();
-    let result = tokio::time::timeout(timeout, async {
+    let mut video = None;
+    let mut scene = None;
+    tokio::time::timeout(timeout, async {
         loop {
             match client.recv_event().await? {
-                ClientEvent::Media(packet) if packet.kind == ChannelKind::Video => {
-                    match assembler.push_or_complete(&packet.payload) {
-                        Ok(Some(frame)) => return Ok((packet, frame)),
-                        Ok(None) => continue,
-                        Err(error) => {
-                            return Err(ApiError::new(
-                                codes::CLIENT_PROTOCOL,
-                                format!("invalid video fragment: {error}"),
-                            ))
-                        }
+                ClientEvent::Media(packet) if packet.kind == ChannelKind::Video && video.is_none() => {
+                    let frame = assembler.push_or_complete(&packet.payload).map_err(|error| {
+                        ApiError::new(codes::CLIENT_PROTOCOL, format!("invalid video fragment: {error}"))
+                    })?;
+                    if let Some(frame) = frame {
+                        video = Some((packet, frame, started.elapsed().as_millis()));
                     }
                 }
-                ClientEvent::Media(_) => continue,
+                ClientEvent::ScenePresented { revision }
+                    if scene.is_none() && target_revision.is_some_and(|target| revision >= target) =>
+                {
+                    scene = Some((revision, started.elapsed().as_millis()));
+                }
                 ClientEvent::Error { error } => return Err(error),
                 ClientEvent::Closed { reason } => {
                     return Err(ApiError::new(
                         codes::CLIENT_DISCONNECTED,
-                        format!(
-                            "The session transport closed before a full video frame arrived ({})",
-                            reason.as_str()
-                        ),
-                    )
-                    .retryable());
+                        format!("The session closed before the requested video and scene arrived ({})", reason.as_str()),
+                    ).retryable());
                 }
                 ClientEvent::Bye { reason } => {
                     return Err(ApiError::new(
                         codes::CLIENT_DISCONNECTED,
-                        format!("The node ended the session before video arrived ({reason:?})"),
+                        format!("The node ended the session before the requested video and scene arrived ({reason:?})"),
                     ));
                 }
-                _ => continue,
+                _ => {}
+            }
+            if video.is_some() && (target_revision.is_none() || scene.is_some()) {
+                let (packet, frame, video_ms) = video.expect("complete video frame was checked");
+                return Ok(ProbeMeasurement { packet, frame, video_ms, scene });
             }
         }
     })
@@ -451,21 +542,11 @@ async fn wait_for_video_frame(
     .map_err(|_| {
         ApiError::new(
             codes::CLIENT_TIMEOUT,
-            format!(
-                "Timed out waiting for the first full video frame after {} ms",
-                timeout.as_millis()
-            ),
+            format!("Timed out waiting for the requested video and scene after {} ms", timeout.as_millis()),
         )
-        .with_remediation(
-            "Check that the node has a capture source and that the session is streaming.",
-        )
+        .with_remediation("Check that the session is streaming and the node can supply the requested scene revision.")
         .retryable()
-    });
-    match result {
-        Ok(Ok((packet, frame))) => (Ok(packet), Ok(frame)),
-        Ok(Err(error)) => (Err(error.clone()), Err(error)),
-        Err(error) => (Err(error.clone()), Err(error)),
-    }
+    })?
 }
 
 fn load_offer(input: &str) -> Result<SessionOffer, ApiError> {

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ozma Cast output</title>
+  <style>
+    body { max-width: 42rem; margin: 3rem auto; font: 16px system-ui; }
+    label { display: block; margin-top: 1rem; }
+    input { box-sizing: border-box; padding: .6rem; width: 100%; }
+    button { margin: 1rem .5rem 0 0; padding: .6rem 1rem; }
+    #status { min-height: 1.5rem; }
+  </style>
+</head>
+<body>
+  <h1>Cast Ozma output</h1>
+  <p>Play an Ozma-composed HLS output on a Cast receiver.</p>
+  <label>Receiver-reachable HLS URL
+    <input id="url" type="url" placeholder="https://node.example/stream/stream.m3u8" required>
+  </label>
+  <button id="cast" disabled>Choose receiver</button>
+  <button id="stop" disabled>Stop casting</button>
+  <p id="status" role="status" aria-live="polite"></p>
+  <script src="cast-output.js"></script>
+  <script async src="https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1"></script>
+</body>
+</html>

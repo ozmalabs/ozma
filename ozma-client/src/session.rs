@@ -15,6 +15,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use bytes::Bytes;
+use ozma_protocol::scene::{
+    CommitStatus, DisplayCapabilities, DisplayProfile, SceneReceiver, SCENE_VERSION,
+};
 use ozma_protocol::{
     codes, ApiError, ChannelKind, ControlMessage, EndReason, InputEvent, Permission, PermissionSet,
     Session, SessionEvent, SessionOffer, SessionState, TrackId, TransportDescriptor, TransportMode,
@@ -44,6 +47,8 @@ pub struct NativeClientConfig {
     /// Grace period after sending `Bye` before closing the QUIC connection.
     /// This lets queued control frames (including `ReleaseAll`) reach the node.
     pub close_grace: Duration,
+    /// Enable scene negotiation with this encoded-image cache budget.
+    pub scene_cache_bytes: Option<usize>,
 }
 
 impl Default for NativeClientConfig {
@@ -54,6 +59,7 @@ impl Default for NativeClientConfig {
             hello_timeout: Duration::from_secs(10),
             idle_timeout: Duration::from_secs(30),
             close_grace: Duration::from_millis(50),
+            scene_cache_bytes: None,
         }
     }
 }
@@ -117,6 +123,10 @@ pub enum ClientEvent {
     Session(SessionEvent),
     /// The server sent another `HelloAck` (normally only once, during connect).
     SessionUpdated(Session),
+    /// The current overlay revision is ready for presentation.
+    ScenePresented { revision: u64 },
+    /// A scene commit arrived without changing the current presentation.
+    ScenePending,
     /// Reply to a client `Ping`.
     Pong { nonce: u64 },
     /// A non-terminal error from the node. The same error is retained and
@@ -158,6 +168,8 @@ pub struct NativeSessionClient {
     end_reason: Option<EndReason>,
     closed: Option<CloseReason>,
     close_grace: Duration,
+    scene: Option<SceneReceiver>,
+    resources: Option<tokio::sync::mpsc::Receiver<Result<Bytes, ApiError>>>,
 }
 
 impl std::fmt::Debug for NativeSessionClient {
@@ -241,25 +253,27 @@ impl NativeSessionClient {
             end_reason: None,
             closed: None,
             close_grace: config.close_grace,
+            scene: None,
+            resources: None,
         };
 
-        // Build Hello as JSON rather than via ControlMessage so an optional
-        // future field (for example `display`) can be added to the protocol
-        // without breaking this client. The node ignores unknown fields.
-        let hello = json!({
-            "type": "hello",
-            "data": {
-                "session_id": offer.session_id,
-                "token": offer.token,
-            }
+        let display = config.scene_cache_bytes.map(|_| DisplayCapabilities {
+            scene_versions: vec![SCENE_VERSION],
         });
-        client.send_raw_control(&hello).await?;
+        client
+            .send_control(&ControlMessage::Hello {
+                session_id: offer.session_id.clone(),
+                token: offer.token.clone(),
+                display,
+            })
+            .await?;
 
-        let session = tokio::time::timeout(config.hello_timeout, client.await_hello_ack())
-            .await
-            .map_err(|_| {
-                error::timeout("waiting for the session HelloAck", config.hello_timeout)
-            })??;
+        let session = tokio::time::timeout(
+            config.hello_timeout,
+            client.await_hello_ack(config.scene_cache_bytes),
+        )
+        .await
+        .map_err(|_| error::timeout("waiting for the session HelloAck", config.hello_timeout))??;
         client.session = Some(session);
         Ok(client)
     }
@@ -290,6 +304,11 @@ impl NativeSessionClient {
     /// The session record from `HelloAck`.
     pub fn session(&self) -> Option<&Session> {
         self.session.as_ref()
+    }
+
+    /// Current scene and encoded image cache for a compositor.
+    pub fn scene(&self) -> Option<&SceneReceiver> {
+        self.scene.as_ref()
     }
 
     /// The session state from `HelloAck`.
@@ -344,7 +363,32 @@ impl NativeSessionClient {
             return Ok(ClientEvent::Closed { reason });
         }
 
-        match self.transport.recv().await {
+        let event = loop {
+            let Some(resources) = self.resources.as_mut() else {
+                break self.transport.recv().await;
+            };
+            tokio::select! {
+                event = self.transport.recv() => break event,
+                resource = resources.recv() => {
+                    match resource {
+                        Some(Ok(bytes)) => {
+                            let scene = self.scene.as_mut().expect("resource reader requires a scene");
+                            if scene.receive_resource(&bytes).map_err(|error| {
+                                error::protocol(format!("Scene resource rejected: {error:?}"))
+                            })? {
+                                return Ok(ClientEvent::ScenePresented { revision: scene.presented().revision });
+                            }
+                        }
+                        Some(Err(error)) => {
+                            self.resources = None;
+                            return Err(error);
+                        }
+                        None => self.resources = None,
+                    }
+                }
+            }
+        };
+        match event {
             TransportEvent::Payload { channel, payload } if channel == ChannelId::CONTROL => {
                 self.handle_control_payload(&payload)
             }
@@ -480,16 +524,10 @@ impl NativeSessionClient {
             .await
     }
 
-    async fn send_raw_control(&self, value: &Value) -> Result<(), ApiError> {
-        let payload = serde_json::to_vec(value).map_err(|error| {
-            error::protocol(format!("Could not encode a control message: {error}"))
-        })?;
-        self.transport
-            .send(ChannelId::CONTROL, Bytes::from(payload))
-            .await
-    }
-
-    async fn await_hello_ack(&mut self) -> Result<Session, ApiError> {
+    async fn await_hello_ack(
+        &mut self,
+        scene_cache_bytes: Option<usize>,
+    ) -> Result<Session, ApiError> {
         loop {
             match self.transport.recv().await {
                 TransportEvent::Payload { channel, payload } if channel == ChannelId::CONTROL => {
@@ -497,7 +535,29 @@ impl NativeSessionClient {
                         error::protocol(format!("Invalid control JSON from the node: {error}"))
                     })?;
                     match control_kind(&value)? {
-                        "hello_ack" => return parse_hello_ack(&value),
+                        "hello_ack" => {
+                            let session = parse_hello_ack(&value)?;
+                            if let (Some(budget), Some(display)) =
+                                (scene_cache_bytes, control_data(&value).get("display"))
+                            {
+                                let display =
+                                    serde_json::from_value::<DisplayProfile>(display.clone())
+                                        .map_err(|error| {
+                                            error::protocol(format!(
+                                                "Invalid display profile: {error}"
+                                            ))
+                                        })?;
+                                if let DisplayProfile::Scene {
+                                    version: SCENE_VERSION,
+                                    initial_scene,
+                                } = display
+                                {
+                                    self.resources = Some(self.transport.resource_reader()?);
+                                    self.scene = Some(SceneReceiver::new(initial_scene, budget));
+                                }
+                            }
+                            return Ok(session);
+                        }
                         "error" => {
                             let api = parse_error(&value)?;
                             self.server_error = Some(api.clone());
@@ -546,6 +606,25 @@ impl NativeSessionClient {
                 let session = parse_hello_ack(&value)?;
                 self.session = Some(session.clone());
                 Ok(ClientEvent::SessionUpdated(session))
+            }
+            "scene_commit" if self.scene.is_some() => {
+                let commit = control_data(&value)
+                    .get("commit")
+                    .ok_or_else(|| error::protocol("SceneCommit has no commit"))?;
+                let commit = serde_json::from_value(commit.clone())
+                    .map_err(|error| error::protocol(format!("Invalid scene commit: {error}")))?;
+                let scene = self.scene.as_mut().expect("scene support was checked");
+                match scene.receive_commit(commit) {
+                    CommitStatus::Presented => Ok(ClientEvent::ScenePresented {
+                        revision: scene.presented().revision,
+                    }),
+                    CommitStatus::InvalidPlacements => {
+                        Err(error::protocol("SceneCommit contains invalid placements"))
+                    }
+                    CommitStatus::WaitingForResources | CommitStatus::IgnoredStale => {
+                        Ok(ClientEvent::ScenePending)
+                    }
+                }
             }
             "event" => Ok(ClientEvent::Session(parse_event(&value)?)),
             "error" => {
