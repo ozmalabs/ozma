@@ -28,13 +28,13 @@ This file records what is actually merged and tested, not what is planned.
 | Scoped view/control grants | Done | HMAC session tokens, permission sets, view-only input rejection |
 | Workstation consent | Done | consent policy + session state machine; denied consent blocks start |
 | HID input sink | Done | gadget writes, 6-key limit, absolute/relative reports, release-all, fake/recording sinks |
-| Audio path | Done | `ozma-audio`: ALSA capture, Opus 48k stereo, fake source, decode roundtrip |
+| Audio path | In progress | Opus encode/decode and ALSA fallback work; PipeWire-native capture/playback is being added |
 | Video fragmentation/reassembly | Done | protocol fragment header, node splitter, client `VideoAssembler` |
 | Input release on disconnect/control loss | Done | `InputReleased` + `ReleaseAll`; QUIC test checks the sink is cleared |
 | Session offer with token | Done | `POST /api/v1/sessions` returns a QUIC offer when configured |
 | Client video decode | Done | `ozma-decode`: OpenH264 H.264 decoder, I420/RGBA/PPM output, Opus decode; real 1920×1080 frame decoded and saved as PPM |
 | Controller connect flow | Done | `ozma-client connect`: controller discovery/activation → node session create/consent/start → transport certificate → QUIC media probe |
-| Client playback | Done | `ozma-playback`: ALSA audio sink, null/PPM/window video sinks, bounded playback engine |
+| Client playback | Done (ALSA) | `ozma-playback`: null/PPM/window video sinks and playback engine; PipeWire audio sink next |
 | Live playback CLI | Done | `ozma-play`: decode video/audio and present to PPM, null, or optional `minifb` window |
 | Native client | Done | `ozma-client` controller/node clients, connect/probe CLI, fragment reassembly, optional decoded PPM frame; desktop rendering is external |
 | Input latency measurement (<30 ms) | Not started | — |

@@ -133,7 +133,7 @@ Priority meanings: **P0** = without it there is no usable replacement;
 |---|---|---|---|---|
 | Live capture | KMS/EVDI/portal/X11/V4L2, hotplug, format negotiation | Enumeration only | `CaptureSource` providers; MMAP/DMABUF; hotplug; format and frame timing | P0 |
 | Encode | NVENC/VAAPI/QSV/V4L2M2M/software, real probe, fallback | Static config | Typed encoder backend + probe with a real frame; runtime fallback; keyframe/intra-refresh control | P0 |
-| Audio | Stream audio + mic, Opus/AAC, sink isolation, A/V sync | UAC2 bridge only | ALSA/UAC2 capture, Opus/AAC encode, jitter buffer, sync, mute/mic policy | P0 |
+| Audio | Stream audio + mic, Opus/AAC, sink isolation, A/V sync | UAC2 bridge only | PipeWire-native capture/playback on Linux (ALSA/UAC2 fallback), Opus/AAC encode, jitter buffer, sync, mute/mic policy | P0 |
 | Video transport | RTP/UDP, FEC, encryption, feedback | None | RTP packetiser for H.264/HEVC/AV1, FEC, RTCP, pacing, keyframe requests | P0 |
 | RTSP | Full server, TCP interleaved, multi-track extensions | None | RTSP server state machine, SDP, SETUP/PLAY/TEARDOWN, interleaved framing | P1 (compatibility) |
 | HID input | Keyboard/mouse/gamepad/touch/pen; uinput/gadget | UDP TODO | Gadget writer, report encoder, owner/handoff, release-all, per-track coordinates | P0 |
@@ -210,6 +210,10 @@ control plane. The architecture follows from that:
 9. **A remote monitor must be a real monitor where the platform permits it.**
    It belongs in the OS display topology, not in an overlay window. When a
    driver or compositor cannot provide that, the fallback must be explicit.
+10. **Linux is PipeWire-native.** Audio capture, playback, and graph routing
+    go through PipeWire first; ALSA is a minimal-device fallback, not the
+    primary architecture. FFmpeg/OpenH264 remain codec backends behind typed
+    encoder traits, not the media graph.
 
 ---
 
@@ -226,6 +230,8 @@ the same types.
 | `ozma-session` | Session state machine, leases, participants, consent, reconnection, multi-client policy, audit, display leases |
 | `ozma-media` | Formats, colour/HDR metadata, frame/buffer abstractions, clocks, A/V sync, track kinds (capture vs virtual display), resource budgets |
 | `ozma-capture` | `v4l2`, KMS/DRM, PipeWire/portal, X11, DXGI (feature-gated), hotplug, format negotiation |
+| `ozma-audio` | PipeWire-native capture/playback on Linux (ALSA/UAC2 fallback), Opus encode/decode, jitter/sync policy |
+| `ozma-playback` | Client ALSA/PipeWire audio sink, null/PPM/window video sinks, bounded playback engine |
 | `ozma-encode` | VAAPI, NVENC, QSV, V4L2M2M, software; probe/fallback; rate control; keyframes/intra-refresh |
 | `ozma-rtp` | RTP packetiser/depacketiser, H.264/HEVC/AV1 payload formats, FEC, RTCP, jitter/loss feedback |
 | `ozma-transport` | Multiplexed channels; UDP, QUIC/WebTransport, TCP-interleaved, Unix/SSH, relay; path selection |
@@ -315,6 +321,9 @@ CaptureSource ──► Frame ──► Encoder ──► EncodedFrame ──►
 - V4L2 with MMAP and DMABUF where available; MJPEG, NV12, YUYV, H.264
   passthrough.
 - KMS/DRM capture and PipeWire/portal for softnodes.
+- PipeWire streams for Linux audio capture/playback, with ALSA only as the
+  fallback for minimal devices; the same graph is used for routing and
+  per-session sinks.
 - Hotplug via udev/inotify; stable device identity; format negotiation;
   timestamps from `CLOCK_MONOTONIC`.
 - Frame validity checks: non-zero size, non-black, expected resolution,
