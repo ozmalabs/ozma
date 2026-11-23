@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
-use crate::ids::SessionId;
+use crate::ids::{SessionId, TrackId};
 use crate::input::InputEvent;
 use crate::scene::{DisplayCapabilities, DisplayProfile, SceneCommit};
 use crate::session::{EndReason, Session, SessionEvent};
@@ -77,6 +77,36 @@ pub enum ControlMessage {
     Bye {
         reason: EndReason,
     },
+    /// Client -> node: begin sending browser camera and/or microphone media.
+    CaptureStart {
+        video: bool,
+        audio: bool,
+    },
+    /// Client -> node: stop sending browser camera and/or microphone media.
+    CaptureStop {
+        video: bool,
+        audio: bool,
+    },
+    /// Client -> node: the capture pipeline's state and negotiated video
+    /// metadata. Optional fields default to `None` when the peer omits them.
+    CaptureState {
+        video: bool,
+        audio: bool,
+        #[serde(default)]
+        video_codec: Option<String>,
+        #[serde(default)]
+        width: Option<u16>,
+        #[serde(default)]
+        height: Option<u16>,
+        #[serde(default)]
+        error: Option<ApiError>,
+    },
+    /// Ask the peer to produce an IDR/keyframe. Clients send this when their
+    /// decoder loses sync; nodes may send it to a browser publisher.
+    KeyframeRequest {
+        #[serde(default)]
+        track: Option<TrackId>,
+    },
 }
 
 impl ControlMessage {
@@ -137,5 +167,85 @@ mod tests {
         };
         let json = serde_json::to_string(&ack).unwrap();
         assert_eq!(serde_json::from_str::<ControlMessage>(&json).unwrap(), ack);
+    }
+
+    #[test]
+    fn browser_capture_messages_roundtrip() {
+        let messages = [
+            ControlMessage::CaptureStart {
+                video: true,
+                audio: false,
+            },
+            ControlMessage::CaptureStop {
+                video: false,
+                audio: true,
+            },
+            ControlMessage::CaptureState {
+                video: true,
+                audio: true,
+                video_codec: Some("h264".to_owned()),
+                width: Some(1280),
+                height: Some(720),
+                error: None,
+            },
+            ControlMessage::KeyframeRequest {
+                track: Some(TrackId::new("video0")),
+            },
+        ];
+        for message in messages {
+            let json = serde_json::to_string(&message).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ControlMessage>(&json).unwrap(),
+                message,
+                "wire form: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_capture_wire_shapes_are_stable() {
+        assert_eq!(
+            serde_json::to_value(ControlMessage::CaptureStart {
+                video: true,
+                audio: false,
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type": "capture_start",
+                "data": { "video": true, "audio": false },
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ControlMessage::KeyframeRequest { track: None }).unwrap(),
+            serde_json::json!({
+                "type": "keyframe_request",
+                "data": { "track": null },
+            })
+        );
+    }
+
+    #[test]
+    fn older_clients_without_capture_fields_still_parse() {
+        // CaptureState's optional fields default to `None` when a peer built
+        // against the earlier shape omits them.
+        let decoded: ControlMessage =
+            serde_json::from_str(r#"{"type":"capture_state","data":{"video":true,"audio":false}}"#)
+                .unwrap();
+        assert_eq!(
+            decoded,
+            ControlMessage::CaptureState {
+                video: true,
+                audio: false,
+                video_codec: None,
+                width: None,
+                height: None,
+                error: None,
+            }
+        );
+
+        // A KeyframeRequest whose `track` is absent defaults to all tracks.
+        let decoded: ControlMessage =
+            serde_json::from_str(r#"{"type":"keyframe_request","data":{}}"#).unwrap();
+        assert_eq!(decoded, ControlMessage::KeyframeRequest { track: None });
     }
 }

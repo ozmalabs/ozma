@@ -39,6 +39,9 @@ pub enum ChannelKind {
     Mic,
     Telemetry,
     Bulk,
+    /// Client -> node encoded camera video. Carries H.264 access units using
+    /// the same fragmentation header as the node -> client video channels.
+    Camera,
 }
 
 /// Scheduling priority. Realtime channels must never be starved by video.
@@ -107,6 +110,18 @@ pub struct SessionOffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn camera_channel_has_a_stable_wire_name() {
+        assert_eq!(
+            serde_json::to_string(&ChannelKind::Camera).unwrap(),
+            "\"camera\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ChannelKind>("\"mic\"").unwrap(),
+            ChannelKind::Mic
+        );
+    }
 
     #[test]
     fn channel_descriptor_roundtrips() {

@@ -16,6 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
+use ozma_client_core::VideoAssembler;
 use ozma_encode::SelectedEncoder;
 use ozma_media::{
     CaptureSource, FakeCapture, FakeEncoder, Frame, FrameFormat, MediaError, Pipeline,
@@ -23,7 +24,8 @@ use ozma_media::{
 };
 use ozma_protocol::scene::{DisplayCapabilities, DisplayProfile};
 use ozma_protocol::{
-    ApiError, ClientId, ControlMessage, DisplayId, InputEvent, Permission, SessionEvent, SessionId,
+    ApiError, ChannelKind, ClientId, ControlMessage, DisplayId, InputEvent, Permission,
+    SessionEvent, SessionId,
 };
 use ozma_transport::{ChannelId, CloseReason, QuicServer, SessionTransport, TransportEvent};
 #[cfg(feature = "webtransport")]
@@ -36,6 +38,7 @@ use tracing::{debug, info, warn};
 
 use crate::audio_runtime::AudioRuntime;
 use crate::backend::SessionBackend;
+use crate::client_capture::{ClientCaptureHub, MAX_CAMERA_ACCESS_UNIT};
 
 /// A bound QUIC listener plus the certificate information clients need.
 pub struct QuicRuntime {
@@ -383,6 +386,12 @@ async fn handle_connection(
     };
 
     let mut events = backend.manager().subscribe();
+    // Resolve browser uplink channels from the negotiated map rather than
+    // assuming the conventional id layout.
+    let channels = transport.channel_map();
+    let camera_channel = channels.channel_for_kind(ChannelKind::Camera);
+    let mic_channel = channels.channel_for_kind(ChannelKind::Mic);
+    let capture = backend.client_capture(&session_id);
     // Shared with control handling so an input-latency ack can name the most
     // recent encoded frame without blocking the media loop. This tracks the
     // encoded frame sequence sent to the client, not display scanout.
@@ -396,6 +405,9 @@ async fn handle_connection(
         &mut audio,
         &mut events,
         &latest_frame_sequence,
+        &capture,
+        camera_channel,
+        mic_channel,
         matches!(selected_display, Some(DisplayProfile::Scene { .. })).then(|| SceneStream {
             session: &session,
             last_revision: 0,
@@ -577,6 +589,32 @@ async fn send_scene_updates(
     Ok(())
 }
 
+/// Reassemble one browser camera datagram and hand complete access units to
+/// the capture hub. Reassembly failures are counted and never end the session.
+fn feed_camera(capture: &ClientCaptureHub, assembler: &mut VideoAssembler, payload: &[u8]) {
+    match assembler.push(payload) {
+        Ok(Some(frame)) => {
+            let sequence = frame.sequence;
+            let keyframe = frame.keyframe;
+            if let Err(error) = capture.push_video(sequence, keyframe, Bytes::from(frame.data)) {
+                debug!(error = %error, "rejecting browser camera access unit");
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            capture.record_rejected();
+            capture.record_error(ApiError::new(
+                "capture.reassembly_failed",
+                format!("The browser camera fragment could not be reassembled: {error}"),
+            ));
+            // Drop the partial access unit so one bad datagram does not poison
+            // the next frame.
+            assembler.reset();
+            debug!(error = %error, "browser camera fragment rejected");
+        }
+    }
+}
+
 struct SceneStream<'a> {
     session: &'a ozma_protocol::Session,
     last_revision: u64,
@@ -593,20 +631,41 @@ async fn session_loop(
     audio: &mut Option<AudioRuntime>,
     events: &mut broadcast::Receiver<SessionEvent>,
     latest_frame_sequence: &AtomicU64,
+    capture: &ClientCaptureHub,
+    camera_channel: Option<ChannelId>,
+    mic_channel: Option<ChannelId>,
     mut scene_stream: Option<SceneStream<'_>>,
 ) -> Result<()> {
+    let mut camera_assembler = VideoAssembler::new(MAX_CAMERA_ACCESS_UNIT, 4);
     loop {
         tokio::select! {
             event = transport.recv() => {
                 match event {
-                    TransportEvent::Payload { channel, payload } => {
+                    TransportEvent::Payload { channel, payload }
+                    | TransportEvent::Datagram { channel, payload } => {
                         if channel == ChannelId::CONTROL {
-                            if let Err(error) = handle_control(backend, session_id, client_id, latest_frame_sequence, &*transport, &payload).await {
+                            if let Err(error) = handle_control(
+                                backend,
+                                session_id,
+                                client_id,
+                                latest_frame_sequence,
+                                capture,
+                                pipeline,
+                                &*transport,
+                                &payload,
+                            )
+                            .await
+                            {
                                 let _ = send_control(&*transport, &ControlMessage::Error { error }).await;
+                            }
+                        } else if Some(channel) == camera_channel {
+                            feed_camera(capture, &mut camera_assembler, &payload);
+                        } else if Some(channel) == mic_channel {
+                            if let Err(error) = capture.push_audio(payload) {
+                                debug!(error = %error, "rejecting browser microphone packet");
                             }
                         }
                     }
-                    TransportEvent::Datagram { .. } => {}
                     TransportEvent::Closed { .. } => break,
                     TransportEvent::Error { error } => {
                         let _ = send_control(&*transport, &ControlMessage::Error { error }).await;
@@ -688,6 +747,8 @@ async fn handle_control(
     session_id: &SessionId,
     client_id: &ClientId,
     latest_frame_sequence: &AtomicU64,
+    capture: &ClientCaptureHub,
+    pipeline: &RunningPipeline,
     transport: &dyn SessionTransport,
     payload: &[u8],
 ) -> Result<(), ozma_protocol::ApiError> {
@@ -745,6 +806,36 @@ async fn handle_control(
         ControlMessage::Bye { reason } => {
             let _ = backend.manager().stop(session_id, reason);
             let _ = backend.input_sink().release_all();
+        }
+        ControlMessage::CaptureStart { video, audio } => {
+            capture.start(video, audio)?;
+            info!(video, audio, "Browser camera/microphone capture started");
+        }
+        ControlMessage::CaptureStop { video, audio } => {
+            capture.stop(video, audio);
+            info!(video, audio, "Browser camera/microphone capture stopped");
+        }
+        ControlMessage::CaptureState {
+            video,
+            audio,
+            video_codec,
+            width,
+            height,
+            error,
+        } => {
+            capture.apply_state(video, audio, video_codec.as_deref(), width, height);
+            if let Some(error) = error {
+                warn!(
+                    code = %error.code,
+                    message = %error.message,
+                    "Browser capture reported an error"
+                );
+                capture.record_error(error);
+            }
+        }
+        ControlMessage::KeyframeRequest { track } => {
+            pipeline.request_keyframe();
+            info!(?track, "Forcing the next encoded frame to be a keyframe");
         }
         ControlMessage::Hello { .. }
         | ControlMessage::HelloAck { .. }

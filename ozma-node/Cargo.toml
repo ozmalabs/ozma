@@ -42,6 +42,9 @@ ozma-rtsp     = { path = "../ozma-rtsp" }
 ozma-display  = { path = "../ozma-display" }
 ozma-input    = { path = "../ozma-input" }
 ozma-audio    = { path = "../ozma-audio" }
+ozma-decode   = { path = "../ozma-decode" }
+# Browser camera/microphone reassembly is shared with the client side.
+ozma-client-core = { path = "../ozma-client-core" }
 
 # HTTP API
 axum = { version = "0.7", features = ["json", "ws"] }
@@ -77,5 +80,3 @@ path = "src/lib.rs"
 tokio = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-# Video reassembly for the WebTransport media test.
-ozma-client-core = { path = "../ozma-client-core" }

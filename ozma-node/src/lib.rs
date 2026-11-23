@@ -6,6 +6,7 @@ pub mod api;
 pub mod audio_runtime;
 pub mod backend;
 pub mod browser_scene;
+pub mod client_capture;
 pub mod config;
 pub mod mdns;
 pub mod platform;
@@ -16,4 +17,5 @@ pub mod transport;
 pub mod usb_audio;
 
 pub use backend::SessionBackend;
+pub use client_capture::{ClientCaptureHub, ClientCaptureSource};
 pub use config::NodeConfig;

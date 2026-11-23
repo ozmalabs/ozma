@@ -20,7 +20,9 @@ use ozma_protocol::{
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiFailure;
-use crate::state::{BrowserSceneSink, NodeBackend, SceneSinkError};
+use crate::state::{
+    BrowserSceneSink, CaptureReport, ClientCaptureSink, NodeBackend, SceneSinkError,
+};
 
 type Backend = Arc<dyn NodeBackend>;
 type ApiResult<T> = Result<Json<T>, ApiFailure>;
@@ -38,6 +40,12 @@ struct BrowserSceneState {
     sink: Option<Arc<dyn BrowserSceneSink>>,
 }
 
+#[derive(Clone)]
+struct CaptureState {
+    backend: Backend,
+    sink: Option<Arc<dyn ClientCaptureSink>>,
+}
+
 /// Build the native API router with an optional static bearer token.
 ///
 /// Health, capabilities, and Hestia capability discovery stay readable so a
@@ -48,9 +56,31 @@ pub fn router_with_token(backend: Backend, token: Option<String>) -> Router {
 
 /// Build the native API router with an optional live browser scene sink.
 pub fn router_with_scene(backend: Backend, sink: Option<Arc<dyn BrowserSceneSink>>) -> Router {
+    router_with_sinks(backend, sink, None, None)
+}
+
+/// Build the native API router with optional browser scene and capture sinks
+/// plus an optional static bearer token.
+pub fn router_with_sinks(
+    backend: Backend,
+    scene_sink: Option<Arc<dyn BrowserSceneSink>>,
+    capture_sink: Option<Arc<dyn ClientCaptureSink>>,
+    token: Option<String>,
+) -> Router {
     let scene = Router::new()
         .route("/api/v1/browser/scene/ws", get(browser_scene_ws))
-        .with_state(BrowserSceneState { sink });
+        .with_state(BrowserSceneState { sink: scene_sink });
+
+    let capture = Router::new()
+        .route("/api/v1/sessions/:id/capture", get(capture_report))
+        .route(
+            "/api/v1/sessions/:id/capture/frame.ppm",
+            get(capture_frame_ppm),
+        )
+        .with_state(CaptureState {
+            backend: backend.clone(),
+            sink: capture_sink,
+        });
 
     let api = Router::new()
         .route("/api/v1/health", get(health))
@@ -85,17 +115,7 @@ pub fn router_with_scene(backend: Backend, sink: Option<Arc<dyn BrowserSceneSink
         )
         .with_state(backend);
 
-    api.merge(scene)
-}
-
-/// Build the native API router with a live browser scene sink and optional
-/// static bearer token. The token guard also covers the browser scene socket.
-pub fn router_with_token_and_scene(
-    backend: Backend,
-    sink: Option<Arc<dyn BrowserSceneSink>>,
-    token: Option<String>,
-) -> Router {
-    let router = router_with_scene(backend, sink);
+    let router = api.merge(scene).merge(capture);
     match token {
         Some(token) if !token.is_empty() => router.layer(middleware::from_fn_with_state(
             std::sync::Arc::new(token),
@@ -103,6 +123,17 @@ pub fn router_with_token_and_scene(
         )),
         _ => router,
     }
+}
+
+/// Build the native API router with a live browser scene sink and optional
+/// static bearer token. The token guard also covers the browser scene socket
+/// and the capture endpoints.
+pub fn router_with_token_and_scene(
+    backend: Backend,
+    sink: Option<Arc<dyn BrowserSceneSink>>,
+    token: Option<String>,
+) -> Router {
+    router_with_sinks(backend, sink, None, token)
 }
 
 async fn require_bearer(
@@ -490,6 +521,54 @@ fn event_belongs(event: &SessionEvent, id: &SessionId) -> bool {
     }
 }
 
+fn capture_unavailable() -> ApiError {
+    ApiError::new(
+        ozma_protocol::error::codes::NOT_FOUND,
+        "Browser capture is not available for this session",
+    )
+    .with_remediation("Start a browser camera or microphone uplink for the session first.")
+}
+
+async fn capture_report(
+    State(state): State<CaptureState>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiResult<CaptureReport> {
+    let session_id = session_id(id);
+    if state.backend.get_session(&session_id).is_none() {
+        return Err(ApiFailure(ApiError::new(
+            ozma_protocol::error::codes::NOT_FOUND,
+            "Session not found",
+        )));
+    }
+    let sink = state
+        .sink
+        .ok_or_else(|| ApiFailure(capture_unavailable()))?;
+    let report = sink
+        .capture_report(&session_id)
+        .ok_or_else(|| ApiFailure(capture_unavailable()))?;
+    Ok(Json(report))
+}
+
+async fn capture_frame_ppm(
+    State(state): State<CaptureState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Response, ApiFailure> {
+    let session_id = session_id(id);
+    if state.backend.get_session(&session_id).is_none() {
+        return Err(ApiFailure(ApiError::new(
+            ozma_protocol::error::codes::NOT_FOUND,
+            "Session not found",
+        )));
+    }
+    let sink = state
+        .sink
+        .ok_or_else(|| ApiFailure(capture_unavailable()))?;
+    let frame = sink
+        .capture_frame_ppm(&session_id)
+        .ok_or_else(|| ApiFailure(capture_unavailable()))?;
+    Ok(([(header::CONTENT_TYPE, "image/x-portable-pixmap")], frame).into_response())
+}
+
 #[derive(Serialize)]
 struct DisplaysResponse {
     displays: Vec<VirtualDisplaySpec>,
@@ -720,7 +799,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
-    use ozma_protocol::{ClientId, InputSpec, PointerMode, TrackKind, TrackSpec};
+    use ozma_protocol::{ClientId, InputSpec, PointerMode, SessionSpec, TrackKind, TrackSpec};
     use tower::ServiceExt;
 
     fn backend() -> Backend {
@@ -862,6 +941,140 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(allowed.status(), StatusCode::OK);
+    }
+
+    struct FakeCaptureSink {
+        report: CaptureReport,
+        ppm: Option<Vec<u8>>,
+    }
+
+    impl ClientCaptureSink for FakeCaptureSink {
+        fn capture_report(&self, _session_id: &ozma_protocol::SessionId) -> Option<CaptureReport> {
+            Some(self.report.clone())
+        }
+
+        fn capture_frame_ppm(&self, _session_id: &ozma_protocol::SessionId) -> Option<Vec<u8>> {
+            self.ppm.clone()
+        }
+    }
+
+    fn capture_spec() -> SessionSpec {
+        SessionSpec {
+            client_id: ClientId::new("browser-1"),
+            principal: "alice".into(),
+            tracks: Vec::new(),
+            audio: Default::default(),
+            input: Default::default(),
+            privacy: Default::default(),
+            transport: Default::default(),
+            ttl_seconds: 60,
+        }
+    }
+
+    fn capture_report_fixture() -> CaptureReport {
+        CaptureReport {
+            video: crate::state::CaptureVideoStats {
+                started: true,
+                packets: 12,
+                frames: 10,
+                bytes: 1_234,
+                width: 1280,
+                height: 720,
+                codec: "h264".to_owned(),
+                decode_errors: 0,
+                last_sequence: 9,
+            },
+            audio: crate::state::CaptureAudioStats {
+                started: true,
+                packets: 50,
+                bytes: 5_000,
+                samples: 48_000,
+                decode_errors: 0,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_endpoints_report_json_and_ppm() {
+        let backend: Backend = Arc::new(crate::state::MemoryBackend::fake());
+        let session = backend.create_session(capture_spec()).unwrap();
+        let ppm = b"P6\n2 2\n255\n\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b".to_vec();
+        let sink = Arc::new(FakeCaptureSink {
+            report: capture_report_fixture(),
+            ppm: Some(ppm.clone()),
+        });
+        let app = router_with_sinks(backend, None, Some(sink), None);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/sessions/{}/capture", session.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["video"]["started"], true);
+        assert_eq!(json["video"]["packets"], 12);
+        assert_eq!(json["video"]["frames"], 10);
+        assert_eq!(json["video"]["bytes"], 1_234);
+        assert_eq!(json["video"]["width"], 1280);
+        assert_eq!(json["video"]["height"], 720);
+        assert_eq!(json["video"]["codec"], "h264");
+        assert_eq!(json["video"]["decode_errors"], 0);
+        assert_eq!(json["video"]["last_sequence"], 9);
+        assert_eq!(json["audio"]["samples"], 48_000);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/sessions/{}/capture/frame.ppm", session.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), ppm.as_slice());
+    }
+
+    #[tokio::test]
+    async fn capture_endpoints_are_404_until_a_frame_and_are_bearer_guarded() {
+        let backend: Backend = Arc::new(crate::state::MemoryBackend::fake());
+        let session = backend.create_session(capture_spec()).unwrap();
+        let sink = Arc::new(FakeCaptureSink {
+            report: CaptureReport::default(),
+            ppm: None,
+        });
+        let app = router_with_sinks(backend, None, Some(sink), Some("secret-token".to_owned()));
+
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/sessions/{}/capture", session.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let missing_frame = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/sessions/{}/capture/frame.ppm", session.id))
+                    .header("authorization", "Bearer secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_frame.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

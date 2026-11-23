@@ -13,6 +13,7 @@ use ozma_protocol::{
     DpmsState, EndReason, NodeCapabilities, NodeId, RuntimeMetrics, Session, SessionEvent,
     SessionId, SessionOffer, SessionSpec, SessionState, VirtualDisplaySpec,
 };
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 /// An ingest failure the browser WebSocket can report without tearing down the
@@ -60,6 +61,56 @@ pub trait BrowserSceneSink: Send + Sync + 'static {
         _frame: serde_json::Value,
     ) -> Result<(), SceneSinkError> {
         Err(SceneSinkError::unavailable())
+    }
+}
+
+/// Camera counter snapshot returned by `GET /api/v1/sessions/{id}/capture`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureVideoStats {
+    pub started: bool,
+    pub packets: u64,
+    pub frames: u64,
+    pub bytes: u64,
+    pub width: u32,
+    pub height: u32,
+    pub codec: String,
+    pub decode_errors: u64,
+    pub last_sequence: u64,
+}
+
+/// Microphone counter snapshot returned by the capture endpoint.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureAudioStats {
+    pub started: bool,
+    pub packets: u64,
+    pub bytes: u64,
+    pub samples: u64,
+    pub decode_errors: u64,
+}
+
+/// Browser camera/microphone uplink counters.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureReport {
+    pub video: CaptureVideoStats,
+    pub audio: CaptureAudioStats,
+}
+
+/// The optional browser camera/microphone read surface used by the API router.
+///
+/// Like [`BrowserSceneSink`], the router knows nothing about `ozma-node`: an
+/// embedding supplies a sink, and the default methods report "not available".
+/// The node wires the same per-session capture hub the transport decodes into.
+pub trait ClientCaptureSink: Send + Sync + 'static {
+    /// The latest counters for `session_id`, or `None` when the session has no
+    /// browser capture hub (or the feature is not installed).
+    fn capture_report(&self, _session_id: &SessionId) -> Option<CaptureReport> {
+        None
+    }
+
+    /// The latest decoded camera frame as a binary PPM, or `None` until one
+    /// has arrived.
+    fn capture_frame_ppm(&self, _session_id: &SessionId) -> Option<Vec<u8>> {
+        None
     }
 }
 

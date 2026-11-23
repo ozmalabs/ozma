@@ -212,6 +212,24 @@ impl ChannelMap {
             track_id: None,
             max_payload: u16::MAX,
         });
+        next_id = next_id.checked_add(1).ok_or_else(|| {
+            ApiError::new(
+                codes::INVALID_REQUEST,
+                "too many channels for the channel id space",
+            )
+        })?;
+
+        // Browser -> node encoded camera video. It is appended last so adding
+        // it never shifts the id of control, input, video, audio, mic,
+        // telemetry, or bulk channels used by existing clients.
+        descriptors.push(ChannelDescriptor {
+            id: next_id,
+            kind: ChannelKind::Camera,
+            priority: ChannelPriority::Normal,
+            reliable: false,
+            track_id: Some(TrackId::new("camera0")),
+            max_payload: 1200,
+        });
 
         Self::new(descriptors)
     }
@@ -219,6 +237,33 @@ impl ChannelMap {
     /// Look up a descriptor, if this map carries the channel.
     pub fn get(&self, channel: ChannelId) -> Option<&ChannelDescriptor> {
         self.channels.get(&channel.raw())
+    }
+
+    /// The first channel of `kind`, in channel-id order.
+    ///
+    /// Channel ids are negotiated, so callers should resolve by kind instead
+    /// of assuming the conventional layout.
+    pub fn channel_for_kind(&self, kind: ChannelKind) -> Option<ChannelId> {
+        self.channels
+            .values()
+            .find(|descriptor| descriptor.kind == kind)
+            .map(|descriptor| ChannelId::new(descriptor.id))
+    }
+
+    /// Every channel of `kind`, in channel-id order.
+    pub fn channels_for_kind(&self, kind: ChannelKind) -> Vec<ChannelId> {
+        self.channels
+            .values()
+            .filter(|descriptor| descriptor.kind == kind)
+            .map(|descriptor| ChannelId::new(descriptor.id))
+            .collect()
+    }
+
+    /// The descriptor for the first channel of `kind`.
+    pub fn descriptor_for_kind(&self, kind: ChannelKind) -> Option<&ChannelDescriptor> {
+        self.channels
+            .values()
+            .find(|descriptor| descriptor.kind == kind)
     }
 
     /// Look up a descriptor or return a typed `invalid_request` error.
@@ -273,7 +318,7 @@ mod tests {
     #[test]
     fn default_layout_matches_the_protocol_channels() {
         let map = ChannelMap::default_session();
-        assert_eq!(map.len(), 7);
+        assert_eq!(map.len(), 8);
         assert_eq!(
             map.require(ChannelId::CONTROL).unwrap().kind,
             ChannelKind::Control
@@ -289,6 +334,37 @@ mod tests {
             ChannelPriority::High
         );
         assert!(map.require(ChannelId::TELEMETRY).unwrap().reliable);
+
+        // The browser camera channel is appended after the existing
+        // single-track layout: control 0, input 1, video 2, audio 3, mic 4,
+        // telemetry 5, bulk 6, camera 7.
+        let camera = map
+            .channel_for_kind(ChannelKind::Camera)
+            .expect("camera channel");
+        assert_eq!(camera, ChannelId::new(7));
+        let descriptor = map.require(camera).unwrap();
+        assert_eq!(descriptor.track_id, Some(TrackId::new("camera0")));
+        assert!(!descriptor.reliable);
+        assert_eq!(descriptor.max_payload, 1200);
+        assert_eq!(map.channels_for_kind(ChannelKind::Camera), vec![camera]);
+    }
+
+    #[test]
+    fn camera_is_appended_without_shifting_existing_ids() {
+        let map = ChannelMap::for_tracks(&[TrackId::new("video0")], false, false).unwrap();
+        // control 0, input 1, video 2, telemetry 3, bulk 4, camera 5.
+        assert_eq!(
+            map.channel_for_kind(ChannelKind::Telemetry),
+            Some(ChannelId::new(3))
+        );
+        assert_eq!(
+            map.channel_for_kind(ChannelKind::Bulk),
+            Some(ChannelId::new(4))
+        );
+        assert_eq!(
+            map.channel_for_kind(ChannelKind::Camera),
+            Some(ChannelId::new(5))
+        );
     }
 
     #[test]

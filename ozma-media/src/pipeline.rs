@@ -6,7 +6,7 @@
 //! propagated to the owner through [`RunningPipeline::wait`]; they are never
 //! swallowed or converted into a silent drop.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -131,6 +131,7 @@ pub struct RunningPipeline {
     frames: mpsc::Receiver<EncodedFrame>,
     cancel: CancelToken,
     counters: Arc<Counters>,
+    force_keyframe: Arc<AtomicBool>,
     capture_task: JoinHandle<Result<(), MediaError>>,
     encode_task: JoinHandle<Result<(), MediaError>>,
 }
@@ -149,6 +150,16 @@ impl RunningPipeline {
     /// Snapshot the live counters.
     pub fn metrics(&self) -> PipelineMetrics {
         self.counters.snapshot()
+    }
+
+    /// Ask the encoder for an IDR on the next frame.
+    ///
+    /// The flag is consumed by the encode task before the next
+    /// [`Encoder::encode`] call, so the request may be coalesced with another
+    /// one but is never lost between frames. Calling this after cancellation
+    /// is harmless.
+    pub fn request_keyframe(&self) {
+        self.force_keyframe.store(true, Ordering::Release);
     }
 
     /// Request cancellation. Idempotent.
@@ -171,9 +182,11 @@ impl RunningPipeline {
             frames,
             cancel,
             counters,
+            force_keyframe,
             capture_task,
             encode_task,
         } = self;
+        let _ = force_keyframe;
         drop(frames);
         let _ = cancel;
         let (capture, encode) = tokio::join!(capture_task, encode_task);
@@ -237,6 +250,7 @@ impl Pipeline {
 
         let cancel = CancelToken::new();
         let counters = Arc::new(Counters::default());
+        let force_keyframe = Arc::new(AtomicBool::new(false));
         let (frame_tx, frame_rx) = mpsc::channel(config.capture_queue);
         let (output_tx, output_rx) = mpsc::channel(config.output_queue);
 
@@ -253,6 +267,7 @@ impl Pipeline {
             output_tx,
             cancel.clone(),
             Arc::clone(&counters),
+            Arc::clone(&force_keyframe),
             config.drop_on_full,
         ));
 
@@ -260,6 +275,7 @@ impl Pipeline {
             frames: output_rx,
             cancel,
             counters,
+            force_keyframe,
             capture_task,
             encode_task,
         })
@@ -333,6 +349,7 @@ async fn run_encoder<E: Encoder>(
     output: mpsc::Sender<EncodedFrame>,
     cancel: CancelToken,
     counters: Arc<Counters>,
+    force_keyframe: Arc<AtomicBool>,
     drop_on_full: bool,
 ) -> Result<(), MediaError> {
     let encoder_id = encoder.id().to_owned();
@@ -370,6 +387,23 @@ async fn run_encoder<E: Encoder>(
             }
             break;
         };
+
+        // Consume a pending keyframe request before encoding this frame. The
+        // swap happens here, in the encode task, so a request made by another
+        // task while a frame was in flight still applies to the next one.
+        if force_keyframe.swap(false, Ordering::AcqRel) {
+            let requested = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                result = encoder.request_keyframe() => result,
+            };
+            if let Err(error) = requested {
+                counters.errors.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(encoder = %encoder_id, error = %error, "encoder keyframe request failed");
+                cancel.cancel();
+                return Err(error);
+            }
+        }
 
         let encoded = tokio::select! {
             biased;
@@ -519,6 +553,100 @@ mod tests {
             .expect("cancellation is a clean stop");
         assert!(metrics.frames_captured >= 3);
         assert!(metrics.errors == 0);
+    }
+
+    /// An encoder that produces an IDR exactly when the pipeline asks it to.
+    #[derive(Debug)]
+    struct KeyframeSpy {
+        input: FrameFormat,
+        output: MediaFormat,
+        seen_request: Arc<AtomicBool>,
+        force_next: bool,
+        encoded: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl Encoder for KeyframeSpy {
+        fn id(&self) -> &str {
+            "keyframe-spy"
+        }
+
+        fn input_format(&self) -> FrameFormat {
+            self.input
+        }
+
+        fn output_format(&self) -> MediaFormat {
+            self.output.clone()
+        }
+
+        async fn encode(&mut self, frame: Frame) -> Result<EncodedFrame, MediaError> {
+            let keyframe = self.encoded == 0 || std::mem::take(&mut self.force_next);
+            let data = if keyframe {
+                b"IDR".to_vec()
+            } else {
+                b"P".to_vec()
+            };
+            self.encoded += 1;
+            EncodedFrame::new(
+                self.output.clone(),
+                frame.pts_micros(),
+                frame.sequence(),
+                keyframe,
+                data,
+            )
+        }
+
+        async fn request_keyframe(&mut self) -> Result<(), MediaError> {
+            self.seen_request.store(true, Ordering::Release);
+            self.force_next = true;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn request_keyframe_reaches_the_encoder_before_the_next_frame() {
+        use std::sync::atomic::AtomicBool;
+
+        let seen_request = Arc::new(AtomicBool::new(false));
+        let input = FrameFormat::rgb24(64, 48);
+        let encoder = KeyframeSpy {
+            input,
+            output: MediaFormat::new(ozma_protocol::Codec::H264, 64, 48, 30, 2_000),
+            seen_request: Arc::clone(&seen_request),
+            force_next: false,
+            encoded: 0,
+        };
+        let source = FakeCapture::new(input).with_fps(200);
+        let mut pipeline =
+            Pipeline::start(source, encoder, PipelineConfig::new().with_queues(2, 8)).unwrap();
+
+        let mut requested = false;
+        let mut keyframes_after_request = 0;
+        for _ in 0..32 {
+            let frame = tokio::time::timeout(Duration::from_secs(2), pipeline.recv())
+                .await
+                .expect("pipeline should produce a frame")
+                .expect("pipeline should stay open");
+            if requested && frame.is_keyframe() {
+                keyframes_after_request += 1;
+                break;
+            }
+            if !requested && !frame.is_keyframe() {
+                pipeline.request_keyframe();
+                requested = true;
+            }
+        }
+
+        assert!(requested, "test should have seen a non-key frame");
+        assert!(
+            seen_request.load(Ordering::Acquire),
+            "the pipeline must call Encoder::request_keyframe"
+        );
+        assert_eq!(
+            keyframes_after_request, 1,
+            "the next encoded frame after a request must be an IDR"
+        );
+        pipeline.cancel_and_wait().await.unwrap();
     }
 
     #[tokio::test]

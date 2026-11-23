@@ -39,9 +39,13 @@ impl AudioRuntime {
             .as_str()
         {
             "fake" => {
-                tracing::info!("Using paced deterministic fake audio source (OZMA_AUDIO_SOURCE=fake)");
+                tracing::info!(
+                    "Using paced deterministic fake audio source (OZMA_AUDIO_SOURCE=fake)"
+                );
                 return Self::spawn(
-                    Box::new(PacedFakeAudioSource::new(FakeAudioSource::new().unlimited())),
+                    Box::new(PacedFakeAudioSource::new(
+                        FakeAudioSource::new().unlimited(),
+                    )),
                     None,
                 );
             }
@@ -253,9 +257,7 @@ impl PacedFakeAudioSource {
     fn new(inner: FakeAudioSource) -> Self {
         Self {
             inner,
-            interval: Duration::from_micros(u64::from(
-                EncoderConfig::opus().frame_micros,
-            )),
+            interval: Duration::from_micros(u64::from(EncoderConfig::opus().frame_micros)),
         }
     }
 }

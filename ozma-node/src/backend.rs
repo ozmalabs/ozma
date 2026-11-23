@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
 //! Adapter from the real session manager to the API backend contract.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ozma_api::state::{CaptureReport, ClientCaptureSink};
 use ozma_api::NodeBackend;
 use ozma_auth::{ConsentPolicy, TokenClaims, TokenIssuer, TokenVerifier};
 use ozma_capture::CaptureRegistry;
@@ -22,6 +24,8 @@ use ozma_transport::offer::{SessionOfferBuilder, TransportDescriptorBuilder};
 use ozma_transport::ChannelMap;
 use rand::RngCore;
 use tokio::sync::broadcast;
+
+use crate::client_capture::ClientCaptureHub;
 
 fn now() -> u64 {
     SystemTime::now()
@@ -88,6 +92,7 @@ pub struct SessionBackend {
     webtransport: Mutex<Option<TransportOffer>>,
     input: SharedSink,
     scene_producer: Option<Arc<dyn SceneProducer>>,
+    client_captures: Mutex<HashMap<SessionId, ClientCaptureHub>>,
 }
 
 impl SessionBackend {
@@ -107,7 +112,40 @@ impl SessionBackend {
             webtransport: Mutex::new(None),
             input: Arc::new(FakeInputSink::default()),
             scene_producer: None,
+            client_captures: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The browser camera/microphone hub for `session_id`, creating it on
+    /// first use.
+    ///
+    /// The transport and the HTTP capture sink share this handle, so decoding
+    /// state does not depend on which surface touches it first.
+    pub fn client_capture(&self, session_id: &SessionId) -> ClientCaptureHub {
+        self.client_captures
+            .lock()
+            .expect("client capture registry lock")
+            .entry(session_id.clone())
+            .or_default()
+            .clone()
+    }
+
+    /// The capture counters for an existing hub, without creating one.
+    pub fn client_capture_report(&self, session_id: &SessionId) -> Option<CaptureReport> {
+        self.client_captures
+            .lock()
+            .expect("client capture registry lock")
+            .get(session_id)
+            .map(ClientCaptureHub::report)
+    }
+
+    /// The latest decoded camera frame for an existing hub as PPM.
+    pub fn client_capture_ppm(&self, session_id: &SessionId) -> Option<Vec<u8>> {
+        self.client_captures
+            .lock()
+            .expect("client capture registry lock")
+            .get(session_id)
+            .and_then(ClientCaptureHub::latest_ppm)
     }
 
     /// Replace the input sink. The node uses a HID gadget sink in production
@@ -274,6 +312,16 @@ impl SessionBackend {
     /// this periodically.
     pub fn expire(&self) -> usize {
         self.manager.expire(now())
+    }
+}
+
+impl ClientCaptureSink for SessionBackend {
+    fn capture_report(&self, session_id: &SessionId) -> Option<CaptureReport> {
+        self.client_capture_report(session_id)
+    }
+
+    fn capture_frame_ppm(&self, session_id: &SessionId) -> Option<Vec<u8>> {
+        self.client_capture_ppm(session_id)
     }
 }
 

@@ -159,10 +159,17 @@ pub async fn serve_with_scene_replay(
     });
 
     let webtransport_info_backend = backend.clone();
+    // The capture sink shares the same per-session hubs the QUIC/WebTransport
+    // session loop decodes into.
+    let capture_sink: Arc<dyn ozma_api::state::ClientCaptureSink> = backend.clone();
     let dynamic: Arc<dyn NodeBackend> = backend;
     let scene_sink: Arc<dyn BrowserSceneSink> = browser_scene;
-    let app =
-        ozma_api::router::router_with_token_and_scene(dynamic, Some(scene_sink), api_token.clone());
+    let app = ozma_api::router::router_with_sinks(
+        dynamic,
+        Some(scene_sink),
+        Some(capture_sink),
+        api_token.clone(),
+    );
     // Additive certificate endpoint for the browser client. It is public cert
     // material, but it is only mounted on the unauthenticated local/dev surface;
     // when a bearer token is configured, clients take the same values from the

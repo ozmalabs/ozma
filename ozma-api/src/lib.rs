@@ -13,5 +13,8 @@ pub mod router;
 pub mod state;
 
 pub use error::ApiFailure;
-pub use router::{router, router_with_token};
-pub use state::{MemoryBackend, NodeBackend};
+pub use router::{router, router_with_sinks, router_with_token};
+pub use state::{
+    BrowserSceneSink, CaptureAudioStats, CaptureReport, CaptureVideoStats, ClientCaptureSink,
+    MemoryBackend, NodeBackend,
+};

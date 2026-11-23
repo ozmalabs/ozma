@@ -272,7 +272,14 @@ mod tests {
         assert_eq!(descriptor.endpoint.as_deref(), Some("127.0.0.1:4433"));
         assert!(descriptor.secure);
         assert_eq!(descriptor.alpn.as_deref(), Some("ozma/1"));
-        assert_eq!(descriptor.channels.len(), 7);
+        assert_eq!(descriptor.channels.len(), 8);
+        assert!(
+            descriptor
+                .channels
+                .iter()
+                .any(|channel| channel.kind == ozma_protocol::ChannelKind::Camera),
+            "the default layout carries the browser camera channel"
+        );
     }
 
     #[test]
