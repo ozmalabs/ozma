@@ -31,7 +31,7 @@ This file records what is actually merged and tested, not what is planned.
 | HID input sink | Done | gadget writes, 6-key limit, absolute/relative reports, release-all, fake/recording sinks |
 | Audio path | Done | `ozma-pipewire` native capture/playback and `ozma-audio` Opus; node prefers PipeWire and falls back to ALSA/fake; real PipeWire daemon smoke test passed |
 | Video fragmentation/reassembly | Done | protocol fragment header, node splitter, client `VideoAssembler` |
-| Client camera/mic uplink | In progress | `ChannelKind::Camera` + `CaptureStart/Stop/State`; node decodes H.264/Opus into a bounded hub with `/api/v1/sessions/{id}/capture` and a PPM proof endpoint; `RunningPipeline::request_keyframe`; browser `getUserMedia` + WebCodecs encoders are being wired |
+| Client camera/mic uplink | In progress | `ChannelKind::Camera` + `CaptureStart/Stop/State` + `KeyframeRequest`; node decodes H.264/Opus into a bounded per-session hub with `/api/v1/sessions/{id}/capture` and a PPM proof endpoint; `RunningPipeline::request_keyframe` is real. Browser (`getUserMedia` + WebCodecs) and native (`ozma-capture`/`ozma-encode`/Opus) uplink clients are being implemented |
 | Input release on disconnect/control loss | Done | `InputReleased` + `ReleaseAll`; QUIC test checks the sink is cleared |
 | Session offer with token | Done | `POST /api/v1/sessions` returns a QUIC offer when configured |
 | Client video decode | Done | `ozma-decode`: OpenH264 H.264 decoder, I420/RGBA/PPM output, Opus decode; real 1920×1080 frame decoded and saved as PPM |
