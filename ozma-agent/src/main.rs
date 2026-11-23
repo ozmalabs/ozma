@@ -38,7 +38,11 @@ struct Cli {
     wg_port: u16,
 
     /// Controller URL (used by mesh task to fetch peer list).
-    #[arg(long, env = "OZMA_CONTROLLER_URL", default_value = "http://localhost:7380")]
+    #[arg(
+        long,
+        env = "OZMA_CONTROLLER_URL",
+        default_value = "http://localhost:7380"
+    )]
     controller_url: String,
 }
 
@@ -84,7 +88,7 @@ async fn main() -> Result<()> {
         match result {
             Ok(Ok(())) => {}
             Ok(Err(e)) => error!("task error: {e:#}"),
-            Err(e)     => error!("task panicked: {e}"),
+            Err(e) => error!("task panicked: {e}"),
         }
     }
 

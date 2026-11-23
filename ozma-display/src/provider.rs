@@ -136,11 +136,7 @@ pub struct VirtualDisplay {
 }
 
 impl VirtualDisplay {
-    pub fn new(
-        spec: VirtualDisplaySpec,
-        mode: DisplayMode,
-        state: DisplayState,
-    ) -> Self {
+    pub fn new(spec: VirtualDisplaySpec, mode: DisplayMode, state: DisplayState) -> Self {
         Self {
             id: spec.id.clone(),
             spec,

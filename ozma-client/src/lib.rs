@@ -31,7 +31,7 @@ pub mod rdp;
 mod http;
 mod node_api;
 pub mod scene_render;
-pub mod spice;
+pub mod xpra_peer;
 mod session;
 pub mod video;
 pub mod vnc;

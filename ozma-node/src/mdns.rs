@@ -34,10 +34,7 @@ pub fn advertise(
     txt: &HashMap<String, String>,
 ) -> Result<MdnsHandle, Box<dyn std::error::Error + Send + Sync>> {
     // Build TXT record properties: ["key=value", ...]
-    let properties: Vec<String> = txt
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect();
+    let properties: Vec<String> = txt.iter().map(|(k, v)| format!("{k}={v}")).collect();
 
     // libmdns expects &[&str]
     let prop_refs: Vec<&str> = properties.iter().map(|s| s.as_str()).collect();
@@ -50,12 +47,7 @@ pub fn advertise(
     );
 
     let responder = Responder::new()?;
-    let service = responder.register(
-        SERVICE_TYPE.to_string(),
-        name.to_string(),
-        port,
-        &prop_refs,
-    );
+    let service = responder.register(SERVICE_TYPE.to_string(), name.to_string(), port, &prop_refs);
 
     Ok(MdnsHandle {
         _service: service,

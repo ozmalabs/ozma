@@ -28,7 +28,10 @@ impl SubmitReport {
 
     /// A no-op report.
     pub const fn noop() -> Self {
-        Self { reports_written: 0, state_changed: false }
+        Self {
+            reports_written: 0,
+            state_changed: false,
+        }
     }
 }
 
@@ -85,7 +88,10 @@ pub struct RecordingSink<S: InputSink> {
 
 impl<S: InputSink> RecordingSink<S> {
     pub fn new(inner: S) -> Self {
-        Self { inner, events: Mutex::new(Vec::new()) }
+        Self {
+            inner,
+            events: Mutex::new(Vec::new()),
+        }
     }
 
     /// Every submitted event, in order.
@@ -130,7 +136,9 @@ impl<S: InputSink> InputSink for RecordingSink<S> {
 }
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
@@ -152,7 +160,9 @@ mod tests {
         sink.submit(&key(0x04, true)).unwrap();
         sink.release_all().unwrap();
         let error = sink
-            .submit(&InputEvent::Clipboard { text: "nope".into() })
+            .submit(&InputEvent::Clipboard {
+                text: "nope".into(),
+            })
             .unwrap_err();
         assert_eq!(error.code, crate::codes::UNSUPPORTED);
 
@@ -161,7 +171,9 @@ mod tests {
             vec![
                 key(0x04, true),
                 InputEvent::ReleaseAll,
-                InputEvent::Clipboard { text: "nope".into() },
+                InputEvent::Clipboard {
+                    text: "nope".into()
+                },
             ]
         );
         assert!(sink.held().is_empty());

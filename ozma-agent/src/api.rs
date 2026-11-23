@@ -13,7 +13,7 @@ use tracing::info;
 
 #[derive(Serialize)]
 struct Status {
-    status:  &'static str,
+    status: &'static str,
     version: &'static str,
 }
 
@@ -23,7 +23,7 @@ async fn healthz() -> &'static str {
 
 async fn status() -> Json<Status> {
     Json(Status {
-        status:  "running",
+        status: "running",
         version: env!("CARGO_PKG_VERSION"),
     })
 }
@@ -35,9 +35,9 @@ async fn version() -> &'static str {
 /// Start the API server and block until it exits.
 pub async fn serve(addr: String) -> Result<()> {
     let app = Router::new()
-        .route("/healthz",         get(healthz))
-        .route("/api/v1/status",   get(status))
-        .route("/api/v1/version",  get(version));
+        .route("/healthz", get(healthz))
+        .route("/api/v1/status", get(status))
+        .route("/api/v1/version", get(version));
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!(addr, "API server listening");

@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use ozma_protocol::{ApiError, Result, TransportMode};
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::{mpsc, watch};
 use tokio::sync::mpsc::error::TryRecvError;
+use tokio::sync::{mpsc, watch};
 
 use crate::channel::{ChannelId, ChannelMap};
 use crate::error::channel_closed;
@@ -73,10 +73,7 @@ impl LoopbackTransport {
     }
 
     /// Create a connected pair with an explicit configuration and channel map.
-    pub fn pair_with_config(
-        config: LoopbackConfig,
-        map: ChannelMap,
-    ) -> (Self, Self) {
+    pub fn pair_with_config(config: LoopbackConfig, map: ChannelMap) -> (Self, Self) {
         let capacity = config.capacity.max(1);
         let (a_tx, b_rx) = mpsc::channel(capacity);
         let (b_tx, a_rx) = mpsc::channel(capacity);
@@ -118,7 +115,8 @@ impl LoopbackTransport {
         let reason = if self.local_closed.load(Ordering::Relaxed) {
             CloseReason::LocalShutdown
         } else {
-            self.peer_close_reason().unwrap_or(CloseReason::TransportError)
+            self.peer_close_reason()
+                .unwrap_or(CloseReason::TransportError)
         };
         channel_closed(channel, reason)
     }
@@ -196,9 +194,7 @@ impl SessionTransport for LoopbackTransport {
             match self.rx.try_recv() {
                 Ok(envelope) => return self.deliver(envelope),
                 Err(TryRecvError::Disconnected) => {
-                    let reason = self
-                        .peer_close_reason()
-                        .unwrap_or(CloseReason::PeerClosed);
+                    let reason = self.peer_close_reason().unwrap_or(CloseReason::PeerClosed);
                     return self.finish_recv(reason);
                 }
                 Err(TryRecvError::Empty) => {}
@@ -266,10 +262,7 @@ mod tests {
     use std::time::Duration;
     use tokio::time::timeout;
 
-    async fn recv_within(
-        transport: &mut LoopbackTransport,
-        limit: Duration,
-    ) -> TransportEvent {
+    async fn recv_within(transport: &mut LoopbackTransport, limit: Duration) -> TransportEvent {
         timeout(limit, transport.recv())
             .await
             .expect("recv timed out")
@@ -284,9 +277,7 @@ mod tests {
             } else {
                 ChannelId::INPUT
             };
-            a.send(channel, Bytes::from(vec![i]))
-                .await
-                .unwrap();
+            a.send(channel, Bytes::from(vec![i])).await.unwrap();
         }
 
         let mut control = Vec::new();
@@ -306,7 +297,10 @@ mod tests {
                 other => panic!("unexpected event: {other:?}"),
             }
         }
-        assert_eq!(control, (0..20u8).filter(|v| v % 2 == 0).collect::<Vec<_>>());
+        assert_eq!(
+            control,
+            (0..20u8).filter(|v| v % 2 == 0).collect::<Vec<_>>()
+        );
         assert_eq!(input, (0..20u8).filter(|v| v % 2 == 1).collect::<Vec<_>>());
     }
 
@@ -452,9 +446,6 @@ mod tests {
         let event = timeout(Duration::from_secs(1), b.recv())
             .await
             .expect("recv timed out");
-        assert_eq!(
-            event.payload().map(|p| p.as_ref()),
-            Some(b"boxed".as_ref())
-        );
+        assert_eq!(event.payload().map(|p| p.as_ref()), Some(b"boxed".as_ref()));
     }
 }

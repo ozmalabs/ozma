@@ -32,9 +32,7 @@ pub use cancel::CancelToken;
 pub use error::{media_codes, MediaError};
 pub use fake::{FakeCapture, FakeEncoder};
 pub use frame::{EncodedFrame, Frame, FrameBuffer, FrameFormat, PixelFormat};
-pub use pipeline::{
-    Pipeline, PipelineConfig, PipelineMetrics, RunningPipeline, TrackPipeline,
-};
+pub use pipeline::{Pipeline, PipelineConfig, PipelineMetrics, RunningPipeline, TrackPipeline};
 pub use traits::{CaptureSource, Encoder};
 
 /// Re-export of the protocol media vocabulary most callers need alongside

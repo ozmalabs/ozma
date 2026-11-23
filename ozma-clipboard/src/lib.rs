@@ -9,8 +9,8 @@
 //!     that exposes GET / SET / WATCH / LIST / SEARCH / PIN / UNPIN / CLEAR
 //!     commands to the controller.
 
-pub mod ring;
 pub mod ipc;
+pub mod ring;
 
 use std::sync::Arc;
 
@@ -31,8 +31,14 @@ pub use ring::{ClipboardEntry, ClipboardRing, ContentType, EntrySummary};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ClipboardContent {
-    Text { text: String },
-    Image { png_b64: String, width: u32, height: u32 },
+    Text {
+        text: String,
+    },
+    Image {
+        png_b64: String,
+        width: u32,
+        height: u32,
+    },
 }
 
 impl ClipboardContent {
@@ -198,11 +204,8 @@ impl ClipboardManager {
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     fn arboard_image_to_content(img: arboard::ImageData<'_>) -> Option<ClipboardContent> {
-        let rgba = RgbaImage::from_raw(
-            img.width as u32,
-            img.height as u32,
-            img.bytes.into_owned(),
-        )?;
+        let rgba =
+            RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned())?;
         let (w, h) = rgba.dimensions();
         let mut buf = Vec::new();
         DynamicImage::ImageRgba8(rgba)

@@ -28,13 +28,27 @@ pub enum ControlMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display: Option<DisplayProfile>,
     },
-    SceneCommit { commit: SceneCommit },
-    Input { event: InputEvent },
-    Event { event: SessionEvent },
-    Ping { nonce: u64 },
-    Pong { nonce: u64 },
-    Error { error: ApiError },
-    Bye { reason: EndReason },
+    SceneCommit {
+        commit: SceneCommit,
+    },
+    Input {
+        event: InputEvent,
+    },
+    Event {
+        event: SessionEvent,
+    },
+    Ping {
+        nonce: u64,
+    },
+    Pong {
+        nonce: u64,
+    },
+    Error {
+        error: ApiError,
+    },
+    Bye {
+        reason: EndReason,
+    },
 }
 
 impl ControlMessage {

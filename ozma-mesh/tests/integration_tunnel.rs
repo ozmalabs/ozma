@@ -7,9 +7,9 @@
 
 use std::time::Duration;
 
-use ozma_mesh::{MeshError, MeshManager, MeshNode, WgPrivateKey, WgPublicKey};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
+use ozma_mesh::{MeshError, MeshManager, MeshNode, WgPrivateKey, WgPublicKey};
 use tracing_subscriber::EnvFilter;
 
 fn init_tracing() {
@@ -27,7 +27,9 @@ async fn make_mgr(id: &str, mesh_ip: &str, port: u16) -> MeshManager {
         mesh_ip: mesh_ip.to_string(),
         wg_port: port,
     };
-    MeshManager::new(node, private_key).await.expect("MeshManager::new")
+    MeshManager::new(node, private_key)
+        .await
+        .expect("MeshManager::new")
 }
 
 /// Helper: collect peer IDs from a manager.
@@ -82,7 +84,10 @@ async fn test_two_nodes_establish_tunnel() {
         0xde, 0xad, 0xbe, 0xef,
     ];
 
-    mgr_a.send_to_peer("node-b", dummy_ipv4).await.expect("A sends to B");
+    mgr_a
+        .send_to_peer("node-b", dummy_ipv4)
+        .await
+        .expect("A sends to B");
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     assert_eq!(peer_ids(&mgr_a).await, vec!["node-b"], "A still has B");

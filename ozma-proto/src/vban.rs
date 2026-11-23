@@ -29,55 +29,54 @@ use zerocopy::{AsBytes, FromBytes, FromZeroes};
 ///
 /// Indices 0-20 are defined by the spec; indices 21-31 are reserved.
 pub const SAMPLE_RATES: [u32; 21] = [
-     6_000,  12_000,  24_000,  48_000,  96_000, 192_000, 384_000,
-     8_000,  16_000,  32_000,  64_000, 128_000, 256_000, 512_000,
-    11_025,  22_050,  44_100,  88_200, 176_400, 352_800, 705_600,
+    6_000, 12_000, 24_000, 48_000, 96_000, 192_000, 384_000, 8_000, 16_000, 32_000, 64_000,
+    128_000, 256_000, 512_000, 11_025, 22_050, 44_100, 88_200, 176_400, 352_800, 705_600,
 ];
 
 /// Sub-protocol values stored in bits[7:5] of `sr_sub_proto`.
 pub mod sub_proto {
-    pub const AUDIO:      u8 = 0x00;
-    pub const SERIAL:     u8 = 0x20;
-    pub const TXT:        u8 = 0x40;
-    pub const SERVICE:    u8 = 0x60;
+    pub const AUDIO: u8 = 0x00;
+    pub const SERIAL: u8 = 0x20;
+    pub const TXT: u8 = 0x40;
+    pub const SERVICE: u8 = 0x60;
     pub const UNDEFINED1: u8 = 0x80;
     pub const UNDEFINED2: u8 = 0xA0;
     pub const UNDEFINED3: u8 = 0xC0;
-    pub const USER:       u8 = 0xE0;
+    pub const USER: u8 = 0xE0;
 }
 
 /// Data-format values stored in bits[2:0] of `data_format_codec`.
 pub mod data_format {
     /// 8-bit unsigned PCM
-    pub const UINT8:   u8 = 0x00;
+    pub const UINT8: u8 = 0x00;
     /// 16-bit signed PCM (most common)
-    pub const INT16:   u8 = 0x01;
+    pub const INT16: u8 = 0x01;
     /// 24-bit signed PCM
-    pub const INT24:   u8 = 0x02;
+    pub const INT24: u8 = 0x02;
     /// 32-bit signed PCM
-    pub const INT32:   u8 = 0x03;
+    pub const INT32: u8 = 0x03;
     /// 32-bit IEEE float
     pub const FLOAT32: u8 = 0x04;
     /// 64-bit IEEE float
     pub const FLOAT64: u8 = 0x05;
     /// 12-bit signed PCM (stored as 16-bit words)
-    pub const INT12:   u8 = 0x06;
+    pub const INT12: u8 = 0x06;
     /// 10-bit signed PCM (stored as 16-bit words)
-    pub const INT10:   u8 = 0x07;
+    pub const INT10: u8 = 0x07;
 }
 
 /// Bytes per sample for each [`data_format`] constant.
 pub fn bytes_per_sample(fmt: u8) -> Option<usize> {
     match fmt & 0x07 {
-        data_format::UINT8   => Some(1),
-        data_format::INT16   => Some(2),
-        data_format::INT24   => Some(3),
-        data_format::INT32   => Some(4),
+        data_format::UINT8 => Some(1),
+        data_format::INT16 => Some(2),
+        data_format::INT24 => Some(3),
+        data_format::INT32 => Some(4),
         data_format::FLOAT32 => Some(4),
         data_format::FLOAT64 => Some(8),
-        data_format::INT12   => Some(2),
-        data_format::INT10   => Some(2),
-        _                    => None,
+        data_format::INT12 => Some(2),
+        data_format::INT10 => Some(2),
+        _ => None,
     }
 }
 
@@ -93,9 +92,7 @@ pub const HEADER_SIZE: usize = 28;
 /// The struct is `#[repr(C)]` and implements [`zerocopy`] traits so it can be
 /// cast directly to/from a `[u8; 28]` without copying.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq,
-    Serialize, Deserialize,
-    AsBytes, FromBytes, FromZeroes,
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, AsBytes, FromBytes, FromZeroes,
 )]
 #[repr(C)]
 pub struct VbanHeader {
@@ -364,9 +361,14 @@ mod tests {
     #[test]
     fn header_round_trip_all_data_formats() {
         let fmts = [
-            data_format::UINT8, data_format::INT16, data_format::INT24,
-            data_format::INT32, data_format::FLOAT32, data_format::FLOAT64,
-            data_format::INT12, data_format::INT10,
+            data_format::UINT8,
+            data_format::INT16,
+            data_format::INT24,
+            data_format::INT32,
+            data_format::FLOAT32,
+            data_format::FLOAT64,
+            data_format::INT12,
+            data_format::INT10,
         ];
         for fmt in fmts {
             let h = VbanHeader::new_audio(3, 1, 1, fmt, "t", 0);
@@ -379,14 +381,14 @@ mod tests {
 
     #[test]
     fn bytes_per_sample_table() {
-        assert_eq!(bytes_per_sample(data_format::UINT8),   Some(1));
-        assert_eq!(bytes_per_sample(data_format::INT16),   Some(2));
-        assert_eq!(bytes_per_sample(data_format::INT24),   Some(3));
-        assert_eq!(bytes_per_sample(data_format::INT32),   Some(4));
+        assert_eq!(bytes_per_sample(data_format::UINT8), Some(1));
+        assert_eq!(bytes_per_sample(data_format::INT16), Some(2));
+        assert_eq!(bytes_per_sample(data_format::INT24), Some(3));
+        assert_eq!(bytes_per_sample(data_format::INT32), Some(4));
         assert_eq!(bytes_per_sample(data_format::FLOAT32), Some(4));
         assert_eq!(bytes_per_sample(data_format::FLOAT64), Some(8));
-        assert_eq!(bytes_per_sample(data_format::INT12),   Some(2));
-        assert_eq!(bytes_per_sample(data_format::INT10),   Some(2));
+        assert_eq!(bytes_per_sample(data_format::INT12), Some(2));
+        assert_eq!(bytes_per_sample(data_format::INT10), Some(2));
     }
 
     // --- VbanAudioFrame ---
@@ -395,7 +397,10 @@ mod tests {
     fn frame_round_trip() {
         let header = make_header();
         let payload: Vec<u8> = (0u8..=255).collect();
-        let frame = VbanAudioFrame { header, payload: payload.clone() };
+        let frame = VbanAudioFrame {
+            header,
+            payload: payload.clone(),
+        };
         let wire = frame.to_bytes();
         assert_eq!(wire.len(), HEADER_SIZE + payload.len());
         let decoded = VbanAudioFrame::from_bytes(&wire).expect("decode failed");
@@ -404,7 +409,10 @@ mod tests {
 
     #[test]
     fn frame_empty_payload() {
-        let frame = VbanAudioFrame { header: make_header(), payload: vec![] };
+        let frame = VbanAudioFrame {
+            header: make_header(),
+            payload: vec![],
+        };
         let wire = frame.to_bytes();
         assert_eq!(wire.len(), HEADER_SIZE);
         let decoded = VbanAudioFrame::from_bytes(&wire).unwrap();
@@ -418,7 +426,11 @@ mod tests {
 
     #[test]
     fn frame_bad_magic_returns_none() {
-        let mut wire = VbanAudioFrame { header: make_header(), payload: vec![1, 2, 3] }.to_bytes();
+        let mut wire = VbanAudioFrame {
+            header: make_header(),
+            payload: vec![1, 2, 3],
+        }
+        .to_bytes();
         wire[0] = b'X';
         assert!(VbanAudioFrame::from_bytes(&wire).is_none());
     }
@@ -427,14 +439,20 @@ mod tests {
     fn frame_expected_payload_size_int16_stereo_255() {
         // 255 samples × 2 channels × 2 bytes (Int16) = 1020
         assert_eq!(make_header().samples_per_frame(), 255);
-        let frame = VbanAudioFrame { header: make_header(), payload: vec![] };
+        let frame = VbanAudioFrame {
+            header: make_header(),
+            payload: vec![],
+        };
         assert_eq!(frame.expected_payload_size(), Some(255 * 2 * 2));
     }
 
     #[test]
     fn frame_expected_payload_size_float32_mono_128() {
         let h = VbanHeader::new_audio(16, 128, 1, data_format::FLOAT32, "mono", 0);
-        let frame = VbanAudioFrame { header: h, payload: vec![] };
+        let frame = VbanAudioFrame {
+            header: h,
+            payload: vec![],
+        };
         // 128 × 1 × 4 = 512
         assert_eq!(frame.expected_payload_size(), Some(512));
     }

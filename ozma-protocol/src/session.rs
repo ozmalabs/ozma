@@ -42,7 +42,10 @@ impl SessionState {
     pub fn is_active(self) -> bool {
         matches!(
             self,
-            SessionState::Preparing | SessionState::Ready | SessionState::Streaming | SessionState::Degraded
+            SessionState::Preparing
+                | SessionState::Ready
+                | SessionState::Streaming
+                | SessionState::Degraded
         )
     }
 
@@ -56,10 +59,7 @@ impl SessionState {
                 next,
                 PendingConsent | Preparing | Rejected | TimedOut | Ended | Failed
             ),
-            PendingConsent => matches!(
-                next,
-                Preparing | Rejected | TimedOut | Ended | Failed
-            ),
+            PendingConsent => matches!(next, Preparing | Rejected | TimedOut | Ended | Failed),
             Preparing => matches!(next, Ready | Failed | Ended),
             Ready => matches!(next, Streaming | Ended | Failed),
             Streaming => matches!(next, Degraded | Draining | Ended),

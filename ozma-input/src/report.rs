@@ -54,13 +54,24 @@ pub struct AbsolutePoint {
 impl AbsolutePoint {
     /// Centre of the absolute report range, used before the first absolute
     /// event so an early button press does not jump the cursor to a corner.
-    pub const CENTER: Self = Self { x: 16_383, y: 16_383 };
+    pub const CENTER: Self = Self {
+        x: 16_383,
+        y: 16_383,
+    };
 
     /// Construct a point, clamping both axes to the report range.
     pub const fn new(x: u16, y: u16) -> Self {
         Self {
-            x: if x > HID_ABSOLUTE_MAX { HID_ABSOLUTE_MAX } else { x },
-            y: if y > HID_ABSOLUTE_MAX { HID_ABSOLUTE_MAX } else { y },
+            x: if x > HID_ABSOLUTE_MAX {
+                HID_ABSOLUTE_MAX
+            } else {
+                x
+            },
+            y: if y > HID_ABSOLUTE_MAX {
+                HID_ABSOLUTE_MAX
+            } else {
+                y
+            },
         }
     }
 }
@@ -95,7 +106,10 @@ impl AbsoluteMapping {
 
     /// Identity mapping for callers that already produce `0..=32767`.
     pub const fn hid_space() -> Self {
-        Self { width: 32_768, height: 32_768 }
+        Self {
+            width: 32_768,
+            height: 32_768,
+        }
     }
 
     /// Map a pixel position to the nearest report coordinate, clamping
@@ -142,12 +156,22 @@ pub struct AbsolutePointerReport {
 impl AbsolutePointerReport {
     /// A neutral report at the centre of the surface.
     pub const fn empty() -> Self {
-        Self { buttons: 0, x: AbsolutePoint::CENTER.x, y: AbsolutePoint::CENTER.y, scroll: 0 }
+        Self {
+            buttons: 0,
+            x: AbsolutePoint::CENTER.x,
+            y: AbsolutePoint::CENTER.y,
+            scroll: 0,
+        }
     }
 
     /// Construct a report at `point`.
     pub const fn new(buttons: u8, point: AbsolutePoint, scroll: i8) -> Self {
-        Self { buttons, x: point.x, y: point.y, scroll }
+        Self {
+            buttons,
+            x: point.x,
+            y: point.y,
+            scroll,
+        }
     }
 
     /// Encode the six-byte on-wire report.
@@ -168,7 +192,12 @@ impl AbsolutePointerReport {
     pub fn from_bytes(bytes: [u8; 6]) -> Self {
         let x = u16::from_le_bytes([bytes[1], bytes[2]]) & HID_ABSOLUTE_MAX;
         let y = u16::from_le_bytes([bytes[3], bytes[4]]) & HID_ABSOLUTE_MAX;
-        Self { buttons: bytes[0], x, y, scroll: bytes[5] as i8 }
+        Self {
+            buttons: bytes[0],
+            x,
+            y,
+            scroll: bytes[5] as i8,
+        }
     }
 }
 
@@ -213,9 +242,18 @@ mod tests {
         assert_eq!(mapping.map(0, 0), AbsolutePoint { x: 0, y: 0 });
         assert_eq!(
             mapping.map(32_767, 32_767),
-            AbsolutePoint { x: 32_767, y: 32_767 }
+            AbsolutePoint {
+                x: 32_767,
+                y: 32_767
+            }
         );
-        assert_eq!(mapping.map(16_383, 16_383), AbsolutePoint { x: 16_383, y: 16_383 });
+        assert_eq!(
+            mapping.map(16_383, 16_383),
+            AbsolutePoint {
+                x: 16_383,
+                y: 16_383
+            }
+        );
     }
 
     #[test]
@@ -224,11 +262,20 @@ mod tests {
         assert_eq!(mapping.map(-10, -10), AbsolutePoint { x: 0, y: 0 });
         assert_eq!(
             mapping.map(1919, 1079),
-            AbsolutePoint { x: 32_767, y: 32_767 }
+            AbsolutePoint {
+                x: 32_767,
+                y: 32_767
+            }
         );
         let centre = mapping.map(960, 540);
-        assert!((16_000..=16_700).contains(&centre.x), "centre x was {centre:?}");
-        assert!((16_000..=16_700).contains(&centre.y), "centre y was {centre:?}");
+        assert!(
+            (16_000..=16_700).contains(&centre.x),
+            "centre x was {centre:?}"
+        );
+        assert!(
+            (16_000..=16_700).contains(&centre.y),
+            "centre y was {centre:?}"
+        );
     }
 
     #[test]
@@ -245,7 +292,10 @@ mod tests {
         assert_eq!(AbsolutePointerReport::from_bytes(bytes), report);
 
         let clamped = AbsolutePointerReport::new(0, AbsolutePoint::CENTER, 0);
-        assert_eq!(AbsolutePointerReport::from_bytes(clamped.to_bytes()), clamped);
+        assert_eq!(
+            AbsolutePointerReport::from_bytes(clamped.to_bytes()),
+            clamped
+        );
     }
 
     #[test]

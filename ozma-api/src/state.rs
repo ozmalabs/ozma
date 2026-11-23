@@ -29,8 +29,11 @@ pub trait NodeBackend: Send + Sync + 'static {
     fn stop_session(&self, id: &SessionId, reason: EndReason) -> Result<Session, ApiError>;
     fn approve_consent(&self, id: &SessionId, by: &str) -> Result<Session, ApiError>;
     fn deny_consent(&self, id: &SessionId, by: &str) -> Result<Session, ApiError>;
-    fn resume_session(&self, id: &SessionId, client_id: &ozma_protocol::ClientId)
-        -> Result<Session, ApiError>;
+    fn resume_session(
+        &self,
+        id: &SessionId,
+        client_id: &ozma_protocol::ClientId,
+    ) -> Result<Session, ApiError>;
 
     /// Native transport endpoint, certificate fingerprint, and certificate.
     fn transport_info(&self) -> Option<TransportInfo> {
@@ -165,7 +168,11 @@ impl NodeBackend for MemoryBackend {
     }
 
     fn capabilities(&self) -> NodeCapabilities {
-        self.inner.lock().expect("backend lock").capabilities.clone()
+        self.inner
+            .lock()
+            .expect("backend lock")
+            .capabilities
+            .clone()
     }
 
     fn diagnostics(&self) -> DiagnosticReport {
@@ -320,7 +327,11 @@ impl NodeBackend for MemoryBackend {
                 "A terminal session cannot be resumed",
             ));
         }
-        if !session.participants.iter().any(|p| &p.client_id == client_id) {
+        if !session
+            .participants
+            .iter()
+            .any(|p| &p.client_id == client_id)
+        {
             return Err(ApiError::new(
                 ozma_protocol::error::codes::NOT_FOUND,
                 "The client is not a participant in this session",

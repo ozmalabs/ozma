@@ -8,7 +8,7 @@
 pub mod hid;
 pub mod vban;
 
-pub use hid::{HidKeyboardReport, HidMouseReport};
 pub use hid::{modifier, usage};
-pub use vban::{VbanAudioFrame, VbanHeader, SAMPLE_RATES, HEADER_SIZE};
-pub use vban::{sub_proto, data_format};
+pub use hid::{HidKeyboardReport, HidMouseReport};
+pub use vban::{data_format, sub_proto};
+pub use vban::{VbanAudioFrame, VbanHeader, HEADER_SIZE, SAMPLE_RATES};

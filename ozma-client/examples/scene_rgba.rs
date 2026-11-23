@@ -52,18 +52,23 @@ async fn write_frames(mut frames: watch::Receiver<Option<Arc<ComposedFrame>>>) -
             );
         } else {
             shape = Some((frame.width, frame.height));
-            output.write_all(b"OZFR").await?;
-            output.write_u32(frame.width).await?;
-            output.write_u32(frame.height).await?;
-            output.write_u32(frame.width * 4).await?;
         }
-        if let Err(error) = output.write_all(&frame.rgba).await {
+        let mut header = [0; 16];
+        header[..4].copy_from_slice(b"OZFR");
+        header[4..8].copy_from_slice(&frame.width.to_be_bytes());
+        header[8..12].copy_from_slice(&frame.height.to_be_bytes());
+        header[12..].copy_from_slice(&(frame.width * 4).to_be_bytes());
+        let write = async {
+            output.write_all(&header).await?;
+            output.write_all(&frame.rgba).await?;
+            output.flush().await
+        };
+        if let Err(error) = write.await {
             if error.kind() == std::io::ErrorKind::BrokenPipe {
                 return Ok(());
             }
             return Err(error.into());
         }
-        output.flush().await?;
     }
     Ok(())
 }

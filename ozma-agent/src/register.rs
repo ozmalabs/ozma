@@ -16,7 +16,7 @@ use serde_json::json;
 use tracing::{info, warn};
 
 const HEARTBEAT_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(30);
-const REGISTER_TIMEOUT:   std::time::Duration   = std::time::Duration::from_secs(10);
+const REGISTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Derive the mDNS-style node ID from the machine hostname.
 pub fn node_id() -> String {
@@ -50,10 +50,10 @@ pub async fn run(controller_url: String, api_port: u16, wg_port: u16) -> Result<
     let register_url = format!("{controller_url}/api/v1/nodes/register");
 
     backoff::future::retry(backoff, || {
-        let client      = client.clone();
-        let id          = id.clone();
-        let url         = register_url.clone();
-        let api_port_s  = api_port.to_string();
+        let client = client.clone();
+        let id = id.clone();
+        let url = register_url.clone();
+        let api_port_s = api_port.to_string();
         async move {
             let payload = json!({
                 "id":           id,
@@ -100,7 +100,7 @@ pub async fn run(controller_url: String, api_port: u16, wg_port: u16) -> Result<
                 // silent success
             }
             Ok(resp) => warn!("heartbeat returned {}", resp.status()),
-            Err(e)   => warn!("heartbeat failed: {e:#}"),
+            Err(e) => warn!("heartbeat failed: {e:#}"),
         }
     }
 }

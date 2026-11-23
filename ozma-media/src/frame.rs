@@ -140,11 +140,7 @@ impl FrameFormat {
 
 impl fmt::Display for FrameFormat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} {}x{}",
-            self.pixel_format, self.width, self.height
-        )
+        write!(f, "{} {}x{}", self.pixel_format, self.width, self.height)
     }
 }
 

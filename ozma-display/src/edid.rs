@@ -49,7 +49,11 @@ impl Edid {
 
     /// True when the whole 128-byte block sums to zero modulo 256.
     pub fn checksum_valid(&self) -> bool {
-        self.bytes.iter().fold(0u32, |sum, byte| sum + u32::from(*byte)) % 256 == 0
+        self.bytes
+            .iter()
+            .fold(0u32, |sum, byte| sum + u32::from(*byte))
+            % 256
+            == 0
     }
 
     /// Decode the first detailed timing descriptor into a mode. Useful for
@@ -152,9 +156,7 @@ pub fn build(spec: &VirtualDisplaySpec) -> Result<Edid> {
     bytes[24] = 0xEA;
 
     // 25-34: sRGB chromaticity coordinates (a standard, conservative set).
-    bytes[25..35].copy_from_slice(&[
-        0xEE, 0x91, 0xA3, 0x54, 0x4C, 0x99, 0x26, 0x0F, 0x50, 0x54,
-    ]);
+    bytes[25..35].copy_from_slice(&[0xEE, 0x91, 0xA3, 0x54, 0x4C, 0x99, 0x26, 0x0F, 0x50, 0x54]);
 
     // 35-37: established timings. 640x480@60, 800x600@60, 1024x768@60.
     bytes[ESTABLISHED_640X480_60] |= 0x20;
@@ -423,8 +425,7 @@ mod tests {
 
     fn spec() -> VirtualDisplaySpec {
         let preferred = DisplayMode::new(1920, 1200, 60).hdr(HdrMode::None);
-        let mut spec =
-            VirtualDisplaySpec::new("laptop-1", "Remote laptop", (300, 190), preferred);
+        let mut spec = VirtualDisplaySpec::new("laptop-1", "Remote laptop", (300, 190), preferred);
         spec.edid_serial = "OZMA-NODE-A3F2-LAPTOP-1".into();
         spec.modes.insert(1, DisplayMode::new(2560, 1440, 60));
         spec.modes.push(DisplayMode::new(1280, 720, 60));
@@ -542,6 +543,8 @@ mod tests {
         spec.name = "Remote — laptop ✓".into();
         let edid = build(&spec).unwrap();
         let text = &edid.as_bytes()[77..90];
-        assert!(text.iter().all(|b| *b == b' ' || *b == 0x0A || (0x20..=0x7E).contains(b)));
+        assert!(text
+            .iter()
+            .all(|b| *b == b' ' || *b == 0x0A || (0x20..=0x7E).contains(b)));
     }
 }

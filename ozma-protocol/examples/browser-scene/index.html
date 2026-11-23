@@ -20,6 +20,7 @@
   <h1>Scene producer fixture</h1>
   <p>Scroll the page. The still image asset is emitted once while its placement changes. The video advances independently.</p>
   <button id="start">Start producer</button>
+  <button id="export" disabled>Download scene replay</button>
   <div class="stage" id="stage">
     <div class="content" id="content">
       <img id="still" alt="Sample still image">
@@ -28,6 +29,7 @@
     </div>
   </div>
   <pre id="events" aria-live="polite"></pre>
+  <p>For a local replay bridge, pipe JSONL events into <code>node bridge.mjs</code>.</p>
 </main>
 <script type="module" src="./producer.js"></script>
 </body>

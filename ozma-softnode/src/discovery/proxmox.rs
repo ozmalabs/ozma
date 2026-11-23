@@ -21,12 +21,7 @@ pub fn discover() -> Result<Vec<VMInfo>> {
 
     let mut entries: Vec<_> = std::fs::read_dir(qmp_dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map(|x| x == "qmp")
-                .unwrap_or(false)
-        })
+        .filter(|e| e.path().extension().map(|x| x == "qmp").unwrap_or(false))
         .collect();
     entries.sort_by_key(|e| e.path());
 

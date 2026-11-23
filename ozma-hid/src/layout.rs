@@ -18,7 +18,7 @@ impl Layout {
         match s.to_lowercase().as_str() {
             "uk" => Self::Uk,
             "de" => Self::De,
-            _    => Self::Us,
+            _ => Self::Us,
         }
     }
 }
@@ -33,9 +33,27 @@ pub struct KeyStroke {
 }
 
 impl KeyStroke {
-    fn plain(key: Key) -> Self { Self { key, shift: false, altgr: false } }
-    fn shifted(key: Key) -> Self { Self { key, shift: true, altgr: false } }
-    fn altgr(key: Key) -> Self { Self { key, shift: false, altgr: true } }
+    fn plain(key: Key) -> Self {
+        Self {
+            key,
+            shift: false,
+            altgr: false,
+        }
+    }
+    fn shifted(key: Key) -> Self {
+        Self {
+            key,
+            shift: true,
+            altgr: false,
+        }
+    }
+    fn altgr(key: Key) -> Self {
+        Self {
+            key,
+            shift: false,
+            altgr: true,
+        }
+    }
 }
 
 /// Return the keystroke needed to produce `ch` on the given layout.
@@ -71,20 +89,20 @@ fn us_keystroke(ch: char) -> Option<KeyStroke> {
         '(' => KeyStroke::shifted(Unicode('9')),
         ')' => KeyStroke::shifted(Unicode('0')),
         // Unshifted punctuation
-        ' '  => KeyStroke::plain(Space),
+        ' ' => KeyStroke::plain(Space),
         '\n' => KeyStroke::plain(Return),
         '\t' => KeyStroke::plain(Tab),
-        '-'  => KeyStroke::plain(Unicode('-')),
-        '='  => KeyStroke::plain(Unicode('=')),
-        '['  => KeyStroke::plain(Unicode('[')),
-        ']'  => KeyStroke::plain(Unicode(']')),
+        '-' => KeyStroke::plain(Unicode('-')),
+        '=' => KeyStroke::plain(Unicode('=')),
+        '[' => KeyStroke::plain(Unicode('[')),
+        ']' => KeyStroke::plain(Unicode(']')),
         '\\' => KeyStroke::plain(Unicode('\\')),
-        ';'  => KeyStroke::plain(Unicode(';')),
+        ';' => KeyStroke::plain(Unicode(';')),
         '\'' => KeyStroke::plain(Unicode('\'')),
-        '`'  => KeyStroke::plain(Unicode('`')),
-        ','  => KeyStroke::plain(Unicode(',')),
-        '.'  => KeyStroke::plain(Unicode('.')),
-        '/'  => KeyStroke::plain(Unicode('/')),
+        '`' => KeyStroke::plain(Unicode('`')),
+        ',' => KeyStroke::plain(Unicode(',')),
+        '.' => KeyStroke::plain(Unicode('.')),
+        '/' => KeyStroke::plain(Unicode('/')),
         // Shifted punctuation
         '_' => KeyStroke::shifted(Unicode('-')),
         '+' => KeyStroke::shifted(Unicode('=')),
@@ -97,7 +115,7 @@ fn us_keystroke(ch: char) -> Option<KeyStroke> {
         '<' => KeyStroke::shifted(Unicode(',')),
         '>' => KeyStroke::shifted(Unicode('.')),
         '?' => KeyStroke::shifted(Unicode('/')),
-        _   => return None,
+        _ => return None,
     })
 }
 
@@ -113,8 +131,8 @@ fn uk_keystroke(ch: char) -> Option<KeyStroke> {
         '#' => Some(KeyStroke::plain(enigo::Key::Unicode('#'))),
         '~' => Some(KeyStroke::shifted(enigo::Key::Unicode('#'))),
         '\\' => Some(KeyStroke::plain(enigo::Key::Unicode('\\'))),
-        '|'  => Some(KeyStroke::shifted(enigo::Key::Unicode('\\'))),
-        _    => us_keystroke(ch),
+        '|' => Some(KeyStroke::shifted(enigo::Key::Unicode('\\'))),
+        _ => us_keystroke(ch),
     }
 }
 
@@ -136,9 +154,9 @@ fn de_keystroke(ch: char) -> Option<KeyStroke> {
         '[' => Some(KeyStroke::altgr(Unicode('8'))),
         ']' => Some(KeyStroke::altgr(Unicode('9'))),
         '\\' => Some(KeyStroke::altgr(Unicode('-'))),
-        '|'  => Some(KeyStroke::altgr(Unicode('<'))),
-        '~'  => Some(KeyStroke::altgr(Unicode('+'))),
-        _    => us_keystroke(ch),
+        '|' => Some(KeyStroke::altgr(Unicode('<'))),
+        '~' => Some(KeyStroke::altgr(Unicode('+'))),
+        _ => us_keystroke(ch),
     }
 }
 

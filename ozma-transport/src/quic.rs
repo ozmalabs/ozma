@@ -134,9 +134,7 @@ impl SelfSignedCertificate {
         })?;
         Ok(Self {
             certificate: generated.cert.der().clone(),
-            key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                generated.key_pair.serialize_der(),
-            )),
+            key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(generated.key_pair.serialize_der())),
         })
     }
 
@@ -199,8 +197,16 @@ impl QuicTransport {
     /// resource does not block the reliable control stream.
     pub async fn send_resource(&self, payload: Bytes) -> Result<()> {
         self.map.check_payload(ChannelId::BULK, payload.len())?;
-        let mut stream = self.inner.conn.open_uni().await.map_err(resource_stream_error)?;
-        stream.write_all(&payload).await.map_err(resource_stream_error)?;
+        let mut stream = self
+            .inner
+            .conn
+            .open_uni()
+            .await
+            .map_err(resource_stream_error)?;
+        stream
+            .write_all(&payload)
+            .await
+            .map_err(resource_stream_error)?;
         stream.finish().map_err(resource_stream_error)?;
         self.inner.metrics.record_sent(payload.len(), false);
         Ok(())
@@ -210,10 +216,30 @@ impl QuicTransport {
     /// profile. Callers can receive resources and control messages concurrently.
     pub async fn recv_resource(&self) -> Result<Bytes> {
         let limit = self.map.require(ChannelId::BULK)?.max_payload as usize;
-        let mut stream = self.inner.conn.accept_uni().await.map_err(resource_stream_error)?;
-        let payload = stream.read_to_end(limit).await.map_err(resource_stream_error)?;
-        self.inner.metrics.record_received(payload.len(), false);
-        Ok(Bytes::from(payload))
+        read_resource(&self.inner, limit).await
+    }
+
+    /// Start a bounded resource reader after negotiating the scene profile.
+    /// The task owns each stream through completion, independently of polls
+    /// of the control and media event queue.
+    pub fn resource_reader(&self) -> Result<mpsc::Receiver<Result<Bytes>>> {
+        let limit = self.map.require(ChannelId::BULK)?.max_payload as usize;
+        let inner = self.inner.clone();
+        let (tx, rx) = mpsc::channel(4);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tx.closed() => break,
+                    payload = read_resource(&inner, limit) => {
+                        let failed = payload.is_err();
+                        if tx.send(payload).await.is_err() || failed {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        Ok(rx)
     }
 
     async fn start(
@@ -316,18 +342,15 @@ impl SessionTransport for QuicTransport {
                     "QUIC stream send failed: {error}"
                 )));
             }
-            self.inner
-                .metrics
-                .record_sent(payload.len(), false);
+            self.inner.metrics.record_sent(payload.len(), false);
             return Ok(());
         }
 
         let max = self.inner.conn.max_datagram_size().ok_or_else(|| {
-            ApiError::new(
-                codes::UNSUPPORTED,
-                "peer does not support QUIC datagrams",
-            )
-            .with_remediation("Advertise RFC 9221 datagram support or use a reliable transport.")
+            ApiError::new(codes::UNSUPPORTED, "peer does not support QUIC datagrams")
+                .with_remediation(
+                    "Advertise RFC 9221 datagram support or use a reliable transport.",
+                )
         })?;
         let capacity = max.saturating_sub(1);
         if payload.len() > capacity {
@@ -467,9 +490,9 @@ impl QuicServer {
 
     /// The bound address, including the actual port when port 0 was requested.
     pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.endpoint
-            .local_addr()
-            .map_err(|error| ApiError::internal(format!("QUIC endpoint has no local address: {error}")))
+        self.endpoint.local_addr().map_err(|error| {
+            ApiError::internal(format!("QUIC endpoint has no local address: {error}"))
+        })
     }
 
     /// DER certificate clients should trust or pin.
@@ -489,12 +512,19 @@ impl QuicServer {
     pub async fn accept(&self) -> Result<QuicTransport> {
         let incoming = timeout(self.config.handshake_timeout, self.endpoint.accept())
             .await
-            .map_err(|_| timeout_error("accepting a QUIC connection", self.config.handshake_timeout))?
+            .map_err(|_| {
+                timeout_error("accepting a QUIC connection", self.config.handshake_timeout)
+            })?
             .ok_or_else(|| transport_unavailable("QUIC endpoint is closed"))?;
         let remote = incoming.remote_address();
         let conn = timeout(self.config.handshake_timeout, incoming)
             .await
-            .map_err(|_| timeout_error("completing the QUIC handshake", self.config.handshake_timeout))?
+            .map_err(|_| {
+                timeout_error(
+                    "completing the QUIC handshake",
+                    self.config.handshake_timeout,
+                )
+            })?
             .map_err(|error| {
                 transport_unavailable(format!("QUIC handshake with {remote} failed: {error}"))
             })?;
@@ -557,9 +587,9 @@ impl QuicClient {
         })?;
         endpoint.set_default_client_config(client_config);
 
-        let connecting = endpoint
-            .connect(addr, server_name)
-            .map_err(|error| transport_unavailable(format!("could not start QUIC connect: {error}")))?;
+        let connecting = endpoint.connect(addr, server_name).map_err(|error| {
+            transport_unavailable(format!("could not start QUIC connect: {error}"))
+        })?;
         let conn = timeout(config.handshake_timeout, connecting)
             .await
             .map_err(|_| timeout_error("connecting over QUIC", config.handshake_timeout))?
@@ -571,13 +601,13 @@ impl QuicClient {
     }
 }
 
-fn build_server_config(config: &QuicConfig, certificate: &SelfSignedCertificate) -> Result<ServerConfig> {
+fn build_server_config(
+    config: &QuicConfig,
+    certificate: &SelfSignedCertificate,
+) -> Result<ServerConfig> {
     let mut crypto = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(
-            vec![certificate.certificate.clone()],
-            certificate.key(),
-        )
+        .with_single_cert(vec![certificate.certificate.clone()], certificate.key())
         .map_err(|error| ApiError::internal(format!("invalid QUIC server certificate: {error}")))?;
     crypto.alpn_protocols = config.alpn.clone();
     let crypto = QuicServerConfig::try_from(crypto)
@@ -591,9 +621,7 @@ fn build_client_config(config: &QuicConfig, certificate_der: &[u8]) -> Result<qu
     let mut roots = rustls::RootCertStore::empty();
     roots
         .add(CertificateDer::from(certificate_der.to_vec()))
-        .map_err(|error| {
-            ApiError::internal(format!("invalid pinned QUIC certificate: {error}"))
-        })?;
+        .map_err(|error| ApiError::internal(format!("invalid pinned QUIC certificate: {error}")))?;
     let mut crypto = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
@@ -607,15 +635,28 @@ fn build_client_config(config: &QuicConfig, certificate_der: &[u8]) -> Result<qu
 
 fn transport_config(config: &QuicConfig) -> Result<TransportConfig> {
     let mut transport = TransportConfig::default();
-    let idle = IdleTimeout::try_from(config.idle_timeout).map_err(|_| {
-        ApiError::invalid("QUIC idle timeout is too large for the varint encoding")
-    })?;
+    let idle = IdleTimeout::try_from(config.idle_timeout)
+        .map_err(|_| ApiError::invalid("QUIC idle timeout is too large for the varint encoding"))?;
     transport.max_idle_timeout(Some(idle));
     transport.keep_alive_interval(config.keep_alive_interval);
     // The control stream plus a little headroom for future channels.
     transport.max_concurrent_bidi_streams(8u8.into());
     transport.max_concurrent_uni_streams(4u8.into());
     Ok(transport)
+}
+
+async fn read_resource(inner: &QuicInner, limit: usize) -> Result<Bytes> {
+    let mut stream = inner
+        .conn
+        .accept_uni()
+        .await
+        .map_err(resource_stream_error)?;
+    let payload = stream
+        .read_to_end(limit)
+        .await
+        .map_err(resource_stream_error)?;
+    inner.metrics.record_received(payload.len(), false);
+    Ok(Bytes::from(payload))
 }
 
 fn resource_stream_error(error: impl std::fmt::Display) -> ApiError {

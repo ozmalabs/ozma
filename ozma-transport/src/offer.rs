@@ -188,9 +188,15 @@ impl SessionOfferBuilder {
 
     /// Validate and finish the offer.
     pub fn build(self) -> Result<SessionOffer> {
-        let token = self.token.filter(|token| !token.is_empty()).ok_or_else(|| {
-            ApiError::new(codes::INVALID_REQUEST, "session offer requires a non-empty token")
-        })?;
+        let token = self
+            .token
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| {
+                ApiError::new(
+                    codes::INVALID_REQUEST,
+                    "session offer requires a non-empty token",
+                )
+            })?;
         if self.expires_at == 0 {
             return Err(ApiError::new(
                 codes::INVALID_REQUEST,
@@ -220,10 +226,7 @@ fn validate_descriptor(descriptor: &TransportDescriptor) -> Result<()> {
     if descriptor.channels.is_empty() {
         return Err(ApiError::new(
             codes::INVALID_REQUEST,
-            format!(
-                "transport {:?} has no channels",
-                descriptor.mode
-            ),
+            format!("transport {:?} has no channels", descriptor.mode),
         ));
     }
     if descriptor

@@ -190,13 +190,7 @@ impl FakeEncoder {
 
     /// A fake H.264 encoder for a raw input format.
     pub fn h264(input: FrameFormat, bitrate_kbps: u32) -> Self {
-        let output = MediaFormat::new(
-            Codec::H264,
-            input.width,
-            input.height,
-            30,
-            bitrate_kbps,
-        );
+        let output = MediaFormat::new(Codec::H264, input.width, input.height, 30, bitrate_kbps);
         Self::new(input, output)
     }
 
@@ -269,9 +263,7 @@ mod tests {
 
     #[tokio::test]
     async fn fake_frames_are_non_empty_and_monotonic() {
-        let mut source = FakeCapture::default()
-            .with_fps(1_000)
-            .with_frame_limit(5);
+        let mut source = FakeCapture::default().with_fps(1_000).with_frame_limit(5);
         let mut previous = None;
         for expected_sequence in 0..5 {
             let frame = source.next_frame().await.unwrap();
@@ -291,9 +283,14 @@ mod tests {
     #[tokio::test]
     async fn fake_encoder_rejects_wrong_input() {
         let mut encoder = FakeEncoder::h264(FrameFormat::rgb24(16, 16), 1_000);
-        let frame =
-            Frame::with_data(FrameFormat::new(PixelFormat::Nv12, 16, 16), 0, 0, true, vec![0; 32])
-                .unwrap();
+        let frame = Frame::with_data(
+            FrameFormat::new(PixelFormat::Nv12, 16, 16),
+            0,
+            0,
+            true,
+            vec![0; 32],
+        )
+        .unwrap();
         let error = encoder.encode(frame).await.unwrap_err();
         assert!(matches!(error, MediaError::FormatMismatch { .. }));
     }
@@ -312,7 +309,11 @@ mod tests {
             )
             .unwrap();
             let encoded = encoder.encode(frame).await.unwrap();
-            assert_eq!(encoded.is_keyframe(), sequence % 2 == 0, "sequence {sequence}");
+            assert_eq!(
+                encoded.is_keyframe(),
+                sequence % 2 == 0,
+                "sequence {sequence}"
+            );
         }
     }
 }

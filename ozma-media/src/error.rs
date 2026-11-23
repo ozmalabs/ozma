@@ -107,7 +107,9 @@ impl MediaError {
             )
             .with_details(id.clone())
             .with_remediation("Open the source again or select another capture device."),
-            Self::Cancelled => ApiError::new(media_codes::CANCELLED, "The media operation was cancelled."),
+            Self::Cancelled => {
+                ApiError::new(media_codes::CANCELLED, "The media operation was cancelled.")
+            }
             Self::EmptyFrame => ApiError::new(
                 media_codes::INVALID_FRAME,
                 "The media pipeline received an empty frame.",
@@ -118,7 +120,9 @@ impl MediaError {
             }
             Self::FormatMismatch { expected, actual } => ApiError::new(
                 media_codes::FORMAT_MISMATCH,
-                format!("Frame format mismatch: encoder expected {expected}, source produced {actual}."),
+                format!(
+                    "Frame format mismatch: encoder expected {expected}, source produced {actual}."
+                ),
             )
             .with_details(format!("{expected} -> {actual}"))
             .with_remediation("Negotiate the capture format before starting the pipeline."),

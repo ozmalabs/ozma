@@ -15,7 +15,9 @@ async fn make_mgr(id: &str, mesh_ip: &str, port: u16) -> MeshManager {
         mesh_ip: mesh_ip.to_string(),
         wg_port: port,
     };
-    MeshManager::new(node, private_key).await.expect("MeshManager::new")
+    MeshManager::new(node, private_key)
+        .await
+        .expect("MeshManager::new")
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

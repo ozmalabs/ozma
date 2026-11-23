@@ -7,13 +7,15 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{ClientId, SessionId};
 use crate::error::ApiError;
+use crate::ids::{ClientId, SessionId};
 
 pub use crate::ids::DisplayId;
 
 /// Rotation of a display in the host topology.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
 pub enum Rotation {
     #[default]
     #[serde(rename = "0")]
@@ -43,7 +45,9 @@ impl Rotation {
 }
 
 /// HDR mode advertised by a panel or node.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum HdrMode {
     #[default]
@@ -274,7 +278,8 @@ impl VirtualDisplaySpec {
                 "A virtual display needs at least one mode",
             ));
         }
-        if self.preferred.width == 0 || self.preferred.height == 0 || self.preferred.refresh_hz == 0 {
+        if self.preferred.width == 0 || self.preferred.height == 0 || self.preferred.refresh_hz == 0
+        {
             return Err(ApiError::new(
                 crate::error::codes::INVALID_REQUEST,
                 "A virtual display mode must have non-zero dimensions and refresh",

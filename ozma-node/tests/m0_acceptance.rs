@@ -7,9 +7,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use ozma_node::api;
 use ozma_node::platform;
-use ozma_protocol::{
-    ClientId, InputSpec, PointerMode, SessionSpec, TrackId, TrackKind, TrackSpec,
-};
+use ozma_protocol::{ClientId, InputSpec, PointerMode, SessionSpec, TrackId, TrackKind, TrackSpec};
 use tower::ServiceExt;
 
 async fn json(response: axum::response::Response) -> serde_json::Value {

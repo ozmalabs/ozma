@@ -33,8 +33,8 @@ use meeting_detect::{DetectorConfig, MeetingDetector};
 
 struct Args {
     poll_interval_secs: u64,
-    extra_ics_paths:    Vec<PathBuf>,
-    socket_path:        PathBuf,
+    extra_ics_paths: Vec<PathBuf>,
+    socket_path: PathBuf,
 }
 
 fn parse_args() -> Args {
@@ -62,14 +62,18 @@ fn parse_args() -> Args {
         .map(|d| PathBuf::from(d).join("ozma-meeting-detect.sock"))
         .unwrap_or_else(|| PathBuf::from("/tmp/ozma-meeting-detect.sock"));
 
-    Args { poll_interval_secs: interval, extra_ics_paths: ics_paths, socket_path }
+    Args {
+        poll_interval_secs: interval,
+        extra_ics_paths: ics_paths,
+        socket_path,
+    }
 }
 
 // ── IPC client handler ───────────────────────────────────────────────────────
 
 async fn handle_client(
-    stream:     UnixStream,
-    mut rx:     broadcast::Receiver<ServerMessage>,
+    stream: UnixStream,
+    mut rx: broadcast::Receiver<ServerMessage>,
     force_scan: Arc<tokio::sync::Notify>,
 ) {
     let (reader, mut writer) = stream.into_split();
@@ -122,8 +126,7 @@ async fn handle_client(
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive("ozma_softnode=info".parse().unwrap()),
+            EnvFilter::from_default_env().add_directive("ozma_softnode=info".parse().unwrap()),
         )
         .init();
 
@@ -133,7 +136,7 @@ async fn main() {
     let _ = std::fs::remove_file(&args.socket_path);
 
     let listener = match UnixListener::bind(&args.socket_path) {
-        Ok(l)  => l,
+        Ok(l) => l,
         Err(e) => {
             error!("Cannot bind socket {:?}: {e}", args.socket_path);
             std::process::exit(1);
@@ -147,7 +150,7 @@ async fn main() {
 
     // Spawn the detector polling loop.
     let config = DetectorConfig {
-        poll_interval:   Duration::from_secs(args.poll_interval_secs),
+        poll_interval: Duration::from_secs(args.poll_interval_secs),
         extra_ics_paths: args.extra_ics_paths,
     };
     let _detector = MeetingDetector::new(config, tx.clone()).spawn();
@@ -157,7 +160,7 @@ async fn main() {
         let tx_shutdown = tx.clone();
         tokio::spawn(async move {
             use tokio::signal::unix::{signal, SignalKind};
-            let mut sigint  = signal(SignalKind::interrupt()).expect("SIGINT handler");
+            let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
             let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
             tokio::select! {
                 _ = sigint.recv()  => {}

@@ -51,10 +51,20 @@ struct Response {
 
 impl Response {
     fn ok(id: u64, data: Value) -> Self {
-        Self { id, ok: true, error: None, data }
+        Self {
+            id,
+            ok: true,
+            error: None,
+            data,
+        }
     }
     fn err(id: u64, msg: impl Into<String>) -> Self {
-        Self { id, ok: false, error: Some(msg.into()), data: Value::Null }
+        Self {
+            id,
+            ok: false,
+            error: Some(msg.into()),
+            data: Value::Null,
+        }
     }
 }
 
@@ -144,8 +154,11 @@ async fn serve_windows(mgr: Arc<ClipboardManager>) {
 
 // ── Connection handler ────────────────────────────────────────────────────────
 
-async fn handle_connection<R, W>(mut reader: BufReader<R>, mut writer: W, mgr: Arc<ClipboardManager>)
-where
+async fn handle_connection<R, W>(
+    mut reader: BufReader<R>,
+    mut writer: W,
+    mgr: Arc<ClipboardManager>,
+) where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
@@ -180,23 +193,27 @@ where
         match req.cmd.to_uppercase().as_str() {
             "GET" => {
                 let resp = match mgr.get().await {
-                    Some(content) => Response::ok(
-                        req.id,
-                        serde_json::json!({ "content": content }),
-                    ),
+                    Some(content) => {
+                        Response::ok(req.id, serde_json::json!({ "content": content }))
+                    }
                     None => Response::err(req.id, "clipboard empty or unavailable"),
                 };
                 send_response(&mut writer, &resp).await;
             }
 
             "SET" => {
-                let content: ClipboardContent = match serde_json::from_value(req.params["content"].clone()) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        send_response(&mut writer, &Response::err(req.id, format!("bad content: {e}"))).await;
-                        continue;
-                    }
-                };
+                let content: ClipboardContent =
+                    match serde_json::from_value(req.params["content"].clone()) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            send_response(
+                                &mut writer,
+                                &Response::err(req.id, format!("bad content: {e}")),
+                            )
+                            .await;
+                            continue;
+                        }
+                    };
                 let resp = match mgr.set(content).await {
                     Ok(()) => Response::ok(req.id, Value::Null),
                     Err(e) => Response::err(req.id, e),
@@ -248,7 +265,11 @@ where
 
             "WATCH" => {
                 // Acknowledge subscription
-                send_response(&mut writer, &Response::ok(req.id, serde_json::json!({ "watching": true }))).await;
+                send_response(
+                    &mut writer,
+                    &Response::ok(req.id, serde_json::json!({ "watching": true })),
+                )
+                .await;
 
                 // Stream change events until the client disconnects
                 let mut rx = mgr.tx.subscribe();
@@ -277,7 +298,11 @@ where
             }
 
             other => {
-                send_response(&mut writer, &Response::err(req.id, format!("unknown command: {other}"))).await;
+                send_response(
+                    &mut writer,
+                    &Response::err(req.id, format!("unknown command: {other}")),
+                )
+                .await;
             }
         }
     }

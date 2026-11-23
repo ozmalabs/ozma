@@ -468,17 +468,15 @@ impl V4l2Capture {
             })?;
 
         match ready_rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(Ok((format, fourcc))) => {
-                Ok(Self {
-                    node,
-                    format,
-                    fourcc,
-                    requests: Some(request_tx),
-                    frames: frame_rx,
-                    worker: Some(worker),
-                    stopped: false,
-                })
-            }
+            Ok(Ok((format, fourcc))) => Ok(Self {
+                node,
+                format,
+                fourcc,
+                requests: Some(request_tx),
+                frames: frame_rx,
+                worker: Some(worker),
+                stopped: false,
+            }),
             Ok(Err(error)) => {
                 drop(request_tx);
                 let _ = worker.join();
@@ -736,7 +734,10 @@ fn open_device(node: &V4l2Node) -> Result<(Device, Format, PixelFormat), ApiErro
         .query_caps()
         .map_err(|error| worker_io_error(node, "query capabilities for", error))?;
 
-    if !capabilities.capabilities.contains(CapabilityFlags::VIDEO_CAPTURE) {
+    if !capabilities
+        .capabilities
+        .contains(CapabilityFlags::VIDEO_CAPTURE)
+    {
         let message = if capabilities
             .capabilities
             .contains(CapabilityFlags::VIDEO_CAPTURE_MPLANE)
@@ -758,7 +759,10 @@ fn open_device(node: &V4l2Node) -> Result<(Device, Format, PixelFormat), ApiErro
             ));
     }
 
-    if !capabilities.capabilities.contains(CapabilityFlags::STREAMING) {
+    if !capabilities
+        .capabilities
+        .contains(CapabilityFlags::STREAMING)
+    {
         return Err(ApiError::new(
             codes::CAPTURE_UNAVAILABLE,
             format!("V4L2 device `{}` does not support streaming I/O.", node.id),
@@ -886,13 +890,17 @@ fn stepwise_contains(stepwise: &Stepwise, width: u32, height: u32) -> bool {
     fn aligned(value: u32, min: u32, max: u32, step: u32) -> bool {
         value >= min && value <= max && (step == 0 || (value - min) % step == 0)
     }
-    aligned(width, stepwise.min_width, stepwise.max_width, stepwise.step_width)
-        && aligned(
-            height,
-            stepwise.min_height,
-            stepwise.max_height,
-            stepwise.step_height,
-        )
+    aligned(
+        width,
+        stepwise.min_width,
+        stepwise.max_width,
+        stepwise.step_width,
+    ) && aligned(
+        height,
+        stepwise.min_height,
+        stepwise.max_height,
+        stepwise.step_height,
+    )
 }
 
 fn capture_one(
@@ -904,8 +912,8 @@ fn capture_one(
     last_pts: Option<u64>,
     origin: Instant,
 ) -> Result<(Frame, u64), MediaError> {
-    let (buffer, metadata) = CaptureStream::next(stream)
-        .map_err(|error| capture_io_error(id, error))?;
+    let (buffer, metadata) =
+        CaptureStream::next(stream).map_err(|error| capture_io_error(id, error))?;
 
     let used = usize::try_from(metadata.bytesused)
         .map_err(|_| MediaError::capture(id, "driver reported an invalid buffer length"))?;
@@ -928,15 +936,11 @@ fn capture_one(
     let keyframe = keyframe_for(pixel_format, driver_keyframe)
         || (pixel_format == PixelFormat::H264 && h264_access_unit_contains_idr(payload));
 
-    Frame::with_data(format, pts, sequence, keyframe, payload.to_vec())
-        .map(|frame| (frame, pts))
+    Frame::with_data(format, pts, sequence, keyframe, payload.to_vec()).map(|frame| (frame, pts))
 }
 
 fn pts_from_metadata(metadata: &Metadata, origin: Instant) -> u64 {
-    if metadata
-        .flags
-        .contains(BufferFlags::TIMESTAMP_MONOTONIC)
-    {
+    if metadata.flags.contains(BufferFlags::TIMESTAMP_MONOTONIC) {
         if let Some(pts) = timestamp_micros(
             metadata.timestamp.sec as i64,
             metadata.timestamp.usec as i64,
@@ -1085,7 +1089,10 @@ mod tests {
         assert_eq!(nodes[3].name, "USB Capture HDMI");
         assert!(nodes[0].capture_like);
         assert!(!nodes[2].capture_like);
-        assert_eq!(nodes[0].id, dev.join("video0").to_string_lossy().to_string());
+        assert_eq!(
+            nodes[0].id,
+            dev.join("video0").to_string_lossy().to_string()
+        );
     }
 
     #[test]
@@ -1093,7 +1100,10 @@ mod tests {
         let (_tree, dev, sys) = fixture();
         let provider = V4l2Provider::with_roots(dev, sys);
         let capabilities = provider.enumerate().unwrap();
-        let ids: Vec<String> = capabilities.iter().map(|capability| capability.id.clone()).collect();
+        let ids: Vec<String> = capabilities
+            .iter()
+            .map(|capability| capability.id.clone())
+            .collect();
         assert_eq!(ids.len(), 3, "metadata node must be excluded");
         assert!(ids[0].ends_with("video0"));
         assert!(ids[1].ends_with("video2"));

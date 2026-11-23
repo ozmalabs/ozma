@@ -38,11 +38,7 @@ pub struct Grant {
 pub type ClientGrant = Grant;
 
 impl Grant {
-    pub fn new(
-        client_id: impl Into<ClientId>,
-        permissions: PermissionSet,
-        issued_at: u64,
-    ) -> Self {
+    pub fn new(client_id: impl Into<ClientId>, permissions: PermissionSet, issued_at: u64) -> Self {
         Self {
             client_id: client_id.into(),
             permissions,
@@ -146,39 +142,48 @@ impl GrantStore {
     ) -> Result<Grant> {
         let mut grants = self.state();
         let grant = grants.get_mut(client_id).ok_or_else(|| {
-            ApiError::new(codes::UNAUTHORIZED, "No permission grant exists for this client")
-                .with_details(serde_json::json!({ "client_id": client_id }))
+            ApiError::new(
+                codes::UNAUTHORIZED,
+                "No permission grant exists for this client",
+            )
+            .with_details(serde_json::json!({ "client_id": client_id }))
         })?;
 
         if grant.revoked {
-            return Err(
-                ApiError::new(codes::FORBIDDEN, "The client's permission grant was revoked")
-                    .with_details(serde_json::json!({ "client_id": client_id })),
-            );
+            return Err(ApiError::new(
+                codes::FORBIDDEN,
+                "The client's permission grant was revoked",
+            )
+            .with_details(serde_json::json!({ "client_id": client_id })));
         }
 
         if grant.is_expired(now) {
-            return Err(
-                ApiError::new(codes::TOKEN_EXPIRED, "The client's permission grant has expired")
-                    .with_details(serde_json::json!({
-                        "client_id": client_id,
-                        "expires_at": grant.expires_at,
-                        "now": now,
-                    }))
-                    .retryable(),
-            );
+            return Err(ApiError::new(
+                codes::TOKEN_EXPIRED,
+                "The client's permission grant has expired",
+            )
+            .with_details(serde_json::json!({
+                "client_id": client_id,
+                "expires_at": grant.expires_at,
+                "now": now,
+            }))
+            .retryable());
         }
 
         let missing = grant.missing_permissions(required);
         if !missing.is_empty() {
-            let missing: Vec<String> = missing.iter().map(|permission| permission.to_string()).collect();
-            return Err(
-                ApiError::new(codes::FORBIDDEN, "The client's grant is missing permissions")
-                    .with_details(serde_json::json!({
-                        "client_id": client_id,
-                        "missing": missing,
-                    })),
-            );
+            let missing: Vec<String> = missing
+                .iter()
+                .map(|permission| permission.to_string())
+                .collect();
+            return Err(ApiError::new(
+                codes::FORBIDDEN,
+                "The client's grant is missing permissions",
+            )
+            .with_details(serde_json::json!({
+                "client_id": client_id,
+                "missing": missing,
+            })));
         }
 
         grant.last_used_at = Some(now);
@@ -306,7 +311,9 @@ mod tests {
         let granted: PermissionSet = [Permission::View].into_iter().collect();
         store.insert(Grant::new(client(), granted, 100)).unwrap();
 
-        let required: PermissionSet = [Permission::View, Permission::Control].into_iter().collect();
+        let required: PermissionSet = [Permission::View, Permission::Control]
+            .into_iter()
+            .collect();
         let error = store.validate(&client(), &required, 200).unwrap_err();
         assert_eq!(error.code, codes::FORBIDDEN);
         assert_eq!(error.details["missing"][0], "control");

@@ -127,8 +127,9 @@ mod tests {
             MachineClass::Server,
             MachineClass::Kiosk,
         ] {
-            assert!(ConsentPolicy::for_machine(machine)
-                .requires_consent(ConsentRequirement::Always));
+            assert!(
+                ConsentPolicy::for_machine(machine).requires_consent(ConsentRequirement::Always)
+            );
         }
     }
 

@@ -41,9 +41,7 @@ pub async fn register(
         }
     }
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()?;
+    let client = Client::builder().timeout(Duration::from_secs(5)).build()?;
 
     let resp = client.post(&url).json(&payload).send().await?;
 

@@ -39,12 +39,7 @@ pub struct LinkQuality {
 
 impl LinkQuality {
     /// Construct a measurement.
-    pub const fn new(
-        rtt_ms: f32,
-        jitter_ms: f32,
-        loss_percent: f32,
-        throughput_kbps: u32,
-    ) -> Self {
+    pub const fn new(rtt_ms: f32, jitter_ms: f32, loss_percent: f32, throughput_kbps: u32) -> Self {
         Self {
             rtt_ms,
             jitter_ms,
@@ -477,7 +472,10 @@ fn evaluate(
     if quality.jitter_ms > policy.max_jitter_ms {
         return Err((
             RejectionReason::ExcessiveJitter,
-            format!("{:.1} ms > {:.1} ms", quality.jitter_ms, policy.max_jitter_ms),
+            format!(
+                "{:.1} ms > {:.1} ms",
+                quality.jitter_ms, policy.max_jitter_ms
+            ),
         ));
     }
     if quality.loss_percent > policy.max_loss_percent {
@@ -501,7 +499,11 @@ fn evaluate(
     Ok(())
 }
 
-fn compare(a: &TransportCandidate, b: &TransportCandidate, strategy: SelectionStrategy) -> Ordering {
+fn compare(
+    a: &TransportCandidate,
+    b: &TransportCandidate,
+    strategy: SelectionStrategy,
+) -> Ordering {
     let latency = a
         .quality
         .rtt_ms
@@ -624,10 +626,7 @@ mod tests {
         assert_eq!(selection.descriptor.mode, TransportMode::Udp);
         assert_eq!(selection.rejected.len(), 1);
         assert_eq!(selection.rejected[0].mode, TransportMode::Quic);
-        assert_eq!(
-            selection.rejected[0].reason,
-            RejectionReason::ExcessiveLoss
-        );
+        assert_eq!(selection.rejected[0].reason, RejectionReason::ExcessiveLoss);
         assert!(selection.reason.contains("rejected: quic"));
     }
 
@@ -666,20 +665,8 @@ mod tests {
     fn a_fixed_preference_restricts_selection() {
         let mut director = TransportDirector::default();
         director
-            .add_candidate(candidate(
-                quic("10.0.0.1:4433"),
-                10.0,
-                1.0,
-                0.0,
-                50_000,
-            ))
-            .add_candidate(candidate(
-                udp("10.0.0.1:5004"),
-                20.0,
-                2.0,
-                0.0,
-                40_000,
-            ));
+            .add_candidate(candidate(quic("10.0.0.1:4433"), 10.0, 1.0, 0.0, 50_000))
+            .add_candidate(candidate(udp("10.0.0.1:5004"), 20.0, 2.0, 0.0, 40_000));
         let selection = director
             .select_for(TransportPreference::Udp)
             .expect("udp was measured");
@@ -695,37 +682,16 @@ mod tests {
     #[test]
     fn adding_the_same_endpoint_replaces_its_measurement() {
         let mut director = TransportDirector::default();
-        director.add_candidate(candidate(
-            quic("10.0.0.1:4433"),
-            100.0,
-            5.0,
-            1.0,
-            10_000,
-        ));
-        director.add_candidate(candidate(
-            quic("10.0.0.1:4433"),
-            8.0,
-            1.0,
-            0.0,
-            60_000,
-        ));
+        director.add_candidate(candidate(quic("10.0.0.1:4433"), 100.0, 5.0, 1.0, 10_000));
+        director.add_candidate(candidate(quic("10.0.0.1:4433"), 8.0, 1.0, 0.0, 60_000));
         assert_eq!(director.candidates().len(), 1);
         assert_eq!(director.candidates()[0].quality.rtt_ms, 8.0);
-        assert_eq!(
-            director.select().unwrap().quality.rtt_ms,
-            8.0
-        );
+        assert_eq!(director.select().unwrap().quality.rtt_ms, 8.0);
     }
 
     #[test]
     fn invalid_measurements_are_rejected_as_a_unit() {
-        let candidates = vec![candidate(
-            quic("10.0.0.1:4433"),
-            f32::NAN,
-            1.0,
-            0.0,
-            50_000,
-        )];
+        let candidates = vec![candidate(quic("10.0.0.1:4433"), f32::NAN, 1.0, 0.0, 50_000)];
         let error = TransportDirector::select_from(&candidates, &TransportPolicy::default())
             .expect_err("nan is not viable");
         assert_eq!(error.code, codes::TRANSPORT_UNAVAILABLE);

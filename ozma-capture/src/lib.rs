@@ -64,7 +64,11 @@ mod tests {
     #[tokio::test]
     async fn fake_provider_is_a_real_registry_path() {
         let mut registry = CaptureRegistry::new();
-        registry.register(FakeCaptureProvider::new().with_frame_limit(2).with_fps(1_000));
+        registry.register(
+            FakeCaptureProvider::new()
+                .with_frame_limit(2)
+                .with_fps(1_000),
+        );
 
         let capabilities = registry.enumerate().unwrap();
         assert_eq!(capabilities.len(), 1);
@@ -78,7 +82,10 @@ mod tests {
         assert_eq!(first.sequence(), 0);
         assert_eq!(second.sequence(), 1);
         assert!(second.pts_micros() > first.pts_micros());
-        assert_eq!(source.next_frame().await.unwrap_err(), MediaError::EndOfStream);
+        assert_eq!(
+            source.next_frame().await.unwrap_err(),
+            MediaError::EndOfStream
+        );
     }
 
     #[test]

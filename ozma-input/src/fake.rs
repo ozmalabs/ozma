@@ -8,8 +8,8 @@ use ozma_protocol::ApiError;
 
 use crate::gadget::GadgetOptions;
 use crate::report::MouseProtocol;
-use crate::state::{HeldInput, Router};
 use crate::sink::{InputSink, SubmitReport};
+use crate::state::{HeldInput, Router};
 
 struct FakeState {
     router: Router,
@@ -113,7 +113,11 @@ mod tests {
     use ozma_protocol::input::{KeyModifiers, PointerButton};
 
     fn key(code: u32, down: bool) -> InputEvent {
-        InputEvent::Key { code, down, modifiers: KeyModifiers::default() }
+        InputEvent::Key {
+            code,
+            down,
+            modifiers: KeyModifiers::default(),
+        }
     }
 
     #[test]

@@ -16,24 +16,24 @@ pub enum Family {
 /// Detailed profile for a specific controller model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControllerProfile {
-    pub family:      Family,
+    pub family: Family,
     /// e.g. "360", "one", "series", "ds4", "dualsense", "switch_pro", ""
-    pub variant:     String,
+    pub variant: String,
     /// Face-button labels in South / East / North / West order.
     pub south_label: String,
-    pub east_label:  String,
+    pub east_label: String,
     pub north_label: String,
-    pub west_label:  String,
+    pub west_label: String,
 }
 
 impl ControllerProfile {
     /// Unique surface-id prefix derived from family + variant.
     pub fn surface_id(&self) -> String {
         let family = match self.family {
-            Family::Xbox        => "xbox",
+            Family::Xbox => "xbox",
             Family::PlayStation => "playstation",
-            Family::Nintendo    => "nintendo",
-            Family::Generic     => "generic",
+            Family::Nintendo => "nintendo",
+            Family::Generic => "generic",
         };
         if self.variant.is_empty() {
             format!("gamepad-{family}")
@@ -95,45 +95,45 @@ pub fn detect_profile(name: &str) -> ControllerProfile {
 
 fn xbox(variant: &str) -> ControllerProfile {
     ControllerProfile {
-        family:      Family::Xbox,
-        variant:     variant.to_owned(),
+        family: Family::Xbox,
+        variant: variant.to_owned(),
         south_label: "A".into(),
-        east_label:  "B".into(),
+        east_label: "B".into(),
         north_label: "X".into(),
-        west_label:  "Y".into(),
+        west_label: "Y".into(),
     }
 }
 
 fn ps(variant: &str) -> ControllerProfile {
     ControllerProfile {
-        family:      Family::PlayStation,
-        variant:     variant.to_owned(),
+        family: Family::PlayStation,
+        variant: variant.to_owned(),
         south_label: "Cross".into(),
-        east_label:  "Circle".into(),
+        east_label: "Circle".into(),
         north_label: "Triangle".into(),
-        west_label:  "Square".into(),
+        west_label: "Square".into(),
     }
 }
 
 fn nintendo(variant: &str) -> ControllerProfile {
     ControllerProfile {
-        family:      Family::Nintendo,
-        variant:     variant.to_owned(),
+        family: Family::Nintendo,
+        variant: variant.to_owned(),
         south_label: "B".into(),
-        east_label:  "A".into(),
+        east_label: "A".into(),
         north_label: "X".into(),
-        west_label:  "Y".into(),
+        west_label: "Y".into(),
     }
 }
 
 fn generic() -> ControllerProfile {
     ControllerProfile {
-        family:      Family::Generic,
-        variant:     String::new(),
+        family: Family::Generic,
+        variant: String::new(),
         south_label: "South".into(),
-        east_label:  "East".into(),
+        east_label: "East".into(),
         north_label: "North".into(),
-        west_label:  "West".into(),
+        west_label: "West".into(),
     }
 }
 

@@ -79,9 +79,7 @@ mod sink;
 mod state;
 
 pub use error::codes;
-pub use gadget::{
-    GadgetOptions, HidGadgetSink, DEFAULT_KEYBOARD_PATH, DEFAULT_MOUSE_PATH,
-};
+pub use gadget::{GadgetOptions, HidGadgetSink, DEFAULT_KEYBOARD_PATH, DEFAULT_MOUSE_PATH};
 pub use report::{
     clamp_i8, pointer_button_bit, AbsoluteMapping, AbsolutePoint, AbsolutePointerReport,
     MouseProtocol, HID_ABSOLUTE_MAX,

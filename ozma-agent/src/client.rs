@@ -61,32 +61,32 @@ pub struct AgentConfig {
 
 #[derive(Debug, Serialize)]
 struct RegisterRequest<'a> {
-    machine_id:   &'a str,
-    pubkey:       &'a str,
+    machine_id: &'a str,
+    pubkey: &'a str,
     capabilities: &'a [String],
-    version:      &'a str,
-    hostname:     String,
-    platform:     &'static str,
-    arch:         &'static str,
+    version: &'a str,
+    hostname: String,
+    platform: &'static str,
+    arch: &'static str,
 }
 
 #[derive(Debug, Deserialize)]
 struct RegisterResponse {
-    ok:    bool,
+    ok: bool,
     relay: Option<RelayParams>,
 }
 
 #[derive(Debug, Serialize)]
 struct HeartbeatRequest<'a> {
     machine_id: &'a str,
-    status:     &'static str,
-    relay_ip:   &'a str,
+    status: &'static str,
+    relay_ip: &'a str,
 }
 
 #[derive(Debug, Serialize)]
 struct MetricsPushRequest<'a> {
     machine_id: &'a str,
-    metrics:    &'a metrics::SystemMetrics,
+    metrics: &'a metrics::SystemMetrics,
 }
 
 // ── Client ───────────────────────────────────────────────────────────────────
@@ -96,10 +96,10 @@ struct MetricsPushRequest<'a> {
 /// Call [`ConnectClient::start`] to spawn background tasks.
 /// Drop the handle (or call [`ConnectClient::stop`]) to shut down.
 pub struct ConnectClient {
-    cfg:      Arc<AgentConfig>,
-    http:     Client,
+    cfg: Arc<AgentConfig>,
+    http: Client,
     relay_ip: Arc<std::sync::Mutex<String>>,
-    running:  Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
 }
 
 impl ConnectClient {
@@ -111,10 +111,10 @@ impl ConnectClient {
     pub fn new(cfg: AgentConfig) -> Result<Self> {
         let http = build_http_client(&cfg)?;
         Ok(Self {
-            cfg:      Arc::new(cfg),
+            cfg: Arc::new(cfg),
             http,
             relay_ip: Arc::new(std::sync::Mutex::new(String::new())),
-            running:  Arc::new(AtomicBool::new(false)),
+            running: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -145,10 +145,10 @@ impl ConnectClient {
 
         // Spawn heartbeat task
         {
-            let cfg      = Arc::clone(&self.cfg);
-            let http     = self.http.clone();
+            let cfg = Arc::clone(&self.cfg);
+            let http = self.http.clone();
             let relay_ip = Arc::clone(&self.relay_ip);
-            let running  = Arc::clone(&self.running);
+            let running = Arc::clone(&self.running);
             tokio::spawn(async move {
                 heartbeat_loop(cfg, http, relay_ip, running).await;
             });
@@ -156,8 +156,8 @@ impl ConnectClient {
 
         // Spawn metrics task
         {
-            let cfg     = Arc::clone(&self.cfg);
-            let http    = self.http.clone();
+            let cfg = Arc::clone(&self.cfg);
+            let http = self.http.clone();
             let running = Arc::clone(&self.running);
             tokio::spawn(async move {
                 metrics_loop(cfg, http, running).await;
@@ -180,8 +180,8 @@ impl ConnectClient {
             .bearer_auth(&self.cfg.token)
             .json(&HeartbeatRequest {
                 machine_id: &self.cfg.machine_id,
-                status:     "offline",
-                relay_ip:   &relay_ip,
+                status: "offline",
+                relay_ip: &relay_ip,
             })
             .send()
             .await;
@@ -215,13 +215,13 @@ impl ConnectClient {
             .unwrap_or_else(|_| "unknown".into());
 
         let body = RegisterRequest {
-            machine_id:   &self.cfg.machine_id,
-            pubkey:       &self.cfg.wg_public_key,
+            machine_id: &self.cfg.machine_id,
+            pubkey: &self.cfg.wg_public_key,
             capabilities: &self.cfg.capabilities,
-            version:      &self.cfg.version,
+            version: &self.cfg.version,
             hostname,
-            platform:     std::env::consts::OS,
-            arch:         std::env::consts::ARCH,
+            platform: std::env::consts::OS,
+            arch: std::env::consts::ARCH,
         };
 
         let resp = self
@@ -239,8 +239,7 @@ impl ConnectClient {
             anyhow::bail!("Register returned {status}: {text}");
         }
 
-        let reg: RegisterResponse =
-            resp.json().await.context("Deserialise register response")?;
+        let reg: RegisterResponse = resp.json().await.context("Deserialise register response")?;
         if !reg.ok {
             anyhow::bail!("Register response ok=false");
         }
@@ -253,10 +252,10 @@ impl ConnectClient {
 // ── Background loops ─────────────────────────────────────────────────────────
 
 async fn heartbeat_loop(
-    cfg:      Arc<AgentConfig>,
-    http:     Client,
+    cfg: Arc<AgentConfig>,
+    http: Client,
     relay_ip: Arc<std::sync::Mutex<String>>,
-    running:  Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
 ) {
     while running.load(Ordering::SeqCst) {
         sleep(HEARTBEAT_INTERVAL).await;
@@ -270,8 +269,8 @@ async fn heartbeat_loop(
             .bearer_auth(&cfg.token)
             .json(&HeartbeatRequest {
                 machine_id: &cfg.machine_id,
-                status:     "online",
-                relay_ip:   &ip,
+                status: "online",
+                relay_ip: &ip,
             })
             .send()
             .await;
@@ -286,11 +285,7 @@ async fn heartbeat_loop(
     }
 }
 
-async fn metrics_loop(
-    cfg:     Arc<AgentConfig>,
-    http:    Client,
-    running: Arc<AtomicBool>,
-) {
+async fn metrics_loop(cfg: Arc<AgentConfig>, http: Client, running: Arc<AtomicBool>) {
     while running.load(Ordering::SeqCst) {
         sleep(METRICS_INTERVAL).await;
         if !running.load(Ordering::SeqCst) {
@@ -303,7 +298,7 @@ async fn metrics_loop(
             .bearer_auth(&cfg.token)
             .json(&MetricsPushRequest {
                 machine_id: &cfg.machine_id,
-                metrics:    &snapshot,
+                metrics: &snapshot,
             })
             .send()
             .await;
@@ -351,8 +346,7 @@ fn build_http_client(cfg: &AgentConfig) -> Result<Client> {
 
     // Optional custom CA
     if let Some(ca_path) = &cfg.ca_cert_pem {
-        let ca_pem = fs::read(ca_path)
-            .with_context(|| format!("Read CA cert {ca_path:?}"))?;
+        let ca_pem = fs::read(ca_path).with_context(|| format!("Read CA cert {ca_path:?}"))?;
         let ca_cert = Certificate::from_pem(&ca_pem).context("Parse CA cert")?;
         builder = builder.add_root_certificate(ca_cert);
     }

@@ -7,9 +7,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use ozma_protocol::TransportMode;
 use ozma_transport::quic::{QuicClient, QuicServer};
-use ozma_transport::{
-    ChannelId, ChannelMap, CloseReason, SessionTransport, TransportEvent,
-};
+use ozma_transport::{ChannelId, ChannelMap, CloseReason, SessionTransport, TransportEvent};
 use tokio::time::timeout;
 
 const OP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -110,8 +108,8 @@ async fn quic_rejects_a_wrong_pinned_certificate() {
     let other = ozma_transport::quic::SelfSignedCertificate::generate(&["localhost".to_string()])
         .expect("generate other certificate");
 
-    let config = ozma_transport::quic::QuicConfig::default()
-        .with_handshake_timeout(Duration::from_secs(2));
+    let config =
+        ozma_transport::quic::QuicConfig::default().with_handshake_timeout(Duration::from_secs(2));
     let error = QuicClient::connect_with_config(
         addr,
         "localhost",

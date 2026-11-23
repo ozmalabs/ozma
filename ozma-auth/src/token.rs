@@ -197,9 +197,9 @@ impl TokenVerifier {
 
     /// Verify the signature, claims shape, and expiry.
     pub fn verify(&self, token: &str, now: u64) -> Result<TokenClaims> {
-        let (payload, signature_b64) = token.split_once('.').ok_or_else(|| {
-            invalid("Session token is missing its signature segment")
-        })?;
+        let (payload, signature_b64) = token
+            .split_once('.')
+            .ok_or_else(|| invalid("Session token is missing its signature segment"))?;
         if payload.is_empty() || signature_b64.is_empty() || signature_b64.contains('.') {
             return Err(invalid("Session token has an invalid encoding"));
         }
@@ -231,15 +231,14 @@ impl TokenVerifier {
         }
 
         if now >= claims.expires_at {
-            return Err(ApiError::new(
-                codes::TOKEN_EXPIRED,
-                "The session token has expired",
-            )
-            .with_details(serde_json::json!({
-                "expires_at": claims.expires_at,
-                "now": now,
-            }))
-            .retryable());
+            return Err(
+                ApiError::new(codes::TOKEN_EXPIRED, "The session token has expired")
+                    .with_details(serde_json::json!({
+                        "expires_at": claims.expires_at,
+                        "now": now,
+                    }))
+                    .retryable(),
+            );
         }
 
         Ok(claims)
@@ -301,15 +300,9 @@ mod tests {
     }
 
     fn claims() -> TokenClaims {
-        TokenClaims::new(
-            "session-1",
-            "client-1",
-            permissions(),
-            1_000,
-            1_600,
-        )
-        .with_nonce("fixed-nonce")
-        .with_node_id("node-a")
+        TokenClaims::new("session-1", "client-1", permissions(), 1_000, 1_600)
+            .with_nonce("fixed-nonce")
+            .with_node_id("node-a")
     }
 
     #[test]
@@ -340,9 +333,7 @@ mod tests {
     fn a_different_nonce_produces_a_different_token() {
         let issuer = TokenIssuer::new(SECRET);
         let first = issuer.issue(&claims()).unwrap();
-        let second = issuer
-            .issue(&claims().with_nonce("another-nonce"))
-            .unwrap();
+        let second = issuer.issue(&claims().with_nonce("another-nonce")).unwrap();
         assert_ne!(first, second);
     }
 

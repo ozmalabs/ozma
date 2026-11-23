@@ -34,11 +34,17 @@ impl KeyboardReport {
     /// Parse from an 8-byte HID boot keyboard report.
     pub fn from_bytes(b: &[u8]) -> Result<Self, ReportError> {
         if b.len() < 8 {
-            return Err(ReportError::TooShort { need: 8, got: b.len() });
+            return Err(ReportError::TooShort {
+                need: 8,
+                got: b.len(),
+            });
         }
         let mut keys = [0u8; 6];
         keys.copy_from_slice(&b[2..8]);
-        Ok(Self { modifier: b[0], keys })
+        Ok(Self {
+            modifier: b[0],
+            keys,
+        })
     }
 
     /// Active (non-zero) key usage IDs.
@@ -64,12 +70,20 @@ impl MouseReport {
     /// Parse from a 6-byte HID mouse report.
     pub fn from_bytes(b: &[u8]) -> Result<Self, ReportError> {
         if b.len() < 6 {
-            return Err(ReportError::TooShort { need: 6, got: b.len() });
+            return Err(ReportError::TooShort {
+                need: 6,
+                got: b.len(),
+            });
         }
         let x = u16::from_le_bytes([b[1], b[2]]);
         let y = u16::from_le_bytes([b[3], b[4]]);
         let scroll = b[5] as i8;
-        Ok(Self { buttons: b[0], x, y, scroll })
+        Ok(Self {
+            buttons: b[0],
+            x,
+            y,
+            scroll,
+        })
     }
 }
 
@@ -89,7 +103,7 @@ impl OzmaPacket {
         match data[0] {
             0x01 => Ok(Self::Keyboard(KeyboardReport::from_bytes(&data[1..])?)),
             0x02 => Ok(Self::Mouse(MouseReport::from_bytes(&data[1..])?)),
-            t    => Err(ReportError::UnknownType(t)),
+            t => Err(ReportError::UnknownType(t)),
         }
     }
 }
@@ -116,7 +130,15 @@ mod tests {
     fn parse_mouse_report() {
         let x: u16 = 16383;
         let y: u16 = 8191;
-        let pkt = [0x02u8, 0x01, x as u8, (x >> 8) as u8, y as u8, (y >> 8) as u8, 0xFE];
+        let pkt = [
+            0x02u8,
+            0x01,
+            x as u8,
+            (x >> 8) as u8,
+            y as u8,
+            (y >> 8) as u8,
+            0xFE,
+        ];
         let p = OzmaPacket::parse(&pkt).unwrap();
         match p {
             OzmaPacket::Mouse(r) => {

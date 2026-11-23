@@ -81,7 +81,10 @@ pub async fn teardown() {
 
     match out {
         Ok(o) if !o.status.success() => {
-            warn!("wg-quick down ozma-relay: {}", String::from_utf8_lossy(&o.stderr));
+            warn!(
+                "wg-quick down ozma-relay: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
         }
         Err(e) => warn!("Failed to run wg-quick: {e}"),
         _ => {}

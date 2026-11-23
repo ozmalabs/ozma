@@ -58,7 +58,13 @@ pub fn encrypt_packet(
 
     let cipher = XChaCha20Poly1305::new(key.into());
     let ciphertext = cipher
-        .encrypt(&nonce, Payload { msg: payload, aad: &aad })
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: payload,
+                aad: &aad,
+            },
+        )
         .expect("XChaCha20-Poly1305 encryption is infallible for valid inputs");
 
     // wire packet = header || ciphertext+MAC
@@ -109,7 +115,13 @@ pub fn decrypt_packet(
 
     let cipher = XChaCha20Poly1305::new(key.into());
     let plaintext = cipher
-        .decrypt(&nonce, Payload { msg: ciphertext, aad: &aad })
+        .decrypt(
+            &nonce,
+            Payload {
+                msg: ciphertext,
+                aad: &aad,
+            },
+        )
         .ok()?;
 
     Some((packet_type, plaintext))

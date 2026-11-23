@@ -7,8 +7,8 @@ pub mod libvirt;
 pub mod proxmox;
 pub mod qmp_scan;
 
-use anyhow::Result;
 use crate::vm_info::VMInfo;
+use anyhow::Result;
 
 /// Discover all running VMs using the best available backend.
 pub async fn discover_vms(qmp_dir: &str) -> Result<Vec<VMInfo>> {

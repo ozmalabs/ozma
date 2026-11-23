@@ -92,7 +92,9 @@ async fn ipc_json_roundtrip() {
                     while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
                         let trimmed = line.trim().to_owned();
                         line.clear();
-                        if trimmed.is_empty() { continue; }
+                        if trimmed.is_empty() {
+                            continue;
+                        }
                         let req: serde_json::Value = serde_json::from_str(&trimmed).unwrap();
                         let id = req["id"].as_u64().unwrap_or(0);
                         match req["cmd"].as_str().unwrap_or("") {
@@ -109,8 +111,12 @@ async fn ipc_json_roundtrip() {
                             "GET" => {
                                 let content = m.get().await;
                                 let resp = match content {
-                                    Some(c) => serde_json::json!({"id": id, "ok": true, "content": c}),
-                                    None => serde_json::json!({"id": id, "ok": false, "error": "empty"}),
+                                    Some(c) => {
+                                        serde_json::json!({"id": id, "ok": true, "content": c})
+                                    }
+                                    None => {
+                                        serde_json::json!({"id": id, "ok": false, "error": "empty"})
+                                    }
                                 };
                                 let mut s = serde_json::to_string(&resp).unwrap();
                                 s.push('\n');
@@ -129,7 +135,9 @@ async fn ipc_json_roundtrip() {
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
     // Connect as client
-    let stream = UnixStream::connect(SOCK2).await.expect("connect to test socket");
+    let stream = UnixStream::connect(SOCK2)
+        .await
+        .expect("connect to test socket");
     let (r, mut w) = stream.into_split();
     let mut reader = BufReader::new(r);
 
@@ -165,7 +173,7 @@ fn ring_push_and_list() {
     use ozma_clipboard::ring::{ClipboardRing, ContentType};
     let mut ring = ClipboardRing::new();
     ring.push("alpha", "n1", "d1", ContentType::Text);
-    ring.push("beta",  "n2", "d1", ContentType::Text);
+    ring.push("beta", "n2", "d1", ContentType::Text);
     let list = ring.list(10);
     // newest first
     assert_eq!(list[0].preview, "beta");
@@ -180,16 +188,15 @@ fn ring_watch_broadcast() {
         let mgr = ClipboardManager::new("watch-test");
         let mut rx = mgr.tx.subscribe();
 
-        let content = ClipboardContent::Text { text: "broadcast-test".to_owned() };
+        let content = ClipboardContent::Text {
+            text: "broadcast-test".to_owned(),
+        };
         let _ = mgr.set(content).await;
 
-        let evt = tokio::time::timeout(
-            tokio::time::Duration::from_millis(200),
-            rx.recv(),
-        )
-        .await
-        .expect("timeout waiting for event")
-        .expect("recv error");
+        let evt = tokio::time::timeout(tokio::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("timeout waiting for event")
+            .expect("recv error");
 
         assert_eq!(evt.entry.preview, "broadcast-test");
     });

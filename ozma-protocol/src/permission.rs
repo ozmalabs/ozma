@@ -158,7 +158,8 @@ mod tests {
     #[test]
     fn subset_and_missing() {
         let granted = PermissionSet::from_iter([Permission::View, Permission::Control]);
-        let required = PermissionSet::from_iter([Permission::View, Permission::Control, Permission::Audio]);
+        let required =
+            PermissionSet::from_iter([Permission::View, Permission::Control, Permission::Audio]);
         assert!(!required.is_subset_of(&granted));
         assert_eq!(
             required.missing_from(&granted),

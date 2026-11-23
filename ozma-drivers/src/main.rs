@@ -14,8 +14,8 @@ use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
 use tokio::sync::broadcast;
-use tracing::info;
 use tokio::{io::AsyncWriteExt, net::UnixListener};
+use tracing::info;
 
 /// ozma-drivers daemon — bridges hardware surfaces to the ozma controller.
 #[derive(Parser, Debug)]
@@ -62,13 +62,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_unix_socket_server(
-    socket_path: PathBuf,
-    tx: broadcast::Sender<String>,
-) -> Result<()> {
+async fn run_unix_socket_server(socket_path: PathBuf, tx: broadcast::Sender<String>) -> Result<()> {
     // Remove existing socket file if it exists
     let _ = std::fs::remove_file(&socket_path);
-    
+
     let listener = UnixListener::bind(&socket_path)?;
     info!("Listening on Unix socket: {}", socket_path.display());
 
@@ -76,7 +73,7 @@ async fn run_unix_socket_server(
     loop {
         let (mut socket, addr) = listener.accept().await?;
         info!("New IPC client connected: {:?}", addr);
-        
+
         let tx_clone = tx.clone();
         tokio::spawn(async move {
             let mut rx = tx_clone.subscribe();

@@ -10,10 +10,10 @@ use serde::Serialize;
 /// Point-in-time system metrics snapshot pushed to Connect.
 #[derive(Debug, Serialize)]
 pub struct SystemMetrics {
-    pub cpu_percent:    f32,
+    pub cpu_percent: f32,
     pub mem_used_bytes: u64,
     pub mem_total_bytes: u64,
-    pub uptime_secs:    u64,
+    pub uptime_secs: u64,
 }
 
 /// Collect a current system metrics snapshot.
@@ -21,7 +21,11 @@ pub fn collect() -> SystemMetrics {
     // Best-effort: read from /proc; return zeros if unavailable.
     let uptime_secs = std::fs::read_to_string("/proc/uptime")
         .ok()
-        .and_then(|s| s.split_whitespace().next().and_then(|v| v.parse::<f64>().ok()))
+        .and_then(|s| {
+            s.split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<f64>().ok())
+        })
         .map(|f| f as u64)
         .unwrap_or(0);
 
@@ -33,7 +37,7 @@ pub fn collect() -> SystemMetrics {
     }
 }
 
-use prometheus::{Encoder, Registry, TextEncoder, process_collector::ProcessCollector};
+use prometheus::{process_collector::ProcessCollector, Encoder, Registry, TextEncoder};
 use std::sync::Arc;
 use tracing::info;
 

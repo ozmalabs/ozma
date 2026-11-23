@@ -5,8 +5,8 @@
 mod agent;
 mod discovery;
 mod manager;
-mod vm_info;
 mod softnode;
+mod vm_info;
 
 use clap::Parser;
 use manager::VirtualNodeManager;

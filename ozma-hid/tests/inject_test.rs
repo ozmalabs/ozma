@@ -161,20 +161,35 @@ async fn linux_evdev_readback() {
     let key_a = evdev::Key::KEY_A;
     let key_b = evdev::Key::KEY_B;
 
-    let a_press   = key_events.iter().position(|(k, v)| *k == key_a && *v == 1);
+    let a_press = key_events.iter().position(|(k, v)| *k == key_a && *v == 1);
     let a_release = key_events.iter().position(|(k, v)| *k == key_a && *v == 0);
-    let b_press   = key_events.iter().position(|(k, v)| *k == key_b && *v == 1);
+    let b_press = key_events.iter().position(|(k, v)| *k == key_b && *v == 1);
     let b_release = key_events.iter().position(|(k, v)| *k == key_b && *v == 0);
 
-    assert!(a_press.is_some(),   "KEY_A press not found in evdev stream");
-    assert!(a_release.is_some(), "KEY_A release not found in evdev stream");
-    assert!(b_press.is_some(),   "KEY_B press not found in evdev stream");
-    assert!(b_release.is_some(), "KEY_B release not found in evdev stream");
+    assert!(a_press.is_some(), "KEY_A press not found in evdev stream");
+    assert!(
+        a_release.is_some(),
+        "KEY_A release not found in evdev stream"
+    );
+    assert!(b_press.is_some(), "KEY_B press not found in evdev stream");
+    assert!(
+        b_release.is_some(),
+        "KEY_B release not found in evdev stream"
+    );
 
     // Order: a_press < a_release < b_press < b_release
-    assert!(a_press.unwrap()   < a_release.unwrap(), "KEY_A release before press");
-    assert!(a_release.unwrap() < b_press.unwrap(),   "KEY_B press before KEY_A release");
-    assert!(b_press.unwrap()   < b_release.unwrap(), "KEY_B release before press");
+    assert!(
+        a_press.unwrap() < a_release.unwrap(),
+        "KEY_A release before press"
+    );
+    assert!(
+        a_release.unwrap() < b_press.unwrap(),
+        "KEY_B press before KEY_A release"
+    );
+    assert!(
+        b_press.unwrap() < b_release.unwrap(),
+        "KEY_B release before press"
+    );
 
     dev.ungrab().ok();
 }

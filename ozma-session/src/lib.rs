@@ -133,9 +133,7 @@ impl SessionManager {
             ));
         }
 
-        let needs_consent = self
-            .consent_policy
-            .requires_consent(spec.privacy.consent);
+        let needs_consent = self.consent_policy.requires_consent(spec.privacy.consent);
 
         let mut inner = self.state();
         let sequence = inner.next_sequence;
@@ -228,11 +226,7 @@ impl SessionManager {
     }
 
     /// Deny consent. The session becomes `Rejected`, a terminal state.
-    pub fn deny_consent(
-        &self,
-        session_id: &SessionId,
-        by: impl Into<String>,
-    ) -> Result<Session> {
+    pub fn deny_consent(&self, session_id: &SessionId, by: impl Into<String>) -> Result<Session> {
         let now = self.now();
         let mut inner = self.state();
         let record = inner
@@ -427,9 +421,7 @@ impl SessionManager {
             let mut inner = self.state();
             if let Some(record) = inner.sessions.get_mut(&id) {
                 if !record.session.state.is_terminal()
-                    && self
-                        .end_record(record, EndReason::IdleTimeout, now)
-                        .is_ok()
+                    && self.end_record(record, EndReason::IdleTimeout, now).is_ok()
                 {
                     ended += 1;
                 }
@@ -515,11 +507,7 @@ impl SessionManager {
 
     /// Claim input ownership. Requires the session's `control` permission and
     /// refuses to steal control from another connected client.
-    pub fn claim_control(
-        &self,
-        session_id: &SessionId,
-        client_id: &ClientId,
-    ) -> Result<Session> {
+    pub fn claim_control(&self, session_id: &SessionId, client_id: &ClientId) -> Result<Session> {
         if client_id.is_empty() {
             return Err(ApiError::invalid("A controller requires a client_id"));
         }
@@ -576,8 +564,11 @@ impl SessionManager {
             .iter_mut()
             .find(|participant| participant.client_id == *client_id)
             .ok_or_else(|| {
-                ApiError::new(codes::NOT_FOUND, "The client is not a participant in this session")
-                    .with_details(json!({ "session_id": session_id, "client_id": client_id }))
+                ApiError::new(
+                    codes::NOT_FOUND,
+                    "The client is not a participant in this session",
+                )
+                .with_details(json!({ "session_id": session_id, "client_id": client_id }))
             })?;
         if !participant.connected {
             return Err(ApiError::new(
@@ -596,11 +587,7 @@ impl SessionManager {
 
     /// Release control back to viewers. Idempotent when this client is not the
     /// controller.
-    pub fn release_control(
-        &self,
-        session_id: &SessionId,
-        client_id: &ClientId,
-    ) -> Result<Session> {
+    pub fn release_control(&self, session_id: &SessionId, client_id: &ClientId) -> Result<Session> {
         let now = self.now();
         let mut inner = self.state();
         let record = inner
@@ -794,12 +781,7 @@ impl SessionManager {
         let _ = self.input_events.send(InputEvent::ReleaseAll);
     }
 
-    fn transition(
-        &self,
-        record: &mut SessionRecord,
-        next: SessionState,
-        now: u64,
-    ) -> Result<()> {
+    fn transition(&self, record: &mut SessionRecord, next: SessionState, now: u64) -> Result<()> {
         let current = record.session.state;
         if !current.can_transition_to(next) {
             return Err(ApiError::new(
@@ -822,12 +804,7 @@ impl SessionManager {
         Ok(())
     }
 
-    fn end_record(
-        &self,
-        record: &mut SessionRecord,
-        reason: EndReason,
-        now: u64,
-    ) -> Result<()> {
+    fn end_record(&self, record: &mut SessionRecord, reason: EndReason, now: u64) -> Result<()> {
         if record.session.state.is_terminal() {
             return Err(invalid_state(&record.session, "end"));
         }
@@ -857,12 +834,9 @@ impl SessionManager {
 }
 
 fn controller(session: &Session) -> Option<&Participant> {
-    session
-        .participants
-        .iter()
-        .find(|participant| {
-            participant.role == ParticipantRole::Controller && participant.connected
-        })
+    session.participants.iter().find(|participant| {
+        participant.role == ParticipantRole::Controller && participant.connected
+    })
 }
 
 fn not_found(session_id: &SessionId) -> ApiError {
@@ -888,22 +862,20 @@ fn ensure_can_start(session: &Session) -> Result<()> {
         .iter()
         .map(|permission| permission.to_string())
         .collect();
-    Err(
-        ApiError::new(codes::FORBIDDEN, "The session grant does not cover its required permissions")
-            .with_details(json!({
-                "session_id": session.id,
-                "missing": missing,
-            })),
+    Err(ApiError::new(
+        codes::FORBIDDEN,
+        "The session grant does not cover its required permissions",
     )
+    .with_details(json!({
+        "session_id": session.id,
+        "missing": missing,
+    })))
 }
 
 fn invalid_state(session: &Session, action: &str) -> ApiError {
     ApiError::new(
         codes::SESSION_STATE,
-        format!(
-            "Cannot {action} while the session is {:?}",
-            session.state
-        ),
+        format!("Cannot {action} while the session is {:?}", session.state),
     )
     .with_details(json!({
         "session_id": session.id,
@@ -982,12 +954,17 @@ mod tests {
         assert_eq!(ready.state, SessionState::Ready);
         assert_eq!(ready.started_at, Some(1_000));
 
-        let claimed = manager.claim_control(&created.id, &client("client-1")).unwrap();
+        let claimed = manager
+            .claim_control(&created.id, &client("client-1"))
+            .unwrap();
         assert_eq!(claimed.participants[0].role, ParticipantRole::Controller);
 
         let streaming = manager.mark_streaming(&created.id).unwrap();
         assert_eq!(streaming.state, SessionState::Streaming);
-        assert_eq!(manager.get(&created.id).unwrap().state, SessionState::Streaming);
+        assert_eq!(
+            manager.get(&created.id).unwrap().state,
+            SessionState::Streaming
+        );
     }
 
     #[test]
@@ -996,9 +973,7 @@ mod tests {
         let mut request = spec("client-1", true);
         request.privacy.consent = ConsentRequirement::Workstation;
 
-        let pending = manager
-            .create(request, view_and_control(), 1_000)
-            .unwrap();
+        let pending = manager.create(request, view_and_control(), 1_000).unwrap();
         assert_eq!(pending.state, SessionState::PendingConsent);
         assert!(pending.consent.is_some());
 
@@ -1023,9 +998,7 @@ mod tests {
         let mut request = spec("client-1", true);
         request.privacy.consent = ConsentRequirement::Workstation;
 
-        let pending = manager
-            .create(request, view_and_control(), 1_000)
-            .unwrap();
+        let pending = manager.create(request, view_and_control(), 1_000).unwrap();
         let preparing = manager.approve_consent(&pending.id, "local user").unwrap();
         assert_eq!(preparing.state, SessionState::Preparing);
 
@@ -1070,12 +1043,12 @@ mod tests {
         let mut request = spec("client-1", true);
         request.privacy.consent = ConsentRequirement::Workstation;
 
-        let pending = manager
-            .create(request, view_and_control(), 1_000)
-            .unwrap();
+        let pending = manager.create(request, view_and_control(), 1_000).unwrap();
         *now.lock().unwrap() = 1_000 + DEFAULT_CONSENT_TIMEOUT_SECONDS;
 
-        let error = manager.approve_consent(&pending.id, "local user").unwrap_err();
+        let error = manager
+            .approve_consent(&pending.id, "local user")
+            .unwrap_err();
         assert_eq!(error.code, codes::CONSENT_REQUIRED);
 
         let session = manager.get(&pending.id).unwrap();
@@ -1111,7 +1084,9 @@ mod tests {
             .unwrap();
         assert_eq!(pending.state, SessionState::PendingConsent);
 
-        let error = manager.approve_consent(&pending.id, "local user").unwrap_err();
+        let error = manager
+            .approve_consent(&pending.id, "local user")
+            .unwrap_err();
         assert_eq!(error.code, codes::FORBIDDEN);
         assert_eq!(
             manager.get(&pending.id).unwrap().state,
@@ -1123,11 +1098,7 @@ mod tests {
     fn view_only_grant_cannot_claim_control() {
         let manager = server_manager();
         let created = manager
-            .create(
-                spec("client-1", false),
-                PermissionSet::view_only(),
-                1_000,
-            )
+            .create(spec("client-1", false), PermissionSet::view_only(), 1_000)
             .unwrap();
         manager.start(&created.id).unwrap();
 
@@ -1137,11 +1108,7 @@ mod tests {
         assert_eq!(error.code, codes::FORBIDDEN);
 
         let error = manager
-            .submit_input(
-                &created.id,
-                &client("client-1"),
-                &InputEvent::ReleaseAll,
-            )
+            .submit_input(&created.id, &client("client-1"), &InputEvent::ReleaseAll)
             .unwrap_err();
         assert_eq!(error.code, codes::FORBIDDEN);
     }
@@ -1153,7 +1120,9 @@ mod tests {
             .create(spec("client-1", true), view_and_control(), 1_000)
             .unwrap();
         manager.start(&created.id).unwrap();
-        manager.claim_control(&created.id, &client("client-1")).unwrap();
+        manager
+            .claim_control(&created.id, &client("client-1"))
+            .unwrap();
         manager.join(&created.id, &client("client-2")).unwrap();
 
         let error = manager
@@ -1185,7 +1154,9 @@ mod tests {
             .create(spec("client-1", true), view_and_control(), 1_000)
             .unwrap();
         manager.start(&created.id).unwrap();
-        manager.claim_control(&created.id, &client("client-1")).unwrap();
+        manager
+            .claim_control(&created.id, &client("client-1"))
+            .unwrap();
         manager.join(&created.id, &client("client-2")).unwrap();
 
         let event = InputEvent::Key {
@@ -1212,7 +1183,9 @@ mod tests {
             .create(spec("client-1", true), view_and_control(), 1_000)
             .unwrap();
         manager.start(&created.id).unwrap();
-        manager.claim_control(&created.id, &client("client-1")).unwrap();
+        manager
+            .claim_control(&created.id, &client("client-1"))
+            .unwrap();
         manager.mark_streaming(&created.id).unwrap();
 
         let mut events = manager.subscribe();
@@ -1263,14 +1236,15 @@ mod tests {
         let manager = server_manager();
         let mut request = spec("client-1", true);
         request.ttl_seconds = 10;
-        let created = manager
-            .create(request, view_and_control(), 1_000)
-            .unwrap();
+        let created = manager.create(request, view_and_control(), 1_000).unwrap();
         let mut events = manager.subscribe();
         let mut input = manager.subscribe_input();
 
         assert_eq!(manager.expire(1_009), 0);
-        assert_eq!(manager.get(&created.id).unwrap().state, SessionState::Created);
+        assert_eq!(
+            manager.get(&created.id).unwrap().state,
+            SessionState::Created
+        );
 
         assert_eq!(manager.expire(1_010), 1);
         let session = manager.get(&created.id).unwrap();
@@ -1315,7 +1289,10 @@ mod tests {
             codes::SESSION_STATE
         );
         assert_eq!(
-            manager.resume(&created.id, &client("client-1")).unwrap_err().code,
+            manager
+                .resume(&created.id, &client("client-1"))
+                .unwrap_err()
+                .code,
             codes::SESSION_STATE
         );
         assert_eq!(
@@ -1361,11 +1338,11 @@ mod tests {
         let manager = server_manager();
         let mut request = spec("client-1", true);
         request.privacy.disconnect_on_local_unlock = false;
-        let created = manager
-            .create(request, view_and_control(), 1_000)
-            .unwrap();
+        let created = manager.create(request, view_and_control(), 1_000).unwrap();
         manager.start(&created.id).unwrap();
-        manager.claim_control(&created.id, &client("client-1")).unwrap();
+        manager
+            .claim_control(&created.id, &client("client-1"))
+            .unwrap();
         manager.mark_streaming(&created.id).unwrap();
 
         let mut input = manager.subscribe_input();
@@ -1375,9 +1352,7 @@ mod tests {
 
         let mut request = spec("client-2", true);
         request.privacy.disconnect_on_local_unlock = true;
-        let created = manager
-            .create(request, view_and_control(), 1_000)
-            .unwrap();
+        let created = manager.create(request, view_and_control(), 1_000).unwrap();
         manager.start(&created.id).unwrap();
         manager.mark_streaming(&created.id).unwrap();
 

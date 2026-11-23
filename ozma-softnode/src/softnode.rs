@@ -22,8 +22,11 @@ impl SoftNode {
     }
 
     pub async fn run(&self) -> Result<()> {
-        println!("Starting Ozma Soft Node: {} on {}:{}", self.name, self.host, self.port);
-        
+        println!(
+            "Starting Ozma Soft Node: {} on {}:{}",
+            self.name, self.host, self.port
+        );
+
         // TODO: Implement the full softnode functionality:
         // - mDNS announcement via zeroconf
         // - UDP server for HID packets
@@ -31,7 +34,7 @@ impl SoftNode {
         // - QEMU/libvirt integration for power control
         // - Video capture and streaming setup
         // - HTTP API for power control and metrics
-        
+
         Ok(())
     }
 }

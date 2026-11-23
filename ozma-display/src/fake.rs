@@ -101,7 +101,9 @@ impl FakeVirtualDisplayProvider {
     fn lock(&self) -> MutexGuard<'_, FakeState> {
         // A poisoned lock only means another test thread panicked while
         // mutating the fake; the invariant-protected state is still readable.
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn emit(&self, event: DisplayEvent) {
@@ -113,11 +115,8 @@ impl FakeVirtualDisplayProvider {
         let mut x = 0i32;
         let mut displays = Vec::with_capacity(state.displays.len());
         for (index, entry) in state.displays.iter().enumerate() {
-            let (width, height) = logical_size(
-                &entry.mode,
-                entry.spec.rotation,
-                entry.spec.scale_percent,
-            );
+            let (width, height) =
+                logical_size(&entry.mode, entry.spec.rotation, entry.spec.scale_percent);
             displays.push(DisplayPlacement {
                 display_id: entry.spec.id.clone(),
                 x,
@@ -202,11 +201,11 @@ impl VirtualDisplayProvider for FakeVirtualDisplayProvider {
         let mut state = self.lock();
 
         if state.displays.iter().any(|entry| entry.spec.id == id) {
-            return Err(error::create_failed(format!(
-                "Display {id} already exists"
-            ))
-            .with_details(serde_json::json!({ "display_id": id.as_str() }))
-            .with_remediation("Destroy the old display or reconnect using its existing identity"));
+            return Err(error::create_failed(format!("Display {id} already exists"))
+                .with_details(serde_json::json!({ "display_id": id.as_str() }))
+                .with_remediation(
+                    "Destroy the old display or reconnect using its existing identity",
+                ));
         }
         if state.displays.len() >= usize::from(self.caps.max_outputs) {
             return Err(error::create_failed(format!(
@@ -231,10 +230,7 @@ impl VirtualDisplayProvider for FakeVirtualDisplayProvider {
         });
 
         if let Some(topology) = state.explicit_topology.as_mut() {
-            let x = topology
-                .bounds()
-                .map(|(_, _, max_x, _)| max_x)
-                .unwrap_or(0);
+            let x = topology.bounds().map(|(_, _, max_x, _)| max_x).unwrap_or(0);
             let primary = topology.displays.is_empty();
             topology.displays.push(DisplayPlacement {
                 display_id: id.clone(),
@@ -248,11 +244,7 @@ impl VirtualDisplayProvider for FakeVirtualDisplayProvider {
             });
         }
 
-        let handle = state
-            .displays
-            .last()
-            .expect("just pushed")
-            .handle();
+        let handle = state.displays.last().expect("just pushed").handle();
         self.emit(DisplayEvent::Added {
             display: spec.clone(),
         });
@@ -310,11 +302,7 @@ impl VirtualDisplayProvider for FakeVirtualDisplayProvider {
         let (width, height) = logical_size(&mode, entry.spec.rotation, entry.spec.scale_percent);
 
         if let Some(topology) = state.explicit_topology.as_mut() {
-            if let Some(placement) = topology
-                .displays
-                .iter_mut()
-                .find(|p| p.display_id == id)
-            {
+            if let Some(placement) = topology.displays.iter_mut().find(|p| p.display_id == id) {
                 placement.width = width;
                 placement.height = height;
             }
@@ -454,10 +442,7 @@ mod tests {
         let provider = provider(4);
         provider.create(spec("remote-1")).unwrap();
         provider
-            .set_mode(
-                DisplayId::new("remote-1"),
-                DisplayMode::new(1280, 720, 60),
-            )
+            .set_mode(DisplayId::new("remote-1"), DisplayMode::new(1280, 720, 60))
             .unwrap();
         assert_eq!(
             provider.get(&DisplayId::new("remote-1")).unwrap().mode(),
@@ -465,19 +450,13 @@ mod tests {
         );
 
         let err = provider
-            .set_mode(
-                DisplayId::new("remote-1"),
-                DisplayMode::new(3840, 2160, 60),
-            )
+            .set_mode(DisplayId::new("remote-1"), DisplayMode::new(3840, 2160, 60))
             .unwrap_err();
         assert_eq!(err.code, ozma_protocol::codes::DISPLAY_MODE_REJECTED);
         assert_eq!(err.details["mode"], "3840x2160@60");
 
         let err = provider
-            .set_mode(
-                DisplayId::new("missing"),
-                DisplayMode::new(1280, 720, 60),
-            )
+            .set_mode(DisplayId::new("missing"), DisplayMode::new(1280, 720, 60))
             .unwrap_err();
         assert_eq!(err.code, ozma_protocol::codes::NOT_FOUND);
     }

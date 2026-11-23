@@ -49,10 +49,10 @@ impl WgTunnel {
         let tunn = Tunn::new(
             keypair.private_bytes().into(),
             peer_static_public,
-            None,  // no pre-shared key
-            None,  // default keepalive
-            0,     // index
-            None,  // rate limiter
+            None, // no pre-shared key
+            None, // default keepalive
+            0,    // index
+            None, // rate limiter
         )
         .map_err(|e| MeshError::TunnelError(format!("boringtun init: {e}")))?;
 
@@ -93,14 +93,25 @@ impl WgTunnel {
         let mut dst = vec![0u8; WG_BUF_SIZE];
         let mut out_buf = vec![0u8; WG_BUF_SIZE];
 
-        match self.inner.lock().unwrap().decapsulate(None, udp_packet, &mut dst) {
+        match self
+            .inner
+            .lock()
+            .unwrap()
+            .decapsulate(None, udp_packet, &mut dst)
+        {
             TunnResult::WriteToNetwork(reply) => {
                 // Handshake response — send it back, no plaintext yet.
                 self.socket.send_to(reply, self.peer_addr).await?;
                 // Drain any queued packets now that the handshake completed.
                 loop {
-                    match self.inner.lock().unwrap().decapsulate(None, &[], &mut out_buf) {
-                        TunnResult::WriteToTunnelV4(pkt, _) | TunnResult::WriteToTunnelV6(pkt, _) => {
+                    match self
+                        .inner
+                        .lock()
+                        .unwrap()
+                        .decapsulate(None, &[], &mut out_buf)
+                    {
+                        TunnResult::WriteToTunnelV4(pkt, _)
+                        | TunnResult::WriteToTunnelV6(pkt, _) => {
                             return Ok(Some(pkt.to_vec()));
                         }
                         TunnResult::WriteToNetwork(pkt) => {

@@ -28,13 +28,13 @@ pub enum MeetingPlatform {
 impl std::fmt::Display for MeetingPlatform {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
-            Self::Zoom     => "zoom",
-            Self::Teams    => "teams",
-            Self::Meet     => "meet",
-            Self::Slack    => "slack",
-            Self::Discord  => "discord",
+            Self::Zoom => "zoom",
+            Self::Teams => "teams",
+            Self::Meet => "meet",
+            Self::Slack => "slack",
+            Self::Discord => "discord",
             Self::FaceTime => "facetime",
-            Self::Unknown  => "unknown",
+            Self::Unknown => "unknown",
         };
         f.write_str(s)
     }
@@ -44,18 +44,18 @@ impl std::fmt::Display for MeetingPlatform {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveMeeting {
-    pub id:         String,
-    pub platform:   MeetingPlatform,
-    pub active:     bool,
+    pub id: String,
+    pub platform: MeetingPlatform,
+    pub active: bool,
     pub started_at: DateTime<Utc>,
-    pub ended_at:   Option<DateTime<Utc>>,
+    pub ended_at: Option<DateTime<Utc>>,
     /// Duration in seconds; `None` while the meeting is still active.
     pub duration_s: Option<f64>,
 
     // Calendar metadata (populated when an ICS event matches)
-    pub title:        String,
-    pub organizer:    String,
-    pub attendees:    Vec<String>,
+    pub title: String,
+    pub organizer: String,
+    pub attendees: Vec<String>,
     pub calendar_uid: String,
 }
 
@@ -64,13 +64,13 @@ impl ActiveMeeting {
         Self {
             id,
             platform,
-            active:       true,
-            started_at:   Utc::now(),
-            ended_at:     None,
-            duration_s:   None,
-            title:        String::new(),
-            organizer:    String::new(),
-            attendees:    Vec::new(),
+            active: true,
+            started_at: Utc::now(),
+            ended_at: None,
+            duration_s: None,
+            title: String::new(),
+            organizer: String::new(),
+            attendees: Vec::new(),
             calendar_uid: String::new(),
         }
     }
@@ -78,11 +78,9 @@ impl ActiveMeeting {
     /// Mark the meeting as finished and record its duration.
     pub fn finish(&mut self) {
         let now = Utc::now();
-        self.active     = false;
-        self.ended_at   = Some(now);
-        self.duration_s = Some(
-            (now - self.started_at).num_milliseconds() as f64 / 1000.0,
-        );
+        self.active = false;
+        self.ended_at = Some(now);
+        self.duration_s = Some((now - self.started_at).num_milliseconds() as f64 / 1000.0);
     }
 }
 
@@ -105,15 +103,15 @@ pub enum MeetingStatus {
 pub enum ServerMessage {
     /// Full state snapshot — sent on connect and after every change.
     Snapshot {
-        status:   MeetingStatus,
+        status: MeetingStatus,
         meetings: Vec<ActiveMeeting>,
     },
     /// A new meeting was detected.
     MeetingStarted { meeting: ActiveMeeting },
     /// A previously active meeting ended.
-    MeetingEnded   { meeting: ActiveMeeting },
+    MeetingEnded { meeting: ActiveMeeting },
     /// Periodic heartbeat so clients can detect a stale connection.
-    Heartbeat      { ts: DateTime<Utc> },
+    Heartbeat { ts: DateTime<Utc> },
 }
 
 /// Messages sent from clients to the server.

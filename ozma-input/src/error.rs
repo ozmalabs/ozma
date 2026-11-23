@@ -43,13 +43,17 @@ pub(crate) fn key_limit(keycode: u8, held: usize) -> ApiError {
         "held_keys": held,
         "max_keys": crate::state::MAX_KEYS,
     }))
-    .with_remediation("Release a held key before pressing another, or use a non-boot keyboard report.")
+    .with_remediation(
+        "Release a held key before pressing another, or use a non-boot keyboard report.",
+    )
 }
 
 pub(crate) fn unsupported_event(event: &'static str, message: impl Into<String>) -> ApiError {
     ApiError::new(codes::UNSUPPORTED, message)
         .with_details(json!({ "event": event }))
-        .with_remediation("Use a sink that supports this event class, or keep the event on the control channel.")
+        .with_remediation(
+            "Use a sink that supports this event class, or keep the event on the control channel.",
+        )
 }
 
 pub(crate) fn wrong_mouse_mode(event: &'static str, required: &'static str) -> ApiError {

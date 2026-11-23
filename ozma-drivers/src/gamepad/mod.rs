@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use gilrs::{
     ev::filter::{axis_dpad_to_button, deadzone, Jitter},
-    Axis, EventType, Filter, Gilrs, GamepadId,
+    Axis, EventType, Filter, GamepadId, Gilrs,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -49,9 +49,9 @@ pub enum GamepadError {
 /// Per-gamepad state tracked by the driver.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GamepadSurface {
-    pub surface_id:  String,
+    pub surface_id: String,
     pub device_name: String,
-    pub profile:     ControllerProfile,
+    pub profile: ControllerProfile,
 }
 
 impl GamepadSurface {
@@ -87,14 +87,13 @@ impl GamepadSurface {
 // ── GamepadDriver ─────────────────────────────────────────────────────────────
 
 /// Callback type: receives `(surface_id, ControlEvent)`.
-pub type EventCallback =
-    Box<dyn Fn(String, ControlEvent) + Send + Sync>;
+pub type EventCallback = Box<dyn Fn(String, ControlEvent) + Send + Sync>;
 
 /// Central gamepad driver.  Call [`GamepadDriver::run`] to start the event loop.
 pub struct GamepadDriver {
-    gilrs:       Gilrs,
-    surfaces:    HashMap<GamepadId, GamepadSurface>,
-    callback:    Option<EventCallback>,
+    gilrs: Gilrs,
+    surfaces: HashMap<GamepadId, GamepadSurface>,
+    callback: Option<EventCallback>,
     /// Rumble duration for force-feedback confirmation pulses.
     ff_duration: Duration,
 }
@@ -257,7 +256,9 @@ impl GamepadDriver {
 
         let effect = EffectBuilder::new()
             .add_effect(BaseEffect {
-                kind: BaseEffectType::Strong { magnitude: (strong * 65535.0) as u16 },
+                kind: BaseEffectType::Strong {
+                    magnitude: (strong * 65535.0) as u16,
+                },
                 scheduling: Replay {
                     play_for: duration_ticks,
                     ..Default::default()
@@ -265,7 +266,9 @@ impl GamepadDriver {
                 ..Default::default()
             })
             .add_effect(BaseEffect {
-                kind: BaseEffectType::Weak { magnitude: (weak * 65535.0) as u16 },
+                kind: BaseEffectType::Weak {
+                    magnitude: (weak * 65535.0) as u16,
+                },
                 scheduling: Replay {
                     play_for: duration_ticks,
                     ..Default::default()

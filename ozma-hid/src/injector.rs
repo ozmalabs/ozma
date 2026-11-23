@@ -7,9 +7,7 @@
 //!
 //! `build_injector()` returns the right backend for the current platform.
 
-use enigo::{
-    Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings,
-};
+use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use thiserror::Error;
 
 use crate::hid_report::{KeyboardReport, MouseReport};
@@ -35,9 +33,12 @@ pub struct HidInjector {
 
 impl HidInjector {
     fn new() -> Result<Self, InjectorError> {
-        let enigo = Enigo::new(&Settings::default())
-            .map_err(|e| InjectorError::Init(e.to_string()))?;
-        Ok(Self { enigo, held_keys: Vec::new() })
+        let enigo =
+            Enigo::new(&Settings::default()).map_err(|e| InjectorError::Init(e.to_string()))?;
+        Ok(Self {
+            enigo,
+            held_keys: Vec::new(),
+        })
     }
 
     // ── Keyboard ─────────────────────────────────────────────────────────────
@@ -103,21 +104,26 @@ impl HidInjector {
     /// Press and immediately release a single key (with optional shift/altgr).
     pub fn tap_key(&mut self, key: Key, shift: bool, altgr: bool) -> Result<(), InjectorError> {
         if altgr {
-            self.enigo.key(Key::Alt, Direction::Press)
+            self.enigo
+                .key(Key::Alt, Direction::Press)
                 .map_err(|e| InjectorError::Key(e.to_string()))?;
         }
         if shift {
-            self.enigo.key(Key::LShift, Direction::Press)
+            self.enigo
+                .key(Key::LShift, Direction::Press)
                 .map_err(|e| InjectorError::Key(e.to_string()))?;
         }
-        self.enigo.key(key, Direction::Click)
+        self.enigo
+            .key(key, Direction::Click)
             .map_err(|e| InjectorError::Key(e.to_string()))?;
         if shift {
-            self.enigo.key(Key::LShift, Direction::Release)
+            self.enigo
+                .key(Key::LShift, Direction::Release)
                 .map_err(|e| InjectorError::Key(e.to_string()))?;
         }
         if altgr {
-            self.enigo.key(Key::Alt, Direction::Release)
+            self.enigo
+                .key(Key::Alt, Direction::Release)
                 .map_err(|e| InjectorError::Key(e.to_string()))?;
         }
         Ok(())
@@ -192,7 +198,10 @@ impl HidInjector {
             }
         }
 
-        Ok(PasteResult { chars_sent, chars_skipped })
+        Ok(PasteResult {
+            chars_sent,
+            chars_skipped,
+        })
     }
 }
 
@@ -242,9 +251,18 @@ pub fn hid_usage_to_enigo_key(hid: u8) -> Option<Key> {
         0x37 => Unicode('.'),
         0x38 => Unicode('/'),
         // F-keys
-        0x3A => F1,  0x3B => F2,  0x3C => F3,  0x3D => F4,
-        0x3E => F5,  0x3F => F6,  0x40 => F7,  0x41 => F8,
-        0x42 => F9,  0x43 => F10, 0x44 => F11, 0x45 => F12,
+        0x3A => F1,
+        0x3B => F2,
+        0x3C => F3,
+        0x3D => F4,
+        0x3E => F5,
+        0x3F => F6,
+        0x40 => F7,
+        0x41 => F8,
+        0x42 => F9,
+        0x43 => F10,
+        0x44 => F11,
+        0x45 => F12,
         // Navigation
         0x49 => Insert,
         0x4A => Home,
@@ -263,14 +281,30 @@ pub fn hid_usage_to_enigo_key(hid: u8) -> Option<Key> {
 /// Expand the HID modifier byte into a list of enigo modifier keys.
 fn modifier_keys(modifier: u8) -> Vec<Key> {
     let mut keys = Vec::new();
-    if modifier & 0x01 != 0 { keys.push(Key::LControl); }
-    if modifier & 0x02 != 0 { keys.push(Key::LShift); }
-    if modifier & 0x04 != 0 { keys.push(Key::Alt); }
-    if modifier & 0x08 != 0 { keys.push(Key::Meta); }
-    if modifier & 0x10 != 0 { keys.push(Key::RControl); }
-    if modifier & 0x20 != 0 { keys.push(Key::RShift); }
-    if modifier & 0x40 != 0 { keys.push(Key::Alt); }  // AltGr
-    if modifier & 0x80 != 0 { keys.push(Key::Meta); }
+    if modifier & 0x01 != 0 {
+        keys.push(Key::LControl);
+    }
+    if modifier & 0x02 != 0 {
+        keys.push(Key::LShift);
+    }
+    if modifier & 0x04 != 0 {
+        keys.push(Key::Alt);
+    }
+    if modifier & 0x08 != 0 {
+        keys.push(Key::Meta);
+    }
+    if modifier & 0x10 != 0 {
+        keys.push(Key::RControl);
+    }
+    if modifier & 0x20 != 0 {
+        keys.push(Key::RShift);
+    }
+    if modifier & 0x40 != 0 {
+        keys.push(Key::Alt);
+    } // AltGr
+    if modifier & 0x80 != 0 {
+        keys.push(Key::Meta);
+    }
     keys
 }
 

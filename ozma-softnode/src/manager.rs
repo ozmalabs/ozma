@@ -165,7 +165,9 @@ struct ManagerInner {
 
 impl ManagerInner {
     fn is_excluded(&self, name: &str) -> bool {
-        self.exclude_patterns.iter().any(|pat| glob_match(pat, name))
+        self.exclude_patterns
+            .iter()
+            .any(|pat| glob_match(pat, name))
     }
 
     async fn discover_and_sync(&self) {
@@ -225,7 +227,11 @@ impl ManagerInner {
             "Auto-managed VM: {} (port={}, os={}, gpu_passthrough={})",
             name,
             port,
-            if vm.guest_os.is_empty() { "unknown" } else { &vm.guest_os },
+            if vm.guest_os.is_empty() {
+                "unknown"
+            } else {
+                &vm.guest_os
+            },
             vm.has_gpu_passthrough,
         );
 

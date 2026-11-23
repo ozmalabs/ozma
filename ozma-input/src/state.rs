@@ -108,7 +108,11 @@ impl KeyboardState {
         for (slot, code) in self.keys.iter().take(MAX_KEYS).enumerate() {
             keycodes[slot] = *code;
         }
-        HidKeyboardReport { modifiers: self.modifiers(), reserved: 0, keycodes }
+        HidKeyboardReport {
+            modifiers: self.modifiers(),
+            reserved: 0,
+            keycodes,
+        }
     }
 
     fn reset(&mut self) {
@@ -181,16 +185,22 @@ impl Router {
 
     pub(crate) fn apply(&mut self, event: &InputEvent) -> Result<Vec<Report>, ApiError> {
         match event {
-            InputEvent::Key { code, down, modifiers } => {
-                self.apply_key(*code, *down, *modifiers)
-            }
+            InputEvent::Key {
+                code,
+                down,
+                modifiers,
+            } => self.apply_key(*code, *down, *modifiers),
             InputEvent::PointerAbsolute { x, y, .. } => self.absolute(*x, *y),
             InputEvent::PointerRelative { dx, dy } => self.relative(*dx, *dy),
             InputEvent::Button { button, down } => self.button(*button, *down),
             InputEvent::Wheel { dx, dy } => self.wheel(*dx, *dy),
-            InputEvent::Touch { contact, phase, x, y, .. } => {
-                self.touch(*contact, *phase, *x, *y)
-            }
+            InputEvent::Touch {
+                contact,
+                phase,
+                x,
+                y,
+                ..
+            } => self.touch(*contact, *phase, *x, *y),
             InputEvent::Pen { phase, x, y, .. } => self.pen(*phase, *x, *y),
             InputEvent::Clipboard { .. } => Err(error::unsupported_event(
                 "clipboard",
@@ -212,9 +222,7 @@ impl Router {
         self.keyboard.last_report = Some(keyboard);
 
         let mouse = match self.protocol {
-            MouseProtocol::Absolute => {
-                Report::AbsoluteMouse(self.absolute_report(0))
-            }
+            MouseProtocol::Absolute => Report::AbsoluteMouse(self.absolute_report(0)),
             MouseProtocol::Relative => Report::RelativeMouse(HidMouseReport::empty()),
         };
         vec![Report::Keyboard(keyboard), mouse]
@@ -251,10 +259,7 @@ impl Router {
                 self.keyboard.modifier_keys &= !bit;
             }
         } else {
-            if down
-                && !self.keyboard.keys.contains(&code)
-                && self.keyboard.keys.len() >= MAX_KEYS
-            {
+            if down && !self.keyboard.keys.contains(&code) && self.keyboard.keys.len() >= MAX_KEYS {
                 // Reject before mutating anything so the caller can retry with
                 // a different event without a stuck-key shadow state.
                 return Err(error::key_limit(code, self.keyboard.keys.len()));
@@ -376,12 +381,8 @@ impl Router {
 
     fn pointer_report(&self, scroll: i8) -> Report {
         match self.protocol {
-            MouseProtocol::Absolute => {
-                Report::AbsoluteMouse(self.absolute_report(scroll))
-            }
-            MouseProtocol::Relative => {
-                Report::RelativeMouse(self.relative_report(0, 0, scroll))
-            }
+            MouseProtocol::Absolute => Report::AbsoluteMouse(self.absolute_report(scroll)),
+            MouseProtocol::Relative => Report::RelativeMouse(self.relative_report(0, 0, scroll)),
         }
     }
 }
@@ -406,7 +407,11 @@ mod tests {
     }
 
     fn key(code: u32, down: bool) -> InputEvent {
-        InputEvent::Key { code, down, modifiers: KeyModifiers::default() }
+        InputEvent::Key {
+            code,
+            down,
+            modifiers: KeyModifiers::default(),
+        }
     }
 
     #[test]
@@ -550,7 +555,11 @@ mod tests {
 
         let mut relative = router(MouseProtocol::Relative);
         let error = relative
-            .apply(&InputEvent::PointerAbsolute { display_id: None, x: 1, y: 1 })
+            .apply(&InputEvent::PointerAbsolute {
+                display_id: None,
+                x: 1,
+                y: 1,
+            })
             .unwrap_err();
         assert_eq!(error.code, crate::error::codes::UNSUPPORTED);
     }
@@ -559,7 +568,9 @@ mod tests {
     fn clipboard_is_explicitly_unsupported() {
         let mut router = router(MouseProtocol::Absolute);
         let error = router
-            .apply(&InputEvent::Clipboard { text: "secret".into() })
+            .apply(&InputEvent::Clipboard {
+                text: "secret".into(),
+            })
             .unwrap_err();
         assert_eq!(error.code, crate::error::codes::UNSUPPORTED);
         assert_eq!(error.details["event"], "clipboard");
@@ -570,7 +581,10 @@ mod tests {
         let mut router = router(MouseProtocol::Absolute);
         router.apply(&key(0x04, true)).unwrap();
         router
-            .apply(&InputEvent::Button { button: PointerButton::Left, down: true })
+            .apply(&InputEvent::Button {
+                button: PointerButton::Left,
+                down: true,
+            })
             .unwrap();
         assert!(!router.snapshot().is_empty());
 

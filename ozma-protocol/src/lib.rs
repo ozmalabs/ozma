@@ -22,8 +22,9 @@ pub mod scene;
 pub mod scene_execution;
 pub mod session;
 pub mod transport;
-pub mod xpra;
 pub mod version;
+pub mod xpra;
+pub mod xpra_output;
 
 pub use capability::{
     AudioCapability, CaptureCapability, CaptureKind, EncodeCapability, EncoderBackend,

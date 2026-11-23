@@ -246,6 +246,9 @@ mod tests {
         let caps = NodeCapabilities::fake("test-node");
         assert!(caps.display.supported);
         assert_eq!(caps.best_capture().unwrap().id, "fake0");
-        assert_eq!(caps.best_encoder(Codec::H264).unwrap().backend, EncoderBackend::Fake);
+        assert_eq!(
+            caps.best_encoder(Codec::H264).unwrap().backend,
+            EncoderBackend::Fake
+        );
     }
 }

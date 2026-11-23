@@ -38,7 +38,9 @@ impl ProtocolVersion {
                     remote.major, local.major
                 ),
             )
-            .with_remediation("Upgrade the node, controller, or client to the same major version."));
+            .with_remediation(
+                "Upgrade the node, controller, or client to the same major version.",
+            ));
         }
         Ok(Self {
             major: local.major,

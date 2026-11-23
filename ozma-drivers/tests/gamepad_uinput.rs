@@ -36,16 +36,32 @@ fn create_virtual_gamepad() -> Result<uinput::Device, Box<dyn std::error::Error>
         // Guide
         .event(GamePad::Mode)?
         // Analog axes — must declare min/max so gilrs can normalise
-        .event(uinput::event::absolute::Position::X)?.min(-32768).max(32767)
-        .event(uinput::event::absolute::Position::Y)?.min(-32768).max(32767)
-        .event(uinput::event::absolute::Position::RX)?.min(-32768).max(32767)
-        .event(uinput::event::absolute::Position::RY)?.min(-32768).max(32767)
+        .event(uinput::event::absolute::Position::X)?
+        .min(-32768)
+        .max(32767)
+        .event(uinput::event::absolute::Position::Y)?
+        .min(-32768)
+        .max(32767)
+        .event(uinput::event::absolute::Position::RX)?
+        .min(-32768)
+        .max(32767)
+        .event(uinput::event::absolute::Position::RY)?
+        .min(-32768)
+        .max(32767)
         // Triggers: 0–255
-        .event(uinput::event::absolute::Position::Z)?.min(0).max(255)
-        .event(uinput::event::absolute::Position::RZ)?.min(0).max(255)
+        .event(uinput::event::absolute::Position::Z)?
+        .min(0)
+        .max(255)
+        .event(uinput::event::absolute::Position::RZ)?
+        .min(0)
+        .max(255)
         // D-pad hat
-        .event(uinput::event::absolute::Hat::X0)?.min(-1).max(1)
-        .event(uinput::event::absolute::Hat::Y0)?.min(-1).max(1)
+        .event(uinput::event::absolute::Hat::X0)?
+        .min(-1)
+        .max(1)
+        .event(uinput::event::absolute::Hat::Y0)?
+        .min(-1)
+        .max(1)
         .create()?;
 
     // Give the kernel time to register the device with gilrs
@@ -143,6 +159,8 @@ fn virtual_gamepad_events_route_through_gilrs() {
     // the virtual device.  For an unmapped generic device this may not fire, so
     // we warn rather than fail the test (button paths above are the critical check).
     if !controls.contains(&"rt_volume".to_string()) {
-        eprintln!("WARN: 'rt_volume' not received — gilrs may not map ABS_RZ for this virtual device");
+        eprintln!(
+            "WARN: 'rt_volume' not received — gilrs may not map ABS_RZ for this virtual device"
+        );
     }
 }

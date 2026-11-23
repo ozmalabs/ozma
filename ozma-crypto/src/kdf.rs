@@ -23,7 +23,8 @@ pub fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
 pub fn hkdf_expand(prk: &[u8; 32], info: &[u8], length: usize) -> Vec<u8> {
     let hk = Hkdf::<Sha256>::from_prk(prk).expect("PRK is always 32 bytes — length is valid");
     let mut okm = alloc::vec![0u8; length];
-    hk.expand(info, &mut okm).expect("HKDF expand length is valid");
+    hk.expand(info, &mut okm)
+        .expect("HKDF expand length is valid");
     okm
 }
 
@@ -69,8 +70,9 @@ pub fn derive_session_keys(
 
     let send_key: [u8; 32] = hkdf_expand(&prk, &send_info, 32).try_into().unwrap();
     let recv_key: [u8; 32] = hkdf_expand(&prk, &recv_info, 32).try_into().unwrap();
-    let nonce_seed: [u8; NONCE_SEED_LEN] =
-        hkdf_expand(&prk, &nonce_info, NONCE_SEED_LEN).try_into().unwrap();
+    let nonce_seed: [u8; NONCE_SEED_LEN] = hkdf_expand(&prk, &nonce_info, NONCE_SEED_LEN)
+        .try_into()
+        .unwrap();
 
     // session_id = SHA-256(ctrl_eph_pub || node_eph_pub || dh_secret)[:16]
     let mut hasher = Sha256::new();

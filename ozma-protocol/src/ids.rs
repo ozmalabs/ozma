@@ -52,7 +52,10 @@ macro_rules! id_type {
     };
 }
 
-id_type!(NodeId, "A stable node identity, normally the mDNS instance name.");
+id_type!(
+    NodeId,
+    "A stable node identity, normally the mDNS instance name."
+);
 id_type!(SessionId, "A controller-issued session identity.");
 id_type!(ClientId, "A paired client identity.");
 id_type!(TrackId, "A media track inside a session.");

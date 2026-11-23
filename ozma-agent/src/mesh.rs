@@ -22,18 +22,14 @@ pub async fn run(controller_url: String, wg_port: u16) -> Result<()> {
     loop {
         match reconcile(&client, &controller_url, wg_port).await {
             Ok(peers) => debug!(peers, "mesh reconciled"),
-            Err(e)    => warn!("mesh reconcile failed: {e:#}"),
+            Err(e) => warn!("mesh reconcile failed: {e:#}"),
         }
         tokio::time::sleep(RECONCILE_INTERVAL).await;
     }
 }
 
 /// Fetch peers from the controller and apply them to the local WG interface.
-async fn reconcile(
-    client: &reqwest::Client,
-    controller_url: &str,
-    _wg_port: u16,
-) -> Result<usize> {
+async fn reconcile(client: &reqwest::Client, controller_url: &str, _wg_port: u16) -> Result<usize> {
     let url = format!("{controller_url}/api/v1/mesh/peers");
     let resp = client.get(&url).send().await?;
 

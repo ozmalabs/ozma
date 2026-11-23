@@ -7,7 +7,7 @@ use alloc::{string::String, vec::Vec};
 
 use crate::{
     kdf::derive_session_keys,
-    packet::{decrypt_packet, encrypt_packet, get_counter, PKT_AUDIO, NONCE_SEED_LEN},
+    packet::{decrypt_packet, encrypt_packet, get_counter, NONCE_SEED_LEN, PKT_AUDIO},
     replay::{ReplayWindow, REPLAY_WINDOW_AUDIO, REPLAY_WINDOW_HID},
 };
 

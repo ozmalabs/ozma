@@ -32,13 +32,17 @@ fn start_agent(api_port: u16, metrics_port: u16, controller_url: &str) -> Child 
     let bin = env!("CARGO_BIN_EXE_ozma-agent");
     Command::new(bin)
         .args([
-            "--api-port",      &api_port.to_string(),
-            "--metrics-port",  &metrics_port.to_string(),
-            "--controller-url", controller_url,
+            "--api-port",
+            &api_port.to_string(),
+            "--metrics-port",
+            &metrics_port.to_string(),
+            "--controller-url",
+            controller_url,
             // Use a throwaway WG port that won't conflict.
-            "--wg-port",       "0",
+            "--wg-port",
+            "0",
         ])
-        .env("RUST_LOG", "warn")  // quieter output during tests
+        .env("RUST_LOG", "warn") // quieter output during tests
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -80,7 +84,7 @@ impl Drop for AgentGuard {
 /// Verify the agent starts, exposes /healthz, and returns 200 OK.
 #[tokio::test]
 async fn healthz_returns_ok() {
-    let api_port     = free_port();
+    let api_port = free_port();
     let metrics_port = free_port();
 
     let child = start_agent(api_port, metrics_port, "http://localhost:7380");
@@ -100,7 +104,7 @@ async fn healthz_returns_ok() {
 /// Verify /api/v1/status returns JSON with status=running and a version field.
 #[tokio::test]
 async fn status_endpoint_returns_running() {
-    let api_port     = free_port();
+    let api_port = free_port();
     let metrics_port = free_port();
 
     let child = start_agent(api_port, metrics_port, "http://localhost:7380");
@@ -116,7 +120,10 @@ async fn status_endpoint_returns_running() {
     assert_eq!(resp.status().as_u16(), 200);
 
     let body: Value = resp.json().await.expect("parse JSON");
-    assert_eq!(body["status"], "running", "status field should be 'running'");
+    assert_eq!(
+        body["status"], "running",
+        "status field should be 'running'"
+    );
     assert!(
         body["version"].as_str().is_some_and(|v| !v.is_empty()),
         "version field should be a non-empty string"
@@ -126,7 +133,7 @@ async fn status_endpoint_returns_running() {
 /// Verify /api/v1/version returns a non-empty version string.
 #[tokio::test]
 async fn version_endpoint_returns_string() {
-    let api_port     = free_port();
+    let api_port = free_port();
     let metrics_port = free_port();
 
     let child = start_agent(api_port, metrics_port, "http://localhost:7380");
@@ -152,7 +159,7 @@ async fn version_endpoint_returns_string() {
 /// Verify the Prometheus metrics endpoint is reachable and returns process_ metrics.
 #[tokio::test]
 async fn metrics_endpoint_returns_prometheus_text() {
-    let api_port     = free_port();
+    let api_port = free_port();
     let metrics_port = free_port();
 
     let child = start_agent(api_port, metrics_port, "http://localhost:7380");
@@ -189,7 +196,7 @@ async fn metrics_endpoint_returns_prometheus_text() {
 /// (returns 404). The agent should log a warning and keep running — not crash.
 #[tokio::test]
 async fn agent_tolerates_mesh_404_from_controller() {
-    let api_port     = free_port();
+    let api_port = free_port();
     let metrics_port = free_port();
 
     // Point at the real controller — it returns 404 for mesh/peers.
@@ -216,7 +223,7 @@ async fn agent_tolerates_mesh_404_from_controller() {
 /// log a warning and retry, not bring down the process.
 #[tokio::test]
 async fn agent_starts_without_controller() {
-    let api_port     = free_port();
+    let api_port = free_port();
     let metrics_port = free_port();
 
     // Port 1 is reserved — nothing should be listening there.
@@ -236,7 +243,7 @@ async fn agent_starts_without_controller() {
 async fn agent_shuts_down_on_sigterm() {
     use std::os::unix::process::ExitStatusExt;
 
-    let api_port     = free_port();
+    let api_port = free_port();
     let metrics_port = free_port();
 
     let mut child = start_agent(api_port, metrics_port, "http://localhost:7380");

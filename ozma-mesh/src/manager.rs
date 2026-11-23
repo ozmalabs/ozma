@@ -175,9 +175,7 @@ impl MeshManager {
                             p.node
                                 .mesh_ip
                                 .parse::<Ipv4Addr>()
-                                .map(|ip| {
-                                    SocketAddr::new(IpAddr::V4(ip), p.node.wg_port) == src
-                                })
+                                .map(|ip| SocketAddr::new(IpAddr::V4(ip), p.node.wg_port) == src)
                                 .unwrap_or(false)
                         });
 
@@ -239,8 +237,8 @@ impl MeshManager {
         let tunnel = Tunn::new(
             local_sk,
             peer_pk,
-            None,       // no preshared key
-            Some(25),   // persistent keepalive every 25 s
+            None,     // no preshared key
+            Some(25), // persistent keepalive every 25 s
             guard.peers.len() as u32,
             None,
         )
@@ -256,7 +254,10 @@ impl MeshManager {
 
         guard.peers.insert(
             peer_node.id.clone(),
-            PeerState { node: peer_node, tunnel: Box::new(tunnel) },
+            PeerState {
+                node: peer_node,
+                tunnel: Box::new(tunnel),
+            },
         );
 
         Ok(())
@@ -319,9 +320,9 @@ impl MeshManager {
         match result {
             TunnResult::WriteToNetwork(data) => {
                 let async_sock = TokioUdpSocket::from_std(
-                    self.socket.try_clone().map_err(|e| {
-                        MeshError::TunnelError(format!("socket clone: {e}"))
-                    })?,
+                    self.socket
+                        .try_clone()
+                        .map_err(|e| MeshError::TunnelError(format!("socket clone: {e}")))?,
                 )
                 .map_err(|e| MeshError::TunnelError(format!("from_std: {e}")))?;
                 async_sock.send_to(data, peer_addr).await.map_err(|e| {
@@ -373,9 +374,9 @@ impl MeshManager {
         match result {
             TunnResult::WriteToNetwork(packet) => {
                 let async_sock = TokioUdpSocket::from_std(
-                    self.socket.try_clone().map_err(|e| {
-                        MeshError::TunnelError(format!("socket clone: {e}"))
-                    })?,
+                    self.socket
+                        .try_clone()
+                        .map_err(|e| MeshError::TunnelError(format!("socket clone: {e}")))?,
                 )
                 .map_err(|e| MeshError::TunnelError(format!("from_std: {e}")))?;
                 let sent = async_sock.send_to(packet, peer_addr).await?;

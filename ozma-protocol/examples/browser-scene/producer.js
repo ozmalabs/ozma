@@ -3,6 +3,11 @@ const video = document.querySelector("#motion");
 const stage = document.querySelector("#stage");
 const log = document.querySelector("#events");
 const start = document.querySelector("#start");
+const exportButton = document.querySelector("#export");
+
+const replay = [];
+const replayLimit = 4 * 1024 * 1024;
+let replayBytes = 0;
 
 let resourceSent = false;
 let starting = false;
@@ -13,6 +18,20 @@ const resourceId = 7;
 
 function emit(type, detail, summary = detail) {
   const event = { type, ...detail };
+  if (detail.bytes instanceof Uint8Array) {
+    let binary = "";
+    for (const byte of detail.bytes) binary += String.fromCharCode(byte);
+    event.payload_base64 = btoa(binary);
+  }
+  if (type === "resource" || type === "scene_commit") {
+    const { bytes, ...record } = event;
+    const line = JSON.stringify(record) + "\n";
+    if (replayBytes + line.length <= replayLimit) {
+      replay.push(line);
+      replayBytes += line.length;
+      exportButton.disabled = false;
+    }
+  }
   window.dispatchEvent(new CustomEvent("ozma-scene", { detail: event }));
   if (type !== "video_frame" || detail.frame % 15 === 1) {
     log.textContent = (JSON.stringify({ type, ...summary }) + "\n" + log.textContent).slice(0, 4096);
@@ -94,3 +113,12 @@ function commitPlacement() {
 }
 
 stage.addEventListener("scroll", commitPlacement, { passive: true });
+
+exportButton.addEventListener("click", () => {
+  const href = URL.createObjectURL(new Blob(replay, { type: "application/x-ndjson" }));
+  const link = document.createElement("a");
+  link.href = href;
+  link.download = "ozma-scene.jsonl";
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(href), 1000);
+});

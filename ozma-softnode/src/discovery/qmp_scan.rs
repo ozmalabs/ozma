@@ -9,10 +9,7 @@ use crate::vm_info::VMInfo;
 
 /// Scan `dir` for `*qmp*` and `*.monitor` Unix sockets.
 pub fn discover(dir: &str) -> Result<Vec<VMInfo>> {
-    let patterns = [
-        format!("{dir}/*qmp*"),
-        format!("{dir}/*.monitor"),
-    ];
+    let patterns = [format!("{dir}/*qmp*"), format!("{dir}/*.monitor")];
 
     let mut paths: Vec<std::path::PathBuf> = Vec::new();
     for pat in &patterns {

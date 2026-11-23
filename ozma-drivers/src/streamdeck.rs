@@ -61,8 +61,7 @@ impl StreamDeckSurface {
         let kind = deck.kind();
         let key_count = kind.key_count() as usize;
         // Devices with key images are the visual variants (not Pedal/Plus encoder-only).
-        let is_visual = key_count > 0
-            && !matches!(kind, Kind::Pedal);
+        let is_visual = key_count > 0 && !matches!(kind, Kind::Pedal);
 
         let surface_id = format!(
             "streamdeck-{}",
@@ -133,9 +132,9 @@ impl StreamDeckSurface {
 
     fn build_pedal_controls(&mut self) {
         for (name, action, value) in [
-            ("pedal_left",   "scenario.next",  Some(serde_json::json!(-1))),
-            ("pedal_middle", "audio.mute",     None),
-            ("pedal_right",  "scenario.next",  Some(serde_json::json!(1))),
+            ("pedal_left", "scenario.next", Some(serde_json::json!(-1))),
+            ("pedal_middle", "audio.mute", None),
+            ("pedal_right", "scenario.next", Some(serde_json::json!(1))),
         ] {
             self.controls.insert(
                 name.to_string(),

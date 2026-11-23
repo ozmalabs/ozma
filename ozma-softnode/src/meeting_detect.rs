@@ -24,36 +24,36 @@ use crate::ipc::{ActiveMeeting, MeetingPlatform, MeetingStatus, ServerMessage};
 // ── Platform detection patterns ──────────────────────────────────────────────
 
 struct PlatformPattern {
-    platform:      MeetingPlatform,
+    platform: MeetingPlatform,
     /// Substrings matched case-insensitively against the process name.
     process_names: &'static [&'static str],
 }
 
 const PATTERNS: &[PlatformPattern] = &[
     PlatformPattern {
-        platform:      MeetingPlatform::Zoom,
+        platform: MeetingPlatform::Zoom,
         process_names: &["zoom", "zoom.us", "zoomlauncher", "zoom_linux_qt"],
     },
     PlatformPattern {
-        platform:      MeetingPlatform::Teams,
+        platform: MeetingPlatform::Teams,
         process_names: &["teams", "ms-teams", "msteams"],
     },
     PlatformPattern {
         // Google Meet runs inside Chrome; we detect the browser process and
         // rely on calendar enrichment to confirm it is a Meet call.
-        platform:      MeetingPlatform::Meet,
+        platform: MeetingPlatform::Meet,
         process_names: &["chrome", "chromium", "google-chrome"],
     },
     PlatformPattern {
-        platform:      MeetingPlatform::Slack,
+        platform: MeetingPlatform::Slack,
         process_names: &["slack"],
     },
     PlatformPattern {
-        platform:      MeetingPlatform::Discord,
+        platform: MeetingPlatform::Discord,
         process_names: &["discord", "discordcanary", "discordptb"],
     },
     PlatformPattern {
-        platform:      MeetingPlatform::FaceTime,
+        platform: MeetingPlatform::FaceTime,
         process_names: &["facetime"],
     },
 ];
@@ -62,8 +62,8 @@ const PATTERNS: &[PlatformPattern] = &[
 
 #[derive(Debug, Default)]
 struct CalendarEvent {
-    uid:       String,
-    summary:   String,
+    uid: String,
+    summary: String,
     organizer: String,
     attendees: Vec<String>,
 }
@@ -144,7 +144,7 @@ fn parse_active_events(path: &Path) -> Vec<CalendarEvent> {
         return vec![];
     };
     let calendar = match content.parse::<icalendar::Calendar>() {
-        Ok(c)  => c,
+        Ok(c) => c,
         Err(e) => {
             debug!("ICS parse error {:?}: {}", path, e);
             return vec![];
@@ -172,11 +172,8 @@ fn parse_active_events(path: &Path) -> Vec<CalendarEvent> {
             continue;
         }
 
-        let uid = ev
-            .property_value("UID")
-            .unwrap_or_default()
-            .to_string();
-        let summary   = ev.get_summary().unwrap_or_default().to_string();
+        let uid = ev.property_value("UID").unwrap_or_default().to_string();
+        let summary = ev.get_summary().unwrap_or_default().to_string();
         let organizer = ev
             .property_value("ORGANIZER")
             .unwrap_or_default()
@@ -189,7 +186,12 @@ fn parse_active_events(path: &Path) -> Vec<CalendarEvent> {
             .map(|p| p.value().trim_start_matches("mailto:").to_string())
             .collect();
 
-        events.push(CalendarEvent { uid, summary, organizer, attendees });
+        events.push(CalendarEvent {
+            uid,
+            summary,
+            organizer,
+            attendees,
+        });
     }
 
     events
@@ -209,7 +211,7 @@ pub struct DetectorConfig {
 impl Default for DetectorConfig {
     fn default() -> Self {
         Self {
-            poll_interval:   Duration::from_secs(5),
+            poll_interval: Duration::from_secs(5),
             extra_ics_paths: Vec::new(),
         }
     }
@@ -217,17 +219,14 @@ impl Default for DetectorConfig {
 
 pub struct MeetingDetector {
     config: DetectorConfig,
-    tx:     tokio::sync::broadcast::Sender<ServerMessage>,
+    tx: tokio::sync::broadcast::Sender<ServerMessage>,
     /// Currently tracked meetings keyed by stable bucket ID.
     active: HashMap<String, ActiveMeeting>,
-    sys:    System,
+    sys: System,
 }
 
 impl MeetingDetector {
-    pub fn new(
-        config: DetectorConfig,
-        tx: tokio::sync::broadcast::Sender<ServerMessage>,
-    ) -> Self {
+    pub fn new(config: DetectorConfig, tx: tokio::sync::broadcast::Sender<ServerMessage>) -> Self {
         Self {
             config,
             tx,
@@ -245,7 +244,7 @@ impl MeetingDetector {
                 interval_secs = self.config.poll_interval.as_secs(),
                 "Meeting detector started"
             );
-            let mut poll_tick      = tokio::time::interval(self.config.poll_interval);
+            let mut poll_tick = tokio::time::interval(self.config.poll_interval);
             let mut heartbeat_tick = tokio::time::interval(Duration::from_secs(30));
             // Consume the immediate first tick to avoid a double-fire.
             poll_tick.tick().await;
@@ -265,9 +264,9 @@ impl MeetingDetector {
     pub fn scan_once(&mut self) {
         self.sys.refresh_processes();
 
-        let detected     = self.detect_platforms();
+        let detected = self.detect_platforms();
         let detected_ids: HashSet<String> = detected.iter().map(|m| m.id.clone()).collect();
-        let active_ids:   HashSet<String> = self.active.keys().cloned().collect();
+        let active_ids: HashSet<String> = self.active.keys().cloned().collect();
 
         // New meetings
         for mut meeting in detected {
@@ -288,7 +287,11 @@ impl MeetingDetector {
         }
 
         // Ended meetings
-        for id in active_ids.difference(&detected_ids).cloned().collect::<Vec<_>>() {
+        for id in active_ids
+            .difference(&detected_ids)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
             if let Some(mut meeting) = self.active.remove(&id) {
                 meeting.finish();
                 info!(
@@ -313,7 +316,7 @@ impl MeetingDetector {
             if self.process_running(pattern.process_names) {
                 // 5-minute time bucket gives a stable ID across polls.
                 let bucket = Utc::now().timestamp() / 300;
-                let id     = format!("{}-{}", pattern.platform, bucket);
+                let id = format!("{}-{}", pattern.platform, bucket);
                 meetings.push(ActiveMeeting::new(id, pattern.platform.clone()));
             }
         }
@@ -341,7 +344,7 @@ impl MeetingDetector {
                     continue;
                 }
                 let summary_lower = ev.summary.to_lowercase();
-                let platform_str  = meeting.platform.to_string();
+                let platform_str = meeting.platform.to_string();
                 // Match if the event mentions the platform or common call keywords.
                 if summary_lower.contains(&platform_str)
                     || summary_lower.contains("call")
@@ -349,9 +352,9 @@ impl MeetingDetector {
                     || summary_lower.contains("standup")
                     || summary_lower.contains("sync")
                 {
-                    meeting.title        = ev.summary;
-                    meeting.organizer    = ev.organizer;
-                    meeting.attendees    = ev.attendees;
+                    meeting.title = ev.summary;
+                    meeting.organizer = ev.organizer;
+                    meeting.attendees = ev.attendees;
                     meeting.calendar_uid = ev.uid;
                     return;
                 }

@@ -298,7 +298,9 @@ async fn run_capture<S: CaptureSource>(
         };
 
         counters.captured.fetch_add(1, Ordering::Relaxed);
-        counters.last_pts.store(frame.pts_micros(), Ordering::Relaxed);
+        counters
+            .last_pts
+            .store(frame.pts_micros(), Ordering::Relaxed);
 
         match frames.try_send(frame) {
             Ok(()) => {}
@@ -438,14 +440,15 @@ mod tests {
     use ozma_protocol::MediaFormat;
 
     fn h264_encoder(input: FrameFormat) -> FakeEncoder {
-        FakeEncoder::new(input, MediaFormat::new(ozma_protocol::Codec::H264, 320, 240, 30, 2_000))
+        FakeEncoder::new(
+            input,
+            MediaFormat::new(ozma_protocol::Codec::H264, 320, 240, 30, 2_000),
+        )
     }
 
     #[tokio::test]
     async fn fake_pipeline_produces_frames() {
-        let source = FakeCapture::default()
-            .with_fps(1_000)
-            .with_frame_limit(8);
+        let source = FakeCapture::default().with_fps(1_000).with_frame_limit(8);
         let encoder = h264_encoder(FrameFormat::rgb24(320, 240));
         let config = PipelineConfig::new().with_queues(4, 16);
         let mut pipeline = Pipeline::start(source, encoder, config).unwrap();
@@ -522,12 +525,8 @@ mod tests {
     async fn zero_capacity_is_rejected() {
         let source = FakeCapture::default();
         let encoder = h264_encoder(FrameFormat::rgb24(320, 240));
-        let error = Pipeline::start(
-            source,
-            encoder,
-            PipelineConfig::new().with_queues(0, 4),
-        )
-        .unwrap_err();
+        let error =
+            Pipeline::start(source, encoder, PipelineConfig::new().with_queues(0, 4)).unwrap_err();
         assert!(matches!(error, MediaError::Api(_)));
     }
 }

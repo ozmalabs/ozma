@@ -87,7 +87,10 @@ fn main() -> ExitCode {
     }
 
     let mut stdout = io::stdout().lock();
-    match stdout.write_all(edid.as_bytes()).and_then(|_| stdout.flush()) {
+    match stdout
+        .write_all(edid.as_bytes())
+        .and_then(|_| stdout.flush())
+    {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("write failed: {error}");

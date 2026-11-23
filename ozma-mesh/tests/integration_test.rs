@@ -48,8 +48,12 @@ async fn two_managers_handshake() -> Result<()> {
     let mgr_b = MeshManager::new(node_b, sk_b).await?;
 
     // ── Cross-register peers (loopback endpoints) ─────────────────────────
-    mgr_a.add_peer(loopback_peer("node-b", pubkey_b.clone(), PORT_B)).await?;
-    mgr_b.add_peer(loopback_peer("node-a", pubkey_a.clone(), PORT_A)).await?;
+    mgr_a
+        .add_peer(loopback_peer("node-b", pubkey_b.clone(), PORT_B))
+        .await?;
+    mgr_b
+        .add_peer(loopback_peer("node-a", pubkey_a.clone(), PORT_A))
+        .await?;
 
     // ── Start receive loops ───────────────────────────────────────────────
     mgr_a.start().await?;
@@ -76,7 +80,10 @@ async fn two_managers_handshake() -> Result<()> {
 
     // ── Remove peer and verify ────────────────────────────────────────────
     mgr_a.remove_peer("node-b").await?;
-    assert!(mgr_a.list_peers().await.is_empty(), "peer list should be empty after remove");
+    assert!(
+        mgr_a.list_peers().await.is_empty(),
+        "peer list should be empty after remove"
+    );
 
     // Removing the same peer again must return PeerNotFound.
     let err = mgr_a.remove_peer("node-b").await.unwrap_err();
@@ -135,6 +142,9 @@ async fn private_key_base64_round_trip() -> Result<()> {
     let sk2 = WgPrivateKey::from_base64(&b64)?;
     let pk_restored = sk2.public_key();
 
-    assert_eq!(pk_original, pk_restored, "public keys must match after round-trip");
+    assert_eq!(
+        pk_original, pk_restored,
+        "public keys must match after round-trip"
+    );
     Ok(())
 }

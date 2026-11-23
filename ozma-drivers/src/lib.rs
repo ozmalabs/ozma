@@ -5,4 +5,4 @@
 pub mod gamepad;
 pub mod streamdeck;
 
-pub use streamdeck::{StreamDeckSurface, ScenarioInfo, discover_streamdecks};
+pub use streamdeck::{discover_streamdecks, ScenarioInfo, StreamDeckSurface};

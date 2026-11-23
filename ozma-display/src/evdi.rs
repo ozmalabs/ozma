@@ -24,9 +24,7 @@ use serde_json::json;
 use tokio::sync::broadcast;
 
 use crate::error;
-use crate::provider::{
-    DisplayEventStream, DisplayPrivacy, VirtualDisplay, VirtualDisplayProvider,
-};
+use crate::provider::{DisplayEventStream, DisplayPrivacy, VirtualDisplay, VirtualDisplayProvider};
 
 const EVENT_CAPACITY: usize = 32;
 

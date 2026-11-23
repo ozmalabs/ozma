@@ -70,10 +70,20 @@ fn test_hkdf_different_info_different_output() {
 
 #[test]
 fn test_derive_session_keys_deterministic() {
-    let (sk1, rk1, ns1, sid1) =
-        derive_session_keys(&DH_SECRET, &CTRL_EPH_PUB, &NODE_EPH_PUB, "ctrl-01", "node-01");
-    let (sk2, rk2, ns2, sid2) =
-        derive_session_keys(&DH_SECRET, &CTRL_EPH_PUB, &NODE_EPH_PUB, "ctrl-01", "node-01");
+    let (sk1, rk1, ns1, sid1) = derive_session_keys(
+        &DH_SECRET,
+        &CTRL_EPH_PUB,
+        &NODE_EPH_PUB,
+        "ctrl-01",
+        "node-01",
+    );
+    let (sk2, rk2, ns2, sid2) = derive_session_keys(
+        &DH_SECRET,
+        &CTRL_EPH_PUB,
+        &NODE_EPH_PUB,
+        "ctrl-01",
+        "node-01",
+    );
     assert_eq!(sk1, sk2);
     assert_eq!(rk1, rk2);
     assert_eq!(ns1, ns2);
@@ -83,17 +93,32 @@ fn test_derive_session_keys_deterministic() {
 #[test]
 fn test_derive_session_keys_send_recv_differ() {
     // send_key and recv_key must differ (different HKDF labels)
-    let (send_key, recv_key, _, _) =
-        derive_session_keys(&DH_SECRET, &CTRL_EPH_PUB, &NODE_EPH_PUB, "ctrl-01", "node-01");
+    let (send_key, recv_key, _, _) = derive_session_keys(
+        &DH_SECRET,
+        &CTRL_EPH_PUB,
+        &NODE_EPH_PUB,
+        "ctrl-01",
+        "node-01",
+    );
     assert_ne!(send_key, recv_key);
 }
 
 #[test]
 fn test_derive_session_keys_different_ids_differ() {
-    let (sk_a, rk_a, ns_a, _) =
-        derive_session_keys(&DH_SECRET, &CTRL_EPH_PUB, &NODE_EPH_PUB, "ctrl-01", "node-01");
-    let (sk_b, rk_b, ns_b, _) =
-        derive_session_keys(&DH_SECRET, &CTRL_EPH_PUB, &NODE_EPH_PUB, "ctrl-01", "node-02");
+    let (sk_a, rk_a, ns_a, _) = derive_session_keys(
+        &DH_SECRET,
+        &CTRL_EPH_PUB,
+        &NODE_EPH_PUB,
+        "ctrl-01",
+        "node-01",
+    );
+    let (sk_b, rk_b, ns_b, _) = derive_session_keys(
+        &DH_SECRET,
+        &CTRL_EPH_PUB,
+        &NODE_EPH_PUB,
+        "ctrl-01",
+        "node-02",
+    );
     assert_ne!(sk_a, sk_b);
     assert_ne!(rk_a, rk_b);
     assert_ne!(ns_a, ns_b);
@@ -101,8 +126,13 @@ fn test_derive_session_keys_different_ids_differ() {
 
 #[test]
 fn test_derive_session_keys_session_id_length() {
-    let (_, _, _, session_id) =
-        derive_session_keys(&DH_SECRET, &CTRL_EPH_PUB, &NODE_EPH_PUB, "ctrl-01", "node-01");
+    let (_, _, _, session_id) = derive_session_keys(
+        &DH_SECRET,
+        &CTRL_EPH_PUB,
+        &NODE_EPH_PUB,
+        "ctrl-01",
+        "node-01",
+    );
     assert_eq!(session_id.len(), 16);
     assert_ne!(session_id, [0u8; 16]);
 }
@@ -250,17 +280,16 @@ fn test_replay_window_audio_size_full_cycle() {
 
 #[test]
 fn test_session_encrypt_decrypt_roundtrip() {
-    let (send_key, recv_key, nonce_seed, session_id) =
-        derive_session_keys(&DH_SECRET, &CTRL_EPH_PUB, &NODE_EPH_PUB, "ctrl-01", "node-01");
+    let (send_key, recv_key, nonce_seed, session_id) = derive_session_keys(
+        &DH_SECRET,
+        &CTRL_EPH_PUB,
+        &NODE_EPH_PUB,
+        "ctrl-01",
+        "node-01",
+    );
 
     // Controller side: encrypts with send_key, decrypts with recv_key
-    let mut ctrl = SessionState::new(
-        "node-01".into(),
-        send_key,
-        recv_key,
-        nonce_seed,
-        session_id,
-    );
+    let mut ctrl = SessionState::new("node-01".into(), send_key, recv_key, nonce_seed, session_id);
 
     // Node side: keys are swapped relative to controller
     let mut node = SessionState::new(
@@ -279,8 +308,13 @@ fn test_session_encrypt_decrypt_roundtrip() {
 
 #[test]
 fn test_session_counter_advances() {
-    let mut sess =
-        SessionState::new("node-01".into(), ZERO_KEY, ZERO_KEY, ZERO_NONCE_SEED, [0u8; 16]);
+    let mut sess = SessionState::new(
+        "node-01".into(),
+        ZERO_KEY,
+        ZERO_KEY,
+        ZERO_NONCE_SEED,
+        [0u8; 16],
+    );
     assert_eq!(sess.send_counter, 0);
     sess.encrypt(PKT_KEYBOARD, b"a");
     assert_eq!(sess.send_counter, 1);
@@ -290,13 +324,16 @@ fn test_session_counter_advances() {
 
 #[test]
 fn test_session_replay_rejected() {
-    let (send_key, recv_key, nonce_seed, session_id) =
-        derive_session_keys(&DH_SECRET, &CTRL_EPH_PUB, &NODE_EPH_PUB, "ctrl-01", "node-01");
+    let (send_key, recv_key, nonce_seed, session_id) = derive_session_keys(
+        &DH_SECRET,
+        &CTRL_EPH_PUB,
+        &NODE_EPH_PUB,
+        "ctrl-01",
+        "node-01",
+    );
 
-    let mut ctrl =
-        SessionState::new("node-01".into(), send_key, recv_key, nonce_seed, session_id);
-    let mut node =
-        SessionState::new("ctrl-01".into(), recv_key, send_key, nonce_seed, session_id);
+    let mut ctrl = SessionState::new("node-01".into(), send_key, recv_key, nonce_seed, session_id);
+    let mut node = SessionState::new("ctrl-01".into(), recv_key, send_key, nonce_seed, session_id);
 
     let pkt = ctrl.encrypt(PKT_KEYBOARD, b"once");
     assert!(node.decrypt(&pkt).is_some());
@@ -326,8 +363,13 @@ fn test_session_from_dh_matches_manual_derivation() {
         "ctrl-01",
         "node-01",
     );
-    let (send_key, recv_key, nonce_seed, session_id) =
-        derive_session_keys(&DH_SECRET, &CTRL_EPH_PUB, &NODE_EPH_PUB, "ctrl-01", "node-01");
+    let (send_key, recv_key, nonce_seed, session_id) = derive_session_keys(
+        &DH_SECRET,
+        &CTRL_EPH_PUB,
+        &NODE_EPH_PUB,
+        "ctrl-01",
+        "node-01",
+    );
 
     assert_eq!(sess.send_key, send_key);
     assert_eq!(sess.recv_key, recv_key);

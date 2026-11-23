@@ -5,8 +5,8 @@
 //! wraps [`ozma_media::FakeCapture`] so tests exercise the same provider and
 //! registry path as a real device, without touching V4L2.
 
-use ozma_protocol::{codes, ApiError, CaptureCapability, CaptureKind};
 use ozma_media::{CaptureSource, FakeCapture, FrameFormat, PixelFormat};
+use ozma_protocol::{codes, ApiError, CaptureCapability, CaptureKind};
 
 use crate::provider::CaptureProvider;
 

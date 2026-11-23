@@ -33,7 +33,7 @@ use std::sync::{
 use std::time::Duration;
 
 use alsa::{
-    pcm::{Access, Format, HwParams, Frames, PCM},
+    pcm::{Access, Format, Frames, HwParams, PCM},
     Direction, ValueOr,
 };
 use anyhow::{bail, Context, Result};
@@ -121,7 +121,8 @@ fn open_pcm(device: &str, direction: Direction) -> Result<PCM> {
         hwp.set_rate(SAMPLE_RATE, ValueOr::Nearest)
             .context("set_rate")?;
         hwp.set_format(Format::S16LE).context("set_format")?;
-        hwp.set_access(Access::RWInterleaved).context("set_access")?;
+        hwp.set_access(Access::RWInterleaved)
+            .context("set_access")?;
         hwp.set_period_size(PERIOD_FRAMES as Frames, ValueOr::Nearest)
             .context("set_period_size")?;
         hwp.set_buffer_size((PERIOD_FRAMES * BUFFER_PERIODS) as Frames)
@@ -271,8 +272,7 @@ impl UsbAudioGadget {
             }
         }
 
-        let playback_device =
-            wait_for_alsa(config.alsa_probe_timeout, config.poll_interval).await;
+        let playback_device = wait_for_alsa(config.alsa_probe_timeout, config.poll_interval).await;
         let capture_device = playback_device.as_deref().map(|d| d.replace(",0", ",1"));
 
         if let Some(ref pb) = playback_device {
@@ -349,16 +349,15 @@ fn spawn_watcher(config: UsbAudioConfig, stop: Arc<AtomicBool>) -> JoinHandle<()
             }
 
             // Wait for the UAC2 card to be present.
-            let pb_dev =
-                match wait_for_alsa(Duration::from_secs(60), config.poll_interval).await {
-                    Some(d) => d,
-                    None => {
-                        if stop.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        continue;
+            let pb_dev = match wait_for_alsa(Duration::from_secs(60), config.poll_interval).await {
+                Some(d) => d,
+                None => {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
                     }
-                };
+                    continue;
+                }
+            };
             let cap_dev = pb_dev.replace(",0", ",1");
 
             info!("UAC2 card appeared — starting ALSA bridge");
@@ -373,34 +372,32 @@ fn spawn_watcher(config: UsbAudioConfig, stop: Arc<AtomicBool>) -> JoinHandle<()
             let pb_stop = bridge_stop.clone();
             let hdmi_src = config.hdmi_capture_device.clone();
             let pb_dst = pb_dev.clone();
-            let pb_handle = tokio::task::spawn_blocking(move || {
-                loop {
-                    if pb_stop.load(Ordering::Relaxed) {
-                        break;
+            let pb_handle = tokio::task::spawn_blocking(move || loop {
+                if pb_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let src = match open_pcm(&hdmi_src, Direction::Capture) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("Cannot open HDMI capture PCM: {:#} — retrying in 2 s", e);
+                        std::thread::sleep(Duration::from_secs(2));
+                        continue;
                     }
-                    let src = match open_pcm(&hdmi_src, Direction::Capture) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            warn!("Cannot open HDMI capture PCM: {:#} — retrying in 2 s", e);
-                            std::thread::sleep(Duration::from_secs(2));
-                            continue;
-                        }
-                    };
-                    let dst = match open_pcm(&pb_dst, Direction::Playback) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            warn!("Cannot open UAC2 playback PCM: {:#} — retrying in 2 s", e);
-                            std::thread::sleep(Duration::from_secs(2));
-                            continue;
-                        }
-                    };
-                    info!("UAC2 playback bridge running: {} → {}", hdmi_src, pb_dst);
-                    match bridge_loop(&src, &dst, &pb_stop) {
-                        Ok(()) => break,
-                        Err(e) => {
-                            warn!("UAC2 playback bridge error: {:#} — reopening in 1 s", e);
-                            std::thread::sleep(Duration::from_secs(1));
-                        }
+                };
+                let dst = match open_pcm(&pb_dst, Direction::Playback) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("Cannot open UAC2 playback PCM: {:#} — retrying in 2 s", e);
+                        std::thread::sleep(Duration::from_secs(2));
+                        continue;
+                    }
+                };
+                info!("UAC2 playback bridge running: {} → {}", hdmi_src, pb_dst);
+                match bridge_loop(&src, &dst, &pb_stop) {
+                    Ok(()) => break,
+                    Err(e) => {
+                        warn!("UAC2 playback bridge error: {:#} — reopening in 1 s", e);
+                        std::thread::sleep(Duration::from_secs(1));
                     }
                 }
             });
@@ -413,34 +410,32 @@ fn spawn_watcher(config: UsbAudioConfig, stop: Arc<AtomicBool>) -> JoinHandle<()
             let cap_stop = bridge_stop.clone();
             let cap_src = cap_dev.clone();
             let spk_dst = config.speaker_output_device.clone();
-            let cap_handle = tokio::task::spawn_blocking(move || {
-                loop {
-                    if cap_stop.load(Ordering::Relaxed) {
-                        break;
+            let cap_handle = tokio::task::spawn_blocking(move || loop {
+                if cap_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let src = match open_pcm(&cap_src, Direction::Capture) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("Cannot open UAC2 capture PCM: {:#} — retrying in 2 s", e);
+                        std::thread::sleep(Duration::from_secs(2));
+                        continue;
                     }
-                    let src = match open_pcm(&cap_src, Direction::Capture) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            warn!("Cannot open UAC2 capture PCM: {:#} — retrying in 2 s", e);
-                            std::thread::sleep(Duration::from_secs(2));
-                            continue;
-                        }
-                    };
-                    let dst = match open_pcm(&spk_dst, Direction::Playback) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            warn!("Cannot open speaker output PCM: {:#} — retrying in 2 s", e);
-                            std::thread::sleep(Duration::from_secs(2));
-                            continue;
-                        }
-                    };
-                    info!("UAC2 capture bridge running: {} → {}", cap_src, spk_dst);
-                    match bridge_loop(&src, &dst, &cap_stop) {
-                        Ok(()) => break,
-                        Err(e) => {
-                            warn!("UAC2 capture bridge error: {:#} — reopening in 1 s", e);
-                            std::thread::sleep(Duration::from_secs(1));
-                        }
+                };
+                let dst = match open_pcm(&spk_dst, Direction::Playback) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("Cannot open speaker output PCM: {:#} — retrying in 2 s", e);
+                        std::thread::sleep(Duration::from_secs(2));
+                        continue;
+                    }
+                };
+                info!("UAC2 capture bridge running: {} → {}", cap_src, spk_dst);
+                match bridge_loop(&src, &dst, &cap_stop) {
+                    Ok(()) => break,
+                    Err(e) => {
+                        warn!("UAC2 capture bridge error: {:#} — reopening in 1 s", e);
+                        std::thread::sleep(Duration::from_secs(1));
                     }
                 }
             });
@@ -450,7 +445,10 @@ fn spawn_watcher(config: UsbAudioConfig, stop: Arc<AtomicBool>) -> JoinHandle<()
             //
             // Collect the stop reason before awaiting the handles so that
             // each handle is consumed exactly once (fixes borrow-after-move).
-            enum WatchOutcome { Shutdown, Restart }
+            enum WatchOutcome {
+                Shutdown,
+                Restart,
+            }
 
             let outcome = loop {
                 sleep(config.poll_interval).await;
@@ -565,12 +563,7 @@ mod tests {
     fn parse_card_with_leading_space() {
         let line = " 3 [UAC2Gadget     ]: UAC2_Gadget - UAC2_Gadget";
         let trimmed = line.trim_start();
-        let idx: u32 = trimmed
-            .split_whitespace()
-            .next()
-            .unwrap()
-            .parse()
-            .unwrap();
+        let idx: u32 = trimmed.split_whitespace().next().unwrap().parse().unwrap();
         assert_eq!(idx, 3);
     }
 
@@ -580,9 +573,8 @@ mod tests {
         let line = " 0 [PCH            ]: HDA-Intel - HDA Intel PCH";
         let trimmed = line.trim_start();
         let upper = trimmed.to_ascii_uppercase();
-        let matched = upper.contains("UAC2")
-            || upper.contains("GADGET AUDIO")
-            || upper.contains("G_AUDIO");
+        let matched =
+            upper.contains("UAC2") || upper.contains("GADGET AUDIO") || upper.contains("G_AUDIO");
         assert!(!matched);
     }
 }

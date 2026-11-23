@@ -182,7 +182,10 @@ pub fn global_to_local(placement: &DisplayPlacement, global: GlobalPoint) -> Res
 }
 
 /// Which display contains a global point, if any.
-pub fn display_at<'a>(topology: &'a DisplayTopology, global: GlobalPoint) -> Option<&'a DisplayPlacement> {
+pub fn display_at<'a>(
+    topology: &'a DisplayTopology,
+    global: GlobalPoint,
+) -> Option<&'a DisplayPlacement> {
     topology
         .displays
         .iter()
@@ -199,10 +202,11 @@ pub fn edge_crossing(topology: &DisplayTopology, global: GlobalPoint) -> Option<
 }
 
 /// Resolve a display in a topology or return `not_found`.
-fn placement_for<'a>(topology: &'a DisplayTopology, id: &DisplayId) -> Result<&'a DisplayPlacement> {
-    topology
-        .find(id)
-        .ok_or_else(|| error::unknown_display(id))
+fn placement_for<'a>(
+    topology: &'a DisplayTopology,
+    id: &DisplayId,
+) -> Result<&'a DisplayPlacement> {
+    topology.find(id).ok_or_else(|| error::unknown_display(id))
 }
 
 /// Map an absolute point for a named display.
@@ -232,10 +236,7 @@ pub fn unmap_absolute(
 /// virtual display from a physical one if it needs to. Events that are not
 /// absolute pointer events are rejected with `invalid_request`; use
 /// [`map_relative_input`] for pointer-lock deltas.
-pub fn map_absolute_input(
-    topology: &DisplayTopology,
-    event: &InputEvent,
-) -> Result<InputEvent> {
+pub fn map_absolute_input(topology: &DisplayTopology, event: &InputEvent) -> Result<InputEvent> {
     match event {
         InputEvent::PointerAbsolute {
             display_id: Some(id),
@@ -458,20 +459,10 @@ mod tests {
     #[test]
     fn rejects_unknown_display() {
         let mode = panel();
-        let topology = DisplayTopology::new(vec![placement(
-            "primary",
-            0,
-            0,
-            &mode,
-            Rotation::Deg0,
-            100,
-        )]);
-        let err = map_absolute(
-            &topology,
-            &DisplayId::new("missing"),
-            LocalPoint::new(1, 1),
-        )
-        .unwrap_err();
+        let topology =
+            DisplayTopology::new(vec![placement("primary", 0, 0, &mode, Rotation::Deg0, 100)]);
+        let err =
+            map_absolute(&topology, &DisplayId::new("missing"), LocalPoint::new(1, 1)).unwrap_err();
         assert_eq!(err.code, ozma_protocol::codes::NOT_FOUND);
         assert_eq!(
             err.details["display_id"],
@@ -499,7 +490,10 @@ mod tests {
             edge_crossing(&topology, GlobalPoint::new(1920, 0)),
             Some(DisplayId::new("right"))
         );
-        assert_eq!(edge_crossing(&topology, GlobalPoint::new(0, 0)), Some(DisplayId::new("left")));
+        assert_eq!(
+            edge_crossing(&topology, GlobalPoint::new(0, 0)),
+            Some(DisplayId::new("left"))
+        );
         assert_eq!(edge_crossing(&topology, GlobalPoint::new(5000, 0)), None);
     }
 
@@ -510,14 +504,7 @@ mod tests {
         assert_eq!(relative_passthrough(-17, 33).dx, -17);
         assert_eq!(relative_passthrough(-17, 33).dy, 33);
         // A 150% display must not multiply the delta.
-        let display = placement(
-            "remote",
-            0,
-            0,
-            &panel(),
-            Rotation::Deg90,
-            150,
-        );
+        let display = placement("remote", 0, 0, &panel(), Rotation::Deg90, 150);
         assert!(display.scale_percent == 150);
         assert_eq!(
             map_relative_input(&InputEvent::PointerRelative { dx: 3, dy: 4 }).unwrap(),
