@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
-//! HTTP API server for the node contract.
+//! Node services: the versioned HTTP API and the native QUIC session listener.
 
 use std::sync::Arc;
 
@@ -8,19 +8,31 @@ use ozma_api::NodeBackend;
 use ozma_auth::{ConsentPolicy, MachineClass};
 use ozma_protocol::NodeCapabilities;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{error, info};
 
 use crate::backend::SessionBackend;
+use crate::transport::QuicRuntime;
 
-/// Run the node API until the task is cancelled or the listener fails.
+/// Run the node API and QUIC listener until either fails.
 pub async fn serve(
     port: u16,
+    quic_port: u16,
     capabilities: NodeCapabilities,
     consent_policy: ConsentPolicy,
 ) -> Result<()> {
-    let backend: Arc<dyn NodeBackend> =
-        Arc::new(SessionBackend::new(capabilities, consent_policy));
-    let app = ozma_api::router(backend);
+    let backend = Arc::new(SessionBackend::new(capabilities, consent_policy));
+
+    let quic = QuicRuntime::bind(quic_port).context("binding native QUIC service")?;
+    backend.configure_transport(quic.endpoint(), quic.fingerprint());
+    let quic_backend = backend.clone();
+    tokio::spawn(async move {
+        if let Err(error) = crate::transport::run(quic, quic_backend).await {
+            error!("Native QUIC listener exited: {error:#}");
+        }
+    });
+
+    let dynamic: Arc<dyn NodeBackend> = backend;
+    let app = ozma_api::router(dynamic);
     let listener = TcpListener::bind(("0.0.0.0", port))
         .await
         .with_context(|| format!("binding node API on port {port}"))?;
@@ -29,7 +41,7 @@ pub async fn serve(
     Ok(())
 }
 
-/// Build the router without binding, for tests and embedding.
+/// Build the HTTP router without binding, for tests and embedding.
 pub fn router(capabilities: NodeCapabilities) -> axum::Router {
     router_with_policy(
         capabilities,
@@ -37,7 +49,7 @@ pub fn router(capabilities: NodeCapabilities) -> axum::Router {
     )
 }
 
-/// Build the router with an explicit consent policy.
+/// Build the HTTP router with an explicit consent policy.
 pub fn router_with_policy(
     capabilities: NodeCapabilities,
     consent_policy: ConsentPolicy,

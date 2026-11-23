@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod capability;
+pub mod control;
 pub mod diagnostics;
 pub mod display;
 pub mod error;
@@ -25,6 +26,7 @@ pub use capability::{
     AudioCapability, CaptureCapability, CaptureKind, EncodeCapability, EncoderBackend,
     InputCapability, NodeCapabilities, PowerCapability, ResourceBudget, UsbCapability,
 };
+pub use control::ControlMessage;
 pub use diagnostics::{CheckStatus, DiagnosticCheck, DiagnosticReport, RuntimeMetrics};
 pub use display::{
     DisplayEvent, DisplayId, DisplayMode, DisplayPlacement, DisplayTopology, DpmsState,

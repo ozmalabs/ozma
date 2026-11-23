@@ -8,6 +8,7 @@ pub mod config;
 pub mod mdns;
 pub mod platform;
 pub mod registration;
+pub mod transport;
 pub mod usb_audio;
 
 pub use backend::SessionBackend;

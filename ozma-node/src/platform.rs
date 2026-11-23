@@ -6,7 +6,7 @@
 use ozma_protocol::{
     AudioCapability, CaptureCapability, CaptureKind, Codec, EncodeCapability, EncoderBackend,
     InputCapability, NodeCapabilities, NodeId, ResourceBudget, TransportMode, UsbCapability,
-    VirtualDisplayBackend, VirtualDisplayCaps,
+    VirtualDisplayCaps,
 };
 
 use crate::config::NodeConfig;
@@ -57,15 +57,11 @@ pub fn detect(config: &NodeConfig) -> NodeCapabilities {
                 profiles: vec!["baseline".to_owned()],
             },
         ];
-        caps.display = VirtualDisplayCaps {
-            supported: true,
-            backends: vec![VirtualDisplayBackend::Fake],
-            max_outputs: 1,
-            hotplug: false,
-            programmable_edid: false,
-            stable_identity: true,
-            ..VirtualDisplayCaps::none()
-        };
+        // The real Linux EVDI/KMS provider is still gated on the M2 spike.
+        // Reporting the fake provider here would claim a monitor the node
+        // cannot actually create, so advertise no virtual display until a
+        // platform provider passes its probe.
+        caps.display = VirtualDisplayCaps::none();
     }
 
     if !config.has_capability("audio") {
@@ -130,7 +126,7 @@ mod tests {
         let caps = detect(&config("hid,video,audio"));
         assert!(!caps.capture.is_empty());
         assert!(!caps.encode.is_empty());
-        assert!(caps.display.supported);
+        assert!(!caps.display.supported);
     }
 
     #[test]

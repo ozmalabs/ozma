@@ -11,8 +11,9 @@ use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use ozma_protocol::{
-    ApiError, DiagnosticReport, DisplayId, DisplayTopology, EndReason, NodeCapabilities, NodeId,
-    RuntimeMetrics, Session, SessionEvent, SessionId, SessionSpec, VirtualDisplaySpec,
+    ApiError, DiagnosticReport, DisplayId, DisplayMode, DisplayTopology, DpmsState, EndReason,
+    NodeCapabilities, NodeId, RuntimeMetrics, Session, SessionEvent, SessionId, SessionOffer,
+    SessionSpec, VirtualDisplaySpec,
 };
 use serde::{Deserialize, Serialize};
 
@@ -40,7 +41,12 @@ pub fn router(backend: Backend) -> Router {
         .route("/api/v1/sessions/:id/events", get(session_events))
         .route("/api/v1/displays", get(list_displays).post(create_display))
         .route("/api/v1/displays/:id", delete(delete_display))
-        .route("/api/v1/displays/topology", get(display_topology))
+        .route("/api/v1/displays/:id/mode", post(set_display_mode))
+        .route("/api/v1/displays/:id/dpms", post(set_display_dpms))
+        .route(
+            "/api/v1/displays/topology",
+            get(display_topology).put(set_display_topology),
+        )
         .with_state(backend)
 }
 
@@ -152,6 +158,13 @@ async fn list_sessions(State(backend): State<Backend>) -> Json<SessionsResponse>
 #[derive(Serialize)]
 struct SessionResponse {
     session: Session,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offer: Option<SessionOffer>,
+}
+
+fn session_response(backend: &Backend, session: Session) -> SessionResponse {
+    let offer = backend.session_offer(&session).ok();
+    SessionResponse { session, offer }
 }
 
 async fn create_session(
@@ -159,10 +172,8 @@ async fn create_session(
     Json(spec): Json<SessionSpec>,
 ) -> Result<(axum::http::StatusCode, Json<SessionResponse>), ApiFailure> {
     let session = backend.create_session(spec)?;
-    Ok((
-        axum::http::StatusCode::CREATED,
-        Json(SessionResponse { session }),
-    ))
+    let response = session_response(&backend, session);
+    Ok((axum::http::StatusCode::CREATED, Json(response)))
 }
 
 fn session_id(value: String) -> SessionId {
@@ -176,7 +187,7 @@ async fn get_session(
     let session = backend
         .get_session(&session_id(id))
         .ok_or_else(|| ApiError::new(ozma_protocol::error::codes::NOT_FOUND, "Session not found"))?;
-    Ok(Json(SessionResponse { session }))
+    Ok(Json(session_response(&backend, session)))
 }
 
 async fn start_session(
@@ -184,7 +195,7 @@ async fn start_session(
     AxumPath(id): AxumPath<String>,
 ) -> ApiResult<SessionResponse> {
     let session = backend.start_session(&session_id(id))?;
-    Ok(Json(SessionResponse { session }))
+    Ok(Json(session_response(&backend, session)))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -202,7 +213,7 @@ async fn stop_session(
         &session_id(id),
         request.reason.unwrap_or(EndReason::AdminTerminated),
     )?;
-    Ok(Json(SessionResponse { session }))
+    Ok(Json(session_response(&backend, session)))
 }
 
 async fn delete_session(
@@ -210,7 +221,7 @@ async fn delete_session(
     AxumPath(id): AxumPath<String>,
 ) -> ApiResult<SessionResponse> {
     let session = backend.stop_session(&session_id(id), EndReason::AdminTerminated)?;
-    Ok(Json(SessionResponse { session }))
+    Ok(Json(session_response(&backend, session)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -226,7 +237,7 @@ async fn approve_session(
 ) -> ApiResult<SessionResponse> {
     let by = request.by.unwrap_or_else(|| "local".to_owned());
     let session = backend.approve_consent(&session_id(id), &by)?;
-    Ok(Json(SessionResponse { session }))
+    Ok(Json(session_response(&backend, session)))
 }
 
 async fn deny_session(
@@ -236,7 +247,7 @@ async fn deny_session(
 ) -> ApiResult<SessionResponse> {
     let by = request.by.unwrap_or_else(|| "local".to_owned());
     let session = backend.deny_consent(&session_id(id), &by)?;
-    Ok(Json(SessionResponse { session }))
+    Ok(Json(session_response(&backend, session)))
 }
 
 async fn session_events(
@@ -321,6 +332,32 @@ async fn delete_display(
 
 async fn display_topology(State(backend): State<Backend>) -> Json<DisplayTopology> {
     Json(backend.topology())
+}
+
+async fn set_display_mode(
+    State(backend): State<Backend>,
+    AxumPath(id): AxumPath<String>,
+    Json(mode): Json<DisplayMode>,
+) -> Result<axum::http::StatusCode, ApiFailure> {
+    backend.set_display_mode(&DisplayId::new(id), mode)?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+async fn set_display_dpms(
+    State(backend): State<Backend>,
+    AxumPath(id): AxumPath<String>,
+    Json(state): Json<DpmsState>,
+) -> Result<axum::http::StatusCode, ApiFailure> {
+    backend.set_display_dpms(&DisplayId::new(id), state)?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+async fn set_display_topology(
+    State(backend): State<Backend>,
+    Json(topology): Json<DisplayTopology>,
+) -> Result<axum::http::StatusCode, ApiFailure> {
+    backend.set_topology(topology)?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]

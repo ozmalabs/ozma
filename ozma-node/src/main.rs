@@ -201,10 +201,11 @@ async fn main() {
     }
 
     let http_port = config.http_port;
+    let quic_port = http_port.saturating_add(2);
     let api_capabilities = capabilities.clone();
     let consent_policy = config.consent_policy();
     tokio::spawn(async move {
-        if let Err(error) = api::serve(http_port, api_capabilities, consent_policy).await {
+        if let Err(error) = api::serve(http_port, quic_port, api_capabilities, consent_policy).await {
             error!("Node API exited: {error:#}");
         }
     });

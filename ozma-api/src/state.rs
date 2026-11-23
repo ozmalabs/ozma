@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ozma_protocol::{
-    ApiError, DisplayId, DisplayTopology, EndReason, NodeCapabilities, NodeId, RuntimeMetrics,
-    Session, SessionEvent, SessionId, SessionSpec, SessionState, VirtualDisplaySpec,
-    DiagnosticReport,
+    ApiError, DiagnosticReport, DisplayId, DisplayMode, DisplayTopology, DpmsState, EndReason,
+    NodeCapabilities, NodeId, RuntimeMetrics, Session, SessionEvent, SessionId, SessionOffer,
+    SessionSpec, SessionState, VirtualDisplaySpec,
 };
 use tokio::sync::broadcast;
 
@@ -30,10 +30,40 @@ pub trait NodeBackend: Send + Sync + 'static {
     fn approve_consent(&self, id: &SessionId, by: &str) -> Result<Session, ApiError>;
     fn deny_consent(&self, id: &SessionId, by: &str) -> Result<Session, ApiError>;
 
+    /// Build the short-lived transport offer for a newly prepared session.
+    /// Backends without a media transport return `unsupported`.
+    fn session_offer(&self, _session: &Session) -> Result<SessionOffer, ApiError> {
+        Err(ApiError::new(
+            ozma_protocol::error::codes::TRANSPORT_UNAVAILABLE,
+            "This node has no native session transport configured",
+        ))
+    }
+
     fn list_displays(&self) -> Vec<VirtualDisplaySpec>;
     fn create_display(&self, spec: VirtualDisplaySpec) -> Result<VirtualDisplaySpec, ApiError>;
     fn destroy_display(&self, id: &DisplayId) -> Result<(), ApiError>;
     fn topology(&self) -> DisplayTopology;
+
+    fn set_display_mode(&self, _id: &DisplayId, _mode: DisplayMode) -> Result<(), ApiError> {
+        Err(ApiError::new(
+            ozma_protocol::error::codes::DISPLAY_UNSUPPORTED,
+            "This node cannot change display modes",
+        ))
+    }
+
+    fn set_display_dpms(&self, _id: &DisplayId, _state: DpmsState) -> Result<(), ApiError> {
+        Err(ApiError::new(
+            ozma_protocol::error::codes::DISPLAY_UNSUPPORTED,
+            "This node cannot control display DPMS",
+        ))
+    }
+
+    fn set_topology(&self, _topology: DisplayTopology) -> Result<(), ApiError> {
+        Err(ApiError::new(
+            ozma_protocol::error::codes::DISPLAY_UNSUPPORTED,
+            "This node cannot set display topology",
+        ))
+    }
 
     fn subscribe(&self) -> broadcast::Receiver<SessionEvent>;
 }

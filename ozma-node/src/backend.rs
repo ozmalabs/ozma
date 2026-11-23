@@ -1,18 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
 //! Adapter from the real session manager to the API backend contract.
 
-use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ozma_api::NodeBackend;
-use ozma_auth::ConsentPolicy;
+use ozma_auth::{ConsentPolicy, TokenClaims, TokenIssuer, TokenVerifier};
+use ozma_display::{FakeVirtualDisplayProvider, VirtualDisplayProvider};
 use ozma_protocol::{
-    ApiError, CheckStatus, DiagnosticCheck, DiagnosticReport, DisplayId, DisplayTopology, EndReason,
-    NodeCapabilities, PermissionSet, RuntimeMetrics, Session, SessionEvent, SessionId, SessionSpec,
-    SessionState, VirtualDisplaySpec,
+    ApiError, CheckStatus, DiagnosticCheck, DiagnosticReport, DisplayId, DisplayMode,
+    DisplayTopology, DpmsState, EndReason, NodeCapabilities, PermissionSet, RuntimeMetrics, Session,
+    SessionEvent, SessionId, SessionOffer, SessionSpec, SessionState, TransportMode,
+    VirtualDisplaySpec,
 };
 use ozma_session::SessionManager;
+use ozma_transport::offer::{SessionOfferBuilder, TransportDescriptorBuilder};
+use rand::RngCore;
 use tokio::sync::broadcast;
 
 fn now() -> u64 {
@@ -22,27 +25,57 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
+#[derive(Clone, Debug)]
+struct TransportOffer {
+    endpoint: String,
+    certificate_fingerprint: String,
+}
+
 /// The node's production backend: the session manager plus display state and
 /// capability/diagnostic reporting.
 pub struct SessionBackend {
     manager: SessionManager,
     capabilities: NodeCapabilities,
-    displays: Mutex<HashMap<DisplayId, VirtualDisplaySpec>>,
-    topology: Mutex<DisplayTopology>,
+    displays: FakeVirtualDisplayProvider,
+    token_issuer: TokenIssuer,
+    token_verifier: TokenVerifier,
+    transport: Mutex<Option<TransportOffer>>,
 }
 
 impl SessionBackend {
     pub fn new(capabilities: NodeCapabilities, consent_policy: ConsentPolicy) -> Self {
+        let mut secret = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut secret);
+        let displays = FakeVirtualDisplayProvider::new(capabilities.display.clone());
         Self {
             manager: SessionManager::new(consent_policy),
             capabilities,
-            displays: Mutex::new(HashMap::new()),
-            topology: Mutex::new(DisplayTopology::default()),
+            displays,
+            token_issuer: TokenIssuer::new(secret),
+            token_verifier: TokenVerifier::new(secret),
+            transport: Mutex::new(None),
         }
     }
 
     pub fn manager(&self) -> &SessionManager {
         &self.manager
+    }
+
+    pub fn display_provider(&self) -> &dyn VirtualDisplayProvider {
+        &self.displays
+    }
+
+    /// Configure the native transport endpoint advertised in session offers.
+    pub fn configure_transport(&self, endpoint: impl Into<String>, certificate_fingerprint: impl Into<String>) {
+        *self.transport.lock().expect("transport lock") = Some(TransportOffer {
+            endpoint: endpoint.into(),
+            certificate_fingerprint: certificate_fingerprint.into(),
+        });
+    }
+
+    /// Verify a controller-issued session token.
+    pub fn verify_token(&self, token: &str) -> Result<TokenClaims, ApiError> {
+        self.token_verifier.verify(token, now())
     }
 
     /// Expire idle sessions and consent requests. The supervisor should call
@@ -163,34 +196,77 @@ impl NodeBackend for SessionBackend {
         self.manager.deny_consent(id, by)
     }
 
+    fn session_offer(&self, session: &Session) -> Result<SessionOffer, ApiError> {
+        let transport = self
+            .transport
+            .lock()
+            .expect("transport lock")
+            .clone()
+            .ok_or_else(|| {
+                ApiError::new(
+                    ozma_protocol::error::codes::TRANSPORT_UNAVAILABLE,
+                    "No native transport endpoint is configured",
+                )
+            })?;
+
+        let ttl = session.spec.ttl_seconds;
+        let (token, _claims) = self.token_issuer.issue_new(
+            session.id.clone(),
+            session.spec.client_id.clone(),
+            session.permissions.clone(),
+            ttl,
+            now(),
+        )?;
+
+        let descriptor = TransportDescriptorBuilder::quic(transport.endpoint)
+            .certificate_fingerprint(transport.certificate_fingerprint)
+            .build();
+        let offer = SessionOfferBuilder::new(session.id.clone())
+            .token(token)
+            .expires_in(now().saturating_mul(1_000), ttl)
+            .transport(descriptor)
+            .build()?;
+        if !offer
+            .transports
+            .iter()
+            .any(|transport| transport.mode == TransportMode::Quic)
+        {
+            return Err(ApiError::internal("session offer has no QUIC transport"));
+        }
+        Ok(offer)
+    }
+
     fn list_displays(&self) -> Vec<VirtualDisplaySpec> {
-        let displays = self.displays.lock().expect("display lock");
-        displays.values().cloned().collect()
+        self.displays
+            .displays()
+            .into_iter()
+            .map(|display| display.spec)
+            .collect()
     }
 
     fn create_display(&self, spec: VirtualDisplaySpec) -> Result<VirtualDisplaySpec, ApiError> {
-        spec.validate()?;
-        let mut displays = self.displays.lock().expect("display lock");
-        if displays.contains_key(&spec.id) {
-            return Err(ApiError::new(
-                ozma_protocol::error::codes::CONFLICT,
-                "A display with that id already exists",
-            ));
-        }
-        displays.insert(spec.id.clone(), spec.clone());
-        Ok(spec)
+        let display = self.displays.create(spec)?;
+        Ok(display.spec)
     }
 
     fn destroy_display(&self, id: &DisplayId) -> Result<(), ApiError> {
-        let mut displays = self.displays.lock().expect("display lock");
-        displays.remove(id).ok_or_else(|| {
-            ApiError::new(ozma_protocol::error::codes::NOT_FOUND, "Display not found")
-        })?;
-        Ok(())
+        self.displays.destroy(id.clone())
     }
 
     fn topology(&self) -> DisplayTopology {
-        self.topology.lock().expect("topology lock").clone()
+        self.displays.topology().unwrap_or_default()
+    }
+
+    fn set_display_mode(&self, id: &DisplayId, mode: DisplayMode) -> Result<(), ApiError> {
+        self.displays.set_mode(id.clone(), mode)
+    }
+
+    fn set_display_dpms(&self, id: &DisplayId, state: DpmsState) -> Result<(), ApiError> {
+        self.displays.set_dpms(id.clone(), state)
+    }
+
+    fn set_topology(&self, topology: DisplayTopology) -> Result<(), ApiError> {
+        self.displays.set_topology(topology)
     }
 
     fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
@@ -248,5 +324,25 @@ mod tests {
         let report = backend().diagnostics();
         assert!(report.ok);
         assert!(report.checks.iter().any(|check| check.id == "encoder"));
+    }
+
+    #[test]
+    fn consent_blocks_start_until_approved() {
+        let backend = SessionBackend::new(
+            NodeCapabilities::fake("node"),
+            ConsentPolicy::new(MachineClass::Workstation, true),
+        );
+        let mut spec = spec();
+        spec.privacy.consent = ConsentRequirement::Workstation;
+        let session = backend.create_session(spec).unwrap();
+        assert_eq!(session.state, SessionState::PendingConsent);
+
+        let error = backend.start_session(&session.id).unwrap_err();
+        assert_eq!(error.code, ozma_protocol::error::codes::SESSION_NOT_READY);
+
+        let session = backend.approve_consent(&session.id, "local").unwrap();
+        assert_eq!(session.state, SessionState::Preparing);
+        let session = backend.start_session(&session.id).unwrap();
+        assert_eq!(session.state, SessionState::Streaming);
     }
 }

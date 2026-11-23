@@ -1,0 +1,370 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
+//! Native QUIC session service.
+//!
+//! One QUIC connection carries a session's typed channels:
+//! reliable control/input on the QUIC stream, unreliable video/audio on QUIC
+//! datagrams. The node verifies the controller-issued session token in the
+//! first `Hello`, then runs the fake media pipeline while the client is
+//! attached. Real V4L2 capture replaces the fake source without changing this
+//! control contract.
+
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use bytes::Bytes;
+use ozma_media::{FakeCapture, FakeEncoder, FrameFormat, Pipeline, PipelineConfig, RunningPipeline};
+use ozma_protocol::{
+    ClientId, ControlMessage, DisplayId, InputEvent, Permission, SessionEvent, SessionId,
+};
+use ozma_transport::{
+    ChannelId, CloseReason, QuicServer, QuicTransport, SessionTransport, TransportEvent,
+};
+use sha2::{Digest, Sha256};
+use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
+use tracing::{debug, info, warn};
+
+use crate::backend::SessionBackend;
+
+/// A bound QUIC listener plus the certificate information clients need.
+pub struct QuicRuntime {
+    server: QuicServer,
+    advertised: SocketAddr,
+    certificate_der: Vec<u8>,
+    fingerprint: String,
+}
+
+impl QuicRuntime {
+    /// Bind the native QUIC listener on `port` (`0` for an ephemeral port).
+    pub fn bind(port: u16) -> Result<Self> {
+        Self::bind_on(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
+    }
+
+    /// Bind on an explicit address. Tests use loopback with port 0.
+    pub fn bind_on(bind_addr: SocketAddr) -> Result<Self> {
+        let server = QuicServer::bind(bind_addr).context("binding native QUIC listener")?;
+        let local = server.local_addr().context("reading QUIC local address")?;
+        let advertised = advertised_address(local);
+        let certificate_der = server.certificate_der().to_vec();
+        let fingerprint = hex_sha256(&certificate_der);
+        Ok(Self {
+            server,
+            advertised,
+            certificate_der,
+            fingerprint,
+        })
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.advertised
+    }
+
+    pub fn endpoint(&self) -> String {
+        self.advertised.to_string()
+    }
+
+    pub fn certificate_der(&self) -> &[u8] {
+        &self.certificate_der
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+}
+
+fn advertised_address(local: SocketAddr) -> SocketAddr {
+    if local.ip().is_unspecified() {
+        if let Ok(IpAddr::V4(ip)) = local_ip_address::local_ip() {
+            return SocketAddr::new(IpAddr::V4(ip), local.port());
+        }
+    }
+    local
+}
+
+fn hex_sha256(data: &[u8]) -> String {
+    let digest = Sha256::digest(data);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Accept QUIC sessions until the listener fails. Each accepted connection
+/// runs in its own task; a bad client cannot stop the listener.
+pub async fn run(runtime: QuicRuntime, backend: Arc<SessionBackend>) -> Result<()> {
+    info!(
+        endpoint = %runtime.endpoint(),
+        fingerprint = %runtime.fingerprint(),
+        "Native QUIC session listener ready"
+    );
+    loop {
+        match runtime.server.accept().await {
+            Ok(transport) => {
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = handle_connection(transport, backend).await {
+                        debug!(error = %error, "QUIC session ended with error");
+                    }
+                });
+            }
+            Err(error) => {
+                warn!(error = %error, "QUIC accept failed");
+                return Err(error.into());
+            }
+        }
+    }
+}
+
+async fn handle_connection(mut transport: QuicTransport, backend: Arc<SessionBackend>) -> Result<()> {
+    let (hello_session_id, hello_token) = timeout(Duration::from_secs(10), read_hello(&mut transport))
+        .await
+        .context("timed out waiting for session Hello")??;
+
+    let claims = match backend.verify_token(&hello_token) {
+        Ok(claims) => claims,
+        Err(error) => {
+            let _ = send_control(&transport, &ControlMessage::Error { error }).await;
+            let _ = transport.close_with_reason(CloseReason::ProtocolError).await;
+            return Ok(());
+        }
+    };
+    if claims.session_id != hello_session_id {
+        let _ = send_control(
+            &transport,
+            &ControlMessage::Error {
+                error: ozma_protocol::ApiError::new(
+                    ozma_protocol::error::codes::FORBIDDEN,
+                    "The token is for a different session",
+                ),
+            },
+        )
+        .await;
+        let _ = transport.close_with_reason(CloseReason::ProtocolError).await;
+        return Ok(());
+    }
+
+    let session = match backend.manager().get(&claims.session_id) {
+        Ok(session) => session,
+        Err(error) => {
+            let _ = send_control(&transport, &ControlMessage::Error { error }).await;
+            let _ = transport.close_with_reason(CloseReason::ProtocolError).await;
+            return Ok(());
+        }
+    };
+    if !session.state.is_active() {
+        let _ = send_control(
+            &transport,
+            &ControlMessage::Error {
+                error: ozma_protocol::ApiError::new(
+                    ozma_protocol::error::codes::SESSION_NOT_READY,
+                    "The session is not ready for a media connection",
+                ),
+            },
+        )
+        .await;
+        let _ = transport.close_with_reason(CloseReason::ProtocolError).await;
+        return Ok(());
+    }
+
+    let session_id = claims.session_id.clone();
+    let client_id = claims.client_id.clone();
+    let _ = backend.manager().join(&session_id, &client_id);
+    let can_control = session.permissions.contains(Permission::Control);
+    if can_control {
+        if let Err(error) = backend.manager().claim_control(&session_id, &client_id) {
+            debug!(error = %error, "client did not become controller");
+        }
+    }
+
+    let session = backend
+        .manager()
+        .get(&session_id)
+        .unwrap_or_else(|_| session.clone());
+    send_control(&transport, &ControlMessage::HelloAck { session }).await?;
+
+    let mut pipeline = match start_media(&session_id).await {
+        Ok(pipeline) => pipeline,
+        Err(error) => {
+            let _ = send_control(&transport, &ControlMessage::Error { error }).await;
+            let _ = transport.close_with_reason(CloseReason::TransportError).await;
+            return Ok(());
+        }
+    };
+
+    let mut events = backend.manager().subscribe();
+    let result = session_loop(
+        &mut transport,
+        &backend,
+        &session_id,
+        &client_id,
+        &mut pipeline,
+        &mut events,
+    )
+    .await;
+
+    pipeline.cancel();
+    let _ = pipeline.wait().await;
+    let _ = backend.manager().on_client_disconnect(&session_id, &client_id);
+    let _ = transport.close_with_reason(CloseReason::Normal).await;
+
+    result
+}
+
+async fn start_media(session_id: &SessionId) -> Result<RunningPipeline, ozma_protocol::ApiError> {
+    let source = FakeCapture::default().with_id(format!("fake:{session_id}")).with_fps(30);
+    let input = FrameFormat::rgb24(320, 240);
+    let encoder = FakeEncoder::h264(input, 2_000);
+    Pipeline::start(source, encoder, PipelineConfig::default()).map_err(Into::into)
+}
+
+async fn session_loop(
+    transport: &mut QuicTransport,
+    backend: &Arc<SessionBackend>,
+    session_id: &SessionId,
+    client_id: &ClientId,
+    pipeline: &mut RunningPipeline,
+    events: &mut broadcast::Receiver<SessionEvent>,
+) -> Result<()> {
+    loop {
+        tokio::select! {
+            event = transport.recv() => {
+                match event {
+                    TransportEvent::Payload { channel, payload } => {
+                        if channel == ChannelId::CONTROL {
+                            if let Err(error) = handle_control(backend, session_id, client_id, transport, &payload).await {
+                                let _ = send_control(transport, &ControlMessage::Error { error }).await;
+                            }
+                        }
+                    }
+                    TransportEvent::Datagram { .. } => {}
+                    TransportEvent::Closed { .. } => break,
+                    TransportEvent::Error { error } => {
+                        let _ = send_control(transport, &ControlMessage::Error { error }).await;
+                        break;
+                    }
+                }
+            }
+            frame = pipeline.recv() => {
+                match frame {
+                    Some(frame) => {
+                        if let Err(error) = transport.send(ChannelId::VIDEO, frame.into_data()).await {
+                            debug!(error = %error, "sending video frame failed");
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            event = events.recv() => {
+                match event {
+                    Ok(event) => {
+                        let _ = send_control(transport, &ControlMessage::Event { event }).await;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_control(
+    backend: &Arc<SessionBackend>,
+    session_id: &SessionId,
+    client_id: &ClientId,
+    transport: &QuicTransport,
+    payload: &[u8],
+) -> Result<(), ozma_protocol::ApiError> {
+    let message: ControlMessage = serde_json::from_slice(payload).map_err(|error| {
+        ozma_protocol::ApiError::new(
+            ozma_protocol::error::codes::INVALID_REQUEST,
+            format!("invalid control message: {error}"),
+        )
+    })?;
+    match message {
+        ControlMessage::Input { event } => {
+            if let Err(error) = backend.manager().submit_input(session_id, client_id, &event) {
+                send_control(transport, &ControlMessage::Error { error }).await?;
+            }
+        }
+        ControlMessage::Ping { nonce } => {
+            send_control(transport, &ControlMessage::Pong { nonce }).await?;
+        }
+        ControlMessage::Bye { reason } => {
+            let _ = backend.manager().stop(session_id, reason);
+        }
+        ControlMessage::Hello { .. } | ControlMessage::HelloAck { .. } => {}
+        ControlMessage::Pong { .. } => {}
+        ControlMessage::Event { .. } => {}
+        ControlMessage::Error { .. } => {}
+    }
+    Ok(())
+}
+
+async fn read_hello(
+    transport: &mut QuicTransport,
+) -> Result<(SessionId, String), ozma_protocol::ApiError> {
+    loop {
+        match transport.recv().await {
+            TransportEvent::Payload { channel, payload } if channel == ChannelId::CONTROL => {
+                let message: ControlMessage = serde_json::from_slice(&payload).map_err(|error| {
+                    ozma_protocol::ApiError::new(
+                        ozma_protocol::error::codes::INVALID_REQUEST,
+                        format!("invalid control message: {error}"),
+                    )
+                })?;
+                match message {
+                    ControlMessage::Hello { session_id, token } => return Ok((session_id, token)),
+                    _ => {
+                        return Err(ozma_protocol::ApiError::new(
+                            ozma_protocol::error::codes::UNAUTHORIZED,
+                            "The first control message must be Hello",
+                        ))
+                    }
+                }
+            }
+            TransportEvent::Payload { .. } | TransportEvent::Datagram { .. } => continue,
+            TransportEvent::Closed { .. } => {
+                return Err(ozma_protocol::ApiError::new(
+                    ozma_protocol::error::codes::TRANSPORT_UNAVAILABLE,
+                    "The client disconnected before Hello",
+                ));
+            }
+            TransportEvent::Error { error } => return Err(error),
+        }
+    }
+}
+
+async fn send_control(
+    transport: &QuicTransport,
+    message: &ControlMessage,
+) -> Result<(), ozma_protocol::ApiError> {
+    let payload = serde_json::to_vec(message).map_err(|error| {
+        ozma_protocol::ApiError::internal(format!("encoding control message: {error}"))
+    })?;
+    transport.send(ChannelId::CONTROL, Bytes::from(payload)).await
+}
+
+/// A client-side helper used by tests and the native client crate.
+pub async fn send_input(
+    transport: &QuicTransport,
+    event: &InputEvent,
+) -> Result<(), ozma_protocol::ApiError> {
+    let message = ControlMessage::Input { event: event.clone() };
+    send_control(transport, &message).await
+}
+
+/// A client-side helper to send a display/edge update. Display ids are carried
+/// in the input event; this keeps the server's accepted set explicit.
+pub fn input_display(event: &InputEvent) -> Option<&DisplayId> {
+    match event {
+        InputEvent::PointerAbsolute { display_id, .. }
+        | InputEvent::Touch { display_id, .. }
+        | InputEvent::Pen { display_id, .. } => display_id.as_ref(),
+        _ => None,
+    }
+}
+
+/// Keep the control task handle type visible to future extensions.
+pub type ControlTask = JoinHandle<()>;

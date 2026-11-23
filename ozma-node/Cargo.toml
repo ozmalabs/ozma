@@ -39,6 +39,11 @@ ozma-display  = { path = "../ozma-display" }
 # HTTP API
 axum = { version = "0.7", features = ["json", "ws"] }
 
+# Native QUIC/control transport
+bytes = { workspace = true }
+rand = "0.8"
+sha2 = "0.10"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 
