@@ -2,9 +2,10 @@
 //! The stable frame seam for an outbound RDP adapter.
 //!
 //! `RdpFrameReader` consumes the deliberately boring `OZFR` stream emitted by
-//! the composed-frame producer.  Keeping this boundary independent of the
-//! FreeRDP C ABI lets a native bridge (or a future `freerdp-server3` binding)
-//! own authentication, peer lifecycle, and surface-update negotiation.
+//! the composed-frame producer. Keeping this boundary independent of the
+//! FreeRDP C ABI lets the direct-surface C bridge in `examples/rdp-direct` own
+//! authentication, peer lifecycle, and surface-update negotiation. The original
+//! Xvfb/ffplay shadow prototype also consumes the same records.
 
 use std::io::{self, Read};
 
@@ -13,7 +14,7 @@ use thiserror::Error;
 const HEADER_LEN: usize = 16;
 const MAGIC: &[u8; 4] = b"OZFR";
 const MAX_DIMENSION: u32 = 16_384;
-const MAX_FRAME_BYTES: usize = 512 * 1024 * 1024;
+const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum RdpFrameError {
@@ -59,11 +60,12 @@ impl RdpFrameLayout {
                 stride: self.stride,
             });
         }
-        let size = self.stride as usize * self.height as usize;
-        if size > MAX_FRAME_BYTES {
-            return Err(RdpFrameError::TooLarge(size));
-        }
-        Ok(size)
+        (self.stride as usize)
+            .checked_mul(self.height as usize)
+            .filter(|size| *size <= MAX_FRAME_BYTES)
+            .ok_or_else(|| {
+                RdpFrameError::TooLarge((self.stride as usize).saturating_mul(self.height as usize))
+            })
     }
 }
 
@@ -188,5 +190,41 @@ mod tests {
             reader.next_frame(),
             Err(RdpFrameError::DimensionsChanged { .. })
         ));
+    }
+
+    #[test]
+    fn rejects_invalid_layout() {
+        for layout in [
+            RdpFrameLayout {
+                width: 0,
+                height: 1,
+                stride: 4,
+            },
+            RdpFrameLayout {
+                width: 2,
+                height: 1,
+                stride: 7,
+            },
+        ] {
+            let bytes = stream(layout, &[0; 8]);
+            let mut reader = RdpFrameReader::new(bytes.as_slice());
+            assert!(matches!(
+                reader.next_frame(),
+                Err(RdpFrameError::InvalidLayout { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn reports_truncated_frames() {
+        let layout = RdpFrameLayout {
+            width: 2,
+            height: 1,
+            stride: 8,
+        };
+        let mut bytes = stream(layout, &[1, 2, 3]);
+        bytes.truncate(16 + 3);
+        let mut reader = RdpFrameReader::new(bytes.as_slice());
+        assert!(matches!(reader.next_frame(), Err(RdpFrameError::Truncated)));
     }
 }

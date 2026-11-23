@@ -55,7 +55,7 @@ This file records what is actually merged and tested, not what is planned.
 
 | Output | Status | Evidence / limit |
 |---|---|---|
-| RDP | Loopback prototype validated | FreeRDP shadow on an isolated Xvfb display; stock FreeRDP viewer showed the Ozma overlay. Direct graphics surfaces and managed viewer auth are active work. |
+| RDP | Direct surface + auth validated | FreeRDP shadow subsystem writes OZFR frames into its own primary surface (no Xvfb/ffplay); TLS-only, token/user auth, viewer limit. Stock `xfreerdp3` verified frames and rejection paths. RDPEGFX/H.264 and scene flattening remain. |
 | SPICE | Loopback prototype validated | libspice-server QXL interface; stock SPICE screenshot client captured the overlay and successive changes. Structured drawing and managed auth are active work. |
 | Xpra | Wire-level validated | Handshake, original PNG delivery, draw acknowledgement, and placement-only update. Video and stock-client interoperability are active work. |
 | VNC | Development output | RFB 3.8 framebuffer server with damage updates; viewer input discarded. |
