@@ -4,49 +4,60 @@
 //! `OzmaClient::connect` parses a `SessionOffer`, selects the WebTransport
 //! descriptor, pins the node certificate by SHA-256, connects
 //! [`BrowserTransport`], performs the core `Hello`/`HelloAck` handshake with
-//! [`ClientDriver`], then hands both media decoders to a `spawn_local` loop.
+//! [`ClientDriver`], then hands the driver and media decoders to a
+//! `spawn_local` loop.
 //!
-//! The facade is intentionally split:
+//! The facade intentionally keeps the transport's cloneable [`BrowserSender`]
+//! outside the media loop:
 //!
-//! - the **media loop** owns the driver and the WebCodecs video decoder;
-//! - the **input queue** is shared and drained by the media loop;
-//! - the **stats** object is shared read-only with the page.
+//! - DOM input handlers serialize `ControlMessage::Input` and enqueue it on the
+//!   reliable writer **synchronously**, so input is not delayed by a pending
+//!   transport read.
+//! - `close()` sends `ReleaseAll` and `Bye` through the same sender and then
+//!   calls `BrowserSender::close`, which wakes a pending `recv` immediately.
+//! - camera and microphone encoders send from their own `spawn_local` tasks;
+//!   they never borrow the driver.
 //!
-//! `send_pointer` and friends are synchronous because DOM event handlers are
-//! synchronous. They enqueue an [`InputEvent`]; the media loop sends queued
-//! input before waiting for the next session event. That keeps one owner for
-//! the driver's `&mut` half without cancelling a pending transport read (which
-//! could lose reliable control bytes).
+//! The media loop therefore owns only the receive half: typed events, video
+//! reassembly/decode, audio decode, and close observation.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::future::Future;
 use std::rc::Rc;
+use std::task::{Context, Poll, Waker};
 
+use bytes::Bytes;
 use ozma_client_core::session::{
-    channel_map_for, webtransport_descriptor, ClientDriver, ClientEvent,
+    channel_map_for, encode_control, webtransport_descriptor, ClientDriver, ClientEvent,
 };
-use ozma_protocol::{ChannelKind, ControlMessage, InputEvent, SessionOffer, TransportMode};
-use ozma_transport::ChannelMap;
-use ozma_transport_web::{BrowserConnectOptions, BrowserTransport};
+use ozma_protocol::{
+    ChannelKind, ControlMessage, EndReason, InputEvent, SessionOffer, TransportMode,
+};
+use ozma_transport::{ChannelId, ChannelMap, CloseReason};
+use ozma_transport_web::{BrowserConnectOptions, BrowserSender, BrowserTransport};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::HtmlCanvasElement;
 
 use crate::audio::AudioPipeline;
+use crate::camera::CameraPipeline;
+use crate::capture::CaptureInfo;
 use crate::error;
 use crate::input;
+use crate::mic::MicPipeline;
 use crate::pin;
 use crate::stats::Stats;
 use crate::video::VideoPipeline;
 
-/// Bound on queued input while the media loop is between events.
-const MAX_QUEUED_INPUT: usize = 1024;
-
 /// Shared state the media loop and the JS facade both touch.
 struct Shared {
     stats: Rc<Stats>,
-    inputs: RefCell<VecDeque<InputEvent>>,
+    capture: Rc<CaptureInfo>,
+    sender: RefCell<Option<BrowserSender>>,
+    control_channel: Cell<Option<ChannelId>>,
     audio: RefCell<Option<AudioPipeline>>,
+    camera: RefCell<Option<CameraPipeline>>,
+    mic: RefCell<Option<MicPipeline>>,
     close_requested: Cell<bool>,
     closed: Cell<bool>,
     status: RefCell<String>,
@@ -87,21 +98,31 @@ impl Shared {
         self.notify("error", &message);
     }
 
-    fn enqueue(&self, event: InputEvent) -> Result<(), JsValue> {
+    fn sender_control(&self) -> Result<(BrowserSender, ChannelId), JsValue> {
         if self.closed.get() {
             return Err(error::client_error(
                 error::DISCONNECTED,
                 "The session is closed",
             ));
         }
-        let mut inputs = self.inputs.borrow_mut();
-        if inputs.len() >= MAX_QUEUED_INPUT {
-            // Never grow without bound if a page fires synthetic events in a
-            // tight loop. Keep the newest input, which is the useful one.
-            inputs.pop_front();
-        }
-        inputs.push_back(event);
-        Ok(())
+        let sender = self.sender.borrow().clone().ok_or_else(|| {
+            error::client_error(error::DISCONNECTED, "The session transport is not ready")
+        })?;
+        let control = self.control_channel.get().ok_or_else(|| {
+            error::client_error(error::DISCONNECTED, "The session has no control channel")
+        })?;
+        Ok((sender, control))
+    }
+
+    /// Serialize and send one control message immediately.
+    fn send_control(&self, message: ControlMessage) -> Result<(), JsValue> {
+        let (sender, control) = self.sender_control()?;
+        let bytes = encode_control(&message).map_err(|api| error::from_api_error(&api))?;
+        send_now(&sender, control, Bytes::from(bytes))
+    }
+
+    fn send_input(&self, event: InputEvent) -> Result<(), JsValue> {
+        self.send_control(ControlMessage::Input { event })
     }
 }
 
@@ -170,8 +191,12 @@ impl OzmaClient {
 
         let shared = Rc::new(Shared {
             stats: stats.clone(),
-            inputs: RefCell::new(VecDeque::new()),
+            capture: CaptureInfo::new(),
+            sender: RefCell::new(None),
+            control_channel: Cell::new(None),
             audio: RefCell::new(None),
+            camera: RefCell::new(None),
+            mic: RefCell::new(None),
             close_requested: Cell::new(false),
             closed: Cell::new(false),
             status: RefCell::new("connecting".to_string()),
@@ -211,6 +236,18 @@ impl OzmaClient {
             .await
             .map_err(|api| error::from_api_error(&api))?;
 
+        // Keep the send half outside the media loop. Everything below this
+        // point can enqueue input, capture control, and uplink media while the
+        // media loop is waiting for the next transport event.
+        let control = driver.channel_for(ChannelKind::Control).ok_or_else(|| {
+            error::client_error(
+                error::DISCONNECTED,
+                "The negotiated channel map has no control channel",
+            )
+        })?;
+        *shared.sender.borrow_mut() = Some(driver.transport().sender());
+        shared.control_channel.set(Some(control));
+
         shared.notify(
             "connected",
             driver
@@ -227,13 +264,13 @@ impl OzmaClient {
         Ok(client)
     }
 
-    /// Queue absolute pointer motion in canvas/display pixels.
+    /// Send absolute pointer motion in canvas/display pixels immediately.
     pub fn send_pointer(&self, x: i32, y: i32) -> Result<(), JsValue> {
-        self.shared.enqueue(input::pointer_absolute(x, y))
+        self.shared.send_input(input::pointer_absolute(x, y))
     }
 
-    /// Queue a mouse button transition. `button` is the DOM `MouseEvent.button`
-    /// index: 0 left, 1 middle, 2 right, 3 back, 4 forward.
+    /// Send a mouse button transition immediately. `button` is the DOM
+    /// `MouseEvent.button` index: 0 left, 1 middle, 2 right, 3 back, 4 forward.
     pub fn send_button(&self, button: u8, down: bool) -> Result<(), JsValue> {
         let event = input::button_event(button, down).ok_or_else(|| {
             error::client_error(
@@ -241,15 +278,15 @@ impl OzmaClient {
                 format!("Unknown pointer button index {button}"),
             )
         })?;
-        self.shared.enqueue(event)
+        self.shared.send_input(event)
     }
 
-    /// Queue wheel scrolling in protocol wheel units.
+    /// Send wheel scrolling in protocol wheel units immediately.
     pub fn send_wheel(&self, dx: i32, dy: i32) -> Result<(), JsValue> {
-        self.shared.enqueue(input::wheel_event(dx, dy))
+        self.shared.send_input(input::wheel_event(dx, dy))
     }
 
-    /// Queue a key transition.
+    /// Send a key transition immediately.
     ///
     /// `hid_usage` is a USB HID keyboard usage id (page 0x07), **not** a
     /// JavaScript `keyCode`. `modifiers` is the HID boot-keyboard modifier byte
@@ -263,30 +300,134 @@ impl OzmaClient {
             ));
         }
         self.shared
-            .enqueue(input::key_event(hid_usage, down, modifiers))
+            .send_input(input::key_event(hid_usage, down, modifiers))
     }
 
-    /// Queue `ReleaseAll`. Sent on focus loss and disconnect; idempotent.
+    /// Send `ReleaseAll`. Sent on focus loss and disconnect; idempotent.
     pub fn release_all(&self) -> Result<(), JsValue> {
-        self.shared.enqueue(InputEvent::ReleaseAll)
+        self.shared.send_input(InputEvent::ReleaseAll)
     }
 
-    /// Request a keyframe.
-    ///
-    /// The current protocol has no client-to-node keyframe request message, so
-    /// this reports `client.unsupported` instead of silently doing nothing.
+    /// Request a keyframe from the node's encoder.
     pub fn request_keyframe(&self) -> Result<(), JsValue> {
-        Err(error::client_error(
-            error::UNSUPPORTED,
-            "The protocol has no client keyframe-request message yet",
-        ))
+        self.shared.send_control(ControlMessage::KeyframeRequest {
+            track: None,
+        })
     }
 
-    /// Presentation counters.
+    /// Start browser camera and/or microphone uplink.
     ///
-    /// Returns `{videoFrames, videoDropped, videoErrors, audioFrames,
-    /// audioDropped, audioErrors, width, height, bytesIn}`.
+    /// This must be awaited from a user gesture: it calls `getUserMedia` and
+    /// resumes the microphone `AudioContext`. If one track fails the other is
+    /// still started; the returned error describes the failed track and the
+    /// node receives a `CaptureState` carrying the typed error.
+    pub async fn start_capture(&self, video: bool, audio: bool) -> Result<(), JsValue> {
+        let (sender, control) = self.shared.sender_control()?;
+        let capture = self.shared.capture.clone();
+        let stats = self.shared.stats.clone();
+        capture.clear_error();
+
+        send_control_async(
+            &sender,
+            control,
+            ControlMessage::CaptureStart { video, audio },
+        )
+        .await?;
+
+        let mut failure: Option<JsValue> = None;
+
+        if video {
+            let already = self.shared.camera.borrow().is_some();
+            if !already {
+                match CameraPipeline::start(sender.clone(), control, stats.clone(), capture.clone())
+                    .await
+                {
+                    Ok(camera) => {
+                        *self.shared.camera.borrow_mut() = Some(camera);
+                    }
+                    Err(value) => {
+                        failure = Some(value);
+                    }
+                }
+            }
+        }
+        if audio {
+            let already = self.shared.mic.borrow().is_some();
+            if !already {
+                match MicPipeline::start(sender.clone(), control, stats, capture.clone()).await {
+                    Ok(mic) => {
+                        *self.shared.mic.borrow_mut() = Some(mic);
+                    }
+                    Err(value) => {
+                        if failure.is_none() {
+                            failure = Some(value);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Report what is actually running, not what was requested.
+        capture.set_video(self.shared.camera.borrow().is_some());
+        capture.set_audio(self.shared.mic.borrow().is_some());
+        capture.send_state(&sender, control);
+
+        match failure {
+            Some(value) => {
+                self.shared.notify_error(value.clone());
+                Err(value)
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Stop camera and microphone uplink and report the stopped state.
+    pub fn stop_capture(&self) -> Result<(), JsValue> {
+        if self.shared.closed.get() {
+            return Ok(());
+        }
+        let (sender, control) = self.shared.sender_control()?;
+        let video = self.shared.camera.borrow_mut().take();
+        let video_running = video.is_some();
+        if let Some(camera) = video {
+            camera.close();
+        }
+        let audio = self.shared.mic.borrow_mut().take();
+        let audio_running = audio.is_some();
+        if let Some(mic) = audio {
+            mic.close();
+        }
+        self.shared.capture.set_video(false);
+        self.shared.capture.set_audio(false);
+
+        let message = ControlMessage::CaptureStop {
+            video: video_running,
+            audio: audio_running,
+        };
+        let bytes = encode_control(&message).map_err(|api| error::from_api_error(&api))?;
+        send_now(&sender, control, Bytes::from(bytes))?;
+        self.shared.capture.send_state(&sender, control);
+        Ok(())
+    }
+
+    /// The current capture state:
+    /// `{video, audio, videoCodec, width, height, error, errorCode}`.
+    pub fn capture_state(&self) -> JsValue {
+        self.shared.capture.to_js()
+    }
+
+    /// Presentation and capture counters.
+    ///
+    /// Returns a fresh object each call with the presentation counters
+    /// (`videoFrames`, `videoDropped`, `videoErrors`, `audioFrames`,
+    /// `audioDropped`, `audioErrors`, `width`, `height`, `bytesIn`), the uplink
+    /// counters (`cameraFrames`, `cameraBytes`, `cameraDropped`,
+    /// `cameraErrors`, `cameraWidth`, `cameraHeight`, `micPackets`, `micBytes`,
+    /// `micErrors`), `audioLevel` (playback RMS, 0..1), and `avDriftMs`.
     pub fn stats(&self) -> JsValue {
+        if let Some(audio) = self.shared.audio.borrow().as_ref() {
+            self.shared.stats.audio_level.set(audio.level());
+        }
         self.shared.stats.to_js()
     }
 
@@ -314,18 +455,47 @@ impl OzmaClient {
         Ok(())
     }
 
-    /// Ask the media loop to release input and close the transport.
+    /// Send `ReleaseAll`, send `Bye`, and close the transport.
     ///
-    /// The close is performed by the loop, which owns the driver. It happens
-    /// when the loop next observes an event or reaches the top of its wait, so
-    /// a session that is actively streaming closes immediately; a completely
-    /// idle transport is closed on the next event.
+    /// All three happen in one spawned task through the cloneable sender, so an
+    /// idle transport is closed immediately: `BrowserSender::close` enqueues a
+    /// `Closed` event that wakes the media loop's pending `recv`.
     pub fn close(&self) {
-        if self.shared.closed.get() {
+        if self.shared.closed.get() || self.shared.close_requested.replace(true) {
             return;
         }
-        self.shared.close_requested.set(true);
         self.shared.notify("closing", "release all and close");
+        let shared = self.shared.clone();
+        spawn_local(async move {
+            if let Some(camera) = shared.camera.borrow_mut().take() {
+                camera.close();
+            }
+            if let Some(mic) = shared.mic.borrow_mut().take() {
+                mic.close();
+            }
+            shared.capture.set_video(false);
+            shared.capture.set_audio(false);
+
+            let sender = shared.sender.borrow().clone();
+            let Some(sender) = sender else {
+                shared.closed.set(true);
+                shared.notify("closed", "no transport");
+                return;
+            };
+            if let Some(control) = shared.control_channel.get() {
+                if let Ok(bytes) = encode_control(&ControlMessage::Input {
+                    event: InputEvent::ReleaseAll,
+                }) {
+                    let _ = sender.send(control, Bytes::from(bytes)).await;
+                }
+                if let Ok(bytes) = encode_control(&ControlMessage::Bye {
+                    reason: EndReason::ClientDisconnected,
+                }) {
+                    let _ = sender.send(control, Bytes::from(bytes)).await;
+                }
+            }
+            sender.close(CloseReason::Normal);
+        });
     }
 }
 
@@ -364,6 +534,51 @@ fn max_payload(channels: &ChannelMap) -> usize {
         .max(1200)
 }
 
+/// Enqueue a payload on the transport synchronously when the adapter can
+/// complete immediately.
+///
+/// Reliable channels (all DOM input and capture control) encode into the shared
+/// `SendQueue` before the future's first `Poll::Ready`, so this preserves the
+/// order of DOM events without awaiting the stream flush. A future that really
+/// is pending (only possible on a datagram write) is handed to `spawn_local`
+/// rather than dropped.
+fn send_now(sender: &BrowserSender, channel: ChannelId, payload: Bytes) -> Result<(), JsValue> {
+    let sender = sender.clone();
+    let mut future = Box::pin(async move { sender.send(channel, payload).await });
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    match future.as_mut().poll(&mut context) {
+        Poll::Ready(Ok(())) => Ok(()),
+        Poll::Ready(Err(failure)) => Err(error::client_error(
+            error::TRANSPORT,
+            format!("The transport rejected a send: {failure}"),
+        )),
+        Poll::Pending => {
+            spawn_local(async move {
+                let _ = future.await;
+            });
+            Ok(())
+        }
+    }
+}
+
+async fn send_control_async(
+    sender: &BrowserSender,
+    control: ChannelId,
+    message: ControlMessage,
+) -> Result<(), JsValue> {
+    let bytes = encode_control(&message).map_err(|api| error::from_api_error(&api))?;
+    sender
+        .send(control, Bytes::from(bytes))
+        .await
+        .map_err(|failure| {
+            error::client_error(
+                error::TRANSPORT,
+                format!("The transport rejected a control message: {failure}"),
+            )
+        })
+}
+
 /// Own the driver and decoders for the lifetime of the connection.
 fn spawn_media_loop(
     driver: ClientDriver<BrowserTransport>,
@@ -375,26 +590,6 @@ fn spawn_media_loop(
         let mut video = video;
 
         loop {
-            if shared.close_requested.get() {
-                let _ = driver.close().await;
-                close_media(&video, &shared);
-                shared.closed.set(true);
-                shared.notify("closed", "client requested close");
-                return;
-            }
-
-            // Drain input before blocking on the transport. The queue is only
-            // filled by synchronous DOM handlers, so it is empty in the common
-            // case. Take one event at a time so the queue is not borrowed while
-            // the send future is pending.
-            loop {
-                let event = shared.inputs.borrow_mut().pop_front();
-                let Some(event) = event else { break };
-                if let Err(api) = driver.send_input(&event).await {
-                    shared.notify_error(error::from_api_error(&api));
-                }
-            }
-
             match driver.next().await {
                 ClientEvent::Media(packet) => {
                     shared.stats.add_bytes(packet.payload.len());
@@ -430,6 +625,13 @@ fn spawn_media_loop(
                     ControlMessage::Bye { reason } => {
                         shared.notify("bye", &format!("{reason:?}"));
                     }
+                    ControlMessage::KeyframeRequest { .. } => {
+                        // The node can ask the browser publisher for an IDR.
+                        if let Some(camera) = shared.camera.borrow().as_ref() {
+                            camera.request_keyframe();
+                        }
+                        shared.notify("keyframe_request", "forcing a camera keyframe");
+                    }
                     _ => {}
                 },
                 ClientEvent::Error(error) => {
@@ -450,10 +652,18 @@ fn warn(message: &str) {
     web_sys::console::warn_1(&JsValue::from_str(message));
 }
 
-/// Release decoder and audio-device resources when the loop ends.
+/// Release decoder, encoder, and audio-device resources when the session ends.
 fn close_media(video: &VideoPipeline, shared: &Shared) {
     video.close();
     if let Some(audio) = shared.audio.borrow_mut().take() {
         audio.close();
     }
+    if let Some(camera) = shared.camera.borrow_mut().take() {
+        camera.close();
+    }
+    if let Some(mic) = shared.mic.borrow_mut().take() {
+        mic.close();
+    }
+    shared.capture.set_video(false);
+    shared.capture.set_audio(false);
 }

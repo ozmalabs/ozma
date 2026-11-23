@@ -23,11 +23,20 @@ const connectButton = document.getElementById('connect');
 const disconnectButton = document.getElementById('disconnect');
 const statusLine = document.getElementById('status');
 const statsLine = document.getElementById('stats');
+const shareCamera = document.getElementById('share-camera');
+const shareMic = document.getElementById('share-mic');
+const startCaptureButton = document.getElementById('start-capture');
+const stopCaptureButton = document.getElementById('stop-capture');
+const previewToggle = document.getElementById('preview-camera');
+const previewVideo = document.getElementById('camera-preview');
+const captureStatusLine = document.getElementById('capture-status');
 
 let client = null;
 let statsTimer = null;
 let lastSample = null;
+let lastCaptureSample = null;
 let connecting = false;
+let capturing = false;
 
 const pressedKeys = new Set();
 const pressedButtons = new Set();
@@ -40,6 +49,14 @@ connectButton.addEventListener('click', () => {
   connect().catch((error) => setStatus(describeError(error), 'error'));
 });
 disconnectButton.addEventListener('click', () => disconnect('user requested'));
+startCaptureButton.addEventListener('click', () => {
+  startCapture().catch((error) => setCaptureStatus(describeError(error), 'error'));
+});
+stopCaptureButton.addEventListener('click', () => stopCapture());
+previewToggle.addEventListener('change', () => {
+  // The Rust camera pipeline owns the stream and keeps this element muted.
+  previewVideo.hidden = !previewToggle.checked;
+});
 
 canvas.addEventListener('pointerdown', async (event) => {
   if (!client) return;
@@ -198,12 +215,19 @@ async function connect() {
       }
     });
     client = connected;
+    // Exposed for the demo's browser verification scripts. Nothing in the page
+    // uses these globals.
+    globalThis.ozmaClient = connected;
+    globalThis.ozmaSession = { id, node };
     stage.classList.add('connected');
     connectButton.disabled = true;
     disconnectButton.disabled = false;
+    startCaptureButton.disabled = false;
+    stopCaptureButton.disabled = true;
     canvas.focus();
     setStatus(`connected (${transport.endpoint ?? 'offer endpoint'})`, 'good');
     lastSample = null;
+    lastCaptureSample = null;
     statsTimer = setInterval(renderStats, 500);
     renderStats();
   } catch (error) {
@@ -221,6 +245,67 @@ async function connect() {
     connecting = false;
     if (!client) connectButton.disabled = false;
   }
+}
+
+async function startCapture() {
+  if (!client || capturing) return;
+  const video = shareCamera.checked;
+  const audio = shareMic.checked;
+  if (!video && !audio) {
+    setCaptureStatus('select the camera, the microphone, or both', 'error');
+    return;
+  }
+  capturing = true;
+  startCaptureButton.disabled = true;
+  stopCaptureButton.disabled = false;
+  setCaptureStatus(
+    `requesting ${video ? 'camera' : ''}${video && audio ? ' + ' : ''}${audio ? 'microphone' : ''}…`,
+  );
+  lastCaptureSample = null;
+  try {
+    // This call must stay directly in the click handler's async chain: the
+    // browser requires the getUserMedia/AudioContext calls to be in a user
+    // gesture.
+    await client.start_capture(video, audio);
+    const state = client.capture_state();
+    const parts = [];
+    if (state.video) {
+      parts.push(`${state.videoCodec ?? 'h264'} ${state.width || '?'}×${state.height || '?'}`);
+    }
+    if (state.audio) parts.push('opus 48 kHz stereo');
+    setCaptureStatus(`capturing ${parts.join(' + ')}`, 'good');
+  } catch (error) {
+    const state = client?.capture_state?.();
+    const running = [];
+    if (state?.video) running.push('camera');
+    if (state?.audio) running.push('microphone');
+    setCaptureStatus(
+      `${describeError(error)}${running.length ? ` (still capturing ${running.join(' + ')})` : ''}`,
+      'error',
+    );
+  } finally {
+    capturing = false;
+    if (client) {
+      startCaptureButton.disabled = false;
+      stopCaptureButton.disabled = client.capture_state().video === false &&
+        client.capture_state().audio === false;
+    }
+    renderStats();
+  }
+}
+
+function stopCapture() {
+  if (!client) return;
+  try {
+    client.stop_capture();
+    setCaptureStatus('capture stopped');
+  } catch (error) {
+    setCaptureStatus(`stop: ${describeError(error)}`, 'error');
+  }
+  startCaptureButton.disabled = false;
+  stopCaptureButton.disabled = true;
+  lastCaptureSample = null;
+  renderStats();
 }
 
 function disconnect(reason) {
@@ -246,6 +331,15 @@ function teardown() {
   pendingPointer = null;
   pressedKeys.clear();
   pressedButtons.clear();
+  capturing = false;
+  lastCaptureSample = null;
+  startCaptureButton.disabled = true;
+  stopCaptureButton.disabled = true;
+  previewToggle.checked = false;
+  previewVideo.hidden = true;
+  setCaptureStatus('capture idle');
+  globalThis.ozmaClient = null;
+  globalThis.ozmaSession = null;
   stage.classList.remove('connected');
   disconnectButton.disabled = true;
   connectButton.disabled = false;
@@ -262,7 +356,8 @@ function sessionSpec() {
     tracks: [],
     audio: {
       enabled: true,
-      mic: false,
+      // The microphone uplink needs the Mic permission and the mic channel.
+      mic: true,
       format: { codec: 'opus', sample_rate: 48000, channels: 2, bitrate_kbps: 128 },
     },
     input: {
@@ -323,6 +418,7 @@ async function requestJson(url, options = {}) {
 function renderStats() {
   if (!client) return;
   const stats = client.stats();
+  const capture = client.capture_state();
   const now = performance.now();
   let fps = 0;
   if (lastSample) {
@@ -332,15 +428,38 @@ function renderStats() {
     }
   }
   lastSample = { at: now, frames: stats.videoFrames };
+  let captureFps = 0;
+  if (lastCaptureSample) {
+    const seconds = (now - lastCaptureSample.at) / 1000;
+    if (seconds > 0) {
+      captureFps = (stats.cameraFrames - lastCaptureSample.frames) / seconds;
+    }
+  }
+  lastCaptureSample = { at: now, frames: stats.cameraFrames };
   const size = stats.width && stats.height ? `${stats.width}×${stats.height}` : '—';
+  const cameraSize =
+    stats.cameraWidth && stats.cameraHeight
+      ? `${stats.cameraWidth}×${stats.cameraHeight}`
+      : '—';
+  const codec = capture.videoCodec ?? '—';
   statsLine.textContent =
     `status      ${client.status()}\n` +
     `video       ${stats.videoFrames} frames  ${fps.toFixed(1)} fps  ` +
     `${stats.videoDropped} dropped  ${stats.videoErrors} errors\n` +
     `audio       ${stats.audioFrames} buffers  ${stats.audioDropped} dropped  ` +
-    `${stats.audioErrors} errors\n` +
+    `${stats.audioErrors} errors  level ${stats.audioLevel.toFixed(3)}  ` +
+    `drift ${stats.avDriftMs.toFixed(1)} ms\n` +
     `canvas      ${size}\n` +
+    `camera      ${stats.cameraFrames} frames  ${captureFps.toFixed(1)} fps  ` +
+    `${formatBytes(stats.cameraBytes)}  ${stats.cameraDropped} dropped  ` +
+    `${stats.cameraErrors} errors  ${cameraSize}  ${codec}\n` +
+    `microphone  ${stats.micPackets} packets  ${formatBytes(stats.micBytes)}  ` +
+    `${stats.micErrors} errors\n` +
     `received    ${formatBytes(stats.bytesIn)}`;
+  if (capture.error) {
+    const code = capture.errorCode ? `[${capture.errorCode}] ` : '';
+    setCaptureStatus(`${code}${capture.error}`, 'error');
+  }
 }
 
 function send(action) {
@@ -419,4 +538,9 @@ function describeError(error) {
 function setStatus(message, kind = '') {
   statusLine.textContent = message;
   statusLine.className = kind;
+}
+
+function setCaptureStatus(message, kind = '') {
+  captureStatusLine.textContent = message;
+  captureStatusLine.className = kind;
 }

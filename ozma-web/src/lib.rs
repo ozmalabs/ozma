@@ -23,11 +23,17 @@ pub mod pin;
 #[cfg(target_arch = "wasm32")]
 mod audio;
 #[cfg(target_arch = "wasm32")]
+mod camera;
+#[cfg(target_arch = "wasm32")]
 mod canvas;
+#[cfg(target_arch = "wasm32")]
+mod capture;
 #[cfg(target_arch = "wasm32")]
 mod client;
 #[cfg(target_arch = "wasm32")]
 mod error;
+#[cfg(target_arch = "wasm32")]
+mod mic;
 #[cfg(target_arch = "wasm32")]
 mod stats;
 #[cfg(target_arch = "wasm32")]

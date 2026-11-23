@@ -86,6 +86,31 @@
     }
     #status.error { color: var(--bad); }
     #status.good { color: var(--good); }
+    #capture-controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .75rem;
+      align-items: center;
+      margin: .5rem 0 0;
+    }
+    #capture-controls input[type="checkbox"] { min-width: 0; }
+    #capture-status {
+      color: var(--muted);
+      min-height: 1.4em;
+      white-space: pre-wrap;
+    }
+    #capture-status.error { color: var(--bad); }
+    #capture-status.good { color: var(--good); }
+    #camera-preview {
+      display: block;
+      max-width: 280px;
+      max-height: 200px;
+      margin-top: .5rem;
+      border: 1px solid var(--line);
+      border-radius: .4rem;
+      background: #000;
+    }
+    #camera-preview[hidden] { display: none; }
     pre#stats {
       margin: .6rem 0 0;
       padding: .6rem .75rem;
@@ -114,6 +139,16 @@
       The first click is also the audio unlock gesture.
     </div>
   </div>
+
+  <div id="capture-controls">
+    <label><input type="checkbox" id="share-camera" checked> Share camera</label>
+    <label><input type="checkbox" id="share-mic" checked> Share microphone</label>
+    <button id="start-capture" disabled>Start capture</button>
+    <button id="stop-capture" disabled>Stop capture</button>
+    <label><input type="checkbox" id="preview-camera"> Preview camera</label>
+  </div>
+  <video id="camera-preview" muted playsinline hidden aria-label="Local camera preview"></video>
+  <p id="capture-status">capture idle</p>
 
   <p id="status">idle</p>
   <pre id="stats">stats appear after connect</pre>

@@ -16,9 +16,9 @@ use std::rc::Rc;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use web_sys::{
-    AudioBufferSourceNode, AudioContext, AudioContextState, AudioData, AudioDataCopyToOptions,
-    AudioDecoder, AudioDecoderConfig, AudioDecoderInit, AudioSampleFormat, EncodedAudioChunk,
-    EncodedAudioChunkInit, EncodedAudioChunkType,
+    AnalyserNode, AudioBufferSourceNode, AudioContext, AudioContextState, AudioData,
+    AudioDataCopyToOptions, AudioDecoder, AudioDecoderConfig, AudioDecoderInit, AudioSampleFormat,
+    EncodedAudioChunk, EncodedAudioChunkInit, EncodedAudioChunkType,
 };
 
 use crate::error;
@@ -38,6 +38,7 @@ const OPUS_PACKET_MICROS: f64 = 20_000.0;
 
 pub struct AudioPipeline {
     context: AudioContext,
+    analyser: AnalyserNode,
     decoder: AudioDecoder,
     config: AudioDecoderConfig,
     needs_configure: bool,
@@ -60,9 +61,24 @@ impl AudioPipeline {
         })?;
         let config = AudioDecoderConfig::new("opus", 2, 48_000);
 
+        // The analyser sits between the scheduled playback sources and the
+        // destination. It is only a measurement tap: it changes no samples and
+        // its output is the same audio the destination receives.
+        let analyser = context.create_analyser().map_err(|value| {
+            error::from_js(value, error::UNSUPPORTED, "creating the audio analyser")
+        })?;
+        analyser.set_fft_size(1024);
+        analyser.set_smoothing_time_constant(0.0);
+        analyser
+            .connect_with_audio_node(&context.destination())
+            .map_err(|value| {
+                error::from_js(value, error::UNSUPPORTED, "connecting the audio analyser")
+            })?;
+
         let playback = Rc::new(Playback {
             context: context.clone(),
             stats: stats.clone(),
+            analyser: analyser.clone(),
             next_start: Cell::new(0.0),
         });
 
@@ -92,6 +108,7 @@ impl AudioPipeline {
 
         Ok(Self {
             context,
+            analyser,
             decoder,
             config,
             needs_configure: false,
@@ -101,6 +118,21 @@ impl AudioPipeline {
             _output: output,
             _error: on_error,
         })
+    }
+
+    /// Current playback RMS in the range 0..1.
+    ///
+    /// The analyser is after the scheduled decoded buffers, so this reports the
+    /// node's audio as it is being played, not microphone input. A suspended or
+    /// silent context reads as 0.
+    pub fn level(&self) -> f64 {
+        let mut samples = [0.0f32; 1024];
+        self.analyser.get_float_time_domain_data(&mut samples);
+        let sum: f64 = samples
+            .iter()
+            .map(|sample| f64::from(*sample) * f64::from(*sample))
+            .sum();
+        (sum / samples.len() as f64).sqrt().clamp(0.0, 1.0)
     }
 
     /// Resume a suspended audio context. Browsers require a user gesture, so
@@ -178,6 +210,7 @@ impl AudioPipeline {
 struct Playback {
     context: AudioContext,
     stats: Rc<Stats>,
+    analyser: AnalyserNode,
     next_start: Cell<f64>,
 }
 
@@ -281,7 +314,7 @@ impl Playback {
     ) -> Result<(), wasm_bindgen::JsValue> {
         source.set_buffer(Some(buffer));
         source
-            .connect_with_audio_node(&self.context.destination())
+            .connect_with_audio_node(&self.analyser)
             .map_err(|value| {
                 error::from_js(value, error::UNSUPPORTED, "connecting the audio source")
             })?;
@@ -289,11 +322,26 @@ impl Playback {
         source.start_with_when(start).map_err(|value| {
             error::from_js(value, error::UNSUPPORTED, "scheduling an audio buffer")
         })?;
-        self.next_start
-            .set(start + frames as f64 / sample_rate as f64);
+        let end = start + f64::from(frames) / f64::from(sample_rate);
+        self.next_start.set(end);
+        // Report the scheduled playout end on the same `performance.now()`
+        // clock the canvas uses. This is an observation, not a lip-sync
+        // guarantee.
+        let wall_now = performance_seconds();
+        if wall_now > 0.0 {
+            self.stats.audio_clock.set(wall_now + (end - now));
+        }
         self.stats
             .audio_frames
             .set(self.stats.audio_frames.get() + 1);
         Ok(())
     }
+}
+
+/// `performance.now()` in seconds, or 0 when no window is available.
+pub(crate) fn performance_seconds() -> f64 {
+    web_sys::window()
+        .and_then(|window| window.performance())
+        .map(|performance| performance.now() / 1000.0)
+        .unwrap_or(0.0)
 }

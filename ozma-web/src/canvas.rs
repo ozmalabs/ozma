@@ -79,6 +79,10 @@ impl CanvasSurface {
             target_height,
         );
         frame.close();
+        let presented = crate::audio::performance_seconds();
+        if presented > 0.0 {
+            self.stats.video_presented.set(presented);
+        }
         self.stats
             .video_frames
             .set(self.stats.video_frames.get() + 1);
