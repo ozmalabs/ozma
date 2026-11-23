@@ -15,10 +15,12 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use async_trait::async_trait;
+use ozma_encode::{H264SoftwareEncoder, SelectedEncoder};
 use ozma_media::{
-    CaptureSource, FakeCapture, FakeEncoder, Frame, FrameFormat, MediaError, Pipeline,
-    PipelineConfig, RunningPipeline,
+    CaptureSource, Codec, FakeCapture, FakeEncoder, Frame, FrameFormat, MediaError, MediaFormat,
+    Pipeline, PipelineConfig, RunningPipeline,
 };
+use ozma_protocol::scene::{DisplayCapabilities, DisplayProfile};
 use ozma_protocol::{
     ClientId, ControlMessage, DisplayId, InputEvent, Permission, SessionEvent, SessionId,
 };
@@ -31,6 +33,7 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
+use crate::audio_runtime::AudioRuntime;
 use crate::backend::SessionBackend;
 
 /// A bound QUIC listener plus the certificate information clients need.
@@ -120,7 +123,7 @@ pub async fn run(runtime: QuicRuntime, backend: Arc<SessionBackend>) -> Result<(
 }
 
 async fn handle_connection(mut transport: QuicTransport, backend: Arc<SessionBackend>) -> Result<()> {
-    let (hello_session_id, hello_token) = timeout(Duration::from_secs(10), read_hello(&mut transport))
+    let (hello_session_id, hello_token, display) = timeout(Duration::from_secs(10), read_hello(&mut transport))
         .await
         .context("timed out waiting for session Hello")??;
 
@@ -184,7 +187,15 @@ async fn handle_connection(mut transport: QuicTransport, backend: Arc<SessionBac
         .manager()
         .get(&session_id)
         .unwrap_or_else(|_| session.clone());
-    send_control(&transport, &ControlMessage::HelloAck { session: session.clone() }).await?;
+    let selected_display = display.as_ref().map(|caps| caps.select(ChannelId::VIDEO.raw()));
+    send_control(
+        &transport,
+        &ControlMessage::HelloAck {
+            session: session.clone(),
+            display: selected_display.clone(),
+        },
+    )
+    .await?;
 
     let mut pipeline = match start_media(&backend, &session).await {
         Ok(pipeline) => pipeline,
@@ -195,6 +206,12 @@ async fn handle_connection(mut transport: QuicTransport, backend: Arc<SessionBac
         }
     };
 
+    let mut audio = if session.spec.audio.enabled {
+        Some(AudioRuntime::start())
+    } else {
+        None
+    };
+
     let mut events = backend.manager().subscribe();
     let result = session_loop(
         &mut transport,
@@ -202,10 +219,15 @@ async fn handle_connection(mut transport: QuicTransport, backend: Arc<SessionBac
         &session_id,
         &client_id,
         &mut pipeline,
+        &mut audio,
         &mut events,
+        matches!(selected_display, Some(DisplayProfile::Scene { .. })).then_some(&session),
     )
     .await;
 
+    if let Some(mut audio) = audio {
+        audio.stop();
+    }
     pipeline.cancel();
     let _ = pipeline.wait().await;
     let _ = backend.manager().on_client_disconnect(&session_id, &client_id);
@@ -239,7 +261,17 @@ async fn start_media(
         }
     };
     let input = source.format();
-    let encoder = FakeEncoder::h264(input, 2_000);
+    let request = MediaFormat::new(Codec::H264, input.width.max(2), input.height.max(2), 30, 2_000);
+    let encoder = match H264SoftwareEncoder::new(input, request) {
+        Ok(encoder) => {
+            tracing::info!(input = %input, "Using software H.264 encoder");
+            SelectedEncoder::Software(encoder.with_keyframe_interval(60))
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "Software H.264 encoder unavailable; using fake encoder");
+            SelectedEncoder::Fake(FakeEncoder::h264(input, 2_000))
+        }
+    };
     Pipeline::start(source, encoder, PipelineConfig::default()).map_err(Into::into)
 }
 
@@ -287,13 +319,60 @@ impl CaptureSource for SessionSource {
     }
 }
 
+/// QUIC datagrams are MTU-bound, so a video access unit is split into
+/// fragments with the protocol's reassembly header.
+const VIDEO_FRAGMENT_PAYLOAD: usize = 1_100;
+
+async fn send_video_frame(
+    transport: &QuicTransport,
+    frame: &ozma_media::EncodedFrame,
+) -> Result<(), ozma_protocol::ApiError> {
+    use ozma_protocol::media::VideoFragmentHeader;
+    let data = frame.data();
+    let count = data.len().div_ceil(VIDEO_FRAGMENT_PAYLOAD).max(1) as u16;
+    for (index, chunk) in data.chunks(VIDEO_FRAGMENT_PAYLOAD).enumerate() {
+        let header = VideoFragmentHeader::new(
+            frame.is_keyframe(),
+            0,
+            frame.sequence(),
+            index as u16,
+            count,
+        );
+        transport
+            .send(ChannelId::VIDEO, Bytes::from(header.encode_into(chunk)))
+            .await?;
+    }
+    Ok(())
+}
+
+async fn send_initial_scene(
+    transport: &QuicTransport,
+    backend: &SessionBackend,
+    session: &ozma_protocol::Session,
+) -> Result<(), ozma_protocol::ApiError> {
+    for update in backend.scene_updates(session) {
+        if let Some(resource) = update.resource {
+            timeout(Duration::from_secs(2), transport.send_resource(Bytes::from(resource)))
+                .await
+                .map_err(|_| ozma_protocol::ApiError::new(
+                    ozma_protocol::codes::TRANSPORT_UNAVAILABLE,
+                    "Scene resource upload timed out",
+                ))??;
+        }
+        send_control(transport, &ControlMessage::SceneCommit { commit: update.commit }).await?;
+    }
+    Ok(())
+}
+
 async fn session_loop(
     transport: &mut QuicTransport,
     backend: &Arc<SessionBackend>,
     session_id: &SessionId,
     client_id: &ClientId,
     pipeline: &mut RunningPipeline,
+    audio: &mut Option<AudioRuntime>,
     events: &mut broadcast::Receiver<SessionEvent>,
+    mut scene_session: Option<&ozma_protocol::Session>,
 ) -> Result<()> {
     loop {
         tokio::select! {
@@ -317,12 +396,30 @@ async fn session_loop(
             frame = pipeline.recv() => {
                 match frame {
                     Some(frame) => {
-                        if let Err(error) = transport.send(ChannelId::VIDEO, frame.into_data()).await {
+                        if let Err(error) = send_video_frame(transport, &frame).await {
                             debug!(error = %error, "sending video frame failed");
                             break;
                         }
+                        if let Some(session) = scene_session.take() {
+                            if let Err(error) = send_initial_scene(transport, backend, session).await {
+                                debug!(error = %error, "initial scene update incomplete");
+                            }
+                        }
                     }
                     None => break,
+                }
+            }
+            audio_packet = async {
+                match audio.as_mut() {
+                    Some(runtime) => runtime.recv().await,
+                    None => std::future::pending::<Option<ozma_audio::EncodedAudio>>().await,
+                }
+            } => {
+                if let Some(packet) = audio_packet {
+                    if let Err(error) = transport.send(ChannelId::AUDIO, Bytes::from(packet.data)).await {
+                        debug!(error = %error, "sending audio packet failed");
+                        break;
+                    }
                 }
             }
             event = events.recv() => {
@@ -372,7 +469,9 @@ async fn handle_control(
             let _ = backend.manager().stop(session_id, reason);
             let _ = backend.input_sink().release_all();
         }
-        ControlMessage::Hello { .. } | ControlMessage::HelloAck { .. } => {}
+        ControlMessage::Hello { .. }
+        | ControlMessage::HelloAck { .. }
+        | ControlMessage::SceneCommit { .. } => {}
         ControlMessage::Pong { .. } => {}
         ControlMessage::Event { .. } => {}
         ControlMessage::Error { .. } => {}
@@ -382,7 +481,7 @@ async fn handle_control(
 
 async fn read_hello(
     transport: &mut QuicTransport,
-) -> Result<(SessionId, String), ozma_protocol::ApiError> {
+) -> Result<(SessionId, String, Option<DisplayCapabilities>), ozma_protocol::ApiError> {
     loop {
         match transport.recv().await {
             TransportEvent::Payload { channel, payload } if channel == ChannelId::CONTROL => {
@@ -393,7 +492,9 @@ async fn read_hello(
                     )
                 })?;
                 match message {
-                    ControlMessage::Hello { session_id, token } => return Ok((session_id, token)),
+                    ControlMessage::Hello { session_id, token, display } => {
+                        return Ok((session_id, token, display));
+                    }
                     _ => {
                         return Err(ozma_protocol::ApiError::new(
                             ozma_protocol::error::codes::UNAUTHORIZED,

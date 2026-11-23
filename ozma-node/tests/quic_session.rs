@@ -15,7 +15,7 @@ use ozma_auth::{ConsentPolicy, MachineClass};
 use ozma_node::backend::SessionBackend;
 use ozma_node::transport::QuicRuntime;
 use ozma_protocol::{
-    ClientId, ControlMessage, InputEvent, KeyModifiers, NodeCapabilities, Permission,
+    AudioSpec, ClientId, ControlMessage, InputEvent, KeyModifiers, NodeCapabilities, Permission,
     PermissionSet, PointerButton, PointerMode, SessionEvent, SessionSpec, TrackId, TrackKind,
     TrackSpec,
 };
@@ -141,20 +141,53 @@ async fn connect(
     (client, session, offer)
 }
 
+struct TestSceneProducer;
+
+impl ozma_node::backend::SceneProducer for TestSceneProducer {
+    fn updates(&self, _: &ozma_protocol::Session) -> Vec<ozma_node::backend::SceneUpdate> {
+        use ozma_node::backend::SceneUpdate;
+        use ozma_protocol::scene::{ImagePlacement, ImageResource, SceneCommit};
+
+        let placement = |revision, y| SceneCommit {
+            revision,
+            images: vec![ImagePlacement {
+                node_id: 1, resource_id: 7, x: 20, y, width: 320, height: 180,
+            }],
+        };
+        vec![
+            SceneUpdate {
+                resource: Some(ImageResource { id: 7, png: b"\x89PNG\r\n\x1a\nfixture" }.encode()),
+                commit: placement(1, 40),
+            },
+            SceneUpdate { resource: None, commit: placement(2, 10) },
+        ]
+    }
+}
+
 #[tokio::test]
 async fn native_quic_session_authenticates_and_streams_video() {
-    let backend = backend();
+    let backend = Arc::new(SessionBackend::new(
+        NodeCapabilities::fake("quic-test"),
+        ConsentPolicy::for_machine(MachineClass::Server),
+    ).with_scene_producer(Arc::new(TestSceneProducer)));
     let permissions = PermissionSet::from_iter([
         Permission::View,
         Permission::Control,
         Permission::Audio,
     ]);
     let mut events = backend.manager().subscribe();
-    let (mut client, session, offer) = connect(&backend, permissions, session_spec(true)).await;
+    let mut spec = session_spec(true);
+    spec.audio = AudioSpec {
+        enabled: true,
+        mic: false,
+        format: ozma_protocol::AudioFormat::opus(),
+    };
+    let (mut client, session, offer) = connect(&backend, permissions, spec).await;
 
     let hello = ControlMessage::Hello {
         session_id: session.id.clone(),
         token: offer.token.clone(),
+        display: Some(ozma_protocol::scene::DisplayCapabilities { scene_versions: vec![1] }),
     };
     client
         .send(
@@ -166,14 +199,34 @@ async fn native_quic_session_authenticates_and_streams_video() {
 
     let ack = next_control(&mut client).await;
     match ack {
-        ControlMessage::HelloAck { session: acknowledged } => {
+        ControlMessage::HelloAck { session: acknowledged, display } => {
+            let Some(ozma_protocol::scene::DisplayProfile::Scene { version, initial_scene }) = display
+            else {
+                panic!("expected a scene profile");
+            };
+            assert_eq!(version, 1);
+            assert_eq!(initial_scene.revision, 0);
+            assert_eq!(initial_scene.full_display.channel, ChannelId::VIDEO.raw());
             assert_eq!(acknowledged.id, session.id);
         }
         other => panic!("expected HelloAck, got {other:?}"),
     }
 
+    for expected in [1, 2] {
+        let ControlMessage::SceneCommit { commit } = next_control(&mut client).await else {
+            panic!("expected a scene commit");
+        };
+        assert_eq!(commit.revision, expected);
+        assert_eq!(commit.images[0].resource_id, 7);
+    }
+    let resource = timeout(STEP_TIMEOUT, client.recv_resource()).await.unwrap().unwrap();
+    assert_eq!(ozma_protocol::scene::ImageResource::decode(&resource).unwrap().id, 7);
+
     let video = wait_for_payload(&mut client, ChannelId::VIDEO, false).await;
     assert!(!video.is_empty(), "fake video datagram must not be empty");
+
+    let audio = wait_for_payload(&mut client, ChannelId::AUDIO, false).await;
+    assert!(!audio.is_empty(), "Opus audio datagram must not be empty");
 
     let input = ControlMessage::Input {
         event: InputEvent::Key {
@@ -236,6 +289,7 @@ async fn view_only_session_rejects_input() {
     let hello = ControlMessage::Hello {
         session_id: session.id.clone(),
         token: offer.token,
+        display: None,
     };
     client
         .send(
@@ -245,7 +299,7 @@ async fn view_only_session_rejects_input() {
         .await
         .unwrap();
     let ack = next_control(&mut client).await;
-    assert!(matches!(ack, ControlMessage::HelloAck { .. }));
+    assert!(matches!(ack, ControlMessage::HelloAck { display: None, .. }));
 
     let input = ControlMessage::Input {
         event: InputEvent::Button {
@@ -270,4 +324,92 @@ async fn view_only_session_rejects_input() {
     }
 
     client.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn scene_resources_and_placement_commits_travel_independently() {
+    use ozma_protocol::scene::{
+        CommitStatus, ImagePlacement, ImageResource, SceneCommit, SceneReceiver, SceneSnapshot,
+        VideoSurface,
+    };
+    use ozma_transport::QuicServer;
+
+    let server = QuicServer::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+    let addr = server.local_addr().unwrap();
+    let certificate = server.certificate_der().to_vec();
+    // A signature-bearing fixture. The wire test does not decode pixels.
+    let png = b"\x89PNG\r\n\x1a\nfixture payload";
+    let revision = |revision, y| SceneCommit {
+        revision,
+        images: vec![ImagePlacement {
+            node_id: 1,
+            resource_id: 42,
+            x: 20,
+            y,
+            width: 320,
+            height: 180,
+        }],
+    };
+
+    timeout(STEP_TIMEOUT, async {
+        let producer = tokio::spawn(async move {
+            let server = server.accept().await.unwrap();
+            let mut server = server;
+            let _ = server.recv().await;
+            for (number, y) in [(1, 40), (2, 10)] {
+                let message = ControlMessage::SceneCommit { commit: revision(number, y) };
+                let payload = Bytes::from(serde_json::to_vec(&message).unwrap());
+                server.send(ChannelId::CONTROL, payload).await.unwrap();
+            }
+            server
+                .send_resource(Bytes::from(ImageResource { id: 42, png }.encode()))
+                .await
+                .unwrap();
+            let _ = server.recv().await;
+            server.send(ChannelId::VIDEO, Bytes::from_static(b"video")).await.unwrap();
+            server
+        });
+
+        let mut client = QuicClient::connect(
+            addr,
+            "localhost",
+            certificate,
+            ChannelMap::default_session(),
+        )
+        .await
+        .unwrap();
+        // Opening the control stream requires a first write before the server
+        // can accept the connection. Resource streams are independent of it.
+        client.send(ChannelId::CONTROL, Bytes::from_static(b"ready")).await.unwrap();
+
+        let ControlMessage::SceneCommit { commit: first } = next_control(&mut client).await else {
+            panic!("expected the initial placement");
+        };
+        let mut receiver = SceneReceiver::new(
+            SceneSnapshot {
+                revision: 0,
+                full_display: VideoSurface { id: 1, channel: ChannelId::VIDEO.raw() },
+            },
+            png.len(),
+        );
+        assert_eq!(receiver.receive_commit(first), CommitStatus::WaitingForResources);
+        assert_eq!(receiver.presented().revision, 0);
+
+        let payload = client.recv_resource().await.unwrap();
+        assert!(receiver.receive_resource(&payload).unwrap());
+        assert_eq!(receiver.image(42), Some(png.as_slice()));
+        assert_eq!(receiver.presented(), &revision(1, 40));
+
+        let ControlMessage::SceneCommit { commit: scrolled } = next_control(&mut client).await else {
+            panic!("expected the scrolled placement");
+        };
+        assert_eq!(receiver.receive_commit(scrolled), CommitStatus::Presented);
+        assert_eq!(receiver.presented(), &revision(2, 10));
+
+        client.send(ChannelId::CONTROL, Bytes::from_static(b"presented")).await.unwrap();
+        assert_eq!(wait_for_payload(&mut client, ChannelId::VIDEO, false).await, b"video"[..]);
+        let _server = producer.await.unwrap();
+    })
+    .await
+    .expect("scene transport timed out");
 }

@@ -155,3 +155,116 @@ mod tests {
         assert_eq!(back, format);
     }
 }
+
+/// Version of the video fragmentation header used on unreliable datagram
+/// channels. A video access unit may exceed one QUIC datagram or UDP packet,
+/// so it is split into fragments and reassembled by the client.
+pub const VIDEO_FRAGMENT_VERSION: u8 = 1;
+
+/// Header length for a video fragment:
+/// `[version u8][flags u8][track u8][frame_sequence u64 LE][index u16 LE][count u16 LE]`.
+pub const VIDEO_FRAGMENT_HEADER_LEN: usize = 15;
+
+/// One fragment of an encoded video access unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoFragmentHeader {
+    pub version: u8,
+    pub keyframe: bool,
+    /// Logical track index (0 for a single-track session).
+    pub track_id: u8,
+    /// Sequence number of the complete access unit.
+    pub frame_sequence: u64,
+    /// Zero-based fragment index.
+    pub index: u16,
+    /// Total fragments in this access unit.
+    pub count: u16,
+}
+
+impl VideoFragmentHeader {
+    /// Build the header for `frame_sequence` fragment `index` of `count`.
+    pub fn new(
+        keyframe: bool,
+        track_id: u8,
+        frame_sequence: u64,
+        index: u16,
+        count: u16,
+    ) -> Self {
+        Self {
+            version: VIDEO_FRAGMENT_VERSION,
+            keyframe,
+            track_id,
+            frame_sequence,
+            index,
+            count,
+        }
+    }
+
+    /// Append this header and `payload` to a datagram.
+    pub fn encode_into(self, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(VIDEO_FRAGMENT_HEADER_LEN + payload.len());
+        bytes.push(self.version);
+        bytes.push(u8::from(self.keyframe));
+        bytes.push(self.track_id);
+        bytes.extend_from_slice(&self.frame_sequence.to_le_bytes());
+        bytes.extend_from_slice(&self.index.to_le_bytes());
+        bytes.extend_from_slice(&self.count.to_le_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    /// Parse a datagram, returning the header and the fragment payload.
+    pub fn parse(bytes: &[u8]) -> Option<(Self, &[u8])> {
+        if bytes.len() < VIDEO_FRAGMENT_HEADER_LEN {
+            return None;
+        }
+        let version = bytes[0];
+        if version != VIDEO_FRAGMENT_VERSION {
+            return None;
+        }
+        let keyframe = bytes[1] & 1 != 0;
+        let track_id = bytes[2];
+        let frame_sequence = u64::from_le_bytes(bytes[3..11].try_into().ok()?);
+        let index = u16::from_le_bytes(bytes[11..13].try_into().ok()?);
+        let count = u16::from_le_bytes(bytes[13..15].try_into().ok()?);
+        if count == 0 || index >= count {
+            return None;
+        }
+        Some((
+            Self {
+                version,
+                keyframe,
+                track_id,
+                frame_sequence,
+                index,
+                count,
+            },
+            &bytes[VIDEO_FRAGMENT_HEADER_LEN..],
+        ))
+    }
+}
+
+
+#[cfg(test)]
+mod fragment_tests {
+    use super::*;
+
+    #[test]
+    fn fragment_header_roundtrips() {
+        let header = VideoFragmentHeader::new(true, 2, 42, 1, 3);
+        let bytes = header.encode_into(b"payload");
+        let (parsed, payload) = VideoFragmentHeader::parse(&bytes).unwrap();
+        assert_eq!(parsed, header);
+        assert_eq!(payload, b"payload");
+    }
+
+    #[test]
+    fn malformed_fragments_are_rejected() {
+        assert!(VideoFragmentHeader::parse(&[]).is_none());
+        let mut bytes = VideoFragmentHeader::new(false, 0, 1, 0, 2).encode_into(b"x");
+        bytes[0] = 99;
+        assert!(VideoFragmentHeader::parse(&bytes).is_none());
+        let mut bytes = VideoFragmentHeader::new(false, 0, 1, 2, 2).encode_into(b"x");
+        bytes[13..15].copy_from_slice(&2u16.to_le_bytes());
+        assert!(VideoFragmentHeader::parse(&bytes).is_none());
+    }
+}

@@ -108,6 +108,7 @@ async fn probe_cli_connects_receives_video_and_exits_cleanly() {
             &transport,
             &ControlMessage::HelloAck {
                 session: session_with(control_permissions()),
+                display: None,
             },
         )
         .await;

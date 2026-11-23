@@ -22,14 +22,16 @@ This file records what is actually merged and tested, not what is planned.
 | V4L2 discovery | Done | `/dev` + sysfs; no C deps for discovery |
 | V4L2 MMAP capture | Done | real single-plane MMAP worker; tested against a real MJPEG camera (1920x1080) |
 | Encoder selection/probe | Done | hardware preference, software fallback, probe records |
-| Real H.264 encode | Not started | QUIC currently feeds real V4L2 frames through the fake encoder; real FFmpeg/VAAPI backend is next |
+| Real H.264 encode | Done | `ozma-encode` OpenH264 software backend: MJPEG/NV12/YUYV/RGB/BGRA → I420 → Annex-B, real probe, keyframes |
 | Native QUIC session | Done | real QUIC + rustls, ALPN `ozma/1`, control stream + datagrams |
 | Scoped view/control grants | Done | HMAC session tokens, permission sets, view-only input rejection |
 | Workstation consent | Done | consent policy + session state machine; denied consent blocks start |
 | HID input sink | Done | gadget writes, 6-key limit, absolute/relative reports, release-all, fake/recording sinks |
+| Audio path | Done | `ozma-audio`: ALSA capture, Opus 48k stereo, fake source, decode roundtrip |
+| Video fragmentation/reassembly | Done | protocol fragment header, node splitter, client `VideoAssembler` |
 | Input release on disconnect/control loss | Done | `InputReleased` + `ReleaseAll`; QUIC test checks the sink is cleared |
 | Session offer with token | Done | `POST /api/v1/sessions` returns a QUIC offer when configured |
-| Native desktop client end-to-end | Not started | server-side QUIC contract is tested with a Rust client |
+| Native client | Done | `ozma-client` controller/node clients, certificate fetch, QUIC session, headless `probe` CLI; desktop rendering is external |
 | Input latency measurement (<30 ms) | Not started | — |
 
 ## M2 — Remote monitor spike
@@ -57,15 +59,19 @@ OZMA_CAPTURE_TEST_DEVICE=/dev/video2 \
 
 ## Deliberate limitations
 
-- The QUIC media path can use a real V4L2 source, but the encoder is still the
-  deterministic fake H.264 encoder. A real FFmpeg/VAAPI/software encoder is the
-  next M1 item.
-- QUIC carries control/input/video over a real connection, but there is no
-  browser WebTransport gateway yet.
+- Video uses the OpenH264 software encoder. VAAPI/NVENC/QSV/V4L2M2M hardware
+  adapters are not implemented yet; the selection policy refuses to pretend a
+  software result is hardware.
+- QUIC carries control/input/video/audio over a real connection, but there is
+  no browser WebTransport gateway yet.
 - The virtual-display API is exercised through the fake provider. The EVDI
   provider has not been validated on a real Xorg/modesetting session.
 - The HTTP API is a local/trusted surface; the QUIC session path is the first
   one to enforce controller-issued tokens and consent. HTTP bearer auth is next.
+- The native client library and headless probe are done; the full desktop
+  renderer/decoder is still an external client concern.
+- Video fragments are reassembled by `ozma_client::VideoAssembler`; the CLI
+  probe still reports the first datagram rather than decoding a frame.
 - `ozma-node` still carries unreferenced legacy capture/HLS/task modules from
   the earlier sketch; they are not part of the build.
 - `v4l` pulls `v4l2-sys-mit`, which needs libclang at build time.

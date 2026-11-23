@@ -227,6 +227,7 @@ async fn view_only_session_rejects_input_locally() {
             &transport,
             &ControlMessage::HelloAck {
                 session: session_with(view_only_permissions()),
+                display: None,
             },
         )
         .await;
@@ -277,6 +278,7 @@ async fn a_server_input_error_is_relayed_and_blocks_later_input() {
             &transport,
             &ControlMessage::HelloAck {
                 session: session_with(control_permissions()),
+                display: None,
             },
         )
         .await;
@@ -422,6 +424,7 @@ async fn connect_with_node_api_fetches_the_der_certificate() {
             &transport,
             &ControlMessage::HelloAck {
                 session: session_with(control_permissions()),
+                display: None,
             },
         )
         .await;

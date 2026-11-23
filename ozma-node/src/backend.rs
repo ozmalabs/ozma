@@ -15,6 +15,7 @@ use ozma_protocol::{
     RuntimeMetrics, Session, SessionEvent, SessionId, SessionOffer, SessionSpec, SessionState,
     TransportMode, VirtualDisplaySpec,
 };
+use ozma_protocol::scene::SceneCommit;
 use ozma_session::SessionManager;
 use ozma_transport::offer::{SessionOfferBuilder, TransportDescriptorBuilder};
 use rand::RngCore;
@@ -34,6 +35,18 @@ struct TransportOffer {
     certificate_der_base64: String,
 }
 
+/// An optional new resource and the placement commit that references it. Producers
+/// are intentionally synchronous at this boundary. Browser and compositor
+/// integrations can prepare updates off-thread and expose a snapshot here.
+pub struct SceneUpdate {
+    pub resource: Option<Vec<u8>>,
+    pub commit: SceneCommit,
+}
+
+pub trait SceneProducer: Send + Sync {
+    fn updates(&self, session: &Session) -> Vec<SceneUpdate>;
+}
+
 /// The node's production backend: the session manager plus display state and
 /// capability/diagnostic reporting.
 pub struct SessionBackend {
@@ -45,6 +58,7 @@ pub struct SessionBackend {
     token_verifier: TokenVerifier,
     transport: Mutex<Option<TransportOffer>>,
     input: SharedSink,
+    scene_producer: Option<Arc<dyn SceneProducer>>,
 }
 
 impl SessionBackend {
@@ -61,6 +75,7 @@ impl SessionBackend {
             token_verifier: TokenVerifier::new(secret),
             transport: Mutex::new(None),
             input: Arc::new(FakeInputSink::default()),
+            scene_producer: None,
         }
     }
 
@@ -69,6 +84,20 @@ impl SessionBackend {
     pub fn with_input_sink(mut self, sink: SharedSink) -> Self {
         self.input = sink;
         self
+    }
+
+    /// Install an optional scene producer. The default node remains video-only
+    /// until a browser or compositor integration supplies one.
+    pub fn with_scene_producer(mut self, producer: Arc<dyn SceneProducer>) -> Self {
+        self.scene_producer = Some(producer);
+        self
+    }
+
+    pub fn scene_updates(&self, session: &Session) -> Vec<SceneUpdate> {
+        self.scene_producer
+            .as_ref()
+            .map(|producer| producer.updates(session))
+            .unwrap_or_default()
     }
 
     pub fn input_sink(&self) -> &dyn InputSink {

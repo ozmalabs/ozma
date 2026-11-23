@@ -26,6 +26,7 @@ pub mod error;
 mod http;
 mod node_api;
 mod session;
+pub mod video;
 
 pub use cert::{
     certificate_der_from_base64, certificate_fingerprint, load_certificate, normalize_fingerprint,
@@ -39,3 +40,5 @@ pub use node_api::{
     fetch_transport_info, FetchedTransportInfo, NodeApiClient, NodeApiClientBuilder,
 };
 pub use session::{ClientEvent, MediaPacket, NativeClientConfig, NativeSessionClient};
+
+pub use video::{VideoAssembler, VideoAssemblyError, VideoFrame};
