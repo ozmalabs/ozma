@@ -1,0 +1,132 @@
+{
+  "_baseline": "Current Python baseline, not a generated snapshot. Packet layout and event ordering mirror softnode/evdev_input.py EvdevHIDTranslator.handle_keyboard / handle_mouse / handle_mouse_relative (lines 412-502) and the controller's UDP HID v1 framing. The Rust compatibility decoder normalizes HID keyboard usages into InputEvent::Key.code (the downstream InputSink maps them to evdev); Python maps them to evdev directly. This fixture therefore asserts the normalized Rust event sequence, which preserves the Python semantics: modifier diff first, release before press, absolute/relative motion before button diff, then wheel.",
+  "_future_work": "An opt-in live comparison against softnode/evdev_input.py with python-evdev/uinput is future work and is not run in CI.",
+  "cases": [
+    {
+      "name": "keyboard_press_a",
+      "steps": [
+        {
+          "packet": "01 00 00 04 00 00 00 00 00",
+          "events": [
+            { "type": "key", "data": { "code": 4, "down": true, "modifiers": 0 } }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "keyboard_press_then_release_a",
+      "steps": [
+        {
+          "packet": "01 00 00 04 00 00 00 00 00",
+          "events": [
+            { "type": "key", "data": { "code": 4, "down": true, "modifiers": 0 } }
+          ]
+        },
+        {
+          "packet": "01 00 00 00 00 00 00 00 00",
+          "events": [
+            { "type": "key", "data": { "code": 4, "down": false, "modifiers": 0 } }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "keyboard_two_keys",
+      "steps": [
+        {
+          "packet": "01 00 00 04 05 00 00 00 00",
+          "events": [
+            { "type": "key", "data": { "code": 4, "down": true, "modifiers": 0 } },
+            { "type": "key", "data": { "code": 5, "down": true, "modifiers": 0 } }
+          ]
+        },
+        {
+          "packet": "01 00 00 04 05 00 00 00 00",
+          "events": []
+        },
+        {
+          "packet": "01 00 00 05 00 00 00 00 00",
+          "events": [
+            { "type": "key", "data": { "code": 4, "down": false, "modifiers": 0 } }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "keyboard_shift_and_key",
+      "steps": [
+        {
+          "packet": "01 02 00 04 00 00 00 00 00",
+          "events": [
+            { "type": "key", "data": { "code": 225, "down": true, "modifiers": 0 } },
+            { "type": "key", "data": { "code": 4, "down": true, "modifiers": 0 } }
+          ]
+        },
+        {
+          "packet": "01 00 00 04 00 00 00 00 00",
+          "events": [
+            { "type": "key", "data": { "code": 225, "down": false, "modifiers": 0 } }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "absolute_move_and_wheel",
+      "steps": [
+        {
+          "packet": "02 00 40 01 F0 00 01",
+          "events": [
+            { "type": "pointer_absolute", "data": { "display_id": null, "x": 320, "y": 240 } },
+            { "type": "wheel", "data": { "dx": 0, "dy": 1 } }
+          ]
+        },
+        {
+          "packet": "02 00 40 01 F0 00 FF",
+          "events": [
+            { "type": "pointer_absolute", "data": { "display_id": null, "x": 320, "y": 240 } },
+            { "type": "wheel", "data": { "dx": 0, "dy": -1 } }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "absolute_button_press_and_release",
+      "steps": [
+        {
+          "packet": "02 01 40 01 F0 00 00",
+          "events": [
+            { "type": "pointer_absolute", "data": { "display_id": null, "x": 320, "y": 240 } },
+            { "type": "button", "data": { "button": "left", "down": true } }
+          ]
+        },
+        {
+          "packet": "02 00 40 01 F0 00 00",
+          "events": [
+            { "type": "pointer_absolute", "data": { "display_id": null, "x": 320, "y": 240 } },
+            { "type": "button", "data": { "button": "left", "down": false } }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "relative_move_button_and_wheel",
+      "steps": [
+        {
+          "packet": "05 02 FE FF 03 00 01",
+          "events": [
+            { "type": "pointer_relative", "data": { "dx": -2, "dy": 3 } },
+            { "type": "button", "data": { "button": "right", "down": true } },
+            { "type": "wheel", "data": { "dx": 0, "dy": 1 } }
+          ]
+        },
+        {
+          "packet": "05 00 00 00 00 00 00",
+          "events": [
+            { "type": "pointer_relative", "data": { "dx": 0, "dy": 0 } },
+            { "type": "button", "data": { "button": "right", "down": false } }
+          ]
+        }
+      ]
+    }
+  ]
+}

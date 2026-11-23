@@ -1,0 +1,49 @@
+{
+  "_baseline": "Current compatibility surface expected by the Python controller. /health mirrors the node's native health document consumed by the controller's node probes; /api/v1/connection mirrors the controller-facing compatibility status endpoint. Type names are checked by ozma-node/tests/parity.rs. The connection document also reports input sink availability/injection, read-only codec state, and 'audio: not-implemented'. HLS is opt-in and honest: 'not-configured' without --hls, 'running' only once stream.m3u8 exists, 'failed' plus hls_error otherwise. WebRTC is still not-implemented and is never faked.",
+  "health": {
+    "ok": "bool",
+    "node_id": "string",
+    "version": "string",
+    "protocol": "object",
+    "sessions": "number"
+  },
+  "connection": {
+    "ok": "bool",
+    "node_id": "string",
+    "profile": "string",
+    "api_port": "number",
+    "quic_port": "number",
+    "hid_udp_port": "number",
+    "sink_kind": "string",
+    "hid": "object",
+    "input": "object",
+    "codec": "object",
+    "hls": "string",
+    "hls_error": "string-or-null",
+    "webrtc": "string",
+    "audio": "string"
+  },
+  "input": {
+    "sink_kind": "string",
+    "available": "bool",
+    "injecting": "bool"
+  },
+  "codec": {
+    "current_encoder": "string-or-null",
+    "override": "string-or-null",
+    "available": "array"
+  },
+  "hid": {
+    "status": "string",
+    "bound_port": "number",
+    "packets_received": "number",
+    "packets_rejected": "number",
+    "events": "number",
+    "submit_errors": "number",
+    "last_error": "string-or-null"
+  },
+  "stream_states": {
+    "hls_not_configured": "not-configured",
+    "webrtc_not_implemented": "not-implemented"
+  }
+}

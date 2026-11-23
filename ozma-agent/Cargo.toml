@@ -1,7 +1,8 @@
 [package]
-name    = "ozma-agent"
-version = "0.1.0"
-edition = "2021"
+name        = "ozma-agent"
+version     = "0.1.0"
+edition     = "2021"
+description = "DEPRECATED: legacy Ozma desktop seat agent skeleton; being folded into `ozma-node --profile desktop`. Do not add new features."
 
 [[bin]]
 name = "ozma-agent"

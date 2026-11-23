@@ -41,6 +41,8 @@ ozma-transport = { path = "../ozma-transport" }
 ozma-rtsp     = { path = "../ozma-rtsp" }
 ozma-display  = { path = "../ozma-display" }
 ozma-input    = { path = "../ozma-input" }
+ozma-qmp      = { path = "../ozma-qmp" }
+ozma-power    = { path = "../ozma-power" }
 ozma-audio    = { path = "../ozma-audio" }
 ozma-decode   = { path = "../ozma-decode" }
 # Browser camera/microphone reassembly is shared with the client side.
@@ -50,7 +52,7 @@ ozma-client-core = { path = "../ozma-client-core" }
 axum = { version = "0.7", features = ["json", "ws"] }
 async-trait = { workspace = true }
 # CORS for the local browser (wasm) dev origin.
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
 
 # Native QUIC/control transport
 bytes = { workspace = true }

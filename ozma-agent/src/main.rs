@@ -1,3 +1,12 @@
+//! **DEPRECATED — do not add new features.**
+//!
+//! `ozma-agent` is the legacy desktop-agent skeleton. It is being retired and
+//! folded into `ozma-node --profile desktop`, as described in
+//! `docs/rust-reconciliation-plan.md`. Desktop seats will be served by
+//! `ozma-node`; this binary remains only until that profile reaches parity and
+//! will then be deleted. Treat it as frozen: bug fixes only, no new
+//! functionality, no new providers, and no new callers.
+//!
 //! ozma-agent — desktop seat agent daemon.
 //!
 //! Spawns five long-running tasks:
@@ -17,9 +26,17 @@ use anyhow::Result;
 use clap::Parser;
 use tracing::{error, info};
 
-/// ozma-agent: desktop seat agent daemon.
+/// ozma-agent: desktop seat agent daemon (DEPRECATED).
 #[derive(Parser, Debug)]
-#[command(name = "ozma-agent", version, about)]
+#[command(
+    name = "ozma-agent",
+    version,
+    about = "DEPRECATED: legacy desktop seat agent — use `ozma-node --profile desktop` instead",
+    long_about = "DEPRECATED: `ozma-agent` is the legacy desktop-agent skeleton and should not be \
+                  used for new deployments. Desktop seats are moving to `ozma-node --profile \
+                  desktop` (see docs/rust-reconciliation-plan.md). This binary is retained only \
+                  until that profile reaches parity, receives bug fixes only, and will be deleted."
+)]
 struct Cli {
     /// Host/IP to bind the API server on.
     #[arg(long, env = "OZMA_API_HOST", default_value = "0.0.0.0")]

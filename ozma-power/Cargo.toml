@@ -1,0 +1,20 @@
+[package]
+name = "ozma-power"
+version = "0.1.0"
+edition = "2021"
+description = "VM power backends (libvirt/virsh and QMP) for Ozma nodes."
+license = "AGPL-3.0-only"
+
+[dependencies]
+ozma-qmp = { path = "../ozma-qmp" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }
+async-trait = { workspace = true }

@@ -8,13 +8,33 @@ use ozma_protocol::{
     UsbCapability, VirtualDisplayCaps,
 };
 
-use ozma_capture::CaptureRegistry;
+use ozma_capture::{CaptureRegistry, QmpDisplayConfig, QMP_DEFAULT_ID, QMP_DEFAULT_MAX_FPS};
 
-use crate::config::NodeConfig;
+use crate::config::{NodeConfig, NodeProfile};
+
+/// Build the capture registry for this node.
+///
+/// Hardware keeps V4L2+PipeWire discovery. A VM only ever advertises its QMP
+/// display: advertising the host's V4L2/PipeWire devices on a guest would claim
+/// hardware the VM does not own. A VM without a configured QMP socket gets an
+/// empty registry.
+pub fn capture_registry(config: &NodeConfig) -> CaptureRegistry {
+    match config.profile {
+        NodeProfile::Vm => match &config.qmp_socket {
+            Some(socket) => CaptureRegistry::new().with_qmp_display(
+                QmpDisplayConfig::new(socket.clone())
+                    .with_identity(QMP_DEFAULT_ID, format!("{} VM display", config.name))
+                    .with_max_fps(QMP_DEFAULT_MAX_FPS),
+            ),
+            None => CaptureRegistry::new(),
+        },
+        NodeProfile::Hardware | NodeProfile::Desktop => CaptureRegistry::system_with_pipewire(),
+    }
+}
 
 /// Build the capability set advertised by this node, probing the host.
 pub fn detect(config: &NodeConfig) -> NodeCapabilities {
-    detect_with_registry(config, &CaptureRegistry::system_with_pipewire())
+    detect_with_registry(config, &capture_registry(config))
 }
 
 /// Build capabilities with an injected capture registry, for tests and
@@ -123,6 +143,21 @@ mod tests {
             machine_class: ozma_auth::MachineClass::Server,
             workstation_consent: false,
             api_token: None,
+            profile: crate::config::NodeProfile::Hardware,
+            providers: crate::config::ProviderSelection::for_profile(
+                crate::config::NodeProfile::Hardware,
+            ),
+            provider_overrides: crate::config::ProviderOverrides::default(),
+            capture_device: None,
+            qmp_socket: None,
+            qmp_input_socket: None,
+            libvirt_domain: None,
+            qmp_connect_timeout: std::time::Duration::from_millis(3_000),
+            qmp_command_timeout: std::time::Duration::from_millis(5_000),
+            audio_sink: None,
+            vm_guest_ip: None,
+            display_outputs_json: "[]".into(),
+            pci_devices_json: "[]".into(),
         }
     }
 
@@ -142,5 +177,27 @@ mod tests {
         assert!(caps.capture.is_empty());
         assert!(caps.encode.is_empty());
         assert!(!caps.display.supported);
+    }
+
+    #[test]
+    fn vm_profile_uses_only_the_qmp_capture_source() {
+        let mut vm = config("hid,video,audio");
+        vm.profile = crate::config::NodeProfile::Vm;
+
+        // No QMP socket: the VM must not advertise host hardware capture.
+        let registry = capture_registry(&vm);
+        assert_eq!(registry.provider_count(), 0);
+        let caps = detect_with_registry(&vm, &registry);
+        assert!(caps.capture.is_empty());
+        assert!(caps.encode.is_empty());
+        assert!(!caps.display.supported);
+
+        // With a QMP socket the registry owns exactly one provider.
+        vm.qmp_socket = Some(std::path::PathBuf::from("/run/ozma/ctrl.qmp"));
+        let registry = capture_registry(&vm);
+        assert_eq!(registry.provider_count(), 1);
+        let scans = registry.scan();
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].kind, ozma_protocol::CaptureKind::Qmp);
     }
 }

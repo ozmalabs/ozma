@@ -10,7 +10,9 @@
 //! | Type | Role |
 //! |---|---|
 //! | [`AudioSource`] | async capture boundary, monotonic PTS/sequence |
+//! | [`AudioTarget`] | named default/object/node/sink-monitor selection |
 //! | [`AlsaCapture`] | real ALSA capture, blocking worker + bounded channel |
+//! | [`PipeWireCapture`] | native PipeWire capture by target (Linux) |
 //! | [`FakeAudioSource`] | deterministic 440 Hz/silence source for CI |
 //! | [`AudioEncoder`] | async encode boundary |
 //! | [`OpusEncoder`] | libopus, 20 ms 48 kHz stereo, one packet per frame |
@@ -35,8 +37,13 @@
 //!   without `stop` is best-effort and does not join.
 //! - No resampling or downmixing: a frame with the wrong rate, channels, or
 //!   sample count is rejected rather than silently reinterpreted.
+//! - [`AudioTarget::SinkMonitor`] names `<sink>.monitor`, but the monitor node
+//!   must already exist in the PipeWire graph. Selection does not create a
+//!   null sink, move streams, or provision per-VM routing (Phase 2).
 //! - `audiopus` and `alsa` are native dependencies (libopus, ALSA). No OpenSSL
-//!   or other TLS stack is involved.
+//!   or other TLS stack is involved. On non-Linux platforms the
+//!   [`PipeWireCapture`] constructors fail with `AudioError::Unavailable`
+//!   instead of pretending to open a stream.
 //!
 //! ```no_run
 //! use ozma_audio::{AlsaCapture, AlsaCaptureConfig, AudioEncoder, AudioSource, OpusEncoder};
@@ -60,8 +67,8 @@ pub mod error;
 pub mod fake;
 pub mod frame;
 pub mod opus;
-#[cfg(target_os = "linux")]
 pub mod pipewire;
+pub mod target;
 pub mod traits;
 
 pub use alsa::{
@@ -75,8 +82,8 @@ pub use frame::{
     FRAME_MICROS, FRAME_SAMPLES, SAMPLE_RATE,
 };
 pub use opus::{default_config, OpusDecoder, OpusEncoder, MAX_OPUS_PACKET_BYTES, OPUS_ENCODER_ID};
-#[cfg(target_os = "linux")]
 pub use pipewire::PipeWireCapture;
+pub use target::{AudioTarget, MONITOR_PREFIX, NODE_PREFIX, OBJECT_PREFIX};
 pub use traits::{AudioEncoder, AudioSource, EncodedAudio, EncoderConfig};
 
 #[cfg(test)]

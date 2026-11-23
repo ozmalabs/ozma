@@ -8,9 +8,16 @@ license = "AGPL-3.0-only"
 [dependencies]
 ozma-protocol = { path = "../ozma-protocol" }
 ozma-proto = { path = "../ozma-proto" }
+ozma-qmp = { path = "../ozma-qmp" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { workspace = true }
 tracing = "0.1"
+
+# Linux desktop/VM input injection. Kept target-specific so the crate still
+# builds on platforms without uinput; UinputSink has a typed stub there.
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.12"
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,0 +1,1460 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
+//! Local HLS pipeline: a [`CaptureSource`] → ffmpeg `rawvideo` → HLS.
+//!
+//! This is the controller-compatibility stream path. The Python controller
+//! proxies `GET /stream/{file}` from a node's API port without credentials
+//! (`controller/api.py::stream_hls_proxy`), so the node serves the HLS output
+//! directory verbatim and unauthenticated. That is media, not control: input,
+//! power, and the native API stay behind the bearer guard and the controller's
+//! own authorization.
+//!
+//! The pipeline is deliberately small and honest:
+//!
+//! * ffmpeg reads packed RGB24 frames from stdin and writes a rolling HLS
+//!   playlist (`stream.m3u8`) plus `seg_%05d.ts` segments.
+//! * [`HlsConfig::validate`] rejects values ffmpeg would misinterpret.
+//! * Only `rgb24` and `bgra` sources are accepted. `bgra` is converted to
+//!   `rgb24`; MJPEG/YUYV/NV12 are rejected with a typed error rather than being
+//!   mislabelled as RGB and fed to the encoder.
+//! * [`HlsStatus`] reports `running` only after the manifest exists. A spawned
+//!   ffmpeg whose playlist has not been written yet is `failed`, not a success.
+//!
+//! This is not WebRTC and it is not the native session plane. It is the
+//! temporary compatibility surface described in
+//! `docs/rust-reconciliation-plan.md` §3 Phase 2.
+
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use async_trait::async_trait;
+use axum::Router;
+use ozma_media::{CaptureSource, Frame, FrameFormat, MediaError, PixelFormat};
+use tokio::io::AsyncWriteExt;
+use tokio::process::{Child, ChildStdin, Command};
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
+use tower_http::services::ServeDir;
+
+/// Default HLS segment duration in seconds.
+pub const DEFAULT_SEGMENT_SECONDS: f32 = 1.0;
+/// Default number of playlist entries.
+pub const DEFAULT_PLAYLIST_SIZE: u32 = 4;
+/// Default capture/encode frame rate.
+pub const DEFAULT_FPS: u32 = 30;
+/// Default H.264 bitrate in kbps (4 Mbps).
+pub const DEFAULT_BITRATE_KBPS: u32 = 4_000;
+/// Largest error string retained for `/api/v1/connection`.
+const MAX_STATUS_ERROR_CHARS: usize = 512;
+
+/// Configuration for the ffmpeg-backed HLS pipeline.
+///
+/// `width`/`height` optionally override the input size advertised to ffmpeg.
+/// When they are unset the source's declared format is used, or — for sources
+/// such as the QMP display, which reports `0x0` until the first screendump —
+/// the size of the first frame is learned lazily.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HlsConfig {
+    /// Directory receiving `stream.m3u8` and `seg_%05d.ts`.
+    pub output_dir: PathBuf,
+    /// Target segment duration in seconds.
+    pub segment_seconds: f32,
+    /// Number of segments retained in the playlist.
+    pub playlist_size: u32,
+    /// Input frame rate advertised to ffmpeg.
+    pub fps: u32,
+    /// H.264 bitrate in kbps.
+    pub bitrate_kbps: u32,
+    /// Optional input width override.
+    pub width: Option<u32>,
+    /// Optional input height override.
+    pub height: Option<u32>,
+    /// ffmpeg executable to spawn (a bare `ffmpeg` uses `PATH`).
+    pub ffmpeg_bin: PathBuf,
+}
+
+impl Default for HlsConfig {
+    fn default() -> Self {
+        Self {
+            output_dir: std::env::temp_dir().join("ozma-stream"),
+            segment_seconds: DEFAULT_SEGMENT_SECONDS,
+            playlist_size: DEFAULT_PLAYLIST_SIZE,
+            fps: DEFAULT_FPS,
+            bitrate_kbps: DEFAULT_BITRATE_KBPS,
+            width: None,
+            height: None,
+            ffmpeg_bin: PathBuf::from("ffmpeg"),
+        }
+    }
+}
+
+impl HlsConfig {
+    /// Reject values that ffmpeg cannot use or that make no sense.
+    pub fn validate(&self) -> Result<(), HlsError> {
+        if self.output_dir.as_os_str().is_empty()
+            || self.output_dir.to_string_lossy().trim().is_empty()
+        {
+            return Err(HlsError::InvalidConfig(
+                "--hls-dir must not be empty".to_owned(),
+            ));
+        }
+        if self.ffmpeg_bin.as_os_str().is_empty()
+            || self.ffmpeg_bin.to_string_lossy().trim().is_empty()
+        {
+            return Err(HlsError::InvalidConfig(
+                "--ffmpeg-bin must not be empty".to_owned(),
+            ));
+        }
+        if !self.segment_seconds.is_finite() || self.segment_seconds <= 0.0 {
+            return Err(HlsError::InvalidConfig(
+                "--hls-segment-seconds must be a finite value greater than zero".to_owned(),
+            ));
+        }
+        if self.playlist_size == 0 {
+            return Err(HlsError::InvalidConfig(
+                "--hls-playlist-size must be at least 1".to_owned(),
+            ));
+        }
+        if self.fps == 0 {
+            return Err(HlsError::InvalidConfig(
+                "--hls-fps must be at least 1".to_owned(),
+            ));
+        }
+        if self.bitrate_kbps == 0 {
+            return Err(HlsError::InvalidConfig(
+                "--hls-bitrate-kbps must be at least 1".to_owned(),
+            ));
+        }
+        match (self.width, self.height) {
+            (Some(0), _) | (_, Some(0)) => {
+                return Err(HlsError::InvalidConfig(
+                    "HLS width and height must be greater than zero".to_owned(),
+                ));
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(HlsError::InvalidConfig(
+                    "HLS width and height must be configured together".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn validated(self) -> Result<Self, HlsError> {
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Path of the HLS playlist that the controller proxies.
+    pub fn manifest_path(&self) -> PathBuf {
+        self.output_dir.join("stream.m3u8")
+    }
+
+    /// Path pattern of the HLS segments.
+    pub fn segment_pattern(&self) -> PathBuf {
+        self.output_dir.join("seg_%05d.ts")
+    }
+}
+
+/// Errors from configuration validation, frame conversion, or ffmpeg I/O.
+#[derive(Debug, thiserror::Error)]
+pub enum HlsError {
+    /// The configuration cannot be used.
+    #[error("invalid HLS configuration: {0}")]
+    InvalidConfig(String),
+    /// A pixel format cannot be fed to ffmpeg's raw RGB24 input.
+    #[error(
+        "HLS cannot feed `{0}` frames to ffmpeg as raw RGB24; only rgb24 and bgra are supported"
+    )]
+    UnsupportedFormat(PixelFormat),
+    /// A frame's pixel layout differs from the source's declared format.
+    #[error("frame format `{actual}` does not match the source's declared `{expected}` format")]
+    FormatMismatch {
+        /// Format the source declared.
+        expected: PixelFormat,
+        /// Format the frame actually carried.
+        actual: PixelFormat,
+    },
+    /// A frame's byte length does not match its geometry.
+    #[error(
+        "frame buffer is {actual} bytes, expected {expected} for {format} at {width}x{height}"
+    )]
+    FrameSize {
+        /// Frame layout.
+        format: PixelFormat,
+        /// Frame width.
+        width: u32,
+        /// Frame height.
+        height: u32,
+        /// Required byte length.
+        expected: usize,
+        /// Actual byte length.
+        actual: usize,
+    },
+    /// A frame's dimensions differ from the size advertised to ffmpeg.
+    #[error(
+        "frame dimensions {width}x{height} do not match the HLS input {expected_width}x{expected_height}"
+    )]
+    FrameDimensions {
+        /// Frame width.
+        width: u32,
+        /// Frame height.
+        height: u32,
+        /// Size advertised to ffmpeg.
+        expected_width: u32,
+        /// Size advertised to ffmpeg.
+        expected_height: u32,
+    },
+    /// The output directory could not be created.
+    #[error("could not create HLS output directory `{path}`: {message}")]
+    OutputDirectory {
+        /// Directory that failed.
+        path: PathBuf,
+        /// Underlying failure.
+        message: String,
+    },
+    /// ffmpeg could not be spawned.
+    #[error("could not start ffmpeg `{bin}`: {message}")]
+    Spawn {
+        /// Executable that failed to start.
+        bin: PathBuf,
+        /// Underlying failure.
+        message: String,
+    },
+    /// The child process did not expose stdin.
+    #[error("ffmpeg did not expose a writable stdin")]
+    StdinUnavailable,
+    /// The frame task panicked or was aborted unexpectedly.
+    #[error("the HLS frame task failed: {message}")]
+    Task {
+        /// Underlying failure.
+        message: String,
+    },
+}
+
+/// Status retained for `/api/v1/connection`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HlsState {
+    /// `--hls` was not requested.
+    #[default]
+    NotConfigured,
+    /// The pipeline is starting or waiting for its first frame.
+    Starting,
+    /// Frames are reaching ffmpeg.
+    Running,
+    /// The pipeline could not start or stopped on an error.
+    Failed,
+    /// The pipeline stopped, including a clean source end-of-stream.
+    Stopped,
+}
+
+#[derive(Debug, Default)]
+struct HlsStatusInner {
+    state: HlsState,
+    error: Option<String>,
+    manifest: Option<PathBuf>,
+}
+
+/// Cloneable, bounded status of the HLS pipeline.
+///
+/// The connection endpoint reads this without touching the frame task.
+#[derive(Clone, Debug, Default)]
+pub struct HlsStatus {
+    inner: Arc<Mutex<HlsStatusInner>>,
+}
+
+impl HlsStatus {
+    /// No pipeline was requested.
+    pub fn not_configured() -> Self {
+        Self::default()
+    }
+
+    /// A pipeline could not be started.
+    pub fn failed(message: impl Into<String>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HlsStatusInner {
+                state: HlsState::Failed,
+                error: Some(bounded(message.into())),
+                manifest: None,
+            })),
+        }
+    }
+
+    fn starting(manifest: PathBuf) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HlsStatusInner {
+                state: HlsState::Starting,
+                error: None,
+                manifest: Some(manifest),
+            })),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, HlsStatusInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn set_running(&self) {
+        let mut inner = self.lock();
+        if matches!(inner.state, HlsState::Starting | HlsState::Running) {
+            inner.state = HlsState::Running;
+            inner.error = None;
+        }
+    }
+
+    fn set_failed(&self, message: impl Into<String>) {
+        let mut inner = self.lock();
+        inner.state = HlsState::Failed;
+        inner.error = Some(bounded(message.into()));
+    }
+
+    fn set_stopped(&self, message: impl Into<String>) {
+        let mut inner = self.lock();
+        if inner.state != HlsState::Failed {
+            inner.state = HlsState::Stopped;
+            inner.error = Some(bounded(message.into()));
+        }
+    }
+
+    /// Current lifecycle state.
+    pub fn state(&self) -> HlsState {
+        self.lock().state
+    }
+
+    /// Controller-facing status token.
+    ///
+    /// `running` is only returned while the playlist actually exists. A
+    /// configured pipeline that has not written its manifest is reported as
+    /// `failed` with an explanatory error, which keeps the endpoint honest.
+    pub fn status_name(&self) -> &'static str {
+        let inner = self.lock();
+        match inner.state {
+            HlsState::NotConfigured => "not-configured",
+            HlsState::Starting | HlsState::Running => {
+                if manifest_exists(&inner) {
+                    "running"
+                } else {
+                    "failed"
+                }
+            }
+            HlsState::Failed | HlsState::Stopped => "failed",
+        }
+    }
+
+    /// Bounded error/status string for `/api/v1/connection`.
+    pub fn error(&self) -> Option<String> {
+        let inner = self.lock();
+        match inner.state {
+            HlsState::NotConfigured => None,
+            HlsState::Starting | HlsState::Running => {
+                if manifest_exists(&inner) {
+                    inner.error.clone()
+                } else {
+                    Some(
+                        inner
+                            .manifest
+                            .as_deref()
+                            .map(|path| {
+                                bounded(format!(
+                                    "HLS manifest `{}` has not been written yet",
+                                    path.display()
+                                ))
+                            })
+                            .unwrap_or_else(|| {
+                                bounded("HLS manifest has not been written yet".to_owned())
+                            }),
+                    )
+                }
+            }
+            HlsState::Failed | HlsState::Stopped => Some(
+                inner
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "HLS pipeline is not running".to_owned()),
+            ),
+        }
+    }
+
+    /// Manifest this status tracks, when the pipeline was configured.
+    pub fn manifest_path(&self) -> Option<PathBuf> {
+        self.lock().manifest.clone()
+    }
+}
+
+fn manifest_exists(inner: &HlsStatusInner) -> bool {
+    inner
+        .manifest
+        .as_deref()
+        .is_some_and(|manifest| manifest.is_file())
+}
+
+fn bounded(message: String) -> String {
+    if message.chars().count() <= MAX_STATUS_ERROR_CHARS {
+        return message;
+    }
+    let mut truncated: String = message.chars().take(MAX_STATUS_ERROR_CHARS).collect();
+    truncated.push('…');
+    truncated
+}
+
+/// Destination for converted raw frames.
+///
+/// The ffmpeg child's stdin implements this; tests inject a recording sink so
+/// the default suite never needs ffmpeg.
+#[async_trait]
+pub trait FrameSink: Send {
+    /// Write one complete frame.
+    async fn write(&mut self, bytes: &[u8]) -> io::Result<()>;
+
+    /// Flush and close the sink. Called after end-of-stream or a failure.
+    async fn close(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A spawned ffmpeg process plus the sink that writes to its stdin.
+pub struct SpawnedFfmpeg {
+    /// Raw-frame destination.
+    pub sink: Box<dyn FrameSink>,
+    /// Child process, when the spawner created one.
+    pub child: Option<Child>,
+}
+
+/// Injectable ffmpeg process factory.
+///
+/// The default implementation runs ffmpeg; tests substitute a recording
+/// spawner so argv construction, conversion, ordering, and shutdown are
+/// asserted without the binary.
+pub trait FfmpegSpawner: Send + Sync {
+    /// Spawn ffmpeg for `width`×`height` raw RGB24 input.
+    fn spawn(&self, config: &HlsConfig, width: u32, height: u32)
+        -> Result<SpawnedFfmpeg, HlsError>;
+}
+
+struct SystemFfmpegSpawner;
+
+impl FfmpegSpawner for SystemFfmpegSpawner {
+    fn spawn(
+        &self,
+        config: &HlsConfig,
+        width: u32,
+        height: u32,
+    ) -> Result<SpawnedFfmpeg, HlsError> {
+        create_output_dir(config)?;
+        let argv = ffmpeg_argv(config, width, height);
+        let mut command = Command::new(&argv[0]);
+        command
+            .args(&argv[1..])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().map_err(|error| HlsError::Spawn {
+            bin: config.ffmpeg_bin.clone(),
+            message: error.to_string(),
+        })?;
+        let stdin = child.stdin.take().ok_or(HlsError::StdinUnavailable)?;
+        Ok(SpawnedFfmpeg {
+            sink: Box::new(ChildStdinSink { stdin: Some(stdin) }),
+            child: Some(child),
+        })
+    }
+}
+
+struct ChildStdinSink {
+    stdin: Option<ChildStdin>,
+}
+
+#[async_trait]
+impl FrameSink for ChildStdinSink {
+    async fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let stdin = self.stdin.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "ffmpeg stdin is already closed")
+        })?;
+        stdin.write_all(bytes).await
+    }
+
+    async fn close(&mut self) -> io::Result<()> {
+        // Dropping stdin sends EOF, letting ffmpeg flush the final segment and
+        // playlist entry.
+        self.stdin.take();
+        Ok(())
+    }
+}
+
+/// A running HLS pipeline.
+pub struct HlsPipeline {
+    config: HlsConfig,
+    manifest: PathBuf,
+    status: HlsStatus,
+    task: Option<JoinHandle<()>>,
+    child: Arc<Mutex<Option<Child>>>,
+    cancel: Arc<Notify>,
+    stopped: bool,
+}
+
+impl HlsPipeline {
+    /// Spawn ffmpeg and start consuming `source`.
+    ///
+    /// When both the source's declared dimensions and the config override are
+    /// absent (QMP display reports `0x0`), ffmpeg is spawned on the first frame
+    /// once its real size is known.
+    pub fn start(source: Box<dyn CaptureSource>, config: HlsConfig) -> Result<Self, HlsError> {
+        Self::start_with_spawner(source, config, Arc::new(SystemFfmpegSpawner))
+    }
+
+    /// Start with an injected process factory, for tests and embedding.
+    pub fn start_with_spawner(
+        source: Box<dyn CaptureSource>,
+        config: HlsConfig,
+        spawner: Arc<dyn FfmpegSpawner>,
+    ) -> Result<Self, HlsError> {
+        let config = config.validated()?;
+        if let Err(error) = ensure_supported(source.format().pixel_format) {
+            return Err(error);
+        }
+        create_output_dir(&config)?;
+
+        let manifest = config.manifest_path();
+        let status = HlsStatus::starting(manifest.clone());
+        let declared = source.format();
+        let expected = initial_dimensions(&config, declared);
+
+        let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+        let sink = match expected {
+            Some((width, height)) => match spawner.spawn(&config, width, height) {
+                Ok(spawned) => {
+                    *child_slot
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = spawned.child;
+                    Some(spawned.sink)
+                }
+                Err(error) => {
+                    status.set_failed(error.to_string());
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
+
+        let cancel = Arc::new(Notify::new());
+        let task = tokio::spawn(run_pipeline(
+            source,
+            config.clone(),
+            declared,
+            expected,
+            spawner,
+            status.clone(),
+            child_slot.clone(),
+            cancel.clone(),
+            sink,
+        ));
+
+        Ok(Self {
+            config,
+            manifest,
+            status,
+            task: Some(task),
+            child: child_slot,
+            cancel,
+            stopped: false,
+        })
+    }
+
+    /// True while the frame task is alive and has not been stopped.
+    pub fn is_running(&self) -> bool {
+        !self.stopped && matches!(self.status.state(), HlsState::Starting | HlsState::Running)
+    }
+
+    /// Playlist the controller proxies.
+    pub fn manifest_path(&self) -> &Path {
+        &self.manifest
+    }
+
+    /// Directory containing the playlist and segments.
+    pub fn output_dir(&self) -> &Path {
+        &self.config.output_dir
+    }
+
+    /// Configuration this pipeline runs with.
+    pub fn config(&self) -> &HlsConfig {
+        &self.config
+    }
+
+    /// Cloneable status for `/api/v1/connection`.
+    pub fn status(&self) -> HlsStatus {
+        self.status.clone()
+    }
+
+    /// Kill ffmpeg, abort and await the frame task, and stop the source.
+    ///
+    /// Idempotent: later calls are no-ops.
+    pub async fn stop(&mut self) -> Result<(), HlsError> {
+        if self.stopped {
+            return Ok(());
+        }
+        self.stopped = true;
+
+        kill_child(&self.child).await;
+        // Ask the task to leave its frame wait so the source's `stop()` runs
+        // and the device/socket is released. `notify_one` stores a permit, so a
+        // stop that races the loop cannot be lost.
+        self.cancel.notify_one();
+
+        let mut task_error = None;
+        if let Some(mut task) = self.task.take() {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), &mut task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) if error.is_cancelled() => {}
+                Ok(Err(error)) => task_error = Some(error.to_string()),
+                Err(_) => {
+                    // A source that ignores cancellation cannot hold shutdown.
+                    task.abort();
+                    let _ = task.await;
+                }
+            }
+        }
+        // A lazily spawned child may have been stored between the first kill
+        // and the task abort.
+        kill_child(&self.child).await;
+
+        if let Some(message) = task_error {
+            self.status
+                .set_failed(format!("HLS frame task failed: {message}"));
+            return Err(HlsError::Task { message });
+        }
+        self.status.set_stopped("HLS pipeline stopped");
+        Ok(())
+    }
+}
+
+impl Drop for HlsPipeline {
+    fn drop(&mut self) {
+        self.cancel.notify_one();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        // The child was spawned with `kill_on_drop`, so dropping the handle is
+        // enough; this also covers a lazily spawned child.
+        if let Ok(mut slot) = self.child.lock() {
+            slot.take();
+        }
+    }
+}
+
+async fn kill_child(child: &Arc<Mutex<Option<Child>>>) {
+    let child = child
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(mut child) = child {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_pipeline(
+    mut source: Box<dyn CaptureSource>,
+    config: HlsConfig,
+    declared: FrameFormat,
+    mut expected: Option<(u32, u32)>,
+    spawner: Arc<dyn FfmpegSpawner>,
+    status: HlsStatus,
+    child: Arc<Mutex<Option<Child>>>,
+    cancel: Arc<Notify>,
+    mut sink: Option<Box<dyn FrameSink>>,
+) {
+    let mut wrote_frame = false;
+    loop {
+        let frame = match tokio::select! {
+            biased;
+            _ = cancel.notified() => {
+                status.set_stopped("HLS pipeline stopped");
+                break;
+            }
+            frame = source.next_frame() => frame,
+        } {
+            Ok(frame) => frame,
+            Err(MediaError::EndOfStream) => {
+                status.set_stopped("capture source reached the end of its stream");
+                break;
+            }
+            Err(error) => {
+                status.set_failed(format!("capture source `{}` failed: {error}", source.id()));
+                break;
+            }
+        };
+
+        if frame.format().pixel_format != declared.pixel_format {
+            status.set_failed(format!(
+                "frame format `{}` does not match the source's declared `{}` format",
+                frame.format().pixel_format,
+                declared.pixel_format
+            ));
+            break;
+        }
+
+        let (width, height) = match expected {
+            Some(dimensions) => dimensions,
+            None => {
+                let width = frame.format().width;
+                let height = frame.format().height;
+                if width == 0 || height == 0 {
+                    status.set_failed("capture frame has zero dimensions");
+                    break;
+                }
+                match spawner.spawn(&config, width, height) {
+                    Ok(spawned) => {
+                        *child
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = spawned.child;
+                        sink = Some(spawned.sink);
+                    }
+                    Err(error) => {
+                        status.set_failed(error.to_string());
+                        break;
+                    }
+                }
+                expected = Some((width, height));
+                (width, height)
+            }
+        };
+
+        let bytes = match convert_frame(&frame, declared.pixel_format, width, height) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                status.set_failed(error.to_string());
+                break;
+            }
+        };
+
+        let Some(writer) = sink.as_mut() else {
+            status.set_failed("ffmpeg input is not available");
+            break;
+        };
+        if let Err(error) = writer.write(&bytes).await {
+            status.set_failed(format!("writing a frame to ffmpeg failed: {error}"));
+            break;
+        }
+        if !wrote_frame {
+            wrote_frame = true;
+            status.set_running();
+        }
+    }
+
+    if let Some(writer) = sink.as_mut() {
+        let _ = writer.close().await;
+    }
+    let _ = source.stop().await;
+    if !wrote_frame && status.state() == HlsState::Starting {
+        status.set_failed("HLS pipeline ended before writing a frame");
+    }
+}
+
+/// Convert one frame into the packed RGB24 bytes ffmpeg expects.
+fn convert_frame(
+    frame: &Frame,
+    expected_format: PixelFormat,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, HlsError> {
+    let actual_format = frame.format().pixel_format;
+    if actual_format != expected_format {
+        return Err(HlsError::FormatMismatch {
+            expected: expected_format,
+            actual: actual_format,
+        });
+    }
+    if frame.format().width != width || frame.format().height != height {
+        return Err(HlsError::FrameDimensions {
+            width: frame.format().width,
+            height: frame.format().height,
+            expected_width: width,
+            expected_height: height,
+        });
+    }
+
+    let data = frame.data();
+    match expected_format {
+        PixelFormat::Rgb24 => {
+            let expected = byte_len(PixelFormat::Rgb24, width, height)?;
+            if data.len() != expected {
+                return Err(HlsError::FrameSize {
+                    format: PixelFormat::Rgb24,
+                    width,
+                    height,
+                    expected,
+                    actual: data.len(),
+                });
+            }
+            Ok(data.to_vec())
+        }
+        PixelFormat::Bgra => {
+            let expected = byte_len(PixelFormat::Bgra, width, height)?;
+            if data.len() != expected {
+                return Err(HlsError::FrameSize {
+                    format: PixelFormat::Bgra,
+                    width,
+                    height,
+                    expected,
+                    actual: data.len(),
+                });
+            }
+            let mut rgb = Vec::with_capacity(expected / 4 * 3);
+            for pixel in data.chunks_exact(4) {
+                rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+            }
+            Ok(rgb)
+        }
+        other => Err(HlsError::UnsupportedFormat(other)),
+    }
+}
+
+fn byte_len(format: PixelFormat, width: u32, height: u32) -> Result<usize, HlsError> {
+    let pixels = u64::from(width) * u64::from(height);
+    let bytes = match format {
+        PixelFormat::Rgb24 => pixels * 3,
+        PixelFormat::Bgra => pixels * 4,
+        other => return Err(HlsError::UnsupportedFormat(other)),
+    };
+    usize::try_from(bytes).map_err(|_| {
+        HlsError::InvalidConfig(format!(
+            "frame dimensions {width}x{height} overflow a host buffer"
+        ))
+    })
+}
+
+fn ensure_supported(format: PixelFormat) -> Result<(), HlsError> {
+    match format {
+        PixelFormat::Rgb24 | PixelFormat::Bgra => Ok(()),
+        other => Err(HlsError::UnsupportedFormat(other)),
+    }
+}
+
+fn initial_dimensions(config: &HlsConfig, declared: FrameFormat) -> Option<(u32, u32)> {
+    match (config.width, config.height) {
+        (Some(width), Some(height)) => Some((width, height)),
+        (None, None) if declared.width > 0 && declared.height > 0 => {
+            Some((declared.width, declared.height))
+        }
+        (None, None) => None,
+        _ => None, // rejected by HlsConfig::validate
+    }
+}
+
+fn create_output_dir(config: &HlsConfig) -> Result<(), HlsError> {
+    std::fs::create_dir_all(&config.output_dir).map_err(|error| HlsError::OutputDirectory {
+        path: config.output_dir.clone(),
+        message: error.to_string(),
+    })
+}
+
+/// Build the exact ffmpeg argument vector for `width`×`height` RGB24 input.
+///
+/// The binary itself is the first element. Tests assert this list directly; the
+/// system spawner uses the same function, so argv and behavior cannot drift.
+pub fn ffmpeg_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String> {
+    vec![
+        config.ffmpeg_bin.display().to_string(),
+        "-hide_banner".to_owned(),
+        "-loglevel".to_owned(),
+        "warning".to_owned(),
+        "-f".to_owned(),
+        "rawvideo".to_owned(),
+        "-pix_fmt".to_owned(),
+        "rgb24".to_owned(),
+        "-s".to_owned(),
+        format!("{width}x{height}"),
+        "-r".to_owned(),
+        config.fps.to_string(),
+        "-i".to_owned(),
+        "-".to_owned(),
+        "-an".to_owned(),
+        "-c:v".to_owned(),
+        "libx264".to_owned(),
+        "-preset".to_owned(),
+        "veryfast".to_owned(),
+        "-tune".to_owned(),
+        "zerolatency".to_owned(),
+        "-b:v".to_owned(),
+        format!("{}k", config.bitrate_kbps),
+        "-f".to_owned(),
+        "hls".to_owned(),
+        "-hls_time".to_owned(),
+        format_seconds(config.segment_seconds),
+        "-hls_list_size".to_owned(),
+        config.playlist_size.to_string(),
+        "-hls_segment_filename".to_owned(),
+        config.segment_pattern().display().to_string(),
+        config.manifest_path().display().to_string(),
+    ]
+}
+
+fn format_seconds(value: f32) -> String {
+    let mut text = format!("{value:.3}");
+    while text.contains('.') && text.ends_with('0') {
+        text.pop();
+    }
+    if text.ends_with('.') {
+        text.pop();
+    }
+    text
+}
+
+/// Unauthenticated HLS file service, mounted at `/stream`.
+///
+/// `ServeDir` rejects `..` components, so a request cannot escape `output_dir`.
+pub fn stream_router(output_dir: impl Into<PathBuf>) -> Router {
+    Router::new().nest_service("/stream", ServeDir::new(output_dir.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use ozma_media::Frame;
+
+    use super::*;
+
+    fn temp_dir(label: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let serial = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("ozma-hls-{label}-{}-{serial}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create test directory");
+        directory
+    }
+
+    fn frame(format: FrameFormat, sequence: u64, data: Vec<u8>) -> Frame {
+        Frame::with_data(format, sequence * 1_000, sequence, true, data).expect("valid frame")
+    }
+
+    fn rgb_frame(width: u32, height: u32, sequence: u64, fill: u8) -> Frame {
+        let format = FrameFormat::rgb24(width, height);
+        frame(format, sequence, vec![fill; (width * height * 3) as usize])
+    }
+
+    struct FakeSource {
+        format: FrameFormat,
+        frames: VecDeque<Result<Frame, MediaError>>,
+        hang_when_empty: bool,
+        stopped: Arc<AtomicBool>,
+    }
+
+    impl FakeSource {
+        fn new(
+            format: FrameFormat,
+            frames: Vec<Result<Frame, MediaError>>,
+            hang_when_empty: bool,
+        ) -> (Self, Arc<AtomicBool>) {
+            let stopped = Arc::new(AtomicBool::new(false));
+            (
+                Self {
+                    format,
+                    frames: frames.into(),
+                    hang_when_empty,
+                    stopped: stopped.clone(),
+                },
+                stopped,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl CaptureSource for FakeSource {
+        fn id(&self) -> &str {
+            "fake-hls"
+        }
+
+        fn format(&self) -> FrameFormat {
+            self.format
+        }
+
+        async fn next_frame(&mut self) -> Result<Frame, MediaError> {
+            if let Some(frame) = self.frames.pop_front() {
+                return frame;
+            }
+            if self.hang_when_empty {
+                std::future::pending::<()>().await;
+            }
+            Err(MediaError::EndOfStream)
+        }
+
+        async fn stop(&mut self) -> Result<(), MediaError> {
+            self.stopped.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct RecordingSink {
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        fail_write: bool,
+        closed: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl FrameSink for RecordingSink {
+        async fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+            if self.fail_write {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "ffmpeg closed the pipe",
+                ));
+            }
+            self.writes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(bytes.to_vec());
+            Ok(())
+        }
+
+        async fn close(&mut self) -> io::Result<()> {
+            self.closed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingSpawner {
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        spawns: Arc<Mutex<Vec<(u32, u32, Vec<String>)>>>,
+        closed: Arc<AtomicBool>,
+        fail_spawn: Option<String>,
+        fail_write: bool,
+    }
+
+    impl FfmpegSpawner for RecordingSpawner {
+        fn spawn(
+            &self,
+            config: &HlsConfig,
+            width: u32,
+            height: u32,
+        ) -> Result<SpawnedFfmpeg, HlsError> {
+            if let Some(message) = &self.fail_spawn {
+                return Err(HlsError::Spawn {
+                    bin: config.ffmpeg_bin.clone(),
+                    message: message.clone(),
+                });
+            }
+            self.spawns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((width, height, ffmpeg_argv(config, width, height)));
+            Ok(SpawnedFfmpeg {
+                sink: Box::new(RecordingSink {
+                    writes: self.writes.clone(),
+                    fail_write: self.fail_write,
+                    closed: self.closed.clone(),
+                }),
+                child: None,
+            })
+        }
+    }
+
+    fn spawner(recording: RecordingSpawner) -> Arc<dyn FfmpegSpawner> {
+        Arc::new(recording)
+    }
+
+    async fn wait_until(mut condition: impl FnMut() -> bool) {
+        for _ in 0..400 {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(condition(), "condition was not met before the timeout");
+    }
+
+    #[test]
+    fn defaults_are_the_documented_pipeline() {
+        let config = HlsConfig::default();
+        assert_eq!(config.segment_seconds, 1.0);
+        assert_eq!(config.playlist_size, 4);
+        assert_eq!(config.fps, 30);
+        assert_eq!(config.bitrate_kbps, 4_000);
+        assert_eq!(config.ffmpeg_bin, PathBuf::from("ffmpeg"));
+        assert_eq!(config.width, None);
+        assert_eq!(config.height, None);
+        config.validate().expect("defaults are valid");
+    }
+
+    #[test]
+    fn invalid_configuration_is_rejected() {
+        let base = HlsConfig::default();
+
+        for mutate in [
+            |config: &mut HlsConfig| config.segment_seconds = 0.0,
+            |config: &mut HlsConfig| config.segment_seconds = f32::NAN,
+            |config: &mut HlsConfig| config.playlist_size = 0,
+            |config: &mut HlsConfig| config.fps = 0,
+            |config: &mut HlsConfig| config.bitrate_kbps = 0,
+            |config: &mut HlsConfig| config.output_dir = PathBuf::new(),
+            |config: &mut HlsConfig| config.ffmpeg_bin = PathBuf::new(),
+            |config: &mut HlsConfig| config.width = Some(640),
+            |config: &mut HlsConfig| {
+                config.width = Some(0);
+                config.height = Some(480);
+            },
+        ] {
+            let mut config = base.clone();
+            mutate(&mut config);
+            assert!(
+                matches!(config.validate(), Err(HlsError::InvalidConfig(_))),
+                "{config:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn ffmpeg_argv_matches_the_compatibility_pipeline() {
+        let config = HlsConfig {
+            output_dir: PathBuf::from("/tmp/ozma-stream-node"),
+            ..HlsConfig::default()
+        };
+        let argv = ffmpeg_argv(&config, 640, 480);
+        assert_eq!(
+            argv,
+            vec![
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "warning",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-s",
+                "640x480",
+                "-r",
+                "30",
+                "-i",
+                "-",
+                "-an",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-tune",
+                "zerolatency",
+                "-b:v",
+                "4000k",
+                "-f",
+                "hls",
+                "-hls_time",
+                "1",
+                "-hls_list_size",
+                "4",
+                "-hls_segment_filename",
+                "/tmp/ozma-stream-node/seg_%05d.ts",
+                "/tmp/ozma-stream-node/stream.m3u8",
+            ]
+        );
+
+        let fractional = ffmpeg_argv(
+            &HlsConfig {
+                segment_seconds: 0.5,
+                fps: 15,
+                bitrate_kbps: 1_500,
+                ..config
+            },
+            1280,
+            720,
+        );
+        assert!(fractional.contains(&"0.5".to_owned()));
+        assert!(fractional.contains(&"15".to_owned()));
+        assert!(fractional.contains(&"1500k".to_owned()));
+        assert!(fractional.contains(&"1280x720".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn rgb24_frames_are_written_unchanged_and_in_order() {
+        let directory = temp_dir("rgb24");
+        let format = FrameFormat::rgb24(2, 2);
+        let first = rgb_frame(2, 2, 0, 0x10);
+        let second = rgb_frame(2, 2, 1, 0x20);
+        let (source, stopped) = FakeSource::new(format, vec![Ok(first), Ok(second)], false);
+
+        let recording = RecordingSpawner::default();
+        let writes = recording.writes.clone();
+        let mut pipeline = HlsPipeline::start_with_spawner(
+            Box::new(source),
+            HlsConfig {
+                output_dir: directory.clone(),
+                ..HlsConfig::default()
+            },
+            spawner(recording),
+        )
+        .expect("start pipeline");
+
+        wait_until(|| writes.lock().unwrap().len() == 2).await;
+        wait_until(|| stopped.load(Ordering::SeqCst)).await;
+
+        let writes = writes.lock().unwrap().clone();
+        assert_eq!(writes[0], vec![0x10; 2 * 2 * 3]);
+        assert_eq!(writes[1], vec![0x20; 2 * 2 * 3]);
+        assert!(!pipeline.is_running());
+        assert_eq!(pipeline.status().state(), HlsState::Stopped);
+        pipeline.stop().await.expect("stop");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn bgra_frames_are_converted_to_rgb24() {
+        let directory = temp_dir("bgra");
+        let format = FrameFormat::new(PixelFormat::Bgra, 2, 1);
+        let bgra = vec![
+            1, 2, 3, 255, // B G R A -> R G B
+            4, 5, 6, 128, // B G R A -> R G B
+        ];
+        let (source, _) = FakeSource::new(format, vec![Ok(frame(format, 0, bgra))], false);
+        let recording = RecordingSpawner::default();
+        let writes = recording.writes.clone();
+        let mut pipeline = HlsPipeline::start_with_spawner(
+            Box::new(source),
+            HlsConfig {
+                output_dir: directory.clone(),
+                ..HlsConfig::default()
+            },
+            spawner(recording),
+        )
+        .expect("start pipeline");
+
+        wait_until(|| writes.lock().unwrap().len() == 1).await;
+        assert_eq!(writes.lock().unwrap()[0], vec![3, 2, 1, 6, 5, 4]);
+        pipeline.stop().await.expect("stop");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn unsupported_pixel_formats_are_rejected_before_spawning() {
+        let directory = temp_dir("yuyv");
+        let format = FrameFormat::new(PixelFormat::Yuyv, 2, 2);
+        let (source, _) = FakeSource::new(format, vec![], false);
+        let recording = RecordingSpawner::default();
+        let spawns = recording.spawns.clone();
+
+        let error = HlsPipeline::start_with_spawner(
+            Box::new(source),
+            HlsConfig {
+                output_dir: directory.clone(),
+                ..HlsConfig::default()
+            },
+            spawner(recording),
+        )
+        .err()
+        .expect("yuyv must be rejected");
+
+        assert!(matches!(
+            error,
+            HlsError::UnsupportedFormat(PixelFormat::Yuyv)
+        ));
+        assert!(
+            spawns.lock().unwrap().is_empty(),
+            "ffmpeg must not be spawned for an unsupported format"
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn write_failure_stops_the_pipeline_and_is_reported() {
+        let directory = temp_dir("write-failure");
+        let format = FrameFormat::rgb24(1, 1);
+        let (source, stopped) = FakeSource::new(format, vec![Ok(rgb_frame(1, 1, 0, 0x7f))], false);
+        let recording = RecordingSpawner {
+            fail_write: true,
+            ..RecordingSpawner::default()
+        };
+        let mut pipeline = HlsPipeline::start_with_spawner(
+            Box::new(source),
+            HlsConfig {
+                output_dir: directory.clone(),
+                ..HlsConfig::default()
+            },
+            spawner(recording),
+        )
+        .expect("start pipeline");
+
+        wait_until(|| pipeline.status().state() == HlsState::Failed).await;
+        wait_until(|| stopped.load(Ordering::SeqCst)).await;
+        let status = pipeline.status();
+        assert_eq!(status.status_name(), "failed");
+        assert!(status
+            .error()
+            .unwrap_or_default()
+            .contains("writing a frame to ffmpeg failed"));
+        assert!(!pipeline.is_running());
+        pipeline.stop().await.expect("stop");
+        assert_eq!(pipeline.status().state(), HlsState::Failed);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn stop_is_idempotent_and_ends_the_frame_task() {
+        let directory = temp_dir("stop");
+        let format = FrameFormat::rgb24(1, 1);
+        let (source, stopped) = FakeSource::new(format, vec![Ok(rgb_frame(1, 1, 0, 0xaa))], true);
+        let recording = RecordingSpawner::default();
+        let writes = recording.writes.clone();
+        let closed = recording.closed.clone();
+        let mut pipeline = HlsPipeline::start_with_spawner(
+            Box::new(source),
+            HlsConfig {
+                output_dir: directory.clone(),
+                ..HlsConfig::default()
+            },
+            spawner(recording),
+        )
+        .expect("start pipeline");
+
+        wait_until(|| writes.lock().unwrap().len() == 1).await;
+        assert!(pipeline.is_running());
+
+        pipeline.stop().await.expect("first stop");
+        pipeline.stop().await.expect("second stop is a no-op");
+
+        assert!(!pipeline.is_running());
+        assert!(stopped.load(Ordering::SeqCst));
+        assert!(closed.load(Ordering::SeqCst));
+        assert_eq!(writes.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn unknown_dimensions_are_learned_from_the_first_frame() {
+        let directory = temp_dir("lazy");
+        let format = FrameFormat::rgb24(0, 0);
+        let frame = Frame::with_data(FrameFormat::rgb24(4, 2), 0, 0, true, vec![0x33; 4 * 2 * 3])
+            .expect("valid frame");
+        let (source, _) = FakeSource::new(format, vec![Ok(frame)], false);
+        let recording = RecordingSpawner::default();
+        let writes = recording.writes.clone();
+        let spawns = recording.spawns.clone();
+
+        let mut pipeline = HlsPipeline::start_with_spawner(
+            Box::new(source),
+            HlsConfig {
+                output_dir: directory.clone(),
+                ..HlsConfig::default()
+            },
+            spawner(recording),
+        )
+        .expect("start pipeline");
+
+        wait_until(|| writes.lock().unwrap().len() == 1).await;
+        let spawns = spawns.lock().unwrap().clone();
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].0, 4);
+        assert_eq!(spawns[0].1, 2);
+        assert!(spawns[0].2.contains(&"4x2".to_owned()));
+        pipeline.stop().await.expect("stop");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn hls_status_never_claims_running_before_the_manifest_exists() {
+        let directory = temp_dir("status");
+        let manifest = directory.join("stream.m3u8");
+        let status = HlsStatus::starting(manifest.clone());
+
+        assert_eq!(status.state(), HlsState::Starting);
+        assert_eq!(status.status_name(), "failed");
+        assert!(status
+            .error()
+            .unwrap_or_default()
+            .contains("has not been written yet"));
+
+        std::fs::write(&manifest, "#EXTM3U\n").expect("write manifest");
+        assert_eq!(status.status_name(), "running");
+        assert_eq!(status.error(), None);
+
+        status.set_failed("ffmpeg exited");
+        assert_eq!(status.status_name(), "failed");
+        assert_eq!(status.error().as_deref(), Some("ffmpeg exited"));
+
+        assert_eq!(HlsStatus::not_configured().status_name(), "not-configured");
+        assert_eq!(
+            HlsStatus::failed("no capture source").status_name(),
+            "failed"
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn spawn_failure_is_a_typed_error() {
+        let directory = temp_dir("spawn-failure");
+        let (source, _) = FakeSource::new(
+            FrameFormat::rgb24(2, 2),
+            vec![Ok(rgb_frame(2, 2, 0, 0))],
+            false,
+        );
+        let error = HlsPipeline::start(
+            Box::new(source),
+            HlsConfig {
+                output_dir: directory.clone(),
+                ffmpeg_bin: PathBuf::from("/nonexistent/ozma-test-ffmpeg"),
+                ..HlsConfig::default()
+            },
+        )
+        .err()
+        .expect("spawn must fail");
+        assert!(matches!(error, HlsError::Spawn { .. }));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// Opt-in real-ffmpeg smoke test. Default CI must not need ffmpeg.
+    #[tokio::test]
+    #[ignore = "requires ffmpeg; set OZMA_FFMPEG_TEST=1 and run with --ignored"]
+    async fn real_ffmpeg_writes_a_playlist() {
+        if std::env::var("OZMA_FFMPEG_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        let directory = temp_dir("real-ffmpeg");
+        let format = FrameFormat::rgb24(64, 48);
+        let frames: Vec<_> = (0..40)
+            .map(|sequence| Ok(rgb_frame(64, 48, sequence, sequence as u8)))
+            .collect();
+        let (source, _) = FakeSource::new(format, frames, false);
+        let config = HlsConfig {
+            output_dir: directory.clone(),
+            segment_seconds: 0.5,
+            playlist_size: 2,
+            fps: 10,
+            bitrate_kbps: 500,
+            ..HlsConfig::default()
+        };
+        let mut pipeline = HlsPipeline::start(Box::new(source), config).expect("start ffmpeg");
+
+        for _ in 0..200 {
+            if pipeline.manifest_path().is_file() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            pipeline.manifest_path().is_file(),
+            "ffmpeg did not write {}",
+            pipeline.manifest_path().display()
+        );
+        let manifest = std::fs::read_to_string(pipeline.manifest_path()).unwrap();
+        assert!(manifest.contains("#EXTM3U"));
+        assert!(
+            std::fs::read_dir(pipeline.output_dir())
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry.path().extension().is_some_and(|ext| ext == "ts")),
+            "ffmpeg did not write a segment"
+        );
+
+        pipeline.stop().await.expect("stop");
+        assert!(pipeline.manifest_path().is_file());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+}

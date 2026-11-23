@@ -1,0 +1,11 @@
+[package]
+name = "ozma-aperture"
+version = "0.1.0"
+edition = "2021"
+description = "Pure aperture policy model: meet, provenance, recourse, receipts, and policy loading for Ozma capability and security negotiation."
+license = "AGPL-3.0-only"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

@@ -1,6 +1,8 @@
 # Aperture policy for Ozma capability and security negotiation
 
-Status: **plan**.
+Status: **plan**; rollout step 1 (`ozma-aperture` crate, policy loader,
+receipts, and tests) is implemented. USB, transport, capture, and auth adoption
+remain planned.
 Inspiration: Ocelot's `observer_aperture` and `aperture_frame` seeds. We borrow
 the *model*, not the cognitive engine or its graph runtime.
 

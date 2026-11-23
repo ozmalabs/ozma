@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! `ozma-capture` — capture-source discovery, real V4L2 MMAP capture, and the
-//! deterministic fake path.
+//! `ozma-capture` — capture-source discovery, real V4L2 MMAP capture, the
+//! deterministic fake path, and VM display providers.
 //!
 //! This crate contains no `unsafe` code. V4L2 discovery reads `/dev` and sysfs
 //! without opening a device; opening a source uses the safe [`v4l`] crate to
@@ -13,22 +13,69 @@
 //! On Linux the optional [`PipeWireCaptureProvider`] adds graph-native video
 //! capture without replacing V4L2. [`CaptureRegistry::system`] remains
 //! V4L2-only; [`CaptureRegistry::system_with_pipewire`] registers both.
+//!
+//! VM display paths live in provider modules that are not registered in
+//! [`CaptureRegistry::system`] by default:
+//!
+//! * [`qmp_display`] polls QEMU's display through QMP `screendump`, parses the
+//!   P6 PPM into owned RGB24 frames, and enforces frame-rate pacing
+//!   ([`QmpDisplaySource`]). It is a polling path, not a real-time framebuffer
+//!   subscription. Register it explicitly with
+//!   [`CaptureRegistry::with_qmp_display`] or from the VM profile.
+//! * [`lookingglass`] parses Looking Glass KVMFR shared memory into owned
+//!   frames ([`LookingGlassSource`]). [`LookingGlassProvider`] advertises the
+//!   region as [`CaptureKind::LookingGlass`] by reading only the KVMFR header;
+//!   it never starts a capture during discovery. It needs no v4l2loopback
+//!   device. Register it with [`CaptureRegistry::with_looking_glass`].
+//! * `virtual` (raw identifier `r#virtual`, because `virtual` is reserved)
+//!   owns the v4l2loopback + ffmpeg lifecycle that publishes a VM's VNC
+//!   display as `/dev/videoN` ([`VirtualCapture`]). [`VirtualCaptureProvider`]
+//!   discovers an existing device by its card label without loading a module
+//!   or starting ffmpeg, and opens it through the lifecycle. Its capabilities
+//!   use [`CaptureKind::V4l2`] because the device really is V4L2. Register it
+//!   with [`CaptureRegistry::with_virtual_capture`].
+//!
+//! All of them report typed errors when their host dependencies are missing;
+//! none silently fabricates a working source. Their registration belongs to
+//! the VM profile workstream.
 
 #![forbid(unsafe_code)]
 
 pub mod fake;
+pub mod lookingglass;
 #[cfg(target_os = "linux")]
 pub mod pipewire;
 pub mod provider;
+pub mod qmp_display;
 pub mod v4l2;
+// `virtual` is a reserved Rust keyword; the raw identifier keeps the intended
+// module name and file (`virtual.rs`) while still compiling.
+pub mod r#virtual;
 
 pub use fake::FakeCaptureProvider;
+pub use lookingglass::{
+    extract_frame, frame_format, parse_frame_header, parse_header, requires_conversion,
+    validate_frame_bounds, KvmfrFrameHeader, KvmfrHeader, LookingGlassProvider,
+    LookingGlassProviderConfig, LookingGlassSource, LOOKING_GLASS_DEFAULT_FPS,
+    LOOKING_GLASS_DEFAULT_ID, LOOKING_GLASS_DEFAULT_NAME, LOOKING_GLASS_DEFAULT_SHM_PATH,
+};
 #[cfg(target_os = "linux")]
 pub use pipewire::{
     capability_for, capability_id, map_pipewire_error, target_for_capability, target_matches,
     PipeWireCaptureProvider, PipeWireCaptureSource, PipeWireOptions,
 };
 pub use provider::{CaptureProvider, CaptureRegistry, CaptureScan};
+pub use qmp_display::{
+    parse_ppm_p6, QmpDisplayConfig, QmpDisplayProvider, QmpDisplaySource, MAX_PPM_DIMENSION,
+    QMP_DEFAULT_ID, QMP_DEFAULT_MAX_FPS, QMP_DEFAULT_MAX_HEIGHT, QMP_DEFAULT_MAX_WIDTH,
+    QMP_DEFAULT_NAME,
+};
+pub use r#virtual::{
+    bounded_fps, next_device_number, ChildId, CommandOutput, CommandRunner, ProcessCommandRunner,
+    V4l2SourceFactory, VirtualCapture, VirtualCaptureConfig, VirtualCaptureProvider,
+    VirtualCaptureProviderConfig, VirtualCaptureSource, VirtualSourceFactory,
+    VIRTUAL_CAPTURE_DEFAULT_DEV_ROOT, VIRTUAL_CAPTURE_DEFAULT_SYS_ROOT,
+};
 pub use v4l2::{
     choose_resolution, discover_v4l2, fourcc_to_pixel_format, h264_access_unit_contains_idr,
     is_capture_like_name, keyframe_for, monotonic_pts, next_sequence, parse_video_index,
@@ -161,5 +208,61 @@ mod tests {
                 pipewire.error
             );
         }
+    }
+
+    #[test]
+    fn qmp_display_is_opt_in() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("qmp.sock");
+        std::fs::write(&socket, b"placeholder").unwrap();
+
+        let registry =
+            CaptureRegistry::new().with_qmp_display(QmpDisplayConfig::new(socket.as_path()));
+        assert_eq!(registry.provider_count(), 1);
+
+        let scans = registry.scan();
+        assert_eq!(scans[0].kind, CaptureKind::Qmp);
+        assert_eq!(scans[0].capabilities.len(), 1);
+        assert_eq!(scans[0].capabilities[0].id, "qmp0");
+
+        // Hardware/system registries must not grow a QMP provider implicitly.
+        assert!(CaptureRegistry::system()
+            .scan()
+            .iter()
+            .all(|scan| scan.kind != CaptureKind::Qmp));
+    }
+
+    #[test]
+    fn looking_glass_and_virtual_capture_are_opt_in() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let looking_glass = CaptureRegistry::new().with_looking_glass(
+            LookingGlassProviderConfig::new(directory.path().join("absent-kvmfr")),
+        );
+        assert_eq!(looking_glass.provider_count(), 1);
+        let scans = looking_glass.scan();
+        assert_eq!(scans[0].kind, CaptureKind::LookingGlass);
+        assert!(scans[0].capabilities.is_empty());
+
+        let sys_root = directory.path().join("sys");
+        std::fs::create_dir_all(sys_root.join("video12")).unwrap();
+        std::fs::write(sys_root.join("video12/name"), "Ozma Virtual vm1\n").unwrap();
+        let mut capture = VirtualCaptureConfig::new("vm1");
+        capture.device_number = Some(12);
+        let virtual_capture = CaptureRegistry::new().with_virtual_capture(
+            VirtualCaptureProviderConfig::new(capture)
+                .with_roots(std::path::PathBuf::from("/dev"), sys_root.clone()),
+        );
+        assert_eq!(virtual_capture.provider_count(), 1);
+        let scans = virtual_capture.scan();
+        assert_eq!(scans[0].kind, CaptureKind::V4l2);
+        assert_eq!(scans[0].capabilities.len(), 1);
+        assert_eq!(scans[0].capabilities[0].id, "/dev/video12");
+
+        // Neither VM provider is registered implicitly on a hardware node.
+        assert!(CaptureRegistry::system()
+            .scan()
+            .iter()
+            .all(|scan| scan.kind != CaptureKind::LookingGlass));
     }
 }

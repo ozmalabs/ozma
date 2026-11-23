@@ -12,9 +12,9 @@ use crate::state::HeldInput;
 /// Result of accepting one event.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubmitReport {
-    /// Number of HID reports written (or, for a fake sink, that would have
-    /// been written). Zero means the event was a no-op such as a duplicate key
-    /// press.
+    /// Number of HID reports written (or QMP input events queued, or, for a
+    /// fake sink, that would have been written). Zero means the event was a
+    /// no-op such as a duplicate key press.
     pub reports_written: usize,
     /// Whether the held-input state or the last report changed.
     pub state_changed: bool,

@@ -13,7 +13,7 @@ use ozma_api::state::BrowserSceneSink;
 use ozma_api::NodeBackend;
 use ozma_auth::{ConsentPolicy, MachineClass};
 use ozma_encode::EncoderRegistry;
-use ozma_input::HidGadgetSink;
+use ozma_input::{HidGadgetSink, SharedSink};
 use ozma_protocol::NodeCapabilities;
 use tokio::net::TcpListener;
 use tower_http::cors::{Any, CorsLayer};
@@ -59,14 +59,68 @@ pub async fn serve_with_scene_replay(
     rtsp_port: u16,
     webtransport: Option<SocketAddr>,
 ) -> Result<()> {
+    serve_with_scene_replay_and_sink(
+        port,
+        quic_port,
+        capabilities,
+        consent_policy,
+        scene_replay,
+        api_token,
+        rtsp_port,
+        webtransport,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+/// Run the node API with a shared input sink and an optional compatibility
+/// router.
+///
+/// `input_sink` is the one sink used by both session input and the controller's
+/// UDP HID listener. When it is `Some`, no second [`HidGadgetSink`] is opened
+/// here. `compat_router` is merged into the HTTP API before the bearer-token
+/// guard, so endpoints such as `/api/v1/connection` are authenticated like the
+/// rest of the node API. `capture_registry` replaces the default V4L2/PipeWire
+/// registry; the VM profile passes a QMP screendump registry.
+///
+/// `hls_dir` is mounted at `/stream` **outside** the bearer guard (the routes
+/// are merged after the guard layer is applied). The Python controller proxies
+/// `GET /stream/{file}` without credentials
+/// (`controller/api.py::stream_hls_proxy`), so HLS media must be readable
+/// unauthenticated; the guard still protects every control endpoint.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_with_scene_replay_and_sink(
+    port: u16,
+    quic_port: u16,
+    capabilities: NodeCapabilities,
+    consent_policy: ConsentPolicy,
+    scene_replay: Option<crate::scene_replay::JsonlSceneProducer>,
+    api_token: Option<String>,
+    rtsp_port: u16,
+    webtransport: Option<SocketAddr>,
+    input_sink: Option<SharedSink>,
+    compat_router: Option<Router>,
+    capture_registry: Option<ozma_capture::CaptureRegistry>,
+    hls_dir: Option<std::path::PathBuf>,
+) -> Result<()> {
     let encoders = EncoderRegistry::with_detected_encoders().await;
     let backend = SessionBackend::new(capabilities, consent_policy).with_encoder_registry(encoders);
-    let backend = match HidGadgetSink::open() {
-        Ok(sink) => backend.with_input_sink(Arc::new(sink)),
-        Err(error) => {
-            tracing::warn!(error = %error, "HID gadget unavailable; input will be recorded but not injected");
-            backend
-        }
+    let backend = match capture_registry {
+        Some(captures) => backend.with_capture_registry(captures),
+        None => backend,
+    };
+    let backend = match input_sink {
+        Some(sink) => backend.with_input_sink(sink),
+        None => match HidGadgetSink::open() {
+            Ok(sink) => backend.with_input_sink(Arc::new(sink)),
+            Err(error) => {
+                tracing::warn!(error = %error, "HID gadget unavailable; input will be recorded but not injected");
+                backend
+            }
+        },
     };
 
     // The live browser hub is always the API ingest sink. Without a JSONL
@@ -164,12 +218,21 @@ pub async fn serve_with_scene_replay(
     let capture_sink: Arc<dyn ozma_api::state::ClientCaptureSink> = backend.clone();
     let dynamic: Arc<dyn NodeBackend> = backend;
     let scene_sink: Arc<dyn BrowserSceneSink> = browser_scene;
-    let app = ozma_api::router::router_with_sinks(
-        dynamic,
-        Some(scene_sink),
-        Some(capture_sink),
-        api_token.clone(),
-    );
+    let app = match compat_router {
+        Some(extra) => ozma_api::router::router_with_sinks_and_extra(
+            dynamic,
+            Some(scene_sink),
+            Some(capture_sink),
+            api_token.clone(),
+            Some(extra),
+        ),
+        None => ozma_api::router::router_with_sinks(
+            dynamic,
+            Some(scene_sink),
+            Some(capture_sink),
+            api_token.clone(),
+        ),
+    };
     // Additive certificate endpoint for the browser client. It is public cert
     // material, but it is only mounted on the unauthenticated local/dev surface;
     // when a bearer token is configured, clients take the same values from the
@@ -179,6 +242,10 @@ pub async fn serve_with_scene_replay(
     } else {
         app
     };
+    // HLS media is merged after the bearer layer on purpose: the controller's
+    // `/stream/*` proxy does not send credentials. See the doc comment on
+    // `serve_with_scene_replay_and_sink`.
+    let app = with_hls(app, hls_dir);
     let app = app.layer(dev_cors());
     info!(port, "Node API listening");
     axum::serve(listener, app)
@@ -201,6 +268,16 @@ fn dev_cors() -> CorsLayer {
         .allow_origin(Any)
         .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+}
+
+/// Merge the unauthenticated `/stream` file service when HLS is configured.
+///
+/// `ServeDir` rejects `..`, so traversal cannot escape the output directory.
+fn with_hls(app: Router, hls_dir: Option<std::path::PathBuf>) -> Router {
+    match hls_dir {
+        Some(directory) => app.merge(crate::hls::stream_router(directory)),
+        None => app,
+    }
 }
 
 #[derive(Clone)]
@@ -272,6 +349,54 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn hls_is_served_without_bearer_but_control_stays_guarded() {
+        let directory = std::env::temp_dir().join(format!("ozma-api-hls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("stream.m3u8"), "#EXTM3U\n").unwrap();
+
+        let backend: Arc<dyn NodeBackend> = Arc::new(SessionBackend::new(
+            NodeCapabilities::fake("hls-guard"),
+            ConsentPolicy::for_machine(MachineClass::Server),
+        ));
+        let guarded = ozma_api::router::router_with_sinks_and_extra(
+            backend,
+            None,
+            None,
+            Some("secret".to_owned()),
+            None,
+        );
+        let app = with_hls(guarded, Some(directory.clone()));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/stream/stream.m3u8")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"#EXTM3U\n");
+
+        let guarded_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(guarded_response.status(), StatusCode::UNAUTHORIZED);
+
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[derive(Debug)]

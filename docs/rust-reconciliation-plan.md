@@ -1,6 +1,10 @@
 # Replacing the Python node stack with Rust
 
-Status: **plan** (not implementation).
+Status: **Phase 0 implemented; Phase 1 core and the Phase 2 VM-provider, HLS,
+controller-input, and softnode-supervisor work implemented. WebRTC, D-Bus/VNC
+capture, full VM provisioning, and Phases 3–5 remain plans.** See
+[`plan-execution-status.md`](plan-execution-status.md) and
+[`parity-matrix.md`](parity-matrix.md) for the evidence and remaining gaps.
 Scope: the Python `softnode/`, `node/`, and `agent/` processes are replaced by the
 Rust `ozma-node` runtime plus its crates. The Python **controller** is a separate,
 much larger program and is handled as a later workstream with a compatibility

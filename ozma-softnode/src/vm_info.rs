@@ -32,7 +32,12 @@ impl VMDisplayOutput {
 pub struct VMInfo {
     pub name: String,
     pub vm_id: String,
+    /// Control QMP socket. Empty means discovery could not prove one exists;
+    /// the supervisor must not fabricate a path.
     pub qmp_path: String,
+    /// Dedicated QMP input socket, when a discovery backend can prove one
+    /// exists. Most libvirt/Proxmox domains expose only a control socket.
+    pub qmp_input_path: Option<String>,
     pub vnc_port: u16,
     pub vnc_host: String,
     pub state: String,
@@ -52,6 +57,7 @@ impl VMInfo {
             name,
             vm_id,
             qmp_path: String::new(),
+            qmp_input_path: None,
             vnc_port: 0,
             vnc_host: "127.0.0.1".into(),
             state: "running".into(),

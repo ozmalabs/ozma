@@ -22,6 +22,8 @@ pub mod audio_codes {
     pub const AUDIO_FORMAT_MISMATCH: &str = "audio.format_mismatch";
     /// A frame is structurally invalid (empty, ragged channel data, ...).
     pub const AUDIO_INVALID_FRAME: &str = "audio.invalid_frame";
+    /// A named capture target is malformed.
+    pub const AUDIO_INVALID_TARGET: &str = "audio.invalid_target";
     /// The Opus encoder backend failed.
     pub const AUDIO_ENCODE_FAILED: &str = "audio.encode_failed";
     /// The Opus decoder backend failed.
@@ -65,6 +67,10 @@ pub enum AudioError {
     /// A frame is structurally invalid.
     #[error("invalid audio frame: {0}")]
     InvalidFrame(String),
+    /// A named capture target is malformed (empty, whitespace-only, or it
+    /// contains control characters).
+    #[error("invalid audio target: {0}")]
+    InvalidTarget(String),
     /// The frame does not match the encoder contract.
     #[error("audio format mismatch: expected {expected}, got {actual}")]
     FormatMismatch {
@@ -155,6 +161,14 @@ impl AudioError {
             Self::InvalidFrame(message) => {
                 ApiError::new(audio_codes::AUDIO_INVALID_FRAME, message.clone())
             }
+            Self::InvalidTarget(message) => ApiError::new(
+                audio_codes::AUDIO_INVALID_TARGET,
+                format!("Invalid audio target: {message}"),
+            )
+            .with_remediation(
+                "Use `default`, `object:<name>`, `node:<id>`, or `monitor:<sink>` with a \
+                 non-empty name that contains no control characters.",
+            ),
             Self::FormatMismatch { expected, actual } => ApiError::new(
                 audio_codes::AUDIO_FORMAT_MISMATCH,
                 format!("Audio frame mismatch: encoder expected {expected}, got {actual}."),
@@ -204,6 +218,18 @@ mod tests {
         let api = AudioError::capture("default", "overrun").to_api_error();
         assert_eq!(api.code, audio_codes::AUDIO_CAPTURE_FAILED);
         assert!(api.retryable);
+    }
+
+    #[test]
+    fn invalid_targets_have_their_own_code_and_remediation() {
+        let api =
+            AudioError::InvalidTarget("sink name must not be empty".to_owned()).to_api_error();
+        assert_eq!(api.code, audio_codes::AUDIO_INVALID_TARGET);
+        assert!(api
+            .remediation
+            .as_deref()
+            .unwrap()
+            .contains("object:<name>"));
     }
 
     #[test]

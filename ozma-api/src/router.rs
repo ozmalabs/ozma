@@ -67,6 +67,24 @@ pub fn router_with_sinks(
     capture_sink: Option<Arc<dyn ClientCaptureSink>>,
     token: Option<String>,
 ) -> Router {
+    router_with_sinks_and_extra(backend, scene_sink, capture_sink, token, None)
+}
+
+/// Build the native API router with optional browser scene and capture sinks,
+/// an optional static bearer token, and an optional extra router.
+///
+/// `extra` is merged **before** the bearer-token middleware, so compatibility
+/// endpoints mounted there (for example `/api/v1/connection`) are covered by
+/// the same guard as the native API. The extra router must have its state
+/// erased (`Router<()>`), which `Router::with_state` produces for concrete
+/// application state.
+pub fn router_with_sinks_and_extra(
+    backend: Backend,
+    scene_sink: Option<Arc<dyn BrowserSceneSink>>,
+    capture_sink: Option<Arc<dyn ClientCaptureSink>>,
+    token: Option<String>,
+    extra: Option<Router>,
+) -> Router {
     let scene = Router::new()
         .route("/api/v1/browser/scene/ws", get(browser_scene_ws))
         .with_state(BrowserSceneState { sink: scene_sink });
@@ -116,6 +134,10 @@ pub fn router_with_sinks(
         .with_state(backend);
 
     let router = api.merge(scene).merge(capture);
+    let router = match extra {
+        Some(extra) => router.merge(extra),
+        None => router,
+    };
     match token {
         Some(token) if !token.is_empty() => router.layer(middleware::from_fn_with_state(
             std::sync::Arc::new(token),
@@ -809,6 +831,47 @@ mod tests {
     async fn body_json(response: axum::response::Response) -> serde_json::Value {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn extra_router_is_merged_behind_the_bearer_guard() {
+        let extra = Router::new().route(
+            "/api/v1/connection",
+            get(|| async { Json(serde_json::json!({ "ok": true })) }),
+        );
+
+        let app = router_with_sinks_and_extra(
+            backend(),
+            None,
+            None,
+            Some("secret-token".to_owned()),
+            Some(extra),
+        );
+
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/connection")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let allowed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/connection")
+                    .header("authorization", "Bearer secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+        assert_eq!(body_json(allowed).await["ok"], true);
     }
 
     #[tokio::test]

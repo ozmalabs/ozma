@@ -56,6 +56,14 @@ impl StreamTarget {
             Self::NodeId(id) => format!("node:{id}"),
         }
     }
+
+    /// Target the monitor of a named sink.
+    ///
+    /// PipeWire exposes a sink's monitor as `<sink>.monitor`.  This is a pure
+    /// name construction; the sink and monitor must already exist in the graph.
+    pub fn monitor_for_sink(sink: &str) -> Self {
+        Self::Object(format!("{sink}.monitor"))
+    }
 }
 
 /// Oneshot slot that reports the first negotiation result exactly once.
@@ -183,6 +191,18 @@ mod tests {
         assert_eq!(StreamTarget::NodeId(42).object_name(), None);
         assert_eq!(StreamTarget::NodeId(42).node_id(), Some(42));
         assert_eq!(StreamTarget::Object("mic".into()).describe(), "object:mic");
+        assert_eq!(
+            StreamTarget::monitor_for_sink("ozma-vm1"),
+            StreamTarget::Object("ozma-vm1.monitor".into())
+        );
+        assert_eq!(
+            StreamTarget::monitor_for_sink("alsa_output.pci-0000_00_1f.3.analog-stereo"),
+            StreamTarget::Object("alsa_output.pci-0000_00_1f.3.analog-stereo.monitor".into())
+        );
+        assert_eq!(
+            StreamTarget::monitor_for_sink("ozma-vm1").describe(),
+            "object:ozma-vm1.monitor"
+        );
     }
 
     #[test]

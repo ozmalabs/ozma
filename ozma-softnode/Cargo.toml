@@ -2,7 +2,7 @@
 name        = "ozma-softnode"
 version     = "0.1.0"
 edition     = "2021"
-description = "Ozma Virtual Node — auto-discover QEMU/KVM/Proxmox VMs and manage one softnode per VM"
+description = "Ozma Virtual Node — supervise one ozma-node --profile vm subprocess per QEMU/KVM VM; discovery, port allocation, restart, and in-guest agent provisioning"
 license     = "AGPL-3.0-only"
 
 [[bin]]
@@ -22,6 +22,8 @@ serde              = { version = "1", features = ["derive"] }
 serde_json         = "1"
 clap               = { version = "4", features = ["derive"] }
 glob               = "0.3"
+async-trait        = { workspace = true }
+libc               = { workspace = true }
 # Add dependencies needed for softnode functionality
 # zeroconf          = "0.7"          # for mDNS
 # evdev             = "0.11"          # for evdev input

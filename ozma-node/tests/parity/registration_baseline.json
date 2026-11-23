@@ -1,0 +1,23 @@
+{
+  "_baseline": "Current Python/controller baseline, not a generated snapshot. Fields mirror the TXT dict built in node/node.py run() and the DirectRegisterRequest model in controller/api.py (lines 203-234). The values are for a representative hardware node: name=parity-node, host=192.0.2.10, hid_udp_port=7331, http_port=7382, cap=hid,video,audio, machine_class=server.",
+  "_future_work": "An opt-in live comparison (start node/node.py against the same fake controller and diff the captured JSON) is deliberately not part of CI yet. It needs Python, aiohttp, and mDNS; see docs/parity-matrix.md.",
+  "id": "parity-node._ozma._udp.local.",
+  "host": "192.0.2.10",
+  "port": 7331,
+  "proto": "1",
+  "role": "compute",
+  "hw": "x86_64",
+  "fw": "0.1.0",
+  "cap": "hid,video,audio",
+  "api_port": "7382",
+  "quic_port": "7384",
+  "machine_class": "server",
+  "capture_device": "/dev/video0",
+  "display_outputs": "[{\"name\":\"HDMI-1\",\"width\":1920,\"height\":1080}]",
+  "pci_devices": "[\"0000:01:00.0\"]",
+  "vm_guest_ip": "10.0.0.42",
+  "stream_port": "7382",
+  "stream_path": "/stream/stream.m3u8",
+  "audio_type": "pipewire",
+  "audio_sink": "ozma-node"
+}

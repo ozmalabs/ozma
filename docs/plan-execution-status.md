@@ -1,13 +1,56 @@
 # Plan execution status
 
-Tracking the implementation of [`node-hermes-parity.md`](node-hermes-parity.md).
-This file records what is actually merged and tested, not what is planned.
+Tracking the implementation of [`node-hermes-parity.md`](node-hermes-parity.md)
+and the Rust reconciliation in
+[`rust-reconciliation-plan.md`](rust-reconciliation-plan.md). This file records
+what is actually merged and tested, not what is planned.
 
-Capability and security policy (aperture) is planned in [`aperture-policy.md`](aperture-policy.md).
+Capability and security policy (aperture) is planned in [`aperture-policy.md`](aperture-policy.md); rollout step 1 (`ozma-aperture`) is implemented, and USB/transport/capture/auth adoption remains planned.
 
 USB video output (UVC basic + raw Ozma vendor mode) is planned in [`usb-video-plan.md`](usb-video-plan.md).
 
-The migration from the Python `softnode/`, `node/`, and `agent/` processes to the Rust stack is planned in [`rust-reconciliation-plan.md`](rust-reconciliation-plan.md).
+The migration from the Python `softnode/`, `node/`, and `agent/` processes to the Rust stack is planned in [`rust-reconciliation-plan.md`](rust-reconciliation-plan.md). Parity evidence is tracked in [`parity-matrix.md`](parity-matrix.md).
+
+## Rust reconciliation — Phase 0
+
+| Item | Status | Evidence |
+|---|---|---|
+| Dead `src/` prototypes deleted | Done | `src/agent`, `src/softnode`, `src/main.rs`, and `src/streamdeck.rs` removed; they were outside the workspace and had no references |
+| `ozma-agent` frozen and marked deprecated | Done | module doc, `Cargo.toml` description, and `--help` all point to `ozma-node --profile desktop` |
+| `ozma-softnode` no longer spawns a nonexistent binary | Done | child-process spawn removed; auto-management fails fast with an actionable error; `--no-auto-manage` is discovery-only |
+| `ozma-node --profile {hardware,vm,desktop}` | Done (configuration) | `NodeProfile` and `ProviderSelection` plus CLI overrides; `vm`/`desktop` log a configuration-only warning until Phases 1/3 |
+| Controller compatibility skeleton | Done | real UDP HID v1 listener, `/api/v1/connection`, registration payload parity, bearer-guarded compat router; `cargo test -p ozma-node --lib` (69 tests) |
+| Parity harness and matrix | Done | `ozma-node/tests/parity.rs` (9 tests, CI-safe fake controller) and [`parity-matrix.md`](parity-matrix.md); `cargo test --workspace` green |
+| `ozma-aperture` rollout step 1 | Done | pure meet/provenance/recourse/receipt crate with policy loader; 9 integration tests plus doctest |
+
+Phase 0 does **not** implement QMP/D-Bus/VNC capture, HLS/WebRTC compat routes,
+power, VM provisioning, or real EVDI. Those remain Phase 1–3 work and are marked
+`not-implemented`/`not-run` in the parity matrix.
+
+## Rust reconciliation — Phase 1 / Phase 2
+
+| Item | Status | Evidence |
+|---|---|---|
+| `ozma-qmp` QMP client | Done | dual control/input sockets, greeting/capabilities, request/response timeouts, event skipping, reconnect/backoff, `screendump`, `input-send-event`, `add_client`, `getfd`; 62 tests (1 ignored real-QEMU) |
+| HID → QMP translation | Done | full `HID_TO_QCODE`, keyboard/mouse/relative state machines, wheel press/release pairs, button diffs; 32 tests |
+| Linux uinput sink | Done (unit) | HID→evdev mapping, absolute/relative modes, buttons/wheel, release-all, selection vocabulary; 70 tests, real-device test ignored |
+| QMP input sink | Done | `QmpSink` async writer, modifier diffing, wheel/button translation, release-all, fake-QMP integration; 70 `ozma-input` tests |
+| `ozma-power` | Done (unit/fake) | `QmpPower`, `LibvirtPower`, `virsh` argv/status/fallbacks, typed errors; 34 tests (1 ignored real-QEMU) |
+| QMP capture provider | Done (polling) | `QmpDisplayProvider` PPM screendump → RGB24, fps pacing, typed errors, fake-QMP integration; opt-in registry |
+| Looking Glass provider | Done (fixture) | KVMFR parser/source/provider, RGBA/I420 conversion, temp shared-memory fixture; opt-in registry |
+| VirtualCapture provider | Done (fake runner) | side-effect-free sysfs discovery, v4l2loopback/ffmpeg lifecycle, rollback/stop; real test ignored |
+| VM display model | Done (model) | `VmConsole`/`VmDisplayTopology`, placements, primary/validation, `Console_N` ids; 14 tests |
+| Audio target selection | Done (model) | `AudioTarget`, `<sink>.monitor` naming, `PipeWireCapture::open_target/open_sink_monitor`; no routing yet |
+| VM profile wiring | Partial | `--qmp-socket`/`--qmp-input-socket`/`--libvirt-domain`, QMP capture registry, input sink chain (single-socket QMP fallback), QMP/libvirt power, `/power/state`, `/power/{action}`, connection power summary; 126 `ozma-node` tests |
+| HLS pipeline | Partial | `HlsPipeline` reads RGB24/BGRA `CaptureSource` frames into ffmpeg HLS, `/stream/*` serves the output dir, connection reports `running`/`failed`/`not-configured`; 112 `ozma-node` tests before the compat additions |
+| Controller input compat | Done (recording/fake in CI) | `/input/key`, `/input/mouse`, `/input/type`, `GET/POST /codec`, honest `/audio/*` 501s, bearer-guarded; real injection is hardware/QMP opt-in |
+| WebRTC compat | Not started | `/webrtc/offer` and `/webrtc/bitrate` remain absent and are reported as `not-implemented` |
+| D-Bus framebuffer / VNC | Not started | QMP screendump is the only VM display capture path today |
+| `ozma-softnode` per-VM supervisor | Partial | supervises real `ozma-node --profile vm` subprocesses with deterministic ports, restart/backoff, stop/reap, and QMP input fallback; 20 tests |
+| `ozma-softnode` provisioning | Not started | QMP/display socket creation, libvirt XML edits, D-Bus p2p, evdev `input-linux`, and per-VM audio routing remain deferred |
+
+Gate 2 is **not** met: WebRTC, D-Bus/VNC capture, full VM provisioning, and a
+real-QEMU/controller demo remain. The parity matrix lists the remaining rows.
 
 ## M0 — Contract and cleanup
 
@@ -19,7 +62,7 @@ The migration from the Python `softnode/`, `node/`, and `agent/` processes to th
 | Fake session reaches `Ready`/`Streaming` | Done | `cargo test -p ozma-node --test m0_acceptance` |
 | Fake capture/encoder/transport | Done | `ozma-media`, `ozma-capture`, `ozma-encode`, `ozma-transport` |
 | OpenAPI/JSON schema | Done | `docs/openapi.yaml` covers the node API, sessions, displays, transport, diagnostics, and errors |
-| Orphaned legacy modules wired or deleted | Not started | `ozma-node/src/{capture,serve,hotplug}.rs`, `src/tasks/*` remain unreferenced |
+| Orphaned legacy modules wired or deleted | Partly done | `src/` prototypes deleted; `ozma-node/src/tasks/udp.rs` replaced by `controller_compat`. `ozma-node/src/{capture,serve,hotplug}.rs` and the remaining `src/tasks/*` are still unreferenced and stay with the Phase 2 HLS/task wiring |
 
 ## M1 — One real media path
 
@@ -79,10 +122,15 @@ authentication, and Xpra video are being extended in separate workstreams.
 ## Verification
 
 ```bash
-cargo test --workspace                                   # green
+cargo test --workspace                                   # 1159 passed, 11 ignored (current)
+cargo test -p ozma-node --test parity                    # Python/controller parity baseline
+cargo test -p ozma-node --lib                            # node API, compat, session unit tests (69)
+cargo test -p ozma-qmp -p ozma-input -p ozma-power       # QMP, uinput/QMP sinks, power (166)
+cargo test -p ozma-capture -p ozma-display -p ozma-audio # VM capture, display model, audio target
+cargo test -p ozma-aperture                              # aperture meet/receipts/policy loader
 cargo test -p ozma-node --test quic_session              # real QUIC end-to-end
 cargo test -p ozma-node --test m0_acceptance
-cargo test -p ozma-capture                               # opt-in real camera test is ignored
+cargo test -p ozma-capture                               # opt-in real camera/v4l2loopback tests are ignored
 OZMA_CAPTURE_TEST_DEVICE=/dev/video2 \
   cargo test -p ozma-capture -- --ignored real_v4l2_capture
 OZMA_TEST_CAPTURE_DEVICE=/dev/video0 \
@@ -91,6 +139,27 @@ OZMA_TEST_CAPTURE_DEVICE=/dev/video0 \
 
 ## Deliberate limitations
 
+- QMP display capture is a polling `screendump` path: every frame costs a QMP
+  round trip plus a PPM write/read, and it captures QEMU's default console only.
+  The D-Bus framebuffer and VNC providers are not implemented.
+- The uinput sink is unit-tested but its real `/dev/uinput` test is ignored; the
+  host user is not in the `input` group. QMP sinks are tested against a fake
+  server, not a real QEMU. QMP has no horizontal wheel, touch, or pen event, and
+  those inputs are rejected rather than faked.
+- `PowerAction::Stop` over QMP calls QEMU `stop` (pause), not destroy; a
+  force-off falls back to ACPI powerdown. The libvirt backend uses `virsh`, not
+  the libvirt API.
+- Audio target selection builds `<sink>.monitor` names but does not create,
+  route, or verify a PipeWire sink/monitor node. Per-VM routing remains open.
+- HLS is a local rawvideo→ffmpeg pipeline. It does not delete old segments,
+  `/webrtc/*` is absent, and the unmodified controller has not proxied a Rust
+  node's playlist in a live run. WebRTC, D-Bus/VNC capture, runtime codec
+  override, audio routing, and full `ozma-softnode` provisioning remain
+  unimplemented. Gate 2 is not met until those and a real-QEMU/controller demo
+  land.
+- `ozma-softnode` supervises `ozma-node --profile vm` subprocesses and allocates
+  ports, but it does not create QMP/display sockets, edit libvirt XML, provision
+  evdev/PulseAudio devices, or aggregate status/metrics yet.
 - Video uses VAAPI when its real probe passes and OpenH264 otherwise.
   NVENC/QSV/V4L2M2M are not implemented; the selection policy refuses to
   pretend a software result is hardware.
@@ -129,7 +198,20 @@ OZMA_TEST_CAPTURE_DEVICE=/dev/video0 \
 - The real-camera test used the USB webcam on this workstation; hardware
   encoder paths, 4K, HDR, and long-run thermal behavior are not validated.
 - The HID gadget is unavailable on this host, so input was validated through
-  the recording sink rather than a real USB target.
+  the recording sink rather than a real USB target. When `/dev/hidg0` and
+  `/dev/hidg1` cannot be opened, the node uses the fake sink, reports
+  `sink_kind: "fake-recording"` on `/api/v1/connection`, and does **not**
+  claim to inject input.
+- The controller-compat UDP HID listener and `/api/v1/connection` are
+  implemented. HLS `/stream/*` and `/webrtc/*` remain absent and are reported
+  as `not-implemented`; they are Phase 2 work.
+- `ozma-node --profile vm` and `--profile desktop` only record provider
+  selections today. They log a configuration-only warning; the vm/desktop
+  providers are not started until the Phase 1/3 work lands.
+- `ozma-softnode` is discovery/status/agent-provisioning only. It no longer
+  spawns a nonexistent child binary; auto-management fails fast and points at
+  `ozma-node --profile vm`.
 - `ozma-node` still carries unreferenced legacy capture/HLS/task modules from
-  the earlier sketch; they are not part of the build.
+  the earlier sketch (`capture.rs`, `serve.rs`, `hotplug.rs`, and most of
+  `src/tasks/*`); they are not part of the build and remain Phase 2 wiring.
 - `v4l` pulls `v4l2-sys-mit`, which needs libclang at build time.

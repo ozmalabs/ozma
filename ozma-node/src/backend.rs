@@ -155,6 +155,15 @@ impl SessionBackend {
         self
     }
 
+    /// Replace the capture registry.
+    ///
+    /// Hardware keeps the default V4L2+PipeWire registry; the VM profile passes
+    /// a QMP screendump registry and must not inherit host capture devices.
+    pub fn with_capture_registry(mut self, captures: CaptureRegistry) -> Self {
+        self.captures = captures;
+        self
+    }
+
     /// Install an optional scene producer. The default node remains video-only
     /// until a browser or compositor integration supplies one.
     pub fn with_scene_producer(mut self, producer: Arc<dyn SceneProducer>) -> Self {

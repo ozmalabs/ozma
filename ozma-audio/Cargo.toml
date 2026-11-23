@@ -11,9 +11,11 @@ ozma-pipewire = { path = "../ozma-pipewire" }
 alsa = { workspace = true }
 async-trait = "0.1"
 audiopus = "0.3.0-rc.0"
+serde = { workspace = true }
 thiserror = "1"
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 tracing = "0.1"
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tokio = { version = "1", features = ["full"] }

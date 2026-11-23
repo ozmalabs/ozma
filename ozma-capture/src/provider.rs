@@ -117,6 +117,51 @@ impl CaptureRegistry {
         self
     }
 
+    /// Add a QMP `screendump` display provider.
+    ///
+    /// This is deliberately not part of [`CaptureRegistry::system`] or
+    /// [`CaptureRegistry::system_with_pipewire`]: a hardware node has no QMP
+    /// socket, and a VM node's socket is profile configuration. Call this from
+    /// the VM profile (or a test) with the socket path it owns.
+    pub fn with_qmp_display(mut self, config: crate::qmp_display::QmpDisplayConfig) -> Self {
+        self.register(crate::qmp_display::QmpDisplayProvider::new(config));
+        self
+    }
+
+    /// Add a Looking Glass KVMFR provider.
+    ///
+    /// Like the QMP provider, this is opt-in: a hardware node has no IVSHMEM
+    /// region. Discovery still only reads the shared-memory header.
+    pub fn with_looking_glass(
+        mut self,
+        config: crate::lookingglass::LookingGlassProviderConfig,
+    ) -> Self {
+        self.register(crate::lookingglass::LookingGlassProvider::new(config));
+        self
+    }
+
+    /// Add a v4l2loopback virtual-capture provider.
+    ///
+    /// The capability is [`CaptureKind::V4l2`], but opening it has to run the
+    /// loopback/ffmpeg lifecycle rather than opening an anonymous device. The
+    /// provider is therefore inserted ahead of any existing V4L2 provider, so
+    /// its labelled capability is offered to the virtual provider first; a
+    /// capability it does not own returns `not_found` and discovery falls
+    /// through to the plain V4L2 provider.
+    ///
+    /// This is deliberately not part of [`CaptureRegistry::system`] or
+    /// [`CaptureRegistry::system_with_pipewire`].
+    pub fn with_virtual_capture(
+        mut self,
+        config: crate::r#virtual::VirtualCaptureProviderConfig,
+    ) -> Self {
+        self.providers.insert(
+            0,
+            Arc::new(crate::r#virtual::VirtualCaptureProvider::new(config)),
+        );
+        self
+    }
+
     /// Number of registered providers.
     pub fn provider_count(&self) -> usize {
         self.providers.len()

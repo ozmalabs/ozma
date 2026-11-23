@@ -2,14 +2,15 @@
 name = "ozma-capture"
 version = "0.1.0"
 edition = "2021"
-description = "Capture-source providers for Ozma: deterministic fake, V4L2 discovery/MMAP capture, and PipeWire video capture."
+description = "Capture-source providers for Ozma: fake, V4L2, PipeWire, QMP screendump, Looking Glass KVMFR, and v4l2loopback virtual capture."
 license = "AGPL-3.0-only"
 
 [dependencies]
 ozma-protocol = { path = "../ozma-protocol" }
 ozma-media = { path = "../ozma-media" }
+ozma-qmp = { path = "../ozma-qmp" }
 async-trait = "0.1"
-tokio = { version = "1", features = ["sync", "time", "rt"] }
+tokio = { version = "1", features = ["fs", "sync", "time", "rt", "process"] }
 tracing = "0.1"
 v4l = "0.14"
 
@@ -17,4 +18,7 @@ v4l = "0.14"
 ozma-pipewire = { path = "../ozma-pipewire" }
 
 [dev-dependencies]
+ozma-protocol = { path = "../ozma-protocol" }
+serde_json = { workspace = true }
+tempfile = "3"
 tokio = { version = "1", features = ["full"] }

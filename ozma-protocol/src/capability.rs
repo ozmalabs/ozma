@@ -17,6 +17,10 @@ pub enum CaptureKind {
     V4l2,
     Kms,
     PipeWire,
+    /// QEMU display captured through QMP `screendump`.
+    Qmp,
+    /// Looking Glass KVMFR shared-memory framebuffer.
+    LookingGlass,
     X11,
     Dxgi,
     HdmiSink,

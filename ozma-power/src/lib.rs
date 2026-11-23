@@ -1,0 +1,92 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! VM power backends for Ozma nodes.
+//!
+//! This crate replaces `softnode/libvirt_power.py` and the power methods of
+//! `softnode/qmp_client.py`. Every backend implements [`PowerBackend`], so the
+//! upcoming VM profile and the controller compatibility HTTP surface can select
+//! libvirt or QMP without branching.
+//!
+//! * [`LibvirtPower`] shells out to `virsh` with an argv vector (no shell),
+//!   exactly like the Python fallback path.
+//! * [`QmpPower`] wraps [`ozma_qmp::QmpClient`] and shares its handshake,
+//!   timeouts, and reconnect policy.
+//!
+//! # Status vocabulary
+//!
+//! [`PowerState`] serializes as `{"status": "..."}`. Backend output is
+//! normalized to the stable Python names: `running`, `blocked`, `paused`,
+//! `shutdown`, `shutoff`, `crashed`, `pmsuspended`, `unknown`.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use ozma_power::{LibvirtPower, PowerBackend};
+//!
+//! # async fn example() -> Result<(), ozma_power::PowerError> {
+//! let mut power = LibvirtPower::new("my-vm");
+//! power.connect().await?;
+//!
+//! let state = power.query_status().await?;
+//! println!("state: {state}");
+//!
+//! power.cont().await?;           // resume paused, or start shutoff
+//! power.system_powerdown().await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! A QMP backend uses the same trait:
+//!
+//! ```no_run
+//! use ozma_power::{PowerBackend, QmpPower};
+//! use ozma_qmp::QmpConfig;
+//!
+//! # async fn example() -> Result<(), ozma_power::PowerError> {
+//! let mut power = QmpPower::connect(QmpConfig::new("/run/ozma/vm-ctrl.qmp")).await?;
+//! assert!(power.query_status().await?.is_running());
+//! # Ok(())
+//! # }
+//! ```
+
+#![forbid(unsafe_code)]
+
+mod action;
+mod error;
+mod libvirt;
+mod qmp;
+mod runner;
+mod state;
+
+use async_trait::async_trait;
+
+pub use action::PowerAction;
+pub use error::PowerError;
+pub use libvirt::{LibvirtPower, DEFAULT_LIBVIRT_URI};
+pub use qmp::QmpPower;
+pub use runner::{CommandOutput, CommandRunner, TokioCommandRunner};
+pub use state::{PowerState, PowerStatus};
+
+/// VM power control shared by every backend.
+///
+/// Implementations are `Send + Sync` and object safe, so a node can hold a
+/// `Box<dyn PowerBackend>` selected from configuration.
+#[async_trait]
+pub trait PowerBackend: Send + Sync {
+    /// Current VM state.
+    async fn query_status(&mut self) -> Result<PowerState, PowerError>;
+
+    /// Resume a paused VM, or start a stopped one.
+    async fn cont(&mut self) -> Result<(), PowerError>;
+
+    /// Request an orderly ACPI shutdown.
+    async fn system_powerdown(&mut self) -> Result<(), PowerError>;
+
+    /// Reset the VM.
+    async fn system_reset(&mut self) -> Result<(), PowerError>;
+
+    /// Force the VM off (destroy, not a guest-requested shutdown).
+    ///
+    /// [`QmpPower`] delegates to QEMU's `stop`, which pauses rather than
+    /// destroys; see its implementation docs.
+    async fn stop(&mut self) -> Result<(), PowerError>;
+}

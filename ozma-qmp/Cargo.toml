@@ -1,0 +1,18 @@
+[package]
+name = "ozma-qmp"
+version = "0.1.0"
+edition = "2021"
+description = "QMP control/input client and HID-to-QMP translation for Ozma nodes."
+license = "AGPL-3.0-only"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+nix = { version = "0.30", features = ["socket", "uio"] }
+
+[dev-dependencies]
+tempfile = "3"
+nix = { version = "0.30", features = ["socket", "uio"] }
