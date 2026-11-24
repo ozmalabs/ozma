@@ -30,7 +30,9 @@ jobs:
   # ── Native x86-64 build + test ──────────────────────────────────────────
   build-native:
     name: Build & test (x86-64)
-    runs-on: ubuntu-22.04
+    # PipeWire 1.x headers are required by libspa 0.9; Ubuntu 22.04's 0.3
+    # headers are too old and fail the generated-bindings build.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -90,7 +92,7 @@ jobs:
   # ── Debian package (aarch64) ────────────────────────────────────────────
   deb-aarch64:
     name: Build .deb (aarch64)
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     needs: build-aarch64
     steps:
       - uses: actions/checkout@v4

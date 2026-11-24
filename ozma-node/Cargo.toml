@@ -77,6 +77,11 @@ libmdns = "0.9"
 local-ip-address = "0.6"
 hostname         = "0.4"
 
+[package.metadata.deb]
+# Explicit runtime dependencies avoid dpkg-shlibdeps, which cannot resolve
+# aarch64 libraries when packaging a cross-compiled binary on an amd64 host.
+depends = "libc6, libgcc-s1, libstdc++6, libasound2, libpipewire-0.3-0, libpam0g, libudev1, libopus0"
+
 [lib]
 name = "ozma_node"
 path = "src/lib.rs"
