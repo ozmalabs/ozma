@@ -195,17 +195,20 @@ capture.
   frame advertises no source. There is no synthetic fallback and no
   `v4l2loopback`/emulated-display claim. `--capture-provider looking-glass`
   requires `--profile vm` and `--looking-glass-shm`.
-- Remaining controller/GPU limits: the console switch is one active capture
-  source at a time, not a per-console capture broker or simultaneous encoders.
-  Only the D-Bus provider exposes runtime-selectable console indexes; QMP/VNC/
-  Looking Glass still require a node restart. WebRTC restarts keep their
-  configured dimensions unless the selected output advertises non-zero
-  geometry, so a console with a different mode may need matching
-  `--webrtc-width/--webrtc-height`. The live two-head QEMU run proved switching
-  to a second emulated VGA head, but that head still showed retained early-boot
-  text rather than a guest-programmed live login console; a real second
-  virtio-gpu scanout remains unproven. No GPU/VFIO or KVMFR host has been
-  exercised in CI.
+- Remaining controller/GPU limits: the default console switch is one active
+  capture source at a time. The bounded snapshot broker provides simultaneous
+  JPEG previews, and opt-in `--multi-console-hls` provides bounded simultaneous
+  HLS encoders for advertised D-Bus consoles; WebRTC is still active-console
+  only and is not simultaneous. Only the D-Bus provider exposes
+  runtime-selectable console indexes; QMP/VNC/Looking Glass still require a node
+  restart (or keep the single active HLS path when `--multi-console-hls` is
+  requested). WebRTC restarts keep their configured dimensions unless the
+  selected output advertises non-zero geometry, so a console with a different
+  mode may need matching `--webrtc-width/--webrtc-height`. The live two-head
+  QEMU run proved switching to a second emulated VGA head, but that head still
+  showed retained early-boot text rather than a guest-programmed live login
+  console; a real second virtio-gpu scanout remains unproven. No GPU/VFIO or
+  KVMFR host has been exercised in CI.
 
 ## Input
 

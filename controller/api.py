@@ -5,6 +5,7 @@ REST API and WebSocket server on port 7380.
 REST endpoints:
   GET  /api/v1/nodes                 — list all known nodes
   GET  /api/v1/nodes/{id}            — get a single node
+  GET  /api/v1/seats                 — read-only multi-seat groups
   POST /api/v1/nodes/{id}/activate   — make a node active
   GET  /api/v1/status                — system snapshot
   GET  /api/v1/graph                 — routing graph (devices + links)
@@ -49,6 +50,7 @@ except (ImportError, Exception):
     _GRAPHQL_AVAILABLE = False
 
 from state import AppState, NodeInfo
+from seats import group_seats
 from node_auth import node_api_headers, node_auth_error
 from permissions import (
     check_node_permission, check_destructive_warnings, warnings_to_dict,
@@ -237,6 +239,9 @@ class DirectRegisterRequest(BaseModel):
     frigate_port: str = ""     # Frigate API port (default 5000)
     vm_guest_ip: str = ""      # VM guest network IP (soft nodes only)
     pci_devices: str = ""     # JSON-encoded list of PCI addresses (GPU passthrough)
+    # Optional explicit seat identity (e.g. "host-seat-0"). Older nodes omit it
+    # and grouping falls back to the node-name convention.
+    seat_id: str = ""
 
 
 def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None, sunshine: Any | None = None, msp_mgr: MSPDashboardManager | None = None, msp_portal: MSPPortalManager | None = None, auto_configure: Any | None = None, cam_connect: Any | None = None, grid: Any | None = None, parental: ParentalControlsManager | None = None, backup_nudge: BackupNudgeService | None = None, dns_filter: Any | None = None, local_proxy: Any | None = None, file_sharing: Any | None = None, zfs: Any | None = None, failover: Any | None = None, ups_monitor: Any | None = None, ddns: Any | None = None, speedtest: Any | None = None, dns_verifier: Any | None = None, node_api_token: str = "", webrtc_ice_servers: list[dict] | None = None, supervisor_status_url: str = "", supervisor_status_token: str = "") -> FastAPI:
@@ -1058,6 +1063,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             direct_registered=True,
             vm_guest_ip=req.vm_guest_ip or None,
             pci_devices=json.loads(req.pci_devices) if req.pci_devices else [],
+            seat_id=req.seat_id.strip(),
         )
         await state.add_node(node)
         if streams:
@@ -1112,6 +1118,17 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             for i, o in enumerate(display_outputs)
         ] if display_outputs else []
         return d
+
+    @app.get("/api/v1/seats")
+    async def list_seats() -> dict[str, Any]:
+        """Read-only seat groups derived from registered nodes.
+
+        Grouping prefers an explicit ``seat_id``/``parent_node_id`` and falls
+        back to the ``<machine>-seat-<n>`` naming convention used by
+        ``ozma-multiseat``. Unrelated nodes stay in ``unseated_node_ids`` and
+        are never reported as seats. No tokens or secrets are included.
+        """
+        return group_seats(state.nodes.values())
 
     # ── Per-node bearer-token store / rotation ────────────────────────────────
     # Metadata only: tokens are never included here. The one exception is the
@@ -1682,6 +1699,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             "ok": True,
             "display_outputs": connection.get("display_outputs") or [],
             "display_capture": connection.get("display_capture") or {},
+            "multi_console_hls": connection.get("multi_console_hls"),
         }
 
     @app.get("/api/v1/nodes/{node_id}/display/info")
@@ -3675,9 +3693,15 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             media_type="multipart/x-mixed-replace; boundary=frame",
         )
 
-    @app.get("/api/v1/streams/{node_id:path}/hls/{filename}")
+    @app.get("/api/v1/streams/{node_id:path}/hls/{filename:path}")
     async def stream_hls_proxy(node_id: str, filename: str) -> Response:
-        """Proxy HLS files (m3u8 + .ts segments) from a node's soft node."""
+        """Proxy HLS files (m3u8 + .ts segments) from a node's soft node.
+
+        ``filename`` may be a plain file (the active console, served at
+        ``/stream/{file}``) or ``console-<N>/<file>`` for the opt-in per-console
+        playlists (served at ``/stream/console-<N>/<file>``). Relative segment
+        URLs in the playlist therefore resolve back through this proxy.
+        """
         node = state.nodes.get(node_id)
         if not node:
             raise HTTPException(status_code=404, detail="Node not found")
@@ -3686,10 +3710,13 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(status_code=404, detail="Node has no API port")
         import aiohttp as _aiohttp
         content_type = "application/vnd.apple.mpegurl" if filename.endswith(".m3u8") else "video/mp2t"
+        target = filename.lstrip("/")
+        if not target or ".." in target.split("/"):
+            raise HTTPException(status_code=404, detail="Invalid HLS file")
         try:
             async with _aiohttp.ClientSession() as session:
                 async with session.get(
-                    f"http://127.0.0.1:{api_port}/stream/{filename}",
+                    f"http://127.0.0.1:{api_port}/stream/{target}",
                     timeout=_aiohttp.ClientTimeout(total=10),
                 ) as resp:
                     if resp.status == 200:

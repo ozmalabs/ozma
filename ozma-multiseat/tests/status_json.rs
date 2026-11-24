@@ -48,6 +48,11 @@ fn status_document_has_one_node_per_seat_and_stable_json() {
     assert_eq!(status.capability.display_backend, "fake-display");
     assert_eq!(status.capability.input_backend, "fake-input");
     assert_eq!(status.capability.capture_providers, vec!["x11"]);
+    assert_eq!(status.capability.display_ownership, "xrandr-output");
+    assert_eq!(
+        status.capability.input_routing,
+        vec!["xinput-map-to-output"]
+    );
     assert_eq!(status.seats.len(), 2);
     assert!(status
         .seats

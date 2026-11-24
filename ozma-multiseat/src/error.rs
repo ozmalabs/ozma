@@ -103,6 +103,46 @@ pub enum MultiseatError {
     /// errors.
     #[error("seat supervisor error: {0}")]
     Supervisor(String),
+
+    /// A required external tool (for example `xinput` or `xrandr`) could not
+    /// be executed. This is a typed error so a missing tool never becomes a
+    /// silent routing/ownership success.
+    #[error("required tool {program:?} is unavailable: {reason}")]
+    CommandUnavailable {
+        /// Program that could not be executed.
+        program: String,
+        /// Why it could not be executed.
+        reason: String,
+    },
+
+    /// An external routing/ownership command ran but exited non-zero.
+    #[error("{program} {args:?} exited with status {status}: {stderr}")]
+    CommandFailed {
+        /// Program that was run.
+        program: String,
+        /// Arguments after the program name.
+        args: Vec<String>,
+        /// Exit status, or `-1` when the process was terminated by a signal.
+        status: i32,
+        /// Captured stderr.
+        stderr: String,
+    },
+
+    /// An input group could not be assigned to a seat, or a release/rollback
+    /// step could not be completed.
+    #[error("input routing error: {0}")]
+    InputRouting(String),
+
+    /// A display could not be owned by a seat, or an ownership release step
+    /// could not be completed.
+    #[error("display ownership error: {0}")]
+    DisplayOwnership(String),
+
+    /// The requested operation needs a platform feature this crate models but
+    /// deliberately does not execute (for example a real `EVIOCGRAB` ioctl or a
+    /// compositor seat).
+    #[error("unsupported operation: {0}")]
+    Unsupported(String),
 }
 
 impl MultiseatError {

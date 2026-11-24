@@ -225,6 +225,47 @@ pub enum UsbError {
         reason: String,
     },
 
+    /// A FunctionFS daemon did not report readiness before the deadline.
+    #[error(
+        "FunctionFS {instance:?} did not become ready within {timeout_ms} ms \
+         (last observed state: {readiness})"
+    )]
+    FunctionFsReadinessTimeout {
+        /// Function instance.
+        instance: String,
+        /// Deadline in milliseconds.
+        timeout_ms: u64,
+        /// Last marker/daemon readiness state.
+        readiness: &'static str,
+    },
+
+    /// A FunctionFS mount, unmount, or lifecycle helper failed.
+    #[error("FunctionFS {operation} failed at {path}: {reason}")]
+    FunctionFsLifecycle {
+        /// Operation that failed (`mount`, `unmount`, `prepare`, ...).
+        operation: &'static str,
+        /// Path involved.
+        path: PathBuf,
+        /// Human-readable reason.
+        reason: String,
+    },
+
+    /// A write-overlay operation would exceed image or allocation bounds.
+    #[error("write overlay bounds exceeded: {reason}")]
+    OverlayBounds {
+        /// Why the operation was rejected.
+        reason: String,
+    },
+
+    /// An overlay persistence file is malformed or does not match its base.
+    #[error("invalid write overlay {path}: {reason}")]
+    OverlayCorrupt {
+        /// Persistence file involved.
+        path: PathBuf,
+        /// Why the file was rejected.
+        reason: String,
+    },
+
     /// A bounded FunctionFS buffer would be exceeded.
     #[error("FunctionFS {context} exceeds {limit} bytes (requested {requested})")]
     FunctionFsBuffer {
@@ -298,12 +339,16 @@ impl UsbError {
             Self::Spawn { .. } => "spawn",
             Self::CommandFailed { .. } => "command-failed",
             Self::UnsupportedFunctionFs { .. } => "unsupported-functionfs",
+            Self::OverlayBounds { .. } => "overlay-bounds",
+            Self::OverlayCorrupt { .. } => "overlay-corrupt",
             Self::MissingFunctionFsMount(_) => "missing-functionfs-mount",
             Self::MissingFunctionFsEp0(_) => "missing-functionfs-ep0",
             Self::MissingFunctionFsEndpoint(_) => "missing-functionfs-endpoint",
             Self::InvalidFunctionFsDescriptor { .. } => "invalid-functionfs-descriptor",
             Self::UnsupportedFunctionFsControl { .. } => "unsupported-functionfs-control",
             Self::InvalidFunctionFsState { .. } => "invalid-functionfs-state",
+            Self::FunctionFsReadinessTimeout { .. } => "functionfs-readiness-timeout",
+            Self::FunctionFsLifecycle { .. } => "functionfs-lifecycle",
             Self::FunctionFsBuffer { .. } => "functionfs-buffer-too-large",
             Self::FunctionFsEp0Io { .. } => "functionfs-ep0-io",
             Self::FunctionFsEndpointIo { .. } => "functionfs-endpoint-io",

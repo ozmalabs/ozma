@@ -25,6 +25,12 @@ pub struct MultiseatCapability {
     pub input_backend: String,
     /// Capture providers in use (`x11`, `pipewire`), sorted.
     pub capture_providers: Vec<String>,
+    /// Planned display ownership mode (`xrandr-output`, or `none`).
+    #[serde(default)]
+    pub display_ownership: String,
+    /// Planned input routing strategies, sorted and deduplicated.
+    #[serde(default)]
+    pub input_routing: Vec<String>,
 }
 
 /// Full multi-seat status document for the controller.
@@ -82,12 +88,42 @@ impl MultiseatStatus {
                 display_backend: plan.display_backend.clone(),
                 input_backend: plan.input_backend.clone(),
                 capture_providers: plan.capture_providers(),
+                display_ownership: display_ownership(plan),
+                input_routing: input_routing(plan),
             },
             requested_seats: plan.requested_seats,
             seats,
             diagnostics: plan.diagnostics.clone(),
         }
     }
+}
+
+fn display_ownership(plan: &MultiseatPlan) -> String {
+    let mut modes: Vec<&str> = plan
+        .seats
+        .iter()
+        .filter_map(|seat| seat.ownership.as_ref())
+        .map(|ownership| ownership.kind.as_str())
+        .collect();
+    modes.sort();
+    modes.dedup();
+    if modes.is_empty() {
+        "none".to_owned()
+    } else {
+        modes.join(",")
+    }
+}
+
+fn input_routing(plan: &MultiseatPlan) -> Vec<String> {
+    let mut strategies: Vec<String> = plan
+        .seats
+        .iter()
+        .filter_map(|seat| seat.input_route.as_ref())
+        .map(|route| route.strategy.as_str().to_owned())
+        .collect();
+    strategies.sort();
+    strategies.dedup();
+    strategies
 }
 
 /// Render the bounded Prometheus text surface for a multi-seat status document.

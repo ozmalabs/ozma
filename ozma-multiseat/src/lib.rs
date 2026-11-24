@@ -17,14 +17,21 @@
 //!   seat is one node, plus a bounded Prometheus metrics renderer.
 //! * [`host`] joins a display backend and an input backend and refuses to plan
 //!   when display enumeration fails or reports no displays.
+//! * [`routing`] is the physical input routing contract: `xinput map-to-output`
+//!   command construction/execution through an injected runner, sysfs evdev
+//!   name resolution, seat assignment/rollback, and an exclusive-`EVIOCGRAB`
+//!   model with per-seat uinput environment.
+//! * [`ownership`] models per-seat display ownership and builds
+//!   `xrandr --output ... --mode ... --pos ...` commands. On one X server this
+//!   is output positioning, not screen isolation.
 //! * [`supervisor`] starts, health-checks, restarts, stops, and reports real
 //!   `ozma-node --profile desktop` children. [`fake`] contains the test-only
-//!   launcher, readiness probe, backends, and `FakeSeatSupervisor`.
+//!   launcher, readiness probe, backends, command runner, and grab fake.
 //!
 //! The crate performs no input injection, opens no evdev node, creates no
-//! virtual display, and allocates no PipeWire sink. The supervisor only spawns
-//! the planned node process; display/input ownership, evdev grabs, audio sink
-//! creation, and game launching remain outside this crate. It contains no
+//! virtual display, and allocates no PipeWire sink. Routing and ownership
+//! commands are only executed through an explicitly injected runner; the
+//! default evdev grab backend returns a typed unsupported error. It contains no
 //! `unsafe` code (the Unix SIGTERM helper is the safe `nix` API).
 //!
 //! Test fakes in [`fake`] never touch the host. Production code must not select
@@ -38,7 +45,9 @@ pub mod error;
 pub mod fake;
 pub mod host;
 pub mod input;
+pub mod ownership;
 pub mod planner;
+pub mod routing;
 pub mod seat;
 pub mod status;
 pub mod supervisor;
@@ -52,7 +61,9 @@ pub use drm::{
 };
 pub use error::MultiseatError;
 pub use fake::{
-    FakeDisplayBackend, FakeInputBackend, FakeNodeLauncher, FakeReadinessProbe, FakeSeatSupervisor,
+    FakeCommandRunner, FakeDeviceNameResolver, FakeDisplayBackend, FakeEvdevGrabBackend,
+    FakeGrabAction, FakeGrabEvent, FakeInputBackend, FakeNodeLauncher, FakeReadinessProbe,
+    FakeSeatSupervisor,
 };
 pub use host::HostTopology;
 pub use input::{
@@ -60,7 +71,21 @@ pub use input::{
     InputDeviceKind, InputGroup, SysfsInputBackend, DEFAULT_INPUT_DEV_ROOT,
     DEFAULT_SYSFS_INPUT_ROOT, INTERNAL_HUB,
 };
+pub use ownership::{
+    apply_ownership, DisplayOwnership, DisplayOwnershipController, DisplayOwnershipKind,
+    XrandrOwnershipController, OZMA_DISPLAY_OWNERSHIP_ENV, OZMA_X11_MODE_ENV, OZMA_X11_OUTPUT_ENV,
+    SINGLE_X_SERVER_LIMITATION, XRANDR_PROGRAM,
+};
 pub use planner::{allocate_ports, CapturePreference, MultiseatPlanner, PlannerOptions};
+pub use routing::{
+    assign_seats, parse_xinput_list, route_environment, CommandOutput, CommandRunner,
+    DeviceNameResolver, EvdevGrabBackend, EvdevGrabCommand, EvdevGrabRequest, EvdevGrabRouter,
+    InputAssignment, InputRelease, InputRoutePlan, InputRouter, InputRoutingStrategy, InputTarget,
+    ProcessCommandRunner, RouteCommand, SeatInputAssignment, SysfsDeviceNameResolver,
+    UnsupportedEvdevGrabBackend, XInputDevice, XInputMapping, XInputRouter, EVDEV_ROUTER_NAME,
+    EVIOCGRAB_REQUEST, OZMA_INPUT_ROUTER_ENV, OZMA_SEAT_ID_ENV, OZMA_UINPUT_SEAT_ENV,
+    XINPUT_PROGRAM, XINPUT_ROUTER_NAME,
+};
 pub use seat::{
     CapturePlan, DiagnosticCode, MultiseatPlan, NodeCommand, PlanDiagnostic, ProfileDefaults,
     SeatConfig, SeatPlan, SeatPorts, SeatProfile, SeatRuntimeStatus, SeatState, SeatStatus,

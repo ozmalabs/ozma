@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use crate::display::DisplayOutput;
 use crate::error::MultiseatError;
 use crate::input::InputGroup;
+use crate::ownership::DisplayOwnership;
+use crate::routing::InputRoutePlan;
 
 /// The built-in per-seat profiles from the Python baseline.
 ///
@@ -312,6 +314,14 @@ pub struct SeatPlan {
     /// Assigned input group, or `None` when no input topology was available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<InputGroup>,
+    /// Planned display ownership. Present for X11 seats; `None` for PipeWire
+    /// capture, where the compositor owns outputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership: Option<DisplayOwnership>,
+    /// Planned physical input routing intent. Present when the seat has an
+    /// input group and an X11 display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_route: Option<InputRoutePlan>,
     /// Deterministic node launch command.
     pub command: NodeCommand,
 }
@@ -343,6 +353,8 @@ impl SeatPlan {
             profile: self.config.profile,
             capture: self.config.capture.clone(),
             input_devices: self.config.input_devices.clone(),
+            ownership: self.ownership.clone(),
+            input_route: self.input_route.clone(),
             state,
             pid: None,
             restarts: 0,
@@ -492,6 +504,12 @@ pub struct SeatStatus {
     /// Assigned input device paths.
     #[serde(default)]
     pub input_devices: Vec<String>,
+    /// Planned display ownership, when the seat owns an X11 output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership: Option<DisplayOwnership>,
+    /// Planned input routing intent, when the seat has an input group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_route: Option<InputRoutePlan>,
     /// Lifecycle state.
     pub state: SeatState,
     /// Child process id, when a live child exists.

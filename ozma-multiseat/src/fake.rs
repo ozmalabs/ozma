@@ -12,6 +12,10 @@ use std::sync::{Arc, Mutex};
 use crate::display::{DisplayBackend, DisplayOutput};
 use crate::error::MultiseatError;
 use crate::input::{InputBackend, InputDevice};
+use crate::routing::{
+    CommandOutput, CommandRunner, DeviceNameResolver, EvdevGrabBackend, EvdevGrabRequest,
+    RouteCommand,
+};
 use crate::seat::{SeatPlan, SeatRuntimeStatus, SeatState};
 use crate::supervisor::{
     ChildExit, ChildHandle, NodeLaunchSpec, NodeLauncher, ReadinessProbe, SeatSupervisor,
@@ -481,5 +485,287 @@ impl ReadinessProbe for FakeReadinessProbe {
             return Err(MultiseatError::Supervisor(reason.clone()));
         }
         Ok(state.calls > state.not_ready_calls)
+    }
+}
+
+#[derive(Debug)]
+struct FakeCommandRule {
+    program: String,
+    args: Vec<String>,
+    output: CommandOutput,
+}
+
+#[derive(Debug, Default)]
+struct FakeCommandRunnerState {
+    commands: Vec<RouteCommand>,
+    rules: Vec<FakeCommandRule>,
+    unavailable: BTreeSet<String>,
+}
+
+/// Recording command runner for routing and ownership tests.
+///
+/// Every invocation is recorded, and responses are matched by exact program
+/// and argv. A program added with [`Self::with_unavailable`] returns a typed
+/// [`MultiseatError::CommandUnavailable`]. An unscripted invocation returns a
+/// typed error instead of a fabricated success.
+#[derive(Clone, Debug, Default)]
+pub struct FakeCommandRunner {
+    state: Arc<Mutex<FakeCommandRunnerState>>,
+}
+
+impl FakeCommandRunner {
+    /// An empty runner with no scripted responses.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mark a program as absent. Any invocation returns `CommandUnavailable`.
+    pub fn with_unavailable(self, program: impl Into<String>) -> Self {
+        self.state
+            .lock()
+            .expect("fake command runner lock")
+            .unavailable
+            .insert(program.into());
+        self
+    }
+
+    /// Script one exact invocation to return `output`.
+    pub fn respond(self, program: impl Into<String>, args: &[&str], output: CommandOutput) -> Self {
+        self.state
+            .lock()
+            .expect("fake command runner lock")
+            .rules
+            .push(FakeCommandRule {
+                program: program.into(),
+                args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+                output,
+            });
+        self
+    }
+
+    /// Script one exact invocation to succeed with `stdout`.
+    pub fn respond_stdout(self, program: impl Into<String>, args: &[&str], stdout: &str) -> Self {
+        self.respond(program, args, CommandOutput::stdout(stdout))
+    }
+
+    /// Script one exact invocation to fail with an exit status and stderr.
+    pub fn respond_failure(
+        self,
+        program: impl Into<String>,
+        args: &[&str],
+        status: i32,
+        stderr: &str,
+    ) -> Self {
+        self.respond(program, args, CommandOutput::failure(status, stderr))
+    }
+
+    /// Every command passed to [`CommandRunner::run`], in order.
+    pub fn commands(&self) -> Vec<RouteCommand> {
+        self.state
+            .lock()
+            .expect("fake command runner lock")
+            .commands
+            .clone()
+    }
+
+    /// Number of invocations.
+    pub fn run_count(&self) -> usize {
+        self.state
+            .lock()
+            .expect("fake command runner lock")
+            .commands
+            .len()
+    }
+
+    /// Most recent invocation, if any.
+    pub fn last_command(&self) -> Option<RouteCommand> {
+        self.state
+            .lock()
+            .expect("fake command runner lock")
+            .commands
+            .last()
+            .cloned()
+    }
+}
+
+impl CommandRunner for FakeCommandRunner {
+    fn run(&self, command: &RouteCommand) -> Result<CommandOutput, MultiseatError> {
+        let mut state = self.state.lock().expect("fake command runner lock");
+        state.commands.push(command.clone());
+
+        if state.unavailable.contains(&command.program) {
+            return Err(MultiseatError::CommandUnavailable {
+                program: command.program.clone(),
+                reason: "marked unavailable by the fake runner".to_owned(),
+            });
+        }
+
+        state
+            .rules
+            .iter()
+            .find(|rule| rule.program == command.program && rule.args == command.args)
+            .map(|rule| rule.output.clone())
+            .ok_or_else(|| {
+                MultiseatError::InputRouting(format!(
+                    "fake command runner has no scripted response for {:?} {:?}",
+                    command.program, command.args
+                ))
+            })
+    }
+}
+
+/// Fake evdev path-to-name resolver backed by an in-memory map.
+#[derive(Clone, Debug, Default)]
+pub struct FakeDeviceNameResolver {
+    names: Arc<Mutex<BTreeMap<String, String>>>,
+    failure: Arc<Mutex<Option<String>>>,
+}
+
+impl FakeDeviceNameResolver {
+    /// An empty resolver.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert a name and return `self` for chaining.
+    pub fn with_name(self, evdev_path: impl Into<String>, name: impl Into<String>) -> Self {
+        self.names
+            .lock()
+            .expect("fake resolver lock")
+            .insert(evdev_path.into(), name.into());
+        self
+    }
+
+    /// Insert a name in place.
+    pub fn insert(&self, evdev_path: impl Into<String>, name: impl Into<String>) {
+        self.names
+            .lock()
+            .expect("fake resolver lock")
+            .insert(evdev_path.into(), name.into());
+    }
+
+    /// Make every lookup return a typed I/O failure.
+    pub fn failing(reason: impl Into<String>) -> Self {
+        let resolver = Self::new();
+        *resolver.failure.lock().expect("fake resolver lock") = Some(reason.into());
+        resolver
+    }
+}
+
+impl DeviceNameResolver for FakeDeviceNameResolver {
+    fn device_name(&self, evdev_path: &str) -> Result<Option<String>, MultiseatError> {
+        if let Some(reason) = self.failure.lock().expect("fake resolver lock").as_ref() {
+            return Err(MultiseatError::InputRouting(reason.clone()));
+        }
+        Ok(self
+            .names
+            .lock()
+            .expect("fake resolver lock")
+            .get(evdev_path)
+            .cloned())
+    }
+}
+
+/// One fake grab/ungrab event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FakeGrabAction {
+    /// Exclusive grab.
+    Grab,
+    /// Release.
+    Ungrab,
+}
+
+/// Recorded fake grab event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FakeGrabEvent {
+    /// Grab or release.
+    pub action: FakeGrabAction,
+    /// Evdev path.
+    pub device: String,
+    /// Seat id.
+    pub seat_id: String,
+}
+
+#[derive(Debug, Default)]
+struct FakeGrabState {
+    grabbed: BTreeSet<String>,
+    events: Vec<FakeGrabEvent>,
+    fail_devices: BTreeSet<String>,
+    fail_next_grab: bool,
+}
+
+/// In-memory `EvdevGrabBackend` that never opens `/dev/input`.
+#[derive(Clone, Debug, Default)]
+pub struct FakeEvdevGrabBackend {
+    state: Arc<Mutex<FakeGrabState>>,
+}
+
+impl FakeEvdevGrabBackend {
+    /// An empty backend.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fail the next grab request.
+    pub fn fail_next_grab(self) -> Self {
+        self.state.lock().expect("fake grab lock").fail_next_grab = true;
+        self
+    }
+
+    /// Always fail grabs for one device path.
+    pub fn fail_device(self, device: impl Into<String>) -> Self {
+        self.state
+            .lock()
+            .expect("fake grab lock")
+            .fail_devices
+            .insert(device.into());
+        self
+    }
+
+    /// Currently grabbed device paths, sorted.
+    pub fn grabbed(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .expect("fake grab lock")
+            .grabbed
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Every grab/ungrab event, in order.
+    pub fn events(&self) -> Vec<FakeGrabEvent> {
+        self.state.lock().expect("fake grab lock").events.clone()
+    }
+}
+
+impl EvdevGrabBackend for FakeEvdevGrabBackend {
+    fn grab(&mut self, request: &EvdevGrabRequest) -> Result<(), MultiseatError> {
+        let mut state = self.state.lock().expect("fake grab lock");
+        if state.fail_next_grab || state.fail_devices.contains(&request.device) {
+            state.fail_next_grab = false;
+            return Err(MultiseatError::InputRouting(format!(
+                "fake grab failure for {}",
+                request.device
+            )));
+        }
+        state.grabbed.insert(request.device.clone());
+        state.events.push(FakeGrabEvent {
+            action: FakeGrabAction::Grab,
+            device: request.device.clone(),
+            seat_id: request.seat_id.clone(),
+        });
+        Ok(())
+    }
+
+    fn ungrab(&mut self, request: &EvdevGrabRequest) -> Result<(), MultiseatError> {
+        let mut state = self.state.lock().expect("fake grab lock");
+        state.grabbed.remove(&request.device);
+        state.events.push(FakeGrabEvent {
+            action: FakeGrabAction::Ungrab,
+            device: request.device.clone(),
+            seat_id: request.seat_id.clone(),
+        });
+        Ok(())
     }
 }

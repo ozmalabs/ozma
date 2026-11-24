@@ -425,6 +425,37 @@ fn print_plan_report(
                 seat.config.input_devices.join(", ")
             }
         );
+        if let Some(ownership) = &seat.ownership {
+            println!(
+                "    ownership: {} {} mode={} pos={} [{}]",
+                ownership.kind.as_str(),
+                ownership.output,
+                ownership.mode,
+                ownership.position(),
+                if ownership.x_screen.is_empty() {
+                    "(no X screen)"
+                } else {
+                    &ownership.x_screen
+                }
+            );
+        }
+        if let Some(route) = &seat.input_route {
+            println!(
+                "    input route: {} hub={} pointers={} grab={}",
+                route.strategy.as_str(),
+                route.hub_path,
+                if route.pointer_devices.is_empty() {
+                    "(none)".to_owned()
+                } else {
+                    route.pointer_devices.join(", ")
+                },
+                if route.grab_exclusive {
+                    "modelled"
+                } else {
+                    "no"
+                }
+            );
+        }
         println!("    argv: {}", seat.node_argv().join(" "));
         if !seat.command.env.is_empty() {
             let env = seat

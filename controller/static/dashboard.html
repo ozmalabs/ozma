@@ -295,6 +295,75 @@ body.mode-amazing #main [data-mode="amazing"].panel.full-width { display: flex; 
 .node-meta .kv .k { color: var(--muted); font-size: 11px; }
 .node-meta .kv .v { color: var(--text); font-size: 11px; font-family: 'JetBrains Mono', 'Fira Code', monospace; }
 
+/* ── Seat groups (read-only multi-seat view) ───────────────────────────────── */
+#seats-list { display: flex; flex-direction: column; gap: 8px; }
+.seat-group {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.seat-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--surface2);
+  border-bottom: 1px solid var(--border);
+}
+.seat-machine {
+  font-size: 12px;
+  font-weight: 700;
+  color: #fff;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.seat-group-state {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.seat-group-state.all-online { color: var(--green); }
+.seat-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  border-top: 1px solid rgba(255,255,255,0.04);
+}
+.seat-row:first-of-type { border-top: none; }
+.seat-row.active-node { background: rgba(74,224,164,0.07); }
+.seat-index {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.seat-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.seat-meta {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--muted);
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .caps { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 9px; }
 .cap {
   font-size: 10px;
@@ -935,6 +1004,19 @@ select option { background: var(--surface); }
     </div>
   </div>
 
+  <!-- Seats (read-only grouping of multi-seat nodes) -->
+  <div class="panel" id="panel-seats">
+    <div class="panel-head">
+      <h2>Seats</h2><span class="count" id="seat-count">0</span>
+      <div class="panel-actions">
+        <button class="btn sm" id="btn-seats-refresh" title="Refresh seat groups">↺</button>
+      </div>
+    </div>
+    <div class="panel-body">
+      <div id="seats-list"><div class="empty">No multi-seat groups detected</div></div>
+    </div>
+  </div>
+
   <!-- Virtual machines (read-only supervisor view) -->
   <div class="panel full-width" id="panel-vms" data-mode="advanced">
     <div class="panel-head">
@@ -1488,6 +1570,7 @@ const nodeDisplay = {}; // node_id → {display_outputs, display_capture}
 let activeNodeId     = null;
 let activeScenarioId = null;
 let vmSupervisor     = null;  // last /supervisor/status document
+let seatsData        = { groups: [], seat_count: 0, online_count: 0, offline_count: 0, unseated_node_ids: [] };
 let eventCount = 0;
 const MAX_EVENTS = 100;
 
@@ -1548,11 +1631,12 @@ async function api(method, path, body) {
 // ── Initial data load ─────────────────────────────────────────────────────────
 async function loadAll() {
   try {
-    const [status, scenarioData, streamData, audioData] = await Promise.all([
+    const [status, scenarioData, streamData, audioData, seatData] = await Promise.all([
       api('GET', '/status'),
       api('GET', '/scenarios'),
       api('GET', '/streams'),
       api('GET', '/audio/nodes').catch(() => ({ nodes: {}, links: [] })),
+      api('GET', '/seats').catch(() => null),
     ]);
 
     activeNodeId = status.active_node_id;
@@ -1567,9 +1651,12 @@ async function loadAll() {
     streams = {};
     for (const s of streamData.streams) streams[s.node_id] = s;
 
+    seatsData = seatData || { groups: [], seat_count: 0, online_count: 0, offline_count: 0, unseated_node_ids: [] };
+
     pwAudioState = audioData;
 
     renderNodes();
+    renderSeats();
     renderScenarios();
     renderStreams();
     renderAudio();
@@ -1893,6 +1980,7 @@ function renderNodes() {
         </div>
       </div>`;
     }).join('');
+    renderSeats();
     return;
   }
 
@@ -1960,6 +2048,62 @@ function renderNodes() {
 
   // Populate node dropdowns
   populateNodeSelects();
+  renderSeats();
+}
+
+// ── Render: seat groups (read-only) ──────────────────────────────────────────
+async function fetchSeats() {
+  try {
+    seatsData = await api('GET', '/seats');
+  } catch (_) {
+    seatsData = { groups: [], seat_count: 0, online_count: 0, offline_count: 0, unseated_node_ids: [] };
+  }
+  renderSeats();
+}
+
+function renderSeats() {
+  const list = $('seats-list');
+  if (!list) return;
+  const groups = Array.isArray(seatsData.groups) ? seatsData.groups : [];
+  $('seat-count').textContent = seatsData.seat_count || 0;
+
+  if (!groups.length) {
+    list.innerHTML = '<div class="empty">No multi-seat groups detected</div>';
+    return;
+  }
+
+  list.innerHTML = groups.map(group => {
+    const machine = esc(group.machine || group.host || 'unknown');
+    const seats = Array.isArray(group.seats) ? group.seats : [];
+    const online = Number(group.online_count) || 0;
+    const total = Number(group.seat_count) || seats.length;
+    const stateClass = group.all_online ? 'all-online' : '';
+    const rows = seats.map(seat => {
+      const isActive = seat.node_id === activeNodeId;
+      const index = seat.seat_index == null ? '—' : `Seat ${esc(seat.seat_index)}`;
+      const ports = [
+        seat.port != null ? `UDP ${esc(seat.port)}` : '',
+        seat.api_port != null ? `HTTP ${esc(seat.api_port)}` : '',
+      ].filter(Boolean).join(' · ');
+      const displays = (Array.isArray(seat.displays) ? seat.displays : [])
+        .map(d => `${esc(d.width)}×${esc(d.height)}`)
+        .join(', ');
+      const meta = [ports, displays].filter(Boolean).join(' · ');
+      return `<div class="seat-row ${isActive ? 'active-node' : ''}" data-node-id="${esc(seat.node_id)}" title="${esc(seat.node_id)}">
+        <span class="node-status-dot ${seat.online ? 'online' : 'offline'}"></span>
+        <span class="seat-index">${index}</span>
+        <span class="seat-name">${esc(shortId(seat.node_id))}</span>
+        ${meta ? `<span class="seat-meta">${meta}</span>` : ''}
+      </div>`;
+    }).join('');
+    return `<div class="seat-group">
+      <div class="seat-group-head">
+        <span class="seat-machine" title="${machine}">${machine}</span>
+        <span class="seat-group-state ${stateClass}">${online}/${total} online</span>
+      </div>
+      ${rows}
+    </div>`;
+  }).join('');
 }
 
 // ── Render: supervisor multi-VM view ─────────────────────────────────────────
@@ -3272,6 +3416,25 @@ function renderDisplayPicker(nodeId) {
   note.style.display = 'block';
   note.textContent = capture.limitation ||
     (outputs.length > 1 ? 'Only one console has a live capture source at a time.' : '');
+  const multi = data.multi_console_hls;
+  if (multi && multi.enabled) {
+    const consoles = multi.consoles || [];
+    const running = consoles.filter(c => c.status === 'running');
+    note.textContent = multi.limitation ||
+      `Per-console HLS: ${running.length}/${consoles.length} running (max ${multi.max_pipelines}).`;
+    if (running.length) {
+      note.appendChild(document.createElement('br'));
+      running.forEach((entry, index) => {
+        if (index) note.appendChild(document.createTextNode(' · '));
+        const link = document.createElement('a');
+        link.href = `/api/v1/streams/${encodeURIComponent(nodeId)}/hls/console-${entry.console}/stream.m3u8`;
+        link.target = '_blank';
+        link.rel = 'noopener';
+        link.textContent = `Console ${entry.console} HLS`;
+        note.appendChild(link);
+      });
+    }
+  }
   note.title = note.textContent;
 }
 
@@ -3474,7 +3637,21 @@ function openStream(nodeId) {
   }
 
   function _startHLS(nid) {
-    const hlsUrl = `/api/v1/streams/${encodeURIComponent(nid)}/hls/stream.m3u8`;
+    // The default single-HLS route follows the active console. With
+    // --multi-console-hls each advertised console has its own playlist, so
+    // follow the console picker when that console's pipeline is running.
+    let hlsUrl = `/api/v1/streams/${encodeURIComponent(nid)}/hls/stream.m3u8`;
+    const multi = nodeDisplay[nid]?.multi_console_hls;
+    const select = $('kvm-display-select');
+    if (multi && multi.enabled && select && select.value !== '') {
+      const selected = Number(select.value);
+      const entry = (multi.consoles || []).find(
+        console => Number(console.console) === selected && console.status === 'running',
+      );
+      if (entry) {
+        hlsUrl = `/api/v1/streams/${encodeURIComponent(nid)}/hls/console-${entry.console}/stream.m3u8`;
+      }
+    }
     if (window.Hls && Hls.isSupported()) {
       hlsInstance = new Hls({liveSyncDuration: 1, liveMaxLatencyDuration: 3, enableWorker: true});
       hlsInstance.loadSource(hlsUrl);
@@ -3744,6 +3921,7 @@ $('modal-overlay').addEventListener('click', e => {
 
 // ── Refresh button ────────────────────────────────────────────────────────────
 $('btn-refresh').addEventListener('click', loadAll);
+$('btn-seats-refresh').addEventListener('click', fetchSeats);
 $('btn-vms-refresh').addEventListener('click', fetchVMs);
 $('btn-clear-events').addEventListener('click', () => {
   $('events-list').innerHTML = '<div class="empty">Cleared</div>';
@@ -3797,6 +3975,7 @@ function handleEvent(msg) {
       renderScenarios();
       renderAudio();
       fetchEnrollment();
+      fetchSeats();
       break;
     case 'node.offline':
       delete nodes[msg.node_id];
@@ -3806,11 +3985,13 @@ function handleEvent(msg) {
       renderStreams();
       renderScenarios();
       renderAudio();
+      fetchSeats();
       break;
     case 'node.switched':
       activeNodeId = msg.node_id;
       renderNodes();
       renderAudio();
+      renderSeats();
       break;
     case 'scenario.activated':
     case 'scenario.transitioning':
@@ -4844,6 +5025,8 @@ setMode(currentMode);
 connect();
 setInterval(fetchServices, 30000);
 setInterval(fetchVMs, 10000);
+// Refresh read-only seat groups so stale/offline seats age out of "online".
+setInterval(fetchSeats, 15000);
 </script>
 </body>
 </html>

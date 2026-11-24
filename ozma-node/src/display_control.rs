@@ -91,6 +91,20 @@ pub trait SwitchablePipeline: Send + Sync {
     ) -> Result<(), String>;
 }
 
+/// Observer notified after a successful console selection.
+///
+/// Runtime multi-console HLS is not a restart-on-switch pipeline: each
+/// advertised console keeps its own independent encoder. The observer lets the
+/// selector publish the new active console and advertised set without stopping
+/// those pipelines, while still allowing them to start/stop when a console is
+/// added or removed.
+#[async_trait]
+pub trait ConsoleSelectionObserver: Send + Sync {
+    /// Apply a committed selection. Failures are logged by the caller and must
+    /// not change the already-committed active console.
+    async fn on_selection(&self, selection: &DisplayOutputSelection);
+}
+
 /// Request body for `POST /display/select`.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct SelectConsoleRequest {
@@ -297,6 +311,7 @@ pub struct DisplayControl {
     factory: Arc<dyn ConsoleSourceFactory>,
     registry: RegistrySlot,
     pipelines: Arc<Vec<Arc<dyn SwitchablePipeline>>>,
+    observers: Arc<Vec<Arc<dyn ConsoleSelectionObserver>>>,
     generation: Arc<AtomicU64>,
 }
 
@@ -334,8 +349,19 @@ impl DisplayControl {
             factory,
             registry,
             pipelines: Arc::new(pipelines),
+            observers: Arc::new(Vec::new()),
             generation: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Attach an observer notified after every committed selection.
+    ///
+    /// Used by the bounded per-console HLS manager: a switch updates which
+    /// console `/stream/*` serves and which pipelines are advertised, but does
+    /// not restart the independent per-console encoders.
+    pub fn with_observer(mut self, observer: Arc<dyn ConsoleSelectionObserver>) -> Self {
+        Arc::make_mut(&mut self.observers).push(observer);
+        self
     }
 
     /// Live display state, safe to call from any task.
@@ -417,13 +443,15 @@ impl DisplayControl {
 
         let previous = selection.active_console;
         if requested == previous {
-            return Ok(self.response(
+            let response = self.response(
                 &selection,
                 provider,
                 previous,
                 false,
                 RestartedPipelines::default(),
-            ));
+            );
+            self.notify_observers(&selection).await;
+            return Ok(response);
         }
 
         let Some(provider) = provider else {
@@ -545,7 +573,19 @@ impl DisplayControl {
                 _ => {}
             }
         }
+        self.notify_observers(&new_selection).await;
         Ok(self.response(&new_selection, Some(provider), previous, true, flags))
+    }
+
+    /// Publish a committed selection to observers.
+    ///
+    /// The console switch itself has already succeeded; an observer failure is
+    /// logged and must not roll back the active console or fabricate an error
+    /// for the caller.
+    async fn notify_observers(&self, selection: &DisplayOutputSelection) {
+        for observer in self.observers.iter() {
+            observer.on_selection(selection).await;
+        }
     }
 
     fn response(

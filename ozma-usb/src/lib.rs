@@ -13,7 +13,9 @@
 //!   descriptors and explicit userspace-daemon readiness. The
 //!   [`FunctionFsDaemonCore`] additionally encodes the FunctionFS `ep0`
 //!   descriptor/string blobs, handles standard control requests, and services
-//!   injected endpoints; it still does not mount FunctionFS or spawn a daemon.
+//!   injected endpoints; [`FunctionFsLifecycle`] sequences ConfigFS
+//!   function/link creation, an injected mount, descriptor writes, readiness
+//!   polling, UDC bind/unbind, and cleanup without mounting by default.
 //! * [`VirtualMedia`] / [`MassStorageImage`] model a backing image, disk vs
 //!   CD-ROM presentation, read-only policy, declared [`MediaFormat`], size,
 //!   and attach/detach state.
@@ -28,6 +30,8 @@
 //!   host/token authorization without a shell.
 //! * [`Fat32ImageBuilder`] creates a bounded, read-only FAT32 image in memory
 //!   from files/directories; [`parse_fat32_image`] validates one read-only.
+//!   [`WriteOverlay`] layers a bounded, copy-on-write block cache with
+//!   checksummed persistent commits over an immutable FAT32/raw base.
 //! * [`IsoImage`] inspects existing ISO 9660 images read-only, and
 //!   [`NbdExport`] / [`NbdRequest`] model NBD exports and framing.
 //! * [`NbdServer`] serves a regular-file or in-memory image over a bounded
@@ -39,7 +43,8 @@
 //! and creates configuration symlinks. FAT32 construction is an in-memory byte
 //! buffer; ISO inspection reads only a bounded descriptor header; the NBD
 //! server opens regular files and loopback sockets only. Tests use a temporary
-//! root and synthetic images; the one real-ConfigFS test is `#[ignore]` and
+//! root and synthetic images; FunctionFS defaults to a temp mountpoint and fake
+//! mounter; the real-ConfigFS and live-NBD-boot tests are `#[ignore]` and
 //! environment-gated.
 //!
 //! # Example
@@ -81,10 +86,12 @@ pub mod fake;
 pub mod fat32;
 pub mod functionfs;
 pub mod functionfs_daemon;
+pub mod functionfs_lifecycle;
 pub mod iso;
 pub mod media;
 pub mod nbd;
 pub mod nbd_server;
+pub mod overlay;
 pub mod status;
 pub mod subprocess;
 pub mod uac2;
@@ -124,6 +131,12 @@ pub use functionfs_daemon::{
     FUNCTIONFS_STRINGS_MAGIC, MAX_FUNCTIONFS_ENDPOINT_TRANSFER_BYTES,
     MAX_FUNCTIONFS_EP0_WRITE_BYTES,
 };
+pub use functionfs_lifecycle::{
+    CommandFunctionFsMounter, FakeFunctionFsMounter, FunctionFsLifecycle, FunctionFsLifecycleClock,
+    FunctionFsLifecycleConfig, FunctionFsLifecyclePhase, FunctionFsLifecycleStatus,
+    FunctionFsMounter, ManualFunctionFsLifecycleClock, SystemFunctionFsLifecycleClock,
+    DEFAULT_FUNCTIONFS_MOUNT_BASE,
+};
 pub use iso::{
     parse_iso_volume_descriptors, validate_iso_image, IsoImage, IsoVolumeDescriptor,
     ISO9660_SECTOR_SIZE,
@@ -138,6 +151,11 @@ pub use nbd_server::{
     serve_session, ManualClock, NbdBackend, NbdClock, NbdExportCatalog, NbdExportSource,
     NbdFileImage, NbdMemoryImage, NbdServer, NbdServerConfig, NbdServerHandle, NbdServerStats,
     NbdSessionEnd, NbdSessionOutcome, NbdTransport, SystemClock,
+};
+pub use overlay::{
+    OverlayConfig, OverlayWriteReport, WriteOverlay, OVERLAY_DEFAULT_BLOCK_SIZE,
+    OVERLAY_DEFAULT_MAX_BASE_BYTES, OVERLAY_DEFAULT_MAX_BYTES, OVERLAY_HEADER_BYTES, OVERLAY_MAGIC,
+    OVERLAY_MAX_BLOCK_SIZE, OVERLAY_MIN_BLOCK_SIZE, OVERLAY_VERSION,
 };
 pub use status::{FunctionStatus, GadgetStatus, UsbGadgetCapabilities};
 pub use subprocess::{

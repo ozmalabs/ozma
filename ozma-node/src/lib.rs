@@ -18,6 +18,7 @@ pub mod hls;
 pub mod input_select;
 pub mod keyboard_layout;
 pub mod mdns;
+pub mod multi_hls;
 pub mod platform;
 pub mod registration;
 pub mod rtsp_runtime;

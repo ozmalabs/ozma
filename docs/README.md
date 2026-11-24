@@ -17,6 +17,7 @@ Technical documentation for the Ozma software-defined KVM fabric.
 - [Remote scene graph integration plan](remote-scene-integration.md) — native presentation, media resources, adaptive rendering, and compatibility
 - [Protobuf-core protocol plan](protobuf-core-plan.md) — protobuf negotiation/meta contract, JSON display definitions, field tables, and compact updates
 - [Display device adapters](display-device-adapters.md) — browser, SBC/e-ink, MCU, Stream Deck, MIDI/OSC, RGB, and native adapter guidance
+- [Software source management plan](software-source-management-plan.md) — Steam/Microsoft Store/native package sources, inventory, reporting, and update-state model
 - [Parity matrix](parity-matrix.md) — Python → Rust parity gates, current evidence, and gaps
 - [Plan execution status](plan-execution-status.md) — what is merged and tested so far
 

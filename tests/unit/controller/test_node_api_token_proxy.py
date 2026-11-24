@@ -541,3 +541,57 @@ def _unused_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
+
+
+def test_node_display_includes_per_console_hls_status(fake_node, tmp_path):
+    fake_node.responder = lambda method, record: (
+        200,
+        {
+            "ok": True,
+            "display_outputs": [
+                {"index": 0, "name": "Console_0", "source_type": "dbus"},
+                {"index": 1, "name": "Console_1", "source_type": "dbus"},
+            ],
+            "display_capture": {"active_console": 0, "provider": "dbus"},
+            "multi_console_hls": {
+                "enabled": True,
+                "max_pipelines": 2,
+                "active_console": 0,
+                "consoles": [
+                    {"console": 0, "active": True, "status": "running"},
+                    {"console": 1, "active": False, "status": "running"},
+                ],
+            },
+        },
+        "application/json",
+    )
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).get(f"/api/v1/nodes/{NODE_ID}/display")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["multi_console_hls"]["enabled"] is True
+    assert body["multi_console_hls"]["consoles"][1]["console"] == 1
+
+
+def test_hls_proxy_forwards_a_per_console_playlist_path(fake_node, tmp_path):
+    playlist = b"#EXTM3U\nseg_00000.ts\n"
+
+    def responder(method, record):
+        if record["path"] == "/stream/console-1/stream.m3u8":
+            return 200, playlist, "application/vnd.apple.mpegurl"
+        return 404, {"error": "missing"}, "application/json"
+
+    fake_node.responder = responder
+    app, _ = _build_app(fake_node.server_address[1], tmp_path)
+    client = _client(app)
+
+    response = client.get(
+        f"/api/v1/streams/{NODE_ID}/hls/console-1/stream.m3u8"
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.content == playlist
+    assert response.headers["content-type"].startswith("application/vnd.apple.mpegurl")
+    assert fake_node.requests[-1]["path"] == "/stream/console-1/stream.m3u8"

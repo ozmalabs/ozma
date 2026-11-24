@@ -4,12 +4,16 @@ Safe USB gadget, virtual-media, and USB/IP control foundations for Ozma nodes.
 
 This crate is the model and controller layer of the Python
 `softnode/virtual_usb.py`, `softnode/usb_mass_storage.py`, and
-`softnode/virtual_media.py` paths. It builds FAT32 images in memory, models
-ISO/NBD media, and includes a bounded fixed-newstyle NBD server backed by a
-regular file or in-memory image. It does not mount filesystems, open
-`/dev/hidg*`, or write a block device. `ozma-node` wires the gadget and NBD
-layers behind explicit USB flags (see below); there is still no automatic
-gadget creation on a hardware profile.
+`softnode/virtual_media.py` paths. It builds FAT32 images in memory, adds a
+bounded copy-on-write write overlay, models ISO/NBD media, includes a bounded
+fixed-newstyle NBD server backed by a regular file or in-memory image, and
+sequences FunctionFS from ConfigFS function creation through descriptor writes,
+readiness, and UDC bind/unbind. Default paths do not mount filesystems, open
+`/dev/hidg*`, or write a block device; an explicit `CommandFunctionFsMounter`
+can mount FunctionFS when the caller opts in and supplies the required
+privileges. `ozma-node` wires the gadget and NBD layers behind explicit USB
+flags (see below); there is still no automatic gadget creation on a hardware
+profile.
 
 ## What is implemented
 
@@ -19,6 +23,7 @@ gadget creation on a hardware profile.
 | Functions | HID keyboard/mouse/custom, mass storage, UAC2 (`Uac2Config`), FunctionFS vendor (`FunctionFsConfig`) |
 | FunctionFS model | `FunctionFsConfig`, `FunctionFsEndpoint`, `FunctionFsStrings`, `FunctionFsDaemonSpec`, `FunctionFsReadiness`, `FunctionFsStatus`, `FunctionFsDaemon`/`MissingFunctionFsDaemon`/`ObservedFunctionFsDaemon`, generated device/config/string descriptors, class-specific descriptors, Microsoft OS descriptors |
 | FunctionFS daemon core | `FunctionFsMount`, `FunctionFsDescriptors` (v2 `ep0` blob + strings), `FunctionFsDaemonCore`, `LoopbackFunctionFsDaemon`/`FakeFunctionFsDaemon`, `FileFunctionFsDaemon`, `FunctionFsControlRequest`/`FunctionFsControlResponse`, `FunctionFsEvent`, injectable `FunctionFsEp0Io`/`FunctionFsEndpointIo`, bounded endpoint loops |
+| FunctionFS lifecycle | `FunctionFsLifecycleConfig`, `FunctionFsLifecycle`, `FunctionFsLifecyclePhase`/`Status`, injectable `FunctionFsMounter` with `CommandFunctionFsMounter`/`FakeFunctionFsMounter`, deterministic `FunctionFsLifecycleClock`; ConfigFS function/link creation, mountpoint expectation, `ep0` descriptor write, readiness timeout, bind rollback, unbind/cleanup |
 | FunctionFS control | Standard `GET_DESCRIPTOR` (device/configuration/string), `SET_CONFIGURATION`, `GET_CONFIGURATION`, `GET/SET_INTERFACE`, `GET_STATUS`, feature requests; typed rejection for class/vendor and unknown requests |
 | FunctionFS status | `FunctionFsDaemonStatus` nested in `FunctionFsStatus.daemon`: `live` only when the descriptor blob, string table, and enable event all succeeded |
 | UAC2 model | `Uac2Config`, `Uac2Mode::{Microphone,Headset,Speaker}`, `Uac2DescriptorSet`, `Uac2Status`, `Uac2BridgeStatus::Unsupported` |
@@ -33,6 +38,7 @@ gadget creation on a hardware profile.
 | ISO media | `IsoImage::inspect`, `parse_iso_volume_descriptors`, read-only `MediaFormat::Iso9660` |
 | NBD model | `NbdExport`, `NbdExportDescriptor`, `NbdHandshake`, `NbdRequest`/`NbdReply` framing, newstyle option constants |
 | NBD server | `NbdServer`/`NbdServerHandle` over TCP or Unix sockets, `NbdExportCatalog`, `NbdExportSource`, `NbdMemoryImage`, `NbdFileImage`, injected `NbdTransport`/`NbdClock`, bounded read/write/flush/trim/disc, read-only exports |
+| Write overlay | `WriteOverlay`, `OverlayConfig`, `OverlayWriteReport`; bounded copy-on-write over FAT32/raw base bytes, per-block allocation accounting, checksummed atomic persistence, typed `overlay-bounds`/`overlay-corrupt` failures |
 | Capabilities/status | `UsbGadgetCapabilities`, `GadgetStatus`, `FunctionStatus` (`media`, `uac2`, `function_fs` details); `protocol_capability()` projects onto `ozma_protocol::UsbCapability` |
 
 ## Quick start
@@ -256,6 +262,62 @@ buffers over 64 KiB. `handle_control_request` answers standard
 class/vendor and unknown requests return typed
 `unsupported-functionfs-control` errors.
 
+#### FunctionFS lifecycle helper
+
+`FunctionFsLifecycle` sequences the ConfigFS, mount, descriptor, readiness, and
+UDC steps. It is deliberately explicit about privileged operations: by default
+it has **no mounter**, so a missing mountpoint is a typed
+`missing-functionfs-mount`/`missing-functionfs-ep0` error rather than an
+automatic `mount` call. Callers can inject:
+
+- `CommandFunctionFsMounter` — argv-only `mount -t functionfs <instance>
+  <mountpoint>` / `umount <mountpoint>`. It requires the caller's privileges and
+  returns `missing-command`/`command-failed` when the tools or mount fail.
+- `FakeFunctionFsMounter` — creates a temporary mountpoint with `ep0`/`epN`
+  regular files; used by the default tests and needs no root.
+- `FunctionFsLifecycleClock` — `SystemFunctionFsLifecycleClock` or the
+  deterministic `ManualFunctionFsLifecycleClock`.
+
+```rust
+use ozma_usb::{
+    FakeFunctionFsMounter, FunctionFsConfig, FunctionFsEndpoint,
+    FunctionFsLifecycle, FunctionFsLifecycleConfig,
+};
+
+let function = FunctionFsConfig::new("vendor0", 0x1209, 0x0001)
+    .with_endpoint(FunctionFsEndpoint::bulk_out(1, 512))
+    .with_endpoint(FunctionFsEndpoint::bulk_in(2, 512));
+let config = FunctionFsLifecycleConfig::new(
+    "ozma-test",
+    "/sys/kernel/config/usb_gadget",
+    "dummy_udc.0",
+    function,
+)
+.with_mountpoint("/dev/ffs-vendor0")
+.with_readiness(5_000, 50);
+let mut lifecycle =
+    FunctionFsLifecycle::new(config)?.with_mounter(FakeFunctionFsMounter::new());
+lifecycle.prepare()?;            // gadget + ffs.vendor0 + config link
+lifecycle.mount()?;              // validates or calls the mounter
+lifecycle.write_descriptors()?;  // v2 blob then strings to ep0
+lifecycle.wait_for_ready()?;     // marker polling, never assumed
+lifecycle.bind()?;               // writes UDC
+lifecycle.unbind()?;             // clears UDC
+lifecycle.cleanup()?;            // removes gadget; unmounts only if it mounted
+# Ok::<(), ozma_usb::UsbError>(())
+```
+
+`prepare` uses `ConfigFsUsbController` against an injectable root and verifies
+the `functions/ffs.<instance>` directory and configuration symlink.
+`wait_for_ready` polls the daemon readiness marker with a deadline; a missing
+marker/program or expired deadline returns `functionfs-readiness-timeout` and
+never marks the function ready. `bind` refuses unless the phase is `ready`. A
+bind failure unbinds/removes the gadget, unmounts a lifecycle-owned mount, and
+returns the original typed error with phase `failed`. `cleanup` is idempotent
+and leaves a caller-supplied mount in place. `FunctionFsLifecycleStatus` exposes
+the phase, bound/mounted/ep0/string flags, paths, and the nested
+`FunctionFsStatus`.
+
 Readiness is explicit and never assumed:
 
 | `FunctionFsReadiness` | Meaning |
@@ -375,6 +437,25 @@ remains available for the existing node wiring.
   true. `parse_fat32_image`/`parse_fat32_boot_sector` validate an existing
   image without mounting it. Cluster sizes 512–65536 bytes are supported;
   the default is one 512-byte sector per cluster for compact test images.
+- **Write overlay** (`overlay`): `WriteOverlay` layers a bounded copy-on-write
+  block cache over an immutable FAT32 or raw base. The first write to a block
+  copies that base block and allocates one block (the final block may be
+  shorter); later writes to the same block are free. Writes are preflighted
+  against `max_overlay_bytes` and the base length, so a rejected write does not
+  partially allocate, and a read falls back to the base when no overlay block
+  exists. `from_fat32`/`from_bytes`/`from_file` accept a base; `read_at`,
+  `read_sectors`, `write_at`, and `write_sectors` operate on raw bytes;
+  `materialize` returns the merged image; `commit_to` writes a checksummed
+  persistence file atomically via a sibling temp file and rename, and
+  `load_from`/`reload` validate it before replacing blocks. The persistence
+  header records magic `OZOV`, version, block size, base length, block count,
+  an FNV-1a header checksum, and a base-image checksum; each block has its own
+  checksum. Bad magic,
+  version, header/block checksum, base-length/checksum mismatch, block-size
+  mismatch, duplicate or out-of-range blocks, truncation, and trailing bytes
+  are typed `overlay-corrupt`; allocation failures are `overlay-bounds`. The base is
+  never written, mounted, or opened as a block device. The overlay is a library
+  layer only: it is not yet wired into the SCSI/NBD data path.
 - **ISO** (`iso`): `IsoImage::inspect` reads at most 32 volume descriptors from
   an existing file, verifies `CD001`, the primary descriptor, both-endian
   size/block fields, and root-directory bounds. `MediaFormat::Iso9660` always
@@ -425,17 +506,34 @@ via `query-block`:
 "qdev": "/machine/peripheral/usbdisk/usbdisk.0/legacy[0]"
 ```
 
-These tests skip when `qemu-img`/`qemu-io` (or the opt-in QEMU binary) is
-absent; they never mount, format, or open a block device.
+`tests/nbd_boot.rs` (opt-in `OZMA_NBD_BOOT_TEST=1`) also proves a real boot
+path rather than only attachment. It builds a synthetic ISO 9660 image with an
+El Torito no-emulation boot catalog and a tiny serial boot sector, serves the
+ISO **read-only** over NBD, and boots a disposable `qemu-system-x86_64` with
+`-drive ... file=nbd://.../boot-iso,readonly=on,media=cdrom` plus
+`ide-cd,bootindex=1`:
+
+```text
+guest serial boot log: "OZMA-NBD-BOOT\r\n"
+QMP query-block: {"return":[{"device":"cd0", ..., "inserted":{...
+  "virtual-size":51200,"filename":"nbd://127.0.0.1:41541/boot-iso",
+  "format":"raw","ro":true,...}}]}
+```
+
+The test captures the guest serial line and QMP block/device evidence, quits
+QEMU over QMP (killing it only on timeout), and stops the NBD server. It skips
+without claiming a boot when `qemu-system-x86_64` is absent. No test mounts a
+filesystem, opens a block device, writes an image, or changes an existing VM.
 
 ## Tests
 
 Default tests are CI-safe and use a temporary ConfigFS-shaped root, a fake
 controller, recording/scripted command runners, synthetic ISO/FAT32/NBD bytes,
-in-memory images, and in-memory transports. They never create a real gadget,
-bind a real UDC, run `usbip`, mount a filesystem, or write a block device. The
-NBD listener tests bind ephemeral loopback TCP/Unix sockets; the QEMU tests
-invoke `qemu-img`/`qemu-io` only when present.
+in-memory images/overlays, a fake FunctionFS mounter/clock, and in-memory
+transports. They never create a real gadget, bind a real UDC, run `usbip`,
+mount a filesystem, or write a block device. The NBD listener tests bind
+ephemeral loopback TCP/Unix sockets; the QEMU client tests invoke
+`qemu-img`/`qemu-io` only when present, and the boot test is opt-in.
 
 ```bash
 cargo test -p ozma-usb
@@ -451,10 +549,13 @@ Relevant suites:
 | `tests/media_formats.rs` | ISO PVD/read-only media, `MediaFormat` consistency/JSON, FAT32 attach probe, NBD descriptors and framing |
 | `tests/functionfs.rs` | FunctionFS descriptor generation, endpoint/string/daemon bounds, explicit readiness states, ConfigFS `ffs.<instance>` creation/status, fake status |
 | `tests/functionfs_daemon.rs` | v2 descriptor/string encoding and alignment, class/OS descriptors, temporary-mount `ep0` writes, standard control requests, enable/disable/live status, endpoint read/write/loopback, malformed/oversized inputs, lazily opened file endpoints |
+| `tests/functionfs_lifecycle.rs` | function/link creation, mountpoint validation, fake-mounter mount/unmount, `ep0` descriptor write, readiness success/timeout, bind failure rollback, unbind/cleanup, caller-supplied mount preservation, missing mount tool, config validation |
+| `tests/fat32_overlay.rs` | FAT32/raw writes and reads, base immutability, per-block copy-on-write, allocation ceiling and preflight atomicity, commit/reload, checksummed persistence corruption, discard/materialise |
 | `tests/uac2.rs` | UAC2 descriptor/channel/rate/size consistency, microphone/speaker/headset modes, invalid rates/channels/modes, ConfigFS attribute writes, unsupported bridge status |
 | `tests/usbip_controller.rs` | exact argv, list/port parsing (IPv4/IPv6), attach/detach state, disabled/missing/non-zero typed errors, config validation, host/token allow-list enforcement, no real `usbip` |
 | `tests/nbd_server.rs` | newstyle handshake, export name/list/info/go, read/write/flush/disc, request bounds, read-only write rejection, malformed/truncated frames, injected transport/clock deadline, concurrent loopback clients, Unix socket, server stop, file/media backends |
 | `tests/nbd_qemu.rs` | live `qemu-img info` on generated FAT32 + read-only ISO, `qemu-io` read and read-only write refusal; opt-in QMP USB attachment |
+| `tests/nbd_boot.rs` | opt-in disposable QEMU boot from a synthetic El Torito ISO served read-only over NBD; guest serial boot marker plus QMP `query-block` evidence |
 
 The one real-ConfigFS round trip is ignored and env-gated:
 
@@ -476,7 +577,18 @@ OZMA_FUNCTIONFS_MOUNT=/dev/ffs-ozma-test \
 
 It requires an existing FunctionFS mount (made by the caller; no mount or sudo
 is performed), opens `ep0`, writes descriptors/strings, and asserts that the
-status is not `live` without an observed enable event.
+status is not `live` without an observed enable event. The lifecycle helper's
+default tests use a temp root, a fake mounter, and a fake UDC name; they never
+mount or bind.
+
+The live NBD boot test is also opt-in:
+
+```bash
+OZMA_NBD_BOOT_TEST=1 cargo test -p ozma-usb --test nbd_boot -- --ignored
+```
+
+It requires `qemu-system-x86_64` and skips otherwise. It never touches an
+existing VM; the disposable QEMU is quit over QMP or killed on timeout.
 
 ## Remaining integration and security gaps
 
@@ -489,27 +601,35 @@ status is not `live` without an observed enable event.
   hotplug, a node route exposing `UsbIpController`, and controller/API pairing
   remain open.
 - The FAT32 builder is a static snapshot, not the Python live `FATSynthesiser`
-  (no sector-on-demand reads, inotify rescan, long-name rescan stability, or
-  write overlay). Generated images are read-only. The NBD server can serve a
-  built image from memory, but `ozma-usb` still never writes a generated image
-  to disk or a block device.
+  (no sector-on-demand reads, inotify rescan, or long-name rescan stability).
+  Generated images are read-only. The new `WriteOverlay` supplies bounded
+  copy-on-write blocks and persistence, but it is not yet connected to the NBD
+  or SCSI data path, has no FAT metadata/consistency repair, directory-entry
+  coalescing, compaction, or write-back to a base image, and no node/API route.
+  `ozma-usb` still never writes a generated image to disk or a block device.
 - ISO support validates descriptors only; no Joliet/Rock Ridge/El Torito
   parsing, directory extraction, writing, or mounting.
 - NBD is a bounded userspace server, not a kernel block device: no structured
   replies, TLS, write-zeroes, cache, multi-conn, or persistent export state.
-  Node wiring is one loopback export behind the existing `--usb-gadget` state
-  and is not exposed through capabilities or registration.
-- FunctionFS now has an `ep0`/endpoint daemon core, but mounting the function,
-  creating the ConfigFS link, reacting to real UDC events, and exposing a
-  vendor protocol are not automated. Class/vendor control requests are rejected
-  with typed errors until a protocol handler exists; there is no persistent
-  daemon process, restart supervision, or node route that starts one. Suspend
-  and resume events are accepted but not acted on. UAC2 still models
-  descriptors/capabilities and writes the primary ConfigFS attributes, but
-  there is no ALSA or isochronous USB audio bridge; status always reports
-  `bridge: "unsupported"`. Node flags exist (`--usb-uac2`, `--usb-vendor`,
-  `--usb-vendor-daemon`), but `/usb` surfaces readiness/absence rather than
-  starting either backend.
+  The live boot evidence covers a read-only ISO over a disposable QEMU; it is
+  not a hardware boot matrix and does not exercise installers, UEFI, or a real
+  target. Node wiring is one loopback export behind the existing `--usb-gadget`
+  state and is not exposed through capabilities or registration.
+- FunctionFS now has an `ep0`/endpoint daemon core and an explicit
+  `FunctionFsLifecycle` helper (ConfigFS function/link creation, mountpoint
+  expectation, descriptor write, marker readiness/timeout, bind rollback,
+  unbind/cleanup), but mounting in the default path still requires an injected
+  mounter and caller privileges. The command mounter is untested against a real
+  FunctionFS mount/UDC in the default suite; there is no persistent daemon
+  process, restart supervision, real UDC event loop, node route that starts the
+  lifecycle, or vendor protocol. Class/vendor control requests are rejected
+  with typed errors until a protocol handler exists. Suspend and resume events
+  are accepted but not acted on. UAC2 still models descriptors/capabilities and
+  writes the primary ConfigFS attributes, but there is no ALSA or isochronous
+  USB audio bridge; status always reports `bridge: "unsupported"`. Node flags
+  exist (`--usb-uac2`, `--usb-vendor`, `--usb-vendor-daemon`), but `/usb`
+  surfaces readiness/absence rather than starting either backend; the lifecycle
+  status is library-only for now.
 - Node-side gadget teardown/recovery across restart, and hardware-profile
   validation. Mounting, block-device I/O, and real USB/IP transport remain
   deliberately outside this crate.

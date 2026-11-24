@@ -68,6 +68,7 @@ use crate::keyboard_layout::{
     key_event, resolve_compose_sequence, resolve_dead_key_sequence, CharOutcome, KeyChord,
     KeyboardLayout,
 };
+use crate::multi_hls::{ConsoleHlsStreamStatus, MultiConsoleHls, MultiConsoleHlsStatus};
 use crate::webrtc::{WebRtcControl, WebRtcError};
 
 /// HID packet type for an 8-byte boot keyboard report.
@@ -1798,6 +1799,9 @@ pub struct ConnectionState {
     /// Bounded per-console broker used by `?console=` snapshots/info. It never
     /// swaps the active HLS/WebRTC registry.
     pub console_broker: Option<ConsoleBroker>,
+    /// Opt-in bounded per-console HLS manager. Its independent pipelines are
+    /// never swapped into the active WebRTC/registry path.
+    pub multi_console_hls: Option<MultiConsoleHls>,
     /// Live capture transport/source for `/api/v1/connection`.
     pub capture: CaptureStatus,
 }
@@ -1823,6 +1827,7 @@ impl ConnectionState {
             display_capture: DisplayCaptureStatus::default(),
             display_control: None,
             console_broker: None,
+            multi_console_hls: None,
             capture: CaptureStatus::default(),
         }
     }
@@ -1871,6 +1876,16 @@ impl ConnectionState {
     /// the active registry used by HLS/WebRTC and the default snapshot route.
     pub fn with_console_broker(mut self, broker: Option<ConsoleBroker>) -> Self {
         self.console_broker = broker;
+        self
+    }
+
+    /// Attach the opt-in per-console HLS manager.
+    ///
+    /// When present, `/api/v1/connection` reports its bounded per-console
+    /// status, `hls` describes the active console's independent pipeline, and
+    /// `/display/info` includes the same per-console state.
+    pub fn with_multi_console_hls(mut self, manager: Option<MultiConsoleHls>) -> Self {
+        self.multi_console_hls = manager;
         self
     }
 
@@ -2046,6 +2061,9 @@ pub struct ConnectionResponse {
     pub display_outputs: serde_json::Value,
     /// Which console the live capture source targets, plus any limitation.
     pub display_capture: DisplayCaptureStatus,
+    /// Opt-in simultaneous per-console HLS state, when enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub multi_console_hls: Option<MultiConsoleHlsStatus>,
     /// Actual capture transport and enumerated source, or `available:false`.
     pub capture: CaptureStatus,
 }
@@ -2244,13 +2262,40 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
             }
         }
     };
-    let (hls, hls_error) = match (&state.hls_control, &state.hls) {
-        (Some(controller), _) => {
-            let status = controller.status();
-            (status.status_name(), status.error())
+    let (hls, hls_error, multi_console_hls) = match &state.multi_console_hls {
+        Some(manager) if manager.supports_independent_consoles() => {
+            let status = manager.active_status().await;
+            (
+                status.status_name(),
+                status.error(),
+                Some(manager.status().await),
+            )
         }
-        (None, None) => ("not-configured", None),
-        (None, Some(status)) => (status.status_name(), status.error()),
+        Some(manager) => {
+            // Single-head provider: the legacy active HLS pipeline (if any)
+            // remains the stream source; the manager only reports why
+            // per-console HLS is unsupported.
+            let (hls, error) = match (&state.hls_control, &state.hls) {
+                (Some(controller), _) => {
+                    let status = controller.status();
+                    (status.status_name(), status.error())
+                }
+                (None, None) => ("not-configured", None),
+                (None, Some(status)) => (status.status_name(), status.error()),
+            };
+            (hls, error, Some(manager.status().await))
+        }
+        None => {
+            let (hls, error) = match (&state.hls_control, &state.hls) {
+                (Some(controller), _) => {
+                    let status = controller.status();
+                    (status.status_name(), status.error())
+                }
+                (None, None) => ("not-configured", None),
+                (None, Some(status)) => (status.status_name(), status.error()),
+            };
+            (hls, error, None)
+        }
     };
     let (webrtc, webrtc_error) = match &state.webrtc {
         None => ("not-configured", None),
@@ -2303,6 +2348,7 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
         webrtc_audio_source,
         display_outputs: display.display_outputs,
         display_capture: display.display_capture,
+        multi_console_hls,
         capture: state.capture.clone(),
     })
 }
@@ -2401,12 +2447,21 @@ async fn display_info(
                 "display snapshot support is not configured".to_owned(),
             )),
         };
+        let mut hls = None;
         if let Some(control) = state.display_control.as_ref() {
             let selection = control.selection();
             info.console = Some(selection.active_console);
             info.active = true;
+            if let Some(manager) = state.multi_console_hls.as_ref() {
+                hls = manager.status_for(selection.active_console).await;
+            }
+        } else if let Some(manager) = state.multi_console_hls.as_ref() {
+            let active = manager.active_console().await;
+            info.console = Some(active);
+            info.active = true;
+            hls = manager.status_for(active).await;
         }
-        return Json(info).into_response();
+        return display_info_response(info, hls);
     };
 
     let Some(control) = state.display_control.as_ref() else {
@@ -2436,7 +2491,35 @@ async fn display_info(
     };
     info.console = Some(console);
     info.active = console == selection.active_console;
-    Json(info).into_response()
+    let hls = match state.multi_console_hls.as_ref() {
+        Some(manager) => manager.status_for(console).await,
+        None => None,
+    };
+    display_info_response(info, hls)
+}
+
+/// Serialize `/display/info`, adding per-console HLS state when enabled.
+///
+/// The core [`DisplayInfo`] shape stays unchanged for nodes without
+/// `--multi-console-hls`; the additive `multi_console_hls` key names this
+/// console's independent pipeline status/error and playlist.
+fn display_info_response(
+    info: DisplayInfo,
+    multi_console_hls: Option<ConsoleHlsStreamStatus>,
+) -> Response {
+    let Ok(mut value) = serde_json::to_value(info) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "serializing /display/info failed",
+        )
+            .into_response();
+    };
+    if let Some(hls) = multi_console_hls {
+        if let Ok(hls) = serde_json::to_value(hls) {
+            value["multi_console_hls"] = hls;
+        }
+    }
+    Json(value).into_response()
 }
 
 fn unavailable_display_info(last_error: Option<String>) -> DisplayInfo {
@@ -5178,6 +5261,213 @@ mod tests {
             json["display_capture"]["limitation"],
             "only Console_0 has a live capture source"
         );
+    }
+
+    struct PerConsoleHlsFactory;
+
+    #[async_trait]
+    impl crate::multi_hls::ConsoleHlsFactory for PerConsoleHlsFactory {
+        fn provider(&self) -> Option<ozma_display::vm::VmConsoleBackend> {
+            Some(ozma_display::vm::VmConsoleBackend::Dbus)
+        }
+
+        async fn start(
+            &self,
+            _console: u32,
+            config: HlsConfig,
+        ) -> Result<Arc<dyn crate::multi_hls::ConsoleHlsPipeline>, String> {
+            std::fs::create_dir_all(&config.output_dir).map_err(|error| error.to_string())?;
+            let manifest = config.manifest_path();
+            std::fs::write(&manifest, "#EXTM3U\n").map_err(|error| error.to_string())?;
+            Ok(Arc::new(PerConsoleHlsPipeline { manifest }))
+        }
+    }
+
+    struct PerConsoleHlsPipeline {
+        manifest: std::path::PathBuf,
+    }
+
+    #[async_trait]
+    impl crate::multi_hls::ConsoleHlsPipeline for PerConsoleHlsPipeline {
+        fn status(&self) -> HlsStatus {
+            HlsStatus::running(self.manifest.clone())
+        }
+
+        async fn stop(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn manifest_path(&self) -> std::path::PathBuf {
+            self.manifest.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_and_display_info_report_per_console_hls() {
+        let root =
+            std::env::temp_dir().join(format!("ozma-compat-multi-hls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let manager = crate::multi_hls::MultiConsoleHls::new(
+            Arc::new(PerConsoleHlsFactory),
+            crate::multi_hls::MultiConsoleHlsConfig {
+                max_pipelines: 2,
+                idle_timeout: Duration::ZERO,
+                root: root.clone(),
+                base: HlsConfig {
+                    output_dir: root,
+                    ..HlsConfig::default()
+                },
+            },
+        );
+        let outputs = vec![
+            crate::display_outputs::DisplayOutput {
+                index: 0,
+                name: "Console_0".into(),
+                source_type: "dbus".into(),
+                capture_source_id: "dbus0".into(),
+                width: 1280,
+                height: 800,
+                primary: true,
+            },
+            crate::display_outputs::DisplayOutput {
+                index: 1,
+                name: "Console_1".into(),
+                source_type: "dbus".into(),
+                capture_source_id: String::new(),
+                width: 720,
+                height: 400,
+                primary: false,
+            },
+        ];
+        manager
+            .sync(&crate::display_outputs::DisplayOutputSelection {
+                outputs: outputs.clone(),
+                active_console: 0,
+                limitation: None,
+            })
+            .await;
+
+        let state = ConnectionState::new(
+            ConnectionInfo::new("vm-a._ozma._udp.local.", "vm", 7382, 7384, 7331, SINK_QMP),
+            CompatStats::default(),
+        )
+        .with_display_outputs(
+            serde_json::to_value(&outputs).unwrap(),
+            DisplayCaptureStatus::new(Some(0), Some("dbus".into()), None),
+        )
+        .with_multi_console_hls(Some(manager));
+
+        let (status, json) =
+            get_json(&connection_router(state.clone()), "/api/v1/connection").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["hls"], "running");
+        assert_eq!(json["multi_console_hls"]["enabled"], true);
+        assert_eq!(json["multi_console_hls"]["max_pipelines"], 2);
+        assert_eq!(json["multi_console_hls"]["consoles"][1]["console"], 1);
+        assert_eq!(
+            json["multi_console_hls"]["consoles"][1]["status"],
+            "running"
+        );
+        assert_eq!(
+            json["multi_console_hls"]["consoles"][1]["playlist"],
+            "/stream/console-1/stream.m3u8"
+        );
+
+        let (status, info) = get_json(&public_router(state), "/display/info").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(info["console"], 0);
+        assert_eq!(info["multi_console_hls"]["console"], 0);
+        assert_eq!(info["multi_console_hls"]["status"], "running");
+    }
+
+    struct SingleHeadHlsFactory;
+
+    #[async_trait]
+    impl crate::multi_hls::ConsoleHlsFactory for SingleHeadHlsFactory {
+        fn provider(&self) -> Option<ozma_display::vm::VmConsoleBackend> {
+            Some(ozma_display::vm::VmConsoleBackend::Qmp)
+        }
+
+        async fn start(
+            &self,
+            _console: u32,
+            _config: HlsConfig,
+        ) -> Result<Arc<dyn crate::multi_hls::ConsoleHlsPipeline>, String> {
+            Err("single-head provider must not start a per-console pipeline".to_owned())
+        }
+    }
+
+    #[tokio::test]
+    async fn single_head_per_console_hls_keeps_the_active_single_hls_status() {
+        let root = std::env::temp_dir().join(format!(
+            "ozma-compat-multi-hls-single-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let manifest = root.join("stream.m3u8");
+        std::fs::write(&manifest, "#EXTM3U\n").unwrap();
+        let manager = crate::multi_hls::MultiConsoleHls::new(
+            Arc::new(SingleHeadHlsFactory),
+            crate::multi_hls::MultiConsoleHlsConfig {
+                max_pipelines: 2,
+                idle_timeout: Duration::ZERO,
+                root: root.clone(),
+                base: HlsConfig {
+                    output_dir: root,
+                    ..HlsConfig::default()
+                },
+            },
+        );
+        manager
+            .sync(&crate::display_outputs::DisplayOutputSelection {
+                outputs: vec![
+                    crate::display_outputs::DisplayOutput {
+                        index: 0,
+                        name: "Console_0".into(),
+                        source_type: "qmp".into(),
+                        capture_source_id: "qmp0".into(),
+                        width: 1280,
+                        height: 800,
+                        primary: true,
+                    },
+                    crate::display_outputs::DisplayOutput {
+                        index: 1,
+                        name: "Console_1".into(),
+                        source_type: "qmp".into(),
+                        capture_source_id: String::new(),
+                        width: 720,
+                        height: 400,
+                        primary: false,
+                    },
+                ],
+                active_console: 0,
+                limitation: None,
+            })
+            .await;
+
+        let state = ConnectionState::new(
+            ConnectionInfo::new("vm-a._ozma._udp.local.", "vm", 7382, 7384, 7331, SINK_QMP),
+            CompatStats::default(),
+        )
+        .with_hls(Some(HlsStatus::running(manifest)))
+        .with_multi_console_hls(Some(manager));
+
+        let (status, json) = get_json(&connection_router(state), "/api/v1/connection").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json["hls"], "running",
+            "single-head providers keep the active single HLS status"
+        );
+        assert_eq!(json["multi_console_hls"]["enabled"], true);
+        assert!(json["multi_console_hls"]["limitation"]
+            .as_str()
+            .is_some_and(|note| note.contains("one default console")));
+        assert!(json["multi_console_hls"]["consoles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|console| console["status"] == "unsupported"));
     }
 
     struct SwitchConsoleFactory;

@@ -6,14 +6,24 @@
 
 The Python baseline in [`agent/multiseat`](../agent/multiseat) remains the
 runnable multi-seat implementation. The Rust [`ozma-multiseat`](../ozma-multiseat)
-crate now covers planning **and** a real subprocess supervisor with a CLI, as
-documented in [`multiseat-rust.md`](multiseat-rust.md):
+crate now covers planning, a real subprocess supervisor with a CLI, and the
+input-routing/display-ownership command layers, as documented in
+[`multiseat-rust.md`](multiseat-rust.md):
 
 - Linux Xrandr output enumeration and DRM connector detection.
 - Read-only sysfs/evdev enumeration and USB-hub input grouping.
 - Deterministic seat planning: one seat per display, sequential UDP/HTTP ports,
   input assignment, profiles, and per-seat `ozma-node --profile desktop` argv
   (uinput input, X11 or explicitly targeted PipeWire capture, audio sink).
+- Input routing: `xinput list` parsing, `xinput map-to-output` command
+  construction/execution through an injectable runner, sysfs evdev name
+  resolution, release/rollback, `assign_seats` all-or-nothing assignment, an
+  exclusive-`EVIOCGRAB` model, and per-seat uinput environment. The default
+  grab backend is unsupported rather than fake.
+- Display ownership: per-seat `xrandr --output ... --mode ... --pos ...` models,
+  apply/release/rollback through an injectable runner, wired into `SeatPlan` and
+  the node environment. On one X server this is output positioning, not screen
+  isolation.
 - `ProcessSeatSupervisor`: spawn the planned node argv/environment, wait for
   `/health` or a bounded port check, restart with bounded exponential backoff,
   stop/reap, and report pid/ports/state/restarts/last error.
@@ -23,13 +33,15 @@ documented in [`multiseat-rust.md`](multiseat-rust.md):
 - Controller capability/status shape where one seat is one node, plus bounded
   Prometheus metrics.
 
-Not yet delivered: node/controller integration, OS-level display ownership,
-physical input routing/grabs, per-seat uinput targeting, audio sink creation,
-hotplug/persistence, game launch, per-seat streaming, supervisor isolation
-(cgroups/namespaces/log rotation), or any Windows (DXGI/IDD/Raw Input/WASAPI)
-path. The phase timeline below is unchanged; the Rust crate covers the
-planner/backends and subprocess-supervision layers of Phase 1, not the full
-Phase 1 deliverable.
+Not yet delivered: node/controller integration, true per-seat screen isolation
+(separate X screens, per-seat compositor/X server, DRM leasing, Wayland),
+automatic execution of routing/ownership commands, real privileged evdev grabs
+and udev/input-device policy, per-seat uinput targeting at the display layer,
+audio sink creation, hotplug/persistence, game launch, per-seat streaming,
+supervisor isolation (cgroups/namespaces/log rotation), or any Windows
+(DXGI/IDD/Raw Input/WASAPI) path. The phase timeline below is unchanged; the
+Rust crate covers the planner/backends, subprocess supervision, and command
+models of Phase 1, not the full Phase 1 deliverable.
 
 ## Architecture
 

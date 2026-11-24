@@ -47,7 +47,9 @@ use ozma_node::{
     },
     input_select,
     keyboard_layout::KeyboardLayout,
-    mdns, platform, registration, shutdown, usb_audio,
+    mdns,
+    multi_hls::{MultiConsoleHls, MultiConsoleHlsConfig},
+    platform, registration, shutdown, usb_audio,
     webrtc::{WebRtcAudioBackend, WebRtcConfig, WebRtcControl, WebRtcHelper},
 };
 
@@ -550,6 +552,41 @@ pub struct Args {
     /// HDR color matrix (`-colorspace`, for example `bt2020nc`).
     #[arg(long, env = "OZMA_HLS_COLOR_MATRIX", value_name = "NAME")]
     pub hls_color_matrix: Option<String>,
+
+    /// Enable one independent HLS pipeline per advertised VM console.
+    ///
+    /// Opt-in and VM/D-Bus only: each advertised `Console_N` gets its own
+    /// `<hls-dir>/console-N/stream.m3u8` and ffmpeg process, served at
+    /// `/stream/console-N/...`. `/stream/...` keeps following the active
+    /// console. Single-head providers (QMP/VNC/Looking Glass) start no
+    /// per-console pipelines and report a typed limitation. Implies `--hls`
+    /// for the active-console path and capability advertisement.
+    #[arg(
+        long,
+        env = "OZMA_MULTI_CONSOLE_HLS",
+        visible_alias = "hls-per-console"
+    )]
+    pub multi_console_hls: bool,
+
+    /// Maximum simultaneous per-console HLS pipelines/encoders (including the
+    /// active console). Bounded to at least one; default 2.
+    #[arg(
+        long,
+        env = "OZMA_MULTI_CONSOLE_HLS_MAX",
+        default_value_t = 2,
+        value_name = "N"
+    )]
+    pub multi_console_hls_max: usize,
+
+    /// Stop a non-active per-console HLS pipeline after this many seconds
+    /// without a `/stream/console-N/...` request (0 disables idle eviction).
+    #[arg(
+        long,
+        env = "OZMA_MULTI_CONSOLE_HLS_IDLE_SECONDS",
+        default_value_t = 60,
+        value_name = "SECONDS"
+    )]
+    pub multi_console_hls_idle_seconds: u64,
 
     /// VAAPI render node used by `h264_vaapi`/`hevc_vaapi` HLS encoders.
     ///
@@ -1341,11 +1378,21 @@ async fn run() -> std::process::ExitCode {
     // ffmpeg leaves it unavailable and reported as `failed`, never as running.
     // The controller owns the live pipeline so POST /codec can restart it with
     // a newly selected software encoder.
-    let hls_output_dir = args.hls.then(|| {
+    let hls_output_dir = (args.hls || args.multi_console_hls).then(|| {
         args.hls_dir
             .clone()
             .unwrap_or_else(|| default_hls_dir(&config.name))
     });
+    // Per-console HLS owns every encoder only for a provider that really
+    // exposes independent console indexes (D-Bus). A single-head provider keeps
+    // the historical active single-HLS path and reports the per-console
+    // limitation instead of losing its stream.
+    let multi_console_hls_owns_stream = args.multi_console_hls
+        && config
+            .capture_display_source()
+            .ok()
+            .flatten()
+            .is_some_and(|source| source.backend == ozma_display::vm::VmConsoleBackend::Dbus);
     let mut hls_controller: Option<HlsController> = None;
     let mut hls_config_for_capabilities: Option<HlsConfig> = None;
     let hls_status = if let Some(directory) = hls_output_dir.as_ref() {
@@ -1391,7 +1438,20 @@ async fn run() -> std::process::ExitCode {
             error!("Invalid HLS configuration: {error}");
             std::process::exit(2);
         }
-        if !config.has_capability("video") {
+        if multi_console_hls_owns_stream {
+            // The per-console manager owns every pipeline (including the
+            // active console) so a console is never encoded twice. It is
+            // constructed after the display selector, below.
+            if !config.has_capability("video") {
+                warn!(
+                    "--multi-console-hls was requested but the video capability is disabled; \
+                     per-console HLS is unavailable"
+                );
+                HlsStatus::failed("video capability is disabled")
+            } else {
+                HlsStatus::not_configured()
+            }
+        } else if !config.has_capability("video") {
             warn!("--hls was requested but the video capability is disabled; HLS is unavailable");
             HlsStatus::failed("video capability is disabled")
         } else {
@@ -1685,6 +1745,55 @@ async fn run() -> std::process::ExitCode {
             None
         }
     };
+    // Opt-in true simultaneous per-console HLS. The manager owns one pipeline
+    // per advertised console (including the active console) and is reconciled
+    // by the selector observer below. It is deliberately separate from the
+    // WebRTC/active-registry path.
+    let mut display_control = display_control;
+    let multi_console_hls = if args.multi_console_hls && config.has_capability("video") {
+        let root = hls_output_dir
+            .clone()
+            .unwrap_or_else(|| default_hls_dir(&config.name));
+        let base = hls_config_for_capabilities
+            .clone()
+            .unwrap_or_else(|| HlsConfig {
+                output_dir: root.clone(),
+                ..HlsConfig::default()
+            });
+        let manager = MultiConsoleHls::from_console_factory(
+            console_factory.clone(),
+            MultiConsoleHlsConfig {
+                max_pipelines: args.multi_console_hls_max,
+                idle_timeout: Duration::from_secs(args.multi_console_hls_idle_seconds),
+                root: root.clone(),
+                base,
+            },
+        );
+        let selection = display_control
+            .as_ref()
+            .map(DisplayControl::selection)
+            .unwrap_or_else(|| {
+                config
+                    .resolve_display_outputs()
+                    .unwrap_or_else(|_| ozma_node::display_outputs::DisplayOutputSelection::empty())
+            });
+        manager.sync(&selection).await;
+        let status = manager.status().await;
+        info!(
+            dir = %root.display(),
+            max_pipelines = status.max_pipelines,
+            active_console = status.active_console,
+            consoles = status.consoles.len(),
+            limitation = ?status.limitation,
+            "per-console HLS manager reconciled advertised consoles"
+        );
+        Some(manager)
+    } else {
+        None
+    };
+    if let (Some(control), Some(manager)) = (display_control.take(), multi_console_hls.clone()) {
+        display_control = Some(control.with_observer(std::sync::Arc::new(manager)));
+    }
     // The broker is a separate snapshot/info path for advertised consoles. It
     // never replaces `registry_slot`, so the active HLS/WebRTC source keeps its
     // console. Sources for other consoles are opened lazily, bounded, and idle
@@ -1717,6 +1826,7 @@ async fn run() -> std::process::ExitCode {
             .with_display_outputs(display_outputs_value, display_capture)
             .with_display_control(display_control)
             .with_console_broker(console_broker.clone())
+            .with_multi_console_hls(multi_console_hls.clone())
             .with_capture(capture_status);
     // Control routes stay behind the bearer guard; the controller's read-only
     // probes are mounted after it so the unmodified controller works with
@@ -1749,6 +1859,32 @@ async fn run() -> std::process::ExitCode {
                     }
                 }
                 broker.shutdown().await;
+            }),
+        ));
+    }
+
+    if let Some(manager) = multi_console_hls.clone() {
+        let manager_shutdown = shutdown.clone();
+        background.push((
+            "multi-console-hls-idle",
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(5));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        _ = manager_shutdown.cancelled() => break,
+                        _ = ticker.tick() => {
+                            let evicted = manager.evict_idle(std::time::Instant::now()).await;
+                            if evicted > 0 {
+                                info!(
+                                    evicted,
+                                    "per-console HLS evicted idle non-active pipelines"
+                                );
+                            }
+                        }
+                    }
+                }
+                manager.shutdown().await;
             }),
         ));
     }
@@ -1976,6 +2112,7 @@ async fn run() -> std::process::ExitCode {
     let consent_policy = config.consent_policy();
     let api_token = config.api_token.clone();
     let api_capture_registry = capture_registry.clone();
+    let api_multi_console_hls = multi_console_hls.clone();
     let api_shutdown = shutdown.clone();
     background.push((
         "node-api",
@@ -1994,6 +2131,7 @@ async fn run() -> std::process::ExitCode {
                 Some(public_compat_router),
                 Some(api_capture_registry),
                 hls_output_dir,
+                api_multi_console_hls,
                 api_shutdown,
             )
             .await
@@ -2016,6 +2154,18 @@ async fn run() -> std::process::ExitCode {
             .is_none()
         {
             warn!("HLS pipeline did not stop within its bound");
+        }
+    }
+    if let Some(manager) = multi_console_hls.as_ref() {
+        if shutdown::with_timeout(
+            "multi-console-hls-stop",
+            shutdown::TASK_STOP_TIMEOUT,
+            manager.shutdown(),
+        )
+        .await
+        .is_none()
+        {
+            warn!("per-console HLS pipelines did not stop within their bound");
         }
     }
     if let Some(control) = webrtc_control.as_ref() {

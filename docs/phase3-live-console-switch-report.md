@@ -11,10 +11,12 @@ console switch previously truncated the playlist and reset
 `#EXT-X-MEDIA-SEQUENCE` to 0. It now appends with
 `#EXT-X-DISCONTINUITY`, and that behavior is unit- and live-tested.
 
-This is not a simultaneous-multi-console encoder claim. The node still has one
-active HLS/WebRTC capture source and one live encoder pair at a time. A
-follow-up snapshot/info broker (§13) adds simultaneous JPEG previews for
-advertised D-Bus consoles without switching the active stream.
+This is not a simultaneous-multi-console encoder claim for the default path. The
+node still has one active HLS/WebRTC capture source and one live encoder pair at
+a time unless the opt-in per-console HLS manager is enabled. A follow-up
+snapshot/info broker (§13) adds simultaneous JPEG previews for advertised D-Bus
+consoles without switching the active stream; the per-console HLS manager (§14)
+adds bounded simultaneous HLS encoders, while WebRTC remains active-console only.
 
 ## 1. Environment
 
@@ -471,10 +473,108 @@ switch/shutdown cleanup; `controller_compat::tests` route tests for
 `?console=`, 404, and single-head 409; focused controller pytest.
 
 **Remaining simultaneous-console gaps.** Snapshot/info are now concurrent for
-advertised D-Bus consoles, but HLS and WebRTC still follow exactly one active
-capture source and one encoder pair. The broker does not feed either encoder and
-does not claim simultaneous encoded streams. True simultaneous HLS/WebRTC would
-need one pipeline/encoder per console, a bounded provider/encoder budget, and a
-control/status model for multiple active streams. Each D-Bus console also holds
-its own QEMU display listener, so `max_open` is a real resource bound, not just
-a cache size. QMP/VNC/Looking Glass remain single-head by design.
+advertised D-Bus consoles; HLS is also concurrent when
+`--multi-console-hls` is enabled (§14). WebRTC still follows exactly one active
+capture source and one encoder pair, and the default single `--hls` path is
+unchanged. The broker does not feed WebRTC. Each D-Bus console also holds its
+own QEMU display listener, so `max_open`/`max_pipelines` are real resource
+bounds, not just cache sizes. QMP/VNC/Looking Glass remain single-head by
+design.
+
+## 14. Per-console HLS manager (follow-up)
+
+`--multi-console-hls` (visible alias `--hls-per-console`,
+`OZMA_MULTI_CONSOLE_HLS=1`) enables true simultaneous local HLS for advertised
+VM consoles. It is opt-in; without it the node keeps the historical single
+active `--hls` path.
+
+Configuration and lifecycle:
+
+- `--multi-console-hls-max N` (default 2, `OZMA_MULTI_CONSOLE_HLS_MAX`) bounds
+  the total simultaneous pipelines/encoders, including the active console. The
+  value is clamped to `1..=MAX_VM_CONSOLES`.
+- `--hls-dir` is the root; each console writes
+  `<hls-root>/console-<N>/stream.m3u8` plus segments.
+- `--multi-console-hls-idle-seconds` (default 60,
+  `OZMA_MULTI_CONSOLE_HLS_IDLE_SECONDS`) stops a non-active pipeline after that
+  long without a `/stream/console-<N>/...` request; `0` disables idle eviction.
+  The active console is never idle-evicted.
+- Only D-Bus consoles are capturable independently. Each advertised output whose
+  `source_type` matches the configured provider gets its own `HlsController`,
+  registry/source, and ffmpeg generation. QMP, VNC, and Looking Glass start
+  nothing for per-console HLS, keep the existing active single `--hls` path, and
+  report a typed `unsupported` limitation.
+- Startup and every committed `POST /display/select` reconcile the advertised
+  set. The active console is preferred; a console removed from
+  `display_outputs` is stopped, and a new console starts while capacity remains.
+  Selecting a console does **not** restart its existing per-console pipeline.
+- When the bound is reached, requesting an omitted console's playlist rotates
+  out the least-recently-used non-active pipeline. The bound is never exceeded.
+- Node shutdown stops every per-console pipeline with the existing bounded
+  `HlsPipeline::stop` wait (ffmpeg is killed and reaped).
+
+Routes and status:
+
+- `/stream/console-<N>/<file>` serves each console directory.
+- `/stream/<file>` retains the old path and follows the active console.
+- `/api/v1/connection.hls` describes the active console's independent pipeline;
+  the additive `multi_console_hls` object carries `enabled`, `provider`,
+  `max_pipelines`, `idle_timeout_seconds`, `active_console`, any `limitation`,
+  and per-console `status`/`error`/`playlist`/`manifest_path`/`output_dir`.
+- `/display/info` (with or without `?console=`) adds the same per-console
+  `multi_console_hls` object for the described console.
+- The controller proxies `/api/v1/streams/{node}/hls/{filename:path}`, so
+  `/api/v1/streams/{node}/hls/console-1/stream.m3u8` and relative segment URLs
+  work. `/api/v1/nodes/{node}/display` includes `multi_console_hls`; the
+  dashboard lists running per-console playlists and follows the picker when
+  that console is running.
+
+**Live smoke (2026-11-25, QEMU 11.1.3, Alpine 3.21, disposable two-head
+D-Bus).** Node command (abridged):
+
+```bash
+./target/debug/ozma-node --name multi-hls-live --profile vm \
+  --qmp-socket "$ROOT/qemu/qmp.sock" \
+  --capture-provider dbus --capture-console 0 \
+  --dbus-width 1280 --dbus-height 800 --dbus-fps 10 \
+  --display-output "0:Console_0:1280x800:primary:dbus" \
+  --display-output "1:Console_1:720x400:dbus" \
+  --multi-console-hls --multi-console-hls-max 2 \
+  --hls-dir "$ROOT/hls" --hls-fps 5 --hls-bitrate-kbps 1000 \
+  --http-port 47931
+```
+
+Both pipelines were `running` at the same time while the active console stayed
+`0`:
+
+```text
+GET /api/v1/connection -> hls:"running", multi_console_hls.enabled:true,
+  consoles:[{console:0,status:"running"},{console:1,status:"running"}]
+GET /stream/console-0/stream.m3u8 -> 200 application/vnd.apple.mpegurl
+GET /stream/console-1/stream.m3u8 -> 200 application/vnd.apple.mpegurl
+GET /stream/stream.m3u8           -> same bytes as console-0 (active route)
+console-0 latest segment: h264 1280x800, sha256 01cd7ad1…ea471c
+console-1 latest segment: h264  720x400, sha256 88ddf4e9…14fc0c
+decoded frame sha256 differs: cb2ba820…dd744 vs 2bd79da7…c4bd
+OCR console 0: Alpine "Installing zlib/apk-tools/busybox…"
+OCR console 1: kernel PCI boot text ("pci_bus", "PIIX3: Enabling Passive Release")
+GET /display/info?console=1 -> console:1, active:false, 720x400,
+  multi_console_hls.status:"running"
+SIGTERM -> exit in ~200 ms, no surviving node/ffmpeg child
+```
+
+Tests: `cargo test -p ozma-node` includes `multi_hls::tests` for two independent
+pipelines, the max bound/LRU rotation, single-head rejection, add/remove and
+shutdown cleanup, active selection without restart, idle eviction, per-console
+start errors, and the active/per-console stream routes. Controller pytest covers
+the per-console HLS proxy and `node/display` pass-through.
+
+**Remaining per-console gaps.** WebRTC is still active-console only; this
+manager does not create simultaneous WebRTC sessions, and the dashboard still
+uses WebRTC first for the active console. `/codec` is not wired to fan out an
+encoder override across per-console pipelines (the single `HlsController` path
+keeps that behavior). The encoder budget is a pipeline count, not a measured
+GPU/CPU capacity model, so `--multi-console-hls-max` must be chosen for the
+host's real encode capacity. Idle eviction is driven by stream requests, not by
+playlist/segment reader counts. The controller UI links per-console playlists
+but does not yet render them side by side in the KVM modal.

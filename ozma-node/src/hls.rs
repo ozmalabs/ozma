@@ -1089,6 +1089,22 @@ impl HlsStatus {
         }
     }
 
+    /// A running pipeline status for an existing manifest.
+    ///
+    /// The per-console HLS manager owns independent [`HlsController`] instances
+    /// and uses this constructor to describe a fake/embedded pipeline through
+    /// the same status shape. As with a real pipeline, [`Self::status_name`]
+    /// still reports `failed` until the manifest file exists.
+    pub fn running(manifest: impl Into<PathBuf>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HlsStatusInner {
+                state: HlsState::Running,
+                error: None,
+                manifest: Some(manifest.into()),
+            })),
+        }
+    }
+
     fn starting(manifest: PathBuf) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HlsStatusInner {

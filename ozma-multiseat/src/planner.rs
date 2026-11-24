@@ -12,6 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::display::{DisplayBackend, DisplayOutput};
 use crate::error::MultiseatError;
 use crate::input::{group_inputs, InputBackend, InputDevice, InputGroup};
+use crate::ownership::DisplayOwnership;
+use crate::routing::InputRoutePlan;
 use crate::seat::{
     CapturePlan, DiagnosticCode, MultiseatPlan, NodeCommand, PlanDiagnostic, SeatConfig, SeatPlan,
     SeatPorts, SeatProfile,
@@ -262,7 +264,27 @@ impl MultiseatPlanner {
             }
 
             let capture = self.capture_for(display, profile_defaults)?;
+            let ownership = match &capture {
+                CapturePlan::X11 {
+                    display: x_screen, ..
+                } => Some(DisplayOwnership::from_output(&seat_id, display, x_screen)),
+                CapturePlan::PipeWire { .. } => None,
+            };
             let input = assignments[ordinal].clone();
+            let input_route = match (&capture, input.as_ref()) {
+                (
+                    CapturePlan::X11 {
+                        display: x_screen, ..
+                    },
+                    Some(group),
+                ) => Some(InputRoutePlan::for_group(
+                    &seat_id,
+                    &display.name,
+                    x_screen,
+                    group,
+                )),
+                _ => None,
+            };
             let input_devices = input
                 .as_ref()
                 .map(InputGroup::all_devices)
@@ -292,13 +314,22 @@ impl MultiseatPlanner {
                 profile: self.options.profile,
                 capture: capture.clone(),
             };
-            let command = self.node_command(&seat_id, ports[ordinal], &audio_sink, &capture);
+            let command = self.node_command(
+                &seat_id,
+                ports[ordinal],
+                &audio_sink,
+                &capture,
+                ownership.as_ref(),
+                input_route.as_ref(),
+            );
 
             seats.push(SeatPlan {
                 config,
                 node_name: seat_id,
                 display: display.clone(),
                 input,
+                ownership,
+                input_route,
                 command,
             });
         }
@@ -428,6 +459,8 @@ impl MultiseatPlanner {
         ports: SeatPorts,
         audio_sink: &str,
         capture: &CapturePlan,
+        ownership: Option<&DisplayOwnership>,
+        input_route: Option<&InputRoutePlan>,
     ) -> NodeCommand {
         let mut args = Vec::new();
         push_pair(&mut args, "--profile", "desktop");
@@ -445,6 +478,12 @@ impl MultiseatPlanner {
         args.extend(self.options.extra_node_args.iter().cloned());
 
         let mut env = capture.environment();
+        if let Some(ownership) = ownership {
+            env.extend(ownership.environment());
+        }
+        if let Some(input_route) = input_route {
+            env.extend(input_route.environment());
+        }
         env.insert("PULSE_SINK".to_owned(), audio_sink.to_owned());
         env.insert("OZMA_SEAT_ID".to_owned(), seat_id.to_owned());
 

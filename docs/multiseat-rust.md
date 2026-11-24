@@ -1,10 +1,16 @@
 # Rust multi-seat planning and supervision (`ozma-multiseat`)
 
-Status: **library + real subprocess supervisor + CLI (2026-11-25).** The crate
-enumerates display/input topology, plans one desktop seat per output, and can
-spawn, health-check, restart, stop, and report one `ozma-node --profile desktop`
-child per seat. It is **not wired into `ozma-node` or `ozma-softnode`**, creates
-no virtual display or audio sink, grabs no input device, and injects no input.
+Status: **library + real subprocess supervisor + CLI + controller read-only
+grouping + input-routing/display-ownership models (2026-11-25).** The crate
+enumerates display/input topology, plans one desktop seat per output, can spawn,
+health-check, restart, stop, and report one `ozma-node --profile desktop` child
+per seat, and now models the two ownership layers: `xinput map-to-output` input
+routing with rollback, and per-seat `xrandr` output/mode/position ownership. It
+is **not wired into `ozma-node` or `ozma-softnode`**, the CLI does not execute
+the routing/ownership plans, and it creates no virtual display or audio sink. No
+real evdev grab is performed and no input is injected. The controller can now
+group the independent per-seat node registrations for display, without merging
+them or taking over seat lifecycle.
 
 The Python baseline in [`agent/multiseat`](../agent/multiseat) remains the
 runnable multi-seat implementation. The plan and phase status are in
@@ -47,16 +53,46 @@ Implemented:
   documents on `--status-port` (loopback only).
 - Controller-facing capability/status document where one seat is one node,
   plus a bounded Prometheus metrics renderer.
+- `routing`: `InputRouter` (`assign`/`release`/`status`), `XInputRouter` with an
+  injectable `CommandRunner` and `DeviceNameResolver`, exact
+  `xinput list --short` parsing, `xinput map-to-output <device> <output>`
+  construction/execution, release-to-`all`, seat-level rollback, and
+  `assign_seats` all-or-nothing assignment. `EvdevGrabRouter` models exclusive
+  `EVIOCGRAB` requests and per-seat uinput environment; its default backend
+  returns a typed unsupported error instead of grabbing.
+- `ownership`: `DisplayOwnership` and `XrandrOwnershipController` model
+  per-seat output ownership as
+  `xrandr --output <output> --mode <mode> --pos <x>x<y>`, with apply/release
+  and rollback through an injectable runner. `SeatPlan` and `NodeCommand`
+  environment carry the output, mode, ownership kind, routing strategy, and
+  explicit uinput seat.
+- Read-only controller seat grouping (`GET /api/v1/seats`, dashboard Seats
+  panel) that recognises the `<machine>-seat-<n>` names the planner produces,
+  or explicit `seat_id`/`parent_node_id` metadata, and reports online state,
+  seat indexes, node ids, displays, and HID/HTTP ports. It never merges nodes,
+  controls seats, or exposes tokens.
 
 Deliberately not implemented yet:
 
 - Node integration inside `ozma-node`/`ozma-softnode`, controller registration,
   or a Python-agent-compatible manager API. The CLI is the external supervisor.
-- Xorg per-seat screens or output ownership; the X11 plan captures a region of
-  one existing X server.
-- Physical input routing to a seat (`xinput map-to-output`, exclusive
-  `EVIOCGRAB`, udev/Xorg `InputDevice` sections).
-- Per-seat uinput targeting; the node's uinput sink does not choose an X screen.
+  The controller grouping above is read-only and does not change this.
+- **True per-seat screen ownership.** The X11 path positions one xrandr output
+  on a single X server. All outputs share one root window and one keyboard
+  focus, so `xrandr` ownership is not screen isolation. Separate X screens,
+  a per-seat X server/compositor, or DRM leasing are still required and are not
+  created here. Wayland compositor seats are modelled only as a kind.
+- **Real exclusive evdev grabs.** `EvdevGrabRouter` models `EVIOCGRAB` and
+  provides the execution seam, but the default backend is unsupported because
+  the crate forbids `unsafe`; no privileged helper exists. udev/Xorg
+  `InputDevice` sections are not generated.
+- **Automatic routing/ownership execution.** The CLI prints the planned
+  ownership/routing intent and injects its environment into the child; it does
+  not call `XInputRouter` or `XrandrOwnershipController`. An operator or a
+  future manager must invoke the controllers.
+- Per-seat uinput targeting at the kernel/compositor level; the node's uinput
+  sink still does not choose an X screen. The environment now names the target
+  seat, but the node must honour it.
 - Audio sink creation and per-process/per-seat routing.
 - Hotplug/auto-detection, persistence, scale up/down, and virtualization of
   missing displays beyond the `DisplayBackend::create_virtual` contract.
@@ -79,11 +115,13 @@ Deliberately not implemented yet:
 | Host | `HostTopology` |
 | Planning | `PlannerOptions`, `CapturePreference`, `MultiseatPlanner`, `allocate_ports` |
 | Seat | `SeatProfile`, `ProfileDefaults`, `SeatConfig`, `SeatPlan`, `CapturePlan`, `NodeCommand`, `SeatPorts`, `SeatState`, `SeatStatus`, `SeatRuntimeStatus` |
+| Input routing | `InputRouter`, `XInputRouter`, `EvdevGrabRouter`, `InputTarget`, `InputAssignment`, `InputRelease`, `InputRoutePlan`, `InputRoutingStrategy`, `assign_seats`, `parse_xinput_list`, `XInputDevice`, `RouteCommand`, `CommandRunner`, `ProcessCommandRunner`, `DeviceNameResolver`, `SysfsDeviceNameResolver`, `EvdevGrabBackend`, `EvdevGrabCommand`, `UnsupportedEvdevGrabBackend` |
+| Display ownership | `DisplayOwnership`, `DisplayOwnershipKind`, `DisplayOwnershipController`, `XrandrOwnershipController`, `apply_ownership` |
 | Plan result | `MultiseatPlan`, `PlanDiagnostic`, `DiagnosticCode` |
 | Status | `MultiseatCapability`, `MultiseatStatus`, `render_metrics` |
 | Supervision | `SeatSupervisor`, `ProcessSeatSupervisor`, `SupervisorOptions`, `NodeLaunchSpec`, `NodeLauncher`, `ProcessLauncher`, `ChildHandle`, `ChildExit`, `ReadinessProbe`, `HttpHealthProbe`, `PortProbe`, `restart_delay` |
 | CLI | `ozma-multiseat` binary |
-| Test-only | `fake::FakeDisplayBackend`, `fake::FakeInputBackend`, `fake::FakeSeatSupervisor`, `fake::FakeNodeLauncher`, `fake::FakeReadinessProbe` |
+| Test-only | `fake::FakeDisplayBackend`, `fake::FakeInputBackend`, `fake::FakeSeatSupervisor`, `fake::FakeNodeLauncher`, `fake::FakeReadinessProbe`, `fake::FakeCommandRunner`, `fake::FakeDeviceNameResolver`, `fake::FakeEvdevGrabBackend` |
 
 `fake` is not selected by detection and never touches `/dev`, sysfs, X11,
 PipeWire, or processes. Production code must choose `XrandrDisplayBackend` /
@@ -134,18 +172,95 @@ ozma-node --profile desktop --name host-seat-0 \
 ```
 
 and seat 1 increments the name, ports, sink, and display offset. The plan also
-carries `DISPLAY`, `PULSE_SINK`, and `OZMA_SEAT_ID` in the command environment,
-which the supervisor passes to the child. `extra_node_args` is appended after
-the generated flags; callers must not duplicate an option that clap would
-reject.
+carries `DISPLAY`, `PULSE_SINK`, `OZMA_SEAT_ID`, `OZMA_X11_OUTPUT`,
+`OZMA_X11_MODE`, `OZMA_DISPLAY_OWNERSHIP`, `OZMA_INPUT_ROUTER`, and
+`OZMA_UINPUT_SEAT` in the command environment, which the supervisor passes to
+the child. For an X11 seat with input, `SeatPlan.ownership` carries the
+`DisplayOwnership` and `SeatPlan.input_route` carries the `InputRoutePlan`
+(pointer paths, exclusive-grab intent, and routing environment).
+`extra_node_args` is appended after the generated flags; callers must not
+duplicate an option that clap would reject.
 
 For PipeWire, the capture flags are `--capture-provider pipewire`,
 `--desktop-capture-target <configured target>`, and
-`--desktop-capture-width/height/fps`.
+`--desktop-capture-width/height/fps`. PipeWire seats carry no
+`DisplayOwnership`; the compositor owns outputs.
 
 The audio sink and `monitor:<sink>` capture target are **configuration intent**.
 Nothing in this crate creates the sink. The node reports a warned no-audio state
 if the sink does not exist.
+
+## Input routing and display ownership
+
+These layers turn the plan's device paths and output names into explicit
+commands, but they are **not invoked by the CLI or supervisor**. A caller (an
+operator, the future manager, or a test) must construct a router/controller and
+call `assign`/`apply`.
+
+### Physical input routing
+
+`InputRouter` is the shared contract:
+
+```rust
+fn assign(&mut self, group: &InputGroup, target: &InputTarget) -> Result<InputAssignment, MultiseatError>;
+fn release(&mut self, seat_id: &str) -> Result<InputRelease, MultiseatError>;
+fn status(&self) -> Vec<InputAssignment>;
+```
+
+- `XInputRouter` takes an injected `CommandRunner` and `DeviceNameResolver`. It
+  runs `xinput list --short` with `DISPLAY` set to the target's X screen, parses
+  `id=<n>` lines (`parse_xinput_list`), resolves each mouse evdev path through
+  sysfs (`/sys/class/input/<event>/device/name`), and runs
+  `xinput map-to-output <id> <output>`.
+- `release` removes the seat assignment and runs
+  `xinput map-to-output <id> all` for every mapped pointer (the `all` reset
+  value). A partial `assign` failure rolls back earlier pointer maps in reverse
+  order before returning the typed `CommandFailed`/`CommandUnavailable`.
+- `assign_seats` validates unique seat ids/hubs/outputs before any command,
+  assigns in order, and releases every earlier seat on a later failure.
+  Keyboard-only groups are tracked with no pointer map; a group whose pointers
+  are all absent from XInput is a typed error, never a silent success.
+- `EvdevGrabRouter` models `EVIOCGRAB` requests (`EVIOCGRAB_REQUEST`,
+  `EvdevGrabCommand`) and builds the per-seat uinput environment. Execution is
+  behind `EvdevGrabBackend`; the default `UnsupportedEvdevGrabBackend` returns a
+  typed `Unsupported` error. Tests inject `FakeEvdevGrabBackend`, which only
+  records requests and never opens `/dev/input`.
+- Missing tools are typed `CommandUnavailable` errors. A non-zero `xinput`
+  exit is `CommandFailed` with program, argv, status, and stderr.
+- XInput names are not unique. Two devices with the same model name resolve to
+  the first matching `id`; stable per-device routing for identical devices needs
+  udev/Xorg or a device-id-aware backend.
+
+Example argv:
+
+```text
+xinput list --short
+xinput map-to-output 12 HDMI-1
+xinput map-to-output 12 all          # release/reset
+```
+
+### Display ownership
+
+`DisplayOwnership` records seat id, kind, X screen, output, mode, geometry, and
+primary/virtual flags. `XrandrOwnershipController` applies and releases one
+output through an injected runner:
+
+```text
+xrandr --output HDMI-1 --mode 1920x1080 --pos 1920x0
+xrandr --output HDMI-1 --auto        # best-effort release; prior layout unknown
+```
+
+`apply_ownership` rejects duplicate seats/outputs before the first command and
+rolls back earlier outputs when a later apply fails. Non-xrandr ownership kinds
+(`x_screen`, `separate_server`, `wayland_compositor`) are modelled but return a
+typed `Unsupported` error from the xrandr controller.
+
+**Single X server limitation.** All xrandr outputs share one root window, one
+window manager, and one keyboard focus. Positioning an output and mapping a
+pointer to it is not seat isolation; `ozma-node` still injects into the one X
+server. True ownership requires separate X screens (`:0.0`, `:0.1`), one X
+server/compositor per seat, or DRM leasing. This crate creates none of those and
+claims no Wayland or Windows ownership.
 
 ## Supervision
 
@@ -249,6 +364,30 @@ Metrics labels are seat ids and fixed state/port kinds only. Node argv,
 environment, input paths, audio sink names, and error strings stay out of the
 metrics surface.
 
+## Controller seat grouping (read-only)
+
+The controller still sees one independent node per seat. `controller/seats.py`
+derives a display-only grouping at read time and exposes it as
+`GET /api/v1/seats`:
+
+- A node is a seat when it has an explicit `seat_id`, its node id (or
+  `seat_id`) matches `<machine>-seat-<n>`, or it has a `parent_node_id`. The
+  `direct` registration endpoint accepts an optional `seat_id`; older nodes
+  that omit it keep working.
+- `parent_node_id` names the machine when present and overrides the name
+  prefix, so an operator can rename a seat node without splitting the group.
+- Nodes that match none of those rules are returned in `unseated_node_ids`.
+  A bare `seat-0` or an ordinary `workstation-1` is never reported as a seat.
+- Each group carries `machine`/`host`, `seat_count`, `online_count`,
+  `offline_count`, `online`, `all_online`, and sorted `seats`. Each seat carries
+  `node_id`, `seat_id`, `seat_index`, `online`, `host`, `port`, `api_port`,
+  `stream_port`, `display_outputs`/`displays`, and display/role fields when set.
+- Online state uses the node's `last_seen` freshness (`offline_after`, default
+  180 s). No tokens, node argv, environment, or audio sink names are exposed.
+- The dashboard has a read-only Seats panel that groups seat rows under their
+  machine; individual node cards remain unchanged. The panel has no start,
+  stop, or destructive controls.
+
 ## CLI
 
 ```bash
@@ -322,6 +461,28 @@ The default suite covers:
   probe errors, spawn failure retry, crash restart with backoff, stop/reap,
   remove, dry-run no-spawn, per-seat pid/ports/restarts/last-error JSON, and
   bounded metrics.
+- XInput list parsing, exact `map-to-output`/list argv, sysfs name resolution,
+  partial-map rollback, release-to-`all`, absent-tool typed errors, unknown
+  pointer rejection, keyboard-only tracking, and `assign_seats` rollback.
+- `EVIOCGRAB` command models, per-seat uinput environment, the unsupported
+  default backend, and fake-backend grab/ungrab recording without touching
+  `/dev/input`.
+- Xrandr ownership argv (`--output/--mode/--pos`), apply/release through a fake
+  runner, absent-`xrandr` typed errors, non-xrandr kind rejection, duplicate
+  output rejection, and multi-seat apply rollback.
+- Planner wiring of `SeatPlan.ownership`, `SeatPlan.input_route`, and the
+  ownership/routing environment.
+
+Controller-side grouping is covered by Python tests with fake nodes:
+
+```bash
+python3 -m pytest tests/unit/controller/test_seats.py
+```
+
+They cover name/`seat_id`/`parent_node_id` grouping, multi-host separation,
+online/offline state, unrelated-node exclusion, the API shape and token
+redaction, optional `seat_id` registration compatibility, and dashboard group
+rendering.
 
 Real host checks are opt-in and `#[ignore]`d:
 
@@ -333,15 +494,50 @@ OZMA_MULTISEAT_REAL=1 cargo test -p ozma-multiseat --test real_backends \
 They enumerate the real `xrandr` output, read-only sysfs input, and DRM
 connectors. They start no node and inject no input.
 
+The routing smoke is also opt-in and can map a pointer only on a throwaway
+display (for example Xvfb `:99`):
+
+```bash
+OZMA_MULTISEAT_REAL=1 cargo test -p ozma-multiseat --test real_routing \
+  -- --ignored --nocapture
+OZMA_MULTISEAT_REAL=1 OZMA_MULTISEAT_XINPUT_MAP=1 DISPLAY=:99 \
+  cargo test -p ozma-multiseat --test real_routing -- --ignored --nocapture
+```
+
+The first check only lists XInput devices. The second calls
+`xinput map-to-output` and resets to `all`; it must point at a disposable X
+server and never the operator's desktop. No evdev grab or input injection is
+part of either check.
+
+Display mode changes are opt-in separately:
+
+```bash
+OZMA_MULTISEAT_REAL=1 OZMA_MULTISEAT_XRANDR_APPLY=1 DISPLAY=:99 \
+  cargo test -p ozma-multiseat --test real_ownership -- --ignored --nocapture
+```
+
+It applies one `--output/--mode/--pos` and releases with `--auto`, again only on
+a throwaway display.
+
 Live smoke (2026-11-25): `--print-plan` and `--dry-run` succeeded against an
 ephemeral Xvfb `:99` with read-only sysfs input, producing one seat and the
 exact `ozma-node --profile desktop` argv without spawning a node or injecting
-input. A separate supervisor smoke used a temporary fake `/health` node: the
-real `ProcessLauncher` passed `DISPLAY`, `PULSE_SINK`, and `OZMA_SEAT_ID`,
-readiness succeeded, `/status`/`/metrics` reported pid/ports/state, and
-SIGTERM stopped and reaped the child. No real `ozma-node` was started. The
-host's existing X sockets `:0`–`:2` rejected `xrandr` without Xauthority; the
-CLI failed with the backend error rather than inventing a display.
+input. The plan printed `ownership: xrandr-output screen mode=1280x800 pos=0x0`
+and `input route: xinput-map-to-output ... grab=no`, with
+`OZMA_X11_OUTPUT`/`OZMA_X11_MODE`/`OZMA_DISPLAY_OWNERSHIP`/`OZMA_INPUT_ROUTER`/
+`OZMA_UINPUT_SEAT` in the child environment. A separate supervisor smoke used a
+temporary fake `/health` node: the real `ProcessLauncher` passed `DISPLAY`,
+`PULSE_SINK`, and `OZMA_SEAT_ID`, readiness succeeded, `/status`/`/metrics`
+reported pid/ports/state, and SIGTERM stopped and reaped the child. No real
+`ozma-node` was started.
+
+The opt-in routing smoke on the same Xvfb display listed six XInput devices and
+mapped `Xvfb mouse` (id 6) to the `screen` output with the real
+`ProcessCommandRunner`; release reset it with `map-to-output 6 all`. The opt-in
+ownership smoke applied `xrandr --output screen --mode 1280x800 --pos 0x0` and
+released with `--auto` on the same disposable display. The host's existing X
+sockets `:0`–`:2` rejected `xrandr` without Xauthority; the CLI failed with the
+backend error rather than inventing a display.
 
 ## Remaining Python parity
 
@@ -352,15 +548,23 @@ local status surface. Still required for parity:
 
 1. **Node/controller integration.** Wire the supervisor into `ozma-node`,
    `ozma-softnode`, or a manager that registers each seat as an independent
-   node with the controller. The CLI status document is local and read-only.
-2. **Display ownership.** Separate X screens or a compositor path per seat;
-   current X11 planning captures a region of one server. Virtual displays still
-   depend on an external Xorg/dummy driver or the future IDD path.
-3. **Physical input routing.** `xinput map-to-output`, exclusive evdev grabs,
-   permissions/udev rules, and per-seat input state. The plan records device
-   paths but does not enforce ownership.
-4. **Per-seat uinput targeting.** Injection currently goes to the focused X
-   window/server, not a specific seat output.
+   node with the controller. The controller groups those registrations
+   read-only, but it does not start/stop seats, merge them into a super-node,
+   or surface supervisor state. The CLI status document is local and
+   read-only.
+2. **True display ownership.** xrandr output positioning exists as a command
+   model/controller, but one X server still shares a root window and keyboard
+   focus. Separate X screens, a per-seat X server/compositor, or DRM leasing
+   are required. Virtual displays still depend on an external Xorg/dummy driver
+   or the future IDD path. There is no Wayland compositor seat path.
+3. **Input routing execution and policy.** `xinput map-to-output` and rollback
+   exist behind an injected runner, and `EVIOCGRAB` is modelled, but the CLI
+   does not invoke them, no privileged grab helper exists, and udev/Xorg
+   `InputDevice` sections, device permissions, hotplug re-routing, and durable
+   per-seat input state are missing.
+4. **Per-seat uinput targeting.** The environment now names the target seat
+   (`OZMA_UINPUT_SEAT`), but injection still goes to the focused X
+   window/server, not a specific seat output or compositor seat.
 5. **Audio isolation.** Create PipeWire null/remap sinks per seat, route
    application streams, and add mic/room-correction/VBAN paths.
 6. **Auto-detection.** USB hotplug, seat persistence (`seats.json`), hub

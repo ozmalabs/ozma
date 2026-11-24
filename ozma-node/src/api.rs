@@ -89,6 +89,7 @@ pub async fn serve_with_scene_replay(
         None,
         None,
         None,
+        None,
         CancellationToken::new(),
     )
     .await
@@ -130,6 +131,7 @@ pub async fn serve_with_scene_replay_and_sink(
     public_compat_router: Option<Router>,
     capture_registry: Option<ozma_capture::CaptureRegistry>,
     hls_dir: Option<std::path::PathBuf>,
+    multi_console_hls: Option<crate::multi_hls::MultiConsoleHls>,
     shutdown: CancellationToken,
 ) -> Result<()> {
     let backend = backend_with_encoders(SessionBackend::new(capabilities, consent_policy)).await;
@@ -316,7 +318,7 @@ pub async fn serve_with_scene_replay_and_sink(
     // HLS media is merged after the bearer layer on purpose: the controller's
     // `/stream/*` proxy does not send credentials. See the doc comment on
     // `serve_with_scene_replay_and_sink`.
-    let app = with_hls(app, hls_dir);
+    let app = with_hls(app, hls_dir, multi_console_hls);
     let app = app.layer(dev_cors());
     info!(port, "Node API listening");
     let served = axum::serve(listener, app)
@@ -346,10 +348,25 @@ fn dev_cors() -> CorsLayer {
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
 }
 
-/// Merge the unauthenticated `/stream` file service when HLS is configured.
+/// Merge the unauthenticated HLS file service when HLS is configured.
 ///
-/// `ServeDir` rejects `..`, so traversal cannot escape the output directory.
-fn with_hls(app: Router, hls_dir: Option<std::path::PathBuf>) -> Router {
+/// A per-console manager takes precedence and serves both
+/// `/stream/console-<N>/...` and `/stream/...` for the active console. Without
+/// it, the historical single-directory `ServeDir` is unchanged. `ServeDir`
+/// rejects `..`, and the per-console router rejects separator/parent path
+/// segments, so traversal cannot escape an output directory.
+fn with_hls(
+    app: Router,
+    hls_dir: Option<std::path::PathBuf>,
+    multi_console_hls: Option<crate::multi_hls::MultiConsoleHls>,
+) -> Router {
+    if let Some(manager) = multi_console_hls {
+        // A single-head provider keeps the historical single-directory HLS
+        // path; the manager is present only to report its typed limitation.
+        if manager.supports_independent_consoles() {
+            return app.merge(crate::multi_hls::stream_router(manager));
+        }
+    }
     match hls_dir {
         Some(directory) => app.merge(crate::hls::stream_router(directory)),
         None => app,
@@ -462,7 +479,7 @@ mod tests {
             Some("secret".to_owned()),
             None,
         );
-        let app = with_hls(guarded, Some(directory.clone()));
+        let app = with_hls(guarded, Some(directory.clone()), None);
 
         let response = app
             .clone()
