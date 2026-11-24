@@ -13,6 +13,7 @@ pub mod capability;
 pub mod control;
 pub mod diagnostics;
 pub mod display;
+pub mod display_method;
 pub mod error;
 pub mod ids;
 pub mod input;
@@ -37,6 +38,10 @@ pub use display::{
     HdrCapability, HdrMode, Rotation, VirtualDisplayBackend, VirtualDisplayCaps,
     VirtualDisplaySpec,
 };
+pub use display_method::{
+    ActionDef, ContentRequirement, DataField, DataSchema, DisplayMethod, FieldDef, Interaction,
+    InteractionTarget, MethodLocation, MethodRegistry, RegisteredMethod, RenderingTier,
+};
 pub use error::{codes, ApiError, ErrorResponse};
 pub use ids::{ClientId, NodeId, SessionId, TrackId};
 pub use input::{InputEvent, KeyModifiers, PointerButton, TouchPhase};
@@ -49,13 +54,16 @@ pub use session::{
 };
 pub use transport::{
     ChannelDescriptor, ChannelKind, ChannelPriority, SessionOffer, TransportDescriptor,
-    TransportMode,
+    TransportMode, WireFormat,
 };
 pub use version::{ProtocolVersion, CURRENT_PROTOCOL_VERSION};
 
 /// The stable protocol name used in ALPN, mDNS TXT, and API metadata.
 pub const PROTOCOL_NAME: &str = "ozma";
-/// Wire-format schema version for JSON payloads that are not the control plane.
+/// Compatibility version for payloads that still use the JSON binding.
+///
+/// Protobuf is canonical for the core protocol; see `proto/ozma/v1` and
+/// `ozma-protocol-proto`.
 pub const SCHEMA_VERSION: u16 = 1;
 
 /// Convenience alias used throughout the workspace.

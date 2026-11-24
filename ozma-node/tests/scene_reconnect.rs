@@ -15,7 +15,7 @@ use ozma_node::transport::QuicRuntime;
 use ozma_protocol::scene::{DisplayCapabilities, ImageResource, SceneReceiver};
 use ozma_protocol::{
     ClientId, ControlMessage, NodeCapabilities, Permission, PermissionSet, SessionSpec, TrackId,
-    TrackKind, TrackSpec,
+    TrackKind, TrackSpec, WireFormat,
 };
 use ozma_transport::{
     ChannelId, ChannelMap, QuicClient, QuicTransport, SessionTransport, TransportEvent,
@@ -97,8 +97,10 @@ async fn attach(
     let hello = ControlMessage::Hello {
         session_id: session.id.clone(),
         token: token.to_owned(),
+        wire_formats: vec![WireFormat::Json],
         display: Some(DisplayCapabilities {
             scene_versions: vec![1],
+            ..Default::default()
         }),
     };
     client

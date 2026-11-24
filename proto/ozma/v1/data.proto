@@ -1,0 +1,100 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// Display definitions, compiled field tables, and compact data updates.
+//
+// Runtime-extensible fields never force dynamic `.proto` generation. The
+// definition document is JSON; its compiled field table is protobuf and its
+// field identifiers are assigned once and never reused.
+
+syntax = "proto3";
+
+package ozma.v1;
+
+import "ozma/v1/action.proto";
+
+// Logical type of a field-table value.
+enum ValueType {
+  VALUE_TYPE_UNSPECIFIED = 0;
+  VALUE_TYPE_SINT = 1;
+  VALUE_TYPE_UINT = 2;
+  VALUE_TYPE_REAL = 3;
+  VALUE_TYPE_BOOL = 4;
+  VALUE_TYPE_STRING = 5;
+  VALUE_TYPE_ENUM = 6;
+  VALUE_TYPE_BYTES = 7;
+  VALUE_TYPE_TIMESTAMP = 8;
+}
+
+// A compiled field-table entry from a display definition.
+message FieldDef {
+  // Stable for the definition lifetime; never reused.
+  uint32 id = 1;
+  // Namespaced key, for example `org.ozma/node.cpu_temp`.
+  string key = 2;
+  ValueType type = 3;
+  optional string unit = 4;
+  // Scaled-integer multiplier, for example `100` for hundredths.
+  optional sint32 scale = 5;
+  optional string description = 6;
+}
+
+// A cached definition reference used during reconnect negotiation.
+message DefinitionRef {
+  string id = 1;
+  uint32 version = 2;
+  // Hash of the canonical definition JSON, so a client can prove it has the
+  // same document and the server can skip resending it.
+  bytes hash = 3;
+}
+
+// A display definition: canonical JSON plus a compiled field and action table.
+message DisplayDefinition {
+  string id = 1;
+  uint32 version = 2;
+  // BLAKE3 hash of the canonical JSON document.
+  bytes hash = 3;
+  // Schema, layout, actions, and extension metadata as canonical JSON.
+  bytes definition_json = 4;
+  // Optional compressed form of `definition_json`.
+  bytes definition_zstd = 5;
+  repeated FieldDef fields = 6;
+  repeated ActionDef actions = 7;
+}
+
+// One changed field value.
+message FieldValue {
+  uint32 field_id = 1;
+  oneof value {
+    sint64 integer = 2;
+    uint64 unsigned = 3;
+    double real = 4;
+    bool flag = 5;
+    string text = 6;
+    int32 enum_value = 7;
+    bytes blob = 8;
+    int64 timestamp_micros = 9;
+  }
+}
+
+// Compact steady-state update carrying only changed fields.
+message DataUpdate {
+  uint32 definition_version = 1;
+  repeated FieldValue values = 2;
+  // Optional per-definition monotonically increasing sequence number.
+  optional uint64 sequence = 3;
+  optional uint64 timestamp_micros = 4;
+}
+
+// A structural change to a display definition, normally an RFC 6902 JSON
+// Patch. Send a full `DisplayDefinition` when a patch cannot be applied.
+message DefinitionPatch {
+  string definition_id = 1;
+  uint32 base_version = 2;
+  uint32 version = 3;
+  // RFC 6902 JSON Patch document.
+  bytes patch_json = 4;
+  // BLAKE3 hash of the resulting canonical definition.
+  bytes hash = 5;
+  // Optional compressed form of `patch_json`.
+  optional bytes patch_zstd = 6;
+}

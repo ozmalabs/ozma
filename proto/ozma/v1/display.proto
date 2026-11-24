@@ -1,0 +1,106 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// Display methods, rendering tiers, and the data schemas a method can present.
+//
+// A rendering tier is only a hint. The advertised `DisplayMethod` messages are
+// authoritative: a tier never implies support for a particular widget, data
+// schema, or interaction.
+
+syntax = "proto3";
+
+package ozma.v1;
+
+// Broad rendering strategy advertised by a device or graph service.
+enum RenderingTier {
+  RENDERING_TIER_UNSPECIFIED = 0;
+  // Raw pixels are pushed to the device.
+  RENDERING_TIER_PIXEL_SINK = 1;
+  // A pre-rendered UI surface is pushed to the device.
+  RENDERING_TIER_RENDERED_UI = 2;
+  // The device renders native widgets from scene data.
+  RENDERING_TIER_NATIVE_WIDGETS = 3;
+  // The device renders a data-driven display definition.
+  RENDERING_TIER_DATA_DRIVEN = 4;
+}
+
+// Where a display method executes.
+enum MethodLocation {
+  METHOD_LOCATION_UNSPECIFIED = 0;
+  // The method runs on the device itself.
+  METHOD_LOCATION_DEVICE = 1;
+  // A graph service renders on behalf of the device.
+  METHOD_LOCATION_GRAPH_SERVICE = 2;
+  // The method may run on either the device or a graph service.
+  METHOD_LOCATION_EITHER = 3;
+}
+
+// Interaction modalities a display method can deliver.
+enum Interaction {
+  INTERACTION_UNSPECIFIED = 0;
+  INTERACTION_POINTER = 1;
+  INTERACTION_TOUCH = 2;
+  INTERACTION_KEYBOARD = 3;
+  INTERACTION_BUTTONS = 4;
+  INTERACTION_GAMEPAD = 5;
+  INTERACTION_PEN = 6;
+  INTERACTION_FOCUS = 7;
+}
+
+// A concrete presentation method advertised during negotiation.
+message DisplayMethod {
+  // Stable identifier, unique within the advertising device or service.
+  string id = 1;
+  // Content types the method accepts, for example
+  // `application/vnd.ozma.scene+json`.
+  repeated string accepts = 2;
+  // Data schema identifiers the method can consume.
+  repeated string schemas = 3;
+  MethodLocation location = 4;
+  // Output formats the method can produce, for example `image/png`.
+  repeated string outputs = 5;
+  // Interaction modalities the method can deliver.
+  repeated Interaction interactions = 6;
+  // Optional JSON Schema describing method-specific configuration.
+  optional string configuration_schema = 7;
+  reserved 8;
+  reserved "tier";
+}
+
+// One field in a `DataSchema`.
+message DataField {
+  // Namespaced field key, for example `org.ozma/node.cpu_temp`.
+  string key = 1;
+  // Logical value type, for example `sint`, `uint`, `real`, `bool`, `string`,
+  // `enum`, `bytes`, or `timestamp`.
+  string value_type = 2;
+  optional string unit = 3;
+  // Labels for enum values, in declaration order.
+  repeated string enum_values = 4;
+  bool required = 5;
+  // Optional default encoded as a display-value string.
+  optional string default_value = 6;
+}
+
+// A data schema a display method can present, for example a telemetry layout.
+message DataSchema {
+  string id = 1;
+  repeated DataField fields = 2;
+  // How values are updated, for example `push`, `poll`, or `delta`.
+  string update_mode = 3;
+  optional uint32 max_update_rate_hz = 4;
+  optional uint32 version = 5;
+}
+
+// Display capabilities advertised during handshake.
+message DisplayCapabilities {
+  repeated uint32 scene_versions = 1;
+  // Concrete methods the device or service can present.
+  repeated DisplayMethod methods = 2;
+  // Tier hints; methods remain authoritative.
+  repeated RenderingTier tiers = 3;
+  // Data schema identifiers the device can render. The schema definitions
+  // themselves travel in the display definition.
+  repeated string schemas = 4;
+  optional uint32 max_update_rate_hz = 5;
+  uint64 resource_budget_bytes = 6;
+}

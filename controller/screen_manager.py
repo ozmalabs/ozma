@@ -31,6 +31,7 @@ generates one large frame; the manager splits it per-screen.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -38,7 +39,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from screen_widgets import ScreenLayout, Widget, BUILTIN_LAYOUTS
+from screen_widgets import ScreenLayout, BUILTIN_LAYOUTS
 
 log = logging.getLogger("ozma.screen_manager")
 
@@ -238,8 +239,12 @@ class ScreenManager:
         self._native_drivers: dict[str, NativeRenderDriver] = {}
         self._renderer_url = RENDERER_URL
         self._scenario_data: dict[str, Any] = {}
+        self._action_handler: Any = None
+        self._interaction_handler: Any = None
+        self._running = False
 
     async def start(self) -> None:
+        self._running = True
         for screen in self._screens.values():
             if screen.enabled:
                 self._start_screen(screen)
@@ -247,6 +252,7 @@ class ScreenManager:
                  len(self._screens), len(self._layouts))
 
     async def stop(self) -> None:
+        self._running = False
         for task in self._tasks.values():
             task.cancel()
         for screen in self._screens.values():
@@ -262,20 +268,25 @@ class ScreenManager:
         log.info("Screen registered: %s (%s, %dx%d, tier=%s)",
                  screen.name, screen.id, screen.width, screen.height,
                  screen.driver.tier if screen.driver else "none")
+        # Devices may connect after the manager has started (native WebSocket
+        # devices do); start their render loop immediately in that case.
+        if self._running and screen.enabled:
+            self._start_screen(screen)
 
     def register_layout(self, layout: ScreenLayout) -> None:
         self._layouts[layout.id] = layout
 
     def unregister_screen(self, screen_id: str) -> None:
         if screen_id in self._tasks:
-            self._tasks[screen_id].cancel()
+            self._tasks.pop(screen_id).cancel()
         self._screens.pop(screen_id, None)
+        self._native_drivers.pop(screen_id, None)
 
     def list_screens(self) -> list[dict[str, Any]]:
         return [s.to_dict() for s in self._screens.values()]
 
     def list_layouts(self) -> list[dict[str, Any]]:
-        return [l.to_dict() for l in self._layouts.values()]
+        return [layout.to_dict() for layout in self._layouts.values()]
 
     def update_screen(self, screen_id: str, **kwargs: Any) -> bool:
         screen = self._screens.get(screen_id)
@@ -299,6 +310,37 @@ class ScreenManager:
         driver = NativeRenderDriver(device_id)
         self._native_drivers[device_id] = driver
         return driver
+
+    def unregister_native_driver(self, device_id: str) -> None:
+        """Forget a native device driver (called when the socket disconnects)."""
+        self._native_drivers.pop(device_id, None)
+
+    def set_action_handlers(self, *, on_action: Any = None, on_interaction: Any = None) -> None:
+        """Install controller callbacks for inbound protobuf display events."""
+        if on_action is not None:
+            self._action_handler = on_action
+        if on_interaction is not None:
+            self._interaction_handler = on_interaction
+
+    async def handle_action_invoke(self, device_id: str, invoke: Any) -> None:
+        """Handle an ActionInvoke sent by a native device."""
+        if self._action_handler is not None:
+            result = self._action_handler(device_id, invoke)
+            if inspect.isawaitable(result):
+                await result
+            return
+        log.info("Action invoke from %s: action_id=%s",
+                 device_id, getattr(invoke, "action_id", "?"))
+
+    async def handle_interaction_event(self, device_id: str, event: Any) -> None:
+        """Handle an InteractionEvent sent by a native device."""
+        if self._interaction_handler is not None:
+            result = self._interaction_handler(device_id, event)
+            if inspect.isawaitable(result):
+                await result
+            return
+        log.debug("Interaction event from %s: node_id=%s",
+                  device_id, getattr(event, "node_id", "?"))
 
     # ── Scenario integration ─────────────────────────────────────────────────
 

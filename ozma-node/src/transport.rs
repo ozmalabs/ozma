@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use ozma_client_core::VideoAssembler;
+use ozma_display_protocol::{scene_convert, DisplayMessage};
 use ozma_encode::SelectedEncoder;
 use ozma_media::{
     CaptureSource, FakeCapture, FakeEncoder, Frame, FrameFormat, MediaError, Pipeline,
@@ -25,7 +26,7 @@ use ozma_media::{
 use ozma_protocol::scene::{DisplayCapabilities, DisplayProfile};
 use ozma_protocol::{
     ApiError, ChannelKind, ClientId, ControlMessage, DisplayId, InputEvent, Permission,
-    SessionEvent, SessionId,
+    SessionEvent, SessionId, WireFormat,
 };
 use ozma_transport::{ChannelId, CloseReason, QuicServer, SessionTransport, TransportEvent};
 #[cfg(feature = "webtransport")]
@@ -283,10 +284,18 @@ async fn handle_connection(
     backend: Arc<SessionBackend>,
 ) -> Result<()> {
     let mut transport = transport;
-    let (hello_session_id, hello_token, display) =
+    let (hello_session_id, hello_token, display, client_wire_formats) =
         timeout(Duration::from_secs(10), read_hello(&mut *transport))
             .await
             .context("timed out waiting for session Hello")??;
+
+    // Protobuf is preferred when both peers support it. A client that predates
+    // negotiation sends no formats, so the JSON compatibility path is selected.
+    let wire_format = WireFormat::negotiate(
+        &[WireFormat::Protobuf, WireFormat::Json],
+        &client_wire_formats,
+    )
+    .unwrap_or(WireFormat::Json);
 
     let claims = match backend.verify_token(&hello_token) {
         Ok(claims) => claims,
@@ -363,6 +372,7 @@ async fn handle_connection(
         &transport,
         &ControlMessage::HelloAck {
             session: session.clone(),
+            wire_format,
             display: selected_display.clone(),
         },
     )
@@ -391,6 +401,7 @@ async fn handle_connection(
     let channels = transport.channel_map();
     let camera_channel = channels.channel_for_kind(ChannelKind::Camera);
     let mic_channel = channels.channel_for_kind(ChannelKind::Mic);
+    let display_channel = channels.channel_for_kind(ChannelKind::Display);
     let capture = backend.client_capture(&session_id);
     // Shared with control handling so an input-latency ack can name the most
     // recent encoded frame without blocking the media loop. This tracks the
@@ -410,6 +421,8 @@ async fn handle_connection(
         mic_channel,
         matches!(selected_display, Some(DisplayProfile::Scene { .. })).then(|| SceneStream {
             session: &session,
+            wire_format,
+            display_channel,
             last_revision: 0,
             initialized: false,
             poll: interval(Duration::from_millis(50)),
@@ -546,12 +559,16 @@ async fn send_initial_scene(
     transport: &dyn SessionTransport,
     backend: &SessionBackend,
     session: &ozma_protocol::Session,
+    wire_format: WireFormat,
+    display_channel: Option<ChannelId>,
 ) -> Result<u64, ozma_protocol::ApiError> {
     let mut last_revision = 0;
     send_scene_updates(
         transport,
         backend.scene_updates(session),
         &mut last_revision,
+        wire_format,
+        display_channel,
     )
     .await?;
     Ok(last_revision)
@@ -561,6 +578,8 @@ async fn send_scene_updates(
     transport: &dyn SessionTransport,
     updates: Vec<crate::backend::SceneUpdate>,
     last_revision: &mut u64,
+    wire_format: WireFormat,
+    display_channel: Option<ChannelId>,
 ) -> Result<(), ozma_protocol::ApiError> {
     for update in updates {
         if let Some(resource) = update.resource {
@@ -577,6 +596,29 @@ async fn send_scene_updates(
             })??;
         }
         let revision = update.commit.revision;
+        if wire_format == WireFormat::Protobuf {
+            if let Some(channel) = display_channel {
+                let snapshot =
+                    scene_convert::scene_commit_to_proto(&update.commit, ChannelId::VIDEO.raw())
+                        .map_err(|error| {
+                            ozma_protocol::ApiError::new(
+                                ozma_protocol::codes::INVALID_REQUEST,
+                                format!("Could not encode the scene commit as protobuf: {error}"),
+                            )
+                        })?;
+                let frame = DisplayMessage::SceneSnapshot(snapshot)
+                    .encode()
+                    .map_err(|error| {
+                        ozma_protocol::ApiError::new(
+                            ozma_protocol::codes::INVALID_REQUEST,
+                            format!("Could not encode the scene snapshot: {error}"),
+                        )
+                    })?;
+                transport.send(channel, Bytes::from(frame)).await?;
+                *last_revision = revision;
+                continue;
+            }
+        }
         send_control(
             transport,
             &ControlMessage::SceneCommit {
@@ -617,6 +659,8 @@ fn feed_camera(capture: &ClientCaptureHub, assembler: &mut VideoAssembler, paylo
 
 struct SceneStream<'a> {
     session: &'a ozma_protocol::Session,
+    wire_format: WireFormat,
+    display_channel: Option<ChannelId>,
     last_revision: u64,
     initialized: bool,
     poll: Interval,
@@ -682,7 +726,15 @@ async fn session_loop(
                         }
                         latest_frame_sequence.store(frame.sequence(), Ordering::Relaxed);
                         if let Some(scene) = scene_stream.as_mut().filter(|scene| !scene.initialized) {
-                            match send_initial_scene(&*transport, backend, scene.session).await {
+                            match send_initial_scene(
+                                &*transport,
+                                backend,
+                                scene.session,
+                                scene.wire_format,
+                                scene.display_channel,
+                            )
+                            .await
+                            {
                                 Ok(revision) => {
                                     scene.last_revision = revision;
                                     scene.initialized = true;
@@ -728,10 +780,14 @@ async fn session_loop(
             } => {
                 if let Some(scene) = scene_stream.as_mut().filter(|scene| scene.initialized) {
                     let updates = backend.scene_updates_since(scene.session, scene.last_revision);
+                    let wire_format = scene.wire_format;
+                    let display_channel = scene.display_channel;
                     if let Err(error) = send_scene_updates(
                         &*transport,
                         updates,
                         &mut scene.last_revision,
+                        wire_format,
+                        display_channel,
                     ).await {
                         debug!(error = %error, "scene update failed");
                     }
@@ -875,7 +931,15 @@ fn authorize_latency_event(
 
 async fn read_hello(
     transport: &mut dyn SessionTransport,
-) -> Result<(SessionId, String, Option<DisplayCapabilities>), ozma_protocol::ApiError> {
+) -> Result<
+    (
+        SessionId,
+        String,
+        Option<DisplayCapabilities>,
+        Vec<WireFormat>,
+    ),
+    ozma_protocol::ApiError,
+> {
     loop {
         match transport.recv().await {
             TransportEvent::Payload { channel, payload } if channel == ChannelId::CONTROL => {
@@ -890,9 +954,10 @@ async fn read_hello(
                     ControlMessage::Hello {
                         session_id,
                         token,
+                        wire_formats,
                         display,
                     } => {
-                        return Ok((session_id, token, display));
+                        return Ok((session_id, token, display, wire_formats));
                     }
                     _ => {
                         return Err(ozma_protocol::ApiError::new(

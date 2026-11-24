@@ -25,7 +25,7 @@ use ozma_node::transport::WebTransportRuntime;
 use ozma_protocol::media::VideoFragmentHeader;
 use ozma_protocol::{
     codes, ClientId, ControlMessage, NodeCapabilities, Permission, PermissionSet, SessionSpec,
-    TrackId, TrackKind, TrackSpec,
+    TrackId, TrackKind, TrackSpec, WireFormat,
 };
 use ozma_transport::{
     ChannelId, ChannelMap, SessionTransport, TransportEvent, WebTransportClient,
@@ -155,6 +155,7 @@ async fn node_webtransport_session_authenticates_and_streams_video() {
     let hello = ControlMessage::Hello {
         session_id: session.id.clone(),
         token: offer.token.clone(),
+        wire_formats: vec![WireFormat::Json],
         display: None,
     };
     client

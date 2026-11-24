@@ -120,6 +120,19 @@ each implement their own protocol role.
 
 ## Current implementation
 
+- **Protocol encoding.** Protobuf is the canonical contract for negotiation,
+  capabilities, display methods, scene state, input, actions, and meta work.
+  Display definitions (schema, widget tree, action catalog, field table) remain
+  JSON inside a protobuf envelope and are sent on first use or when they change.
+  Data and scene updates use protobuf field IDs after the definition is cached.
+  The migration phases and compatibility rules are in the
+  [protobuf-core plan](protobuf-core-plan.md). `ozma-display-protocol` provides
+  the stable tag + protobuf codec for the reliable Display channel, domain
+  conversions, and the `DisplaySession` state machine;
+  `ozma-display-definition` owns canonical JSON, BLAKE3 hashes, RFC 6902
+  patches, and compiled field/action tables. `Hello`/`HelloAck` negotiate the
+  wire format; the node sends protobuf scene snapshots on the Display channel
+  when both peers support it, with JSON control messages as the fallback.
 - **Native QUIC.** The node sends the first video frame before scene updates.
   It supports optional producers and polls for newer scene revisions. A
   placement-only update reuses its cached image. The native client can opt in

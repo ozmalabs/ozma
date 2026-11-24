@@ -1,0 +1,27 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// Protocol version and wire-format negotiation.
+//
+// Field and enum numbers are part of the wire contract. Never reuse a number
+// after a field or value has been removed; reserve it instead.
+
+syntax = "proto3";
+
+package ozma.v1;
+
+// A `major.minor` protocol version. A new major version may break the wire
+// contract; a new minor version may only add messages or fields and must stay
+// readable by older decoders.
+message ProtocolVersion {
+  uint32 major = 1;
+  uint32 minor = 2;
+}
+
+// Encoding selected for the remainder of a session.
+enum WireFormat {
+  WIRE_FORMAT_UNSPECIFIED = 0;
+  // Canonical encoding for native sessions.
+  WIRE_FORMAT_PROTOBUF = 1;
+  // Legacy compatibility and diagnostics only.
+  WIRE_FORMAT_JSON = 2;
+}

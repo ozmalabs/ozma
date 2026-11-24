@@ -10,6 +10,7 @@ use crate::ids::{SessionId, TrackId};
 use crate::input::InputEvent;
 use crate::scene::{DisplayCapabilities, DisplayProfile, SceneCommit};
 use crate::session::{EndReason, Session, SessionEvent};
+use crate::transport::WireFormat;
 
 /// A JSON control frame on the reliable channel.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,11 +21,20 @@ pub enum ControlMessage {
     Hello {
         session_id: SessionId,
         token: String,
+        /// Encodings the client supports, in preference order. A peer that
+        /// predates negotiation omits the field, which parses as an empty list
+        /// and selects the JSON compatibility path.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        wire_formats: Vec<WireFormat>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display: Option<DisplayCapabilities>,
     },
     HelloAck {
         session: Session,
+        /// Encoding selected for the rest of the connection. Missing in older
+        /// JSON payloads, which default to [`WireFormat::Json`].
+        #[serde(default)]
+        wire_format: WireFormat,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display: Option<DisplayProfile>,
     },
@@ -118,6 +128,101 @@ impl ControlMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::ClientId;
+    use crate::session::SessionSpec;
+
+    fn session() -> Session {
+        Session::new(
+            SessionId::new("session-test"),
+            SessionSpec {
+                client_id: ClientId::new("client-test"),
+                principal: "alice".into(),
+                tracks: Vec::new(),
+                audio: Default::default(),
+                input: Default::default(),
+                privacy: Default::default(),
+                transport: Default::default(),
+                ttl_seconds: 60,
+            },
+            Default::default(),
+            1,
+        )
+    }
+
+    #[test]
+    fn hello_carries_wire_format_preferences() {
+        let message = ControlMessage::Hello {
+            session_id: SessionId::new("session-test"),
+            token: "token-test".into(),
+            wire_formats: vec![WireFormat::Protobuf, WireFormat::Json],
+            display: None,
+        };
+        let encoded = serde_json::to_value(&message).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "type": "hello",
+                "data": {
+                    "session_id": "session-test",
+                    "token": "token-test",
+                    "wire_formats": ["protobuf", "json"],
+                },
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ControlMessage>(encoded).unwrap(),
+            message
+        );
+    }
+
+    #[test]
+    fn legacy_hello_without_wire_formats_parses_as_json() {
+        let decoded: ControlMessage =
+            serde_json::from_str(r#"{"type":"hello","data":{"session_id":"s","token":"t"}}"#)
+                .unwrap();
+        assert_eq!(
+            decoded,
+            ControlMessage::Hello {
+                session_id: SessionId::new("s"),
+                token: "t".into(),
+                wire_formats: Vec::new(),
+                display: None,
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_hello_ack_without_wire_format_parses_as_json() {
+        let session = session();
+        let decoded: ControlMessage = serde_json::from_value(serde_json::json!({
+            "type": "hello_ack",
+            "data": { "session": session },
+        }))
+        .unwrap();
+        assert_eq!(
+            decoded,
+            ControlMessage::HelloAck {
+                session,
+                wire_format: WireFormat::Json,
+                display: None,
+            }
+        );
+    }
+
+    #[test]
+    fn hello_ack_carries_the_selected_wire_format() {
+        let message = ControlMessage::HelloAck {
+            session: session(),
+            wire_format: WireFormat::Protobuf,
+            display: None,
+        };
+        let encoded = serde_json::to_value(&message).unwrap();
+        assert_eq!(encoded["data"]["wire_format"], "protobuf");
+        assert_eq!(
+            serde_json::from_value::<ControlMessage>(encoded).unwrap(),
+            message
+        );
+    }
 
     #[test]
     fn control_messages_roundtrip() {

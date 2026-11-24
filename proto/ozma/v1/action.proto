@@ -1,0 +1,88 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// Action descriptors, invocations, and interaction events.
+
+syntax = "proto3";
+
+package ozma.v1;
+
+// An action exposed by a display definition.
+message ActionDef {
+  // Stable for the definition lifetime; never reused.
+  uint32 id = 1;
+  // Namespaced key, for example `org.ozma.scenario.activate`.
+  string key = 2;
+  // JSON Schema for the action parameters.
+  bytes params_schema_json = 3;
+  repeated string permissions = 4;
+  bool requires_confirmation = 5;
+  optional string label = 6;
+  optional string description = 7;
+}
+
+// A request to execute an action.
+message ActionInvoke {
+  uint32 action_id = 1;
+  // Typed protobuf message or JSON/CBOR extension payload.
+  bytes params = 2;
+  uint64 idempotency_key = 3;
+  // Optional JSON representation of the parameters for compatibility.
+  optional bytes params_json = 4;
+  optional uint64 timestamp_micros = 5;
+}
+
+// Phase of a pointer or touch interaction.
+enum PointerPhase {
+  POINTER_PHASE_UNSPECIFIED = 0;
+  POINTER_PHASE_DOWN = 1;
+  POINTER_PHASE_MOVE = 2;
+  POINTER_PHASE_UP = 3;
+  POINTER_PHASE_CANCEL = 4;
+  POINTER_PHASE_WHEEL = 5;
+}
+
+// Pointer, mouse, or touch input attached to a scene node.
+message PointerEvent {
+  sint32 x = 1;
+  sint32 y = 2;
+  PointerPhase phase = 3;
+  optional uint32 button = 4;
+  // Pressure in parts per thousand.
+  optional uint32 pressure_ppt = 5;
+  optional sint32 wheel_delta = 6;
+}
+
+// Key transition for a keyboard interaction.
+enum KeyAction {
+  KEY_ACTION_UNSPECIFIED = 0;
+  KEY_ACTION_DOWN = 1;
+  KEY_ACTION_UP = 2;
+  KEY_ACTION_PRESS = 3;
+}
+
+// Keyboard input attached to a scene node.
+message KeyEvent {
+  string key = 1;
+  KeyAction action = 2;
+  repeated string modifiers = 3;
+  optional uint32 repeat = 4;
+}
+
+// Semantic input without a pointer or key, for example a media key.
+message SemanticEvent {
+  string name = 1;
+  map<string, string> params = 2;
+}
+
+// An input or semantic interaction targeted at a scene node or action.
+message InteractionEvent {
+  uint64 node_id = 1;
+  optional string target_id = 2;
+  optional uint64 timestamp_micros = 3;
+  oneof event {
+    PointerEvent pointer = 4;
+    KeyEvent key = 5;
+    SemanticEvent semantic = 6;
+    ActionInvoke action = 7;
+  }
+}

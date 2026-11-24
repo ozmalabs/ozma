@@ -13,7 +13,7 @@ use ozma_client::certificate_fingerprint;
 use ozma_protocol::scene::{DisplayCapabilities, ImagePlacement, ImageResource, SceneCommit};
 use ozma_protocol::{
     ClientId, ControlMessage, Participant, ParticipantRole, Permission, PermissionSet, Session,
-    SessionId, SessionOffer, SessionSpec, SessionState,
+    SessionId, SessionOffer, SessionSpec, SessionState, WireFormat,
 };
 use ozma_transport::offer::{SessionOfferBuilder, TransportDescriptorBuilder};
 use ozma_transport::{
@@ -126,6 +126,7 @@ async fn probe_cli(scene: bool) {
             &transport,
             &ControlMessage::HelloAck {
                 session: session_with(control_permissions()),
+                wire_format: WireFormat::Json,
                 display,
             },
         )

@@ -1,0 +1,14 @@
+version: v2
+
+# The proto module is rooted at ./proto so that package ozma.v1 maps to
+# proto/ozma/v1. Run `buf lint` and `buf breaking` from the repository root.
+modules:
+  - path: proto
+
+lint:
+  use:
+    - STANDARD
+
+breaking:
+  use:
+    - FILE

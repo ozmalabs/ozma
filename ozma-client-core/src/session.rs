@@ -37,7 +37,7 @@ use bytes::Bytes;
 use ozma_protocol::scene::DisplayCapabilities;
 use ozma_protocol::{
     ApiError, ChannelKind, ControlMessage, EndReason, InputEvent, Permission, Session,
-    SessionOffer, TrackId, TransportDescriptor, TransportMode,
+    SessionOffer, TrackId, TransportDescriptor, TransportMode, WireFormat,
 };
 use ozma_transport::{ChannelId, ChannelMap, CloseReason, TransportEvent};
 
@@ -152,6 +152,7 @@ pub struct ClientDriver<T: ChannelTransport> {
     control: ChannelId,
     session: Option<Session>,
     display: Option<ozma_protocol::scene::DisplayProfile>,
+    wire_format: WireFormat,
     pending: VecDeque<ClientEvent>,
     video: VideoAssembler,
     media_sequence: u64,
@@ -205,6 +206,7 @@ impl<T: ChannelTransport> ClientDriver<T> {
             control,
             session: None,
             display: None,
+            wire_format: WireFormat::Json,
             pending: VecDeque::new(),
             video: VideoAssembler::default(),
             media_sequence: 0,
@@ -217,6 +219,7 @@ impl<T: ChannelTransport> ClientDriver<T> {
             .send_control(ControlMessage::Hello {
                 session_id: offer.session_id.clone(),
                 token: offer.token.clone(),
+                wire_formats: vec![WireFormat::Protobuf, WireFormat::Json],
                 display,
             })
             .await?;
@@ -234,6 +237,14 @@ impl<T: ChannelTransport> ClientDriver<T> {
     /// The display profile selected by the node, if any.
     pub fn display(&self) -> Option<&ozma_protocol::scene::DisplayProfile> {
         self.display.as_ref()
+    }
+
+    /// The wire format the node selected in `HelloAck`.
+    ///
+    /// Defaults to [`WireFormat::Json`] when the node did not negotiate, which
+    /// keeps compatibility with older nodes.
+    pub fn wire_format(&self) -> WireFormat {
+        self.wire_format
     }
 
     /// The offer used to connect.
@@ -492,7 +503,12 @@ impl<T: ChannelTransport> ClientDriver<T> {
                             protocol_error(format!("Invalid control JSON from the node: {error}"))
                         })?;
                     match message {
-                        ControlMessage::HelloAck { session, display } => {
+                        ControlMessage::HelloAck {
+                            session,
+                            wire_format,
+                            display,
+                        } => {
+                            self.wire_format = wire_format;
                             self.display = display;
                             return Ok(session);
                         }
@@ -530,13 +546,19 @@ impl<T: ChannelTransport> ClientDriver<T> {
                 self.server_error = Some(error.clone());
                 Ok(Some(ClientEvent::Error(error)))
             }
-            ControlMessage::HelloAck { session, display } => {
+            ControlMessage::HelloAck {
+                session,
+                wire_format,
+                display,
+            } => {
                 self.session = Some(session.clone());
+                self.wire_format = wire_format;
                 if display.is_some() {
                     self.display = display.clone();
                 }
                 Ok(Some(ClientEvent::Control(ControlMessage::HelloAck {
                     session,
+                    wire_format,
                     display,
                 })))
             }
@@ -910,10 +932,12 @@ mod tests {
                 ControlMessage::Hello {
                     session_id,
                     token,
+                    wire_formats,
                     display,
                 } => {
                     assert_eq!(session_id, SessionId::new("session-test"));
                     assert_eq!(token, "token-test");
+                    assert_eq!(wire_formats, vec![WireFormat::Protobuf, WireFormat::Json]);
                     assert!(display.is_none());
                 }
                 other => panic!("expected Hello, got {other:?}"),
@@ -927,12 +951,14 @@ mod tests {
             server
                 .send_control(ControlMessage::HelloAck {
                     session: session(),
+                    wire_format: WireFormat::Protobuf,
                     display: None,
                 })
                 .await;
         });
 
         let mut driver = driver.unwrap();
+        assert_eq!(driver.wire_format(), WireFormat::Protobuf);
         assert_eq!(driver.session().unwrap().id, SessionId::new("session-test"));
         assert_eq!(
             driver.recv().await,
@@ -981,6 +1007,7 @@ mod tests {
         let offer = offer();
         let capabilities = DisplayCapabilities {
             scene_versions: vec![SCENE_VERSION],
+            ..Default::default()
         };
 
         let (driver, ()) = tokio::join!(
@@ -993,6 +1020,7 @@ mod tests {
                 server
                     .send_control(ControlMessage::HelloAck {
                         session: session(),
+                        wire_format: WireFormat::Json,
                         display: Some(DisplayProfile::Video),
                     })
                     .await;
@@ -1011,6 +1039,7 @@ mod tests {
             server
                 .send_control(ControlMessage::HelloAck {
                     session: session(),
+                    wire_format: WireFormat::Json,
                     display: None,
                 })
                 .await;
@@ -1129,6 +1158,7 @@ mod tests {
             server
                 .send_control(ControlMessage::HelloAck {
                     session: view_only,
+                    wire_format: WireFormat::Json,
                     display: None,
                 })
                 .await;
@@ -1320,6 +1350,7 @@ mod tests {
             server
                 .send_control(ControlMessage::HelloAck {
                     session: session(),
+                    wire_format: WireFormat::Json,
                     display: None,
                 })
                 .await;

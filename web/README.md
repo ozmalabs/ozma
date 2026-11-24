@@ -12,6 +12,9 @@ It is not a JavaScript reimplementation of the protocol:
 - `web/main.js` only creates the session over the node's JSON API and forwards
   DOM events. No protocol bytes are handled in JavaScript.
 
+For the separate browser **display adapter** that speaks the controller's
+protobuf Display protocol, see [`web/display/`](display/README.md).
+
 ## Prerequisites
 
 ```sh

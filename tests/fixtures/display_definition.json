@@ -1,0 +1,37 @@
+{
+  "id": "org.ozma.dashboard/status",
+  "version": 3,
+  "layout": {
+    "type": "column",
+    "children": [
+      { "type": "text", "field": 1 },
+      { "type": "gauge", "field": 2 }
+    ]
+  },
+  "fields": [
+    {
+      "id": 1,
+      "key": "org.ozma/node.cpu_temp",
+      "type": "sint",
+      "unit": "celsius",
+      "scale": 100
+    },
+    {
+      "id": 2,
+      "key": "org.ozma/node.load",
+      "type": "real"
+    }
+  ],
+  "actions": [
+    {
+      "id": 1,
+      "key": "org.ozma.scenario.activate",
+      "params_schema": "{\"type\":\"object\"}",
+      "permissions": ["scenario.control"]
+    }
+  ],
+  "meta": {
+    "numbers": [1.5, 65.2, 1e20, 1e-7, -0.0],
+    "unicode": "Grüße"
+  }
+}

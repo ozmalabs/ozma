@@ -7,6 +7,9 @@ members = [
     "ozma-drivers",
     "ozma-proto",
     "ozma-protocol",
+    "ozma-protocol-proto",
+    "ozma-display-protocol",
+    "ozma-display-definition",
     "ozma-aperture",
     "ozma-media",
     "ozma-capture",
@@ -52,3 +55,6 @@ alsa        = "0.9"
 usb-gadget  = "0.5"
 async-trait = "0.1"
 libc        = "0.2"
+prost       = "0.14"
+prost-types = "0.14"
+pbjson      = "0.9"

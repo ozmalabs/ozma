@@ -5,7 +5,7 @@ WebSocket server for native-rendering screen devices.
 ESP32, Android apps, and dedicated ozma display endpoints connect here
 to receive UI definitions and real-time data updates.
 
-Protocol:
+JSON protocol (legacy default):
 
   Client → Server:
     {"type": "register", "device_id": "esp32-desk", "width": 320, "height": 240,
@@ -23,12 +23,25 @@ Protocol:
   Client → Server (optional capability report):
     {"type": "capabilities", "widgets": ["gauge", "bar", "vu_meter", "label"]}
 
+Protobuf protocol (opt-in):
+
+  Registration is still JSON but includes ``"protocol": "protobuf"`` (or the
+  alias ``"wire_format": "protobuf"``)::
+
+    {"type": "register", "device_id": "esp32-desk", "protocol": "protobuf"}
+
+  The server then sends one binary ``[tag][protobuf]`` DisplayDefinition frame
+  followed by compact DataUpdate frames (see ``display_protocol``).  Devices
+  may send binary ActionInvoke and InteractionEvent frames back on the same
+  WebSocket.
+
 The server runs alongside the main FastAPI app on a separate port (7391).
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 from typing import Any
@@ -41,10 +54,30 @@ SCREEN_WS_PORT = 7391
 class ScreenWebSocketServer:
     """WebSocket server for native-rendering screen devices."""
 
-    def __init__(self, screen_manager: Any) -> None:
+    def __init__(
+        self,
+        screen_manager: Any,
+        *,
+        action_handler: Any = None,
+        interaction_handler: Any = None,
+    ) -> None:
         self._screen_mgr = screen_manager
         self._server: Any = None
         self._clients: dict[str, Any] = {}  # device_id → (ws, Screen)
+        self._protocols: dict[str, str] = {}  # device_id → "json" | "protobuf"
+        self._action_handler = action_handler
+        self._interaction_handler = interaction_handler
+
+    @staticmethod
+    def _protocol_for(msg: dict) -> str:
+        """Return the requested wire format, defaulting to JSON."""
+        requested = msg.get("protocol", msg.get("wire_format", "json"))
+        if requested is None:
+            return "json"
+        name = str(requested).strip().lower().replace("-", "_")
+        if name in {"protobuf", "proto", "pb", "binary"}:
+            return "protobuf"
+        return "json"
 
     async def start(self) -> None:
         try:
@@ -74,7 +107,24 @@ class ScreenWebSocketServer:
         device_id = ""
         try:
             async for message in ws:
-                msg = json.loads(message)
+                if isinstance(message, (bytes, bytearray, memoryview)):
+                    raw = bytes(message)
+                    # Some legacy clients send JSON registration frames as
+                    # binary WebSocket messages.  Preserve that path; anything
+                    # else is a protobuf Display frame.
+                    if not raw.lstrip().startswith(b"{"):
+                        await self._handle_binary_message(device_id, raw)
+                        continue
+                    message = raw
+
+                try:
+                    msg = json.loads(message)
+                except (ValueError, TypeError):
+                    log.debug("Ignoring malformed screen message from %s",
+                              device_id or "unknown")
+                    continue
+                if not isinstance(msg, dict):
+                    continue
                 msg_type = msg.get("type", "")
 
                 if msg_type == "register":
@@ -82,13 +132,24 @@ class ScreenWebSocketServer:
                     width = msg.get("width", 320)
                     height = msg.get("height", 240)
                     capabilities = msg.get("capabilities", [])
+                    protocol = self._protocol_for(msg)
 
-                    log.info("Native screen connected: %s (%dx%d, caps: %s)",
-                             device_id, width, height, capabilities)
+                    log.info("Native screen connected: %s (%dx%d, caps: %s, wire=%s)",
+                             device_id, width, height, capabilities, protocol)
 
-                    # Create a NativeRenderDriver and register the screen
+                    # Create the tier-2 driver for the requested wire format.
                     from screen_manager import Screen, NativeRenderDriver
-                    driver = NativeRenderDriver(device_id)
+
+                    if protocol == "protobuf":
+                        from screen_drivers import NativeRenderProtobufDriver
+
+                        driver = NativeRenderProtobufDriver(
+                            device_id,
+                            on_action=self._on_action,
+                            on_interaction=self._on_interaction,
+                        )
+                    else:
+                        driver = NativeRenderDriver(device_id)
                     driver.set_websocket(ws)
 
                     screen = Screen(
@@ -102,16 +163,21 @@ class ScreenWebSocketServer:
                     )
                     self._screen_mgr.register_screen(screen)
                     self._clients[device_id] = (ws, screen)
+                    self._protocols[device_id] = protocol
 
-                    # Push initial layout
+                    # Push initial layout (a DisplayDefinition frame for
+                    # protobuf devices, legacy JSON for everyone else).
                     if screen.layout:
                         await driver.push_layout(screen.layout.to_dict())
 
-                    # Acknowledge
+                    # Acknowledge. Registration and the ack stay JSON even for
+                    # protobuf clients so a device can negotiate with one parser.
                     await ws.send(json.dumps({
                         "type": "registered",
                         "device_id": device_id,
                         "layout_id": screen.layout_id,
+                        "protocol": protocol,
+                        "wire_format": protocol,
                     }))
 
                 elif msg_type == "capabilities":
@@ -122,8 +188,58 @@ class ScreenWebSocketServer:
         finally:
             if device_id:
                 self._screen_mgr.unregister_screen(device_id)
+                unregister_driver = getattr(
+                    self._screen_mgr, "unregister_native_driver", None
+                )
+                if unregister_driver is not None:
+                    unregister_driver(device_id)
                 self._clients.pop(device_id, None)
+                self._protocols.pop(device_id, None)
                 log.info("Native screen disconnected: %s", device_id)
+
+    async def _handle_binary_message(self, device_id: str, frame: bytes) -> None:
+        """Decode an inbound Display frame from a protobuf client."""
+        if not device_id:
+            log.debug("Ignoring binary screen frame received before registration")
+            return
+        client = self._clients.get(device_id)
+        if client is None:
+            return
+        screen = client[1]
+        handler = getattr(screen.driver, "handle_inbound_frame", None)
+        if handler is None:
+            log.debug("Ignoring binary frame from JSON client %s", device_id)
+            return
+        try:
+            await handler(frame)
+        except Exception as exc:
+            log.debug("Rejected malformed display frame from %s: %s", device_id, exc)
+
+    async def _on_action(self, device_id: str, invoke: Any) -> None:
+        """Dispatch an inbound ActionInvoke to the controller."""
+        handler = self._action_handler
+        if handler is None:
+            handler = getattr(self._screen_mgr, "handle_action_invoke", None)
+        if handler is None:
+            log.info("Action invoke from %s: action_id=%s",
+                     device_id, getattr(invoke, "action_id", "?"))
+            return
+        result = handler(device_id, invoke)
+        if inspect.isawaitable(result):
+            await result
+
+    async def _on_interaction(self, device_id: str, event: Any) -> None:
+        """Dispatch an inbound InteractionEvent to the controller."""
+        handler = self._interaction_handler
+        if handler is None:
+            handler = getattr(self._screen_mgr, "handle_interaction_event", None)
+        if handler is None:
+            log.debug("Interaction event from %s: node_id=%s",
+                      device_id, getattr(event, "node_id", "?"))
+            return
+        result = handler(device_id, event)
+        if inspect.isawaitable(result):
+            await result
 
     async def _handle_raw_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         """Fallback: simple newline-delimited JSON over TCP."""
@@ -147,6 +263,10 @@ class ScreenWebSocketServer:
         """Push scenario change to all connected native devices."""
         msg = json.dumps({"type": "scenario", **scenario})
         for device_id, (ws, screen) in list(self._clients.items()):
+            if self._protocols.get(device_id) == "protobuf":
+                # Protobuf devices receive scenario variables through typed
+                # DataUpdate frames from the screen manager loop.
+                continue
             try:
                 await ws.send(msg)
             except Exception:

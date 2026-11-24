@@ -1,0 +1,163 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// Scene graph, scene operations, and the baseline scene snapshot.
+//
+// The scene describes what is currently presented. It is separate from the
+// display definition (what can be rendered) and from data updates (changed
+// values). Hot-path node references use `uint64` identifiers.
+
+syntax = "proto3";
+
+package ozma.v1;
+
+// A live video surface, normally carried on an existing media channel.
+message VideoSurface {
+  uint32 id = 1;
+  // Logical channel identifier that carries the video.
+  uint32 channel = 2;
+  optional uint32 width = 3;
+  optional uint32 height = 4;
+  optional string codec = 5;
+  optional string track_id = 6;
+}
+
+// An immutable, session-local resource such as an image, font, or pack.
+message ResourceRef {
+  // Resource identifier, stable for the session lifetime.
+  uint64 id = 1;
+  // Optional content hash used to validate or reuse a cached resource.
+  optional bytes hash = 2;
+  optional string mime_type = 3;
+  optional uint64 size_bytes = 4;
+  // Optional cache lifetime hint.
+  optional uint32 ttl_seconds = 5;
+  // Optional URI for diagnostics or a bulk-channel fetch.
+  optional string uri = 6;
+}
+
+// A point in layout coordinates.
+message Vec2 {
+  sint32 x = 1;
+  sint32 y = 2;
+}
+
+// Position and scale for a scene node. Coordinates and sizes use the display's
+// logical layout space. Scale is expressed in parts per million so fixed
+// layouts do not depend on floating-point rounding.
+message Transform {
+  sint32 translation_x = 1;
+  sint32 translation_y = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+  sint32 scale_x_ppm = 5;
+  sint32 scale_y_ppm = 6;
+  // Rotation in millidegrees, clockwise.
+  sint32 rotation_millidegrees = 7;
+  optional Vec2 origin = 8;
+  optional uint32 opacity_ppm = 9;
+}
+
+// An axis-aligned rectangle in layout coordinates.
+message Rect {
+  sint32 x = 1;
+  sint32 y = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+}
+
+// Text content rendered by the device or graph service.
+message TextContent {
+  string text = 1;
+  // Optional style identifier from the display definition.
+  optional string style = 2;
+  optional string align = 3;
+  optional uint32 max_lines = 4;
+  optional bool wrap = 5;
+}
+
+// A native or data-driven widget selected from the display definition.
+message WidgetNode {
+  // Widget type or definition-local widget identifier.
+  string widget = 1;
+  // Definition version the widget identifier belongs to.
+  uint32 definition_version = 2;
+  map<string, string> properties = 3;
+  repeated DataBinding bindings = 4;
+}
+
+// A node whose value is supplied by a field-table entry.
+message DataBinding {
+  string definition_id = 1;
+  uint32 field_id = 2;
+  optional string field_key = 3;
+  // Widget property or text slot to populate.
+  optional string property = 4;
+  // Optional display formatter, for example `fixed(1)`.
+  optional string format = 5;
+}
+
+// The interaction target attached to a scene node.
+message InteractionTarget {
+  optional uint32 action_id = 1;
+  optional uint64 node_id = 2;
+  optional string accessibility_label = 3;
+  optional string cursor = 4;
+}
+
+// A node in the scene graph.
+message SceneNode {
+  uint64 id = 1;
+  optional uint64 parent = 2;
+  Transform transform = 3;
+  optional Rect clip = 4;
+  int32 z = 5;
+  oneof content {
+    VideoSurface video = 6;
+    ResourceRef image = 7;
+    TextContent text = 8;
+    WidgetNode widget = 9;
+    DataBinding data = 10;
+  }
+  optional InteractionTarget interaction = 11;
+  optional bool visible = 12;
+  optional string name = 13;
+}
+
+// Re-parent or re-order an existing node.
+message NodeMove {
+  optional uint64 parent = 1;
+  // New index among the parent's children; omitted means append.
+  optional int32 index = 2;
+}
+
+// One operation in a scene commit.
+message SceneOp {
+  uint64 node_id = 1;
+  oneof operation {
+    // Insert or replace the complete node.
+    SceneNode upsert = 2;
+    // Move an existing node without replacing its content.
+    NodeMove move = 3;
+    // Remove the node and its descendants.
+    bool remove = 4;
+  }
+}
+
+// An ordered set of operations that advances the scene to `revision`.
+message SceneCommit {
+  uint64 revision = 1;
+  repeated SceneOp operations = 2;
+  // Revision the operations were produced against, for conflict detection.
+  optional uint64 base_revision = 3;
+  optional string definition_id = 4;
+}
+
+// A complete, self-contained scene at one revision.
+message SceneSnapshot {
+  uint64 revision = 1;
+  repeated SceneNode nodes = 2;
+  // Node identifiers that have no parent.
+  repeated uint64 roots = 3;
+  optional uint64 base_revision = 4;
+  optional string definition_id = 5;
+}

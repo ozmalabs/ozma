@@ -17,6 +17,7 @@ use ozma_client::{
 use ozma_protocol::{
     ApiError, ChannelKind, ClientId, ControlMessage, InputEvent, Participant, ParticipantRole,
     Permission, PermissionSet, Session, SessionId, SessionOffer, SessionSpec, SessionState,
+    WireFormat,
 };
 use ozma_transport::offer::{SessionOfferBuilder, TransportDescriptorBuilder};
 use ozma_transport::{
@@ -227,6 +228,7 @@ async fn view_only_session_rejects_input_locally() {
             &transport,
             &ControlMessage::HelloAck {
                 session: session_with(view_only_permissions()),
+                wire_format: WireFormat::Json,
                 display: None,
             },
         )
@@ -278,6 +280,7 @@ async fn a_server_input_error_is_relayed_and_blocks_later_input() {
             &transport,
             &ControlMessage::HelloAck {
                 session: session_with(control_permissions()),
+                wire_format: WireFormat::Json,
                 display: None,
             },
         )
@@ -424,6 +427,7 @@ async fn connect_with_node_api_fetches_the_der_certificate() {
             &transport,
             &ControlMessage::HelloAck {
                 session: session_with(control_permissions()),
+                wire_format: WireFormat::Json,
                 display: None,
             },
         )
@@ -490,6 +494,7 @@ async fn scene_client_receives_assets_and_presents_ordered_updates() {
             &transport,
             &ControlMessage::HelloAck {
                 session,
+                wire_format: WireFormat::Json,
                 display: Some(capabilities.select(ChannelId::VIDEO.raw())),
             },
         )
@@ -554,4 +559,321 @@ async fn scene_client_receives_assets_and_presents_ordered_updates() {
     })
     .await
     .expect("scene exchange timed out");
+}
+
+#[tokio::test]
+async fn protobuf_scene_snapshot_is_decoded_from_the_display_channel() {
+    use ozma_display_protocol::{scene_convert, DisplayMessage};
+    use ozma_protocol::scene::{DisplayProfile, SceneCommit, VideoSurface, SCENE_VERSION};
+
+    let (server, address, certificate, fingerprint) = bind_server();
+    let offer = offer_for(address, &fingerprint);
+
+    let server_task = tokio::spawn(async move {
+        let mut transport = server.accept().await.unwrap();
+        let hello = recv_control(&mut transport).await;
+        assert_eq!(
+            hello["data"]["wire_formats"],
+            json!(["protobuf", "json"]),
+            "the client must advertise protobuf and the JSON fallback"
+        );
+        // Resolve Display from the channel map instead of assuming its id.
+        let display = transport
+            .channel_map()
+            .channel_for_kind(ChannelKind::Display)
+            .expect("the session channel map includes Display");
+
+        send_control(
+            &transport,
+            &ControlMessage::HelloAck {
+                session: session_with(view_only_permissions()),
+                wire_format: WireFormat::Protobuf,
+                display: Some(DisplayProfile::Scene {
+                    version: SCENE_VERSION,
+                    initial_scene: ozma_protocol::scene::SceneSnapshot {
+                        revision: 0,
+                        full_display: VideoSurface {
+                            id: 1,
+                            channel: ChannelId::VIDEO.raw(),
+                        },
+                    },
+                }),
+            },
+        )
+        .await;
+
+        let commit = SceneCommit {
+            revision: 3,
+            images: Vec::new(),
+        };
+        let snapshot =
+            scene_convert::scene_commit_to_proto(&commit, ChannelId::VIDEO.raw()).unwrap();
+        let frame = DisplayMessage::SceneSnapshot(snapshot).encode().unwrap();
+        transport.send(display, Bytes::from(frame)).await.unwrap();
+
+        let mut seen = Vec::new();
+        drain_until_close(&mut transport, &mut seen).await;
+        let _ = transport.close_with_reason(CloseReason::Normal).await;
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let config = NativeClientConfig {
+            scene_cache_bytes: Some(1024),
+            ..NativeClientConfig::default()
+        };
+        let mut client = NativeSessionClient::connect_with_config(&offer, &certificate, config)
+            .await
+            .unwrap();
+        assert_eq!(client.wire_format(), WireFormat::Protobuf);
+        assert!(client.display_channel().is_some());
+        assert_eq!(
+            client.recv_event().await.unwrap(),
+            ClientEvent::ScenePresented { revision: 3 }
+        );
+        assert_eq!(client.scene().unwrap().presented().revision, 3);
+        client.close().await.unwrap();
+        server_task.await.unwrap();
+    })
+    .await
+    .expect("protobuf scene exchange timed out");
+}
+
+const DISPLAY_DEFINITION: &[u8] = br#"
+{
+  "id": "org.ozma.test/native-display",
+  "version": 1,
+  "fields": [
+    {"id": 1, "key": "org.ozma/test.temp", "type": "sint", "scale": 100},
+    {"id": 2, "key": "org.ozma/test.online", "type": "bool"}
+  ],
+  "actions": [
+    {
+      "id": 7,
+      "key": "org.ozma.scenario.activate",
+      "params_schema": "{\"type\":\"object\"}",
+      "permissions": ["scenario.control"]
+    }
+  ],
+  "layout": {"type": "column", "children": []}
+}
+"#;
+
+#[tokio::test]
+async fn protobuf_definition_and_data_update_are_applied_from_the_display_channel() {
+    use ozma_display_definition::DisplayDefinitionDocument;
+    use ozma_display_protocol::{proto, DisplayEvent, DisplayMessage};
+
+    let (server, address, certificate, fingerprint) = bind_server();
+    let offer = offer_for(address, &fingerprint);
+
+    let document = DisplayDefinitionDocument::parse(DISPLAY_DEFINITION).expect("valid definition");
+    let definition = document.to_proto().expect("compile definition");
+    let definition_id = document.id().to_string();
+    let data_update = proto::DataUpdate {
+        definition_version: 1,
+        values: vec![
+            document
+                .encode_field_value(1, &json!(65.5))
+                .expect("encode sint field"),
+            document
+                .encode_field_value(2, &json!(true))
+                .expect("encode bool field"),
+        ],
+        sequence: Some(9),
+        timestamp_micros: None,
+    };
+
+    let server_task = tokio::spawn(async move {
+        let mut transport = server.accept().await.unwrap();
+        let _hello = recv_control(&mut transport).await;
+        let display = transport
+            .channel_map()
+            .channel_for_kind(ChannelKind::Display)
+            .expect("the session channel map includes Display");
+        send_control(
+            &transport,
+            &ControlMessage::HelloAck {
+                session: session_with(view_only_permissions()),
+                wire_format: WireFormat::Protobuf,
+                display: None,
+            },
+        )
+        .await;
+
+        for message in [
+            DisplayMessage::Definition(definition),
+            DisplayMessage::DataUpdate(data_update),
+        ] {
+            transport
+                .send(display, Bytes::from(message.encode().unwrap()))
+                .await
+                .unwrap();
+        }
+
+        // The device-to-node direction uses the same Display channel.
+        let action = loop {
+            match transport.recv().await {
+                TransportEvent::Payload { channel, payload } if channel == display => {
+                    break payload
+                }
+                TransportEvent::Payload { .. } | TransportEvent::Datagram { .. } => continue,
+                TransportEvent::Error { error } => panic!("transport error: {error}"),
+                TransportEvent::Closed { reason } => {
+                    panic!("transport closed before the client action: {reason:?}")
+                }
+            }
+        };
+        match DisplayMessage::decode(&action).expect("client Display frame") {
+            DisplayMessage::ActionInvoke(invoke) => {
+                assert_eq!(invoke.action_id, 7);
+                assert_eq!(invoke.idempotency_key, 42);
+            }
+            other => panic!("expected ActionInvoke, got {other:?}"),
+        }
+
+        let mut seen = Vec::new();
+        drain_until_close(&mut transport, &mut seen).await;
+        let _ = transport.close_with_reason(CloseReason::Normal).await;
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut client = NativeSessionClient::connect_with_config(
+            &offer,
+            &certificate,
+            NativeClientConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert!(client.display_session().is_some());
+
+        assert_eq!(
+            client.recv_event().await.unwrap(),
+            ClientEvent::Display(DisplayEvent::DefinitionApplied {
+                id: definition_id,
+                version: 1,
+            })
+        );
+        assert_eq!(
+            client.recv_event().await.unwrap(),
+            ClientEvent::Display(DisplayEvent::DataUpdated {
+                definition_version: 1,
+                changed_field_ids: vec![1, 2],
+            })
+        );
+        let session = client.display_session().unwrap();
+        assert_eq!(session.definition_version(), Some(1));
+        assert_eq!(session.field_value(1), Some(&json!(6550)));
+        assert_eq!(session.field_value(2), Some(&json!(true)));
+        assert_eq!(session.last_data_sequence(), Some(9));
+
+        client
+            .send_display_message(DisplayMessage::ActionInvoke(proto::ActionInvoke {
+                action_id: 7,
+                params: Vec::new(),
+                idempotency_key: 42,
+                params_json: None,
+                timestamp_micros: None,
+            }))
+            .await
+            .unwrap();
+        client.close().await.unwrap();
+        server_task.await.unwrap();
+    })
+    .await
+    .expect("protobuf definition exchange timed out");
+}
+
+#[tokio::test]
+async fn malformed_and_unknown_display_frames_are_non_fatal() {
+    use ozma_display_protocol::{proto, DisplayEvent, DisplayMessage, TAG_DATA_UPDATE};
+
+    let (server, address, certificate, fingerprint) = bind_server();
+    let offer = offer_for(address, &fingerprint);
+
+    let server_task = tokio::spawn(async move {
+        let mut transport = server.accept().await.unwrap();
+        let _hello = recv_control(&mut transport).await;
+        let display = transport
+            .channel_map()
+            .channel_for_kind(ChannelKind::Display)
+            .expect("the session channel map includes Display");
+        send_control(
+            &transport,
+            &ControlMessage::HelloAck {
+                session: session_with(view_only_permissions()),
+                wire_format: WireFormat::Protobuf,
+                display: None,
+            },
+        )
+        .await;
+
+        // A known tag with a truncated protobuf payload.
+        transport
+            .send(display, Bytes::from(vec![TAG_DATA_UPDATE, 0xff]))
+            .await
+            .unwrap();
+        // A tag this client does not know.
+        transport
+            .send(display, Bytes::from_static(&[0x7f]))
+            .await
+            .unwrap();
+        // The session must still process a valid frame afterwards.
+        let invoke = proto::ActionInvoke {
+            action_id: 3,
+            params: Vec::new(),
+            idempotency_key: 1,
+            params_json: None,
+            timestamp_micros: None,
+        };
+        transport
+            .send(
+                display,
+                Bytes::from(DisplayMessage::ActionInvoke(invoke).encode().unwrap()),
+            )
+            .await
+            .unwrap();
+
+        let mut seen = Vec::new();
+        drain_until_close(&mut transport, &mut seen).await;
+        let _ = transport.close_with_reason(CloseReason::Normal).await;
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut client = NativeSessionClient::connect_with_config(
+            &offer,
+            &certificate,
+            NativeClientConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        match client.recv_event().await.unwrap() {
+            ClientEvent::UnknownControl { kind } => {
+                assert!(
+                    kind.starts_with("display.malformed"),
+                    "unexpected kind: {kind}"
+                );
+            }
+            other => panic!("expected a malformed Display control event, got {other:?}"),
+        }
+        match client.recv_event().await.unwrap() {
+            ClientEvent::UnknownControl { kind } => {
+                assert_eq!(kind, "display.unknown_tag.0x7f");
+            }
+            other => panic!("expected an unknown Display tag event, got {other:?}"),
+        }
+        assert!(!client.is_closed());
+
+        match client.recv_event().await.unwrap() {
+            ClientEvent::Display(DisplayEvent::Action(invoke)) => {
+                assert_eq!(invoke.action_id, 3);
+            }
+            other => panic!("expected a Display action event, got {other:?}"),
+        }
+
+        client.close().await.unwrap();
+        server_task.await.unwrap();
+    })
+    .await
+    .expect("non-fatal Display frame exchange timed out");
 }

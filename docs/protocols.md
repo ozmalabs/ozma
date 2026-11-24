@@ -7,11 +7,47 @@ All protocol versions are currently `0.1` — **unstable, breaking changes expec
 ## Core substrate direction
 
 The core protocol is the stable, language-neutral contract for connecting
-participants and negotiating what they can do. The target canonical schema and
-encoding for connection negotiation, feature exchange, intent requests,
-resolution proposals, decisions, and lifecycle events is protobuf. This does
-not require every feature to be a built-in protobuf enum or every payload to
-use one transport.
+participants and negotiating what they can do. The canonical schema and
+encoding for connection negotiation, feature exchange, capability and display
+method advertisement, session lifecycle, scene state, input, actions, consent,
+aperture policy, diagnostics, and audit metadata is protobuf. This does not
+require every feature to be a built-in protobuf enum or every payload to use
+one transport.
+
+Protobuf is the source of truth for protocol types. Rust, Python, TypeScript,
+C/C++, Kotlin, and device SDK bindings are generated from the same `.proto`
+files. The hand-written JSON control model is transitional and exists only for
+the compatibility window described in the
+[protobuf-core plan](protobuf-core-plan.md).
+
+JSON remains canonical in exactly two places:
+
+- **Display definitions.** A schema, widget/layout tree, action catalog, and
+  extension field table are carried as a JSON document inside a protobuf
+  `DisplayDefinition` envelope. It is sent on first use, on a cache miss, or
+  when the definition changes. Steady-state data, scene operations, and action
+  invocations are protobuf.
+- **REST/GraphQL and browser management APIs.** These are JSON mappings of the
+  protobuf messages, generated with `pbjson` or an equivalent binding. They are
+  not a second hand-written protocol model.
+
+Definition fields have explicit stable numeric IDs. Data updates reference
+those IDs and send only changed values, so repeated JSON keys never appear on
+the hot path. Unknown protobuf fields are skipped by ordinary endpoints;
+relays that must forward extensions retain the raw frame or use a dynamic
+protobuf decoder.
+
+Display traffic uses a reliable `Display` channel. Each frame is a one-byte
+message tag followed by a protobuf payload; the existing transport frame
+already carries the length. The current tags are definition, definition-ref,
+definition-patch, scene-commit, data-update, action-invoke,
+interaction-event, and scene-snapshot. Tag values are part of the wire
+contract and are never reused.
+
+`Hello` advertises the wire formats a client accepts and `HelloAck` selects
+one for the connection. Protobuf is preferred; JSON remains the legacy
+compatibility path. The node sends protobuf scene snapshots on the Display
+channel when protobuf is selected and keeps JSON control messages otherwise.
 
 Feature and intent identifiers are open, namespaced values. Participants
 advertise the features they currently provide; features may be introduced,

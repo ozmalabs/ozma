@@ -1,0 +1,15 @@
+[package]
+name        = "ozma-display-protocol"
+version     = "0.1.0"
+edition     = "2021"
+description = "Stable protobuf framing codec for the reliable Ozma Display channel."
+license     = "AGPL-3.0-only"
+
+[dependencies]
+ozma-protocol           = { path = "../ozma-protocol" }
+ozma-display-definition = { path = "../ozma-display-definition" }
+ozma-protocol-proto     = { path = "../ozma-protocol-proto" }
+prost                   = { workspace = true }
+serde_json              = { workspace = true }
+thiserror               = { workspace = true }
+zstd                    = "0.14"

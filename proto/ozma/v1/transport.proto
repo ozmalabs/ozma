@@ -1,0 +1,70 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// Transport modes and logical channels.
+
+syntax = "proto3";
+
+package ozma.v1;
+
+// How a session is carried.
+enum TransportMode {
+  TRANSPORT_MODE_UNSPECIFIED = 0;
+  // Native QUIC/WebTransport on one UDP port.
+  TRANSPORT_MODE_QUIC = 1;
+  // Raw RTP/UDP, including the Moonlight-compatible path.
+  TRANSPORT_MODE_UDP = 2;
+  // RTSP over TCP with interleaved framing.
+  TRANSPORT_MODE_TCP_INTERLEAVED = 3;
+  // Local Unix domain socket plus a stdio proxy.
+  TRANSPORT_MODE_UNIX_SOCKET = 4;
+  // SSH subsystem or port-forwarded stream.
+  TRANSPORT_MODE_SSH = 5;
+  // HLS/LL-HLS/MJPEG fallback.
+  TRANSPORT_MODE_HLS = 6;
+  // WireGuard relay when direct connectivity fails.
+  TRANSPORT_MODE_RELAY = 7;
+  // In-process transport for tests and local bring-up.
+  TRANSPORT_MODE_LOOPBACK = 8;
+}
+
+// Logical channel carried inside a session.
+//
+// New channel kinds are appended so existing channel identifiers do not shift.
+enum ChannelKind {
+  CHANNEL_KIND_UNSPECIFIED = 0;
+  CHANNEL_KIND_CONTROL = 1;
+  CHANNEL_KIND_INPUT = 2;
+  CHANNEL_KIND_VIDEO = 3;
+  CHANNEL_KIND_AUDIO = 4;
+  CHANNEL_KIND_MIC = 5;
+  CHANNEL_KIND_TELEMETRY = 6;
+  CHANNEL_KIND_BULK = 7;
+  CHANNEL_KIND_CAMERA = 8;
+  // Reliable, ordered display traffic: definitions, patches, scene commits,
+  // data updates, and action descriptors/invocations.
+  CHANNEL_KIND_DISPLAY = 9;
+}
+
+// Relative priority of a logical channel.
+enum ChannelPriority {
+  CHANNEL_PRIORITY_UNSPECIFIED = 0;
+  CHANNEL_PRIORITY_LOW = 1;
+  CHANNEL_PRIORITY_NORMAL = 2;
+  CHANNEL_PRIORITY_HIGH = 3;
+  CHANNEL_PRIORITY_CRITICAL = 4;
+}
+
+// Descriptor for one logical channel in a prepared session.
+message ChannelDescriptor {
+  // Channel identifier, 0-255 on the existing framing.
+  uint32 id = 1;
+  ChannelKind kind = 2;
+  ChannelPriority priority = 3;
+  bool reliable = 4;
+  optional string track_id = 5;
+  // Maximum payload in bytes for a single transport frame.
+  uint32 max_payload = 6;
+  bool ordered = 7;
+  optional string label = 8;
+  optional bytes metadata = 9;
+}

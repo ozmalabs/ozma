@@ -1,0 +1,21 @@
+[package]
+name        = "ozma-protocol-proto"
+version     = "0.1.0"
+edition     = "2021"
+description = "Generated protobuf and pbjson types for the Ozma protocol."
+license     = "AGPL-3.0-only"
+build       = "build.rs"
+
+[dependencies]
+prost       = { workspace = true }
+prost-types = { workspace = true }
+pbjson      = { workspace = true }
+serde       = { workspace = true }
+
+[build-dependencies]
+prost-build         = "0.14"
+pbjson-build        = "0.9"
+protoc-bin-vendored = "3.3"
+
+[dev-dependencies]
+serde_json = { workspace = true }

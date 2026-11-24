@@ -1,0 +1,83 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// Session negotiation and the control-channel envelope.
+
+syntax = "proto3";
+
+package ozma.v1;
+
+import "ozma/v1/action.proto";
+import "ozma/v1/data.proto";
+import "ozma/v1/display.proto";
+import "ozma/v1/scene.proto";
+import "ozma/v1/transport.proto";
+import "ozma/v1/version.proto";
+
+// First message from a client on the control channel.
+message Hello {
+  string session_id = 1;
+  // Bearer credential. Never log this field.
+  string token = 2;
+  ProtocolVersion protocol = 3;
+  // Wire formats the client accepts, in preference order.
+  repeated WireFormat wire_formats = 4;
+  DisplayCapabilities display = 5;
+  optional string client_id = 6;
+  repeated string capabilities = 7;
+  // Definitions the client already has cached, keyed by id/version/hash.
+  repeated DefinitionRef definitions = 8;
+}
+
+// Response to `Hello`, selecting the wire format for the rest of the session.
+message HelloAck {
+  Session session = 1;
+  WireFormat wire_format = 2;
+  DisplayCapabilities display = 3;
+  ProtocolVersion protocol = 4;
+  optional string server_id = 5;
+  // The definition to use for this connection. If the client already has the
+  // matching hash, the server does not need to resend the JSON document.
+  optional DefinitionRef definition = 6;
+  bool need_definition = 7;
+}
+
+// Minimal prepared session returned by the control channel.
+message Session {
+  string id = 1;
+  string node_id = 2;
+  uint64 created_at_micros = 3;
+  optional uint64 expires_at_micros = 4;
+  optional uint64 revision = 5;
+  repeated ChannelDescriptor channels = 6;
+  optional TransportMode transport = 7;
+}
+
+// An error returned on the control channel or as a correlated response.
+message ApiError {
+  string code = 1;
+  string message = 2;
+  optional string detail = 3;
+  // Optional JSON object with structured error details.
+  optional bytes details_json = 4;
+  bool retryable = 5;
+  optional uint64 retry_after_micros = 6;
+}
+
+// Envelope for control-channel traffic. Display traffic normally travels on
+// the reliable, ordered Display channel, but these variants make the control
+// channel self-contained for small deployments and tests.
+message ControlMessage {
+  oneof message {
+    Hello hello = 1;
+    HelloAck hello_ack = 2;
+    Session session = 3;
+    ApiError error = 4;
+    SceneCommit scene_commit = 5;
+    DataUpdate data_update = 6;
+    DefinitionPatch definition_patch = 7;
+    ActionInvoke action_invoke = 8;
+    InteractionEvent interaction_event = 9;
+    DisplayDefinition definition = 10;
+    DefinitionRef definition_ref = 11;
+  }
+}

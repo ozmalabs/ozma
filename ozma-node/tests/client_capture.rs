@@ -26,6 +26,7 @@ use ozma_protocol::media::VideoFragmentHeader;
 use ozma_protocol::{
     AudioFormat, AudioSpec, ChannelKind, ClientId, Codec, ControlMessage, MediaFormat,
     NodeCapabilities, Permission, PermissionSet, SessionSpec, TrackId, TrackKind, TrackSpec,
+    WireFormat,
 };
 use ozma_transport::{
     ChannelId, ChannelMap, QuicClient, QuicTransport, SessionTransport, TransportEvent,
@@ -114,6 +115,7 @@ async fn connect(
     let hello = ControlMessage::Hello {
         session_id: session.id.clone(),
         token: offer.token.clone(),
+        wire_formats: vec![WireFormat::Json],
         display: None,
     };
     client

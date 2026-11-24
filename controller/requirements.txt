@@ -6,6 +6,10 @@ fastapi>=0.111
 uvicorn[standard]>=0.29
 pydantic>=2.0
 
+# Protobuf display protocol (bindings generated into controller/proto_gen)
+protobuf>=7.36.1
+blake3>=1.0
+
 # GraphQL with Strawberry
 strawberry-graphql[fastapi]>=0.230
 

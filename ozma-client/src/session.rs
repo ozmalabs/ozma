@@ -15,12 +15,16 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use ozma_display_protocol::{
+    scene_convert, CodecError, DisplayEvent, DisplayMessage, DisplaySession,
+};
 use ozma_protocol::scene::{
     CommitStatus, DisplayCapabilities, DisplayProfile, SceneReceiver, SCENE_VERSION,
 };
 use ozma_protocol::{
     codes, ApiError, ChannelKind, ControlMessage, EndReason, InputEvent, Permission, PermissionSet,
     Session, SessionEvent, SessionOffer, SessionState, TrackId, TransportDescriptor, TransportMode,
+    WireFormat,
 };
 use ozma_transport::{
     ChannelId, ChannelMap, CloseReason, QuicClient, QuicConfig, QuicTransport, SessionTransport,
@@ -153,7 +157,10 @@ pub struct InputLatencyReport {
 }
 
 /// An event received from a native session.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// The `Eq` bound is not derived because Display events embed generated
+/// protobuf message types, which only implement `PartialEq`.
+#[derive(Clone, Debug, PartialEq)]
 pub enum ClientEvent {
     /// Video, audio, mic, telemetry, or bulk bytes from the node.
     Media(MediaPacket),
@@ -183,6 +190,13 @@ pub enum ClientEvent {
     /// A control message type this client does not know. The session remains
     /// usable, which keeps the client forward-compatible with newer nodes.
     UnknownControl { kind: String },
+    /// A decoded Display-channel message was applied to the session state
+    /// machine or forwarded to the application.
+    ///
+    /// Scene snapshots that feed the compositor still produce
+    /// [`ClientEvent::ScenePresented`] and [`ClientEvent::ScenePending`];
+    /// definition, data, action, and interaction messages appear here.
+    Display(DisplayEvent),
     /// The transport is closed. This event is returned again on later calls.
     Closed { reason: CloseReason },
 }
@@ -204,6 +218,8 @@ impl ClientEvent {
 pub struct NativeSessionClient {
     transport: QuicTransport,
     channels: ChannelMap,
+    display_channel: Option<ChannelId>,
+    wire_format: WireFormat,
     descriptor: TransportDescriptor,
     offer: SessionOffer,
     session: Option<Session>,
@@ -215,6 +231,7 @@ pub struct NativeSessionClient {
     closed: Option<CloseReason>,
     close_grace: Duration,
     scene: Option<SceneReceiver>,
+    display: Option<DisplaySession>,
     resources: Option<tokio::sync::mpsc::Receiver<Result<Bytes, ApiError>>>,
     capture: Option<ClientCapture>,
     captured: Option<ClientCaptureState>,
@@ -289,9 +306,12 @@ impl NativeSessionClient {
         )
         .await?;
 
+        let display_channel = channels.channel_for_kind(ChannelKind::Display);
         let mut client = Self {
             transport,
             channels,
+            display_channel,
+            wire_format: WireFormat::Json,
             descriptor,
             offer: offer.clone(),
             session: None,
@@ -303,6 +323,7 @@ impl NativeSessionClient {
             closed: None,
             close_grace: config.close_grace,
             scene: None,
+            display: display_channel.map(|_| DisplaySession::default()),
             resources: None,
             capture: None,
             captured: None,
@@ -310,11 +331,13 @@ impl NativeSessionClient {
 
         let display = config.scene_cache_bytes.map(|_| DisplayCapabilities {
             scene_versions: vec![SCENE_VERSION],
+            ..Default::default()
         });
         client
             .send_control(&ControlMessage::Hello {
                 session_id: offer.session_id.clone(),
                 token: offer.token.clone(),
+                wire_formats: vec![WireFormat::Protobuf, WireFormat::Json],
                 display,
             })
             .await?;
@@ -362,6 +385,16 @@ impl NativeSessionClient {
         self.scene.as_ref()
     }
 
+    /// The Display-channel state machine, when the transport negotiated a
+    /// reliable `Display` channel.
+    ///
+    /// This caches the current definition, decoded field values, and the latest
+    /// scene revision. Events that change it are also delivered through
+    /// [`ClientEvent::Display`].
+    pub fn display_session(&self) -> Option<&DisplaySession> {
+        self.display.as_ref()
+    }
+
     /// The session state from `HelloAck`.
     pub fn state(&self) -> Option<SessionState> {
         self.session.as_ref().map(|session| session.state)
@@ -383,6 +416,21 @@ impl NativeSessionClient {
     /// The negotiated channel map.
     pub fn channel_map(&self) -> &ChannelMap {
         &self.channels
+    }
+
+    /// The `Display` channel selected by the negotiated map, if one exists.
+    ///
+    /// The node may omit the channel for transports built before display
+    /// traffic existed, in which case scene commits stay on the control channel.
+    pub fn display_channel(&self) -> Option<ChannelId> {
+        self.display_channel
+    }
+
+    /// The wire format selected by the node in `HelloAck`.
+    ///
+    /// Defaults to [`WireFormat::Json`] for older nodes that omit the field.
+    pub fn wire_format(&self) -> WireFormat {
+        self.wire_format
     }
 
     /// The transport descriptor used to connect.
@@ -444,7 +492,15 @@ impl NativeSessionClient {
                 self.handle_control_payload(&payload)
             }
             TransportEvent::Payload { channel, payload }
-            | TransportEvent::Datagram { channel, payload } => {
+                if Some(channel) == self.display_channel =>
+            {
+                self.handle_display_payload(&payload)
+            }
+            TransportEvent::Payload { channel, payload } => {
+                let packet = self.media_packet(channel, payload)?;
+                Ok(ClientEvent::Media(packet))
+            }
+            TransportEvent::Datagram { channel, payload } => {
                 let packet = self.media_packet(channel, payload)?;
                 Ok(ClientEvent::Media(packet))
             }
@@ -457,6 +513,41 @@ impl NativeSessionClient {
                 Ok(ClientEvent::Closed { reason })
             }
         }
+    }
+
+    /// Send one decoded Display message on the negotiated reliable `Display`
+    /// channel.
+    ///
+    /// This is the device-to-node direction for `ActionInvoke` and
+    /// `InteractionEvent`; it can carry any [`DisplayMessage`] variant. The
+    /// message is encoded with the stable one-byte tag framing used by
+    /// [`DisplayMessage::encode`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `client.unsupported` when the negotiated channel map has no
+    /// `Display` channel, `client.disconnected` when the session is closed or
+    /// terminal, and `client.protocol` when the message cannot be encoded.
+    pub async fn send_display_message(&mut self, message: DisplayMessage) -> Result<(), ApiError> {
+        self.ensure_open()?;
+        if let Some(session) = &self.session {
+            if session.state.is_terminal() {
+                return Err(error::disconnected(format!("{:?}", session.state)));
+            }
+        }
+
+        let channel = self.display_channel.ok_or_else(|| {
+            ApiError::new(
+                error::codes::CLIENT_UNSUPPORTED,
+                "The negotiated session has no reliable Display channel",
+            )
+            .with_remediation("Connect to a node that advertises the Display channel, then retry.")
+        })?;
+
+        let frame = message.encode().map_err(|error| {
+            error::protocol(format!("Could not encode a Display message: {error}"))
+        })?;
+        self.transport.send(channel, Bytes::from(frame)).await
     }
 
     /// Send one input event on the reliable control channel.
@@ -901,6 +992,7 @@ impl NativeSessionClient {
                     match control_kind(&value)? {
                         "hello_ack" => {
                             let session = parse_hello_ack(&value)?;
+                            self.wire_format = parse_wire_format(&value)?;
                             if let (Some(budget), Some(display)) =
                                 (scene_cache_bytes, control_data(&value).get("display"))
                             {
@@ -969,6 +1061,7 @@ impl NativeSessionClient {
             "hello_ack" => {
                 let session = parse_hello_ack(&value)?;
                 self.session = Some(session.clone());
+                self.wire_format = parse_wire_format(&value)?;
                 Ok(ClientEvent::SessionUpdated(session))
             }
             "scene_commit" if self.scene.is_some() => {
@@ -977,18 +1070,7 @@ impl NativeSessionClient {
                     .ok_or_else(|| error::protocol("SceneCommit has no commit"))?;
                 let commit = serde_json::from_value(commit.clone())
                     .map_err(|error| error::protocol(format!("Invalid scene commit: {error}")))?;
-                let scene = self.scene.as_mut().expect("scene support was checked");
-                match scene.receive_commit(commit) {
-                    CommitStatus::Presented => Ok(ClientEvent::ScenePresented {
-                        revision: scene.presented().revision,
-                    }),
-                    CommitStatus::InvalidPlacements => {
-                        Err(error::protocol("SceneCommit contains invalid placements"))
-                    }
-                    CommitStatus::WaitingForResources | CommitStatus::IgnoredStale => {
-                        Ok(ClientEvent::ScenePending)
-                    }
-                }
+                self.apply_scene_commit(commit)
             }
             "event" => Ok(ClientEvent::Session(parse_event(&value)?)),
             "error" => {
@@ -1022,6 +1104,76 @@ impl NativeSessionClient {
             other => Ok(ClientEvent::UnknownControl {
                 kind: other.to_string(),
             }),
+        }
+    }
+
+    /// Handle one frame from the reliable `Display` channel.
+    ///
+    /// Scene snapshots continue to feed the compositor's [`SceneReceiver`].
+    /// Every other message kind is applied to the [`DisplaySession`] state
+    /// machine and surfaced as [`ClientEvent::Display`].
+    ///
+    /// Unknown tags and malformed frames are reported as
+    /// [`ClientEvent::UnknownControl`] instead of terminating the session, so a
+    /// newer node can add message kinds without breaking this client. A
+    /// decoded message that the state machine rejects (for example a data
+    /// update for an unknown field) is still a protocol error.
+    fn handle_display_payload(&mut self, payload: &[u8]) -> Result<ClientEvent, ApiError> {
+        let message = match DisplayMessage::decode(payload) {
+            Ok(message) => message,
+            Err(CodecError::UnknownTag(tag)) => {
+                return Ok(ClientEvent::UnknownControl {
+                    kind: format!("display.unknown_tag.0x{tag:02x}"),
+                });
+            }
+            Err(error) => {
+                return Ok(ClientEvent::UnknownControl {
+                    kind: format!("display.malformed.{error}"),
+                });
+            }
+        };
+
+        match message {
+            DisplayMessage::SceneSnapshot(snapshot) => {
+                if self.scene.is_none() {
+                    return Ok(ClientEvent::UnknownControl {
+                        kind: "display.scene_snapshot".to_string(),
+                    });
+                }
+                let commit = scene_convert::scene_commit_from_proto(&snapshot)
+                    .map_err(|error| error::protocol(format!("Invalid scene snapshot: {error}")))?;
+                self.apply_scene_commit(commit)
+            }
+            message => {
+                let kind = message.kind();
+                let Some(display) = self.display.as_mut() else {
+                    return Ok(ClientEvent::UnknownControl {
+                        kind: format!("display.{kind}"),
+                    });
+                };
+                let event = display.apply(message).map_err(|error| {
+                    error::protocol(format!("Display {kind} message was rejected: {error}"))
+                })?;
+                Ok(ClientEvent::Display(event))
+            }
+        }
+    }
+
+    fn apply_scene_commit(
+        &mut self,
+        commit: ozma_protocol::scene::SceneCommit,
+    ) -> Result<ClientEvent, ApiError> {
+        let scene = self.scene.as_mut().expect("scene support was checked");
+        match scene.receive_commit(commit) {
+            CommitStatus::Presented => Ok(ClientEvent::ScenePresented {
+                revision: scene.presented().revision,
+            }),
+            CommitStatus::InvalidPlacements => {
+                Err(error::protocol("Scene commit contains invalid placements"))
+            }
+            CommitStatus::WaitingForResources | CommitStatus::IgnoredStale => {
+                Ok(ClientEvent::ScenePending)
+            }
         }
     }
 }
@@ -1164,6 +1316,20 @@ fn parse_hello_ack(value: &Value) -> Result<Session, ApiError> {
         error::protocol(format!("HelloAck contains an invalid session: {error}"))
             .with_details(json!({ "session": session }))
     })
+}
+
+/// Read the negotiated wire format from a `HelloAck`.
+///
+/// A node that predates negotiation omits the field; that means the legacy
+/// JSON path remains in effect.
+fn parse_wire_format(value: &Value) -> Result<WireFormat, ApiError> {
+    match control_data(value).get("wire_format") {
+        Some(format) => serde_json::from_value(format.clone()).map_err(|error| {
+            error::protocol(format!("HelloAck has an invalid wire_format: {error}"))
+                .with_details(json!({ "wire_format": format }))
+        }),
+        None => Ok(WireFormat::default()),
+    }
 }
 
 fn parse_event(value: &Value) -> Result<SessionEvent, ApiError> {
@@ -1329,6 +1495,7 @@ mod latency_tests {
                 &transport,
                 &ControlMessage::HelloAck {
                     session: session(),
+                    wire_format: WireFormat::Json,
                     display: None,
                 },
             )

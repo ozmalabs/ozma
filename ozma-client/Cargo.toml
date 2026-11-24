@@ -21,6 +21,7 @@ window = ["ozma-playback/window"]
 ozma-protocol = { path = "../ozma-protocol" }
 ozma-client-core = { path = "../ozma-client-core" }
 ozma-transport = { path = "../ozma-transport" }
+ozma-display-protocol = { path = "../ozma-display-protocol" }
 ozma-media = { path = "../ozma-media" }
 ozma-capture = { path = "../ozma-capture" }
 ozma-encode = { path = "../ozma-encode" }
@@ -44,6 +45,7 @@ urlencoding = "2"
 
 [dev-dependencies]
 axum = "0.7"
+ozma-display-definition = { path = "../ozma-display-definition" }
 openh264 = "0.9"
 tokio = { workspace = true }
 tower = { version = "0.5", features = ["util"] }

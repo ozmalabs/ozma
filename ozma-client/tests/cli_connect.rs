@@ -18,7 +18,7 @@ use bytes::Bytes;
 use ozma_client::certificate_fingerprint;
 use ozma_protocol::{
     ClientId, ControlMessage, Permission, PermissionSet, Session, SessionId, SessionSpec,
-    SessionState,
+    SessionState, WireFormat,
 };
 use ozma_transport::offer::{SessionOfferBuilder, TransportDescriptorBuilder};
 use ozma_transport::{
@@ -241,6 +241,7 @@ async fn connect_cli_creates_starts_receives_video_and_exits() {
             &transport,
             &ControlMessage::HelloAck {
                 session: session_in(SessionState::Streaming),
+                wire_format: WireFormat::Json,
                 display: None,
             },
         )

@@ -121,7 +121,8 @@ impl ChannelMap {
     /// Allocate channels for a session with `track_ids` video tracks.
     ///
     /// Ids 0 and 1 are reserved for control and input; video tracks follow from
-    /// id 2 in the supplied order; audio, mic, telemetry and bulk follow.
+    /// id 2 in the supplied order; audio, mic, telemetry and bulk follow. The
+    /// camera and display channels are appended last so existing ids stay put.
     pub fn for_tracks(track_ids: &[TrackId], audio: bool, mic: bool) -> Result<Self, ApiError> {
         let mut descriptors = Vec::new();
         descriptors.push(ChannelDescriptor {
@@ -230,6 +231,24 @@ impl ChannelMap {
             track_id: Some(TrackId::new("camera0")),
             max_payload: 1200,
         });
+        next_id = next_id.checked_add(1).ok_or_else(|| {
+            ApiError::new(
+                codes::INVALID_REQUEST,
+                "too many channels for the channel id space",
+            )
+        })?;
+
+        // Display traffic (definitions, scene commits, data updates, and
+        // actions) is appended after every existing channel so no previously
+        // allocated id moves.
+        descriptors.push(ChannelDescriptor {
+            id: next_id,
+            kind: ChannelKind::Display,
+            priority: ChannelPriority::High,
+            reliable: true,
+            track_id: None,
+            max_payload: u16::MAX,
+        });
 
         Self::new(descriptors)
     }
@@ -318,7 +337,7 @@ mod tests {
     #[test]
     fn default_layout_matches_the_protocol_channels() {
         let map = ChannelMap::default_session();
-        assert_eq!(map.len(), 8);
+        assert_eq!(map.len(), 9);
         assert_eq!(
             map.require(ChannelId::CONTROL).unwrap().kind,
             ChannelKind::Control
@@ -337,7 +356,7 @@ mod tests {
 
         // The browser camera channel is appended after the existing
         // single-track layout: control 0, input 1, video 2, audio 3, mic 4,
-        // telemetry 5, bulk 6, camera 7.
+        // telemetry 5, bulk 6, camera 7, display 8.
         let camera = map
             .channel_for_kind(ChannelKind::Camera)
             .expect("camera channel");
@@ -347,12 +366,49 @@ mod tests {
         assert!(!descriptor.reliable);
         assert_eq!(descriptor.max_payload, 1200);
         assert_eq!(map.channels_for_kind(ChannelKind::Camera), vec![camera]);
+
+        let display = map
+            .channel_for_kind(ChannelKind::Display)
+            .expect("display channel");
+        assert_eq!(display, ChannelId::new(8));
+        let descriptor = map.require(display).unwrap();
+        assert_eq!(descriptor.track_id, None);
+        assert!(descriptor.reliable);
+        assert_eq!(descriptor.priority, ChannelPriority::High);
+        assert_eq!(descriptor.max_payload, u16::MAX);
+        assert_eq!(map.channels_for_kind(ChannelKind::Display), vec![display]);
+    }
+
+    #[test]
+    fn single_track_default_ids_are_stable() {
+        let map = ChannelMap::default_session();
+        let expected = [
+            (ChannelId::new(0), ChannelKind::Control),
+            (ChannelId::new(1), ChannelKind::Input),
+            (ChannelId::new(2), ChannelKind::Video),
+            (ChannelId::new(3), ChannelKind::Audio),
+            (ChannelId::new(4), ChannelKind::Mic),
+            (ChannelId::new(5), ChannelKind::Telemetry),
+            (ChannelId::new(6), ChannelKind::Bulk),
+            (ChannelId::new(7), ChannelKind::Camera),
+            (ChannelId::new(8), ChannelKind::Display),
+        ];
+        for (id, kind) in expected {
+            assert_eq!(
+                map.channel_for_kind(kind),
+                Some(id),
+                "unexpected id for {kind:?}"
+            );
+            assert_eq!(map.require(id).unwrap().kind, kind);
+        }
+        assert_eq!(map.len(), expected.len());
     }
 
     #[test]
     fn camera_is_appended_without_shifting_existing_ids() {
         let map = ChannelMap::for_tracks(&[TrackId::new("video0")], false, false).unwrap();
-        // control 0, input 1, video 2, telemetry 3, bulk 4, camera 5.
+        // control 0, input 1, video 2, telemetry 3, bulk 4, camera 5,
+        // display 6.
         assert_eq!(
             map.channel_for_kind(ChannelKind::Telemetry),
             Some(ChannelId::new(3))
@@ -364,6 +420,10 @@ mod tests {
         assert_eq!(
             map.channel_for_kind(ChannelKind::Camera),
             Some(ChannelId::new(5))
+        );
+        assert_eq!(
+            map.channel_for_kind(ChannelKind::Display),
+            Some(ChannelId::new(6))
         );
     }
 

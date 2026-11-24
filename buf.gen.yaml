@@ -1,0 +1,30 @@
+version: v2
+
+# Optional cross-language code generation.
+#
+# The Rust crate is normally built by `cargo build -p ozma-protocol-proto`,
+# which invokes prost-build and pbjson-build from build.rs. `buf` is not
+# required for a normal build or test run. Use this file only when you want
+# additional language bindings or an independent generation check.
+#
+# Prerequisites:
+#   cargo install protoc-gen-prost protoc-gen-prost-serde
+#
+# Then:
+#   buf generate
+#
+# The generated Rust would land in ozma-protocol-proto/src/generated; the
+# crate's checked-in lib.rs intentionally includes bindings from OUT_DIR
+# instead, so do not commit that output unless the build strategy changes.
+inputs:
+  - directory: proto
+
+plugins:
+  - local: protoc-gen-prost
+    out: ozma-protocol-proto/src/generated
+    opt:
+      - compile_well_known_types
+  - local: protoc-gen-prost-serde
+    out: ozma-protocol-proto/src/generated
+    opt:
+      - preserve_proto_field_names

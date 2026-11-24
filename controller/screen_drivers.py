@@ -14,9 +14,9 @@ The screen_manager.py dispatches to whichever driver is registered.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
-import struct
 from typing import Any
 
 from screen_manager import FramePushDriver, NativeRenderDriver, ConstrainedDriver
@@ -149,6 +149,141 @@ class HDMIOverlayDriver(FramePushDriver):
 
 # ── Tier 2: Native Render Drivers ────────────────────────────────────────────
 
+
+class NativeRenderProtobufDriver(NativeRenderDriver):
+    """Tier 2 native device speaking the protobuf Display protocol.
+
+    Sends a ``DisplayDefinition`` frame once (and again only if the layout
+    changes), then streams compact binary ``DataUpdate`` frames carrying only
+    changed field values.  Inbound ``ActionInvoke`` and ``InteractionEvent``
+    frames are decoded and dispatched to controller callbacks.
+
+    The protobuf modules are imported lazily so JSON-only installations keep
+    working before ``scripts/gen_proto_python.sh`` has been run.
+    """
+
+    tier = "native_render"
+    wire_format = "protobuf"
+
+    def __init__(
+        self,
+        device_id: str,
+        *,
+        on_action: Any = None,
+        on_interaction: Any = None,
+    ) -> None:
+        super().__init__(device_id)
+        self._definition: Any = None
+        self._layout_token: str | None = None
+        self._last_values: dict[str, Any] = {}
+        self._on_action = on_action
+        self._on_interaction = on_interaction
+        self.last_action: Any = None
+        self.last_interaction: Any = None
+
+    @property
+    def definition(self) -> Any:
+        """The currently advertised ``DisplayDefinition``, if sent."""
+        return self._definition
+
+    def set_callbacks(self, on_action: Any = None, on_interaction: Any = None) -> None:
+        """Install or replace inbound-frame callbacks."""
+        if on_action is not None:
+            self._on_action = on_action
+        if on_interaction is not None:
+            self._on_interaction = on_interaction
+
+    @staticmethod
+    def _layout_token_for(layout: dict) -> str:
+        try:
+            return json.dumps(layout, sort_keys=True, separators=(",", ":"), default=repr)
+        except (TypeError, ValueError):
+            return repr(layout)
+
+    async def push_layout(self, layout: dict) -> None:
+        if not self._ws:
+            return
+        token = self._layout_token_for(layout)
+        if self._definition is not None and token == self._layout_token:
+            # Definition is sent once per layout version.
+            return
+        try:
+            import display_protocol as protocol
+
+            version = int(layout.get("version", 1) or 1)
+            if self._definition is not None:
+                version = max(version, self._definition.version + 1)
+            definition = protocol.build_definition(layout, self.device_id, version)
+            await self._ws.send(protocol.encode_frame(protocol.TAG_DEFINITION, definition))
+            self._definition = definition
+            self._layout_token = token
+            self._layout_sent = True
+            self._last_values = {}
+        except Exception as exc:
+            self._layout_sent = False
+            log.debug("Protobuf layout push failed for %s: %s", self.device_id, exc)
+
+    async def push_data(self, data: dict) -> None:
+        if not (self._ws and self._definition and self._layout_sent):
+            return
+        try:
+            import display_protocol as protocol
+
+            changed: dict[str, Any] = {}
+            for key, value in data.items():
+                if key not in self._last_values or not _values_equal(self._last_values[key], value):
+                    changed[key] = value
+            if not changed:
+                return
+            update = protocol.build_data_update(self._definition, changed)
+            if not update.values:
+                # Nothing in the update matched the compiled field table.
+                self._last_values.update(changed)
+                return
+            await self._ws.send(protocol.encode_frame(protocol.TAG_DATA_UPDATE, update))
+            self._last_values.update(changed)
+        except Exception as exc:
+            log.debug("Protobuf data push failed for %s: %s", self.device_id, exc)
+
+    async def handle_inbound_frame(self, frame: bytes) -> tuple[int, Any]:
+        """Decode and dispatch one frame received from the device.
+
+        Returns ``(tag, message)`` for callers that need the decoded value.
+        """
+        import display_protocol as protocol
+
+        tag, message = protocol.decode_frame(frame)
+        if tag == protocol.TAG_ACTION_INVOKE:
+            self.last_action = message
+            await _maybe_await(self._on_action, self.device_id, message)
+        elif tag == protocol.TAG_INTERACTION_EVENT:
+            self.last_interaction = message
+            await _maybe_await(self._on_interaction, self.device_id, message)
+            # An interaction may carry an embedded action (for example a tap
+            # bound to ``ActionInvoke``) rather than a pointer/key event.
+            if message.WhichOneof("event") == "action":
+                self.last_action = message.action
+                await _maybe_await(self._on_action, self.device_id, message.action)
+        return tag, message
+
+
+def _values_equal(left: Any, right: Any) -> bool:
+    """Value comparison that preserves bool/int and exact type changes."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, float) and isinstance(right, float):
+        return left == right or (left != left and right != right)
+    return left == right
+
+
+async def _maybe_await(callback: Any, *args: Any) -> None:
+    if callback is None:
+        return
+    result = callback(*args)
+    if inspect.isawaitable(result):
+        await result
+
+
 class ESP32Driver(NativeRenderDriver):
     """ESP32 with TFT display — connects via WebSocket on port 7391."""
 
@@ -243,7 +378,7 @@ class XTouchLCDDriver(ConstrainedDriver):
         async def _push(values: dict[str, Any]) -> None:
             if not self._midi:
                 return
-            from midi import Color, _hex_to_lcd_color
+            from midi import _hex_to_lcd_color
             top = str(values.get("scenario_name", ""))[:7]
             bottom = str(values.get("_primary_metric", ""))[:7]
             color = _hex_to_lcd_color(values.get("scenario_color"))
@@ -311,6 +446,7 @@ DRIVER_TYPES: dict[str, type] = {
     "eink": EInkDriver,
     "hdmi_overlay": HDMIOverlayDriver,
     # Tier 2
+    "native_protobuf": NativeRenderProtobufDriver,
     "esp32": ESP32Driver,
     "android": AndroidAppDriver,
     "rpi_touch": RPiTouchscreenDriver,

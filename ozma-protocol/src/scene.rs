@@ -5,11 +5,26 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::display_method::{DisplayMethod, RenderingTier};
+
 pub const SCENE_VERSION: u16 = 1;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DisplayCapabilities {
     pub scene_versions: Vec<u16>,
+    /// Concrete methods the device can present. Tiers are only hints; these
+    /// methods are authoritative.
+    #[serde(default)]
+    pub methods: Vec<DisplayMethod>,
+    #[serde(default)]
+    pub tiers: Vec<RenderingTier>,
+    /// Data schema ids the device can render.
+    #[serde(default)]
+    pub schemas: Vec<String>,
+    #[serde(default)]
+    pub max_update_rate_hz: Option<u32>,
+    #[serde(default)]
+    pub resource_budget_bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,7 +322,21 @@ mod tests {
     fn unknown_scene_version_uses_video_profile() {
         let capabilities = DisplayCapabilities {
             scene_versions: vec![SCENE_VERSION + 1],
+            ..Default::default()
         };
         assert_eq!(capabilities.select(2), DisplayProfile::Video);
+    }
+
+    #[test]
+    fn legacy_display_capabilities_deserialize_with_defaults() {
+        let capabilities: DisplayCapabilities =
+            serde_json::from_str(r#"{"scene_versions":[1]}"#).unwrap();
+
+        assert_eq!(capabilities.scene_versions, vec![SCENE_VERSION]);
+        assert!(capabilities.methods.is_empty());
+        assert!(capabilities.tiers.is_empty());
+        assert!(capabilities.schemas.is_empty());
+        assert_eq!(capabilities.max_update_rate_hz, None);
+        assert_eq!(capabilities.resource_budget_bytes, 0);
     }
 }

@@ -1,0 +1,15 @@
+[package]
+name        = "ozma-display-definition"
+version     = "0.1.0"
+edition     = "2021"
+description = "Canonical JSON display definitions, hashing, patching, and field tables."
+license     = "AGPL-3.0-only"
+
+[dependencies]
+serde               = { workspace = true }
+serde_json          = { workspace = true }
+thiserror           = { workspace = true }
+blake3              = "1.8"
+json-patch          = "5.0"
+ozma-protocol       = { path = "../ozma-protocol" }
+ozma-protocol-proto = { path = "../ozma-protocol-proto" }

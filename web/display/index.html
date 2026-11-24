@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Ozma Browser Display</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div>
+        <h1>Ozma Display</h1>
+        <p id="connection-detail" class="connection-detail">Not connected</p>
+      </div>
+    </div>
+
+    <div class="topbar-right">
+      <div id="status" class="status" data-state="offline" role="status" aria-live="polite">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="status-text">Offline</span>
+      </div>
+
+      <form id="connect-form" class="connect-form" autocomplete="off">
+        <label for="server">Server</label>
+        <input
+          id="server"
+          name="server"
+          type="text"
+          inputmode="url"
+          spellcheck="false"
+          placeholder="ws://localhost:7391"
+          value="ws://localhost:7391"
+        >
+        <button id="connect-button" type="submit" class="button primary">Connect</button>
+      </form>
+    </div>
+  </header>
+
+  <main class="page">
+    <section class="panel display-panel" aria-labelledby="display-heading">
+      <div class="panel-head">
+        <div>
+          <h2 id="display-heading">Display</h2>
+          <p id="definition-meta" class="muted">Waiting for a protobuf DisplayDefinition frame.</p>
+        </div>
+        <span id="stats" class="stats">0 frames · 0 updates</span>
+      </div>
+
+      <div id="empty-state" class="empty-state">
+        <div class="empty-icon" aria-hidden="true">◫</div>
+        <p>Waiting for the controller to send a display definition.</p>
+        <p class="muted small">
+          Start the controller screen server, then make sure the browser is pointed at
+          <code>ws://localhost:7391</code>.
+        </p>
+      </div>
+
+      <div id="screen" class="screen" hidden></div>
+    </section>
+
+    <section class="panel fields-panel" aria-labelledby="fields-heading">
+      <div class="panel-head">
+        <h2 id="fields-heading">Fields</h2>
+      </div>
+      <p id="fields-empty" class="muted">No definition field table yet.</p>
+      <div class="table-wrap">
+        <table id="fields-table" class="fields-table" hidden>
+          <thead>
+            <tr>
+              <th scope="col">Key</th>
+              <th scope="col">ID</th>
+              <th scope="col">Type</th>
+              <th scope="col">Value</th>
+            </tr>
+          </thead>
+          <tbody id="fields-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel log-panel" aria-labelledby="log-heading">
+      <div class="panel-head">
+        <h2 id="log-heading">Log</h2>
+        <button id="clear-log" type="button" class="button ghost">Clear</button>
+      </div>
+      <ol id="log" class="log" aria-live="polite"></ol>
+    </section>
+  </main>
+
+  <script type="module" src="client.js"></script>
+</body>
+</html>

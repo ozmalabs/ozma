@@ -15,9 +15,9 @@ use ozma_auth::{ConsentPolicy, MachineClass};
 use ozma_node::backend::SessionBackend;
 use ozma_node::transport::QuicRuntime;
 use ozma_protocol::{
-    ClientId, ControlMessage, InputEvent, KeyModifiers, NodeCapabilities, Permission,
+    ChannelKind, ClientId, ControlMessage, InputEvent, KeyModifiers, NodeCapabilities, Permission,
     PermissionSet, PointerButton, PointerMode, SessionEvent, SessionSpec, TrackId, TrackKind,
-    TrackSpec,
+    TrackSpec, WireFormat,
 };
 use ozma_transport::{
     ChannelId, ChannelMap, QuicClient, QuicTransport, SessionTransport, TransportEvent,
@@ -219,8 +219,10 @@ async fn native_quic_session_authenticates_and_streams_video() {
     let hello = ControlMessage::Hello {
         session_id: session.id.clone(),
         token: offer.token.clone(),
+        wire_formats: vec![WireFormat::Json],
         display: Some(ozma_protocol::scene::DisplayCapabilities {
             scene_versions: vec![1],
+            ..Default::default()
         }),
     };
     client
@@ -235,6 +237,7 @@ async fn native_quic_session_authenticates_and_streams_video() {
     match ack {
         ControlMessage::HelloAck {
             session: acknowledged,
+            wire_format,
             display,
         } => {
             let Some(ozma_protocol::scene::DisplayProfile::Scene {
@@ -244,6 +247,7 @@ async fn native_quic_session_authenticates_and_streams_video() {
             else {
                 panic!("expected a scene profile");
             };
+            assert_eq!(wire_format, WireFormat::Json);
             assert_eq!(version, 1);
             assert_eq!(initial_scene.revision, 0);
             assert_eq!(initial_scene.full_display.channel, ChannelId::VIDEO.raw());
@@ -332,6 +336,7 @@ async fn view_only_session_rejects_input() {
     let hello = ControlMessage::Hello {
         session_id: session.id.clone(),
         token: offer.token,
+        wire_formats: vec![WireFormat::Json],
         display: None,
     };
     client
@@ -368,6 +373,66 @@ async fn view_only_session_rejects_input() {
         }
         other => panic!("expected an input error, got {other:?}"),
     }
+
+    client.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn protobuf_scene_snapshot_travels_on_the_display_channel() {
+    use ozma_display_protocol::{scene_convert, DisplayMessage};
+
+    let backend = Arc::new(
+        SessionBackend::new(
+            NodeCapabilities::fake("quic-test"),
+            ConsentPolicy::for_machine(MachineClass::Server),
+        )
+        .with_scene_producer(Arc::new(TestSceneProducer)),
+    );
+    let permissions = PermissionSet::from_iter([Permission::View]);
+    let (mut client, session, offer) = connect(&backend, permissions, session_spec(false)).await;
+
+    // Resolve the Display channel from the negotiated map rather than assuming
+    // the conventional id.
+    let display = client
+        .channel_map()
+        .channel_for_kind(ChannelKind::Display)
+        .expect("the session channel map includes Display");
+
+    let hello = ControlMessage::Hello {
+        session_id: session.id.clone(),
+        token: offer.token.clone(),
+        wire_formats: vec![WireFormat::Protobuf, WireFormat::Json],
+        display: Some(ozma_protocol::scene::DisplayCapabilities {
+            scene_versions: vec![1],
+            ..Default::default()
+        }),
+    };
+    client
+        .send(
+            ChannelId::CONTROL,
+            Bytes::from(serde_json::to_vec(&hello).unwrap()),
+        )
+        .await
+        .unwrap();
+
+    match next_control(&mut client).await {
+        ControlMessage::HelloAck {
+            wire_format,
+            display: Some(ozma_protocol::scene::DisplayProfile::Scene { .. }),
+            ..
+        } => assert_eq!(wire_format, WireFormat::Protobuf),
+        other => panic!("expected a protobuf HelloAck with a scene profile, got {other:?}"),
+    }
+
+    let payload = wait_for_payload(&mut client, display, true).await;
+    let DisplayMessage::SceneSnapshot(snapshot) = DisplayMessage::decode(&payload).unwrap() else {
+        panic!("expected a SceneSnapshot on the Display channel");
+    };
+    assert_eq!(snapshot.revision, 1);
+    let commit = scene_convert::scene_commit_from_proto(&snapshot).unwrap();
+    assert_eq!(commit.revision, 1);
+    assert_eq!(commit.images[0].resource_id, 7);
+    assert_eq!(commit.images[0].y, 40);
 
     client.close().await.unwrap();
 }

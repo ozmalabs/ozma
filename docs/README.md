@@ -14,6 +14,8 @@ Technical documentation for the Ozma software-defined KVM fabric.
 - [Multi-seat plan](multi-seat-plan.md) — multiple users on one physical PC, each seat exposed as an Ozma node
 - [Node ↔ Hermes parity plan](node-hermes-parity.md) — Rust node feature parity, remote displays, session/media architecture, UX, roadmap
 - [Remote scene graph integration plan](remote-scene-integration.md) — native presentation, media resources, adaptive rendering, and compatibility
+- [Protobuf-core protocol plan](protobuf-core-plan.md) — protobuf negotiation/meta contract, JSON display definitions, field tables, and compact updates
+- [Display device adapters](display-device-adapters.md) — browser, SBC/e-ink, MCU, Stream Deck, MIDI/OSC, RGB, and native adapter guidance
 - [Parity matrix](parity-matrix.md) — Python → Rust parity gates, current evidence, and gaps
 - [Plan execution status](plan-execution-status.md) — what is merged and tested so far
 
