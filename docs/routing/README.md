@@ -16,10 +16,12 @@ specification are to be interpreted as described in
 
 ## Abstract
 
-Ozma is a software-defined KVMA router. This specification defines how
-signals — video, audio, peripherals, data, power, and control — are modelled,
-discovered, negotiated, and delivered across an arbitrarily complex graph of
-devices, transports, and conversions.
+Ozma is a general connection substrate whose graph models participants,
+features, connectivity, and the services that interpret or fulfil user intent.
+KVMA is one important use case. This specification defines how signals — video,
+audio, peripherals, data, power, and control — are modelled, discovered,
+negotiated, and delivered across an arbitrarily complex graph of devices,
+services, transports, and conversions.
 
 Every path through the system — from a keyboard through a USB cable, across a
 network, into a USB gadget on a target machine; from a wall outlet through a
@@ -27,8 +29,11 @@ UPS, PDU, and PSU to a CPU core; from a microphone through a mix bus, insert
 chain, and network transport to a remote speaker — is a graph of typed ports
 connected by links. Each link has measurable properties (bandwidth, latency,
 jitter, loss, voltage, current). Each port has discoverable capabilities
-(supported formats, maximum throughput, power budget). The router assembles
-the best pipeline through this graph to satisfy a declared **intent**.
+(supported formats, maximum throughput, power budget). A user or system
+declares an **intent** as a desired outcome, optionally with requirements or
+preferences. The graph resolves the intent against current state, routing it to
+interpreter or arbitrator services when needed, and assembles execution paths
+only after resolution. Intent is not a fixed pipeline recipe.
 
 This specification does not define wire formats or byte layouts — those live in
 individual protocol specs (`protocol/specs/`). This specification defines the

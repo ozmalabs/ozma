@@ -10,24 +10,88 @@ interpreted as described in [RFC 2119](https://www.ietf.org/rfc/rfc2119.txt).
 
 ## Abstract
 
-An intent declares what the user (or system) wants to achieve with a pipeline.
-Intents drive every routing decision -- they are not metadata, they are the
-primary input to the route calculator. This document specifies the intent
-structure, the built-in intents that MUST be available in every implementation,
-the rules for composing intents, degradation policies, and the extension
-mechanism for custom intents.
+An intent declares an outcome the user or system wants. It is a first-class
+object in Ozma, not a pipeline recipe: selecting a menu item expresses a desired
+outcome, and the graph resolves that intent against its current state. This
+document specifies intent requests and profiles, interpretation and resolution,
+the built-in structured profiles, composition, degradation policies, and
+extension mechanisms.
 
 ## Specification
 
 ### 3.1 Intent structure
 
+An intent request MUST preserve the desired outcome independently of any
+particular route, device, provider, codec, or transport selected to fulfil it.
+The intent remains stable while the graph may produce a different resolution
+as devices, links, features, services, measurements, or policy change.
+
+```yaml
+IntentRequest:
+  id: string                    # stable request identity
+  expression: IntentExpression # structured, free_text, or an extension kind
+  requirements: Requirement[]?  # optional hard requirements
+  preferences: Preference[]?   # optional ranking hints
+  context: ContextRef[]?        # optional user, application, target, or scene context
+  requested_by: ParticipantRef
+
+IntentExpression:
+  structured: StructuredIntent? # typed, machine-actionable expression
+  free_text: string?            # natural-language expression for an interpreter
+  extension: ExtensionValue?    # namespaced, discoverable expression type
+```
+
+`IntentExpression` has exactly one active form. A request MAY omit explicit
+requirements and preferences: the resolver may infer defaults from the intent,
+context, policy, and graph. If requirements are supplied, they constrain
+resolution; they do not prescribe the implementation route. For example,
+"put application X on screen Y" names an outcome. It does not require the user
+to select a codec, transport, capture node, or pipeline.
+
+Structured intents can be evaluated directly by a capable node or service.
+Free-text intents require an interpreter service that can convert the
+expression into a structured intent or a set of candidate outcomes. An
+interpreter is an ordinary graph participant with advertised features; it may
+be remote and need not share the user's local network. The graph routes the
+request to an eligible interpreter or arbitrator based on reachability,
+capability, policy, cost, and availability.
+
+Intent interpretation, resolution, and execution are distinct stages:
+
+1. **Interpretation** derives a structured request from the expression when
+   needed. It may ask for clarification or return multiple candidates.
+2. **Resolution** evaluates the request against graph state and returns a
+   proposal: outcomes, participating features and devices, unmet requirements,
+   alternatives, and an explanation. Resolution MAY be distributed across
+   interpreter, arbitrator, and domain services.
+3. **Execution** realizes an accepted resolution. It may assemble one or more
+   pipelines and invoke services or devices. The user intent remains the source
+   of truth; execution details are derived artefacts.
+
+Implementations MUST make the request and its resolution distinguishable in
+state and events. A graph change MAY invalidate a resolution and trigger a new
+one without changing the user's intent. Whether a revised resolution is
+automatically executed or requires renewed approval depends on policy and the
+intent's authorization requirements.
+
+The protocol substrate MUST provide stable, language-neutral framing and
+negotiation for exchanging intent requests, resolution proposals, decisions,
+and lifecycle events. Protobuf is the canonical schema and encoding for this
+core exchange. Intent kinds, feature identifiers, and extension payloads are
+open and namespaced; adding or removing an intent type MUST NOT require adding
+a closed enum value to the substrate. HTTP/JSON, browser, and compatibility
+bindings MAY expose equivalent representations. Media payloads continue to use
+transports suited to their timing and bandwidth requirements.
+
+### 3.2 Structured intent profile
+
 ```yaml
 Intent:
   name: string                  # identifier (built-in or user-defined)
   description: string           # human-readable purpose
-  streams: StreamIntent[]       # per-media-type requirements
-  priority: uint                # relative priority when resources are contended
-  degradation: DegradationPolicy # what to do when constraints can't be met
+  streams: StreamIntent[]?      # optional per-media-type requirements
+  priority: uint?               # relative priority when resources are contended
+  degradation: DegradationPolicy? # optional response when requirements cannot be met
 ```
 
 **StreamIntent**:
@@ -73,7 +137,7 @@ Preferences:
   prefer_higher_quality: bool?  # weight quality more heavily
 ```
 
-### 3.2 Built-in intents
+### 3.3 Built-in structured profiles
 
 The following standard intents MUST be available in every Ozma implementation.
 Users MAY modify their parameters or define entirely new intents.
@@ -325,7 +389,11 @@ streams:
     required: false
 ```
 
-### 3.3 Intent composition
+These profiles are reusable structured expressions or defaults, not a closed
+list of outcomes the substrate can carry. Implementations and plugins MAY
+register additional namespaced intent kinds without changing core negotiation.
+
+### 3.4 Intent composition
 
 Intents are composable. A user MAY want `control` + `fidelity_audio` (typing on
 a headless audio workstation). When intents are composed:
@@ -338,7 +406,7 @@ a headless audio workstation). When intents are composed:
 Composition produces a new synthetic intent that the router MUST treat
 identically to a named intent.
 
-### 3.4 Degradation policy
+### 3.5 Degradation policy
 
 When the graph cannot satisfy an intent's constraints, the degradation policy
 SHOULD be applied to determine what happens:
@@ -365,7 +433,7 @@ priorities. HID SHOULD almost never be degraded -- it is tiny bandwidth and
 critical for usability. Audio next. Video last (it has the most room to degrade
 gracefully).
 
-### 3.5 Custom intents
+### 3.6 Custom intents
 
 Users MAY define custom intents in the same YAML schema. Custom intents MAY
 extend or override built-in intents:

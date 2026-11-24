@@ -4,6 +4,38 @@ All protocol specifications live in `protocol/specs/`. This document summarises 
 
 All protocol versions are currently `0.1` — **unstable, breaking changes expected**.
 
+## Core substrate direction
+
+The core protocol is the stable, language-neutral contract for connecting
+participants and negotiating what they can do. The target canonical schema and
+encoding for connection negotiation, feature exchange, intent requests,
+resolution proposals, decisions, and lifecycle events is protobuf. This does
+not require every feature to be a built-in protobuf enum or every payload to
+use one transport.
+
+Feature and intent identifiers are open, namespaced values. Participants
+advertise the features they currently provide; features may be introduced,
+withdrawn, or implemented by plugins and external services without changing a
+closed core catalogue. The substrate defines how peers negotiate, identify,
+and safely carry extensions. Generic participants MAY forward unknown
+extensions when policy allows, without claiming to understand them.
+
+An intent describes a desired outcome, optionally with requirements or
+preferences. It does not prescribe a route. The graph routes requests to
+eligible interpreter or arbitrator services when needed, including remote
+services, then resolves the intent against current graph state. Structured
+intents can be handled directly by a capable participant; free-text intents
+require an interpreter feature. Resolution is a proposal derived from the
+intent and graph; execution is separate. Graph changes may trigger a new
+resolution while preserving the user's intent.
+
+REST/JSON, WebSocket, and browser APIs are bindings for management,
+compatibility, and browser use; they do not define a separate intent model.
+Media and other high-rate data continue to use transports selected for their
+requirements. This is the target architecture: existing protocol versions and
+bindings remain subject to their migration and compatibility rules, and this
+section does not claim current implementations already use protobuf.
+
 ---
 
 ## Security Envelope
