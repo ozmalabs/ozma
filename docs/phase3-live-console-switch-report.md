@@ -520,7 +520,8 @@ Routes and status:
 - `/api/v1/connection.hls` describes the active console's independent pipeline;
   the additive `multi_console_hls` object carries `enabled`, `provider`,
   `max_pipelines`, `idle_timeout_seconds`, `active_console`, any `limitation`,
-  and per-console `status`/`error`/`playlist`/`manifest_path`/`output_dir`.
+  and per-console `status`/`error`/`encoder`/`bitrate_kbps`/`playlist`/
+  `manifest_path`/`output_dir`.
 - `/display/info` (with or without `?console=`) adds the same per-console
   `multi_console_hls` object for the described console.
 - The controller proxies `/api/v1/streams/{node}/hls/{filename:path}`, so
@@ -528,6 +529,20 @@ Routes and status:
   work. `/api/v1/nodes/{node}/display` includes `multi_console_hls`; the
   dashboard lists running per-console playlists and follows the picker when
   that console is running.
+- `POST /codec` fans out to every running per-console pipeline (bounded by the
+  manager's `max_pipelines`) and to the active single `--hls` pipeline when one
+  is also running. `applied:true` is returned only when every targeted pipeline
+  restarted with the requested encoder and no software fallback. If a pipeline
+  fails, pipelines that already restarted are rolled back to their previous
+  encoder/bitrate; the response is a typed 502 with
+  `details.applied:false`, `details.rolled_back`, per-pipeline `pipelines`
+  results, and failing labels in `details.failed_consoles`. A failed rollback
+  reports `details.rolled_back:false` and `details.rollback_failed_consoles`;
+  partial success is never reported as full. With no running pipeline the
+  override is stored with `pending_restart:true`, preserving the single-HLS
+  contract. `GET /codec` and `/api/v1/connection.codec` add `pipelines` (encoder
+  and bitrate per active/per-console pipeline) and `fan_out` (enabled, running
+  count, last target count, applied/rollback state, failed labels).
 
 **Live smoke (2026-11-25, QEMU 11.1.3, Alpine 3.21, disposable two-head
 D-Bus).** Node command (abridged):
@@ -563,18 +578,48 @@ GET /display/info?console=1 -> console:1, active:false, 720x400,
 SIGTERM -> exit in ~200 ms, no surviving node/ffmpeg child
 ```
 
+**Codec fan-out live smoke (2026-11-25, QEMU 11.1.3, Alpine 3.21, disposable
+two-head D-Bus, Intel VAAPI).** The same two-head node command above was run
+with port 47961. Before the switch both playlists were `libx264` at 1000 kbps
+(`console-0` 1280x800, `console-1` 720x400). A controller-shaped request
+
+```bash
+curl -X POST http://127.0.0.1:47961/codec \
+  -H 'content-type: application/json' \
+  -d '{"codec":"hevc","bitrate":"800k"}'
+```
+
+selected `hevc_vaapi` and returned `applied:true`, `pending_restart:false`,
+`fan_out:{enabled:true,running:2,targeted:2,applied:true}`, and two
+`pipelines` entries with `status:"applied"` / `encoder:"hevc_vaapi"`. After the
+restart `GET /codec` and `/api/v1/connection` reported both per-console
+encoders as `hevc_vaapi` at 800 kbps, and fresh playlist segments from both
+`/stream/console-0/stream.m3u8` and `/stream/console-1/stream.m3u8` probed as:
+
+```text
+console-0 latest seg_00003.ts -> hevc 1280x800
+console-1 latest seg_00000.ts -> hevc  720x400
+```
+
+Both ffprobe checks passed; SIGTERM stopped the node and QEMU, and the temporary
+tree/ISO extraction was removed.
+
 Tests: `cargo test -p ozma-node` includes `multi_hls::tests` for two independent
 pipelines, the max bound/LRU rotation, single-head rejection, add/remove and
 shutdown cleanup, active selection without restart, idle eviction, per-console
-start errors, and the active/per-console stream routes. Controller pytest covers
-the per-console HLS proxy and `node/display` pass-through.
+start errors, the active/per-console stream routes, and codec fan-out (all
+pipelines, one failure plus rollback, failed rollback, no pipelines, active-only,
+hardware rejection, per-console encoders, and the extra active single-HLS path).
+Controller pytest covers the per-console HLS proxy, `node/display` pass-through,
+and the codec fan-out result pass-through.
 
 **Remaining per-console gaps.** WebRTC is still active-console only; this
 manager does not create simultaneous WebRTC sessions, and the dashboard still
-uses WebRTC first for the active console. `/codec` is not wired to fan out an
-encoder override across per-console pipelines (the single `HlsController` path
-keeps that behavior). The encoder budget is a pipeline count, not a measured
-GPU/CPU capacity model, so `--multi-console-hls-max` must be chosen for the
-host's real encode capacity. Idle eviction is driven by stream requests, not by
-playlist/segment reader counts. The controller UI links per-console playlists
-but does not yet render them side by side in the KVM modal.
+uses WebRTC first for the active console. `/codec` now fans out across the
+per-console HLS pipelines, but it still cannot switch WebRTC (and never claims
+to). The encoder budget is a pipeline count, not a measured GPU/CPU capacity
+model, so `--multi-console-hls-max` must be chosen for the host's real encode
+capacity; a codec fan-out restarts at most that many pipelines. Idle eviction is
+driven by stream requests, not by playlist/segment reader counts. The controller
+UI links per-console playlists but does not yet render them side by side in the
+KVM modal.

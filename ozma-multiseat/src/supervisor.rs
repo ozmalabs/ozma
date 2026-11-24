@@ -23,7 +23,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::error::MultiseatError;
-use crate::seat::{SeatPlan, SeatRuntimeStatus, SeatState};
+use crate::input::InputGroup;
+use crate::ownership::{DisplayOwnership, DisplayOwnershipController};
+use crate::routing::{InputRoutePlan, InputRouter, InputRoutingStrategy, InputTarget};
+use crate::seat::{
+    ResourceAction, ResourceKind, SeatPlan, SeatResourceStatus, SeatRuntimeStatus, SeatState,
+};
 
 /// Default node binary used by the planner and the process launcher.
 pub const DEFAULT_NODE_BIN: &str = "ozma-node";
@@ -340,6 +345,16 @@ pub struct SupervisorOptions {
     pub healthy_uptime: Duration,
     /// Record plans without spawning processes.
     pub dry_run: bool,
+    /// Apply each seat's xrandr output ownership before spawning.
+    ///
+    /// Off by default. When enabled without a controller, the seat fails with
+    /// a typed `Unsupported` error instead of spawning unowned.
+    pub apply_ownership: bool,
+    /// Apply each seat's xinput/evdev input routing before spawning.
+    ///
+    /// Off by default. The evdev strategy still requires an injected backend;
+    /// the default backend is typed unsupported.
+    pub apply_routing: bool,
 }
 
 impl Default for SupervisorOptions {
@@ -352,6 +367,8 @@ impl Default for SupervisorOptions {
             restart_backoff_max: DEFAULT_RESTART_BACKOFF_MAX,
             healthy_uptime: DEFAULT_HEALTHY_UPTIME,
             dry_run: false,
+            apply_ownership: false,
+            apply_routing: false,
         }
     }
 }
@@ -370,6 +387,10 @@ pub fn restart_delay(initial: Duration, max: Duration, attempt: u32) -> Duration
 
 struct ManagedSeat {
     launch: NodeLaunchSpec,
+    ownership: Option<DisplayOwnership>,
+    input: Option<InputGroup>,
+    input_route: Option<InputRoutePlan>,
+    resources: SeatResourceStatus,
     state: SeatState,
     child: Option<Box<dyn ChildHandle>>,
     pid: Option<u32>,
@@ -385,9 +406,13 @@ struct ManagedSeat {
 }
 
 impl ManagedSeat {
-    fn new(launch: NodeLaunchSpec) -> Self {
+    fn new(plan: &SeatPlan) -> Self {
         Self {
-            launch,
+            launch: NodeLaunchSpec::from_plan(plan),
+            ownership: plan.ownership.clone(),
+            input: plan.input.clone(),
+            input_route: plan.input_route.clone(),
+            resources: SeatResourceStatus::default(),
             state: SeatState::Planned,
             child: None,
             pid: None,
@@ -408,7 +433,8 @@ impl ManagedSeat {
     fn status(&self, now: Instant) -> SeatRuntimeStatus {
         let mut status = SeatRuntimeStatus::new(&self.launch.seat_id, self.state)
             .with_process(self.pid, self.launch.udp_port, self.launch.http_port)
-            .with_restarts(self.restarts());
+            .with_restarts(self.restarts())
+            .with_resources(self.resources.clone());
         status.last_error = self.last_error.clone();
         if let Some(next) = self.next_restart {
             status.next_restart_in_ms = Some(
@@ -430,6 +456,9 @@ pub struct ProcessSeatSupervisor {
     options: SupervisorOptions,
     launcher: Arc<dyn NodeLauncher>,
     probe: Arc<dyn ReadinessProbe>,
+    ownership: Option<Box<dyn DisplayOwnershipController>>,
+    routing: Option<Box<dyn InputRouter>>,
+    evdev_routing: Option<Box<dyn InputRouter>>,
     seats: BTreeMap<String, ManagedSeat>,
 }
 
@@ -453,8 +482,44 @@ impl ProcessSeatSupervisor {
             options,
             launcher,
             probe,
+            ownership: None,
+            routing: None,
+            evdev_routing: None,
             seats: BTreeMap::new(),
         }
+    }
+
+    /// Install the xrandr ownership controller used by
+    /// [`SupervisorOptions::apply_ownership`].
+    ///
+    /// Without a controller, an ownership-enabled start fails with a typed
+    /// `Unsupported` error before any child is spawned.
+    pub fn with_ownership_controller(
+        mut self,
+        controller: Box<dyn DisplayOwnershipController>,
+    ) -> Self {
+        self.ownership = Some(controller);
+        self
+    }
+
+    /// Install the xinput input router used by
+    /// [`SupervisorOptions::apply_routing`] for
+    /// [`InputRoutingStrategy::XInputMapToOutput`] seats.
+    pub fn with_routing_controller(mut self, router: Box<dyn InputRouter>) -> Self {
+        self.routing = Some(router);
+        self
+    }
+
+    /// Install the optional evdev router used by
+    /// [`InputRoutingStrategy::EvdevGrab`] seats.
+    ///
+    /// The production CLI deliberately installs the default
+    /// [`crate::routing::EvdevGrabRouter`] with its unsupported backend, so a
+    /// grab request fails with a typed `Unsupported` error instead of a fake
+    /// grab. Tests may inject a router backed by `FakeEvdevGrabBackend`.
+    pub fn with_evdev_routing_controller(mut self, router: Box<dyn InputRouter>) -> Self {
+        self.evdev_routing = Some(router);
+        self
     }
 
     /// Configuration in use.
@@ -465,6 +530,246 @@ impl ProcessSeatSupervisor {
     /// Number of tracked seats.
     pub fn seat_count(&self) -> usize {
         self.seats.len()
+    }
+
+    /// Apply both opt-in resources for one seat in deterministic order:
+    /// xrandr ownership first, then input routing.
+    fn apply_seat_resources(&mut self, seat_id: &str) -> Result<(), MultiseatError> {
+        if self.options.apply_ownership {
+            self.apply_ownership(seat_id)?;
+        }
+        if self.options.apply_routing {
+            if let Err(error) = self.apply_routing(seat_id) {
+                // The ownership applied a moment ago must not leak when
+                // routing cannot be reserved.
+                self.release_seat_resources(seat_id);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_ownership(&mut self, seat_id: &str) -> Result<(), MultiseatError> {
+        let ownership = {
+            let Some(seat) = self.seats.get(seat_id) else {
+                return Err(MultiseatError::UnknownSeat(seat_id.to_owned()));
+            };
+            if seat.resources.ownership_applied {
+                return Ok(());
+            }
+            seat.ownership.clone()
+        };
+        let Some(ownership) = ownership else {
+            return Ok(());
+        };
+
+        let result = match self.ownership.as_mut() {
+            Some(controller) => controller.apply(&ownership),
+            None => Err(MultiseatError::Unsupported(format!(
+                "seat {seat_id} requested display ownership but no xrandr ownership controller is configured"
+            ))),
+        };
+
+        match result {
+            Ok(()) => {
+                if let Some(seat) = self.seats.get_mut(seat_id) {
+                    seat.resources.ownership_applied = true;
+                    seat.resources.ownership_released = false;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                self.record_resource_error(
+                    seat_id,
+                    ResourceKind::Ownership,
+                    ResourceAction::Apply,
+                    &error.to_string(),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn apply_routing(&mut self, seat_id: &str) -> Result<(), MultiseatError> {
+        let (route, group) = {
+            let Some(seat) = self.seats.get(seat_id) else {
+                return Err(MultiseatError::UnknownSeat(seat_id.to_owned()));
+            };
+            if seat.resources.routing_applied {
+                return Ok(());
+            }
+            (seat.input_route.clone(), seat.input.clone())
+        };
+        let Some(route) = route else {
+            return Ok(());
+        };
+        let Some(group) = group else {
+            let error = MultiseatError::InputRouting(format!(
+                "seat {seat_id} has an input route but no assigned input group"
+            ));
+            self.record_resource_error(
+                seat_id,
+                ResourceKind::Routing,
+                ResourceAction::Apply,
+                &error.to_string(),
+            );
+            return Err(error);
+        };
+
+        let target = match InputTarget::new(&route.seat_id, &route.display_output, &route.x_screen)
+        {
+            Ok(target) => target,
+            Err(error) => {
+                self.record_resource_error(
+                    seat_id,
+                    ResourceKind::Routing,
+                    ResourceAction::Apply,
+                    &error.to_string(),
+                );
+                return Err(error);
+            }
+        };
+
+        let result = match route.strategy {
+            InputRoutingStrategy::XInputMapToOutput => match self.routing.as_mut() {
+                Some(router) => router.assign(&group, &target).map(|_| ()),
+                None => Err(MultiseatError::Unsupported(format!(
+                    "seat {seat_id} requested xinput routing but no input router is configured"
+                ))),
+            },
+            InputRoutingStrategy::EvdevGrab => match self.evdev_routing.as_mut() {
+                Some(router) => router.assign(&group, &target).map(|_| ()),
+                None => Err(MultiseatError::Unsupported(format!(
+                    "seat {seat_id} requested evdev routing but no evdev backend is configured; \
+                     the default backend is unsupported"
+                ))),
+            },
+        };
+
+        match result {
+            Ok(()) => {
+                if let Some(seat) = self.seats.get_mut(seat_id) {
+                    seat.resources.routing_applied = true;
+                    seat.resources.routing_released = false;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                self.record_resource_error(
+                    seat_id,
+                    ResourceKind::Routing,
+                    ResourceAction::Apply,
+                    &error.to_string(),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    /// Release both resources for one seat, best effort.
+    ///
+    /// Routing is released before ownership (reverse of apply order). A
+    /// release failure leaves the applied flag set, records a typed error, and
+    /// does not hide the seat's lifecycle state.
+    fn release_seat_resources(&mut self, seat_id: &str) {
+        let Some((routing_applied, ownership_applied, strategy)) =
+            self.seats.get(seat_id).map(|seat| {
+                (
+                    seat.resources.routing_applied,
+                    seat.resources.ownership_applied,
+                    seat.input_route
+                        .as_ref()
+                        .map(|route| route.strategy)
+                        .unwrap_or(InputRoutingStrategy::XInputMapToOutput),
+                )
+            })
+        else {
+            return;
+        };
+
+        if routing_applied {
+            let result = match strategy {
+                InputRoutingStrategy::XInputMapToOutput => match self.routing.as_mut() {
+                    Some(router) => router.release(seat_id).map(|_| ()),
+                    None => Err(MultiseatError::Unsupported(format!(
+                        "seat {seat_id} has an applied xinput route but no input router is configured"
+                    ))),
+                },
+                InputRoutingStrategy::EvdevGrab => match self.evdev_routing.as_mut() {
+                    Some(router) => router.release(seat_id).map(|_| ()),
+                    None => Err(MultiseatError::Unsupported(format!(
+                        "seat {seat_id} has an applied evdev route but no evdev backend is configured"
+                    ))),
+                },
+            };
+            match result {
+                Ok(()) => {
+                    if let Some(seat) = self.seats.get_mut(seat_id) {
+                        seat.resources.routing_applied = false;
+                        seat.resources.routing_released = true;
+                    }
+                }
+                Err(error) => self.record_resource_error(
+                    seat_id,
+                    ResourceKind::Routing,
+                    ResourceAction::Release,
+                    &error.to_string(),
+                ),
+            }
+        }
+
+        if ownership_applied {
+            let result = match self.ownership.as_mut() {
+                Some(controller) => controller.release(seat_id),
+                None => Err(MultiseatError::Unsupported(format!(
+                    "seat {seat_id} has applied display ownership but no ownership controller is configured"
+                ))),
+            };
+            match result {
+                Ok(()) => {
+                    if let Some(seat) = self.seats.get_mut(seat_id) {
+                        seat.resources.ownership_applied = false;
+                        seat.resources.ownership_released = true;
+                    }
+                }
+                Err(error) => self.record_resource_error(
+                    seat_id,
+                    ResourceKind::Ownership,
+                    ResourceAction::Release,
+                    &error.to_string(),
+                ),
+            }
+        }
+    }
+
+    /// Release every applied resource in reverse seat order.
+    ///
+    /// Used when a later seat cannot reserve its resources: earlier seats are
+    /// released before the start attempt fails, so a partially applied seat set
+    /// is not left behind. Child processes are not touched here.
+    fn rollback_applied_resources(&mut self) {
+        let mut seat_ids: Vec<String> = self
+            .seats
+            .iter()
+            .filter(|(_, seat)| seat.resources.ownership_applied || seat.resources.routing_applied)
+            .map(|(seat_id, _)| seat_id.clone())
+            .collect();
+        seat_ids.reverse();
+        for seat_id in seat_ids {
+            self.release_seat_resources(&seat_id);
+        }
+    }
+
+    fn record_resource_error(
+        &mut self,
+        seat_id: &str,
+        kind: ResourceKind,
+        action: ResourceAction,
+        message: &str,
+    ) {
+        if let Some(seat) = self.seats.get_mut(seat_id) {
+            seat.resources.push_error(kind, action, message);
+        }
     }
 
     /// Poll children and start any restart whose backoff has elapsed.
@@ -543,6 +848,17 @@ impl ProcessSeatSupervisor {
                     && seat.next_restart.is_some_and(|at| at <= now)
             });
             if due {
+                // A restart re-applies resources only when they were released
+                // by a previous failed attempt; an already-applied resource is
+                // left in place. A failed re-apply is reported and backed off.
+                if let Err(error) = self.apply_seat_resources(&seat_id) {
+                    let text = error.to_string();
+                    let seat = self.seats.get_mut(&seat_id).expect("tracked seat");
+                    seat.last_error = Some(text.clone());
+                    seat.message = None;
+                    schedule_restart(&self.options, seat, now);
+                    continue;
+                }
                 // A failed restart schedules the next backoff internally.
                 let _ = self.launch_once(&seat_id, now);
             }
@@ -550,8 +866,16 @@ impl ProcessSeatSupervisor {
     }
 
     /// Stop a seat and forget it. Unknown ids are an error.
+    ///
+    /// If a best-effort resource release fails, the seat is retained in
+    /// `stopped` state with the typed error in `resources.errors` so a later
+    /// `remove` can retry the release. Forgetting the seat would otherwise drop
+    /// the only handle to still-applied ownership/routing.
     pub fn remove(&mut self, seat_id: &str) -> Result<SeatRuntimeStatus, MultiseatError> {
         let status = self.stop(seat_id)?;
+        if status.resources.ownership_applied || status.resources.routing_applied {
+            return Ok(status);
+        }
         self.seats.remove(seat_id);
         Ok(status)
     }
@@ -717,8 +1041,16 @@ impl ProcessSeatSupervisor {
             let seat = self
                 .seats
                 .entry(seat_id.clone())
-                .or_insert_with(|| ManagedSeat::new(spec.clone()));
+                .or_insert_with(|| ManagedSeat::new(plan));
             seat.launch = spec;
+            seat.ownership = plan.ownership.clone();
+            seat.input = plan.input.clone();
+            seat.input_route = plan.input_route.clone();
+            // A fresh start after stop/release begins a new resource cycle;
+            // keep applied state when this is a retry of the same reservation.
+            if !seat.resources.ownership_applied && !seat.resources.routing_applied {
+                seat.resources = SeatResourceStatus::default();
+            }
             seat.state = SeatState::Starting;
             seat.next_restart = None;
             seat.failures = 0;
@@ -729,23 +1061,65 @@ impl ProcessSeatSupervisor {
             if self.options.dry_run {
                 seat.state = SeatState::Planned;
                 seat.pid = None;
-                seat.message = Some(format!(
+                let mut message = format!(
                     "dry-run: would launch {} ({})",
                     seat.launch.program, seat.launch.http_port
-                ));
+                );
+                if self.options.apply_ownership && seat.ownership.is_some() {
+                    message.push_str("; would apply xrandr ownership");
+                }
+                if self.options.apply_routing && seat.input_route.is_some() {
+                    message.push_str("; would apply input routing");
+                }
+                seat.message = Some(message);
                 return Ok(seat.status(now));
+            }
+        }
+
+        // Opt-in resources are reserved before the child exists. An apply
+        // failure never spawns this seat, and earlier seats are rolled back so
+        // a partially applied seat set is not left behind.
+        if self.options.apply_ownership || self.options.apply_routing {
+            if let Err(error) = self.apply_seat_resources(&seat_id) {
+                self.release_seat_resources(&seat_id);
+                self.rollback_applied_resources();
+                let text = error.to_string();
+                let seat = self.seats.get_mut(&seat_id).expect("tracked seat");
+                seat.child = None;
+                seat.pid = None;
+                seat.started_at = None;
+                seat.state = SeatState::Failed;
+                seat.next_restart = None;
+                seat.last_error = Some(text);
+                seat.message = None;
+                return Err(error);
             }
         }
 
         // A start attempt owns the spawn/readiness sequence. On failure the
         // seat is retained in `failed` state with a scheduled restart so a
         // caller can either tick or retry explicitly.
-        self.launch_once(&seat_id, now)?;
-
-        self.seats
-            .get(&seat_id)
-            .map(|seat| seat.status(now))
-            .ok_or_else(|| MultiseatError::UnknownSeat(seat_id))
+        match self.launch_once(&seat_id, now) {
+            Ok(()) => self
+                .seats
+                .get(&seat_id)
+                .map(|seat| seat.status(now))
+                .ok_or_else(|| MultiseatError::UnknownSeat(seat_id)),
+            Err(error) => {
+                // A child that never became ready must not keep ownership or
+                // pointer mappings reserved. If cleanup failed, the handle is
+                // retained and the resource stays reserved until a later stop
+                // reaps the child.
+                let child_retained = self
+                    .seats
+                    .get(&seat_id)
+                    .is_some_and(|seat| seat.child.is_some());
+                if !child_retained {
+                    self.release_seat_resources(&seat_id);
+                }
+                Err(error)
+            }
+        }
     }
 }
 
@@ -756,6 +1130,9 @@ impl Drop for ProcessSeatSupervisor {
                 let _ = child.terminate();
             }
         }
+        // Best-effort shutdown release; errors are dropped with the
+        // supervisor. `stop`/`stop_all` surface them in status first.
+        self.rollback_applied_resources();
     }
 }
 
@@ -766,23 +1143,32 @@ impl SeatSupervisor for ProcessSeatSupervisor {
 
     fn stop(&mut self, seat_id: &str) -> Result<SeatRuntimeStatus, MultiseatError> {
         let now = Instant::now();
-        let seat = self
-            .seats
-            .get_mut(seat_id)
-            .ok_or_else(|| MultiseatError::UnknownSeat(seat_id.to_owned()))?;
+        if !self.seats.contains_key(seat_id) {
+            return Err(MultiseatError::UnknownSeat(seat_id.to_owned()));
+        }
 
-        if let Some(mut child) = seat.child.take() {
-            if let Err(error) = child.terminate() {
-                let text = error.to_string();
-                // Keep the handle so Drop or a later stop can retry cleanup.
-                seat.child = Some(child);
-                seat.state = SeatState::Failed;
-                seat.last_error = Some(text.clone());
-                seat.next_restart = None;
-                return Err(MultiseatError::Supervisor(text));
+        {
+            let seat = self.seats.get_mut(seat_id).expect("tracked seat");
+            if let Some(mut child) = seat.child.take() {
+                if let Err(error) = child.terminate() {
+                    let text = error.to_string();
+                    // Keep the handle so Drop or a later stop can retry
+                    // cleanup. Resources stay reserved while the child may
+                    // still be alive.
+                    seat.child = Some(child);
+                    seat.state = SeatState::Failed;
+                    seat.last_error = Some(text.clone());
+                    seat.next_restart = None;
+                    return Err(MultiseatError::Supervisor(text));
+                }
             }
         }
 
+        // Child is gone: release routing before ownership. Failures are
+        // best-effort and remain visible in `resources.errors`.
+        self.release_seat_resources(seat_id);
+
+        let seat = self.seats.get_mut(seat_id).expect("tracked seat");
         seat.pid = None;
         seat.state = SeatState::Stopped;
         seat.started_at = None;

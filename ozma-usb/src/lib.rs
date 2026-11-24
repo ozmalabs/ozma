@@ -26,16 +26,18 @@
 //! * [`SubprocessUsbController`] provides the USB/IP system-tool fallback with
 //!   a [`CommandRunner`] and argv-only, shell-free execution.
 //! * [`UsbIpConfig`] / [`UsbIpState`] and [`SubprocessUsbIpController`] model
-//!   USB/IP enablement, host/port, local exports, remote attachments, and
-//!   host/token authorization without a shell.
+//!   USB/IP enablement, host/port, local exports, remote attachments, host and
+//!   token authorization, peer key-fingerprint pairing, bounded hotplug events,
+//!   and a fail-closed TLS-required policy without a shell.
 //! * [`Fat32ImageBuilder`] creates a bounded, read-only FAT32 image in memory
 //!   from files/directories; [`parse_fat32_image`] validates one read-only.
 //!   [`WriteOverlay`] layers a bounded, copy-on-write block cache with
 //!   checksummed persistent commits over an immutable FAT32/raw base.
 //! * [`IsoImage`] inspects existing ISO 9660 images read-only, and
 //!   [`NbdExport`] / [`NbdRequest`] model NBD exports and framing.
-//! * [`NbdServer`] serves a regular-file or in-memory image over a bounded
-//!   fixed-newstyle TCP/Unix NBD listener with an injectable transport/clock.
+//! * [`NbdServer`] serves a regular-file, in-memory, or overlay-backed image
+//!   over a bounded fixed-newstyle TCP/Unix NBD listener with an injectable
+//!   transport/clock; writable exports never modify their base image.
 //!
 //! No code in this crate uses `unsafe`, mounts a filesystem, opens a block
 //! device, writes a block device, or creates a real USB gadget. The ConfigFS
@@ -149,8 +151,9 @@ pub use nbd::{
 };
 pub use nbd_server::{
     serve_session, ManualClock, NbdBackend, NbdClock, NbdExportCatalog, NbdExportSource,
-    NbdFileImage, NbdMemoryImage, NbdServer, NbdServerConfig, NbdServerHandle, NbdServerStats,
-    NbdSessionEnd, NbdSessionOutcome, NbdTransport, SystemClock,
+    NbdFileImage, NbdMemoryImage, NbdOverlayBackend, NbdOverlayPolicy, NbdOverlayStatus, NbdServer,
+    NbdServerConfig, NbdServerHandle, NbdServerStats, NbdSessionEnd, NbdSessionOutcome,
+    NbdTransport, SystemClock,
 };
 pub use overlay::{
     OverlayConfig, OverlayWriteReport, WriteOverlay, OVERLAY_DEFAULT_BLOCK_SIZE,
@@ -170,5 +173,6 @@ pub use uac2::{
 };
 pub use usbip::{
     SubprocessUsbIpController, UsbIpAttachment, UsbIpAuthorization, UsbIpConfig, UsbIpController,
-    UsbIpKey, UsbIpState, UsbIpToken, DEFAULT_USBIP_PORT,
+    UsbIpHotplugEvent, UsbIpHotplugKind, UsbIpHotplugLog, UsbIpKey, UsbIpPeerGrant, UsbIpState,
+    UsbIpTlsPolicy, UsbIpTlsStatus, UsbIpToken, DEFAULT_USBIP_PORT, MAX_USBIP_HOTPLUG_EVENTS,
 };

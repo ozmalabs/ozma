@@ -50,6 +50,8 @@ fn options() -> SupervisorOptions {
         restart_backoff_max: Duration::from_millis(40),
         healthy_uptime: Duration::from_secs(30),
         dry_run: false,
+        apply_ownership: false,
+        apply_routing: false,
     }
 }
 

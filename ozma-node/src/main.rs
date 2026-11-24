@@ -49,7 +49,9 @@ use ozma_node::{
     keyboard_layout::KeyboardLayout,
     mdns,
     multi_hls::{MultiConsoleHls, MultiConsoleHlsConfig},
-    platform, registration, shutdown, usb_audio,
+    platform, registration, shutdown,
+    software::report::{InventoryReporter, DEFAULT_REPORT_INTERVAL},
+    usb_audio,
     webrtc::{WebRtcAudioBackend, WebRtcConfig, WebRtcControl, WebRtcHelper},
 };
 
@@ -1632,7 +1634,7 @@ async fn run() -> std::process::ExitCode {
     // session backend. When HLS is running, POST /codec restarts the HLS
     // pipeline with the selected software encoder; when HLS is off the override
     // is stored for a future start. WebRTC keeps its existing encoder.
-    let codec_control = if config.has_capability("video") && !capabilities.encode.is_empty() {
+    let mut codec_control = if config.has_capability("video") && !capabilities.encode.is_empty() {
         let detected = ozma_encode::EncoderRegistry::with_detected_encoders_for_device(Some(
             config.vaapi_device.as_path(),
         ))
@@ -1791,6 +1793,9 @@ async fn run() -> std::process::ExitCode {
     } else {
         None
     };
+    if let Some(control) = codec_control.take() {
+        codec_control = Some(control.with_multi_console_hls(multi_console_hls.clone()));
+    }
     if let (Some(control), Some(manager)) = (display_control.take(), multi_console_hls.clone()) {
         display_control = Some(control.with_observer(std::sync::Arc::new(manager)));
     }
@@ -2034,8 +2039,12 @@ async fn run() -> std::process::ExitCode {
             Err(error) => error!("Direct registration failed: {error}"),
         }
 
-        let url = url.clone();
-        let node_id = node_id.clone();
+        // Prepare both controller loops before either spawned future takes
+        // ownership of the URL/node-id values.
+        let software_url = url.clone();
+        let software_host = node_id.to_string();
+        let heartbeat_url = url.clone();
+        let heartbeat_node_id = node_id.clone();
         let interval = config.heartbeat_interval_secs;
         let heartbeat_shutdown = shutdown.clone();
         background.push((
@@ -2043,8 +2052,33 @@ async fn run() -> std::process::ExitCode {
             tokio::spawn(async move {
                 tokio::select! {
                     _ = heartbeat_shutdown.cancelled() => {}
-                    _ = registration::heartbeat_loop(&url, node_id.as_str(), interval) => {}
+                    _ = registration::heartbeat_loop(
+                        &heartbeat_url,
+                        heartbeat_node_id.as_str(),
+                        interval,
+                    ) => {}
                 }
+            }),
+        ));
+
+        // Fleet software inventory. Steam, the Microsoft Store, and native
+        // package managers are sources of installed software; the controller
+        // stores one latest snapshot per host. Vendor-managed records are
+        // reported as external_managed and are never patched in place.
+        let software_shutdown = shutdown.clone();
+        background.push((
+            "software-inventory",
+            tokio::spawn(async move {
+                let reporter = match InventoryReporter::new(software_url, software_host) {
+                    Ok(reporter) => reporter,
+                    Err(error) => {
+                        error!("Software inventory reporter disabled: {error}");
+                        return;
+                    }
+                };
+                reporter
+                    .run(DEFAULT_REPORT_INTERVAL, software_shutdown)
+                    .await;
             }),
         ));
     }

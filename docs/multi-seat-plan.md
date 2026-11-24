@@ -26,22 +26,27 @@ input-routing/display-ownership command layers, as documented in
   isolation.
 - `ProcessSeatSupervisor`: spawn the planned node argv/environment, wait for
   `/health` or a bounded port check, restart with bounded exponential backoff,
-  stop/reap, and report pid/ports/state/restarts/last error.
+  stop/reap, and report pid/ports/state/restarts/last error. With the default-off
+  `--apply-ownership`/`--apply-routing` flags it also applies xrandr ownership
+  and xinput/evdev routing before spawn, refuses to spawn on an apply failure,
+  releases earlier seats, and releases resources on stop/remove/shutdown.
 - `ozma-multiseat` CLI: enumerate topology, print/validate the plan, dry-run,
   or supervise seats, with optional loopback `/status`, `/metrics`, and
-  `/health`.
+  `/health` and opt-in ownership/routing application.
 - Controller capability/status shape where one seat is one node, plus bounded
   Prometheus metrics.
 
 Not yet delivered: node/controller integration, true per-seat screen isolation
 (separate X screens, per-seat compositor/X server, DRM leasing, Wayland),
-automatic execution of routing/ownership commands, real privileged evdev grabs
-and udev/input-device policy, per-seat uinput targeting at the display layer,
-audio sink creation, hotplug/persistence, game launch, per-seat streaming,
-supervisor isolation (cgroups/namespaces/log rotation), or any Windows
-(DXGI/IDD/Raw Input/WASAPI) path. The phase timeline below is unchanged; the
-Rust crate covers the planner/backends, subprocess supervision, and command
-models of Phase 1, not the full Phase 1 deliverable.
+real privileged evdev grabs and udev/input-device policy, per-seat uinput
+targeting at the display layer, audio sink creation, hotplug/persistence, game
+launch, per-seat streaming, supervisor isolation (cgroups/namespaces/log
+rotation), or any Windows (DXGI/IDD/Raw Input/WASAPI) path. The ownership/routing
+commands are executable only through the explicit opt-in supervisor flags; there
+is no manager policy, reconciliation, or automatic hotplug path. The phase
+timeline below is unchanged; the Rust crate covers the planner/backends,
+subprocess supervision, and opt-in command execution of Phase 1, not the full
+Phase 1 deliverable.
 
 ## Architecture
 

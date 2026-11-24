@@ -51,9 +51,9 @@ use ozma_protocol::{
 use ozma_usb::MediaFormat as UsbMediaFormat;
 use ozma_usb::{
     is_safe_identifier, FunctionFsStatus, FunctionStatus, GadgetStatus, MassStorageImage,
-    MediaState, NbdExportCatalog, NbdExportSource, NbdServer, NbdServerConfig, NbdServerHandle,
-    NbdServerStats, Uac2Status, UsbError, UsbFunctionKind, UsbGadgetCapabilities,
-    UsbGadgetController, VirtualMedia,
+    MediaState, NbdExportCatalog, NbdExportSource, NbdOverlayPolicy, NbdServer, NbdServerConfig,
+    NbdServerHandle, NbdServerStats, OverlayConfig, Uac2Status, UsbError, UsbFunctionKind,
+    UsbGadgetCapabilities, UsbGadgetController, VirtualMedia,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -68,7 +68,10 @@ use crate::keyboard_layout::{
     key_event, resolve_compose_sequence, resolve_dead_key_sequence, CharOutcome, KeyChord,
     KeyboardLayout,
 };
-use crate::multi_hls::{ConsoleHlsStreamStatus, MultiConsoleHls, MultiConsoleHlsStatus};
+use crate::multi_hls::{
+    CodecFanoutTarget, ConsoleHlsStreamStatus, ControllerHlsPipeline, MultiConsoleCodecOutcome,
+    MultiConsoleHls, MultiConsoleHlsStatus,
+};
 use crate::webrtc::{WebRtcControl, WebRtcError};
 
 /// HID packet type for an 8-byte boot keyboard report.
@@ -522,12 +525,64 @@ pub async fn run_hid_listener(
 ///
 /// Controller-facing codec state.
 ///
+/// One HLS pipeline as reported by `GET /codec`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct CodecPipelineStatus {
+    /// `active` for the single `--hls` path or `console-<N>` for a per-console
+    /// pipeline.
+    pub id: String,
+    /// `active-hls` or `per-console-hls`.
+    pub kind: String,
+    /// Console index for a per-console pipeline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub console: Option<u32>,
+    /// True for the active console / active single stream.
+    pub active: bool,
+    /// Pipeline status (`running`, `failed`, `not-started`, ...).
+    pub status: String,
+    /// Encoder this pipeline currently runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoder: Option<String>,
+    /// Bitrate this pipeline currently targets, in kbps.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bitrate_kbps: Option<u32>,
+}
+
+/// Last codec fan-out state for `GET /codec`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct CodecFanOutStatus {
+    /// A per-console HLS manager is attached.
+    pub enabled: bool,
+    /// Running per-console pipelines right now.
+    pub running: usize,
+    /// Pipelines targeted by the last fan-out request.
+    pub targeted: usize,
+    /// True only when the last fan-out restarted every target with the
+    /// requested encoder and no fallback.
+    pub applied: bool,
+    /// Rollback result of the last failed fan-out; `null` before a failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rolled_back: Option<bool>,
+    /// Pipeline labels that failed the last fan-out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<String>,
+    /// Pipeline labels whose rollback failed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rollback_failed: Vec<String>,
+    /// First failure/rollback message from the last fan-out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// `current_encoder` and `available` describe the encoders the node can
 /// actually run. `override` is the accepted request, `receipt` is the policy
 /// evaluation that was stored with it, and `pending_restart` says the running
 /// HLS pipeline has **not** restarted into that selection yet. `applied` is
-/// true only after a real HLS restart succeeded. WebRTC keeps its existing
-/// encoder; neither `applied` nor `current_encoder` claims a WebRTC switch.
+/// true only after every targeted HLS pipeline restarted with the requested
+/// encoder. `pipelines` names the encoder each active/per-console pipeline runs,
+/// and `fan_out` reports the last multi-console fan-out result. WebRTC keeps its
+/// existing encoder; neither `applied` nor `current_encoder` claims a WebRTC
+/// switch.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct CodecStatus {
     /// The encoder currently used by the HLS pipeline, or `null` with no video.
@@ -568,8 +623,15 @@ pub struct CodecStatus {
     pub receipt: Option<OverrideReceipt>,
     /// True while a stored override has not been applied by a pipeline restart.
     pub pending_restart: bool,
-    /// True only when the HLS pipeline restarted with the selected encoder.
+    /// True only when every targeted HLS pipeline restarted with the requested
+    /// encoder (no fallback, no partial success).
     pub applied: bool,
+    /// Encoder/status for each active or per-console HLS pipeline.
+    #[serde(default)]
+    pub pipelines: Vec<CodecPipelineStatus>,
+    /// Last per-console fan-out state.
+    #[serde(default)]
+    pub fan_out: CodecFanOutStatus,
 }
 
 impl CodecStatus {
@@ -596,6 +658,8 @@ impl CodecStatus {
             receipt: None,
             pending_restart: false,
             applied: false,
+            pipelines: Vec::new(),
+            fan_out: CodecFanOutStatus::default(),
         }
     }
 }
@@ -640,6 +704,7 @@ pub struct CodecControl {
     state: Arc<Mutex<StoredCodecState>>,
     format: MediaFormat,
     hls: Option<HlsController>,
+    multi_console_hls: Option<MultiConsoleHls>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -647,6 +712,21 @@ struct StoredCodecState {
     override_state: CodecOverrideState,
     /// The HLS encoder the running pipeline was actually restarted into.
     applied_encoder: Option<HlsEncoder>,
+    /// True only when the last apply restarted every target with the requested
+    /// encoder (no fallback).
+    applied_ok: bool,
+    /// Last fan-out result, retained for `GET /codec`.
+    fan_out: Option<StoredFanOut>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct StoredFanOut {
+    targeted: usize,
+    applied: bool,
+    rolled_back: Option<bool>,
+    failed: Vec<String>,
+    rollback_failed: Vec<String>,
+    error: Option<String>,
 }
 
 impl CodecControl {
@@ -657,6 +737,7 @@ impl CodecControl {
             state: Arc::new(Mutex::new(StoredCodecState::default())),
             format,
             hls: None,
+            multi_console_hls: None,
         }
     }
 
@@ -676,6 +757,13 @@ impl CodecControl {
         self
     }
 
+    /// Attach the bounded per-console HLS manager that `POST /codec` fans out
+    /// to. `None` keeps the historical single active-HLS behavior.
+    pub fn with_multi_console_hls(mut self, manager: Option<MultiConsoleHls>) -> Self {
+        self.multi_console_hls = manager;
+        self
+    }
+
     /// The registry this control evaluates against.
     pub fn registry(&self) -> &EncoderRegistry {
         &self.registry
@@ -691,6 +779,10 @@ impl CodecControl {
 
     /// Status derived from the registry, stored override state, and applied HLS
     /// encoder.
+    ///
+    /// This synchronous form includes the active single-HLS pipeline and the
+    /// last stored fan-out result. [`Self::status_async`] additionally reads the
+    /// live per-console manager, so the HTTP routes use that form.
     pub fn status(&self) -> CodecStatus {
         let available = video_codec_names(
             self.registry
@@ -747,6 +839,39 @@ impl CodecControl {
         } else {
             vec!["yuv420p".to_owned()]
         };
+        let pipelines = self
+            .hls
+            .as_ref()
+            .map(|hls| {
+                let status = hls.status();
+                let config = hls.config();
+                vec![CodecPipelineStatus {
+                    id: "active".to_owned(),
+                    kind: "active-hls".to_owned(),
+                    console: None,
+                    active: true,
+                    status: status.status_name().to_owned(),
+                    encoder: Some(config.video_encoder.ffmpeg_name().to_owned()),
+                    bitrate_kbps: Some(config.bitrate_kbps),
+                }]
+            })
+            .unwrap_or_default();
+        let fan_out = match state.fan_out.as_ref() {
+            Some(fan_out) => CodecFanOutStatus {
+                enabled: self.multi_console_hls.is_some(),
+                running: 0,
+                targeted: fan_out.targeted,
+                applied: fan_out.applied,
+                rolled_back: fan_out.rolled_back,
+                failed: fan_out.failed.clone(),
+                rollback_failed: fan_out.rollback_failed.clone(),
+                error: fan_out.error.clone(),
+            },
+            None => CodecFanOutStatus {
+                enabled: self.multi_console_hls.is_some(),
+                ..CodecFanOutStatus::default()
+            },
+        };
         CodecStatus {
             current_encoder: applied.clone().or(fallback_encoder),
             override_setting: state.override_state.requested,
@@ -760,8 +885,41 @@ impl CodecControl {
             nvenc_gpu: hls_config.as_ref().and_then(|config| config.nvenc_gpu),
             receipt: state.override_state.receipt,
             pending_restart,
-            applied: applied.is_some(),
+            applied: applied.is_some() && state.applied_ok,
+            pipelines,
+            fan_out,
         }
+    }
+
+    /// Live status including every per-console HLS pipeline.
+    pub async fn status_async(&self) -> CodecStatus {
+        let mut status = self.status();
+        let Some(manager) = self.multi_console_hls.as_ref() else {
+            return status;
+        };
+        let manager_status = manager.status().await;
+        status.fan_out.enabled = true;
+        status.fan_out.running = manager.running_pipeline_count().await;
+        status
+            .pipelines
+            .retain(|pipeline| pipeline.kind != "per-console-hls");
+        status
+            .pipelines
+            .extend(
+                manager_status
+                    .consoles
+                    .into_iter()
+                    .map(|console| CodecPipelineStatus {
+                        id: format!("console-{}", console.console),
+                        kind: "per-console-hls".to_owned(),
+                        console: Some(console.console),
+                        active: console.active,
+                        status: console.status,
+                        encoder: console.encoder,
+                        bitrate_kbps: console.bitrate_kbps,
+                    }),
+            );
+        status
     }
 
     /// Evaluate and store a controller codec request, restarting HLS when it is
@@ -795,8 +953,13 @@ impl CodecControl {
         let selected_backend = selected_capability
             .map(|capability| backend_name(capability.backend))
             .unwrap_or("software");
-        let running = self.hls.as_ref().is_some_and(HlsController::is_running);
-        if !running {
+        let single_running = self.hls.as_ref().is_some_and(HlsController::is_running);
+        let manager_running = match self.multi_console_hls.as_ref() {
+            Some(manager) => manager.has_running_pipelines().await,
+            None => false,
+        };
+
+        if !single_running && !manager_running {
             let hls_status = self
                 .hls
                 .as_ref()
@@ -805,6 +968,15 @@ impl CodecControl {
             *lock(&self.state) = StoredCodecState {
                 override_state: CodecOverrideState::from_receipt(request, receipt.clone()),
                 applied_encoder: None,
+                applied_ok: false,
+                fan_out: Some(StoredFanOut {
+                    targeted: 0,
+                    applied: false,
+                    rolled_back: None,
+                    failed: Vec::new(),
+                    rollback_failed: Vec::new(),
+                    error: None,
+                }),
             };
             return Ok(serde_json::json!({
                 "ok": true,
@@ -819,6 +991,12 @@ impl CodecControl {
                 "fallback_reason": Value::Null,
                 "hls": hls_status,
                 "receipt": receipt,
+                "pipelines": Vec::<CodecPipelineStatus>::new(),
+                "fan_out": CodecFanOutStatus {
+                    enabled: self.multi_console_hls.is_some(),
+                    targeted: 0,
+                    ..CodecFanOutStatus::default()
+                },
             }));
         }
 
@@ -829,10 +1007,100 @@ impl CodecControl {
             ))
         })?;
         let encoder = hls_encoder_for_selection(selected).map_err(CodecApplyError::pipeline)?;
+
+        // Multi-console fan-out is the wider path. It also includes the active
+        // single `--hls` pipeline when one is running, so a node that has both
+        // does not leave one encoder behind.
+        if manager_running {
+            let manager = self
+                .multi_console_hls
+                .as_ref()
+                .expect("manager_running implies a manager");
+            let mut extras = Vec::new();
+            if single_running {
+                if let Some(hls) = self.hls.as_ref() {
+                    extras.push(CodecFanoutTarget {
+                        id: "active".to_owned(),
+                        kind: "active-hls",
+                        console: None,
+                        active: true,
+                        pipeline: Arc::new(ControllerHlsPipeline::new(hls.clone())),
+                    });
+                }
+            }
+            let outcome = manager
+                .apply_codec(
+                    encoder,
+                    preference.bitrate_kbps,
+                    preference.allow_software_fallback,
+                    extras,
+                )
+                .await;
+            let stored = StoredFanOut {
+                targeted: outcome.targeted,
+                applied: outcome.applied,
+                rolled_back: outcome.error.is_some().then_some(outcome.rolled_back),
+                failed: outcome.failed.clone(),
+                rollback_failed: outcome.rollback_failed.clone(),
+                error: outcome.error.clone(),
+            };
+            if !outcome.failed.is_empty() || outcome.error.is_some() {
+                // Keep the previous accepted override: this request did not
+                // apply. Record the attempted fan-out so GET /codec is honest
+                // about the rollback result.
+                lock(&self.state).fan_out = Some(stored);
+                return Err(CodecApplyError::pipeline(codec_fanout_error(
+                    &outcome, encoder,
+                )));
+            }
+            let applied_encoder = outcome.applied_encoder;
+            *lock(&self.state) = StoredCodecState {
+                override_state: CodecOverrideState::from_receipt(request, receipt.clone()),
+                applied_encoder,
+                applied_ok: outcome.applied,
+                fan_out: Some(stored),
+            };
+            let base = manager.base_config();
+            let vaapi_device = encoder
+                .is_vaapi()
+                .then(|| base.vaapi_device.display().to_string());
+            let nvenc_gpu = applied_encoder
+                .is_some_and(HlsEncoder::is_nvenc)
+                .then_some(base.nvenc_gpu)
+                .flatten();
+            let hls_status = manager.active_status().await.status_name();
+            let fan_out = CodecFanOutStatus {
+                enabled: true,
+                running: manager.running_pipeline_count().await,
+                targeted: outcome.targeted,
+                applied: outcome.applied,
+                rolled_back: outcome.error.is_some().then_some(outcome.rolled_back),
+                failed: outcome.failed.clone(),
+                rollback_failed: outcome.rollback_failed.clone(),
+                error: outcome.error.clone(),
+            };
+            return Ok(serde_json::json!({
+                "ok": true,
+                "applied": outcome.applied,
+                "pending_restart": false,
+                "encoder": applied_encoder.map(HlsEncoder::ffmpeg_name),
+                "requested_encoder": encoder.ffmpeg_name(),
+                "backend": backend_name(selected.backend),
+                "vaapi_device": vaapi_device,
+                "nvenc_gpu": nvenc_gpu,
+                "fallback": outcome.fallback,
+                "fallback_reason": outcome.fallback.then_some("software_fallback"),
+                "hls": hls_status,
+                "receipt": receipt,
+                "pipelines": outcome.pipelines,
+                "fan_out": fan_out,
+            }));
+        }
+
         let hls = self
             .hls
             .as_ref()
-            .expect("running implies an HLS controller");
+            .expect("single_running implies an HLS controller");
         let vaapi_device = encoder
             .is_vaapi()
             .then(|| hls.config().vaapi_device.display().to_string());
@@ -854,6 +1122,8 @@ impl CodecControl {
         *lock(&self.state) = StoredCodecState {
             override_state: CodecOverrideState::from_receipt(request, receipt.clone()),
             applied_encoder: Some(applied),
+            applied_ok: true,
+            fan_out: None,
         };
         Ok(serde_json::json!({
             "ok": true,
@@ -868,6 +1138,16 @@ impl CodecControl {
             "fallback_reason": fallback_reason,
             "hls": outcome.status.status_name(),
             "receipt": receipt,
+            "pipelines": [CodecPipelineStatus {
+                id: "active".to_owned(),
+                kind: "active-hls".to_owned(),
+                console: None,
+                active: true,
+                status: outcome.status.status_name().to_owned(),
+                encoder: Some(applied.ffmpeg_name().to_owned()),
+                bitrate_kbps: Some(preference.bitrate_kbps.unwrap_or(hls.config().bitrate_kbps)),
+            }],
+            "fan_out": CodecFanOutStatus::default(),
         }))
     }
 
@@ -1005,6 +1285,53 @@ fn hls_encoder_for_selection(capability: &EncodeCapability) -> Result<HlsEncoder
         }
     };
     Ok(encoder)
+}
+
+/// Turn a failed multi-pipeline codec fan-out into a typed 502 body.
+///
+/// `applied` is always false here; `details.rolled_back` and the per-pipeline
+/// results say whether the previous encoders were restored.
+fn codec_fanout_error(outcome: &MultiConsoleCodecOutcome, encoder: HlsEncoder) -> ApiError {
+    let failed = if outcome.failed.is_empty() {
+        outcome
+            .pipelines
+            .iter()
+            .filter(|pipeline| pipeline.status == "failed")
+            .map(|pipeline| pipeline.id.clone())
+            .collect::<Vec<_>>()
+    } else {
+        outcome.failed.clone()
+    };
+    let message = match outcome.error.as_deref() {
+        Some(error) if !failed.is_empty() => format!(
+            "Codec fan-out failed on {} ({}); applied:false",
+            failed.join(", "),
+            error
+        ),
+        Some(error) => format!("Codec fan-out failed: {error}; applied:false"),
+        None => "Codec fan-out failed; applied:false".to_owned(),
+    };
+    let code = if outcome.unavailable {
+        codes::ENCODER_UNAVAILABLE
+    } else {
+        codes::INTERNAL
+    };
+    ApiError::new(code, message)
+        .with_details(serde_json::json!({
+            "applied": false,
+            "rolled_back": outcome.rolled_back,
+            "targeted": outcome.targeted,
+            "failed_consoles": failed,
+            "rollback_failed_consoles": outcome.rollback_failed,
+            "encoder": encoder.ffmpeg_name(),
+            "backend": encoder.backend_label(),
+            "pipelines": outcome.pipelines,
+        }))
+        .with_remediation(
+            "The previous encoder was restored on every pipeline where rollback succeeded. \
+             Check the failing console(s), ffmpeg encoder availability, and whether the \
+             requested hardware backend is advertised on GET /codec.",
+        )
 }
 
 /// Turn an HLS restart error into a typed 502 body.
@@ -1290,6 +1617,7 @@ pub struct UsbControl {
 
 struct NbdRuntime {
     handle: NbdServerHandle,
+    source: NbdExportSource,
     url: String,
     export: String,
     size_bytes: u64,
@@ -2319,11 +2647,10 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
         .as_ref()
         .map(UsbControl::connection_status)
         .unwrap_or_default();
-    let codec = state
-        .codec_control
-        .as_ref()
-        .map(CodecControl::status)
-        .unwrap_or_else(|| state.codecs.clone());
+    let codec = match state.codec_control.as_ref() {
+        Some(control) => control.status_async().await,
+        None => state.codecs.clone(),
+    };
     let display = state.display_status();
     Json(ConnectionResponse {
         ok: true,
@@ -2870,6 +3197,16 @@ struct UsbNbdStartRequest {
     /// read-only and reject `false`.
     #[serde(default)]
     read_only: Option<bool>,
+    /// Optional absolute path for the writable overlay's checksummed
+    /// persistence file. Omit for an ephemeral overlay.
+    #[serde(default)]
+    persist_path: Option<String>,
+    /// Commit the overlay on NBD FLUSH (defaults to true).
+    #[serde(default)]
+    persist_on_flush: Option<bool>,
+    /// Commit the overlay when the server stops (defaults to true).
+    #[serde(default)]
+    persist_on_stop: Option<bool>,
 }
 
 /// `GET /usb/nbd` — running export summary and counters.
@@ -2894,6 +3231,7 @@ async fn usb_nbd_status(State(state): State<ConnectionState>) -> Response {
             "export": runtime.export,
             "size_bytes": runtime.size_bytes,
             "read_only": runtime.read_only,
+            "overlay": runtime.source.backend.overlay_status(),
             "stats": runtime.handle.stats(),
         }))
         .into_response(),
@@ -2993,13 +3331,59 @@ async fn usb_nbd_start(
         .filter(|name| !name.is_empty())
         .unwrap_or("media")
         .to_owned();
-    let source = match NbdExportSource::from_media(export_name.clone(), &media) {
+
+    // A writable raw export is copy-on-write: the base file is only opened
+    // read-only and writes land in a bounded WriteOverlay. The optional
+    // persistence path must be absolute and must not be the base itself.
+    let mut overlay_config = OverlayConfig::default();
+    if !read_only {
+        if let Some(persist_text) = request.persist_path.as_deref() {
+            let persist_text = persist_text.trim();
+            if persist_text.is_empty() || persist_text.contains('\0') {
+                return compat_error_with_remediation(
+                    StatusCode::BAD_REQUEST,
+                    "usb-invalid-overlay-path",
+                    "overlay `persist_path` must be a non-empty path without NUL bytes",
+                    Some("Omit persist_path for an ephemeral overlay, or pass an absolute path."),
+                );
+            }
+            let persist = Path::new(persist_text);
+            if !persist.is_absolute() {
+                return compat_error_with_remediation(
+                    StatusCode::BAD_REQUEST,
+                    "usb-invalid-overlay-path",
+                    "overlay `persist_path` must be absolute",
+                    Some("Use an absolute path outside the base image."),
+                );
+            }
+            if persist == path {
+                return compat_error_with_remediation(
+                    StatusCode::BAD_REQUEST,
+                    "usb-invalid-overlay-path",
+                    "overlay `persist_path` must not be the base image",
+                    Some("Choose a separate file; the base image is never written."),
+                );
+            }
+            overlay_config = overlay_config.with_persistence(persist);
+        }
+    }
+    let overlay_policy = NbdOverlayPolicy {
+        persist_on_flush: request.persist_on_flush.unwrap_or(true),
+        persist_on_stop: request.persist_on_stop.unwrap_or(true),
+    };
+    let source = if read_only {
+        NbdExportSource::from_media(export_name.clone(), &media)
+    } else {
+        NbdExportSource::overlay_media(export_name.clone(), &media, overlay_config, overlay_policy)
+    };
+    let source = match source {
         Ok(source) => source,
         Err(error) => return usb_error_response(error),
     };
     let read_only = source.is_read_only();
     let size_bytes = source.export.size_bytes;
-    let catalog = match NbdExportCatalog::new(vec![source]) {
+    let overlay_status = source.backend.overlay_status();
+    let catalog = match NbdExportCatalog::new(vec![source.clone()]) {
         Ok(catalog) => catalog,
         Err(error) => return usb_error_response(error),
     };
@@ -3036,6 +3420,7 @@ async fn usb_nbd_start(
     let url = format!("nbd://{address}/{export_name}");
     let runtime = NbdRuntime {
         handle,
+        source,
         url: url.clone(),
         export: export_name.clone(),
         size_bytes,
@@ -3063,6 +3448,7 @@ async fn usb_nbd_start(
         "export": export_name,
         "size_bytes": size_bytes,
         "read_only": read_only,
+        "overlay": overlay_status,
         "max_request_bytes": 1024 * 1024,
         "stats": NbdServerStats::default(),
     }))
@@ -3818,11 +4204,10 @@ async fn input_type(
 // ---------------------------------------------------------------------------
 
 async fn codec_get(State(state): State<ConnectionState>) -> Json<CodecStatus> {
-    let status = state
-        .codec_control
-        .as_ref()
-        .map(CodecControl::status)
-        .unwrap_or_else(|| state.codecs.clone());
+    let status = match state.codec_control.as_ref() {
+        Some(control) => control.status_async().await,
+        None => state.codecs.clone(),
+    };
     Json(status)
 }
 
@@ -5293,8 +5678,35 @@ mod tests {
             HlsStatus::running(self.manifest.clone())
         }
 
+        fn is_running(&self) -> bool {
+            true
+        }
+
+        fn encoder(&self) -> HlsEncoder {
+            HlsEncoder::H264
+        }
+
+        fn bitrate_kbps(&self) -> u32 {
+            4_000
+        }
+
         async fn stop(&self) -> Result<(), String> {
             Ok(())
+        }
+
+        async fn restart_with_encoder(
+            &self,
+            encoder: HlsEncoder,
+            _bitrate_kbps: Option<u32>,
+            _allow_software_fallback: bool,
+        ) -> Result<crate::hls::HlsRestartOutcome, crate::multi_hls::ConsoleHlsRestartError>
+        {
+            Ok(crate::hls::HlsRestartOutcome {
+                status: HlsStatus::running(self.manifest.clone()),
+                requested_encoder: encoder,
+                applied_encoder: encoder,
+                fallback: None,
+            })
         }
 
         fn manifest_path(&self) -> std::path::PathBuf {
@@ -8891,6 +9303,372 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body["current_encoder"].is_null());
         assert_eq!(body["available"], serde_json::json!([]));
+    }
+
+    struct FanoutHlsFactory {
+        fail_restart: Arc<Mutex<Vec<(u32, HlsEncoder)>>>,
+        restarts: Arc<Mutex<Vec<(u32, HlsEncoder, u32)>>>,
+    }
+
+    #[async_trait]
+    impl crate::multi_hls::ConsoleHlsFactory for FanoutHlsFactory {
+        fn provider(&self) -> Option<ozma_display::vm::VmConsoleBackend> {
+            Some(ozma_display::vm::VmConsoleBackend::Dbus)
+        }
+
+        async fn start(
+            &self,
+            console: u32,
+            config: HlsConfig,
+        ) -> Result<Arc<dyn crate::multi_hls::ConsoleHlsPipeline>, String> {
+            std::fs::create_dir_all(&config.output_dir).map_err(|error| error.to_string())?;
+            let manifest = config.manifest_path();
+            std::fs::write(&manifest, "#EXTM3U\n").map_err(|error| error.to_string())?;
+            Ok(Arc::new(FanoutHlsPipeline {
+                console,
+                manifest,
+                encoder: Mutex::new(config.video_encoder),
+                bitrate_kbps: Mutex::new(config.bitrate_kbps),
+                fail_restart: self.fail_restart.clone(),
+                restarts: self.restarts.clone(),
+            }))
+        }
+    }
+
+    struct FanoutHlsPipeline {
+        console: u32,
+        manifest: std::path::PathBuf,
+        encoder: Mutex<HlsEncoder>,
+        bitrate_kbps: Mutex<u32>,
+        fail_restart: Arc<Mutex<Vec<(u32, HlsEncoder)>>>,
+        restarts: Arc<Mutex<Vec<(u32, HlsEncoder, u32)>>>,
+    }
+
+    #[async_trait]
+    impl crate::multi_hls::ConsoleHlsPipeline for FanoutHlsPipeline {
+        fn status(&self) -> HlsStatus {
+            HlsStatus::running(self.manifest.clone())
+        }
+
+        fn is_running(&self) -> bool {
+            true
+        }
+
+        fn encoder(&self) -> HlsEncoder {
+            *self.encoder.lock().unwrap()
+        }
+
+        fn bitrate_kbps(&self) -> u32 {
+            *self.bitrate_kbps.lock().unwrap()
+        }
+
+        async fn stop(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn restart_with_encoder(
+            &self,
+            encoder: HlsEncoder,
+            bitrate_kbps: Option<u32>,
+            _allow_software_fallback: bool,
+        ) -> Result<crate::hls::HlsRestartOutcome, crate::multi_hls::ConsoleHlsRestartError>
+        {
+            if self
+                .fail_restart
+                .lock()
+                .unwrap()
+                .contains(&(self.console, encoder))
+            {
+                return Err(crate::multi_hls::ConsoleHlsRestartError::new(
+                    format!(
+                        "fake `{}` for Console_{} failed",
+                        encoder.ffmpeg_name(),
+                        self.console
+                    ),
+                    encoder.is_hardware(),
+                ));
+            }
+            *self.encoder.lock().unwrap() = encoder;
+            let bitrate = bitrate_kbps.unwrap_or_else(|| self.bitrate_kbps());
+            *self.bitrate_kbps.lock().unwrap() = bitrate;
+            self.restarts
+                .lock()
+                .unwrap()
+                .push((self.console, encoder, bitrate));
+            Ok(crate::hls::HlsRestartOutcome {
+                status: HlsStatus::running(self.manifest.clone()),
+                requested_encoder: encoder,
+                applied_encoder: encoder,
+                fallback: None,
+            })
+        }
+
+        fn manifest_path(&self) -> std::path::PathBuf {
+            self.manifest.clone()
+        }
+    }
+
+    struct FanoutHarness {
+        manager: crate::multi_hls::MultiConsoleHls,
+        fail_restart: Arc<Mutex<Vec<(u32, HlsEncoder)>>>,
+        restarts: Arc<Mutex<Vec<(u32, HlsEncoder, u32)>>>,
+    }
+
+    async fn fanout_harness(label: &str, consoles: &[u32]) -> FanoutHarness {
+        let root =
+            std::env::temp_dir().join(format!("ozma-codec-fanout-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let fail_restart = Arc::new(Mutex::new(Vec::new()));
+        let restarts = Arc::new(Mutex::new(Vec::new()));
+        let factory = Arc::new(FanoutHlsFactory {
+            fail_restart: fail_restart.clone(),
+            restarts: restarts.clone(),
+        });
+        let manager = crate::multi_hls::MultiConsoleHls::new(
+            factory,
+            crate::multi_hls::MultiConsoleHlsConfig {
+                max_pipelines: 2,
+                idle_timeout: Duration::ZERO,
+                root: root.clone(),
+                base: HlsConfig {
+                    output_dir: root,
+                    ..HlsConfig::default()
+                },
+            },
+        );
+        let outputs: Vec<crate::display_outputs::DisplayOutput> = consoles
+            .iter()
+            .map(|index| crate::display_outputs::DisplayOutput {
+                index: *index,
+                name: format!("Console_{index}"),
+                source_type: "dbus".into(),
+                capture_source_id: format!("dbus{index}"),
+                width: 1280,
+                height: 800,
+                primary: *index == 0,
+            })
+            .collect();
+        manager
+            .sync(&crate::display_outputs::DisplayOutputSelection {
+                outputs,
+                active_console: consoles.first().copied().unwrap_or(0),
+                limitation: None,
+            })
+            .await;
+        FanoutHarness {
+            manager,
+            fail_restart,
+            restarts,
+        }
+    }
+
+    fn fanout_control(manager: crate::multi_hls::MultiConsoleHls) -> CodecControl {
+        let registry = EncoderRegistry::from_capabilities([
+            software_capability(Codec::H264),
+            software_capability(Codec::Hevc),
+            hardware_capability(Codec::H264, EncoderBackend::Vaapi),
+        ]);
+        CodecControl::new(
+            registry,
+            MediaFormat::new(Codec::H264, 1280, 720, 30, 4_000),
+        )
+        .with_multi_console_hls(Some(manager))
+    }
+
+    fn fanout_state(
+        control: CodecControl,
+        manager: crate::multi_hls::MultiConsoleHls,
+    ) -> ConnectionState {
+        ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_codec_control(Some(control))
+        .with_multi_console_hls(Some(manager))
+    }
+
+    #[tokio::test]
+    async fn codec_route_fans_out_to_every_per_console_pipeline() {
+        let harness = fanout_harness("all", &[0, 1]).await;
+        let manager = harness.manager.clone();
+        let state = fanout_state(fanout_control(manager.clone()), manager.clone());
+        let app = codec_router(state.clone());
+
+        let (status, body) = post_json(
+            &app,
+            "/codec",
+            serde_json::json!({"codec": "hevc", "bitrate": "2M", "hw_accel": "software"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["applied"], true, "{body}");
+        assert_eq!(body["pending_restart"], false);
+        assert_eq!(body["encoder"], "libx265");
+        assert_eq!(body["fan_out"]["enabled"], true);
+        assert_eq!(body["fan_out"]["targeted"], 2);
+        assert_eq!(body["fan_out"]["applied"], true);
+        assert_eq!(body["pipelines"].as_array().unwrap().len(), 2);
+        assert_eq!(body["pipelines"][0]["id"], "console-0");
+        assert_eq!(body["pipelines"][1]["id"], "console-1");
+        assert_eq!(body["pipelines"][1]["status"], "applied");
+        assert_eq!(body["pipelines"][1]["encoder"], "libx265");
+        assert_eq!(
+            harness.restarts.lock().unwrap().clone(),
+            vec![(0, HlsEncoder::Hevc, 2_000), (1, HlsEncoder::Hevc, 2_000)]
+        );
+
+        let (status, body) = get_json(&app, "/codec").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["applied"], true);
+        assert_eq!(body["fan_out"]["running"], 2);
+        assert_eq!(body["pipelines"][0]["encoder"], "libx265");
+        assert_eq!(body["pipelines"][1]["encoder"], "libx265");
+        assert_eq!(body["pipelines"][1]["console"], 1);
+
+        let (status, connection) = get_json(&connection_router(state), "/api/v1/connection").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(connection["codec"]["applied"], true);
+        assert_eq!(connection["codec"]["fan_out"]["targeted"], 2);
+        assert_eq!(
+            connection["multi_console_hls"]["consoles"][0]["encoder"],
+            "libx265"
+        );
+        assert_eq!(
+            connection["multi_console_hls"]["consoles"][1]["encoder"],
+            "libx265"
+        );
+    }
+
+    #[tokio::test]
+    async fn codec_route_fanout_failure_rolls_back_and_never_reports_applied() {
+        let harness = fanout_harness("rollback", &[0, 1]).await;
+        harness
+            .fail_restart
+            .lock()
+            .unwrap()
+            .push((1, HlsEncoder::Hevc));
+        let manager = harness.manager.clone();
+        let state = fanout_state(fanout_control(manager.clone()), manager.clone());
+        let app = codec_router(state);
+
+        let (status, body) = post_json(
+            &app,
+            "/codec",
+            serde_json::json!({"codec": "hevc", "bitrate": "2M", "hw_accel": "software"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["details"]["applied"], false);
+        assert_eq!(body["details"]["rolled_back"], true);
+        assert_eq!(
+            body["details"]["failed_consoles"],
+            serde_json::json!(["console-1"])
+        );
+        assert_eq!(body["details"]["pipelines"][0]["status"], "rolled-back");
+        assert_eq!(body["details"]["pipelines"][1]["status"], "failed");
+        assert!(
+            body.get("applied").is_none(),
+            "a failed fan-out must not return a top-level applied field"
+        );
+
+        let status = manager.status().await;
+        assert_eq!(status.consoles[0].encoder.as_deref(), Some("libx264"));
+        assert_eq!(status.consoles[1].encoder.as_deref(), Some("libx264"));
+        let (status, codec) = get_json(&app, "/codec").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(codec["applied"], false);
+        assert_eq!(codec["fan_out"]["rolled_back"], true);
+        assert_eq!(codec["fan_out"]["failed"], serde_json::json!(["console-1"]));
+    }
+
+    #[tokio::test]
+    async fn codec_route_fanout_reports_a_failed_rollback() {
+        let harness = fanout_harness("rollback-failed", &[0, 1]).await;
+        harness
+            .fail_restart
+            .lock()
+            .unwrap()
+            .extend([(1, HlsEncoder::Hevc), (0, HlsEncoder::H264)]);
+        let manager = harness.manager.clone();
+        let app = codec_router(fanout_state(
+            fanout_control(manager),
+            harness.manager.clone(),
+        ));
+
+        let (status, body) = post_json(
+            &app,
+            "/codec",
+            serde_json::json!({"codec": "hevc", "hw_accel": "software"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["details"]["applied"], false);
+        assert_eq!(body["details"]["rolled_back"], false);
+        assert_eq!(
+            body["details"]["rollback_failed_consoles"],
+            serde_json::json!(["console-0"])
+        );
+        assert_eq!(body["details"]["pipelines"][0]["status"], "rollback-failed");
+    }
+
+    #[tokio::test]
+    async fn codec_route_fanout_with_no_pipelines_keeps_pending_restart() {
+        let harness = fanout_harness("none", &[]).await;
+        let manager = harness.manager.clone();
+        let app = codec_router(fanout_state(
+            fanout_control(manager),
+            harness.manager.clone(),
+        ));
+
+        let (status, body) = post_json(
+            &app,
+            "/codec",
+            serde_json::json!({"codec": "hevc", "hw_accel": "software"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["applied"], false);
+        assert_eq!(body["pending_restart"], true);
+        assert_eq!(body["encoder"], Value::Null);
+        assert_eq!(body["fan_out"]["enabled"], true);
+        assert_eq!(body["fan_out"]["targeted"], 0);
+    }
+
+    #[tokio::test]
+    async fn codec_route_fanout_rejects_unavailable_hardware_as_typed_502() {
+        let harness = fanout_harness("hardware", &[0]).await;
+        harness
+            .fail_restart
+            .lock()
+            .unwrap()
+            .push((0, HlsEncoder::VaapiH264));
+        let manager = harness.manager.clone();
+        let app = codec_router(fanout_state(
+            fanout_control(manager),
+            harness.manager.clone(),
+        ));
+
+        let (status, body) = post_json(
+            &app,
+            "/codec",
+            serde_json::json!({"codec": "h264", "hw_accel": "vaapi"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["code"], codes::ENCODER_UNAVAILABLE);
+        assert_eq!(body["details"]["applied"], false);
+        assert_eq!(body["details"]["rolled_back"], true);
+        assert_eq!(
+            body["details"]["failed_consoles"],
+            serde_json::json!(["console-0"])
+        );
     }
 
     #[tokio::test]

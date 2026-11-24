@@ -73,6 +73,7 @@ impl MultiseatStatus {
                         seat_status.restarts = status.restarts;
                         seat_status.last_error = status.last_error.clone();
                         seat_status.next_restart_in_ms = status.next_restart_in_ms;
+                        seat_status.resources = status.resources.clone();
                         seat_status
                     }
                     None => seat.status(SeatState::Planned, None),

@@ -113,6 +113,13 @@ pub enum UsbError {
         reason: String,
     },
 
+    /// USB/IP TLS was requested but this crate cannot terminate it.
+    #[error("USB/IP TLS is unavailable: {reason}")]
+    UsbIpTlsUnsupported {
+        /// Why TLS cannot be provided in-process.
+        reason: String,
+    },
+
     /// A `usbip`/NBD response could not be parsed.
     #[error("invalid {protocol} response: {reason}")]
     Protocol {
@@ -332,6 +339,7 @@ impl UsbError {
             Self::InvalidUsbIp { .. } => "invalid-usbip",
             Self::UsbIpDisabled => "usbip-disabled",
             Self::UsbIpUnauthorized { .. } => "usbip-unauthorized",
+            Self::UsbIpTlsUnsupported { .. } => "usbip-tls-unsupported",
             Self::Protocol { .. } => "protocol-error",
             Self::ConfigFs { .. } => "configfs-io",
             Self::Io { .. } => "io",

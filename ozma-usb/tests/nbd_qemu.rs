@@ -17,9 +17,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ozma_usb::nbd_server::{
-    NbdExportCatalog, NbdExportSource, NbdMemoryImage, NbdServer, NbdServerConfig, NbdServerHandle,
+    NbdBackend, NbdExportCatalog, NbdExportSource, NbdMemoryImage, NbdOverlayBackend,
+    NbdOverlayPolicy, NbdServer, NbdServerConfig, NbdServerHandle,
 };
-use ozma_usb::{fat32_image_from_directory, IsoImage, MassStorageImage};
+use ozma_usb::{fat32_image_from_directory, IsoImage, MassStorageImage, OverlayConfig};
 
 const ISO_SECTOR: usize = 2048;
 
@@ -209,6 +210,79 @@ fn qemu_io_can_read_but_not_write_the_read_only_export() {
     // NBD_FLAG_READ_ONLY; either way no write reached the read-only backend.
     assert!(stats.connections_accepted >= 1);
     assert_eq!(backend.snapshot(), data);
+}
+
+#[test]
+fn qemu_io_writes_and_reads_a_writable_overlay_export() {
+    let Some(qemu_io) = qemu_io() else {
+        eprintln!("SKIP: qemu-io is not installed");
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let base_path = temp.path().join("base.raw");
+    let persistence = temp.path().join("overlay.ozov");
+    let base: Vec<u8> = (0..1_048_576u32).map(|value| (value % 251) as u8).collect();
+    fs::write(&base_path, &base).unwrap();
+    let export = NbdExportSource::overlay_file(
+        "writable",
+        &base_path,
+        OverlayConfig::new(4096, 16 * 1024 * 1024).with_persistence(&persistence),
+        NbdOverlayPolicy::default(),
+    )
+    .unwrap();
+    let source = export.clone();
+    let (handle, url) = start(export);
+
+    let output = Command::new(&qemu_io)
+        .args([
+            "-f",
+            "raw",
+            "-c",
+            "write -P 0x5a 0 4096",
+            "-c",
+            "flush",
+            "-c",
+            "read -P 0x5a 0 4096",
+            &url,
+        ])
+        .output()
+        .expect("run qemu-io writable overlay");
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    eprintln!("qemu-io writable overlay output:\n{text}");
+    assert!(
+        output.status.success(),
+        "qemu-io writable overlay failed: {text}"
+    );
+
+    // QEMU closed the connection after FLUSH; the live overlay already holds
+    // the write and the immutable base file is unchanged.
+    let mut actual = vec![0u8; 4096];
+    source.backend.read_at(0, &mut actual).unwrap();
+    assert_eq!(actual, vec![0x5au8; 4096]);
+    assert_eq!(fs::read(&base_path).unwrap(), base);
+    assert!(persistence.exists(), "qemu-io FLUSH persisted the overlay");
+
+    let stats = handle.stop();
+    assert!(stats.connections_accepted >= 1);
+    assert!(stats.write_requests >= 1);
+    assert!(stats.flush_requests >= 1);
+    assert_eq!(stats.persist_failures, 0);
+
+    // A fresh backend reloads the QEMU-written block from persistence.
+    let reloaded = NbdOverlayBackend::load_from_file(
+        &base_path,
+        OverlayConfig::new(4096, 16 * 1024 * 1024).with_persistence(&persistence),
+        NbdOverlayPolicy::default(),
+        &persistence,
+    )
+    .unwrap();
+    let mut restored = vec![0u8; 4096];
+    reloaded.read_at(0, &mut restored).unwrap();
+    assert_eq!(restored, vec![0x5au8; 4096]);
 }
 
 /// Optional disposable-QEMU USB attachment validated over QMP.

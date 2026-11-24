@@ -4,8 +4,10 @@
 //! The server speaks the fixed-newstyle NBD handshake over a TCP or Unix
 //! stream, lists exports, negotiates `EXPORT_NAME`/`INFO`/`GO`, and serves
 //! `READ`, `WRITE`, `FLUSH`, `TRIM`, and `DISC`. It never opens a block device:
-//! exports are backed by a regular file or an in-memory image
-//! ([`NbdMemoryImage`]), and ISO/FAT32 media stay read-only.
+//! exports are backed by a regular file, an in-memory image
+//! ([`NbdMemoryImage`]), or a bounded copy-on-write [`NbdOverlayBackend`], and
+//! ISO/FAT32 media stay read-only. Writable raw/FAT32 files are served through
+//! the overlay so the base file is never modified.
 //!
 //! Every read/write is bounds-checked against both the export size and
 //! [`NbdServerConfig::max_request_bytes`]. Connections are bounded by
@@ -57,10 +59,12 @@ use crate::nbd::{
     NBD_REP_ERR_UNKNOWN, NBD_REP_ERR_UNSUP, NBD_REP_INFO, NBD_REP_MAGIC, NBD_REP_SERVER,
     NBD_REQUEST_HEADER_LEN,
 };
+use crate::overlay::{OverlayConfig, WriteOverlay};
 
 const EPERM: u32 = 1;
 const EIO: u32 = 5;
 const EINVAL: u32 = 22;
+const ENOSPC: u32 = 28;
 const EOPNOTSUPP: u32 = 95;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -152,10 +156,23 @@ pub trait NbdBackend: Send + Sync {
         Ok(())
     }
 
+    /// Persist any durable state (called when the server stops).
+    ///
+    /// Backends with nothing durable to keep (memory, read-only, or an overlay
+    /// without a persistence path) use the default no-op.
+    fn persist(&self) -> Result<(), UsbError> {
+        Ok(())
+    }
+
     /// Discard a range (best-effort; the default is a successful no-op).
     fn trim(&self, offset: u64, length: u64) -> Result<(), UsbError> {
         let _ = (offset, length);
         Ok(())
+    }
+
+    /// Live overlay summary, when this backend is overlay-backed.
+    fn overlay_status(&self) -> Option<NbdOverlayStatus> {
+        None
     }
 }
 
@@ -327,6 +344,218 @@ impl NbdBackend for NbdFileImage {
     }
 }
 
+/// When an overlay-backed NBD export commits its persistence file.
+///
+/// Commits only happen when the overlay has a persistence path; an ephemeral
+/// overlay keeps every write in memory and returns to the base when dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NbdOverlayPolicy {
+    /// Commit to the persistence file on every NBD `FLUSH`.
+    pub persist_on_flush: bool,
+    /// Commit to the persistence file when the server stops.
+    pub persist_on_stop: bool,
+}
+
+impl Default for NbdOverlayPolicy {
+    fn default() -> Self {
+        Self {
+            persist_on_flush: true,
+            persist_on_stop: true,
+        }
+    }
+}
+
+impl NbdOverlayPolicy {
+    /// Commit only on flush, not on stop.
+    pub fn flush_only() -> Self {
+        Self {
+            persist_on_flush: true,
+            persist_on_stop: false,
+        }
+    }
+
+    /// Never commit automatically (the caller must call `commit` explicitly).
+    pub fn manual() -> Self {
+        Self {
+            persist_on_flush: false,
+            persist_on_stop: false,
+        }
+    }
+}
+
+/// A live summary of an overlay-backed NBD export.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NbdOverlayStatus {
+    /// Copy-on-write block size.
+    pub block_size: usize,
+    /// Immutable base image length.
+    pub base_bytes: u64,
+    /// Bytes currently allocated in the overlay.
+    pub allocated_bytes: u64,
+    /// Number of allocated overlay blocks.
+    pub allocated_blocks: usize,
+    /// Configured allocation ceiling.
+    pub max_overlay_bytes: u64,
+    /// Whether writes are uncommitted.
+    pub dirty: bool,
+    /// Persistence file, when configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistence: Option<PathBuf>,
+    /// Commit on `FLUSH`.
+    pub persist_on_flush: bool,
+    /// Commit on server stop.
+    pub persist_on_stop: bool,
+}
+
+/// A writable NBD backend backed by a bounded [`WriteOverlay`].
+///
+/// The base file/image is only ever opened read-only. NBD reads come from the
+/// overlay when a block was written and from the base otherwise; WRITE copies
+/// the touched base block into the overlay before patching it. FLUSH and server
+/// stop commit the checksummed persistence file according to
+/// [`NbdOverlayPolicy`]. TRIM is a successful no-op (the overlay never discards
+/// base content).
+#[derive(Debug)]
+pub struct NbdOverlayBackend {
+    overlay: Mutex<WriteOverlay>,
+    policy: NbdOverlayPolicy,
+}
+
+impl NbdOverlayBackend {
+    /// Wrap an in-memory base image.
+    pub fn from_bytes(
+        base: impl Into<Vec<u8>>,
+        config: OverlayConfig,
+        policy: NbdOverlayPolicy,
+    ) -> Result<Self, UsbError> {
+        Ok(Self {
+            overlay: Mutex::new(WriteOverlay::from_bytes(base, config)?),
+            policy,
+        })
+    }
+
+    /// Read an existing regular file as the immutable base.
+    pub fn from_file(
+        path: impl AsRef<Path>,
+        config: OverlayConfig,
+        policy: NbdOverlayPolicy,
+    ) -> Result<Self, UsbError> {
+        Ok(Self {
+            overlay: Mutex::new(WriteOverlay::from_file(path, config)?),
+            policy,
+        })
+    }
+
+    /// Load a base file plus an existing checksummed persistence file.
+    pub fn load_from_file(
+        base: impl AsRef<Path>,
+        config: OverlayConfig,
+        policy: NbdOverlayPolicy,
+        persistence: impl AsRef<Path>,
+    ) -> Result<Self, UsbError> {
+        Ok(Self {
+            overlay: Mutex::new(WriteOverlay::load_from_file(base, config, persistence)?),
+            policy,
+        })
+    }
+
+    /// Commit policy.
+    pub fn policy(&self) -> NbdOverlayPolicy {
+        self.policy
+    }
+
+    /// Live overlay summary.
+    pub fn status(&self) -> NbdOverlayStatus {
+        let overlay = self
+            .overlay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        NbdOverlayStatus {
+            block_size: overlay.block_size(),
+            base_bytes: overlay.base_len(),
+            allocated_bytes: overlay.allocated_bytes(),
+            allocated_blocks: overlay.allocated_blocks(),
+            max_overlay_bytes: overlay.max_overlay_bytes(),
+            dirty: overlay.is_dirty(),
+            persistence: overlay.persistence_path().map(Path::to_path_buf),
+            persist_on_flush: self.policy.persist_on_flush,
+            persist_on_stop: self.policy.persist_on_stop,
+        }
+    }
+
+    /// Merged base-plus-overlay bytes (diagnostics/tests).
+    pub fn snapshot(&self) -> Vec<u8> {
+        self.overlay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .materialize()
+    }
+
+    fn commit(&self) -> Result<(), UsbError> {
+        let mut overlay = self
+            .overlay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if overlay.persistence_path().is_some() {
+            overlay.commit()?;
+        }
+        Ok(())
+    }
+}
+
+impl NbdBackend for NbdOverlayBackend {
+    fn len(&self) -> u64 {
+        self.overlay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .base_len()
+    }
+
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
+    fn read_at(&self, offset: u64, buffer: &mut [u8]) -> Result<(), UsbError> {
+        self.overlay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .read_into(offset, buffer)
+    }
+
+    fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), UsbError> {
+        self.overlay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .write_at(offset, data)
+            .map(|_| ())
+    }
+
+    fn flush(&self) -> Result<(), UsbError> {
+        if self.policy.persist_on_flush {
+            self.commit()?;
+        }
+        Ok(())
+    }
+
+    fn persist(&self) -> Result<(), UsbError> {
+        if self.policy.persist_on_stop {
+            self.commit()?;
+        }
+        Ok(())
+    }
+
+    fn trim(&self, offset: u64, length: u64) -> Result<(), UsbError> {
+        // A trim never discards base or overlay content; it is a bounded
+        // successful no-op just like a read-only export's default.
+        let _ = (offset, length);
+        Ok(())
+    }
+
+    fn overlay_status(&self) -> Option<NbdOverlayStatus> {
+        Some(self.status())
+    }
+}
+
 /// One export plus its backing image.
 #[derive(Clone)]
 pub struct NbdExportSource {
@@ -348,14 +577,28 @@ impl NbdExportSource {
     }
 
     /// An export over an existing regular file.
+    ///
+    /// A read-only request uses the ordinary immutable file backend. A writable
+    /// request is served through a bounded ephemeral [`WriteOverlay`] over the
+    /// file so the file itself is never modified; use
+    /// [`NbdExportSource::overlay_file`] to set geometry, a persistence path, or
+    /// a commit policy.
     pub fn file(
         name: impl Into<String>,
         path: impl AsRef<Path>,
         read_only: bool,
     ) -> Result<Self, UsbError> {
         let path = path.as_ref();
-        let image = NbdFileImage::open(path, read_only)?;
-        let mut export = export_for(name, image.len(), read_only);
+        if !read_only {
+            return Self::overlay_file(
+                name,
+                path,
+                OverlayConfig::default(),
+                NbdOverlayPolicy::default(),
+            );
+        }
+        let image = NbdFileImage::open(path, true)?;
+        let mut export = export_for(name, image.len(), true);
         export.description = Some(path.display().to_string());
         Self::from_backend_with_export(export, Arc::new(image))
     }
@@ -367,9 +610,12 @@ impl NbdExportSource {
 
     /// Build an export from a [`MassStorageImage`].
     ///
-    /// ISO and FAT32 formats are probed read-only and forced read-only.
-    /// `MediaFormat::Nbd`/`Raw` files may be writable only when the media model
-    /// says so; no block device is ever opened.
+    /// ISO and FAT32 formats are probed read-only and forced read-only. A
+    /// writable `MediaFormat::Nbd`/`Raw` file is served through a bounded
+    /// [`WriteOverlay`] over the immutable file (the file itself is never
+    /// written); use [`NbdExportSource::overlay_media`] to choose the overlay
+    /// geometry, allocation ceiling, persistence path, and commit policy. No
+    /// block device is ever opened.
     pub fn from_media(name: impl Into<String>, media: &MassStorageImage) -> Result<Self, UsbError> {
         media.validate()?;
         let metadata = fs::metadata(&media.path).map_err(|source| {
@@ -398,7 +644,87 @@ impl NbdExportSource {
             crate::media::MediaFormat::Raw | crate::media::MediaFormat::Nbd => {}
         }
         let read_only = media.read_only || media.format.is_read_only() || media.mode.is_cdrom();
-        Self::file(name, &media.path, read_only)
+        if read_only {
+            return Self::file(name, &media.path, true);
+        }
+        Self::overlay_file(
+            name,
+            &media.path,
+            OverlayConfig::default(),
+            NbdOverlayPolicy::default(),
+        )
+    }
+
+    /// Build a writable export from media with an explicit overlay policy.
+    ///
+    /// Read-only formats/modes stay on the ordinary immutable file backend,
+    /// exactly like [`NbdExportSource::from_media`]. A writable raw/FAT32/NBD
+    /// image is validated and then layered through [`WriteOverlay`].
+    pub fn overlay_media(
+        name: impl Into<String>,
+        media: &MassStorageImage,
+        config: OverlayConfig,
+        policy: NbdOverlayPolicy,
+    ) -> Result<Self, UsbError> {
+        media.validate()?;
+        let metadata = fs::metadata(&media.path).map_err(|source| {
+            if source.kind() == io::ErrorKind::NotFound {
+                UsbError::MediaNotFound(media.path.clone())
+            } else {
+                crate::error::io_error("stat NBD media", media.path.clone(), source)
+            }
+        })?;
+        if !metadata.is_file() {
+            return Err(UsbError::MediaNotFile(media.path.clone()));
+        }
+        if metadata.len() == 0 {
+            return Err(invalid_nbd_image(format!(
+                "media image {} is empty",
+                media.path.display()
+            )));
+        }
+        match media.format {
+            crate::media::MediaFormat::Iso9660 => {
+                crate::iso::validate_iso_image(&media.path)?;
+            }
+            crate::media::MediaFormat::Fat32 => {
+                crate::fat32::validate_fat32_boot_sector(&media.path)?;
+            }
+            crate::media::MediaFormat::Raw | crate::media::MediaFormat::Nbd => {}
+        }
+        let read_only = media.read_only || media.format.is_read_only() || media.mode.is_cdrom();
+        if read_only {
+            return Self::file(name, &media.path, true);
+        }
+        Self::overlay_file(name, &media.path, config, policy)
+    }
+
+    /// A writable export backed by an in-memory base and a write overlay.
+    pub fn overlay_bytes(
+        name: impl Into<String>,
+        base: impl Into<Vec<u8>>,
+        config: OverlayConfig,
+        policy: NbdOverlayPolicy,
+    ) -> Result<Self, UsbError> {
+        let backend = Arc::new(NbdOverlayBackend::from_bytes(base, config, policy)?);
+        Self::from_backend(name, backend, false)
+    }
+
+    /// A writable export backed by a copy-on-write overlay over a regular file.
+    ///
+    /// The base file is opened read-only and its checksummed persistence file
+    /// is written only when the policy says so.
+    pub fn overlay_file(
+        name: impl Into<String>,
+        path: impl AsRef<Path>,
+        config: OverlayConfig,
+        policy: NbdOverlayPolicy,
+    ) -> Result<Self, UsbError> {
+        let path = path.as_ref();
+        let backend = Arc::new(NbdOverlayBackend::from_file(path, config, policy)?);
+        let mut export = export_for(name, backend.len(), false);
+        export.description = Some(path.display().to_string());
+        Self::from_backend_with_export(export, backend)
     }
 
     /// Wrap a custom backend.
@@ -642,6 +968,9 @@ pub struct NbdServerStats {
     pub bytes_written: u64,
     /// Malformed frames, unknown options, and I/O failures.
     pub protocol_errors: u64,
+    /// Backends that failed to persist on server stop.
+    #[serde(default)]
+    pub persist_failures: u64,
 }
 
 #[derive(Debug, Default)]
@@ -657,6 +986,7 @@ struct Counters {
     bytes_read: AtomicU64,
     bytes_written: AtomicU64,
     errors: AtomicU64,
+    persist_failures: AtomicU64,
 }
 
 impl Counters {
@@ -691,6 +1021,15 @@ impl Counters {
             bytes_read: self.bytes_read.load(Ordering::Relaxed),
             bytes_written: self.bytes_written.load(Ordering::Relaxed),
             protocol_errors: self.errors.load(Ordering::Relaxed),
+            persist_failures: self.persist_failures.load(Ordering::Relaxed),
+        }
+    }
+
+    fn persist_backends(&self, catalog: &NbdExportCatalog) {
+        for entry in catalog.entries() {
+            if entry.backend.persist().is_err() {
+                self.persist_failures.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -914,6 +1253,8 @@ impl NbdServer {
             wake,
             local_addr,
             unix_path,
+            catalog,
+            persisted: false,
         })
     }
 }
@@ -999,6 +1340,8 @@ pub struct NbdServerHandle {
     wake: WakeTarget,
     local_addr: Option<SocketAddr>,
     unix_path: Option<PathBuf>,
+    catalog: Arc<NbdExportCatalog>,
+    persisted: bool,
 }
 
 impl NbdServerHandle {
@@ -1022,20 +1365,29 @@ impl NbdServerHandle {
         self.active.load(Ordering::SeqCst)
     }
 
-    /// Stop accepting, wake active sessions, join the listener, and return the
-    /// final counters. A client that ignores `shutdown` is bounded by the
-    /// configured idle timeout.
+    /// Stop accepting, wake active sessions, join the listener, persist any
+    /// durable backend state, and return the final counters. A client that
+    /// ignores `shutdown` is bounded by the configured idle timeout.
     pub fn stop(mut self) -> NbdServerStats {
         self.request_stop();
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
+        self.persist();
         self.counters.snapshot()
     }
 
     fn request_stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
         self.wake.wake();
+    }
+
+    fn persist(&mut self) {
+        if self.persisted {
+            return;
+        }
+        self.persisted = true;
+        self.counters.persist_backends(&self.catalog);
     }
 }
 
@@ -1045,6 +1397,7 @@ impl Drop for NbdServerHandle {
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
+        self.persist();
     }
 }
 
@@ -1686,6 +2039,7 @@ fn range_end(export: &NbdExportSource, offset: u64, length: u32) -> Result<(), U
 fn errno_for(error: &UsbError) -> u32 {
     match error {
         UsbError::ReadOnlyMedia(_) => EPERM,
+        UsbError::OverlayBounds { .. } => ENOSPC,
         UsbError::MediaNotFound(_) | UsbError::MediaNotFile(_) => EIO,
         UsbError::InvalidMedia { .. }
         | UsbError::InvalidConfig(_)

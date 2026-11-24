@@ -174,6 +174,58 @@ def test_post_codec_forwards_config_and_returns_node_result(fake_node, tmp_path)
     ).to_dict()
 
 
+def test_post_codec_passes_through_per_console_fanout_result(fake_node, tmp_path):
+    node_result = {
+        "ok": True,
+        "applied": True,
+        "pending_restart": False,
+        "encoder": "libx265",
+        "requested_encoder": "libx265",
+        "backend": "software",
+        "hls": "running",
+        "pipelines": [
+            {
+                "id": "console-0",
+                "kind": "per-console-hls",
+                "console": 0,
+                "active": True,
+                "status": "applied",
+                "encoder": "libx265",
+            },
+            {
+                "id": "console-1",
+                "kind": "per-console-hls",
+                "console": 1,
+                "active": False,
+                "status": "applied",
+                "encoder": "libx265",
+            },
+        ],
+        "fan_out": {
+            "enabled": True,
+            "running": 2,
+            "targeted": 2,
+            "applied": True,
+        },
+        "receipt": {"selected": {"codec": "hevc", "backend": "software"}},
+    }
+    fake_node.responder = lambda method, record: (200, node_result)
+
+    response = _client(_build_app(fake_node.server_address[1], tmp_path)).post(
+        f"/api/v1/streams/{NODE_ID}/codec",
+        json={"codec": "hevc", "bitrate": "2M", "hw_accel": "software"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == node_result
+    assert response.json()["fan_out"]["targeted"] == 2
+    assert [p["encoder"] for p in response.json()["pipelines"]] == [
+        "libx265",
+        "libx265",
+    ]
+    assert fake_node.requests[0]["path"] == "/codec"
+
+
 @pytest.mark.parametrize("status", [400, 502])
 def test_post_codec_propagates_typed_node_error(fake_node, tmp_path, status):
     node_error = {

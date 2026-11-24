@@ -297,7 +297,7 @@ fn color_bitstream_filter(config: &HlsConfig) -> Option<String> {
 /// RGB24 stdin path needs. They are never assumed to work: a hardware request
 /// is only started after an injected [`EncoderProbe`] confirms that ffmpeg
 /// advertises the encoder (see [`HlsController`] and [`HlsPipeline`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum HlsEncoder {
     /// Software H.264 through `libx264` (the historical default).
     #[default]

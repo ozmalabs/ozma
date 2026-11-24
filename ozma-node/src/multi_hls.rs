@@ -47,7 +47,9 @@ use tokio::sync::Mutex;
 
 use crate::display_control::{open_first_source, ConsoleSelectionObserver, ConsoleSourceFactory};
 use crate::display_outputs::{DisplayOutput, DisplayOutputSelection};
-use crate::hls::{HlsConfig, HlsController, HlsError, HlsSourceFactory, HlsStatus};
+use crate::hls::{
+    HlsConfig, HlsController, HlsEncoder, HlsError, HlsRestartOutcome, HlsSourceFactory, HlsStatus,
+};
 
 /// Default maximum number of simultaneous per-console HLS pipelines.
 pub const DEFAULT_MAX_CONSOLE_HLS: usize = 2;
@@ -87,13 +89,51 @@ impl MultiConsoleHlsConfig {
     }
 }
 
+/// Why a per-console restart could not apply an encoder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsoleHlsRestartError {
+    /// Bounded human-readable failure.
+    pub message: String,
+    /// True when the failure is an encoder/device availability problem rather
+    /// than a generic spawn/restart failure.
+    pub unavailable: bool,
+}
+
+impl ConsoleHlsRestartError {
+    /// A too-long message is already bounded by the HLS status type; keep this
+    /// constructor for fakes and embedders.
+    pub fn new(message: impl Into<String>, unavailable: bool) -> Self {
+        Self {
+            message: bounded(message.into()),
+            unavailable,
+        }
+    }
+}
+
 /// One owned per-console encoder generation.
 #[async_trait]
 pub trait ConsoleHlsPipeline: Send + Sync {
     /// Live status (running only while the manifest exists).
     fn status(&self) -> HlsStatus;
+    /// True while this generation is starting or running.
+    fn is_running(&self) -> bool;
+    /// Encoder this generation currently runs.
+    fn encoder(&self) -> HlsEncoder;
+    /// Bitrate this generation currently targets, in kbps.
+    fn bitrate_kbps(&self) -> u32;
     /// Stop the source and reap ffmpeg with the pipeline's bounded wait.
     async fn stop(&self) -> Result<(), String>;
+    /// Restart this generation with an encoder and optional bitrate.
+    ///
+    /// The implementation must not claim success unless the new generation is
+    /// actually running. A failed restart should restore the previous
+    /// generation when possible (as [`HlsController`] does).
+    async fn restart_with_encoder(
+        &self,
+        encoder: HlsEncoder,
+        bitrate_kbps: Option<u32>,
+        allow_software_fallback: bool,
+    ) -> Result<HlsRestartOutcome, ConsoleHlsRestartError>;
     /// Playlist this generation writes.
     fn manifest_path(&self) -> PathBuf;
 }
@@ -115,14 +155,36 @@ pub trait ConsoleHlsFactory: Send + Sync {
     ) -> Result<Arc<dyn ConsoleHlsPipeline>, String>;
 }
 
-struct ControllerPipeline {
+/// Adapter that exposes one [`HlsController`] generation as a per-console
+/// pipeline. Used by the manager and by `POST /codec` when the active single
+/// `--hls` path is also running.
+pub struct ControllerHlsPipeline {
     controller: HlsController,
 }
 
+impl ControllerHlsPipeline {
+    /// Wrap an existing controller (sharing its pipeline slot/status).
+    pub fn new(controller: HlsController) -> Self {
+        Self { controller }
+    }
+}
+
 #[async_trait]
-impl ConsoleHlsPipeline for ControllerPipeline {
+impl ConsoleHlsPipeline for ControllerHlsPipeline {
     fn status(&self) -> HlsStatus {
         self.controller.status()
+    }
+
+    fn is_running(&self) -> bool {
+        self.controller.is_running()
+    }
+
+    fn encoder(&self) -> HlsEncoder {
+        self.controller.config().video_encoder
+    }
+
+    fn bitrate_kbps(&self) -> u32 {
+        self.controller.config().bitrate_kbps
     }
 
     async fn stop(&self) -> Result<(), String> {
@@ -130,6 +192,24 @@ impl ConsoleHlsPipeline for ControllerPipeline {
             .stop()
             .await
             .map_err(|error| error.to_string())
+    }
+
+    async fn restart_with_encoder(
+        &self,
+        encoder: HlsEncoder,
+        bitrate_kbps: Option<u32>,
+        allow_software_fallback: bool,
+    ) -> Result<HlsRestartOutcome, ConsoleHlsRestartError> {
+        self.controller
+            .restart_with_encoder_fallback(encoder, bitrate_kbps, allow_software_fallback)
+            .await
+            .map_err(|error| ConsoleHlsRestartError {
+                unavailable: matches!(
+                    error,
+                    HlsError::EncoderUnavailable { .. } | HlsError::VaapiDevice { .. }
+                ),
+                message: error.to_string(),
+            })
     }
 
     fn manifest_path(&self) -> PathBuf {
@@ -161,7 +241,7 @@ impl ConsoleHlsFactory for ControllerHlsFactory {
             .start()
             .await
             .map_err(|error| error.to_string())?;
-        Ok(Arc::new(ControllerPipeline { controller }))
+        Ok(Arc::new(ControllerHlsPipeline::new(controller)))
     }
 }
 
@@ -195,6 +275,12 @@ pub struct ConsoleHlsStreamStatus {
     /// Why the pipeline is not running, when it is configured and failing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Encoder this console's pipeline currently runs, when one is running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoder: Option<String>,
+    /// Bitrate this console's pipeline currently targets, when one is running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bitrate_kbps: Option<u32>,
     /// Controller-relative playlist path once a pipeline owns the console.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub playlist: Option<String>,
@@ -225,6 +311,90 @@ pub struct MultiConsoleHlsStatus {
     pub limitation: Option<String>,
     /// Per-console pipeline state.
     pub consoles: Vec<ConsoleHlsStreamStatus>,
+}
+
+/// One pipeline targeted by a codec fan-out, including the active single-HLS
+/// path when it is also running.
+pub struct CodecFanoutTarget {
+    /// Stable label (`active` for the single path, `console-<N>` otherwise).
+    pub id: String,
+    /// `active-hls` or `per-console-hls`.
+    pub kind: &'static str,
+    /// Zero-based console index for a per-console pipeline.
+    pub console: Option<u32>,
+    /// True for the active console / active single stream.
+    pub active: bool,
+    /// The pipeline generation to restart.
+    pub pipeline: Arc<dyn ConsoleHlsPipeline>,
+}
+
+/// Per-pipeline result of one codec fan-out.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CodecFanoutPipelineResult {
+    /// Stable pipeline label (`active`, `console-0`, ...).
+    pub id: String,
+    /// `active-hls` or `per-console-hls`.
+    pub kind: String,
+    /// Console index for a per-console pipeline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub console: Option<u32>,
+    /// True for the active console / active single stream.
+    pub active: bool,
+    /// `applied`, `failed`, `rolled-back`, `rollback-failed`, `not-attempted`,
+    /// or `fallback`.
+    pub status: String,
+    /// Encoder the pipeline runs after this operation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoder: Option<String>,
+    /// Encoder the caller requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_encoder: Option<String>,
+    /// True when this pipeline was restarted with an explicit software fallback.
+    pub fallback: bool,
+    /// Failure/rollback detail.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Result of applying one codec request to every running per-console pipeline
+/// (plus an optional active single-HLS path).
+#[derive(Clone, Debug, Default)]
+pub struct MultiConsoleCodecOutcome {
+    /// True only when every targeted pipeline restarted with the requested
+    /// encoder and none needed a software fallback.
+    pub applied: bool,
+    /// True when every pipeline restarted before a failure was restored to its
+    /// previous configuration. Vacuously true when nothing had to be restored.
+    pub rolled_back: bool,
+    /// Number of running pipelines targeted.
+    pub targeted: usize,
+    /// Per-pipeline results in fan-out order.
+    pub pipelines: Vec<CodecFanoutPipelineResult>,
+    /// Labels of pipelines that failed to apply.
+    pub failed: Vec<String>,
+    /// Labels of pipelines whose rollback failed.
+    pub rollback_failed: Vec<String>,
+    /// True when at least one pipeline needed a software fallback.
+    pub fallback: bool,
+    /// True when any failure was an encoder/device availability problem.
+    pub unavailable: bool,
+    /// Encoder common to every successfully restarted pipeline, when they
+    /// agree. `None` when no pipeline was restarted or they differ.
+    pub applied_encoder: Option<HlsEncoder>,
+    /// First failure/rollback message, bounded.
+    pub error: Option<String>,
+}
+
+impl MultiConsoleCodecOutcome {
+    /// True when some pipeline was restarted but the whole request did not
+    /// apply cleanly.
+    pub fn partial(&self) -> bool {
+        !self.applied
+            && self
+                .pipelines
+                .iter()
+                .any(|pipeline| pipeline.status == "applied")
+    }
 }
 
 /// Bounded manager for independent per-console HLS pipelines.
@@ -276,6 +446,11 @@ impl MultiConsoleHls {
         &self.inner.config.root
     }
 
+    /// Base HLS configuration (output directory is replaced per console).
+    pub fn base_config(&self) -> HlsConfig {
+        self.inner.config.base.clone()
+    }
+
     /// Directory for one console (`<root>/console-<N>`).
     pub fn console_dir(&self, console: u32) -> PathBuf {
         console_dir_for(&self.inner.config.root, console)
@@ -309,6 +484,28 @@ impl MultiConsoleHls {
             .outputs
             .iter()
             .any(|output| output.index == console)
+    }
+
+    /// Number of per-console pipelines currently starting/running.
+    pub async fn running_pipeline_count(&self) -> usize {
+        self.inner
+            .state
+            .lock()
+            .await
+            .entries
+            .values()
+            .filter(|entry| {
+                entry
+                    .pipeline
+                    .as_ref()
+                    .is_some_and(|pipeline| pipeline.is_running())
+            })
+            .count()
+    }
+
+    /// True when at least one per-console pipeline is starting/running.
+    pub async fn has_running_pipelines(&self) -> bool {
+        self.running_pipeline_count().await > 0
     }
 
     /// Reconcile the advertised consoles with the running pipelines.
@@ -591,10 +788,12 @@ impl MultiConsoleHls {
         for output in &state.selection.outputs {
             let capturable = supported && output_is_capturable(output, provider);
             let entry = state.entries.get(&output.index);
-            let (status, error, manifest_path) = if !capturable {
+            let (status, error, manifest_path, encoder, bitrate_kbps) = if !capturable {
                 (
                     "unsupported".to_owned(),
                     Some(unsupported_message(provider)),
+                    None,
+                    None,
                     None,
                 )
             } else if let Some(entry) = entry {
@@ -605,6 +804,8 @@ impl MultiConsoleHls {
                             status.status_name().to_owned(),
                             status.error(),
                             Some(pipeline.manifest_path()),
+                            Some(pipeline.encoder().ffmpeg_name().to_owned()),
+                            Some(pipeline.bitrate_kbps()),
                         )
                     }
                     None => (
@@ -615,6 +816,8 @@ impl MultiConsoleHls {
                                 output.index
                             ))
                         }),
+                        None,
+                        None,
                         None,
                     ),
                 }
@@ -627,6 +830,8 @@ impl MultiConsoleHls {
                             .to_owned(),
                     ),
                     None,
+                    None,
+                    None,
                 )
             };
             let output_dir = console_dir_for(&self.inner.config.root, output.index);
@@ -635,6 +840,8 @@ impl MultiConsoleHls {
                 active: output.index == active,
                 status,
                 error,
+                encoder,
+                bitrate_kbps,
                 playlist: manifest_path
                     .is_some()
                     .then(|| format!("/stream/console-{}/stream.m3u8", output.index)),
@@ -661,6 +868,192 @@ impl MultiConsoleHls {
             .consoles
             .into_iter()
             .find(|entry| entry.console == console)
+    }
+
+    /// Apply one encoder/bitrate to every running per-console pipeline, plus any
+    /// extra pipeline supplied by the caller (the active single-HLS path).
+    ///
+    /// Fan-out is serialized under the manager lock and bounded by the running
+    /// entry set (itself bounded by `max_pipelines`). If a pipeline fails, the
+    /// already-restarted pipelines are rolled back to their previous encoder
+    /// and bitrate; `applied` stays false even when some pipelines briefly
+    /// accepted the new encoder.
+    pub async fn apply_codec(
+        &self,
+        encoder: HlsEncoder,
+        bitrate_kbps: Option<u32>,
+        allow_software_fallback: bool,
+        extras: Vec<CodecFanoutTarget>,
+    ) -> MultiConsoleCodecOutcome {
+        let state = self.inner.state.lock().await;
+        let active = state.selection.active_console;
+
+        let mut targets: Vec<CodecFanoutTarget> = extras
+            .into_iter()
+            .filter(|target| target.pipeline.is_running())
+            .collect();
+        let mut per_console: Vec<CodecFanoutTarget> = state
+            .entries
+            .iter()
+            .filter_map(|(console, entry)| {
+                let pipeline = entry.pipeline.as_ref()?;
+                pipeline.is_running().then(|| CodecFanoutTarget {
+                    id: format!("console-{console}"),
+                    kind: "per-console-hls",
+                    console: Some(*console),
+                    active: *console == active,
+                    pipeline: pipeline.clone(),
+                })
+            })
+            .collect();
+        per_console.sort_by_key(|target| (target.console != Some(active), target.console));
+        targets.extend(per_console);
+
+        let targeted = targets.len();
+        if targeted == 0 {
+            return MultiConsoleCodecOutcome {
+                rolled_back: true,
+                ..MultiConsoleCodecOutcome::default()
+            };
+        }
+
+        // Snapshot the previous configuration before the first restart so a
+        // mid-fan-out failure can restore every pipeline that moved.
+        let previous: Vec<(HlsEncoder, u32)> = targets
+            .iter()
+            .map(|target| (target.pipeline.encoder(), target.pipeline.bitrate_kbps()))
+            .collect();
+        let requested = encoder.ffmpeg_name().to_owned();
+        let mut results: Vec<Option<CodecFanoutPipelineResult>> = vec![None; targeted];
+        let mut restarted: Vec<usize> = Vec::new();
+        let mut applied_encoders: Vec<HlsEncoder> = Vec::new();
+        let mut failure: Option<ConsoleHlsRestartError> = None;
+        let mut unavailable = false;
+
+        for (index, target) in targets.iter().enumerate() {
+            match target
+                .pipeline
+                .restart_with_encoder(encoder, bitrate_kbps, allow_software_fallback)
+                .await
+            {
+                Ok(restart) => {
+                    let fallback = restart.fallback.is_some();
+                    applied_encoders.push(restart.applied_encoder);
+                    restarted.push(index);
+                    results[index] = Some(CodecFanoutPipelineResult {
+                        id: target.id.clone(),
+                        kind: target.kind.to_owned(),
+                        console: target.console,
+                        active: target.active,
+                        status: if fallback { "fallback" } else { "applied" }.to_owned(),
+                        encoder: Some(restart.applied_encoder.ffmpeg_name().to_owned()),
+                        requested_encoder: Some(requested.clone()),
+                        fallback,
+                        error: None,
+                    });
+                }
+                Err(error) => {
+                    unavailable = error.unavailable;
+                    results[index] = Some(CodecFanoutPipelineResult {
+                        id: target.id.clone(),
+                        kind: target.kind.to_owned(),
+                        console: target.console,
+                        active: target.active,
+                        status: "failed".to_owned(),
+                        encoder: Some(target.pipeline.encoder().ffmpeg_name().to_owned()),
+                        requested_encoder: Some(requested.clone()),
+                        fallback: false,
+                        error: Some(error.message.clone()),
+                    });
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+
+        for (index, target) in targets.iter().enumerate() {
+            if results[index].is_some() {
+                continue;
+            }
+            results[index] = Some(CodecFanoutPipelineResult {
+                id: target.id.clone(),
+                kind: target.kind.to_owned(),
+                console: target.console,
+                active: target.active,
+                status: "not-attempted".to_owned(),
+                encoder: Some(target.pipeline.encoder().ffmpeg_name().to_owned()),
+                requested_encoder: Some(requested.clone()),
+                fallback: false,
+                error: None,
+            });
+        }
+
+        let mut outcome = MultiConsoleCodecOutcome {
+            targeted,
+            unavailable,
+            error: failure.as_ref().map(|error| bounded(error.message.clone())),
+            ..MultiConsoleCodecOutcome::default()
+        };
+        if let Some(failure_error) = failure {
+            outcome.failed = targets
+                .iter()
+                .zip(results.iter())
+                .filter(|(_, result)| {
+                    result
+                        .as_ref()
+                        .is_some_and(|result| result.status == "failed")
+                })
+                .map(|(target, _)| target.id.clone())
+                .collect();
+            // Restore already-restarted pipelines in reverse order. A failed
+            // restore is reported, never hidden as success.
+            for index in restarted.into_iter().rev() {
+                let target = &targets[index];
+                let (previous_encoder, previous_bitrate) = previous[index];
+                match target
+                    .pipeline
+                    .restart_with_encoder(previous_encoder, Some(previous_bitrate), false)
+                    .await
+                {
+                    Ok(restart) => {
+                        if let Some(result) = results[index].as_mut() {
+                            result.status = "rolled-back".to_owned();
+                            result.encoder = Some(restart.applied_encoder.ffmpeg_name().to_owned());
+                            result.fallback = false;
+                        }
+                    }
+                    Err(error) => {
+                        outcome.rollback_failed.push(target.id.clone());
+                        if let Some(result) = results[index].as_mut() {
+                            result.status = "rollback-failed".to_owned();
+                            result.error = Some(bounded(format!(
+                                "{}; rollback to `{}` failed: {}",
+                                failure_error.message,
+                                previous_encoder.ffmpeg_name(),
+                                error.message
+                            )));
+                        }
+                    }
+                }
+            }
+            outcome.rolled_back = outcome.rollback_failed.is_empty();
+        } else {
+            outcome.fallback = results.iter().flatten().any(|result| result.fallback);
+            outcome.applied = results
+                .iter()
+                .flatten()
+                .all(|result| result.status == "applied");
+            let common = applied_encoders.first().copied();
+            if common.is_some()
+                && applied_encoders
+                    .iter()
+                    .all(|encoder| Some(*encoder) == common)
+            {
+                outcome.applied_encoder = common;
+            }
+        }
+        outcome.pipelines = results.into_iter().flatten().collect();
+        outcome
     }
 }
 
@@ -886,6 +1279,10 @@ mod tests {
         manifest: PathBuf,
         running: Arc<AtomicBool>,
         stopped: Arc<StdMutex<Vec<u32>>>,
+        encoder: StdMutex<HlsEncoder>,
+        bitrate_kbps: StdMutex<u32>,
+        fail_restart: Arc<StdMutex<HashSet<(u32, HlsEncoder)>>>,
+        restarts: Arc<StdMutex<Vec<(u32, HlsEncoder, u32)>>>,
     }
 
     #[async_trait]
@@ -898,10 +1295,58 @@ mod tests {
             }
         }
 
+        fn is_running(&self) -> bool {
+            self.running.load(Ordering::SeqCst)
+        }
+
+        fn encoder(&self) -> HlsEncoder {
+            *self.encoder.lock().expect("encoder")
+        }
+
+        fn bitrate_kbps(&self) -> u32 {
+            *self.bitrate_kbps.lock().expect("bitrate")
+        }
+
         async fn stop(&self) -> Result<(), String> {
             self.running.store(false, Ordering::SeqCst);
             self.stopped.lock().expect("stops").push(self.console);
             Ok(())
+        }
+
+        async fn restart_with_encoder(
+            &self,
+            encoder: HlsEncoder,
+            bitrate_kbps: Option<u32>,
+            _allow_software_fallback: bool,
+        ) -> Result<HlsRestartOutcome, ConsoleHlsRestartError> {
+            if self
+                .fail_restart
+                .lock()
+                .expect("fail restart")
+                .contains(&(self.console, encoder))
+            {
+                return Err(ConsoleHlsRestartError::new(
+                    format!(
+                        "fake encoder `{}` for Console_{} failed",
+                        encoder.ffmpeg_name(),
+                        self.console
+                    ),
+                    encoder.is_hardware(),
+                ));
+            }
+            *self.encoder.lock().expect("encoder") = encoder;
+            let bitrate = bitrate_kbps.unwrap_or_else(|| self.bitrate_kbps());
+            *self.bitrate_kbps.lock().expect("bitrate") = bitrate;
+            self.restarts
+                .lock()
+                .expect("restarts")
+                .push((self.console, encoder, bitrate));
+            Ok(HlsRestartOutcome {
+                status: HlsStatus::running(self.manifest.clone()),
+                requested_encoder: encoder,
+                applied_encoder: encoder,
+                fallback: None,
+            })
         }
 
         fn manifest_path(&self) -> PathBuf {
@@ -914,6 +1359,8 @@ mod tests {
         started: Arc<StdMutex<Vec<u32>>>,
         stopped: Arc<StdMutex<Vec<u32>>>,
         fail: Arc<StdMutex<HashSet<u32>>>,
+        fail_restart: Arc<StdMutex<HashSet<(u32, HlsEncoder)>>>,
+        restarts: Arc<StdMutex<Vec<(u32, HlsEncoder, u32)>>>,
     }
 
     impl FakeFactory {
@@ -923,6 +1370,8 @@ mod tests {
                 started: Arc::new(StdMutex::new(Vec::new())),
                 stopped: Arc::new(StdMutex::new(Vec::new())),
                 fail: Arc::new(StdMutex::new(HashSet::new())),
+                fail_restart: Arc::new(StdMutex::new(HashSet::new())),
+                restarts: Arc::new(StdMutex::new(Vec::new())),
             }
         }
 
@@ -932,6 +1381,17 @@ mod tests {
 
         fn stopped(&self) -> Vec<u32> {
             self.stopped.lock().expect("stopped").clone()
+        }
+
+        fn fail_restart(&self, console: u32, encoder: HlsEncoder) {
+            self.fail_restart
+                .lock()
+                .expect("fail restart")
+                .insert((console, encoder));
+        }
+
+        fn restarts(&self) -> Vec<(u32, HlsEncoder, u32)> {
+            self.restarts.lock().expect("restarts").clone()
         }
     }
 
@@ -958,6 +1418,10 @@ mod tests {
                 manifest,
                 running: Arc::new(AtomicBool::new(true)),
                 stopped: self.stopped.clone(),
+                encoder: StdMutex::new(config.video_encoder),
+                bitrate_kbps: StdMutex::new(config.bitrate_kbps),
+                fail_restart: self.fail_restart.clone(),
+                restarts: self.restarts.clone(),
             }))
         }
     }
@@ -1179,5 +1643,183 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
         }
+    }
+
+    #[tokio::test]
+    async fn codec_fanout_applies_every_running_pipeline_and_reports_encoders() {
+        let root = temp_dir("codec-all");
+        let factory = Arc::new(FakeFactory::new(Some(VmConsoleBackend::Dbus)));
+        let manager = manager(factory.clone(), &root, 2, Duration::ZERO);
+        manager.sync(&selection(0, &[0, 1], "dbus")).await;
+
+        let outcome = manager
+            .apply_codec(HlsEncoder::Hevc, Some(2_000), false, Vec::new())
+            .await;
+        assert!(outcome.applied, "{outcome:?}");
+        assert!(!outcome.partial());
+        assert_eq!(outcome.targeted, 2);
+        assert_eq!(outcome.applied_encoder, Some(HlsEncoder::Hevc));
+        assert!(outcome.failed.is_empty());
+        assert!(outcome.rollback_failed.is_empty());
+        assert_eq!(
+            outcome
+                .pipelines
+                .iter()
+                .map(|pipeline| pipeline.status.as_str())
+                .collect::<Vec<_>>(),
+            vec!["applied", "applied"]
+        );
+        assert_eq!(
+            factory.restarts(),
+            vec![(0, HlsEncoder::Hevc, 2_000), (1, HlsEncoder::Hevc, 2_000)]
+        );
+
+        let status = manager.status().await;
+        assert_eq!(status.consoles[0].encoder.as_deref(), Some("libx265"));
+        assert_eq!(status.consoles[1].encoder.as_deref(), Some("libx265"));
+        assert_eq!(status.consoles[1].bitrate_kbps, Some(2_000));
+    }
+
+    #[tokio::test]
+    async fn codec_fanout_rolls_back_already_restarted_pipelines_on_one_failure() {
+        let root = temp_dir("codec-rollback");
+        let factory = Arc::new(FakeFactory::new(Some(VmConsoleBackend::Dbus)));
+        let manager = manager(factory.clone(), &root, 2, Duration::ZERO);
+        manager.sync(&selection(0, &[0, 1], "dbus")).await;
+        factory.fail_restart(1, HlsEncoder::Hevc);
+
+        let outcome = manager
+            .apply_codec(HlsEncoder::Hevc, Some(2_000), false, Vec::new())
+            .await;
+        assert!(!outcome.applied, "{outcome:?}");
+        assert!(outcome.rolled_back, "{outcome:?}");
+        assert_eq!(outcome.failed, vec!["console-1"]);
+        assert!(outcome.rollback_failed.is_empty());
+        assert_eq!(outcome.pipelines[0].status, "rolled-back");
+        assert_eq!(outcome.pipelines[1].status, "failed");
+        assert_eq!(
+            factory.restarts(),
+            vec![(0, HlsEncoder::Hevc, 2_000), (0, HlsEncoder::H264, 4_000)]
+        );
+        let status = manager.status().await;
+        assert_eq!(status.consoles[0].encoder.as_deref(), Some("libx264"));
+        assert_eq!(status.consoles[1].encoder.as_deref(), Some("libx264"));
+    }
+
+    #[tokio::test]
+    async fn codec_fanout_reports_a_failed_rollback_without_claiming_success() {
+        let root = temp_dir("codec-rollback-failed");
+        let factory = Arc::new(FakeFactory::new(Some(VmConsoleBackend::Dbus)));
+        let manager = manager(factory.clone(), &root, 2, Duration::ZERO);
+        manager.sync(&selection(0, &[0, 1], "dbus")).await;
+        factory.fail_restart(1, HlsEncoder::Hevc);
+        factory.fail_restart(0, HlsEncoder::H264);
+
+        let outcome = manager
+            .apply_codec(HlsEncoder::Hevc, Some(2_000), false, Vec::new())
+            .await;
+        assert!(!outcome.applied, "{outcome:?}");
+        assert!(!outcome.rolled_back, "{outcome:?}");
+        assert_eq!(outcome.failed, vec!["console-1"]);
+        assert_eq!(outcome.rollback_failed, vec!["console-0"]);
+        assert_eq!(outcome.pipelines[0].status, "rollback-failed");
+        assert_eq!(outcome.pipelines[1].status, "failed");
+        assert!(outcome.pipelines[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("rollback")));
+    }
+
+    #[tokio::test]
+    async fn codec_fanout_with_no_running_pipelines_targets_nothing() {
+        let root = temp_dir("codec-empty");
+        let factory = Arc::new(FakeFactory::new(Some(VmConsoleBackend::Dbus)));
+        let manager = manager(factory.clone(), &root, 2, Duration::ZERO);
+
+        let outcome = manager
+            .apply_codec(HlsEncoder::Hevc, Some(2_000), false, Vec::new())
+            .await;
+        assert_eq!(outcome.targeted, 0);
+        assert!(!outcome.applied);
+        assert!(outcome.pipelines.is_empty());
+        assert!(factory.restarts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn codec_fanout_applies_to_the_active_console_only() {
+        let root = temp_dir("codec-active");
+        let factory = Arc::new(FakeFactory::new(Some(VmConsoleBackend::Dbus)));
+        let manager = manager(factory.clone(), &root, 2, Duration::ZERO);
+        manager.sync(&selection(0, &[0], "dbus")).await;
+
+        let outcome = manager
+            .apply_codec(HlsEncoder::Hevc, Some(2_000), false, Vec::new())
+            .await;
+        assert!(outcome.applied, "{outcome:?}");
+        assert_eq!(outcome.targeted, 1);
+        assert!(outcome.pipelines[0].active);
+        assert_eq!(outcome.pipelines[0].id, "console-0");
+        assert_eq!(factory.restarts(), vec![(0, HlsEncoder::Hevc, 2_000)]);
+    }
+
+    #[tokio::test]
+    async fn codec_fanout_hardware_rejection_is_typed_and_does_not_apply() {
+        let root = temp_dir("codec-hardware");
+        let factory = Arc::new(FakeFactory::new(Some(VmConsoleBackend::Dbus)));
+        let manager = manager(factory.clone(), &root, 2, Duration::ZERO);
+        manager.sync(&selection(0, &[0], "dbus")).await;
+        factory.fail_restart(0, HlsEncoder::VaapiH264);
+
+        let outcome = manager
+            .apply_codec(HlsEncoder::VaapiH264, None, false, Vec::new())
+            .await;
+        assert!(!outcome.applied, "{outcome:?}");
+        assert!(outcome.unavailable, "{outcome:?}");
+        assert!(outcome.rolled_back);
+        assert_eq!(outcome.failed, vec!["console-0"]);
+        assert_eq!(outcome.pipelines[0].status, "failed");
+        assert!(outcome.pipelines[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("h264_vaapi")));
+    }
+
+    #[tokio::test]
+    async fn codec_fanout_also_restarts_an_extra_active_single_hls_pipeline() {
+        let root = temp_dir("codec-extra");
+        let factory = Arc::new(FakeFactory::new(Some(VmConsoleBackend::Dbus)));
+        let manager = manager(factory.clone(), &root, 2, Duration::ZERO);
+        manager.sync(&selection(0, &[0], "dbus")).await;
+        let extra_root = temp_dir("codec-extra-single");
+        let extra = Arc::new(FakePipeline {
+            console: 99,
+            manifest: extra_root.join("stream.m3u8"),
+            running: Arc::new(AtomicBool::new(true)),
+            stopped: Arc::new(StdMutex::new(Vec::new())),
+            encoder: StdMutex::new(HlsEncoder::H264),
+            bitrate_kbps: StdMutex::new(4_000),
+            fail_restart: factory.fail_restart.clone(),
+            restarts: factory.restarts.clone(),
+        });
+        let target = CodecFanoutTarget {
+            id: "active".to_owned(),
+            kind: "active-hls",
+            console: None,
+            active: true,
+            pipeline: extra,
+        };
+
+        let outcome = manager
+            .apply_codec(HlsEncoder::Hevc, Some(2_000), false, vec![target])
+            .await;
+        assert!(outcome.applied, "{outcome:?}");
+        assert_eq!(outcome.targeted, 2);
+        assert_eq!(outcome.pipelines[0].id, "active");
+        assert_eq!(outcome.pipelines[0].kind, "active-hls");
+        assert_eq!(outcome.pipelines[1].id, "console-0");
+        assert_eq!(
+            factory.restarts(),
+            vec![(99, HlsEncoder::Hevc, 2_000), (0, HlsEncoder::Hevc, 2_000)]
+        );
     }
 }

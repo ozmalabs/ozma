@@ -1,16 +1,20 @@
 # Rust multi-seat planning and supervision (`ozma-multiseat`)
 
 Status: **library + real subprocess supervisor + CLI + controller read-only
-grouping + input-routing/display-ownership models (2026-11-25).** The crate
-enumerates display/input topology, plans one desktop seat per output, can spawn,
-health-check, restart, stop, and report one `ozma-node --profile desktop` child
-per seat, and now models the two ownership layers: `xinput map-to-output` input
-routing with rollback, and per-seat `xrandr` output/mode/position ownership. It
-is **not wired into `ozma-node` or `ozma-softnode`**, the CLI does not execute
-the routing/ownership plans, and it creates no virtual display or audio sink. No
-real evdev grab is performed and no input is injected. The controller can now
-group the independent per-seat node registrations for display, without merging
-them or taking over seat lifecycle.
+grouping + opt-in input-routing/display-ownership execution (2026-11-25).**
+The crate enumerates display/input topology, plans one desktop seat per output,
+can spawn, health-check, restart, stop, and report one `ozma-node --profile
+desktop` child per seat, and models the two ownership layers: `xinput
+map-to-output` input routing with rollback, and per-seat `xrandr`
+output/mode/position ownership. The supervisor can now **apply those resources
+before spawning and release them on stop/remove/shutdown** when the explicit
+`--apply-ownership`/`--apply-routing` CLI flags (or the matching
+`SupervisorOptions` booleans) are enabled; both default to off, and dry-run
+still performs no action. It is **not wired into `ozma-node` or
+`ozma-softnode`**, and it creates no virtual display or audio sink. No real
+evdev grab is performed and no input is injected. The controller can group the
+independent per-seat node registrations for display, without merging them or
+taking over seat lifecycle.
 
 The Python baseline in [`agent/multiseat`](../agent/multiseat) remains the
 runnable multi-seat implementation. The plan and phase status are in
@@ -66,6 +70,15 @@ Implemented:
   and rollback through an injectable runner. `SeatPlan` and `NodeCommand`
   environment carry the output, mode, ownership kind, routing strategy, and
   explicit uinput seat.
+- Opt-in supervisor resource execution: with `apply_ownership`/`apply_routing`
+  enabled, `ProcessSeatSupervisor` applies xrandr ownership and then
+  xinput/evdev routing **before** spawning a child. An apply failure prevents
+  that spawn, records a typed `SeatResourceError`, and releases resources
+  already applied for earlier seats. Stop, remove, rollback, and `Drop` release
+  routing before ownership, best effort, with failures kept in status.
+- Status carries `resources` (`ownership_applied`, `routing_applied`,
+  `ownership_released`, `routing_released`, and typed `errors`). The field is
+  omitted when no resource action happened, so default status is unchanged.
 - Read-only controller seat grouping (`GET /api/v1/seats`, dashboard Seats
   panel) that recognises the `<machine>-seat-<n>` names the planner produces,
   or explicit `seat_id`/`parent_node_id` metadata, and reports online state,
@@ -86,10 +99,12 @@ Deliberately not implemented yet:
   provides the execution seam, but the default backend is unsupported because
   the crate forbids `unsafe`; no privileged helper exists. udev/Xorg
   `InputDevice` sections are not generated.
-- **Automatic routing/ownership execution.** The CLI prints the planned
-  ownership/routing intent and injects its environment into the child; it does
-  not call `XInputRouter` or `XrandrOwnershipController`. An operator or a
-  future manager must invoke the controllers.
+- **Automatic routing/ownership execution is opt-in.** The CLI now executes
+  the planned ownership/routing commands only with `--apply-ownership` and/or
+  `--apply-routing`; both default off, and `--print-plan`/`--dry-run` never
+  execute them. There is no policy engine, per-seat retry loop beyond the
+  supervisor's restart path, or automatic reconciliation after external X
+  layout changes. Evdev routing still requires an injected backend.
 - Per-seat uinput targeting at the kernel/compositor level; the node's uinput
   sink still does not choose an X screen. The environment now names the target
   seat, but the node must honour it.
@@ -118,6 +133,7 @@ Deliberately not implemented yet:
 | Input routing | `InputRouter`, `XInputRouter`, `EvdevGrabRouter`, `InputTarget`, `InputAssignment`, `InputRelease`, `InputRoutePlan`, `InputRoutingStrategy`, `assign_seats`, `parse_xinput_list`, `XInputDevice`, `RouteCommand`, `CommandRunner`, `ProcessCommandRunner`, `DeviceNameResolver`, `SysfsDeviceNameResolver`, `EvdevGrabBackend`, `EvdevGrabCommand`, `UnsupportedEvdevGrabBackend` |
 | Display ownership | `DisplayOwnership`, `DisplayOwnershipKind`, `DisplayOwnershipController`, `XrandrOwnershipController`, `apply_ownership` |
 | Plan result | `MultiseatPlan`, `PlanDiagnostic`, `DiagnosticCode` |
+| Supervisor | `SeatSupervisor`, `ProcessSeatSupervisor`, `SupervisorOptions`, `NodeLaunchSpec`, `NodeLauncher`, `ReadinessProbe`, `SeatRuntimeStatus`, `SeatResourceStatus`, `SeatResourceError`, `ResourceKind`, `ResourceAction` |
 | Status | `MultiseatCapability`, `MultiseatStatus`, `render_metrics` |
 | Supervision | `SeatSupervisor`, `ProcessSeatSupervisor`, `SupervisorOptions`, `NodeLaunchSpec`, `NodeLauncher`, `ProcessLauncher`, `ChildHandle`, `ChildExit`, `ReadinessProbe`, `HttpHealthProbe`, `PortProbe`, `restart_delay` |
 | CLI | `ozma-multiseat` binary |
@@ -193,9 +209,11 @@ if the sink does not exist.
 ## Input routing and display ownership
 
 These layers turn the plan's device paths and output names into explicit
-commands, but they are **not invoked by the CLI or supervisor**. A caller (an
-operator, the future manager, or a test) must construct a router/controller and
-call `assign`/`apply`.
+commands. They are **opt-in** in the CLI and supervisor: with the flags off (the
+default) the plan is printed and injected into the child environment only; with
+`--apply-ownership`/`--apply-routing` the supervisor calls the
+`XrandrOwnershipController` and `XInputRouter` around the child lifecycle. A
+caller can still construct a router/controller directly.
 
 ### Physical input routing
 
@@ -274,27 +292,45 @@ fn status(&self) -> Vec<SeatRuntimeStatus>;
 
 `ProcessSeatSupervisor` is the real implementation:
 
+- **Resource reservation (opt-in).** With `apply_ownership` and/or
+  `apply_routing`, start applies the seat's `xrandr` ownership first, then
+  input routing, before spawning. Ownership is applied through
+  `XrandrOwnershipController`; xinput seats use `XInputRouter`; an evdev-strategy
+  seat needs an injected evdev router, otherwise it fails with a typed
+  `Unsupported` error. A failed apply never spawns that seat, records a typed
+  `SeatResourceError`, and releases every resource already applied for earlier
+  seats in reverse order. Controllers are installed with
+  `with_ownership_controller`, `with_routing_controller`, and
+  `with_evdev_routing_controller`; without the flags no controller is called.
 - **Start.** Spawn `plan.command.program` with its exact args and environment.
   The child inherits the supervisor's stdout/stderr. Wait until `GET /health`
   returns HTTP 200 (default) or a bounded TCP connect succeeds. A readiness
   timeout, probe error, spawn error, or early child exit is a `failed` state,
-  never a fabricated `running` state.
+  never a fabricated `running` state; resources reserved for that failed child
+  are released.
 - **Restart.** An exited or failed child is restarted with bounded exponential
   backoff (`initial * 2^attempt`, capped). A child that stays up for
-  `healthy_uptime` resets the failure count. There is no restart-count limit;
-  call `stop`/`remove` to end supervision.
+  `healthy_uptime` resets the failure count. Already-applied resources remain in
+  place across a restart; a resource released after a failed start is re-applied
+  before the restart spawn.
 - **Stop.** Send `SIGTERM`, wait up to five seconds for the node to exit, then
-  kill and reap it. `remove` additionally forgets the seat; `stop` keeps the
-  stopped status so it can be started again.
+  kill and reap it. Only after the child is gone are routing and ownership
+  released (routing first). Release failures are best effort: the state is
+  `stopped`, the applied flag stays set, and the typed error is reported in
+  `resources.errors`. `remove` additionally forgets the seat only when its
+  resources are released; otherwise it retains the seat for a retry.
 - **Status.** Each seat reports pid, planned UDP/HTTP ports, state, restart
-  count, next restart delay, and the most recent error. A planned seat with no
-  runtime entry stays `planned`.
+  count, next restart delay, the most recent error, and applied/released
+  resource state. A planned seat with no runtime entry stays `planned`.
 - **Dry run.** `SupervisorOptions::dry_run` records the launch spec and reports
-  `planned` with a `dry-run` message; it never spawns or probes.
+  `planned` with a `dry-run` message; it never spawns, probes, or invokes a
+  routing/ownership controller even when the apply flags are set.
 - **Tests.** `ProcessSeatSupervisor::with_parts` injects a `NodeLauncher` and a
   `ReadinessProbe`. `FakeNodeLauncher` records spawns, simulates exits and
   spawn failures, and records stop requests; `FakeReadinessProbe` can be ready,
-  not-ready, delayed, or failing.
+  not-ready, delayed, or failing. `FakeCommandRunner` plus
+  `FakeDeviceNameResolver` drive the real `XrandrOwnershipController` and
+  `XInputRouter` without running `xrandr`/`xinput`.
 
 `ProcessSeatSupervisor::tick` performs child polling and due restarts. It is
 synchronous; a caller with an async runtime runs it from a poll loop. `Drop`
@@ -337,7 +373,13 @@ stops any child still owned by the supervisor.
       "input_devices": ["/dev/input/event0", "/dev/input/event1"],
       "state": "running",
       "pid": 4242,
-      "restarts": 0
+      "restarts": 0,
+      "resources": {
+        "ownership_applied": true,
+        "routing_applied": true,
+        "ownership_released": false,
+        "routing_released": false
+      }
     }
   ],
   "diagnostics": []
@@ -345,9 +387,11 @@ stops any child still owned by the supervisor.
 ```
 
 A failed seat also carries `last_error` and, while a restart is pending,
-`next_restart_in_ms`. `capability.node_count` always equals
-`capability.seat_count` and the number of seat entries. There is no merged
-super-node.
+`next_restart_in_ms`. Resource apply/release failures add entries such as
+`{"kind":"ownership","action":"release","message":"..."}` to
+`resources.errors`; the field is omitted entirely when both apply flags are off.
+`capability.node_count` always equals `capability.seat_count` and the number of
+seat entries. There is no merged super-node.
 
 `render_metrics` emits a bounded text surface:
 
@@ -403,6 +447,10 @@ ozma-multiseat --display :0 \
   --status-port 7390 \
   --restart-backoff-ms 1000 --restart-backoff-max-ms 30000 \
   --readiness-timeout-ms 15000 --poll-interval-ms 1000
+
+# Opt in to per-seat xrandr ownership and xinput routing. Both are off by
+# default; a failed apply stops the start and releases earlier seats.
+ozma-multiseat --display :0 --apply-ownership --apply-routing
 ```
 
 Configuration:
@@ -419,6 +467,8 @@ Configuration:
 | `--healthy-uptime-secs` | Uptime that resets the failure count. |
 | `--print-plan` | Print the plan and exit without spawning. |
 | `--dry-run` | Record/print launch state without spawning or probing. |
+| `--apply-ownership` | Apply each seat's `xrandr` output ownership before spawn (default off). |
+| `--apply-routing` | Apply each seat's xinput/evdev input routing before spawn (default off). |
 | `--machine-name NAME` | Seat id prefix. |
 | `--profile NAME` | Seat profile (capture defaults/label). |
 | `--seats N` | Requested seats (default one per display). |
@@ -431,6 +481,16 @@ The CLI aborts if `xrandr` is missing, the X display cannot be opened, no
 display is reported, or input enumeration fails. It does not fall back to a
 fake backend. DRM connectors are printed for diagnostics only. A seat with no
 input group is still planned with a `SeatWithoutInput` diagnostic.
+
+With `--apply-ownership`/`--apply-routing`, the supervisor applies each seat's
+resource before spawning it. A missing `xrandr`/`xinput`, a non-zero command, a
+non-xrandr ownership kind, or an evdev strategy without a backend is a typed
+failure: that seat is not spawned, and already-applied resources for earlier
+seats are released. On SIGINT/SIGTERM the CLI calls `stop_all`, which releases
+routing/ownership after each child exits. Output lists applied/released state
+and any release error; JSON carries `resources` on each seat. With the flags
+off (the default) the CLI never runs `xrandr` or `xinput` for ownership/routing,
+and `--print-plan`/`--dry-run` never run them even when the flags are present.
 
 The optional status listener is bound to `127.0.0.1` and exposes only
 `/health`, `/status`, `/metrics`, and `/api/v1/connection`. It carries no
@@ -470,6 +530,12 @@ The default suite covers:
 - Xrandr ownership argv (`--output/--mode/--pos`), apply/release through a fake
   runner, absent-`xrandr` typed errors, non-xrandr kind rejection, duplicate
   output rejection, and multi-seat apply rollback.
+- Supervisor resource execution with fake runner/router/launcher: ownership
+  before routing before spawn, apply failure stops the spawn and releases
+  earlier seats, stop/remove release routing before ownership, best-effort
+  release errors stay in status, dry-run and flags-off perform no resource
+  action, missing tools are typed, and an evdev strategy without a backend is
+  typed unsupported (`tests/resource_supervisor.rs`).
 - Planner wiring of `SeatPlan.ownership`, `SeatPlan.input_route`, and the
   ownership/routing environment.
 
@@ -519,20 +585,39 @@ OZMA_MULTISEAT_REAL=1 OZMA_MULTISEAT_XRANDR_APPLY=1 DISPLAY=:99 \
 It applies one `--output/--mode/--pos` and releases with `--auto`, again only on
 a throwaway display.
 
-Live smoke (2026-11-25): `--print-plan` and `--dry-run` succeeded against an
-ephemeral Xvfb `:99` with read-only sysfs input, producing one seat and the
-exact `ozma-node --profile desktop` argv without spawning a node or injecting
-input. The plan printed `ownership: xrandr-output screen mode=1280x800 pos=0x0`
+The full supervisor resource path is also opt-in:
+
+```bash
+Xvfb :97 -screen 0 1280x800x24 &
+OZMA_MULTISEAT_REAL=1 OZMA_MULTISEAT_SUPERVISOR_APPLY=1 DISPLAY=:97 \
+  cargo test -p ozma-multiseat --test live_resource_supervisor \
+  -- --ignored --nocapture
+```
+
+It applies real `xrandr` ownership and a real `xinput map-to-output` route, starts
+a temporary fake HTTP node, stops it through `ProcessSeatSupervisor`, and
+asserts both resources were released. It uses the throwaway display only and
+never grabs evdev or injects input.
+
+Live smoke (2026-11-25): `--print-plan`, `--dry-run`, and the normal supervisor
+path succeeded against ephemeral Xvfb `:99`/`:97` with read-only sysfs input,
+producing the exact `ozma-node --profile desktop` argv without spawning a real
+node. The plan printed `ownership: xrandr-output screen mode=1280x800 pos=0x0`
 and `input route: xinput-map-to-output ... grab=no`, with
 `OZMA_X11_OUTPUT`/`OZMA_X11_MODE`/`OZMA_DISPLAY_OWNERSHIP`/`OZMA_INPUT_ROUTER`/
-`OZMA_UINPUT_SEAT` in the child environment. A separate supervisor smoke used a
-temporary fake `/health` node: the real `ProcessLauncher` passed `DISPLAY`,
-`PULSE_SINK`, and `OZMA_SEAT_ID`, readiness succeeded, `/status`/`/metrics`
-reported pid/ports/state, and SIGTERM stopped and reaped the child. No real
-`ozma-node` was started.
+`OZMA_UINPUT_SEAT` in the child environment. A supervisor smoke with
+`--apply-ownership` and a temporary fake `/health` node applied
+`xrandr --output screen --mode 1280x800 --pos 0x0` on Xvfb `:97`, reported
+`resources(ownership=applied)`, and on SIGTERM stopped/reaped the child and
+reported `resources(ownership=released)`. The live
+`live_resource_supervisor` test additionally applied both real ownership and a
+real `xinput map-to-output 6 screen` route before starting the fake node, then
+released the route to `all` and the output with `--auto`; status ended with
+`ownership_applied=false`, `routing_applied=false`, both released flags true,
+and no resource errors.
 
-The opt-in routing smoke on the same Xvfb display listed six XInput devices and
-mapped `Xvfb mouse` (id 6) to the `screen` output with the real
+The opt-in routing smoke on Xvfb listed six XInput devices and mapped
+`Xvfb mouse` (id 6) to the `screen` output with the real
 `ProcessCommandRunner`; release reset it with `map-to-output 6 all`. The opt-in
 ownership smoke applied `xrandr --output screen --mode 1280x800 --pos 0x0` and
 released with `--auto` on the same disposable display. The host's existing X
@@ -558,10 +643,10 @@ local status surface. Still required for parity:
    are required. Virtual displays still depend on an external Xorg/dummy driver
    or the future IDD path. There is no Wayland compositor seat path.
 3. **Input routing execution and policy.** `xinput map-to-output` and rollback
-   exist behind an injected runner, and `EVIOCGRAB` is modelled, but the CLI
-   does not invoke them, no privileged grab helper exists, and udev/Xorg
-   `InputDevice` sections, device permissions, hotplug re-routing, and durable
-   per-seat input state are missing.
+   are now invoked by the supervisor when `--apply-routing` is enabled, but
+   `EVIOCGRAB` still has no privileged grab helper, so evdev stays modelled and
+   typed unsupported. udev/Xorg `InputDevice` sections, device permissions,
+   hotplug re-routing, and durable per-seat input state are missing.
 4. **Per-seat uinput targeting.** The environment now names the target seat
    (`OZMA_UINPUT_SEAT`), but injection still goes to the focused X
    window/server, not a specific seat output or compositor seat.

@@ -23,10 +23,11 @@ use std::time::Duration;
 
 use clap::Parser;
 use ozma_multiseat::{
-    detect_drm, render_metrics, DrmDetection, HostTopology, HttpHealthProbe, MultiseatPlan,
-    MultiseatPlanner, MultiseatStatus, PlannerOptions, PortProbe, ProcessLauncher,
-    ProcessSeatSupervisor, ReadinessProbe, SeatProfile, SeatState, SeatSupervisor,
-    SupervisorOptions, SysfsInputBackend, XrandrDisplayBackend, DEFAULT_HEALTH_PATH,
+    detect_drm, render_metrics, DrmDetection, EvdevGrabRouter, HostTopology, HttpHealthProbe,
+    MultiseatPlan, MultiseatPlanner, MultiseatStatus, PlannerOptions, PortProbe,
+    ProcessCommandRunner, ProcessLauncher, ProcessSeatSupervisor, ReadinessProbe, SeatProfile,
+    SeatResourceStatus, SeatState, SeatSupervisor, SupervisorOptions, SysfsInputBackend,
+    XInputRouter, XrandrDisplayBackend, XrandrOwnershipController, DEFAULT_HEALTH_PATH,
     DEFAULT_NODE_BIN,
 };
 
@@ -47,7 +48,10 @@ use ozma_multiseat::{
                   the launch plan without spawning. Without either flag the supervisor \
                   starts every seat, waits for `/health` (or a bounded port check), restarts \
                   failed children with bounded exponential backoff, and stops them on \
-                  SIGINT/SIGTERM."
+                  SIGINT/SIGTERM. `--apply-ownership` and `--apply-routing` opt in to applying \
+                  each seat's xrandr ownership and xinput/evdev routing before spawn; both \
+                  default off, a failed apply stops that spawn, and earlier seats are released. \
+                  `--print-plan` and `--dry-run` never run routing or ownership commands."
 )]
 struct Args {
     /// Node binary or path passed to every planned seat.
@@ -97,6 +101,14 @@ struct Args {
     /// Record and print the launch plan without spawning any child.
     #[arg(long)]
     dry_run: bool,
+
+    /// Apply each seat's xrandr output ownership before spawning (default off).
+    #[arg(long)]
+    apply_ownership: bool,
+
+    /// Apply each seat's xinput/evdev input routing before spawning (default off).
+    #[arg(long)]
+    apply_routing: bool,
 
     /// Machine name used to build seat ids (`<machine>-seat-N`).
     #[arg(long, default_value = "ozma")]
@@ -177,6 +189,8 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
         restart_backoff_max: Duration::from_millis(args.restart_backoff_max_ms),
         healthy_uptime: Duration::from_secs(args.healthy_uptime_secs),
         dry_run: args.dry_run,
+        apply_ownership: args.apply_ownership,
+        apply_routing: args.apply_routing,
     };
 
     if args.dry_run {
@@ -200,6 +214,19 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
     };
     let mut supervisor =
         ProcessSeatSupervisor::with_parts(options, Arc::new(ProcessLauncher), probe);
+    if args.apply_ownership {
+        supervisor = supervisor.with_ownership_controller(Box::new(
+            XrandrOwnershipController::new(Box::new(ProcessCommandRunner)),
+        ));
+    }
+    if args.apply_routing {
+        supervisor = supervisor
+            .with_routing_controller(Box::new(XInputRouter::new(Box::new(ProcessCommandRunner))));
+        // The planner emits xinput mapping today. Keeping the default evdev
+        // router wired means an explicit evdev strategy fails with the typed
+        // unsupported error rather than pretending a grab happened.
+        supervisor = supervisor.with_evdev_routing_controller(Box::new(EvdevGrabRouter::new()));
+    }
 
     let mut started = 0usize;
     for seat in &plan.seats {
@@ -212,6 +239,18 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
             }
             Err(error) => {
                 eprintln!("seat {} failed to start: {error}", seat.config.id);
+                if args.apply_ownership || args.apply_routing {
+                    // The supervisor already released every applied resource
+                    // when the later seat could not be reserved. Stop any
+                    // children started by this plan so the CLI does not leave
+                    // a partial seat set running, then print the final
+                    // released/error state.
+                    supervisor.stop_all();
+                    for status in supervisor.status() {
+                        print_status(&args, &status);
+                    }
+                    return Err(error);
+                }
             }
         }
     }
@@ -512,10 +551,40 @@ fn print_status(args: &Args, status: &ozma_multiseat::SeatRuntimeStatus) {
     if let Some(error) = &status.last_error {
         line.push_str(&format!(" error={error}"));
     }
+    if !status.resources.is_empty() {
+        line.push_str(&resource_summary(&status.resources));
+    }
     if let Some(message) = &status.message {
         line.push_str(&format!(" ({message})"));
     }
     println!("{line}");
+}
+
+fn resource_state(applied: bool, released: bool) -> &'static str {
+    if applied {
+        "applied"
+    } else if released {
+        "released"
+    } else {
+        "none"
+    }
+}
+
+fn resource_summary(resources: &SeatResourceStatus) -> String {
+    let mut summary = format!(
+        " resources(ownership={} routing={})",
+        resource_state(resources.ownership_applied, resources.ownership_released),
+        resource_state(resources.routing_applied, resources.routing_released),
+    );
+    for error in &resources.errors {
+        summary.push_str(&format!(
+            " resource_error[{} {}]={}",
+            error.kind.as_str(),
+            error.action.as_str(),
+            error.message
+        ));
+    }
+    summary
 }
 
 fn print_status_document(args: &Args, status: &MultiseatStatus) {
@@ -552,6 +621,9 @@ fn print_status_document(args: &Args, status: &MultiseatStatus) {
         }
         if let Some(error) = &seat.last_error {
             line.push_str(&format!(" error={error}"));
+        }
+        if !seat.resources.is_empty() {
+            line.push_str(&resource_summary(&seat.resources));
         }
         if let Some(message) = &seat.message {
             line.push_str(&format!(" ({message})"));

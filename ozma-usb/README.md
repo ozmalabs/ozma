@@ -6,7 +6,8 @@ This crate is the model and controller layer of the Python
 `softnode/virtual_usb.py`, `softnode/usb_mass_storage.py`, and
 `softnode/virtual_media.py` paths. It builds FAT32 images in memory, adds a
 bounded copy-on-write write overlay, models ISO/NBD media, includes a bounded
-fixed-newstyle NBD server backed by a regular file or in-memory image, and
+fixed-newstyle NBD server backed by a regular file, an in-memory image, or a
+copy-on-write overlay, and
 sequences FunctionFS from ConfigFS function creation through descriptor writes,
 readiness, and UDC bind/unbind. Default paths do not mount filesystems, open
 `/dev/hidg*`, or write a block device; an explicit `CommandFunctionFsMounter`
@@ -32,13 +33,13 @@ profile.
 | Controller trait | `UsbGadgetController` (`create`, `bind`, `unbind`, `status`, `list`, `attach_media`, `detach_media`, `media_state`, `capabilities`) |
 | Linux ConfigFS | `ConfigFsUsbController`, injectable root, default `/sys/kernel/config/usb_gadget` |
 | Test/dry-run fake | `FakeUsbGadgetController` |
-| USB/IP model | `UsbIpConfig`, `UsbIpDevice`, `UsbIpState`, `UsbIpAttachment`, `UsbIpAuthorization`/`UsbIpKey`/`UsbIpToken` (host + token allow-lists) |
-| USB/IP control | `UsbIpController`, `SubprocessUsbIpController` (`attach_with_token`), argv-only `CommandRunner`; legacy `UsbIpControl`/`SubprocessUsbController` |
+| USB/IP model | `UsbIpConfig`, `UsbIpDevice`, `UsbIpState`, `UsbIpAttachment`, `UsbIpAuthorization`/`UsbIpKey`/`UsbIpToken` (host + token allow-lists), `UsbIpPeerGrant`, `UsbIpHotplugLog`/`UsbIpHotplugEvent`, `UsbIpTlsPolicy`/`UsbIpTlsStatus` |
+| USB/IP control | `UsbIpController`, `SubprocessUsbIpController` (`attach_with_token`, peer-side `authorize_peer`/`export_with_token`), bounded hotplug events, argv-only `CommandRunner`; legacy `UsbIpControl`/`SubprocessUsbController` |
 | FAT32 builder | `Fat32ImageBuilder`, `Fat32Node`, `build_fat32_image`, `fat32_image_from_directory`, `parse_fat32_image`, `Fat32Info`/`Fat32Layout` |
 | ISO media | `IsoImage::inspect`, `parse_iso_volume_descriptors`, read-only `MediaFormat::Iso9660` |
 | NBD model | `NbdExport`, `NbdExportDescriptor`, `NbdHandshake`, `NbdRequest`/`NbdReply` framing, newstyle option constants |
-| NBD server | `NbdServer`/`NbdServerHandle` over TCP or Unix sockets, `NbdExportCatalog`, `NbdExportSource`, `NbdMemoryImage`, `NbdFileImage`, injected `NbdTransport`/`NbdClock`, bounded read/write/flush/trim/disc, read-only exports |
-| Write overlay | `WriteOverlay`, `OverlayConfig`, `OverlayWriteReport`; bounded copy-on-write over FAT32/raw base bytes, per-block allocation accounting, checksummed atomic persistence, typed `overlay-bounds`/`overlay-corrupt` failures |
+| NBD server | `NbdServer`/`NbdServerHandle` over TCP or Unix sockets, `NbdExportCatalog`, `NbdExportSource` (`overlay_file`/`overlay_media`/`overlay_bytes`), `NbdMemoryImage`, `NbdFileImage`, `NbdOverlayBackend`/`NbdOverlayPolicy`/`NbdOverlayStatus`, injected `NbdTransport`/`NbdClock`, bounded read/write/flush/trim/disc, read-only exports, copy-on-write writable exports |
+| Write overlay | `WriteOverlay`, `OverlayConfig`, `OverlayWriteReport`; bounded copy-on-write over FAT32/raw base bytes, per-block allocation accounting, checksummed atomic persistence, typed `overlay-bounds`/`overlay-corrupt` failures; wired into writable NBD exports |
 | Capabilities/status | `UsbGadgetCapabilities`, `GadgetStatus`, `FunctionStatus` (`media`, `uac2`, `function_fs` details); `protocol_capability()` projects onto `ozma_protocol::UsbCapability` |
 
 ## Quick start
@@ -104,16 +105,18 @@ When bound, `ozma-node` advertises `usb` in capabilities, TXT/registration, and
 | `GET /usb` | Bearer-guarded read-only gadget status, function list, capabilities, LUN media state, UAC2 descriptor/bridge status, and FunctionFS daemon readiness (no backing paths). |
 | `POST /usb/media/attach` | Attach an existing absolute regular file to a mass-storage instance; enforces read-only/CD-ROM. |
 | `POST /usb/media/detach` | Clear the LUN `file` attribute; the function/gadget stay in place. |
-| `GET /usb/nbd` | Running loopback NBD export summary and counters (`running`, URL, export, size, read-only, stats). |
-| `POST /usb/nbd/start` | Serve one existing absolute FAT32/ISO/raw file over loopback NBD (`path`, optional `export`, `format`, `read_only`). ISO/FAT32 are forced read-only; raw defaults to read-only; a second start is a typed 409. |
-| `POST /usb/nbd/stop` | Stop the opt-in NBD listener and return its final counters. |
+| `GET /usb/nbd` | Running loopback NBD export summary and counters (`running`, URL, export, size, read-only, writable overlay status, stats). |
+| `POST /usb/nbd/start` | Serve one existing absolute FAT32/ISO/raw file over loopback NBD (`path`, optional `export`, `format`, `read_only`, `persist_path`, `persist_on_flush`, `persist_on_stop`). ISO/FAT32 are forced read-only; raw defaults to read-only; a second start is a typed 409. A writable raw export is copy-on-write. |
+| `POST /usb/nbd/stop` | Stop the opt-in NBD listener, persist any configured overlay, and return its final counters. |
 
 Attach/detach write only ConfigFS `file`/`ro`/`cdrom` attributes. The NBD
 routes only bind a loopback TCP socket and read the backing file; they do not
-mount, create, truncate, or write the backing image unless a raw export was
-explicitly started with `read_only: false` (writes still go to that regular
-file, never a block device). Like the rest of the USB router, the NBD routes
-answer a typed 501 unless the node was started with `--usb-gadget`.
+mount, create, truncate, or write the backing image. A raw export started with
+`read_only: false` writes into a bounded in-memory `WriteOverlay`; the base file
+stays immutable, and an optional `persist_path` receives an atomic checksummed
+overlay file on FLUSH/stop according to `persist_on_flush`/`persist_on_stop`.
+Like the rest of the USB router, the NBD routes answer a typed 501 unless the
+node was started with `--usb-gadget`.
 
 Formats are declarative and additive. Existing `disk`/`cdrom` images keep the
 opaque `Raw` format, so their JSON and ConfigFS behaviour is unchanged:
@@ -396,14 +399,39 @@ beginning with `-`.
 `SubprocessUsbIpController::attach_with_token(host, bus_id, token)` checks the
 host and token before building any `usbip attach` argv. A non-empty host list
 requires an exact host match; a non-empty token list requires a matching token
-(16–256 printable ASCII bytes, constant-time comparison for equal lengths);
+(16–256 printable ASCII bytes, compared without an early length-mismatch
+return);
 an authorization with no hosts and no tokens fails closed. Tokens are redacted
 from `Debug` output and never echoed in errors. `attach` (the trait method)
 passes no token and therefore fails when a token is required. No command is run
-on denial (`usbip-unauthorized`). This is still **not TLS, key exchange, or
-cryptographic client authentication**: an external `usbipd`, firewall, or TLS
-terminator must protect the USB/IP wire protocol. No kernel `vhci_hcd`
-lifecycle exists in this crate.
+on denial (`usbip-unauthorized`).
+
+The server-side path uses `UsbIpAuthorization::authorize_peer(host, token,
+key_fingerprint)` (or the controller's `authorize_peer`/`export_with_token`):
+when configured, the peer host must match the allow-list, a token must match in
+constant time, and a presented key fingerprint must match one of the configured
+`UsbIpKey` fingerprints (also constant-time). A successful check returns a
+`UsbIpPeerGrant` that records the host and matched key metadata but never the
+raw token or presented fingerprint. `export_with_token` runs the `usbip bind`
+argv only after that grant; `export` remains the local-administration path with
+no peer check.
+
+Each export/unexport/attach/detach transition is appended to a bounded
+`UsbIpHotplugLog` (default and maximum 64 events, drop-oldest, monotonic
+sequence numbers) exposed through `hotplug_events`/`take_hotplug_events`. It is
+a library model for a future node route/event stream; no kernel hotplug
+monitor is started.
+
+USB/IP TLS is **not available in-process**. `UsbIpConfig::tls =
+UsbIpTlsPolicy::Required` fails closed with the typed
+`usbip-tls-unsupported` error (`UsbIpTlsStatus` reports `available: false` and
+the reason) instead of silently running plaintext. This is a deliberate
+architecture limit, not a missing rustls call: `ozma-usb` drives the external
+`usbip` CLI, does not own the USB/IP control socket, does not implement the
+USB/IP wire protocol, and cannot intercept the kernel `vhci_hcd` data path.
+An external `usbipd`, firewall, TLS terminator, or encrypted tunnel (for
+example WireGuard/stunnel) must protect the wire protocol. No kernel
+`vhci_hcd` lifecycle exists in this crate.
 
 `SubprocessUsbIpController` implements `UsbIpController` with an injected
 `CommandRunner`:
@@ -412,6 +440,7 @@ lifecycle exists in this crate.
 |---|---|
 | `list()` | `list -l` |
 | `export(bus_id)` | `bind -b <bus_id>` |
+| `export_with_token(bus_id, host, token, key)` | peer check, then `bind -b <bus_id>` |
 | `unexport(bus_id)` | `unbind -b <bus_id>` |
 | `attach(host, bus_id)` | `attach -r <host> -b <bus_id>` |
 | `detach(port)` | `detach -p <port>` |
@@ -454,8 +483,12 @@ remains available for the existing node wiring.
   version, header/block checksum, base-length/checksum mismatch, block-size
   mismatch, duplicate or out-of-range blocks, truncation, and trailing bytes
   are typed `overlay-corrupt`; allocation failures are `overlay-bounds`. The base is
-  never written, mounted, or opened as a block device. The overlay is a library
-  layer only: it is not yet wired into the SCSI/NBD data path.
+  never written, mounted, or opened as a block device. Writable NBD exports are
+  backed by this overlay (`NbdOverlayBackend`): WRITE copies the touched base
+  block, READ prefers overlay blocks, FLUSH/stop commit the checksummed
+  persistence file according to `NbdOverlayPolicy`, and TRIM is a bounded
+  no-op. The SCSI/FunctionFS data path still uses the Python synthesiser and is
+  not wired to this overlay yet.
 - **ISO** (`iso`): `IsoImage::inspect` reads at most 32 volume descriptors from
   an existing file, verifies `CD001`, the primary descriptor, both-endian
   size/block fields, and root-directory bounds. `MediaFormat::Iso9660` always
@@ -471,9 +504,13 @@ remains available for the existing node wiring.
   and serves `READ`/`WRITE`/`FLUSH`/`TRIM`/`DISC` with per-request and
   per-connection bounds. `NbdMemoryImage`/`NbdFileImage` back exports from
   memory or an existing regular file; `NbdExportSource::from_media` probes
-  ISO/FAT32 and forces read-only. `NbdServerConfig` bounds request size,
-  clients, handshake/idle deadlines, and option payloads;
-  `NbdServerHandle::stop` wakes idle sessions and joins them. The server never
+  ISO/FAT32 and forces read-only, and serves a writable raw image through a
+  copy-on-write `NbdOverlayBackend` (base file immutable). `NbdOverlayStatus`
+  exposes block size, base length, allocated blocks/bytes, the ceiling, dirty
+  state, persistence path, and FLUSH/stop policy. `NbdServerConfig` bounds
+  request size, clients, handshake/idle deadlines, and option payloads;
+  `NbdServerHandle::stop` wakes idle sessions, joins them, and persists
+  configured overlays (failures increment `persist_failures`). The server never
   opens a block device, and it does not advertise write-zeroes.
 
 ### Live NBD/QEMU evidence
@@ -495,6 +532,19 @@ qemu-io -r -c "read -v 0 64" nbd://...: read 64/64 bytes
 qemu-io -c "write -P 0x11 0 64" nbd://...:
 qemu-io: can't open device ...: Could not open image: Permission denied
 ```
+
+A writable raw export is also validated live with `qemu-io` against the
+copy-on-write overlay backend (`tests/nbd_qemu.rs`):
+
+```text
+qemu-io -c "write -P 0x5a 0 4096" -c "flush" -c "read -P 0x5a 0 4096" nbd://...
+wrote 4096/4096 bytes at offset 0
+read 4096/4096 bytes at offset 0
+```
+
+The test then confirms the base file is byte-for-byte unchanged, the overlay
+read-back matches, FLUSH wrote the checksummed persistence file, and a fresh
+`NbdOverlayBackend` reloads the QEMU-written block.
 
 The optional QMP test (`OZMA_NBD_QMP_TEST=1 ... --ignored`) attaches the same
 export to a disposable `qemu-system-x86_64` as a USB storage device and reports
@@ -553,8 +603,10 @@ Relevant suites:
 | `tests/fat32_overlay.rs` | FAT32/raw writes and reads, base immutability, per-block copy-on-write, allocation ceiling and preflight atomicity, commit/reload, checksummed persistence corruption, discard/materialise |
 | `tests/uac2.rs` | UAC2 descriptor/channel/rate/size consistency, microphone/speaker/headset modes, invalid rates/channels/modes, ConfigFS attribute writes, unsupported bridge status |
 | `tests/usbip_controller.rs` | exact argv, list/port parsing (IPv4/IPv6), attach/detach state, disabled/missing/non-zero typed errors, config validation, host/token allow-list enforcement, no real `usbip` |
+| `tests/usbip_security.rs` | server-side peer host/token/key-fingerprint pairing, constant-time token/fingerprint comparison, no secrets in errors/Debug, TLS-required fail-closed policy, bounded ordered hotplug events, JSON metadata, no real `usbip` |
 | `tests/nbd_server.rs` | newstyle handshake, export name/list/info/go, read/write/flush/disc, request bounds, read-only write rejection, malformed/truncated frames, injected transport/clock deadline, concurrent loopback clients, Unix socket, server stop, file/media backends |
-| `tests/nbd_qemu.rs` | live `qemu-img info` on generated FAT32 + read-only ISO, `qemu-io` read and read-only write refusal; opt-in QMP USB attachment |
+| `tests/nbd_overlay.rs` | copy-on-write writable NBD writes/read-back, trim no-op, base immutability, typed bounds/allocation ceiling, FLUSH and stop persistence, reload through a new backend, policy-controlled commits, ENOSPC through the wire protocol |
+| `tests/nbd_qemu.rs` | live `qemu-img info` on generated FAT32 + read-only ISO, `qemu-io` read and read-only write refusal, live `qemu-io` write+flush+read on a writable overlay export with persistence reload; opt-in QMP USB attachment |
 | `tests/nbd_boot.rs` | opt-in disposable QEMU boot from a synthetic El Torito ISO served read-only over NBD; guest serial boot marker plus QMP `query-block` evidence |
 
 The one real-ConfigFS round trip is ignored and env-gated:
@@ -594,27 +646,31 @@ existing VM; the disposable QEMU is quit over QMP or killed on timeout.
 
 - Real gadget validation on `dummy_hcd` and hardware UDCs; currently only the
   ignored round trip exists, and node tests use a temp root/fake controller.
-- USB/IP security is still transport-level only: the host/token allow-list is
-  enforced before `usbip attach`, but there is no TLS, cryptographic pairing,
-  challenge/response, daemon, or kernel `vhci_hcd` lifecycle. An external
-  `usbipd`/firewall/TLS terminator must protect the wire protocol. USB/IP
-  hotplug, a node route exposing `UsbIpController`, and controller/API pairing
-  remain open.
+- USB/IP security is still transport-level only: the host/token/key-fingerprint
+  allow-list is enforced before `usbip attach` and before peer-authorized
+  `usbip bind`, but there is no TLS, cryptographic pairing handshake,
+  challenge/response, daemon, or kernel `vhci_hcd` lifecycle. `Required` TLS
+  fails closed as `usbip-tls-unsupported`; an external
+  `usbipd`/firewall/TLS terminator must protect the wire protocol. Hotplug is a
+  bounded library event log only; a node route exposing `UsbIpController` and
+  controller/API pairing remain open.
 - The FAT32 builder is a static snapshot, not the Python live `FATSynthesiser`
   (no sector-on-demand reads, inotify rescan, or long-name rescan stability).
-  Generated images are read-only. The new `WriteOverlay` supplies bounded
-  copy-on-write blocks and persistence, but it is not yet connected to the NBD
-  or SCSI data path, has no FAT metadata/consistency repair, directory-entry
-  coalescing, compaction, or write-back to a base image, and no node/API route.
-  `ozma-usb` still never writes a generated image to disk or a block device.
+  Generated images are read-only. `WriteOverlay` is now wired into writable NBD
+  exports with bounded copy-on-write blocks and persistence, but it is not yet
+  connected to the SCSI/FunctionFS data path and has no FAT
+  metadata/consistency repair, directory-entry coalescing, compaction, or
+  write-back to a base image. `ozma-usb` still never writes a generated image
+  to disk or a block device.
 - ISO support validates descriptors only; no Joliet/Rock Ridge/El Torito
   parsing, directory extraction, writing, or mounting.
 - NBD is a bounded userspace server, not a kernel block device: no structured
-  replies, TLS, write-zeroes, cache, multi-conn, or persistent export state.
-  The live boot evidence covers a read-only ISO over a disposable QEMU; it is
-  not a hardware boot matrix and does not exercise installers, UEFI, or a real
-  target. Node wiring is one loopback export behind the existing `--usb-gadget`
-  state and is not exposed through capabilities or registration.
+  replies, TLS, write-zeroes, cache, multi-conn, or persistent export state
+  beyond an optional overlay persistence file. The live boot evidence covers a
+  read-only ISO over a disposable QEMU; it is not a hardware boot matrix and
+  does not exercise installers, UEFI, or a real target. Node wiring is one
+  loopback export behind the existing `--usb-gadget` state and is not exposed
+  through capabilities or registration.
 - FunctionFS now has an `ep0`/endpoint daemon core and an explicit
   `FunctionFsLifecycle` helper (ConfigFS function/link creation, mountpoint
   expectation, descriptor write, marker readiness/timeout, bind rollback,

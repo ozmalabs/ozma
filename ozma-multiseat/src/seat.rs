@@ -360,6 +360,7 @@ impl SeatPlan {
             restarts: 0,
             last_error: None,
             next_restart_in_ms: None,
+            resources: SeatResourceStatus::default(),
             message,
         }
     }
@@ -395,6 +396,109 @@ impl SeatState {
     }
 }
 
+/// Which optional seat resource an action or error refers to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceKind {
+    /// Per-seat `xrandr` output ownership.
+    Ownership,
+    /// Per-seat `xinput`/evdev input routing.
+    Routing,
+}
+
+impl ResourceKind {
+    /// Stable wire/status name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ownership => "ownership",
+            Self::Routing => "routing",
+        }
+    }
+}
+
+/// Whether a resource operation was an apply or a release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceAction {
+    /// Reserve/apply the resource before spawning a child.
+    Apply,
+    /// Release the resource on stop, rollback, or shutdown.
+    Release,
+}
+
+impl ResourceAction {
+    /// Stable wire/status name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Apply => "apply",
+            Self::Release => "release",
+        }
+    }
+}
+
+/// One typed resource apply/release failure.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeatResourceError {
+    /// Resource kind.
+    pub kind: ResourceKind,
+    /// Action that failed.
+    pub action: ResourceAction,
+    /// Error text from the controller, preserving the typed
+    /// `MultiseatError` message (missing tool, non-zero command, unsupported).
+    pub message: String,
+}
+
+/// Applied/released state for the optional ownership and routing resources of
+/// one seat.
+///
+/// The field is omitted from status JSON when empty, so supervisor status with
+/// both opt-in flags off is byte-for-byte compatible with the earlier shape.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeatResourceStatus {
+    /// Ownership was applied successfully and has not been released.
+    #[serde(default)]
+    pub ownership_applied: bool,
+    /// Routing was applied successfully and has not been released.
+    #[serde(default)]
+    pub routing_applied: bool,
+    /// Ownership was released after being applied (or a previous release was
+    /// retried successfully).
+    #[serde(default)]
+    pub ownership_released: bool,
+    /// Routing was released after being applied.
+    #[serde(default)]
+    pub routing_released: bool,
+    /// Apply/release errors, in occurrence order. Best-effort release failures
+    /// are reported here without hiding the seat's lifecycle state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<SeatResourceError>,
+}
+
+impl SeatResourceStatus {
+    /// Whether no resource was applied/released and no error was recorded.
+    pub fn is_empty(&self) -> bool {
+        !self.ownership_applied
+            && !self.routing_applied
+            && !self.ownership_released
+            && !self.routing_released
+            && self.errors.is_empty()
+    }
+
+    /// Record one typed apply/release failure.
+    pub fn push_error(
+        &mut self,
+        kind: ResourceKind,
+        action: ResourceAction,
+        message: impl Into<String>,
+    ) {
+        self.errors.push(SeatResourceError {
+            kind,
+            action,
+            message: message.into(),
+        });
+    }
+}
+
 /// State transition reported by a [`crate::supervisor::SeatSupervisor`].
 ///
 /// The state fields are a superset of the original `state`/`message` pair so a
@@ -426,6 +530,9 @@ pub struct SeatRuntimeStatus {
     /// Milliseconds until the next scheduled restart, when one is pending.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_restart_in_ms: Option<u64>,
+    /// Applied/released ownership and routing state, with typed errors.
+    #[serde(default, skip_serializing_if = "SeatResourceStatus::is_empty")]
+    pub resources: SeatResourceStatus,
     /// Optional operator-facing message.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -443,6 +550,7 @@ impl SeatRuntimeStatus {
             restarts: 0,
             last_error: None,
             next_restart_in_ms: None,
+            resources: SeatResourceStatus::default(),
             message: None,
         }
     }
@@ -476,6 +584,12 @@ impl SeatRuntimeStatus {
     /// Attach the pending restart delay.
     pub fn with_next_restart_in_ms(mut self, delay_ms: u64) -> Self {
         self.next_restart_in_ms = Some(delay_ms);
+        self
+    }
+
+    /// Attach applied/released resource state.
+    pub fn with_resources(mut self, resources: SeatResourceStatus) -> Self {
+        self.resources = resources;
         self
     }
 }
@@ -524,6 +638,9 @@ pub struct SeatStatus {
     /// Milliseconds until the next scheduled restart, when one is pending.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_restart_in_ms: Option<u64>,
+    /// Applied/released ownership and routing state, with typed errors.
+    #[serde(default, skip_serializing_if = "SeatResourceStatus::is_empty")]
+    pub resources: SeatResourceStatus,
     /// Optional state message.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,

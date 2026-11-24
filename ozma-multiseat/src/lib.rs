@@ -88,7 +88,8 @@ pub use routing::{
 };
 pub use seat::{
     CapturePlan, DiagnosticCode, MultiseatPlan, NodeCommand, PlanDiagnostic, ProfileDefaults,
-    SeatConfig, SeatPlan, SeatPorts, SeatProfile, SeatRuntimeStatus, SeatState, SeatStatus,
+    ResourceAction, ResourceKind, SeatConfig, SeatPlan, SeatPorts, SeatProfile, SeatResourceError,
+    SeatResourceStatus, SeatRuntimeStatus, SeatState, SeatStatus,
 };
 pub use status::{render_metrics, MultiseatCapability, MultiseatStatus};
 pub use supervisor::{
