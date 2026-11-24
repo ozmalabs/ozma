@@ -25,6 +25,7 @@ jobs:
       - uses: bufbuild/buf-setup-action@v1
         with:
           version: '1.75.0'
+          github_token: ${{ secrets.GITHUB_TOKEN }}
       - name: Lint protocol schema
         run: buf lint
       - name: Check protocol formatting
