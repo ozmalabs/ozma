@@ -14,7 +14,8 @@ thiserror = { workspace = true }
 tokio = { version = "1", features = ["fs", "sync", "time", "rt", "process", "io-util", "net"] }
 tracing = "0.1"
 v4l = "0.14"
-nix = { version = "0.30", features = ["socket", "uio", "user"] }
+nix = { version = "0.30", features = ["fs", "socket", "uio", "user"] }
+memmap2 = "0.8"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ozma-pipewire = { path = "../ozma-pipewire" }

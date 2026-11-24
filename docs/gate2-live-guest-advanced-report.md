@@ -2,10 +2,12 @@
 
 **Scope:** close the remaining guest-behaviour gaps on the disposable Alpine
 Linux live ISO: ACPI/power semantics, guest-produced audio, and the QEMU D-Bus
-display paths for GL, `Disable`, and a secondary console.
+display paths for GL (including DMA-BUF import), `Disable`, and a secondary
+console.
 
-**Result:** ACPI, guest audio, and the D-Bus `Disable`/secondary-console paths
-were exercised live. The important qualifications are:
+**Result:** ACPI, guest audio, the D-Bus `Disable`/secondary-console paths, and
+the GL `ScanoutDMABUF`/`UpdateDMABUF` capture path were exercised live. The
+DMA-BUF importer is a follow-up in §5.2. The important qualifications are:
 
 | Area | Result |
 |---|---|
@@ -15,11 +17,12 @@ were exercised live. The important qualifications are:
 | Node `POST /power/stop` | **PASS** — QMP `quit`; QEMU process exits |
 | Guest-initiated `reboot` through node `/input/type` | **PASS** — `reboot: Restarting system`; QEMU stays alive |
 | Guest-initiated `poweroff` through node `/input/type` and manual QMP | **PASS** — `reboot: Power down`; QEMU exits |
+| Node `/input/type` full ASCII punctuation string (+ tab probe) | **PASS after fix (follow-up)** — exact body echoed to the serial console, `0x09` tab captured, no stuck key; see §7.1 |
 | Guest audio | **PASS** — 440.1 Hz tone captured from QEMU's host audio monitor; peak −6.94 dBFS, tone RMS −9.96 dBFS |
 | Node `/audio/*` routing | **PASS** — 523 Hz reference played to the null sink and captured; peak −26.89 dBFS |
 | D-Bus 2D capture | **PASS** — BGRA `Scanout`/`Update`, snapshot and HLS |
 | D-Bus `Disable` | **PASS on the GL path only** — QEMU emitted two `Disable` messages on reset; 2D VGA emitted none |
-| D-Bus GL capture | **BLOCKED** — QEMU sends `ScanoutDMABUF`/`UpdateDMABUF`; the provider implements only BGRA `Scanout`/`Update` |
+| D-Bus GL capture | **PASS (follow-up)** — `ScanoutDMABUF`/`UpdateDMABUF` importer maps linear XBGR/ABGR DMA-BUFs; live 1280×800 HLS, snapshot, `UpdateDMABUF`, and reset `Disable` verified. Tiled/compressed modifiers remain typed unsupported |
 | Secondary `Console_1` selection + live Scanout | **PASS with a second VGA device**; a guest-programmed second virtio-gpu head was **not** achieved |
 
 > No `sudo`, no package download, no libvirt mutation, and no write to an
@@ -35,7 +38,7 @@ were exercised live. The important qualifications are:
 | Run | 2026-11-24 17:36–18:03 AEDT (2026-11-24T06:36–07:03Z) |
 | Repo | `/home/matt/ozma/ozma` |
 | HEAD at finish | `e600c43630185d92df29099eff1931c65b61c0d7` (`e600c43`) |
-| Working tree | Dirty from concurrent sessions; this run added the D-Bus fix, this report, and short follow-up notes in existing reports |
+| Working tree | Dirty from concurrent sessions; this run added the D-Bus fix, this report, short follow-up notes in existing reports, and the `/input/type` key-hold fix (§7.1) |
 | Build | `cargo build -p ozma-node` → exit 0; `cargo test -p ozma-capture --lib dbus_display` → 26 passed, 1 ignored |
 | Node binary | `target/debug/ozma-node`, 283,021,464 bytes, `ozma-node 0.1.0` |
 | QEMU | `qemu-system-x86_64` 11.1.3, KVM (`accel=kvm:tcg`) |
@@ -391,9 +394,11 @@ qemu-system-x86_64 \
 The guest saw `virtio-vga`, `features: +virgl ...`, one scanout, and
 `fb0: virtio_gpudrmfb frame buffer device`.
 
-### 5.2 Live GL capture — BLOCKED by DMABUF
+### 5.2 Live GL capture — DMABUF importer (follow-up)
 
-The node selected `Console_0`:
+#### 5.2.1 Original observation (was blocked)
+
+The original run selected `Console_0`:
 
 ```text
 D-Bus console id=dbus0 label="virtio-vga-gl" width=1280 height=800
@@ -408,9 +413,7 @@ method="UpdateDMABUF"  body_bytes=16    (1724 occurrences)
 method="MouseSet"      body_bytes=12     (1 occurrence)
 ```
 
-It produced **no BGRA frame**, and no BGRA `Scanout` reached the source. The
-provider implements only the BGRA `Scanout`/`Update`/`Disable` members, so it
-could not produce a frame:
+It produced **no BGRA frame**, and no BGRA `Scanout` reached the source:
 
 ```text
 hls: "failed"
@@ -420,11 +423,122 @@ QMP screendump → {"error":{"class":"GenericError","desc":"no surface"}}
 ```
 
 The QMP screendump failure independently confirms that the GL display path has
-no 2D surface to dump. **Exact blocker:** QEMU's `-display dbus,gl=on` uses
-`ScanoutDMABUF`/`UpdateDMABUF`; `ozma-capture/src/dbus_display.rs` does not
-implement the DMABUF members (it is a BGRA/pixman listener). This is the same
-structural limitation recorded in the earlier D-Bus report, now confirmed live
-with a guest and with named method logs.
+no 2D surface to dump. The exact blocker was that QEMU's `-display dbus,gl=on`
+uses `ScanoutDMABUF`/`UpdateDMABUF`, while the provider implemented only the
+BGRA/pixman `Scanout`/`Update` members.
+
+#### 5.2.2 Exact wire format (2026-11-24 follow-up)
+
+A disposable QEMU 11.1.3 guest (`virtio-vga-gl`, `-display
+"dbus,p2p=yes,gl=on"`, Alpine 3.21, read-only ISO) was probed with a raw
+D-Bus/SCM_RIGHTS reader. The members are:
+
+```text
+ScanoutDMABUF(h dmabuf, u width, u height, u stride, u fourcc,
+              t modifier, b y0_top)     signature "huuuutb", body 36 bytes
+UpdateDMABUF(i x, i y, i w, i h)        signature "iiii",    body 16 bytes
+```
+
+`ScanoutDMABUF` body layout: `h` fd index at 0, width at 4, height at 8, stride
+at 12, fourcc at 16, four D-Bus padding bytes at 20, `t` modifier at 24,
+`b y0_top` at 32. The descriptor is attached with SCM_RIGHTS. The two initial
+live scans were:
+
+```text
+1280x800 stride=5120 fourcc=0x34324258 'XB24' (XBGR8888) modifier=0 y0_top=0 fd=5
+1280x800 stride=5120 fourcc=0x34324241 'AB24' (ABGR8888) modifier=0 y0_top=1 fd=7
+```
+
+`fstat` reported 4,096,000 bytes (`5120 × 800`), exactly the mapped size. `pread`
+fails with `ESPIPE`; a read-only `mmap` succeeds. `UpdateDMABUF` carries **no
+descriptor and no pixels**: it is a damage rectangle for the current scanout, and
+the GPU has already written the mapped buffer. A 70 s probe saw 2
+`ScanoutDMABUF` and 334 `UpdateDMABUF` messages. `MouseSet` (`iii`) remains
+informational and is not a frame.
+
+#### 5.2.3 Importer implementation
+
+New private module `ozma-capture/src/dbus_dmabuf.rs`, plus a
+`DBusTransport::read_with_fds`/`read_message_with_fds` path in
+`ozma-capture/src/dbus_display.rs`:
+
+1. **Descriptor reception.** The listener reads the first byte of every message
+   with `recvmsg(MSG_CMSG_CLOEXEC)`, adopts `SCM_RIGHTS` descriptors as
+   `OwnedFd`, and requires the header's `UNIX_FDS` count to match. The `h` index
+   selects the descriptor; any unused descriptors are dropped and closed.
+2. **Validation.** Body length/signature, non-zero and configured-bounded
+   dimensions, stride, checked `stride × height`, and the descriptor's reported
+   size are validated before touching pixels. A descriptor that is too small is
+   a typed geometry error.
+3. **Modifier.** Only `DRM_FORMAT_MOD_LINEAR` (`0`) is mapped. Any tiled or
+   compressed modifier, and any unknown fourcc, returns
+   `DBusError::Unsupported` naming the modifier and fourcc. No fake frame is
+   emitted.
+4. **Formats.** Packed 32-bit scanouts are converted to BGRA:
+   `XBGR8888`/`ABGR8888` (memory R,G,B,A; swaps R/B), `XRGB8888`/`ARGB8888`
+   (memory B,G,R,A; direct), `BGRA8888`/`RGBA8888` (DRM word order, shuffled),
+   and single-fd contiguous `NV12` (limited-range BT.601, Y plane then UV
+   plane). `y0_top=0` is flipped vertically. `X` formats become opaque BGRA.
+5. **Mapping and lifetime.** `memmap2` maps the descriptor read-only; the
+   `File` (sole owner of the descriptor) and mapping live in the imported
+   surface, with the mapping dropped before the descriptor. `Scanout` (pixman),
+   `Disable`, and source drop all release the previous mapping. `UpdateDMABUF`
+   re-snapshots the full mapped buffer into an owned BGRA frame.
+6. **Unsafe isolation.** The crate previously used `#![forbid(unsafe_code)]`.
+   DMA-BUF has no safe read path (`pread` returns `ESPIPE`), so the crate now
+   uses `#![deny(unsafe_code)]` with `#[allow(unsafe_code)]` only on
+   `dbus_dmabuf`. The unsafe operations are `memmap2`'s read-only mapping
+   constructor, justified by the fixed lifetime/size of a DMA-BUF export, and
+   `OwnedFd::from_raw_fd` adoption for descriptors just received via
+   `SCM_RIGHTS`; both are confined to that module. The rest of
+   `ozma-capture` remains unsafe-free.
+
+#### 5.2.4 Live verification
+
+Follow-up run: 2026-11-24 18:29–18:50 AEDT, QEMU 11.1.3, Alpine 3.21 live
+(read-only ISO SHA-256 `f28171c3…490f2d`), temp root
+`/tmp/opencode/ozma-dmabuf` (removed), node HTTP port 47591. HEAD was `f12add9`
+plus the uncommitted DMABUF change and concurrent-session changes. The node was
+built from this tree and started with `--capture-provider dbus --dbus-console 0
+--dbus-width 1280 --dbus-height 800 --hls`.
+
+- `cargo test -p ozma-capture --lib dbus_`: **40 passed, 0 failed, 1 ignored**.
+- `OZMA_DBUS_TEST_QMP=… real_qemu_dbus_display_pushes_a_frame`: **PASS**,
+  `1280x800`, `4,096,000` bytes.
+- Node log: `D-Bus DMA-BUF scanout imported` for `fourcc=875709016` (`XB24`),
+  modifier `0x0000000000000000`, `y0_top=false`, and `fourcc=875708993`
+  (`AB24`), `y0_top=true`.
+- HLS: `GET /api/v1/connection` reported `hls: "running"`, `hls_error: null`;
+  `stream.m3u8` and 1 s segments (~132 KB) were written.
+- A decoded HLS segment was **1280×800** and non-black (56,274 non-black
+  pixels), with real console text. The one-shot `GET /display/snapshot` also
+  returned a **1280×800 JPEG** (126,080 bytes) when the guest screen had
+  content.
+- **Channel order:** a known `printf` wrote red, green, then blue blocks to the
+  guest console. In the HLS frame, exact ANSI colours appeared left-to-right in
+  that order: red at x=2–31, green at x=34+, blue at x=66+ on the same row.
+  Treating `ABGR8888` as BGRA would have swapped red and blue; the live frame
+  proves the conversion is correct.
+- **`y0_top=false`:** after `POST /power/reset` the new 1280×800 scanout had
+  `y0_top=false`. A fresh red/green/blue line appeared at y=18–25 (top of the
+  image), not at the bottom, so the vertical flip is active and correct.
+- **`UpdateDMABUF`:** continuous console output (login, prompt, `printf`) changed
+  the HLS frames; `UpdateDMABUF` produced new BGRA frames without a pixman
+  `Scanout`.
+- **`Disable`:** `POST /power/reset` produced `D-Bus Disable received;
+  framebuffer cleared` (twice in the reset sequence), followed by fresh
+  720×400 and 1280×800 scanouts. The DMABUF mapping and framebuffer were
+  cleared and re-established, and HLS continued.
+
+**Remaining GL limits:** non-linear/tiled/compressed modifiers and multi-plane
+`ScanoutDMABUF2` are rejected with a typed error; `NV12` is accepted only in the
+single-fd contiguous layout the v1 signature can describe; there is no explicit
+`DMA_BUF_IOCTL_SYNC` (the path relies on QEMU's `glFlush` before
+`UpdateDMABUF` and coherent x86 mappings); `UpdateDMABUF` re-snapshots the full
+buffer rather than only the damage rectangle. A one-shot snapshot taken
+immediately after listener registration can catch the initial black scanout on
+GL; the continuous HLS pipeline is the authoritative live path. The real-QEMU
+test remains opt-in and is not in CI.
 
 ### 5.3 `Disable` — live on GL, absent on 2D
 
@@ -441,8 +555,9 @@ and emits no frame, as designed. On the BGRA 2D path, QEMU's
 `dbus_dcl_ops` has no disable callback, so a 2D VGA capture never sees
 `Disable` regardless of reset or hotplug attempt.
 
-The provider also now logs any unhandled method at debug level, which is how the
-DMABUF names above were observed instead of silently disappearing.
+The provider also logs any unhandled method at debug level (for example
+`MouseSet` and `CursorDefine`), which is how the GL method names were first
+observed instead of silently disappearing.
 
 ### 5.4 Secondary `Console_1`
 
@@ -516,8 +631,37 @@ New test:
 `console_properties_changed_only_applies_to_the_selected_console`.
 
 ```text
-$ cargo test -p ozma-capture --lib dbus_display
-test result: ok. 26 passed; 0 failed; 1 ignored; 0 measured; 103 filtered out
+$ cargo test -p ozma-capture --lib dbus_
+test result: ok. 40 passed; 0 failed; 1 ignored; 0 measured; 103 filtered out
+```
+
+### 5.6 DMABUF follow-up code change
+
+Files changed in the follow-up:
+
+- `ozma-capture/src/dbus_display.rs` — SCM_RIGHTS reception
+  (`DBusTransport::read_with_fds`, `read_message_with_fds`), the
+  `ScanoutDMABUF`/`UpdateDMABUF` match arms, DMABUF frame snapshots, and the
+  `Disable`/pixman reset of the mapped surface.
+- `ozma-capture/src/dbus_dmabuf.rs` (new) — body parsing, fourcc/modifier
+  validation, read-only `memmap2` mapping, BGRA conversion, and typed errors.
+- `ozma-capture/src/lib.rs` — `#![forbid(unsafe_code)]` narrowed to
+  `#![deny(unsafe_code)]`, with `#[allow(unsafe_code)]` only on
+  `dbus_dmabuf`.
+- `ozma-capture/Cargo.toml` — `memmap2` dependency and the `nix` `fs` feature
+  for the descriptor-close tests.
+
+Tests added: live-layout parsing, ABGR/XRGB conversion, bottom-up row flip,
+NV12 conversion, tiled-modifier rejection, unknown-fourcc/geometry rejection,
+fd close on success/failure, adopted-fd cleanup, scanout+update end-to-end,
+missing-fd protocol error, unsupported-modifier typed error, and `Disable`
+clearing a mapped surface. The pixman `Scanout`/`Update` tests are unchanged
+and still pass.
+
+```text
+$ cargo test -p ozma-capture
+test result: ok. 140 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
 No `ozma-power`/ACPI change was needed. `POST /power/stop` already calls QMP
@@ -540,13 +684,15 @@ No `ozma-power`/ACPI change was needed. `POST /power/stop` already calls QMP
 | Guest-initiated `reboot` via node input | **PASS** | `reboot: Restarting system`; QEMU alive |
 | Guest-initiated `poweroff` via node input and manual QMP | **PASS** | `reboot: Power down`; QEMU exited |
 | D-Bus 2D `Scanout`/`Update`, snapshot, HLS | **PASS** | 1280×800 JPEG; HLS `running` |
-| D-Bus GL capture | **FAIL / BLOCKED** | 11 `ScanoutDMABUF`, 1724 `UpdateDMABUF`, zero BGRA frames |
-| D-Bus `Disable` on GL reset | **PASS** | two `Disable` messages, handler cleared framebuffer |
+| D-Bus GL `ScanoutDMABUF` + `UpdateDMABUF` | **PASS (follow-up)** | live 1280×800 HLS (56,274 non-black px); snapshot JPEG 126,080 bytes; correct R/G/B order; `y0_top=false` flip verified |
+| D-Bus GL capture before the follow-up | **FAIL / BLOCKED (historical)** | 11 `ScanoutDMABUF`, 1724 `UpdateDMABUF`, zero BGRA frames |
+| D-Bus GL tiled/compressed modifier | **TYPED UNSUPPORTED** | `DBusError::Unsupported` names modifier + fourcc; no fake frame |
+| D-Bus `Disable` on GL reset | **PASS** | two `Disable` messages; handler cleared framebuffer and DMABUF mapping |
 | D-Bus `Disable` on 2D reset/hotplug | **ABSENT, as expected** | no `Disable`; device_del not hotpluggable |
 | `Console_1` selection | **PASS** | `virtio-gpu-pci.1` / `VGA` labels |
 | `Console_1` live BGRA Scanout | **PASS with second VGA** | 720×400 JPEG + HLS; content early boot text |
 | Guest-programmed second virtio-gpu head | **BLOCKED** | guest `Virtual-2` disconnected/disabled; no modesetting tool |
-| Node `/input/type` shifted characters | **ANOMALY** | line stalled after `_`; unshifted `root`/`reboot`/`poweroff` worked |
+| Node `/input/type` shifted characters | **PASS after fix (follow-up)** | full punctuation string reached the guest exactly; tab captured as `0x09`; no stuck key (§7.1) |
 
 ## 7. Findings and remaining blockers
 
@@ -559,11 +705,16 @@ No `ozma-power`/ACPI change was needed. `POST /power/stop` already calls QMP
    local static helper proved the QEMU/HDA/host-monitor path end to end, but it
    is a test artifact, not a guest package. Native `aplay`/`pw-play` evidence
    remains blocked by the ISO contents.
-3. **D-Bus GL is still not a capture surface.** The GL listener emits
-   `ScanoutDMABUF`/`UpdateDMABUF`; the provider handles only BGRA
-   `Scanout`/`Update`/`Disable`. `Disable` itself is live and handled, which
-   closes the "QEMU never emits it" question for the GL path, but a GL guest
-   cannot be captured without a DMABUF importer.
+3. **D-Bus GL is now a capture surface for linear DMABUFs.** The GL listener
+   emits `ScanoutDMABUF`/`UpdateDMABUF`; the provider now receives the
+   SCM_RIGHTS descriptor, maps linear XBGR/ABGR/XRGB/ARGB/BGRA/RGBA (and
+   single-fd contiguous NV12), flips `y0_top=false`, and re-snapshots on
+   `UpdateDMABUF`. Live 1280×800 HLS, snapshot, update, channel order, and
+   `Disable` on reset are verified. Remaining gaps are non-linear/tiled
+   modifiers (typed unsupported), multi-plane `ScanoutDMABUF2`, explicit
+   DMA-BUF sync on non-coherent hosts, and a damage-only update fast path. A
+   one-shot snapshot can still catch the initial black scanout; continuous HLS
+   is the reliable live path.
 4. **Secondary console is live but not a guest second head.** `Console_1`
    selection and a live `Scanout` were demonstrated with a second VGA device.
    A `virtio-gpu-pci,max_outputs=2` guest kept `Virtual-2` disconnected and
@@ -572,13 +723,67 @@ No `ozma-power`/ACPI change was needed. `POST /power/stop` already calls QMP
 5. **Secondary geometry signal bug fixed.** `Console_0`'s 1280×800
    `PropertiesChanged` was applied to `Console_1` (640×480). The path filter
    and its regression test are in `ozma-capture/src/dbus_display.rs`.
-6. **Node shifted-character input anomaly.** A `/input/type` string containing
-   `_` and `>` stopped appearing in the guest after the `_`; subsequent
-   unshifted input also did not appear until the guest was restarted. Unshifted
-   `root`, `reboot`, and `poweroff` worked repeatedly. This is recorded as an
-   observed anomaly, not root-caused or fixed here.
+6. **Node shifted-character input anomaly root-caused and fixed.** The node
+   submitted each key-down and key-up back-to-back and only paced *between*
+   characters. QEMU's emulated USB keyboard reports its current state at the
+   guest's poll cadence, so a press/release pair could collapse into one
+   released report (the character was lost) or lose the release (the key
+   auto-repeated). The earlier run's frozen line and non-responsive input were
+   this stuck-key state, not a hung HTTP handler: QMP had accepted every event.
+   The fix in `ozma-node/src/controller_compat.rs` holds each non-modifier key
+   for 20 ms, keeps the 15 ms inter-character delay, sends explicit left-shift
+   down/up around shifted characters, releases each key and shift, releases any
+   held state on a submit error, and rejects unsupported text before sending the
+   first event. See §7.1 for the live re-run.
 7. **Not in this run:** WebRTC media, controller/dashboard, mouse-pointer
-   artifacts (text console), and D-Bus GL with a DMABUF-capable importer.
+   artifacts (text console), and non-linear/multi-plane DMA-BUF capture. D-Bus
+   GL with linear DMA-BUFs is covered by the follow-up in §5.2.
+
+### 7.1 Follow-up: `/input/type` full ASCII punctuation (2026-11-24)
+
+After the fix, a fresh disposable Alpine 3.21 guest (same read-only ISO and
+QEMU command as §2, temp root
+`/tmp/opencode/ozma-input-fix-fixed-20261124-183252`, node HTTP port 47522,
+HID port 60522) was logged in with `/input/type` `root\n`, then given this
+96-character here-doc through the same route. The follow-up ran on HEAD
+`f12add9` with the uncommitted `ozma-node/src/controller_compat.rs` change in
+the working tree.
+
+```text
+cat > /dev/ttyS0 <<'Z'
+azAZ09 _ > | ~ : " < ? + = - , . / ; ' \ [ ] ` { } ! @ # $ % ^ & * ( )
+Z
+```
+
+The request returned `{"events":250,"ok":true}` in 3.58 s, and the guest's
+serial console received the body byte-for-byte:
+
+```text
+localhost login: azAZ09 _ > | ~ : " < ? + = - , . / ; ' \ [ ] ` { } ! @ # $ % ^ & * ( )
+FIXED-PUNCTUATION-OK
+```
+
+A following `echo FIXED-PUNCTUATION-OK > /dev/ttyS0` returned
+`{"events":118,"ok":true}` and executed, so no modifier or key was left down.
+The node log showed every batch sent on the shared QMP client; there was no
+HTTP timeout or queue stall. A separate `dd bs=1 count=4 of=/dev/ttyS0` read
+the bytes `A<TAB>B\n` and the serial log contained `41 09 42 0d 0a`, confirming
+the Tab mapping (`0x2B`) itself. (Typing a literal Tab inside the interactive
+shell's own line editor is consumed for completion; the `dd` test bypasses
+that guest feature, not the node mapping.)
+
+Before the fix, the same punctuation sequence produced a corrupted line and
+then an endless `5` auto-repeat; the here-doc terminator was never accepted and
+serial received no body. That pre-fix guest was discarded without being used as
+PASS evidence.
+
+**Remaining keyboard-layout limitations:** text is US layout only. A guest
+whose keymap is not US will produce that layout's characters for these HID
+usages; dead keys, compose, IME, and non-ASCII characters are not supported and
+return a typed 400 before typing. Typing is paced at a fixed 20 ms key hold plus
+15 ms between characters, not by guest acknowledgement; the 4096-character
+limit therefore takes about 2.5 minutes, and an unusually slow guest may still
+need a larger hold or a guest-side keymap check.
 
 ## 8. Cleanup
 
@@ -593,6 +798,11 @@ The final cleanup table is filled after the run:
 | D-Bus GL node | 122766 | SIGINT; exited |
 | D-Bus second-console QEMU | 131751 | `quit`; exited |
 | D-Bus second-console node + ffmpeg | 137657 / 137673 | SIGINT; exited |
+| D-Bus DMABUF follow-up QEMU | 238742 | node `/power/stop` (QMP `quit`); exited |
+| D-Bus DMABUF follow-up node | 292844 | SIGINT/TERM did not exit (QMP gone); SIGKILL; stopped |
+| D-Bus DMABUF follow-up ffmpeg | 297129 | exited with the node |
+| D-Bus DMABUF follow-up temp root | `/tmp/opencode/ozma-dmabuf` | removed |
+| D-Bus DMABUF follow-up ports | 47591/60591 | no listeners |
 | Serial bridges | 131746 and the per-run bridge PIDs | killed |
 | Null sink | `ozma-gate2-adv` (module 536870916) | unloaded; `pactl list short sinks` no longer shows it |
 | Temp root | `/tmp/opencode/ozma-gate2-adv-20261124-173623` | removed |

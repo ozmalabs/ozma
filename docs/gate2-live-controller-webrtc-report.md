@@ -22,6 +22,12 @@ GStreamer/Python helper, host ICE candidates only, and one Chromium build. See
 > no commit were used. Every QEMU, node, helper, controller, browser, null
 > sink, port, and temporary file was removed; see [Cleanup](#cleanup).
 
+> **Follow-up (2026-11-24, browser matrix):** Playwright Firefox 159.0
+> (OpenH264 2.6.0) and Chromium 159 iPhone emulation later decoded H.264/Opus
+> through the same dashboard path. Safari/WebKit, TURN, a distinct `srflx`
+> candidate, and trickle ICE remain unvalidated; see
+> [`gate2-live-webrtc-matrix-report.md`](gate2-live-webrtc-matrix-report.md).
+
 ## 1. Run metadata
 
 | Item | Value |
@@ -338,9 +344,11 @@ claimed here.
   browser behind NAT or a different network is untested and would likely fail.
   Chrome's default mDNS `.local` candidates did not prevent connection here
   because the helper's host candidate was directly reachable.
-- **One browser only.** Chromium 145 headless. Firefox/Safari, mobile browsers,
-  hardware decode, multiple concurrent peers, and reconnect/session teardown
-  were not tested.
+- **Browser matrix.** This run used Chromium 145 headless. A follow-up added
+  Playwright Firefox 159.0 with OpenH264 2.6.0 and Chromium 159 iPhone
+  emulation ([`gate2-live-webrtc-matrix-report.md`](gate2-live-webrtc-matrix-report.md)).
+  Safari/WebKit, hardware decode, multiple concurrent peers, and
+  reconnect/session teardown remain untested.
 - **External helper only.** There is no native `webrtc-rs`/`str0m` path. The
   node still depends on `softnode/gst_webrtc_worker.py` and GStreamer.
 - **Controller `/codec` proxying.** The controller now proxies GET/POST to the

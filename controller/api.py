@@ -19,6 +19,7 @@ WebSocket:
 import asyncio
 import json
 import logging
+import secrets
 import time
 from pathlib import Path
 from typing import Any
@@ -1111,6 +1112,89 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             for i, o in enumerate(display_outputs)
         ] if display_outputs else []
         return d
+
+    # ── Per-node bearer-token store / rotation ────────────────────────────────
+    # Metadata only: tokens are never included here. The one exception is the
+    # PUT response when a token is generated, because that is the only time the
+    # new secret exists; callers must persist it on the node immediately.
+
+    def _require_token_write(request: Request) -> None:
+        _require_scope(request, SCOPE_WRITE)
+
+    @app.get("/api/v1/nodes/{node_id}/token")
+    async def get_node_token(request: Request, node_id: str) -> dict[str, Any]:
+        """Return token metadata (configured/source/updated_at), never the token."""
+        _require_scope(request, SCOPE_READ)
+        if node_id not in state.nodes:
+            raise HTTPException(status_code=404, detail="Node not found")
+        return state.token_metadata(node_id)
+
+    @app.put("/api/v1/nodes/{node_id}/token")
+    async def set_node_token(
+        request: Request, node_id: str, body: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Set or rotate a node's bearer token (scope: write/admin).
+
+        Body: ``{"token": "..."}``. If the body omits ``token``, the controller
+        generates one and returns it once as ``token`` with
+        ``token_returned_once: true``. That response is the only place the
+        secret appears; configure the node with it and do not log the response.
+        A plain ``dict`` body is used so FastAPI validation errors cannot echo
+        a partially supplied secret.
+        """
+        _require_token_write(request)
+        if node_id not in state.nodes:
+            raise HTTPException(status_code=404, detail="Node not found")
+        if body is not None and not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="body must be a JSON object")
+        raw_token = (body or {}).get("token", "")
+        if raw_token not in (None, "") and not isinstance(raw_token, str):
+            raise HTTPException(status_code=400, detail="token must be a string")
+        supplied = str(raw_token or "").strip()
+        generate = not supplied
+        token = supplied or secrets.token_urlsafe(32)
+        changed = state.set_node_token(node_id, token, source="rotation")
+        if streams:
+            streams.update_node_token(node_id, token)
+        result: dict[str, Any] = {
+            "ok": True,
+            "node_id": node_id,
+            "rotated": True,
+            "changed": changed,
+            **state.token_metadata(node_id),
+        }
+        if generate:
+            # One-time reveal of the newly generated token.
+            result["token"] = token
+            result["token_returned_once"] = True
+            result["notice"] = (
+                "Store this token on the node now; it is not returned again. "
+                "Treat controller responses as sensitive."
+            )
+        log.info("Rotated node token for %s", node_id)
+        return result
+
+    @app.delete("/api/v1/nodes/{node_id}/token")
+    async def clear_node_token(request: Request, node_id: str) -> dict[str, Any]:
+        """Revoke a node's stored token (scope: write/admin).
+
+        After revocation requests fall back to OZMA_NODE_API_TOKEN when set;
+        otherwise no Authorization header is sent.
+        """
+        _require_token_write(request)
+        if node_id not in state.nodes:
+            raise HTTPException(status_code=404, detail="Node not found")
+        removed = state.clear_node_token(node_id)
+        if streams:
+            streams.update_node_token(node_id, "")
+        log.info("Revoked node token for %s", node_id)
+        return {
+            "ok": True,
+            "node_id": node_id,
+            "cleared": removed,
+            "fallback_configured": bool(state.node_api_token),
+            **state.token_metadata(node_id),
+        }
 
     @app.put("/api/v1/nodes/{node_id}/machine_class")
     async def set_machine_class(request: Request, node_id: str, body: dict) -> dict[str, Any]:

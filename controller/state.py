@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from node_auth import node_api_headers, node_api_token  # re-exported for callers
+from node_tokens import NodeTokenStore
 
 log = logging.getLogger("ozma.state")
 
@@ -47,9 +48,11 @@ class NodeInfo:
     stream_path: str | None = None    # path, e.g. /stream/stream.m3u8
     # HTTP API port (health + /usb + HLS if video); same as stream_port when both present
     api_port: int | None = None
-    # Node HTTP API bearer token, supplied by the node at registration when it
-    # uses `--api-token`. Never serialized by to_dict()/events/dashboard JSON.
-    # Empty means "use the controller-wide OZMA_NODE_API_TOKEN, if configured".
+    # Node HTTP API bearer token, supplied by the node at registration or
+    # hydrated from the controller's persistent node token store. The store
+    # takes precedence over a registration token. Never serialized by
+    # to_dict()/events/dashboard JSON. Empty means "use the controller-wide
+    # OZMA_NODE_API_TOKEN, if configured".
     api_token: str = field(default="", repr=False)
     # Audio routing (V0.3)
     audio_type: str | None = None        # "pipewire" | "vban" | None
@@ -159,13 +162,18 @@ class NodeInfo:
 
 
 class AppState:
-    def __init__(self) -> None:
+    def __init__(self, node_token_store_path: str | Path | None = None) -> None:
         import time
         self.nodes: dict[str, NodeInfo] = {}
         self.active_node_id: str | None = None
         # Controller-wide fallback bearer token for node HTTP APIs
-        # (OZMA_NODE_API_TOKEN). Per-node tokens from registration win.
+        # (OZMA_NODE_API_TOKEN). Per-node tokens from the persistent store or
+        # registration win; the store takes precedence over registration.
         self.node_api_token: str = ""
+        # Persistent per-node token store, loaded at startup. It lives next to
+        # the controller (or at OZMA_NODE_TOKEN_STORE) and is never serialized
+        # into node list/detail responses or events.
+        self.node_tokens: NodeTokenStore = NodeTokenStore(node_token_store_path)
         self._lock = asyncio.Lock()
         # Start time for uptime calculation
         self._start_time: float = time.monotonic()
@@ -282,6 +290,19 @@ class AppState:
                 elif node.capabilities and existing.capabilities:
                     # Union of capabilities
                     node.capabilities = list(set(node.capabilities) | set(existing.capabilities))
+            # Persistent per-node token wins over the registration token. If
+            # the store has no entry, adopt the registration token so it
+            # survives controller restarts. Rotation always goes through
+            # set_node_token() so a re-registration cannot clobber it.
+            stored_token = self.node_tokens.get(node.id)
+            if stored_token:
+                node.api_token = stored_token
+            elif self.node_tokens.is_revoked(node.id):
+                # Revocation tombstone: ignore a re-registration token until an
+                # operator explicitly rotates or forgets it.
+                node.api_token = ""
+            elif node.api_token:
+                self.node_tokens.set(node.id, node.api_token, source="registration")
             # Restore vm_guest_ip from persisted meta for fresh registrations
             if not node.vm_guest_ip:
                 node.vm_guest_ip = self._nodes_meta.get(node.id, {}).get("vm_guest_ip")
@@ -311,11 +332,46 @@ class AppState:
                 severity="info",
             ))
 
-    async def remove_node(self, node_id: str) -> None:
+    # ── Per-node token management ─────────────────────────────────────────────
+
+    def token_metadata(self, node_id: str) -> dict[str, Any]:
+        """Return token-free metadata for a node's stored token."""
+        return self.node_tokens.metadata(node_id)
+
+    def set_node_token(self, node_id: str, token: str, *, source: str = "rotation") -> bool:
+        """Persist and apply a node token. Returns ``True`` when it changed."""
+        token = str(token or "").strip()
+        if not token:
+            return False
+        changed = self.node_tokens.set(node_id, token, source=source)
+        node = self.nodes.get(node_id)
+        if node is not None:
+            node.api_token = token
+        return changed
+
+    def clear_node_token(self, node_id: str) -> bool:
+        """Revoke a node token (persistent) and fall back to the global token."""
+        removed = self.node_tokens.clear(node_id)
+        node = self.nodes.get(node_id)
+        if node is not None:
+            node.api_token = ""
+        return removed
+
+    def forget_node_token(self, node_id: str) -> bool:
+        """Hard-delete a token and its revocation tombstone on node cleanup."""
+        removed = self.node_tokens.forget(node_id)
+        node = self.nodes.get(node_id)
+        if node is not None:
+            node.api_token = ""
+        return removed
+
+    async def remove_node(self, node_id: str, *, forget_token: bool = False) -> None:
         async with self._lock:
             removed = self.nodes.pop(node_id, None)
             if self.active_node_id == node_id:
                 self.active_node_id = None
+        if forget_token:
+            self.forget_node_token(node_id)
         if removed:
             self._graph_builder.apply_node_removed(node_id)
             self.pipeline_cache.invalidate()

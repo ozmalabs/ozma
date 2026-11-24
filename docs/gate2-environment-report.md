@@ -449,27 +449,40 @@ not require a token, and the controller's token is additive.
 
 | Item | Status |
 |---|---|
-| Global config | `OZMA_NODE_API_TOKEN` → `Config.node_api_token` → `AppState.node_api_token` / `build_app(node_api_token=...)` |
-| Per-node token | Optional `api_token` field on `DirectRegisterRequest`; stored on `NodeInfo` with `repr=False`; preserved across re-registration |
-| Central helper | `controller/node_auth.py` resolves per-node token first, then the global fallback, and builds `Authorization` headers plus the token-free 401/403 message. `controller/state.py` re-exports the old helpers for existing callers. |
+| Global config | `OZMA_NODE_API_TOKEN` → `Config.node_api_token` → `AppState.node_api_token` / `build_app(node_api_token=...)`. Remains a fallback only. |
+| Per-node token | Optional `api_token` field on `DirectRegisterRequest`; stored on `NodeInfo` with `repr=False`; preserved across re-registration and now also persisted in the controller token store. |
+| Persistent store | `controller/node_tokens.py`; default `<controller dir>/node_tokens.json`, overridable with `OZMA_NODE_TOKEN_STORE` / `Config.node_token_store`. Schema `{"version":1,"nodes":{"<node-id>":{"token","source","updated_at"}},"revoked":["<node-id>"]}`. Loaded at `AppState` startup. Atomic same-directory temp write + `os.replace`, mode `0600`, no tokens logged. File is cleartext at rest. |
+| Precedence | persistent store → registration `api_token` → global `OZMA_NODE_API_TOKEN` → none. A rotated store token survives re-registration and controller restarts; a registration token is adopted only when the store has no entry. |
+| Central helper | `controller/node_auth.py` resolves per-node token first, then the global fallback, and builds `Authorization` headers plus the token-free 401/403 message. `controller/state.py` hydrates `NodeInfo.api_token` from the store and re-exports the old helpers for existing callers. |
+| Rotation/revocation API | `GET /api/v1/nodes/{node_id}/token` → token-free metadata (`configured`, `source`, `updated_at`); `PUT` with `{"token": "..."}` sets it without echoing it, or with an empty/omitted body generates a token and returns it **once** as `token` + `token_returned_once:true` (the documented one-time secret response); `DELETE` revokes it with a persistent tombstone, so a later re-registration cannot silently re-adopt the old token; an explicit `PUT` clears the tombstone. `GET` requires `read`; `PUT`/`DELETE` require `write` or `admin` (`admin` implies all). Rotation updates `NodeInfo.api_token` immediately, so API proxies and live soft-node streams use the new value; revocation falls back to the global token when configured. |
 | Header sent | `Authorization: Bearer <token>` on JSON input/audio, raw WebRTC, snapshot, hints, metrics poller, power/current/RGB/USB, codec and remote-screenshot proxies. The same header is now sent by direct background clients outside `api.py`: control-surface power, agent hints, soft-node stream snapshot/input/codec, terminal snapshots, serial polling, node RGB zones, mesh status, session init, and backup proxy. |
 | No token configured | No `Authorization` header; previous behavior preserved |
 | Node 401/403 | Raw WebRTC and codec responses pass the node status/body through; other proxies return controller 502 with a clear “Node rejected the controller's bearer token (HTTP 401)” detail |
-| Secret exposure | Token excluded from `NodeInfo.to_dict()`, node events, dashboard/list responses, and logs; tests assert it never appears in response text or captured logs |
-| Tests | `tests/unit/controller/test_node_api_token_proxy.py` (31 cases) and `tests/unit/controller/test_node_api_token_direct.py` (21 cases) use a fake node HTTP server to assert header present/absent, per-node over global, 401/403 handling, and token-free logs/responses. |
+| Secret exposure | Token excluded from `NodeInfo.to_dict()`, node events, node list/detail responses, token metadata responses, and logs; tests assert it never appears in response text or captured logs. The only secret-bearing response is the one-time generated-token `PUT` above. |
+| Removal/cleanup | `AppState.remove_node(..., forget_token=True)` and `forget_node_token()` hard-delete the token entry and its revocation tombstone. Plain mDNS removal/offline intentionally does **not** purge tokens, so a transient disappearance does not destroy a rotated secret. |
+| Tests | `tests/unit/controller/test_node_api_token_proxy.py` (31 cases) and `tests/unit/controller/test_node_api_token_direct.py` (21 cases) cover header present/absent, per-node over global, 401/403 handling, and token-free logs/responses. `tests/unit/controller/test_node_token_store.py` (14 cases) adds fake-node coverage for reload persistence, store-over-registration precedence, one-time rotation response, proxy/stream propagation, persistent revocation and global fallback, explicit cleanup, `0600`/atomic writes, schema, malformed-body handling, and secret-free list/detail/events/logs. |
 
-Remaining limitations: there is no per-node token store, rotation, or controller
-UI/registration field in the dashboard; a global token is applied to every node
-that does not register its own; the node still exposes read-only compat routes
-publicly by design (`/display/snapshot`, `/display/info`, `/ui/hints`,
-`/node/status`, `/agent/metrics`, `/audio/nodes`, `/audio/sweep`), so configured
-clients send the header but the node also accepts those routes without it. Direct
-registration sends `api_token` in cleartext, so it is only safe on a
-trusted/loopback link or over TLS/SSH tunneling. External device/peer endpoints
-(Sunshine, motion controllers, OLED/e-ink/LCD drivers, controller peers, sharing
-and WireGuard) are not node APIs and never receive the controller's node token.
-A node that was started with `--api-token` and whose token does not match will
-return a typed controller 502 instead of silently reading controller-local data.
+Remaining limitations: there is still no dashboard UI for setting/rotating a
+node token and no registration form field; operators must call the API (or edit
+`node_tokens.json` while the controller is stopped) and then configure the node
+with the same token out-of-band. A generated token is shown once, so a lost
+response requires another rotation. The store is cleartext JSON at rest (mode
+`0600`); protect the controller data directory and backups. A global token is
+still applied to every node that has neither a store nor a registration token.
+The node still exposes read-only compat routes publicly by design
+(`/display/snapshot`, `/display/info`, `/ui/hints`, `/node/status`,
+`/agent/metrics`, `/audio/nodes`, `/audio/sweep`), so configured clients send
+the header but the node also accepts those routes without it. Direct
+registration and the rotation API carry the token in cleartext over HTTP, so
+they are only safe on a trusted/loopback link or over TLS/SSH tunneling; the
+controller also accepts the token on its own API only when `OZMA_AUTH` is
+enabled. Rotation changes the controller-side secret only — the node is not
+notified, so updating the node is an operator step. External device/peer
+endpoints (Sunshine, motion controllers, OLED/e-ink/LCD drivers, controller
+peers, sharing and WireGuard) are not node APIs and never receive the
+controller's node token. A node that was started with `--api-token` and whose
+token does not match will return a typed controller 502 instead of silently
+reading controller-local data.
 
 ## 8. Next-run checklist
 

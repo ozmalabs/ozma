@@ -486,6 +486,16 @@ class StreamManager:
         """Start capturing for a node if not already started. Public alias for _maybe_start."""
         self._maybe_start(node)
 
+    def update_node_token(self, node_id: str, token: str) -> None:
+        """Apply a rotated token to an existing soft-node stream.
+
+        Direct proxies read ``NodeInfo.api_token`` on every request; long-lived
+        soft-node streams keep their own copy, so rotation must update it here.
+        """
+        entry = self._captures.get(node_id)
+        if isinstance(entry, _SoftNodeStream):
+            entry.set_token(token)
+
     def mjpeg_frames(self, node_id: str) -> AsyncIterator[bytes] | None:
         entry = self._captures.get(node_id)
         if isinstance(entry, StreamCapture):
@@ -736,6 +746,10 @@ class _SoftNodeStream:
         self._task: asyncio.Task | None = None
         self._vnc_w = 1024
         self._vnc_h = 768
+
+    def set_token(self, token: str) -> None:
+        """Replace the bearer token used for subsequent node requests."""
+        self._token = str(token or "").strip()
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._pull_loop(), name=f"softnode-stream-{self.node_id}")

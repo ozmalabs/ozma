@@ -74,6 +74,15 @@ pub const SINK_FAKE_RECORDING: &str = "fake-recording";
 pub const MAX_TYPE_TEXT_CHARS: usize = 4096;
 /// Delay between typed characters so the guest sees separate keystrokes.
 pub const TYPE_CHAR_DELAY: Duration = Duration::from_millis(15);
+/// Minimum time a key is held down while typing.
+///
+/// A QEMU USB keyboard only reports its state when the guest polls the
+/// interrupt endpoint (10 ms for the emulated device). Sending key-down and
+/// key-up back-to-back lets one poll coalesce them into a single released
+/// report, losing the character; if the release is the report that is lost, the
+/// guest instead auto-repeats the key. Holding for at least two poll intervals
+/// makes every press observable on its own.
+pub const TYPE_KEY_HOLD: Duration = Duration::from_millis(20);
 /// How long a synthesized click holds the button before releasing it.
 pub const CLICK_HOLD: Duration = Duration::from_millis(20);
 /// Largest absolute pointer coordinate accepted by `POST /input/mouse`.
@@ -2085,18 +2094,29 @@ fn require_input_sink(state: &ConnectionState) -> Result<SharedSink, Response> {
 }
 
 fn submit_input(sink: &SharedSink, event: &InputEvent) -> Result<SubmitReport, Response> {
-    sink.submit_report(event).map_err(|error| {
-        let mut body = serde_json::json!({
-            "ok": false,
-            "code": "input-rejected",
-            "sink_code": error.code,
-            "error": error.message,
-        });
-        if let Some(remediation) = error.remediation {
-            body["remediation"] = serde_json::Value::String(remediation);
-        }
-        (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
-    })
+    sink.submit_report(event).map_err(input_error_response)
+}
+
+fn input_error_response(error: ApiError) -> Response {
+    let mut body = serde_json::json!({
+        "ok": false,
+        "code": "input-rejected",
+        "sink_code": error.code,
+        "error": error.message,
+    });
+    if let Some(remediation) = error.remediation {
+        body["remediation"] = serde_json::Value::String(remediation);
+    }
+    (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
+}
+
+/// Best-effort recovery after a failed typing chunk. Nothing is emitted when the
+/// sink already considers every key released, so the recording sink does not
+/// see a spurious `ReleaseAll`.
+fn release_held_input(sink: &SharedSink) {
+    if !sink.held().is_empty() {
+        let _ = sink.release_all();
+    }
 }
 
 async fn input_key(
@@ -2236,6 +2256,32 @@ async fn input_mouse(
     Json(serde_json::json!({"ok": true})).into_response()
 }
 
+/// Submit one character's events, holding the non-modifier key down long
+/// enough for the guest to observe it.
+///
+/// `text_to_key_chunks` emits either `[key down, key up]` or
+/// `[shift down, key down, key up, shift up]`. Shift-down can share a USB
+/// report with the key-down, and shift-up can share one with the key-up, but the
+/// key-down/key-up pair must straddle a guest poll. If a submit fails midway,
+/// the caller's `release_all` recovers the modifiers and keys already sent.
+async fn submit_key_chunk(sink: &SharedSink, chunk: &[InputEvent]) -> Result<usize, Response> {
+    let press_index = if chunk.len() >= 4 { 1 } else { 0 };
+    let Some(press) = chunk.get(press_index) else {
+        return Ok(0);
+    };
+
+    for event in &chunk[..press_index] {
+        submit_input(sink, event)?;
+    }
+    submit_input(sink, press)?;
+    tokio::time::sleep(TYPE_KEY_HOLD).await;
+    for event in &chunk[press_index + 1..] {
+        submit_input(sink, event)?;
+    }
+
+    Ok(chunk.len())
+}
+
 async fn input_type(
     State(state): State<ConnectionState>,
     payload: Result<Json<TypeRequest>, JsonRejection>,
@@ -2262,12 +2308,18 @@ async fn input_type(
     };
 
     let mut submitted = 0usize;
+    // `submit_report` is synchronous and releases the sink lock before it
+    // returns; the only awaits here are the fixed hold/character delays, so the
+    // shared QMP client cannot be held across an await by this handler.
     for (index, chunk) in chunks.iter().enumerate() {
-        for event in chunk {
-            if let Err(response) = submit_input(&sink, event) {
+        match submit_key_chunk(&sink, chunk).await {
+            Ok(count) => submitted += count,
+            Err(response) => {
+                // A failed chunk may have left a modifier or key logically down
+                // in the sink. Release everything before reporting the error.
+                release_held_input(&sink);
                 return response;
             }
-            submitted += 1;
         }
         if index + 1 < chunks.len() {
             tokio::time::sleep(TYPE_CHAR_DELAY).await;
@@ -4235,6 +4287,229 @@ mod tests {
         assert!(events("").is_empty());
     }
 
+    /// Canonical US-layout HID usages for unshifted printable ASCII plus the
+    /// supported whitespace controls.
+    const UNSHIFTED_HID: &[(char, u8)] = &[
+        ('a', 0x04),
+        ('b', 0x05),
+        ('c', 0x06),
+        ('d', 0x07),
+        ('e', 0x08),
+        ('f', 0x09),
+        ('g', 0x0A),
+        ('h', 0x0B),
+        ('i', 0x0C),
+        ('j', 0x0D),
+        ('k', 0x0E),
+        ('l', 0x0F),
+        ('m', 0x10),
+        ('n', 0x11),
+        ('o', 0x12),
+        ('p', 0x13),
+        ('q', 0x14),
+        ('r', 0x15),
+        ('s', 0x16),
+        ('t', 0x17),
+        ('u', 0x18),
+        ('v', 0x19),
+        ('w', 0x1A),
+        ('x', 0x1B),
+        ('y', 0x1C),
+        ('z', 0x1D),
+        ('1', 0x1E),
+        ('2', 0x1F),
+        ('3', 0x20),
+        ('4', 0x21),
+        ('5', 0x22),
+        ('6', 0x23),
+        ('7', 0x24),
+        ('8', 0x25),
+        ('9', 0x26),
+        ('0', 0x27),
+        ('\n', 0x28),
+        ('\r', 0x28),
+        ('\t', 0x2B),
+        (' ', 0x2C),
+        ('-', 0x2D),
+        ('=', 0x2E),
+        ('[', 0x2F),
+        (']', 0x30),
+        ('\\', 0x31),
+        (';', 0x33),
+        ('\'', 0x34),
+        ('`', 0x35),
+        (',', 0x36),
+        ('.', 0x37),
+        ('/', 0x38),
+    ];
+
+    /// Canonical US-layout HID usages for shifted printable ASCII.
+    const SHIFTED_HID: &[(char, u8)] = &[
+        ('A', 0x04),
+        ('B', 0x05),
+        ('C', 0x06),
+        ('D', 0x07),
+        ('E', 0x08),
+        ('F', 0x09),
+        ('G', 0x0A),
+        ('H', 0x0B),
+        ('I', 0x0C),
+        ('J', 0x0D),
+        ('K', 0x0E),
+        ('L', 0x0F),
+        ('M', 0x10),
+        ('N', 0x11),
+        ('O', 0x12),
+        ('P', 0x13),
+        ('Q', 0x14),
+        ('R', 0x15),
+        ('S', 0x16),
+        ('T', 0x17),
+        ('U', 0x18),
+        ('V', 0x19),
+        ('W', 0x1A),
+        ('X', 0x1B),
+        ('Y', 0x1C),
+        ('Z', 0x1D),
+        ('!', 0x1E),
+        ('@', 0x1F),
+        ('#', 0x20),
+        ('$', 0x21),
+        ('%', 0x22),
+        ('^', 0x23),
+        ('&', 0x24),
+        ('*', 0x25),
+        ('(', 0x26),
+        (')', 0x27),
+        ('_', 0x2D),
+        ('+', 0x2E),
+        ('{', 0x2F),
+        ('}', 0x30),
+        ('|', 0x31),
+        (':', 0x33),
+        ('"', 0x34),
+        ('~', 0x35),
+        ('<', 0x36),
+        ('>', 0x37),
+        ('?', 0x38),
+    ];
+
+    /// Unshifted/shifted pairs must use the same physical key.
+    const SHIFT_PAIRS: &[(char, char)] = &[
+        ('a', 'A'),
+        ('b', 'B'),
+        ('c', 'C'),
+        ('d', 'D'),
+        ('e', 'E'),
+        ('f', 'F'),
+        ('g', 'G'),
+        ('h', 'H'),
+        ('i', 'I'),
+        ('j', 'J'),
+        ('k', 'K'),
+        ('l', 'L'),
+        ('m', 'M'),
+        ('n', 'N'),
+        ('o', 'O'),
+        ('p', 'P'),
+        ('q', 'Q'),
+        ('r', 'R'),
+        ('s', 'S'),
+        ('t', 'T'),
+        ('u', 'U'),
+        ('v', 'V'),
+        ('w', 'W'),
+        ('x', 'X'),
+        ('y', 'Y'),
+        ('z', 'Z'),
+        ('1', '!'),
+        ('2', '@'),
+        ('3', '#'),
+        ('4', '$'),
+        ('5', '%'),
+        ('6', '^'),
+        ('7', '&'),
+        ('8', '*'),
+        ('9', '('),
+        ('0', ')'),
+        ('-', '_'),
+        ('=', '+'),
+        ('[', '{'),
+        (']', '}'),
+        ('\\', '|'),
+        (';', ':'),
+        ('\'', '"'),
+        ('`', '~'),
+        (',', '<'),
+        ('.', '>'),
+        ('/', '?'),
+    ];
+
+    fn expected_char_events(usage: u8, shift: bool) -> Vec<InputEvent> {
+        let mut events = Vec::with_capacity(if shift { 4 } else { 2 });
+        if shift {
+            events.push(key(0xE1, true));
+        }
+        events.push(key(u32::from(usage), true));
+        events.push(key(u32::from(usage), false));
+        if shift {
+            events.push(key(0xE1, false));
+        }
+        events
+    }
+
+    #[test]
+    fn text_mapping_covers_every_printable_ascii_character_exactly_once() {
+        for &(character, usage) in UNSHIFTED_HID {
+            assert_eq!(
+                ascii_hid_usage(character),
+                Some((usage, false)),
+                "unshifted {character:?}"
+            );
+            assert_eq!(
+                text_to_input_events(&character.to_string()).unwrap(),
+                expected_char_events(usage, false),
+                "events for {character:?}"
+            );
+        }
+        for &(character, usage) in SHIFTED_HID {
+            assert_eq!(
+                ascii_hid_usage(character),
+                Some((usage, true)),
+                "shifted {character:?}"
+            );
+            assert_eq!(
+                text_to_input_events(&character.to_string()).unwrap(),
+                expected_char_events(usage, true),
+                "events for {character:?}"
+            );
+        }
+
+        let mapped: std::collections::BTreeSet<char> = UNSHIFTED_HID
+            .iter()
+            .chain(SHIFTED_HID)
+            .map(|&(character, _)| character)
+            .filter(|character| character.is_ascii() && !character.is_ascii_control())
+            .collect();
+        let printable_ascii: std::collections::BTreeSet<char> =
+            (0x20u8..=0x7E).map(char::from).collect();
+        assert_eq!(mapped, printable_ascii);
+    }
+
+    #[test]
+    fn every_shift_pair_shares_a_usage_and_differs_only_in_shift() {
+        for &(plain, shifted) in SHIFT_PAIRS {
+            let (plain_usage, plain_shift) = ascii_hid_usage(plain).unwrap();
+            let (shifted_usage, shifted_shift) = ascii_hid_usage(shifted).unwrap();
+            assert!(!plain_shift, "{plain:?} must not require shift");
+            assert!(shifted_shift, "{shifted:?} must require shift");
+            assert_eq!(
+                plain_usage, shifted_usage,
+                "{plain:?} and {shifted:?} must share one HID usage"
+            );
+        }
+    }
+
     #[test]
     fn text_mapping_rejects_unsupported_characters_and_oversized_text() {
         assert_eq!(
@@ -4520,11 +4795,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn input_type_route_rejects_unsupported_and_oversized_text() {
+    async fn input_type_route_types_shifted_punctuation_without_a_stuck_modifier() {
         let (state, recording) = input_state(SINK_FAKE_RECORDING);
         let app = input_router(state);
 
-        let (status, body) = post_json(&app, "/input/type", serde_json::json!({"text": "é"})).await;
+        // The live-guest stall was reported around `_` and `>`; assert the exact
+        // shift/key order for both and that neither shift nor the key remains.
+        let (status, body) =
+            post_json(&app, "/input/type", serde_json::json!({"text": "_>"})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["events"], 8);
+
+        assert_eq!(
+            recording.take_events(),
+            vec![
+                key(0xE1, true),
+                key(0x2D, true),
+                key(0x2D, false),
+                key(0xE1, false),
+                key(0xE1, true),
+                key(0x37, true),
+                key(0x37, false),
+                key(0xE1, false),
+            ]
+        );
+        assert!(
+            recording.held().is_empty(),
+            "shift and punctuation must be released"
+        );
+    }
+
+    #[tokio::test]
+    async fn input_type_route_rejects_unsupported_and_oversized_text_atomically() {
+        let (state, recording) = input_state(SINK_FAKE_RECORDING);
+        let app = input_router(state);
+
+        // An unsupported character anywhere in the request rejects the whole
+        // request before the first event reaches the sink.
+        let (status, body) =
+            post_json(&app, "/input/type", serde_json::json!({"text": "oké"})).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["code"], "unsupported-character");
         assert!(recording.events().is_empty());

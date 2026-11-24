@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
 """Bearer-token resolution for controller → node HTTP calls.
 
-A node may be started with ``--api-token``. The token arrives either on
-``NodeInfo.api_token`` at registration or from the controller-wide
-``OZMA_NODE_API_TOKEN`` (``AppState.node_api_token``). Per-node tokens win.
+A node may be started with ``--api-token``. The token arrives either from the
+controller's persistent per-node store (loaded into ``NodeInfo.api_token`` and
+taking precedence), from registration, or from the controller-wide
+``OZMA_NODE_API_TOKEN`` (``AppState.node_api_token``). Per-node tokens win; the
+global token is only a fallback.
 
 Callers use :func:`node_api_headers` / :func:`node_api_headers_for_state` to
 build request headers. Tokens are never logged, serialized, or returned in an

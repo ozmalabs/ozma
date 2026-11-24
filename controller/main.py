@@ -156,9 +156,10 @@ log = logging.getLogger("ozma")
 
 
 async def run(config: Config) -> None:
-    state = AppState()
-    # Controller-wide fallback token for node HTTP APIs. Per-node tokens from
-    # registration take precedence. Never log either value.
+    # Load the persistent per-node token store at startup. Per-node tokens from
+    # the store take precedence over registration tokens, which in turn take
+    # precedence over the controller-wide fallback below. Never log any token.
+    state = AppState(node_token_store_path=config.node_token_store or None)
     state.node_api_token = config.node_api_token.strip()
     
     # Start Rust drivers subprocess

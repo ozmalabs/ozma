@@ -20,6 +20,12 @@ GStreamer, not a browser, and the node still runs the external Python helper.
 > [`gate2-live-controller-webrtc-report.md`](gate2-live-controller-webrtc-report.md).
 > That run also fixed the worker's hard-coded H.264/Opus payload types (Chrome
 > uses 103/111, not 96/97), which this GStreamer-only report did not expose.
+>
+> **Follow-up (2026-11-24, browser matrix):** Playwright Firefox 159.0 with
+> OpenH264 2.6.0 and Chromium 159 iPhone emulation later decoded the helper's
+> H.264/Opus through the dashboard. STUN/TURN and trickle ICE remain
+> unimplemented; no distinct `srflx` or relay candidate was observed. See
+> [`gate2-live-webrtc-matrix-report.md`](gate2-live-webrtc-matrix-report.md).
 
 | Item | Value |
 |---|---|
@@ -325,8 +331,10 @@ cargo test -p ozma-node --lib controller_compat::tests::webrtc_
   `POST /api/v1/streams/{node}/webrtc`, Chromium ICE/DTLS, and dashboard media;
   see
   [`gate2-live-controller-webrtc-report.md`](gate2-live-controller-webrtc-report.md).
-  That run is one Chromium build on the same host; Firefox/Safari and a
-  NAT/STUN/TURN matrix remain open.
+  A further matrix run added Playwright Firefox 159.0 (OpenH264 2.6.0) and
+  Chromium 159 iPhone emulation; see
+  [`gate2-live-webrtc-matrix-report.md`](gate2-live-webrtc-matrix-report.md).
+  Safari/WebKit and a NAT/STUN/TURN/trickle matrix remain open.
 - **No trickle ICE.** Candidates travel inside the offer/answer SDP after a
   bounded gather. There is no STUN/TURN and no mDNS obfuscation; host
   candidates only. A slow gather can return a candidate-less answer.

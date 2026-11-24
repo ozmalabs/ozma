@@ -13,7 +13,11 @@ class Config:
     node_port: int = 7331
     # Bearer token forwarded to node HTTP APIs (snapshot/hints/metrics/control).
     # Empty keeps the previous unauthenticated behavior. Never log this value.
+    # Per-node tokens from node_tokens.json / registration take precedence.
     node_api_token: str = ""
+    # Persistent per-node token store (mode 0600). Empty uses
+    # OZMA_NODE_TOKEN_STORE or <controller dir>/node_tokens.json.
+    node_token_store: str = ""
 
     # mDNS
     mdns_service_type: str = "_ozma._udp.local."
@@ -83,6 +87,7 @@ class Config:
             api_port=int(os.environ.get("OZMA_API_PORT", "7380")),
             node_port=int(os.environ.get("OZMA_NODE_PORT", "7331")),
             node_api_token=os.environ.get("OZMA_NODE_API_TOKEN", ""),
+            node_token_store=os.environ.get("OZMA_NODE_TOKEN_STORE", ""),
             keyboard_device=os.environ.get("OZMA_KBD_DEVICE"),
             mouse_device=os.environ.get("OZMA_MOUSE_DEVICE"),
             virtual_only=os.environ.get("OZMA_VIRTUAL_ONLY", "").lower() in ("1", "true", "yes"),

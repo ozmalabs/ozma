@@ -13,6 +13,12 @@ import pytest
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture(autouse=True)
+def _isolate_node_token_store(tmp_path, monkeypatch):
+    """Keep unit tests from reading or writing the real node token store."""
+    monkeypatch.setenv("OZMA_NODE_TOKEN_STORE", str(tmp_path / "node_tokens.json"))
+
+
 # ── AppState + NodeInfo ───────────────────────────────────────────────────
 
 def _make_node(**kwargs):
