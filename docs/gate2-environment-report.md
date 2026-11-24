@@ -315,6 +315,39 @@ the live tree. The P0/P1 snapshot/hints/metrics routes and the P2 aliases/stubs
 were subsequently implemented in `ozma-node` (see each item); none has been
 validated against a running controller/dashboard in this audit.
 
+### 7.1 Public vs guarded controller routes
+
+`ozma-node` assembles the HTTP app from two compatibility routers. The control
+router ([`compat_router`](../ozma-node/src/controller_compat.rs)) is merged
+**before** the bearer-token layer; the read-only router (`public_router`) is
+merged **after** it, exactly like the HLS `/stream/*` media service. A request
+without `Authorization: Bearer <token>` therefore succeeds only on the public
+surface; every other controller route still returns 401 before any handler runs.
+
+| Route | Access with `--api-token` | Purpose / controller caller |
+|---|---|---|
+| `GET /display/snapshot` | public | One-shot JPEG; `controller/stream.py`, `controller/terminal_bridge.py`, `controller/api.py` |
+| `GET /display/info` | public | Capture source metadata (read-only) |
+| `GET /ui/hints` | public | Empty/no-agent hint shape; `controller/agent_engine.py`, `controller/api.py` |
+| `GET /node/status` | public | Connection summary; `controller/mesh_intelligence.py` |
+| `GET /agent/metrics` | public | Flat host metrics JSON; `controller/device_metrics.py` |
+| `GET /audio/nodes` | public (typed 501) | No graph enumeration; always `audio-nodes-unsupported` |
+| `POST /audio/sweep` | public (typed 501) | No room-correction engine; always `audio-sweep-unsupported` |
+| `GET /stream/{file}` | public | HLS media; `controller/api.py::stream_hls_proxy` |
+| `GET /display/mjpeg` | guarded (401 without token) | Typed 501; no controller caller |
+| `GET /api/v1/connection` | guarded | Compatibility status document |
+| `GET /power/state`, `POST /power/{action}` | guarded | Power control |
+| `POST /input/{key,mouse,type}` | guarded | Input injection |
+| `GET/POST /codec` | guarded | Codec status / runtime override |
+| `POST /audio/{apply,remove,play,stop}` | guarded | Audio routing control |
+| `POST /webrtc/{offer,bitrate}` | guarded | WebRTC helper signaling |
+| `/usb`, `/rgb/*`, `/current`, `/session/init`, `/serial/*` | guarded | Typed 501 legacy stubs |
+
+No public response contains the configured API token, an `Authorization`
+header, or an environment dump. The metrics document exposes host resource
+totals by design (the controller's metrics panel consumes them) and names every
+metric it cannot measure instead of reporting a zero.
+
 1. **P0 — `GET /display/snapshot` was missing on the Rust node. Resolved in code
    (not yet live-validated).** The controller consumes a raw-JPEG snapshot at
    several places:
@@ -334,34 +367,47 @@ validated against a running controller/dashboard in this audit.
    missing source, busy device, timeout, or unsupported format returns a typed
    JSON 503/504 with `code`, `error`, and `remediation` instead of a fake image. `GET /display/info` reports the source
    id/name, width/height, pixel format, and snapshot availability without opening
-   the device. `GET /display/mjpeg` is a typed 501 because no multipart stream is
-   implemented. All three are mounted through the compat extra router **behind**
-   the bearer guard, like `/power/*`.
+   the device. `GET /display/mjpeg` is a guarded typed 501 because no multipart
+   stream is implemented.
 
-   **Controller requirement:** the snapshot consumers above call the node
-   without a bearer token. When `--api-token`/`OZMA_API_TOKEN` is configured,
-   the controller must send `Authorization: Bearer <token>` or the node returns
-   401 before any capture occurs. The guard is not bypassed. The dashboard live
-   view has **not** been run against this route yet.
+   **Controller requirement (resolved without a controller change):**
+   `display/snapshot` and `display/info` are mounted in
+   `controller_compat::public_router`, which `ozma-node` merges **after** the
+   bearer-token layer (like `/stream/*`). The unmodified controller's snapshot
+   callers therefore work when `--api-token` is set; the control routes remain
+   guarded. The dashboard live view has **not** been run against this route yet.
 2. **P1 — `/ui/hints` was missing. Resolved in code.** Both
    `controller/agent_engine.py:620` and `controller/api.py:3984` call
    `http://<node>:<api_port>/ui/hints?level=...`. The node now returns the
    minimal shape (`windows`, `focused_window`, `controls`, `focused_control`,
    `level`) with an empty hints list and `available:false`, because no in-guest
-   accessibility agent is connected. It never invents windows or controls.
-3. **P1 — `/agent/metrics` path mismatch. Resolved as an honest typed 501.**
-   `controller/device_metrics.py:340` polls `/agent/metrics` and decodes JSON,
-   not Prometheus text. The Rust node has no host agent metrics document; it now
-   returns a typed 501 (`agent.metrics_unsupported`) pointing at the native
-   `/api/v1/metrics` JSON and `/metrics` Prometheus text. It does not re-label
-   runtime session metrics as hardware sensor data.
-4. **P2 — Other controller-consumed node routes. Resolved as typed stubs.**
-   `GET /node/status` now aliases the connection/health summary.
-   `/usb`, `/rgb/state`, `/rgb/effect`, `/current`, `/session/init`, and
-   `/serial/*` return typed 501 JSON with `ok:false`, a stable `code`, `error`,
-   and `remediation`; none returns a success-shaped no-op. `/audio/nodes`,
-   `/audio/sweep`, `/bluetooth/pair-keys/import`, and `/api/v1/rpa/*` remain
-   unimplemented and are listed as known limits rather than parity.
+   accessibility agent is connected. It never invents windows or controls. It is
+   public (merged after the bearer guard) because both callers send no token.
+3. **P1 — `/agent/metrics` path mismatch. Resolved as an honest JSON
+   document.** `controller/device_metrics.py:340` polls `/agent/metrics`,
+   decodes JSON, and calls `update_batch`, which only records top-level numbers.
+   The node now returns `200 application/json` with a flat document:
+   `cpu_usage` (percent), `ram_used`/`ram_total` and `disk_used`/`disk_total`
+   (bytes), `net_rx_rate`/`net_tx_rate` (bytes/s from `/proc/net/dev` deltas),
+   and `uptime` (seconds), plus `ok`, `available`, `source`, `scope`,
+   `node_id`, `unavailable`, and `notes`. Reads are
+   bounded to `/proc/{stat,meminfo,net/dev,uptime}` (256 KiB each) and one
+   `statvfs`; there is no subprocess or network poll. Missing values (CPU
+   temperature, GPU, fan, power draw, or a first network sample) are omitted
+   and listed in `unavailable`; they are never reported as invented zeros. The
+   route is public because the controller poller sends no token.
+4. **P2 — Other controller-consumed node routes.** `GET /node/status` is
+   public and aliases the connection/health summary (`controller/mesh_intelligence.py`
+   polls it without a token). `GET /audio/nodes` and `POST /audio/sweep` are
+   public typed 501 stubs with the soft-node shape: `AudioRouter` has no graph
+   enumeration or room-correction operation, so `/audio/nodes` returns
+   `{"nodes":[],"links":[],"default_sink":null,"default_source":null,...}` and
+   `/audio/sweep` returns `{"ok":false,"available":false,"profile":null,...}`.
+   Neither fabricates a graph or profile. `/usb`, `/rgb/state`, `/rgb/effect`,
+   `/current`, `/session/init`, and `/serial/*` return guarded typed 501 JSON
+   with `ok:false`, a stable `code`, `error`, and `remediation`; none returns a
+   success-shaped no-op. `/bluetooth/pair-keys/import` and `/api/v1/rpa/*`
+   remain unimplemented and are listed as known limits rather than parity.
 5. **P2 — `/codec` has no controller caller.** The Rust node implements
    `GET/POST /codec`, but the controller's codec endpoints
    (`/api/v1/streams/{id}/codec`) operate on its own `StreamManager` and never
@@ -379,8 +425,10 @@ validated against a running controller/dashboard in this audit.
    `input`/`power` shapes, `/power/state`, `/power/{action}` names (`on`/`off`/
    `reset`/`force-off`), `/input/{key,mouse,type}` bodies,
    `/audio/{apply,remove,play,stop}` bodies, `/webrtc/{offer,bitrate}`,
+   `/display/{snapshot,info}`, `/ui/hints`, `/node/status`, `/agent/metrics`,
    `/stream/{file}` served without a bearer token, and the `stream_url`
-   composition (`http://<host>:<stream_port>/stream/stream.m3u8`).
+   composition (`http://<host>:<stream_port>/stream/stream.m3u8`). The public/
+   guarded split is in §7.1.
 
 ## 8. Next-run checklist
 

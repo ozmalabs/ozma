@@ -12,6 +12,7 @@ use ozma_capture::{
     CaptureRegistry, DBusDisplayConfig, QmpDisplayConfig, VncDisplayConfig, DBUS_DEFAULT_ID,
     QMP_DEFAULT_ID, QMP_DEFAULT_MAX_FPS, VNC_DEFAULT_ID,
 };
+use ozma_qmp::SharedQmpClient;
 
 use crate::config::{NodeConfig, NodeProfile};
 
@@ -22,14 +23,27 @@ use crate::config::{NodeConfig, NodeProfile};
 /// selected by the provider resolver. Advertising the host's V4L2/PipeWire
 /// devices on a guest would claim hardware the VM does not own. A VM with no
 /// configured display gets an empty registry.
+///
+/// This form gives a QMP provider its own connection. The node's `main` uses
+/// [`capture_registry_with_qmp_shared`] so QMP capture shares the single
+/// control client with power, snapshots, and input.
 pub fn capture_registry(config: &NodeConfig) -> CaptureRegistry {
+    capture_registry_with_qmp_shared(config, None)
+}
+
+/// Build the capture registry, optionally routing QMP `screendump` through the
+/// node's single shared control client.
+pub fn capture_registry_with_qmp_shared(
+    config: &NodeConfig,
+    shared: Option<&SharedQmpClient>,
+) -> CaptureRegistry {
     match config.profile {
-        NodeProfile::Vm => vm_capture_registry(config),
+        NodeProfile::Vm => vm_capture_registry(config, shared),
         NodeProfile::Hardware | NodeProfile::Desktop => CaptureRegistry::system_with_pipewire(),
     }
 }
 
-fn vm_capture_registry(config: &NodeConfig) -> CaptureRegistry {
+fn vm_capture_registry(config: &NodeConfig, shared: Option<&SharedQmpClient>) -> CaptureRegistry {
     let capture = config
         .vm_providers()
         .ok()
@@ -49,11 +63,17 @@ fn vm_capture_registry(config: &NodeConfig) -> CaptureRegistry {
             _ => CaptureRegistry::new(),
         },
         Some("qmp") => match &config.qmp_socket {
-            Some(socket) => CaptureRegistry::new().with_qmp_display(
-                QmpDisplayConfig::new(socket.clone())
+            Some(socket) => {
+                let display = QmpDisplayConfig::new(socket.clone())
                     .with_identity(QMP_DEFAULT_ID, format!("{} VM display", config.name))
-                    .with_max_fps(QMP_DEFAULT_MAX_FPS),
-            ),
+                    .with_max_fps(QMP_DEFAULT_MAX_FPS);
+                match shared {
+                    Some(shared) => {
+                        CaptureRegistry::new().with_qmp_display_shared(display, shared.clone())
+                    }
+                    None => CaptureRegistry::new().with_qmp_display(display),
+                }
+            }
             None => CaptureRegistry::new(),
         },
         Some("dbus") => match &config.qmp_socket {

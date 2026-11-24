@@ -72,6 +72,7 @@ pub async fn serve_with_scene_replay(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -82,9 +83,15 @@ pub async fn serve_with_scene_replay(
 /// `input_sink` is the one sink used by both session input and the controller's
 /// UDP HID listener. When it is `Some`, no second [`HidGadgetSink`] is opened
 /// here. `compat_router` is merged into the HTTP API before the bearer-token
-/// guard, so endpoints such as `/api/v1/connection` are authenticated like the
-/// rest of the node API. `capture_registry` replaces the default V4L2/PipeWire
-/// registry; the VM profile passes a QMP screendump registry.
+/// guard, so control endpoints such as `/api/v1/connection`, `/input/*`,
+/// `/power/*`, `/audio/{apply,remove,play,stop}`, `/codec`, and `/webrtc/*`
+/// are authenticated like the rest of the node API. `public_compat_router` is
+/// merged **after** the guard: it carries only the controller's read-only
+/// probes (`/display/snapshot`, `/display/info`, `/ui/hints`, `/node/status`,
+/// `/agent/metrics`, `/audio/nodes`) and the always-unsupported
+/// `POST /audio/sweep` stub, none of which change state or expose credentials.
+/// `capture_registry` replaces the default V4L2/PipeWire registry; the VM
+/// profile passes a QMP screendump registry.
 ///
 /// `hls_dir` is mounted at `/stream` **outside** the bearer guard (the routes
 /// are merged after the guard layer is applied). The Python controller proxies
@@ -103,6 +110,7 @@ pub async fn serve_with_scene_replay_and_sink(
     webtransport: Option<SocketAddr>,
     input_sink: Option<SharedSink>,
     compat_router: Option<Router>,
+    public_compat_router: Option<Router>,
     capture_registry: Option<ozma_capture::CaptureRegistry>,
     hls_dir: Option<std::path::PathBuf>,
 ) -> Result<()> {
@@ -241,6 +249,14 @@ pub async fn serve_with_scene_replay_and_sink(
         app.merge(webtransport_info_router(webtransport_info_backend))
     } else {
         app
+    };
+    // Controller read-only probes are merged after the bearer layer on purpose:
+    // the unmodified controller polls snapshot/info/hints/status/metrics and the
+    // audio discovery/sweep stubs without credentials. This router contains no
+    // control surface; see `controller_compat::public_router`.
+    let app = match public_compat_router {
+        Some(public) => app.merge(public),
+        None => app,
     };
     // HLS media is merged after the bearer layer on purpose: the controller's
     // `/stream/*` proxy does not send credentials. See the doc comment on
@@ -784,16 +800,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compat_display_and_legacy_routes_share_the_bearer_guard() {
+    async fn public_controller_routes_bypass_bearer_but_controls_stay_guarded() {
         use crate::controller_compat::{
-            compat_router, CompatStats, ConnectionInfo, ConnectionState, SINK_FAKE_RECORDING,
+            compat_router, public_router, CompatStats, ConnectionInfo, ConnectionState,
+            SINK_FAKE_RECORDING,
         };
+        use crate::display_compat::SnapshotControl;
+        use ozma_capture::{CaptureRegistry, FakeCaptureProvider};
 
         let backend: Arc<dyn NodeBackend> = Arc::new(SessionBackend::new(
             NodeCapabilities::fake("compat-guard"),
             ConsentPolicy::for_machine(MachineClass::Server),
         ));
-        let extra = compat_router(ConnectionState::new(
+        let state = ConnectionState::new(
             ConnectionInfo::new(
                 "compat-guard._ozma._udp.local.",
                 "hardware",
@@ -803,40 +822,104 @@ mod tests {
                 SINK_FAKE_RECORDING,
             ),
             CompatStats::default(),
-        ));
+        )
+        .with_snapshot(Some(SnapshotControl::new(
+            CaptureRegistry::new().with(FakeCaptureProvider::new()),
+        )));
         let app = ozma_api::router::router_with_sinks_and_extra(
             backend,
             None,
             None,
-            Some("secret".to_owned()),
-            Some(extra),
-        );
+            Some("secret-token".to_owned()),
+            Some(compat_router(state.clone())),
+        )
+        .merge(public_router(state));
 
+        // The controller pulls raw JPEG snapshots without credentials.
+        let snapshot = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/display/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.status(), StatusCode::OK);
+        assert_eq!(snapshot.headers()[header::CONTENT_TYPE], "image/jpeg");
+        let jpeg = snapshot.into_body().collect().await.unwrap().to_bytes();
+        assert!(jpeg.starts_with(&[0xFF, 0xD8]), "not a JPEG: {jpeg:?}");
+
+        // The rest of the public read-only surface answers without a token,
+        // and none of it echoes the configured secret.
         for uri in [
-            "/display/snapshot",
             "/display/info",
+            "/ui/hints?level=2",
             "/node/status",
-            "/ui/hints",
             "/agent/metrics",
-            "/usb",
-            "/rgb/state",
-            "/current",
-            "/serial/buffer?lines=50",
         ] {
-            let denied = app
+            let response = app
                 .clone()
                 .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
                 .await
                 .unwrap();
-            assert_eq!(denied.status(), StatusCode::UNAUTHORIZED, "{uri}");
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "application/json",
+                "{uri}"
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let text = String::from_utf8(body.to_vec()).unwrap();
+            assert!(!text.contains("secret-token"), "{uri} leaked the token");
+            assert!(!text.contains("api_token"), "{uri} exposed a token field");
+            assert!(
+                !text.contains("Authorization"),
+                "{uri} exposed auth headers"
+            );
         }
 
-        for uri in ["/session/init", "/rgb/effect"] {
+        // Audio discovery/sweep are public typed 501 stubs, never 401 and never
+        // a success-shaped no-op.
+        for (method, uri, code) in [
+            ("GET", "/audio/nodes", "audio-nodes-unsupported"),
+            ("POST", "/audio/sweep", "audio-sweep-unsupported"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED, "{uri}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["ok"], false, "{uri}");
+            assert_eq!(json["available"], false, "{uri}");
+            assert_eq!(json["code"], code, "{uri}");
+        }
+
+        // Control endpoints remain behind the bearer guard.
+        for (method, uri) in [
+            ("GET", "/power/state"),
+            ("GET", "/codec"),
+            ("GET", "/display/mjpeg"),
+            ("GET", "/usb"),
+            ("POST", "/input/key"),
+            ("POST", "/audio/apply"),
+            ("POST", "/webrtc/offer"),
+        ] {
             let denied = app
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .method(Method::POST)
+                        .method(method)
                         .uri(uri)
                         .body(Body::empty())
                         .unwrap(),
@@ -846,31 +929,17 @@ mod tests {
             assert_eq!(denied.status(), StatusCode::UNAUTHORIZED, "{uri}");
         }
 
-        let snapshot = app
-            .clone()
+        // The same guarded route still works with the token.
+        let allowed = app
             .oneshot(
                 Request::builder()
-                    .uri("/display/snapshot")
-                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .uri("/codec")
+                    .header(header::AUTHORIZATION, "Bearer secret-token")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        // The guard runs first; with no snapshot control the route is an honest
-        // typed 503, never an image.
-        assert_eq!(snapshot.status(), StatusCode::SERVICE_UNAVAILABLE);
-
-        let status = app
-            .oneshot(
-                Request::builder()
-                    .uri("/node/status")
-                    .header(header::AUTHORIZATION, "Bearer secret")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(status.status(), StatusCode::OK);
+        assert_eq!(allowed.status(), StatusCode::OK);
     }
 }

@@ -21,10 +21,14 @@
 //!
 //! [`QmpDisplayProvider::enumerate`] only checks that the socket path exists;
 //! it never connects. [`QmpDisplayProvider::open`] is synchronous and also
-//! does not connect. [`QmpDisplaySource`] connects (and performs the
-//! `qmp_capabilities` handshake) lazily on the first call to `next_frame`, then
-//! reuses that control socket. A missing or unresponsive socket therefore
-//! surfaces as a typed [`MediaError`] from `next_frame`, not from `open`.
+//! does not connect. A source built with [`QmpDisplaySource::new`] connects
+//! (and performs the `qmp_capabilities` handshake) lazily on the first call to
+//! `next_frame`, then reuses that control socket. A source built with
+//! [`QmpDisplaySource::with_shared_client`] instead uses the node's single
+//! [`ozma_qmp::SharedQmpClient`]: it never opens a second QMP connection, and
+//! its `screendump` calls serialize with power and input on the same control
+//! socket. A missing or unresponsive socket surfaces as a typed [`MediaError`]
+//! from `next_frame`, not from `open`.
 //!
 //! ## Temporary files
 //!
@@ -47,7 +51,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use ozma_media::{CaptureSource, Frame, FrameFormat, MediaError, PixelFormat};
 use ozma_protocol::{codes, ApiError, CaptureCapability, CaptureKind};
-use ozma_qmp::{QmpClient, QmpConfig, QmpError};
+use ozma_qmp::{QmpClient, QmpConfig, QmpError, SharedQmpClient};
 use tracing::warn;
 
 use crate::provider::CaptureProvider;
@@ -194,17 +198,37 @@ impl QmpDisplayConfig {
 #[derive(Clone, Debug)]
 pub struct QmpDisplayProvider {
     config: QmpDisplayConfig,
+    shared: Option<SharedQmpClient>,
 }
 
 impl QmpDisplayProvider {
-    /// Create a provider for `config`.
+    /// Create a provider that owns its own QMP connection when opened.
     pub fn new(config: QmpDisplayConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            shared: None,
+        }
+    }
+
+    /// Create a provider whose sources share one node-owned QMP client.
+    ///
+    /// The source never opens a second control connection: every screendump
+    /// goes through `shared`, serialized with power, snapshots, and input.
+    pub fn with_shared_client(config: QmpDisplayConfig, shared: SharedQmpClient) -> Self {
+        Self {
+            config,
+            shared: Some(shared),
+        }
     }
 
     /// The configuration this provider was built with.
     pub fn config(&self) -> &QmpDisplayConfig {
         &self.config
+    }
+
+    /// The shared client this provider was built with, if any.
+    pub fn shared_client(&self) -> Option<&SharedQmpClient> {
+        self.shared.as_ref()
     }
 
     /// The capability advertised when the QMP socket path exists.
@@ -253,7 +277,12 @@ impl CaptureProvider for QmpDisplayProvider {
             return Err(missing_socket_error(&self.config.qmp_socket));
         }
 
-        Ok(Box::new(QmpDisplaySource::new(self.config.clone())?))
+        Ok(Box::new(match &self.shared {
+            Some(shared) => {
+                QmpDisplaySource::with_shared_client(self.config.clone(), shared.clone())?
+            }
+            None => QmpDisplaySource::new(self.config.clone())?,
+        }))
     }
 }
 
@@ -265,6 +294,7 @@ impl CaptureProvider for QmpDisplayProvider {
 pub struct QmpDisplaySource {
     config: QmpDisplayConfig,
     client: QmpClient,
+    shared: Option<SharedQmpClient>,
     format: FrameFormat,
     interval: Duration,
     origin: Instant,
@@ -280,6 +310,22 @@ impl QmpDisplaySource {
     /// frame-rate ceiling with a structured [`ApiError`]. The socket itself is
     /// only opened on the first `next_frame`.
     pub fn new(config: QmpDisplayConfig) -> Result<Self, ApiError> {
+        Self::build(config, None)
+    }
+
+    /// Build a source that shares the node's single QMP control client.
+    ///
+    /// Opening this source never connects and `next_frame` never opens a second
+    /// connection; it calls `shared.screendump` while the shared mutex
+    /// serializes with power, snapshots, and input.
+    pub fn with_shared_client(
+        config: QmpDisplayConfig,
+        shared: SharedQmpClient,
+    ) -> Result<Self, ApiError> {
+        Self::build(config, Some(shared))
+    }
+
+    fn build(config: QmpDisplayConfig, shared: Option<SharedQmpClient>) -> Result<Self, ApiError> {
         config.validate()?;
         let interval = config.frame_interval();
         let client = QmpClient::new(QmpConfig::new(config.qmp_socket.clone()));
@@ -287,6 +333,7 @@ impl QmpDisplaySource {
         Ok(Self {
             config,
             client,
+            shared,
             // Geometry is unknown until the first screendump arrives.
             format: FrameFormat::rgb24(0, 0),
             interval,
@@ -295,6 +342,11 @@ impl QmpDisplaySource {
             last_sequence: None,
             last_pts: None,
         })
+    }
+
+    /// The shared client this source uses, if any.
+    pub fn shared_client(&self) -> Option<&SharedQmpClient> {
+        self.shared.as_ref()
     }
 
     /// QMP control socket this source uses.
@@ -319,7 +371,10 @@ impl QmpDisplaySource {
 
     /// True while the QMP control socket is connected.
     pub fn is_connected(&self) -> bool {
-        self.client.control_connected()
+        match &self.shared {
+            Some(shared) => shared.is_connected_now(),
+            None => self.client.control_connected(),
+        }
     }
 
     /// Unique path for the next screendump, inside the configured directory.
@@ -346,7 +401,10 @@ impl CaptureSource for QmpDisplaySource {
             return Err(MediaError::EndOfStream);
         }
 
-        if !self.client.control_connected() {
+        // Owned clients connect lazily. Shared clients are already the node's
+        // one control owner; `screendump` makes at most one lazy reconnect of
+        // that same connection and never opens a second one.
+        if self.shared.is_none() && !self.client.control_connected() {
             self.client
                 .connect_control()
                 .await
@@ -362,7 +420,11 @@ impl CaptureSource for QmpDisplaySource {
         let started = Instant::now();
         let path = self.next_screendump_path();
 
-        if let Err(error) = self.client.screendump(&path).await {
+        let screendump = match &self.shared {
+            Some(shared) => shared.screendump(&path).await,
+            None => self.client.screendump(&path).await,
+        };
+        if let Err(error) = screendump {
             remove_screendump(&path).await;
             return Err(qmp_error(&self.config.id, "screendump", error));
         }
@@ -427,7 +489,11 @@ impl CaptureSource for QmpDisplaySource {
             return Ok(());
         }
         self.stopped = true;
-        self.client.disconnect().await;
+        // Never disconnect a shared control connection: power, input, or
+        // another capture source still owns it. An owned connection is closed.
+        if self.shared.is_none() {
+            self.client.disconnect().await;
+        }
         Ok(())
     }
 }

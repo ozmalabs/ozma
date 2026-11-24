@@ -28,6 +28,7 @@ anyhow             = { workspace = true }
 thiserror          = { workspace = true }
 usb-gadget         = { workspace = true }
 alsa               = { workspace = true }
+libc               = { workspace = true }
 
 # Ozma plan crates
 ozma-protocol = { path = "../ozma-protocol" }

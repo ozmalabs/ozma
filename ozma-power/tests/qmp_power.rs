@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use common::{FakeQmpOptions, FakeQmpServer};
 use ozma_power::{PowerBackend, PowerError, PowerState, QmpPower};
-use ozma_qmp::{QmpClient, QmpConfig, QmpError};
+use ozma_qmp::{QmpClient, QmpConfig, QmpError, SharedQmpClient};
 use serde_json::json;
 
 fn config(server: &FakeQmpServer) -> QmpConfig {
@@ -155,6 +155,31 @@ async fn not_connected_maps_to_the_backend_level_error() {
         power.stop().await.unwrap_err(),
         PowerError::NotConnected
     ));
+}
+
+#[tokio::test]
+async fn shared_client_power_commands_use_the_supplied_connection() {
+    let mut server = FakeQmpServer::spawn().await;
+    let shared = SharedQmpClient::connect(config(&server)).await.unwrap();
+    let mut power = QmpPower::with_shared_client(shared.clone());
+
+    assert!(power.is_connected());
+    assert!(power.shared_client().is_some());
+    assert_eq!(power.query_status().await.unwrap(), PowerState::running());
+    power.cont().await.unwrap();
+
+    assert_eq!(
+        server.recv_command().await,
+        json!({"execute": "qmp_capabilities"})
+    );
+    assert_eq!(
+        server.recv_command().await,
+        json!({"execute": "query-status"})
+    );
+    assert_eq!(server.recv_command().await, json!({"execute": "cont"}));
+
+    // Power did not take ownership of the shared connection.
+    assert!(shared.is_connected().await);
 }
 
 #[tokio::test]

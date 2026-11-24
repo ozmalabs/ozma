@@ -338,6 +338,9 @@ impl VmProviderConfig {
     /// both. With only the control socket, input uses the same connection in
     /// single-socket mode (matching `ozma-qmp`'s legacy fallback). With only an
     /// input socket, that socket is used as the control socket.
+    ///
+    /// The node normally prefers [`VmProviderConfig::qmp_dedicated_input_config`]
+    /// when `--qmp-input-socket` is set, and a shared control client otherwise.
     pub fn qmp_input_config(&self) -> Option<QmpConfig> {
         let config = match (&self.qmp_socket, &self.qmp_input_socket) {
             (Some(control), Some(input)) => QmpConfig::dual(control, input),
@@ -347,6 +350,22 @@ impl VmProviderConfig {
         };
         Some(
             config
+                .with_connect_timeout(self.connect_timeout)
+                .with_command_timeout(self.command_timeout),
+        )
+    }
+
+    /// QMP configuration that uses only the dedicated input socket.
+    ///
+    /// Returns `None` when `--qmp-input-socket` is absent. The returned config
+    /// is dual-shaped so `QmpSink::spawn_dedicated_input` keeps fire-and-forget
+    /// writes and connects only the input half; the control path is a required
+    /// config field but is never opened by that path.
+    pub fn qmp_dedicated_input_config(&self) -> Option<QmpConfig> {
+        let input = self.qmp_input_socket.as_ref()?;
+        let control = self.qmp_socket.as_ref().unwrap_or(input);
+        Some(
+            QmpConfig::dual(control, input)
                 .with_connect_timeout(self.connect_timeout)
                 .with_command_timeout(self.command_timeout),
         )

@@ -2,6 +2,7 @@
 //! `ozma-node` library crate — the supervisor, platform detection, discovery,
 //! registration, API, and audio bridge used by the binary and tests.
 
+pub mod agent_metrics;
 pub mod api;
 pub mod audio_runtime;
 pub mod backend;

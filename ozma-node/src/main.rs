@@ -18,6 +18,7 @@ use ozma_audio::{
 use ozma_input::SinkKind;
 use ozma_power::{LibvirtPower, PowerBackend, QmpPower};
 use ozma_protocol::NodeId;
+use ozma_qmp::SharedQmpClient;
 use tracing::{error, info, warn};
 
 use ozma_node::{
@@ -480,10 +481,44 @@ async fn main() {
         }
     };
 
+    // QEMU accepts one client per `-qmp` chardev. The node creates exactly one
+    // shared control client here and hands clones to power, QMP capture,
+    // snapshots (through the capture registry), and QMP input. A dedicated
+    // `--qmp-input-socket` is a separate input-only client and never takes a
+    // second control connection.
+    let shared_qmp = match vm_providers.qmp_control_config() {
+        Some(qmp_config) => {
+            let socket = qmp_config.control_path.clone();
+            let shared = SharedQmpClient::new(qmp_config);
+            match shared.ensure_connected().await {
+                Ok(()) => info!(
+                    socket = %socket.display(),
+                    owner = "node-shared-control",
+                    "QMP control socket: one shared client for power, capture, snapshots, and input"
+                ),
+                Err(error) => warn!(
+                    socket = %socket.display(),
+                    owner = "node-shared-control",
+                    error = %error,
+                    "QMP control socket: shared client created; initial connect failed and commands will retry"
+                ),
+            }
+            Some(shared)
+        }
+        None => None,
+    };
+    if let Some(input_socket) = vm_providers.qmp_input_socket.as_ref() {
+        info!(
+            socket = %input_socket.display(),
+            "QMP input uses the dedicated input socket; it does not open another control client"
+        );
+    }
+
     // Capture: hardware keeps V4L2/PipeWire; a VM uses only its QMP or VNC
     // display. A VM without either flag gets an empty registry so it never
-    // advertises host hardware it does not own.
-    let capture_registry = platform::capture_registry(&config);
+    // advertises host hardware it does not own. QMP display sources share the
+    // control client above, so HLS and snapshots serialize their screendumps.
+    let capture_registry = platform::capture_registry_with_qmp_shared(&config, shared_qmp.as_ref());
     if config.profile == NodeProfile::Vm && !vm_providers.has_capture() {
         warn!(
             "vm profile has no --qmp-socket, --vnc-host/--vnc-port, or D-Bus display flags: \
@@ -497,7 +532,16 @@ async fn main() {
     // listener. The chain comes from the profile and flags; every real sink is
     // wrapped in a recorder so the path is observable. The QMP task must stay
     // alive for injection to continue.
-    let input_factory = input_select::SystemInputFactory::new(vm_providers.qmp_input_config());
+    //
+    // Precedence for QMP input: a dedicated `--qmp-input-socket` (input only),
+    // else the shared control client, else the legacy owned-client config.
+    let mut input_factory = input_select::SystemInputFactory::new(vm_providers.qmp_input_config());
+    if let Some(shared) = shared_qmp.clone() {
+        input_factory = input_factory.with_shared_client(shared);
+    }
+    if let Some(dedicated) = vm_providers.qmp_dedicated_input_config() {
+        input_factory = input_factory.with_dedicated_input(dedicated);
+    }
     let selected_input =
         input_select::select_input(&input_factory, &vm_providers.input_chain).await;
     let input_sink = selected_input.sink;
@@ -505,7 +549,7 @@ async fn main() {
     let _input_qmp_handle = selected_input.handle;
     info!(sink = sink_kind, "Input sink ready");
 
-    let power = build_power(&vm_providers).await;
+    let power = build_power(&vm_providers, shared_qmp.clone()).await;
 
     // Audio routing controls an existing PipeWire/PulseAudio graph. `none`
     // leaves /audio/* at typed 501. A missing `pactl` marks the backend failed
@@ -690,7 +734,7 @@ async fn main() {
     let codec_status = controller_compat::CodecStatus::from_codecs(
         capabilities.encode.iter().map(|encode| encode.codec),
     );
-    let compat_router = controller_compat::compat_router(
+    let compat_state =
         controller_compat::ConnectionState::new(connection_info, compat_stats.clone())
             .with_power(power)
             .with_hls(Some(hls_status))
@@ -700,8 +744,12 @@ async fn main() {
             .with_codec_control(codec_control)
             .with_audio(audio_control)
             .with_webrtc(webrtc_control.clone())
-            .with_snapshot(Some(SnapshotControl::new(capture_registry.clone()))),
-    );
+            .with_snapshot(Some(SnapshotControl::new(capture_registry.clone())));
+    // Control routes stay behind the bearer guard; the controller's read-only
+    // probes are mounted after it so the unmodified controller works with
+    // `--api-token`. See `controller_compat::{compat_router, public_router}`.
+    let compat_router = controller_compat::compat_router(compat_state.clone());
+    let public_compat_router = controller_compat::public_router(compat_state);
 
     // Start the controller-facing UDP HID listener only when the node
     // advertises the `hid` capability.
@@ -876,6 +924,7 @@ async fn main() {
             webtransport,
             Some(input_sink),
             Some(compat_router),
+            Some(public_compat_router),
             Some(api_capture_registry),
             hls_output_dir,
         )
@@ -964,10 +1013,20 @@ fn default_webrtc_shm() -> std::path::PathBuf {
 
 /// Build the optional power backend. A connection failure is logged and leaves
 /// power unavailable; it must never crash the node.
-async fn build_power(vm: &VmProviderConfig) -> Option<controller_compat::SharedPower> {
+async fn build_power(
+    vm: &VmProviderConfig,
+    shared: Option<SharedQmpClient>,
+) -> Option<controller_compat::SharedPower> {
     match vm.power {
         None => None,
         Some(PowerProvider::Qmp) => {
+            if let Some(shared) = shared {
+                info!(
+                    socket = %shared.config().control_path.display(),
+                    "QMP power backend uses the shared control client"
+                );
+                return Some(shared_power(QmpPower::with_shared_client(shared)));
+            }
             let Some(qmp) = vm.qmp_control_config() else {
                 warn!("QMP power selected without a control socket; power is unavailable");
                 return None;

@@ -108,7 +108,7 @@ from backup_status import BackupStatusTracker, BackupNudgeService
 from game_streaming import SunshineManager
 from gaming.moonlight_protocol import MoonlightProtocol
 from gaming.moonlight_server import MoonlightServer
-from gaming.scenario_app_mapping import ScenarioAppMapper, HybridStreamingManager
+from gaming.scenario_app_mapping import ScenarioAppMapper
 from gaming.capture_to_moonlight import CaptureToMoonlightManager
 from auto_configure import AutoConfigureManager
 from camera_connect import CameraConnectManager
@@ -679,12 +679,14 @@ async def run(config: Config) -> None:
     await sunshine_mgr.start()
 
     # Moonlight protocol server — native Moonlight streaming
+    # MoonlightServer.start() owns the protocol lifecycle, so do not start it
+    # separately here (RTSPServer.start() is not idempotent).
     moonlight_data = Path(__file__).parent / "moonlight_data"
     moonlight_protocol = MoonlightProtocol(moonlight_data)
-    await moonlight_protocol.start()
 
-    # Scenario-to-Moonlight app mapper
-    app_mapper = ScenarioAppMapper(scenarios, moonlight_protocol)
+    # Scenario-to-Moonlight app mapper (source resolution for the app list)
+    app_mapper = ScenarioAppMapper(captures)
+    app_mapper.refresh(scenarios.list())
 
     # Capture-to-Moonlight bridge (HDMI capture streaming)
     capture_to_moonlight = CaptureToMoonlightManager(
@@ -692,13 +694,12 @@ async def run(config: Config) -> None:
     )
     await capture_to_moonlight.start()
 
-    # Hybrid streaming manager (unified source adapters)
-    hybrid_streaming = HybridStreamingManager(moonlight_data / "hybrid")
+    # The V1.2 refactor removed the HybridStreamingManager source-adapter
+    # registry; ScenarioAppMapper now resolves sources directly.
+    log.warning("HybridStreamingManager removed; hybrid source-adapter registry disabled")
 
     # Full Moonlight server
-    moonlight_server = MoonlightServer(
-        scenarios, moonlight_protocol, app_mapper, hybrid_streaming, moonlight_data
-    )
+    moonlight_server = MoonlightServer(scenarios, moonlight_protocol, moonlight_data)
     await moonlight_server.start()
 
     # Auto-configure (V1.7) — PoE subnet device discovery + camera auto-registration

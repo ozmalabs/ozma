@@ -17,7 +17,7 @@ use ozma_input::{
     FakeInputSink, HidGadgetSink, InputSink, QmpSink, QmpSinkHandle, RecordingSink, SharedSink,
     SinkKind, UinputSink,
 };
-use ozma_qmp::QmpConfig;
+use ozma_qmp::{QmpConfig, SharedQmpClient};
 use tracing::{debug, info, warn};
 
 /// A sink that opened successfully, plus the QMP background task (if any).
@@ -55,13 +55,34 @@ pub trait InputSinkFactory: Send + Sync {
 /// Production factory backed by the real sinks.
 pub struct SystemInputFactory {
     qmp_input: Option<QmpConfig>,
+    shared: Option<SharedQmpClient>,
+    dedicated_input: Option<QmpConfig>,
 }
 
 impl SystemInputFactory {
-    /// Build a factory. `qmp_input` is `Some` only when
-    /// `--qmp-input-socket` is configured.
+    /// Build a factory. `qmp_input` is the legacy owned-client config.
     pub fn new(qmp_input: Option<QmpConfig>) -> Self {
-        Self { qmp_input }
+        Self {
+            qmp_input,
+            shared: None,
+            dedicated_input: None,
+        }
+    }
+
+    /// Use the node's single shared control client for QMP input.
+    pub fn with_shared_client(mut self, shared: SharedQmpClient) -> Self {
+        self.shared = Some(shared);
+        self
+    }
+
+    /// Use a dedicated `--qmp-input-socket` for input only.
+    ///
+    /// This takes precedence over [`SystemInputFactory::with_shared_client`]:
+    /// a provisioned dual-socket VM keeps input off the shared control
+    /// connection, and no second control client is opened.
+    pub fn with_dedicated_input(mut self, config: QmpConfig) -> Self {
+        self.dedicated_input = Some(config);
+        self
     }
 }
 
@@ -73,8 +94,24 @@ impl InputSinkFactory for SystemInputFactory {
                 .map(BuiltInput::recorded)
                 .map_err(|error| format!("uinput unavailable: {error}")),
             SinkKind::Qmp => {
+                if let Some(config) = &self.dedicated_input {
+                    let (sink, handle) = QmpSink::spawn_dedicated_input(config.clone())
+                        .await
+                        .map_err(|error| format!("qmp unavailable: {error}"))?;
+                    return Ok(BuiltInput {
+                        sink: Arc::new(RecordingSink::new(sink)),
+                        handle: Some(handle),
+                    });
+                }
+                if let Some(shared) = &self.shared {
+                    let (sink, handle) = QmpSink::spawn_with_shared(shared.clone());
+                    return Ok(BuiltInput {
+                        sink: Arc::new(RecordingSink::new(sink)),
+                        handle: Some(handle),
+                    });
+                }
                 let config = self.qmp_input.clone().ok_or_else(|| {
-                    "qmp unavailable: no --qmp-input-socket configured".to_owned()
+                    "qmp unavailable: no --qmp-socket or --qmp-input-socket configured".to_owned()
                 })?;
                 let (sink, handle) = QmpSink::spawn(config)
                     .await

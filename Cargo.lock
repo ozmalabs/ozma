@@ -3255,6 +3255,7 @@ dependencies = [
  "hostname 0.4.2",
  "http-body-util",
  "jpeg-decoder",
+ "libc",
  "libmdns 0.9.1",
  "local-ip-address",
  "ozma-api",

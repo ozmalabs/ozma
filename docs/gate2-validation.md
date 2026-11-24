@@ -92,6 +92,10 @@ Notes:
 - `--input-provider qmp` makes the guest input path deterministic. The VM
   profile's default chain is `uinput -> qmp -> hid-gadget -> recording`; if the
   user can open `/dev/uinput`, that sink wins instead of QMP.
+- With `--qmp-socket`, the node creates one shared QMP control client and
+  serializes power, QMP capture, snapshots, and QMP input through it. Add
+  `--qmp-input-socket` only when QEMU has a second `-qmp` chardev: input then
+  uses that dedicated input socket and never opens another control client.
 - `--power-provider qmp` is the default when `--qmp-socket` is set; the explicit
   flag documents the intent. Use `--libvirt-domain <domain>` (and omit the
   power override) if power must go through libvirt instead.
@@ -554,10 +558,19 @@ parity matrix until the underlying work lands.
    keeps four entries by default. `/stream/*` is unauthenticated by design so
    the controller can proxy it; control endpoints remain guarded when a token
    is configured.
-5. **HLS and WebRTC each open their own capture source.** They do not share a
-   frame tap. A source that cannot be opened twice (or a VNC server that allows
-   one client) makes one path report `failed`. QMP screendump normally supports
-   multiple connections.
+5. **QMP has one control client per `-qmp` chardev.** QEMU accepts one client
+   per socket. With `--qmp-socket` the node creates one `SharedQmpClient` in
+   `main`; power, QMP `screendump` capture, snapshots, and QMP input when no
+   dedicated input socket is configured all serialize through that connection
+   under one async command mutex. HLS and snapshots each still open a capture
+   *source* (and HLS/WebRTC still do not share a frame tap), but a QMP source
+   reuses the shared control connection instead of dialing a second client.
+   `--qmp-input-socket` selects a dedicated input-only client for input, so the
+   control socket remains single-owner. D-Bus display capture still performs
+   its own QMP `getfd`/`add_client` handoff and is **not** multiplexed through
+   the shared client; do not combine D-Bus capture with concurrent QMP control
+   roles on a one-socket VM. A non-QMP source that cannot be opened twice (for
+   example a single-client VNC server) can still make one path report `failed`.
 6. **The controller proxies to `127.0.0.1`.** `controller/api.py` input, HLS,
    WebRTC, and snapshot proxies use `http://127.0.0.1:<api_port>`, ignoring the
    node's registered `host`. The node must be on the controller host or share

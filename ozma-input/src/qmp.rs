@@ -46,13 +46,27 @@
 //! draining the channel. It does not retry the batch that failed: an event
 //! that could not be delivered is logged rather than replayed out of order.
 //! Indefinite retry belongs to a supervisor, not to the event path.
+//!
+//! # Socket precedence
+//!
+//! * [`QmpSink::spawn_with_shared`] is the single-control-socket mode: input
+//!   shares the node's one [`ozma_qmp::SharedQmpClient`] with power, capture,
+//!   and snapshots, so no second QMP client is opened.
+//! * [`QmpSink::spawn_dedicated_input`] is the provisioned dual-socket mode:
+//!   `input-send-event` writes go to the dedicated `--qmp-input-socket` with
+//!   fire-and-forget semantics and never touch the control socket.
+//! * [`QmpSink::spawn`] keeps the original owned-client behavior (single or
+//!   dual config) for callers that manage their own QMP lifecycle.
+//!
+//! A caller that has a dedicated input socket should prefer it for input only;
+//! otherwise it should pass the shared control client.
 
 use std::collections::BTreeSet;
 use std::sync::Mutex;
 
 use ozma_protocol::input::{InputEvent, KeyModifiers, PointerButton};
 use ozma_protocol::ApiError;
-use ozma_qmp::{hid_to_qcode, QmpClient, QmpConfig, QmpInputEvent};
+use ozma_qmp::{hid_to_qcode, QmpClient, QmpConfig, QmpInputEvent, SharedQmpClient};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tracing::{debug, warn};
 
@@ -332,6 +346,42 @@ impl QmpSink {
         Ok((sink, handle))
     }
 
+    /// Share the node's single control client instead of opening another QMP
+    /// connection.
+    ///
+    /// Input batches call `input-send-event` on the shared client while its
+    /// command mutex serializes them with power, capture, and snapshots. This is
+    /// the correct mode for a VM with one `--qmp-socket` and no
+    /// `--qmp-input-socket`.
+    pub fn spawn_with_shared(shared: SharedQmpClient) -> (Self, QmpSinkHandle) {
+        let (sink, receiver) = Self::channel();
+        let handle = tokio::spawn(run_shared_input_task(shared, receiver));
+        (sink, handle)
+    }
+
+    /// Write input to a dedicated `--qmp-input-socket` only.
+    ///
+    /// The client is built in dual-socket mode and connects only the input
+    /// half, so it never takes a second control client. `input-send-event`
+    /// keeps the fire-and-forget behavior of the dedicated socket. A
+    /// non-dual config falls back to [`QmpSink::spawn`].
+    pub async fn spawn_dedicated_input(
+        config: QmpConfig,
+    ) -> Result<(Self, QmpSinkHandle), ApiError> {
+        if !config.is_dual() {
+            return Self::spawn(config).await;
+        }
+
+        let client = QmpClient::new(config.clone());
+        client
+            .connect_input()
+            .await
+            .map_err(|error| error::qmp_connect_error(&config, error))?;
+        let (sink, receiver) = Self::channel();
+        let handle = tokio::spawn(run_dedicated_input_task(client, receiver));
+        Ok((sink, handle))
+    }
+
     fn dispatch(&self, events: Vec<QmpInputEvent>) -> Result<(), ApiError> {
         if events.is_empty() {
             return Ok(());
@@ -466,9 +516,68 @@ async fn run_input_task(client: QmpClient, mut receiver: UnboundedReceiver<Vec<Q
     debug!("QMP input channel closed; background task exiting");
 }
 
+/// Drain input batches through the node's shared control client.
+///
+/// The shared client makes at most one lazy reconnect of the same connection;
+/// this task must not call `disconnect`, because power or capture still own it.
+async fn run_shared_input_task(
+    shared: SharedQmpClient,
+    mut receiver: UnboundedReceiver<Vec<QmpInputEvent>>,
+) {
+    while let Some(events) = receiver.recv().await {
+        if events.is_empty() {
+            continue;
+        }
+
+        match shared.send_input_events(&events).await {
+            Ok(()) => debug!(
+                count = events.len(),
+                "QMP input events sent on shared client"
+            ),
+            Err(error) => {
+                warn!(%error, "QMP input send on shared client failed; the next event retries");
+            }
+        }
+    }
+
+    debug!("QMP input channel closed; shared background task exiting");
+}
+
+/// Drain input batches through a dedicated input socket only.
+///
+/// On failure this reconnects the input half; it never connects the control
+/// half, so a provisioned dual-socket VM keeps input isolated.
+async fn run_dedicated_input_task(
+    client: QmpClient,
+    mut receiver: UnboundedReceiver<Vec<QmpInputEvent>>,
+) {
+    while let Some(events) = receiver.recv().await {
+        if events.is_empty() {
+            continue;
+        }
+
+        match client.send_input_events(&events).await {
+            Ok(()) => debug!(
+                count = events.len(),
+                "QMP input events sent on dedicated socket"
+            ),
+            Err(error) => {
+                warn!(%error, "QMP dedicated input send failed; reconnecting the input socket");
+                if let Err(reconnect_error) = client.connect_input().await {
+                    warn!(%reconnect_error, "QMP dedicated input reconnect failed");
+                }
+            }
+        }
+    }
+
+    debug!("QMP input channel closed; dedicated background task exiting");
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use ozma_protocol::input::TouchPhase;
@@ -816,10 +925,11 @@ mod tests {
                     }
                     Some("input-send-event") => {
                         received.push(value);
-                        writer
-                            .write_all(b"{\"return\":{}}\n")
-                            .await
-                            .expect("write input response");
+                        // Fire-and-forget mode may close the socket before
+                        // QEMU's reply is written; that is not a server error.
+                        if writer.write_all(b"{\"return\":{}}\n").await.is_err() {
+                            break;
+                        }
                     }
                     _ => {}
                 }
@@ -861,5 +971,88 @@ mod tests {
                 }
             }])
         );
+    }
+
+    #[tokio::test]
+    async fn spawn_with_shared_sends_over_the_supplied_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("qmp.sock");
+        let server = fake_qmp_server(&socket);
+
+        let shared = SharedQmpClient::connect(QmpConfig::new(&socket))
+            .await
+            .unwrap();
+        let (sink, handle) = QmpSink::spawn_with_shared(shared.clone());
+        sink.submit(&key(0x04, true)).unwrap();
+
+        drop(sink);
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("shared QMP task should exit after the channel closes")
+            .unwrap();
+        assert!(shared.is_connected().await);
+
+        drop(shared);
+        let received = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("fake QMP server should exit")
+            .unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0]["execute"], "input-send-event");
+        assert_eq!(
+            received[0]["arguments"]["events"],
+            json!([{
+                "type": "key",
+                "data": {
+                    "down": true,
+                    "key": {"type": "qcode", "data": "a"}
+                }
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn dedicated_input_never_connects_the_control_socket() {
+        let directory = tempfile::tempdir().unwrap();
+        let control_path = directory.path().join("control.sock");
+        let input_path = directory.path().join("input.sock");
+
+        // A listener for the control socket that records (and rejects) any
+        // connection. A dedicated input sink must never reach it.
+        let control_listener = UnixListener::bind(&control_path).unwrap();
+        let control_connections = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&control_connections);
+        let control_task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = control_listener.accept().await else {
+                    break;
+                };
+                observed.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+
+        let input_server = fake_qmp_server(&input_path);
+        let (sink, handle) =
+            QmpSink::spawn_dedicated_input(QmpConfig::dual(&control_path, &input_path))
+                .await
+                .unwrap();
+        assert_eq!(control_connections.load(Ordering::SeqCst), 0);
+
+        sink.submit(&key(0x04, true)).unwrap();
+        drop(sink);
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("dedicated QMP task should exit after the channel closes")
+            .unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(5), input_server)
+            .await
+            .expect("fake input QMP server should exit")
+            .unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0]["execute"], "input-send-event");
+        assert_eq!(control_connections.load(Ordering::SeqCst), 0);
+        control_task.abort();
     }
 }

@@ -50,6 +50,12 @@ pub const DEFAULT_BITRATE_KBPS: u32 = 4_000;
 /// Largest error string retained for `/api/v1/connection`.
 const MAX_STATUS_ERROR_CHARS: usize = 512;
 
+/// Largest GOP value ffmpeg accepts for `-g`/`-keyint_min`.
+///
+/// Both are signed 32-bit `AVCodecContext` options, so a larger value would
+/// make ffmpeg reject the whole argv.
+const MAX_GOP_FRAMES: u32 = i32::MAX as u32;
+
 /// Video encoder used by the HLS ffmpeg pipeline.
 ///
 /// The software variants are the historical path. The hardware variants name
@@ -417,6 +423,38 @@ impl HlsConfig {
     fn validated(self) -> Result<Self, HlsError> {
         self.validate()?;
         Ok(self)
+    }
+
+    /// Keyframe interval in frames that keeps GOPs aligned with segments.
+    ///
+    /// `-hls_time` is only a target: libavformat can split a segment only at a
+    /// keyframe, so the encoder's default GOP decides the real segment length
+    /// (libx264 defaults to 250 frames, which is 50 seconds at 5 fps). This is
+    /// `round(fps × segment_seconds)`, clamped to at least one frame and to
+    /// [`MAX_GOP_FRAMES`] so extreme but valid configurations cannot overflow
+    /// or produce an argv ffmpeg rejects.
+    pub fn gop_frames(&self) -> u32 {
+        let frames = f64::from(self.fps) * f64::from(self.segment_seconds);
+        if !frames.is_finite() {
+            return MAX_GOP_FRAMES;
+        }
+        let rounded = frames.round();
+        if rounded < 1.0 {
+            1
+        } else if rounded > f64::from(MAX_GOP_FRAMES) {
+            MAX_GOP_FRAMES
+        } else {
+            rounded as u32
+        }
+    }
+
+    /// `-force_key_frames` expression that closes a segment on time even when
+    /// `fps × segment_seconds` is fractional.
+    pub fn force_key_frames_expr(&self) -> String {
+        format!(
+            "expr:gte(t,n_forced*{})",
+            format_seconds(self.segment_seconds)
+        )
     }
 
     /// Path of the HLS playlist that the controller proxies.
@@ -1918,6 +1956,30 @@ pub fn ffmpeg_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String> {
         ]),
     }
 
+    // Keep GOPs aligned with segment boundaries. `-hls_time` can only cut a
+    // segment at a keyframe, so without this libx264's default 250-frame GOP
+    // made `-hls_time 1` produce 50-second segments at 5 fps (see
+    // docs/gate2-live-qmp-report.md, Finding 2). `-g` sets the fixed interval;
+    // `-keyint_min`/`-sc_threshold 0` stop scene changes from drifting it on
+    // software encoders; `-force_key_frames` closes a segment on time even
+    // when fps × segment_seconds is fractional. Hardware wrappers do not all
+    // honour the software-only flags, so they receive only `-g` and the force
+    // expression.
+    let gop = config.gop_frames();
+    argv.extend(["-g".to_owned(), gop.to_string()]);
+    if !config.video_encoder.is_hardware() {
+        argv.extend([
+            "-keyint_min".to_owned(),
+            gop.to_string(),
+            "-sc_threshold".to_owned(),
+            "0".to_owned(),
+        ]);
+    }
+    argv.extend([
+        "-force_key_frames".to_owned(),
+        config.force_key_frames_expr(),
+    ]);
+
     argv.extend([
         "-f".to_owned(),
         "hls".to_owned(),
@@ -2154,6 +2216,8 @@ mod tests {
         assert_eq!(config.ffmpeg_bin, PathBuf::from("ffmpeg"));
         assert_eq!(config.width, None);
         assert_eq!(config.height, None);
+        assert_eq!(config.gop_frames(), 30);
+        assert_eq!(config.force_key_frames_expr(), "expr:gte(t,n_forced*1)");
         config.validate().expect("defaults are valid");
     }
 
@@ -2163,7 +2227,9 @@ mod tests {
 
         for mutate in [
             |config: &mut HlsConfig| config.segment_seconds = 0.0,
+            |config: &mut HlsConfig| config.segment_seconds = -1.0,
             |config: &mut HlsConfig| config.segment_seconds = f32::NAN,
+            |config: &mut HlsConfig| config.segment_seconds = f32::INFINITY,
             |config: &mut HlsConfig| config.playlist_size = 0,
             |config: &mut HlsConfig| config.fps = 0,
             |config: &mut HlsConfig| config.bitrate_kbps = 0,
@@ -2217,6 +2283,14 @@ mod tests {
                 "zerolatency",
                 "-b:v",
                 "4000k",
+                "-g",
+                "30",
+                "-keyint_min",
+                "30",
+                "-sc_threshold",
+                "0",
+                "-force_key_frames",
+                "expr:gte(t,n_forced*1)",
                 "-f",
                 "hls",
                 "-hls_time",
@@ -2245,6 +2319,58 @@ mod tests {
         assert!(fractional.contains(&"15".to_owned()));
         assert!(fractional.contains(&"1500k".to_owned()));
         assert!(fractional.contains(&"1280x720".to_owned()));
+    }
+
+    #[test]
+    fn gop_frames_follow_fps_and_segment_duration() {
+        for (fps, segment_seconds, expected) in [
+            (30, 1.0, 30),
+            (5, 1.0, 5),
+            (24, 2.5, 60),
+            (15, 0.5, 8),
+            (1, 0.4, 1), // rounds to zero, so the minimum is one frame
+            (30, 0.001, 1),
+            (u32::MAX, 1.0, MAX_GOP_FRAMES),
+            (u32::MAX, f32::MAX, MAX_GOP_FRAMES), // saturates instead of overflowing
+            (30, 1.0e30, MAX_GOP_FRAMES),
+        ] {
+            let config = HlsConfig {
+                fps,
+                segment_seconds,
+                ..HlsConfig::default()
+            };
+            assert_eq!(
+                config.gop_frames(),
+                expected,
+                "fps {fps} x {segment_seconds}s"
+            );
+            assert!(config.gop_frames() >= 1);
+        }
+    }
+
+    #[test]
+    fn fractional_segment_duration_forces_keyframes_on_time() {
+        let config = HlsConfig {
+            segment_seconds: 2.5,
+            fps: 24,
+            ..HlsConfig::default()
+        };
+        assert_eq!(config.force_key_frames_expr(), "expr:gte(t,n_forced*2.5)");
+
+        let argv = ffmpeg_argv(&config, 640, 480);
+        assert!(
+            argv.windows(2).any(|window| window == ["-g", "60"]),
+            "{argv:?}"
+        );
+        assert!(
+            argv.windows(2)
+                .any(|window| window == ["-force_key_frames", "expr:gte(t,n_forced*2.5)"]),
+            "{argv:?}"
+        );
+        assert!(
+            argv.windows(2).any(|window| window == ["-hls_time", "2.5"]),
+            "{argv:?}"
+        );
     }
 
     #[test]
@@ -2297,6 +2423,25 @@ mod tests {
                 argv.windows(2)
                     .any(|window| window == ["-hls_flags", "delete_segments"]),
                 "{encoder:?} argv must prune segments"
+            );
+            assert!(
+                argv.windows(2).any(|window| window == ["-g", "30"]),
+                "{encoder:?} argv must pin the GOP to the segment duration"
+            );
+            assert!(
+                argv.windows(2)
+                    .any(|window| window == ["-keyint_min", "30"]),
+                "{encoder:?} argv must keep scene changes from shortening the GOP"
+            );
+            assert!(
+                argv.windows(2)
+                    .any(|window| window == ["-sc_threshold", "0"]),
+                "{encoder:?} argv must disable scene-cut keyframes"
+            );
+            assert!(
+                argv.windows(2)
+                    .any(|window| window == ["-force_key_frames", "expr:gte(t,n_forced*1)"]),
+                "{encoder:?} argv must force a keyframe on each segment boundary"
             );
         }
     }
@@ -2376,6 +2521,25 @@ mod tests {
                 );
             }
             assert!(argv.contains(&"4000k".to_owned()), "{encoder:?}");
+            assert!(
+                argv.windows(2).any(|window| window == ["-g", "30"]),
+                "{encoder:?} argv must pin the GOP to the segment duration"
+            );
+            assert!(
+                argv.windows(2)
+                    .any(|window| window == ["-force_key_frames", "expr:gte(t,n_forced*1)"]),
+                "{encoder:?} argv must force a keyframe on each segment boundary"
+            );
+            // These are software-encoder controls; hardware wrappers do not
+            // all honour them, so they must stay out of the hardware argv.
+            assert!(
+                !argv.iter().any(|argument| argument == "-keyint_min"),
+                "{encoder:?} argv must not carry software-only -keyint_min"
+            );
+            assert!(
+                !argv.iter().any(|argument| argument == "-sc_threshold"),
+                "{encoder:?} argv must not carry software-only -sc_threshold"
+            );
             assert!(
                 argv.windows(2)
                     .any(|window| window == ["-hls_flags", "delete_segments"]),

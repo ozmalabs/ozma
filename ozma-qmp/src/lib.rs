@@ -22,10 +22,14 @@
 //! -qmp unix:/run/ozma/vm-input.qmp,server,nowait
 //! ```
 //!
-//! With [`QmpConfig::dual`] the control socket serves request/response
-//! commands and the input socket serves fire-and-forget `input-send-event`
-//! writes (a background task drains QEMU's replies). With [`QmpConfig::new`]
-//! both roles share the control socket.
+//! QEMU accepts **one client per chardev**, so every node role that uses the
+//! control socket must share it. [`SharedQmpClient`] is a cloneable wrapper
+//! that serializes power, capture, snapshot, and input commands through one
+//! control connection. With [`QmpConfig::dual`] the dedicated input socket is
+//! used only for fire-and-forget `input-send-event` writes (a background task
+//! drains QEMU's replies); the control socket remains the shared client. With
+//! [`QmpConfig::new`] both roles share the control socket, through either the
+//! shared wrapper or a single [`QmpClient`].
 //!
 //! # Example
 //!
@@ -60,6 +64,7 @@ pub mod config;
 pub mod error;
 pub mod hid;
 pub mod input_event;
+pub mod shared;
 
 pub use backoff::{backoff_delay, Backoff, BACKOFF_FACTOR, BACKOFF_INITIAL, BACKOFF_MAX};
 pub use client::{QmpClient, QmpStatus};
@@ -69,3 +74,4 @@ pub use hid::{
     hid_to_qcode, KeyboardReportState, MouseReportState, RelativeMouseReportState, HID_TO_QCODE,
 };
 pub use input_event::{QmpInputEvent, QmpKeyValue};
+pub use shared::SharedQmpClient;

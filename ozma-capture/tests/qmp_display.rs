@@ -14,6 +14,7 @@ use ozma_capture::qmp_display::{QmpDisplayConfig, QmpDisplayProvider, QmpDisplay
 use ozma_capture::{CaptureKind, CaptureProvider, CaptureRegistry};
 use ozma_media::{CaptureSource, FrameFormat, MediaError};
 use ozma_protocol::codes;
+use ozma_qmp::{QmpConfig, SharedQmpClient};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -39,6 +40,7 @@ struct FakeScreendumpServer {
     socket: PathBuf,
     handle: JoinHandle<()>,
     screendumps: Arc<AtomicUsize>,
+    connections: Arc<AtomicUsize>,
 }
 
 impl FakeScreendumpServer {
@@ -48,13 +50,28 @@ impl FakeScreendumpServer {
         let listener = UnixListener::bind(&socket).expect("bind fake QMP socket");
         let screendumps = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&screendumps);
+        let connections = Arc::new(AtomicUsize::new(0));
+        let accepted = Arc::clone(&connections);
 
         let handle = tokio::spawn(async move {
-            let Ok((stream, _)) = listener.accept().await else {
-                return;
-            };
-            if let Err(error) = serve(stream, &ppm, fail_screendump, &count).await {
-                eprintln!("fake QMP screendump server failed: {error}");
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let index = accepted.fetch_add(1, Ordering::SeqCst);
+                if index > 0 {
+                    // A second control client is a test failure; dropping the
+                    // stream makes it visible as a closed handshake.
+                    drop(stream);
+                    continue;
+                }
+                let ppm = ppm.clone();
+                let count = Arc::clone(&count);
+                tokio::spawn(async move {
+                    if let Err(error) = serve(stream, &ppm, fail_screendump, &count).await {
+                        eprintln!("fake QMP screendump server failed: {error}");
+                    }
+                });
             }
         });
 
@@ -63,6 +80,7 @@ impl FakeScreendumpServer {
             socket,
             handle,
             screendumps,
+            connections,
         }
     }
 
@@ -72,6 +90,10 @@ impl FakeScreendumpServer {
 
     fn screendumps(&self) -> usize {
         self.screendumps.load(Ordering::Relaxed)
+    }
+
+    fn connections(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
     }
 }
 
@@ -120,6 +142,11 @@ async fn serve(
                     screendumps.fetch_add(1, Ordering::Relaxed);
                     write_half.write_all(b"{\"return\":{}}\n").await?;
                 }
+            }
+            "query-status" => {
+                write_half
+                    .write_all(b"{\"return\":{\"status\":\"running\",\"running\":true}}\n")
+                    .await?;
             }
             other => {
                 let response = json!({
@@ -225,6 +252,43 @@ async fn screendump_produces_rgb24_frames_with_increasing_sequence_and_pts() {
         source.next_frame().await,
         Err(MediaError::EndOfStream)
     ));
+}
+
+#[tokio::test]
+async fn shared_client_source_uses_one_qmp_connection() {
+    let server = FakeScreendumpServer::spawn(ppm_2x2(), false).await;
+    let output = tempfile::tempdir().unwrap();
+    let config = QmpDisplayConfig::new(server.socket().to_path_buf())
+        .with_max_fps(240)
+        .with_screendump_dir(output.path());
+
+    let shared = SharedQmpClient::connect(QmpConfig::new(server.socket().to_path_buf()))
+        .await
+        .unwrap();
+    assert_eq!(server.connections(), 1);
+
+    // Provider enumerate is unchanged by sharing; opening must not connect.
+    let registry = CaptureRegistry::new().with_qmp_display_shared(config.clone(), shared.clone());
+    let capabilities = registry.enumerate().unwrap();
+    assert_eq!(capabilities.len(), 1);
+    assert_eq!(server.connections(), 1);
+
+    let mut source = registry.open(&capabilities[0]).unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(5), source.next_frame())
+        .await
+        .expect("shared source frame timed out")
+        .expect("shared source frame failed");
+    assert_eq!(frame.format(), FrameFormat::rgb24(2, 2));
+    assert_eq!(frame.data(), &PIXELS_2X2[..]);
+    assert_eq!(server.screendumps(), 1);
+
+    // Another role can use the same client between frames.
+    assert!(shared.query_status().await.unwrap().running);
+
+    source.stop().await.unwrap();
+    // Stopping a shared source must not disconnect the node's connection.
+    assert!(shared.is_connected().await);
+    assert_eq!(server.connections(), 1);
 }
 
 #[tokio::test]

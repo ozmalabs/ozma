@@ -23,8 +23,9 @@ use ozma_input::{FakeInputSink, InputSink, RecordingSink, SharedSink};
 use ozma_media::{CaptureSource, Frame, FrameFormat, MediaError};
 use ozma_node::api;
 use ozma_node::controller_compat::{
-    audio_router, codec_router, compat_router, connection_router, CodecControl, CompatStats,
-    ConnectionInfo, ConnectionState, HidPacketDecoder, HidUdpListener, SINK_FAKE_RECORDING,
+    audio_router, codec_router, compat_router, connection_router, public_router, CodecControl,
+    CompatStats, ConnectionInfo, ConnectionState, HidPacketDecoder, HidUdpListener,
+    SINK_FAKE_RECORDING,
 };
 use ozma_node::display_compat::SnapshotControl;
 use ozma_node::hls::{
@@ -613,7 +614,7 @@ async fn display_snapshot_and_info_match_baseline() {
     .with_snapshot(Some(SnapshotControl::new(
         CaptureRegistry::new().with(FakeCaptureProvider::new()),
     )));
-    let app = compat_router(state);
+    let app = compat_router(state.clone()).merge(public_router(state));
 
     let response = app
         .clone()
@@ -651,6 +652,72 @@ async fn display_snapshot_and_info_match_baseline() {
 }
 
 #[tokio::test]
+async fn agent_metrics_is_a_flat_controller_metrics_document() {
+    let baseline = baseline(include_str!("parity/http_baseline.json"));
+    let state = ConnectionState::new(
+        ConnectionInfo::new(
+            NODE_ID,
+            "hardware",
+            HTTP_PORT,
+            QUIC_PORT,
+            HID_PORT,
+            SINK_FAKE_RECORDING,
+        ),
+        CompatStats::default(),
+    );
+    let app = public_router(state);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/agent/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"],
+        "application/json",
+        "/agent/metrics must be JSON, not Prometheus text"
+    );
+    let bytes = body_bytes(response).await;
+    let document: Value = serde_json::from_slice(&bytes).expect("metrics JSON");
+
+    assert_shape(&document, &baseline["agent_metrics"], "agent_metrics");
+    assert_eq!(document["ok"], true);
+    assert_eq!(document["source"], "ozma-node");
+    assert_eq!(document["scope"], "host");
+    assert_eq!(document["node_id"], NODE_ID);
+    assert!(document["unavailable"].is_array());
+
+    // On Linux the procfs-backed values must be present and plausible; the
+    // document must never contain a bearer token or an auth header.
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(document["available"], true);
+        let cpu = document["cpu_usage"].as_f64().expect("cpu_usage");
+        assert!(
+            (0.0..=100.0).contains(&cpu),
+            "cpu_usage out of range: {cpu}"
+        );
+        assert!(document["ram_total"].as_u64().unwrap() > 0);
+        assert!(document["ram_used"].as_u64().unwrap() <= document["ram_total"].as_u64().unwrap());
+        assert!(document["disk_total"].as_u64().unwrap() > 0);
+        assert!(
+            document["disk_used"].as_u64().unwrap() <= document["disk_total"].as_u64().unwrap()
+        );
+        assert!(document["uptime"].as_u64().is_some());
+    }
+
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(!text.contains("token"));
+    assert!(!text.contains("Authorization"));
+}
+
+#[tokio::test]
 async fn legacy_routes_report_typed_501s_and_minimal_hints() {
     let baseline = baseline(include_str!("parity/http_baseline.json"));
     let state = ConnectionState::new(
@@ -664,7 +731,7 @@ async fn legacy_routes_report_typed_501s_and_minimal_hints() {
         ),
         CompatStats::default(),
     );
-    let app = compat_router(state);
+    let app = compat_router(state.clone()).merge(public_router(state));
 
     let (status, hints) = get_json(&app, "/ui/hints?level=2").await;
     assert_eq!(status, StatusCode::OK);
@@ -681,7 +748,6 @@ async fn legacy_routes_report_typed_501s_and_minimal_hints() {
     assert_eq!(node_status["api_port"], HTTP_PORT);
 
     for (uri, code) in [
-        ("/agent/metrics", "agent.metrics_unsupported"),
         ("/usb", "usb.unsupported"),
         ("/current", "power.current_unsupported"),
         ("/rgb/state", "rgb.unsupported"),
@@ -947,6 +1013,53 @@ async fn audio_routes_remain_typed_501_without_a_router() {
         assert_eq!(body["code"], "audio-routing-unsupported", "{path}");
         assert!(body["remediation"].is_string(), "{path}");
     }
+}
+
+#[tokio::test]
+async fn public_audio_discovery_and_sweep_are_typed_501s() {
+    let baseline = baseline(include_str!("parity/http_baseline.json"));
+    let state = ConnectionState::new(
+        ConnectionInfo::new(
+            NODE_ID,
+            "vm",
+            HTTP_PORT,
+            QUIC_PORT,
+            HID_PORT,
+            SINK_FAKE_RECORDING,
+        ),
+        CompatStats::default(),
+    );
+    let app = public_router(state);
+
+    let (status, nodes) = get_json(&app, "/audio/nodes").await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_shape(
+        &nodes,
+        &baseline["audio_nodes_unsupported"],
+        "audio_nodes_unsupported",
+    );
+    assert_eq!(nodes["ok"], false);
+    assert_eq!(nodes["available"], false);
+    assert_eq!(nodes["code"], "audio-nodes-unsupported");
+    assert_eq!(nodes["nodes"], json!([]));
+    assert_eq!(nodes["links"], json!([]));
+
+    let (status, sweep) = post_json(
+        &app,
+        "/audio/sweep",
+        json!({"source": "mic", "sink": "speaker"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_shape(
+        &sweep,
+        &baseline["audio_sweep_unsupported"],
+        "audio_sweep_unsupported",
+    );
+    assert_eq!(sweep["ok"], false);
+    assert_eq!(sweep["available"], false);
+    assert_eq!(sweep["code"], "audio-sweep-unsupported");
+    assert!(sweep["profile"].is_null());
 }
 
 #[tokio::test]

@@ -26,7 +26,10 @@
 //!   P6 PPM into owned RGB24 frames, and enforces frame-rate pacing
 //!   ([`QmpDisplaySource`]). It is a polling path, not a real-time framebuffer
 //!   subscription. Register it explicitly with
-//!   [`CaptureRegistry::with_qmp_display`] or from the VM profile.
+//!   [`CaptureRegistry::with_qmp_display`] or from the VM profile. When the
+//!   node owns one [`ozma_qmp::SharedQmpClient`] for power/input/snapshots,
+//!   use [`CaptureRegistry::with_qmp_display_shared`] instead so capture does
+//!   not open a second QMP control connection.
 //! * [`vnc_display`] reads QEMU's VNC display through ffmpeg's VNC input and
 //!   returns packed RGB24 frames ([`VncDisplaySource`]). It is a transition
 //!   path for hosts where the D-Bus display is unavailable; it needs no

@@ -128,6 +128,23 @@ impl CaptureRegistry {
         self
     }
 
+    /// Add a QMP `screendump` provider that shares the node's control client.
+    ///
+    /// QEMU accepts one client per `-qmp` chardev. When the node owns a single
+    /// [`ozma_qmp::SharedQmpClient`] for power, capture, snapshots, and input,
+    /// register the display provider with this method so HLS and snapshot
+    /// sources never open a second control connection.
+    pub fn with_qmp_display_shared(
+        mut self,
+        config: crate::qmp_display::QmpDisplayConfig,
+        shared: ozma_qmp::SharedQmpClient,
+    ) -> Self {
+        self.register(crate::qmp_display::QmpDisplayProvider::with_shared_client(
+            config, shared,
+        ));
+        self
+    }
+
     /// Add an ffmpeg-backed VNC display provider.
     ///
     /// This is opt-in for the same reason as [`CaptureRegistry::with_qmp_display`]:

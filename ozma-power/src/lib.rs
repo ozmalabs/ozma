@@ -9,7 +9,10 @@
 //! * [`LibvirtPower`] shells out to `virsh` with an argv vector (no shell),
 //!   exactly like the Python fallback path.
 //! * [`QmpPower`] wraps [`ozma_qmp::QmpClient`] and shares its handshake,
-//!   timeouts, and reconnect policy.
+//!   timeouts, and reconnect policy. A node can instead pass its one
+//!   [`ozma_qmp::SharedQmpClient`] via [`QmpPower::with_shared_client`], so
+//!   power serializes with QMP capture, snapshots, and input on the single
+//!   control socket.
 //!
 //! # Status vocabulary
 //!

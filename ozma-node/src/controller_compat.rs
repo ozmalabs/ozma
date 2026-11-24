@@ -1202,6 +1202,8 @@ pub struct ConnectionState {
     /// One-shot display snapshot control. `None` leaves `/display/snapshot`
     /// at a typed 503 rather than fabricating an image.
     pub snapshot: Option<SnapshotControl>,
+    /// Bounded host sampler for the public `/agent/metrics` document.
+    pub metrics: crate::agent_metrics::AgentMetricsSampler,
 }
 
 impl ConnectionState {
@@ -1218,6 +1220,7 @@ impl ConnectionState {
             audio: None,
             webrtc: None,
             snapshot: None,
+            metrics: crate::agent_metrics::AgentMetricsSampler::default(),
         }
     }
 
@@ -1359,8 +1362,17 @@ pub struct ConnectionResponse {
     pub webrtc_audio_source: Option<String>,
 }
 
-/// Build the compatibility router. Mount it before the node API auth layer so
-/// the endpoints are covered by the same bearer-token guard.
+/// Build the control compatibility router. Mount it before the node API auth
+/// layer so these endpoints are covered by the same bearer-token guard.
+///
+/// This router deliberately excludes the controller's read-only probes
+/// (`/display/snapshot`, `/display/info`, `/node/status`, `/ui/hints`,
+/// `/agent/metrics`, `/audio/nodes`) and the always-unsupported
+/// `POST /audio/sweep` stub. Those live in [`public_router`] and must be merged
+/// **after** the guard layer so the unmodified controller can poll them without
+/// a bearer token. Control surfaces (`/input/*`, `/power/*`, `/audio/*`,
+/// `/codec`, `/webrtc/*`, `/display/mjpeg`, and the legacy mutating aliases)
+/// stay here and stay guarded.
 pub fn compat_router(state: ConnectionState) -> Router {
     connection_router(state.clone())
         .merge(power_router(state.clone()))
@@ -1370,6 +1382,33 @@ pub fn compat_router(state: ConnectionState) -> Router {
         .merge(audio_router(state.clone()))
         .merge(display_router(state.clone()))
         .merge(legacy_router(state))
+}
+
+/// Build the controller's unauthenticated read-only compatibility router.
+///
+/// The unmodified Python controller fetches these routes without a node bearer
+/// token:
+///
+/// * `GET /display/snapshot` (`controller/stream.py`,
+///   `controller/terminal_bridge.py`, `controller/api.py`)
+/// * `GET /ui/hints` (`controller/agent_engine.py`, `controller/api.py`)
+/// * `GET /node/status` (`controller/mesh_intelligence.py`)
+/// * `GET /agent/metrics` (`controller/device_metrics.py`)
+///
+/// `GET /display/info`, `GET /audio/nodes`, and `POST /audio/sweep` are mounted
+/// here as well: the first is read-only metadata, and the audio routes are
+/// typed 501 stubs that never change state. Merge this router **after** the
+/// bearer layer; see [`crate::api::serve_with_scene_replay_and_sink`].
+pub fn public_router(state: ConnectionState) -> Router {
+    Router::new()
+        .route("/display/snapshot", get(display_snapshot))
+        .route("/display/info", get(display_info))
+        .route("/node/status", get(node_status))
+        .route("/agent/metrics", get(agent_metrics))
+        .route("/ui/hints", get(ui_hints))
+        .route("/audio/nodes", get(audio_nodes))
+        .route("/audio/sweep", post(audio_sweep))
+        .with_state(state)
 }
 
 /// The original connection-only router, retained for callers that do not need
@@ -1439,32 +1478,27 @@ pub fn webrtc_router(state: ConnectionState) -> Router {
         .with_state(state)
 }
 
-/// Display compatibility routes.
+/// Display compatibility control routes.
 ///
-/// `GET /display/snapshot` returns a real `image/jpeg` body from a one-shot
-/// capture. `GET /display/info` describes the source without opening it, and
-/// `GET /display/mjpeg` is a typed 501 because this node does not implement a
-/// multipart MJPEG stream. All three are mounted behind the node bearer guard
-/// with the rest of the compatibility surface.
+/// `GET /display/snapshot` and `GET /display/info` are read-only and live in
+/// [`public_router`] so the controller's unauthenticated preview pollers work
+/// with `--api-token`. `GET /display/mjpeg` stays here as a guarded typed 501
+/// because no controller caller depends on it and it is not a media surface
+/// this node implements.
 pub fn display_router(state: ConnectionState) -> Router {
     Router::new()
-        .route("/display/snapshot", get(display_snapshot))
-        .route("/display/info", get(display_info))
         .route("/display/mjpeg", get(display_mjpeg))
         .with_state(state)
 }
 
-/// Legacy controller routes.
+/// Legacy controller control routes.
 ///
-/// `/node/status` is an honest alias of the connection summary. `/ui/hints`
-/// returns the minimal empty hint shape the controller reads. Routes the Rust
-/// node does not implement answer a typed 501 with a code, error, and
-/// remediation instead of a success-shaped no-op.
+/// `/node/status`, `/agent/metrics`, and `/ui/hints` are read-only and live in
+/// [`public_router`]. The routes below are either mutating or unsupported
+/// control surfaces: they stay guarded and answer a typed 501 with a code,
+/// error, and remediation instead of a success-shaped no-op.
 pub fn legacy_router(state: ConnectionState) -> Router {
     Router::new()
-        .route("/node/status", get(node_status))
-        .route("/agent/metrics", get(agent_metrics))
-        .route("/ui/hints", get(ui_hints))
         .route("/usb", get(legacy_stub))
         .route("/rgb/state", get(legacy_stub))
         .route("/rgb/effect", get(legacy_stub).post(legacy_stub))
@@ -1618,17 +1652,23 @@ async fn node_status(State(state): State<ConnectionState>) -> Json<ConnectionRes
     connection(State(state)).await
 }
 
-async fn agent_metrics(State(_state): State<ConnectionState>) -> Response {
-    compat_error_with_remediation(
-        StatusCode::NOT_IMPLEMENTED,
-        "agent.metrics_unsupported",
-        "This node has no host agent metrics document at /agent/metrics.",
-        Some(
-            "Use GET /api/v1/metrics for the native runtime metrics JSON or GET /metrics for \
-             Prometheus text. The controller's device-metrics fallback probes /current and \
-             /pd/state, which this node does not implement.",
-        ),
+/// `GET /agent/metrics` — flat host metrics JSON for the controller's poller.
+///
+/// `controller/device_metrics.py` decodes JSON and only records top-level
+/// numeric values, so this returns the flat [`crate::agent_metrics`] document
+/// rather than Prometheus text. Values that cannot be measured are omitted and
+/// named in `unavailable`; the route is public (merged after the bearer guard)
+/// because the controller's poller sends no node token.
+async fn agent_metrics(State(state): State<ConnectionState>) -> Response {
+    let document = state.metrics.collect(&state.info.node_id);
+    (
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        Json(document),
     )
+        .into_response()
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -2524,6 +2564,60 @@ fn audio_error_response(error: AudioError) -> Response {
     api_error_response(status, error.to_api_error())
 }
 
+/// `GET /audio/nodes` — typed unsupported response with the soft-node shape.
+///
+/// The Python soft node returns `{"nodes": [...], "default_sink": "...",
+/// "default_source": "..."}` from its PipeWire watcher. The Rust
+/// [`AudioRouter`] controls an existing graph but has no node-enumeration
+/// operation, so this node cannot honestly fill that list. The controller
+/// proxies the body to the dashboard, which can then show the exact reason
+/// instead of an empty fake graph. The route is public because the controller's
+/// proxy sends no node token; it never mutates state.
+async fn audio_nodes(State(_state): State<ConnectionState>) -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "ok": false,
+            "available": false,
+            "code": "audio-nodes-unsupported",
+            "error": "This node does not enumerate PipeWire/PulseAudio graph nodes.",
+            "remediation": "Use a soft node with a PipeWire watcher for room-correction device \
+                            discovery, or choose a sink by name with --audio-sink. The Rust \
+                            AudioRouter controls an existing graph and does not expose a node \
+                            listing; no nodes are fabricated.",
+            "nodes": [],
+            "links": [],
+            "default_sink": serde_json::Value::Null,
+            "default_source": serde_json::Value::Null,
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /audio/sweep` — typed unsupported response with the soft-node shape.
+///
+/// `controller/api.py::run_room_sweep` proxies a sweep to the node when the
+/// request names one. The Rust node has no room-correction engine or sweep
+/// transport, so it never claims a profile. The route is public because that
+/// proxy sends no node token; the 501 is the whole behaviour, so the public
+/// surface cannot change state.
+async fn audio_sweep() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "ok": false,
+            "available": false,
+            "code": "audio-sweep-unsupported",
+            "error": "Room-correction sweeps are not implemented on this node.",
+            "remediation": "Run the sweep on the controller host or a soft node with \
+                            room_correction. This node has no sweep engine and returns no \
+                            fabricated profile.",
+            "profile": serde_json::Value::Null,
+        })),
+    )
+        .into_response()
+}
+
 fn api_error_response(status: StatusCode, error: ApiError) -> Response {
     let mut body = serde_json::json!({
         "ok": false,
@@ -3412,7 +3506,7 @@ mod tests {
         .with_snapshot(Some(SnapshotControl::new(
             CaptureRegistry::new().with(FakeCaptureProvider::new()),
         )));
-        let app = display_router(state);
+        let app = public_router(state);
 
         let response = app
             .clone()
@@ -3461,7 +3555,7 @@ mod tests {
             CompatStats::default(),
         )
         .with_snapshot(Some(SnapshotControl::new(CaptureRegistry::new())));
-        let app = display_router(state);
+        let app = public_router(state);
 
         let (status, body) = get_json(&app, "/display/snapshot").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -3494,7 +3588,7 @@ mod tests {
         .with_snapshot(Some(SnapshotControl::new(CaptureRegistry::new().with(
             FakeCaptureProvider::new().with_format(FrameFormat::new(PixelFormat::Nv12, 4, 4)),
         ))));
-        let (status, body) = get_json(&display_router(state), "/display/snapshot").await;
+        let (status, body) = get_json(&public_router(state), "/display/snapshot").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["ok"], false);
         assert_eq!(body["code"], "display.unsupported_format");
@@ -3535,7 +3629,7 @@ mod tests {
             ),
             CompatStats::default(),
         );
-        let app = legacy_router(state);
+        let app = public_router(state);
         let (status, body) = get_json(&app, "/node/status").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["ok"], true);
@@ -3558,7 +3652,7 @@ mod tests {
             ),
             CompatStats::default(),
         );
-        let (status, body) = get_json(&legacy_router(state), "/ui/hints?level=3").await;
+        let (status, body) = get_json(&public_router(state), "/ui/hints?level=3").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["ok"], true);
         assert_eq!(body["available"], false);
@@ -3585,7 +3679,6 @@ mod tests {
         let app = legacy_router(state);
 
         for (uri, method, expected) in [
-            ("/agent/metrics", "GET", "agent.metrics_unsupported"),
             ("/usb", "GET", "usb.unsupported"),
             ("/rgb/state", "GET", "rgb.unsupported"),
             ("/rgb/effect", "POST", "rgb.unsupported"),
