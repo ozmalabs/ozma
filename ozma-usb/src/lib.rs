@@ -20,20 +20,22 @@
 //!   a [`CommandRunner`] and argv-only, shell-free execution.
 //! * [`UsbIpConfig`] / [`UsbIpState`] and [`SubprocessUsbIpController`] model
 //!   USB/IP enablement, host/port, local exports, remote attachments, and
-//!   advisory pairing metadata without a shell.
+//!   host/token authorization without a shell.
 //! * [`Fat32ImageBuilder`] creates a bounded, read-only FAT32 image in memory
 //!   from files/directories; [`parse_fat32_image`] validates one read-only.
 //! * [`IsoImage`] inspects existing ISO 9660 images read-only, and
-//!   [`NbdExport`] / [`NbdRequest`] model NBD exports and framing without a
-//!   socket server.
+//!   [`NbdExport`] / [`NbdRequest`] model NBD exports and framing.
+//! * [`NbdServer`] serves a regular-file or in-memory image over a bounded
+//!   fixed-newstyle TCP/Unix NBD listener with an injectable transport/clock.
 //!
 //! No code in this crate uses `unsafe`, mounts a filesystem, opens a block
-//! device, writes a block device, starts an NBD/USB/IP socket server, or
-//! creates a real USB gadget. The ConfigFS implementation only creates/removes
-//! directories, writes attribute files, and creates configuration symlinks.
-//! FAT32 construction is an in-memory byte buffer; ISO inspection reads only a
-//! bounded descriptor header. Tests use a temporary root and synthetic images;
-//! the one real-ConfigFS test is `#[ignore]` and environment-gated.
+//! device, writes a block device, or creates a real USB gadget. The ConfigFS
+//! implementation only creates/removes directories, writes attribute files,
+//! and creates configuration symlinks. FAT32 construction is an in-memory byte
+//! buffer; ISO inspection reads only a bounded descriptor header; the NBD
+//! server opens regular files and loopback sockets only. Tests use a temporary
+//! root and synthetic images; the one real-ConfigFS test is `#[ignore]` and
+//! environment-gated.
 //!
 //! # Example
 //!
@@ -75,6 +77,7 @@ pub mod fat32;
 pub mod iso;
 pub mod media;
 pub mod nbd;
+pub mod nbd_server;
 pub mod status;
 pub mod subprocess;
 pub mod usbip;
@@ -102,6 +105,11 @@ pub use nbd::{
     NbdRequest, NbdRequestHeader, NBD_DEFAULT_PORT, NBD_HANDSHAKE_LEN, NBD_MAX_REQUEST_BYTES,
     NBD_REPLY_HEADER_LEN, NBD_REQUEST_HEADER_LEN,
 };
+pub use nbd_server::{
+    serve_session, ManualClock, NbdBackend, NbdClock, NbdExportCatalog, NbdExportSource,
+    NbdFileImage, NbdMemoryImage, NbdServer, NbdServerConfig, NbdServerHandle, NbdServerStats,
+    NbdSessionEnd, NbdSessionOutcome, NbdTransport, SystemClock,
+};
 pub use status::{FunctionStatus, GadgetStatus, UsbGadgetCapabilities};
 pub use subprocess::{
     CommandOutput, CommandRunner, CommandSpec, SubprocessUsbController, SystemCommandRunner,
@@ -109,5 +117,5 @@ pub use subprocess::{
 };
 pub use usbip::{
     SubprocessUsbIpController, UsbIpAttachment, UsbIpAuthorization, UsbIpConfig, UsbIpController,
-    UsbIpKey, UsbIpState, DEFAULT_USBIP_PORT,
+    UsbIpKey, UsbIpState, UsbIpToken, DEFAULT_USBIP_PORT,
 };

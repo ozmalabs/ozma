@@ -132,7 +132,6 @@ pub struct UsbIpKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
 }
-
 impl UsbIpKey {
     /// Build and validate a fingerprint record.
     pub fn new(fingerprint: impl Into<String>) -> Result<Self, UsbError> {
@@ -185,9 +184,70 @@ impl UsbIpKey {
     }
 }
 
-/// Advisory USB/IP authorization/pairing metadata.
+/// One opaque bearer token for USB/IP host authorization.
+///
+/// Tokens are compared in constant time for equal-length inputs, but this is a
+/// simple allow-list check, **not** TLS, password hashing, or a cryptographic
+/// protocol. Configuration/debug output redacts the token value; the JSON
+/// configuration still contains it so an operator can provision it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct UsbIpToken(String);
+
+impl UsbIpToken {
+    /// Validate and wrap a bearer token.
+    pub fn new(token: impl Into<String>) -> Result<Self, UsbError> {
+        let token = token.into();
+        Self::validate_value(&token)?;
+        Ok(Self(token))
+    }
+
+    /// Validate the token shape without keeping it.
+    pub fn validate_value(token: &str) -> Result<(), UsbError> {
+        if token.len() < 16 || token.len() > 256 {
+            return Err(UsbError::InvalidUsbIp {
+                field: "authorization.allowed_tokens",
+                reason: "tokens must be 16..=256 bytes".to_owned(),
+            });
+        }
+        if !token.chars().all(|character| character.is_ascii_graphic()) {
+            return Err(UsbError::InvalidUsbIp {
+                field: "authorization.allowed_tokens",
+                reason: "tokens must contain printable ASCII without whitespace".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Whether `candidate` matches this token.
+    pub fn matches(&self, candidate: &str) -> bool {
+        constant_time_eq(self.0.as_bytes(), candidate.as_bytes())
+    }
+}
+
+impl std::fmt::Debug for UsbIpToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("UsbIpToken(<redacted>)")
+    }
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (left, right) in left.iter().zip(right) {
+        difference |= left ^ right;
+    }
+    difference == 0
+}
+
+/// Advisory USB/IP authorization/pairing metadata plus an enforceable token
+/// allow-list.
 ///
 /// There is no cryptographic enforcement here; see the module documentation.
+/// When the controller is given an `UsbIpAuthorization`, the host allow-list
+/// and token list are checked before any `usbip attach` argv is built.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsbIpAuthorization {
     /// Hostnames or addresses permitted to import/export devices.
@@ -196,15 +256,25 @@ pub struct UsbIpAuthorization {
     /// Advisory key fingerprints.
     #[serde(default)]
     pub allowed_keys: Vec<UsbIpKey>,
+    /// Bearer tokens accepted for a remote host. Empty means no token check;
+    /// if the host list is also empty, authorization fails closed.
+    #[serde(default)]
+    pub allowed_tokens: Vec<UsbIpToken>,
 }
 
 impl UsbIpAuthorization {
-    /// Validate every allowed host and key.
+    /// Validate every allowed host, key, and token.
     pub fn validate(&self) -> Result<(), UsbError> {
         if self.allowed_hosts.len() > 64 {
             return Err(UsbError::InvalidUsbIp {
                 field: "authorization.allowed_hosts",
                 reason: "at most 64 allowed hosts are supported".to_owned(),
+            });
+        }
+        if self.allowed_hosts.is_empty() && self.allowed_tokens.is_empty() {
+            return Err(UsbError::InvalidUsbIp {
+                field: "authorization",
+                reason: "authorization needs at least one allowed host or token".to_owned(),
             });
         }
         for host in &self.allowed_hosts {
@@ -219,12 +289,74 @@ impl UsbIpAuthorization {
         for key in &self.allowed_keys {
             key.validate()?;
         }
+        if self.allowed_tokens.len() > 64 {
+            return Err(UsbError::InvalidUsbIp {
+                field: "authorization.allowed_tokens",
+                reason: "at most 64 tokens are supported".to_owned(),
+            });
+        }
+        let mut seen = std::collections::HashSet::new();
+        for token in &self.allowed_tokens {
+            UsbIpToken::validate_value(&token.0)?;
+            if !seen.insert(token.0.clone()) {
+                return Err(UsbError::InvalidUsbIp {
+                    field: "authorization.allowed_tokens",
+                    reason: "duplicate tokens are not allowed".to_owned(),
+                });
+            }
+        }
         Ok(())
     }
 
-    /// Whether a host appears in the advisory allow-list.
+    /// Whether a host appears in the allow-list (exact match).
     pub fn host_allowed(&self, host: &str) -> bool {
         self.allowed_hosts.iter().any(|allowed| allowed == host)
+    }
+
+    /// Whether a token appears in the allow-list.
+    pub fn token_allowed(&self, token: &str) -> bool {
+        self.allowed_tokens
+            .iter()
+            .any(|allowed| allowed.matches(token))
+    }
+
+    /// Whether a token is required for authorization.
+    pub fn requires_token(&self) -> bool {
+        !self.allowed_tokens.is_empty()
+    }
+
+    /// Enforce this authorization for a remote host and optional token.
+    ///
+    /// The check fails closed: an authorization with no hosts and no tokens
+    /// denies everything, a non-empty host list requires an exact host match,
+    /// and a non-empty token list requires a matching token. Denial messages
+    /// never include the supplied token.
+    pub fn authorize(&self, host: &str, token: Option<&str>) -> Result<(), UsbError> {
+        self.validate()?;
+        if !self.allowed_hosts.is_empty() && !self.host_allowed(host) {
+            return Err(UsbError::UsbIpUnauthorized {
+                host: host.to_owned(),
+                reason: "host is not in the USB/IP allow-list".to_owned(),
+            });
+        }
+        if self.requires_token() {
+            match token {
+                Some(token) if self.token_allowed(token) => {}
+                Some(_) => {
+                    return Err(UsbError::UsbIpUnauthorized {
+                        host: host.to_owned(),
+                        reason: "token is not in the USB/IP allow-list".to_owned(),
+                    });
+                }
+                None => {
+                    return Err(UsbError::UsbIpUnauthorized {
+                        host: host.to_owned(),
+                        reason: "host requires an authorization token".to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -237,7 +369,7 @@ pub struct UsbIpConfig {
     pub host: String,
     /// Default USB/IP TCP port.
     pub port: u16,
-    /// Optional advisory pairing metadata.
+    /// Optional host/token authorization and advisory pairing metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorization: Option<UsbIpAuthorization>,
     /// Devices named by configuration (local exports or remote devices).
@@ -283,7 +415,7 @@ impl UsbIpConfig {
         }
     }
 
-    /// Attach advisory pairing metadata.
+    /// Attach host/token authorization metadata.
     pub fn with_authorization(mut self, authorization: UsbIpAuthorization) -> Self {
         self.authorization = Some(authorization);
         self
@@ -568,6 +700,46 @@ impl<R: CommandRunner> SubprocessUsbIpController<R> {
         }
     }
 
+    /// Enforce the configured host allow-list/token before an attach.
+    ///
+    /// A configuration without `authorization` keeps the historical behaviour
+    /// (no controller-level check). A present authorization fails closed and
+    /// must name the host or accept a token.
+    pub fn authorize_host(&self, host: &str, token: Option<&str>) -> Result<(), UsbError> {
+        validate_host(host)?;
+        match &self.config.authorization {
+            Some(authorization) => authorization.authorize(host, token),
+            None => Ok(()),
+        }
+    }
+
+    /// Attach a remote device after checking the authorization allow-list.
+    ///
+    /// This is the token-aware entry point; [`UsbIpController::attach`] calls
+    /// it with no token and therefore fails when the configuration requires
+    /// one.
+    pub fn attach_with_token(
+        &self,
+        host: &str,
+        bus_id: &str,
+        token: Option<&str>,
+    ) -> Result<UsbIpAttachment, UsbError> {
+        self.ensure_enabled()?;
+        validate_host(host)?;
+        validate_bus_id(bus_id)?;
+        self.authorize_host(host, token)?;
+        self.run(&["attach", "-r", host, "-b", bus_id])?;
+        let attachment = UsbIpAttachment {
+            host: host.to_owned(),
+            bus_id: bus_id.to_owned(),
+            port: None,
+            vendor_id: None,
+            product_id: None,
+        };
+        self.lock_state().record_attachment(attachment.clone());
+        Ok(attachment)
+    }
+
     fn run(&self, args: &[&str]) -> Result<CommandOutput, UsbError> {
         let command = CommandSpec::new(
             self.program.clone(),
@@ -608,19 +780,7 @@ impl<R: CommandRunner> UsbIpController for SubprocessUsbIpController<R> {
     }
 
     fn attach(&self, host: &str, bus_id: &str) -> Result<UsbIpAttachment, UsbError> {
-        self.ensure_enabled()?;
-        validate_host(host)?;
-        validate_bus_id(bus_id)?;
-        self.run(&["attach", "-r", host, "-b", bus_id])?;
-        let attachment = UsbIpAttachment {
-            host: host.to_owned(),
-            bus_id: bus_id.to_owned(),
-            port: None,
-            vendor_id: None,
-            product_id: None,
-        };
-        self.lock_state().record_attachment(attachment.clone());
-        Ok(attachment)
+        self.attach_with_token(host, bus_id, None)
     }
 
     fn detach(&self, port: u16) -> Result<(), UsbError> {

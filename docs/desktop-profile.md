@@ -172,9 +172,15 @@ capture.
   registry for that console, and restarts HLS and WebRTC only if they were
   running. A successful switch updates `/api/v1/connection.display_outputs` and
   `.display_capture.active_console`/`provider` and returns the new outputs plus
-  `restarted: {hls, webrtc}`. A failed pipeline restart restores the previous
-  registry/console and returns a typed 502; it never reports success. Selecting
-  the already-active console is an idempotent 200 with `changed:false`.
+  `restarted: {hls, webrtc}`. The HLS replacement generation appends to the
+  existing playlist with `#EXT-X-DISCONTINUITY` and a non-decreasing media
+  sequence, so a console switch does not truncate the playlist. A failed
+  pipeline restart restores the previous registry/console and returns a typed
+  502; it never reports success. Selecting the already-active console is an
+  idempotent 200 with `changed:false`. Live two-head evidence (1280x800
+  Console_0 login/shell ↔ 720x400 Console_1 second-VGA boot text, including a
+  forced-failure rollback) is in
+  [`phase3-live-console-switch-report.md`](phase3-live-console-switch-report.md).
 - QMP, VNC, and Looking Glass remain single-head: selecting a different console
   returns a typed 409 (`code:"conflict"`, `details.single_head:true`) with the
   provider and requested index, and instructs the operator to restart with
@@ -192,11 +198,14 @@ capture.
 - Remaining controller/GPU limits: the console switch is one active capture
   source at a time, not a per-console capture broker or simultaneous encoders.
   Only the D-Bus provider exposes runtime-selectable console indexes; QMP/VNC/
-  Looking Glass still require a node restart. WebRTC restarts keep its
+  Looking Glass still require a node restart. WebRTC restarts keep their
   configured dimensions unless the selected output advertises non-zero
   geometry, so a console with a different mode may need matching
-  `--webrtc-width/--webrtc-height`. No real QEMU/GPU/VFIO or KVMFR host has
-  been exercised in CI.
+  `--webrtc-width/--webrtc-height`. The live two-head QEMU run proved switching
+  to a second emulated VGA head, but that head still showed retained early-boot
+  text rather than a guest-programmed live login console; a real second
+  virtio-gpu scanout remains unproven. No GPU/VFIO or KVMFR host has been
+  exercised in CI.
 
 ## Input
 

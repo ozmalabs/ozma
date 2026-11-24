@@ -60,6 +60,7 @@ user, or Python tree is changed.
 | PipeWire | audio/video capture | `libpipewire-0.3-dev` | `pipewire-devel` | `pipewire` |
 | PAM | node link-time auth | `libpam0g-dev` | `pam-devel` | `pam` |
 | libclang/clang | `bindgen` for `v4l2-sys-mit` | `libclang-dev clang` | `clang clang-devel` | `clang` |
+| libxdo | `enigo` link dep for `ozma-hid` tests | `libxdo-dev` | `libxdo-devel` | `xdotool` |
 | cmake/nasm | bundled codec deps | `cmake nasm` | `cmake nasm` | `cmake nasm` |
 | ffmpeg | HLS/VNC/X11 runtime | `ffmpeg` | `ffmpeg` | `ffmpeg` |
 

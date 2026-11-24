@@ -8,8 +8,9 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use ozma_usb::{
-    CommandOutput, CommandRunner, CommandSpec, SubprocessUsbIpController, UsbError, UsbIpConfig,
-    UsbIpController, UsbIpDevice, UsbIpKey, DEFAULT_USBIP_PORT,
+    CommandOutput, CommandRunner, CommandSpec, SubprocessUsbIpController, UsbError,
+    UsbIpAuthorization, UsbIpConfig, UsbIpController, UsbIpDevice, UsbIpKey, UsbIpToken,
+    DEFAULT_USBIP_PORT,
 };
 
 #[derive(Debug, Default)]
@@ -206,6 +207,7 @@ fn config_validates_host_port_devices_and_pairing_metadata() {
             fingerprint: "not a fingerprint".to_owned(),
             label: None,
         }],
+        allowed_tokens: Vec::new(),
     });
     assert_eq!(bad_key.validate().unwrap_err().kind(), "invalid-usbip");
 
@@ -214,6 +216,7 @@ fn config_validates_host_port_devices_and_pairing_metadata() {
     good.authorization = Some(ozma_usb::UsbIpAuthorization {
         allowed_hosts: vec!["192.0.2.10".to_owned()],
         allowed_keys: vec![good_key],
+        allowed_tokens: Vec::new(),
     });
     assert!(good.validate().is_ok());
     assert!(good
@@ -239,4 +242,137 @@ Port 02: <Port in Use>
     assert_eq!(parsed[0].port, Some(1));
     assert_eq!(parsed[1].host, "2001:db8::1");
     assert_eq!(parsed[1].bus_id, "2-1");
+}
+
+#[test]
+fn authorization_allowlist_and_token_gate_the_attach_command() {
+    let token = UsbIpToken::new("ozma-test-token-0123456789").unwrap();
+    let mut config = UsbIpConfig::server("127.0.0.1", DEFAULT_USBIP_PORT);
+    config.authorization = Some(UsbIpAuthorization {
+        allowed_hosts: vec!["192.0.2.10".to_owned()],
+        allowed_keys: Vec::new(),
+        allowed_tokens: vec![token.clone()],
+    });
+    config.validate().unwrap();
+    let controller = make_controller(config);
+    controller.runner().push_ok("");
+
+    // Allowed host + token runs exactly one argv-only attach.
+    controller
+        .attach_with_token("192.0.2.10", "1-1", Some("ozma-test-token-0123456789"))
+        .unwrap();
+    assert_eq!(
+        controller.runner().calls(),
+        vec![CommandSpec::new(
+            "usbip",
+            ["attach", "-r", "192.0.2.10", "-b", "1-1"]
+        )]
+    );
+
+    // Denied host, missing token, wrong token, and token-less `attach` fail
+    // before any command is built.
+    for (host, supplied) in [
+        ("192.0.2.11", Some("ozma-test-token-0123456789")),
+        ("192.0.2.10", None),
+        ("192.0.2.10", Some("wrong-token-0000000000")),
+    ] {
+        let error = controller
+            .attach_with_token(host, "1-2", supplied)
+            .unwrap_err();
+        assert_eq!(error.kind(), "usbip-unauthorized", "{host:?} {supplied:?}");
+        // The error never echoes the supplied token.
+        if let Some(supplied) = supplied {
+            assert!(!error.to_string().contains(supplied));
+        }
+    }
+    assert_eq!(
+        controller.attach("192.0.2.10", "1-3").unwrap_err().kind(),
+        "usbip-unauthorized"
+    );
+    assert_eq!(controller.runner().calls().len(), 1);
+    assert!(!controller.known_state().is_attached("1-2"));
+}
+
+#[test]
+fn token_only_and_host_only_authorization_modes() {
+    // Token-only authorization accepts any host that presents the token.
+    let mut config = UsbIpConfig::server("127.0.0.1", DEFAULT_USBIP_PORT);
+    config.authorization = Some(UsbIpAuthorization {
+        allowed_hosts: Vec::new(),
+        allowed_keys: Vec::new(),
+        allowed_tokens: vec![UsbIpToken::new("shared-token-abcdefgh").unwrap()],
+    });
+    let controller = make_controller(config);
+    controller.runner().push_ok("");
+    controller
+        .attach_with_token("203.0.113.5", "2-1", Some("shared-token-abcdefgh"))
+        .unwrap();
+    assert_eq!(
+        controller.attach("203.0.113.5", "2-2").unwrap_err().kind(),
+        "usbip-unauthorized"
+    );
+
+    // Host-only authorization keeps the historical no-token attach.
+    let mut config = UsbIpConfig::server("127.0.0.1", DEFAULT_USBIP_PORT);
+    config.authorization = Some(UsbIpAuthorization {
+        allowed_hosts: vec!["198.51.100.7".to_owned()],
+        allowed_keys: Vec::new(),
+        allowed_tokens: Vec::new(),
+    });
+    let controller = make_controller(config);
+    controller.runner().push_ok("");
+    controller.attach("198.51.100.7", "3-1").unwrap();
+    assert_eq!(
+        controller.attach("198.51.100.8", "3-2").unwrap_err().kind(),
+        "usbip-unauthorized"
+    );
+
+    // A present-but-empty authorization fails closed.
+    let empty = UsbIpAuthorization::default();
+    assert_eq!(empty.validate().unwrap_err().kind(), "invalid-usbip");
+    assert_eq!(
+        empty.authorize("127.0.0.1", None).unwrap_err().kind(),
+        "invalid-usbip"
+    );
+}
+
+#[test]
+fn token_values_are_validated_and_redacted() {
+    for bad in [
+        "short",
+        "",
+        "has whitespace in it now",
+        "line\nbreak-token-123",
+    ] {
+        assert_eq!(
+            UsbIpToken::new(bad).unwrap_err().kind(),
+            "invalid-usbip",
+            "{bad:?}"
+        );
+    }
+    let token = UsbIpToken::new("valid-token-0123456789").unwrap();
+    assert!(token.matches("valid-token-0123456789"));
+    assert!(!token.matches("valid-token-0123456788"));
+    assert!(!token.matches("valid-token-012345678"));
+    assert!(!format!("{token:?}").contains("valid-token"));
+
+    let duplicate = UsbIpAuthorization {
+        allowed_hosts: vec!["127.0.0.1".to_owned()],
+        allowed_keys: Vec::new(),
+        allowed_tokens: vec![
+            UsbIpToken::new("duplicate-token-012345").unwrap(),
+            UsbIpToken::new("duplicate-token-012345").unwrap(),
+        ],
+    };
+    assert_eq!(duplicate.validate().unwrap_err().kind(), "invalid-usbip");
+
+    let mut too_many = UsbIpConfig::server("127.0.0.1", DEFAULT_USBIP_PORT);
+    too_many.authorization = Some(UsbIpAuthorization {
+        allowed_hosts: vec!["127.0.0.1".to_owned()],
+        allowed_keys: Vec::new(),
+        allowed_tokens: (0..65)
+            .map(|index| UsbIpToken::new(format!("token-number-{index:04}-padding")).unwrap())
+            .collect(),
+    });
+    assert_eq!(too_many.validate().unwrap_err().kind(), "invalid-usbip");
 }

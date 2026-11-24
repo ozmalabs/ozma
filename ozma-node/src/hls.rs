@@ -1954,6 +1954,22 @@ impl HlsPipeline {
         Self::start_with_clock(source, config, spawner, probe, Arc::new(SystemClock))
     }
 
+    /// Start a generation that must append to an existing playlist.
+    ///
+    /// This is the console-switch path: the previous pipeline has stopped but
+    /// its playlist and segments are still on disk. The first ffmpeg argv uses
+    /// `append_list+discont_start`, so controllers and players keep the media
+    /// sequence increasing and see an explicit discontinuity instead of a
+    /// truncated playlist.
+    pub fn start_restarted_with_spawner_and_probe(
+        source: Box<dyn CaptureSource>,
+        config: HlsConfig,
+        spawner: Arc<dyn FfmpegSpawner>,
+        probe: Arc<dyn EncoderProbe>,
+    ) -> Result<Self, HlsError> {
+        Self::start_with_clock_restart(source, config, spawner, probe, Arc::new(SystemClock), true)
+    }
+
     /// Start with an injected process factory, encoder probe, and clock.
     fn start_with_clock(
         source: Box<dyn CaptureSource>,
@@ -1961,6 +1977,19 @@ impl HlsPipeline {
         spawner: Arc<dyn FfmpegSpawner>,
         probe: Arc<dyn EncoderProbe>,
         clock: Arc<dyn HlsClock>,
+    ) -> Result<Self, HlsError> {
+        Self::start_with_clock_restart(source, config, spawner, probe, clock, false)
+    }
+
+    /// Start with an injected process factory, encoder probe, clock, and
+    /// initial-generation semantics.
+    fn start_with_clock_restart(
+        source: Box<dyn CaptureSource>,
+        config: HlsConfig,
+        spawner: Arc<dyn FfmpegSpawner>,
+        probe: Arc<dyn EncoderProbe>,
+        clock: Arc<dyn HlsClock>,
+        restart: bool,
     ) -> Result<Self, HlsError> {
         let mut config = config.validated()?;
         validate_encoder_runtime(&config, probe.as_ref())?;
@@ -1983,18 +2012,20 @@ impl HlsPipeline {
 
         let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
         let sink = match expected {
-            Some((width, height)) => match spawner.spawn(&config, width, height) {
-                Ok(spawned) => {
-                    *child_slot
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = spawned.child;
-                    Some(spawned.sink)
+            Some((width, height)) => {
+                match spawner.spawn_generation(&config, width, height, restart) {
+                    Ok(spawned) => {
+                        *child_slot
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = spawned.child;
+                        Some(spawned.sink)
+                    }
+                    Err(error) => {
+                        status.set_failed(error.to_string());
+                        return Err(error);
+                    }
                 }
-                Err(error) => {
-                    status.set_failed(error.to_string());
-                    return Err(error);
-                }
-            },
+            }
             None => None,
         };
 
@@ -2010,6 +2041,7 @@ impl HlsPipeline {
             cancel.clone(),
             sink,
             clock,
+            restart,
         ));
 
         Ok(Self {
@@ -2252,36 +2284,64 @@ impl HlsController {
         }
     }
 
-    /// Start the pipeline from an already-open source.
+    /// Start the pipeline from an already-open source as a fresh generation.
     ///
-    /// This is the console-switch path: the caller has rebuilt the capture
-    /// registry for a different `Console_N` and opened the source itself, so no
-    /// source factory is consulted. A failure leaves the controller stopped
-    /// with `failed` status; the caller is responsible for restoring the old
-    /// source (and should not report success).
+    /// The caller has opened the source itself, so no source factory is
+    /// consulted. A failure leaves the controller stopped with `failed` status;
+    /// the caller is responsible for restoring the old source (and should not
+    /// report success). Console switches should use
+    /// [`Self::start_restarted_with_source`] so an existing playlist is
+    /// appended to rather than truncated.
     pub async fn start_with_source(
         &self,
         source: Box<dyn CaptureSource>,
     ) -> Result<HlsStatus, HlsError> {
         let mut pipeline = self.pipeline.lock().await;
-        self.start_with_source_locked(&mut pipeline, source).await
+        self.start_with_source_locked_restart(&mut pipeline, source, false)
+            .await
     }
 
-    async fn start_with_source_locked(
+    /// Start a console-switch generation from an already-open source.
+    ///
+    /// The previous pipeline must already be stopped. Its playlist and segments
+    /// stay on disk; the new generation uses `append_list+discont_start` so the
+    /// media sequence keeps increasing and players see an explicit
+    /// discontinuity at the console boundary.
+    pub async fn start_restarted_with_source(
+        &self,
+        source: Box<dyn CaptureSource>,
+    ) -> Result<HlsStatus, HlsError> {
+        let mut pipeline = self.pipeline.lock().await;
+        self.start_with_source_locked_restart(&mut pipeline, source, true)
+            .await
+    }
+
+    async fn start_with_source_locked_restart(
         &self,
         pipeline: &mut Option<HlsPipeline>,
         source: Box<dyn CaptureSource>,
+        restart: bool,
     ) -> Result<HlsStatus, HlsError> {
         if pipeline.is_some() {
             return Ok(self.status());
         }
         let config = self.config();
-        match HlsPipeline::start_with_spawner_and_probe(
-            source,
-            config,
-            self.spawner.clone(),
-            self.probe.clone(),
-        ) {
+        let started = if restart {
+            HlsPipeline::start_restarted_with_spawner_and_probe(
+                source,
+                config,
+                self.spawner.clone(),
+                self.probe.clone(),
+            )
+        } else {
+            HlsPipeline::start_with_spawner_and_probe(
+                source,
+                config,
+                self.spawner.clone(),
+                self.probe.clone(),
+            )
+        };
+        match started {
             Ok(started) => {
                 let status = started.status();
                 *lock(&self.status) = status.clone();
@@ -2307,10 +2367,14 @@ impl HlsController {
         source: Box<dyn CaptureSource>,
     ) -> Result<HlsStatus, HlsError> {
         let mut pipeline = self.pipeline.lock().await;
-        if let Some(mut previous) = pipeline.take() {
+        let restarted = if let Some(mut previous) = pipeline.take() {
             let _ = previous.stop().await;
-        }
-        self.start_with_source_locked(&mut pipeline, source).await
+            true
+        } else {
+            false
+        };
+        self.start_with_source_locked_restart(&mut pipeline, source, restarted)
+            .await
     }
 
     /// Stop and drop the current pipeline.
@@ -2535,6 +2599,7 @@ async fn run_pipeline(
     cancel: Arc<Notify>,
     mut sink: Option<Box<dyn FrameSink>>,
     clock: Arc<dyn HlsClock>,
+    restart: bool,
 ) {
     let mut pacer = FramePacer::new(config.fps, clock.now());
     let mut wrote_frame = false;
@@ -2640,7 +2705,7 @@ async fn run_pipeline(
                     status.set_failed("capture frame has zero dimensions");
                     break;
                 }
-                match spawner.spawn_generation(&config, width, height, false) {
+                match spawner.spawn_generation(&config, width, height, restart) {
                     Ok(spawned) => {
                         *child
                             .lock()
@@ -4532,6 +4597,59 @@ mod tests {
         controller.stop().await.expect("stop");
         assert_eq!(controller.status().state(), HlsState::Stopped);
         assert!(!controller.is_running());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn controller_console_switch_generation_appends_the_existing_playlist() {
+        let directory = temp_dir("controller-console-switch");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fail_on = Arc::new(Mutex::new(Vec::new()));
+        let stopped = Arc::new(Mutex::new(Vec::new()));
+        let recording = RecordingSpawner::default();
+        let writes = recording.writes.clone();
+        let spawns = recording.spawns.clone();
+        let controller = HlsController::with_spawner(
+            controller_factory(calls, fail_on, stopped),
+            HlsConfig {
+                output_dir: directory.clone(),
+                ..HlsConfig::default()
+            },
+            spawner(recording),
+        );
+
+        controller.start().await.expect("start controller");
+        wait_until(|| writes.lock().unwrap().len() == 1).await;
+        controller.stop().await.expect("stop first console");
+
+        let (source, _) = FakeSource::new(
+            FrameFormat::rgb24(2, 2),
+            vec![Ok(rgb_frame(2, 2, 0, 0x66))],
+            true,
+        );
+        controller
+            .start_restarted_with_source(Box::new(source))
+            .await
+            .expect("start switched console");
+        wait_until(|| writes.lock().unwrap().len() == 2).await;
+
+        let spawns = spawns.lock().unwrap().clone();
+        assert_eq!(spawns.len(), 2, "one spawn per console generation");
+        assert!(
+            spawns[0].2.contains(&"delete_segments".to_owned())
+                && !spawns[0]
+                    .2
+                    .contains(&"delete_segments+append_list+discont_start".to_owned()),
+            "the startup generation starts a fresh playlist"
+        );
+        assert!(
+            spawns[1]
+                .2
+                .contains(&"delete_segments+append_list+discont_start".to_owned()),
+            "the console-switch generation appends and marks a discontinuity"
+        );
+
+        controller.stop().await.expect("stop");
         let _ = std::fs::remove_dir_all(directory);
     }
 

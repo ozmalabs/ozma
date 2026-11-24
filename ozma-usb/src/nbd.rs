@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! NBD export descriptors and protocol framing model.
+//! NBD export descriptors and protocol framing.
 //!
-//! This is deliberately **not** a socket server. It defines the bounded
-//! newstyle/oldstyle-style handshake and request/reply frames that a node's
-//! userspace media layer (or an external `nbdkit`/QEMU client) can use, plus
-//! validated export descriptors. No default test opens a socket, creates a
-//! block device, or writes media.
+//! This module defines the bounded oldstyle/newstyle handshake and
+//! request/reply frames plus validated export descriptors. The socket server
+//! itself lives in [`crate::nbd_server`]; this module stays transport-free so
+//! the same framing can be tested with in-memory streams.
 //!
-//! The framing mirrors `softnode/virtual_media.py`'s server: the oldstyle
-//! handshake (`NBDMAGIC` + `IHAVEOPT` magic + size + 128 zero/flag bytes) and
-//! 28-byte big-endian request headers with 16-byte replies.
+//! The oldstyle handshake mirrors `softnode/virtual_media.py`'s server
+//! (`NBDMAGIC` + `IHAVEOPT` magic + size + 128 zero/flag bytes). The newstyle
+//! handshake and option constants are used by the fixed-newstyle server.
 
 use std::path::{Path, PathBuf};
 
@@ -36,6 +35,65 @@ pub const NBD_REPLY_HEADER_LEN: usize = 16;
 pub const NBD_HANDSHAKE_LEN: usize = 152;
 /// Largest read/write request accepted by the framing model (32 MiB).
 pub const NBD_MAX_REQUEST_BYTES: u32 = 32 * 1024 * 1024;
+
+/// Newstyle server magic: `IHAVEOPT`.
+pub const NBD_NEWSTYLE_MAGIC: u64 = 0x4948_4156_454f_5054;
+/// Newstyle option-reply magic.
+pub const NBD_REP_MAGIC: u64 = 0x0003_e889_0455_65a9;
+/// Server handshake flag: fixed newstyle negotiation.
+pub const NBD_FLAG_FIXED_NEWSTYLE: u16 = 1 << 0;
+/// Server handshake flag: the client may omit the 124 zero bytes.
+pub const NBD_FLAG_NO_ZEROES: u16 = 1 << 1;
+/// Client handshake flag: fixed newstyle negotiation.
+pub const NBD_FLAG_C_FIXED_NEWSTYLE: u32 = 1 << 0;
+/// Client handshake flag: the client accepts no-zeroes export responses.
+pub const NBD_FLAG_C_NO_ZEROES: u32 = 1 << 1;
+
+/// `NBD_OPT_EXPORT_NAME`.
+pub const NBD_OPT_EXPORT_NAME: u32 = 1;
+/// `NBD_OPT_ABORT`.
+pub const NBD_OPT_ABORT: u32 = 2;
+/// `NBD_OPT_LIST`.
+pub const NBD_OPT_LIST: u32 = 3;
+/// `NBD_OPT_STARTTLS` (deliberately unsupported).
+pub const NBD_OPT_STARTTLS: u32 = 5;
+/// `NBD_OPT_INFO`.
+pub const NBD_OPT_INFO: u32 = 6;
+/// `NBD_OPT_GO`.
+pub const NBD_OPT_GO: u32 = 7;
+
+/// `NBD_REP_ACK`.
+pub const NBD_REP_ACK: u32 = 1;
+/// `NBD_REP_SERVER`.
+pub const NBD_REP_SERVER: u32 = 2;
+/// `NBD_REP_INFO`.
+pub const NBD_REP_INFO: u32 = 3;
+/// `NBD_REP_ERR_UNSUP`.
+pub const NBD_REP_ERR_UNSUP: u32 = 0x8000_0001;
+/// `NBD_REP_ERR_POLICY`.
+pub const NBD_REP_ERR_POLICY: u32 = 0x8000_0002;
+/// `NBD_REP_ERR_INVALID`.
+pub const NBD_REP_ERR_INVALID: u32 = 0x8000_0003;
+/// `NBD_REP_ERR_UNKNOWN`.
+pub const NBD_REP_ERR_UNKNOWN: u32 = 0x8000_0006;
+/// `NBD_REP_ERR_TOO_BIG`.
+pub const NBD_REP_ERR_TOO_BIG: u32 = 0x8000_0009;
+
+/// `NBD_INFO_EXPORT`.
+pub const NBD_INFO_EXPORT: u16 = 0;
+/// `NBD_INFO_NAME`.
+pub const NBD_INFO_NAME: u16 = 1;
+/// `NBD_INFO_DESCRIPTION`.
+pub const NBD_INFO_DESCRIPTION: u16 = 2;
+/// `NBD_INFO_BLOCK_SIZE`.
+pub const NBD_INFO_BLOCK_SIZE: u16 = 3;
+
+/// `NBD_CMD_FLAG_FUA`.
+pub const NBD_CMD_FLAG_FUA: u16 = 1 << 0;
+/// `NBD_CMD_FLAG_NO_HOLE`.
+pub const NBD_CMD_FLAG_NO_HOLE: u16 = 1 << 1;
+/// `NBD_CMD_FLAG_DF`.
+pub const NBD_CMD_FLAG_DF: u16 = 1 << 2;
 
 /// `NBD_CMD_READ`.
 pub const NBD_CMD_READ: u32 = 0;
@@ -315,6 +373,8 @@ impl NbdCommand {
 /// Parsed request header without write payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NbdRequestHeader {
+    /// Command flags (`NBD_CMD_FLAG_*`).
+    pub flags: u16,
     /// Command.
     pub command: NbdCommand,
     /// Client handle echoed in the reply.
@@ -335,7 +395,10 @@ impl NbdRequestHeader {
         if magic != NBD_REQUEST_MAGIC {
             return Err(nbd_protocol_error("bad request magic"));
         }
-        let raw_command = u32::from_be_bytes(bytes[4..8].try_into().unwrap_or([0; 4]));
+        // Newstyle request headers carry 16-bit flags followed by a 16-bit
+        // command. Oldstyle/legacy senders use a 32-bit command with flags=0.
+        let flags = u16::from_be_bytes(bytes[4..6].try_into().unwrap_or([0; 2]));
+        let raw_command = u16::from_be_bytes(bytes[6..8].try_into().unwrap_or([0; 2])) as u32;
         let command = match raw_command {
             NBD_CMD_READ => NbdCommand::Read,
             NBD_CMD_WRITE => NbdCommand::Write,
@@ -358,6 +421,7 @@ impl NbdRequestHeader {
             )));
         }
         Ok(Self {
+            flags,
             command,
             handle,
             offset,
@@ -369,7 +433,10 @@ impl NbdRequestHeader {
     pub fn encode(&self) -> [u8; NBD_REQUEST_HEADER_LEN] {
         let mut bytes = [0u8; NBD_REQUEST_HEADER_LEN];
         bytes[0..4].copy_from_slice(&NBD_REQUEST_MAGIC.to_be_bytes());
-        bytes[4..8].copy_from_slice(&self.command.as_u32().to_be_bytes());
+        bytes[4..6].copy_from_slice(&self.flags.to_be_bytes());
+        // Commands are 16-bit in newstyle framing; oldstyle values above
+        // `u16::MAX` are not valid protocol commands anyway.
+        bytes[6..8].copy_from_slice(&(self.command.as_u32() as u16).to_be_bytes());
         bytes[8..16].copy_from_slice(&self.handle.to_be_bytes());
         bytes[16..24].copy_from_slice(&self.offset.to_be_bytes());
         bytes[24..28].copy_from_slice(&self.length.to_be_bytes());
@@ -480,6 +547,7 @@ impl NbdRequest {
                 offset,
                 length,
             } => NbdRequestHeader {
+                flags: 0,
                 command: NbdCommand::Read,
                 handle: *handle,
                 offset: *offset,
@@ -490,18 +558,21 @@ impl NbdRequest {
                 offset,
                 data,
             } => NbdRequestHeader {
+                flags: 0,
                 command: NbdCommand::Write,
                 handle: *handle,
                 offset: *offset,
                 length: data.len() as u32,
             },
             Self::Disconnect { handle } => NbdRequestHeader {
+                flags: 0,
                 command: NbdCommand::Disconnect,
                 handle: *handle,
                 offset: 0,
                 length: 0,
             },
             Self::Flush { handle } => NbdRequestHeader {
+                flags: 0,
                 command: NbdCommand::Flush,
                 handle: *handle,
                 offset: 0,
@@ -512,6 +583,7 @@ impl NbdRequest {
                 offset,
                 length,
             } => NbdRequestHeader {
+                flags: 0,
                 command: NbdCommand::Trim,
                 handle: *handle,
                 offset: *offset,
@@ -522,6 +594,7 @@ impl NbdRequest {
                 offset,
                 length,
             } => NbdRequestHeader {
+                flags: 0,
                 command: NbdCommand::WriteZeroes,
                 handle: *handle,
                 offset: *offset,

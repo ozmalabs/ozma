@@ -705,14 +705,16 @@ impl SwitchablePipeline for HlsPipelineSwitch {
         // Stop the old generation before opening the new source: capture
         // backends release their socket/device in `stop`, and the switch must
         // not hold two consoles at once. The caller rolls back with the old
-        // registry if the new source cannot start.
+        // registry if the new source cannot start. The replacement generation
+        // appends to the existing playlist with `#EXT-X-DISCONTINUITY`, so a
+        // console switch does not reset the HLS media sequence.
         self.controller
             .stop()
             .await
             .map_err(|error| error.to_string())?;
         let source = open_first_source(registry)?;
         self.controller
-            .start_with_source(source)
+            .start_restarted_with_source(source)
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())

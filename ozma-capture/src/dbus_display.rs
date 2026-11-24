@@ -141,7 +141,10 @@ pub const DBUS_LISTENER_INTERFACE: &str = "org.qemu.Display1.Listener";
 /// Optional listener interface that carries multi-plane DMA-BUF scanouts.
 pub const DBUS_LISTENER_DMABUF2_INTERFACE: &str = "org.qemu.Display1.Listener.Unix.ScanoutDMABUF2";
 
-pub use crate::dmabuf_egl::{RenderNodeProbe, TiledImportProbe, UnsupportedModifier};
+pub use crate::dmabuf_egl::{
+    ModifierImportProbe, ModifierImportVerdict, RenderNodeProbe, TiledImportProbe,
+    UnsupportedModifier,
+};
 
 /// Probe the host's optional GBM/EGL tiled DMA-BUF importer.
 ///
@@ -152,6 +155,27 @@ pub use crate::dmabuf_egl::{RenderNodeProbe, TiledImportProbe, UnsupportedModifi
 /// rejected, or to report which modifiers the host could actually export.
 pub fn tiled_import_probe() -> TiledImportProbe {
     crate::dmabuf_egl::probe()
+}
+
+/// Probe host-advertised compressed modifiers and tiled YUV layouts for real.
+///
+/// Unlike [`tiled_import_probe`], this allocates a private GBM buffer per
+/// `(fourcc, modifier)` on each render node, imports it through EGL, paints a
+/// known four-quadrant pattern, and verifies the readback. It never touches a
+/// QEMU scanout or emits a frame. Results distinguish "GBM refused to
+/// allocate", "EGL import failed" (with the exact EGL error), and "imported but
+/// the compressed metadata is not in the DMA-BUF".
+pub fn compressed_modifier_probe() -> Vec<ModifierImportProbe> {
+    crate::dmabuf_egl::probe_compressed_imports()
+}
+
+/// Probe one explicit `(fourcc, modifier)` pair on every render node.
+///
+/// This performs a private GBM allocation and EGL import/readback on each node;
+/// it never touches a QEMU scanout. Use it when a typed error names a modifier
+/// and you need the exact per-node EGL result.
+pub fn modifier_import_probe(fourcc: u32, modifier: u64) -> Vec<ModifierImportProbe> {
+    crate::dmabuf_egl::probe_modifier_import(fourcc, modifier)
 }
 
 /// `org.freedesktop.DBus.Properties` interface.

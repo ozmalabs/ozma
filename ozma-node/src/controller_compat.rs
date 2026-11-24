@@ -48,9 +48,11 @@ use ozma_protocol::input::{InputEvent, KeyModifiers, PointerButton};
 use ozma_protocol::{
     codes, ApiError, CaptureKind, Codec, EncodeCapability, EncoderBackend, MediaFormat,
 };
+use ozma_usb::MediaFormat as UsbMediaFormat;
 use ozma_usb::{
-    is_safe_identifier, FunctionStatus, GadgetStatus, MediaState, UsbError, UsbFunctionKind,
-    UsbGadgetCapabilities, UsbGadgetController, VirtualMedia,
+    is_safe_identifier, FunctionStatus, GadgetStatus, MassStorageImage, MediaState,
+    NbdExportCatalog, NbdExportSource, NbdServer, NbdServerConfig, NbdServerHandle, NbdServerStats,
+    UsbError, UsbFunctionKind, UsbGadgetCapabilities, UsbGadgetController, VirtualMedia,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1280,6 +1282,15 @@ pub struct UsbControl {
     gadget: String,
     capabilities: UsbGadgetCapabilities,
     error: Option<String>,
+    nbd: Arc<Mutex<Option<NbdRuntime>>>,
+}
+
+struct NbdRuntime {
+    handle: NbdServerHandle,
+    url: String,
+    export: String,
+    size_bytes: u64,
+    read_only: bool,
 }
 
 impl UsbControl {
@@ -1291,6 +1302,7 @@ impl UsbControl {
             gadget: gadget.into(),
             capabilities,
             error: None,
+            nbd: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1301,6 +1313,7 @@ impl UsbControl {
             gadget: crate::config::DEFAULT_USB_GADGET_NAME.to_owned(),
             capabilities: UsbGadgetCapabilities::unavailable(),
             error: Some(reason.into()),
+            nbd: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -2143,7 +2156,9 @@ pub fn webrtc_router(state: ConnectionState) -> Router {
 /// `GET /usb` is the controller's read-only probe (`node/node.py::_read_usb_info`
 /// shape). `POST /usb/media/attach` and `/usb/media/detach` operate on the
 /// configured mass-storage LUN through the [`UsbGadgetController`]; they never
-/// mount the image, write a block device, or create a backing file.
+/// mount the image, write a block device, or create a backing file. `GET
+/// /usb/nbd` plus `POST /usb/nbd/start|stop` are an opt-in loopback NBD export
+/// (one file at a time) that never mounts the image or opens a block device.
 ///
 /// Without `--usb-gadget` every route keeps the typed 501 surface. A gadget
 /// that was requested but could not be created/bound answers 503 with the
@@ -2153,6 +2168,9 @@ pub fn usb_router(state: ConnectionState) -> Router {
         .route("/usb", get(usb_status))
         .route("/usb/media/attach", post(usb_media_attach))
         .route("/usb/media/detach", post(usb_media_detach))
+        .route("/usb/nbd", get(usb_nbd_status))
+        .route("/usb/nbd/start", post(usb_nbd_start))
+        .route("/usb/nbd/stop", post(usb_nbd_stop))
         .with_state(state)
 }
 
@@ -2627,6 +2645,243 @@ async fn usb_media_detach(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct UsbNbdStartRequest {
+    /// Existing absolute regular file to serve.
+    path: String,
+    /// Export name; defaults to `media`.
+    #[serde(default)]
+    export: Option<String>,
+    /// `raw` (default), `fat32`, or `iso9660`/`iso`.
+    #[serde(default)]
+    format: Option<String>,
+    /// Serve a raw image read-only. Defaults to `true`; ISO/FAT32 are always
+    /// read-only and reject `false`.
+    #[serde(default)]
+    read_only: Option<bool>,
+}
+
+/// `GET /usb/nbd` — running export summary and counters.
+async fn usb_nbd_status(State(state): State<ConnectionState>) -> Response {
+    let Some(control) = state.usb.as_ref() else {
+        return usb_not_configured();
+    };
+    let nbd = lock(&control.nbd);
+    match nbd.as_ref() {
+        None => Json(serde_json::json!({
+            "ok": true,
+            "running": false,
+            "url": null,
+            "export": null,
+            "stats": NbdServerStats::default(),
+        }))
+        .into_response(),
+        Some(runtime) => Json(serde_json::json!({
+            "ok": true,
+            "running": true,
+            "url": runtime.url,
+            "export": runtime.export,
+            "size_bytes": runtime.size_bytes,
+            "read_only": runtime.read_only,
+            "stats": runtime.handle.stats(),
+        }))
+        .into_response(),
+    }
+}
+
+/// `POST /usb/nbd/start` — serve one existing image over loopback NBD.
+///
+/// This is an opt-in virtual-media path: it never mounts the image or writes a
+/// block device. ISO/FAT32 files are probed read-only and force a read-only
+/// export; raw images default to read-only unless `read_only: false`.
+async fn usb_nbd_start(
+    State(state): State<ConnectionState>,
+    payload: Result<Json<UsbNbdStartRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(error) => return json_rejection(error),
+    };
+    let Some(control) = state.usb.as_ref() else {
+        return usb_not_configured();
+    };
+    if lock(&control.nbd).is_some() {
+        return compat_error_with_remediation(
+            StatusCode::CONFLICT,
+            "usb-nbd-already-running",
+            "an NBD export is already running on this node",
+            Some("POST /usb/nbd/stop before starting a different export."),
+        );
+    }
+
+    let path_text = request.path.trim();
+    if path_text.is_empty() || path_text.contains('\0') {
+        return compat_error_with_remediation(
+            StatusCode::BAD_REQUEST,
+            "usb-invalid-media-path",
+            "media `path` must be a non-empty path without NUL bytes",
+            Some("Pass the absolute path of an existing FAT32/ISO/raw image."),
+        );
+    }
+    let path = Path::new(path_text);
+    if !path.is_absolute() {
+        return compat_error_with_remediation(
+            StatusCode::BAD_REQUEST,
+            "usb-invalid-media-path",
+            "media path must be absolute",
+            Some("Use an absolute path; relative paths are resolved differently by the kernel."),
+        );
+    }
+
+    let format = match request
+        .format
+        .as_deref()
+        .unwrap_or("raw")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "raw" | "nbd" => UsbMediaFormat::Raw,
+        "fat32" | "vfat" => UsbMediaFormat::Fat32,
+        "iso" | "iso9660" => UsbMediaFormat::Iso9660,
+        other => {
+            return compat_error_with_remediation(
+                StatusCode::BAD_REQUEST,
+                "usb-invalid-media-format",
+                format!("unsupported NBD media format {other:?}"),
+                Some("Use `raw`, `fat32`, or `iso9660`."),
+            );
+        }
+    };
+    let requested_read_only = request.read_only;
+    if format != UsbMediaFormat::Raw && requested_read_only == Some(false) {
+        return compat_error_with_remediation(
+            StatusCode::BAD_REQUEST,
+            "usb-read-only-media",
+            "ISO 9660 and FAT32 NBD exports are always read-only",
+            Some("Omit read_only or set it to true."),
+        );
+    }
+    let mut media = match format {
+        UsbMediaFormat::Iso9660 => MassStorageImage::iso(path),
+        UsbMediaFormat::Fat32 => MassStorageImage::fat32(path),
+        _ => MassStorageImage::disk(path),
+    };
+    let read_only = requested_read_only.unwrap_or(true) || format.is_read_only();
+    if format == UsbMediaFormat::Raw {
+        media = match media.with_read_only(read_only) {
+            Ok(media) => media,
+            Err(error) => return usb_error_response(error),
+        };
+    }
+
+    let export_name = request
+        .export
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("media")
+        .to_owned();
+    let source = match NbdExportSource::from_media(export_name.clone(), &media) {
+        Ok(source) => source,
+        Err(error) => return usb_error_response(error),
+    };
+    let read_only = source.is_read_only();
+    let size_bytes = source.export.size_bytes;
+    let catalog = match NbdExportCatalog::new(vec![source]) {
+        Ok(catalog) => catalog,
+        Err(error) => return usb_error_response(error),
+    };
+    let config = NbdServerConfig {
+        max_request_bytes: 1024 * 1024,
+        max_clients: 4,
+        handshake_timeout_ms: 10_000,
+        idle_timeout_ms: Some(30_000),
+        option_max_bytes: 64 * 1024,
+    };
+    let server = match NbdServer::bind_tcp(
+        std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        catalog,
+        config,
+    ) {
+        Ok(server) => server,
+        Err(error) => return usb_error_response(error),
+    };
+    let address = match server.local_addr() {
+        Some(address) => address,
+        None => {
+            return compat_error_with_remediation(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "usb-nbd-error",
+                "the NBD listener has no bound address",
+                Some("No export was started; check the node log."),
+            );
+        }
+    };
+    let handle = match server.start() {
+        Ok(handle) => handle,
+        Err(error) => return usb_error_response(error),
+    };
+    let url = format!("nbd://{address}/{export_name}");
+    let runtime = NbdRuntime {
+        handle,
+        url: url.clone(),
+        export: export_name.clone(),
+        size_bytes,
+        read_only,
+    };
+    {
+        let mut slot = lock(&control.nbd);
+        if slot.is_some() {
+            drop(slot);
+            runtime.handle.stop();
+            return compat_error_with_remediation(
+                StatusCode::CONFLICT,
+                "usb-nbd-already-running",
+                "an NBD export is already running on this node",
+                Some("POST /usb/nbd/stop before starting a different export."),
+            );
+        }
+        *slot = Some(runtime);
+    }
+
+    Json(serde_json::json!({
+        "ok": true,
+        "running": true,
+        "url": url,
+        "export": export_name,
+        "size_bytes": size_bytes,
+        "read_only": read_only,
+        "max_request_bytes": 1024 * 1024,
+        "stats": NbdServerStats::default(),
+    }))
+    .into_response()
+}
+
+/// `POST /usb/nbd/stop` — stop the opt-in NBD export and return its counters.
+async fn usb_nbd_stop(State(state): State<ConnectionState>) -> Response {
+    let Some(control) = state.usb.as_ref() else {
+        return usb_not_configured();
+    };
+    let runtime = lock(&control.nbd).take();
+    let Some(runtime) = runtime else {
+        return compat_error_with_remediation(
+            StatusCode::CONFLICT,
+            "usb-nbd-not-running",
+            "no NBD export is running on this node",
+            Some("POST /usb/nbd/start first."),
+        );
+    };
+    let stats = runtime.handle.stop();
+    Json(serde_json::json!({
+        "ok": true,
+        "running": false,
+        "export": runtime.export,
+        "stats": stats,
+    }))
+    .into_response()
+}
+
 /// Accept `usb0` or `mass_storage.usb0`, returning the instance name.
 fn normalized_media_function(function: &str) -> Result<String, Response> {
     let instance = function
@@ -2690,6 +2945,16 @@ fn usb_error_response(error: UsbError) -> Response {
             StatusCode::BAD_REQUEST,
             "usb-invalid-media",
             "the media image is not usable as a mass-storage backing file",
+        ),
+        "invalid-media" => (
+            StatusCode::BAD_REQUEST,
+            "usb-invalid-media",
+            "the media image failed its declared-format probe",
+        ),
+        "unsupported-media-format" => (
+            StatusCode::BAD_REQUEST,
+            "usb-invalid-media-format",
+            "the media format is not usable for this virtual-media operation",
         ),
         "media-not-found" => (
             StatusCode::BAD_REQUEST,
@@ -8382,6 +8647,9 @@ mod tests {
             ("GET", "/usb", None),
             ("POST", "/usb/media/attach", Some(serde_json::json!({}))),
             ("POST", "/usb/media/detach", Some(serde_json::json!({}))),
+            ("GET", "/usb/nbd", None),
+            ("POST", "/usb/nbd/start", Some(serde_json::json!({}))),
+            ("POST", "/usb/nbd/stop", Some(serde_json::json!({}))),
         ] {
             let builder = Request::builder().method(method).uri(uri);
             let request = match body {
@@ -8598,6 +8866,128 @@ mod tests {
         assert_eq!(body["media"]["mode"], "cdrom");
         assert_eq!(body["media"]["read_only"], true);
         assert_eq!(body["media"]["size_bytes"], 2048);
+
+        std::fs::remove_file(image).unwrap();
+    }
+
+    #[tokio::test]
+    async fn usb_nbd_start_status_and_stop_are_opt_in_and_path_free() {
+        let (state, _) = usb_fake_state();
+        let app = usb_router(state);
+        let image = temp_file("nbd-media", &vec![0x5Au8; 4096]);
+
+        let (status, body) = get_json(&app, "/usb/nbd").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["running"], false);
+
+        let (status, body) = post_json(
+            &app,
+            "/usb/nbd/start",
+            serde_json::json!({"path": image.to_string_lossy(), "format": "raw"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["running"], true);
+        assert_eq!(body["export"], "media");
+        assert_eq!(body["size_bytes"], 4096);
+        assert_eq!(body["read_only"], true);
+        let url = body["url"].as_str().unwrap();
+        assert!(url.starts_with("nbd://127.0.0.1:"), "{url}");
+        assert!(url.ends_with("/media"), "{url}");
+        assert!(
+            !body.to_string().contains(image.to_string_lossy().as_ref()),
+            "NBD start response must not echo the backing path: {body}"
+        );
+
+        let (status, body) = get_json(&app, "/usb/nbd").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["running"], true);
+        assert_eq!(body["export"], "media");
+
+        let (status, body) = post_json(
+            &app,
+            "/usb/nbd/start",
+            serde_json::json!({"path": image.to_string_lossy()}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "usb-nbd-already-running");
+
+        let (status, body) = post_json(&app, "/usb/nbd/stop", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["running"], false);
+        assert_eq!(body["stats"]["connections_accepted"], 0);
+
+        let (status, body) = post_json(&app, "/usb/nbd/stop", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "usb-nbd-not-running");
+
+        std::fs::remove_file(image).unwrap();
+    }
+
+    #[tokio::test]
+    async fn usb_nbd_start_rejects_bad_paths_and_writable_iso_or_fat32() {
+        let (state, _) = usb_fake_state();
+        let app = usb_router(state);
+        let image = temp_file("nbd-bad-format", &vec![0u8; 4096]);
+
+        let (status, body) = post_json(
+            &app,
+            "/usb/nbd/start",
+            serde_json::json!({"path": "relative.img"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "usb-invalid-media-path");
+
+        let (status, body) = post_json(
+            &app,
+            "/usb/nbd/start",
+            serde_json::json!({"path": "/does/not/exist/ozma.img"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "usb-media-not-found");
+        assert!(!body.to_string().contains("/does/not/exist/ozma.img"));
+
+        for format in ["iso9660", "fat32"] {
+            let (status, body) = post_json(
+                &app,
+                "/usb/nbd/start",
+                serde_json::json!({
+                    "path": image.to_string_lossy(),
+                    "format": format,
+                    "read_only": false,
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{format}");
+            assert_eq!(body["code"], "usb-read-only-media", "{format}");
+        }
+
+        let (status, body) = post_json(
+            &app,
+            "/usb/nbd/start",
+            serde_json::json!({"path": image.to_string_lossy(), "format": "vhd"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "usb-invalid-media-format");
+
+        // A file that is not really ISO 9660 is rejected by the bounded probe.
+        let (status, body) = post_json(
+            &app,
+            "/usb/nbd/start",
+            serde_json::json!({
+                "path": image.to_string_lossy(),
+                "format": "iso9660",
+                "read_only": true,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "usb-invalid-media");
 
         std::fs::remove_file(image).unwrap();
     }

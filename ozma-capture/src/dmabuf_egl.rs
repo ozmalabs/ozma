@@ -31,14 +31,25 @@
 //!
 //! ## What this importer does not do
 //!
-//! - It supports single-plane packed 32-bit formats only. Tiled YUV needs a
-//!   colour-conversion shader or a YUV import extension; those buffers keep the
-//!   typed unsupported error rather than being decoded incorrectly.
+//! - It reads back packed 32-bit formats only. Tiled YUV needs a
+//!   colour-conversion shader or an external-texture path; those buffers keep
+//!   the typed unsupported error rather than being decoded incorrectly.
 //! - It only claims modifiers it understands. `DRM_FORMAT_MOD_INVALID` is
 //!   refused even though it is not `0`: an exporter that cannot name its layout
 //!   (QEMU on an AMD render node does this) must not be treated as linear.
-//! - Compressed/DCC/CCS modifiers are refused. EGL may import some of them, but
-//!   a wrong DCC interpretation would silently corrupt a frame.
+//! - Intel CCS is refused. EGL accepts the BMG flat-CCS modifier, but the
+//!   compression metadata is not exposed as a DMA-BUF plane, so a compressed
+//!   producer's bytes cannot be decoded; importing it anyway would silently
+//!   corrupt a frame.
+//! - AMD DCC is supported only when the descriptor carries *both* the main
+//!   surface and the DCC metadata plane. Mesa's radeonsi importer requires the
+//!   metadata plane and fails with `EGL_BAD_MATCH` without it. `ScanoutDMABUF2`
+//!   can carry both; the single-fd `ScanoutDMABUF` cannot.
+//!
+//! [`probe_modifier_import`] and [`probe_compressed_imports`] allocate private
+//! GBM buffers and perform the real EGL import/readback so the exact per-node
+//! result (including the EGL error code) can be reported without faking a
+//! frame. `dbus_display::compressed_modifier_probe()` exposes that report.
 //!
 //! The GL readback returns rows in DMA-BUF row order (row 0 first). The caller
 //! keeps the existing `y0_top` and damage-rectangle handling in
@@ -46,9 +57,7 @@
 
 use std::ffi::{c_char, c_void, CString};
 use std::fs::OpenOptions;
-#[cfg(test)]
-use std::os::fd::FromRawFd;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -94,8 +103,32 @@ const EGL_LINUX_DRM_FOURCC_EXT: i32 = 0x3271;
 const EGL_DMA_BUF_PLANE0_FD_EXT: i32 = 0x3272;
 const EGL_DMA_BUF_PLANE0_OFFSET_EXT: i32 = 0x3273;
 const EGL_DMA_BUF_PLANE0_PITCH_EXT: i32 = 0x3274;
+const EGL_DMA_BUF_PLANE1_FD_EXT: i32 = 0x3275;
+const EGL_DMA_BUF_PLANE1_OFFSET_EXT: i32 = 0x3276;
+const EGL_DMA_BUF_PLANE1_PITCH_EXT: i32 = 0x3277;
+const EGL_DMA_BUF_PLANE2_FD_EXT: i32 = 0x3278;
+const EGL_DMA_BUF_PLANE2_OFFSET_EXT: i32 = 0x3279;
+const EGL_DMA_BUF_PLANE2_PITCH_EXT: i32 = 0x327A;
+const EGL_DMA_BUF_PLANE3_FD_EXT: i32 = 0x3440;
+const EGL_DMA_BUF_PLANE3_OFFSET_EXT: i32 = 0x3441;
+const EGL_DMA_BUF_PLANE3_PITCH_EXT: i32 = 0x3442;
 const EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT: i32 = 0x3443;
 const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: i32 = 0x3444;
+const EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT: i32 = 0x3445;
+const EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT: i32 = 0x3446;
+const EGL_DMA_BUF_PLANE2_MODIFIER_LO_EXT: i32 = 0x3447;
+const EGL_DMA_BUF_PLANE2_MODIFIER_HI_EXT: i32 = 0x3448;
+const EGL_DMA_BUF_PLANE3_MODIFIER_LO_EXT: i32 = 0x3449;
+const EGL_DMA_BUF_PLANE3_MODIFIER_HI_EXT: i32 = 0x344A;
+
+/// EGL error codes that this importer reports verbatim in typed errors.
+const EGL_SUCCESS: i32 = 0x3000;
+const EGL_BAD_ACCESS: i32 = 0x3002;
+const EGL_BAD_ALLOC: i32 = 0x3003;
+const EGL_BAD_ATTRIBUTE: i32 = 0x3004;
+const EGL_BAD_MATCH: i32 = 0x3009;
+const EGL_BAD_PARAMETER: i32 = 0x300C;
+const EGL_BAD_CONTEXT: i32 = 0x3006;
 
 const GL_TEXTURE_2D: u32 = 0x0DE1;
 const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
@@ -108,9 +141,7 @@ const GL_RGBA: u32 = 0x1908;
 const GL_UNSIGNED_BYTE: u32 = 0x1401;
 const GL_RENDERER: u32 = 0x1F01;
 const GL_NO_ERROR: u32 = 0;
-#[cfg(test)]
 const GL_COLOR_BUFFER_BIT: u32 = 0x4000;
-#[cfg(test)]
 const GL_SCISSOR_TEST: u32 = 0x0C11;
 
 type EglGetProcAddress = unsafe extern "C" fn(*const c_char) -> *mut c_void;
@@ -143,6 +174,10 @@ type GbmBoDestroy = unsafe extern "C" fn(*mut c_void);
 type GbmBoGetFd = unsafe extern "C" fn(*mut c_void) -> RawFd;
 type GbmBoGetStride = unsafe extern "C" fn(*mut c_void) -> u32;
 type GbmBoGetModifier = unsafe extern "C" fn(*mut c_void) -> u64;
+type GbmBoGetPlaneCount = unsafe extern "C" fn(*mut c_void) -> i32;
+type GbmBoGetFdForPlane = unsafe extern "C" fn(*mut c_void, i32) -> RawFd;
+type GbmBoGetStrideForPlane = unsafe extern "C" fn(*mut c_void, i32) -> u32;
+type GbmBoGetOffset = unsafe extern "C" fn(*mut c_void, i32) -> u32;
 
 type GlGenTextures = unsafe extern "C" fn(i32, *mut u32);
 type GlDeleteTextures = unsafe extern "C" fn(i32, *const u32);
@@ -189,6 +224,10 @@ struct Api {
     gbm_bo_get_fd: GbmBoGetFd,
     gbm_bo_get_stride: GbmBoGetStride,
     gbm_bo_get_modifier: GbmBoGetModifier,
+    gbm_bo_get_plane_count: Option<GbmBoGetPlaneCount>,
+    gbm_bo_get_fd_for_plane: Option<GbmBoGetFdForPlane>,
+    gbm_bo_get_stride_for_plane: Option<GbmBoGetStrideForPlane>,
+    gbm_bo_get_offset: Option<GbmBoGetOffset>,
     gl_gen_textures: GlGenTextures,
     gl_delete_textures: GlDeleteTextures,
     gl_bind_texture: GlBindTexture,
@@ -339,6 +378,10 @@ unsafe fn load_inner() -> ApiLoad {
         gbm_bo_get_fd: require!(gbm, "gbm_bo_get_fd"),
         gbm_bo_get_stride: require!(gbm, "gbm_bo_get_stride"),
         gbm_bo_get_modifier: require!(gbm, "gbm_bo_get_modifier"),
+        gbm_bo_get_plane_count: dlsym(gbm, "gbm_bo_get_plane_count"),
+        gbm_bo_get_fd_for_plane: dlsym(gbm, "gbm_bo_get_fd_for_plane"),
+        gbm_bo_get_stride_for_plane: dlsym(gbm, "gbm_bo_get_stride_for_plane"),
+        gbm_bo_get_offset: dlsym(gbm, "gbm_bo_get_offset"),
         gl_gen_textures: require_gl!("glGenTextures"),
         gl_delete_textures: require_gl!("glDeleteTextures"),
         gl_bind_texture: require_gl!("glBindTexture"),
@@ -365,6 +408,50 @@ unsafe fn load_inner() -> ApiLoad {
         api: Some(api),
         error: None,
     }
+}
+
+/// Export every plane of a GBM BO as an owned descriptor plus offset/stride.
+///
+/// `gbm_bo_get_fd` only describes plane 0, so multi-plane (DCC) fixtures and
+/// probes need the newer `*_for_plane` entry points. They are optional at load
+/// time so older libgbm still builds and runs the single-plane path.
+unsafe fn gbm_bo_planes(api: &Api, bo: *mut c_void) -> Result<Vec<(OwnedFd, u32, u32)>, String> {
+    let plane_count = match api.gbm_bo_get_plane_count {
+        Some(get_plane_count) => get_plane_count(bo),
+        None => 1,
+    };
+    if !(1..=4).contains(&plane_count) {
+        return Err(format!("GBM reported {plane_count} planes"));
+    }
+    let mut planes = Vec::with_capacity(plane_count as usize);
+    for plane_index in 0..plane_count {
+        let raw_fd = match api.gbm_bo_get_fd_for_plane {
+            Some(get_fd_for_plane) => get_fd_for_plane(bo, plane_index),
+            None if plane_index == 0 => (api.gbm_bo_get_fd)(bo),
+            None => -1,
+        };
+        if raw_fd < 0 {
+            return Err(format!("gbm_bo_get_fd_for_plane({plane_index}) failed"));
+        }
+        // `gbm_bo_get_fd[_for_plane]` returns a newly owned descriptor.
+        let fd = OwnedFd::from_raw_fd(raw_fd);
+        let stride = match api.gbm_bo_get_stride_for_plane {
+            Some(get_stride_for_plane) => get_stride_for_plane(bo, plane_index),
+            None if plane_index == 0 => (api.gbm_bo_get_stride)(bo),
+            None => {
+                return Err(format!(
+                    "gbm_bo_get_stride_for_plane is unavailable for plane {plane_index}"
+                ))
+            }
+        };
+        let offset = match api.gbm_bo_get_offset {
+            Some(get_offset) => get_offset(bo, plane_index),
+            None if plane_index == 0 => 0,
+            None => return Err("gbm_bo_get_offset is unavailable".to_owned()),
+        };
+        planes.push((fd, offset, stride));
+    }
+    Ok(planes)
 }
 
 /// One render node that was probed for EGL/GBM import support.
@@ -414,10 +501,63 @@ pub struct TiledImportProbe {
     pub render_nodes: Vec<RenderNodeProbe>,
     /// Modifiers this importer understands and can pass to EGL.
     pub supported_modifiers: Vec<u64>,
+    /// Subset of `supported_modifiers` that also needs the auxiliary DCC
+    /// metadata plane (AMD DCC); a single-plane `ScanoutDMABUF` cannot use it.
+    pub aux_plane_modifiers: Vec<u64>,
     /// Modifiers the host advertises but this importer refuses.
     pub unsupported_modifiers: Vec<UnsupportedModifier>,
     /// Diagnostics, including why EGL is unavailable and nodes that failed.
     pub notes: Vec<String>,
+}
+
+/// Outcome of one real GBM-allocation + EGL-import + readback probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModifierImportVerdict {
+    /// GBM allocated it, EGL imported it, and a painted pattern read back
+    /// exactly. For compressed layouts this is only reachable when the
+    /// descriptor carries every plane the importer needs.
+    Verified,
+    /// EGL accepted the modifier and round-tripped, but the modifier is
+    /// compressed and the descriptor has only the main plane. The compression
+    /// metadata lives outside the DMA-BUF, so a compressed third-party
+    /// producer cannot be decoded safely.
+    CompressedMetadataMissing,
+    /// GBM could not allocate a buffer with this modifier on this node.
+    GbmAllocationFailed,
+    /// GBM allocated it, but `eglCreateImageKHR` failed.
+    EglImportFailed,
+    /// EGL created the image, but the framebuffer was not complete.
+    FramebufferIncomplete,
+    /// The framebuffer was complete but `glReadPixels` did not return the
+    /// painted pattern (or reported a GL error).
+    ReadbackFailed,
+    /// EGL/GBM was unavailable on this node.
+    Unavailable,
+}
+
+/// One real compressed/tiled modifier probe on one render node.
+#[derive(Clone, Debug)]
+pub struct ModifierImportProbe {
+    /// Fourcc that was passed to GBM/EGL.
+    pub fourcc: u32,
+    /// Exact modifier value.
+    pub modifier: u64,
+    /// Render node used for the probe.
+    pub node: String,
+    /// Number of planes GBM exported (0 when allocation failed).
+    pub planes: usize,
+    /// Whether GBM allocated a buffer with this modifier.
+    pub gbm_allocated: bool,
+    /// Modifier GBM reported for the allocation.
+    pub gbm_reported_modifier: Option<u64>,
+    /// Exact `eglGetError()` value when image creation failed.
+    pub egl_error: Option<i32>,
+    /// Exact `glGetError()` value when binding/readback failed.
+    pub gl_error: Option<u32>,
+    /// Overall verdict.
+    pub verdict: ModifierImportVerdict,
+    /// Human-readable detail, including the exact modifier/fourcc/error.
+    pub detail: String,
 }
 
 /// Probe EGL/GBM availability and the tiled modifiers the host advertises.
@@ -447,6 +587,7 @@ pub(crate) fn probe() -> TiledImportProbe {
     }
 
     let mut supported = Vec::new();
+    let mut aux_plane = Vec::new();
     let mut unsupported = Vec::new();
     for node in nodes {
         let path = node.display().to_string();
@@ -477,6 +618,9 @@ pub(crate) fn probe() -> TiledImportProbe {
                     if classify_modifier(modifier, packed_probe_fourcc()).is_ok() {
                         if !supported.contains(&modifier) {
                             supported.push(modifier);
+                        }
+                        if modifier_requires_aux_plane(modifier) && !aux_plane.contains(&modifier) {
+                            aux_plane.push(modifier);
                         }
                     } else {
                         let reason =
@@ -516,7 +660,267 @@ pub(crate) fn probe() -> TiledImportProbe {
     supported.sort_unstable();
     supported.dedup();
     result.supported_modifiers = supported;
+    aux_plane.sort_unstable();
+    aux_plane.dedup();
+    result.aux_plane_modifiers = aux_plane;
     result.unsupported_modifiers = unsupported;
+    result
+}
+
+/// Probe every host-advertised compressed modifier and tiled YUV layout with a
+/// real GBM allocation, EGL import, painted pattern, and readback.
+///
+/// This allocates and frees private GBM buffers; it never touches a QEMU
+/// scanout or emits a frame. It is intentionally separate from [`probe`]
+/// because it performs actual imports and is slower.
+pub(crate) fn probe_compressed_imports() -> Vec<ModifierImportProbe> {
+    let loaded = load();
+    let Some(api) = loaded.api.as_ref() else {
+        return Vec::new();
+    };
+    let mut results = Vec::new();
+    for node in candidate_devices() {
+        let mut state = match EglState::new(api, &node) {
+            Ok(state) => state,
+            Err(error) => {
+                results.push(ModifierImportProbe {
+                    fourcc: 0,
+                    modifier: 0,
+                    node: node.display().to_string(),
+                    planes: 0,
+                    gbm_allocated: false,
+                    gbm_reported_modifier: None,
+                    egl_error: None,
+                    gl_error: None,
+                    verdict: ModifierImportVerdict::Unavailable,
+                    detail: error,
+                });
+                continue;
+            }
+        };
+        let display = state.display;
+        // SAFETY: `display` is a live EGL display owned by `state`.
+        let formats = unsafe { query_formats(api, display) };
+        for format in formats {
+            let fourcc = format as u32;
+            let interesting_format = crate::dbus_dmabuf::is_packed_fourcc(fourcc)
+                || matches!(
+                    fourcc,
+                    crate::dbus_dmabuf::DRM_FORMAT_NV12
+                        | crate::dbus_dmabuf::DRM_FORMAT_NV21
+                        | crate::dbus_dmabuf::DRM_FORMAT_YUV420
+                        | crate::dbus_dmabuf::DRM_FORMAT_YVU420
+                );
+            if !interesting_format {
+                continue;
+            }
+            // SAFETY: `display` is live and `format` came from it.
+            let mut modifiers = unsafe { query_modifiers(api, display, format) };
+            modifiers.sort_unstable();
+            modifiers.dedup();
+            for modifier in modifiers {
+                if modifier == 0 || modifier == DRM_FORMAT_MOD_INVALID {
+                    continue;
+                }
+                let is_yuv = !crate::dbus_dmabuf::is_packed_fourcc(fourcc);
+                if !modifier_is_compressed(modifier) && !is_yuv {
+                    continue;
+                }
+                results.push(probe_modifier_on_state(&mut state, fourcc, modifier));
+            }
+        }
+    }
+    results
+}
+
+/// Probe one fourcc/modifier pair on every candidate render node.
+pub(crate) fn probe_modifier_import(fourcc: u32, modifier: u64) -> Vec<ModifierImportProbe> {
+    let loaded = load();
+    let Some(api) = loaded.api.as_ref() else {
+        return Vec::new();
+    };
+    let mut results = Vec::new();
+    for node in candidate_devices() {
+        match EglState::new(api, &node) {
+            Ok(mut state) => {
+                results.push(probe_modifier_on_state(&mut state, fourcc, modifier));
+            }
+            Err(error) => results.push(ModifierImportProbe {
+                fourcc,
+                modifier,
+                node: node.display().to_string(),
+                planes: 0,
+                gbm_allocated: false,
+                gbm_reported_modifier: None,
+                egl_error: None,
+                gl_error: None,
+                verdict: ModifierImportVerdict::Unavailable,
+                detail: error,
+            }),
+        }
+    }
+    results
+}
+
+fn probe_modifier_on_state(
+    state: &mut EglState,
+    fourcc: u32,
+    modifier: u64,
+) -> ModifierImportProbe {
+    let api = state.api;
+    let node = state.path.clone();
+    let width = 64u32;
+    let height = 64u32;
+    let mut result = ModifierImportProbe {
+        fourcc,
+        modifier,
+        node: node.clone(),
+        planes: 0,
+        gbm_allocated: false,
+        gbm_reported_modifier: None,
+        egl_error: None,
+        gl_error: None,
+        verdict: ModifierImportVerdict::GbmAllocationFailed,
+        detail: String::new(),
+    };
+
+    // SAFETY: `state.gbm_device` is live for `state`'s lifetime and `modifier`
+    // points at a valid local value.
+    let bo = unsafe {
+        (api.gbm_bo_create_with_modifiers)(state.gbm_device, width, height, fourcc, &modifier, 1)
+    };
+    if bo.is_null() {
+        let error = std::io::Error::last_os_error();
+        result.detail = format!(
+            "gbm_bo_create_with_modifiers({}, {}) failed: {error}",
+            crate::dbus_dmabuf::fourcc_name(fourcc),
+            modifier_name(modifier)
+        );
+        return result;
+    }
+    result.gbm_allocated = true;
+    result.gbm_reported_modifier = Some(unsafe { (api.gbm_bo_get_modifier)(bo) });
+    let planes = unsafe { gbm_bo_planes(api, bo) };
+    unsafe { (api.gbm_bo_destroy)(bo) };
+    let planes = match planes {
+        Ok(planes) => planes,
+        Err(error) => {
+            result.detail = format!(
+                "allocated {} with {} but could not export its planes: {error}",
+                crate::dbus_dmabuf::fourcc_name(fourcc),
+                modifier_name(modifier)
+            );
+            return result;
+        }
+    };
+    result.planes = planes.len();
+    if result.gbm_reported_modifier != Some(modifier) {
+        result.detail = format!(
+            "GBM returned modifier {:#018x} for requested {:#018x}",
+            result.gbm_reported_modifier.unwrap_or(0),
+            modifier
+        );
+        return result;
+    }
+
+    let attrs: Vec<PlaneAttrs> = planes
+        .iter()
+        .map(|(fd, offset, stride)| PlaneAttrs {
+            fd: fd.as_raw_fd(),
+            offset: *offset,
+            stride: *stride,
+        })
+        .collect();
+    if let Err(error) = state.bind_dmabuf(&attrs, width, height, fourcc, modifier) {
+        result.egl_error = error.egl_error;
+        result.gl_error = error.gl_error;
+        result.verdict = match error.stage {
+            EglImportStage::CreateImage => ModifierImportVerdict::EglImportFailed,
+            EglImportStage::Framebuffer => ModifierImportVerdict::FramebufferIncomplete,
+            _ => ModifierImportVerdict::ReadbackFailed,
+        };
+        result.detail = format!(
+            "{} with {} on {}: {error}",
+            crate::dbus_dmabuf::fourcc_name(fourcc),
+            modifier_name(modifier),
+            node
+        );
+        return result;
+    }
+
+    // Paint the same four quadrants the fixture tests use, then read them back.
+    // A compressed layout must round-trip through the GPU for this to match.
+    let colors = [
+        [1.0, 0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0, 1.0],
+        [1.0, 1.0, 1.0, 1.0],
+    ];
+    if let Err(error) = state.paint_quadrants(colors) {
+        result.verdict = ModifierImportVerdict::ReadbackFailed;
+        result.detail = format!(
+            "imported {} with {} but painting failed: {error}",
+            crate::dbus_dmabuf::fourcc_name(fourcc),
+            modifier_name(modifier)
+        );
+        return result;
+    }
+    let pixels = match state.read_bgra() {
+        Ok(pixels) => pixels,
+        Err(error) => {
+            result.verdict = ModifierImportVerdict::ReadbackFailed;
+            result.detail = format!(
+                "imported {} with {} but readback failed: {error}",
+                crate::dbus_dmabuf::fourcc_name(fourcc),
+                modifier_name(modifier)
+            );
+            return result;
+        }
+    };
+    let row = width as usize * 4;
+    let top = (height as usize - 1) * row;
+    let half = (width as usize / 2) * 4;
+    let expected = [
+        (0, [0u8, 0, 255, 255]),            // bottom-left red
+        (half, [0, 255, 0, 255]),           // bottom-right green
+        (top, [255, 0, 0, 255]),            // top-left blue
+        (top + half, [255, 255, 255, 255]), // top-right white
+    ];
+    let correct = expected.iter().all(|(offset, color)| {
+        pixels
+            .get(*offset..*offset + 4)
+            .is_some_and(|pixel| pixel == color)
+    });
+    if !correct {
+        result.verdict = ModifierImportVerdict::ReadbackFailed;
+        result.detail = format!(
+            "imported {} with {} but the painted quadrants did not read back exactly",
+            crate::dbus_dmabuf::fourcc_name(fourcc),
+            modifier_name(modifier)
+        );
+        return result;
+    }
+
+    if modifier_is_compressed(modifier) && planes.len() < 2 {
+        result.verdict = ModifierImportVerdict::CompressedMetadataMissing;
+        result.detail = format!(
+            "EGL accepted and round-tripped {} with {}, but the descriptor has {} plane and the \
+             compression metadata is not addressable; a third-party compressed producer cannot be \
+             decoded safely",
+            crate::dbus_dmabuf::fourcc_name(fourcc),
+            modifier_name(modifier),
+            planes.len()
+        );
+    } else {
+        result.verdict = ModifierImportVerdict::Verified;
+        result.detail = format!(
+            "{} with {} imported and round-tripped on {} ({} plane(s))",
+            crate::dbus_dmabuf::fourcc_name(fourcc),
+            modifier_name(modifier),
+            node,
+            planes.len()
+        );
+    }
     result
 }
 
@@ -525,14 +929,24 @@ pub(crate) fn probe() -> TiledImportProbe {
 /// `Ok(())` means the modifier is in the known safe set; EGL may still refuse a
 /// particular buffer, which becomes a typed import error. `Err(reason)` is the
 /// exact reason reported to the caller.
+///
+/// Non-linear YUV remains refused: the GBM/EGL path only reads back packed
+/// 32-bit formats. AMD DCC is accepted because Mesa imports it from the main
+/// plane *plus* the DCC metadata plane; callers must use
+/// [`modifier_requires_aux_plane`] and pass both descriptors to
+/// [`TiledEglBuffer::new_with_planes`]. Intel CCS is refused because the
+/// flat-CCS metadata is not exposed as a plane in the DMA-BUF, so EGL accepts
+/// the modifier but cannot decode a compressed third-party producer.
 pub(crate) fn classify_modifier(modifier: u64, fourcc: u32) -> Result<(), String> {
     if modifier == 0 {
         return Ok(());
     }
     if !crate::dbus_dmabuf::is_packed_fourcc(fourcc) {
         return Err(format!(
-            "tiled YUV or non-32-bit fourcc {} has no EGL readback path",
-            crate::dbus_dmabuf::fourcc_name(fourcc)
+            "tiled YUV/non-32-bit fourcc {} with modifier {} has no EGL RGBA readback path \
+             (colour conversion would need a shader)",
+            crate::dbus_dmabuf::fourcc_name(fourcc),
+            modifier_name(modifier)
         ));
     }
     if modifier == DRM_FORMAT_MOD_INVALID {
@@ -547,8 +961,15 @@ pub(crate) fn classify_modifier(modifier: u64, fourcc: u32) -> Result<(), String
     match vendor {
         0x01 => match modifier & 0xff {
             1 | 2 | 3 | 9 => Ok(()),
-            4..=8 | 10..=17 => Err(format!(
-                "Intel modifier {} is compressed (CCS); compressed scanouts are not supported",
+            0x10 | 0x11 => Err(format!(
+                "Intel modifier {} is flat-CCS compressed; its compression metadata is not exposed \
+                 as a DMA-BUF plane, so EGL cannot decode a compressed producer (importing it \
+                 would silently misinterpret the bytes)",
+                modifier_name(modifier)
+            )),
+            4..=8 | 10..=15 => Err(format!(
+                "Intel modifier {} is CCS-compressed with an auxiliary CCS/clear-colour plane; this \
+                 importer has no verified Intel multi-plane CCS readback path",
                 modifier_name(modifier)
             )),
             _ => Err(format!(
@@ -562,9 +983,10 @@ pub(crate) fn classify_modifier(modifier: u64, fourcc: u32) -> Result<(), String
             let dcc = (modifier >> 13) & 1;
             let dcc_retile = (modifier >> 14) & 1;
             let dcc_pipe_align = (modifier >> 15) & 1;
-            if dcc != 0 || dcc_retile != 0 || dcc_pipe_align != 0 {
+            if dcc == 0 && (dcc_retile != 0 || dcc_pipe_align != 0) {
                 return Err(format!(
-                    "AMD modifier {} is DCC-compressed; compressed scanouts are not supported",
+                    "AMD modifier {} sets DCC retile/pipe-align bits without DCC; the modifier is \
+                     malformed",
                     modifier_name(modifier)
                 ));
             }
@@ -584,6 +1006,38 @@ pub(crate) fn classify_modifier(modifier: u64, fourcc: u32) -> Result<(), String
     }
 }
 
+/// True for an AMD modifier whose DCC metadata is a second DMA-BUF plane.
+///
+/// Mesa's radeonsi importer requires that plane: importing only the main plane
+/// fails with `EGL_BAD_MATCH`. Callers that have a second descriptor must pass
+/// it to [`TiledEglBuffer::new_with_planes`].
+pub(crate) fn modifier_requires_aux_plane(modifier: u64) -> bool {
+    modifier >> 56 == 0x02 && ((modifier >> 13) & 1) != 0
+}
+
+/// True for modifiers that describe a compressed layout (Intel CCS or AMD DCC).
+pub(crate) fn modifier_is_compressed(modifier: u64) -> bool {
+    match modifier >> 56 {
+        0x01 => matches!(modifier & 0xff, 4..=8 | 10..=17),
+        0x02 => ((modifier >> 13) & 1) != 0,
+        _ => false,
+    }
+}
+
+/// Human-readable EGL error name for typed errors and probe reports.
+pub(crate) fn egl_error_name(code: i32) -> &'static str {
+    match code {
+        EGL_SUCCESS => "EGL_SUCCESS",
+        EGL_BAD_ACCESS => "EGL_BAD_ACCESS",
+        EGL_BAD_ALLOC => "EGL_BAD_ALLOC",
+        EGL_BAD_ATTRIBUTE => "EGL_BAD_ATTRIBUTE",
+        EGL_BAD_CONTEXT => "EGL_BAD_CONTEXT",
+        EGL_BAD_MATCH => "EGL_BAD_MATCH",
+        EGL_BAD_PARAMETER => "EGL_BAD_PARAMETER",
+        _ => "EGL error",
+    }
+}
+
 /// Human-readable modifier name used in errors and the probe report.
 pub(crate) fn modifier_name(modifier: u64) -> String {
     match modifier {
@@ -593,6 +1047,25 @@ pub(crate) fn modifier_name(modifier: u64) -> String {
         I915_FORMAT_MOD_Y_TILED => format!("I915_FORMAT_MOD_Y_TILED ({modifier:#018x})"),
         I915_FORMAT_MOD_YF_TILED => format!("I915_FORMAT_MOD_Yf_TILED ({modifier:#018x})"),
         I915_FORMAT_MOD_4_TILED => format!("I915_FORMAT_MOD_4_TILED ({modifier:#018x})"),
+        0x0100_0000_0000_0004 => format!("I915_FORMAT_MOD_Y_TILED_CCS ({modifier:#018x})"),
+        0x0100_0000_0000_0005 => format!("I915_FORMAT_MOD_Yf_TILED_CCS ({modifier:#018x})"),
+        0x0100_0000_0000_0006 => format!("I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS ({modifier:#018x})"),
+        0x0100_0000_0000_0007 => format!("I915_FORMAT_MOD_Y_TILED_GEN12_MC_CCS ({modifier:#018x})"),
+        0x0100_0000_0000_0008 => {
+            format!("I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS_CC ({modifier:#018x})")
+        }
+        0x0100_0000_0000_000a => format!("I915_FORMAT_MOD_4_TILED_DG2_RC_CCS ({modifier:#018x})"),
+        0x0100_0000_0000_000b => format!("I915_FORMAT_MOD_4_TILED_DG2_MC_CCS ({modifier:#018x})"),
+        0x0100_0000_0000_000c => {
+            format!("I915_FORMAT_MOD_4_TILED_DG2_RC_CCS_CC ({modifier:#018x})")
+        }
+        0x0100_0000_0000_000d => format!("I915_FORMAT_MOD_4_TILED_MTL_RC_CCS ({modifier:#018x})"),
+        0x0100_0000_0000_000e => format!("I915_FORMAT_MOD_4_TILED_MTL_MC_CCS ({modifier:#018x})"),
+        0x0100_0000_0000_000f => {
+            format!("I915_FORMAT_MOD_4_TILED_MTL_RC_CCS_CC ({modifier:#018x})")
+        }
+        0x0100_0000_0000_0010 => format!("I915_FORMAT_MOD_4_TILED_LNL_CCS ({modifier:#018x})"),
+        0x0100_0000_0000_0011 => format!("I915_FORMAT_MOD_4_TILED_BMG_CCS ({modifier:#018x})"),
         AMD_FMT_MOD_TILE_GFX9_64K_S => {
             format!("AMD_FMT_MOD_TILE_GFX9_64K_S ({modifier:#018x})")
         }
@@ -606,8 +1079,9 @@ pub(crate) fn modifier_name(modifier: u64) -> String {
             let tile_version = modifier & 0xff;
             let tile = (modifier >> 8) & 0x1f;
             let dcc = (modifier >> 13) & 1;
+            let dcc_retile = (modifier >> 14) & 1;
             format!(
-                "AMD_FMT_MOD(tile_version={tile_version}, tile={tile}, dcc={dcc}) ({modifier:#018x})"
+                "AMD_FMT_MOD(tile_version={tile_version}, tile={tile}, dcc={dcc}, retile={dcc_retile}) ({modifier:#018x})"
             )
         }
         _ => format!("{modifier:#018x}"),
@@ -652,7 +1126,7 @@ unsafe fn query_string(api: &Api, display: *mut c_void, name: i32) -> Option<Str
         .map(ToOwned::to_owned)
 }
 
-unsafe fn query_packed_formats(api: &Api, display: *mut c_void) -> Vec<i32> {
+unsafe fn query_formats(api: &Api, display: *mut c_void) -> Vec<i32> {
     let mut count = 0;
     if (api.egl_query_dma_buf_formats)(display, 0, std::ptr::null_mut(), &mut count) != EGL_TRUE
         || count <= 0
@@ -665,8 +1139,14 @@ unsafe fn query_packed_formats(api: &Api, display: *mut c_void) -> Vec<i32> {
         return Vec::new();
     }
     formats.truncate(count.max(0) as usize);
-    formats.retain(|format| crate::dbus_dmabuf::is_packed_fourcc(*format as u32));
     formats
+}
+
+unsafe fn query_packed_formats(api: &Api, display: *mut c_void) -> Vec<i32> {
+    query_formats(api, display)
+        .into_iter()
+        .filter(|format| crate::dbus_dmabuf::is_packed_fourcc(*format as u32))
+        .collect()
 }
 
 unsafe fn query_modifiers(api: &Api, display: *mut c_void, format: i32) -> Vec<u64> {
@@ -699,6 +1179,39 @@ unsafe fn query_modifiers(api: &Api, display: *mut c_void, format: i32) -> Vec<u
     modifiers
 }
 
+/// One DMA-BUF plane handed to EGL.
+#[derive(Clone, Copy, Debug)]
+struct PlaneAttrs {
+    fd: RawFd,
+    offset: u32,
+    stride: u32,
+}
+
+/// Which EGL/GL step failed during an import.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EglImportStage {
+    Context,
+    Texture,
+    CreateImage,
+    TargetTexture,
+    Framebuffer,
+}
+
+/// A typed EGL import failure with the exact EGL/GL error codes.
+#[derive(Debug)]
+struct EglImportError {
+    stage: EglImportStage,
+    message: String,
+    egl_error: Option<i32>,
+    gl_error: Option<u32>,
+}
+
+impl std::fmt::Display for EglImportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
 struct EglState {
     api: &'static Api,
     display: *mut c_void,
@@ -710,6 +1223,7 @@ struct EglState {
     width: u32,
     height: u32,
     renderer: Option<String>,
+    path: String,
 }
 
 // SAFETY: the state is owned by one `TiledEglBuffer`/`MappedDmaBuf` at a time.
@@ -844,6 +1358,7 @@ impl EglState {
             width: 0,
             height: 0,
             renderer,
+            path: path.display().to_string(),
         })
     }
 
@@ -858,37 +1373,81 @@ impl EglState {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Import `planes` (one packed surface, or a DCC main + metadata pair).
+    ///
+    /// Every plane gets the same modifier; that is what Mesa's radeonsi DCC
+    /// importer expects, and `eglCreateImageKHR` rejects a DCC modifier with
+    /// only the main plane (`EGL_BAD_MATCH`).
     fn bind_dmabuf(
         &mut self,
-        fd: RawFd,
+        planes: &[PlaneAttrs],
         width: u32,
         height: u32,
         fourcc: u32,
         modifier: u64,
-        offset: u32,
-        stride: u32,
-    ) -> Result<(), String> {
-        self.make_current()?;
-        let attributes = [
-            EGL_WIDTH,
-            width as i32,
-            EGL_HEIGHT,
-            height as i32,
-            EGL_LINUX_DRM_FOURCC_EXT,
-            fourcc as i32,
-            EGL_DMA_BUF_PLANE0_FD_EXT,
-            fd,
-            EGL_DMA_BUF_PLANE0_OFFSET_EXT,
-            offset as i32,
-            EGL_DMA_BUF_PLANE0_PITCH_EXT,
-            stride as i32,
-            EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
-            (modifier & 0xffff_ffff) as i32,
-            EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
-            (modifier >> 32) as i32,
-            EGL_NONE,
-        ];
+    ) -> Result<(), EglImportError> {
+        self.make_current().map_err(|message| EglImportError {
+            stage: EglImportStage::Context,
+            message,
+            egl_error: None,
+            gl_error: None,
+        })?;
+        if planes.is_empty() || planes.len() > 4 {
+            return Err(EglImportError {
+                stage: EglImportStage::CreateImage,
+                message: format!("EGL DMA-BUF import needs 1-4 planes, got {}", planes.len()),
+                egl_error: None,
+                gl_error: None,
+            });
+        }
+        let mut attributes = [EGL_NONE; 64];
+        let mut index = 0;
+        let mut push = |key: i32, value: i32| {
+            attributes[index] = key;
+            attributes[index + 1] = value;
+            index += 2;
+        };
+        push(EGL_WIDTH, width as i32);
+        push(EGL_HEIGHT, height as i32);
+        push(EGL_LINUX_DRM_FOURCC_EXT, fourcc as i32);
+        for (plane_index, plane) in planes.iter().enumerate() {
+            let fd_key = [
+                EGL_DMA_BUF_PLANE0_FD_EXT,
+                EGL_DMA_BUF_PLANE1_FD_EXT,
+                EGL_DMA_BUF_PLANE2_FD_EXT,
+                EGL_DMA_BUF_PLANE3_FD_EXT,
+            ][plane_index];
+            let offset_key = [
+                EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+                EGL_DMA_BUF_PLANE1_OFFSET_EXT,
+                EGL_DMA_BUF_PLANE2_OFFSET_EXT,
+                EGL_DMA_BUF_PLANE3_OFFSET_EXT,
+            ][plane_index];
+            let pitch_key = [
+                EGL_DMA_BUF_PLANE0_PITCH_EXT,
+                EGL_DMA_BUF_PLANE1_PITCH_EXT,
+                EGL_DMA_BUF_PLANE2_PITCH_EXT,
+                EGL_DMA_BUF_PLANE3_PITCH_EXT,
+            ][plane_index];
+            let modifier_lo_key = [
+                EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
+                EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT,
+                EGL_DMA_BUF_PLANE2_MODIFIER_LO_EXT,
+                EGL_DMA_BUF_PLANE3_MODIFIER_LO_EXT,
+            ][plane_index];
+            let modifier_hi_key = [
+                EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
+                EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT,
+                EGL_DMA_BUF_PLANE2_MODIFIER_HI_EXT,
+                EGL_DMA_BUF_PLANE3_MODIFIER_HI_EXT,
+            ][plane_index];
+            push(fd_key, plane.fd);
+            push(offset_key, plane.offset as i32);
+            push(pitch_key, plane.stride as i32);
+            push(modifier_lo_key, (modifier & 0xffff_ffff) as i32);
+            push(modifier_hi_key, (modifier >> 32) as i32);
+        }
+        attributes[index] = EGL_NONE;
         let image = unsafe {
             (self.api.egl_create_image)(
                 self.display,
@@ -900,7 +1459,18 @@ impl EglState {
         };
         if image.is_null() {
             let error = unsafe { (self.api.egl_get_error)() };
-            return Err(format!("eglCreateImageKHR failed (0x{error:x})"));
+            return Err(EglImportError {
+                stage: EglImportStage::CreateImage,
+                message: format!(
+                    "eglCreateImageKHR failed (0x{error:x} {}) for {} plane(s) of {} with {}",
+                    egl_error_name(error),
+                    planes.len(),
+                    crate::dbus_dmabuf::fourcc_name(fourcc),
+                    modifier_name(modifier)
+                ),
+                egl_error: Some(error),
+                gl_error: None,
+            });
         }
 
         let mut texture = 0;
@@ -913,16 +1483,24 @@ impl EglState {
             (self.api.egl_destroy_image)(self.display, image);
         }
         if texture == 0 {
-            return Err("glGenTextures returned 0".to_owned());
+            return Err(EglImportError {
+                stage: EglImportStage::Texture,
+                message: "glGenTextures returned 0".to_owned(),
+                egl_error: None,
+                gl_error: None,
+            });
         }
         let gl_error = unsafe { (self.api.gl_get_error)() };
         if gl_error != GL_NO_ERROR {
             unsafe {
                 (self.api.gl_delete_textures)(1, &texture);
             }
-            return Err(format!(
-                "glEGLImageTargetTexture2DOES failed (GL error 0x{gl_error:x})"
-            ));
+            return Err(EglImportError {
+                stage: EglImportStage::TargetTexture,
+                message: format!("glEGLImageTargetTexture2DOES failed (GL error 0x{gl_error:x})"),
+                egl_error: None,
+                gl_error: Some(gl_error),
+            });
         }
 
         let mut framebuffer = 0;
@@ -943,9 +1521,12 @@ impl EglState {
                 (self.api.gl_delete_framebuffers)(1, &framebuffer);
                 (self.api.gl_delete_textures)(1, &texture);
             }
-            return Err(format!(
-                "framebuffer for imported DMA-BUF is incomplete (0x{status:x})"
-            ));
+            return Err(EglImportError {
+                stage: EglImportStage::Framebuffer,
+                message: format!("framebuffer for imported DMA-BUF is incomplete (0x{status:x})"),
+                egl_error: None,
+                gl_error: None,
+            });
         }
 
         // Replace an older binding in the same state, if any.
@@ -998,7 +1579,6 @@ impl EglState {
         Ok(pixels)
     }
 
-    #[cfg(test)]
     fn paint_quadrants(&self, colors: [[f32; 4]; 4]) -> Result<(), String> {
         self.make_current()?;
         let half_width = self.width / 2;
@@ -1114,11 +1694,18 @@ unsafe fn choose_config(api: &Api, display: *mut c_void) -> Result<*mut c_void, 
     Err(format!("eglChooseConfig failed (0x{error:x})"))
 }
 
-/// An imported tiled DMA-BUF and the EGL/GL state that reads it back.
-pub(crate) struct TiledEglBuffer {
-    /// Declared before `fd` so GL teardown runs while the descriptor is open.
-    state: EglState,
+/// One owned DMA-BUF plane plus the byte offset/stride EGL needs.
+struct OwnedPlane {
     fd: OwnedFd,
+    offset: u32,
+    stride: u32,
+}
+
+/// An imported tiled/composited DMA-BUF and the EGL/GL state that reads it back.
+pub(crate) struct TiledEglBuffer {
+    /// Declared before `planes` so GL teardown runs while the descriptors are open.
+    state: EglState,
+    planes: Vec<OwnedPlane>,
     modifier: u64,
 }
 
@@ -1127,7 +1714,6 @@ impl TiledEglBuffer {
     ///
     /// `width`/`height` are the backing-buffer dimensions, not the display
     /// crop; the caller applies `x`/`y`/`y0_top` through `MappedDmaBuf`.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         fd: OwnedFd,
         width: u32,
@@ -1137,27 +1723,86 @@ impl TiledEglBuffer {
         offset: u32,
         stride: u32,
     ) -> Result<Self, String> {
+        Self::new_with_planes(vec![(fd, offset, stride)], width, height, fourcc, modifier)
+    }
+
+    /// Import a packed DMA-BUF with one or more planes.
+    ///
+    /// AMD DCC exports the main surface and its DCC metadata as two planes;
+    /// Mesa requires both for the `EGLImage` and fails with `EGL_BAD_MATCH`
+    /// when only the main plane is supplied. Non-DCC packed formats must use
+    /// exactly one plane. All planes carry the same modifier.
+    pub(crate) fn new_with_planes(
+        planes: Vec<(OwnedFd, u32, u32)>,
+        width: u32,
+        height: u32,
+        fourcc: u32,
+        modifier: u64,
+    ) -> Result<Self, String> {
         if width == 0 || height == 0 {
             return Err("tiled DMA-BUF has a zero dimension".to_owned());
         }
-        if stride < width.saturating_mul(4) {
+        if !crate::dbus_dmabuf::is_packed_fourcc(fourcc) {
             return Err(format!(
-                "tiled DMA-BUF stride {stride} is smaller than a {width}-pixel BGRA row ({})",
-                width.saturating_mul(4)
+                "{} is not a packed 32-bit fourcc; the EGL path cannot convert it to BGRA",
+                crate::dbus_dmabuf::fourcc_name(fourcc)
             ));
         }
-        let needed = (offset as u64)
-            .checked_add((stride as u64).saturating_mul(height as u64))
-            .ok_or_else(|| "tiled DMA-BUF plane length overflows".to_owned())?;
-        if let Ok(stat) = nix::sys::stat::fstat(&fd) {
-            if stat.st_size > 0 && (stat.st_size as u64) < needed {
-                return Err(format!(
-                    "tiled DMA-BUF reports {} bytes; {needed} are required",
-                    stat.st_size
-                ));
-            }
-        }
         classify_modifier(modifier, fourcc)?;
+
+        let aux_expected = modifier_requires_aux_plane(modifier);
+        let expected_planes = if aux_expected { 2 } else { 1 };
+        if planes.len() != expected_planes {
+            return Err(format!(
+                "modifier {} needs {expected_planes} EGL plane(s), but {} descriptor(s) were \
+                 supplied{}",
+                modifier_name(modifier),
+                planes.len(),
+                if aux_expected {
+                    " (the DCC metadata plane is missing)"
+                } else {
+                    ""
+                }
+            ));
+        }
+
+        let row_bytes = width
+            .checked_mul(4)
+            .ok_or_else(|| "tiled DMA-BUF row length overflows".to_owned())?;
+        let mut owned = Vec::with_capacity(planes.len());
+        for (index, (fd, offset, stride)) in planes.into_iter().enumerate() {
+            let stat = nix::sys::stat::fstat(&fd).ok();
+            if index == 0 {
+                if stride < row_bytes {
+                    return Err(format!(
+                        "tiled DMA-BUF stride {stride} is smaller than a {width}-pixel BGRA row \
+                         ({row_bytes})"
+                    ));
+                }
+                let needed = (offset as u64)
+                    .checked_add((stride as u64).saturating_mul(height as u64))
+                    .ok_or_else(|| "tiled DMA-BUF plane length overflows".to_owned())?;
+                if let Some(stat) = stat {
+                    if stat.st_size > 0 && (stat.st_size as u64) < needed {
+                        return Err(format!(
+                            "tiled DMA-BUF reports {} bytes; {needed} are required",
+                            stat.st_size
+                        ));
+                    }
+                }
+            } else if let Some(stat) = stat {
+                // The DCC metadata plane is not laid out as `stride * height`
+                // pixel rows, so only check that its offset is inside the
+                // descriptor.
+                if stat.st_size > 0 && (stat.st_size as u64) <= offset as u64 {
+                    return Err(format!(
+                        "DCC metadata plane offset {offset} is outside its {}-byte descriptor",
+                        stat.st_size
+                    ));
+                }
+            }
+            owned.push(OwnedPlane { fd, offset, stride });
+        }
 
         let loaded = load();
         let Some(api) = loaded.api.as_ref() else {
@@ -1167,24 +1812,25 @@ impl TiledEglBuffer {
                 .unwrap_or_else(|| "EGL/GBM loader failed".to_owned()));
         };
 
+        let plane_attrs: Vec<PlaneAttrs> = owned
+            .iter()
+            .map(|plane| PlaneAttrs {
+                fd: plane.fd.as_raw_fd(),
+                offset: plane.offset,
+                stride: plane.stride,
+            })
+            .collect();
+
         let mut failures = Vec::new();
         for node in candidate_devices() {
             let path = node.display().to_string();
             match EglState::new(api, &node) {
                 Ok(mut state) => {
-                    match state.bind_dmabuf(
-                        fd.as_raw_fd(),
-                        width,
-                        height,
-                        fourcc,
-                        modifier,
-                        offset,
-                        stride,
-                    ) {
+                    match state.bind_dmabuf(&plane_attrs, width, height, fourcc, modifier) {
                         Ok(()) => {
                             return Ok(Self {
                                 state,
-                                fd,
+                                planes: owned,
                                 modifier,
                             })
                         }
@@ -1198,9 +1844,10 @@ impl TiledEglBuffer {
             Err("no /dev/dri/renderD* node was available for EGL import".to_owned())
         } else {
             Err(format!(
-                "no EGL render node accepted {} with {}: {}",
+                "no EGL render node accepted {} with {} ({} plane(s)): {}",
                 crate::dbus_dmabuf::fourcc_name(fourcc),
                 modifier_name(modifier),
+                plane_attrs.len(),
                 failures.join("; ")
             ))
         }
@@ -1212,7 +1859,11 @@ impl TiledEglBuffer {
     }
 
     fn sync(&self, start: bool) -> Result<(), String> {
-        crate::dbus_dmabuf::sync_fd(self.fd.as_raw_fd(), start).map_err(|error| error.to_string())
+        for plane in &self.planes {
+            crate::dbus_dmabuf::sync_fd(plane.fd.as_raw_fd(), start)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     /// Read the current backing buffer into tightly packed BGRA in DMA-BUF row
@@ -1232,7 +1883,7 @@ impl TiledEglBuffer {
 #[cfg(test)]
 impl TiledEglBuffer {
     /// Create a tiled GBM buffer, paint four quadrants through GL, and return
-    /// its descriptor plus the EGL-reported plane 0 stride.
+    /// its single descriptor plus the EGL-reported plane 0 stride.
     ///
     /// This is a real driver buffer, not a synthetic byte layout: GBM performs
     /// the tiling/swizzling and GL writes through the same EGLImage path this
@@ -1243,6 +1894,29 @@ impl TiledEglBuffer {
         height: u32,
         colors: [[f32; 4]; 4],
     ) -> Result<(OwnedFd, u32), String> {
+        let (mut planes, stride) = Self::synthetic_fixture_planes(modifier, width, height, colors)?;
+        if planes.len() != 1 {
+            return Err(format!(
+                "modifier {} produced {} planes; use synthetic_fixture_planes",
+                modifier_name(modifier),
+                planes.len()
+            ));
+        }
+        let (fd, _, _) = planes.pop().expect("checked one plane");
+        Ok((fd, stride))
+    }
+
+    /// Like [`Self::synthetic_fixture`], but returns every plane GBM exported.
+    ///
+    /// AMD DCC buffers have a second (metadata) plane; the returned vector is
+    /// `(fd, offset, stride)` per plane and can be passed to
+    /// [`Self::new_with_planes`].
+    pub(crate) fn synthetic_fixture_planes(
+        modifier: u64,
+        width: u32,
+        height: u32,
+        colors: [[f32; 4]; 4],
+    ) -> Result<(Vec<(OwnedFd, u32, u32)>, u32), String> {
         if width < 2 || height < 2 {
             return Err("fixture dimensions must be at least 2x2".to_owned());
         }
@@ -1279,30 +1953,37 @@ impl TiledEglBuffer {
                 continue;
             }
             let reported = unsafe { (api.gbm_bo_get_modifier)(bo) };
-            let stride = unsafe { (api.gbm_bo_get_stride)(bo) };
-            let raw_fd = unsafe { (api.gbm_bo_get_fd)(bo) };
+            let planes = unsafe { gbm_bo_planes(api, bo) };
             unsafe { (api.gbm_bo_destroy)(bo) };
-            if raw_fd < 0 {
-                failures.push(format!("{path}: gbm_bo_get_fd failed"));
-                continue;
-            }
-            // `gbm_bo_get_fd` returns a newly owned descriptor.
-            let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+            let planes = match planes {
+                Ok(planes) => planes,
+                Err(error) => {
+                    failures.push(format!("{path}: {error}"));
+                    continue;
+                }
+            };
             if reported != modifier {
                 failures.push(format!(
                     "{path}: GBM returned modifier {reported:#018x}, expected {modifier:#018x}"
                 ));
                 continue;
             }
+            let stride0 = planes.first().map(|plane| plane.2).unwrap_or(0);
+            let attrs: Vec<PlaneAttrs> = planes
+                .iter()
+                .map(|(fd, offset, stride)| PlaneAttrs {
+                    fd: fd.as_raw_fd(),
+                    offset: *offset,
+                    stride: *stride,
+                })
+                .collect();
             if state
                 .bind_dmabuf(
-                    fd.as_raw_fd(),
+                    &attrs,
                     width,
                     height,
                     crate::dbus_dmabuf::DRM_FORMAT_XRGB8888,
                     modifier,
-                    0,
-                    stride,
                 )
                 .is_err()
             {
@@ -1310,7 +1991,7 @@ impl TiledEglBuffer {
                 continue;
             }
             state.paint_quadrants(colors)?;
-            return Ok((fd, stride));
+            return Ok((planes, stride0));
         }
         Err(format!(
             "no render node could create the tiled fixture: {}",

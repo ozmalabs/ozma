@@ -33,11 +33,14 @@
 //!
 //! A named tiled modifier that the optional GBM/EGL helper understands is
 //! imported through an EGLImage and read back as BGRA; see
-//! [`crate::dmabuf_egl`]. Compressed/DCC/CCS layouts, tiled YUV, and
-//! `DRM_FORMAT_MOD_INVALID` are rejected with a typed error naming the exact
-//! modifier, fourcc, and reason rather than being interpreted as linear pixels.
-//! QEMU's AMD render-node path is known to send `DRM_FORMAT_MOD_INVALID`; it is
-//! refused because the exporter has not reported a concrete layout.
+//! [`crate::dmabuf_egl`]. AMD DCC is imported from its main surface plus the
+//! separate DCC metadata plane that `ScanoutDMABUF2` carries; a one-descriptor
+//! `ScanoutDMABUF` cannot supply that plane and is rejected with a typed error.
+//! Intel CCS, tiled YUV, and `DRM_FORMAT_MOD_INVALID` are rejected with a typed
+//! error naming the exact modifier, fourcc, and reason rather than being
+//! interpreted as linear/tiled pixels. QEMU's AMD render-node path is known to
+//! send `DRM_FORMAT_MOD_INVALID`; it is refused because the exporter has not
+//! reported a concrete layout.
 //!
 //! ## CPU access
 //!
@@ -750,6 +753,14 @@ impl MappedDmaBuf {
         )?;
 
         if header.modifier != DRM_FORMAT_MOD_LINEAR {
+            if crate::dmabuf_egl::modifier_requires_aux_plane(header.modifier) {
+                return Err(DmaBufError::Unsupported(format!(
+                    "fourcc {} uses DCC modifier {}; DCC needs the separate metadata plane, but \
+                     ScanoutDMABUF carries one descriptor (use ScanoutDMABUF2 with both planes)",
+                    fourcc_name(header.fourcc),
+                    crate::dmabuf_egl::modifier_name(header.modifier)
+                )));
+            }
             if !is_packed_fourcc(header.fourcc) || format.is_yuv() {
                 return Err(DmaBufError::Unsupported(format!(
                     "tiled fourcc {} needs a colour-conversion shader; only packed 32-bit tiled scanouts are supported",
@@ -879,11 +890,24 @@ impl MappedDmaBuf {
             )));
         }
         let expected = format.plane_count();
-        if num_planes != expected {
-            return Err(DmaBufError::Unsupported(format!(
-                "fourcc {} requires {expected} planes, but ScanoutDMABUF2 declares {num_planes}",
-                fourcc_name(header.fourcc)
-            )));
+        let aux_required = crate::dmabuf_egl::modifier_requires_aux_plane(header.modifier);
+        let expected_total = expected + usize::from(aux_required);
+        if num_planes != expected_total {
+            let detail = if aux_required {
+                format!(
+                    "fourcc {} uses DCC modifier {}, which requires {expected} main plane(s) plus \
+                     the DCC metadata plane ({expected_total} total), but ScanoutDMABUF2 declares \
+                     {num_planes}",
+                    fourcc_name(header.fourcc),
+                    crate::dmabuf_egl::modifier_name(header.modifier)
+                )
+            } else {
+                format!(
+                    "fourcc {} requires {expected} planes, but ScanoutDMABUF2 declares {num_planes}",
+                    fourcc_name(header.fourcc)
+                )
+            };
+            return Err(DmaBufError::Unsupported(detail));
         }
 
         let backing_width = if header.backing_width == 0 {
@@ -920,27 +944,29 @@ impl MappedDmaBuf {
         }
 
         if header.modifier != DRM_FORMAT_MOD_LINEAR {
-            if num_planes != 1 || format.is_yuv() || !is_packed_fourcc(header.fourcc) {
+            if format.is_yuv() || !is_packed_fourcc(header.fourcc) {
                 return Err(DmaBufError::Unsupported(format!(
-                    "tiled fourcc {} with {num_planes} plane(s) needs a colour-conversion or multi-plane EGL path; only single-plane packed 32-bit tiled scanouts are supported",
+                    "tiled fourcc {} with {num_planes} plane(s) needs a colour-conversion EGL path; \
+                     only packed 32-bit tiled scanouts are supported",
                     fourcc_name(header.fourcc)
                 )));
             }
-            let fd = fds.into_iter().next().ok_or_else(|| {
-                DmaBufError::Protocol("tiled scanout lost its descriptor".to_owned())
-            })?;
-            let tiled = crate::dmabuf_egl::TiledEglBuffer::new(
-                fd,
+            let planes: Vec<(OwnedFd, u32, u32)> = fds
+                .into_iter()
+                .enumerate()
+                .map(|(index, fd)| (fd, header.offsets[index], header.strides[index]))
+                .collect();
+            let tiled = crate::dmabuf_egl::TiledEglBuffer::new_with_planes(
+                planes,
                 backing_width,
                 backing_height,
                 header.fourcc,
                 header.modifier,
-                header.offsets[0],
-                header.strides[0],
             )
             .map_err(|reason| {
                 DmaBufError::Unsupported(format!(
-                    "fourcc {} modifier {} could not be imported through EGL/GBM: {reason}",
+                    "fourcc {} modifier {} with {num_planes} plane(s) could not be imported through \
+                     EGL/GBM: {reason}",
                     fourcc_name(header.fourcc),
                     crate::dmabuf_egl::modifier_name(header.modifier)
                 ))
@@ -1718,9 +1744,19 @@ mod tests {
         assert!(invalid.contains("DRM_FORMAT_MOD_INVALID"), "{invalid}");
         assert!(invalid.contains("did not report"), "{invalid}");
 
-        let dcc = classify_modifier(0x0200_0000_0056_bb03, DRM_FORMAT_XBGR8888).unwrap_err();
-        assert!(dcc.contains("DCC-compressed"), "{dcc}");
-        assert!(dcc.contains("0x020000000056bb03"), "{dcc}");
+        let dcc = 0x0200_0000_0056_bb03;
+        assert!(
+            classify_modifier(dcc, DRM_FORMAT_XBGR8888).is_ok(),
+            "DCC is importable when its metadata plane is supplied"
+        );
+        assert!(crate::dmabuf_egl::modifier_requires_aux_plane(dcc));
+        assert!(!crate::dmabuf_egl::modifier_requires_aux_plane(
+            AMD_FMT_MOD_TILE_GFX9_64K_S
+        ));
+
+        let ccs = classify_modifier(0x0100_0000_0000_0011, DRM_FORMAT_XBGR8888).unwrap_err();
+        assert!(ccs.contains("flat-CCS"), "{ccs}");
+        assert!(ccs.contains("0x0100000000000011"), "{ccs}");
 
         let tiled_yuv =
             classify_modifier(AMD_FMT_MOD_TILE_GFX9_64K_S, DRM_FORMAT_NV12).unwrap_err();
@@ -1749,7 +1785,50 @@ mod tests {
         let error = import(&body, temp_fd(&[0; 16]), 64, 64).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("0x020000000056bb03"), "{message}");
-        assert!(message.contains("DCC-compressed"), "{message}");
+        assert!(message.contains("metadata plane"), "{message}");
+        assert!(message.contains("ScanoutDMABUF2"), "{message}");
+
+        let body = scanout_body(0, 2, 2, 8, DRM_FORMAT_XBGR8888, 0x0100_0000_0000_0011, true);
+        let error = import(&body, temp_fd(&[0; 16]), 64, 64).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("0x0100000000000011"), "{message}");
+        assert!(message.contains("CCS"), "{message}");
+    }
+
+    #[test]
+    fn a_failed_dcc_import_closes_both_descriptors() {
+        let main = tempfile::tempfile().unwrap();
+        main.set_len(16).unwrap();
+        let metadata = tempfile::tempfile().unwrap();
+        metadata.set_len(16).unwrap();
+        let main_raw = main.as_raw_fd();
+        let metadata_raw = metadata.as_raw_fd();
+        let main_identity = fd_identity(main_raw);
+        let metadata_identity = fd_identity(metadata_raw);
+        let body = scanout2_body(
+            &[0, 1],
+            0,
+            0,
+            2,
+            2,
+            &[0, 0],
+            &[8, 8],
+            DRM_FORMAT_XBGR8888,
+            2,
+            2,
+            0x0200_0000_0056_bb03,
+            true,
+        );
+        let error = import_v2(&body, vec![main.into(), metadata.into()], 64, 64).unwrap_err();
+        assert!(matches!(error, DmaBufError::Unsupported(_)));
+        assert!(
+            fd_is_closed(main_raw, main_identity),
+            "main descriptor {main_raw} was not closed"
+        );
+        assert!(
+            fd_is_closed(metadata_raw, metadata_identity),
+            "metadata descriptor {metadata_raw} was not closed"
+        );
     }
 
     #[test]
@@ -1825,6 +1904,13 @@ mod tests {
                 "{modifier:#018x}"
             );
         }
+        for modifier in &probe.aux_plane_modifiers {
+            assert!(
+                crate::dmabuf_egl::modifier_requires_aux_plane(*modifier),
+                "{modifier:#018x}"
+            );
+            assert!(probe.supported_modifiers.contains(modifier), "{probe:#?}");
+        }
         for unsupported in &probe.unsupported_modifiers {
             assert!(!unsupported.reason.is_empty(), "{unsupported:?}");
             assert!(
@@ -1843,6 +1929,186 @@ mod tests {
         file.set_len(16).unwrap();
         assert!(sync_fd(file.as_raw_fd(), true).is_ok());
         assert!(sync_fd(file.as_raw_fd(), false).is_ok());
+    }
+
+    #[test]
+    fn dcc_scanout_dmabuf2_requires_the_metadata_plane() {
+        let body = scanout2_body(
+            &[0],
+            0,
+            0,
+            2,
+            2,
+            &[0],
+            &[8],
+            DRM_FORMAT_XBGR8888,
+            2,
+            2,
+            0x0200_0000_0056_bb03,
+            true,
+        );
+        let error = import_v2(&body, vec![temp_fd(&[0; 16])], 64, 64).unwrap_err();
+        let message = error.to_string();
+        assert!(matches!(error, DmaBufError::Unsupported(_)));
+        assert!(message.contains("0x020000000056bb03"), "{message}");
+        assert!(message.contains("metadata plane"), "{message}");
+        assert!(message.contains("2 total"), "{message}");
+    }
+
+    #[test]
+    fn a_packed_scanout_with_an_unexpected_second_plane_is_typed() {
+        // No DCC bit: a packed 32-bit fourcc must be exactly one plane.
+        let body = scanout2_body(
+            &[0, 1],
+            0,
+            0,
+            2,
+            2,
+            &[0, 16],
+            &[8, 8],
+            DRM_FORMAT_XBGR8888,
+            2,
+            2,
+            crate::dmabuf_egl::I915_FORMAT_MOD_X_TILED,
+            true,
+        );
+        let error =
+            import_v2(&body, vec![temp_fd(&[0; 16]), temp_fd(&[0; 16])], 64, 64).unwrap_err();
+        assert!(matches!(error, DmaBufError::Unsupported(_)));
+        assert!(error.to_string().contains("requires 1 planes"), "{error}");
+    }
+
+    #[test]
+    #[ignore = "requires an AMD render node/EGL and OZMA_DMABUF_TILED_TEST=<hex DCC modifier>"]
+    fn real_dcc_fixture_reads_back_bgra_with_metadata_plane() {
+        let Ok(value) = std::env::var("OZMA_DMABUF_TILED_TEST") else {
+            return;
+        };
+        let modifier = u64::from_str_radix(value.trim().trim_start_matches("0x"), 16).unwrap();
+        if !crate::dmabuf_egl::modifier_requires_aux_plane(modifier) {
+            eprintln!("OZMA_DMABUF_TILED_TEST={modifier:#018x} is not an AMD DCC modifier");
+            return;
+        }
+        let colors = [
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0, 1.0],
+        ];
+        let size = 32u32;
+        let (planes, stride0) = crate::dmabuf_egl::TiledEglBuffer::synthetic_fixture_planes(
+            modifier, size, size, colors,
+        )
+        .unwrap();
+        assert_eq!(
+            planes.len(),
+            2,
+            "DCC fixture must expose its metadata plane"
+        );
+        assert_eq!(planes[0].2, stride0);
+        let offsets: Vec<u32> = planes.iter().map(|plane| plane.1).collect();
+        let strides: Vec<u32> = planes.iter().map(|plane| plane.2).collect();
+        let fds: Vec<std::os::fd::OwnedFd> = planes.into_iter().map(|plane| plane.0).collect();
+        let body = scanout2_body(
+            &[0, 1],
+            0,
+            0,
+            size,
+            size,
+            &offsets,
+            &strides,
+            DRM_FORMAT_XRGB8888,
+            size,
+            size,
+            modifier,
+            true,
+        );
+        let mapped = import_v2(&body, fds, 64, 64).unwrap();
+        let snapshot = mapped.snapshot_bgra().unwrap();
+        let half_row = (size as usize / 2) * 4;
+        let last_row = (size as usize - 1) * size as usize * 4;
+        assert_eq!(&snapshot[0..4], &[0, 0, 255, 255], "red BGRA");
+        assert_eq!(
+            &snapshot[half_row..half_row + 4],
+            &[0, 255, 0, 255],
+            "green BGRA"
+        );
+        assert_eq!(
+            &snapshot[last_row..last_row + 4],
+            &[255, 0, 0, 255],
+            "blue BGRA"
+        );
+        assert_eq!(
+            &snapshot[last_row + half_row..last_row + half_row + 4],
+            &[255, 255, 255, 255],
+            "white BGRA"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an AMD render node/EGL and OZMA_DMABUF_TILED_TEST=<hex DCC modifier>"]
+    fn one_plane_dcc_import_is_rejected_before_egl() {
+        let Ok(value) = std::env::var("OZMA_DMABUF_TILED_TEST") else {
+            return;
+        };
+        let modifier = u64::from_str_radix(value.trim().trim_start_matches("0x"), 16).unwrap();
+        if !crate::dmabuf_egl::modifier_requires_aux_plane(modifier) {
+            return;
+        }
+        let colors = [
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0, 1.0],
+        ];
+        let (mut planes, _) =
+            crate::dmabuf_egl::TiledEglBuffer::synthetic_fixture_planes(modifier, 32, 32, colors)
+                .unwrap();
+        assert_eq!(planes.len(), 2);
+        let (main, offset, stride) = planes.remove(0);
+        drop(planes); // close the metadata plane: exactly what a v1 message does
+        let error = match crate::dmabuf_egl::TiledEglBuffer::new_with_planes(
+            vec![(main, offset, stride)],
+            32,
+            32,
+            DRM_FORMAT_XRGB8888,
+            modifier,
+        ) {
+            Ok(_) => panic!("one-plane DCC import unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        // The importer refuses before EGL; letting it through would make Mesa
+        // return EGL_BAD_MATCH (0x3009).
+        assert!(error.contains("needs 2 EGL plane(s)"), "{error}");
+        assert!(error.contains("metadata plane"), "{error}");
+    }
+
+    #[test]
+    #[ignore = "allocates real GBM buffers; run with --nocapture to print host compressed-modifier results"]
+    fn compressed_modifier_probe_reports_every_host_modifier() {
+        let results = crate::dbus_display::compressed_modifier_probe();
+        for result in &results {
+            println!("{result:#?}");
+            assert!(result.node.starts_with("/dev/dri/") || result.node.is_empty());
+            assert!(!result.detail.is_empty(), "{result:?}");
+            match result.verdict {
+                crate::dmabuf_egl::ModifierImportVerdict::Verified => {
+                    assert!(result.gbm_allocated, "{result:?}");
+                    assert_eq!(result.gbm_reported_modifier, Some(result.modifier));
+                }
+                crate::dmabuf_egl::ModifierImportVerdict::EglImportFailed => {
+                    assert!(result.egl_error.is_some(), "{result:?}");
+                }
+                crate::dmabuf_egl::ModifierImportVerdict::CompressedMetadataMissing => {
+                    assert_eq!(result.planes, 1, "{result:?}");
+                    assert!(crate::dmabuf_egl::modifier_is_compressed(result.modifier));
+                }
+                crate::dmabuf_egl::ModifierImportVerdict::GbmAllocationFailed
+                | crate::dmabuf_egl::ModifierImportVerdict::FramebufferIncomplete
+                | crate::dmabuf_egl::ModifierImportVerdict::ReadbackFailed
+                | crate::dmabuf_egl::ModifierImportVerdict::Unavailable => {}
+            }
+        }
     }
 
     #[test]

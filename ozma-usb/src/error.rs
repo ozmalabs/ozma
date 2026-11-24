@@ -104,6 +104,15 @@ pub enum UsbError {
     #[error("USB/IP is disabled in the node configuration")]
     UsbIpDisabled,
 
+    /// A USB/IP host or token was rejected by the allow-list.
+    #[error("USB/IP authorization denied for host {host:?}: {reason}")]
+    UsbIpUnauthorized {
+        /// Remote host that was checked.
+        host: String,
+        /// Why it was denied (never includes the supplied token).
+        reason: String,
+    },
+
     /// A `usbip`/NBD response could not be parsed.
     #[error("invalid {protocol} response: {reason}")]
     Protocol {
@@ -190,6 +199,7 @@ impl UsbError {
             Self::UnsupportedMediaFormat { .. } => "unsupported-media-format",
             Self::InvalidUsbIp { .. } => "invalid-usbip",
             Self::UsbIpDisabled => "usbip-disabled",
+            Self::UsbIpUnauthorized { .. } => "usbip-unauthorized",
             Self::Protocol { .. } => "protocol-error",
             Self::ConfigFs { .. } => "configfs-io",
             Self::Io { .. } => "io",
