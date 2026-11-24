@@ -1147,10 +1147,28 @@ async fn webrtc_offer_proxies_to_a_fake_unix_socket_helper() {
         assert_eq!(request["type"], "offer");
         assert_eq!(request["sdp"], "v=0 parity offer");
         server_writer
-            .write_all(b"{\"type\":\"answer\",\"sdp\":\"v=0 parity answer\"}\n")
+            .write_all(
+                b"{\"type\":\"answer\",\"sdp\":\"v=0 parity answer\",\"session\":\"sess-1\"}\n",
+            )
             .await
             .expect("write answer");
         server_writer.flush().await.expect("flush answer");
+
+        line.clear();
+        reader.read_line(&mut line).await.expect("read candidate");
+        let request: Value = serde_json::from_str(line.trim()).expect("candidate JSON");
+        assert_eq!(request["type"], "add-ice-candidate");
+        assert_eq!(request["session"], "sess-1");
+        assert_eq!(
+            request["candidate"],
+            "candidate:1 1 UDP 2122260223 192.0.2.1 5000 typ host"
+        );
+        assert_eq!(request["sdpMLineIndex"], 0);
+        server_writer
+            .write_all(b"{\"ok\":true}\n")
+            .await
+            .expect("write candidate ack");
+        server_writer.flush().await.expect("flush candidate ack");
     });
 
     let spawner = Arc::new(FakeHelperSpawner::new(Box::new(PairSignaler {
@@ -1169,6 +1187,10 @@ async fn webrtc_offer_proxies_to_a_fake_unix_socket_helper() {
         bitrate_kbps: 4_000,
         audio_source: None,
         audio_backend: Default::default(),
+        stun_server: None,
+        turn_server: None,
+        turn_user: None,
+        turn_password: None,
         startup_timeout: Duration::from_millis(50),
         offer_timeout: Duration::from_secs(1),
     };
@@ -1213,6 +1235,20 @@ async fn webrtc_offer_proxies_to_a_fake_unix_socket_helper() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["type"], "answer");
     assert_eq!(body["sdp"], "v=0 parity answer");
+    assert_eq!(body["session"], "sess-1");
+
+    let (status, body) = post_json(
+        &app,
+        "/webrtc/candidate",
+        json!({
+            "session": "sess-1",
+            "candidate": "candidate:1 1 UDP 2122260223 192.0.2.1 5000 typ host",
+            "sdpMLineIndex": 0
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], true);
 
     control.shutdown().await;
     helper_task.await.expect("fake helper task");
@@ -1251,6 +1287,10 @@ async fn webrtc_bitrate_is_not_reported_as_success_without_an_ack() {
         bitrate_kbps: 4_000,
         audio_source: None,
         audio_backend: Default::default(),
+        stun_server: None,
+        turn_server: None,
+        turn_user: None,
+        turn_password: None,
         startup_timeout: Duration::from_millis(50),
         offer_timeout: Duration::from_millis(100),
     };

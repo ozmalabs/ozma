@@ -20,6 +20,7 @@ import os
 import sys
 import time
 import threading
+from urllib.parse import quote
 
 # Populated by `load_gstreamer()`; `None` until then.
 Gst = None
@@ -40,6 +41,13 @@ MAX_BITRATE_BPS = 50_000_000
 DESCRIPTION_TIMEOUT_SECONDS = 5.0
 #: Bounded wait for ICE gathering after the local answer is set, in seconds.
 ICE_GATHER_TIMEOUT_SECONDS = 5.0
+
+#: Schemes accepted by the STUN/TURN URI normalisers.
+STUN_SCHEMES = frozenset({"stun", "stuns"})
+TURN_SCHEMES = frozenset({"turn", "turns"})
+
+#: ICE candidate types emitted by webrtcbin that this worker can name.
+CANDIDATE_TYPES = frozenset({"host", "srflx", "prflx", "relay"})
 
 #: Elements required by the optional audio branch (besides the source).
 AUDIO_PIPELINE_ELEMENTS = frozenset(
@@ -126,6 +134,116 @@ def select_audio_source_element(
             )
             return element, property_name
     return None
+
+
+def _split_ice_address(value: str, schemes: frozenset[str], default: str):
+    """Return ``(scheme, host[:port])`` for a STUN/TURN address.
+
+    Accepts webrtcbin URI form (``stun://host:port``), the common
+    ``stun:host:port`` form, and a bare ``host:port``. Credentials are never
+    accepted in this part of the address.
+    """
+    value = (value or "").strip()
+    if not value:
+        raise ValueError("ICE server address must not be empty")
+    if any(character.isspace() for character in value):
+        raise ValueError("ICE server address must not contain whitespace")
+    if "@" in value:
+        raise ValueError(
+            "ICE server address must not embed credentials; use the TURN "
+            "username/password arguments"
+        )
+    scheme, separator, rest = value.partition("://")
+    if not separator:
+        head, colon, tail = value.partition(":")
+        if colon and head.lower() in schemes:
+            scheme, rest = head, tail
+        elif colon and head.lower() in (STUN_SCHEMES | TURN_SCHEMES):
+            raise ValueError(
+                f"unsupported ICE scheme {head.lower()!r}; expected one of "
+                f"{', '.join(sorted(schemes))}"
+            )
+        else:
+            scheme, rest = default, value
+    scheme = scheme.lower()
+    if scheme not in schemes:
+        raise ValueError(
+            f"unsupported ICE scheme {scheme!r}; expected one of "
+            f"{', '.join(sorted(schemes))}"
+        )
+    rest = rest.strip()
+    if not rest:
+        raise ValueError("ICE server address is missing a host")
+    return scheme, rest
+
+
+def normalize_stun_server(value: str) -> str:
+    """Return webrtcbin's ``stun://host:port`` form for *value*."""
+    scheme, rest = _split_ice_address(value, STUN_SCHEMES, "stun")
+    return f"{scheme}://{rest}"
+
+
+def normalize_turn_address(value: str) -> tuple[str, str]:
+    """Return ``(scheme, host[:port])`` for a TURN address without credentials."""
+    return _split_ice_address(value, TURN_SCHEMES, "turn")
+
+
+def build_turn_uri(
+    server: str, username: str | None, password: str | None
+) -> str:
+    """Build webrtcbin's ``turn://user:password@host:port`` property value.
+
+    The username and password are percent-encoded so a colon, at-sign, slash,
+    or base64 padding cannot change the URI's authority. The password is never
+    returned in logs or status by the worker.
+    """
+    if not username or not password:
+        raise ValueError("TURN requires both a username and a password")
+    scheme, rest = normalize_turn_address(server)
+    user = quote(username, safe="")
+    secret = quote(password, safe="")
+    return f"{scheme}://{user}:{secret}@{rest}"
+
+
+def candidate_type(candidate: str) -> str | None:
+    """Return the candidate's ICE type (``host``/``srflx``/``prflx``/``relay``).
+
+    ``None`` means the candidate did not carry a recognised ``typ`` token. The
+    worker only labels candidates it actually received from webrtcbin; it never
+    invents a candidate.
+    """
+    value = candidate.strip()
+    if value.startswith("a="):
+        value = value[2:]
+    parts = value.split()
+    try:
+        index = parts.index("typ")
+    except ValueError:
+        return None
+    if index + 1 >= len(parts):
+        return None
+    kind = parts[index + 1].lower()
+    return kind if kind in CANDIDATE_TYPES else None
+
+
+def candidate_type_counts(candidates) -> dict[str, int]:
+    """Count the ICE types in ``(mline, candidate)`` pairs."""
+    counts: dict[str, int] = {}
+    for _mline, candidate in candidates:
+        kind = candidate_type(candidate)
+        if kind is not None:
+            counts[kind] = counts.get(kind, 0) + 1
+    return counts
+
+
+def validate_stun_turn_args(args) -> None:
+    """Validate CLI ICE arguments, raising ``ValueError`` for argparse."""
+    if args.stun_server:
+        normalize_stun_server(args.stun_server)
+    if args.turn_server:
+        build_turn_uri(args.turn_server, args.turn_user, args.turn_password)
+    elif args.turn_user or args.turn_password:
+        raise ValueError("--turn-user/--turn-password require --turn-server")
 
 
 def build_pipeline_string(
@@ -346,6 +464,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "falls back to pipewiresrc); ignored without --audio-source"
         ),
     )
+    parser.add_argument(
+        "--stun-server",
+        default=None,
+        help=(
+            "STUN server (stun://host:port, stun:host:port, or host:port); "
+            "omit to keep host-candidate-only gathering"
+        ),
+    )
+    parser.add_argument(
+        "--turn-server",
+        default=None,
+        help=(
+            "TURN server address without credentials (turn://host:port, "
+            "turn:host:port, or host:port); requires --turn-user and "
+            "--turn-password"
+        ),
+    )
+    parser.add_argument(
+        "--turn-user",
+        default=None,
+        help="TURN username; requires --turn-server",
+    )
+    parser.add_argument(
+        "--turn-password",
+        default=None,
+        help="TURN password; requires --turn-server and is never logged",
+    )
     return parser
 
 
@@ -358,6 +503,10 @@ class WebRTCWorker:
         fps: int,
         audio_source: str | None = None,
         audio_backend: str = "auto",
+        stun_server: str | None = None,
+        turn_server: str | None = None,
+        turn_user: str | None = None,
+        turn_password: str | None = None,
     ):
         self.shm_path = shm_path
         self.width = width
@@ -365,8 +514,30 @@ class WebRTCWorker:
         self.fps = fps
         self.audio_source = audio_source or None
         self.audio_backend = audio_backend
+        self.stun_server = (
+            normalize_stun_server(stun_server) if stun_server else None
+        )
+        self.turn_uri = (
+            build_turn_uri(turn_server, turn_user, turn_password)
+            if turn_server
+            else None
+        )
         self.sessions = {}
         self.mainloop = None
+
+    def ice_properties(self) -> dict[str, str]:
+        """Return the webrtcbin ICE properties for this worker.
+
+        Empty when no STUN/TURN server was configured, which preserves the
+        historical host-candidate-only pipeline. The TURN value contains
+        credentials and must never be logged.
+        """
+        properties = {}
+        if self.stun_server:
+            properties["stun-server"] = self.stun_server
+        if self.turn_uri:
+            properties["turn-server"] = self.turn_uri
+        return properties
 
     # -- optional audio ---------------------------------------------------
 
@@ -453,15 +624,14 @@ class WebRTCWorker:
 
     # -- sessions ---------------------------------------------------------
 
-    def create_session(self, offer_sdp: str) -> str | None:
-        """Create a WebRTC session from an SDP offer. Returns answer SDP.
+    def create_session(self, offer_sdp: str) -> tuple[str, str] | None:
+        """Create a WebRTC session from an SDP offer.
 
-        ``webrtcbin`` only builds an answer once the bin is in ``PLAYING`` and
-        the remote description has been applied.  Those two operations are
-        asynchronous in GStreamer, so this waits on their promises and then
-        gathers host ICE candidates before returning.  The candidates are
-        appended to the answer SDP because the signaling protocol has no
-        trickle-ICE message.
+        Returns ``(answer_sdp, session_id)``. The answer carries every local
+        candidate gathered before the bounded gathering wait completes, so a
+        peer that never sends a trickle message still works. The session id lets
+        a peer deliver late remote candidates through
+        :meth:`add_ice_candidate`.
         """
         import uuid
         sid = uuid.uuid4().hex[:8]
@@ -480,11 +650,30 @@ class WebRTCWorker:
         appsrc = pipeline.get_by_name("src")
         video_encoder = pipeline.get_by_name(VIDEO_ENCODER_NAME)
 
+        # STUN/TURN are only applied when configured. Without them the element
+        # keeps its historical host-candidate-only behavior.
+        ice_properties = self.ice_properties()
+        for property_name, value in ice_properties.items():
+            webrtc.set_property(property_name, value)
+
+        session = {
+            "pipeline": pipeline,
+            "appsrc": appsrc,
+            "video_encoder": video_encoder,
+            "webrtc": webrtc,
+            "audio": audio_enabled,
+            "local_candidates": [],
+            "remote_candidates": [],
+            "gather_complete": False,
+        }
+        self.sessions[sid] = session
+
         # `create-answer` returns no answer when the bin is still in NULL.
         pipeline.set_state(Gst.State.PLAYING)
         result, _, _ = pipeline.get_state(Gst.CLOCK_TIME_NONE)
         if result == Gst.StateChangeReturn.FAILURE:
             pipeline.set_state(Gst.State.NULL)
+            self.sessions.pop(sid, None)
             print("WebRTC pipeline failed to reach PLAYING", file=sys.stderr,
                   flush=True)
             return None
@@ -517,14 +706,17 @@ class WebRTCWorker:
                 flush=True,
             )
             pipeline.set_state(Gst.State.NULL)
+            self.sessions.pop(sid, None)
             return None
 
         remote_candidates = remote_ice_candidates(offer_sdp)
+        session["remote_candidates"].extend(remote_candidates)
         for mline, candidate in remote_candidates:
             webrtc.emit("add-ice-candidate", mline, candidate)
 
-        # Collect local host candidates; they have to travel inside the answer.
-        local_candidates: list[tuple[int, str]] = []
+        # Collect local candidates; the ones already known travel inside the
+        # answer so a peer that does not poll for late candidates still works.
+        local_candidates: list[tuple[int, str]] = session["local_candidates"]
         gather_complete = threading.Event()
 
         def on_candidate(_webrtc, mline, candidate):
@@ -534,6 +726,7 @@ class WebRTCWorker:
         def on_gathering_state(*_args):
             state = webrtc.get_property("ice-gathering-state")
             if state == GstWebRTC.WebRTCICEGatheringState.COMPLETE:
+                session["gather_complete"] = True
                 gather_complete.set()
 
         webrtc.connect("on-ice-candidate", on_candidate)
@@ -570,6 +763,7 @@ class WebRTCWorker:
                     flush=True,
                 )
             pipeline.set_state(Gst.State.NULL)
+            self.sessions.pop(sid, None)
             return None
 
         if not gather_complete.wait(timeout=ICE_GATHER_TIMEOUT_SECONDS):
@@ -581,27 +775,79 @@ class WebRTCWorker:
             )
         answer_sdp[0] = append_ice_candidates(answer_sdp[0], local_candidates)
 
-        self.sessions[sid] = {
-            "pipeline": pipeline,
-            "appsrc": appsrc,
-            "video_encoder": video_encoder,
-            "audio": audio_enabled,
-        }
-
         # Start frame feeder
         t = threading.Thread(target=self._feed, args=(sid, appsrc), daemon=True)
         t.start()
 
         enc_name = "NVENC" if nvenc else "x264"
         audio_name = f" audio={self.audio_source}" if audio_enabled else ""
+        types = candidate_type_counts(local_candidates)
+        type_summary = ",".join(
+            f"{kind}={count}" for kind, count in sorted(types.items())
+        ) or "none"
+        ice_summary = "+".join(sorted(ice_properties)) or "none"
         print(
             f"Session {sid}: {self.width}x{self.height}@{self.fps} "
-            f"{enc_name}{audio_name} "
-            f"ice_candidates={len(local_candidates)} "
-            f"remote_candidates={len(remote_candidates)}",
+            f"{enc_name}{audio_name} ice={ice_summary} "
+            f"ice_candidates={len(local_candidates)} ({type_summary}) "
+            f"remote_candidates={len(session['remote_candidates'])}",
             flush=True,
         )
-        return answer_sdp[0]
+        return answer_sdp[0], sid
+
+    def add_ice_candidate(
+        self, session_id: str | None, candidate: str, sdp_mline_index: int = 0
+    ) -> dict:
+        """Add one trickled remote ICE candidate to an existing session.
+
+        When ``session_id`` is omitted the candidate is applied to every live
+        session, which keeps old single-session clients working. The candidate
+        is validated before it reaches webrtcbin and is never echoed back.
+        """
+        value = (candidate or "").strip()
+        if not value:
+            return {"ok": False, "error": "candidate must not be empty"}
+        if any(
+            character != " "
+            and (ord(character) < 0x20 or ord(character) == 0x7F)
+            for character in value
+        ):
+            return {"ok": False, "error": "candidate contains control characters"}
+        if value.startswith("a=candidate:"):
+            value = value[len("a="):]
+        if not value.startswith("candidate:"):
+            return {"ok": False, "error": "candidate must start with `candidate:`"}
+        if candidate_type(value) is None:
+            return {
+                "ok": False,
+                "error": "candidate must carry a recognised `typ` token",
+            }
+        try:
+            mline = int(sdp_mline_index)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "sdpMLineIndex must be an integer"}
+        if mline < 0:
+            return {"ok": False, "error": "sdpMLineIndex must not be negative"}
+
+        if session_id:
+            sessions = [self.sessions[session_id]] if session_id in self.sessions else []
+            if not sessions:
+                return {"ok": False, "error": "unknown WebRTC session"}
+        else:
+            sessions = list(self.sessions.values())
+            if not sessions:
+                return {"ok": False, "error": "no live WebRTC session"}
+
+        for session in sessions:
+            session["webrtc"].emit("add-ice-candidate", mline, value)
+            session["remote_candidates"].append((mline, value))
+        return {
+            "ok": True,
+            "session": session_id,
+            "remote_candidates": sum(
+                len(session["remote_candidates"]) for session in sessions
+            ),
+        }
 
     def set_bitrate(self, requested) -> dict:
         """Apply a video bitrate (bps) to every live session's encoder.
@@ -666,7 +912,12 @@ class WebRTCWorker:
 
 
 async def main():
-    args = build_arg_parser().parse_args()
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    try:
+        validate_stun_turn_args(args)
+    except ValueError as error:
+        parser.error(str(error))
 
     if not load_gstreamer():
         return 1
@@ -678,6 +929,10 @@ async def main():
         args.fps,
         audio_source=args.audio_source,
         audio_backend=args.audio_backend,
+        stun_server=args.stun_server,
+        turn_server=args.turn_server,
+        turn_user=args.turn_user,
+        turn_password=args.turn_password,
     )
     worker.mainloop = GLib.MainLoop()
 
@@ -699,10 +954,23 @@ async def main():
                     break
                 msg = json.loads(line)
                 if msg.get("type") == "offer":
-                    answer = worker.create_session(msg["sdp"])
-                    resp = json.dumps({"type": "answer", "sdp": answer} if answer
-                                      else {"type": "error"})
+                    result = worker.create_session(msg["sdp"])
+                    if result:
+                        answer, session = result
+                        resp = json.dumps(
+                            {"type": "answer", "sdp": answer, "session": session}
+                        )
+                    else:
+                        resp = json.dumps({"type": "error"})
                     writer.write(resp.encode() + b"\n")
+                    await writer.drain()
+                elif msg.get("type") in ("add-ice-candidate", "candidate"):
+                    resp = worker.add_ice_candidate(
+                        msg.get("session"),
+                        msg.get("candidate", ""),
+                        msg.get("sdpMLineIndex", 0),
+                    )
+                    writer.write(json.dumps(resp).encode() + b"\n")
                     await writer.drain()
                 elif msg.get("type") == "bitrate":
                     resp = worker.set_bitrate(msg.get("bitrate"))

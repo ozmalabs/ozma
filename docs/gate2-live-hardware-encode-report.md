@@ -26,9 +26,12 @@ on both Intel and AMD) and both `queen` NVENC GPUs (H.264 and HEVC). It
 also fixes VAAPI rate control: the old argv left `rc_mode=auto`, which overshot
 the requested bitrate by 22-26% on Intel; naming `-rc_mode CBR` brings the
 steady-state mean to +6-7%. NVENC CBR holds at +3-6% for 1080p/4K on both GPUs.
-HEVC Main10/p010 encodes directly on both VAAPI devices, but the HLS path is
-still SDR 8-bit only: it uploads `nv12`, pins `yuv420p`, and has no 10-bit/HDR
-signaling.
+HEVC Main10/p010 encodes directly on both VAAPI devices. A follow-up (§9.4)
+extends the HLS path with an opt-in 10-bit/Main10 target for software
+libx265/AV1, `hevc_vaapi`, and `hevc_nvenc`, plus HDR color signaling; the
+default remains SDR 8-bit. The node's advertised encode envelope now follows
+the real capture size (4K for a 4K fake source) instead of a hard-coded 1080p,
+and `/codec` reports `max_width`/`max_height`, `hdr`, and `pixel_formats`.
 
 > No `sudo`, package install, driver/module change, VM definition, or commit was
 > made. The only VM was a direct, headless `qemu-system-x86_64` process with a
@@ -874,31 +877,124 @@ encoder during a probe), and the RTX 3090 had ~22.8 GB used by an unrelated
 resident workload but 0% utilization; neither prevented the encode or broke the
 CBR result. CPU is again node+ffmpeg normalized to one core.
 
-### 9.4 HEVC 10-bit/HDR status (not implemented in HLS)
+### 9.4 HEVC 10-bit/HDR HLS (implemented follow-up)
 
-Direct `ffmpeg` proof on both local VAAPI devices:
+The HLS path now has an opt-in 10-bit/Main10 target. Production defaults are
+unchanged: no `--hls-*bit`/HDR flag still means `yuv420p`, SDR, 8-bit.
+
+**CLI contract.** `--hls-pixel-format yuv420p|p010` (env
+`OZMA_HLS_PIXEL_FORMAT`) or `--hls-10bit` selects the target.
+`--hls-hdr` (env `OZMA_HLS_HDR`) requires a 10-bit target and supplies
+BT.2020/PQ defaults (`bt2020` / `smpte2084` / `bt2020nc`) for unset fields.
+`--hls-color-primaries`, `--hls-color-transfer`, and `--hls-color-matrix`
+override individual fields and are checked against the ffmpeg color-name
+allowlists. An explicit `yuv420p` plus `--hls-10bit`/`--hls-hdr` is an exit-2
+configuration error.
+
+**Encoder mapping.** 10-bit is only accepted where the pipeline has a real
+Main10 argv; unsupported combinations return a typed
+`HlsError::UnsupportedPixelFormat` before ffmpeg is spawned.
+
+| Encoder | 10-bit argv |
+|---|---|
+| `libx265` | `-vf format=yuv420p10le -profile:v main10 -pix_fmt yuv420p10le` |
+| `libsvtav1` / `libaom-av1` | `-vf format=yuv420p10le -profile:v main -pix_fmt yuv420p10le` |
+| `hevc_vaapi` | `-vf format=p010,hwupload -profile:v main10` (no output pin) |
+| `hevc_nvenc` | `-profile:v main10 -pix_fmt p010le` |
+| `libx264`/`h264_vaapi`/`h264_nvenc`/QSV/V4L2M2M/MJPEG | rejected for `p010` |
+
+A captured P010 source is fed as raw `p010le` with the same 3-byte-per-pixel
+semi-planar layout. The dev fake provider also gained a real P010 pattern
+(`FakeCaptureProvider::with_p010()`); the live runs below instead used the
+default RGB24 fake source and let ffmpeg convert to P010/Main10, so no external
+10-bit source or converter was needed.
+
+**HDR signaling.** `-color_primaries/-color_trc/-colorspace` alone were not
+enough through the HLS/MPEG-TS path: `ffprobe` reported `color_transfer=unknown`
+and `color_primaries=unknown` (the same gap as the earlier direct VAAPI test).
+The node therefore also emits a sequence-header rewrite:
+`-bsf:v hevc_metadata=colour_primaries=9:transfer_characteristics=16:matrix_coefficients=9`
+for HEVC (or `av1_metadata` for AV1) when color metadata is configured. This
+preserves the validated primaries/transfer/matrix values in the HLS segment.
+
+Live local validation (debug binary from this tree, 30 fps, 1-second segments,
+default fake RGB24 source; all processes and output removed afterwards):
 
 ```bash
-ffmpeg -f lavfi -i testsrc2=size=1920x1080:rate=30 -t 3 \
-  -vaapi_device /dev/dri/renderD128 \
-  -vf format=p010,hwupload -c:v hevc_vaapi -profile:v main10 \
-  -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc out.mkv
+# Intel VAAPI, 4K, 10-bit HDR
+target/debug/ozma-node --name hdrintel --profile vm \
+  --capture-provider fake --fake-width 3840 --fake-height 2160 --fake-fps 30 \
+  --input-provider fake-recording --cap video \
+  --hls --hls-dir /tmp/opencode/ozma-hdr-live/hls --hls-fps 30 \
+  --hls-bitrate-kbps 12000 --hls-encoder hevc_vaapi \
+  --vaapi-device /dev/dri/renderD128 --hls-10bit --hls-hdr
+
+# Software libx265, 1080p, 10-bit HDR
+target/debug/ozma-node --name hdrsoft --profile vm \
+  --capture-provider fake --fake-width 1920 --fake-height 1080 --fake-fps 30 \
+  --input-provider fake-recording --cap video \
+  --hls --hls-dir /tmp/opencode/ozma-hdr-soft-node/hls --hls-fps 30 \
+  --hls-bitrate-kbps 8000 --hls-encoder libx265 --hls-10bit --hls-hdr
 ```
 
-Both `renderD128` (Intel) and `renderD129` (AMD) produced
-`hevc Main 10 yuv420p10le 1920x1080`. That is a device capability, **not** an
-HLS feature:
+`ffprobe` on the resulting segments:
 
-- The HLS VAAPI filter is hard-coded to `format=nv12,hwupload`; there is no
-  `p010`/`Main10` option and no bit-depth flag.
-- Software/NVENC/QSV paths pin `-pix_fmt yuv420p` (8-bit 4:2:0).
-- The only accepted capture formats are `rgb24`/`bgra`; the dev source is
-  RGB24. There is no 10-bit source path.
-- Even the direct test did not preserve HDR signaling: `ffprobe` reported
-  `color_space=bt2020nc` but `color_transfer=unknown` and
-  `color_primaries=unknown`.
+```text
+# /tmp/opencode/ozma-hdr-live/hls/seg_00001.ts (Intel hevc_vaapi, 4K)
+codec_name=hevc
+profile=Main 10
+width=3840
+height=2160
+pix_fmt=yuv420p10le
+color_range=tv
+color_space=bt2020nc
+color_transfer=smpte2084
+color_primaries=bt2020
 
-So HLS remains SDR 8-bit. 10-bit/HDR is reported as a gap, not claimed.
+# /tmp/opencode/ozma-hdr-soft-node/hls/seg_00001.ts (libx265, 1080p)
+codec_name=hevc
+profile=Main 10
+width=1920
+height=1080
+pix_fmt=yuv420p10le
+color_range=tv
+color_space=bt2020nc
+color_transfer=smpte2084
+color_primaries=bt2020
+```
+
+Both runs wrote real `.ts` segments and playlists; the 4K VAAPI run produced
+`seg_00000.ts` (2,429,900 B) and `seg_00001.ts` (1,110,704 B) with Main10
+`yuv420p10le`, and the software run produced a rolling 1080p playlist. No
+`queen`/NVENC 10-bit run was made in this follow-up, so `hevc_nvenc` Main10 is
+covered by argv/unit tests only.
+
+**Envelope.** `platform::capture_envelope` derives the advertised encode bounds
+from the discovered capture source (4K fake source → 4K envelope; 1080p source →
+1080p), capped at 4K/60 fps, instead of the previous hard-coded 1080p. Software,
+VAAPI, and NVENC capabilities are fitted to that envelope; QSV/V4L2M2M keep
+their earlier bound because this tree has no 4K evidence for them. HDR is only
+set when the configured HLS target is validated 10-bit HDR and only for the
+configured codec family, never inferred from 4K alone. A live `GET /codec` for
+the 4K Intel VAAPI HDR configuration returned:
+
+```json
+{"current_encoder":"hevc","available":["hevc"],"backends":["vaapi"],
+ "max_width":3840,"max_height":2160,"max_fps":30,
+ "hdr":true,"pixel_formats":["yuv420p","p010"]}
+```
+
+The 10-bit registry hides codec/backend pairs without a Main10 mapping
+(H.264/MJPEG/QSV/V4L2M2M), so a controller cannot select a combination the
+fixed 10-bit pipeline would reject. The same live run reported
+`/api/v1/connection` `hls: "running"` after the manifest appeared.
+
+**Remaining HDR gaps:** no real HDR camera/guest source was used; the synthetic
+pattern is not colorimetrically HDR (the metadata is a signaling test). There is
+no live NVENC 10-bit run in this follow-up, AV1 10-bit has argv/tests but no HLS
+playback evidence, browser/player decode of Main10 HLS is not validated, and
+H.264/QSV/V4L2M2M 10-bit remain unsupported rather than silently downconverted.
+This is HLS evidence only, not a WebRTC/Gate 2 claim.
 
 ### 9.5 Tests added
 
@@ -910,14 +1006,26 @@ So HLS remains SDR 8-bit. 10-bit/HDR is reported as a gap, not claimed.
   `--capture-provider fake`.
 - `ozma-node/src/hls.rs`: 4K argv carries `3840x2160`, the requested bitrate,
   1-second segments, NVENC `-gpu`/`-rc cbr`, VAAPI `-rc_mode CBR` + `nv12`
-  upload, and the 8-bit `yuv420p` pin.
+  upload, and the 8-bit `yuv420p` pin (the default regression).
+- `ozma-node/src/hls.rs`: 10-bit argv for `libx265`, `libsvtav1`, `hevc_vaapi`,
+  and `hevc_nvenc` (`p010` upload / `yuv420p10le` / `p010le`, Main10 profile,
+  HDR color args + `hevc_metadata`/`av1_metadata` BSF); every H.264/MJPEG/QSV/
+  V4L2M2M combination is rejected with `UnsupportedPixelFormat`; HDR requires
+  10-bit; invalid color names and `yuv420p + hdr` are rejected; P010 input is
+  declared as raw `p010le` and passed through unchanged.
+- `ozma-node/src/platform.rs`: a 4K fake source yields a 4K encode envelope
+  without HDR; the configured HEVC HLS capability is 4K SDR or 10-bit HDR
+  (`main10`) only when configured; an 8K source envelope is capped at 4K.
+- `ozma-node/src/main.rs`: `--hls-10bit`/`--hls-pixel-format`/`--hls-hdr`
+  resolution, explicit 8-bit conflicts, and all four color flags parse.
 - `ozma-capture/src/fake.rs`: the block pattern is deterministic per sequence,
-  differs between frames, and the first 32×32 block is uniform.
-- Existing `ffmpeg_argv_carries_each_hardware_encoder_upload_and_rate_control`
-  now asserts VAAPI `-rc_mode CBR`.
+  differs between frames, and the first 32×32 block is uniform; `with_p010()`
+  emits a real 10-bit semi-planar layout with frame-varying limited-range luma.
 
-Default tests use no real GPU: 38 HLS lib tests (1 ignored), 155 `ozma-capture`
-tests (4 ignored), and the parity suite pass without hardware.
+Default tests use no real GPU: the HLS lib suite, `ozma-capture`, platform/main
+unit tests, and the parity suite pass without hardware. The required commands
+(`cargo test -p ozma-node -p ozma-capture`, `cargo check --workspace
+--all-targets`, `cargo fmt`) are recorded in the final verification summary.
 
 ### 9.6 Cleanup
 
@@ -925,6 +1033,10 @@ Local:
 
 - `/tmp/opencode/ozma-synth` (case HLS dirs, copied segments, logs, raw noise
   and block inputs, direct 10-bit outputs) removed.
+- The 10-bit follow-up directories `/tmp/opencode/ozma-hdr-live`,
+  `/tmp/opencode/ozma-hdr-soft-node`, `/tmp/opencode/ozma-envelope-live`, and
+  the direct `hdr-soft`/`hdr-bsf` probes were removed; no node/ffmpeg child or
+  listener remained.
 - All synth node processes were killed by process group; no test ffmpeg child
   or listener remained. Ports 47520–47747/TCP and 60520–60747/UDP were only
   used for these runs and are free.

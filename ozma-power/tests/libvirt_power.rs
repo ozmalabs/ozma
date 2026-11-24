@@ -250,6 +250,24 @@ async fn power_actions_use_exact_virsh_argv() {
 }
 
 #[tokio::test]
+async fn pause_and_resume_use_virsh_suspend_and_resume() {
+    let (mut power, fake) = connected(vec![output("running"), output(""), output("")]).await;
+
+    power.pause().await.unwrap();
+    power.resume().await.unwrap();
+
+    assert_eq!(
+        fake.calls(),
+        vec![
+            argv(&["virsh", "domstate", "test-vm"]),
+            argv(&["virsh", "suspend", "test-vm"]),
+            argv(&["virsh", "resume", "test-vm"]),
+        ],
+        "pause must use virsh suspend; resume must not fall back to start"
+    );
+}
+
+#[tokio::test]
 async fn non_zero_exit_is_a_typed_command_failure() {
     let (mut power, _fake) = connected(vec![
         output("running"),

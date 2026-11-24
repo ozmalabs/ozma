@@ -4,8 +4,8 @@
 //! Real V4L2/encoder probes plug in here without changing the API.
 
 use ozma_protocol::{
-    AudioCapability, InputCapability, NodeCapabilities, NodeId, PowerCapability, ResourceBudget,
-    TransportMode, UsbCapability, VirtualDisplayCaps,
+    AudioCapability, Codec, EncodeCapability, EncoderBackend, InputCapability, NodeCapabilities,
+    NodeId, PowerCapability, ResourceBudget, TransportMode, UsbCapability, VirtualDisplayCaps,
 };
 
 use ozma_capture::{
@@ -16,6 +16,7 @@ use ozma_media::FrameFormat;
 use ozma_qmp::SharedQmpClient;
 
 use crate::config::{NodeConfig, NodeProfile};
+use crate::hls::HlsConfig;
 
 /// Build the capture registry for this node.
 ///
@@ -119,6 +120,165 @@ fn vm_capture_registry(config: &NodeConfig, shared: Option<&SharedQmpClient>) ->
     }
 }
 
+/// Largest encode width this node advertises from a synthetic or real source.
+///
+/// The Gate 2 live report measured 4K (3840x2160) software, VAAPI, and NVENC
+/// HLS encodes. Larger sources are real capture input, but not part of the
+/// probed encode envelope.
+pub const MAX_ENCODE_WIDTH: u32 = 3_840;
+/// Largest encode height this node advertises.
+pub const MAX_ENCODE_HEIGHT: u32 = 2_160;
+/// Highest encode frame rate this node advertises.
+pub const MAX_ENCODE_FPS: u32 = 60;
+
+/// The real capture envelope an encoder may be advertised against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncodeEnvelope {
+    /// Widest source, capped at [`MAX_ENCODE_WIDTH`].
+    pub width: u32,
+    /// Tallest source, capped at [`MAX_ENCODE_HEIGHT`].
+    pub height: u32,
+    /// Highest source frame rate, capped at [`MAX_ENCODE_FPS`].
+    pub fps: u32,
+}
+
+impl EncodeEnvelope {
+    /// Conservative fallback when a source has not reported a mode yet.
+    pub const fn fallback() -> Self {
+        Self {
+            width: 1_920,
+            height: 1_080,
+            fps: 30,
+        }
+    }
+}
+
+/// Derive the advertised encode envelope from capture capabilities.
+///
+/// A 4K synthetic source becomes a 4K encode envelope; a 1080p camera stays
+/// 1080p. This is deliberately a source bound, not a hard-coded resolution.
+pub fn capture_envelope(captures: &[ozma_protocol::CaptureCapability]) -> EncodeEnvelope {
+    let mut envelope = EncodeEnvelope {
+        width: 0,
+        height: 0,
+        fps: 0,
+    };
+    for capture in captures {
+        let area = u64::from(capture.max_width) * u64::from(capture.max_height);
+        let current_area = u64::from(envelope.width) * u64::from(envelope.height);
+        if area > current_area {
+            envelope.width = capture.max_width;
+            envelope.height = capture.max_height;
+        }
+        envelope.fps = envelope.fps.max(capture.max_fps);
+    }
+    if envelope.width == 0 || envelope.height == 0 {
+        return EncodeEnvelope::fallback();
+    }
+    EncodeEnvelope {
+        width: envelope.width.clamp(1, MAX_ENCODE_WIDTH),
+        height: envelope.height.clamp(1, MAX_ENCODE_HEIGHT),
+        fps: envelope.fps.clamp(1, MAX_ENCODE_FPS),
+    }
+}
+
+/// Build the capability for the encoder HLS is configured to run.
+pub fn hls_encode_capability(config: &HlsConfig, envelope: EncodeEnvelope) -> EncodeCapability {
+    let encoder = config.video_encoder;
+    let (codec, backend) = match encoder {
+        crate::hls::HlsEncoder::H264 => (Codec::H264, EncoderBackend::Software),
+        crate::hls::HlsEncoder::Hevc => (Codec::Hevc, EncoderBackend::Software),
+        crate::hls::HlsEncoder::Av1Svt | crate::hls::HlsEncoder::Av1Aom => {
+            (Codec::Av1, EncoderBackend::Software)
+        }
+        crate::hls::HlsEncoder::Mjpeg => (Codec::Mjpeg, EncoderBackend::Software),
+        crate::hls::HlsEncoder::VaapiH264 => (Codec::H264, EncoderBackend::Vaapi),
+        crate::hls::HlsEncoder::VaapiHevc => (Codec::Hevc, EncoderBackend::Vaapi),
+        crate::hls::HlsEncoder::NvencH264 => (Codec::H264, EncoderBackend::Nvenc),
+        crate::hls::HlsEncoder::NvencHevc => (Codec::Hevc, EncoderBackend::Nvenc),
+        crate::hls::HlsEncoder::QsvH264 => (Codec::H264, EncoderBackend::Qsv),
+        crate::hls::HlsEncoder::QsvHevc => (Codec::Hevc, EncoderBackend::Qsv),
+        crate::hls::HlsEncoder::V4l2m2mH264 => (Codec::H264, EncoderBackend::V4l2M2m),
+        crate::hls::HlsEncoder::V4l2m2mHevc => (Codec::Hevc, EncoderBackend::V4l2M2m),
+    };
+    let ten_bit = config.pixel_format.is_10bit();
+    let hdr = config.hdr && ten_bit;
+    let profiles = match codec {
+        Codec::Hevc if ten_bit => vec!["main10".to_owned()],
+        Codec::Hevc => vec!["main".to_owned()],
+        Codec::Av1 if ten_bit => vec!["main".to_owned(), "main10".to_owned()],
+        Codec::Av1 => vec!["main".to_owned()],
+        Codec::H264 => vec!["high".to_owned()],
+        Codec::Mjpeg => vec!["baseline".to_owned()],
+        _ => Vec::new(),
+    };
+    EncodeCapability {
+        codec,
+        backend,
+        hardware: encoder.is_hardware(),
+        max_width: envelope.width,
+        max_height: envelope.height,
+        max_fps: envelope.fps.min(config.fps.max(1)),
+        hdr,
+        profiles,
+    }
+}
+
+/// Fit advertised encoder capabilities to the real source envelope.
+///
+/// Software, VAAPI, and NVENC have live 4K evidence, so their source bound is
+/// raised to the capture envelope (up to 4K). QSV/V4L2M2M keep their earlier
+/// bound because this tree has no 4K evidence for them. HDR is only set for
+/// the configured HLS codec family, and only after `HlsConfig::validate`
+/// accepted a Main10 encoder/format combination.
+pub fn fit_encode_capabilities(
+    capabilities: &mut [EncodeCapability],
+    envelope: EncodeEnvelope,
+    hdr_codec: Option<Codec>,
+) {
+    for capability in capabilities {
+        let proven_4k = matches!(
+            capability.backend,
+            EncoderBackend::Software | EncoderBackend::Vaapi | EncoderBackend::Nvenc
+        );
+        if proven_4k {
+            capability.max_width = envelope.width;
+            capability.max_height = envelope.height;
+        } else {
+            capability.max_width = capability.max_width.min(envelope.width);
+            capability.max_height = capability.max_height.min(envelope.height);
+        }
+        capability.max_fps = if capability.max_fps == 0 {
+            envelope.fps
+        } else {
+            capability.max_fps.min(envelope.fps)
+        };
+        if hdr_codec == Some(capability.codec) && proven_4k {
+            capability.hdr = true;
+            if !capability
+                .profiles
+                .iter()
+                .any(|profile| profile == "main10")
+            {
+                capability.profiles.push("main10".to_owned());
+            }
+        }
+    }
+}
+
+/// Replace/add the configured HLS encoder and fit the whole advertised list to
+/// the real capture envelope.
+pub fn apply_hls_encode_capability(caps: &mut NodeCapabilities, config: &HlsConfig) {
+    let envelope = capture_envelope(&caps.capture);
+    let hls_capability = hls_encode_capability(config, envelope);
+    caps.encode.retain(|capability| {
+        capability.codec != hls_capability.codec || capability.backend != hls_capability.backend
+    });
+    caps.encode.push(hls_capability.clone());
+    let hdr_codec = (config.hdr && config.pixel_format.is_10bit()).then_some(hls_capability.codec);
+    fit_encode_capabilities(&mut caps.encode, envelope, hdr_codec);
+}
+
 /// Build the capability set advertised by this node, probing the host.
 pub fn detect(config: &NodeConfig) -> NodeCapabilities {
     detect_with_registry(config, &capture_registry(config))
@@ -163,8 +323,11 @@ pub fn detect_with_registry(config: &NodeConfig, capture: &CaptureRegistry) -> N
         } else {
             // Advertise only the encoder this build can actually run. A
             // hardware adapter must be added here after its probe passes,
-            // never assumed from the platform name.
+            // never assumed from the platform name. Fit its envelope to the
+            // discovered source instead of a hard-coded 1080p ceiling.
             caps.encode = vec![ozma_encode::H264SoftwareEncoder::capability()];
+            let envelope = capture_envelope(&caps.capture);
+            fit_encode_capabilities(&mut caps.encode, envelope, None);
         }
         // The real Linux EVDI/KMS provider is still gated on the M2 spike.
         // Reporting the fake provider here would claim a monitor the node
@@ -287,6 +450,12 @@ mod tests {
         assert!(!caps.capture.is_empty());
         assert!(!caps.encode.is_empty());
         assert!(!caps.display.supported);
+        // A 320x240 fake source must not be advertised as 1080p or 4K.
+        assert!(caps.encode.iter().all(|capability| {
+            capability.max_width == caps.capture[0].max_width
+                && capability.max_height == caps.capture[0].max_height
+                && capability.max_width < MAX_ENCODE_WIDTH
+        }));
     }
 
     #[test]
@@ -439,6 +608,11 @@ mod tests {
         let caps = detect_with_registry(&vm, &registry);
         assert_eq!(caps.capture.len(), 1);
         assert_eq!(caps.capture[0].max_width, 3_840);
+        // The encode envelope follows the real source instead of hard-coding
+        // 1080p, but a 4K size alone must not claim HDR.
+        assert!(caps.encode.iter().all(|capability| {
+            capability.max_width == 3_840 && capability.max_height == 2_160 && !capability.hdr
+        }));
         let source = registry
             .open(&caps.capture[0])
             .expect("fake source must open");
@@ -447,6 +621,79 @@ mod tests {
             ozma_media::FrameFormat::rgb24(3_840, 2_160)
         );
         assert_eq!(source.id(), "fake0");
+    }
+
+    #[test]
+    fn hls_capability_reflects_configured_ten_bit_hdr_only() {
+        let mut vm = config("hid,video,audio");
+        vm.profile = crate::config::NodeProfile::Vm;
+        vm.provider_overrides = crate::config::ProviderOverrides::from_cli("fake", "", "", "", "");
+        vm.providers = crate::config::ProviderSelection::for_profile(vm.profile)
+            .with_overrides(&vm.provider_overrides);
+        vm.fake_width = 3_840;
+        vm.fake_height = 2_160;
+        let registry = capture_registry(&vm);
+        let mut caps = detect_with_registry(&vm, &registry);
+        assert!(caps.encode.iter().all(|capability| !capability.hdr));
+
+        let sdr = HlsConfig {
+            video_encoder: crate::hls::HlsEncoder::Hevc,
+            ..HlsConfig::default()
+        };
+        apply_hls_encode_capability(&mut caps, &sdr);
+        let hevc = caps
+            .encode
+            .iter()
+            .find(|capability| capability.codec == Codec::Hevc)
+            .expect("configured HEVC HLS capability");
+        assert_eq!((hevc.max_width, hevc.max_height), (3_840, 2_160));
+        assert!(!hevc.hdr);
+        assert!(hevc.profiles.iter().any(|profile| profile == "main"));
+
+        let hdr = HlsConfig {
+            video_encoder: crate::hls::HlsEncoder::Hevc,
+            pixel_format: crate::hls::HlsPixelFormat::P010,
+            hdr: true,
+            ..HlsConfig::default()
+        };
+        apply_hls_encode_capability(&mut caps, &hdr);
+        let hevc = caps
+            .encode
+            .iter()
+            .find(|capability| capability.codec == Codec::Hevc)
+            .expect("configured HEVC HLS capability");
+        assert!(hevc.hdr);
+        assert!(hevc.profiles.iter().any(|profile| profile == "main10"));
+        // H.264 has no Main10 mapping, so it must stay non-HDR.
+        assert!(caps
+            .encode
+            .iter()
+            .filter(|capability| capability.codec == Codec::H264)
+            .all(|capability| !capability.hdr));
+    }
+
+    #[test]
+    fn encode_envelope_is_capped_to_the_probed_four_k_maximum() {
+        let envelope = capture_envelope(&[ozma_protocol::CaptureCapability {
+            id: "fake0".to_owned(),
+            name: "8K synthetic".to_owned(),
+            kind: ozma_protocol::CaptureKind::Fake,
+            formats: vec!["rgb24".to_owned()],
+            max_width: 8_192,
+            max_height: 4_320,
+            max_fps: 240,
+            compressed: false,
+            hdr: false,
+            has_audio: false,
+        }]);
+        assert_eq!(
+            envelope,
+            EncodeEnvelope {
+                width: MAX_ENCODE_WIDTH,
+                height: MAX_ENCODE_HEIGHT,
+                fps: MAX_ENCODE_FPS,
+            }
+        );
     }
 
     #[test]

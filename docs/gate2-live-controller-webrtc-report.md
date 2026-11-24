@@ -259,12 +259,16 @@ the node's `/codec` route when a node API endpoint is known:
   endpoint keep the previous controller-local behavior.
 
 The endpoint is taken from the registered node's `api_port` (falling back to
-`stream_port`, then the authority of the remote HLS URL). This run did not
-repeat the live Rust-node validation after the proxy change; a fake-node HTTP
+`stream_port`, then the authority of the remote HLS URL). A fake-node HTTP
 suite asserts GET/POST forwarding, request headers/body, 400/502 passthrough,
 unreachable, timeout, auth, and local fallback:
 `tests/unit/controller/test_stream_codec_proxy.py` (10 tests, including the
-parametrised 400/502 error cases).
+parametrised 400/502 error cases). A later live run repeated the route through
+the controller against a real Rust node
+([`gate2-final-e2e-report.md`](gate2-final-e2e-report.md) §5.7): POST
+`{"codec":"h264","hw_accel":"software","bitrate":"1500k"}` returned
+`applied:true`, `pending_restart:false`, `encoder:"libx264"`, restarted HLS,
+and the next segment still probed as H.264.
 
 Still separate: the controller's codec probe/encoder database and stats remain
 controller-local and are not merged with the node's `EncoderRegistry`. The

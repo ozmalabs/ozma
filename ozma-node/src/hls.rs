@@ -64,6 +64,228 @@ const MAX_STATUS_ERROR_CHARS: usize = 512;
 /// make ffmpeg reject the whole argv.
 const MAX_GOP_FRAMES: u32 = i32::MAX as u32;
 
+/// Encoded HLS bit depth / chroma layout.
+///
+/// The default is the historical SDR 8-bit 4:2:0 path. `P010` is the optional
+/// 10-bit path: software HEVC/AV1 emit `yuv420p10le`, NVENC HEVC emits
+/// `p010le`, and VAAPI HEVC uploads `p010` surfaces. H.264, MJPEG, QSV, and
+/// V4L2M2M are rejected for `P010` with [`HlsError::UnsupportedPixelFormat`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum HlsPixelFormat {
+    /// SDR 8-bit 4:2:0 (`yuv420p` / VAAPI `nv12`).
+    #[default]
+    Yuv420p,
+    /// 10-bit 4:2:0 (`yuv420p10le` / VAAPI `p010` / NVENC `p010le`).
+    P010,
+}
+
+impl HlsPixelFormat {
+    /// Stable CLI/config name (`yuv420p` or `p010`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Yuv420p => "yuv420p",
+            Self::P010 => "p010",
+        }
+    }
+
+    /// True for the 10-bit target.
+    pub fn is_10bit(self) -> bool {
+        matches!(self, Self::P010)
+    }
+
+    /// Parse an operator/CLI pixel format.
+    pub fn parse(value: &str) -> Result<Self, HlsError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "yuv420p" | "8bit" | "8-bit" | "sdr" => Ok(Self::Yuv420p),
+            "p010" | "p010le" | "10bit" | "10-bit" | "hdr" => Ok(Self::P010),
+            other => Err(HlsError::InvalidConfig(format!(
+                "unsupported HLS pixel format `{other}`; expected yuv420p or p010"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for HlsPixelFormat {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Effective ffmpeg color metadata for one HLS generation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HlsColorMetadata {
+    /// `-color_primaries` value.
+    pub primaries: Option<String>,
+    /// `-color_trc` value.
+    pub transfer: Option<String>,
+    /// `-colorspace` value.
+    pub matrix: Option<String>,
+}
+
+/// ffmpeg color-primary names accepted on the HLS path.
+const COLOR_PRIMARIES: &[&str] = &[
+    "bt709",
+    "bt470m",
+    "bt470bg",
+    "smpte170m",
+    "smpte240m",
+    "film",
+    "bt2020",
+    "smpte428",
+    "smpte431",
+    "smpte432",
+    "jedec-p22",
+    "ebu3213",
+];
+
+/// ffmpeg transfer-characteristic names accepted on the HLS path.
+const COLOR_TRANSFERS: &[&str] = &[
+    "bt709",
+    "gamma22",
+    "gamma28",
+    "smpte170m",
+    "smpte240m",
+    "linear",
+    "log",
+    "log-sqrt",
+    "iec61966-2-1",
+    "bt1361",
+    "iec61966-2-4",
+    "bt2020-10",
+    "bt2020-12",
+    "smpte2084",
+    "smpte428",
+    "arib-std-b67",
+];
+
+/// ffmpeg color-matrix names accepted on the HLS path.
+const COLOR_MATRICES: &[&str] = &[
+    "rgb",
+    "bt709",
+    "fcc",
+    "bt470bg",
+    "smpte170m",
+    "smpte240m",
+    "ycgco",
+    "bt2020nc",
+    "bt2020c",
+    "smpte2085",
+    "chroma-derived-nc",
+    "chroma-derived-c",
+    "ictcp",
+];
+
+fn validate_color_option(
+    flag: &str,
+    value: Option<&str>,
+    allowed: &[&str],
+) -> Result<(), HlsError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Err(HlsError::InvalidConfig(format!("{flag} must not be empty")));
+    }
+    if allowed.contains(&normalized.as_str()) {
+        Ok(())
+    } else {
+        Err(HlsError::InvalidConfig(format!(
+            "{flag} `{value}` is not a recognized ffmpeg color value; expected one of {}",
+            allowed.join(", ")
+        )))
+    }
+}
+
+/// H.273 / AV1 numeric code for a validated primaries name.
+fn color_primaries_code(value: &str) -> Option<u8> {
+    Some(match value {
+        "bt709" => 1,
+        "bt470m" => 4,
+        "bt470bg" => 5,
+        "smpte170m" => 6,
+        "smpte240m" => 7,
+        "film" => 8,
+        "bt2020" => 9,
+        "smpte428" => 10,
+        "smpte431" => 11,
+        "smpte432" => 12,
+        "jedec-p22" | "ebu3213" => 22,
+        _ => return None,
+    })
+}
+
+/// H.273 / AV1 numeric code for a validated transfer name.
+fn color_transfer_code(value: &str) -> Option<u8> {
+    Some(match value {
+        "bt709" => 1,
+        "gamma22" => 4,
+        "gamma28" => 5,
+        "smpte170m" => 6,
+        "smpte240m" => 7,
+        "linear" => 8,
+        "log" => 9,
+        "log-sqrt" => 10,
+        "iec61966-2-1" => 11,
+        "bt1361" => 12,
+        "iec61966-2-4" => 13,
+        "bt2020-10" => 14,
+        "bt2020-12" => 15,
+        "smpte2084" => 16,
+        "smpte428" => 17,
+        "arib-std-b67" => 18,
+        _ => return None,
+    })
+}
+
+/// H.273 / AV1 numeric code for a validated matrix name.
+fn color_matrix_code(value: &str) -> Option<u8> {
+    Some(match value {
+        "rgb" => 0,
+        "bt709" => 1,
+        "fcc" => 4,
+        "bt470bg" => 5,
+        "smpte170m" => 6,
+        "smpte240m" => 7,
+        "ycgco" => 8,
+        "bt2020nc" => 9,
+        "bt2020c" => 10,
+        "smpte2085" => 11,
+        "chroma-derived-nc" => 12,
+        "chroma-derived-c" => 13,
+        "ictcp" => 14,
+        _ => return None,
+    })
+}
+
+/// Bitstream filter that makes color metadata survive MPEG-TS HLS muxing.
+///
+/// ffmpeg's `hls` muxer/MPEG-TS path does not reliably carry the encoder VUI
+/// for HEVC/AV1, so `ffprobe` reported `unknown` primaries/transfer even though
+/// `-color_primaries`/`-color_trc` were set. Rewriting the sequence header with
+/// `hevc_metadata`/`av1_metadata` preserves the same validated values.
+fn color_bitstream_filter(config: &HlsConfig) -> Option<String> {
+    let color = config.color_metadata();
+    let (filter, primaries_key) = match config.video_encoder {
+        HlsEncoder::Hevc | HlsEncoder::VaapiHevc | HlsEncoder::NvencHevc => {
+            ("hevc_metadata", "colour_primaries")
+        }
+        HlsEncoder::Av1Svt | HlsEncoder::Av1Aom => ("av1_metadata", "color_primaries"),
+        _ => return None,
+    };
+    let mut options = Vec::new();
+    if let Some(code) = color.primaries.as_deref().and_then(color_primaries_code) {
+        options.push(format!("{primaries_key}={code}"));
+    }
+    if let Some(code) = color.transfer.as_deref().and_then(color_transfer_code) {
+        options.push(format!("transfer_characteristics={code}"));
+    }
+    if let Some(code) = color.matrix.as_deref().and_then(color_matrix_code) {
+        options.push(format!("matrix_coefficients={code}"));
+    }
+    (!options.is_empty()).then(|| format!("{filter}={}", options.join(":")))
+}
+
 /// Video encoder used by the HLS ffmpeg pipeline.
 ///
 /// The software variants are the historical path. The hardware variants name
@@ -201,14 +423,68 @@ impl HlsEncoder {
     /// its filter; QSV wants NV12; every other video encoder gets 4:2:0.
     /// MJPEG keeps ffmpeg's default (`yuvj420p`/`yuvj444p`).
     pub fn hls_pixel_format(self) -> Option<&'static str> {
-        match self {
-            Self::H264 | Self::Hevc | Self::Av1Svt | Self::Av1Aom => Some("yuv420p"),
-            Self::VaapiH264 | Self::VaapiHevc => None,
-            Self::NvencH264 | Self::NvencHevc | Self::V4l2m2mH264 | Self::V4l2m2mHevc => {
-                Some("yuv420p")
+        self.hls_pixel_format_for(HlsPixelFormat::Yuv420p)
+    }
+
+    /// True when this encoder has a real ffmpeg mapping for `target`.
+    ///
+    /// 10-bit is only offered where the backend has a documented Main10 path:
+    /// libx265, libsvtav1/libaom-av1, `hevc_vaapi`, and `hevc_nvenc`. H.264
+    /// (software or hardware), MJPEG, QSV, and V4L2M2M have no honest 10-bit
+    /// argv in this pipeline and are rejected instead of silently staying 8-bit.
+    pub fn supports_hls_pixel_format(self, target: HlsPixelFormat) -> bool {
+        match target {
+            HlsPixelFormat::Yuv420p => true,
+            HlsPixelFormat::P010 => matches!(
+                self,
+                Self::Hevc | Self::Av1Svt | Self::Av1Aom | Self::VaapiHevc | Self::NvencHevc
+            ),
+        }
+    }
+
+    /// Output `-pix_fmt` for the encoder and target bit depth.
+    ///
+    /// VAAPI has no output pin: its filter uploads `nv12`/`p010` and the
+    /// encoder surface decides the coded format. MJPEG keeps ffmpeg's default.
+    pub fn hls_pixel_format_for(self, target: HlsPixelFormat) -> Option<&'static str> {
+        match (self, target) {
+            (_, HlsPixelFormat::Yuv420p) => match self {
+                Self::H264 | Self::Hevc | Self::Av1Svt | Self::Av1Aom => Some("yuv420p"),
+                Self::VaapiH264 | Self::VaapiHevc => None,
+                Self::NvencH264 | Self::NvencHevc | Self::V4l2m2mH264 | Self::V4l2m2mHevc => {
+                    Some("yuv420p")
+                }
+                Self::QsvH264 | Self::QsvHevc => Some("nv12"),
+                Self::Mjpeg => None,
+            },
+            (Self::Hevc | Self::Av1Svt | Self::Av1Aom, HlsPixelFormat::P010) => Some("yuv420p10le"),
+            (Self::NvencHevc, HlsPixelFormat::P010) => Some("p010le"),
+            (Self::VaapiHevc, HlsPixelFormat::P010) => None,
+            (_, HlsPixelFormat::P010) => None,
+        }
+    }
+
+    /// Codec profile argument for the target bit depth, when one is required.
+    pub fn hls_profile_for(self, target: HlsPixelFormat) -> Option<&'static str> {
+        match (self, target) {
+            (Self::Hevc | Self::VaapiHevc | Self::NvencHevc, HlsPixelFormat::P010) => {
+                Some("main10")
             }
-            Self::QsvH264 | Self::QsvHevc => Some("nv12"),
-            Self::Mjpeg => None,
+            // AV1 Main covers both 8-bit and 10-bit; naming it is harmless and
+            // makes the requested profile explicit.
+            (Self::Av1Svt | Self::Av1Aom, HlsPixelFormat::P010) => Some("main"),
+            _ => None,
+        }
+    }
+
+    /// VAAPI upload filter for the target bit depth.
+    pub fn vaapi_upload_filter(self, target: HlsPixelFormat) -> Option<&'static str> {
+        match (self, target) {
+            (Self::VaapiH264 | Self::VaapiHevc, HlsPixelFormat::Yuv420p) => {
+                Some("format=nv12,hwupload")
+            }
+            (Self::VaapiHevc, HlsPixelFormat::P010) => Some("format=p010,hwupload"),
+            _ => None,
         }
     }
 
@@ -372,6 +648,31 @@ pub struct HlsConfig {
     pub bitrate_kbps: u32,
     /// Video encoder selected for this pipeline generation.
     pub video_encoder: HlsEncoder,
+    /// Encoded bit depth / chroma layout (SDR 8-bit by default).
+    pub pixel_format: HlsPixelFormat,
+    /// Optional HDR color primaries passed as ffmpeg `-color_primaries`.
+    ///
+    /// `--hls-hdr` supplies `bt2020` when this is unset.
+    pub color_primaries: Option<String>,
+    /// Optional color transfer passed as ffmpeg `-color_trc`.
+    ///
+    /// `--hls-hdr` supplies `smpte2084` (PQ) when this is unset.
+    pub color_transfer: Option<String>,
+    /// Optional color matrix passed as ffmpeg `-colorspace`.
+    ///
+    /// `--hls-hdr` supplies `bt2020nc` when this is unset.
+    pub color_matrix: Option<String>,
+    /// Signal HDR color metadata on the encoded stream.
+    ///
+    /// This requires a 10-bit target and an encoder with a Main10 mapping; it
+    /// defaults the three color fields above to BT.2020/PQ when they are unset.
+    pub hdr: bool,
+    /// Byte layout of the raw frames fed on stdin.
+    ///
+    /// [`HlsPipeline`] sets this from the opened source before spawning ffmpeg.
+    /// The default is RGB24 so a directly constructed config produces the
+    /// historical argv. P010 is fed as `p010le`; BGRA is converted to RGB24.
+    pub input_pixel_format: PixelFormat,
     /// Optional input width override.
     pub width: Option<u32>,
     /// Optional input height override.
@@ -401,6 +702,12 @@ impl Default for HlsConfig {
             fps: DEFAULT_FPS,
             bitrate_kbps: DEFAULT_BITRATE_KBPS,
             video_encoder: HlsEncoder::default(),
+            pixel_format: HlsPixelFormat::default(),
+            color_primaries: None,
+            color_transfer: None,
+            color_matrix: None,
+            hdr: false,
+            input_pixel_format: PixelFormat::Rgb24,
             width: None,
             height: None,
             ffmpeg_bin: PathBuf::from("ffmpeg"),
@@ -447,6 +754,12 @@ impl HlsConfig {
                 "--hls-bitrate-kbps must be at least 1".to_owned(),
             ));
         }
+        if !matches!(
+            self.input_pixel_format,
+            PixelFormat::Rgb24 | PixelFormat::Bgra | PixelFormat::P010
+        ) {
+            return Err(HlsError::UnsupportedFormat(self.input_pixel_format));
+        }
         if let Some(gpu) = self.nvenc_gpu {
             if gpu > i32::MAX as u32 {
                 return Err(HlsError::InvalidConfig(format!(
@@ -468,7 +781,55 @@ impl HlsConfig {
             }
             _ => {}
         }
+        if !self
+            .video_encoder
+            .supports_hls_pixel_format(self.pixel_format)
+        {
+            return Err(HlsError::UnsupportedPixelFormat {
+                encoder: self.video_encoder.ffmpeg_name().to_owned(),
+                pixel_format: self.pixel_format.as_str().to_owned(),
+                message: "this encoder has no 10-bit/Main10 mapping in the HLS pipeline; use \
+                          libx265, libsvtav1, libaom-av1, hevc_vaapi, or hevc_nvenc"
+                    .to_owned(),
+            });
+        }
+        if self.hdr && !self.pixel_format.is_10bit() {
+            return Err(HlsError::InvalidConfig(
+                "--hls-hdr requires a 10-bit target; pass --hls-10bit or \
+                 --hls-pixel-format p010"
+                    .to_owned(),
+            ));
+        }
+        validate_color_option(
+            "--hls-color-primaries",
+            self.color_primaries.as_deref(),
+            COLOR_PRIMARIES,
+        )?;
+        validate_color_option(
+            "--hls-color-transfer",
+            self.color_transfer.as_deref(),
+            COLOR_TRANSFERS,
+        )?;
+        validate_color_option(
+            "--hls-color-matrix",
+            self.color_matrix.as_deref(),
+            COLOR_MATRICES,
+        )?;
         Ok(())
+    }
+
+    /// Effective color metadata, applying the HDR preset to unset fields.
+    pub fn color_metadata(&self) -> HlsColorMetadata {
+        let preset = |configured: &Option<String>, hdr_default: &str| {
+            configured
+                .clone()
+                .or_else(|| self.hdr.then(|| hdr_default.to_owned()))
+        };
+        HlsColorMetadata {
+            primaries: preset(&self.color_primaries, "bt2020"),
+            transfer: preset(&self.color_transfer, "smpte2084"),
+            matrix: preset(&self.color_matrix, "bt2020nc"),
+        }
     }
 
     fn validated(self) -> Result<Self, HlsError> {
@@ -551,6 +912,16 @@ pub enum HlsError {
         /// Encoder name as supplied.
         encoder: String,
         /// Why it cannot be used.
+        message: String,
+    },
+    /// The encoder has no honest mapping for the requested output bit depth.
+    #[error("HLS encoder `{encoder}` cannot produce {pixel_format}: {message}")]
+    UnsupportedPixelFormat {
+        /// Exact ffmpeg encoder name.
+        encoder: String,
+        /// Requested HLS pixel format (`yuv420p` or `p010`).
+        pixel_format: String,
+        /// Why the combination is unsupported.
         message: String,
     },
     /// A hardware encoder was requested but ffmpeg does not advertise it.
@@ -1309,6 +1680,9 @@ fn probe_hardware_encode(config: &HlsConfig) -> Result<(), String> {
         playlist_size: 4,
         width: None,
         height: None,
+        // The probe writes real RGB24 frames regardless of the live source
+        // layout; ffmpeg still performs the selected P010/Main10 conversion.
+        input_pixel_format: PixelFormat::Rgb24,
         ..config.clone()
     };
     let mut argv = ffmpeg_argv(&probe_config, width, height);
@@ -1588,7 +1962,7 @@ impl HlsPipeline {
         probe: Arc<dyn EncoderProbe>,
         clock: Arc<dyn HlsClock>,
     ) -> Result<Self, HlsError> {
-        let config = config.validated()?;
+        let mut config = config.validated()?;
         validate_encoder_runtime(&config, probe.as_ref())?;
         if let Err(error) = ensure_supported(source.format().pixel_format) {
             return Err(error);
@@ -1598,6 +1972,13 @@ impl HlsPipeline {
         let manifest = config.manifest_path();
         let status = HlsStatus::starting(manifest.clone());
         let declared = source.format();
+        // The feeder may convert BGRA to RGB24 in Rust, but P010 is passed
+        // through byte-for-byte. Store the exact rawvideo layout so argv and
+        // the feeder cannot disagree after a `/codec` restart or size change.
+        config.input_pixel_format = match declared.pixel_format {
+            PixelFormat::Bgra => PixelFormat::Rgb24,
+            other => other,
+        };
         let expected = initial_dimensions(&config, declared);
 
         let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
@@ -2305,6 +2686,21 @@ fn convert_frame(
             }
             Ok(rgb)
         }
+        PixelFormat::P010 => {
+            let expected = byte_len(PixelFormat::P010, width, height)?;
+            if data.len() != expected {
+                return Err(HlsError::FrameSize {
+                    format: PixelFormat::P010,
+                    width,
+                    height,
+                    expected,
+                    actual: data.len(),
+                });
+            }
+            // P010 and ffmpeg `p010le` share the same semi-planar layout:
+            // 16-bit little-endian luma followed by interleaved 16-bit UV.
+            Ok(data.to_vec())
+        }
         other => Err(HlsError::UnsupportedFormat(other)),
     }
 }
@@ -2314,6 +2710,7 @@ fn byte_len(format: PixelFormat, width: u32, height: u32) -> Result<usize, HlsEr
     let bytes = match format {
         PixelFormat::Rgb24 => pixels * 3,
         PixelFormat::Bgra => pixels * 4,
+        PixelFormat::P010 => pixels * 3,
         other => return Err(HlsError::UnsupportedFormat(other)),
     };
     usize::try_from(bytes).map_err(|_| {
@@ -2325,7 +2722,16 @@ fn byte_len(format: PixelFormat, width: u32, height: u32) -> Result<usize, HlsEr
 
 fn ensure_supported(format: PixelFormat) -> Result<(), HlsError> {
     match format {
-        PixelFormat::Rgb24 | PixelFormat::Bgra => Ok(()),
+        PixelFormat::Rgb24 | PixelFormat::Bgra | PixelFormat::P010 => Ok(()),
+        other => Err(HlsError::UnsupportedFormat(other)),
+    }
+}
+
+/// ffmpeg rawvideo input name for a captured pixel layout.
+fn rawvideo_input_pixel_format(format: PixelFormat) -> Result<&'static str, HlsError> {
+    match format {
+        PixelFormat::Rgb24 | PixelFormat::Bgra => Ok("rgb24"),
+        PixelFormat::P010 => Ok("p010le"),
         other => Err(HlsError::UnsupportedFormat(other)),
     }
 }
@@ -2383,6 +2789,8 @@ pub fn ffmpeg_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String> {
 /// The feeder writes raw bytes only, so frame sequence/PTS order is unchanged.
 fn ffmpeg_argv_for(config: &HlsConfig, width: u32, height: u32, restart: bool) -> Vec<String> {
     let bitrate = format!("{}k", config.bitrate_kbps);
+    let target = config.pixel_format;
+    let input_format = rawvideo_input_pixel_format(config.input_pixel_format).unwrap_or("rgb24");
     let mut argv = vec![
         config.ffmpeg_bin.display().to_string(),
         "-hide_banner".to_owned(),
@@ -2391,7 +2799,7 @@ fn ffmpeg_argv_for(config: &HlsConfig, width: u32, height: u32, restart: bool) -
         "-f".to_owned(),
         "rawvideo".to_owned(),
         "-pix_fmt".to_owned(),
-        "rgb24".to_owned(),
+        input_format.to_owned(),
         "-s".to_owned(),
         format!("{width}x{height}"),
         "-r".to_owned(),
@@ -2400,6 +2808,19 @@ fn ffmpeg_argv_for(config: &HlsConfig, width: u32, height: u32, restart: bool) -
         "-".to_owned(),
         "-an".to_owned(),
     ];
+
+    // Convert the raw input to the requested 10-bit swscale format before a
+    // software encoder. Hardware encoders either upload a P010 surface (VAAPI)
+    // or accept `p010le` directly (NVENC). An 8-bit target keeps the historical
+    // argv with no extra filter.
+    let software_10bit_filter = target.is_10bit()
+        && matches!(
+            config.video_encoder,
+            HlsEncoder::Hevc | HlsEncoder::Av1Svt | HlsEncoder::Av1Aom
+        );
+    if software_10bit_filter {
+        argv.extend(["-vf".to_owned(), "format=yuv420p10le".to_owned()]);
+    }
 
     match config.video_encoder {
         HlsEncoder::H264 => argv.extend([
@@ -2446,22 +2867,29 @@ fn ffmpeg_argv_for(config: &HlsConfig, width: u32, height: u32, restart: bool) -
             "-q:v".to_owned(),
             "5".to_owned(),
         ]),
-        HlsEncoder::VaapiH264 | HlsEncoder::VaapiHevc => argv.extend([
-            "-vaapi_device".to_owned(),
-            config.vaapi_device.display().to_string(),
-            "-vf".to_owned(),
-            "format=nv12,hwupload".to_owned(),
-            "-c:v".to_owned(),
-            config.video_encoder.ffmpeg_name().to_owned(),
-            // VAAPI's `auto` rate-control mode is not a CBR contract: on Intel
-            // iHD it overshot a `-b:v` target by 22-25% on moderate content.
-            // Naming CBR selects the driver's constant-bitrate mode instead of
-            // leaving it to a VBR-ish auto choice. Both iHD and Mesa expose it.
-            "-rc_mode".to_owned(),
-            "CBR".to_owned(),
-            "-b:v".to_owned(),
-            bitrate,
-        ]),
+        HlsEncoder::VaapiH264 | HlsEncoder::VaapiHevc => {
+            let upload = config
+                .video_encoder
+                .vaapi_upload_filter(target)
+                .unwrap_or("format=nv12,hwupload");
+            argv.extend([
+                "-vaapi_device".to_owned(),
+                config.vaapi_device.display().to_string(),
+                "-vf".to_owned(),
+                upload.to_owned(),
+                "-c:v".to_owned(),
+                config.video_encoder.ffmpeg_name().to_owned(),
+                // VAAPI's `auto` rate-control mode is not a CBR contract: on
+                // Intel iHD it overshot a `-b:v` target by 22-25% on moderate
+                // content. Naming CBR selects the driver's constant-bitrate
+                // mode instead of leaving it to a VBR-ish auto choice. Both iHD
+                // and Mesa expose it.
+                "-rc_mode".to_owned(),
+                "CBR".to_owned(),
+                "-b:v".to_owned(),
+                bitrate,
+            ]);
+        }
         HlsEncoder::NvencH264 | HlsEncoder::NvencHevc => {
             argv.extend([
                 "-c:v".to_owned(),
@@ -2500,11 +2928,33 @@ fn ffmpeg_argv_for(config: &HlsConfig, width: u32, height: u32, restart: bool) -
         ]),
     }
 
-    // Pin the encoded chroma format. The raw input is RGB24, and without an
-    // explicit target ffmpeg may choose 4:4:4 (libx264 yuv444p, NVENC gbrp),
-    // which HLS/browser decoders commonly reject.
-    if let Some(pixel_format) = config.video_encoder.hls_pixel_format() {
+    // Pin the encoded profile/bit depth. Without an explicit 4:2:0 target
+    // ffmpeg may choose 4:4:4 (libx264 yuv444p, NVENC gbrp), which HLS/browser
+    // decoders commonly reject. VAAPI's uploaded surface determines its format;
+    // its filter above is the only bit-depth control.
+    if let Some(profile) = config.video_encoder.hls_profile_for(target) {
+        argv.extend(["-profile:v".to_owned(), profile.to_owned()]);
+    }
+    if let Some(pixel_format) = config.video_encoder.hls_pixel_format_for(target) {
         argv.extend(["-pix_fmt".to_owned(), pixel_format.to_owned()]);
+    }
+
+    // Propagate color signaling. ffmpeg's muxer/encoder carries these into the
+    // HEVC/AV1 sequence headers, which `ffprobe` reports as color_primaries,
+    // color_transfer, and color_space. `--hls-hdr` supplies the BT.2020/PQ
+    // defaults for any field the operator did not set.
+    let color = config.color_metadata();
+    for (flag, value) in [
+        ("-color_primaries", color.primaries),
+        ("-color_trc", color.transfer),
+        ("-colorspace", color.matrix),
+    ] {
+        if let Some(value) = value {
+            argv.extend([flag.to_owned(), value]);
+        }
+    }
+    if let Some(filter) = color_bitstream_filter(config) {
+        argv.extend(["-bsf:v".to_owned(), filter]);
     }
 
     // Keep GOPs aligned with segment boundaries. `-hls_time` can only cut a
@@ -3385,8 +3835,8 @@ mod tests {
                     "{encoder:?} must request CBR, not the driver's auto mode: {argv:?}"
                 );
             } else {
-                // SDR 8-bit 4:2:0 is explicit; 10-bit HDR is not supported by
-                // this HLS path and must not be implied by a 4K size.
+                // The default is still explicit SDR 8-bit 4:2:0; a 4K size must
+                // not imply 10-bit or HDR.
                 assert!(
                     argv.windows(2)
                         .any(|window| window == ["-pix_fmt", "yuv420p"]),
@@ -3394,6 +3844,275 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn ffmpeg_argv_maps_ten_bit_encoders_to_main10() {
+        let base = HlsConfig {
+            output_dir: PathBuf::from("/tmp/ozma-stream-10bit"),
+            pixel_format: HlsPixelFormat::P010,
+            color_primaries: Some("bt2020".to_owned()),
+            color_transfer: Some("smpte2084".to_owned()),
+            color_matrix: Some("bt2020nc".to_owned()),
+            ..HlsConfig::default()
+        };
+
+        let software = ffmpeg_argv(
+            &HlsConfig {
+                video_encoder: HlsEncoder::Hevc,
+                ..base.clone()
+            },
+            320,
+            240,
+        );
+        assert!(
+            software
+                .windows(2)
+                .any(|window| window == ["-c:v", "libx265"]),
+            "{software:?}"
+        );
+        assert!(
+            software
+                .windows(2)
+                .any(|window| window == ["-vf", "format=yuv420p10le"]),
+            "software HEVC must convert RGB to 10-bit before libx265: {software:?}"
+        );
+        assert!(
+            software
+                .windows(2)
+                .any(|window| window == ["-pix_fmt", "yuv420p10le"]),
+            "{software:?}"
+        );
+        assert!(
+            software
+                .windows(2)
+                .any(|window| window == ["-profile:v", "main10"]),
+            "{software:?}"
+        );
+
+        let vaapi = ffmpeg_argv(
+            &HlsConfig {
+                video_encoder: HlsEncoder::VaapiHevc,
+                ..base.clone()
+            },
+            320,
+            240,
+        );
+        assert!(
+            vaapi
+                .windows(2)
+                .any(|window| window == ["-vf", "format=p010,hwupload"]),
+            "VAAPI 10-bit must upload a P010 surface: {vaapi:?}"
+        );
+        assert!(
+            vaapi
+                .windows(2)
+                .any(|window| window == ["-profile:v", "main10"]),
+            "{vaapi:?}"
+        );
+        assert!(
+            !vaapi
+                .windows(2)
+                .any(|window| window == ["-pix_fmt", "yuv420p10le"]),
+            "VAAPI must not pin a software output format: {vaapi:?}"
+        );
+
+        let nvenc = ffmpeg_argv(
+            &HlsConfig {
+                video_encoder: HlsEncoder::NvencHevc,
+                ..base.clone()
+            },
+            320,
+            240,
+        );
+        assert!(
+            nvenc
+                .windows(2)
+                .any(|window| window == ["-pix_fmt", "p010le"]),
+            "NVENC 10-bit must request p010le: {nvenc:?}"
+        );
+        assert!(
+            nvenc
+                .windows(2)
+                .any(|window| window == ["-profile:v", "main10"]),
+            "{nvenc:?}"
+        );
+        assert!(
+            !nvenc.iter().any(|argument| argument == "-vf"),
+            "NVENC does not need a software upload filter: {nvenc:?}"
+        );
+
+        let av1 = ffmpeg_argv(
+            &HlsConfig {
+                video_encoder: HlsEncoder::Av1Svt,
+                ..base.clone()
+            },
+            320,
+            240,
+        );
+        assert!(
+            av1.windows(2)
+                .any(|window| window == ["-pix_fmt", "yuv420p10le"]),
+            "{av1:?}"
+        );
+        assert!(
+            av1.windows(2)
+                .any(|window| window == ["-profile:v", "main"]),
+            "{av1:?}"
+        );
+
+        for argv in [&software, &vaapi, &nvenc] {
+            for pair in [
+                ["-color_primaries", "bt2020"],
+                ["-color_trc", "smpte2084"],
+                ["-colorspace", "bt2020nc"],
+            ] {
+                assert!(
+                    argv.windows(2).any(|window| window == pair),
+                    "missing HDR metadata {pair:?}: {argv:?}"
+                );
+            }
+            assert!(
+                argv.windows(2).any(|window| {
+                    window[0] == "-bsf:v"
+                        && window[1]
+                            == "hevc_metadata=colour_primaries=9:transfer_characteristics=16:matrix_coefficients=9"
+                }),
+                "HEVC HDR must rewrite the sequence-header color metadata: {argv:?}"
+            );
+        }
+        assert!(
+            av1.windows(2).any(|window| {
+                window[0] == "-bsf:v"
+                    && window[1]
+                        == "av1_metadata=color_primaries=9:transfer_characteristics=16:matrix_coefficients=9"
+            }),
+            "AV1 HDR must rewrite the sequence-header color metadata: {av1:?}"
+        );
+    }
+
+    #[test]
+    fn ten_bit_rejects_encoders_without_a_main10_mapping() {
+        for encoder in [
+            HlsEncoder::H264,
+            HlsEncoder::Mjpeg,
+            HlsEncoder::VaapiH264,
+            HlsEncoder::NvencH264,
+            HlsEncoder::QsvH264,
+            HlsEncoder::QsvHevc,
+            HlsEncoder::V4l2m2mH264,
+            HlsEncoder::V4l2m2mHevc,
+        ] {
+            assert!(
+                !encoder.supports_hls_pixel_format(HlsPixelFormat::P010),
+                "{encoder:?} must not claim a 10-bit mapping"
+            );
+            let config = HlsConfig {
+                video_encoder: encoder,
+                pixel_format: HlsPixelFormat::P010,
+                ..HlsConfig::default()
+            };
+            assert!(
+                matches!(
+                    config.validate(),
+                    Err(HlsError::UnsupportedPixelFormat { .. })
+                ),
+                "{encoder:?} must be rejected with a typed error"
+            );
+        }
+        for encoder in [
+            HlsEncoder::Hevc,
+            HlsEncoder::Av1Svt,
+            HlsEncoder::Av1Aom,
+            HlsEncoder::VaapiHevc,
+            HlsEncoder::NvencHevc,
+        ] {
+            assert!(encoder.supports_hls_pixel_format(HlsPixelFormat::P010));
+            HlsConfig {
+                video_encoder: encoder,
+                pixel_format: HlsPixelFormat::P010,
+                ..HlsConfig::default()
+            }
+            .validate()
+            .unwrap_or_else(|error| panic!("{encoder:?} should be valid: {error}"));
+        }
+    }
+
+    #[test]
+    fn hdr_requires_ten_bit_and_valid_color_metadata() {
+        let sdr_hdr = HlsConfig {
+            hdr: true,
+            ..HlsConfig::default()
+        };
+        assert!(matches!(
+            sdr_hdr.validate(),
+            Err(HlsError::InvalidConfig(message)) if message.contains("--hls-hdr")
+        ));
+
+        let invalid_color = HlsConfig {
+            video_encoder: HlsEncoder::Hevc,
+            pixel_format: HlsPixelFormat::P010,
+            color_transfer: Some("not-a-transfer".to_owned()),
+            ..HlsConfig::default()
+        };
+        assert!(matches!(
+            invalid_color.validate(),
+            Err(HlsError::InvalidConfig(message)) if message.contains("--hls-color-transfer")
+        ));
+
+        let hdr_defaults = HlsConfig {
+            video_encoder: HlsEncoder::Hevc,
+            pixel_format: HlsPixelFormat::P010,
+            hdr: true,
+            ..HlsConfig::default()
+        };
+        let argv = ffmpeg_argv(&hdr_defaults, 320, 240);
+        for pair in [
+            ["-color_primaries", "bt2020"],
+            ["-color_trc", "smpte2084"],
+            ["-colorspace", "bt2020nc"],
+        ] {
+            assert!(
+                argv.windows(2).any(|window| window == pair),
+                "--hls-hdr must supply {pair:?}: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn p010_source_is_fed_as_raw_p010le() {
+        let config = HlsConfig {
+            video_encoder: HlsEncoder::Hevc,
+            pixel_format: HlsPixelFormat::P010,
+            input_pixel_format: PixelFormat::P010,
+            ..HlsConfig::default()
+        };
+        let argv = ffmpeg_argv(&config, 320, 240);
+        let input_index = argv
+            .iter()
+            .position(|argument| argument == "-i")
+            .expect("argv has an input");
+        assert!(
+            argv[..input_index]
+                .windows(2)
+                .any(|window| window == ["-pix_fmt", "p010le"]),
+            "P010 source must be declared as raw p010le: {argv:?}"
+        );
+        assert!(
+            argv[input_index..]
+                .windows(2)
+                .any(|window| window == ["-pix_fmt", "yuv420p10le"]),
+            "encoded output must stay yuv420p10le: {argv:?}"
+        );
+
+        let format = FrameFormat::new(PixelFormat::P010, 2, 2);
+        let p010_frame = frame(
+            format,
+            0,
+            vec![0x40; PixelFormat::P010.nominal_len(2, 2).unwrap()],
+        );
+        let bytes = convert_frame(&p010_frame, PixelFormat::P010, 2, 2).expect("P010 pass-through");
+        assert_eq!(bytes, p010_frame.data());
     }
 
     #[test]

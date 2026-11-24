@@ -52,7 +52,10 @@ use tracing::{debug, info, warn};
 
 use crate::display_compat::{DisplayInfo, SnapshotControl, SnapshotError};
 use crate::hls::{HlsController, HlsEncoder, HlsError, HlsStatus};
-use crate::keyboard_layout::{key_event, CharOutcome, KeyChord, KeyboardLayout};
+use crate::keyboard_layout::{
+    key_event, resolve_compose_sequence, resolve_dead_key_sequence, CharOutcome, KeyChord,
+    KeyboardLayout,
+};
 use crate::webrtc::{WebRtcControl, WebRtcError};
 
 /// HID packet type for an 8-byte boot keyboard report.
@@ -525,6 +528,23 @@ pub struct CodecStatus {
     /// `software`, `vaapi`, `nvenc`).
     #[serde(default)]
     pub backends: Vec<String>,
+    /// Widest source/encoder envelope advertised, not a hard-coded 1080p.
+    #[serde(default)]
+    pub max_width: u32,
+    /// Tallest source/encoder envelope advertised.
+    #[serde(default)]
+    pub max_height: u32,
+    /// Highest frame rate the advertised encoders can take from this source.
+    #[serde(default)]
+    pub max_fps: u32,
+    /// True only when the configured HLS pipeline is a validated 10-bit HDR
+    /// target; never inferred from a codec name or a 4K size.
+    #[serde(default)]
+    pub hdr: bool,
+    /// Raw pixel formats this node can feed/encode (`yuv420p`, plus `p010`
+    /// when 10-bit is configured).
+    #[serde(default)]
+    pub pixel_formats: Vec<String>,
     /// Configured NVENC CUDA ordinal, or `null` when no GPU was configured.
     ///
     /// This is the stored preference, not proof that the current encoder is
@@ -554,6 +574,11 @@ impl CodecStatus {
             override_setting: None,
             available,
             backends: Vec::new(),
+            max_width: 0,
+            max_height: 0,
+            max_fps: 0,
+            hdr: false,
+            pixel_formats: Vec::new(),
             nvenc_gpu: None,
             receipt: None,
             pending_restart: false,
@@ -673,12 +698,53 @@ impl CodecControl {
             .map(|encoder| encoder.ffmpeg_name().to_owned());
         let pending_restart =
             state.override_state.requested.is_some() && state.applied_encoder.is_none();
+        let hls_config = self.hls.as_ref().map(HlsController::config);
+        let max_width = self
+            .registry
+            .capabilities()
+            .iter()
+            .map(|capability| capability.max_width)
+            .max()
+            .unwrap_or(self.format.width)
+            .max(self.format.width);
+        let max_height = self
+            .registry
+            .capabilities()
+            .iter()
+            .map(|capability| capability.max_height)
+            .max()
+            .unwrap_or(self.format.height)
+            .max(self.format.height);
+        let max_fps = self
+            .registry
+            .capabilities()
+            .iter()
+            .map(|capability| capability.max_fps)
+            .max()
+            .unwrap_or(self.format.fps)
+            .max(self.format.fps);
+        let hdr = hls_config
+            .as_ref()
+            .is_some_and(|config| config.hdr && config.pixel_format.is_10bit());
+        let pixel_formats = if hls_config
+            .as_ref()
+            .is_some_and(|config| config.pixel_format.is_10bit())
+        {
+            vec!["yuv420p".to_owned(), "p010".to_owned()]
+        } else {
+            vec!["yuv420p".to_owned()]
+        };
         CodecStatus {
             current_encoder: applied.clone().or(fallback_encoder),
             override_setting: state.override_state.requested,
             available,
             backends,
-            nvenc_gpu: self.hls.as_ref().and_then(|hls| hls.config().nvenc_gpu),
+            max_width,
+            max_height,
+            max_fps,
+            hdr,
+            pixel_formats,
+            nvenc_gpu: hls_config.as_ref().and_then(|config| config.nvenc_gpu),
             receipt: state.override_state.receipt,
             pending_restart,
             applied: applied.is_some(),
@@ -969,6 +1035,22 @@ fn codec_pipeline_error(error: HlsError, encoder: HlsEncoder) -> ApiError {
         )
         .with_details(serde_json::json!({ "encoder": name }))
         .with_remediation("Choose a hardware encoder this node advertises, or a software codec."),
+        HlsError::UnsupportedPixelFormat {
+            encoder: name,
+            pixel_format,
+            ..
+        } => ApiError::new(
+            codes::UNSUPPORTED,
+            format!("The HLS pipeline cannot run `{name}` with {pixel_format}: {error}"),
+        )
+        .with_details(serde_json::json!({
+            "encoder": name,
+            "pixel_format": pixel_format,
+        }))
+        .with_remediation(
+            "Keep the configured 10-bit target with HEVC/AV1 Main10, or restart the node \
+             with an 8-bit --hls-pixel-format before selecting H.264/MJPEG/QSV/V4L2M2M.",
+        ),
         _ => ApiError::new(
             codes::INTERNAL,
             format!("HLS pipeline could not apply the codec override: {error}"),
@@ -1522,14 +1604,18 @@ pub fn audio_router(state: ConnectionState) -> Router {
 /// Controller WebRTC signaling routes, proxied to the external helper.
 ///
 /// `POST /webrtc/offer` accepts `{"sdp": "...", "type": "offer"}` and returns
-/// `{"sdp": "...", "type": "answer"}`. `POST /webrtc/bitrate` accepts
-/// `{"bitrate": <bps>}`. Both are mounted through [`compat_router`] before the
-/// node API's bearer guard. A node with no helper answers 503; a helper that
-/// does not acknowledge a bitrate change answers a typed 501/502 rather than a
-/// fake success.
+/// `{"sdp": "...", "type": "answer"}` plus an optional `session` id.
+/// `POST /webrtc/candidate` accepts
+/// `{"session": "...", "candidate": "...", "sdpMLineIndex": 0}` and forwards a
+/// late (trickled) remote ICE candidate to that helper session.
+/// `POST /webrtc/bitrate` accepts `{"bitrate": <bps>}`. All are mounted through
+/// [`compat_router`] before the node API's bearer guard. A node with no helper
+/// answers 503; a helper that does not acknowledge a request answers a typed
+/// 501/502 rather than a fake success.
 pub fn webrtc_router(state: ConnectionState) -> Router {
     Router::new()
         .route("/webrtc/offer", post(webrtc_offer))
+        .route("/webrtc/candidate", post(webrtc_candidate))
         .route("/webrtc/bitrate", post(webrtc_bitrate))
         .with_state(state)
 }
@@ -1864,6 +1950,8 @@ async fn power_action(
         PowerAction::Start => backend.cont().await,
         PowerAction::Shutdown => backend.system_powerdown().await,
         PowerAction::Reset => backend.system_reset().await,
+        PowerAction::Pause => backend.pause().await,
+        PowerAction::Resume => backend.resume().await,
         PowerAction::Stop => backend.stop().await,
     };
 
@@ -1934,10 +2022,10 @@ struct TypeRequest {
 /// A text-to-keystroke mapping failure.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TextMappingError {
-    /// A character has no direct key on the selected layout.
+    /// A character has no direct key or documented sequence on the layout.
     #[error(
         "unsupported character {character:?} at index {index} for keyboard layout `{layout}`; \
-         only characters the layout types directly are accepted, and IME/compose input is not supported"
+         the layout has no direct key or documented dead-key/compose sequence, and IME input is not supported"
     )]
     Unsupported {
         /// The offending character.
@@ -1947,10 +2035,10 @@ pub enum TextMappingError {
         /// The selected layout.
         layout: KeyboardLayout,
     },
-    /// A character is only reachable through a dead-key sequence on this layout.
+    /// A dead key has no following composable character, or cannot be typed.
     #[error(
-        "character {character:?} at index {index} requires a dead-key sequence on keyboard layout \
-         `{layout}`; dead keys and compose are not supported, so nothing was typed"
+        "dead key {character:?} at index {index} on keyboard layout `{layout}` has no following \
+         composable character; emitting it alone would consume the next key, so nothing was typed"
     )]
     DeadKey {
         /// The offending character.
@@ -1970,21 +2058,40 @@ pub enum TextMappingError {
     },
 }
 
-/// Resolve text into one chord per character, validating the whole request.
+/// Resolve text into one chord per physical keystroke, validating the whole
+/// request.
 ///
-/// Validation finishes before any event or sink is touched, so an unsupported
-/// or dead-key-only character anywhere in the request is rejected atomically.
+/// Known dead-key and compose pairs become two chords (dead key, then base
+/// key); every other character becomes one chord. A prefix is consumed only
+/// when the pair is documented, so unmatched prefixes fall through to their
+/// normal direct/dead/unsupported mapping. Validation finishes before any
+/// event or sink is touched, so an unsupported character or dangling dead key
+/// anywhere in the request is rejected atomically.
 fn text_to_chords(text: &str, layout: KeyboardLayout) -> Result<Vec<KeyChord>, TextMappingError> {
-    let length = text.chars().count();
-    if length > MAX_TYPE_TEXT_CHARS {
+    let characters: Vec<char> = text.chars().collect();
+    if characters.len() > MAX_TYPE_TEXT_CHARS {
         return Err(TextMappingError::TooLong {
-            actual: length,
+            actual: characters.len(),
             limit: MAX_TYPE_TEXT_CHARS,
         });
     }
 
-    let mut chords = Vec::with_capacity(length);
-    for (index, character) in text.chars().enumerate() {
+    let mut chords = Vec::with_capacity(characters.len());
+    let mut index = 0;
+    while index < characters.len() {
+        let character = characters[index];
+        if let Some(&next) = characters.get(index + 1) {
+            if let Some(sequence) = resolve_dead_key_sequence(layout, character, next) {
+                chords.extend(sequence.chords);
+                index += 2;
+                continue;
+            }
+            if let Some(sequence) = resolve_compose_sequence(layout, character, next) {
+                chords.extend(sequence.chords);
+                index += 2;
+                continue;
+            }
+        }
         match layout.chord(character) {
             CharOutcome::Direct(chord) => chords.push(chord),
             CharOutcome::DeadKey => {
@@ -2002,16 +2109,18 @@ fn text_to_chords(text: &str, layout: KeyboardLayout) -> Result<Vec<KeyChord>, T
                 });
             }
         }
+        index += 1;
     }
     Ok(chords)
 }
 
-/// Convert text into per-character key event chunks.
+/// Convert text into per-keystroke key event chunks.
 ///
-/// Each chunk contains the character's key-down/up pair plus any Shift and
-/// AltGr down/up events. The handler sleeps between chunks so the guest sees
-/// separate keystrokes; [`text_to_input_events`] flattens the same mapping for
-/// callers and tests that only need the event sequence.
+/// Each chunk contains one chord's key-down/up pair plus any Shift and AltGr
+/// down/up events. A dead-key/compose sequence therefore has one chunk for the
+/// dead key and one for the base key. The handler sleeps between chunks so the
+/// guest sees separate keystrokes; [`text_to_input_events`] flattens the same
+/// mapping for callers and tests that only need the event sequence.
 fn text_to_key_chunks(
     text: &str,
     layout: KeyboardLayout,
@@ -2312,16 +2421,17 @@ async fn input_type(
                     "unsupported-character",
                     Some(
                         "Select the guest's layout with --keyboard-layout (us, uk, de, fr) and \
-                         send characters that layout types directly. IME/compose input is not \
+                         send characters that layout types directly or through a documented \
+                         dead-key/compose sequence. IME, CJK, emoji, and combining marks are not \
                          supported; send raw /input/key events for anything else. Nothing was typed.",
                     ),
                 ),
                 TextMappingError::DeadKey { .. } => (
                     "dead-key-required",
                     Some(
-                        "Dead-key sequences and compose are not implemented. Use a layout that \
-                         types the character directly, or send raw /input/key events. Nothing was \
-                         typed.",
+                        "A dead key must be followed by a composable base character (for example \
+                         `´e`, `` `e ``, `^e`, `\"u`, `~n`, or `,c`), or use a layout that types \
+                         the character directly, or send raw /input/key events. Nothing was typed.",
                     ),
                 ),
             };
@@ -2770,6 +2880,20 @@ struct WebrtcOfferResponse {
     sdp: String,
     #[serde(rename = "type")]
     kind: &'static str,
+    /// Helper session id for later `/webrtc/candidate` messages. Omitted when
+    /// the configured worker does not emit one (old helpers stay compatible).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<String>,
+}
+
+/// `POST /webrtc/candidate` body; a late remote ICE candidate.
+#[derive(Debug, Deserialize)]
+struct WebrtcCandidateRequest {
+    #[serde(default)]
+    session: Option<String>,
+    candidate: String,
+    #[serde(default, rename = "sdpMLineIndex")]
+    sdp_mline_index: u32,
 }
 
 /// `POST /webrtc/bitrate` body; `bitrate` is bits per second.
@@ -2818,13 +2942,51 @@ async fn webrtc_offer(
         return webrtc_unavailable(&reason);
     }
 
-    match control.offer(&request.sdp).await {
-        Ok(sdp) => Json(WebrtcOfferResponse {
-            sdp,
+    match control.offer_answer(&request.sdp).await {
+        Ok(answer) => Json(WebrtcOfferResponse {
+            sdp: answer.sdp,
             kind: "answer",
+            session: answer.session,
         })
         .into_response(),
         Err(error) => webrtc_offer_failure(error),
+    }
+}
+
+async fn webrtc_candidate(
+    State(state): State<ConnectionState>,
+    payload: Result<Json<WebrtcCandidateRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(error) => return json_rejection(error),
+    };
+    let candidate = request.candidate.trim();
+    if candidate.is_empty() {
+        return compat_error(
+            StatusCode::BAD_REQUEST,
+            "invalid-candidate",
+            "the `candidate` field must not be empty",
+        );
+    }
+
+    let Some(control) = state.webrtc.as_ref() else {
+        return webrtc_not_configured();
+    };
+    if let Some(reason) = control.unavailable_reason() {
+        return webrtc_unavailable(&reason);
+    }
+
+    match control
+        .add_ice_candidate(
+            request.session.as_deref(),
+            candidate,
+            request.sdp_mline_index,
+        )
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(error) => webrtc_candidate_failure(error),
     }
 }
 
@@ -2893,6 +3055,39 @@ fn webrtc_offer_failure(error: WebRtcError) -> Response {
                 "The external helper did not answer the offer. Check that it is running and \
                  still owns its signaling socket; see the node log.",
             ),
+        ),
+    }
+}
+
+fn webrtc_candidate_failure(error: WebRtcError) -> Response {
+    match &error {
+        WebRtcError::InvalidConfig(_) => compat_error(
+            StatusCode::BAD_REQUEST,
+            "invalid-candidate",
+            error.to_string(),
+        ),
+        WebRtcError::Unsupported(_) => compat_error_with_remediation(
+            StatusCode::NOT_IMPLEMENTED,
+            "webrtc-candidate-unsupported",
+            error.to_string(),
+            Some(
+                "The configured helper does not acknowledge trickled ICE candidates. \
+                 Keep candidates embedded in the offer or update the helper.",
+            ),
+        ),
+        WebRtcError::Timeout { .. } => compat_error_with_remediation(
+            StatusCode::BAD_GATEWAY,
+            "webrtc-helper-timeout",
+            error.to_string(),
+            Some("The helper did not acknowledge the candidate in time."),
+        ),
+        WebRtcError::NotConfigured => webrtc_not_configured(),
+        WebRtcError::NotRunning => webrtc_unavailable(&error.to_string()),
+        _ => compat_error_with_remediation(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "webrtc-helper-error",
+            error.to_string(),
+            Some("Check the node log for the WebRTC helper's failure."),
         ),
     }
 }
@@ -3013,6 +3208,14 @@ mod tests {
 
         async fn cont(&mut self) -> Result<(), PowerError> {
             self.record("on")
+        }
+
+        async fn pause(&mut self) -> Result<(), PowerError> {
+            self.record("pause")
+        }
+
+        async fn resume(&mut self) -> Result<(), PowerError> {
+            self.record("resume")
         }
 
         async fn system_powerdown(&mut self) -> Result<(), PowerError> {
@@ -3923,6 +4126,29 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["ok"], false);
         assert_eq!(body["code"], "webrtc-not-configured");
+
+        let (status, body) = post_json(
+            &app,
+            "/webrtc/candidate",
+            serde_json::json!({
+                "session": "sess-1",
+                "candidate": "candidate:1 1 UDP 1 192.0.2.1 5000 typ host",
+                "sdpMLineIndex": 0
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["code"], "webrtc-not-configured");
+
+        let (status, body) = post_json(
+            &app,
+            "/webrtc/candidate",
+            serde_json::json!({"session": "sess-1", "candidate": "  "}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "invalid-candidate");
     }
 
     #[tokio::test]
@@ -4016,6 +4242,9 @@ mod tests {
             ("/power/off", "off"),
             ("/power/shutdown", "off"),
             ("/power/reset", "reset"),
+            ("/power/pause", "pause"),
+            ("/power/suspend", "pause"),
+            ("/power/resume", "resume"),
             ("/power/force-off", "force-off"),
             ("/power/stop", "force-off"),
         ] {
@@ -4043,11 +4272,13 @@ mod tests {
             ("/power/on", "on"),
             ("/power/start", "on"),
             ("/power/cont", "on"),
-            ("/power/resume", "on"),
             ("/power/off", "off"),
             ("/power/shutdown", "off"),
             ("/power/powerdown", "off"),
             ("/power/reset", "reset"),
+            ("/power/pause", "pause"),
+            ("/power/suspend", "pause"),
+            ("/power/resume", "resume"),
             ("/power/force-off", "force-off"),
             ("/power/force_off", "force-off"),
             ("/power/stop", "force-off"),
@@ -4735,15 +4966,18 @@ mod tests {
                 key(0xE6, false),
             ]
         );
-        // Alpine's `fr-latin9` places grave on AltGr+7; AltGr must be released
-        // after the character key.
+        // Alpine's `fr-latin9` and `fr-latin9_nodeadkeys` put the direct grave
+        // character at Shift+AltGr+`p`; both modifiers must be released after
+        // the character key.
         assert_eq!(
             events("`"),
             vec![
+                key(0xE1, true),
                 key(0xE6, true),
-                key(0x24, true),
-                key(0x24, false),
+                key(0x13, true),
+                key(0x13, false),
                 key(0xE6, false),
+                key(0xE1, false),
             ]
         );
     }
@@ -4789,6 +5023,290 @@ mod tests {
         assert!(!text_to_input_events("£", KeyboardLayout::Uk)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn text_mapping_resolves_dead_key_sequences() {
+        let de = |text: &str| text_to_input_events(text, KeyboardLayout::De).unwrap();
+        assert_eq!(
+            de("´e"),
+            vec![
+                key(0x2E, true),
+                key(0x2E, false),
+                key(0x08, true),
+                key(0x08, false),
+            ]
+        );
+        assert_eq!(
+            de("`e"),
+            vec![
+                key(0xE1, true),
+                key(0x2E, true),
+                key(0x2E, false),
+                key(0xE1, false),
+                key(0x08, true),
+                key(0x08, false),
+            ]
+        );
+        assert_eq!(
+            de("^e"),
+            vec![
+                key(0x35, true),
+                key(0x35, false),
+                key(0x08, true),
+                key(0x08, false),
+            ]
+        );
+        assert_eq!(
+            de("~n"),
+            vec![
+                key(0xE6, true),
+                key(0x30, true),
+                key(0x30, false),
+                key(0xE6, false),
+                key(0x11, true),
+                key(0x11, false),
+            ]
+        );
+        assert_eq!(
+            de("¨u"),
+            vec![
+                key(0xE6, true),
+                key(0x2F, true),
+                key(0x2F, false),
+                key(0xE6, false),
+                key(0x18, true),
+                key(0x18, false),
+            ]
+        );
+        assert_eq!(
+            de("¸c"),
+            vec![
+                key(0xE6, true),
+                key(0x2E, true),
+                key(0x2E, false),
+                key(0xE6, false),
+                key(0x06, true),
+                key(0x06, false),
+            ]
+        );
+        // The base character may itself need Shift.
+        assert_eq!(
+            de("´E"),
+            vec![
+                key(0x2E, true),
+                key(0x2E, false),
+                key(0xE1, true),
+                key(0x08, true),
+                key(0x08, false),
+                key(0xE1, false),
+            ]
+        );
+
+        let fr = |text: &str| text_to_input_events(text, KeyboardLayout::Fr).unwrap();
+        assert_eq!(
+            fr("´e"),
+            vec![
+                key(0xE6, true),
+                key(0x1E, true),
+                key(0x1E, false),
+                key(0xE6, false),
+                key(0x08, true),
+                key(0x08, false),
+            ]
+        );
+        assert_eq!(
+            fr("`e"),
+            vec![
+                key(0xE6, true),
+                key(0x24, true),
+                key(0x24, false),
+                key(0xE6, false),
+                key(0x08, true),
+                key(0x08, false),
+            ]
+        );
+        assert_eq!(
+            fr("^e"),
+            vec![
+                key(0x2F, true),
+                key(0x2F, false),
+                key(0x08, true),
+                key(0x08, false),
+            ]
+        );
+        assert_eq!(
+            fr("~n"),
+            vec![
+                key(0xE6, true),
+                key(0x2F, true),
+                key(0x2F, false),
+                key(0xE6, false),
+                key(0x11, true),
+                key(0x11, false),
+            ]
+        );
+        assert_eq!(
+            fr("¨u"),
+            vec![
+                key(0xE1, true),
+                key(0x2F, true),
+                key(0x2F, false),
+                key(0xE1, false),
+                key(0x18, true),
+                key(0x18, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn text_mapping_resolves_the_documented_compose_set() {
+        let de = |text: &str| text_to_input_events(text, KeyboardLayout::De).unwrap();
+        assert_eq!(
+            de("'e"),
+            vec![
+                key(0x2E, true),
+                key(0x2E, false),
+                key(0x08, true),
+                key(0x08, false),
+            ]
+        );
+        assert_eq!(
+            de("\"u"),
+            vec![
+                key(0xE6, true),
+                key(0x2F, true),
+                key(0x2F, false),
+                key(0xE6, false),
+                key(0x18, true),
+                key(0x18, false),
+            ]
+        );
+        assert_eq!(
+            de(",c"),
+            vec![
+                key(0xE6, true),
+                key(0x2E, true),
+                key(0x2E, false),
+                key(0xE6, false),
+                key(0x06, true),
+                key(0x06, false),
+            ]
+        );
+
+        let fr = |text: &str| text_to_input_events(text, KeyboardLayout::Fr).unwrap();
+        assert_eq!(
+            fr("'e"),
+            vec![
+                key(0xE6, true),
+                key(0x1E, true),
+                key(0x1E, false),
+                key(0xE6, false),
+                key(0x08, true),
+                key(0x08, false),
+            ]
+        );
+        assert_eq!(
+            fr("\"u"),
+            vec![
+                key(0xE1, true),
+                key(0x2F, true),
+                key(0x2F, false),
+                key(0xE1, false),
+                key(0x18, true),
+                key(0x18, false),
+            ]
+        );
+        // fr-latin9 has no dead cedilla; ç is a direct key.
+        assert_eq!(fr(",c"), vec![key(0x26, true), key(0x26, false)]);
+
+        // Unmatched prefixes are ordinary characters, not dropped.
+        assert_eq!(
+            text_to_input_events("'b", KeyboardLayout::De).unwrap(),
+            vec![
+                key(0xE1, true),
+                key(0x32, true),
+                key(0x32, false),
+                key(0xE1, false),
+                key(0x05, true),
+                key(0x05, false),
+            ]
+        );
+        // On fr, ^ has a direct key, so ^x is typed literally rather than
+        // being consumed as a failed composition.
+        assert_eq!(
+            text_to_input_events("^x", KeyboardLayout::Fr).unwrap(),
+            vec![
+                key(0xE6, true),
+                key(0x26, true),
+                key(0x26, false),
+                key(0xE6, false),
+                key(0x1B, true),
+                key(0x1B, false),
+            ]
+        );
+        // US and UK have no dead keys, so the compose prefixes are literal.
+        assert_eq!(
+            text_to_input_events("'e", KeyboardLayout::Us).unwrap(),
+            vec![
+                key(0x34, true),
+                key(0x34, false),
+                key(0x08, true),
+                key(0x08, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn text_mapping_rejects_dangling_dead_keys_and_ime_characters_atomically() {
+        for (text, character, index) in [("ab^", '^', 2), ("a´", '´', 1), ("^x", '^', 0)] {
+            assert_eq!(
+                text_to_input_events(text, KeyboardLayout::De).unwrap_err(),
+                TextMappingError::DeadKey {
+                    character,
+                    index,
+                    layout: KeyboardLayout::De,
+                },
+                "DE {text:?}"
+            );
+        }
+        assert_eq!(
+            text_to_input_events("a¸", KeyboardLayout::De).unwrap_err(),
+            TextMappingError::DeadKey {
+                character: '¸',
+                index: 1,
+                layout: KeyboardLayout::De,
+            }
+        );
+        assert_eq!(
+            text_to_input_events("´x", KeyboardLayout::Fr).unwrap_err(),
+            TextMappingError::DeadKey {
+                character: '´',
+                index: 0,
+                layout: KeyboardLayout::Fr,
+            }
+        );
+        for character in ['日', '🙂'] {
+            assert_eq!(
+                text_to_input_events(&format!("a{character}"), KeyboardLayout::Fr).unwrap_err(),
+                TextMappingError::Unsupported {
+                    character,
+                    index: 1,
+                    layout: KeyboardLayout::Fr,
+                },
+                "FR {character:?}"
+            );
+        }
+        // Plain accented characters still require a direct key or a sequence;
+        // the parser must not guess one on a layout without it.
+        assert_eq!(
+            text_to_input_events("é", KeyboardLayout::De).unwrap_err(),
+            TextMappingError::Unsupported {
+                character: 'é',
+                index: 0,
+                layout: KeyboardLayout::De,
+            }
+        );
     }
 
     #[tokio::test]
@@ -5176,6 +5694,157 @@ mod tests {
             ]
         );
         assert!(recording.held().is_empty());
+    }
+
+    #[tokio::test]
+    async fn input_type_route_types_dead_key_sequences_on_the_german_layout() {
+        let (state, recording) = input_state_with_layout(SINK_FAKE_RECORDING, KeyboardLayout::De);
+        let app = input_router(state);
+
+        let (status, body) = post_json(
+            &app,
+            "/input/type",
+            serde_json::json!({"text": "´e`e^e~n¨u¸c"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["events"], 32);
+        assert_eq!(
+            recording.take_events(),
+            vec![
+                // ´e
+                key(0x2E, true),
+                key(0x2E, false),
+                key(0x08, true),
+                key(0x08, false),
+                // `e
+                key(0xE1, true),
+                key(0x2E, true),
+                key(0x2E, false),
+                key(0xE1, false),
+                key(0x08, true),
+                key(0x08, false),
+                // ^e
+                key(0x35, true),
+                key(0x35, false),
+                key(0x08, true),
+                key(0x08, false),
+                // ~n
+                key(0xE6, true),
+                key(0x30, true),
+                key(0x30, false),
+                key(0xE6, false),
+                key(0x11, true),
+                key(0x11, false),
+                // ¨u
+                key(0xE6, true),
+                key(0x2F, true),
+                key(0x2F, false),
+                key(0xE6, false),
+                key(0x18, true),
+                key(0x18, false),
+                // ¸c
+                key(0xE6, true),
+                key(0x2E, true),
+                key(0x2E, false),
+                key(0xE6, false),
+                key(0x06, true),
+                key(0x06, false),
+            ]
+        );
+        assert!(
+            recording.held().is_empty(),
+            "dead keys, base keys, Shift, and AltGr must all be released"
+        );
+    }
+
+    #[tokio::test]
+    async fn input_type_route_types_dead_keys_and_compose_on_the_french_layout() {
+        let (state, recording) = input_state_with_layout(SINK_FAKE_RECORDING, KeyboardLayout::Fr);
+        let app = input_router(state);
+
+        let (status, body) = post_json(
+            &app,
+            "/input/type",
+            serde_json::json!({"text": "´e`e^e~n¨u,c"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["events"], 30);
+        assert_eq!(
+            recording.take_events(),
+            vec![
+                // ´e (dead acute is AltGr+1)
+                key(0xE6, true),
+                key(0x1E, true),
+                key(0x1E, false),
+                key(0xE6, false),
+                key(0x08, true),
+                key(0x08, false),
+                // `e (dead grave is AltGr+è)
+                key(0xE6, true),
+                key(0x24, true),
+                key(0x24, false),
+                key(0xE6, false),
+                key(0x08, true),
+                key(0x08, false),
+                // ^e
+                key(0x2F, true),
+                key(0x2F, false),
+                key(0x08, true),
+                key(0x08, false),
+                // ~n
+                key(0xE6, true),
+                key(0x2F, true),
+                key(0x2F, false),
+                key(0xE6, false),
+                key(0x11, true),
+                key(0x11, false),
+                // ¨u (dead diaeresis is Shift+^ key)
+                key(0xE1, true),
+                key(0x2F, true),
+                key(0x2F, false),
+                key(0xE1, false),
+                key(0x18, true),
+                key(0x18, false),
+                // ,c composes to the direct ç key
+                key(0x26, true),
+                key(0x26, false),
+            ]
+        );
+        assert!(recording.held().is_empty());
+    }
+
+    #[tokio::test]
+    async fn input_type_route_rejects_dangling_dead_keys_and_ime_before_typing() {
+        let (state, recording) = input_state_with_layout(SINK_FAKE_RECORDING, KeyboardLayout::Fr);
+        let app = input_router(state);
+
+        let (status, body) =
+            post_json(&app, "/input/type", serde_json::json!({"text": "ab´"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "dead-key-required");
+        assert!(body["remediation"].is_string());
+        assert!(recording.events().is_empty());
+
+        // A known dead prefix followed by a non-composable character is not a
+        // composition; on fr `^` falls back to its direct key, while a CJK
+        // character remains a typed 400 with no partial typing.
+        let (status, body) =
+            post_json(&app, "/input/type", serde_json::json!({"text": "a日"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "unsupported-character");
+        assert!(recording.events().is_empty());
+
+        let (state, recording) = input_state_with_layout(SINK_FAKE_RECORDING, KeyboardLayout::De);
+        let app = input_router(state);
+        let (status, body) =
+            post_json(&app, "/input/type", serde_json::json!({"text": "a🙂"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "unsupported-character");
+        assert!(recording.events().is_empty());
     }
 
     struct PendingCapture {

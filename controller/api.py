@@ -239,7 +239,7 @@ class DirectRegisterRequest(BaseModel):
     pci_devices: str = ""     # JSON-encoded list of PCI addresses (GPU passthrough)
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None, sunshine: Any | None = None, msp_mgr: MSPDashboardManager | None = None, msp_portal: MSPPortalManager | None = None, auto_configure: Any | None = None, cam_connect: Any | None = None, grid: Any | None = None, parental: ParentalControlsManager | None = None, backup_nudge: BackupNudgeService | None = None, dns_filter: Any | None = None, local_proxy: Any | None = None, file_sharing: Any | None = None, zfs: Any | None = None, failover: Any | None = None, ups_monitor: Any | None = None, ddns: Any | None = None, speedtest: Any | None = None, dns_verifier: Any | None = None, node_api_token: str = "") -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None, sunshine: Any | None = None, msp_mgr: MSPDashboardManager | None = None, msp_portal: MSPPortalManager | None = None, auto_configure: Any | None = None, cam_connect: Any | None = None, grid: Any | None = None, parental: ParentalControlsManager | None = None, backup_nudge: BackupNudgeService | None = None, dns_filter: Any | None = None, local_proxy: Any | None = None, file_sharing: Any | None = None, zfs: Any | None = None, failover: Any | None = None, ups_monitor: Any | None = None, ddns: Any | None = None, speedtest: Any | None = None, dns_verifier: Any | None = None, node_api_token: str = "", webrtc_ice_servers: list[dict] | None = None) -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -1671,6 +1671,16 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             **state.snapshot(),
             "active_scenario_id": scenarios.active_id,
         }
+
+    @app.get("/api/v1/webrtc/ice")
+    async def get_webrtc_ice() -> dict[str, Any]:
+        """Browser ICE servers configured with OZMA_WEBRTC_ICE_SERVERS.
+
+        TURN credentials are intentionally returned to the browser: a WebRTC
+        peer cannot use a TURN relay without them. The value is still guarded by
+        the normal auth middleware when auth is enabled.
+        """
+        return {"iceServers": list(webrtc_ice_servers or [])}
 
     # --- Routing graph endpoints (Phase 1: observational) ---
 
@@ -3554,6 +3564,16 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     async def stream_webrtc(node_id: str, body: dict) -> Response:
         """WebRTC signaling — proxy to soft node's aiortc endpoint."""
         return await _proxy_to_node_raw(node_id, "/webrtc/offer", body)
+
+    @app.post("/api/v1/streams/{node_id:path}/webrtc/candidate")
+    async def stream_webrtc_candidate(node_id: str, body: dict) -> Response:
+        """Forward one late/trickled remote ICE candidate to the node.
+
+        The browser includes the `session` id returned by the offer response;
+        older nodes answer a typed error and the browser keeps its candidates
+        embedded in the original offer.
+        """
+        return await _proxy_to_node_raw(node_id, "/webrtc/candidate", body)
 
     async def _proxy_to_node_raw(node_id: str, path: str, body: dict) -> Response:
         node = state.nodes.get(node_id)

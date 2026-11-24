@@ -13,30 +13,48 @@
 //! |---|---|---|
 //! | `us` | `us` / `defkeymap` | Every printable US-ASCII character. |
 //! | `uk` | `uk` (Alpine `gb`) | ISO UK: `"` on Shift+2, `£`, `#~` on HID `0x32`, `\` on HID `0x64`. |
-//! | `de` | `de-latin1` / `de` | QWERTZ, umlauts, `ß`, AltGr for `@ € {[]} \`. |
-//! | `fr` | `fr-latin9_nodeadkeys` (Alpine `kbd-bkeymaps`) | AZERTY, shifted digits, AltGr for `# {[]} \| @ ^ ~ \``, French accents. |
+//! | `de` | `de-deadtilde` / `de-latin1` | QWERTZ, umlauts, `ß`, AltGr for `@ € {[]} \`, dead accents. |
+//! | `fr` | `fr-latin9` (Alpine `kbd-bkeymaps`) | AZERTY, shifted digits, AltGr punctuation, French accents, dead accents. |
 //!
 //! The tables follow the Linux **console** keymaps shipped by `kbd` and
 //! Alpine's `kbd-bkeymaps`, not the XKB desktop layouts. They intentionally do
 //! not guess: a character that a layout only produces through a dead-key or
 //! compose sequence is reported as [`CharOutcome::DeadKey`] (or
 //! [`CharOutcome::Unsupported`] when it needs an IME), so the caller can return
-//! a typed 400 before typing anything.
+//! a typed 400 before typing anything. Known dead-key and compose sequences are
+//! resolved by [`resolve_dead_key_sequence`] and [`resolve_compose_sequence`].
 //!
-//! The French table follows the **nodeadkeys** `fr-latin9` keymap shipped by
-//! Alpine's `kbd-bkeymaps` and XKB, where `` ` `` is a direct AltGr+7 and
-//! `^`/`~` are direct AltGr+9/AltGr+2. Plain `fr-latin9` defines AltGr+7 as
-//! `dead_grave`, which would consume the following character; install
-//! `fr-latin9_nodeadkeys` on the guest, or send raw `/input/key` events for
-//! `` ` `` when using the dead-key variant. Layouts are not auto-detected.
+//! The French table targets Alpine's `fr-latin9` map (the dead-key variant).
+//! Its direct accents and AltGr punctuation are the same as
+//! `fr-latin9_nodeadkeys`; `` ` `` is mapped to the direct Shift+AltGr+`p`
+//! position that both variants provide. With `fr-latin9`, the standard French
+//! dead accents (`^`, `¨`, `´`, `` ` ``, `~`) are also available for
+//! compositions. Layouts are not auto-detected.
 //!
-//! # Dead keys
+//! The German table targets Alpine's `de-deadtilde` map (the `de-latin1`
+//! layout), where `~` is AltGr+`+` and is a dead key. Alpine's plain `de.bmap`
+//! has a direct `~` at that position instead, so it cannot compose `~n`; load
+//! `de-deadtilde.bmap` (or the matching `kbd` `de-latin1` map) for the German
+//! dead-tilde sequences below.
 //!
-//! Dead-key composition is not implemented. On `de`, `^`, `~`, `` ` ``, and `´`
-//! are dead keys in the console keymap, so they are rejected rather than
-//! emitted (emitting the dead key alone would swallow the next character). On
-//! `fr`, the printable ASCII forms `^`, `~`, and `` ` `` are available directly
-//! through AltGr in `fr-latin9` and are therefore supported.
+//! # Dead keys and compose
+//!
+//! A dead-key sequence is written with the dead accent mark followed by the
+//! base character: `´e` → é, `` `e `` → è, `^e` → ê, `~n` → ñ, `¨u` → ü, and
+//! `¸c` → ç. The node emits the dead-key press/release and then the base key,
+//! so the guest's keymap performs the composition. A small compose set is also
+//! accepted using ASCII prefixes: `'e` → é, `` `e `` → è, `^e` → ê, `~n` → ñ,
+//! `"u` → ü, and `,c` → ç. Compose is available only on layouts that have dead
+//! keys (`de` and `fr`); on `us`/`uk` those prefixes are ordinary characters.
+//!
+//! A prefix is consumed only when the pair is a documented composition.
+//! Otherwise the prefix is treated as a normal character, so `^x` types `^x`
+//! on `fr` (where `^` has a direct key) and is a typed 400 on `de` (where `^`
+//! is dead-only). A dead key with no following composable character is never
+//! silently dropped: it is a typed 400 before any event is submitted. IME,
+//! CJK, emoji, and combining marks are still [`CharOutcome::Unsupported`]. A
+//! real IME/clipboard path (for example pasting a composed string into the
+//! guest) remains future work.
 
 use std::fmt;
 use std::str::FromStr;
@@ -96,8 +114,8 @@ impl KeyboardLayout {
         match self {
             Self::Us => "us/defkeymap",
             Self::Uk => "uk/gb",
-            Self::De => "de-latin1/de",
-            Self::Fr => "fr-latin9_nodeadkeys",
+            Self::De => "de-deadtilde/de-latin1",
+            Self::Fr => "fr-latin9",
         }
     }
 
@@ -113,8 +131,10 @@ impl KeyboardLayout {
         if character.is_ascii_alphabetic() {
             return CharOutcome::Direct(self.letter_chord(character));
         }
-        if self.dead_chars().contains(&character) {
-            return CharOutcome::DeadKey;
+        if let Some(dead) = DeadKey::from_mark(character) {
+            if self.dead_key_chord(dead).is_some() {
+                return CharOutcome::DeadKey;
+            }
         }
         CharOutcome::Unsupported
     }
@@ -164,12 +184,41 @@ impl KeyboardLayout {
             })
     }
 
-    fn dead_chars(self) -> &'static [char] {
+    /// The dead-key accents this layout's console keymap provides.
+    pub fn dead_keys(self) -> &'static [(DeadKey, KeyChord)] {
         match self {
             Self::Us | Self::Uk => &[],
-            Self::De => DE_DEAD,
-            Self::Fr => FR_DEAD,
+            Self::De => DE_DEAD_KEYS,
+            Self::Fr => FR_DEAD_KEYS,
         }
+    }
+
+    /// The chord that presses one dead key on this layout.
+    pub fn dead_key_chord(self, dead: DeadKey) -> Option<KeyChord> {
+        self.dead_keys()
+            .iter()
+            .find(|(candidate, _)| *candidate == dead)
+            .map(|(_, chord)| *chord)
+    }
+
+    /// Resolve `dead_char` + `base_char` on this layout.
+    ///
+    /// This is the two-argument form of [`resolve_dead_key_sequence`].
+    pub fn resolve_dead_key_sequence(
+        self,
+        dead_char: char,
+        base_char: char,
+    ) -> Option<KeyChordSequence> {
+        resolve_dead_key_sequence(self, dead_char, base_char)
+    }
+
+    /// Resolve an ASCII compose prefix + `base_char` on this layout.
+    pub fn resolve_compose_sequence(
+        self,
+        prefix: char,
+        base_char: char,
+    ) -> Option<KeyChordSequence> {
+        resolve_compose_sequence(self, prefix, base_char)
     }
 }
 
@@ -234,6 +283,229 @@ impl KeyChord {
             }
         }
         events
+    }
+}
+
+/// Two or more chords that together produce one character.
+///
+/// A dead-key composition is the dead-key chord followed by the base-key
+/// chord. A compose sequence whose result has a direct key on the layout is a
+/// single chord. The caller processes each chord as its own timed keystroke so
+/// every press is held long enough for the guest to see it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyChordSequence {
+    /// Chords in the order they must be sent.
+    pub chords: Vec<KeyChord>,
+}
+
+impl KeyChordSequence {
+    fn new(chords: Vec<KeyChord>) -> Self {
+        Self { chords }
+    }
+
+    /// Flatten the sequence into balanced key events.
+    pub fn events(&self) -> Vec<InputEvent> {
+        self.chords
+            .iter()
+            .copied()
+            .flat_map(KeyChord::events)
+            .collect()
+    }
+}
+
+/// A dead accent this module can compose with a following base character.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DeadKey {
+    /// Grave accent, `` ` ``.
+    Grave,
+    /// Acute accent, `´`.
+    Acute,
+    /// Circumflex, `^`.
+    Circumflex,
+    /// Tilde, `~`.
+    Tilde,
+    /// Diaeresis, `¨`.
+    Diaeresis,
+    /// Cedilla, `¸`.
+    Cedilla,
+}
+
+impl DeadKey {
+    /// The spacing character used to write this dead key in a request.
+    pub const fn mark(self) -> char {
+        match self {
+            Self::Grave => '`',
+            Self::Acute => '´',
+            Self::Circumflex => '^',
+            Self::Tilde => '~',
+            Self::Diaeresis => '¨',
+            Self::Cedilla => '¸',
+        }
+    }
+
+    /// Resolve a dead-key mark written in a request.
+    pub fn from_mark(character: char) -> Option<Self> {
+        match character {
+            '`' => Some(Self::Grave),
+            '´' => Some(Self::Acute),
+            '^' => Some(Self::Circumflex),
+            '~' => Some(Self::Tilde),
+            '¨' => Some(Self::Diaeresis),
+            '¸' => Some(Self::Cedilla),
+            _ => None,
+        }
+    }
+
+    /// Resolve one ASCII prefix of the documented compose set.
+    pub fn from_compose_prefix(character: char) -> Option<Self> {
+        match character {
+            '`' => Some(Self::Grave),
+            '\'' => Some(Self::Acute),
+            '^' => Some(Self::Circumflex),
+            '~' => Some(Self::Tilde),
+            '"' => Some(Self::Diaeresis),
+            ',' => Some(Self::Cedilla),
+            _ => None,
+        }
+    }
+
+    /// The composed character for `dead` + `base`, or `None` when this module
+    /// does not document that pair.
+    ///
+    /// The table is deliberately small and Latin-1 only. It says whether the
+    /// guest's console composition is expected to succeed; the node types the
+    /// dead key and the base key, not this result character.
+    pub fn compose(self, base: char) -> Option<char> {
+        match self {
+            Self::Grave => compose_from(&GRAVE_COMPOSITIONS, base),
+            Self::Acute => compose_from(&ACUTE_COMPOSITIONS, base),
+            Self::Circumflex => compose_from(&CIRCUMFLEX_COMPOSITIONS, base),
+            Self::Tilde => compose_from(&TILDE_COMPOSITIONS, base),
+            Self::Diaeresis => compose_from(&DIAERESIS_COMPOSITIONS, base),
+            Self::Cedilla => compose_from(&CEDILLA_COMPOSITIONS, base),
+        }
+    }
+}
+
+fn compose_from(table: &[(char, char)], base: char) -> Option<char> {
+    table
+        .iter()
+        .find(|(candidate, _)| *candidate == base)
+        .map(|(_, composed)| *composed)
+}
+
+// Latin-1 compositions used by the Linux console dead-key tables. The node
+// only uses these to decide whether a pair is a documented composition.
+const GRAVE_COMPOSITIONS: &[(char, char)] = &[
+    ('a', 'à'),
+    ('A', 'À'),
+    ('e', 'è'),
+    ('E', 'È'),
+    ('i', 'ì'),
+    ('I', 'Ì'),
+    ('o', 'ò'),
+    ('O', 'Ò'),
+    ('u', 'ù'),
+    ('U', 'Ù'),
+];
+const ACUTE_COMPOSITIONS: &[(char, char)] = &[
+    ('a', 'á'),
+    ('A', 'Á'),
+    ('e', 'é'),
+    ('E', 'É'),
+    ('i', 'í'),
+    ('I', 'Í'),
+    ('o', 'ó'),
+    ('O', 'Ó'),
+    ('u', 'ú'),
+    ('U', 'Ú'),
+    ('y', 'ý'),
+    ('Y', 'Ý'),
+];
+const CIRCUMFLEX_COMPOSITIONS: &[(char, char)] = &[
+    ('a', 'â'),
+    ('A', 'Â'),
+    ('e', 'ê'),
+    ('E', 'Ê'),
+    ('i', 'î'),
+    ('I', 'Î'),
+    ('o', 'ô'),
+    ('O', 'Ô'),
+    ('u', 'û'),
+    ('U', 'Û'),
+];
+const TILDE_COMPOSITIONS: &[(char, char)] = &[
+    ('a', 'ã'),
+    ('A', 'Ã'),
+    ('n', 'ñ'),
+    ('N', 'Ñ'),
+    ('o', 'õ'),
+    ('O', 'Õ'),
+];
+const DIAERESIS_COMPOSITIONS: &[(char, char)] = &[
+    ('a', 'ä'),
+    ('A', 'Ä'),
+    ('e', 'ë'),
+    ('E', 'Ë'),
+    ('i', 'ï'),
+    ('I', 'Ï'),
+    ('o', 'ö'),
+    ('O', 'Ö'),
+    ('u', 'ü'),
+    ('U', 'Ü'),
+    ('y', 'ÿ'),
+    ('Y', 'Ÿ'),
+];
+const CEDILLA_COMPOSITIONS: &[(char, char)] = &[('c', 'ç'), ('C', 'Ç')];
+
+/// Resolve `dead_char` followed by `base_char` into the two chords that make
+/// the guest's console compose the accented character.
+///
+/// `dead_char` must be the layout's dead accent mark (for example `´`, `` ` ``,
+/// `^`, `~`, `¨`, or `¸`), not an ASCII compose prefix. Returns `None` when the
+/// layout has no such dead key, when this module does not document the pair, or
+/// when the base character has no direct key on the layout.
+pub fn resolve_dead_key_sequence(
+    layout: KeyboardLayout,
+    dead_char: char,
+    base_char: char,
+) -> Option<KeyChordSequence> {
+    let dead = DeadKey::from_mark(dead_char)?;
+    let dead_chord = layout.dead_key_chord(dead)?;
+    dead.compose(base_char)?;
+    let base_chord = match layout.chord(base_char) {
+        CharOutcome::Direct(chord) => chord,
+        _ => return None,
+    };
+    Some(KeyChordSequence::new(vec![dead_chord, base_chord]))
+}
+
+/// Resolve one ASCII compose prefix and base character.
+///
+/// On layouts with dead keys the prefix maps to its dead accent and the result
+/// is the same as [`resolve_dead_key_sequence`]. When the layout has no dead
+/// key for that accent but types the composed character directly (for example
+/// `,c` → ç on `fr`), the sequence is that single direct chord.
+pub fn resolve_compose_sequence(
+    layout: KeyboardLayout,
+    prefix: char,
+    base_char: char,
+) -> Option<KeyChordSequence> {
+    if layout.dead_keys().is_empty() {
+        return None;
+    }
+    let dead = DeadKey::from_compose_prefix(prefix)?;
+    let composed = dead.compose(base_char)?;
+    if let Some(dead_chord) = layout.dead_key_chord(dead) {
+        let base_chord = match layout.chord(base_char) {
+            CharOutcome::Direct(chord) => chord,
+            _ => return None,
+        };
+        return Some(KeyChordSequence::new(vec![dead_chord, base_chord]));
+    }
+    match layout.chord(composed) {
+        CharOutcome::Direct(chord) => Some(KeyChordSequence::new(vec![chord])),
+        _ => None,
     }
 }
 
@@ -414,13 +686,63 @@ const DE_SPECIAL: &[LayoutEntry] = &[
     ('µ', 0x10, false, true),
 ];
 
-// `de-latin1`/`de` define these as dead keys. `^` is dead at HID 0x35, `´`
-// and `` ` `` at 0x2E, and `~` is AltGr+`+` (HID 0x30) dead_tilde.
-const DE_DEAD: &[char] = &['^', '~', '`', '´'];
+// Alpine `de-deadtilde` / `kbd` `de-latin1` dead-key positions. `^` is dead at
+// HID 0x35; `´` (unshifted), `` ` `` (shifted), and `¸` (AltGr) share HID
+// 0x2E; `¨` is AltGr at HID 0x2F; `~` is AltGr+`+` at HID 0x30.
+const DE_DEAD_KEYS: &[(DeadKey, KeyChord)] = &[
+    (
+        DeadKey::Acute,
+        KeyChord {
+            usage: 0x2E,
+            shift: false,
+            altgr: false,
+        },
+    ),
+    (
+        DeadKey::Grave,
+        KeyChord {
+            usage: 0x2E,
+            shift: true,
+            altgr: false,
+        },
+    ),
+    (
+        DeadKey::Circumflex,
+        KeyChord {
+            usage: 0x35,
+            shift: false,
+            altgr: false,
+        },
+    ),
+    (
+        DeadKey::Tilde,
+        KeyChord {
+            usage: 0x30,
+            shift: false,
+            altgr: true,
+        },
+    ),
+    (
+        DeadKey::Diaeresis,
+        KeyChord {
+            usage: 0x2F,
+            shift: false,
+            altgr: true,
+        },
+    ),
+    (
+        DeadKey::Cedilla,
+        KeyChord {
+            usage: 0x2E,
+            shift: false,
+            altgr: true,
+        },
+    ),
+];
 
-// French AZERTY (`fr-latin9_nodeadkeys`). Digits are shifted; AltGr supplies
-// the missing ASCII punctuation directly (`# {[]} \| @ ^ ~ \``), so no dead key
-// is needed.
+// French AZERTY (`fr-latin9`). Digits are shifted; AltGr supplies the missing
+// ASCII punctuation directly (`# {[]} \| @ ^ ~`), so those characters do not
+// need a dead key even though the same map also defines French dead accents.
 const FR_SPECIAL: &[LayoutEntry] = &[
     ('\n', 0x28, false, false),
     ('\r', 0x28, false, false),
@@ -477,9 +799,11 @@ const FR_SPECIAL: &[LayoutEntry] = &[
     ('@', 0x27, false, true),
     (']', 0x2D, false, true),
     ('}', 0x2E, false, true),
-    // Alpine's `fr-latin9`/XKB places grave on AltGr+7; a Shift+AltGr+`^`
-    // sequence is dead_abovering/apostrophe there, not a backtick.
-    ('`', 0x24, false, true),
+    // Alpine's `fr-latin9` and `fr-latin9_nodeadkeys` both place the direct
+    // grave/backtick character at Shift+AltGr+`p` (HID 0x13). AltGr+`è` (HID
+    // 0x24) is `dead_grave` on plain `fr-latin9`, so it must not be used for a
+    // literal backtick.
+    ('`', 0x13, true, true),
     ('¤', 0x08, false, true),
     ('É', 0x1F, true, true),
     ('È', 0x24, true, true),
@@ -493,8 +817,51 @@ const FR_SPECIAL: &[LayoutEntry] = &[
     ('û', 0x18, false, true),
 ];
 
-// Accents available only as dead keys in `fr-latin9_nodeadkeys`.
-const FR_DEAD: &[char] = &['¨', '´', '¸'];
+// Alpine `fr-latin9` dead-key positions. `^` is unshifted and `¨` shifted at
+// HID 0x2F; `´`, `` ` ``, and `~` are AltGr at HID 0x1E, 0x24, and 0x2F.
+// `fr-latin9` has no dead cedilla; `,c` composes to the direct `ç` key instead.
+const FR_DEAD_KEYS: &[(DeadKey, KeyChord)] = &[
+    (
+        DeadKey::Acute,
+        KeyChord {
+            usage: 0x1E,
+            shift: false,
+            altgr: true,
+        },
+    ),
+    (
+        DeadKey::Grave,
+        KeyChord {
+            usage: 0x24,
+            shift: false,
+            altgr: true,
+        },
+    ),
+    (
+        DeadKey::Circumflex,
+        KeyChord {
+            usage: 0x2F,
+            shift: false,
+            altgr: false,
+        },
+    ),
+    (
+        DeadKey::Tilde,
+        KeyChord {
+            usage: 0x2F,
+            shift: false,
+            altgr: true,
+        },
+    ),
+    (
+        DeadKey::Diaeresis,
+        KeyChord {
+            usage: 0x2F,
+            shift: true,
+            altgr: false,
+        },
+    ),
+];
 
 #[cfg(test)]
 mod tests {
@@ -680,7 +1047,7 @@ mod tests {
         assert_direct(layout, ']', 0x2D, false, true);
         assert_direct(layout, '}', 0x2E, false, true);
         assert_direct(layout, '~', 0x1F, false, true);
-        assert_direct(layout, '`', 0x24, false, true);
+        assert_direct(layout, '`', 0x13, true, true);
         assert_direct(layout, 'É', 0x1F, true, true);
     }
 
@@ -725,6 +1092,301 @@ mod tests {
         assert_eq!(KeyboardLayout::De.chord('é'), CharOutcome::Unsupported);
         assert_eq!(KeyboardLayout::De.chord('日'), CharOutcome::Unsupported);
         assert_eq!(KeyboardLayout::Fr.chord('日'), CharOutcome::Unsupported);
+    }
+
+    fn chord(usage: u8, shift: bool, altgr: bool) -> KeyChord {
+        KeyChord {
+            usage,
+            shift,
+            altgr,
+        }
+    }
+
+    fn assert_sequence(layout: KeyboardLayout, dead: char, base: char, expected: &[KeyChord]) {
+        let sequence = resolve_dead_key_sequence(layout, dead, base)
+            .unwrap_or_else(|| panic!("{layout} {dead:?}+{base:?} must resolve"));
+        assert_eq!(sequence.chords, expected, "{layout} {dead:?}+{base:?}");
+        assert_eq!(
+            sequence.events(),
+            expected
+                .iter()
+                .copied()
+                .flat_map(KeyChord::events)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn dead_key_chords_match_the_alpine_keymaps() {
+        // de-deadtilde / de-latin1.
+        assert_eq!(
+            KeyboardLayout::De.dead_key_chord(DeadKey::Acute),
+            Some(chord(0x2E, false, false))
+        );
+        assert_eq!(
+            KeyboardLayout::De.dead_key_chord(DeadKey::Grave),
+            Some(chord(0x2E, true, false))
+        );
+        assert_eq!(
+            KeyboardLayout::De.dead_key_chord(DeadKey::Circumflex),
+            Some(chord(0x35, false, false))
+        );
+        assert_eq!(
+            KeyboardLayout::De.dead_key_chord(DeadKey::Tilde),
+            Some(chord(0x30, false, true))
+        );
+        assert_eq!(
+            KeyboardLayout::De.dead_key_chord(DeadKey::Diaeresis),
+            Some(chord(0x2F, false, true))
+        );
+        assert_eq!(
+            KeyboardLayout::De.dead_key_chord(DeadKey::Cedilla),
+            Some(chord(0x2E, false, true))
+        );
+
+        // fr-latin9.
+        assert_eq!(
+            KeyboardLayout::Fr.dead_key_chord(DeadKey::Acute),
+            Some(chord(0x1E, false, true))
+        );
+        assert_eq!(
+            KeyboardLayout::Fr.dead_key_chord(DeadKey::Grave),
+            Some(chord(0x24, false, true))
+        );
+        assert_eq!(
+            KeyboardLayout::Fr.dead_key_chord(DeadKey::Circumflex),
+            Some(chord(0x2F, false, false))
+        );
+        assert_eq!(
+            KeyboardLayout::Fr.dead_key_chord(DeadKey::Tilde),
+            Some(chord(0x2F, false, true))
+        );
+        assert_eq!(
+            KeyboardLayout::Fr.dead_key_chord(DeadKey::Diaeresis),
+            Some(chord(0x2F, true, false))
+        );
+        assert_eq!(
+            KeyboardLayout::Fr.dead_key_chord(DeadKey::Cedilla),
+            None,
+            "fr-latin9 has no dead cedilla; ç is a direct key"
+        );
+
+        assert!(KeyboardLayout::Us.dead_keys().is_empty());
+        assert!(KeyboardLayout::Uk.dead_keys().is_empty());
+    }
+
+    #[test]
+    fn german_dead_key_sequences_use_dead_then_base_chords() {
+        let layout = KeyboardLayout::De;
+        assert_sequence(
+            layout,
+            '´',
+            'e',
+            &[chord(0x2E, false, false), chord(0x08, false, false)],
+        );
+        assert_sequence(
+            layout,
+            '´',
+            'E',
+            &[chord(0x2E, false, false), chord(0x08, true, false)],
+        );
+        assert_sequence(
+            layout,
+            '`',
+            'e',
+            &[chord(0x2E, true, false), chord(0x08, false, false)],
+        );
+        assert_sequence(
+            layout,
+            '^',
+            'e',
+            &[chord(0x35, false, false), chord(0x08, false, false)],
+        );
+        assert_sequence(
+            layout,
+            '~',
+            'n',
+            &[chord(0x30, false, true), chord(0x11, false, false)],
+        );
+        assert_sequence(
+            layout,
+            '¨',
+            'u',
+            &[chord(0x2F, false, true), chord(0x18, false, false)],
+        );
+        assert_sequence(
+            layout,
+            '¸',
+            'c',
+            &[chord(0x2E, false, true), chord(0x06, false, false)],
+        );
+    }
+
+    #[test]
+    fn french_dead_key_sequences_use_dead_then_base_chords() {
+        let layout = KeyboardLayout::Fr;
+        assert_sequence(
+            layout,
+            '´',
+            'e',
+            &[chord(0x1E, false, true), chord(0x08, false, false)],
+        );
+        assert_sequence(
+            layout,
+            '`',
+            'e',
+            &[chord(0x24, false, true), chord(0x08, false, false)],
+        );
+        assert_sequence(
+            layout,
+            '^',
+            'e',
+            &[chord(0x2F, false, false), chord(0x08, false, false)],
+        );
+        assert_sequence(
+            layout,
+            '~',
+            'n',
+            &[chord(0x2F, false, true), chord(0x11, false, false)],
+        );
+        assert_sequence(
+            layout,
+            '¨',
+            'u',
+            &[chord(0x2F, true, false), chord(0x18, false, false)],
+        );
+        assert_sequence(
+            layout,
+            '¨',
+            'U',
+            &[chord(0x2F, true, false), chord(0x18, true, false)],
+        );
+    }
+
+    #[test]
+    fn unknown_or_unavailable_dead_key_pairs_do_not_resolve() {
+        for (layout, dead, base) in [
+            (KeyboardLayout::De, '^', 'x'),
+            (KeyboardLayout::De, '´', 'b'),
+            (KeyboardLayout::De, '~', 'q'),
+            (KeyboardLayout::Fr, '^', 'x'),
+            (KeyboardLayout::Fr, '~', 'q'),
+            (KeyboardLayout::Fr, '¸', 'c'),
+            (KeyboardLayout::Us, '´', 'e'),
+            (KeyboardLayout::Uk, '`', 'e'),
+        ] {
+            assert_eq!(
+                resolve_dead_key_sequence(layout, dead, base),
+                None,
+                "{layout} {dead:?}+{base:?}"
+            );
+        }
+        // A base that is not directly typeable or is itself a dead key.
+        assert_eq!(
+            resolve_dead_key_sequence(KeyboardLayout::De, '´', '日'),
+            None
+        );
+        assert_eq!(
+            resolve_dead_key_sequence(KeyboardLayout::De, '´', '^'),
+            None
+        );
+    }
+
+    #[test]
+    fn compose_set_maps_documented_pairs_only() {
+        assert_eq!(
+            resolve_compose_sequence(KeyboardLayout::De, '\'', 'e')
+                .unwrap()
+                .chords,
+            vec![chord(0x2E, false, false), chord(0x08, false, false)]
+        );
+        assert_eq!(
+            resolve_compose_sequence(KeyboardLayout::De, '"', 'u')
+                .unwrap()
+                .chords,
+            vec![chord(0x2F, false, true), chord(0x18, false, false)]
+        );
+        assert_eq!(
+            resolve_compose_sequence(KeyboardLayout::De, ',', 'c')
+                .unwrap()
+                .chords,
+            vec![chord(0x2E, false, true), chord(0x06, false, false)]
+        );
+        assert_eq!(
+            resolve_compose_sequence(KeyboardLayout::Fr, '\'', 'e')
+                .unwrap()
+                .chords,
+            vec![chord(0x1E, false, true), chord(0x08, false, false)]
+        );
+        assert_eq!(
+            resolve_compose_sequence(KeyboardLayout::Fr, '"', 'u')
+                .unwrap()
+                .chords,
+            vec![chord(0x2F, true, false), chord(0x18, false, false)]
+        );
+        assert_eq!(
+            resolve_compose_sequence(KeyboardLayout::Fr, '~', 'n')
+                .unwrap()
+                .chords,
+            vec![chord(0x2F, false, true), chord(0x11, false, false)]
+        );
+        assert_eq!(
+            resolve_compose_sequence(KeyboardLayout::Fr, ',', 'c')
+                .unwrap()
+                .chords,
+            vec![chord(0x26, false, false)],
+            "fr-latin9 has no dead cedilla, so ,c uses the direct ç key"
+        );
+        assert_eq!(
+            resolve_compose_sequence(KeyboardLayout::Fr, ',', 'C')
+                .unwrap()
+                .chords,
+            vec![chord(0x26, true, true)]
+        );
+
+        // Unknown pairs and layouts without dead keys are not invented.
+        assert_eq!(
+            resolve_compose_sequence(KeyboardLayout::De, '\'', 'b'),
+            None
+        );
+        assert_eq!(resolve_compose_sequence(KeyboardLayout::Fr, '~', 'q'), None);
+        assert_eq!(
+            resolve_compose_sequence(KeyboardLayout::Us, '\'', 'e'),
+            None
+        );
+        assert_eq!(
+            resolve_compose_sequence(KeyboardLayout::Uk, '\'', 'e'),
+            None
+        );
+    }
+
+    #[test]
+    fn dead_key_sequence_modifiers_are_balanced_and_released() {
+        let sequence = resolve_dead_key_sequence(KeyboardLayout::De, '¨', 'U').unwrap();
+        let events = sequence.events();
+        // Dead diaeresis: AltGr down, ü down/up, AltGr up. Base U: Shift down,
+        // u down/up, Shift up. Nothing is left held.
+        assert_eq!(
+            events,
+            vec![
+                key_event(0xE6, true),
+                key_event(0x2F, true),
+                key_event(0x2F, false),
+                key_event(0xE6, false),
+                key_event(0xE1, true),
+                key_event(0x18, true),
+                key_event(0x18, false),
+                key_event(0xE1, false),
+            ]
+        );
+        for event in events {
+            if let InputEvent::Key { code, down, .. } = event {
+                assert!(
+                    !down || !(0xE0..=0xE7).contains(&code) || code == 0xE1 || code == 0xE6,
+                    "unexpected modifier state"
+                );
+            }
+        }
     }
 
     #[test]

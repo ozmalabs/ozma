@@ -37,6 +37,7 @@ struct FakeQemu {
     handle: Option<JoinHandle<()>>,
     commands: UnboundedReceiver<Value>,
     exited: Arc<AtomicBool>,
+    running: Arc<std::sync::Mutex<bool>>,
 }
 
 impl FakeQemu {
@@ -54,11 +55,15 @@ impl FakeQemu {
         let listener = UnixListener::bind(&path).expect("bind fake QMP socket");
         let exited = Arc::new(AtomicBool::new(false));
         let exited_flag = Arc::clone(&exited);
+        let running = Arc::new(std::sync::Mutex::new(true));
+        let running_state = Arc::clone(&running);
         let (sender, commands) = unbounded_channel();
 
         let handle = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let quit = serve(stream, sender.clone()).await.unwrap_or(false);
+                let quit = serve(stream, sender.clone(), Arc::clone(&running_state))
+                    .await
+                    .unwrap_or(false);
                 if quit {
                     exited_flag.store(true, Ordering::SeqCst);
                     // Dropping the listener leaves the socket path behind, but
@@ -74,11 +79,16 @@ impl FakeQemu {
             handle: Some(handle),
             commands,
             exited,
+            running,
         }
     }
 
     fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn is_running(&self) -> bool {
+        *self.running.lock().unwrap()
     }
 
     fn has_exited(&self) -> bool {
@@ -118,7 +128,11 @@ impl Drop for FakeQemu {
 }
 
 /// Serve one fake QMP connection. Returns `true` when the client sent `quit`.
-async fn serve(stream: UnixStream, commands: UnboundedSender<Value>) -> io::Result<bool> {
+async fn serve(
+    stream: UnixStream,
+    commands: UnboundedSender<Value>,
+    running: Arc<std::sync::Mutex<bool>>,
+) -> io::Result<bool> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
@@ -142,12 +156,23 @@ async fn serve(stream: UnixStream, commands: UnboundedSender<Value>) -> io::Resu
         let (response, quit) = match name.as_str() {
             "qmp_capabilities" | "system_powerdown" | "system_reset" | "stop" | "cont"
             | "screendump" | "input-send-event" | "add_client" | "getfd" => {
+                match name.as_str() {
+                    // QMP `stop` is a monitor pause; `cont` resumes. Reset
+                    // returns the guest to a running state.
+                    "stop" => *running.lock().unwrap() = false,
+                    "cont" | "system_reset" => *running.lock().unwrap() = true,
+                    _ => {}
+                }
                 (json!({"return": {}}), false)
             }
-            "query-status" => (
-                json!({"return": {"status": "running", "running": true}}),
-                false,
-            ),
+            "query-status" => {
+                let is_running = *running.lock().unwrap();
+                let status = if is_running { "running" } else { "paused" };
+                (
+                    json!({"return": {"status": status, "running": is_running}}),
+                    false,
+                )
+            }
             // QEMU acknowledges quit and then exits. Everything after this is
             // a new process (or, here, a refused connection).
             "quit" => (json!({"return": {}}), true),
@@ -225,6 +250,41 @@ async fn force_off_sends_quit_and_the_vm_is_unavailable_afterward() {
     );
     assert!(!qemu.has_exited());
     assert!(shared.is_connected().await);
+    assert!(qemu.is_running());
+
+    // Pause is a distinct monitor stop, not a power-off.
+    let (status, json) = call(&app, "POST", "/power/pause").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["action"], "pause");
+    assert_eq!(
+        qemu.recv_command_named("stop").await,
+        json!({"execute": "stop"})
+    );
+    assert!(!qemu.is_running());
+    assert!(!qemu.has_exited());
+
+    let (status, json) = call(&app, "GET", "/power/state").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["status"], "paused");
+    assert_eq!(json["available"], true);
+    qemu.recv_command_named("query-status").await;
+
+    // Resume is `cont`, not `on`'s start fallback.
+    let (status, json) = call(&app, "POST", "/power/resume").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["action"], "resume");
+    assert_eq!(
+        qemu.recv_command_named("cont").await,
+        json!({"execute": "cont"})
+    );
+    assert!(qemu.is_running());
+
+    let (status, json) = call(&app, "GET", "/power/state").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["status"], "running");
+    qemu.recv_command_named("query-status").await;
 
     // Reset and resume remain real QMP commands over the same connection.
     let (status, _) = call(&app, "POST", "/power/reset").await;

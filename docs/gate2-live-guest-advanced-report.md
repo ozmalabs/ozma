@@ -18,7 +18,8 @@ DMA-BUF importer is a follow-up in §5.2. The important qualifications are:
 | Guest-initiated `reboot` through node `/input/type` | **PASS** — `reboot: Restarting system`; QEMU stays alive |
 | Guest-initiated `poweroff` through node `/input/type` and manual QMP | **PASS** — `reboot: Power down`; QEMU exits |
 | Node `/input/type` full ASCII punctuation string (+ tab probe) | **PASS after fix (follow-up)** — exact body echoed to the serial console, `0x09` tab captured, no stuck key; see §7.1 |
-| Node `/input/type` selectable US/UK/DE/FR layouts | **PASS (follow-up)** — exact serial echoes for all four guest keymaps, AltGr/Shift released, dead-key and unsupported characters typed 400 atomically; see §7.2 |
+| Node `/input/type` selectable US/UK/DE/FR layouts | **PASS (follow-up)** — exact serial echoes for all four guest keymaps, AltGr/Shift released, and unsupported characters typed 400 atomically; dead keys were still rejected at that point, then implemented in §7.3; see §7.2 |
+| Node `/input/type` DE/FR dead-key and compose sequences | **PASS (follow-up)** — Alpine `de-deadtilde`/`fr-latin9` echoed `é è ê ñ ü ç` and a literal grave; no stuck modifier; CJK/emoji/dangling dead keys typed 400 with the serial log byte-identical; see §7.3 |
 | Guest audio | **PASS** — 440.1 Hz tone captured from QEMU's host audio monitor; peak −6.94 dBFS, tone RMS −9.96 dBFS |
 | Node `/audio/*` routing | **PASS** — 523 Hz reference played to the null sink and captured; peak −26.89 dBFS |
 | D-Bus 2D capture | **PASS** — BGRA `Scanout`/`Update`, snapshot and HLS |
@@ -39,8 +40,9 @@ DMA-BUF importer is a follow-up in §5.2. The important qualifications are:
 | Run | 2026-11-24 17:36–18:03 AEDT (2026-11-24T06:36–07:03Z) |
 | Repo | `/home/matt/ozma/ozma` |
 | HEAD at finish | `e600c43630185d92df29099eff1931c65b61c0d7` (`e600c43`) |
-| Working tree | Dirty from concurrent sessions; this run added the D-Bus fix, this report, short follow-up notes in existing reports, the `/input/type` key-hold fix (§7.1), and the selectable keyboard-layout change (§7.2) |
+| Working tree | Dirty from concurrent sessions; this run added the D-Bus fix, this report, short follow-up notes in existing reports, the `/input/type` key-hold fix (§7.1), the selectable keyboard-layout change (§7.2), and dead-key/compose support (§7.3) |
 | Layout follow-up (§7.2) | 2026-11-24 ~19:15–19:35 AEDT; HEAD `9f0edc2` plus the uncommitted layout change; temp root `/tmp/opencode/ozma-kbd-layout-20261124` (removed) |
+| Dead-key follow-up (§7.3) | 2026-11-24 ~20:06–20:14 AEDT; HEAD `ef99c9e` plus the uncommitted keyboard change and concurrent-session edits; temp root `/tmp/opencode/ozma-kbd-dead-20261124` (removed) |
 | Build | `cargo build -p ozma-node` → exit 0; `cargo test -p ozma-capture --lib dbus_display` → 26 passed, 1 ignored |
 | Node binary | `target/debug/ozma-node`, 283,021,464 bytes, `ozma-node 0.1.0` |
 | QEMU | `qemu-system-x86_64` 11.1.3, KVM (`accel=kvm:tcg`) |
@@ -865,12 +867,13 @@ serial received no body. That pre-fix guest was discarded without being used as
 PASS evidence.
 
 **Keyboard-layout follow-up:** this run was US-only. §7.2 adds selectable
-`us`/`uk`/`de`/`fr` layouts and live evidence for all four. Dead-key sequences,
-compose, and IME remain unsupported and are typed 400 before any event. Typing
-is still paced at a fixed 20 ms key hold plus 15 ms between characters, not by
-guest acknowledgement; the 4096-character limit therefore takes about
-2.5 minutes, and an unusually slow guest may still need a larger hold or a
-guest-side keymap check.
+`us`/`uk`/`de`/`fr` layouts and live evidence for all four. At that point
+dead-key sequences, compose, and IME were unsupported and typed 400 before any
+event. §7.3 implements the documented dead-key and compose set; IME/CJK/emoji
+remain unsupported. Typing is still paced at a fixed 20 ms key hold plus 15 ms
+between chords/characters, not by guest acknowledgement; the 4096-character
+limit therefore takes about 2.5 minutes, and an unusually slow guest may still
+need a larger hold or a guest-side keymap check.
 
 ### 7.2 Follow-up: selectable keyboard layouts (2026-11-24)
 
@@ -924,22 +927,119 @@ Atomic rejection was checked against the German keymap. `ab^` (German `^` is
 `{"code":"unsupported-character"}`; the serial log's byte count was unchanged
 (28175 before and after both requests), so no partial text reached the guest.
 
-**French keymap variance:** plain `fr-latin9` was tried first. Its AltGr+7 is
-`dead_grave`, so the backtick consumed the following space and the serial line
-became ``... ^ `{[]} ...`` instead of ``... ^ ` {[]} ...``. The FR table therefore
-targets `fr-latin9_nodeadkeys` (and Alpine's matching bmap), which produced the
-exact line above. The layout is configured, not detected; a guest with plain
-`fr-latin9` should use that keymap's nodeadkeys variant or send raw
-`/input/key` events for the grave key.
+**French keymap variance:** at the time of this run, plain `fr-latin9` was tried
+first. Its AltGr+`è` is `dead_grave`, so the backtick consumed the following
+space and the serial line became ``... ^ `{[]} ...`` instead of
+``... ^ ` {[]} ...``. The FR table therefore targeted `fr-latin9_nodeadkeys`
+(and Alpine's matching bmap), which produced the exact line above. §7.3 changes
+the target to Alpine `fr-latin9` now that dead keys are implemented, and maps a
+literal grave to the direct Shift+AltGr+`p` position shared by both variants.
+The layout is configured, not detected; the guest keymap must match it.
 
-**Remaining layout gaps:** dead-key sequences, compose, and IME are not
-implemented. German `^`, `~`, and the grave key are rejected as dead-key-only;
-the French dead-key accents `¨`, `´`, and `¸` are rejected. Non-ASCII text with
-no direct key on the selected layout (CJK, emoji, combining marks, and `é` on
-US/UK/DE) is rejected. The node does not inspect the guest keymap, so
-`--keyboard-layout` must match it. The ISO `#~` position (HID `0x32`) needed a
-new mapping to `KEY_BACKSLASH`/QEMU `backslash`; it is covered by
+**Remaining layout gaps at §7.2 time:** dead-key sequences, compose, and IME
+were not implemented, so German `^`, `~`, and the grave key and the French dead
+accents `¨`, `´`, and `¸` were rejected. Non-ASCII text with no direct key on
+the selected layout (CJK, emoji, combining marks, and `é` on US/UK/DE) was
+rejected. §7.3 implements the documented dead-key and compose set; IME and
+non-Latin/emoji input remain rejected. The node does not inspect the guest
+keymap, so `--keyboard-layout` must match it. The ISO `#~` position (HID `0x32`)
+needed a new mapping to `KEY_BACKSLASH`/QEMU `backslash`; it is covered by
 `cargo test -p ozma-input --lib keymap` and `cargo test -p ozma-qmp`.
+
+### 7.3 Follow-up: dead-key and compose sequences (2026-11-24)
+
+`POST /input/type` now resolves a documented dead-key and compose set in
+`ozma-node/src/keyboard_layout.rs`:
+
+```text
+DE (Alpine de-deadtilde / de-latin1)
+  dead prefix   ´e→é  `e→è  ^e→ê  ~n→ñ  ¨u→ü  ¸c→ç
+  compose       'e→é  "u→ü  ,c→ç
+FR (Alpine fr-latin9)
+  dead prefix   ´e→é  `e→è  ^e→ê  ~n→ñ  ¨u→ü
+  compose       'e→é  "u→ü  ,c→ç  (`,c` uses the direct ç key; the keymap has
+                                 no dead cedilla)
+```
+
+Each sequence is emitted as a dead-key chord followed by the base-key chord,
+with the normal 20 ms hold per chord and 15 ms between chords. Modifiers are
+released in reverse order. `fr` now targets Alpine `fr-latin9`; a literal grave
+uses the direct Shift+AltGr+`p` mapping. `de` targets `de-deadtilde` because
+Alpine's default `de.bmap` has a direct `~` at AltGr+`+`, which cannot compose
+`~n`. A prefix is consumed only for a documented pair: `^x` types literally on
+`fr` (where `^` has a direct key) and is a typed 400 on `de` (where it is
+dead-only). A dead key with no following composable character is a typed 400
+before any event.
+
+This follow-up used a fresh disposable Alpine 3.21 guest (kernel
+6.12.13-0-virt, QEMU 11.1.3, `-device usb-kbd`, QMP input, serial socket
+bridge) under `/tmp/opencode/ozma-kbd-dead-20261124`. The `kbd-bkeymaps` package
+was extracted from the read-only ISO inside the guest, then `loadkmap` loaded
+`de-deadtilde` and `fr-latin9`. A host copy of the same APK was downloaded only
+to decode the binary bkeymap tables while implementing this change; no guest
+network access was used. The test text was sent through
+`POST /input/type` with the matching `--keyboard-layout` and written by the
+guest to `/dev/ttyS0` with a here-doc.
+
+German request (node port 47882):
+
+```text
+cat > /dev/ttyS0 <<'Z'
+´e `e ^e ~n ¨u ¸c
+DE-DEAD-OK
+Z
+echo DE-NO-STUCK >/dev/ttyS0
+```
+
+The request returned `{"events":232,"ok":true}`, and the serial console echoed:
+
+```text
+é è ê ñ ü ç
+DE-DEAD-OK
+DE-NO-STUCK
+```
+
+French request (node port 47883; the body also contained a literal grave line):
+
+```text
+cat > /dev/ttyS0 <<'Z'
+´e `e ^e ~n ¨u ,c
+`
+FR-DEAD-OK
+Z
+echo FR-NO-STUCK >/dev/ttyS0
+```
+
+The request returned `{"events":238,"ok":true}`, and the serial console echoed:
+
+```text
+é è ê ñ ü ç
+`
+FR-DEAD-OK
+FR-NO-STUCK
+```
+
+The markers executed after AltGr/Shift sequences, so no modifier or dead key was
+left held. Atomic rejection was checked against the French keymap: `a日本`,
+`a🙂`, and `ab´` (dangling dead acute) each returned HTTP 400
+`unsupported-character` / `unsupported-character` / `dead-key-required`; the
+serial log stayed at 4979 bytes across all three requests, so no partial text
+reached the guest. `^x` returned 200 and typed the literal caret and `x`, as
+documented for an unmatched prefix on `fr`.
+
+Tests added or updated: dead-key chord tables and sequences for DE/FR, the
+compose set (including direct `,c` on FR), unknown and lone dead keys, balanced
+modifier release, `TextMappingError` atomicity, and route-level tests with a
+recording sink for both layouts. Results: `cargo test -p ozma-node` passed
+(245 lib tests plus the integration suites), `cargo check --workspace
+--all-targets` passed, and `cargo fmt -p ozma-node` was run.
+
+**Remaining gaps:** IME/CJK/emoji/combining marks still return typed 400 with no
+events. A real IME or clipboard-paste path (for example writing a composed
+string to the guest through a clipboard channel) remains future work; no
+Unicode key injection is attempted. The documented composition table is
+deliberately small and Latin-1-only. The layout is still configured, not
+detected.
 
 ## 8. Cleanup
 
@@ -963,6 +1063,12 @@ The final cleanup table is filled after the run:
 | Keyboard-layout follow-up nodes | `node/node.pid` (restarted per layout) | SIGTERM; exited |
 | Keyboard-layout follow-up temp root | `/tmp/opencode/ozma-kbd-layout-20261124` | removed |
 | Keyboard-layout follow-up ports | 47741/60741 | no listeners |
+| Dead-key follow-up QEMU | 609637 (`qemu/qemu.pid`) | SIGTERM; exited |
+| Dead-key follow-up nodes | 614577 (DE) / 615502 (FR) | SIGTERM; DE restarted per keymap, both exited |
+| Dead-key follow-up serial bridge | 609667 | SIGTERM; exited |
+| Dead-key follow-up temp root | `/tmp/opencode/ozma-kbd-dead-20261124` | removed |
+| Dead-key follow-up ports | 47882/47883 and HID 60882/60883 | no listeners |
+| Host keymap inspection copy | `/tmp/bkeymaps.apk`, `/tmp/bmaps` | removed |
 | Serial bridges | 131746 and the per-run bridge PIDs | killed |
 | Null sink | `ozma-gate2-adv` (module 536870916) | unloaded; `pactl list short sinks` no longer shows it |
 | Temp root | `/tmp/opencode/ozma-gate2-adv-20261124-173623` | removed |

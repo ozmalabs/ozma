@@ -97,6 +97,13 @@ impl QmpPower {
         }
     }
 
+    async fn pause_command(&self) -> Result<(), PowerError> {
+        match &self.client {
+            QmpHandle::Owned(client) => Ok(client.stop().await?),
+            QmpHandle::Shared(shared) => Ok(shared.stop().await?),
+        }
+    }
+
     async fn powerdown_command(&self) -> Result<(), PowerError> {
         match &self.client {
             QmpHandle::Owned(client) => Ok(client.system_powerdown().await?),
@@ -138,6 +145,18 @@ impl PowerBackend for QmpPower {
     }
 
     async fn cont(&mut self) -> Result<(), PowerError> {
+        self.cont_command().await
+    }
+
+    /// Pause the VM with QMP `stop`.
+    ///
+    /// QEMU's `stop` is a monitor pause, not a power-off. The control socket
+    /// stays connected and [`PowerBackend::query_status`] reports `paused`.
+    async fn pause(&mut self) -> Result<(), PowerError> {
+        self.pause_command().await
+    }
+
+    async fn resume(&mut self) -> Result<(), PowerError> {
         self.cont_command().await
     }
 

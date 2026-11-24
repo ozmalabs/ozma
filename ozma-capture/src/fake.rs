@@ -82,6 +82,26 @@ impl FakeCaptureProvider {
         self.capability.formats = vec![format.pixel_format.as_str().to_owned()];
         self.capability.max_width = format.width;
         self.capability.max_height = format.height;
+        // A P010 source is 10-bit but this deterministic pattern is not
+        // colorimetrically HDR; leave the HDR claim to an explicit opt-in.
+        self.capability.hdr = false;
+        self
+    }
+
+    /// Switch the synthetic source to 10-bit semi-planar P010.
+    ///
+    /// The block pattern is written in the real P010 layout (16-bit
+    /// little-endian Y, then interleaved UV), so an HLS/encoder test can feed
+    /// genuine 10-bit frames without a camera or an external converter.
+    pub fn with_p010(mut self) -> Self {
+        self.format.pixel_format = PixelFormat::P010;
+        self.capability.formats = vec![PixelFormat::P010.as_str().to_owned()];
+        self
+    }
+
+    /// Mark the advertised capability as HDR (dev/test only).
+    pub fn with_hdr(mut self, hdr: bool) -> Self {
+        self.capability.hdr = hdr;
         self
     }
 
@@ -208,6 +228,10 @@ impl BlocksCapture {
         if height == 0 || width == 0 {
             return;
         }
+        if self.format.pixel_format == PixelFormat::P010 {
+            self.fill_p010(sequence, data, width, height);
+            return;
+        }
         let stride = data.len() / height;
         if stride == 0 {
             return;
@@ -228,6 +252,47 @@ impl BlocksCapture {
                 }
                 let len = chunk.len();
                 chunk.copy_from_slice(&pattern[..len]);
+            }
+        }
+    }
+
+    /// Fill a real P010 (10-bit 4:2:0 semi-planar) payload.
+    ///
+    /// Luma is a 32x32 block mosaic in the 10-bit limited range, and chroma is
+    /// a coarser 16x16 block pattern around neutral 512. Both planes use
+    /// 16-bit little-endian samples, matching ffmpeg `p010le`.
+    fn fill_p010(&self, sequence: u64, data: &mut [u8], width: usize, height: usize) {
+        let y_samples = width.saturating_mul(height);
+        let y_bytes = y_samples.saturating_mul(2).min(data.len());
+        for y in 0..height {
+            for x in 0..width {
+                let offset = (y * width + x) * 2;
+                if offset + 2 > y_bytes {
+                    break;
+                }
+                let color = block_color(sequence, y / BLOCK_PIXELS, x / BLOCK_PIXELS);
+                // Limited-range 10-bit luma: 64..940.
+                let luma = 64 + (u32::from(color[0]) * 876 / 255) as u16;
+                data[offset..offset + 2].copy_from_slice(&luma.to_le_bytes());
+            }
+        }
+
+        let chroma_width = width / 2;
+        let chroma_height = height / 2;
+        let mut offset = y_bytes;
+        for y in 0..chroma_height {
+            for x in 0..chroma_width {
+                let color = block_color(sequence ^ 0xA5A5_A5A5_A5A5_A5A5, y / 16, x / 16);
+                // Limited-range 10-bit chroma around the 512 neutral point.
+                let u = 512 + (i32::from(color[1]) - 128) * 3 / 4;
+                let v = 512 + (i32::from(color[2]) - 128) * 3 / 4;
+                for sample in [u.clamp(64, 960) as u16, v.clamp(64, 960) as u16] {
+                    if offset + 2 > data.len() {
+                        return;
+                    }
+                    data[offset..offset + 2].copy_from_slice(&sample.to_le_bytes());
+                    offset += 2;
+                }
             }
         }
     }
@@ -344,5 +409,44 @@ mod tests {
                 < a.data().len() / 8,
             "mosaic payload must not be a compressible ramp"
         );
+    }
+
+    #[tokio::test]
+    async fn p010_pattern_is_real_ten_bit_layout_and_frame_dependent() {
+        let provider = FakeCaptureProvider::new()
+            .with_format(FrameFormat::rgb24(64, 32))
+            .with_p010()
+            .with_hdr(true)
+            .with_blocks()
+            .with_fps(1_000)
+            .with_frame_limit(2);
+
+        assert_eq!(provider.capability().formats, vec!["p010"]);
+        assert!(provider.capability().hdr);
+        let mut source = provider
+            .open(provider.capability())
+            .expect("p010 source opens");
+        assert_eq!(source.format().pixel_format, PixelFormat::P010);
+        let first = source.next_frame().await.unwrap();
+        let second = source.next_frame().await.unwrap();
+
+        assert_eq!(
+            first.data().len(),
+            PixelFormat::P010.nominal_len(64, 32).unwrap()
+        );
+        assert_ne!(first.data(), second.data());
+        // Every Y sample is a 10-bit little-endian value in limited range.
+        for sample in first.data()[..64 * 32 * 2].chunks_exact(2) {
+            let value = u16::from_le_bytes([sample[0], sample[1]]);
+            assert!(
+                (64..=960).contains(&value),
+                "unexpected 10-bit luma {value}"
+            );
+        }
+        // The first 32x32 luma block is uniform (the block mosaic property).
+        let first_luma = &first.data()[..2 * 32];
+        assert!(first_luma
+            .chunks_exact(2)
+            .all(|sample| sample == &first_luma[..2]));
     }
 }

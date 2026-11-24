@@ -211,6 +211,10 @@ class ArgumentTests(unittest.TestCase):
         )
         self.assertIsNone(args.audio_source)
         self.assertEqual(args.audio_backend, "auto")
+        self.assertIsNone(args.stun_server)
+        self.assertIsNone(args.turn_server)
+        self.assertIsNone(args.turn_user)
+        self.assertIsNone(args.turn_password)
 
     def test_audio_arguments_are_accepted(self):
         args = worker.build_arg_parser().parse_args(
@@ -223,6 +227,188 @@ class ArgumentTests(unittest.TestCase):
         )
         self.assertEqual(args.audio_source, "ozma-vm1.monitor")
         self.assertEqual(args.audio_backend, "pipewire")
+
+    def test_stun_turn_arguments_are_accepted_and_validated(self):
+        args = worker.build_arg_parser().parse_args(
+            [
+                "--sock", "/tmp/x.sock", "--shm", "/tmp/frame.bgra",
+                "--stun-server", "stun:stun.example.org:3478",
+                "--turn-server", "turn:turn.example.org:3478",
+                "--turn-user", "alice",
+                "--turn-password", "s3cret",
+            ]
+        )
+        worker.validate_stun_turn_args(args)
+
+        missing_password = worker.build_arg_parser().parse_args(
+            [
+                "--sock", "/tmp/x.sock", "--shm", "/tmp/frame.bgra",
+                "--turn-server", "turn:turn.example.org:3478",
+                "--turn-user", "alice",
+            ]
+        )
+        with self.assertRaises(ValueError):
+            worker.validate_stun_turn_args(missing_password)
+
+        orphan_user = worker.build_arg_parser().parse_args(
+            [
+                "--sock", "/tmp/x.sock", "--shm", "/tmp/frame.bgra",
+                "--turn-user", "alice",
+            ]
+        )
+        with self.assertRaises(ValueError):
+            worker.validate_stun_turn_args(orphan_user)
+
+
+class IceServerTests(unittest.TestCase):
+    def test_stun_forms_normalise_to_webrtcbin_uri(self):
+        for value in (
+            "stun:stun.example.org:3478",
+            "stun://stun.example.org:3478",
+            "stun.example.org:3478",
+        ):
+            self.assertEqual(
+                worker.normalize_stun_server(value),
+                "stun://stun.example.org:3478",
+            )
+        self.assertEqual(
+            worker.normalize_stun_server("stuns:secure.example.org:5349"),
+            "stuns://secure.example.org:5349",
+        )
+
+    def test_stun_rejects_embedded_credentials_and_bad_scheme(self):
+        with self.assertRaises(ValueError):
+            worker.normalize_stun_server("stun://user:pass@stun.example.org:3478")
+        with self.assertRaises(ValueError):
+            worker.normalize_stun_server("turn:turn.example.org:3478")
+        with self.assertRaises(ValueError):
+            worker.normalize_stun_server("  ")
+
+    def test_turn_uri_percent_encodes_credentials(self):
+        uri = worker.build_turn_uri(
+            "turn:turn.example.org:3478", "user:name", "p@ss/word"
+        )
+        self.assertEqual(
+            uri, "turn://user%3Aname:p%40ss%2Fword@turn.example.org:3478"
+        )
+        self.assertEqual(
+            worker.build_turn_uri("turn://turn.example.org:3478", "a", "b"),
+            "turn://a:b@turn.example.org:3478",
+        )
+
+    def test_turn_requires_both_credentials(self):
+        with self.assertRaises(ValueError):
+            worker.build_turn_uri("turn:turn.example.org:3478", "alice", None)
+        with self.assertRaises(ValueError):
+            worker.build_turn_uri("turn:turn.example.org:3478", None, "s3cret")
+
+    def test_worker_properties_are_empty_without_ice_config(self):
+        instance = worker.WebRTCWorker.__new__(worker.WebRTCWorker)
+        instance.stun_server = None
+        instance.turn_uri = None
+        self.assertEqual(instance.ice_properties(), {})
+
+    def test_worker_properties_include_configured_servers(self):
+        instance = worker.WebRTCWorker.__new__(worker.WebRTCWorker)
+        instance.stun_server = "stun://stun.example.org:3478"
+        instance.turn_uri = "turn://a:b@turn.example.org:3478"
+        self.assertEqual(
+            instance.ice_properties(),
+            {
+                "stun-server": "stun://stun.example.org:3478",
+                "turn-server": "turn://a:b@turn.example.org:3478",
+            },
+        )
+
+
+class CandidateTypeTests(unittest.TestCase):
+    def test_names_only_real_types(self):
+        self.assertEqual(
+            worker.candidate_type(
+                "candidate:1 1 UDP 2122260223 192.0.2.1 5000 typ host"
+            ),
+            "host",
+        )
+        self.assertEqual(
+            worker.candidate_type(
+                "a=candidate:2 1 UDP 1686052607 198.51.100.7 5001 typ srflx"
+            ),
+            "srflx",
+        )
+        self.assertEqual(
+            worker.candidate_type(
+                "candidate:3 1 UDP 41885439 203.0.113.9 6000 typ relay"
+            ),
+            "relay",
+        )
+        self.assertIsNone(worker.candidate_type("candidate:4 1 UDP 1 192.0.2.1 1"))
+        self.assertIsNone(worker.candidate_type("not a candidate"))
+
+    def test_counts_do_not_invent_candidates(self):
+        self.assertEqual(worker.candidate_type_counts([]), {})
+        self.assertEqual(
+            worker.candidate_type_counts(
+                [
+                    (0, "candidate:1 1 UDP 1 192.0.2.1 5000 typ host"),
+                    (0, "candidate:2 1 UDP 1 192.0.2.1 5001 typ host"),
+                ]
+            ),
+            {"host": 2},
+        )
+
+
+class FakeWebRtc:
+    def __init__(self):
+        self.candidates = []
+
+    def emit(self, signal, mline, candidate):
+        self.candidates.append((signal, mline, candidate))
+
+
+class CandidateSignalingTests(unittest.TestCase):
+    def worker_with_session(self):
+        instance = worker.WebRTCWorker.__new__(worker.WebRTCWorker)
+        instance.sessions = {
+            "sess-1": {
+                "webrtc": FakeWebRtc(),
+                "remote_candidates": [],
+            }
+        }
+        return instance
+
+    def test_candidate_is_applied_to_the_named_session(self):
+        instance = self.worker_with_session()
+        reply = instance.add_ice_candidate(
+            "sess-1",
+            "candidate:1 1 UDP 1 192.0.2.1 5000 typ host",
+            0,
+        )
+        self.assertTrue(reply["ok"])
+        self.assertEqual(
+            instance.sessions["sess-1"]["webrtc"].candidates,
+            [
+                (
+                    "add-ice-candidate",
+                    0,
+                    "candidate:1 1 UDP 1 192.0.2.1 5000 typ host",
+                )
+            ],
+        )
+
+    def test_unknown_session_is_an_explicit_failure(self):
+        instance = self.worker_with_session()
+        reply = instance.add_ice_candidate(
+            "missing", "candidate:1 1 UDP 1 192.0.2.1 5000 typ host"
+        )
+        self.assertFalse(reply["ok"])
+        self.assertIn("unknown", reply["error"])
+
+    def test_malformed_candidate_is_rejected_before_webrtcbin(self):
+        instance = self.worker_with_session()
+        for candidate in ("", "garbage", "candidate:1 1 UDP 1 192.0.2.1 5000"):
+            reply = instance.add_ice_candidate("sess-1", candidate)
+            self.assertFalse(reply["ok"], candidate)
+        self.assertEqual(instance.sessions["sess-1"]["webrtc"].candidates, [])
 
 
 class FakeEncoder:

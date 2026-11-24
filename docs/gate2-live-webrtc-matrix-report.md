@@ -21,6 +21,14 @@ configuration at all**, the dashboard hard-codes `iceServers: []`, and there is
 no signaling message for incremental ICE candidates. Those are reported as gaps,
 not passes. See [Remaining gaps](#remaining-gaps).
 
+> **Follow-up (2026-11-24, later):** STUN/TURN configuration, browser
+> `iceServers` configuration, and one-way (browser→helper) trickle candidate
+> signaling were added after this matrix run. The matrix above remains an
+> honest record of the **no-ICE-configuration** run. See
+> [§11](#11-follow-up-stunturn-configuration-and-trickle-candidates) for the
+> new configuration surface, live candidate evidence, and the narrower
+> remaining gaps.
+
 > No `sudo`, no global package install, no commit, and no external network
 > service was used at runtime. Controller dependencies were installed only into
 > a disposable `/tmp` venv. Every QEMU, node, helper, controller, browser, STUN
@@ -316,7 +324,101 @@ webrtcbin stun-server probe
   -> gathering COMPLETE / 9 candidates / all typ host / no srflx
 ```
 
-## Cleanup
+## 11. Follow-up: STUN/TURN configuration and trickle candidates
+
+This follow-up adds a product configuration surface and validates it on the
+same host. It does **not** turn the earlier same-host result into a cross-NAT
+pass.
+
+### 11.1 Configuration surface
+
+| Layer | Configuration |
+|---|---|
+| Node CLI/env | `--webrtc-stun` / `OZMA_WEBRTC_STUN`; `--webrtc-turn` / `OZMA_WEBRTC_TURN`; `--webrtc-turn-user` / `OZMA_WEBRTC_TURN_USER`; `--webrtc-turn-password` / `OZMA_WEBRTC_TURN_PASSWORD` |
+| `WebRtcConfig` | `stun_server`, `turn_server`, `turn_user`, `turn_password`; manual `Debug` redacts both TURN username and password |
+| Helper argv | `--stun-server <addr>`, `--turn-server <addr>`, `--turn-user <user>`, `--turn-password <secret>` (appended only when configured) |
+| `webrtcbin` | `stun-server=stun://host:port`; `turn-server=turn://user:password@host:port` with percent-encoded credentials |
+| Controller/browser | `OZMA_WEBRTC_ICE_SERVERS` JSON array, served at `GET /api/v1/webrtc/ice` and consumed by `dashboard.html`/`console.html` |
+| Node signaling | `POST /webrtc/offer` returns optional `session`; `POST /webrtc/candidate` accepts `{"session", "candidate", "sdpMLineIndex"}` |
+
+Validation is deliberately strict: empty or whitespace addresses, embedded
+`user:pass@` credentials, an unsupported scheme, TURN without both credentials,
+or credentials without a TURN server are startup errors. The node log reports
+only the server addresses and `turn_auth=true`; the password never appears.
+With no STUN/TURN values the helper argv and the historical host-candidate-only
+pipeline are byte-for-byte unchanged. Browser `iceServers` default to `[]` and
+keep the old bundled-offer behavior when the controller has no configured
+servers.
+
+The TURN password is passed to the helper as a separate argv value because the
+worker CLI has no secret-stdin/environment channel. It is redacted from
+`Debug`, logs, and status output, but a same-user process listing can still see
+the argv. That residual exposure is a known limitation, not a claim of secret
+isolation.
+
+### 11.2 Live candidate evidence
+
+The stack used the debug `ozma-node` with a synthetic RGB24 capture source
+(`--capture-provider fake`, 320x240@15), the real Python/GStreamer worker, a
+local `stund` on UDP 3478, and coturn extracted under `/tmp` on UDP 34780 with
+relay ports 50000–50020. No `sudo`, package install, or system service was used.
+
+A real GStreamer client (`scripts/gate2/webrtc-client.py`) received this
+helper answer and decoded **93 H.264 buffers** at 320x240/15 fps:
+
+```text
+host  UDP  192.168.40.19:53228
+host  TCP  active/passive
+host  UDP  IPv6
+srflx TCP  127.0.0.1:38987  raddr 192.168.40.19 rport 38987  tcptype passive
+srflx TCP  127.0.0.1:9      raddr 192.168.40.19 rport 9      tcptype active
+relay UDP  127.0.0.1:50007  raddr 192.168.40.19 rport 9
+```
+
+The `relay` UDP port is inside coturn's configured relay range, so it is a real
+allocation from the local TURN server, not a fabricated candidate. No UDP
+`srflx` appeared on this same-host path; libnice can discard a reflexive mapping
+that duplicates the host address. The TCP `srflx` entries are real webrtcbin
+output, but they are not evidence of a distinct NAT mapping.
+
+Playwright Chromium (Chrome for Testing 159.0.8154.6) with the configured
+STUN/TURN servers produced:
+
+```text
+browser candidate types: {"host": 1, "srflx": 1, "relay": 1}
+trickle acks: [(200, true), (200, true), (200, true)]
+connectionState: connected
+selected pair: host ↔ host (UDP, 192.168.40.19)  # same host
+inbound video: 140 frames decoded, 15 fps, 320x240, 774,525 bytes
+```
+
+The browser posted the offer immediately, then delivered its later candidates
+through `/webrtc/candidate`; every candidate received an explicit `{"ok":true}`
+ack from the helper. This exercises the new browser→helper trickle path with
+real candidate types. The selected pair was still host↔host, so the run does
+not prove relay media or connectivity across a NAT/firewall.
+
+### 11.3 Trickle status
+
+- **Browser→helper: implemented and exercised.** The offer response carries a
+  helper session id, the dashboard/console buffer candidates until the answer
+  arrives, and the node forwards `add-ice-candidate` messages to that session.
+  Unknown sessions, malformed candidates, and candidates without a recognised
+  `typ` token are rejected without reaching webrtcbin.
+- **Helper→browser: still embedded, not trickled.** The worker waits for its
+  bounded gather and appends every local candidate to the answer. A peer that
+  needs a helper candidate discovered after the answer has no incremental
+  channel; this is the remaining trickle limitation.
+- Old helpers that do not return a `session` stay compatible: the browser keeps
+  candidates embedded in the offer and never calls the candidate endpoint.
+
+### 11.4 Follow-up cleanup
+
+The follow-up node and its helper were stopped with `SIGINT`; `stund` and the
+`/tmp` coturn process were killed; `/tmp/opencode/nat-ice`, the extracted
+coturn tree, browser profiles, sockets, shared-memory files, and relay ports
+50000–50020 were removed. No commit was made.
+
 
 - Node received `SIGINT`; it reaped the Python WebRTC helper and its Unix
   socket/shared-memory file.
@@ -337,12 +439,20 @@ webrtcbin stun-server probe
   Playwright WebKit browser revision was not installed.
 - **No real mobile browser or OS.** The mobile result is Chromium Blink under an
   iPhone descriptor, not iOS Safari/WebKit.
-- **No STUN/TURN wiring.** Node/helper/dashboard expose no STUN or TURN setting;
-  no relay candidate and no distinct `srflx` candidate were produced. The local
-  `stund` responder works, but nothing in the product uses it.
-- **No trickle ICE.** Candidates are gathered into one offer/answer exchange.
-  A candidate-less same-host offer connected via peer-reflexive checks, but a
-  NAT or late-candidate peer has no signaling path.
+- **No STUN/TURN wiring in this run.** Node/helper/dashboard expose a STUN/TURN
+  setting after the follow-up (§11), and live local allocations produced real
+  `srflx`/`relay` candidates, but this matrix run itself configured none.
+- **No trickle ICE in this run.** Candidates were gathered into one
+  offer/answer exchange. The follow-up adds browser→helper candidate
+  signaling; helper→browser candidates remain embedded (§11.3).
+- **No cross-NAT or relay-media proof.** STUN/TURN configuration and real
+  `srflx`/`relay` candidates exist, but every validated selected pair was
+  host↔host on one machine. No NAT namespace, firewall, or remote peer was
+  exercised, and relay media was not selected.
+- **No end-to-end controller dashboard ICE run.** The new
+  `OZMA_WEBRTC_ICE_SERVERS` parser and `/api/v1/webrtc/ice` endpoint are unit
+  tested, and Chromium used the same ICE configuration directly; the full
+  controller+dashboard page was not re-run with the new endpoint.
 - **H.264-only helper.** Firefox without OpenH264 offers no H.264 and gets an
   `inactive` video m-line. VP8 encoding exists on the host but is not wired.
 - **No webrtc-internals artifact.** `about:webrtc` and

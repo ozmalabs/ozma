@@ -15,7 +15,17 @@
 //! * the node writes packed BGRA frames to `shm_path` (whole-file replacement
 //!   via a temporary file and `rename`, so the worker never reads a torn frame);
 //! * signaling is newline-delimited JSON over `socket_path`:
-//!   `{"type":"offer","sdp":"..."}` → `{"type":"answer","sdp":"..."}`.
+//!   `{"type":"offer","sdp":"..."}` → `{"type":"answer","sdp":"...","session":"..."}`;
+//!   `{"type":"add-ice-candidate","session":"...","candidate":"...",
+//!   "sdpMLineIndex":0}` → `{"ok":true}`. The `session`/candidate messages are
+//!   optional: a worker that omits them keeps the original embedded-candidate
+//!   behavior, and the node's browser route only trickles when a session id is
+//!   returned.
+//!
+//! STUN/TURN are opt-in. When [`WebRtcConfig::stun_server`] or
+//! [`WebRtcConfig::turn_server`] is set, the helper also receives
+//! `--stun-server` and/or `--turn-server`/`--turn-user`/`--turn-password`;
+//! without them the helper argv and host-candidate-only pipeline are unchanged.
 //!
 //! WebRTC is **disabled unless a helper program is configured**. There is no
 //! implicit Python default: a node without `--webrtc-helper` reports
@@ -35,6 +45,7 @@
 //! only if the required GStreamer elements exist. Without it the helper argv
 //! and pipeline are unchanged, and video still runs if audio is unavailable.
 
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -101,7 +112,13 @@ impl WebRtcAudioBackend {
 /// unless the operator points the node at a helper. `helper_script` is passed
 /// as the first argument (for example the Python worker), which lets the
 /// program be an interpreter.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// ICE server configuration is optional. With no STUN/TURN values the helper
+/// argv is byte-for-byte the historical video/audio argv and `webrtcbin` keeps
+/// its default host-candidate gathering. TURN credentials are held separately
+/// from the server address so the address can be logged while the credentials
+/// are redacted from `Debug` output.
+#[derive(Clone, PartialEq, Eq)]
 pub struct WebRtcConfig {
     /// Helper executable (for example `/usr/bin/python3`).
     pub helper_program: PathBuf,
@@ -126,13 +143,62 @@ pub struct WebRtcConfig {
     pub audio_source: Option<String>,
     /// Capture backend for [`WebRtcConfig::audio_source`].
     pub audio_backend: WebRtcAudioBackend,
+    /// Optional STUN server (`stun:host:port`, `stun://host:port`, or bare
+    /// `host:port`). The worker normalises it to webrtcbin's
+    /// `stun://host:port` form.
+    pub stun_server: Option<String>,
+    /// Optional TURN server address without credentials
+    /// (`turn:host:port`, `turn://host:port`, or bare `host:port`).
+    pub turn_server: Option<String>,
+    /// TURN username paired with [`WebRtcConfig::turn_server`].
+    pub turn_user: Option<String>,
+    /// TURN password paired with [`WebRtcConfig::turn_server`].
+    ///
+    /// Redacted by the manual [`fmt::Debug`] implementation. The worker receives
+    /// it as a separate argv value so it never has to be embedded in a logged
+    /// server URI.
+    pub turn_password: Option<String>,
     /// Bounded wait for the helper to create and accept its socket.
     pub startup_timeout: Duration,
     /// Bounded wait for one signaling response.
     pub offer_timeout: Duration,
 }
 
+impl fmt::Debug for WebRtcConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WebRtcConfig")
+            .field("helper_program", &self.helper_program)
+            .field("helper_script", &self.helper_script)
+            .field("socket_path", &self.socket_path)
+            .field("shm_path", &self.shm_path)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("fps", &self.fps)
+            .field("bitrate_kbps", &self.bitrate_kbps)
+            .field("audio_source", &self.audio_source)
+            .field("audio_backend", &self.audio_backend)
+            .field("stun_server", &self.stun_server)
+            .field("turn_server", &self.turn_server)
+            .field("turn_user", &self.turn_user.as_ref().map(|_| "<redacted>"))
+            .field(
+                "turn_password",
+                &self.turn_password.as_ref().map(|_| "<redacted>"),
+            )
+            .field("startup_timeout", &self.startup_timeout)
+            .field("offer_timeout", &self.offer_timeout)
+            .finish()
+    }
+}
+
 impl WebRtcConfig {
+    /// True when any ICE server was configured.
+    ///
+    /// This is configuration intent, not proof that a candidate was gathered.
+    pub fn ice_servers_configured(&self) -> bool {
+        self.stun_server.is_some() || self.turn_server.is_some()
+    }
+
     /// Reject values the helper cannot use and make the parent directories.
     ///
     /// The socket and shared-memory parents are created here (idempotently);
@@ -157,6 +223,35 @@ impl WebRtcConfig {
             return Err(WebRtcError::InvalidConfig(
                 "the WebRTC audio source must not be empty when configured".to_owned(),
             ));
+        }
+        validate_ice_server("--webrtc-stun", self.stun_server.as_deref(), "stun")?;
+        validate_ice_server("--webrtc-turn", self.turn_server.as_deref(), "turn")?;
+        if self.turn_server.is_some() {
+            if self.turn_user.as_deref().map_or(true, str::is_empty)
+                || self.turn_password.as_deref().map_or(true, str::is_empty)
+            {
+                return Err(WebRtcError::InvalidConfig(
+                    "--webrtc-turn requires non-empty --webrtc-turn-user and \
+                     --webrtc-turn-password"
+                        .to_owned(),
+                ));
+            }
+        } else if self.turn_user.is_some() || self.turn_password.is_some() {
+            return Err(WebRtcError::InvalidConfig(
+                "--webrtc-turn-user/--webrtc-turn-password require --webrtc-turn".to_owned(),
+            ));
+        }
+        for (flag, value) in [
+            ("--webrtc-turn-user", self.turn_user.as_deref()),
+            ("--webrtc-turn-password", self.turn_password.as_deref()),
+        ] {
+            if let Some(value) = value {
+                if value.chars().any(char::is_control) {
+                    return Err(WebRtcError::InvalidConfig(format!(
+                        "{flag} must not contain control characters"
+                    )));
+                }
+            }
         }
         if is_empty_path(&self.socket_path) {
             return Err(WebRtcError::InvalidConfig(
@@ -682,12 +777,33 @@ pub fn helper_argv(config: &WebRtcConfig) -> Vec<String> {
         argv.push("--audio-backend".to_owned());
         argv.push(config.audio_backend.as_arg().to_owned());
     }
+    if let Some(stun) = &config.stun_server {
+        argv.push("--stun-server".to_owned());
+        argv.push(stun.clone());
+    }
+    if let Some(turn) = &config.turn_server {
+        argv.push("--turn-server".to_owned());
+        argv.push(turn.clone());
+        argv.push("--turn-user".to_owned());
+        argv.push(config.turn_user.clone().unwrap_or_default());
+        argv.push("--turn-password".to_owned());
+        argv.push(config.turn_password.clone().unwrap_or_default());
+    }
     argv
 }
 
 // ---------------------------------------------------------------------------
 // Helper supervision
 // ---------------------------------------------------------------------------
+
+/// One helper answer plus the session id needed for trickle candidates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WebRtcAnswer {
+    /// Answer SDP returned to the browser or peer.
+    pub sdp: String,
+    /// Helper session id, when the worker supports candidate signaling.
+    pub session: Option<String>,
+}
 
 /// A running external WebRTC helper plus the shared-memory frame feeder.
 pub struct WebRtcHelper {
@@ -786,6 +902,12 @@ impl WebRtcHelper {
 
     /// Send one SDP offer and return the helper's answer SDP.
     pub async fn offer(&mut self, sdp: &str) -> Result<String, WebRtcError> {
+        Ok(self.offer_answer(sdp).await?.sdp)
+    }
+
+    /// Send one SDP offer and return the answer plus the optional helper session
+    /// id used by trickle-candidate messages.
+    pub async fn offer_answer(&mut self, sdp: &str) -> Result<WebRtcAnswer, WebRtcError> {
         if sdp.trim().is_empty() {
             return Err(WebRtcError::InvalidConfig(
                 "the WebRTC offer SDP must not be empty".to_owned(),
@@ -797,7 +919,46 @@ impl WebRtcHelper {
         let message = json!({"type": "offer", "sdp": sdp}).to_string();
         self.signal(&message, "offer").await?;
         let line = self.read_response("offer").await?;
-        parse_answer(&line)
+        parse_answer_details(&line)
+    }
+
+    /// Forward one trickled remote ICE candidate to the helper session.
+    ///
+    /// The helper acknowledges with `{"ok":true}`. A worker that does not
+    /// implement the message is a typed [`WebRtcError::Unsupported`] rather than
+    /// a fake success. `session` may be omitted for compatibility with a worker
+    /// that only has one live session; the current worker applies such a
+    /// candidate to every live session.
+    pub async fn add_ice_candidate(
+        &mut self,
+        session: Option<&str>,
+        candidate: &str,
+        sdp_mline_index: u32,
+    ) -> Result<(), WebRtcError> {
+        let candidate = candidate.trim();
+        if candidate.is_empty() {
+            return Err(WebRtcError::InvalidConfig(
+                "the ICE candidate must not be empty".to_owned(),
+            ));
+        }
+        if candidate.chars().any(char::is_control) {
+            return Err(WebRtcError::InvalidConfig(
+                "the ICE candidate must not contain control characters".to_owned(),
+            ));
+        }
+        if self.stopped {
+            return Err(WebRtcError::NotRunning);
+        }
+        let message = json!({
+            "type": "add-ice-candidate",
+            "session": session,
+            "candidate": candidate,
+            "sdpMLineIndex": sdp_mline_index,
+        })
+        .to_string();
+        self.signal(&message, "candidate").await?;
+        let line = self.read_response("candidate").await?;
+        parse_ack(&line, "candidate")
     }
 
     /// Ask the helper to change its video bitrate.
@@ -1007,6 +1168,27 @@ impl WebRtcControl {
         helper.lock().await.offer(sdp).await
     }
 
+    /// Proxy one SDP offer and keep the helper session id for trickle.
+    pub async fn offer_answer(&self, sdp: &str) -> Result<WebRtcAnswer, WebRtcError> {
+        let helper = self.require_helper()?;
+        helper.lock().await.offer_answer(sdp).await
+    }
+
+    /// Forward one trickled remote ICE candidate to the helper.
+    pub async fn add_ice_candidate(
+        &self,
+        session: Option<&str>,
+        candidate: &str,
+        sdp_mline_index: u32,
+    ) -> Result<(), WebRtcError> {
+        let helper = self.require_helper()?;
+        helper
+            .lock()
+            .await
+            .add_ice_candidate(session, candidate, sdp_mline_index)
+            .await
+    }
+
     /// Request a bitrate change in bits per second.
     ///
     /// [`WebRtcHelper::set_bitrate`] is kbps-based, so the controller's bps
@@ -1213,7 +1395,7 @@ async fn write_frame_atomically(config: &WebRtcConfig, bgra: &[u8]) -> io::Resul
 // Signaling response parsing
 // ---------------------------------------------------------------------------
 
-fn parse_answer(line: &str) -> Result<String, WebRtcError> {
+fn parse_answer_details(line: &str) -> Result<WebRtcAnswer, WebRtcError> {
     let value = parse_json_object(line)?;
     if value.get("type").and_then(Value::as_str) == Some("error") {
         return Err(WebRtcError::HelperError(
@@ -1227,11 +1409,49 @@ fn parse_answer(line: &str) -> Result<String, WebRtcError> {
     if let Some(message) = value.get("error").and_then(Value::as_str) {
         return Err(WebRtcError::HelperError(message.to_owned()));
     }
-    match value.get("sdp").and_then(Value::as_str) {
-        Some(sdp) if !sdp.trim().is_empty() => Ok(sdp.to_owned()),
-        _ => Err(WebRtcError::MalformedResponse(
-            "the answer has no non-empty `sdp` string".to_owned(),
-        )),
+    let sdp = match value.get("sdp").and_then(Value::as_str) {
+        Some(sdp) if !sdp.trim().is_empty() => sdp.to_owned(),
+        _ => {
+            return Err(WebRtcError::MalformedResponse(
+                "the answer has no non-empty `sdp` string".to_owned(),
+            ))
+        }
+    };
+    let session = value
+        .get("session")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|session| !session.is_empty())
+        .map(str::to_owned);
+    Ok(WebRtcAnswer { sdp, session })
+}
+
+fn parse_ack(line: &str, operation: &'static str) -> Result<(), WebRtcError> {
+    let value = parse_json_object(line)?;
+    if value.get("type").and_then(Value::as_str) == Some("error") {
+        return Err(WebRtcError::HelperError(
+            value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("the helper rejected the request")
+                .to_owned(),
+        ));
+    }
+    if value.get("ok") == Some(&Value::Bool(false)) {
+        return Err(WebRtcError::HelperError(
+            value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("the helper did not apply the request")
+                .to_owned(),
+        ));
+    }
+    if value.get("ok") == Some(&Value::Bool(true)) {
+        Ok(())
+    } else {
+        Err(WebRtcError::Unsupported(format!(
+            "signaling {operation} messages (it did not acknowledge the request)"
+        )))
     }
 }
 
@@ -1293,6 +1513,60 @@ fn parse_json_object(line: &str) -> Result<Value, WebRtcError> {
 
 fn is_empty_path(path: &Path) -> bool {
     path.as_os_str().is_empty() || path.to_string_lossy().trim().is_empty()
+}
+
+/// Validate one optional ICE server address.
+///
+/// Credentials are deliberately not accepted inside the address: TURN
+/// credentials travel in separate fields so this string can be logged and
+/// passed through a URI builder without leaking a password.
+fn validate_ice_server(
+    flag: &str,
+    value: Option<&str>,
+    expected_scheme: &str,
+) -> Result<(), WebRtcError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(WebRtcError::InvalidConfig(format!(
+            "{flag} must not be empty when configured"
+        )));
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err(WebRtcError::InvalidConfig(format!(
+            "{flag} must not contain whitespace"
+        )));
+    }
+    if value.contains('@') {
+        return Err(WebRtcError::InvalidConfig(format!(
+            "{flag} must not embed credentials; use --webrtc-turn-user/\
+             --webrtc-turn-password for TURN"
+        )));
+    }
+    let allowed: &[&str] = if expected_scheme == "stun" {
+        &["stun", "stuns"]
+    } else {
+        &["turn", "turns"]
+    };
+    if let Some((scheme, rest)) = value.split_once(':') {
+        let known_scheme = ["stun", "stuns", "turn", "turns"].contains(&scheme);
+        if known_scheme || rest.starts_with("//") {
+            if !allowed.contains(&scheme) {
+                return Err(WebRtcError::InvalidConfig(format!(
+                    "{flag} has unsupported scheme `{scheme}`; expected {expected_scheme}"
+                )));
+            }
+            let rest = rest.trim_start_matches("//");
+            if rest.is_empty() {
+                return Err(WebRtcError::InvalidConfig(format!(
+                    "{flag} is missing a host"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn create_parent(label: &'static str, path: &Path) -> Result<(), WebRtcError> {
@@ -1518,6 +1792,10 @@ mod tests {
             bitrate_kbps: 4_000,
             audio_source: None,
             audio_backend: WebRtcAudioBackend::Auto,
+            stun_server: None,
+            turn_server: None,
+            turn_user: None,
+            turn_password: None,
             startup_timeout: Duration::from_millis(150),
             offer_timeout: Duration::from_millis(150),
         }
@@ -1595,6 +1873,153 @@ mod tests {
         let argv = helper_argv(&config);
         assert!(!argv.iter().any(|arg| arg == "--audio-source"));
         assert!(!argv.iter().any(|arg| arg == "--audio-backend"));
+    }
+
+    #[test]
+    fn argv_appends_stun_and_turn_only_when_configured() {
+        let mut config = config("argv-ice");
+        let argv = helper_argv(&config);
+        assert!(!argv.iter().any(|arg| arg == "--stun-server"));
+        assert!(!argv.iter().any(|arg| arg == "--turn-server"));
+
+        config.stun_server = Some("stun:stun.example.org:3478".to_owned());
+        config.turn_server = Some("turn:turn.example.org:3478".to_owned());
+        config.turn_user = Some("alice".to_owned());
+        config.turn_password = Some("s3cret".to_owned());
+        let argv = helper_argv(&config);
+        assert_eq!(
+            &argv[argv.len() - 8..],
+            [
+                "--stun-server",
+                "stun:stun.example.org:3478",
+                "--turn-server",
+                "turn:turn.example.org:3478",
+                "--turn-user",
+                "alice",
+                "--turn-password",
+                "s3cret",
+            ]
+        );
+    }
+
+    #[test]
+    fn config_debug_redacts_turn_credentials() {
+        let mut config = config("debug-redaction");
+        config.turn_server = Some("turn:turn.example.org:3478".to_owned());
+        config.turn_user = Some("alice".to_owned());
+        config.turn_password = Some("s3cret".to_owned());
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("s3cret"), "{debug}");
+        assert!(!debug.contains("alice"), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+        assert!(debug.contains("turn.example.org:3478"), "{debug}");
+    }
+
+    #[test]
+    fn validation_rejects_incomplete_or_credentialed_ice_servers() {
+        let mut invalid = config("validate-turn-without-auth");
+        invalid.turn_server = Some("turn:turn.example.org:3478".to_owned());
+        assert!(matches!(
+            invalid.validate(),
+            Err(WebRtcError::InvalidConfig(_))
+        ));
+
+        let mut invalid = config("validate-turn-user-only");
+        invalid.turn_user = Some("alice".to_owned());
+        assert!(matches!(
+            invalid.validate(),
+            Err(WebRtcError::InvalidConfig(_))
+        ));
+
+        let mut invalid = config("validate-stun-empty");
+        invalid.stun_server = Some("   ".to_owned());
+        assert!(matches!(
+            invalid.validate(),
+            Err(WebRtcError::InvalidConfig(_))
+        ));
+
+        let mut invalid = config("validate-stun-credentials");
+        invalid.stun_server = Some("stun://user:pass@stun.example.org:3478".to_owned());
+        assert!(matches!(
+            invalid.validate(),
+            Err(WebRtcError::InvalidConfig(_))
+        ));
+
+        let mut valid = config("validate-ice-ok");
+        valid.stun_server = Some("stun:stun.example.org:3478".to_owned());
+        valid.turn_server = Some("turn:turn.example.org:3478".to_owned());
+        valid.turn_user = Some("alice".to_owned());
+        valid.turn_password = Some("s3cret".to_owned());
+        valid.validate().expect("complete ICE config is valid");
+    }
+
+    #[test]
+    fn answer_session_is_optional_and_parsed_when_present() {
+        let plain = parse_answer_details("{\"type\":\"answer\",\"sdp\":\"v=0 a\"}").unwrap();
+        assert_eq!(plain.sdp, "v=0 a");
+        assert_eq!(plain.session, None);
+
+        let trickled =
+            parse_answer_details("{\"type\":\"answer\",\"sdp\":\"v=0 b\",\"session\":\"abc123\"}")
+                .unwrap();
+        assert_eq!(trickled.sdp, "v=0 b");
+        assert_eq!(trickled.session.as_deref(), Some("abc123"));
+
+        assert!(matches!(
+            parse_answer_details("{\"type\":\"answer\",\"sdp\":\"v=0\",\"session\":\"  \"}")
+                .unwrap()
+                .session,
+            None
+        ));
+    }
+
+    #[tokio::test]
+    async fn add_ice_candidate_round_trips_and_requires_an_ack() {
+        let (signaler, mut reader, mut writer) = pair();
+        let helper_task = tokio::spawn(async move {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let request: Value = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(request["type"], "add-ice-candidate");
+            assert_eq!(request["session"], "abc123");
+            assert_eq!(
+                request["candidate"],
+                "candidate:1 1 UDP 2122260223 192.0.2.1 5000 typ host"
+            );
+            assert_eq!(request["sdpMLineIndex"], 0);
+            writer.write_all(b"{\"ok\":true}\n").await.unwrap();
+            writer.flush().await.unwrap();
+        });
+
+        let mut config = config("candidate");
+        config.helper_program = PathBuf::from("/fake/helper");
+        let spawner = Arc::new(RecordingSpawner::new(signaler));
+        let source = Box::new(PendingSource::new(FrameFormat::rgb24(2, 2)));
+        let mut helper = WebRtcHelper::start_with_spawner(source, config, spawner).unwrap();
+
+        helper
+            .add_ice_candidate(
+                Some("abc123"),
+                "candidate:1 1 UDP 2122260223 192.0.2.1 5000 typ host",
+                0,
+            )
+            .await
+            .expect("ack is success");
+        helper.stop().await.unwrap();
+        helper_task.await.unwrap();
+    }
+
+    #[test]
+    fn candidate_ack_rejects_missing_or_false_acknowledgements() {
+        assert!(parse_ack("{\"ok\":true}", "candidate").is_ok());
+        assert!(matches!(
+            parse_ack("{\"ok\":false,\"error\":\"unknown WebRTC session\"}", "candidate"),
+            Err(WebRtcError::HelperError(message)) if message == "unknown WebRTC session"
+        ));
+        assert!(matches!(
+            parse_ack("{\"type\":\"answer\",\"sdp\":\"v=0\"}", "candidate"),
+            Err(WebRtcError::Unsupported(_))
+        ));
     }
 
     #[test]

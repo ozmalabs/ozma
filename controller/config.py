@@ -1,6 +1,63 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
 from dataclasses import dataclass, field
+import json
 import os
+
+
+def parse_ice_servers(raw: str) -> list[dict]:
+    """Parse ``OZMA_WEBRTC_ICE_SERVERS`` into browser ``iceServers`` entries.
+
+    The value is a JSON array such as
+    ``[{"urls": "stun:stun.example.org:3478"}]`` or a TURN entry with
+    ``username``/``credential``. Empty means no configured servers (the
+    historical ``iceServers: []`` behavior). Malformed values raise
+    ``ValueError`` at startup rather than silently producing a broken browser
+    connection.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"OZMA_WEBRTC_ICE_SERVERS is not valid JSON: {error}")
+    if not isinstance(parsed, list):
+        raise ValueError("OZMA_WEBRTC_ICE_SERVERS must be a JSON array")
+    servers: list[dict] = []
+    for index, entry in enumerate(parsed):
+        if not isinstance(entry, dict) or "urls" not in entry:
+            raise ValueError(
+                f"OZMA_WEBRTC_ICE_SERVERS[{index}] must be an object with `urls`"
+            )
+        urls = entry["urls"]
+        values = urls if isinstance(urls, list) else [urls]
+        if not values or not all(
+            isinstance(value, str) and value.strip() for value in values
+        ):
+            raise ValueError(
+                f"OZMA_WEBRTC_ICE_SERVERS[{index}].urls must be a non-empty string or list"
+            )
+        for value in values:
+            scheme = value.strip().split(":", 1)[0].lower()
+            if scheme not in ("stun", "stuns", "turn", "turns"):
+                raise ValueError(
+                    f"OZMA_WEBRTC_ICE_SERVERS[{index}] has unsupported URL "
+                    f"scheme `{scheme}`"
+                )
+        server = {"urls": urls if isinstance(urls, list) else urls.strip()}
+        for key in ("username", "credential"):
+            if key in entry:
+                if not isinstance(entry[key], str) or not entry[key]:
+                    raise ValueError(
+                        f"OZMA_WEBRTC_ICE_SERVERS[{index}].{key} must be a non-empty string"
+                    )
+                server[key] = entry[key]
+        if ("username" in server) != ("credential" in server):
+            raise ValueError(
+                f"OZMA_WEBRTC_ICE_SERVERS[{index}] requires both username and credential"
+            )
+        servers.append(server)
+    return servers
 
 
 @dataclass
@@ -18,6 +75,11 @@ class Config:
     # Persistent per-node token store (mode 0600). Empty uses
     # OZMA_NODE_TOKEN_STORE or <controller dir>/node_tokens.json.
     node_token_store: str = ""
+    # Browser ICE servers for the dashboard/console WebRTC peers. JSON array,
+    # for example [{"urls": "stun:stun.example.org:3478"}]. Empty preserves the
+    # historical iceServers: [] behavior. TURN credentials are client-visible by
+    # design; do not log this value.
+    webrtc_ice_servers: str = ""
 
     # mDNS
     mdns_service_type: str = "_ozma._udp.local."
@@ -88,6 +150,7 @@ class Config:
             node_port=int(os.environ.get("OZMA_NODE_PORT", "7331")),
             node_api_token=os.environ.get("OZMA_NODE_API_TOKEN", ""),
             node_token_store=os.environ.get("OZMA_NODE_TOKEN_STORE", ""),
+            webrtc_ice_servers=os.environ.get("OZMA_WEBRTC_ICE_SERVERS", ""),
             keyboard_device=os.environ.get("OZMA_KBD_DEVICE"),
             mouse_device=os.environ.get("OZMA_MOUSE_DEVICE"),
             virtual_only=os.environ.get("OZMA_VIRTUAL_ONLY", "").lower() in ("1", "true", "yes"),

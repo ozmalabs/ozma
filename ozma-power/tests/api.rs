@@ -146,6 +146,8 @@ fn action_names_match_the_python_http_surface() {
         (PowerAction::Start, "on"),
         (PowerAction::Shutdown, "off"),
         (PowerAction::Reset, "reset"),
+        (PowerAction::Pause, "pause"),
+        (PowerAction::Resume, "resume"),
         (PowerAction::Stop, "force-off"),
     ];
 
@@ -158,7 +160,7 @@ fn action_names_match_the_python_http_surface() {
         assert_eq!(decoded, action);
     }
 
-    assert_eq!(PowerAction::ALL.len(), 4);
+    assert_eq!(PowerAction::ALL.len(), 6);
 }
 
 #[test]
@@ -167,12 +169,14 @@ fn action_parsing_accepts_canonical_names_and_aliases() {
         ("on", PowerAction::Start),
         ("start", PowerAction::Start),
         ("cont", PowerAction::Start),
-        ("resume", PowerAction::Start),
         ("off", PowerAction::Shutdown),
         ("shutdown", PowerAction::Shutdown),
         ("powerdown", PowerAction::Shutdown),
         ("power-off", PowerAction::Shutdown),
         ("reset", PowerAction::Reset),
+        ("pause", PowerAction::Pause),
+        ("suspend", PowerAction::Pause),
+        ("resume", PowerAction::Resume),
         ("force-off", PowerAction::Stop),
         ("force_off", PowerAction::Stop),
         ("stop", PowerAction::Stop),
@@ -190,7 +194,9 @@ fn action_parsing_accepts_canonical_names_and_aliases() {
 
     let error = PowerAction::from_str("explode").unwrap_err();
     assert!(matches!(error, PowerError::InvalidState(_)));
-    assert!(error.to_string().contains("on, off, reset, force-off"));
+    assert!(error
+        .to_string()
+        .contains("on, off, reset, pause, resume, force-off"));
 }
 
 struct DummyBackend {
@@ -228,8 +234,15 @@ async fn power_backend_is_object_safe() {
     });
 
     assert_eq!(backend.query_status().await.unwrap(), PowerState::paused());
-    backend.cont().await.unwrap();
+    // The default resume is an alias for cont, so a paused backend becomes
+    // running; pause itself is typed unsupported unless the backend overrides
+    // it (QMP and libvirt do).
+    backend.resume().await.unwrap();
     assert_eq!(backend.query_status().await.unwrap(), PowerState::running());
+    match backend.pause().await.unwrap_err() {
+        PowerError::Unsupported(operation) => assert_eq!(operation, "pause"),
+        other => panic!("expected Unsupported(pause), got {other:?}"),
+    }
     backend.system_powerdown().await.unwrap();
     backend.system_reset().await.unwrap();
     backend.stop().await.unwrap();

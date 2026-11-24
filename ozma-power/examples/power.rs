@@ -4,7 +4,7 @@
 //! Usage:
 //!
 //! ```text
-//! cargo run -p ozma-power --example power -- <domain> [on|off|reset|force-off]
+//! cargo run -p ozma-power --example power -- <domain> [on|off|reset|pause|resume|force-off]
 //! ```
 
 use std::str::FromStr;
@@ -26,6 +26,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             PowerAction::Start => power.cont().await?,
             PowerAction::Shutdown => power.system_powerdown().await?,
             PowerAction::Reset => power.system_reset().await?,
+            PowerAction::Pause => power.pause().await?,
+            PowerAction::Resume => power.resume().await?,
             PowerAction::Stop => power.stop().await?,
         }
         println!("{action} requested");

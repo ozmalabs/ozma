@@ -304,10 +304,12 @@ actual QMP/libvirt state). Expected controller response: the same through the
 proxy. `available:false` means no power backend is configured and Gate 2 power
 parity is not met.
 
-Do **not** call `/power/off`, `/power/stop`, or `/power/reset` on a VM you care
-about. The harness never does. If you test an action manually, use a disposable
-VM and note that QMP `stop` is a pause, not a destroy; force-off falls back to
-ACPI powerdown.
+Do **not** call `/power/stop` (or its `force-off`/`destroy` aliases) on a VM you
+care about: it is a hard force-off (QMP `quit` / `virsh destroy`) that terminates
+QEMU. `/power/off` requests an ACPI shutdown and leaves QEMU running. For a
+disposable VM, `/power/pause` is the monitor pause (QMP `stop` / `virsh suspend`)
+and returns state `paused`; `/power/resume` uses QMP `cont` / `virsh resume`;
+`/power/on` also resumes and can start a stopped VM.
 
 Artifact: both responses.
 
@@ -596,9 +598,10 @@ parity matrix until the underlying work lands.
    NAT/TURN, multiple peers, and reconnect are untested. `running` by itself
    means the helper's Unix socket is connected, not that a peer completed
    ICE/DTLS.
-4. **HLS does not delete old segments.** The ffmpeg argv has no
-   `-hls_flags delete_segments`; retained `.ts` files accumulate. The playlist
-   keeps four entries by default. `/stream/*` is unauthenticated by design so
+4. **HLS deletes old segments.** The ffmpeg argv uses
+   `-hls_flags delete_segments+append_list+discont_start`, so segments outside
+   the playlist window are removed instead of accumulating. The playlist keeps
+   four entries by default. `/stream/*` is unauthenticated by design so
    the controller can proxy it; control endpoints remain guarded when a token
    is configured.
 5. **QMP has one control client per `-qmp` chardev.** QEMU accepts one client
@@ -632,10 +635,14 @@ parity matrix until the underlying work lands.
    uses `--keyboard-layout us|uk|de|fr` (default `us`); dead-key-only,
    IME/compose, and non-ASCII characters without a direct key are typed 400
    before any event.
-9. **Power semantics.** QMP `stop` is a pause, not a destroy; force-off falls
-   back to ACPI powerdown. `LibvirtPower` shells out to `virsh`. The harness
-   never invokes a power action, so action parity remains manual and must use a
-   disposable VM.
+9. **Power semantics.** `/power/pause` is the monitor pause (QMP `stop`,
+   `virsh suspend`) and `/power/resume` is QMP `cont` / `virsh resume`;
+   `/power/on` also resumes and can start a stopped VM. `/power/stop` (aliases
+   `force-off`/`destroy`) is a hard power-off (QMP `quit`, `virsh destroy`) that
+   exits QEMU; it is not a pause. `/power/off` requests ACPI shutdown and leaves
+   QEMU running. `LibvirtPower` shells out to `virsh`. The harness only invokes
+   `/power/state`; action parity is covered by fake-QMP/fake-backend tests and a
+   disposable-QEMU run, and must not be pointed at a VM you care about.
 10. **Audio is not implemented.** `/api/v1/connection.audio` is
     `"not-implemented"` and `/audio/*` returns typed 501s. There is no per-VM
     sink routing, room correction, or WebRTC audio in this gate.
@@ -649,6 +656,14 @@ parity matrix until the underlying work lands.
     D-Bus framebuffer capture, libvirt device creation beyond the opt-in XML
     command-line block, evdev/PulseAudio provisioning, and the controller
     pytest/demo/clean-host runs are still outside this harness.
+14. **Codec override applies to HLS only.** `POST /codec` validates the
+    request and, when HLS is running, restarts the pipeline with the mapped
+    encoder and returns `applied:true` / `pending_restart:false`; with HLS off
+    it stores the override as `pending_restart:true`. WebRTC keeps its existing
+    encoder. The controller proxies `GET`/`POST
+    /api/v1/streams/{id}/codec` to the node for `hls-remote` streams; this is
+    fake-node tested and was repeated live through the controller in
+    [`gate2-final-e2e-report.md`](gate2-final-e2e-report.md) §5.7.
 
 ## 8. Evidence and the Gate 2 claim
 

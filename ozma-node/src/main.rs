@@ -30,7 +30,9 @@ use ozma_node::{
     },
     controller_compat::{self, AudioControl, CodecControl},
     display_compat::SnapshotControl,
-    hls::{HlsConfig, HlsController, HlsEncoder, HlsError, HlsSourceFactory, HlsStatus},
+    hls::{
+        HlsConfig, HlsController, HlsEncoder, HlsError, HlsPixelFormat, HlsSourceFactory, HlsStatus,
+    },
     input_select,
     keyboard_layout::KeyboardLayout,
     mdns, platform, registration, usb_audio,
@@ -313,6 +315,36 @@ pub struct Args {
     )]
     pub hls_encoder: String,
 
+    /// HLS encoded pixel format: `yuv420p` (default SDR 8-bit) or `p010`
+    /// (10-bit; HEVC/AV1 Main10 only).
+    #[arg(long, env = "OZMA_HLS_PIXEL_FORMAT", value_name = "FORMAT")]
+    pub hls_pixel_format: Option<String>,
+
+    /// Select the 10-bit `p010` HLS target (equivalent to
+    /// `--hls-pixel-format p010`; HEVC/AV1 Main10 only).
+    #[arg(long, env = "OZMA_HLS_10BIT")]
+    pub hls_10bit: bool,
+
+    /// Signal HDR color metadata and default it to BT.2020/PQ.
+    ///
+    /// Requires a 10-bit target. `--hls-color-primaries`,
+    /// `--hls-color-transfer`, and `--hls-color-matrix` override the preset
+    /// fields individually.
+    #[arg(long, env = "OZMA_HLS_HDR")]
+    pub hls_hdr: bool,
+
+    /// HDR color primaries (`-color_primaries`, for example `bt2020`).
+    #[arg(long, env = "OZMA_HLS_COLOR_PRIMARIES", value_name = "NAME")]
+    pub hls_color_primaries: Option<String>,
+
+    /// HDR transfer characteristic (`-color_trc`, for example `smpte2084`).
+    #[arg(long, env = "OZMA_HLS_COLOR_TRANSFER", value_name = "NAME")]
+    pub hls_color_transfer: Option<String>,
+
+    /// HDR color matrix (`-colorspace`, for example `bt2020nc`).
+    #[arg(long, env = "OZMA_HLS_COLOR_MATRIX", value_name = "NAME")]
+    pub hls_color_matrix: Option<String>,
+
     /// VAAPI render node used by `h264_vaapi`/`hevc_vaapi` HLS encoders.
     ///
     /// The path is validated when a hardware pipeline starts or restarts, not
@@ -401,6 +433,31 @@ pub struct Args {
     )]
     pub webrtc_audio_backend: WebRtcAudioBackend,
 
+    /// Optional STUN server for WebRTC ICE, for example
+    /// `stun:stun.example.org:3478` or `stun://stun.example.org:3478`.
+    /// Omit to keep host-candidate-only gathering.
+    #[arg(long, env = "OZMA_WEBRTC_STUN", value_name = "URI")]
+    pub webrtc_stun: Option<String>,
+
+    /// Optional TURN server address without credentials, for example
+    /// `turn:turn.example.org:3478`. Requires `--webrtc-turn-user` and
+    /// `--webrtc-turn-password`.
+    #[arg(long, env = "OZMA_WEBRTC_TURN", value_name = "URI")]
+    pub webrtc_turn: Option<String>,
+
+    /// TURN username; never logged or returned by the status API.
+    #[arg(long, env = "OZMA_WEBRTC_TURN_USER", value_name = "USER")]
+    pub webrtc_turn_user: Option<String>,
+
+    /// TURN password; redacted from logs and status.
+    #[arg(
+        long,
+        env = "OZMA_WEBRTC_TURN_PASSWORD",
+        value_name = "PASSWORD",
+        hide_env_values = true
+    )]
+    pub webrtc_turn_password: Option<String>,
+
     /// Enable verbose debug logging.
     #[arg(long)]
     pub debug: bool,
@@ -427,6 +484,41 @@ fn default_hw() -> String {
         }
     }
     std::env::consts::ARCH.to_string()
+}
+
+/// Resolve the HLS pixel-format flags into one target.
+///
+/// `--hls-hdr` implies 10-bit when no explicit format was given, but an
+/// explicit `yuv420p` is a contradiction rather than a silent override.
+fn resolve_hls_pixel_format(
+    explicit: Option<&str>,
+    ten_bit: bool,
+    hdr: bool,
+) -> Result<HlsPixelFormat, String> {
+    let parsed = explicit
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(HlsPixelFormat::parse)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    if ten_bit && parsed == Some(HlsPixelFormat::Yuv420p) {
+        return Err("--hls-10bit conflicts with an explicit --hls-pixel-format yuv420p".to_owned());
+    }
+    let resolved = if ten_bit {
+        HlsPixelFormat::P010
+    } else if let Some(parsed) = parsed {
+        parsed
+    } else if hdr {
+        HlsPixelFormat::P010
+    } else {
+        HlsPixelFormat::Yuv420p
+    };
+    if hdr && !resolved.is_10bit() {
+        return Err("--hls-hdr requires a 10-bit target; pass --hls-10bit or \
+             --hls-pixel-format p010"
+            .to_owned());
+    }
+    Ok(resolved)
 }
 
 /// The dev/test synthetic capture flags only make sense with the fake provider.
@@ -639,7 +731,7 @@ async fn main() {
              no capture source is configured. Hardware capture is not advertised on a VM."
         );
     }
-    let capabilities = platform::detect_with_registry(&config, &capture_registry);
+    let mut capabilities = platform::detect_with_registry(&config, &capture_registry);
     let quic_port = config.http_port.saturating_add(2);
 
     // One input sink is shared by session input and the controller's UDP HID
@@ -690,6 +782,7 @@ async fn main() {
             .unwrap_or_else(|| default_hls_dir(&config.name))
     });
     let mut hls_controller: Option<HlsController> = None;
+    let mut hls_config_for_capabilities: Option<HlsConfig> = None;
     let hls_status = if let Some(directory) = hls_output_dir.as_ref() {
         let encoder = match HlsEncoder::parse(&args.hls_encoder) {
             Ok(encoder) => encoder,
@@ -698,16 +791,33 @@ async fn main() {
                 std::process::exit(2);
             }
         };
+        let pixel_format = match resolve_hls_pixel_format(
+            args.hls_pixel_format.as_deref(),
+            args.hls_10bit,
+            args.hls_hdr,
+        ) {
+            Ok(pixel_format) => pixel_format,
+            Err(error) => {
+                error!("Invalid HLS pixel format: {error}");
+                std::process::exit(2);
+            }
+        };
         let hls_config = HlsConfig {
             output_dir: directory.clone(),
             fps: args.hls_fps,
             bitrate_kbps: args.hls_bitrate_kbps,
             video_encoder: encoder,
+            pixel_format,
+            color_primaries: args.hls_color_primaries.clone(),
+            color_transfer: args.hls_color_transfer.clone(),
+            color_matrix: args.hls_color_matrix.clone(),
+            hdr: args.hls_hdr,
             ffmpeg_bin: args.ffmpeg_bin.clone(),
             vaapi_device: config.vaapi_device.clone(),
             nvenc_gpu: config.nvenc_gpu,
             ..HlsConfig::default()
         };
+        hls_config_for_capabilities = Some(hls_config.clone());
         if let Err(error) = hls_config.validate() {
             error!("Invalid HLS configuration: {error}");
             std::process::exit(2);
@@ -750,6 +860,14 @@ async fn main() {
         HlsStatus::not_configured()
     };
 
+    // Advertise the encoder that HLS is actually configured to run, with the
+    // real source envelope and HDR only when a 10-bit HDR target passed
+    // validation. Without HLS this leaves the conservative native capability
+    // untouched.
+    if let Some(hls_config) = hls_config_for_capabilities.as_ref() {
+        platform::apply_hls_encode_capability(&mut capabilities, hls_config);
+    }
+
     // External WebRTC helper (GStreamer/Python first; native WebRTC is future
     // work). WebRTC is disabled unless `--webrtc-helper` is configured. A
     // configured helper that cannot start is reported as `failed`, never
@@ -772,6 +890,10 @@ async fn main() {
                 bitrate_kbps: args.webrtc_bitrate_kbps,
                 audio_source: audio_source.clone(),
                 audio_backend: args.webrtc_audio_backend,
+                stun_server: args.webrtc_stun.clone(),
+                turn_server: args.webrtc_turn.clone(),
+                turn_user: args.webrtc_turn_user.clone(),
+                turn_password: args.webrtc_turn_password.clone(),
                 startup_timeout: std::time::Duration::from_secs(5),
                 offer_timeout: std::time::Duration::from_secs(10),
             };
@@ -805,6 +927,10 @@ async fn main() {
                             fps = webrtc_config.fps,
                             audio = ?webrtc_config.audio_source,
                             audio_backend = webrtc_config.audio_backend.as_arg(),
+                            stun = ?webrtc_config.stun_server,
+                            turn = ?webrtc_config.turn_server,
+                            turn_auth = webrtc_config.turn_user.is_some()
+                                && webrtc_config.turn_password.is_some(),
                             "WebRTC helper started"
                         );
                         Some(WebRtcControl::from_helper(helper))
@@ -838,15 +964,54 @@ async fn main() {
     // pipeline with the selected software encoder; when HLS is off the override
     // is stored for a future start. WebRTC keeps its existing encoder.
     let codec_control = if config.has_capability("video") && !capabilities.encode.is_empty() {
-        let registry = ozma_encode::EncoderRegistry::with_detected_encoders_for_device(Some(
+        let detected = ozma_encode::EncoderRegistry::with_detected_encoders_for_device(Some(
             config.vaapi_device.as_path(),
         ))
         .await;
+        // The encoder registry's own hardware caps still carry a conservative
+        // 1080p ceiling. Fit the advertised list to the real source envelope
+        // and the configured HLS encoder, so GET/POST /codec and its error
+        // details describe the stream this node can actually run.
+        let envelope = platform::capture_envelope(&capabilities.capture);
+        let mut registry_caps: Vec<_> = detected.capabilities().iter().cloned().collect();
+        let mut hdr_codec = None;
+        if let Some(hls) = hls_config_for_capabilities.as_ref() {
+            let hls_capability = platform::hls_encode_capability(hls, envelope);
+            registry_caps.retain(|capability| {
+                capability.codec != hls_capability.codec
+                    || capability.backend != hls_capability.backend
+            });
+            registry_caps.push(hls_capability.clone());
+            if hls.pixel_format.is_10bit() {
+                // The HLS target bit depth is fixed for the pipeline lifetime.
+                // Do not offer a codec/backend that has no Main10 mapping and
+                // would fail the restart with a typed error.
+                registry_caps.retain(|capability| {
+                    matches!(
+                        (capability.codec, capability.backend),
+                        (
+                            ozma_protocol::Codec::Hevc,
+                            ozma_protocol::EncoderBackend::Software
+                                | ozma_protocol::EncoderBackend::Vaapi
+                                | ozma_protocol::EncoderBackend::Nvenc
+                        ) | (
+                            ozma_protocol::Codec::Av1,
+                            ozma_protocol::EncoderBackend::Software
+                        )
+                    )
+                });
+                if hls.hdr {
+                    hdr_codec = Some(hls_capability.codec);
+                }
+            }
+        }
+        platform::fit_encode_capabilities(&mut registry_caps, envelope, hdr_codec);
+        let registry = ozma_encode::EncoderRegistry::from_capabilities(registry_caps);
         let format = ozma_protocol::MediaFormat::new(
             ozma_protocol::Codec::H264,
-            1920,
-            1080,
-            args.hls_fps.max(1),
+            envelope.width,
+            envelope.height,
+            args.hls_fps.max(1).min(envelope.fps.max(1)),
             args.hls_bitrate_kbps.max(1),
         );
         Some(CodecControl::new(registry, format).with_hls(hls_controller.clone()))
@@ -927,8 +1092,9 @@ async fn main() {
              injection, QMP/libvirt power control, and optional PipeWire/PulseAudio routing \
              start when their flags are configured. Local HLS is opt-in via `--hls` and feeds \
              `/stream/*` from the first capture source. WebRTC runs only through an external \
-             helper and only when `--webrtc-helper` is set. POST /codec stores a validated \
-             override but does not restart the pipeline (pending_restart). Still not \
+             helper and only when `--webrtc-helper` is set. POST /codec validates an override and, \
+             when HLS is running, restarts the pipeline with the mapped encoder; with HLS off it \
+             is stored with pending_restart. Still not \
              implemented: native WebRTC, live D-Bus/VNC validation in CI, per-VM provisioning \
              (ozma-softnode supervisor), and WebRTC audio. Do not treat WebRTC as functional \
              without a configured helper.",
@@ -1421,6 +1587,35 @@ mod tests {
             "WebRTC audio must stay disabled unless a monitor source is supplied"
         );
         assert_eq!(args.webrtc_audio_backend, WebRtcAudioBackend::Auto);
+        assert!(args.webrtc_stun.is_none());
+        assert!(args.webrtc_turn.is_none());
+        assert!(args.webrtc_turn_user.is_none());
+        assert!(args.webrtc_turn_password.is_none());
+    }
+
+    #[test]
+    fn webrtc_stun_and_turn_flags_parse_without_defaults() {
+        let args = Args::parse_from([
+            "ozma-node",
+            "--webrtc-stun",
+            "stun:stun.example.org:3478",
+            "--webrtc-turn",
+            "turn:turn.example.org:3478",
+            "--webrtc-turn-user",
+            "alice",
+            "--webrtc-turn-password",
+            "s3cret",
+        ]);
+        assert_eq!(
+            args.webrtc_stun.as_deref(),
+            Some("stun:stun.example.org:3478")
+        );
+        assert_eq!(
+            args.webrtc_turn.as_deref(),
+            Some("turn:turn.example.org:3478")
+        );
+        assert_eq!(args.webrtc_turn_user.as_deref(), Some("alice"));
+        assert_eq!(args.webrtc_turn_password.as_deref(), Some("s3cret"));
     }
 
     #[test]
@@ -1554,6 +1749,50 @@ mod tests {
         assert!(error.contains("--capture-provider fake"), "{error}");
         assert!(validate_fake_flags("v4l2", None, None, Some(60)).is_err());
         assert!(validate_fake_flags("", None, None, None).is_ok());
+    }
+
+    #[test]
+    fn hls_pixel_format_flags_resolve_and_reject_conflicts() {
+        assert_eq!(
+            resolve_hls_pixel_format(None, false, false).unwrap(),
+            HlsPixelFormat::Yuv420p
+        );
+        assert_eq!(
+            resolve_hls_pixel_format(None, true, false).unwrap(),
+            HlsPixelFormat::P010
+        );
+        assert_eq!(
+            resolve_hls_pixel_format(None, false, true).unwrap(),
+            HlsPixelFormat::P010,
+            "--hls-hdr implies a 10-bit target"
+        );
+        assert_eq!(
+            resolve_hls_pixel_format(Some("p010"), false, false).unwrap(),
+            HlsPixelFormat::P010
+        );
+        assert!(resolve_hls_pixel_format(Some("yuv420p"), true, false).is_err());
+        assert!(resolve_hls_pixel_format(Some("yuv420p"), false, true).is_err());
+        assert!(resolve_hls_pixel_format(Some("nv12"), false, false).is_err());
+
+        let args = Args::parse_from([
+            "ozma-node",
+            "--hls",
+            "--hls-encoder",
+            "hevc_vaapi",
+            "--hls-10bit",
+            "--hls-hdr",
+            "--hls-color-primaries",
+            "bt2020",
+            "--hls-color-transfer",
+            "smpte2084",
+            "--hls-color-matrix",
+            "bt2020nc",
+        ]);
+        assert!(args.hls_10bit);
+        assert!(args.hls_hdr);
+        assert_eq!(args.hls_color_primaries.as_deref(), Some("bt2020"));
+        assert_eq!(args.hls_color_transfer.as_deref(), Some("smpte2084"));
+        assert_eq!(args.hls_color_matrix.as_deref(), Some("bt2020nc"));
     }
 
     #[test]

@@ -15,14 +15,19 @@ use crate::error::PowerError;
 ///
 /// | Action | Canonical name | Accepted aliases |
 /// |---|---|---|
-/// | [`PowerAction::Start`] | `on` | `start`, `cont`, `resume` |
+/// | [`PowerAction::Start`] | `on` | `start`, `cont` |
 /// | [`PowerAction::Shutdown`] | `off` | `shutdown`, `powerdown`, `power-off` |
 /// | [`PowerAction::Reset`] | `reset` | — |
+/// | [`PowerAction::Pause`] | `pause` | `suspend` |
+/// | [`PowerAction::Resume`] | `resume` | — |
 /// | [`PowerAction::Stop`] | `force-off` | `stop`, `destroy`, `force_off` |
 ///
-/// [`PowerAction::Start`] means "resume a paused VM or start a stopped one",
-/// matching [`crate::PowerBackend::cont`]. [`PowerAction::Stop`] means a hard
-/// stop, matching [`crate::PowerBackend::stop`].
+/// [`PowerAction::Start`] calls [`crate::PowerBackend::cont`] (resume or start);
+/// [`PowerAction::Resume`] calls [`crate::PowerBackend::resume`] (QMP `cont`,
+/// libvirt `virsh resume`), the explicit pause counterpart. [`PowerAction::Pause`]
+/// calls [`crate::PowerBackend::pause`] (QMP `stop`, libvirt `suspend`) and is
+/// deliberately distinct from [`PowerAction::Stop`], the hard force-off that
+/// calls [`crate::PowerBackend::stop`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PowerAction {
     /// Resume a paused VM or start a stopped VM (`on`).
@@ -34,6 +39,12 @@ pub enum PowerAction {
     /// Reset the VM (`reset`).
     #[serde(rename = "reset")]
     Reset,
+    /// Pause a running VM without powering it off (`pause`).
+    #[serde(rename = "pause")]
+    Pause,
+    /// Resume a paused VM (`resume`).
+    #[serde(rename = "resume")]
+    Resume,
     /// Force the VM off (`force-off`).
     #[serde(rename = "force-off")]
     Stop,
@@ -41,10 +52,12 @@ pub enum PowerAction {
 
 impl PowerAction {
     /// Every action, in HTTP-surface order.
-    pub const ALL: [PowerAction; 4] = [
+    pub const ALL: [PowerAction; 6] = [
         PowerAction::Start,
         PowerAction::Shutdown,
         PowerAction::Reset,
+        PowerAction::Pause,
+        PowerAction::Resume,
         PowerAction::Stop,
     ];
 
@@ -54,6 +67,8 @@ impl PowerAction {
             Self::Start => "on",
             Self::Shutdown => "off",
             Self::Reset => "reset",
+            Self::Pause => "pause",
+            Self::Resume => "resume",
             Self::Stop => "force-off",
         }
     }
@@ -70,12 +85,14 @@ impl FromStr for PowerAction {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "on" | "start" | "cont" | "resume" => Ok(Self::Start),
+            "on" | "start" | "cont" => Ok(Self::Start),
             "off" | "shutdown" | "powerdown" | "power-off" => Ok(Self::Shutdown),
             "reset" => Ok(Self::Reset),
+            "pause" | "suspend" => Ok(Self::Pause),
+            "resume" => Ok(Self::Resume),
             "force-off" | "force_off" | "stop" | "destroy" => Ok(Self::Stop),
             _ => Err(PowerError::InvalidState(format!(
-                "unknown power action {value:?}; expected one of: on, off, reset, force-off"
+                "unknown power action {value:?}; expected one of: on, off, reset, pause, resume, force-off"
             ))),
         }
     }

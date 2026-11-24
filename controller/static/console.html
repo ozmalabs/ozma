@@ -875,10 +875,46 @@ async function startVideoChain(force) {
   }
 }
 
+async function loadIceServers() {
+  // Controller-configured browser ICE servers (OZMA_WEBRTC_ICE_SERVERS).
+  try {
+    const resp = await fetch('/api/v1/webrtc/ice');
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    return Array.isArray(data.iceServers) ? data.iceServers : [];
+  } catch (_) {
+    return [];
+  }
+}
+
 async function startWebRTC() {
   try {
-    const pc = new RTCPeerConnection({ iceServers: [] });
+    const iceServers = await loadIceServers();
+    const pc = new RTCPeerConnection({ iceServers });
     S.pc = pc;
+    const candidateUrl = `/api/v1/streams/${encodeURIComponent(nodeId)}/webrtc/candidate`;
+    const pendingCandidates = [];
+    let remoteSession = null;
+    const sendCandidate = (candidate) => {
+      if (!remoteSession) return;
+      fetch(candidateUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session: remoteSession,
+          candidate: candidate.candidate,
+          sdpMLineIndex: candidate.sdpMLineIndex ?? 0,
+        }),
+      }).catch(() => {});
+    };
+    pc.onicecandidate = (event) => {
+      if (!event.candidate) return;
+      const candidate = typeof event.candidate.toJSON === 'function'
+        ? event.candidate.toJSON()
+        : { candidate: event.candidate.candidate, sdpMLineIndex: event.candidate.sdpMLineIndex };
+      if (remoteSession) sendCandidate(candidate);
+      else pendingCandidates.push(candidate);
+    };
     const vcvr = pc.addTransceiver('video', { direction: 'recvonly' });
     pc.addTransceiver('audio', { direction: 'recvonly' });
     // Prefer H.264
@@ -910,11 +946,14 @@ async function startWebRTC() {
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    await new Promise(r => {
-      if (pc.iceGatheringState === 'complete') return r();
-      pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') r(); };
-      setTimeout(r, 2500);
-    });
+    // Preserve the historical bundled offer when no ICE server is configured.
+    if (!iceServers.length) {
+      await new Promise(r => {
+        if (pc.iceGatheringState === 'complete') return r();
+        pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') r(); };
+        setTimeout(r, 2500);
+      });
+    }
 
     const resp = await fetch(`/api/v1/streams/${encodeURIComponent(nodeId)}/webrtc`, {
       method: 'POST',
@@ -924,6 +963,10 @@ async function startWebRTC() {
     if (!resp.ok) throw new Error(`WebRTC ${resp.status}`);
     const answer = await resp.json();
     await pc.setRemoteDescription(new RTCSessionDescription(answer));
+    if (answer.session) {
+      remoteSession = answer.session;
+      for (const candidate of pendingCandidates.splice(0)) sendCandidate(candidate);
+    }
     S.videoMode = 'webrtc';
 
   } catch (err) {

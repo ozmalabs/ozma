@@ -103,6 +103,27 @@ async fn power_commands_are_sent_in_order() {
 }
 
 #[tokio::test]
+async fn pause_and_resume_send_qmp_stop_and_cont() {
+    let (mut power, mut server) = connected(FakeQmpOptions::default()).await;
+
+    power.pause().await.unwrap();
+    power.resume().await.unwrap();
+
+    assert_eq!(
+        server.recv_command_named("stop").await,
+        json!({"execute": "stop"})
+    );
+    assert_eq!(
+        server.recv_command_named("cont").await,
+        json!({"execute": "cont"})
+    );
+    // Pause is the monitor stop, not `quit`; the control socket stays usable.
+    assert!(power.is_connected());
+    assert_eq!(power.query_status().await.unwrap(), PowerState::running());
+    server.recv_command_named("query-status").await;
+}
+
+#[tokio::test]
 async fn force_off_sends_quit_and_leaves_power_unavailable() {
     let (mut power, mut server) = connected(FakeQmpOptions::default()).await;
 

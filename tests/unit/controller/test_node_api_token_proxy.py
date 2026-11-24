@@ -159,6 +159,8 @@ PROXY_CASES = [
     ("get", f"/api/v1/streams/{NODE_ID}/snapshot", None, "/display/snapshot"),
     ("get", f"/api/v1/nodes/{NODE_ID}/ui/hints", None, "/ui/hints"),
     ("get", f"/api/v1/nodes/{NODE_ID}/power/state", None, "/power/state"),
+    ("post", f"/api/v1/nodes/{NODE_ID}/power/pause", {}, "/power/pause"),
+    ("post", f"/api/v1/nodes/{NODE_ID}/power/resume", {}, "/power/resume"),
     ("get", f"/api/v1/nodes/{NODE_ID}/usb", None, "/usb"),
     ("get", f"/api/v1/streams/{NODE_ID}/codec", None, "/codec"),
     ("get", f"/api/v1/remote/{NODE_ID}/screenshot", None, "/display/snapshot"),
@@ -178,6 +180,21 @@ def test_proxy_sends_configured_bearer_token(
     assert fake_node.requests, f"{url} did not reach the node"
     record = fake_node.requests[-1]
     assert record["path"].startswith(node_path)
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+@pytest.mark.parametrize("action", ["pause", "resume"])
+def test_power_pause_and_resume_actions_are_propagated(fake_node, tmp_path, action):
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+    client = _client(app)
+
+    response = client.post(f"/api/v1/nodes/{NODE_ID}/power/{action}", json={})
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"ok": True}
+    record = fake_node.requests[-1]
+    assert record["method"] == "POST"
+    assert record["path"] == f"/power/{action}"
     assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
 
 

@@ -81,6 +81,25 @@ pub trait PowerBackend: Send + Sync {
     /// Resume a paused VM, or start a stopped one.
     async fn cont(&mut self) -> Result<(), PowerError>;
 
+    /// Pause a running VM without powering it off.
+    ///
+    /// QMP backends send QEMU's `stop` (monitor pause); libvirt backends run
+    /// `virsh suspend`. This is deliberately separate from
+    /// [`PowerBackend::stop`], which terminates the VM. Backends that cannot
+    /// pause return [`PowerError::Unsupported`].
+    async fn pause(&mut self) -> Result<(), PowerError> {
+        Err(PowerError::Unsupported("pause".to_string()))
+    }
+
+    /// Resume a paused VM.
+    ///
+    /// This is the explicit pause counterpart. The default implementation uses
+    /// [`PowerBackend::cont`]; backends with a distinct resume command (libvirt
+    /// `virsh resume`) may override it.
+    async fn resume(&mut self) -> Result<(), PowerError> {
+        self.cont().await
+    }
+
     /// Request an orderly ACPI shutdown.
     ///
     /// This is a request to the guest, not a host-side power cut; QEMU keeps

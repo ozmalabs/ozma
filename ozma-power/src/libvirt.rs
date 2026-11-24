@@ -10,6 +10,8 @@
 //! |---|---|
 //! | connect / status | `virsh domstate <domain>` |
 //! | cont | `virsh resume <domain>`, then `virsh start <domain>` |
+//! | pause | `virsh suspend <domain>` |
+//! | resume | `virsh resume <domain>` |
 //! | shutdown | `virsh shutdown <domain>` |
 //! | reset | `virsh reset <domain>` |
 //! | stop | `virsh destroy <domain>` |
@@ -231,6 +233,21 @@ impl PowerBackend for LibvirtPower {
     async fn system_powerdown(&mut self) -> Result<(), PowerError> {
         self.ensure_connected()?;
         self.run_action("shutdown").await
+    }
+
+    /// Pause the domain (`virsh suspend`).
+    async fn pause(&mut self) -> Result<(), PowerError> {
+        self.ensure_connected()?;
+        self.run_action("suspend").await
+    }
+
+    /// Resume a paused domain (`virsh resume`).
+    ///
+    /// Unlike [`PowerBackend::cont`], this does not fall back to `virsh start`;
+    /// a stopped domain should be started explicitly.
+    async fn resume(&mut self) -> Result<(), PowerError> {
+        self.ensure_connected()?;
+        self.run_action("resume").await
     }
 
     async fn system_reset(&mut self) -> Result<(), PowerError> {
