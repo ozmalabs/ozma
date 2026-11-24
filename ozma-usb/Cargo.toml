@@ -1,0 +1,15 @@
+[package]
+name        = "ozma-usb"
+version     = "0.1.0"
+edition     = "2021"
+description = "Safe USB gadget, virtual-media, and USB/IP control foundations for Ozma nodes."
+license     = "AGPL-3.0-only"
+
+[dependencies]
+ozma-protocol = { path = "../ozma-protocol" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = "3"

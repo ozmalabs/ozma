@@ -190,6 +190,9 @@ demo scenario end to end.
 - Audio: per-VM sink monitor routing, mic path, VBAN/WebRTC audio.
 - Optional breadth, only if required by product: Connect relay/mesh, virtual
   USB gadget, USB mass storage, virtual media (FAT32/NBD), Hyper-V, wallpaper.
+  The `ozma-usb` foundation (gadget/function model, safe ConfigFS controller,
+  virtual-media model, fake, and USB/IP argv fallback) is implemented; node
+  wiring, FAT32/NBD/media backends, Hyper-V, and wallpaper remain.
 - Port remaining Python unit tests; add QEMU integration tests to CI (skip when
   no KVM).
 

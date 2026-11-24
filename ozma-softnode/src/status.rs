@@ -11,7 +11,7 @@
 //! * only VMs the supervisor currently tracks (plus names excluded by
 //!   `--exclude`) appear, so cardinality is bounded by the hypervisor's VM set;
 //! * no sockets are opened, no child is probed, and no QEMU/virsh command runs
-//!   while answering a request;
+//!   while answering a request (optional child polling runs in its own task);
 //! * QMP socket paths and policy values stay in `/status`; metrics only carry
 //!   VM names and numeric state so a scrape does not leak host paths or
 //!   secrets.
@@ -51,6 +51,13 @@ pub struct SupervisorStatus {
     pub node_id: String,
     /// Port this status server is bound to (`0` when the listener is disabled).
     pub status_port: u16,
+    /// Child `/api/v1/connection` poll interval in milliseconds; `0` when child
+    /// aggregation is disabled.
+    #[serde(default)]
+    pub child_poll_interval_ms: u64,
+    /// Per-child poll timeout in milliseconds.
+    #[serde(default)]
+    pub child_poll_timeout_ms: u64,
     /// Aggregate counts and the next free per-VM ports.
     pub supervisor: SupervisorTotals,
     /// One entry per tracked VM, plus excluded VMs (state `excluded`).
@@ -79,6 +86,8 @@ impl SupervisorStatus {
             profile: SUPERVISOR_PROFILE.to_owned(),
             node_id: SUPERVISOR_NODE_ID.to_owned(),
             status_port: 0,
+            child_poll_interval_ms: 0,
+            child_poll_timeout_ms: 0,
             supervisor,
             vms,
         }
@@ -183,6 +192,10 @@ pub struct VmStatus {
     pub agent_status: String,
     /// Consecutive failed in-guest agent checks.
     pub agent_checks: u32,
+    /// Cached summary of the child's own `/api/v1/connection` document.
+    /// `None` when child polling is disabled or the child has never been polled.
+    #[serde(default)]
+    pub child: Option<ChildStatus>,
 }
 
 impl VmStatus {
@@ -209,8 +222,66 @@ impl VmStatus {
             audio_sink: None,
             agent_status: "disabled".to_owned(),
             agent_checks: 0,
+            child: None,
         }
     }
+}
+
+/// One running child's cached `/api/v1/connection` summary.
+///
+/// The supervisor polls only the handful of fields needed for a multi-VM view;
+/// it does not copy the full child document. Ages and `stale` are derived at
+/// status read time, so a cached entry cannot claim to be fresher than it is.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildStatus {
+    /// Whether the most recent poll reached the child and it reported `ok:true`.
+    pub reachable: bool,
+    /// Child node id reported by `/api/v1/connection`, when present.
+    pub node_id: Option<String>,
+    /// Child profile (`vm`), when reported.
+    pub profile: Option<String>,
+    /// Child HTTP API port, when reported.
+    pub api_port: Option<u16>,
+    /// HLS state (`running`, `not-configured`, or `failed`).
+    pub hls: Option<String>,
+    /// WebRTC state (`running`, `not-configured`, or `failed`).
+    pub webrtc: Option<String>,
+    /// Audio routing state (`running`, `not-configured`, or `failed`).
+    pub audio: Option<String>,
+    /// Power backend state, when reported.
+    pub power: Option<ChildPowerStatus>,
+    /// Input sink state, when reported.
+    pub input: Option<ChildInputStatus>,
+    /// Age of the most recent poll attempt, successful or not.
+    pub last_poll_age_ms: Option<u64>,
+    /// Age of the most recent successful poll.
+    pub last_seen_age_ms: Option<u64>,
+    /// Wall-clock time (Unix milliseconds) of the most recent successful poll.
+    pub last_seen_unix_ms: Option<u64>,
+    /// True when no successful poll is recent enough for the configured
+    /// interval and timeout. A child that was never polled is stale.
+    pub stale: bool,
+    /// Most recent transport/HTTP/parse error. Never contains a token.
+    pub last_error: Option<String>,
+}
+
+/// Child power backend summary. The child reports either a status string or an
+/// object with `status`/`available`; both are normalised here.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildPowerStatus {
+    pub state: String,
+    pub available: bool,
+}
+
+/// Child input sink summary.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildInputStatus {
+    /// Controller-facing sink kind (`uinput`, `qmp`, `hid-gadget`, ...).
+    pub kind: String,
+    /// Whether a shared sink is attached.
+    pub available: bool,
+    /// Whether events are really injected.
+    pub injecting: bool,
 }
 
 /// `GET /api/v1/connection`-like document for the supervisor.
@@ -432,6 +503,40 @@ pub fn render_metrics(status: &SupervisorStatus) -> String {
             escape_label(&vm.state)
         ));
     }
+
+    // Child API aggregation is optional. Only reachability and staleness are
+    // exported: child error strings and sink names stay out of metrics.
+    let mut wrote_child_header = false;
+    for vm in &status.vms {
+        let Some(child) = &vm.child else { continue };
+        if !wrote_child_header {
+            out.push_str(
+                "# HELP ozma_supervisor_vm_child_up Whether the last child API poll succeeded.\n\
+                 # TYPE ozma_supervisor_vm_child_up gauge\n",
+            );
+            wrote_child_header = true;
+        }
+        out.push_str(&format!(
+            "ozma_supervisor_vm_child_up{{vm=\"{}\"}} {}\n",
+            escape_label(&vm.name),
+            u8::from(child.reachable)
+        ));
+    }
+    if wrote_child_header {
+        out.push_str(
+            "# HELP ozma_supervisor_vm_child_stale Whether the cached child summary is stale.\n\
+             # TYPE ozma_supervisor_vm_child_stale gauge\n",
+        );
+        for vm in &status.vms {
+            if let Some(child) = &vm.child {
+                out.push_str(&format!(
+                    "ozma_supervisor_vm_child_stale{{vm=\"{}\"}} {}\n",
+                    escape_label(&vm.name),
+                    u8::from(child.stale)
+                ));
+            }
+        }
+    }
     out
 }
 
@@ -521,6 +626,29 @@ mod tests {
                     audio_sink: Some("ozma-vm-a".to_owned()),
                     agent_status: "pending".to_owned(),
                     agent_checks: 0,
+                    child: Some(ChildStatus {
+                        reachable: true,
+                        node_id: Some("vm-a".to_owned()),
+                        profile: Some("vm".to_owned()),
+                        api_port: Some(7700),
+                        hls: Some("running".to_owned()),
+                        webrtc: Some("not-configured".to_owned()),
+                        audio: Some("running".to_owned()),
+                        power: Some(ChildPowerStatus {
+                            state: "running".to_owned(),
+                            available: true,
+                        }),
+                        input: Some(ChildInputStatus {
+                            kind: "qmp".to_owned(),
+                            available: true,
+                            injecting: true,
+                        }),
+                        last_poll_age_ms: Some(250),
+                        last_seen_age_ms: Some(250),
+                        last_seen_unix_ms: Some(1_700_000_000_000),
+                        stale: false,
+                        last_error: None,
+                    }),
                 },
                 VmStatus::excluded("infra-template"),
             ],
@@ -544,6 +672,8 @@ mod tests {
         assert_eq!(json["supervisor"]["excluded"], 1);
         assert_eq!(json["supervisor"]["next_hid_port"], 7610);
         assert_eq!(json["supervisor"]["next_http_port"], 7710);
+        assert_eq!(json["child_poll_interval_ms"], 0);
+        assert_eq!(json["child_poll_timeout_ms"], 0);
         assert_eq!(json["vms"].as_array().unwrap().len(), 2);
 
         let vm = &json["vms"][0];
@@ -568,9 +698,14 @@ mod tests {
             "audio_sink",
             "agent_status",
             "agent_checks",
+            "child",
         ] {
             assert!(vm.get(key).is_some(), "missing /status.vms[].{key}");
         }
+        assert_eq!(vm["child"]["reachable"], true);
+        assert_eq!(vm["child"]["hls"], "running");
+        assert_eq!(vm["child"]["input"]["kind"], "qmp");
+        assert_eq!(vm["child"]["stale"], false);
 
         // Round-trip keeps the schema stable.
         let decoded: SupervisorStatus = serde_json::from_value(json).expect("deserialize status");
@@ -589,6 +724,12 @@ mod tests {
         assert!(text.contains("ozma_supervisor_vm_restarts_total{vm=\"vm-a\"} 1"));
         assert!(text.contains("ozma_supervisor_vm_port{vm=\"vm-a\",kind=\"http\"} 7700"));
         assert!(text.contains("ozma_supervisor_vm_state{vm=\"vm-a\",state=\"running\"} 1"));
+        assert!(text.contains("ozma_supervisor_vm_child_up{vm=\"vm-a\"} 1"));
+        assert!(text.contains("ozma_supervisor_vm_child_stale{vm=\"vm-a\"} 0"));
+        assert!(
+            !text.contains("not-configured"),
+            "metrics must not leak child state labels"
+        );
         assert!(
             !text.contains("/run/ozma"),
             "metrics must not leak QMP paths"

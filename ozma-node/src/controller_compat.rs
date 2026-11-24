@@ -27,6 +27,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -44,7 +45,13 @@ use ozma_encode::{
 };
 use ozma_input::{linux_keycode_to_hid_usage, SharedSink, SubmitReport};
 use ozma_protocol::input::{InputEvent, KeyModifiers, PointerButton};
-use ozma_protocol::{codes, ApiError, Codec, EncodeCapability, EncoderBackend, MediaFormat};
+use ozma_protocol::{
+    codes, ApiError, CaptureKind, Codec, EncodeCapability, EncoderBackend, MediaFormat,
+};
+use ozma_usb::{
+    is_safe_identifier, FunctionStatus, GadgetStatus, MediaState, UsbError, UsbFunctionKind,
+    UsbGadgetCapabilities, UsbGadgetController, VirtualMedia,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::net::UdpSocket;
@@ -1259,6 +1266,323 @@ impl AudioControl {
     }
 }
 
+/// Runtime USB gadget control for `/usb` and the virtual-media routes.
+///
+/// `controller` is `None` when `--usb-gadget` was requested but the gadget
+/// could not be created or bound (missing UDC, missing ConfigFS root, invalid
+/// media, ...); `error` then carries the typed reason and the routes answer a
+/// 503. A node without `--usb-gadget` does not build a control at all and keeps
+/// the typed 501 `/usb` surface.
+#[derive(Clone)]
+pub struct UsbControl {
+    controller: Option<Arc<dyn UsbGadgetController>>,
+    gadget: String,
+    capabilities: UsbGadgetCapabilities,
+    error: Option<String>,
+}
+
+impl UsbControl {
+    /// A control over a created and bound gadget.
+    pub fn configured(controller: Arc<dyn UsbGadgetController>, gadget: impl Into<String>) -> Self {
+        let capabilities = controller.capabilities();
+        Self {
+            controller: Some(controller),
+            gadget: gadget.into(),
+            capabilities,
+            error: None,
+        }
+    }
+
+    /// A configured gadget that could not be initialised.
+    pub fn failed(reason: impl Into<String>) -> Self {
+        Self {
+            controller: None,
+            gadget: crate::config::DEFAULT_USB_GADGET_NAME.to_owned(),
+            capabilities: UsbGadgetCapabilities::unavailable(),
+            error: Some(reason.into()),
+        }
+    }
+
+    /// Configured gadget directory name.
+    pub fn gadget(&self) -> &str {
+        &self.gadget
+    }
+
+    /// Capability advertisement for this controller.
+    pub fn capabilities(&self) -> &UsbGadgetCapabilities {
+        &self.capabilities
+    }
+
+    /// True when a controller is present and did not fail at startup.
+    pub fn is_available(&self) -> bool {
+        self.controller.is_some() && self.error.is_none()
+    }
+
+    /// Connection status token.
+    pub fn status_name(&self) -> &'static str {
+        if self.is_available() {
+            "running"
+        } else {
+            "failed"
+        }
+    }
+
+    /// The startup error, when the gadget could not be created or bound.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// Project the controller capabilities onto the protocol type.
+    pub fn protocol_capability(&self) -> ozma_protocol::UsbCapability {
+        self.capabilities.protocol_capability()
+    }
+
+    fn controller(&self) -> Result<&Arc<dyn UsbGadgetController>, Response> {
+        match (&self.controller, &self.error) {
+            (Some(controller), None) => Ok(controller),
+            (_, Some(error)) => Err(usb_unavailable(error)),
+            (None, None) => Err(usb_not_configured()),
+        }
+    }
+
+    /// Read the live gadget status without exposing paths.
+    fn snapshot(&self) -> Result<UsbGadgetSnapshot, String> {
+        let controller = self.controller.as_ref().ok_or_else(|| {
+            self.error
+                .clone()
+                .unwrap_or_else(|| "USB is not configured".into())
+        })?;
+        controller
+            .status(&self.gadget)
+            .map(UsbGadgetSnapshot::from_status)
+            .map_err(|error| format!("{}: {error}", error.kind()))
+    }
+
+    /// The mass-storage instance to use when a request omits `function`.
+    fn default_media_function(&self) -> Result<String, Response> {
+        let snapshot = self
+            .snapshot()
+            .map_err(|error| usb_status_unavailable(&error))?;
+        snapshot
+            .functions
+            .iter()
+            .find(|function| function.kind == UsbFunctionKind::MassStorage)
+            .and_then(|function| function.name.split_once('.').map(|(_, instance)| instance))
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                compat_error_with_remediation(
+                    StatusCode::CONFLICT,
+                    "usb-missing-function",
+                    "the USB gadget has no mass-storage function",
+                    Some(
+                        "Start ozma-node with --usb-media <path> so the gadget includes a \
+                         mass_storage function before attaching media.",
+                    ),
+                )
+            })
+    }
+
+    /// Compact, path-free status for `/api/v1/connection`.
+    pub fn connection_status(&self) -> UsbConnectionStatus {
+        let mut status = UsbConnectionStatus {
+            status: self.status_name(),
+            available: false,
+            gadget: Some(self.gadget.clone()),
+            bound: false,
+            udc: None,
+            configfs: self.capabilities.configfs,
+            virtual_media: self.capabilities.virtual_media,
+            mass_storage: self.capabilities.mass_storage,
+            functions: Vec::new(),
+            error: self.error.clone(),
+        };
+        match self.snapshot() {
+            Ok(snapshot) => {
+                status.available = snapshot.bound;
+                status.bound = snapshot.bound;
+                status.udc = snapshot.udc.clone();
+                status.functions = snapshot
+                    .functions
+                    .iter()
+                    .map(|function| function.name.clone())
+                    .collect();
+                if !snapshot.bound {
+                    status.status = "unbound";
+                }
+            }
+            Err(error) => {
+                status.status = "failed";
+                status.error = Some(error);
+            }
+        }
+        status
+    }
+}
+
+/// Connection-level USB status, built from the live gadget when present.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct UsbConnectionStatus {
+    /// `running` (bound), `unbound`, `failed`, or `not-configured`.
+    pub status: &'static str,
+    /// Whether the gadget is currently bound and readable.
+    pub available: bool,
+    /// Configured gadget directory name.
+    pub gadget: Option<String>,
+    /// Whether a UDC is bound.
+    pub bound: bool,
+    /// Bound UDC, when present.
+    pub udc: Option<String>,
+    /// ConfigFS root availability reported by the controller.
+    pub configfs: bool,
+    /// Virtual-media support reported by the controller.
+    pub virtual_media: bool,
+    /// Mass-storage support reported by the controller.
+    pub mass_storage: bool,
+    /// Function names visible in the gadget.
+    pub functions: Vec<String>,
+    /// Why the gadget is not running, when configured but failing.
+    pub error: Option<String>,
+}
+
+impl Default for UsbConnectionStatus {
+    fn default() -> Self {
+        Self {
+            status: "not-configured",
+            available: false,
+            gadget: None,
+            bound: false,
+            udc: None,
+            configfs: false,
+            virtual_media: false,
+            mass_storage: false,
+            functions: Vec::new(),
+            error: None,
+        }
+    }
+}
+
+/// Read-only `/usb` gadget snapshot. No backing paths are included.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct UsbGadgetSnapshot {
+    pub name: String,
+    pub active: bool,
+    pub bound: bool,
+    pub udc: Option<String>,
+    pub functions: Vec<UsbFunctionSnapshot>,
+}
+
+impl UsbGadgetSnapshot {
+    fn from_status(status: GadgetStatus) -> Self {
+        let functions = status
+            .functions
+            .iter()
+            .map(UsbFunctionSnapshot::from_status)
+            .collect();
+        Self {
+            name: status.name,
+            active: status.bound,
+            bound: status.bound,
+            udc: status.udc,
+            functions,
+        }
+    }
+
+    fn media(&self) -> Vec<UsbMediaStatus> {
+        self.functions
+            .iter()
+            .filter_map(|function| function.media.clone())
+            .collect()
+    }
+}
+
+/// One gadget function in the `/usb` response.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct UsbFunctionSnapshot {
+    pub name: String,
+    pub kind: UsbFunctionKind,
+    pub subtype: String,
+    pub linked: bool,
+    pub requires_userspace: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media: Option<UsbMediaStatus>,
+}
+
+impl UsbFunctionSnapshot {
+    fn from_status(function: &FunctionStatus) -> Self {
+        let instance = function
+            .name
+            .split_once('.')
+            .map(|(_, instance)| instance)
+            .unwrap_or(function.name.as_str());
+        Self {
+            name: function.name.clone(),
+            kind: function.kind,
+            subtype: usb_function_subtype(function.kind).to_owned(),
+            linked: function.linked,
+            requires_userspace: function.requires_userspace,
+            media: function
+                .media
+                .as_ref()
+                .map(|media| UsbMediaStatus::from_state(instance, media)),
+        }
+    }
+}
+
+fn usb_function_subtype(kind: UsbFunctionKind) -> &'static str {
+    match kind {
+        UsbFunctionKind::Hid => "hid",
+        UsbFunctionKind::MassStorage => "mass-storage",
+        UsbFunctionKind::Uac2 => "audio-uac2",
+        UsbFunctionKind::Vendor => "vendor",
+    }
+}
+
+/// Attached/detached media state without the backing path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct UsbMediaStatus {
+    pub function: String,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+}
+
+impl UsbMediaStatus {
+    fn from_state(function: &str, state: &MediaState) -> Self {
+        match state {
+            MediaState::Detached => Self {
+                function: function.to_owned(),
+                state: "detached".to_owned(),
+                mode: None,
+                read_only: None,
+                size_bytes: None,
+            },
+            MediaState::Attached {
+                mode,
+                read_only,
+                size_bytes,
+                ..
+            } => Self {
+                function: function.to_owned(),
+                state: "attached".to_owned(),
+                mode: Some(mode_name(*mode).to_owned()),
+                read_only: Some(*read_only),
+                size_bytes: *size_bytes,
+            },
+        }
+    }
+}
+
+fn mode_name(mode: ozma_usb::MediaMode) -> &'static str {
+    match mode {
+        ozma_usb::MediaMode::Disk => "disk",
+        ozma_usb::MediaMode::CdRom => "cdrom",
+    }
+}
+
 /// Input sink status exposed on `/api/v1/connection`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct InputStatus {
@@ -1268,6 +1592,108 @@ pub struct InputStatus {
     pub available: bool,
     /// Whether events are really injected (false for a recording-only sink).
     pub injecting: bool,
+}
+
+/// Display capture status exposed on `/api/v1/connection`.
+///
+/// `active_console`/`provider` describe the one live capture source.
+/// `limitation` is set when more consoles are advertised than have capture
+/// sources (for example QMP/VNC/Looking Glass expose one default head), so the
+/// controller can surface the limitation instead of showing a broken picker.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct DisplayCaptureStatus {
+    /// Console index the live capture source targets.
+    pub active_console: Option<u32>,
+    /// Capture transport (`qmp`, `dbus`, `vnc`, `looking_glass`).
+    pub provider: Option<String>,
+    /// Why not every advertised console has a capture source.
+    pub limitation: Option<String>,
+}
+
+impl DisplayCaptureStatus {
+    /// Build a status from explicit parts.
+    pub fn new(
+        active_console: Option<u32>,
+        provider: Option<String>,
+        limitation: Option<String>,
+    ) -> Self {
+        Self {
+            active_console,
+            provider,
+            limitation,
+        }
+    }
+}
+
+/// The live capture source exposed on `/api/v1/connection`.
+///
+/// `provider` names the configured transport (`pipewire`, `x11`, `portal`,
+/// `fake`, or `none`). `kind`/`source`/`name` are filled only from a source the
+/// provider actually enumerated; a failed portal handshake or absent X display
+/// therefore reports `available:false` with no kind or source.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CaptureStatus {
+    /// Configured capture transport.
+    pub provider: String,
+    /// Enumerated capture kind (`x11`, `pipewire`, ...), or `null`.
+    pub kind: Option<String>,
+    /// Enumerated source id, or `null`.
+    pub source: Option<String>,
+    /// Enumerated human-readable source name, or `null`.
+    pub name: Option<String>,
+    /// Whether a real source was enumerated.
+    pub available: bool,
+}
+
+impl Default for CaptureStatus {
+    fn default() -> Self {
+        Self {
+            provider: "none".to_owned(),
+            kind: None,
+            source: None,
+            name: None,
+            available: false,
+        }
+    }
+}
+
+impl CaptureStatus {
+    /// Build the status from the configured provider and first enumerated
+    /// capability.
+    pub fn from_capability(
+        provider: impl Into<String>,
+        capability: Option<&ozma_protocol::CaptureCapability>,
+    ) -> Self {
+        match capability {
+            Some(capability) => Self {
+                provider: provider.into(),
+                kind: Some(capture_kind_name(capability.kind).to_owned()),
+                source: Some(capability.id.clone()),
+                name: Some(capability.name.clone()),
+                available: true,
+            },
+            None => Self {
+                provider: provider.into(),
+                ..Self::default()
+            },
+        }
+    }
+}
+
+fn capture_kind_name(kind: CaptureKind) -> &'static str {
+    match kind {
+        CaptureKind::V4l2 => "v4l2",
+        CaptureKind::Kms => "kms",
+        CaptureKind::PipeWire => "pipewire",
+        CaptureKind::Qmp => "qmp",
+        CaptureKind::Dbus => "dbus",
+        CaptureKind::LookingGlass => "looking_glass",
+        CaptureKind::Vnc => "vnc",
+        CaptureKind::X11 => "x11",
+        CaptureKind::Dxgi => "dxgi",
+        CaptureKind::HdmiSink => "hdmi_sink",
+        CaptureKind::Fake => "fake",
+    }
 }
 
 /// Static facts about the node needed by the connection endpoint.
@@ -1329,6 +1755,8 @@ pub struct ConnectionState {
     pub codec_control: Option<CodecControl>,
     /// Runtime audio routing control. `None` leaves `/audio/*` at typed 501.
     pub audio: Option<AudioControl>,
+    /// Runtime USB gadget control. `None` leaves `/usb` at a typed 501.
+    pub usb: Option<UsbControl>,
     /// External WebRTC helper. `None` means no `--webrtc-helper` was given;
     /// `Some(control)` may be a configured-but-failed helper.
     pub webrtc: Option<WebRtcControl>,
@@ -1337,6 +1765,12 @@ pub struct ConnectionState {
     pub snapshot: Option<SnapshotControl>,
     /// Bounded host sampler for the public `/agent/metrics` document.
     pub metrics: crate::agent_metrics::AgentMetricsSampler,
+    /// Controller-facing display outputs (VM consoles or raw host outputs).
+    pub display_outputs: serde_json::Value,
+    /// Live capture console/provider and any multi-console limitation.
+    pub display_capture: DisplayCaptureStatus,
+    /// Live capture transport/source for `/api/v1/connection`.
+    pub capture: CaptureStatus,
 }
 
 impl ConnectionState {
@@ -1352,10 +1786,40 @@ impl ConnectionState {
             codecs: CodecStatus::not_configured(),
             codec_control: None,
             audio: None,
+            usb: None,
             webrtc: None,
             snapshot: None,
             metrics: crate::agent_metrics::AgentMetricsSampler::default(),
+            display_outputs: serde_json::json!([]),
+            display_capture: DisplayCaptureStatus::default(),
+            capture: CaptureStatus::default(),
         }
+    }
+
+    /// Attach the actual capture transport and enumerated source.
+    ///
+    /// This is derived from the registry's first advertised capability. A
+    /// failed portal handshake or an absent X display keeps `available:false`
+    /// with no kind/source instead of naming a source that does not exist.
+    pub fn with_capture(mut self, capture: CaptureStatus) -> Self {
+        self.capture = capture;
+        self
+    }
+
+    /// Attach the controller-facing display outputs and live capture status.
+    ///
+    /// The outputs come from `NodeConfig::resolve_display_outputs` (or the raw
+    /// `--display-outputs-json` escape hatch). Only the selected console has a
+    /// non-empty `capture_source_id`; the status names the limitation when the
+    /// provider captures one head.
+    pub fn with_display_outputs(
+        mut self,
+        outputs: serde_json::Value,
+        capture: DisplayCaptureStatus,
+    ) -> Self {
+        self.display_outputs = outputs;
+        self.display_capture = capture;
+        self
     }
 
     /// Attach a connected power backend.
@@ -1432,6 +1896,16 @@ impl ConnectionState {
         self
     }
 
+    /// Attach the runtime USB gadget control.
+    ///
+    /// `None` keeps `usb.status: "not-configured"` and the typed 501 `/usb`
+    /// response. A configured gadget that failed to start reports `failed`
+    /// with its typed reason and answers 503, never a fabricated gadget.
+    pub fn with_usb(mut self, usb: Option<UsbControl>) -> Self {
+        self.usb = usb;
+        self
+    }
+
     /// Attach the external WebRTC helper control surface.
     ///
     /// `None` means WebRTC was not configured and reports `not-configured`.
@@ -1496,6 +1970,8 @@ pub struct ConnectionResponse {
     pub audio: &'static str,
     /// Why audio routing is `failed` (for example a missing `pactl`).
     pub audio_error: Option<String>,
+    /// USB gadget status (`not-configured`, `running`, `unbound`, `failed`).
+    pub usb: UsbConnectionStatus,
     /// Whether a WebRTC audio monitor was configured for the helper.
     ///
     /// This is configuration intent only; it does not claim that the worker
@@ -1503,6 +1979,12 @@ pub struct ConnectionResponse {
     pub webrtc_audio_configured: bool,
     /// Configured WebRTC audio monitor name, when one was supplied.
     pub webrtc_audio_source: Option<String>,
+    /// Controller-facing display outputs (same JSON as registration).
+    pub display_outputs: serde_json::Value,
+    /// Which console the live capture source targets, plus any limitation.
+    pub display_capture: DisplayCaptureStatus,
+    /// Actual capture transport and enumerated source, or `available:false`.
+    pub capture: CaptureStatus,
 }
 
 /// Build the control compatibility router. Mount it before the node API auth
@@ -1523,6 +2005,7 @@ pub fn compat_router(state: ConnectionState) -> Router {
         .merge(codec_router(state.clone()))
         .merge(webrtc_router(state.clone()))
         .merge(audio_router(state.clone()))
+        .merge(usb_router(state.clone()))
         .merge(display_router(state.clone()))
         .merge(legacy_router(state))
 }
@@ -1627,6 +2110,24 @@ pub fn webrtc_router(state: ConnectionState) -> Router {
         .with_state(state)
 }
 
+/// Controller USB gadget and virtual-media routes.
+///
+/// `GET /usb` is the controller's read-only probe (`node/node.py::_read_usb_info`
+/// shape). `POST /usb/media/attach` and `/usb/media/detach` operate on the
+/// configured mass-storage LUN through the [`UsbGadgetController`]; they never
+/// mount the image, write a block device, or create a backing file.
+///
+/// Without `--usb-gadget` every route keeps the typed 501 surface. A gadget
+/// that was requested but could not be created/bound answers 503 with the
+/// typed reason instead of a success-shaped response.
+pub fn usb_router(state: ConnectionState) -> Router {
+    Router::new()
+        .route("/usb", get(usb_status))
+        .route("/usb/media/attach", post(usb_media_attach))
+        .route("/usb/media/detach", post(usb_media_detach))
+        .with_state(state)
+}
+
 /// Display compatibility control routes.
 ///
 /// `GET /display/snapshot` and `GET /display/info` are read-only and live in
@@ -1648,7 +2149,6 @@ pub fn display_router(state: ConnectionState) -> Router {
 /// error, and remediation instead of a success-shaped no-op.
 pub fn legacy_router(state: ConnectionState) -> Router {
     Router::new()
-        .route("/usb", get(legacy_stub))
         .route("/rgb/state", get(legacy_stub))
         .route("/rgb/effect", get(legacy_stub).post(legacy_stub))
         .route("/rgb/set", post(legacy_stub))
@@ -1703,6 +2203,11 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
         None => ("not-configured", None),
         Some(control) => (control.status_name(), control.error().map(str::to_owned)),
     };
+    let usb = state
+        .usb
+        .as_ref()
+        .map(UsbControl::connection_status)
+        .unwrap_or_default();
     let codec = state
         .codec_control
         .as_ref()
@@ -1726,8 +2231,12 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
         webrtc_error,
         audio,
         audio_error,
+        usb,
         webrtc_audio_configured,
         webrtc_audio_source,
+        display_outputs: state.display_outputs.clone(),
+        display_capture: state.display_capture.clone(),
+        capture: state.capture.clone(),
     })
 }
 
@@ -1847,12 +2356,6 @@ async fn ui_hints(
 
 async fn legacy_stub(State(_state): State<ConnectionState>, uri: Uri) -> Response {
     let (code, error, remediation) = match uri.path() {
-        "/usb" => (
-            "usb.unsupported",
-            "USB passthrough/state is not implemented on this node.",
-            "Use a node build with USB gadget support or configure the feature outside /usb; \
-             no USB state is fabricated.",
-        ),
         "/rgb/state" | "/rgb/effect" | "/rgb/set" => (
             "rgb.unsupported",
             "RGB lighting control is not implemented on this node.",
@@ -1884,6 +2387,303 @@ async fn legacy_stub(State(_state): State<ConnectionState>, uri: Uri) -> Respons
         ),
     };
     compat_error_with_remediation(StatusCode::NOT_IMPLEMENTED, code, error, Some(remediation))
+}
+
+/// `GET /usb` — read-only gadget status/capabilities.
+async fn usb_status(State(state): State<ConnectionState>) -> Response {
+    let Some(control) = state.usb.as_ref() else {
+        return usb_not_configured();
+    };
+    let capabilities = control.capabilities().clone();
+    if let Err(response) = control.controller() {
+        return response;
+    }
+    match control.snapshot() {
+        Ok(gadget) => {
+            let media = gadget.media();
+            let body = serde_json::json!({
+                "ok": true,
+                "available": gadget.bound,
+                "status": if gadget.bound { "running" } else { "unbound" },
+                "gadget": gadget,
+                "capabilities": capabilities,
+                "media": media,
+                // Host-port USB discovery is not implemented; this is an
+                // honest empty list, never a fabricated device tree.
+                "attached": [],
+                "attached_scan": false,
+            });
+            Json(body).into_response()
+        }
+        Err(error) => usb_status_unavailable(&error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct UsbMediaAttachRequest {
+    /// Backing image path.
+    path: String,
+    /// Mass-storage instance (`usb0` or `mass_storage.usb0`); the first
+    /// mass-storage function is used when omitted.
+    #[serde(default)]
+    function: Option<String>,
+    /// Expose the LUN read-only.
+    #[serde(default)]
+    read_only: bool,
+    /// Present the image as a read-only CD-ROM.
+    #[serde(default)]
+    cdrom: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct UsbMediaDetachRequest {
+    #[serde(default)]
+    function: Option<String>,
+}
+
+/// `POST /usb/media/attach` — attach an existing image to a mass-storage LUN.
+///
+/// The backing file must already exist and be a regular file. The route only
+/// writes ConfigFS LUN attributes (`file`, `ro`, `cdrom`); it never mounts,
+/// creates, or truncates the image.
+async fn usb_media_attach(
+    State(state): State<ConnectionState>,
+    payload: Result<Json<UsbMediaAttachRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(error) => return json_rejection(error),
+    };
+    let Some(control) = state.usb.as_ref() else {
+        return usb_not_configured();
+    };
+    let controller = match control.controller() {
+        Ok(controller) => controller.clone(),
+        Err(response) => return response,
+    };
+    let function = match request
+        .function
+        .as_deref()
+        .map(str::trim)
+        .filter(|function| !function.is_empty())
+    {
+        Some(function) => match normalized_media_function(function) {
+            Ok(function) => function,
+            Err(response) => return response,
+        },
+        None => match control.default_media_function() {
+            Ok(function) => function,
+            Err(response) => return response,
+        },
+    };
+
+    let path_text = request.path.trim();
+    if path_text.is_empty() || path_text.contains('\0') {
+        return compat_error_with_remediation(
+            StatusCode::BAD_REQUEST,
+            "usb-invalid-media-path",
+            "media `path` must be a non-empty path without NUL bytes",
+            Some("Pass the absolute path of an existing disk image or ISO."),
+        );
+    }
+    let path = Path::new(path_text);
+    if !path.is_absolute() {
+        return compat_error_with_remediation(
+            StatusCode::BAD_REQUEST,
+            "usb-invalid-media-path",
+            "media path must be absolute",
+            Some("Use an absolute path; relative paths are resolved differently by the kernel."),
+        );
+    }
+
+    let mut media = if request.cdrom {
+        // CD-ROM presentation is read-only by definition.
+        VirtualMedia::cdrom(function.clone(), path)
+    } else {
+        VirtualMedia::disk(function.clone(), path)
+    };
+    if request.read_only && !request.cdrom {
+        media = match media.with_read_only(true) {
+            Ok(media) => media,
+            Err(error) => return usb_error_response(error),
+        };
+    }
+    if let Err(error) = media.image.validate() {
+        return usb_error_response(error);
+    }
+
+    match controller.attach_media(control.gadget(), &media) {
+        Ok(media_state) => Json(serde_json::json!({
+            "ok": true,
+            "function": function,
+            "media": UsbMediaStatus::from_state(&function, &media_state),
+        }))
+        .into_response(),
+        Err(error) => usb_error_response(error),
+    }
+}
+
+/// `POST /usb/media/detach` — clear the LUN `file` attribute.
+///
+/// The function and gadget stay in place; no file is deleted or modified.
+async fn usb_media_detach(
+    State(state): State<ConnectionState>,
+    payload: Result<Json<UsbMediaDetachRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(error) => return json_rejection(error),
+    };
+    let Some(control) = state.usb.as_ref() else {
+        return usb_not_configured();
+    };
+    let controller = match control.controller() {
+        Ok(controller) => controller.clone(),
+        Err(response) => return response,
+    };
+    let function = match request
+        .function
+        .as_deref()
+        .map(str::trim)
+        .filter(|function| !function.is_empty())
+    {
+        Some(function) => match normalized_media_function(function) {
+            Ok(function) => function,
+            Err(response) => return response,
+        },
+        None => match control.default_media_function() {
+            Ok(function) => function,
+            Err(response) => return response,
+        },
+    };
+
+    match controller.detach_media(control.gadget(), &function) {
+        Ok(media_state) => Json(serde_json::json!({
+            "ok": true,
+            "function": function,
+            "media": UsbMediaStatus::from_state(&function, &media_state),
+        }))
+        .into_response(),
+        Err(error) => usb_error_response(error),
+    }
+}
+
+/// Accept `usb0` or `mass_storage.usb0`, returning the instance name.
+fn normalized_media_function(function: &str) -> Result<String, Response> {
+    let instance = function
+        .strip_prefix("mass_storage.")
+        .unwrap_or(function)
+        .trim();
+    if is_safe_identifier(instance) {
+        Ok(instance.to_owned())
+    } else {
+        Err(compat_error_with_remediation(
+            StatusCode::BAD_REQUEST,
+            "usb-invalid-function",
+            format!(
+                "mass-storage function {function:?} must contain only letters, digits, '-' or '_'"
+            ),
+            Some("Pass the function instance (`usb0`) or `mass_storage.usb0`."),
+        ))
+    }
+}
+
+fn usb_not_configured() -> Response {
+    compat_error_with_remediation(
+        StatusCode::NOT_IMPLEMENTED,
+        "usb.unsupported",
+        "USB gadget support is not configured on this node.",
+        Some(
+            "Start ozma-node with --usb-gadget --usb-udc <udc> (and optionally \
+             --usb-media <path>) to create and bind a composite gadget. No USB state is \
+             fabricated without it.",
+        ),
+    )
+}
+
+fn usb_unavailable(reason: &str) -> Response {
+    compat_error_with_remediation(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "usb-unavailable",
+        format!("USB gadget is configured but unavailable: {reason}"),
+        Some(
+            "Check the node log and /api/v1/connection.usb.error. The gadget was not created \
+             or bound; no USB capability is advertised.",
+        ),
+    )
+}
+
+fn usb_status_unavailable(reason: &str) -> Response {
+    compat_error_with_remediation(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "usb-status-unavailable",
+        format!("USB gadget status could not be read: {reason}"),
+        Some(
+            "The configured ConfigFS gadget is missing or unreadable. Recreate it or restart \
+             the node with --usb-gadget; no gadget state is fabricated.",
+        ),
+    )
+}
+
+fn usb_error_response(error: UsbError) -> Response {
+    let (status, code, message) = match error.kind() {
+        "invalid-config" => (
+            StatusCode::BAD_REQUEST,
+            "usb-invalid-media",
+            "the media image is not usable as a mass-storage backing file",
+        ),
+        "media-not-found" => (
+            StatusCode::BAD_REQUEST,
+            "usb-media-not-found",
+            "the backing image does not exist",
+        ),
+        "media-not-file" => (
+            StatusCode::BAD_REQUEST,
+            "usb-media-not-file",
+            "the backing image is not a regular file",
+        ),
+        "read-only-media" => (
+            StatusCode::BAD_REQUEST,
+            "usb-read-only-media",
+            "CD-ROM media cannot be made writable",
+        ),
+        "missing-function" => (
+            StatusCode::CONFLICT,
+            "usb-missing-function",
+            "the gadget has no mass-storage function with that instance",
+        ),
+        "missing-gadget" => (
+            StatusCode::NOT_FOUND,
+            "usb-missing-gadget",
+            "the configured USB gadget does not exist",
+        ),
+        "already-bound" => (
+            StatusCode::CONFLICT,
+            "usb-already-bound",
+            "the USB gadget is already bound to another UDC",
+        ),
+        "missing-configfs-root" | "configfs-root-not-directory" | "configfs-io" | "io" => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "usb-configfs-error",
+            "the ConfigFS operation failed; the gadget or LUN state was not changed",
+        ),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "usb-error",
+            "the USB controller rejected the request",
+        ),
+    };
+    // Keep the path-bearing detail in the log, not the HTTP response.
+    warn!(kind = error.kind(), error = %error, "USB virtual-media request rejected");
+    compat_error_with_remediation(
+        status,
+        code,
+        format!("{}: {message}", error.kind()),
+        Some(
+            "The virtual-media request was rejected by the USB controller; the backing image \
+             was not opened for writing and no LUN state was fabricated.",
+        ),
+    )
 }
 
 async fn power_state(State(state): State<ConnectionState>) -> axum::response::Response {
@@ -3191,6 +3991,10 @@ mod tests {
     use ozma_input::{FakeInputSink, InputSink, RecordingSink};
     use ozma_media::{CaptureSource, Frame, FrameFormat, MediaError, PixelFormat};
     use ozma_power::{PowerBackend, PowerError, PowerState};
+    use ozma_usb::{
+        ConfigFsUsbController, FakeUsbGadgetController, MassStorageImage, UsbFunction,
+        UsbGadgetConfig,
+    };
     use serde_json::Value;
     use std::time::Duration;
     use tower::ServiceExt;
@@ -3871,6 +4675,136 @@ mod tests {
         assert!(json["webrtc_error"].is_null());
         assert_eq!(json["audio"], "not-configured");
         assert!(json["audio_error"].is_null());
+        assert_eq!(json["display_outputs"], serde_json::json!([]));
+        assert!(json["display_capture"]["active_console"].is_null());
+        assert!(json["display_capture"]["provider"].is_null());
+        assert!(json["display_capture"]["limitation"].is_null());
+    }
+
+    #[tokio::test]
+    async fn connection_reports_display_outputs_and_the_capture_limitation() {
+        let state = ConnectionState::new(
+            ConnectionInfo::new("vm-a._ozma._udp.local.", "vm", 7382, 7384, 7331, SINK_QMP),
+            CompatStats::default(),
+        )
+        .with_display_outputs(
+            serde_json::json!([
+                {
+                    "index": 0,
+                    "name": "Console_0",
+                    "source_type": "qmp",
+                    "capture_source_id": "qmp0",
+                    "width": 1920,
+                    "height": 1080,
+                    "primary": true
+                },
+                {
+                    "index": 1,
+                    "name": "Console_1",
+                    "source_type": "qmp",
+                    "capture_source_id": "",
+                    "width": 1280,
+                    "height": 1024,
+                    "primary": false
+                }
+            ]),
+            DisplayCaptureStatus::new(
+                Some(0),
+                Some("qmp".into()),
+                Some("only Console_0 has a live capture source".into()),
+            ),
+        );
+
+        let (status, json) = get_json(&connection_router(state), "/api/v1/connection").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["display_outputs"].as_array().unwrap().len(), 2);
+        assert_eq!(json["display_outputs"][0]["capture_source_id"], "qmp0");
+        assert_eq!(json["display_outputs"][1]["capture_source_id"], "");
+        assert_eq!(json["display_capture"]["active_console"], 0);
+        assert_eq!(json["display_capture"]["provider"], "qmp");
+        assert_eq!(
+            json["display_capture"]["limitation"],
+            "only Console_0 has a live capture source"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_reports_actual_capture_kind_and_source() {
+        let capability = ozma_protocol::CaptureCapability {
+            id: "x11".into(),
+            name: "X11 display".into(),
+            kind: CaptureKind::X11,
+            formats: vec!["rgb24".into()],
+            max_width: 1920,
+            max_height: 1080,
+            max_fps: 30,
+            compressed: false,
+            hdr: false,
+            has_audio: false,
+        };
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "desk-a._ozma._udp.local.",
+                "desktop",
+                7382,
+                7384,
+                7331,
+                SINK_UINPUT,
+            ),
+            CompatStats::default(),
+        )
+        .with_capture(CaptureStatus::from_capability("x11", Some(&capability)));
+        let (status, json) = get_json(&connection_router(state), "/api/v1/connection").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["capture"]["provider"], "x11");
+        assert_eq!(json["capture"]["kind"], "x11");
+        assert_eq!(json["capture"]["source"], "x11");
+        assert_eq!(json["capture"]["name"], "X11 display");
+        assert_eq!(json["capture"]["available"], true);
+
+        // A portal stream reports the real PipeWire kind and selected source id,
+        // while the provider remains `portal`.
+        let portal = ozma_protocol::CaptureCapability {
+            kind: CaptureKind::PipeWire,
+            id: "portal0".into(),
+            name: "Desktop portal screen cast".into(),
+            ..capability.clone()
+        };
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "desk-a._ozma._udp.local.",
+                "desktop",
+                7382,
+                7384,
+                7331,
+                SINK_UINPUT,
+            ),
+            CompatStats::default(),
+        )
+        .with_capture(CaptureStatus::from_capability("portal", Some(&portal)));
+        let (_, json) = get_json(&connection_router(state), "/api/v1/connection").await;
+        assert_eq!(json["capture"]["provider"], "portal");
+        assert_eq!(json["capture"]["kind"], "pipewire");
+        assert_eq!(json["capture"]["source"], "portal0");
+
+        // With no enumerated source the document names no kind/source.
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "desk-a._ozma._udp.local.",
+                "desktop",
+                7382,
+                7384,
+                7331,
+                SINK_UINPUT,
+            ),
+            CompatStats::default(),
+        )
+        .with_capture(CaptureStatus::from_capability("portal", None));
+        let (_, json) = get_json(&connection_router(state), "/api/v1/connection").await;
+        assert_eq!(json["capture"]["provider"], "portal");
+        assert!(json["capture"]["kind"].is_null());
+        assert!(json["capture"]["source"].is_null());
+        assert_eq!(json["capture"]["available"], false);
     }
 
     #[tokio::test]
@@ -4140,7 +5074,7 @@ mod tests {
             ),
             CompatStats::default(),
         );
-        let app = legacy_router(state);
+        let app = compat_router(state);
 
         for (uri, method, expected) in [
             ("/usb", "GET", "usb.unsupported"),
@@ -7283,6 +8217,9 @@ mod tests {
                 "/webrtc/bitrate",
                 Some(serde_json::json!({"bitrate": 4_000_000})),
             ),
+            ("GET", "/usb", None),
+            ("POST", "/usb/media/attach", Some(serde_json::json!({}))),
+            ("POST", "/usb/media/detach", Some(serde_json::json!({}))),
         ] {
             let builder = Request::builder().method(method).uri(uri);
             let request = match body {
@@ -7344,6 +8281,264 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    fn temp_path(label: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("ozma-usb-{label}-{}-{unique}", std::process::id()))
+    }
+
+    fn temp_file(label: &str, contents: &[u8]) -> std::path::PathBuf {
+        let path = temp_path(label);
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn usb_fake_state() -> (ConnectionState, Arc<FakeUsbGadgetController>) {
+        let fake = Arc::new(FakeUsbGadgetController::new());
+        let config = UsbGadgetConfig::new("ozma", "dummy_udc.0")
+            .with_function(UsbFunction::keyboard("kbd"))
+            .with_function(UsbFunction::mouse("mouse"))
+            .with_function(UsbFunction::mass_storage("usb0", None));
+        fake.create_gadget(&config).unwrap();
+        fake.bind("ozma", "dummy_udc.0").unwrap();
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_usb(Some(UsbControl::configured(fake.clone(), "ozma")));
+        (state, fake)
+    }
+
+    #[tokio::test]
+    async fn usb_status_reports_a_bound_fake_gadget_and_connection_state() {
+        let (state, _) = usb_fake_state();
+        let (status, body) = get_json(&usb_router(state.clone()), "/usb").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["available"], true);
+        assert_eq!(body["status"], "running");
+        assert_eq!(body["gadget"]["name"], "ozma");
+        assert_eq!(body["gadget"]["active"], true);
+        assert_eq!(body["gadget"]["bound"], true);
+        assert_eq!(body["gadget"]["udc"], "dummy_udc.0");
+        assert_eq!(body["capabilities"]["gadget"], true);
+        assert_eq!(body["capabilities"]["virtual_media"], true);
+        assert_eq!(body["capabilities"]["mass_storage"], true);
+        assert_eq!(body["attached"], serde_json::json!([]));
+        let functions = body["gadget"]["functions"].as_array().unwrap();
+        assert_eq!(functions.len(), 3);
+        assert_eq!(functions[0]["name"], "hid.kbd");
+        assert_eq!(functions[2]["name"], "mass_storage.usb0");
+        assert_eq!(functions[2]["subtype"], "mass-storage");
+
+        let (status, connection) = get_json(&connection_router(state), "/api/v1/connection").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(connection["usb"]["status"], "running");
+        assert_eq!(connection["usb"]["available"], true);
+        assert_eq!(connection["usb"]["bound"], true);
+        assert_eq!(connection["usb"]["udc"], "dummy_udc.0");
+        assert!(connection["usb"]["error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn usb_media_attach_and_detach_are_read_only_and_do_not_echo_paths() {
+        let (state, _) = usb_fake_state();
+        let app = usb_router(state);
+        let image = temp_file("media-attach", &vec![0u8; 4096]);
+
+        let (status, body) = post_json(
+            &app,
+            "/usb/media/attach",
+            serde_json::json!({"path": image.to_string_lossy(), "read_only": true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["function"], "usb0");
+        assert_eq!(body["media"]["state"], "attached");
+        assert_eq!(body["media"]["mode"], "disk");
+        assert_eq!(body["media"]["read_only"], true);
+        assert_eq!(body["media"]["size_bytes"], 4096);
+        assert!(
+            !body.to_string().contains(image.to_string_lossy().as_ref()),
+            "attach response must not echo the backing path: {body}"
+        );
+
+        let (status, usb) = get_json(&app, "/usb").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(usb["media"][0]["state"], "attached");
+        assert_eq!(usb["media"][0]["function"], "usb0");
+        assert!(
+            !usb.to_string().contains(image.to_string_lossy().as_ref()),
+            "status must not expose the backing path: {usb}"
+        );
+
+        let (status, body) = post_json(
+            &app,
+            "/usb/media/detach",
+            serde_json::json!({"function": "mass_storage.usb0"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["media"]["state"], "detached");
+        let (_, usb) = get_json(&app, "/usb").await;
+        assert_eq!(usb["media"][0]["state"], "detached");
+
+        std::fs::remove_file(image).unwrap();
+    }
+
+    #[tokio::test]
+    async fn usb_media_attach_validates_paths_and_cdrom_mode() {
+        let (state, _) = usb_fake_state();
+        let app = usb_router(state);
+        let image = temp_file("media-cdrom", &vec![0u8; 2048]);
+
+        let (status, body) = post_json(
+            &app,
+            "/usb/media/attach",
+            serde_json::json!({"path": "relative.img"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "usb-invalid-media-path");
+
+        let (status, body) = post_json(
+            &app,
+            "/usb/media/attach",
+            serde_json::json!({"path": "/does/not/exist/ozma.img"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "usb-media-not-found");
+        assert!(
+            !body.to_string().contains("/does/not/exist/ozma.img"),
+            "media errors must not echo the path: {body}"
+        );
+
+        let (status, body) = post_json(
+            &app,
+            "/usb/media/attach",
+            serde_json::json!({"path": image.to_string_lossy(), "cdrom": true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["media"]["mode"], "cdrom");
+        assert_eq!(body["media"]["read_only"], true);
+        assert_eq!(body["media"]["size_bytes"], 2048);
+
+        std::fs::remove_file(image).unwrap();
+    }
+
+    #[tokio::test]
+    async fn usb_unavailable_is_a_typed_503_not_a_fake_gadget() {
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_usb(Some(UsbControl::failed(
+            "missing-configfs-root: /sys/kernel/config/usb_gadget does not exist",
+        )));
+
+        let (status, body) = get_json(&usb_router(state.clone()), "/usb").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["code"], "usb-unavailable");
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("missing-configfs-root"));
+        assert!(body["remediation"].is_string());
+
+        let (status, body) = post_json(
+            &usb_router(state.clone()),
+            "/usb/media/attach",
+            serde_json::json!({"path": "/srv/media.img"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "usb-unavailable");
+
+        let (status, connection) = get_json(&connection_router(state), "/api/v1/connection").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(connection["usb"]["status"], "failed");
+        assert_eq!(connection["usb"]["available"], false);
+        assert!(connection["usb"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("missing-configfs-root"));
+    }
+
+    #[tokio::test]
+    async fn configfs_temp_root_creates_binds_and_reports_usb_status() {
+        let root = temp_path("configfs-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let image = temp_file("configfs-media", &vec![0u8; 4096]);
+        let controller: Arc<dyn UsbGadgetController> = Arc::new(ConfigFsUsbController::new(&root));
+        let gadget = UsbGadgetConfig::new("ozma", "dummy_udc.0")
+            .with_function(UsbFunction::keyboard("kbd"))
+            .with_function(UsbFunction::mouse("mouse"))
+            .with_function(UsbFunction::mass_storage(
+                "usb0",
+                Some(MassStorageImage::disk(&image)),
+            ));
+        let created = controller.create_and_bind(&gadget).unwrap();
+        assert!(created.bound);
+        assert_eq!(created.udc.as_deref(), Some("dummy_udc.0"));
+
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_usb(Some(UsbControl::configured(controller, "ozma")));
+
+        let app = usb_router(state.clone());
+        let (status, body) = get_json(&app, "/usb").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "running");
+        assert_eq!(body["gadget"]["bound"], true);
+        assert_eq!(body["capabilities"]["configfs"], true);
+        assert_eq!(body["media"][0]["state"], "attached");
+        assert_eq!(body["media"][0]["size_bytes"], 4096);
+        assert!(!body.to_string().contains(&*image.to_string_lossy()));
+
+        let (status, body) = post_json(
+            &app,
+            "/usb/media/detach",
+            serde_json::json!({"function": "usb0"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["media"]["state"], "detached");
+        let lun_file = root.join("ozma/functions/mass_storage.usb0/lun.0/file");
+        assert_eq!(std::fs::read_to_string(lun_file).unwrap().trim(), "");
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_file(image).unwrap();
     }
 
     async fn wait_for(mut predicate: impl FnMut() -> bool) {

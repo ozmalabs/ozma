@@ -9,11 +9,14 @@ use std::time::Duration;
 
 use clap::ValueEnum;
 use ozma_auth::MachineClass;
+use ozma_capture::{DBUS_DEFAULT_ID, QMP_DEFAULT_ID, VNC_DEFAULT_ID};
+use ozma_display::vm::{VmConsoleBackend, MAX_VM_CONSOLES};
 use ozma_input::SinkKind;
 use ozma_protocol::NodeId;
 use ozma_qmp::QmpConfig;
 use serde::{Deserialize, Serialize};
 
+use crate::display_outputs::{self, DisplayOutput, DisplayOutputSelection};
 use crate::webrtc::WebRtcAudioBackend;
 
 /// Default QMP connect/greeting timeout, matching `ozma-qmp`.
@@ -34,6 +37,13 @@ pub const DEFAULT_FAKE_FPS: u32 = 30;
 pub const MAX_FAKE_DIMENSION: u32 = 8_192;
 /// Highest dev/test synthetic capture frame rate accepted.
 pub const MAX_FAKE_FPS: u32 = 240;
+
+/// ConfigFS composite-gadget root used by `--usb-configfs-root`.
+pub const DEFAULT_USB_CONFIGFS_ROOT: &str = ozma_usb::DEFAULT_CONFIGFS_ROOT;
+/// Gadget directory name presented by the node.
+pub const DEFAULT_USB_GADGET_NAME: &str = "ozma";
+/// Mass-storage function instance used for `--usb-media`.
+pub const DEFAULT_USB_MASS_STORAGE_INSTANCE: &str = "usb0";
 
 /// Which deployment shape this node is running as.
 ///
@@ -353,16 +363,117 @@ fn validate_capture_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// XDG Desktop Portal `SelectSources.types` choice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum PortalSourceKind {
+    /// Select a monitor (the whole desktop screen).
+    #[default]
+    Monitor,
+    /// Select one window.
+    Window,
+    /// Select a virtual source (ScreenCast version >= 2).
+    Virtual,
+}
+
+impl PortalSourceKind {
+    /// Stable CLI/API name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Monitor => "monitor",
+            Self::Window => "window",
+            Self::Virtual => "virtual",
+        }
+    }
+}
+
+/// Portal cursor embedding choice (`SelectSources.cursor_mode`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum PortalCursorKind {
+    /// The compositor omits the cursor from the stream.
+    #[default]
+    Hidden,
+    /// The compositor draws the cursor into the frames.
+    Embedded,
+    /// Cursor metadata is exported separately.
+    Metadata,
+}
+
+impl PortalCursorKind {
+    /// Stable CLI/API name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hidden => "hidden",
+            Self::Embedded => "embedded",
+            Self::Metadata => "metadata",
+        }
+    }
+}
+
+/// Portal ScreenCast handshake settings.
+///
+/// The handshake may show a consent dialog and therefore runs in `main` before
+/// the capture registry is finalised, never during capability enumeration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PortalCaptureOptions {
+    /// Source type offered by the selection dialog.
+    pub source: PortalSourceKind,
+    /// Cursor embedding policy.
+    pub cursor: PortalCursorKind,
+    /// Restore token from a previous portal session, when supplied.
+    pub restore_token: Option<String>,
+    /// Bound on the whole consent/selection handshake.
+    pub timeout: Duration,
+    /// Requested PipeWire mode for the selected node.
+    pub width: u32,
+    /// Requested PipeWire height for the selected node.
+    pub height: u32,
+    /// Requested PipeWire frame rate for the selected node.
+    pub fps: u32,
+}
+
+/// The desktop profile's resolved capture transport.
+///
+/// Portal capture is deliberately represented before its handshake: the stream
+/// is resolved separately in `main`, and a denial/timeout is an honest no-capture
+/// state rather than a fallback to X11, a camera, or the fake source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DesktopCaptureSelection {
+    /// Open an existing PipeWire `Video/Source` node.
+    PipeWire(DesktopCaptureTarget),
+    /// ffmpeg `x11grab` against an explicitly named X display.
+    X11(ozma_capture::X11CaptureConfig),
+    /// Run the XDG Portal ScreenCast handshake, then open the selected node.
+    Portal(PortalCaptureOptions),
+    /// Dev/test synthetic RGB24 source.
+    Fake,
+    /// No capture source is configured.
+    None,
+}
+
+impl DesktopCaptureSelection {
+    /// Short provider name for logs and `/api/v1/connection`.
+    pub const fn provider_name(&self) -> &'static str {
+        match self {
+            Self::PipeWire(_) => "pipewire",
+            Self::X11(_) => "x11",
+            Self::Portal(_) => "portal",
+            Self::Fake => "fake",
+            Self::None => "none",
+        }
+    }
+}
+
 /// The desktop profile's resolved capture/input/audio selection.
 ///
 /// This is pure like [`VmProviderConfig`]: it never probes or opens a source.
-/// The capture provider is always PipeWire for a real desktop capture path;
-/// `fake` is the explicit dev/test source. X11 capture is not implemented.
+/// The portal handshake is the one asynchronous step and happens in `main`
+/// before the registry is built.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DesktopProviderConfig {
-    /// PipeWire capture target. `None` means the explicit dev/test fake source
-    /// was requested (the registry handles it separately).
-    pub capture_target: Option<DesktopCaptureTarget>,
+    /// Resolved capture transport.
+    pub capture: DesktopCaptureSelection,
     /// Remote PipeWire instance name, when configured.
     pub capture_remote: Option<String>,
     /// Requested capture width.
@@ -383,19 +494,23 @@ impl DesktopProviderConfig {
     pub fn resolve(config: &NodeConfig) -> Result<Self, String> {
         config.validate()?;
         let capture_provider = resolve_capture(config)?;
-        let capture_target = match capture_provider.as_deref() {
-            Some("fake") => None,
-            Some("pipewire") => Some(config.desktop_capture_target.clone()),
+        let capture = match capture_provider.as_deref() {
+            Some("fake") => DesktopCaptureSelection::Fake,
+            Some("pipewire") => {
+                DesktopCaptureSelection::PipeWire(config.desktop_capture_target.clone())
+            }
+            Some("x11") => DesktopCaptureSelection::X11(config.x11_capture_config()?),
+            Some("portal") => DesktopCaptureSelection::Portal(config.portal_capture_options()),
             Some(other) => {
                 return Err(format!(
                     "capture provider `{other}` is not a desktop capture path; expected \
-                     pipewire or fake (dev/test)"
+                     pipewire, x11, portal, or fake (dev/test)"
                 ));
             }
-            None => None,
+            None => DesktopCaptureSelection::None,
         };
         Ok(Self {
-            capture_target,
+            capture,
             capture_remote: config.desktop_capture_remote.clone(),
             capture_width: config.desktop_capture_width,
             capture_height: config.desktop_capture_height,
@@ -535,6 +650,7 @@ impl VmProviderConfig {
 fn resolve_capture(config: &NodeConfig) -> Result<Option<String>, String> {
     let vnc_requested = config.vnc_host.is_some() || config.vnc_port.is_some();
     let dbus_requested = config.dbus_requested;
+    let looking_glass_requested = config.looking_glass_shm.is_some();
 
     if let Some(value) = &config.provider_overrides.capture {
         let name = value.trim().to_ascii_lowercase();
@@ -543,11 +659,25 @@ fn resolve_capture(config: &NodeConfig) -> Result<Option<String>, String> {
                 if config.qmp_socket.is_none() {
                     return Err("--capture-provider qmp requires --qmp-socket".to_owned());
                 }
+                if config.looking_glass_shm.is_some() {
+                    return Err(
+                        "--capture-provider qmp conflicts with --looking-glass-shm; \
+                         select one VM display capture provider"
+                            .to_owned(),
+                    );
+                }
                 Ok(Some("qmp".to_owned()))
             }
             "vnc" => {
                 if config.profile != NodeProfile::Vm {
                     return Err("--capture-provider vnc requires --profile vm".to_owned());
+                }
+                if config.looking_glass_shm.is_some() {
+                    return Err(
+                        "--capture-provider vnc conflicts with --looking-glass-shm; \
+                         select one VM display capture provider"
+                            .to_owned(),
+                    );
                 }
                 validate_vnc_flags(config, true)?;
                 Ok(Some("vnc".to_owned()))
@@ -566,7 +696,39 @@ fn resolve_capture(config: &NodeConfig) -> Result<Option<String>, String> {
                             .to_owned(),
                     );
                 }
+                if config.looking_glass_shm.is_some() {
+                    return Err(
+                        "--capture-provider dbus conflicts with --looking-glass-shm; \
+                         select one VM display capture provider"
+                            .to_owned(),
+                    );
+                }
                 Ok(Some("dbus".to_owned()))
+            }
+            "looking-glass" | "looking_glass" | "lookingglass" => {
+                if config.profile != NodeProfile::Vm {
+                    return Err("--capture-provider looking-glass requires --profile vm".to_owned());
+                }
+                if config.looking_glass_shm.is_none() {
+                    return Err(
+                        "--capture-provider looking-glass requires --looking-glass-shm".to_owned(),
+                    );
+                }
+                if vnc_requested {
+                    return Err(
+                        "--capture-provider looking-glass conflicts with --vnc-host/--vnc-port; \
+                         select one VM display capture provider"
+                            .to_owned(),
+                    );
+                }
+                if dbus_requested {
+                    return Err(
+                        "--capture-provider looking-glass conflicts with the D-Bus display \
+                         flags; select one VM display capture provider"
+                            .to_owned(),
+                    );
+                }
+                Ok(Some("looking-glass".to_owned()))
             }
             // Dev/test only: a synthetic RGB24 source for validating the
             // encode/HLS path on a host with no real capture device. It is
@@ -594,6 +756,28 @@ fn resolve_capture(config: &NodeConfig) -> Result<Option<String>, String> {
                             .to_owned(),
                     );
                 }
+                if config.looking_glass_shm.is_some() {
+                    return Err(
+                        "--capture-provider fake conflicts with --looking-glass-shm; \
+                         remove the Looking Glass flags"
+                            .to_owned(),
+                    );
+                }
+                if config.x11_requested {
+                    return Err(
+                        "--capture-provider fake conflicts with the X11 capture flags; \
+                         remove --x11-display/--x11-offset/--x11-width/--x11-height/--x11-fps"
+                            .to_owned(),
+                    );
+                }
+                if config.portal_requested {
+                    return Err(
+                        "--capture-provider fake conflicts with the portal capture flags; \
+                         remove --portal-source-type/--portal-cursor/--portal-restore-token/\
+                         --portal-timeout-ms"
+                            .to_owned(),
+                    );
+                }
                 Ok(Some("fake".to_owned()))
             }
             "pipewire" => {
@@ -610,21 +794,63 @@ fn resolve_capture(config: &NodeConfig) -> Result<Option<String>, String> {
                             .to_owned(),
                     );
                 }
+                if config.x11_requested {
+                    return Err(
+                        "--capture-provider pipewire conflicts with the X11 capture flags; \
+                         remove --x11-display/--x11-offset/--x11-width/--x11-height/--x11-fps"
+                            .to_owned(),
+                    );
+                }
+                if config.portal_requested {
+                    return Err(
+                        "--capture-provider pipewire conflicts with the portal capture flags; \
+                         remove the --portal-* flags"
+                            .to_owned(),
+                    );
+                }
                 Ok(Some("pipewire".to_owned()))
             }
-            "x11" => Err(
-                "--capture-provider x11 is not implemented; X11 screen capture needs a \
-                 separate XGetImage/XShm provider. Use the PipeWire ScreenCast node instead"
-                    .to_owned(),
-            ),
+            "x11" => {
+                if config.profile != NodeProfile::Desktop {
+                    return Err("--capture-provider x11 requires --profile desktop".to_owned());
+                }
+                if vnc_requested || dbus_requested || config.looking_glass_shm.is_some() {
+                    return Err(
+                        "--capture-provider x11 conflicts with the VM display flags; \
+                         select one capture provider"
+                            .to_owned(),
+                    );
+                }
+                if config.x11_display.is_none() {
+                    return Err(
+                        "--capture-provider x11 requires --x11-display (:0, :0.0, or host:10.0)"
+                            .to_owned(),
+                    );
+                }
+                Ok(Some("x11".to_owned()))
+            }
+            "portal" => {
+                if config.profile != NodeProfile::Desktop {
+                    return Err("--capture-provider portal requires --profile desktop".to_owned());
+                }
+                if vnc_requested || dbus_requested || config.looking_glass_shm.is_some() {
+                    return Err(
+                        "--capture-provider portal conflicts with the VM display flags; \
+                         select one capture provider"
+                            .to_owned(),
+                    );
+                }
+                // The portal handshake may be denied or unavailable; that is a
+                // warned no-capture state, not a reason to reject the profile.
+                Ok(Some("portal".to_owned()))
+            }
             _ if config.profile == NodeProfile::Vm => Err(format!(
-                "unknown capture provider {value:?} for the vm profile; expected qmp, dbus, vnc, \
-                 or fake (dev/test)"
+                "unknown capture provider {value:?} for the vm profile; expected qmp, dbus, \
+                 vnc, looking-glass, or fake (dev/test)"
             )),
             _ if config.profile == NodeProfile::Desktop => Err(format!(
-                "unknown capture provider {value:?} for the desktop profile; expected pipewire \
-                 or fake (dev/test). X11 screen capture is not implemented; use a PipeWire \
-                 ScreenCast node."
+                "unknown capture provider {value:?} for the desktop profile; expected pipewire, \
+                 x11, portal, or fake (dev/test)"
             )),
             _ if vnc_requested => Err(format!(
                 "--capture-provider {value:?} conflicts with --vnc-host/--vnc-port; \
@@ -640,10 +866,20 @@ fn resolve_capture(config: &NodeConfig) -> Result<Option<String>, String> {
     }
 
     if config.profile == NodeProfile::Vm {
-        if vnc_requested && dbus_requested {
+        if config.x11_requested {
+            return Err("the X11 capture flags require --profile desktop".to_owned());
+        }
+        if config.portal_requested {
+            return Err("the portal capture flags require --profile desktop".to_owned());
+        }
+        let selected_endpoints = [vnc_requested, dbus_requested, looking_glass_requested]
+            .into_iter()
+            .filter(|selected| *selected)
+            .count();
+        if selected_endpoints > 1 {
             return Err(
-                "--vnc-host/--vnc-port and the D-Bus display flags are both set; \
-                 select exactly one VM display capture provider"
+                "--vnc-host/--vnc-port, the D-Bus display flags, and --looking-glass-shm are \
+                 mutually exclusive; select exactly one VM display capture provider"
                     .to_owned(),
             );
         }
@@ -657,12 +893,15 @@ fn resolve_capture(config: &NodeConfig) -> Result<Option<String>, String> {
             }
             return Ok(Some("dbus".to_owned()));
         }
+        if looking_glass_requested {
+            return Ok(Some("looking-glass".to_owned()));
+        }
         if vnc_requested {
             validate_vnc_flags(config, false)?;
             return Ok(Some("vnc".to_owned()));
         }
-        // QMP keeps precedence when no VNC/D-Bus endpoint and no provider was
-        // asked for. A VM with neither configured gets no capture source.
+        // QMP keeps precedence when no VNC/D-Bus/Looking Glass endpoint and no
+        // provider was asked for. A VM with none configured gets no capture.
         return Ok(if config.qmp_socket.is_some() {
             Some("qmp".to_owned())
         } else {
@@ -678,6 +917,32 @@ fn resolve_capture(config: &NodeConfig) -> Result<Option<String>, String> {
     if dbus_requested {
         return Err(
             "the QEMU D-Bus display flags select D-Bus capture, which requires --profile vm"
+                .to_owned(),
+        );
+    }
+    if looking_glass_requested {
+        return Err(
+            "--looking-glass-shm selects Looking Glass capture, which requires --profile vm"
+                .to_owned(),
+        );
+    }
+    if config.x11_requested {
+        if config.profile == NodeProfile::Desktop {
+            return Ok(Some("x11".to_owned()));
+        }
+        return Err(
+            "--x11-display/--x11-offset/--x11-width/--x11-height/--x11-fps select X11 capture, \
+             which requires --profile desktop"
+                .to_owned(),
+        );
+    }
+    if config.portal_requested {
+        if config.profile == NodeProfile::Desktop {
+            return Ok(Some("portal".to_owned()));
+        }
+        return Err(
+            "the --portal-* flags select XDG Portal ScreenCast capture, which requires \
+             --profile desktop"
                 .to_owned(),
         );
     }
@@ -771,6 +1036,26 @@ fn resolve_power(config: &NodeConfig) -> Result<Option<PowerProvider>, String> {
     })
 }
 
+/// The VM console a configured capture provider targets.
+///
+/// This is the bridge between provider selection and the display-output list:
+/// D-Bus can select `Console_N`, while QMP/VNC/Looking Glass capture a single
+/// default head. Geometry is whatever the provider actually produces; `0` means
+/// it is not known until the first frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureDisplaySource {
+    /// Capture transport.
+    pub backend: VmConsoleBackend,
+    /// Advertised capture source id.
+    pub source_id: String,
+    /// Console index the provider targets.
+    pub console_index: u32,
+    /// Produced width, or `0` when unknown before the first frame.
+    pub width: u32,
+    /// Produced height, or `0` when unknown before the first frame.
+    pub height: u32,
+}
+
 /// Effective node configuration.
 #[derive(Clone, Debug)]
 pub struct NodeConfig {
@@ -826,6 +1111,22 @@ pub struct NodeConfig {
     /// True when any D-Bus display flag was supplied explicitly. A default
     /// console index of 0 must not select D-Bus capture on its own.
     pub dbus_requested: bool,
+    /// Console selected for the one live capture source (`--capture-console`).
+    /// D-Bus honours any index; QMP/VNC/Looking Glass capture the default head.
+    pub capture_console: Option<u32>,
+    /// Repeated `--display-output <label:WxH[:primary][:source]>` arguments.
+    pub display_output_specs: Vec<String>,
+    /// Validated/normalized display outputs; empty when none were configured
+    /// (or when the raw `--display-outputs-json` escape hatch is used).
+    pub display_outputs: Vec<DisplayOutput>,
+    /// Looking Glass KVMFR shared-memory path (`--looking-glass-shm`).
+    pub looking_glass_shm: Option<PathBuf>,
+    /// Looking Glass polling rate (`--looking-glass-fps`).
+    pub looking_glass_fps: u32,
+    /// Looking Glass capture source id (`--looking-glass-id`).
+    pub looking_glass_id: String,
+    /// Looking Glass human-readable source name (`--looking-glass-name`).
+    pub looking_glass_name: String,
     /// Dev/test synthetic capture width (`--fake-width`).
     ///
     /// Only used when the capture provider is `fake`, which is rejected for the
@@ -845,6 +1146,33 @@ pub struct NodeConfig {
     pub desktop_capture_target: DesktopCaptureTarget,
     /// Optional PipeWire remote instance for desktop capture.
     pub desktop_capture_remote: Option<String>,
+    /// Explicit X11 display for `--capture-provider x11` (e.g. `:0`).
+    ///
+    /// Never inherited from ambient `DISPLAY`; an empty value is invalid.
+    pub x11_display: Option<String>,
+    /// X11 capture region X offset.
+    pub x11_x: u32,
+    /// X11 capture region Y offset.
+    pub x11_y: u32,
+    /// X11 capture output width.
+    pub x11_width: u32,
+    /// X11 capture output height.
+    pub x11_height: u32,
+    /// X11 capture frame rate.
+    pub x11_fps: u32,
+    /// True when any X11 flag was supplied explicitly. An X11 flag on a
+    /// non-desktop profile is a typed configuration error.
+    pub x11_requested: bool,
+    /// Portal ScreenCast source type.
+    pub portal_source_type: PortalSourceKind,
+    /// Portal cursor mode.
+    pub portal_cursor: PortalCursorKind,
+    /// Restore token from an earlier portal session.
+    pub portal_restore_token: Option<String>,
+    /// Bound on the portal consent/selection handshake.
+    pub portal_timeout: Duration,
+    /// True when any portal flag was supplied explicitly.
+    pub portal_requested: bool,
     /// PipeWire audio capture target (`default`, `object:...`, `node:N`, or
     /// `monitor:<sink>`). A monitor target captures an existing sink's audio.
     pub audio_capture_target: ozma_audio::AudioTarget,
@@ -873,6 +1201,22 @@ pub struct NodeConfig {
     pub display_outputs_json: String,
     /// JSON-encoded PCI passthrough device list sent to the controller.
     pub pci_devices_json: String,
+    /// Opt in to creating and binding a composite USB gadget (`--usb-gadget`).
+    ///
+    /// Never enabled by a profile default: a node without the flag advertises
+    /// no USB capability and performs no ConfigFS writes.
+    pub usb_gadget: bool,
+    /// ConfigFS composite-gadget root (`--usb-configfs-root`).
+    pub usb_configfs_root: PathBuf,
+    /// UDC the gadget binds to (`--usb-udc`). `None` leaves the gadget
+    /// unavailable rather than guessing a controller.
+    pub usb_udc: Option<String>,
+    /// Initial mass-storage backing image (`--usb-media`).
+    pub usb_media: Option<PathBuf>,
+    /// Expose the mass-storage LUN read-only (`--usb-media-ro`).
+    pub usb_media_ro: bool,
+    /// Present the image as a read-only CD-ROM (`--usb-media-cdrom`).
+    pub usb_media_cdrom: bool,
 }
 
 impl NodeConfig {
@@ -891,6 +1235,162 @@ impl NodeConfig {
             .capture
             .as_deref()
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("fake"))
+    }
+
+    /// The display head the configured capture provider targets.
+    ///
+    /// Returns `None` when no VM display provider is configured (including the
+    /// dev/test `fake` source, which has no console). D-Bus honours
+    /// `--capture-console` (falling back to `--dbus-console`); the other
+    /// providers expose one default head.
+    pub fn capture_display_source(&self) -> Result<Option<CaptureDisplaySource>, String> {
+        let Some(capture) = resolve_capture(self)? else {
+            return Ok(None);
+        };
+        let normalized = capture.trim().to_ascii_lowercase().replace('_', "-");
+        let backend = match normalized.as_str() {
+            "qmp" => VmConsoleBackend::Qmp,
+            "dbus" => VmConsoleBackend::Dbus,
+            "vnc" => VmConsoleBackend::Vnc,
+            "looking-glass" | "lookingglass" => VmConsoleBackend::LookingGlass,
+            // `fake` (and any hardware/desktop provider) is not a VM console.
+            _ => return Ok(None),
+        };
+        let (source_id, console_index, width, height) = match backend {
+            VmConsoleBackend::Qmp => (QMP_DEFAULT_ID.to_owned(), 0, 0, 0),
+            VmConsoleBackend::Dbus => (
+                DBUS_DEFAULT_ID.to_owned(),
+                self.capture_console.unwrap_or(self.dbus_console),
+                0,
+                0,
+            ),
+            VmConsoleBackend::Vnc => (
+                VNC_DEFAULT_ID.to_owned(),
+                0,
+                self.vnc_width,
+                self.vnc_height,
+            ),
+            VmConsoleBackend::LookingGlass => (self.looking_glass_id.clone(), 0, 0, 0),
+        };
+        if console_index >= MAX_VM_CONSOLES {
+            return Err(format!(
+                "capture console {console_index} is out of range (maximum {})",
+                MAX_VM_CONSOLES - 1
+            ));
+        }
+        Ok(Some(CaptureDisplaySource {
+            backend,
+            source_id,
+            console_index,
+            width,
+            height,
+        }))
+    }
+
+    /// Resolve the controller-facing display-output list.
+    ///
+    /// * repeated `--display-output` specs are parsed into a
+    ///   [`VmDisplayTopology`](ozma_display::vm::VmDisplayTopology) and
+    ///   validated;
+    /// * otherwise a non-empty raw `--display-outputs-json` is left untouched;
+    /// * otherwise a VM display provider contributes a single implicit console.
+    pub fn resolve_display_outputs(&self) -> Result<DisplayOutputSelection, String> {
+        let source = self.capture_display_source()?;
+
+        let mut selection = if !self.display_output_specs.is_empty() {
+            if self.profile != NodeProfile::Vm {
+                return Err(
+                    "--display-output describes VM console heads and requires --profile vm; \
+                     use --display-outputs-json for host display outputs"
+                        .to_owned(),
+                );
+            }
+            let (backend, source_id, active) = match source.as_ref() {
+                Some(source) => (
+                    source.backend,
+                    Some(source.source_id.as_str()),
+                    source.console_index,
+                ),
+                None => (
+                    VmConsoleBackend::Qmp,
+                    None,
+                    self.capture_console.unwrap_or(0),
+                ),
+            };
+            display_outputs::outputs_from_specs(
+                &self.display_output_specs,
+                backend,
+                source_id,
+                Some(active),
+            )?
+        } else if !self.display_outputs_json.trim().is_empty()
+            && self.display_outputs_json.trim() != "[]"
+        {
+            // Hardware/legacy outputs are already validated as a JSON array and
+            // are not VM consoles; do not reinterpret them through the model.
+            DisplayOutputSelection::empty()
+        } else if let Some(source) = source.as_ref() {
+            display_outputs::single_output(
+                source.backend,
+                source.console_index,
+                Some(&source.source_id),
+                source.width,
+                source.height,
+                None,
+            )
+        } else {
+            DisplayOutputSelection::empty()
+        };
+
+        if let (Some(requested), Some(source)) = (self.capture_console, source.as_ref()) {
+            if source.backend != VmConsoleBackend::Dbus && requested != source.console_index {
+                let note = format!(
+                    "--capture-console {requested} is not supported by the {} capture \
+                     provider; it captures Console_{} only",
+                    source.backend, source.console_index
+                );
+                selection.limitation = Some(match selection.limitation.take() {
+                    Some(existing) => format!("{existing}; {note}"),
+                    None => note,
+                });
+            }
+        }
+
+        // A per-output `source` is layout/selection metadata, not a promise
+        // that this node runs that transport. Never attach the live provider's
+        // source id to a console advertised as a different transport.
+        if let Some(source) = source.as_ref() {
+            if let Some(active) = selection
+                .outputs
+                .iter_mut()
+                .find(|output| output.index == selection.active_console)
+            {
+                if active.source_type != source.backend.as_str() {
+                    active.capture_source_id.clear();
+                    let note = format!(
+                        "the {} capture provider targets Console_{}, which is advertised as \
+                         {}; no capture_source_id is claimed for it",
+                        source.backend, selection.active_console, active.source_type
+                    );
+                    selection.limitation = Some(match selection.limitation.take() {
+                        Some(existing) => format!("{existing}; {note}"),
+                        None => note,
+                    });
+                }
+            }
+        }
+
+        Ok(selection)
+    }
+
+    /// Number of displayed outputs, including the raw JSON escape hatch.
+    pub fn display_output_count(&self) -> usize {
+        if !self.display_outputs.is_empty() {
+            return self.display_outputs.len();
+        }
+        serde_json::from_str::<Vec<serde_json::Value>>(&self.display_outputs_json)
+            .map(|outputs| outputs.len())
+            .unwrap_or(0)
     }
 
     pub fn node_id_from_name(name: &str) -> NodeId {
@@ -913,6 +1413,48 @@ impl NodeConfig {
         validate_path("--qmp-socket", self.qmp_socket.as_deref())?;
         validate_path("--qmp-input-socket", self.qmp_input_socket.as_deref())?;
         validate_path("--ffmpeg-bin", Some(self.ffmpeg_bin.as_path()))?;
+        if let Some(index) = self.capture_console {
+            if index >= MAX_VM_CONSOLES {
+                return Err(format!(
+                    "--capture-console must be between 0 and {}, got {index}",
+                    MAX_VM_CONSOLES - 1
+                ));
+            }
+        }
+        let raw_display_outputs = self.display_outputs_json.trim();
+        if !self.display_output_specs.is_empty()
+            && !raw_display_outputs.is_empty()
+            && raw_display_outputs != "[]"
+        {
+            return Err(
+                "--display-output and a non-empty --display-outputs-json are mutually exclusive; \
+                 use --display-output for VM consoles or the JSON escape hatch for host outputs"
+                    .to_owned(),
+            );
+        }
+        // This validates the topology (duplicate indices, zero dimensions,
+        // multiple primaries) as well as the profile restriction on
+        // `--display-output`.
+        self.resolve_display_outputs()?;
+        if self.looking_glass_fps == 0 || self.looking_glass_fps > MAX_FAKE_FPS {
+            return Err(format!(
+                "--looking-glass-fps must be between 1 and {MAX_FAKE_FPS}, got {}",
+                self.looking_glass_fps
+            ));
+        }
+        validate_path("--looking-glass-shm", self.looking_glass_shm.as_deref())?;
+        if self.looking_glass_id.trim().is_empty() {
+            return Err("--looking-glass-id must not be empty or whitespace".to_owned());
+        }
+        if self.looking_glass_name.trim().is_empty() {
+            return Err("--looking-glass-name must not be empty or whitespace".to_owned());
+        }
+        if self.looking_glass_shm.is_some() && self.profile != NodeProfile::Vm {
+            return Err(
+                "--looking-glass-shm captures a VM's KVMFR region and requires --profile vm"
+                    .to_owned(),
+            );
+        }
         if let Some(gpu) = self.nvenc_gpu {
             if gpu > i32::MAX as u32 {
                 return Err(format!(
@@ -994,6 +1536,26 @@ impl NodeConfig {
                 return Err("--desktop-capture-remote must not be empty or whitespace".to_owned());
             }
         }
+        if self.x11_requested {
+            if self.profile != NodeProfile::Desktop {
+                return Err("the X11 capture flags require --profile desktop".to_owned());
+            }
+            self.x11_capture_config()?;
+        }
+        if self.portal_requested && self.profile != NodeProfile::Desktop {
+            return Err("the portal capture flags require --profile desktop".to_owned());
+        }
+        if self.portal_timeout.is_zero() {
+            return Err("--portal-timeout-ms must be greater than zero".to_owned());
+        }
+        if let Some(token) = &self.portal_restore_token {
+            if token.is_empty() || token.chars().any(char::is_control) {
+                return Err(
+                    "--portal-restore-token must be non-empty and contain no control characters"
+                        .to_owned(),
+                );
+            }
+        }
         self.audio_capture_target
             .validate()
             .map_err(|error| format!("--audio-capture-target: {error}"))?;
@@ -1016,6 +1578,35 @@ impl NodeConfig {
         if self.qmp_command_timeout.is_zero() {
             return Err("--qmp-command-timeout-ms must be greater than zero".to_owned());
         }
+        if self.usb_configfs_root.as_os_str().is_empty()
+            || self.usb_configfs_root.to_string_lossy().trim().is_empty()
+        {
+            return Err("--usb-configfs-root must not be empty".to_owned());
+        }
+        if let Some(udc) = &self.usb_udc {
+            validate_udc_name(udc)?;
+            if !self.usb_gadget {
+                return Err("--usb-udc requires --usb-gadget".to_owned());
+            }
+        }
+        validate_path("--usb-media", self.usb_media.as_deref())?;
+        if let Some(path) = self.usb_media.as_deref() {
+            if !path.is_absolute() {
+                return Err(format!(
+                    "--usb-media {} must be an absolute path; ConfigFS stores the path verbatim",
+                    path.display()
+                ));
+            }
+        }
+        if self.usb_media.is_some() && !self.usb_gadget {
+            return Err("--usb-media requires --usb-gadget".to_owned());
+        }
+        if self.usb_media_ro && self.usb_media.is_none() {
+            return Err("--usb-media-ro requires --usb-media".to_owned());
+        }
+        if self.usb_media_cdrom && self.usb_media.is_none() {
+            return Err("--usb-media-cdrom requires --usb-media".to_owned());
+        }
         Ok(())
     }
 
@@ -1028,6 +1619,51 @@ impl NodeConfig {
     pub fn desktop_providers(&self) -> Result<DesktopProviderConfig, String> {
         DesktopProviderConfig::resolve(self)
     }
+
+    /// The active capture provider name, or `None` when no source is configured.
+    ///
+    /// This is the pure provider resolver used by logs and
+    /// `/api/v1/connection`; it never probes or opens a source.
+    pub fn capture_provider_name(&self) -> Result<Option<String>, String> {
+        resolve_capture(self)
+    }
+
+    /// Build the X11 provider configuration from the desktop flags.
+    ///
+    /// A missing display is a typed configuration error; it is never replaced
+    /// by ambient `DISPLAY` or a scan of the local X servers.
+    pub fn x11_capture_config(&self) -> Result<ozma_capture::X11CaptureConfig, String> {
+        let display = self
+            .x11_display
+            .as_deref()
+            .map(str::trim)
+            .filter(|display| !display.is_empty())
+            .ok_or_else(|| {
+                "--capture-provider x11 requires --x11-display (:0, :0.0, or host:10.0)".to_owned()
+            })?;
+        let config = ozma_capture::X11CaptureConfig::new(display)
+            .with_offset(self.x11_x, self.x11_y)
+            .with_dimensions(self.x11_width, self.x11_height)
+            .with_fps(self.x11_fps)
+            .with_ffmpeg_bin(self.ffmpeg_bin.clone());
+        config
+            .validate()
+            .map_err(|error| format!("--x11-display/geometry: {}", error.message))?;
+        Ok(config)
+    }
+
+    /// Build the portal handshake settings from the desktop flags.
+    pub fn portal_capture_options(&self) -> PortalCaptureOptions {
+        PortalCaptureOptions {
+            source: self.portal_source_type,
+            cursor: self.portal_cursor,
+            restore_token: self.portal_restore_token.clone(),
+            timeout: self.portal_timeout,
+            width: self.desktop_capture_width,
+            height: self.desktop_capture_height,
+            fps: self.desktop_capture_fps,
+        }
+    }
 }
 
 fn validate_path(label: &str, path: Option<&std::path::Path>) -> Result<(), String> {
@@ -1037,6 +1673,26 @@ fn validate_path(label: &str, path: Option<&std::path::Path>) -> Result<(), Stri
         }
     }
     Ok(())
+}
+
+/// Reject a UDC name ConfigFS cannot bind.
+///
+/// The name is written verbatim to the gadget's `UDC` attribute, so it must not
+/// contain path separators, whitespace, or control characters.
+fn validate_udc_name(udc: &str) -> Result<(), String> {
+    let valid = !udc.is_empty()
+        && udc.len() <= 63
+        && !udc.starts_with('.')
+        && udc.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "--usb-udc {udc:?} is not a valid UDC name (letters, digits, '-', '_', '.', ':')"
+        ))
+    }
 }
 
 fn validate_json_array(label: &str, value: &str) -> Result<(), String> {
@@ -1203,6 +1859,13 @@ mod tests {
             dbus_height: ozma_capture::DBUS_DEFAULT_HEIGHT,
             dbus_fps: ozma_capture::DBUS_DEFAULT_FPS,
             dbus_requested: false,
+            capture_console: None,
+            display_output_specs: Vec::new(),
+            display_outputs: Vec::new(),
+            looking_glass_shm: None,
+            looking_glass_fps: ozma_capture::LOOKING_GLASS_DEFAULT_FPS,
+            looking_glass_id: ozma_capture::LOOKING_GLASS_DEFAULT_ID.to_owned(),
+            looking_glass_name: ozma_capture::LOOKING_GLASS_DEFAULT_NAME.to_owned(),
             fake_width: DEFAULT_FAKE_WIDTH,
             fake_height: DEFAULT_FAKE_HEIGHT,
             fake_fps: DEFAULT_FAKE_FPS,
@@ -1211,6 +1874,18 @@ mod tests {
             desktop_capture_fps: DEFAULT_FAKE_FPS,
             desktop_capture_target: DesktopCaptureTarget::Default,
             desktop_capture_remote: None,
+            x11_display: None,
+            x11_x: 0,
+            x11_y: 0,
+            x11_width: ozma_capture::X11_DEFAULT_WIDTH,
+            x11_height: ozma_capture::X11_DEFAULT_HEIGHT,
+            x11_fps: ozma_capture::X11_DEFAULT_FPS,
+            x11_requested: false,
+            portal_source_type: PortalSourceKind::Monitor,
+            portal_cursor: PortalCursorKind::Hidden,
+            portal_restore_token: None,
+            portal_timeout: ozma_capture::PORTAL_DEFAULT_RESPONSE_TIMEOUT,
+            portal_requested: false,
             audio_capture_target: ozma_audio::AudioTarget::Default,
             audio_router: AudioRouterKind::None,
             audio_track_root: None,
@@ -1223,6 +1898,12 @@ mod tests {
             vm_guest_ip: None,
             display_outputs_json: "[]".into(),
             pci_devices_json: "[]".into(),
+            usb_gadget: false,
+            usb_configfs_root: PathBuf::from(DEFAULT_USB_CONFIGFS_ROOT),
+            usb_udc: None,
+            usb_media: None,
+            usb_media_ro: false,
+            usb_media_cdrom: false,
         }
     }
 
@@ -1512,7 +2193,7 @@ mod tests {
         let config = vm_config_with_overrides("v4l2", "", "");
         let error = config.vm_providers().unwrap_err();
         assert!(
-            error.contains("expected qmp, dbus, vnc, or fake"),
+            error.contains("expected qmp, dbus, vnc, looking-glass, or fake"),
             "{error}"
         );
     }
@@ -1622,6 +2303,159 @@ mod tests {
     }
 
     #[test]
+    fn looking_glass_flags_select_the_provider_and_validate() {
+        let mut config = test_config(NodeProfile::Vm);
+        config.looking_glass_shm = Some(PathBuf::from("/dev/shm/looking-glass"));
+
+        let providers = config.vm_providers().unwrap();
+        assert_eq!(providers.capture.as_deref(), Some("looking-glass"));
+
+        let source = config.capture_display_source().unwrap().unwrap();
+        assert_eq!(source.backend, VmConsoleBackend::LookingGlass);
+        assert_eq!(source.source_id, ozma_capture::LOOKING_GLASS_DEFAULT_ID);
+
+        let selection = config.resolve_display_outputs().unwrap();
+        assert_eq!(selection.outputs.len(), 1);
+        assert_eq!(selection.outputs[0].source_type, "looking_glass");
+        assert_eq!(
+            selection.outputs[0].capture_source_id,
+            ozma_capture::LOOKING_GLASS_DEFAULT_ID
+        );
+        assert!(selection.outputs[0].primary);
+
+        let mut invalid_fps = config.clone();
+        invalid_fps.looking_glass_fps = 0;
+        assert!(invalid_fps.validate().is_err());
+
+        let mut explicit_without_shm = test_config(NodeProfile::Vm);
+        explicit_without_shm.provider_overrides =
+            ProviderOverrides::from_cli("looking-glass", "", "", "", "");
+        assert!(explicit_without_shm
+            .vm_providers()
+            .unwrap_err()
+            .contains("--looking-glass-shm"));
+    }
+
+    #[test]
+    fn looking_glass_conflicts_with_other_vm_capture_sources() {
+        let mut vnc = test_config(NodeProfile::Vm);
+        vnc.vnc_host = Some("127.0.0.1".into());
+        vnc.vnc_port = Some(5901);
+        vnc.looking_glass_shm = Some(PathBuf::from("/dev/shm/looking-glass"));
+        assert!(vnc.vm_providers().is_err());
+
+        let mut dbus = test_config(NodeProfile::Vm);
+        dbus.qmp_socket = Some(PathBuf::from("/run/ozma/qmp.sock"));
+        dbus.dbus_requested = true;
+        dbus.looking_glass_shm = Some(PathBuf::from("/dev/shm/looking-glass"));
+        assert!(dbus.vm_providers().is_err());
+
+        let mut hardware = test_config(NodeProfile::Hardware);
+        hardware.looking_glass_shm = Some(PathBuf::from("/dev/shm/looking-glass"));
+        assert!(hardware.validate().is_err());
+
+        let mut explicit_qmp = test_config(NodeProfile::Vm);
+        explicit_qmp.qmp_socket = Some(PathBuf::from("/run/ozma/qmp.sock"));
+        explicit_qmp.provider_overrides = ProviderOverrides::from_cli("qmp", "", "", "", "");
+        explicit_qmp.looking_glass_shm = Some(PathBuf::from("/dev/shm/looking-glass"));
+        assert!(explicit_qmp.vm_providers().is_err());
+    }
+
+    #[test]
+    fn display_output_specs_validate_and_normalize_through_the_topology() {
+        let mut config = test_config(NodeProfile::Vm);
+        config.qmp_socket = Some(PathBuf::from("/run/ozma/qmp.sock"));
+        config.display_output_specs = vec![
+            "0:Console_0:1920x1080:primary:qmp".into(),
+            "1:Console_1:1280x1024:qmp".into(),
+        ];
+
+        let selection = config.resolve_display_outputs().unwrap();
+        assert_eq!(selection.outputs.len(), 2);
+        assert!(selection.outputs[0].primary);
+        assert_eq!(
+            selection.outputs[0].capture_source_id,
+            ozma_capture::QMP_DEFAULT_ID
+        );
+        assert_eq!(selection.outputs[1].capture_source_id, "");
+        assert!(selection.limitation.is_some());
+
+        let json: serde_json::Value = serde_json::from_str(&selection.to_json()).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 2);
+        assert_eq!(json[0]["source_type"], "qmp");
+        assert_eq!(json[1]["capture_source_id"], "");
+
+        let mut two_primaries = config.clone();
+        two_primaries.display_output_specs = vec![
+            "0:Console_0:1920x1080:primary".into(),
+            "1:Console_1:1280x1024:primary".into(),
+        ];
+        assert!(two_primaries.validate().is_err());
+
+        let mut non_vm = test_config(NodeProfile::Hardware);
+        non_vm.display_output_specs = vec!["HDMI-1:1920x1080".into()];
+        assert!(non_vm.validate().is_err());
+
+        let mut conflicting_raw = config.clone();
+        conflicting_raw.display_outputs_json =
+            r#"[{"name":"HDMI-1","width":1920,"height":1080}]"#.into();
+        assert!(conflicting_raw.validate().is_err());
+    }
+
+    #[test]
+    fn a_mismatched_per_output_source_does_not_claim_the_live_capture_id() {
+        let mut config = test_config(NodeProfile::Vm);
+        config.qmp_socket = Some(PathBuf::from("/run/ozma/qmp.sock"));
+        config.display_output_specs = vec!["0:Console_0:1920x1080:vnc".into()];
+        let selection = config.resolve_display_outputs().unwrap();
+        assert_eq!(selection.outputs[0].source_type, "vnc");
+        assert_eq!(selection.outputs[0].capture_source_id, "");
+        let limitation = selection.limitation.unwrap();
+        assert!(limitation.contains("advertised as vnc"), "{limitation}");
+    }
+
+    #[test]
+    fn display_output_specs_without_an_explicit_primary_fall_back_to_console_zero() {
+        let mut config = test_config(NodeProfile::Vm);
+        config.qmp_socket = Some(PathBuf::from("/run/ozma/qmp.sock"));
+        config.display_output_specs = vec![
+            "0:Console_0:1920x1080".into(),
+            "1:Console_1:1280x1024".into(),
+        ];
+        let selection = config.resolve_display_outputs().unwrap();
+        assert_eq!(selection.primary_console(), Some(0));
+        assert_eq!(selection.outputs[1].capture_source_id, "");
+    }
+
+    #[test]
+    fn capture_console_selects_the_dbus_head_and_reports_single_head_limits() {
+        let mut dbus = test_config(NodeProfile::Vm);
+        dbus.qmp_socket = Some(PathBuf::from("/run/ozma/qmp.sock"));
+        dbus.dbus_requested = true;
+        dbus.capture_console = Some(2);
+        let source = dbus.capture_display_source().unwrap().unwrap();
+        assert_eq!(source.backend, VmConsoleBackend::Dbus);
+        assert_eq!(source.console_index, 2);
+        let selection = dbus.resolve_display_outputs().unwrap();
+        assert_eq!(selection.outputs[0].index, 2);
+        assert_eq!(
+            selection.outputs[0].capture_source_id,
+            ozma_capture::DBUS_DEFAULT_ID
+        );
+        assert!(selection.limitation.is_none());
+
+        let mut qmp = test_config(NodeProfile::Vm);
+        qmp.qmp_socket = Some(PathBuf::from("/run/ozma/qmp.sock"));
+        qmp.capture_console = Some(2);
+        let source = qmp.capture_display_source().unwrap().unwrap();
+        assert_eq!(source.backend, VmConsoleBackend::Qmp);
+        assert_eq!(source.console_index, 0);
+        let limitation = qmp.resolve_display_outputs().unwrap().limitation.unwrap();
+        assert!(limitation.contains("--capture-console 2"), "{limitation}");
+        assert!(limitation.contains("Console_0"), "{limitation}");
+    }
+
+    #[test]
     fn nvenc_gpu_is_optional_and_bounded() {
         let mut config = test_config(NodeProfile::Vm);
         assert_eq!(config.nvenc_gpu, None, "no default GPU is invented");
@@ -1683,7 +2517,10 @@ mod tests {
         let config = test_config(NodeProfile::Desktop);
         let resolved = config.desktop_providers().unwrap();
 
-        assert_eq!(resolved.capture_target, Some(DesktopCaptureTarget::Default));
+        assert_eq!(
+            resolved.capture,
+            DesktopCaptureSelection::PipeWire(DesktopCaptureTarget::Default)
+        );
         assert_eq!(
             resolved.input_chain,
             vec![SinkKind::Uinput, SinkKind::HidGadget, SinkKind::Recording]
@@ -1710,7 +2547,10 @@ mod tests {
         fake.provider_overrides = ProviderOverrides::from_cli("fake", "", "", "", "");
         fake.providers = ProviderSelection::for_profile(NodeProfile::Desktop)
             .with_overrides(&fake.provider_overrides);
-        assert_eq!(fake.desktop_providers().unwrap().capture_target, None);
+        assert_eq!(
+            fake.desktop_providers().unwrap().capture,
+            DesktopCaptureSelection::Fake
+        );
     }
 
     #[test]
@@ -1764,29 +2604,172 @@ mod tests {
     }
 
     #[test]
-    fn desktop_rejects_non_pipewire_capture_and_x11() {
+    fn desktop_rejects_unknown_capture_and_requires_x11_display() {
         let mut config = test_config(NodeProfile::Desktop);
         config.provider_overrides = ProviderOverrides::from_cli("v4l2", "", "", "", "");
         config.providers = ProviderSelection::for_profile(NodeProfile::Desktop)
             .with_overrides(&config.provider_overrides);
         let error = config.desktop_providers().unwrap_err();
-        assert!(error.contains("PipeWire"), "{error}");
+        assert!(error.contains("expected pipewire, x11, portal"), "{error}");
 
+        // X11 is selected but has no explicit display: a typed configuration
+        // error, never ambient DISPLAY.
         let mut x11 = test_config(NodeProfile::Desktop);
         x11.provider_overrides = ProviderOverrides::from_cli("x11", "", "", "", "");
         x11.providers = ProviderSelection::for_profile(NodeProfile::Desktop)
             .with_overrides(&x11.provider_overrides);
         let error = x11.desktop_providers().unwrap_err();
-        assert!(error.contains("not implemented"), "{error}");
+        assert!(error.contains("--x11-display"), "{error}");
+
+        // X11/portal flags belong to the desktop profile only.
+        let mut vm = test_config(NodeProfile::Vm);
+        vm.x11_display = Some(":0".into());
+        vm.x11_requested = true;
+        let error = vm.vm_providers().unwrap_err();
+        assert!(error.contains("--profile desktop"), "{error}");
+
+        let mut hardware = test_config(NodeProfile::Hardware);
+        hardware.portal_source_type = PortalSourceKind::Window;
+        hardware.portal_requested = true;
+        assert!(hardware.validate().is_err());
+
+        let mut vm_portal = test_config(NodeProfile::Vm);
+        vm_portal.provider_overrides = ProviderOverrides::from_cli("portal", "", "", "", "");
+        vm_portal.providers = ProviderSelection::for_profile(NodeProfile::Vm)
+            .with_overrides(&vm_portal.provider_overrides);
+        assert!(vm_portal.desktop_providers().is_err());
 
         let mut pipewire = test_config(NodeProfile::Desktop);
         pipewire.provider_overrides = ProviderOverrides::from_cli("pipewire", "", "", "", "");
         pipewire.providers = ProviderSelection::for_profile(NodeProfile::Desktop)
             .with_overrides(&pipewire.provider_overrides);
         assert_eq!(
-            pipewire.desktop_providers().unwrap().capture_target,
-            Some(DesktopCaptureTarget::Default)
+            pipewire.desktop_providers().unwrap().capture,
+            DesktopCaptureSelection::PipeWire(DesktopCaptureTarget::Default)
         );
+    }
+
+    #[test]
+    fn desktop_x11_capture_resolves_flags_to_provider_config() {
+        let mut config = test_config(NodeProfile::Desktop);
+        config.provider_overrides = ProviderOverrides::from_cli("x11", "", "", "", "");
+        config.providers = ProviderSelection::for_profile(NodeProfile::Desktop)
+            .with_overrides(&config.provider_overrides);
+        config.x11_display = Some(":0.0".into());
+        config.x11_x = 10;
+        config.x11_y = 20;
+        config.x11_width = 640;
+        config.x11_height = 480;
+        config.x11_fps = 15;
+        config.x11_requested = true;
+        config.ffmpeg_bin = PathBuf::from("/opt/ffmpeg");
+
+        let resolved = config.desktop_providers().unwrap();
+        let DesktopCaptureSelection::X11(x11) = resolved.capture else {
+            panic!("expected an X11 capture selection");
+        };
+        assert_eq!(x11.display, ":0.0");
+        assert_eq!((x11.x, x11.y), (10, 20));
+        assert_eq!((x11.width, x11.height, x11.fps), (640, 480, 15));
+        assert_eq!(x11.ffmpeg_bin, PathBuf::from("/opt/ffmpeg"));
+        assert_eq!(
+            ozma_capture::x11grab_argv(&x11),
+            vec![
+                "/opt/ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "x11grab",
+                "-i",
+                ":0.0+10,20",
+                "-pix_fmt",
+                "rgb24",
+                "-f",
+                "rawvideo",
+                "-s",
+                "640x480",
+                "-r",
+                "15",
+                "-",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+        );
+
+        // An X11 flag alone selects the X11 provider on the desktop profile.
+        let mut implicit = test_config(NodeProfile::Desktop);
+        implicit.x11_display = Some(":1".into());
+        implicit.x11_requested = true;
+        assert_eq!(
+            implicit
+                .desktop_providers()
+                .unwrap()
+                .capture
+                .provider_name(),
+            "x11"
+        );
+
+        // Invalid geometry/rate is rejected before any capture is attempted.
+        let mut invalid = config.clone();
+        invalid.x11_width = 0;
+        assert!(invalid.validate().is_err());
+        let mut invalid = config.clone();
+        invalid.x11_fps = ozma_capture::MAX_X11_FPS + 1;
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn desktop_portal_capture_validates_options() {
+        let mut config = test_config(NodeProfile::Desktop);
+        config.provider_overrides = ProviderOverrides::from_cli("portal", "", "", "", "");
+        config.providers = ProviderSelection::for_profile(NodeProfile::Desktop)
+            .with_overrides(&config.provider_overrides);
+        config.portal_source_type = PortalSourceKind::Window;
+        config.portal_cursor = PortalCursorKind::Embedded;
+        config.portal_restore_token = Some("token-1".into());
+        config.portal_timeout = Duration::from_millis(9_000);
+        config.portal_requested = true;
+        config.desktop_capture_width = 1280;
+        config.desktop_capture_height = 720;
+        config.desktop_capture_fps = 24;
+
+        let resolved = config.desktop_providers().unwrap();
+        let DesktopCaptureSelection::Portal(options) = resolved.capture else {
+            panic!("expected a portal capture selection");
+        };
+        assert_eq!(options.source, PortalSourceKind::Window);
+        assert_eq!(options.cursor, PortalCursorKind::Embedded);
+        assert_eq!(options.restore_token.as_deref(), Some("token-1"));
+        assert_eq!(options.timeout, Duration::from_millis(9_000));
+        assert_eq!(
+            (options.width, options.height, options.fps),
+            (1280, 720, 24)
+        );
+
+        // A portal flag alone also selects portal capture on desktop.
+        let mut implicit = test_config(NodeProfile::Desktop);
+        implicit.portal_cursor = PortalCursorKind::Metadata;
+        implicit.portal_requested = true;
+        assert_eq!(
+            implicit
+                .desktop_providers()
+                .unwrap()
+                .capture
+                .provider_name(),
+            "portal"
+        );
+
+        let mut zero_timeout = config.clone();
+        zero_timeout.portal_timeout = Duration::ZERO;
+        assert!(zero_timeout.validate().is_err());
+        let mut empty_token = config.clone();
+        empty_token.portal_restore_token = Some(String::new());
+        assert!(empty_token.validate().is_err());
+        let mut control_token = config.clone();
+        control_token.portal_restore_token = Some("bad\u{7}token".into());
+        assert!(control_token.validate().is_err());
     }
 
     #[test]
@@ -1804,8 +2787,8 @@ mod tests {
             ozma_audio::AudioTarget::SinkMonitor("ozma-desktop".into())
         );
         assert_eq!(
-            resolved.capture_target,
-            Some(DesktopCaptureTarget::NodeId(12))
+            resolved.capture,
+            DesktopCaptureSelection::PipeWire(DesktopCaptureTarget::NodeId(12))
         );
 
         config.desktop_capture_width = 0;
@@ -1816,5 +2799,57 @@ mod tests {
         config.desktop_capture_fps = 60;
         config.desktop_capture_remote = Some("   ".into());
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn usb_flags_are_opt_in_and_validate_media_and_udc() {
+        let mut config = test_config(NodeProfile::Hardware);
+        assert!(config.validate().is_ok());
+        assert!(!config.has_capability("usb"));
+
+        // Every USB control flag requires the explicit opt-in.
+        let mut udc_without_gadget = config.clone();
+        udc_without_gadget.usb_udc = Some("dummy_udc.0".into());
+        assert!(udc_without_gadget.validate().is_err());
+
+        let mut media_without_gadget = config.clone();
+        media_without_gadget.usb_media = Some(PathBuf::from("/srv/installer.iso"));
+        assert!(media_without_gadget.validate().is_err());
+
+        config.usb_gadget = true;
+        config.usb_udc = Some("dummy_udc.0".into());
+        assert!(config.validate().is_ok());
+
+        // UDC names are written verbatim to ConfigFS and must stay safe.
+        for bad in ["", "a/b", "dummy udc.0", "../udc", ".hidden"] {
+            let mut invalid = config.clone();
+            invalid.usb_udc = Some(bad.into());
+            assert!(invalid.validate().is_err(), "{bad:?} must be rejected");
+        }
+
+        // Read-only/CD-ROM flags only make sense with a backing image.
+        config.usb_media_ro = true;
+        assert!(config.validate().is_err());
+        config.usb_media_ro = false;
+        config.usb_media_cdrom = true;
+        assert!(config.validate().is_err());
+        config.usb_media_cdrom = false;
+
+        config.usb_media = Some(PathBuf::from("/srv/installer.iso"));
+        config.usb_media_ro = true;
+        config.usb_media_cdrom = true;
+        assert!(config.validate().is_ok());
+
+        config.usb_media = Some(PathBuf::from("relative.img"));
+        assert!(config.validate().is_err());
+
+        config.usb_media = Some(PathBuf::new());
+        assert!(config.validate().is_err());
+
+        // The default root is always a usable, explicit path.
+        assert_eq!(
+            test_config(NodeProfile::Hardware).usb_configfs_root,
+            PathBuf::from(DEFAULT_USB_CONFIGFS_ROOT)
+        );
     }
 }

@@ -46,6 +46,8 @@ ozma-qmp      = { path = "../ozma-qmp" }
 ozma-power    = { path = "../ozma-power" }
 ozma-audio    = { path = "../ozma-audio" }
 ozma-decode   = { path = "../ozma-decode" }
+# USB gadget/ConfigFS/virtual-media controller (Phase 3 USB workstream).
+ozma-usb      = { path = "../ozma-usb" }
 # Binary display envelopes (scene snapshots) for the reliable Display channel.
 ozma-display-protocol = { path = "../ozma-display-protocol" }
 # Browser camera/microphone reassembly is shared with the client side.

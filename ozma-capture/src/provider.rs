@@ -155,6 +155,34 @@ impl CaptureRegistry {
         self
     }
 
+    /// Add an ffmpeg `x11grab` X11 screen provider.
+    ///
+    /// Like the VM display providers, this is opt-in: a hardware/VM node has no
+    /// X11 seat, and an X display must be named explicitly rather than inferred
+    /// from ambient `DISPLAY`. Enumeration validates the configuration only; it
+    /// does not connect to the X server or spawn ffmpeg.
+    pub fn with_x11_display(mut self, config: crate::x11::X11CaptureConfig) -> Self {
+        self.register(crate::x11::X11CaptureProvider::new(config));
+        self
+    }
+
+    /// Add a provider that opens the PipeWire node selected by an XDG Desktop
+    /// Portal ScreenCast session.
+    ///
+    /// Run [`PortalScreenCast::request_stream`](crate::portal::PortalScreenCast::request_stream)
+    /// first; the handshake may show a consent dialog and is therefore not part
+    /// of enumeration. Registering this provider never falls back to X11, a
+    /// camera, or a synthetic source.
+    #[cfg(all(target_os = "linux", feature = "portal"))]
+    pub fn with_portal_capture(
+        mut self,
+        config: crate::portal::PortalCaptureConfig,
+        stream: crate::portal::PortalStream,
+    ) -> Self {
+        self.register(crate::portal::PortalCaptureProvider::new(config, stream));
+        self
+    }
+
     /// Add a QEMU D-Bus display provider.
     ///
     /// Like [`CaptureRegistry::with_qmp_display`], this is opt-in: the QMP

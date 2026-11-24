@@ -29,13 +29,16 @@ packaging/tests do not break, but it does not provide a real desktop media path.
 These are the gaps that still block deleting this crate. Each needs either a
 real provider or a documented product decision:
 
-1. **XDG Desktop Portal ScreenCast consent/selection.** The node can open a
-   PipeWire node by id/name, but does not perform the portal D-Bus handshake,
-   monitor picker, restore token, or consent UI. Until this exists, an external
-   portal client must supply `--desktop-capture-target`.
-2. **X11 capture fallback.** No `XGetImage`/XShm provider exists;
-   `--capture-provider x11` is a typed startup error. This still matters for
-   non-portal X11 sessions.
+1. **Portal ScreenCast fd handoff and restore-token persistence.** The node now
+   runs the portal `CreateSession`/`SelectSources`/`Start`/`OpenPipeWireRemote`
+   handshake and registers the selected node. The remaining gap is that the
+   PipeWire backend has no fd-connect API: compositors that expose the screen
+   only through the portal fd fail with a typed error, and a returned restore
+   token is reported but not persisted. `--portal-restore-token` accepts a token
+   supplied by the operator.
+2. **X11 live validation.** The real ffmpeg `x11grab` provider is wired through
+   `--capture-provider x11 --x11-display`, but CI uses fake children and the
+   checked-in real test is `#[ignore]`d (`OZMA_X11_TEST=1`).
 3. **Desktop audio sink provisioning.** The legacy agent created a virtual
    sink. The node can capture `monitor:<existing-sink>` and route through an
    existing graph, but does not create a desktop null/remap sink itself

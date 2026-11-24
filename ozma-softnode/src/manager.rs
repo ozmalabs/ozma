@@ -23,9 +23,11 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use serde::Deserialize;
+use serde_json::Value;
 use tokio::sync::{watch, Mutex};
 use tracing::{debug, info, warn};
 
@@ -39,7 +41,7 @@ use crate::evdev_provisioning::{EvdevPaths, EvdevProvisioner, UinputEvdevProvisi
 use crate::provisioning::{
     LibvirtProvisioner, ProvisionConfig, ProvisionHints, TokioCommandRunner, VmProvisioner,
 };
-use crate::status::{SupervisorStatus, VmStatus};
+use crate::status::{ChildInputStatus, ChildPowerStatus, ChildStatus, SupervisorStatus, VmStatus};
 use crate::supervisor::{
     build_node_spec, restart_delay, NodeExitStatus, NodeHandle, NodeLauncher, NodeSpec,
     PortAllocator, ProcessNodeLauncher, DEFAULT_BASE_PORT, DEFAULT_NODE_BIN,
@@ -75,6 +77,14 @@ pub struct ManagerOptions {
     pub discovery_interval: Duration,
     /// Child poll / restart tick.
     pub supervision_tick: Duration,
+    /// How often each running child's `GET /api/v1/connection` is polled.
+    /// `Duration::ZERO` disables child aggregation.
+    pub child_poll_interval: Duration,
+    /// Per-child HTTP timeout for status polling.
+    pub child_poll_timeout: Duration,
+    /// Optional bearer token sent to child APIs when polling. Never serialized
+    /// into status or metrics.
+    pub child_api_token: String,
     /// Opt-in libvirt provisioning for VMs without a QMP socket.
     pub provision: bool,
     /// Provisioning paths, environment, and restart behaviour.
@@ -98,6 +108,9 @@ impl Default for ManagerOptions {
             restart_backoff_max: Duration::from_millis(DEFAULT_RESTART_BACKOFF_MAX_MS),
             discovery_interval: DEFAULT_DISCOVERY_INTERVAL,
             supervision_tick: DEFAULT_SUPERVISION_TICK,
+            child_poll_interval: Duration::ZERO,
+            child_poll_timeout: Duration::from_millis(2_000),
+            child_api_token: String::new(),
             provision: false,
             provision_config: ProvisionConfig::default(),
             audio: AudioProvisionConfig::default(),
@@ -212,6 +225,69 @@ struct SupervisorState {
     excluded: HashSet<String>,
 }
 
+/// One child's cached connection summary plus poll freshness metadata.
+#[derive(Clone, Debug, Default)]
+struct ChildPollRecord {
+    reachable: bool,
+    last_attempt: Option<Instant>,
+    last_success: Option<Instant>,
+    last_seen_unix_ms: Option<u64>,
+    summary: Option<ChildConnectionSummary>,
+    last_error: Option<String>,
+}
+
+/// The subset of a child `/api/v1/connection` document kept in memory.
+#[derive(Clone, Debug, Default)]
+struct ChildConnectionSummary {
+    node_id: Option<String>,
+    profile: Option<String>,
+    api_port: Option<u16>,
+    hls: Option<String>,
+    webrtc: Option<String>,
+    audio: Option<String>,
+    power: Option<ChildPowerStatus>,
+    input: Option<ChildInputStatus>,
+}
+
+/// Typed, bounded view of a child connection document. Unknown fields are
+/// ignored so a newer node cannot bloat the supervisor's cache.
+#[derive(Debug, Deserialize)]
+struct ChildConnectionDoc {
+    #[serde(default)]
+    ok: bool,
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    api_port: Option<u16>,
+    #[serde(default)]
+    hls: Option<String>,
+    #[serde(default)]
+    webrtc: Option<String>,
+    #[serde(default)]
+    audio: Option<String>,
+    #[serde(default)]
+    power: Option<Value>,
+    #[serde(default)]
+    input: Option<ChildInputDoc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChildInputDoc {
+    #[serde(default)]
+    sink_kind: Option<String>,
+    #[serde(default)]
+    available: bool,
+    #[serde(default)]
+    injecting: bool,
+}
+
+/// Hard cap on a child connection response; the document is normally tiny.
+const CHILD_CONNECTION_MAX_BYTES: usize = 256 * 1024;
+/// Cap copied free-form strings so one malformed child cannot inflate `/status`.
+const CHILD_FIELD_MAX_CHARS: usize = 256;
+
 // ── VirtualNodeManager ─────────────────────────────────────────────────────
 
 pub struct VirtualNodeManager {
@@ -229,6 +305,10 @@ struct ManagerInner {
     evdev_provisioner: Option<Arc<dyn EvdevProvisioner>>,
     audio_provisioner: Option<Arc<dyn AudioSinkProvisioner>>,
     state: Mutex<SupervisorState>,
+    /// Child connection summaries. Kept separate from `state` so a slow child
+    /// poll never blocks a status read, and a status read never waits on HTTP.
+    child_polls: Mutex<HashMap<String, ChildPollRecord>>,
+    child_client: reqwest::Client,
 }
 
 impl VirtualNodeManager {
@@ -290,6 +370,11 @@ impl VirtualNodeManager {
                 discovered: HashSet::new(),
                 excluded: HashSet::new(),
             }),
+            child_polls: Mutex::new(HashMap::new()),
+            child_client: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         });
         Self {
             options,
@@ -320,6 +405,13 @@ impl VirtualNodeManager {
             anyhow::bail!(
                 "--restart-backoff-max-ms must be greater than or equal to \
                  --restart-backoff-ms"
+            );
+        }
+        if !self.options.child_poll_interval.is_zero() && self.options.child_poll_timeout.is_zero()
+        {
+            anyhow::bail!(
+                "--child-poll-timeout-ms must be greater than zero when \
+                 --child-poll-interval-ms enables child polling"
             );
         }
         if self.options.provision_config.restart_vm && !self.options.provision {
@@ -374,6 +466,18 @@ impl VirtualNodeManager {
             None
         };
 
+        // Child API polling runs independently so a slow or hung child never
+        // delays discovery, restart handling, or status reads.
+        let child_poll_task = if self.options.child_poll_interval.is_zero() {
+            None
+        } else {
+            let inner = Arc::clone(&self.inner);
+            let mut stop_rx = self.stop_rx.clone();
+            Some(tokio::spawn(async move {
+                inner.child_poll_loop(&mut stop_rx).await;
+            }))
+        };
+
         let tick = self.options.supervision_tick.max(Duration::from_millis(1));
         let mut ticker = tokio::time::interval(tick);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -397,6 +501,10 @@ impl VirtualNodeManager {
             task.abort();
             let _ = task.await;
         }
+        if let Some(task) = child_poll_task {
+            task.abort();
+            let _ = task.await;
+        }
 
         info!("Shutting down: stopping every per-VM ozma-node child...");
         self.inner.shutdown().await;
@@ -416,31 +524,51 @@ impl VirtualNodeManager {
 
     /// Snapshot the aggregated multi-VM status.
     ///
-    /// This only reads in-memory supervisor state: it never polls a child,
-    /// opens a QMP socket, or runs a provisioning command.
+    /// This reads in-memory supervisor state and the child poll cache: it never
+    /// performs an HTTP request, opens a QMP socket, or runs a provisioning
+    /// command while answering. A child poll in flight cannot block a status
+    /// read because the poll cache lock is only held to copy completed results.
     pub async fn status(&self) -> SupervisorStatus {
-        let state = self.inner.state.lock().await;
-        let now = Instant::now();
-        let mut vms = Vec::with_capacity(state.vms.len() + state.excluded.len());
+        let (mut vms, discovered, next_ports) = {
+            let state = self.inner.state.lock().await;
+            let now = Instant::now();
+            let mut vms = Vec::with_capacity(state.vms.len() + state.excluded.len());
 
-        for managed in state.vms.values() {
-            vms.push(vm_status(
-                managed,
-                self.options.auto_agent,
-                self.options.provision_config.evdev.enabled,
-                now,
-            ));
+            for managed in state.vms.values() {
+                vms.push(vm_status(
+                    managed,
+                    self.options.auto_agent,
+                    self.options.provision_config.evdev.enabled,
+                    now,
+                ));
+            }
+            for name in &state.excluded {
+                vms.push(VmStatus::excluded(name.clone()));
+            }
+            vms.sort_by(|a, b| a.name.cmp(&b.name));
+
+            (vms, state.discovered.len(), state.ports.next_ports())
+        };
+
+        let children = self.inner.child_status_map(Instant::now()).await;
+        if !children.is_empty() {
+            for vm in &mut vms {
+                if let Some(child) = children.get(&vm.name) {
+                    let mut child = child.clone();
+                    // A child that is no longer spawned cannot be reachable now,
+                    // even if the last poll succeeded before it exited.
+                    if !vm.spawned {
+                        child.reachable = false;
+                    }
+                    vm.child = Some(child);
+                }
+            }
         }
-        for name in &state.excluded {
-            vms.push(VmStatus::excluded(name.clone()));
-        }
-        vms.sort_by(|a, b| a.name.cmp(&b.name));
 
-        let discovered = state.discovered.len();
-        let next_ports = state.ports.next_ports();
-        drop(state);
-
-        SupervisorStatus::new(discovered, next_ports, vms)
+        let mut status = SupervisorStatus::new(discovered, next_ports, vms);
+        status.child_poll_interval_ms = duration_millis(self.options.child_poll_interval);
+        status.child_poll_timeout_ms = duration_millis(self.options.child_poll_timeout);
+        status
     }
 
     /// Test-only entry point: apply one discovery snapshot and poll children.
@@ -484,6 +612,20 @@ impl VirtualNodeManager {
             "  Auto-agent:  {}",
             if self.options.auto_agent { "on" } else { "off" }
         );
+        if self.options.child_poll_interval.is_zero() {
+            info!("  Child poll:  off (no per-VM API aggregation)");
+        } else {
+            info!(
+                "  Child poll:  every {:?}, timeout {:?} (bearer token: {})",
+                self.options.child_poll_interval,
+                self.options.child_poll_timeout,
+                if self.options.child_api_token.is_empty() {
+                    "none"
+                } else {
+                    "configured"
+                }
+            );
+        }
         info!(
             "  Provision:   {}{}",
             if self.options.provision { "on" } else { "off" },
@@ -593,6 +735,141 @@ impl ManagerInner {
             Ok(vms) => self.reconcile(vms).await,
             Err(error) => warn!("VM discovery error: {}", error),
         }
+    }
+
+    /// Poll every running child's `/api/v1/connection` on the configured
+    /// interval until shutdown. Polling runs outside the supervision loop and
+    /// outside the status state lock.
+    async fn child_poll_loop(&self, stop: &mut watch::Receiver<bool>) {
+        let interval = self
+            .options
+            .child_poll_interval
+            .max(Duration::from_millis(1));
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            ticker.tick().await;
+            if *stop.borrow() {
+                break;
+            }
+            self.poll_children().await;
+        }
+    }
+
+    /// Fetch one connection document per running child, concurrently, with a
+    /// per-request timeout. Results are applied under the cache lock without
+    /// holding it across any HTTP await.
+    async fn poll_children(&self) {
+        let (targets, tracked) = {
+            let state = self.state.lock().await;
+            let tracked: HashSet<String> = state.vms.keys().cloned().collect();
+            let targets: Vec<(String, u16)> = state
+                .vms
+                .values()
+                .filter_map(|managed| {
+                    managed
+                        .node
+                        .as_ref()
+                        .filter(|node| node.handle.is_some())
+                        .map(|node| (managed.vm.name.clone(), node.spec.http_port))
+                })
+                .collect();
+            (targets, tracked)
+        };
+
+        // Bound the cache to VMs the supervisor still tracks. A stopped child's
+        // last summary is kept (and reported stale) until the VM disappears.
+        self.child_polls
+            .lock()
+            .await
+            .retain(|name, _| tracked.contains(name));
+
+        if targets.is_empty() {
+            return;
+        }
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for (name, port) in targets {
+            let client = self.child_client.clone();
+            let token = self.options.child_api_token.clone();
+            let timeout = self.options.child_poll_timeout;
+            tasks.spawn(async move {
+                let result = fetch_child_connection(&client, &token, port, timeout).await;
+                (name, result)
+            });
+        }
+
+        while let Some(joined) = tasks.join_next().await {
+            let Ok((name, result)) = joined else {
+                continue;
+            };
+            let now = Instant::now();
+            let mut polls = self.child_polls.lock().await;
+            let record = polls.entry(name).or_default();
+            record.last_attempt = Some(now);
+            match result {
+                Ok(summary) => {
+                    record.reachable = true;
+                    record.last_success = Some(now);
+                    record.last_seen_unix_ms = Some(unix_millis());
+                    record.summary = Some(summary);
+                    record.last_error = None;
+                }
+                Err(error) => {
+                    record.reachable = false;
+                    record.last_error = Some(error);
+                }
+            }
+        }
+    }
+
+    /// Snapshot the child poll cache with ages and staleness derived at read
+    /// time. The lock is held only for this in-memory copy.
+    async fn child_status_map(&self, now: Instant) -> HashMap<String, ChildStatus> {
+        let polls = self.child_polls.lock().await;
+        let stale_after = self
+            .options
+            .child_poll_interval
+            .saturating_mul(2)
+            .saturating_add(self.options.child_poll_timeout);
+
+        polls
+            .iter()
+            .filter_map(|(name, record)| {
+                // A record exists only after at least one attempt; skip empty
+                // placeholders rather than reporting a fabricated summary.
+                record.last_attempt?;
+                let summary = record.summary.as_ref();
+                let stale = match record.last_success {
+                    None => true,
+                    Some(at) => now.saturating_duration_since(at) > stale_after,
+                };
+                Some((
+                    name.clone(),
+                    ChildStatus {
+                        reachable: record.reachable,
+                        node_id: summary.and_then(|s| s.node_id.clone()),
+                        profile: summary.and_then(|s| s.profile.clone()),
+                        api_port: summary.and_then(|s| s.api_port),
+                        hls: summary.and_then(|s| s.hls.clone()),
+                        webrtc: summary.and_then(|s| s.webrtc.clone()),
+                        audio: summary.and_then(|s| s.audio.clone()),
+                        power: summary.and_then(|s| s.power.clone()),
+                        input: summary.and_then(|s| s.input.clone()),
+                        last_poll_age_ms: record
+                            .last_attempt
+                            .map(|at| duration_millis(now.saturating_duration_since(at))),
+                        last_seen_age_ms: record
+                            .last_success
+                            .map(|at| duration_millis(now.saturating_duration_since(at))),
+                        last_seen_unix_ms: record.last_seen_unix_ms,
+                        stale,
+                        last_error: record.last_error.clone(),
+                    },
+                ))
+            })
+            .collect()
     }
 
     /// Create or reuse evdev devices. Returns `None` on any failure so XML
@@ -1308,6 +1585,109 @@ impl ManagerInner {
 
 // ── Status assembly ────────────────────────────────────────────────────────
 
+/// Fetch and validate one child's connection document.
+///
+/// The request targets loopback and the allocated child HTTP port. The optional
+/// bearer token is only sent in the `Authorization` header; it is never copied
+/// into the result, status document, or an error string.
+async fn fetch_child_connection(
+    client: &reqwest::Client,
+    token: &str,
+    port: u16,
+    timeout: Duration,
+) -> Result<ChildConnectionSummary, String> {
+    let url = format!("http://127.0.0.1:{port}/api/v1/connection");
+    let mut request = client.get(&url).timeout(timeout);
+    if !token.is_empty() {
+        request = request.bearer_auth(token);
+    }
+
+    let response = request.send().await.map_err(|error| {
+        if error.is_timeout() {
+            format!(
+                "child /api/v1/connection timed out after {} ms",
+                timeout.as_millis()
+            )
+        } else {
+            format!("child /api/v1/connection failed: {error}")
+        }
+    })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("child /api/v1/connection returned HTTP {status}"));
+    }
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("child /api/v1/connection body failed: {error}"))?;
+    if bytes.len() > CHILD_CONNECTION_MAX_BYTES {
+        return Err(format!(
+            "child /api/v1/connection body exceeded {} bytes",
+            CHILD_CONNECTION_MAX_BYTES
+        ));
+    }
+
+    let doc: ChildConnectionDoc = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("child /api/v1/connection returned invalid JSON: {error}"))?;
+    if !doc.ok {
+        return Err("child /api/v1/connection reported ok=false".to_owned());
+    }
+
+    Ok(ChildConnectionSummary {
+        node_id: bounded(doc.node_id),
+        profile: bounded(doc.profile),
+        api_port: Some(doc.api_port.unwrap_or(port)),
+        hls: bounded(doc.hls),
+        webrtc: bounded(doc.webrtc),
+        audio: bounded(doc.audio),
+        power: doc.power.as_ref().and_then(power_status),
+        input: doc.input.map(|input| ChildInputStatus {
+            kind: bounded(input.sink_kind).unwrap_or_else(|| "unknown".to_owned()),
+            available: input.available,
+            injecting: input.injecting,
+        }),
+    })
+}
+
+fn power_status(value: &Value) -> Option<ChildPowerStatus> {
+    match value {
+        Value::String(state) => Some(ChildPowerStatus {
+            state: bounded(Some(state.clone())).unwrap_or_default(),
+            available: false,
+        }),
+        Value::Object(object) => Some(ChildPowerStatus {
+            state: object
+                .get("status")
+                .and_then(Value::as_str)
+                .and_then(|state| bounded(Some(state.to_owned())))
+                .unwrap_or_else(|| "unknown".to_owned()),
+            available: object
+                .get("available")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        }),
+        _ => None,
+    }
+}
+
+/// Truncate a free-form child string to keep `/status` bounded.
+fn bounded(value: Option<String>) -> Option<String> {
+    value.map(|value| value.chars().take(CHILD_FIELD_MAX_CHARS).collect())
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(duration_millis)
+        .unwrap_or(0)
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
 /// Build one VM's status entry from live supervisor state.
 fn vm_status(managed: &ManagedVm, auto_agent: bool, evdev_enabled: bool, now: Instant) -> VmStatus {
     let node = managed.node.as_ref();
@@ -1397,6 +1777,7 @@ fn vm_status(managed: &ManagedVm, auto_agent: bool, evdev_enabled: bool, now: In
         audio_sink,
         agent_status: agent_status.to_owned(),
         agent_checks: managed.agent_check_failures,
+        child: None,
     }
 }
 
@@ -1453,6 +1834,76 @@ mod tests {
 
     fn manager(options: ManagerOptions, launcher: Arc<FakeNodeLauncher>) -> VirtualNodeManager {
         VirtualNodeManager::with_launcher(options, launcher)
+    }
+
+    #[derive(Clone)]
+    struct FakeChildState {
+        body: serde_json::Value,
+        delay: Duration,
+        authorization: Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    async fn fake_child_handler(
+        axum::extract::State(state): axum::extract::State<FakeChildState>,
+        headers: axum::http::HeaderMap,
+    ) -> axum::Json<serde_json::Value> {
+        if let Some(value) = headers.get(axum::http::header::AUTHORIZATION) {
+            if let Ok(value) = value.to_str() {
+                *state.authorization.lock().unwrap() = Some(value.to_owned());
+            }
+        }
+        if !state.delay.is_zero() {
+            tokio::time::sleep(state.delay).await;
+        }
+        axum::Json(state.body.clone())
+    }
+
+    /// Start a fake child node API on an ephemeral loopback port.
+    async fn spawn_fake_child(
+        body: serde_json::Value,
+        delay: Duration,
+    ) -> (
+        u16,
+        Arc<std::sync::Mutex<Option<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::routing::get;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind fake child");
+        let port = listener.local_addr().expect("fake child addr").port();
+        let authorization = Arc::new(std::sync::Mutex::new(None));
+        let state = FakeChildState {
+            body,
+            delay,
+            authorization: Arc::clone(&authorization),
+        };
+        let app = axum::Router::new()
+            .route("/api/v1/connection", get(fake_child_handler))
+            .with_state(state);
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (port, authorization, task)
+    }
+
+    fn child_doc() -> serde_json::Value {
+        serde_json::json!({
+            "ok": true,
+            "node_id": "vm-a",
+            "profile": "vm",
+            "api_port": 7700,
+            "quic_port": 0,
+            "hid_udp_port": 7600,
+            "sink_kind": "qmp",
+            "hls": "running",
+            "webrtc": "not-configured",
+            "audio": "running",
+            "power": {"status": "running", "available": true},
+            "input": {"sink_kind": "qmp", "available": true, "injecting": true},
+            "api_token": "child-secret-that-must-not-leak"
+        })
     }
 
     fn manager_with_provisioner(
@@ -2404,6 +2855,172 @@ mod tests {
         assert!(excluded.excluded);
         assert!(excluded.skipped);
         assert_eq!(excluded.hid_udp_port, None);
+    }
+
+    #[tokio::test]
+    async fn child_poll_aggregates_connection_state_without_leaking_tokens() {
+        let (port, authorization, server) = spawn_fake_child(child_doc(), Duration::ZERO).await;
+        let launcher = Arc::new(FakeNodeLauncher::new());
+        let mut options = options(true);
+        options.node_http_base = port;
+        options.child_poll_interval = Duration::from_millis(50);
+        options.child_poll_timeout = Duration::from_millis(250);
+        options.child_api_token = "supervisor-token".to_owned();
+        let mgr = manager(options, launcher);
+
+        mgr.inner
+            .reconcile(vec![vm("vm-a", "/run/ozma/a.qmp")])
+            .await;
+        mgr.inner.supervise().await;
+        mgr.inner.poll_children().await;
+
+        let status = mgr.status().await;
+        assert_eq!(status.child_poll_interval_ms, 50);
+        assert_eq!(status.child_poll_timeout_ms, 250);
+        let child = status.vms[0].child.as_ref().expect("child summary");
+        assert!(child.reachable);
+        assert_eq!(child.node_id.as_deref(), Some("vm-a"));
+        assert_eq!(child.profile.as_deref(), Some("vm"));
+        assert_eq!(child.api_port, Some(7700));
+        assert_eq!(child.hls.as_deref(), Some("running"));
+        assert_eq!(child.webrtc.as_deref(), Some("not-configured"));
+        assert_eq!(child.audio.as_deref(), Some("running"));
+        assert_eq!(
+            child.power.as_ref().map(|power| power.state.as_str()),
+            Some("running")
+        );
+        assert_eq!(
+            child.input.as_ref().map(|input| input.kind.as_str()),
+            Some("qmp")
+        );
+        assert!(child.input.as_ref().unwrap().injecting);
+        assert!(!child.stale);
+        assert!(child.last_seen_unix_ms.unwrap() > 0);
+        assert!(child.last_poll_age_ms.is_some());
+
+        assert_eq!(
+            authorization.lock().unwrap().as_deref(),
+            Some("Bearer supervisor-token"),
+            "the configured supervisor token is sent to children"
+        );
+        let json = serde_json::to_string(&status).expect("serialize status");
+        assert!(!json.contains("supervisor-token"));
+        assert!(!json.contains("child-secret-that-must-not-leak"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn child_poll_timeout_is_reported_and_never_fabricates_state() {
+        let (port, _, server) = spawn_fake_child(child_doc(), Duration::from_millis(300)).await;
+        let launcher = Arc::new(FakeNodeLauncher::new());
+        let mut options = options(true);
+        options.node_http_base = port;
+        options.child_poll_interval = Duration::from_millis(20);
+        options.child_poll_timeout = Duration::from_millis(40);
+        let mgr = manager(options, launcher);
+
+        mgr.inner
+            .reconcile(vec![vm("vm-a", "/run/ozma/a.qmp")])
+            .await;
+        mgr.inner.supervise().await;
+        mgr.inner.poll_children().await;
+
+        let status = mgr.status().await;
+        let child = status.vms[0].child.as_ref().expect("poll record");
+        assert!(!child.reachable);
+        assert!(
+            child.hls.is_none(),
+            "a timeout must not fabricate HLS state"
+        );
+        assert!(child.input.is_none());
+        assert!(child.stale);
+        assert!(child.last_seen_age_ms.is_none());
+        let error = child.last_error.as_deref().unwrap_or_default();
+        assert!(
+            error.contains("timed out"),
+            "unexpected timeout error: {error}"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn child_summary_becomes_stale_after_the_configured_interval() {
+        let (port, _, server) = spawn_fake_child(child_doc(), Duration::ZERO).await;
+        let launcher = Arc::new(FakeNodeLauncher::new());
+        let mut options = options(true);
+        options.node_http_base = port;
+        options.child_poll_interval = Duration::from_millis(20);
+        options.child_poll_timeout = Duration::from_millis(20);
+        let mgr = manager(options, launcher);
+
+        mgr.inner
+            .reconcile(vec![vm("vm-a", "/run/ozma/a.qmp")])
+            .await;
+        mgr.inner.supervise().await;
+        mgr.inner.poll_children().await;
+
+        // stale_after is interval * 2 + timeout (60 ms here).
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let status = mgr.status().await;
+        let child = status.vms[0].child.as_ref().expect("poll record");
+        assert!(
+            child.reachable,
+            "the last successful poll is still reachable"
+        );
+        assert!(
+            child.stale,
+            "the cached summary is older than the threshold"
+        );
+        assert!(child.last_seen_age_ms.unwrap_or_default() >= 60);
+        assert!(child.last_seen_unix_ms.unwrap() > 0);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn child_aggregation_is_absent_when_polling_is_disabled() {
+        let launcher = Arc::new(FakeNodeLauncher::new());
+        let mgr = manager(options(true), launcher);
+
+        mgr.inner
+            .reconcile(vec![vm("vm-a", "/run/ozma/a.qmp")])
+            .await;
+        mgr.inner.supervise().await;
+
+        let status = mgr.status().await;
+        assert_eq!(status.child_poll_interval_ms, 0);
+        assert!(status.vms[0].child.is_none());
+        let metrics = crate::status::render_metrics(&status);
+        assert!(
+            !metrics.contains("ozma_supervisor_vm_child_up"),
+            "disabled child polling must not emit child metrics"
+        );
+    }
+
+    #[test]
+    fn validate_child_poll_timeout_only_when_polling_is_enabled() {
+        let disabled = VirtualNodeManager::new(ManagerOptions {
+            child_poll_interval: Duration::ZERO,
+            child_poll_timeout: Duration::ZERO,
+            ..options(true)
+        });
+        assert!(disabled.validate().is_ok());
+
+        let missing_timeout = VirtualNodeManager::new(ManagerOptions {
+            child_poll_interval: Duration::from_millis(500),
+            child_poll_timeout: Duration::ZERO,
+            ..options(true)
+        });
+        assert!(missing_timeout.validate().is_err());
+
+        let enabled = VirtualNodeManager::new(ManagerOptions {
+            child_poll_interval: Duration::from_millis(500),
+            child_poll_timeout: Duration::from_millis(250),
+            ..options(true)
+        });
+        assert!(enabled.validate().is_ok());
     }
 
     #[tokio::test]

@@ -19,6 +19,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use http_body_util::BodyExt;
 use ozma_capture::{CaptureRegistry, FakeCaptureProvider};
+use ozma_display::vm::VmConsoleBackend;
 use ozma_input::{FakeInputSink, InputSink, RecordingSink, SharedSink};
 use ozma_media::{CaptureSource, Frame, FrameFormat, MediaError};
 use ozma_node::api;
@@ -28,6 +29,7 @@ use ozma_node::controller_compat::{
     SINK_FAKE_RECORDING,
 };
 use ozma_node::display_compat::SnapshotControl;
+use ozma_node::display_outputs::outputs_from_specs;
 use ozma_node::hls::{
     ffmpeg_argv, stream_router, FfmpegSpawner, FrameSink, HlsConfig, HlsController, HlsEncoder,
     HlsSourceFactory, HlsStatus, SpawnedFfmpeg,
@@ -192,6 +194,34 @@ fn minimal_registration_keeps_the_required_controller_fields() {
             "port": HID_PORT,
         })
     );
+}
+
+#[test]
+fn multi_display_registration_carries_validated_console_outputs() {
+    let specs = vec![
+        "0:Console_0:1920x1080:primary:dbus".to_owned(),
+        "1:Console_1:1280x1024:dbus".to_owned(),
+    ];
+    let selection = outputs_from_specs(&specs, VmConsoleBackend::Dbus, Some("dbus0"), Some(1))
+        .expect("valid multi-console topology");
+    assert_eq!(selection.active_console, 1);
+
+    let mut txt = hardware_txt();
+    txt.insert("display_outputs".into(), selection.to_json());
+    let payload = registration::registration_payload(NODE_ID, HOST, HID_PORT, &txt);
+
+    let displays: Value =
+        serde_json::from_str(payload["display_outputs"].as_str().unwrap()).unwrap();
+    assert_eq!(displays.as_array().unwrap().len(), 2);
+    assert_eq!(displays[0]["index"], 0);
+    assert_eq!(displays[0]["source_type"], "dbus");
+    assert_eq!(displays[0]["capture_source_id"], "");
+    assert_eq!(displays[0]["primary"], true);
+    assert_eq!(displays[1]["index"], 1);
+    assert_eq!(displays[1]["capture_source_id"], "dbus0");
+    assert_eq!(displays[1]["width"], 1280);
+    assert_eq!(displays[1]["height"], 1024);
+    assert_eq!(displays[1]["primary"], false);
 }
 
 #[derive(Clone, Default)]

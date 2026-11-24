@@ -25,6 +25,21 @@ use crate::transport::QuicRuntime;
 #[cfg(feature = "webtransport")]
 use crate::transport::WebTransportRuntime;
 
+/// Attach the host's detected encoders only when a real capture source exists.
+///
+/// `SessionBackend::with_encoder_registry` replaces the advertised `encode`
+/// list. Attaching it unconditionally would make a node whose portal handshake
+/// was denied (or whose X display/VM target is absent) look like it can encode
+/// video. No source means no encode claim.
+async fn backend_with_encoders(backend: SessionBackend) -> SessionBackend {
+    if backend.capabilities().capture.is_empty() {
+        backend.with_encoder_registry(EncoderRegistry::new())
+    } else {
+        let encoders = EncoderRegistry::with_detected_encoders().await;
+        backend.with_encoder_registry(encoders)
+    }
+}
+
 /// Run the node API and QUIC listener until either fails.
 pub async fn serve(
     port: u16,
@@ -114,8 +129,7 @@ pub async fn serve_with_scene_replay_and_sink(
     capture_registry: Option<ozma_capture::CaptureRegistry>,
     hls_dir: Option<std::path::PathBuf>,
 ) -> Result<()> {
-    let encoders = EncoderRegistry::with_detected_encoders().await;
-    let backend = SessionBackend::new(capabilities, consent_policy).with_encoder_registry(encoders);
+    let backend = backend_with_encoders(SessionBackend::new(capabilities, consent_policy)).await;
     let backend = match capture_registry {
         Some(captures) => backend.with_capture_registry(captures),
         None => backend,
@@ -365,6 +379,23 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn no_capture_source_does_not_advertise_encoders() {
+        let mut capabilities = NodeCapabilities::fake("no-capture");
+        capabilities.capture.clear();
+        capabilities.encode.clear();
+        let backend = backend_with_encoders(SessionBackend::new(
+            capabilities,
+            ConsentPolicy::for_machine(MachineClass::Server),
+        ))
+        .await;
+        assert!(backend.capabilities().capture.is_empty());
+        assert!(
+            backend.capabilities().encode.is_empty(),
+            "detected encoders must not be advertised without a capture source"
+        );
     }
 
     #[tokio::test]
@@ -911,6 +942,8 @@ mod tests {
             ("GET", "/codec"),
             ("GET", "/display/mjpeg"),
             ("GET", "/usb"),
+            ("POST", "/usb/media/attach"),
+            ("POST", "/usb/media/detach"),
             ("POST", "/input/key"),
             ("POST", "/audio/apply"),
             ("POST", "/webrtc/offer"),

@@ -935,6 +935,19 @@ select option { background: var(--surface); }
     </div>
   </div>
 
+  <!-- Virtual machines (read-only supervisor view) -->
+  <div class="panel full-width" id="panel-vms" data-mode="advanced">
+    <div class="panel-head">
+      <h2>Virtual Machines</h2><span class="count" id="vm-count">0</span>
+      <div class="panel-actions">
+        <button class="btn sm" id="btn-vms-refresh" title="Refresh supervisor status">↺</button>
+      </div>
+    </div>
+    <div class="panel-body">
+      <div id="vms-list"><div class="empty">Supervisor status not loaded</div></div>
+    </div>
+  </div>
+
   <!-- Streams -->
   <div class="panel" id="panel-streams" data-mode="advanced">
     <div class="panel-head">
@@ -1468,6 +1481,7 @@ let scenarios = {};   // id → Scenario
 let streams   = {};   // node_id → stream info
 let activeNodeId     = null;
 let activeScenarioId = null;
+let vmSupervisor     = null;  // last /supervisor/status document
 let eventCount = 0;
 const MAX_EVENTS = 100;
 
@@ -1554,6 +1568,7 @@ async function loadAll() {
     renderStreams();
     renderAudio();
     renderAudioSimple();
+    fetchVMs();
     initSimpleMicSelector();
     fetchAllAudioDevices();
     fetchCaptures();
@@ -1939,6 +1954,79 @@ function renderNodes() {
 
   // Populate node dropdowns
   populateNodeSelects();
+}
+
+// ── Render: supervisor multi-VM view ─────────────────────────────────────────
+async function fetchVMs() {
+  const list = $('vms-list');
+  if (!list) return;
+  try {
+    const data = await api('GET', '/supervisor/status');
+    vmSupervisor = data && data.status ? data.status : null;
+    renderVMs();
+  } catch (e) {
+    vmSupervisor = null;
+    $('vm-count').textContent = '0';
+    const detail = (e && (e.detail || e.message)) || 'unreachable';
+    list.innerHTML = `<div class="empty">Supervisor unavailable — ${esc(detail)}</div>`;
+  }
+}
+
+function vmAge(ms) {
+  const value = Number(ms);
+  if (!Number.isFinite(value) || value < 0) return '—';
+  if (value < 1000) return `${Math.round(value)} ms ago`;
+  if (value < 60000) return `${(value / 1000).toFixed(1)} s ago`;
+  return `${Math.round(value / 60000)} min ago`;
+}
+
+function renderVMs() {
+  const list = $('vms-list');
+  if (!list) return;
+  const vms = vmSupervisor && Array.isArray(vmSupervisor.vms) ? vmSupervisor.vms : [];
+  $('vm-count').textContent = vms.length;
+
+  if (!vms.length) {
+    list.innerHTML = '<div class="empty">No virtual machines reported</div>';
+    return;
+  }
+
+  list.innerHTML = vms.map(vm => {
+    const ports = [
+      vm.http_port != null ? `HTTP ${vm.http_port}` : '',
+      vm.hid_udp_port != null ? `HID ${vm.hid_udp_port}` : '',
+    ].filter(Boolean).join(' · ');
+    const child = vm.child || null;
+    const signals = child ? [
+      child.reachable ? 'API up' : 'API down',
+      child.hls ? `HLS ${child.hls}` : '',
+      child.webrtc ? `WebRTC ${child.webrtc}` : '',
+      child.audio ? `Audio ${child.audio}` : '',
+      child.power && child.power.state ? `Power ${child.power.state}` : '',
+      child.input ? `Input ${child.input.kind}${child.input.injecting ? '' : ' (not injecting)'}` : '',
+    ].filter(Boolean) : [];
+    const seen = child
+      ? (child.last_seen_age_ms != null ? vmAge(child.last_seen_age_ms) : 'never')
+      : '';
+    const stale = child && child.stale;
+    return `<div class="node-card" data-vm="${esc(vm.name)}">
+      <div class="node-card-top">
+        <div class="node-status-dot ${vm.state === 'running' ? 'online' : ''}"></div>
+        <div class="node-name" title="${esc(vm.name)}">${esc(vm.name)}</div>
+        <span class="node-active-badge">${esc(vm.state)}</span>
+        ${stale ? '<span class="node-active-badge" style="background:var(--red)">stale</span>' : ''}
+      </div>
+      <div class="node-meta">
+        <div class="kv"><span class="k">ports</span><span class="v">${esc(ports || '—')}</span></div>
+        <div class="kv"><span class="k">qmp</span><span class="v">${esc(vm.qmp_socket || '—')}</span></div>
+        <div class="kv"><span class="k">child</span><span class="v">${esc(signals.join(' · ') || 'not polled')}</span></div>
+        <div class="kv"><span class="k">last seen</span><span class="v">${esc(seen || '—')}</span></div>
+        ${child && child.last_error
+          ? `<div class="kv"><span class="k">error</span><span class="v" style="color:var(--red)">${esc(child.last_error)}</span></div>`
+          : ''}
+      </div>
+    </div>`;
+  }).join('');
 }
 
 // ── Audio state from PipeWire watcher ─────────────────────────────────────────
@@ -3509,6 +3597,7 @@ $('modal-overlay').addEventListener('click', e => {
 
 // ── Refresh button ────────────────────────────────────────────────────────────
 $('btn-refresh').addEventListener('click', loadAll);
+$('btn-vms-refresh').addEventListener('click', fetchVMs);
 $('btn-clear-events').addEventListener('click', () => {
   $('events-list').innerHTML = '<div class="empty">Cleared</div>';
   eventCount = 0;
@@ -4607,6 +4696,7 @@ function doorbellDismiss() {
 setMode(currentMode);
 connect();
 setInterval(fetchServices, 30000);
+setInterval(fetchVMs, 10000);
 </script>
 </body>
 </html>

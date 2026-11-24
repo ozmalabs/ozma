@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! `ozma-capture` — capture-source discovery, real V4L2 MMAP capture, the
-//! deterministic fake path, and VM display providers.
+//! deterministic fake path, VM display providers, X11 `x11grab`, and the XDG
+//! Desktop Portal ScreenCast client.
 //!
 //! This crate is `unsafe`-free except for one isolated module. V4L2 discovery
 //! reads `/dev` and sysfs without opening a device; opening a source uses the
@@ -20,6 +21,21 @@
 //! On Linux the optional [`PipeWireCaptureProvider`] adds graph-native video
 //! capture without replacing V4L2. [`CaptureRegistry::system`] remains
 //! V4L2-only; [`CaptureRegistry::system_with_pipewire`] registers both.
+//!
+//! Desktop capture has two opt-in paths, neither in a `system*` default:
+//!
+//! * [`x11`] runs ffmpeg's `x11grab` input against an explicitly configured X
+//!   display and returns packed RGB24 frames ([`X11CaptureSource`]). Register
+//!   it with [`CaptureRegistry::with_x11_display`]. Enumeration never probes
+//!   the X server or spawns ffmpeg.
+//! * [`portal`] (Linux, `portal` feature) performs the bounded
+//!   `org.freedesktop.portal.ScreenCast` consent/selection handshake. The
+//!   selected monitor/window is a PipeWire node; [`PortalCaptureProvider`]
+//!   opens it through the existing PipeWire path and holds the portal's
+//!   `OpenPipeWireRemote` fd for the session. Register it with
+//!   [`CaptureRegistry::with_portal_capture`] after
+//!   [`PortalScreenCast::request_stream`]. A denied consent, missing bus, or
+//!   missing fd is a typed error, never a synthetic source.
 //!
 //! VM display paths live in provider modules that are not registered in
 //! [`CaptureRegistry::system`] by default:
@@ -77,6 +93,11 @@ pub mod v4l2;
 // module name and file (`virtual.rs`) while still compiling.
 pub mod r#virtual;
 pub mod vnc_display;
+pub mod x11;
+
+/// XDG Desktop Portal ScreenCast client (Linux, optional `portal` feature).
+#[cfg(all(target_os = "linux", feature = "portal"))]
+pub mod portal;
 
 pub use dbus_display::{
     DBusDisplayConfig, DBusDisplayProvider, DBusDisplaySource, DBusError, DBusHeader, DBusMessage,
@@ -101,6 +122,18 @@ pub use pipewire::{
     capability_for, capability_id, map_pipewire_error, target_for_capability, target_matches,
     PipeWireCaptureProvider, PipeWireCaptureSource, PipeWireOptions,
 };
+/// XDG Desktop Portal ScreenCast client and provider.
+#[cfg(all(target_os = "linux", feature = "portal"))]
+pub use portal::{
+    portal_request_path, PortalCaptureConfig, PortalCaptureProvider, PortalCaptureSource,
+    PortalConfig, PortalCursorMode, PortalError, PortalPreflight, PortalResults, PortalScreenCast,
+    PortalSourceType, PortalStream, PortalStreamInfo, PortalTransport, ZbusPortalTransport,
+    MAX_PORTAL_DIMENSION, MIN_SCREENCAST_VERSION, PORTAL_BUS_NAME, PORTAL_DEFAULT_FPS,
+    PORTAL_DEFAULT_HEIGHT, PORTAL_DEFAULT_ID, PORTAL_DEFAULT_NAME,
+    PORTAL_DEFAULT_PREFLIGHT_TIMEOUT, PORTAL_DEFAULT_RESPONSE_TIMEOUT, PORTAL_DEFAULT_WIDTH,
+    PORTAL_OBJECT_PATH, REQUEST_INTERFACE, SCREENCAST_INTERFACE, SCREENCAST_VERSION_VIRTUAL,
+    SESSION_INTERFACE,
+};
 pub use provider::{CaptureProvider, CaptureRegistry, CaptureScan};
 pub use qmp_display::{
     parse_ppm_p6, QmpDisplayConfig, QmpDisplayProvider, QmpDisplaySource, MAX_PPM_DIMENSION,
@@ -124,6 +157,12 @@ pub use vnc_display::{
     VncDisplaySource, VncSpawner, MAX_STDERR_BYTES, MAX_VNC_DIMENSION, VNC_DEFAULT_CONNECT_TIMEOUT,
     VNC_DEFAULT_FFMPEG_BIN, VNC_DEFAULT_FPS, VNC_DEFAULT_HEIGHT, VNC_DEFAULT_HOST, VNC_DEFAULT_ID,
     VNC_DEFAULT_NAME, VNC_DEFAULT_PORT, VNC_DEFAULT_WIDTH,
+};
+pub use x11::{
+    ffmpeg_argv as x11_ffmpeg_argv, x11grab_argv, ProcessX11Spawner, X11CaptureConfig,
+    X11CaptureProvider, X11CaptureSource, X11Child, X11Spawner, MAX_X11_DIMENSION, MAX_X11_FPS,
+    X11_DEFAULT_CONNECT_TIMEOUT, X11_DEFAULT_FFMPEG_BIN, X11_DEFAULT_FPS, X11_DEFAULT_HEIGHT,
+    X11_DEFAULT_ID, X11_DEFAULT_NAME, X11_DEFAULT_WIDTH, X11_MAX_STDERR_BYTES,
 };
 
 /// Re-export of the capture vocabulary callers need alongside this crate.
@@ -328,5 +367,68 @@ mod tests {
             .scan()
             .iter()
             .all(|scan| scan.kind != CaptureKind::Vnc));
+    }
+
+    #[test]
+    fn x11_display_is_opt_in_and_registry_driven() {
+        let registry = CaptureRegistry::new().with_x11_display(
+            X11CaptureConfig::new(":0")
+                .with_dimensions(640, 480)
+                .with_fps(10),
+        );
+        assert_eq!(registry.provider_count(), 1);
+        let scans = registry.scan();
+        assert_eq!(scans[0].kind, CaptureKind::X11);
+        assert_eq!(scans[0].capabilities.len(), 1);
+        assert_eq!(scans[0].capabilities[0].id, X11_DEFAULT_ID);
+        assert_eq!(scans[0].capabilities[0].formats, vec!["rgb24".to_owned()]);
+
+        // No hardware/VM registry acquires an X11 provider implicitly.
+        assert!(CaptureRegistry::system()
+            .scan()
+            .iter()
+            .all(|scan| scan.kind != CaptureKind::X11));
+        assert!(CaptureRegistry::system_with_pipewire()
+            .scan()
+            .iter()
+            .all(|scan| scan.kind != CaptureKind::X11));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "portal"))]
+    #[test]
+    fn portal_capture_is_opt_in_and_registry_driven() {
+        use crate::portal::{
+            PortalCaptureConfig, PortalCaptureProvider, PortalStream, PortalStreamInfo,
+        };
+
+        let fd = std::fs::File::open("/dev/null").unwrap();
+        let stream = PortalStream {
+            session_handle: "/org/freedesktop/portal/desktop/session/1_1/ozma".to_owned(),
+            streams: vec![PortalStreamInfo {
+                node_id: 7,
+                position: None,
+                size: None,
+                source_type: Some(1),
+                mapping_id: None,
+            }],
+            pipewire_fd: Some(fd.into()),
+            pipewire_fd_error: None,
+            restore_token: None,
+            keepalive: None,
+        };
+        let provider = PortalCaptureProvider::new(PortalCaptureConfig::default(), stream);
+        let mut registry = CaptureRegistry::new();
+        registry.register(provider);
+
+        let scans = registry.scan();
+        assert_eq!(scans[0].kind, CaptureKind::PipeWire);
+        assert_eq!(scans[0].capabilities.len(), 1);
+        assert_eq!(scans[0].capabilities[0].id, "portal0");
+        assert_eq!(scans[0].capabilities[0].kind, CaptureKind::PipeWire);
+
+        assert!(CaptureRegistry::system()
+            .scan()
+            .iter()
+            .all(|scan| scan.capabilities.iter().all(|cap| cap.id != "portal0")));
     }
 }

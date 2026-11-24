@@ -80,6 +80,13 @@ class Config:
     # historical iceServers: [] behavior. TURN credentials are client-visible by
     # design; do not log this value.
     webrtc_ice_servers: str = ""
+    # Read-only supervisor status document URL, for example
+    # http://127.0.0.1:9555/status. Empty disables the controller multi-VM view.
+    # The controller never appends routes or probes the supervisor's children.
+    supervisor_status_url: str = ""
+    # Optional bearer token sent to the supervisor status URL. Never returned to
+    # the browser or logged.
+    supervisor_status_token: str = ""
 
     # mDNS
     mdns_service_type: str = "_ozma._udp.local."
@@ -151,6 +158,8 @@ class Config:
             node_api_token=os.environ.get("OZMA_NODE_API_TOKEN", ""),
             node_token_store=os.environ.get("OZMA_NODE_TOKEN_STORE", ""),
             webrtc_ice_servers=os.environ.get("OZMA_WEBRTC_ICE_SERVERS", ""),
+            supervisor_status_url=os.environ.get("OZMA_SUPERVISOR_STATUS_URL", ""),
+            supervisor_status_token=os.environ.get("OZMA_SUPERVISOR_STATUS_TOKEN", ""),
             keyboard_device=os.environ.get("OZMA_KBD_DEVICE"),
             mouse_device=os.environ.get("OZMA_MOUSE_DEVICE"),
             virtual_only=os.environ.get("OZMA_VIRTUAL_ONLY", "").lower() in ("1", "true", "yes"),

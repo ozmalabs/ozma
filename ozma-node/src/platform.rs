@@ -4,13 +4,15 @@
 //! Real V4L2/encoder probes plug in here without changing the API.
 
 use ozma_protocol::{
-    AudioCapability, Codec, EncodeCapability, EncoderBackend, InputCapability, NodeCapabilities,
-    NodeId, PowerCapability, ResourceBudget, TransportMode, UsbCapability, VirtualDisplayCaps,
+    AudioCapability, CaptureKind, Codec, EncodeCapability, EncoderBackend, InputCapability,
+    NodeCapabilities, NodeId, PowerCapability, ResourceBudget, TransportMode, UsbCapability,
+    VirtualDisplayCaps,
 };
 
 use ozma_capture::{
-    CaptureRegistry, DBusDisplayConfig, FakeCaptureProvider, QmpDisplayConfig, VncDisplayConfig,
-    DBUS_DEFAULT_ID, QMP_DEFAULT_ID, QMP_DEFAULT_MAX_FPS, VNC_DEFAULT_ID,
+    CaptureRegistry, DBusDisplayConfig, FakeCaptureProvider, LookingGlassProviderConfig,
+    QmpDisplayConfig, VncDisplayConfig, DBUS_DEFAULT_ID, QMP_DEFAULT_ID, QMP_DEFAULT_MAX_FPS,
+    VNC_DEFAULT_ID,
 };
 use ozma_input::SinkKind;
 use ozma_media::FrameFormat;
@@ -47,38 +49,105 @@ pub fn capture_registry_with_qmp_shared(
     }
 }
 
+/// Build the capture registry for a desktop node with a pre-resolved portal
+/// stream.
+///
+/// The portal consent/selection handshake is asynchronous and may prompt the
+/// user, so `main` runs it before this point. `None` means the handshake was not
+/// requested, or it was denied/timed out/unavailable: the desktop registry then
+/// contains no portal provider and the node advertises no capture. It never
+/// falls back to X11, a camera, or the synthetic source.
+#[cfg(target_os = "linux")]
+pub fn capture_registry_with_portal(
+    config: &NodeConfig,
+    shared: Option<&SharedQmpClient>,
+    portal: Option<ozma_capture::PortalStream>,
+) -> CaptureRegistry {
+    match config.profile {
+        NodeProfile::Vm => vm_capture_registry(config, shared),
+        NodeProfile::Desktop => desktop_capture_registry_with_portal(config, portal),
+        NodeProfile::Hardware => CaptureRegistry::system_with_pipewire(),
+    }
+}
+
 /// The desktop profile's capture registry.
 ///
-/// Real desktop capture is PipeWire only: a ScreenCast portal session exposes
-/// the selected monitor as a normal `Video/Source` node, and `--desktop-capture-target`
-/// names that node. The portal consent/selection handshake is not implemented
-/// here (it belongs in a separate front-end); without it the graph default is
-/// used and the discovered node is advertised truthfully, not relabelled as a
-/// screen. V4L2 is deliberately absent: a desktop seat's camera is not its
-/// screen. X11 capture is not implemented.
+/// Real desktop capture is selected by the same pure resolver used for logs and
+/// `/api/v1/connection`:
+///
+/// * `pipewire` opens `--desktop-capture-target`;
+/// * `x11` runs ffmpeg's `x11grab` on an explicitly named `--x11-display`;
+/// * `portal` uses the already-resolved ScreenCast stream;
+/// * `fake` is the explicit dev/test source;
+/// * no provider is an empty registry.
+///
+/// V4L2 is deliberately absent: a desktop seat's camera is not its screen. A
+/// portal denial/timeout leaves an empty registry rather than a fake source.
 fn desktop_capture_registry(config: &NodeConfig) -> CaptureRegistry {
-    if config.fake_capture_requested() {
-        return fake_capture_registry(config);
-    }
-
     #[cfg(target_os = "linux")]
     {
-        let options = ozma_capture::PipeWireOptions {
-            target: stream_target_for(&config.desktop_capture_target),
-            remote: config.desktop_capture_remote.clone(),
-            width: config.desktop_capture_width,
-            height: config.desktop_capture_height,
-            fps: config.desktop_capture_fps,
-            ..ozma_capture::PipeWireOptions::default()
-        };
-        CaptureRegistry::new().with(ozma_capture::PipeWireCaptureProvider::with_options(options))
+        desktop_capture_registry_with_portal(config, None)
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        // PipeWire screen capture is Linux-only and there is no honest
-        // non-Linux desktop capture provider in this build.
-        CaptureRegistry::new()
+        desktop_capture_registry_common(config)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn desktop_capture_registry_with_portal(
+    config: &NodeConfig,
+    portal: Option<ozma_capture::PortalStream>,
+) -> CaptureRegistry {
+    let selection = match config.desktop_providers() {
+        Ok(providers) => providers.capture,
+        Err(error) => {
+            tracing::warn!(error = %error, "desktop capture: provider selection is invalid");
+            return CaptureRegistry::new();
+        }
+    };
+    match selection {
+        crate::config::DesktopCaptureSelection::PipeWire(target) => {
+            let options = ozma_capture::PipeWireOptions {
+                target: stream_target_for(&target),
+                remote: config.desktop_capture_remote.clone(),
+                width: config.desktop_capture_width,
+                height: config.desktop_capture_height,
+                fps: config.desktop_capture_fps,
+                ..ozma_capture::PipeWireOptions::default()
+            };
+            CaptureRegistry::new()
+                .with(ozma_capture::PipeWireCaptureProvider::with_options(options))
+        }
+        crate::config::DesktopCaptureSelection::X11(x11) => {
+            CaptureRegistry::new().with_x11_display(x11)
+        }
+        crate::config::DesktopCaptureSelection::Portal(options) => match portal {
+            Some(stream) => {
+                CaptureRegistry::new().with_portal_capture(portal_capture_config(&options), stream)
+            }
+            None => CaptureRegistry::new(),
+        },
+        crate::config::DesktopCaptureSelection::Fake => fake_capture_registry(config),
+        crate::config::DesktopCaptureSelection::None => CaptureRegistry::new(),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn desktop_capture_registry_common(config: &NodeConfig) -> CaptureRegistry {
+    let selection = match config.desktop_providers() {
+        Ok(providers) => providers.capture,
+        Err(_) => return CaptureRegistry::new(),
+    };
+    match selection {
+        crate::config::DesktopCaptureSelection::X11(x11) => {
+            CaptureRegistry::new().with_x11_display(x11)
+        }
+        crate::config::DesktopCaptureSelection::Fake => fake_capture_registry(config),
+        // PipeWire/portal are Linux-only; there is no honest non-Linux desktop
+        // capture provider in this build.
+        _ => CaptureRegistry::new(),
     }
 }
 
@@ -90,6 +159,85 @@ fn stream_target_for(target: &crate::config::DesktopCaptureTarget) -> ozma_captu
             ozma_capture::StreamTarget::Object(name.clone())
         }
         crate::config::DesktopCaptureTarget::NodeId(id) => ozma_capture::StreamTarget::NodeId(*id),
+    }
+}
+
+/// Translate the node's portal source choice into the capture crate's enum.
+#[cfg(target_os = "linux")]
+pub fn portal_source_type(kind: crate::config::PortalSourceKind) -> ozma_capture::PortalSourceType {
+    match kind {
+        crate::config::PortalSourceKind::Monitor => ozma_capture::PortalSourceType::Monitor,
+        crate::config::PortalSourceKind::Window => ozma_capture::PortalSourceType::Window,
+        crate::config::PortalSourceKind::Virtual => ozma_capture::PortalSourceType::Virtual,
+    }
+}
+
+/// Translate the node's cursor choice into the capture crate's enum.
+#[cfg(target_os = "linux")]
+pub fn portal_cursor_mode(kind: crate::config::PortalCursorKind) -> ozma_capture::PortalCursorMode {
+    match kind {
+        crate::config::PortalCursorKind::Hidden => ozma_capture::PortalCursorMode::Hidden,
+        crate::config::PortalCursorKind::Embedded => ozma_capture::PortalCursorMode::Embedded,
+        crate::config::PortalCursorKind::Metadata => ozma_capture::PortalCursorMode::Metadata,
+    }
+}
+
+/// Build the bounded portal consent/selection configuration.
+#[cfg(target_os = "linux")]
+pub fn portal_screencast_config(
+    options: &crate::config::PortalCaptureOptions,
+) -> ozma_capture::PortalConfig {
+    ozma_capture::PortalConfig {
+        source: portal_source_type(options.source),
+        multiple: false,
+        cursor_mode: portal_cursor_mode(options.cursor),
+        restore_token: options.restore_token.clone(),
+        response_timeout: options.timeout,
+        // The availability probe must not outlive the user's configured bound.
+        preflight_timeout: options
+            .timeout
+            .min(ozma_capture::PORTAL_DEFAULT_PREFLIGHT_TIMEOUT),
+    }
+}
+
+/// Build the provider config for an already-selected portal stream.
+#[cfg(target_os = "linux")]
+pub fn portal_capture_config(
+    options: &crate::config::PortalCaptureOptions,
+) -> ozma_capture::PortalCaptureConfig {
+    ozma_capture::PortalCaptureConfig::default()
+        .with_identity(
+            ozma_capture::PORTAL_DEFAULT_ID,
+            ozma_capture::PORTAL_DEFAULT_NAME,
+        )
+        .with_mode(options.width, options.height, options.fps)
+        .with_require_pipewire_fd(true)
+}
+
+/// Run the portal handshake and turn a denial/timeout/missing portal into a
+/// warned no-capture state.
+///
+/// This is the only asynchronous capture step in the desktop profile. It runs
+/// in `main` before the registry is built, never during enumeration. The
+/// returned stream owns the portal D-Bus connection and `OpenPipeWireRemote` fd
+/// for the provider's lifetime.
+#[cfg(target_os = "linux")]
+pub async fn acquire_portal_stream(
+    portal: &ozma_capture::PortalScreenCast,
+) -> Option<ozma_capture::PortalStream> {
+    match portal.request_stream().await {
+        Ok(stream) => Some(stream),
+        Err(error) => {
+            let api = error.to_api_error();
+            tracing::warn!(
+                code = %api.code,
+                error = %error,
+                "portal ScreenCast: consent was denied, timed out, or the portal is unavailable. \
+                 The node keeps running without capture; no X11, camera, or fake source is \
+                 substituted."
+            );
+            None
+        }
     }
 }
 
@@ -161,6 +309,22 @@ fn vm_capture_registry(config: &NodeConfig, shared: Option<&SharedQmpClient>) ->
                     None => CaptureRegistry::new().with_dbus_display(display),
                 }
             }
+            None => CaptureRegistry::new(),
+        },
+        // GPU passthrough: QEMU publishes the guest framebuffer through an
+        // IVSHMEM region instead of an emulated display. Discovery reads only
+        // the KVMFR header; a missing file, foreign magic, or a region without
+        // a published frame yields no source (never a synthetic frame). The
+        // provider is registered explicitly here, not in `system*`.
+        Some("looking-glass") => match &config.looking_glass_shm {
+            Some(shm) => CaptureRegistry::new().with_looking_glass(
+                LookingGlassProviderConfig::new(shm.clone())
+                    .with_identity(
+                        config.looking_glass_id.clone(),
+                        config.looking_glass_name.clone(),
+                    )
+                    .with_fps(config.looking_glass_fps),
+            ),
             None => CaptureRegistry::new(),
         },
         _ => CaptureRegistry::new(),
@@ -400,12 +564,17 @@ fn detect_base(config: &NodeConfig, capture: &CaptureRegistry) -> NodeCapabiliti
             .map(|mut source| {
                 // Discovery reads sysfs, which does not expose modes. Advertise
                 // a conservative ceiling until the source is opened, rather
-                // than pretending a 0x0 mode is usable.
-                if source.max_width == 0 {
-                    source.max_width = 1920;
-                }
-                if source.max_height == 0 {
-                    source.max_height = 1080;
+                // than pretending a 0x0 mode is usable. Looking Glass is the
+                // exception: a placeholder KVMFR region has no published frame
+                // yet, so its unknown geometry stays 0x0 instead of becoming an
+                // invented 1080p mode.
+                if source.kind != CaptureKind::LookingGlass {
+                    if source.max_width == 0 {
+                        source.max_width = 1920;
+                    }
+                    if source.max_height == 0 {
+                        source.max_height = 1080;
+                    }
                 }
                 if source.max_fps == 0 {
                     source.max_fps = 30;
@@ -441,13 +610,11 @@ fn detect_base(config: &NodeConfig, capture: &CaptureRegistry) -> NodeCapabiliti
         caps.input = InputCapability::default();
     }
 
-    if config.has_capability("usb") {
-        caps.usb = UsbCapability {
-            gadget: true,
-            usbip: false,
-            virtual_media: false,
-        };
-    }
+    // The `usb` capability string is only configuration intent. The node
+    // advertises USB after it actually creates and binds a gadget in `main`;
+    // a bare `cap` entry must never claim ConfigFS support that failed to
+    // initialise.
+    caps.usb = UsbCapability::default();
 
     if config
         .vm_providers()
@@ -470,7 +637,11 @@ fn detect_base(config: &NodeConfig, capture: &CaptureRegistry) -> NodeCapabiliti
         max_sessions: 1,
         max_tracks: 1,
         max_bitrate_kbps: 8_000,
-        max_remote_displays: 1,
+        // A multi-console VM advertises every head it knows about. This is a
+        // layout/selection count, not a claim that each head has a live capture
+        // source (only the selected console does).
+        max_remote_displays: u16::try_from(config.display_output_count().max(1))
+            .unwrap_or(u16::MAX),
     };
     caps
 }
@@ -523,6 +694,13 @@ mod tests {
             dbus_height: ozma_capture::DBUS_DEFAULT_HEIGHT,
             dbus_fps: ozma_capture::DBUS_DEFAULT_FPS,
             dbus_requested: false,
+            capture_console: None,
+            display_output_specs: Vec::new(),
+            display_outputs: Vec::new(),
+            looking_glass_shm: None,
+            looking_glass_fps: ozma_capture::LOOKING_GLASS_DEFAULT_FPS,
+            looking_glass_id: ozma_capture::LOOKING_GLASS_DEFAULT_ID.to_owned(),
+            looking_glass_name: ozma_capture::LOOKING_GLASS_DEFAULT_NAME.to_owned(),
             fake_width: crate::config::DEFAULT_FAKE_WIDTH,
             fake_height: crate::config::DEFAULT_FAKE_HEIGHT,
             fake_fps: crate::config::DEFAULT_FAKE_FPS,
@@ -531,6 +709,18 @@ mod tests {
             desktop_capture_fps: crate::config::DEFAULT_FAKE_FPS,
             desktop_capture_target: crate::config::DesktopCaptureTarget::Default,
             desktop_capture_remote: None,
+            x11_display: None,
+            x11_x: 0,
+            x11_y: 0,
+            x11_width: ozma_capture::X11_DEFAULT_WIDTH,
+            x11_height: ozma_capture::X11_DEFAULT_HEIGHT,
+            x11_fps: ozma_capture::X11_DEFAULT_FPS,
+            x11_requested: false,
+            portal_source_type: crate::config::PortalSourceKind::Monitor,
+            portal_cursor: crate::config::PortalCursorKind::Hidden,
+            portal_restore_token: None,
+            portal_timeout: ozma_capture::PORTAL_DEFAULT_RESPONSE_TIMEOUT,
+            portal_requested: false,
             audio_capture_target: ozma_audio::AudioTarget::Default,
             audio_router: crate::config::AudioRouterKind::None,
             audio_track_root: None,
@@ -543,7 +733,24 @@ mod tests {
             vm_guest_ip: None,
             display_outputs_json: "[]".into(),
             pci_devices_json: "[]".into(),
+            usb_gadget: false,
+            usb_configfs_root: std::path::PathBuf::from(crate::config::DEFAULT_USB_CONFIGFS_ROOT),
+            usb_udc: None,
+            usb_media: None,
+            usb_media_ro: false,
+            usb_media_cdrom: false,
         }
+    }
+
+    #[test]
+    fn usb_is_not_advertised_from_the_capability_string_alone() {
+        let registry = CaptureRegistry::new().with(FakeCaptureProvider::new());
+        let caps = detect_with_registry(&config("hid,video,audio,usb"), &registry);
+        // main.rs only sets this after a gadget is created and bound. A bare
+        // `cap` entry (or platform profile) must not claim USB support.
+        assert!(!caps.usb.gadget);
+        assert!(!caps.usb.virtual_media);
+        assert!(!caps.usb.usbip);
     }
 
     #[test]
@@ -676,6 +883,97 @@ mod tests {
         assert_eq!(caps.capture[0].kind, ozma_protocol::CaptureKind::Dbus);
 
         let _ = std::fs::remove_file(socket);
+    }
+
+    fn kvmfr_fixture(magic: bool) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "ozma-kvmfr-{}-{}.shm",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut region = vec![0u8; ozma_capture::lookingglass::FRAME_HEADER_OFFSET + 128];
+        if magic {
+            region[..8].copy_from_slice(b"KVMFR---");
+            region[8..12].copy_from_slice(&ozma_capture::lookingglass::KVMFR_VERSION.to_le_bytes());
+            region[12..16].copy_from_slice(&0u32.to_le_bytes());
+        }
+        std::fs::write(&path, &region).unwrap();
+        path
+    }
+
+    #[test]
+    fn vm_profile_registers_looking_glass_only_for_a_valid_kvmfr_region() {
+        let path = kvmfr_fixture(true);
+        let mut vm = config("hid,video,audio");
+        vm.profile = crate::config::NodeProfile::Vm;
+        vm.looking_glass_shm = Some(path.clone());
+
+        let registry = capture_registry(&vm);
+        assert_eq!(registry.provider_count(), 1);
+        let scans = registry.scan();
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].kind, ozma_protocol::CaptureKind::LookingGlass);
+        assert!(scans[0].error.is_none(), "{:?}", scans[0].error);
+        assert_eq!(scans[0].capabilities.len(), 1);
+        let capability = &scans[0].capabilities[0];
+        assert_eq!(capability.id, ozma_capture::LOOKING_GLASS_DEFAULT_ID);
+        // A placeholder KVMFR region has no published frame, so geometry stays
+        // unknown instead of being guessed.
+        assert!((capability.max_width, capability.max_height) == (0, 0));
+        assert!(capability.formats.is_empty());
+
+        let caps = detect_with_registry(&vm, &registry);
+        assert_eq!(caps.capture.len(), 1);
+        assert_eq!(
+            caps.capture[0].kind,
+            ozma_protocol::CaptureKind::LookingGlass
+        );
+        // The placeholder geometry is not upgraded to a guessed 1080p mode.
+        assert_eq!(
+            (caps.capture[0].max_width, caps.capture[0].max_height),
+            (0, 0)
+        );
+
+        // An absent region is "no source", not a hardware claim.
+        vm.looking_glass_shm = Some(path.with_extension("absent"));
+        let scans = capture_registry(&vm).scan();
+        assert_eq!(scans.len(), 1);
+        assert!(scans[0].capabilities.is_empty());
+        assert!(scans[0].error.is_none());
+        let caps = detect_with_registry(&vm, &CaptureRegistry::new());
+        assert!(caps.capture.is_empty());
+        assert!(caps.encode.is_empty());
+
+        // A foreign magic is also ignored rather than advertised.
+        let foreign = kvmfr_fixture(false);
+        vm.looking_glass_shm = Some(foreign.clone());
+        let scans = capture_registry(&vm).scan();
+        assert_eq!(scans.len(), 1);
+        assert!(scans[0].capabilities.is_empty());
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(foreign);
+    }
+
+    #[test]
+    fn multi_console_display_outputs_raise_the_remote_display_budget() {
+        let mut vm = config("hid,video,audio");
+        vm.profile = crate::config::NodeProfile::Vm;
+        vm.qmp_socket = Some(std::path::PathBuf::from("/run/ozma/ctrl.qmp"));
+        vm.display_output_specs = vec![
+            "0:Console_0:1920x1080:primary:qmp".into(),
+            "1:Console_1:1280x1024:qmp".into(),
+        ];
+        let selection = vm.resolve_display_outputs().unwrap();
+        let json = selection.to_json();
+        vm.display_outputs = selection.outputs;
+        vm.display_outputs_json = json;
+
+        let caps = detect_with_registry(&vm, &CaptureRegistry::new());
+        assert_eq!(caps.budget.max_remote_displays, 2);
     }
 
     #[test]
@@ -864,5 +1162,297 @@ mod tests {
         assert!(caps.capture.is_empty());
         assert!(caps.encode.is_empty());
         assert!(!caps.display.supported);
+    }
+
+    fn desktop_with_provider(provider: &str) -> NodeConfig {
+        let mut desktop = config("hid,video,audio");
+        desktop.profile = crate::config::NodeProfile::Desktop;
+        desktop.provider_overrides =
+            crate::config::ProviderOverrides::from_cli(provider, "", "", "", "");
+        desktop.providers = crate::config::ProviderSelection::for_profile(desktop.profile)
+            .with_overrides(&desktop.provider_overrides);
+        desktop
+    }
+
+    #[test]
+    fn desktop_x11_registry_advertises_x11_kind_and_geometry() {
+        let mut desktop = desktop_with_provider("x11");
+        desktop.x11_display = Some(":0".into());
+        desktop.x11_requested = true;
+        desktop.x11_x = 4;
+        desktop.x11_y = 8;
+        desktop.x11_width = 320;
+        desktop.x11_height = 240;
+        desktop.x11_fps = 12;
+
+        let registry = capture_registry(&desktop);
+        assert_eq!(registry.provider_count(), 1);
+        let scans = registry.scan();
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].kind, ozma_protocol::CaptureKind::X11);
+        assert!(scans[0].error.is_none());
+        assert_eq!(scans[0].capabilities.len(), 1);
+        let capability = &scans[0].capabilities[0];
+        assert_eq!(capability.id, ozma_capture::X11_DEFAULT_ID);
+        assert_eq!(capability.kind, ozma_protocol::CaptureKind::X11);
+        assert_eq!((capability.max_width, capability.max_height), (320, 240));
+        assert_eq!(capability.max_fps, 12);
+        assert_eq!(capability.formats, vec!["rgb24".to_owned()]);
+
+        // The advertised capability is a real desktop capture source.
+        let caps = detect_with_registry(&desktop, &registry);
+        assert_eq!(caps.capture.len(), 1);
+        assert!(!caps.encode.is_empty());
+    }
+
+    #[test]
+    fn desktop_x11_missing_display_is_a_configuration_error_not_a_registry_claim() {
+        let desktop = desktop_with_provider("x11");
+        let error = desktop.desktop_providers().unwrap_err();
+        assert!(error.contains("--x11-display"), "{error}");
+        assert!(desktop.validate().is_err());
+
+        // Even if a caller builds the registry without validating first, it
+        // advertises nothing rather than an ambient or fake X display.
+        let registry = capture_registry(&desktop);
+        assert_eq!(registry.provider_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn desktop_x11_missing_ffmpeg_is_a_typed_capture_failure() {
+        let mut desktop = desktop_with_provider("x11");
+        desktop.x11_display = Some(":0".into());
+        desktop.x11_requested = true;
+        desktop.ffmpeg_bin = std::path::PathBuf::from("/nonexistent/ozma-ffmpeg");
+        let registry = capture_registry(&desktop);
+        let capability = registry.scan()[0].capabilities[0].clone();
+        let mut source = registry.open(&capability).expect("source opens lazily");
+        let error = source
+            .next_frame()
+            .await
+            .expect_err("a missing ffmpeg must not produce a frame");
+        let message = error.to_string();
+        assert!(message.contains("could not start ffmpeg"), "{message}");
+        assert!(message.contains("/nonexistent/ozma-ffmpeg"), "{message}");
+    }
+
+    #[cfg(target_os = "linux")]
+    mod portal_tests {
+        use super::*;
+        use std::os::fd::OwnedFd;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use async_trait::async_trait;
+        use ozma_capture::{
+            PortalConfig, PortalError, PortalResults, PortalScreenCast, PortalSourceType,
+            PortalStream, PortalStreamInfo, PortalTransport,
+        };
+
+        #[derive(Clone, Copy)]
+        enum Failure {
+            Denied,
+            Timeout,
+            Missing,
+        }
+
+        struct FailureTransport {
+            failure: Failure,
+        }
+
+        #[async_trait]
+        impl PortalTransport for FailureTransport {
+            async fn name_owner(&self, _name: &str) -> Result<Option<String>, PortalError> {
+                match self.failure {
+                    Failure::Missing => Ok(None),
+                    Failure::Timeout => {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        Ok(Some(":1.42".into()))
+                    }
+                    Failure::Denied => Ok(Some(":1.42".into())),
+                }
+            }
+
+            async fn screencast_version(&self) -> Result<u32, PortalError> {
+                Ok(2)
+            }
+
+            async fn create_session(
+                &self,
+                _config: &PortalConfig,
+                _handle_token: &str,
+                _session_handle_token: &str,
+            ) -> Result<PortalResults, PortalError> {
+                match self.failure {
+                    Failure::Denied => Err(PortalError::Denied {
+                        stage: "CreateSession".into(),
+                    }),
+                    _ => panic!("preflight should have failed before CreateSession"),
+                }
+            }
+
+            async fn select_sources(
+                &self,
+                _session: &str,
+                _config: &PortalConfig,
+                _handle_token: &str,
+            ) -> Result<PortalResults, PortalError> {
+                Err(PortalError::Denied {
+                    stage: "SelectSources".into(),
+                })
+            }
+
+            async fn start(
+                &self,
+                _session: &str,
+                _config: &PortalConfig,
+                _handle_token: &str,
+            ) -> Result<PortalResults, PortalError> {
+                Err(PortalError::Denied {
+                    stage: "Start".into(),
+                })
+            }
+
+            async fn open_pipewire_remote(&self, _session: &str) -> Result<OwnedFd, PortalError> {
+                Err(PortalError::PipeWireFdUnavailable {
+                    message: "no fd in failure transport".into(),
+                })
+            }
+
+            async fn close_session(&self, _session: &str) {}
+        }
+
+        fn portal_client(failure: Failure, preflight: Duration) -> PortalScreenCast {
+            PortalScreenCast::with_transport(
+                PortalConfig {
+                    source: PortalSourceType::Monitor,
+                    preflight_timeout: preflight,
+                    response_timeout: Duration::from_millis(500),
+                    ..PortalConfig::default()
+                },
+                Arc::new(FailureTransport { failure }),
+            )
+            .expect("test portal config")
+        }
+
+        fn fake_stream() -> PortalStream {
+            let fd = std::fs::File::open("/dev/null").expect("/dev/null");
+            PortalStream {
+                session_handle: "/org/freedesktop/portal/desktop/session/1_1/ozma".into(),
+                streams: vec![PortalStreamInfo {
+                    node_id: 7,
+                    position: None,
+                    size: Some((1920, 1080)),
+                    source_type: Some(1),
+                    mapping_id: None,
+                }],
+                pipewire_fd: Some(fd.into()),
+                pipewire_fd_error: None,
+                restore_token: Some("restore-1".into()),
+                keepalive: None,
+            }
+        }
+
+        fn portal_desktop() -> NodeConfig {
+            let mut desktop = desktop_with_provider("portal");
+            desktop.portal_source_type = crate::config::PortalSourceKind::Monitor;
+            desktop.portal_requested = true;
+            desktop
+        }
+
+        #[test]
+        fn portal_config_maps_source_cursor_timeout_and_mode() {
+            let mut desktop = portal_desktop();
+            desktop.portal_source_type = crate::config::PortalSourceKind::Virtual;
+            desktop.portal_cursor = crate::config::PortalCursorKind::Metadata;
+            desktop.portal_restore_token = Some("token-xyz".into());
+            desktop.portal_timeout = Duration::from_secs(7);
+            desktop.desktop_capture_width = 1024;
+            desktop.desktop_capture_height = 768;
+            desktop.desktop_capture_fps = 20;
+
+            let options = desktop.portal_capture_options();
+            let config = portal_screencast_config(&options);
+            assert_eq!(config.source, PortalSourceType::Virtual);
+            assert_eq!(config.cursor_mode, ozma_capture::PortalCursorMode::Metadata);
+            assert_eq!(config.restore_token.as_deref(), Some("token-xyz"));
+            assert_eq!(config.response_timeout, Duration::from_secs(7));
+            assert!(config.preflight_timeout <= config.response_timeout);
+
+            let provider = portal_capture_config(&options);
+            assert_eq!(provider.id, ozma_capture::PORTAL_DEFAULT_ID);
+            assert!(provider.require_pipewire_fd);
+            assert_eq!(
+                (
+                    provider.pipewire.width,
+                    provider.pipewire.height,
+                    provider.pipewire.fps
+                ),
+                (1024, 768, 20)
+            );
+        }
+
+        #[tokio::test]
+        async fn portal_success_registers_one_pipewire_source() {
+            let desktop = portal_desktop();
+            let registry = capture_registry_with_portal(&desktop, None, Some(fake_stream()));
+            assert_eq!(registry.provider_count(), 1);
+            let scans = registry.scan();
+            assert_eq!(scans.len(), 1);
+            assert_eq!(scans[0].kind, ozma_protocol::CaptureKind::PipeWire);
+            assert!(scans[0].error.is_none(), "{:?}", scans[0].error);
+            assert_eq!(scans[0].capabilities.len(), 1);
+            assert_eq!(scans[0].capabilities[0].id, "portal0");
+
+            let caps = detect_with_registry(&desktop, &registry);
+            assert_eq!(caps.capture.len(), 1);
+            assert_eq!(caps.capture[0].id, "portal0");
+            assert!(!caps.encode.is_empty());
+        }
+
+        #[tokio::test]
+        async fn portal_denial_timeout_and_missing_service_are_warned_no_capture() {
+            for (failure, preflight) in [
+                (Failure::Denied, Duration::from_millis(50)),
+                (Failure::Timeout, Duration::from_millis(10)),
+                (Failure::Missing, Duration::from_millis(50)),
+            ] {
+                let portal = portal_client(failure, preflight);
+                assert!(
+                    acquire_portal_stream(&portal).await.is_none(),
+                    "failure must not yield a stream"
+                );
+
+                // The node keeps running with an empty desktop registry: no
+                // X11, camera, or fake fallback, and no encode/display claim.
+                let desktop = portal_desktop();
+                let registry = capture_registry_with_portal(&desktop, None, None);
+                assert_eq!(registry.provider_count(), 0);
+                let caps = detect_with_registry(&desktop, &registry);
+                assert!(caps.capture.is_empty());
+                assert!(caps.encode.is_empty());
+                assert!(!caps.display.supported);
+            }
+        }
+
+        #[test]
+        fn portal_missing_fd_is_a_typed_unsupported_source() {
+            let desktop = portal_desktop();
+            let mut stream = fake_stream();
+            stream.pipewire_fd = None;
+            stream.pipewire_fd_error = Some("OpenPipeWireRemote is not implemented".into());
+            let registry = capture_registry_with_portal(&desktop, None, Some(stream));
+            let scans = registry.scan();
+            let error = scans[0]
+                .error
+                .as_ref()
+                .expect("a missing required fd is an error");
+            assert_eq!(error.code, ozma_protocol::codes::UNSUPPORTED);
+            assert!(
+                error.message.contains("PipeWire remote fd"),
+                "{}",
+                error.message
+            );
+        }
     }
 }

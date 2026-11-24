@@ -115,6 +115,27 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     status_port: u16,
 
+    /// Poll each running child's `/api/v1/connection` every N milliseconds
+    ///
+    /// `0` (the default) disables child aggregation. When enabled, the
+    /// supervisor caches a bounded per-VM summary and reports `last_seen`/`stale`
+    /// honestly. Polls run independently and never block `/status`.
+    #[arg(long, default_value_t = 0)]
+    child_poll_interval_ms: u64,
+
+    /// Per-child HTTP timeout for status polling, in milliseconds
+    ///
+    /// Only used when `--child-poll-interval-ms` is greater than zero.
+    #[arg(long, default_value_t = 2000)]
+    child_poll_timeout_ms: u64,
+
+    /// Optional bearer token sent to child APIs while polling status
+    ///
+    /// Read from `OZMA_NODE_API_TOKEN` when not passed. The token is never
+    /// included in `/status`, `/metrics`, `/health`, or logs.
+    #[arg(long, default_value = "", env = "OZMA_NODE_API_TOKEN", hide = true)]
+    child_api_token: String,
+
     /// Opt in to defining ozma QMP/display XML on libvirt domains
     ///
     /// Proxmox configuration is never edited.
@@ -257,6 +278,9 @@ async fn main() -> anyhow::Result<()> {
         node_http_base: args.node_http_base,
         restart_backoff: Duration::from_millis(args.restart_backoff_ms),
         restart_backoff_max: Duration::from_millis(args.restart_backoff_max_ms),
+        child_poll_interval: Duration::from_millis(args.child_poll_interval_ms),
+        child_poll_timeout: Duration::from_millis(args.child_poll_timeout_ms),
+        child_api_token: args.child_api_token,
         provision: args.provision,
         provision_config,
         audio,
@@ -326,6 +350,8 @@ mod tests {
         assert_eq!(args.restart_backoff_ms, 1000);
         assert_eq!(args.restart_backoff_max_ms, 30000);
         assert_eq!(args.status_port, 0);
+        assert_eq!(args.child_poll_interval_ms, 0);
+        assert_eq!(args.child_poll_timeout_ms, 2000);
         assert!(!args.no_auto_manage);
         assert!(!args.no_auto_agent);
         assert!(!args.provision);
@@ -388,6 +414,24 @@ mod tests {
 
         let defaults = Args::try_parse_from(["ozma-virtual-node"]).expect("parse defaults");
         assert_eq!(defaults.status_port, 0);
+    }
+
+    #[test]
+    fn child_poll_flags_parse_and_interval_zero_disables_polling() {
+        let args = Args::try_parse_from([
+            "ozma-virtual-node",
+            "--child-poll-interval-ms",
+            "5000",
+            "--child-poll-timeout-ms",
+            "750",
+        ])
+        .expect("parse child poll flags");
+        assert_eq!(args.child_poll_interval_ms, 5000);
+        assert_eq!(args.child_poll_timeout_ms, 750);
+
+        let defaults = Args::try_parse_from(["ozma-virtual-node"]).expect("parse defaults");
+        assert_eq!(defaults.child_poll_interval_ms, 0);
+        assert_eq!(defaults.child_poll_timeout_ms, 2000);
     }
 
     #[test]

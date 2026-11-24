@@ -37,13 +37,13 @@ power, VM provisioning, or real EVDI. Those remain Phase 1–3 work and are mark
 | QMP input sink | Done | `QmpSink` async writer, modifier diffing, wheel/button translation, release-all, fake-QMP integration; 70 `ozma-input` tests |
 | `ozma-power` | Done (unit/fake) | `QmpPower`, `LibvirtPower`, `virsh` argv/status/fallbacks, typed errors; 34 tests (1 ignored real-QEMU) |
 | QMP capture provider | Done (polling) | `QmpDisplayProvider` PPM screendump → RGB24, fps pacing, typed errors, fake-QMP integration; opt-in registry |
-| Looking Glass provider | Done (fixture) | KVMFR parser/source/provider, RGBA/I420 conversion, temp shared-memory fixture; opt-in registry |
+| Looking Glass provider | Done (fixture + VM-profile wiring) | KVMFR parser/source/provider, RGBA/I420 conversion, temp shared-memory fixture. `--capture-provider looking-glass`/`--looking-glass-shm` register it in the VM capture registry with fps/id/name; absent/foreign SHM advertises no source. No real IVSHMEM/GPU run |
 | VirtualCapture provider | Done (fake runner) | side-effect-free sysfs discovery, v4l2loopback/ffmpeg lifecycle, rollback/stop; real test ignored |
 | VNC display provider | Partial (ffmpeg transition) | `VncDisplayProvider`/`VncDisplaySource` enumerate without I/O, spawn ffmpeg `-f vnc` lazily, read raw RGB24 frames with monotonic PTS/sequence, bound stderr, and map EOF/short frames to typed errors; fake-child tests; real VNC test ignored (`OZMA_VNC_TEST=1`) |
 | D-Bus framebuffer provider | Done (unit/fake) | `DBusDisplayProvider`/`DBusDisplaySource`, a small D-Bus wire codec, QMP `getfd`/`add_client`, SCM_RIGHTS listener, `Scanout`/`Update` BGRA frames, and scripted-transport tests; VM profile selection via `--capture-provider dbus` or `--dbus-console`/`--dbus-width`/`--dbus-height`/`--dbus-fps` with `--qmp-socket`. Real QEMU test ignored (`OZMA_DBUS_TEST_QMP`) |
-| VM display model | Done (model) | `VmConsole`/`VmDisplayTopology`, placements, primary/validation, `Console_N` ids; 14 tests |
+| VM display model and multi-display registration | Done (model + registration) | `VmConsole`/`VmDisplayTopology`, placements, primary/validation, `Console_N` ids; `ozma-node --display-output` parses repeated console specs into the topology, normalizes the primary, and writes registration/TXT `display_outputs` plus `/api/v1/connection.display_outputs`/`display_capture`; D-Bus honours `--capture-console`, QMP/VNC/Looking Glass report the single-head limitation |
 | Audio target selection | Done (model + routing) | `AudioTarget`, `<sink>.monitor` naming, `PipeWireCapture::open_target/open_source/open_named_source/open_sink_monitor`; `AudioRouter`/`PipeWireAudioRouter`/`PulseAudioAudioRouter` create/remove null sinks and named `module-remap-source`s, move sink-inputs/source-outputs, apply sink/source profiles, and play reference tracks through `pactl`/`pw-play`/`paplay` with a fake command runner in tests |
-| VM profile wiring | Partial | `--qmp-socket`/`--qmp-input-socket`/`--libvirt-domain`, QMP capture registry, `--vnc-host`/`--vnc-port`/`--vnc-width`/`--vnc-height`/`--vnc-fps`, D-Bus display flags/`--capture-provider dbus`, input sink chain (single-socket QMP fallback), QMP/libvirt power, `--audio-router`/`--audio-track-root`, `/power/state`, `/power/{action}`, `/codec`, `/audio/*`, and connection summaries; 136 `ozma-node` lib tests |
+| VM profile wiring | Partial | `--qmp-socket`/`--qmp-input-socket`/`--libvirt-domain`, QMP capture registry, `--vnc-host`/`--vnc-port`/`--vnc-width`/`--vnc-height`/`--vnc-fps`, D-Bus display flags/`--capture-provider dbus`/`--capture-console`, Looking Glass `--capture-provider looking-glass`/`--looking-glass-shm|fps|id|name`, multi-console `--display-output` registration, input sink chain (single-socket QMP fallback), QMP/libvirt power, `--audio-router`/`--audio-track-root`, `/power/state`, `/power/{action}`, `/codec`, `/audio/*`, and connection summaries; `cargo test -p ozma-node` |
 | HLS pipeline | Partial | `HlsPipeline` reads RGB24/BGRA `CaptureSource` frames into ffmpeg HLS with software encoders (`libx264`, `libx265`, `libsvtav1`, `libaom-av1`, `mjpeg`), `-hls_flags delete_segments`, and a restartable controller that swaps encoders; `/stream/*` serves the output dir; connection reports `running`/`failed`/`not-configured` |
 | Controller input compat | Done (recording/fake in CI) | `/input/key`, `/input/mouse`, `/input/type`, `GET/POST /codec`, `/audio/apply|remove|play|stop`, bearer-guarded; HLS codec overrides restart the real HLS pipeline and report `applied: true` only on success, while WebRTC keeps its encoder; audio routes call a real router when configured; real injection/audio is hardware/QMP/audio-server opt-in |
 | WebRTC compat | Done (helper-first) | `WebRtcHelper` supervises an external GStreamer/Python worker over a Unix socket, feeds BGRA frames, and proxies offer/bitrate/candidate. Live-validated with the controller, GStreamer peer, Firefox, and Chromium including Opus audio; STUN/TURN config and browser↔helper trickle are implemented. Native WebRTC and helper→browser trickle remain future work |
@@ -62,28 +62,66 @@ the controller pytest/clean-host regression remain in the parity matrix.
 
 | Item | Status | Evidence |
 |---|---|---|
-| `ozma-node --profile desktop` runtime | Done (except portal/X11) | real `UinputSink`-first input chain, PipeWire video capture with a configurable target, PipeWire audio capture target, snapshots/status, and desktop input gating; [`desktop-profile.md`](desktop-profile.md) |
-| Desktop capture registry | Done | desktop registers `PipeWireCaptureProvider` with `--desktop-capture-target` (`default`, `name:/object:`, `node:<id>`), `--desktop-capture-remote`, width/height/fps; V4L2 and the fake source are not silently substituted; `cargo test -p ozma-node --lib platform::tests::desktop_` |
+| `ozma-node --profile desktop` runtime | Done | real `UinputSink`-first input chain, PipeWire/X11/portal video capture selection, PipeWire audio capture target, snapshots/status, and desktop input gating; [`desktop-profile.md`](desktop-profile.md) |
+| Desktop capture registry | Done | selects exactly one transport: `PipeWireCaptureProvider` with `--desktop-capture-target` (`default`, `name:/object:`, `node:<id>`), `X11CaptureProvider` with `--capture-provider x11 --x11-display/--x11-offset/--x11-width/--x11-height/--x11-fps/--ffmpeg-bin`, or `PortalCaptureProvider` built from the node-run ScreenCast handshake. V4L2 and the fake source are not silently substituted; `cargo test -p ozma-node --lib platform::tests::desktop platform::tests::portal_tests` |
 | Desktop input | Done (uinput opt-in) | chain is `uinput -> [qmp only if a QMP socket is set] -> hid-gadget -> recording`; a missing `/dev/uinput` leaves the node running with recording-only input and no keyboard/pointer injection capability; `cargo test -p ozma-node --lib platform::tests::desktop_capabilities` |
 | Desktop audio | Partial | `--audio-capture-target default|object:|node:|monitor:<sink>` configures session capture; `--audio-router pipewire|pulseaudio` drives `/audio/*` over an existing graph; default capture target is PipeWire then ALSA/fake. `/audio/nodes` still returns the typed 501 graph stub |
-| Desktop compatibility routes | Done | public `/status` (alias of `/node/status`) and `/snapshot` (alias of `/display/snapshot`), plus `/display/info`, `/health`, `/api/v1/connection`, `/agent/metrics`, `/ui/hints`; `/audio/*` control routes work when a router is configured and are typed 501 otherwise |
+| Desktop compatibility routes | Done | public `/status` (alias of `/node/status`) and `/snapshot` (alias of `/display/snapshot`), plus `/display/info`, `/health`, `/api/v1/connection` (including actual `capture` provider/kind/source), `/agent/metrics`, `/ui/hints`; `/audio/*` control routes work when a router is configured and are typed 501 otherwise |
 | Desktop startup/route test | Done | `cargo test -p ozma-node --test desktop_profile` starts the real binary with fake capture + recording input, then checks `/health`, `/status`, `/snapshot`, `/display/snapshot`, `/display/info`, `/api/v1/connection`, `/api/v1/capabilities`, and `/audio/*` without PipeWire/uinput/X11 |
-| XDG ScreenCast portal consent/selection | Not implemented | documented in [`desktop-profile.md`](desktop-profile.md); an external portal client must select a monitor and pass the resulting `Video/Source` node as `--desktop-capture-target` |
-| X11 capture fallback | Not implemented | `--capture-provider x11` is a typed startup error; no XGetImage/XShm provider exists |
+| XDG ScreenCast portal consent/selection | Done (fd/restore-token limits) | `--capture-provider portal` runs `PortalScreenCast::connect`/`request_stream` in `main` under `--portal-timeout-ms`, then registers `PortalCaptureProvider`. Denial/timeout/missing portal logs a warning and leaves no capture (no X11/camera/fake fallback). The portal fd/session is held; compositors that allow only the fd fail with a typed unsupported/PipeWire error, and returned restore tokens are not persisted; [`desktop-profile.md`](desktop-profile.md) |
+| X11 capture fallback | Done | `--capture-provider x11` registers the real ffmpeg `x11grab` provider with an explicit `--x11-display` (never ambient `DISPLAY`), region/mode/fps flags, typed missing-display/ffmpeg failures; `cargo test -p ozma-node --lib platform::tests::desktop_x11` and `cargo test -p ozma-capture x11::` |
 | Delete `ozma-agent` | Blocked on parity | kept deprecated; remaining items are listed in [`ozma-agent/README.md`](../ozma-agent/README.md) |
 
 Desktop live smoke on this host (2026-11-24): the host has a PipeWire session
-and a writable `/dev/uinput`, but no X11/Wayland display (`XDG_SESSION_TYPE=tty`,
-empty `DISPLAY`/`WAYLAND_DISPLAY`) and no portal ScreenCast session. A desktop
-node with `--capture-provider fake --input-provider fake-recording` served
-`/health`, `/status`, `/snapshot`, `/display/snapshot`, `/display/info`, and
-`/api/v1/connection`; no desktop input was injected. The default PipeWire
-provider advertised the host's real camera node (not a screen), and `/snapshot`
-returned a typed 503 because that camera negotiates `yuyv`, which the JPEG
-snapshot path does not convert; a missing configured target
-(`--desktop-capture-target node:999999`) left capture empty with an explicit
-log. `/audio/nodes` remained a typed 501. See
+and a writable `/dev/uinput`. `XDG_SESSION_TYPE=tty` and `DISPLAY` are empty,
+but local X sockets `:0`/`:1`/`:2` exist and are usable with
+`XAUTHORITY=/run/user/1000/xauth_zBixvF`. With
+`--capture-provider x11 --x11-display :1 --x11-width 320 --x11-height 240
+--x11-fps 5 --input-provider fake-recording`, the real binary started, logged
+the X11 selection, served `/api/v1/connection` with
+`capture.provider=x11`, `kind=x11`, `source=x11`, advertised `encode` bounds
+fitted to 320x240@5, and returned a real 320x240 JPEG from `/snapshot`. No
+desktop input was injected. With `--capture-provider portal` and a bogus
+`DBUS_SESSION_BUS_ADDRESS`, the node logged the portal connect warning, stayed
+up with `capture.available=false`, no capture source and **no encode/display**
+capability, and `/snapshot` returned a typed 503. A successful portal
+consent/selection run was not attempted because it would open an interactive
+desktop consent dialog. The earlier default PipeWire provider advertised the
+host's real camera node (not a screen), and `/snapshot` returned a typed 503
+because that camera negotiates `yuyv`, which the JPEG snapshot path does not
+convert. `/audio/nodes` remained a typed 501. See
 [`desktop-profile.md`](desktop-profile.md) for the exact limitations.
+
+## Rust reconciliation — Phase 3: multi-display and GPU passthrough
+
+| Item | Status | Evidence |
+|---|---|---|
+| Multi-display registration/config | Done (VM consoles) | `--display-output <label:WxH[:primary][:source]>` (repeatable, indexed form accepted) parses into `VmDisplayTopology`, validates duplicate indices/zero geometry/multiple primaries, normalizes the primary, and writes registration/TXT `display_outputs` plus `/api/v1/connection.display_outputs`. `--display-outputs-json` remains the raw host-output escape hatch and conflicts with `--display-output`. An implicit single console is derived from QMP/D-Bus/VNC/Looking Glass when no spec is given. `cargo test -p ozma-node --lib display_outputs:: config::tests::display_output` |
+| Per-console capture selection | Partial | D-Bus honours `--capture-console N`/`--dbus-console`; QMP/VNC/Looking Glass capture one default head and the node reports `display_capture.limitation` instead of faking a second source. Only the selected console has a non-empty `capture_source_id`. `cargo test -p ozma-node --lib config::tests::capture_console platform::tests::multi_console` |
+| GPU passthrough / Looking Glass | Done (fixture) | `--capture-provider looking-glass` (or `--looking-glass-shm`) registers `LookingGlassProvider` with `--looking-glass-fps`/`id`/`name`. Missing/foreign SHM or an unpublished frame advertises no/placeholder source, never a hardware claim. `cargo test -p ozma-node --lib platform::tests::vm_profile_registers_looking_glass config::tests::looking_glass` |
+| Controller display picker | Not implemented | The controller can read `display_outputs`/`display_capture` and show the limitation, but has no live per-console encoder switch; changing consoles requires restarting the node with that console selected. |
+| Real GPU/VFIO/KVMFR validation | Not run | CI uses a temp KVMFR fixture only; no real QEMU IVSHMEM, VFIO/iommu group, GPU, or `/dev/shm/looking-glass` run. |
+
+## Rust reconciliation — Phase 3: USB/media foundation
+
+| Item | Status | Evidence |
+|---|---|---|
+| `ozma-usb` gadget/function model | Done (library) | `UsbGadgetConfig`/`UsbFunction` for HID keyboard/mouse/custom, mass storage, UAC2, and FunctionFS vendor; validation covers safe gadget/function names, non-zero VID/PID, strings, power, duplicate links, HID report shape, UAC2 rates/sizes, and CD-ROM read-only. `cargo test -p ozma-usb --test config_validation` (11 passed) |
+| `ozma-usb` virtual media | Done (model) | `MassStorageImage`/`VirtualMedia`, `MediaMode::{Disk,CdRom}`, `MediaState::{Attached,Detached}`, read-only policy, size, and attach validation; no mount, image creation, FAT32/NBD, or block I/O. `cargo test -p ozma-usb --test media_model` (9 passed) |
+| ConfigFS gadget controller | Done (temp-root tests) | Safe `std::fs` controller with injectable root, descriptor/string/config/function/link creation, HID/mass-storage/UAC2 attributes, `bind`/`unbind`, status/list, attach/detach LUN `file`/`ro`/`cdrom`, typed missing-root/gadget/function/media errors, and rollback on create failure. `cargo test -p ozma-usb --test configfs_controller` (12 passed) |
+| Fake controller and USB/IP fallback | Done (unit/fake runner) | In-memory `FakeUsbGadgetController` mirrors create/bind/status/media; `SubprocessUsbController` builds argv-only `usbip` commands (no shell), validates bus IDs/hosts/ports, parses `usbip list -l`, and injects a `CommandRunner`. `cargo test -p ozma-usb --test fake_controller --test subprocess` (11 passed) |
+| Capability/status shape | Done (model) | `UsbGadgetCapabilities` (`gadget`, `usbip`, `virtual_media`, `mass_storage`, `configfs`, function kinds), `GadgetStatus`/`FunctionStatus`, and `protocol_capability()` projection onto `ozma_protocol::UsbCapability`. `cargo test -p ozma-usb --test status_shape` (3 passed) |
+| Node/controller wiring | Done (opt-in, temp-root/fake tests) | `ozma-node` exposes `--usb-gadget`, `--usb-configfs-root`, `--usb-udc`, `--usb-media`, `--usb-media-ro`, and `--usb-media-cdrom` (and `OZMA_USB_*` envs). It builds a HID keyboard/mouse gadget plus an optional mass-storage LUN, creates and binds it through `ConfigFsUsbController` only when a UDC is supplied and the root exists, and adds `usb` to capabilities/TXT/registration only after the bind succeeds. A missing UDC/root/permission/media or bind error is logged with its typed `kind()` and leaves the node running with no USB capability. `/usb` replaces the old 501 with a read-only gadget/capabilities/media status when configured, keeps a typed 501 without `--usb-gadget`, and answers a typed 503 for a configured-but-failed gadget. `POST /usb/media/attach`/`detach` use `VirtualMedia`/`UsbGadgetController`, require an existing absolute regular file, enforce CD-ROM read-only, and never mount or write the image. `/api/v1/connection.usb` reports status/bound/UDC/functions/error. Routes stay behind the bearer guard. |
+| USB node tests | Done (CI-safe) | Config/flag opt-in and media/UDC validation; capability not advertised from a bare `cap` string; fake-gadget `/usb` and `/api/v1/connection.usb` shapes; attach/detach + path/read-only/CD-ROM validation without path leakage; unavailable-gadget 503; temp-ConfigFS root create/bind/status/detach; bearer guard for `/usb` and media routes. No real UDC/ConfigFS/mount is touched. |
+| Real gadget/media validation | Not implemented (opt-in only) | One real ConfigFS round trip is `#[ignore]` and gated by `OZMA_USB_CONFIGFS_TEST=1`/`OZMA_USB_UDC`; no dummy_hcd/hardware-UDC run, FunctionFS vendor daemon, UAC2 audio bridge, FAT32 synthesis/NBD/ISO backend, read-write sync/overlay, mount, image creation, USB/IP pairing/hotplug, or node-side gadget teardown. |
+
+The default `ozma-usb` suite is CI-safe: 46 tests passed and 1 is ignored,
+plus the crate doctest. It uses a temporary ConfigFS-shaped root, the fake
+controller, and a recording command runner; it never creates a real gadget,
+binds a real UDC, mounts anything, or writes a block device. The node-side USB
+tests extend this with a temp-root create/bind/attach/detach round trip, the
+fake controller, and typed unavailable-gadget fallbacks; they also never touch
+a real UDC, ConfigFS mount, or block device.
 
 ## M0 — Contract and cleanup
 
@@ -155,7 +193,7 @@ authentication, and Xpra video are being extended in separate workstreams.
 ## Verification
 
 ```bash
-cargo test --workspace                                   # 1676 passed, 17 ignored (current)
+cargo test --workspace                                   # 1797 passed, 20 ignored (current)
 cargo test -p ozma-node --test parity                    # Python/controller parity baseline (16)
 cargo test -p ozma-node --lib                            # node API, compat, session unit tests (136, 2 ignored)
 cargo test -p ozma-qmp -p ozma-input -p ozma-power       # QMP, uinput/QMP sinks, power (166)

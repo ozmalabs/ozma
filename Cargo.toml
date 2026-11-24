@@ -36,6 +36,7 @@ members = [
     "ozma-hid",
     "ozma-clipboard",
     "ozma-pipewire",
+    "ozma-usb",
 ]
 
 [workspace.dependencies]

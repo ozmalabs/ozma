@@ -25,7 +25,8 @@
     "webrtc_audio_configured": "bool",
     "webrtc_audio_source": "string-or-null",
     "audio": "string",
-    "audio_error": "string-or-null"
+    "audio_error": "string-or-null",
+    "usb": "object"
   },
   "display_info": {
     "ok": "bool",

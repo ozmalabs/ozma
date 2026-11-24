@@ -60,7 +60,7 @@ so restrict it with the same network policy as the per-VM node ports.
 | Route | Content |
 |---|---|
 | `GET /health` | `{ok, version, profile, discovered, running, failed, skipped}` |
-| `GET /status` | Full aggregated document: supervisor totals plus one entry per tracked and excluded VM |
+| `GET /status` | Full aggregated document: supervisor totals plus one entry per tracked and excluded VM and optional cached child summaries |
 | `GET /metrics` | Prometheus text (`text/plain; version=0.0.4`) |
 | `GET /api/v1/connection` | Connection-shaped summary: `ok`, `node_id`, `profile: "hypervisor"`, `version`, `api_port`, `quic_port: 0`, `hid_udp_port: 0`, `sink_kind: "supervisor"`, `supervisor` totals |
 
@@ -85,8 +85,8 @@ listener and is not an error.
 Each `vms[]` entry has `name`, `state`, `qmp_socket`, `hid_udp_port`,
 `http_port`, `child_pid`, `spawned`, `skipped`, `needs_restart`, `excluded`,
 `restart_count`, `restart_in_ms`, `last_exit`, `last_error`, `evdev_status`,
-`evdev_keyboard`, `evdev_mouse`, `audio_sink`, `agent_status`, and
-`agent_checks`.
+`evdev_keyboard`, `evdev_mouse`, `audio_sink`, `agent_status`, `agent_checks`,
+and `child`.
 
 `state` is one of `running`, `starting`, `backoff`, `stopped`, `skipped`,
 `needs-restart`, `awaiting-socket`, `failed`, `discovery-only`, or `excluded`.
@@ -95,6 +95,37 @@ is the most recent exit (`exit code 1`, `signal`, ...); `last_error` is cleared
 by a successful start. `agent_status` is `provisioned`, `pending`, `retrying`,
 `failed`, or `disabled`. `evdev_status` is `ready`, `unavailable`, or
 `not-configured`.
+
+### Per-child API aggregation (from `--child-poll-interval-ms`)
+
+`--child-poll-interval-ms <u64>` (default `0`, disabled) polls each **running**
+child's `GET /api/v1/connection` on loopback. `--child-poll-timeout-ms`
+(default `2000`) bounds each request. `--child-api-token` (or
+`OZMA_NODE_API_TOKEN`) is sent as a bearer token when child APIs are guarded;
+the token is never serialized or logged. Setting the interval to `0` disables
+polling cleanly: no task is spawned and `vms[].child` is `null`.
+
+Polling runs in its own task and does not block discovery, restart handling, or
+`/status`. The status read only copies the in-memory cache. Each `child` entry
+is a bounded summary:
+
+| Field | Meaning |
+|---|---|
+| `reachable` | Most recent poll reached the child, it reported `ok:true`, and the child is still spawned |
+| `node_id`, `profile`, `api_port` | Child identity and API port |
+| `hls`, `webrtc`, `audio` | Child state strings (`running`, `not-configured`, `failed`) |
+| `power` | `{state, available}`; a string-only power value becomes `available:false` |
+| `input` | `{kind, available, injecting}` |
+| `last_poll_age_ms` | Age of the most recent attempt (success or failure) |
+| `last_seen_age_ms`, `last_seen_unix_ms` | Age and wall-clock time of the last success |
+| `stale` | No success within `2 × interval + timeout` (never-seen is stale) |
+| `last_error` | Most recent transport/HTTP/parse error, with no token |
+
+`/status` also reports `child_poll_interval_ms` and `child_poll_timeout_ms`
+(`0`/configured timeout when disabled). A timeout or HTTP failure keeps the last
+successful summary visible but sets `reachable:false`, leaves `stale` honest,
+and records `last_error`; it never fabricates HLS/WebRTC/audio/power/input state.
+The cache is pruned when a VM leaves the supervisor's tracked set.
 
 ### Metrics
 
@@ -108,12 +139,15 @@ ozma_supervisor_vm_up{vm="<name>"} 0|1
 ozma_supervisor_vm_restarts_total{vm="<name>"} N
 ozma_supervisor_vm_port{vm="<name>",kind="hid_udp|http"} N
 ozma_supervisor_vm_state{vm="<name>",state="<state>"} 1
+ozma_supervisor_vm_child_up{vm="<name>"} 0|1
+ozma_supervisor_vm_child_stale{vm="<name>"} 0|1
 ```
 
-The documents describe *supervisor* state only. They do not proxy each child's
-`/api/v1/connection`, capture, input, audio, or power status; use the allocated
-per-VM HTTP port for that. Restart/reset controls, a controller-side aggregate
-view, and per-VM API aggregation remain deferred.
+Child metrics appear only for VMs that have a poll record and carry only
+reachability/staleness; child state strings, errors, sink names, and tokens stay
+out of `/metrics`. The status documents never carry secrets or QMP output. QMP
+socket paths remain in `/status` (as they were before child aggregation); use
+`--status-port` network policy accordingly.
 
 ## Opt-in libvirt provisioning
 
@@ -262,10 +296,14 @@ deliberately **not** implemented here:
   restart against a real audio server/sink (ownership persistence itself is
   covered with a fake router and a temporary state file);
 * USB/media, Looking Glass, and VBAN/UAC2 audio;
-* aggregating each child's own API (`/api/v1/connection`, capture, input,
-  audio, power) into the supervisor document, a controller UI for the
-  multi-VM view, and supervisor-side reset/restart controls beyond the
-  automatic crash-restart loop;
+* per-child controls (reset/restart/stop) beyond the automatic crash-restart
+  loop; the supervisor and controller views are read-only;
+* controller multi-VM UI polish: the dashboard renders the read-only proxied
+  document in Advanced/Amazing modes, but there is no dedicated VM page,
+  history, alerting, or drill-down;
+* child states beyond the connection summary (capture, detailed codec,
+  per-session HID counters, QMP errors) and aggregate child metrics beyond
+  reachability/staleness;
 * a real libvirt/QEMU restart integration test (default tests use a fake
   command runner, fake evdev/audio provisioners, and XML fixtures; no test
   opens `/dev/uinput` or runs `pactl`);
