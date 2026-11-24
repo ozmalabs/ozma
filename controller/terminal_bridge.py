@@ -29,6 +29,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Awaitable
 
+from node_auth import node_api_headers_for_state
+
 log = logging.getLogger("ozma.terminal_bridge")
 
 try:
@@ -511,7 +513,9 @@ class TerminalBridgeManager:
                 url = f"http://127.0.0.1:{node.api_port}/display/snapshot"
                 try:
                     async with httpx.AsyncClient(timeout=2.0) as client:
-                        r = await client.get(url)
+                        r = await client.get(
+                            url, headers=node_api_headers_for_state(node, self._state)
+                        )
                         if r.status_code == 200:
                             return r.content
                 except Exception:

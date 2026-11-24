@@ -33,6 +33,7 @@ from typing import Any
 
 from rgb import RGB, hex_to_rgb, lerp_rgb
 from rgb_compositor import RGBCompositor, AmbientConfig, LayerPriority
+from node_auth import node_api_headers_for_state
 
 log = logging.getLogger("ozma.rgb_outputs")
 
@@ -232,11 +233,14 @@ class RGBOutputManager:
             "color": list(color),
             "effect": effect,
         }).encode()
+        node = getattr(self._state, "nodes", {}).get(zone.node_id) if self._state else None
+        headers = {"Content-Type": "application/json",
+                   **node_api_headers_for_state(node, self._state)}
         try:
             loop = asyncio.get_running_loop()
             req = urllib.request.Request(
                 url, data=body,
-                headers={"Content-Type": "application/json"},
+                headers=headers,
                 method="POST",
             )
             await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=3))

@@ -272,7 +272,8 @@ pub struct Args {
     /// h264_qsv, hevc_qsv, h264_v4l2m2m, or hevc_v4l2m2m.
     ///
     /// A hardware encoder is only started after `ffmpeg -encoders` confirms it
-    /// is available; naming one never silently falls back to software.
+    /// is available; naming one never silently falls back to software. For
+    /// NVENC, `--nvenc-gpu <n>` selects the CUDA ordinal (`-gpu <n>`).
     #[arg(
         long,
         env = "OZMA_HLS_ENCODER",
@@ -292,6 +293,19 @@ pub struct Args {
         value_name = "PATH"
     )]
     pub vaapi_device: std::path::PathBuf,
+
+    /// NVIDIA CUDA ordinal for NVENC H.264/HEVC (ffmpeg `-gpu <n>`).
+    ///
+    /// Only emitted for `h264_nvenc`/`hevc_nvenc`; a non-NVENC encoder is
+    /// rejected at startup rather than passed an unsupported flag. `None`
+    /// leaves device selection to ffmpeg/the driver.
+    #[arg(
+        long,
+        env = "OZMA_NVENC_GPU",
+        value_name = "INDEX",
+        visible_alias = "cuda-device"
+    )]
+    pub nvenc_gpu: Option<u32>,
 
     /// ffmpeg executable used by the HLS pipeline.
     #[arg(
@@ -461,6 +475,7 @@ async fn main() {
         audio_track_root: args.audio_track_root.clone(),
         ffmpeg_bin: args.ffmpeg_bin.clone(),
         vaapi_device: args.vaapi_device.clone(),
+        nvenc_gpu: args.nvenc_gpu,
         audio_sink: args.audio_sink.clone(),
         webrtc_audio_source: args.webrtc_audio_source.clone(),
         webrtc_audio_backend: args.webrtc_audio_backend,
@@ -610,9 +625,14 @@ async fn main() {
             video_encoder: encoder,
             ffmpeg_bin: args.ffmpeg_bin.clone(),
             vaapi_device: config.vaapi_device.clone(),
+            nvenc_gpu: config.nvenc_gpu,
             ..HlsConfig::default()
         };
         if let Err(error) = hls_config.validate() {
+            error!("Invalid HLS configuration: {error}");
+            std::process::exit(2);
+        }
+        if let Err(error) = hls_config.validate_encoder_options() {
             error!("Invalid HLS configuration: {error}");
             std::process::exit(2);
         }
@@ -1381,6 +1401,21 @@ mod tests {
             (1280, 720, 15)
         );
         assert_eq!(args.ffmpeg_bin, std::path::PathBuf::from("/usr/bin/ffmpeg"));
+    }
+
+    #[test]
+    fn nvenc_gpu_flag_parses_and_rejects_invalid_values() {
+        let defaults = Args::parse_from(["ozma-node"]);
+        assert_eq!(defaults.nvenc_gpu, None, "no GPU is invented by default");
+
+        let explicit = Args::parse_from(["ozma-node", "--nvenc-gpu", "1"]);
+        assert_eq!(explicit.nvenc_gpu, Some(1));
+
+        let alias = Args::parse_from(["ozma-node", "--cuda-device", "0"]);
+        assert_eq!(alias.nvenc_gpu, Some(0));
+
+        assert!(Args::try_parse_from(["ozma-node", "--nvenc-gpu", "abc"]).is_err());
+        assert!(Args::try_parse_from(["ozma-node", "--nvenc-gpu", "-1"]).is_err());
     }
 
     #[test]

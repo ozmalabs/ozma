@@ -25,6 +25,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncIterator
 from urllib.parse import urlsplit
 
+from node_auth import node_api_headers, node_api_token, state_node_api_token
+
 import asyncvnc
 import numpy as np
 from PIL import Image
@@ -545,7 +547,12 @@ class StreamManager:
         # Soft node with D-Bus display — pull MJPEG from soft node API
         api_port = node.api_port or 0
         if api_port and node.hw == "soft":
-            cap = _SoftNodeStream(node.id, node.host, api_port)
+            cap = _SoftNodeStream(
+                node.id,
+                node.host,
+                api_port,
+                token=node_api_token(node, state_node_api_token(self._state)),
+            )
             self._captures[node.id] = cap
             cap.start()
             log.info("Soft node display stream for %s (D-Bus via %s:%d)",
@@ -602,7 +609,10 @@ class StreamManager:
             url = f"http://{entry._host}:{entry._api_port}/codec"
             try:
                 async with httpx.AsyncClient(timeout=5.0) as client:
-                    await client.post(url, json=config.to_dict())
+                    await client.post(
+                        url, json=config.to_dict(),
+                        headers=node_api_headers(None, entry._token),
+                    )
                 return True
             except Exception as e:
                 log.warning("Could not forward codec switch to soft node %s: %s", node_id, e)
@@ -715,10 +725,12 @@ class _SoftNodeStream:
     forwards keyboard/mouse input to the soft node's D-Bus display.
     """
 
-    def __init__(self, node_id: str, host: str, api_port: int) -> None:
+    def __init__(self, node_id: str, host: str, api_port: int,
+                 token: str = "") -> None:
         self.node_id = node_id
         self._host = host
         self._api_port = api_port
+        self._token = str(token or "").strip()
         self.active = False
         self._latest_jpeg: bytes | None = None
         self._task: asyncio.Task | None = None
@@ -745,7 +757,10 @@ class _SoftNodeStream:
         while self.active:
             try:
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                    async with session.get(
+                        url, headers=node_api_headers(None, self._token),
+                        timeout=aiohttp.ClientTimeout(total=3),
+                    ) as resp:
                         if resp.status == 200:
                             self._latest_jpeg = await resp.read()
                             # Parse dimensions
@@ -777,6 +792,7 @@ class _SoftNodeStream:
                 await session.post(
                     f"http://{self._host}:{self._api_port}/input/mouse",
                     json={"x": x, "y": y, "button": 0, "action": action},
+                    headers=node_api_headers(None, self._token),
                     timeout=aiohttp.ClientTimeout(total=1),
                 )
         except Exception:
@@ -816,6 +832,7 @@ class _SoftNodeStream:
                 await session.post(
                     f"http://{self._host}:{self._api_port}/input/key",
                     json={"keycode": keycode, "down": down},
+                    headers=node_api_headers(None, self._token),
                     timeout=aiohttp.ClientTimeout(total=1),
                 )
         except Exception:

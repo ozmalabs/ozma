@@ -566,6 +566,14 @@ No guest-produced sound existed to observe, and no audio route was claimed.
 Node `/audio/*` remains honestly `not-configured`/unimplemented. Audio parity is
 still unproven.
 
+> **Follow-up (2026-11-24):** a later run added `intel-hda`/`hda-duplex` and
+> `-audiodev pa,out.name=ozma-gate2-adv`, played a 440 Hz tone through the
+> guest's `/dev/snd/pcmC0D0p`, and captured the host monitor at −6.94 dBFS peak
+> (tone RMS −9.96 dBFS, dominant 440.1 Hz). The Alpine live ISO has no
+> `aplay`/`speaker-test`/`pw-play`/`pacat`; a locally compiled static UAPI
+> helper and a guest-side unmute were required. See
+> [`gate2-live-guest-advanced-report.md`](gate2-live-guest-advanced-report.md).
+
 ## 9. Findings and failures
 
 1. **HLS did not survive a guest resolution change (pre-fix).** QMP HLS failed

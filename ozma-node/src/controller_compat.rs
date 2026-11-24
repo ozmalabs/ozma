@@ -515,6 +515,12 @@ pub struct CodecStatus {
     /// `software`, `vaapi`, `nvenc`).
     #[serde(default)]
     pub backends: Vec<String>,
+    /// Configured NVENC CUDA ordinal, or `null` when no GPU was configured.
+    ///
+    /// This is the stored preference, not proof that the current encoder is
+    /// NVENC; `current_encoder` says which encoder is actually running.
+    #[serde(default)]
+    pub nvenc_gpu: Option<u32>,
     /// The last stored policy receipt, or `null` when none was evaluated.
     pub receipt: Option<OverrideReceipt>,
     /// True while a stored override has not been applied by a pipeline restart.
@@ -538,6 +544,7 @@ impl CodecStatus {
             override_setting: None,
             available,
             backends: Vec::new(),
+            nvenc_gpu: None,
             receipt: None,
             pending_restart: false,
             applied: false,
@@ -661,6 +668,7 @@ impl CodecControl {
             override_setting: state.override_state.requested,
             available,
             backends,
+            nvenc_gpu: self.hls.as_ref().and_then(|hls| hls.config().nvenc_gpu),
             receipt: state.override_state.receipt,
             pending_restart,
             applied: applied.is_some(),
@@ -717,6 +725,7 @@ impl CodecControl {
                 "requested_encoder": mapped_encoder.map(HlsEncoder::ffmpeg_name),
                 "backend": selected_backend,
                 "vaapi_device": Value::Null,
+                "nvenc_gpu": Value::Null,
                 "fallback": false,
                 "fallback_reason": Value::Null,
                 "hls": hls_status,
@@ -748,6 +757,7 @@ impl CodecControl {
             .map_err(|error| CodecApplyError::pipeline(codec_pipeline_error(error, encoder)))?;
 
         let applied = outcome.applied_encoder;
+        let nvenc_gpu = applied.is_nvenc().then(|| hls.config().nvenc_gpu).flatten();
         let fallback_reason = outcome
             .fallback
             .as_ref()
@@ -764,6 +774,7 @@ impl CodecControl {
             "requested_encoder": encoder.ffmpeg_name(),
             "backend": backend_name(selected.backend),
             "vaapi_device": vaapi_device,
+            "nvenc_gpu": nvenc_gpu,
             "fallback": fallback_reason.is_some(),
             "fallback_reason": fallback_reason,
             "hls": outcome.status.status_name(),
@@ -5398,6 +5409,107 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["applied"], true);
         assert_eq!(body["current_encoder"], "h264_vaapi");
+
+        controller.stop().await.expect("stop HLS");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn codec_route_preserves_and_reports_the_configured_nvenc_gpu() {
+        let directory = codec_test_dir("nvenc-gpu");
+        std::fs::write(directory.join("stream.m3u8"), "#EXTM3U\n").expect("manifest");
+        let spawner = Arc::new(CodecSpawner::new(Vec::new()));
+        let controller = HlsController::with_spawner_and_probe(
+            pending_factory(),
+            HlsConfig {
+                output_dir: directory.clone(),
+                nvenc_gpu: Some(1),
+                ..HlsConfig::default()
+            },
+            spawner.clone(),
+            Arc::new(StaticEncoderProbe::new(EncoderAvailability::from_names([
+                HlsEncoder::H264.ffmpeg_name(),
+                HlsEncoder::NvencH264.ffmpeg_name(),
+                HlsEncoder::NvencHevc.ffmpeg_name(),
+            ]))),
+        );
+        controller.start().await.expect("start HLS");
+        let control = CodecControl::new(
+            mixed_hardware_registry(),
+            MediaFormat::new(Codec::H264, 320, 240, 30, 4_000),
+        )
+        .with_hls(Some(controller.clone()));
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_hls_controller(Some(controller.clone()))
+        .with_codec_control(Some(control));
+        let app = codec_router(state);
+
+        // The preference is reported before any NVENC switch, and no GPU is
+        // invented when it was not configured.
+        let (status, body) = get_json(&app, "/codec").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["nvenc_gpu"], 1);
+
+        let (status, body) = post_json(
+            &app,
+            "/codec",
+            serde_json::json!({"codec": "h264", "hw_accel": "nvenc"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["applied"], true);
+        assert_eq!(body["encoder"], "h264_nvenc");
+        assert_eq!(body["nvenc_gpu"], 1);
+        assert_eq!(controller.config().nvenc_gpu, Some(1));
+        assert!(spawner.spawns()[1]
+            .windows(2)
+            .any(|window| window == ["-gpu", "1"]));
+
+        // A software switch keeps the stored preference but omits `-gpu`.
+        let (status, body) = post_json(
+            &app,
+            "/codec",
+            serde_json::json!({"codec": "h264", "hw_accel": "software"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["encoder"], "libx264");
+        assert!(
+            body["nvenc_gpu"].is_null(),
+            "a software encoder must not claim a GPU: {body}"
+        );
+        assert_eq!(
+            controller.config().nvenc_gpu,
+            Some(1),
+            "the preference must survive the software switch"
+        );
+        assert!(!spawner.spawns()[2]
+            .iter()
+            .any(|argument| argument == "-gpu"));
+
+        // Switching back to NVENC targets the same GPU.
+        let (status, body) = post_json(
+            &app,
+            "/codec",
+            serde_json::json!({"codec": "hevc", "hw_accel": "nvenc"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["encoder"], "hevc_nvenc");
+        assert_eq!(body["nvenc_gpu"], 1);
+        assert!(spawner.spawns()[3]
+            .windows(2)
+            .any(|window| window == ["-gpu", "1"]));
 
         controller.stop().await.expect("stop HLS");
         let _ = std::fs::remove_dir_all(directory);

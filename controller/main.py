@@ -34,6 +34,7 @@ import uvicorn
 
 from config import Config
 from state import AppState
+from node_auth import node_api_headers_for_state
 from discovery import DiscoveryService
 from hid import HIDForwarder
 from scenarios import ScenarioManager
@@ -955,10 +956,14 @@ async def run(config: Config) -> None:
                                 import urllib.request
                                 loop = asyncio.get_running_loop()
                                 url = f"http://{node.host}:{node.api_port}/session/init"
+                                headers = {
+                                    "Content-Type": "application/octet-stream",
+                                    **node_api_headers_for_state(node, state),
+                                }
                                 def _post():
                                     req = urllib.request.Request(
                                         url, data=init_bytes,
-                                        headers={"Content-Type": "application/octet-stream"},
+                                        headers=headers,
                                         method="POST",
                                     )
                                     with urllib.request.urlopen(req, timeout=5) as r:

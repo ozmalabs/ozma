@@ -619,6 +619,11 @@ pub struct NodeConfig {
     pub ffmpeg_bin: PathBuf,
     /// VAAPI render node used by encoder detection and the HLS VAAPI argv.
     pub vaapi_device: PathBuf,
+    /// CUDA ordinal used by the HLS NVENC argv (`-gpu <n>`).
+    ///
+    /// `None` leaves NVIDIA device selection to ffmpeg/the driver; it is never
+    /// replaced by an invented ordinal.
+    pub nvenc_gpu: Option<u32>,
     /// Audio sink name advertised to the controller.
     pub audio_sink: Option<String>,
     /// Optional PulseAudio/PipeWire monitor source for WebRTC audio.
@@ -660,6 +665,14 @@ impl NodeConfig {
         validate_path("--qmp-socket", self.qmp_socket.as_deref())?;
         validate_path("--qmp-input-socket", self.qmp_input_socket.as_deref())?;
         validate_path("--ffmpeg-bin", Some(self.ffmpeg_bin.as_path()))?;
+        if let Some(gpu) = self.nvenc_gpu {
+            if gpu > i32::MAX as u32 {
+                return Err(format!(
+                    "--nvenc-gpu must be a CUDA ordinal between 0 and {}, got {gpu}",
+                    i32::MAX
+                ));
+            }
+        }
         if let Some(host) = &self.vnc_host {
             if host.trim().is_empty() {
                 return Err("--vnc-host must not be empty".to_owned());
@@ -899,6 +912,7 @@ mod tests {
             audio_track_root: None,
             ffmpeg_bin: PathBuf::from("ffmpeg"),
             vaapi_device: PathBuf::from("/dev/dri/renderD128"),
+            nvenc_gpu: None,
             audio_sink: None,
             webrtc_audio_source: None,
             webrtc_audio_backend: WebRtcAudioBackend::Auto,
@@ -1246,6 +1260,20 @@ mod tests {
             config.vm_providers().unwrap().capture.as_deref(),
             Some("vnc")
         );
+    }
+
+    #[test]
+    fn nvenc_gpu_is_optional_and_bounded() {
+        let mut config = test_config(NodeProfile::Vm);
+        assert_eq!(config.nvenc_gpu, None, "no default GPU is invented");
+        assert!(config.validate().is_ok());
+
+        config.nvenc_gpu = Some(1);
+        assert!(config.validate().is_ok());
+
+        config.nvenc_gpu = Some(i32::MAX as u32 + 1);
+        let error = config.validate().expect_err("out-of-range ordinal");
+        assert!(error.contains("--nvenc-gpu"), "{error}");
     }
 
     #[test]

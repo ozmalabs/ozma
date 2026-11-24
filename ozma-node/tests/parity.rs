@@ -475,6 +475,7 @@ fn assert_shape(value: &Value, shape: &Value, context: &str) {
             "object" => field.is_object(),
             "array" => field.is_array(),
             "string-or-null" => field.is_string() || field.is_null(),
+            "number-or-null" => field.is_number() || field.is_null(),
             "object-or-null" => field.is_object() || field.is_null(),
             other => panic!("{context}.{name} has unknown shape {other:?}"),
         };

@@ -32,6 +32,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from node_auth import node_api_headers_for_state
+
 try:
     import aiohttp
 except ImportError:
@@ -387,9 +389,12 @@ class BackupNudgeService:
         if aiohttp is None:
             return None
         try:
+            node = getattr(self._state, "nodes", {}).get(node_id)
+            headers = node_api_headers_for_state(node, self._state)
             async with aiohttp.ClientSession() as session:
                 async with session.get(
-                    url, timeout=aiohttp.ClientTimeout(total=self._PROXY_TIMEOUT)
+                    url, headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=self._PROXY_TIMEOUT),
                 ) as resp:
                     if resp.status == 200:
                         return await resp.json()
@@ -409,9 +414,11 @@ class BackupNudgeService:
         if aiohttp is None:
             return None
         try:
+            node = getattr(self._state, "nodes", {}).get(node_id)
+            headers = node_api_headers_for_state(node, self._state)
             async with aiohttp.ClientSession() as session:
                 async with session.post(
-                    url, json=body,
+                    url, json=body, headers=headers,
                     timeout=aiohttp.ClientTimeout(total=self._PROXY_TIMEOUT),
                 ) as resp:
                     if resp.status in (200, 201, 202):

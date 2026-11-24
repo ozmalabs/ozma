@@ -53,6 +53,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from node_auth import node_api_headers_for_state
+
 log = logging.getLogger("ozma.serial_console")
 
 DEFAULT_BAUD = 115200
@@ -357,8 +359,10 @@ class SerialConsoleManager:
             try:
                 loop = asyncio.get_running_loop()
                 url = f"http://{node.host}:{node.api_port}/serial/buffer?lines=50"
-                def _fetch(u=url):
-                    with urllib.request.urlopen(u, timeout=3) as r:
+                headers = node_api_headers_for_state(node, self._state)
+                def _fetch(u=url, h=headers):
+                    req = urllib.request.Request(u, headers=h)
+                    with urllib.request.urlopen(req, timeout=3) as r:
                         return _json.loads(r.read())
                 lines = await loop.run_in_executor(None, _fetch)
 

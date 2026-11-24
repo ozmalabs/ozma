@@ -467,6 +467,16 @@ fn parse_properties_cursor(
     Ok(properties)
 }
 
+/// Whether a console signal belongs to the selected console.
+///
+/// QEMU's console connection can carry signals for every console. A signal
+/// with an explicit path is only applied when it matches the selected
+/// `Console_N`; a pathless signal is accepted because older QEMU versions did
+/// not always set one.
+fn console_signal_applies(path: Option<&str>, selected: &str) -> bool {
+    path.map_or(true, |path| path == selected)
+}
+
 /// Read the console size from a `PropertiesChanged` signal body.
 ///
 /// QEMU updates the console's `Width`/`Height` properties when the guest
@@ -1892,6 +1902,7 @@ impl DBusDisplaySource {
             return;
         };
         let id = self.config.id.clone();
+        let console_path = self.config.console_path();
         let max_body = self.config.max_message_body();
         let console_size = Arc::clone(&self.console_size);
         self.display_drain = Some(tokio::spawn(async move {
@@ -1901,9 +1912,16 @@ impl DBusDisplaySource {
                         // QEMU updates the console Width/Height properties when
                         // the display mode changes. Keep the latest geometry
                         // available to the listener before its Update bands use
-                        // it. Everything else on this connection is an
-                        // unhandled signal and is discarded.
-                        if message.header.member.as_deref() == Some("PropertiesChanged") {
+                        // it. The console connection can also carry signals for
+                        // other consoles (for example Console_0 while this
+                        // source selected Console_1), so only apply a
+                        // PropertiesChanged that names this console. A signal
+                        // without a path is still accepted for compatibility.
+                        let for_this_console =
+                            console_signal_applies(message.header.path.as_deref(), &console_path);
+                        if message.header.member.as_deref() == Some("PropertiesChanged")
+                            && for_this_console
+                        {
                             match parse_console_size_signal(&message.body) {
                                 Some((width, height)) => {
                                     tracing::debug!(
@@ -2418,7 +2436,25 @@ impl DBusDisplaySource {
                         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                     self.format = FrameFormat::new(PixelFormat::Bgra, 0, 0);
                 }
-                _ => {}
+                Some(other) => {
+                    // The QEMU GL listener sends ScanoutDMABUF/UpdateDMABUF
+                    // instead of the BGRA Scanout/Update messages this source
+                    // implements. Keep the surface unchanged, but name the
+                    // unsupported method so a live GL run is diagnosable
+                    // instead of looking like a dead capture source.
+                    tracing::debug!(
+                        id = %self.config.id,
+                        method = other,
+                        body_bytes = message.body.len(),
+                        "D-Bus display method not handled"
+                    );
+                }
+                None => {
+                    tracing::debug!(
+                        id = %self.config.id,
+                        "D-Bus method call without a member name"
+                    );
+                }
             }
         }
     }
@@ -3318,6 +3354,19 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(parse_console_size_signal(&other), None);
+    }
+
+    #[test]
+    fn console_properties_changed_only_applies_to_the_selected_console() {
+        assert!(console_signal_applies(
+            Some("/org/qemu/Display1/Console_1"),
+            "/org/qemu/Display1/Console_1"
+        ));
+        assert!(!console_signal_applies(
+            Some("/org/qemu/Display1/Console_0"),
+            "/org/qemu/Display1/Console_1"
+        ));
+        assert!(console_signal_applies(None, "/org/qemu/Display1/Console_1"));
     }
 
     #[test]

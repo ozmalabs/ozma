@@ -92,6 +92,7 @@
     "current_encoder": "string-or-null",
     "override": "object-or-null",
     "available": "array",
+    "nvenc_gpu": "number-or-null",
     "receipt": "object-or-null",
     "pending_restart": "bool",
     "applied": "bool"
@@ -104,6 +105,7 @@
     "requested_encoder": "string-or-null",
     "backend": "string",
     "vaapi_device": "string-or-null",
+    "nvenc_gpu": "number-or-null",
     "fallback": "bool",
     "fallback_reason": "string-or-null",
     "hls": "string",

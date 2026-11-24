@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from node_auth import node_api_headers, node_api_token  # re-exported for callers
+
 log = logging.getLogger("ozma.state")
 
 
@@ -154,22 +156,6 @@ class NodeInfo:
         if self.pci_devices:
             d["pci_devices"] = self.pci_devices
         return d
-
-
-def node_api_token(node: Any, fallback: str = "") -> str:
-    """Resolve the bearer token used for a node's HTTP API.
-
-    A per-node token captured at registration wins; otherwise the
-    controller-wide configured token is used. The token is never logged here.
-    """
-    token = getattr(node, "api_token", "") or fallback or ""
-    return str(token).strip()
-
-
-def node_api_headers(node: Any, fallback: str = "") -> dict[str, str]:
-    """Return Authorization headers for a node request, or {} when unset."""
-    token = node_api_token(node, fallback)
-    return {"Authorization": f"Bearer {token}"} if token else {}
 
 
 class AppState:

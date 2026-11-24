@@ -58,7 +58,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
-from state import node_api_headers
+from node_auth import node_api_headers_for_state
 
 log = logging.getLogger("ozma.metrics")
 
@@ -188,8 +188,7 @@ class MetricsCollector:
 
     def _node_headers(self, node: Any) -> dict[str, str]:
         """Bearer header for a node poll; never logged."""
-        fallback = getattr(self._state, "node_api_token", "") or ""
-        return node_api_headers(node, fallback)
+        return node_api_headers_for_state(node, self._state)
 
     async def start(self) -> None:
         self._task = asyncio.create_task(self._collect_loop(), name="metrics-collector")

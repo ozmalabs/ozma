@@ -32,6 +32,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, TYPE_CHECKING
 
+from node_auth import node_api_headers_for_state
+
 if TYPE_CHECKING:
     from scenarios import ScenarioManager
     from audio import AudioRouter
@@ -452,9 +454,11 @@ class ControlManager:
             log.debug("power.%s: node %r not found or no API port", action, node_name)
             return
         url = f"http://{node.host}:{node.api_port}/power/{action}"
+        headers = {"Content-Type": "application/json",
+                   **node_api_headers_for_state(node, self._state)}
         try:
             loop = asyncio.get_running_loop()
-            req = urllib.request.Request(url, data=b"{}", headers={"Content-Type": "application/json"}, method="POST")
+            req = urllib.request.Request(url, data=b"{}", headers=headers, method="POST")
             await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=10))
             log.info("Power %s → %s", action, node.id)
         except Exception as e:

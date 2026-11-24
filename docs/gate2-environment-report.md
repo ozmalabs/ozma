@@ -451,17 +451,24 @@ not require a token, and the controller's token is additive.
 |---|---|
 | Global config | `OZMA_NODE_API_TOKEN` → `Config.node_api_token` → `AppState.node_api_token` / `build_app(node_api_token=...)` |
 | Per-node token | Optional `api_token` field on `DirectRegisterRequest`; stored on `NodeInfo` with `repr=False`; preserved across re-registration |
-| Header sent | `Authorization: Bearer <token>` on JSON input/audio, raw WebRTC, snapshot, hints, metrics poller, power/current/RGB/USB, codec and remote-screenshot proxies |
+| Central helper | `controller/node_auth.py` resolves per-node token first, then the global fallback, and builds `Authorization` headers plus the token-free 401/403 message. `controller/state.py` re-exports the old helpers for existing callers. |
+| Header sent | `Authorization: Bearer <token>` on JSON input/audio, raw WebRTC, snapshot, hints, metrics poller, power/current/RGB/USB, codec and remote-screenshot proxies. The same header is now sent by direct background clients outside `api.py`: control-surface power, agent hints, soft-node stream snapshot/input/codec, terminal snapshots, serial polling, node RGB zones, mesh status, session init, and backup proxy. |
 | No token configured | No `Authorization` header; previous behavior preserved |
 | Node 401/403 | Raw WebRTC and codec responses pass the node status/body through; other proxies return controller 502 with a clear “Node rejected the controller's bearer token (HTTP 401)” detail |
 | Secret exposure | Token excluded from `NodeInfo.to_dict()`, node events, dashboard/list responses, and logs; tests assert it never appears in response text or captured logs |
+| Tests | `tests/unit/controller/test_node_api_token_proxy.py` (31 cases) and `tests/unit/controller/test_node_api_token_direct.py` (21 cases) use a fake node HTTP server to assert header present/absent, per-node over global, 401/403 handling, and token-free logs/responses. |
 
 Remaining limitations: there is no per-node token store, rotation, or controller
 UI/registration field in the dashboard; a global token is applied to every node
 that does not register its own; the node still exposes read-only compat routes
-publicly by design; and direct registration sends `api_token` in cleartext, so
-it is only safe on a trusted/loopback link or over TLS/SSH tunneling. A node
-that was started with `--api-token` and whose token does not match will now
+publicly by design (`/display/snapshot`, `/display/info`, `/ui/hints`,
+`/node/status`, `/agent/metrics`, `/audio/nodes`, `/audio/sweep`), so configured
+clients send the header but the node also accepts those routes without it. Direct
+registration sends `api_token` in cleartext, so it is only safe on a
+trusted/loopback link or over TLS/SSH tunneling. External device/peer endpoints
+(Sunshine, motion controllers, OLED/e-ink/LCD drivers, controller peers, sharing
+and WireGuard) are not node APIs and never receive the controller's node token.
+A node that was started with `--api-token` and whose token does not match will
 return a typed controller 502 instead of silently reading controller-local data.
 
 ## 8. Next-run checklist

@@ -47,7 +47,8 @@ except (ImportError, Exception):
     _gql_add_graphiql_route = None  # type: ignore[assignment]
     _GRAPHQL_AVAILABLE = False
 
-from state import AppState, NodeInfo, node_api_headers
+from state import AppState, NodeInfo
+from node_auth import node_api_headers, node_auth_error
 from permissions import (
     check_node_permission, check_destructive_warnings, warnings_to_dict,
     get_user_seats, get_user_permission_level, PERMISSION_LEVELS,
@@ -263,10 +264,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     def _node_auth_error(status: int) -> str:
         """Clear, token-free message for a node 401/403."""
-        return (
-            "Node rejected the controller's bearer token "
-            f"(HTTP {status}); configure OZMA_NODE_API_TOKEN to match the node"
-        )
+        return node_auth_error(status)
 
     # Paths that don't require authentication
     _AUTH_EXEMPT = {

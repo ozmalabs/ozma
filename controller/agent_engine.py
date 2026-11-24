@@ -33,6 +33,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from node_auth import node_api_headers_for_state
+
 log = logging.getLogger("ozma.agent_engine")
 
 # ── Approval modes ────────────────────────────────────────────────────────────
@@ -618,10 +620,13 @@ class AgentEngine:
         """
         api_port = getattr(node, 'api_port', None) or 7390
         url = f"http://{node.host}:{api_port}/ui/hints?level={level}"
+        headers = node_api_headers_for_state(node, self._state)
         try:
             import aiohttp
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=2)) as resp:
+                async with session.get(
+                    url, headers=headers, timeout=aiohttp.ClientTimeout(total=2)
+                ) as resp:
                     if resp.status == 200:
                         return await resp.json()
         except Exception:

@@ -41,6 +41,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
 
+from node_auth import node_api_headers_for_state
+
 log = logging.getLogger("ozma.mesh")
 
 
@@ -201,8 +203,10 @@ class MeshIntelligence:
                 loop = asyncio.get_running_loop()
                 url = f"http://{node.host}:{node.api_port}/node/status"
                 t_start = time.monotonic()
-                def _fetch(u=url):
-                    with urllib.request.urlopen(u, timeout=5) as r:
+                headers = node_api_headers_for_state(node, self._state)
+                def _fetch(u=url, h=headers):
+                    req = urllib.request.Request(u, headers=h)
+                    with urllib.request.urlopen(req, timeout=5) as r:
                         return json.loads(r.read())
                 data = await loop.run_in_executor(None, _fetch)
                 ms.rtt_ms = (time.monotonic() - t_start) * 1000

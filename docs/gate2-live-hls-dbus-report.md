@@ -17,6 +17,17 @@ or network device, and was removed at the end.
 > resolution-change limitation found later (640×480 -> 1280×800) is fixed in
 > code with unit tests; a live guest rerun is still required (§6.2).
 
+> **Follow-up (2026-11-24):** the disposable Alpine guest run in
+> [`gate2-live-guest-advanced-report.md`](gate2-live-guest-advanced-report.md)
+> observed a live `Console_1` Scanout with a second display device, live 2D
+> `Update`, and two live `Disable` messages when a guest reset the
+> `-display dbus,gl=on` path. GL capture remains unsupported because QEMU sends
+> `ScanoutDMABUF`/`UpdateDMABUF`, not BGRA `Scanout`/`Update`; the source now
+> logs those methods. It also fixed a secondary-console bug: `PropertiesChanged`
+> signals are now filtered by `Console_N` path so `Console_0` geometry cannot
+> resize a `Console_1` capture. The original 2D-VGA `Disable` conclusion below
+> still holds for the 2D path; the GL path is the one that emits `Disable`.
+
 | Item | Result |
 |---|---|
 | HLS pacer, QMP capture, `--hls-fps 5`, 1 s segments | **PASS** — 10 segments in 10.073 s (0.993/s), `#EXTINF:1.000000` |

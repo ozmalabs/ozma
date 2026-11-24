@@ -159,6 +159,11 @@ impl HlsEncoder {
         matches!(self, Self::VaapiH264 | Self::VaapiHevc)
     }
 
+    /// True when this encoder is an NVIDIA NVENC wrapper (`-gpu` capable).
+    pub fn is_nvenc(self) -> bool {
+        matches!(self, Self::NvencH264 | Self::NvencHevc)
+    }
+
     /// Stable hardware-backend label (`vaapi`, `nvenc`, `qsv`, `v4l2m2m`).
     pub fn backend_label(self) -> &'static str {
         match self {
@@ -378,6 +383,13 @@ pub struct HlsConfig {
     /// Only checked for existence when a pipeline starts/restarts, never while
     /// building argv, so tests can construct argv without a real GPU node.
     pub vaapi_device: PathBuf,
+    /// CUDA ordinal passed as ffmpeg `-gpu <n>` for NVENC H.264/HEVC.
+    ///
+    /// `None` means no `-gpu` is emitted and ffmpeg/driver pick the device.
+    /// The preference is independent of the current encoder: a `/codec`
+    /// restart onto software or VAAPI keeps it but deliberately does not pass
+    /// `-gpu` to an encoder that does not support that option.
+    pub nvenc_gpu: Option<u32>,
 }
 
 impl Default for HlsConfig {
@@ -393,6 +405,7 @@ impl Default for HlsConfig {
             height: None,
             ffmpeg_bin: PathBuf::from("ffmpeg"),
             vaapi_device: PathBuf::from("/dev/dri/renderD128"),
+            nvenc_gpu: None,
         }
     }
 }
@@ -434,6 +447,14 @@ impl HlsConfig {
                 "--hls-bitrate-kbps must be at least 1".to_owned(),
             ));
         }
+        if let Some(gpu) = self.nvenc_gpu {
+            if gpu > i32::MAX as u32 {
+                return Err(HlsError::InvalidConfig(format!(
+                    "--nvenc-gpu must be a CUDA ordinal between 0 and {}, got {gpu}",
+                    i32::MAX
+                )));
+            }
+        }
         match (self.width, self.height) {
             (Some(0), _) | (_, Some(0)) => {
                 return Err(HlsError::InvalidConfig(
@@ -453,6 +474,26 @@ impl HlsConfig {
     fn validated(self) -> Result<Self, HlsError> {
         self.validate()?;
         Ok(self)
+    }
+
+    /// Reject a startup selection that pairs `--nvenc-gpu` with a non-NVENC
+    /// encoder.
+    ///
+    /// This is the CLI/startup contract, not a runtime invariant. A
+    /// `/codec` restart may switch a running pipeline to software or VAAPI;
+    /// that keeps [`HlsConfig::nvenc_gpu`] (so a later NVENC restart still
+    /// targets the same GPU) but omits `-gpu` from the argv because the flag is
+    /// not an option of the other encoders.
+    pub fn validate_encoder_options(&self) -> Result<(), HlsError> {
+        if self.nvenc_gpu.is_some() && !self.video_encoder.is_nvenc() {
+            return Err(HlsError::InvalidConfig(format!(
+                "--nvenc-gpu selects an NVIDIA device and is only used by h264_nvenc/hevc_nvenc; \
+                 the selected encoder `{}` is {}",
+                self.video_encoder.ffmpeg_name(),
+                self.video_encoder.backend_label()
+            )));
+        }
+        Ok(())
     }
 
     /// Keyframe interval in frames that keeps GOPs aligned with segments.
@@ -2415,18 +2456,28 @@ fn ffmpeg_argv_for(config: &HlsConfig, width: u32, height: u32, restart: bool) -
             "-b:v".to_owned(),
             bitrate,
         ]),
-        HlsEncoder::NvencH264 | HlsEncoder::NvencHevc => argv.extend([
-            "-c:v".to_owned(),
-            config.video_encoder.ffmpeg_name().to_owned(),
-            "-preset".to_owned(),
-            "p4".to_owned(),
-            "-tune".to_owned(),
-            "ll".to_owned(),
-            "-rc".to_owned(),
-            "cbr".to_owned(),
-            "-b:v".to_owned(),
-            bitrate,
-        ]),
+        HlsEncoder::NvencH264 | HlsEncoder::NvencHevc => {
+            argv.extend([
+                "-c:v".to_owned(),
+                config.video_encoder.ffmpeg_name().to_owned(),
+            ]);
+            // `-gpu` is an NVENC AVOption only. Emitting it for any other
+            // encoder would make ffmpeg reject the whole argv, so this stays
+            // inside the NVENC arm.
+            if let Some(gpu) = config.nvenc_gpu {
+                argv.extend(["-gpu".to_owned(), gpu.to_string()]);
+            }
+            argv.extend([
+                "-preset".to_owned(),
+                "p4".to_owned(),
+                "-tune".to_owned(),
+                "ll".to_owned(),
+                "-rc".to_owned(),
+                "cbr".to_owned(),
+                "-b:v".to_owned(),
+                bitrate,
+            ]);
+        }
         HlsEncoder::QsvH264 | HlsEncoder::QsvHevc => argv.extend([
             "-c:v".to_owned(),
             config.video_encoder.ffmpeg_name().to_owned(),
@@ -2814,6 +2865,7 @@ mod tests {
         assert_eq!(config.bitrate_kbps, 4_000);
         assert_eq!(config.video_encoder, HlsEncoder::H264);
         assert_eq!(config.ffmpeg_bin, PathBuf::from("ffmpeg"));
+        assert_eq!(config.nvenc_gpu, None);
         assert_eq!(config.width, None);
         assert_eq!(config.height, None);
         assert_eq!(config.gop_frames(), 30);
@@ -3253,6 +3305,194 @@ mod tests {
                 "{encoder:?} argv must prune segments"
             );
         }
+    }
+
+    #[test]
+    fn nvenc_gpu_validation_is_bounded_and_nvenc_only() {
+        // A configured ordinal with NVENC is valid, including the largest value
+        // ffmpeg's integer AVOption accepts.
+        let nvenc = HlsConfig {
+            video_encoder: HlsEncoder::NvencH264,
+            nvenc_gpu: Some(i32::MAX as u32),
+            ..HlsConfig::default()
+        };
+        nvenc.validate().expect("i32::MAX is a valid -gpu value");
+        nvenc
+            .validate_encoder_options()
+            .expect("NVENC accepts --nvenc-gpu");
+
+        // Anything larger would be misparsed by ffmpeg's int option.
+        let too_large = HlsConfig {
+            nvenc_gpu: Some(i32::MAX as u32 + 1),
+            ..nvenc.clone()
+        };
+        let error = too_large
+            .validate()
+            .expect_err("out-of-range ordinals are rejected");
+        assert!(error.to_string().contains("--nvenc-gpu"), "{error}");
+
+        // A `/codec` restart may leave the preference on a software/VAAPI
+        // config; only the startup selection check rejects that pairing.
+        for encoder in [
+            HlsEncoder::H264,
+            HlsEncoder::Hevc,
+            HlsEncoder::VaapiH264,
+            HlsEncoder::QsvH264,
+            HlsEncoder::V4l2m2mH264,
+        ] {
+            let config = HlsConfig {
+                video_encoder: encoder,
+                nvenc_gpu: Some(1),
+                ..HlsConfig::default()
+            };
+            config
+                .validate()
+                .expect("a stored GPU preference does not invalidate a runtime config");
+            let error = config
+                .validate_encoder_options()
+                .expect_err("the CLI must not pair --nvenc-gpu with a non-NVENC encoder");
+            assert!(
+                error.to_string().contains("--nvenc-gpu")
+                    && error.to_string().contains(encoder.ffmpeg_name()),
+                "{error}"
+            );
+        }
+        // No preference is always accepted.
+        HlsConfig::default()
+            .validate_encoder_options()
+            .expect("no GPU configured");
+    }
+
+    #[test]
+    fn ffmpeg_argv_emits_gpu_only_for_nvenc() {
+        let base = HlsConfig {
+            output_dir: PathBuf::from("/tmp/ozma-stream-nvenc-gpu"),
+            nvenc_gpu: Some(1),
+            ..HlsConfig::default()
+        };
+
+        for encoder in HlsEncoder::ALL {
+            let argv = ffmpeg_argv(
+                &HlsConfig {
+                    video_encoder: encoder,
+                    ..base.clone()
+                },
+                320,
+                240,
+            );
+            let gpu_arguments: Vec<usize> = argv
+                .iter()
+                .enumerate()
+                .filter(|(_, argument)| argument.as_str() == "-gpu")
+                .map(|(index, _)| index)
+                .collect();
+            if encoder.is_nvenc() {
+                assert_eq!(gpu_arguments.len(), 1, "{encoder:?} argv: {argv:?}");
+                let index = gpu_arguments[0];
+                assert_eq!(argv[index + 1], "1", "{encoder:?}");
+                let codec_index = argv
+                    .iter()
+                    .position(|argument| argument == "-c:v")
+                    .unwrap_or_else(|| panic!("{encoder:?} argv has no -c:v"));
+                assert!(
+                    index > codec_index,
+                    "{encoder:?} -gpu must be an output/encoder option after -c:v"
+                );
+            } else {
+                assert!(
+                    gpu_arguments.is_empty(),
+                    "{encoder:?} must not receive the NVENC-only -gpu flag: {argv:?}"
+                );
+            }
+        }
+
+        // No configured GPU means no invented ordinal, even for NVENC.
+        for encoder in [HlsEncoder::NvencH264, HlsEncoder::NvencHevc] {
+            let argv = ffmpeg_argv(
+                &HlsConfig {
+                    video_encoder: encoder,
+                    nvenc_gpu: None,
+                    ..base.clone()
+                },
+                320,
+                240,
+            );
+            assert!(
+                !argv.iter().any(|argument| argument == "-gpu"),
+                "{encoder:?} must not invent a GPU: {argv:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn codec_restart_preserves_the_configured_nvenc_gpu() {
+        let directory = temp_dir("nvenc-gpu-restart");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fail_on = Arc::new(Mutex::new(Vec::new()));
+        let stopped = Arc::new(Mutex::new(Vec::new()));
+        let recording = RecordingSpawner::default();
+        let spawns = recording.spawns.clone();
+        let controller = HlsController::with_spawner_and_probe(
+            controller_factory(calls, fail_on, stopped),
+            HlsConfig {
+                output_dir: directory.clone(),
+                video_encoder: HlsEncoder::NvencH264,
+                nvenc_gpu: Some(1),
+                ..HlsConfig::default()
+            },
+            spawner(recording),
+            Arc::new(StaticEncoderProbe::with_encoders([
+                HlsEncoder::H264,
+                HlsEncoder::NvencH264,
+                HlsEncoder::NvencHevc,
+            ])),
+        );
+
+        controller.start().await.expect("start NVENC controller");
+        assert_eq!(controller.config().video_encoder, HlsEncoder::NvencH264);
+        assert_eq!(controller.config().nvenc_gpu, Some(1));
+        {
+            let recorded = spawns.lock().unwrap();
+            let argv = &recorded.last().expect("initial spawn").2;
+            assert!(argv.windows(2).any(|window| window == ["-gpu", "1"]));
+        }
+
+        // Software restart: the preference stays stored, but `-gpu` is not
+        // passed to libx264.
+        controller
+            .restart_with_encoder(HlsEncoder::H264, None)
+            .await
+            .expect("software restart");
+        assert_eq!(controller.config().video_encoder, HlsEncoder::H264);
+        assert_eq!(
+            controller.config().nvenc_gpu,
+            Some(1),
+            "a codec switch must not forget the configured GPU"
+        );
+        {
+            let recorded = spawns.lock().unwrap();
+            let argv = &recorded.last().expect("software spawn").2;
+            assert!(
+                !argv.iter().any(|argument| argument == "-gpu"),
+                "libx264 must not receive -gpu: {argv:?}"
+            );
+        }
+
+        // Switching back targets the same GPU again.
+        controller
+            .restart_with_encoder(HlsEncoder::NvencHevc, None)
+            .await
+            .expect("NVENC HEVC restart");
+        assert_eq!(controller.config().video_encoder, HlsEncoder::NvencHevc);
+        assert_eq!(controller.config().nvenc_gpu, Some(1));
+        {
+            let recorded = spawns.lock().unwrap();
+            let argv = &recorded.last().expect("NVENC HEVC spawn").2;
+            assert!(argv.windows(2).any(|window| window == ["-gpu", "1"]));
+        }
+
+        controller.stop().await.expect("stop");
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
