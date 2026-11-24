@@ -10,6 +10,7 @@ pub mod browser_scene;
 pub mod client_capture;
 pub mod config;
 pub mod controller_compat;
+pub mod display_broker;
 pub mod display_compat;
 pub mod display_control;
 pub mod display_outputs;

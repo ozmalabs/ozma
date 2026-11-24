@@ -1684,6 +1684,23 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             "display_capture": connection.get("display_capture") or {},
         }
 
+    @app.get("/api/v1/nodes/{node_id}/display/info")
+    async def node_display_info(
+        node_id: str, console: str | None = None
+    ) -> dict[str, Any]:
+        """Read per-console snapshot geometry/source/availability from a node.
+
+        ``console`` accepts the same ``<N|label|Console_N|source-id>`` value as
+        the node's ``GET /display/info``. Without it the node reports its active
+        console, preserving the existing shape.
+        """
+        path = "/display/info"
+        if console not in (None, ""):
+            from urllib.parse import quote
+
+            path += "?console=" + quote(str(console), safe="")
+        return await _proxy_node(node_id, path)
+
     @app.post("/api/v1/nodes/{node_id}/display/select")
     async def node_display_select(
         node_id: str, body: dict[str, Any] | None = None
@@ -3720,19 +3737,30 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(status_code=502, detail=str(e))
 
     @app.get("/api/v1/streams/{node_id:path}/snapshot")
-    async def stream_snapshot(node_id: str) -> Response:
-        """Single JPEG frame from a node's display (proxy to soft node API)."""
+    async def stream_snapshot(node_id: str, console: str | None = None) -> Response:
+        """Single JPEG frame from a node's display (proxy to soft node API).
+
+        ``console`` is forwarded as ``?console=<N|label>`` so the controller can
+        preview an advertised VM console without switching the active
+        HLS/WebRTC source. Without it the node returns its active console,
+        preserving the previous behavior.
+        """
         node = state.nodes.get(node_id)
         if not node:
             raise HTTPException(status_code=404, detail="Node not found")
         api_port = getattr(node, "api_port", 0)
         if not api_port:
             raise HTTPException(status_code=404, detail="Node has no API port")
+        snapshot_url = f"http://127.0.0.1:{api_port}/display/snapshot"
+        if console not in (None, ""):
+            from urllib.parse import quote
+
+            snapshot_url += "?console=" + quote(str(console), safe="")
         import aiohttp as _aiohttp
         try:
             async with _aiohttp.ClientSession() as session:
                 async with session.get(
-                    f"http://127.0.0.1:{api_port}/display/snapshot",
+                    snapshot_url,
                     headers=_node_headers(node),
                     timeout=_aiohttp.ClientTimeout(total=10),
                 ) as resp:

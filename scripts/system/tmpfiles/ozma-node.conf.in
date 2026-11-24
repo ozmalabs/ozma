@@ -5,5 +5,8 @@
 #   systemd-tmpfiles --create /etc/tmpfiles.d/ozma-node.conf
 # Type Path        Mode User        Group        Age Argument
 d /run/ozma-node 0750 @OZMA_USER@ @OZMA_GROUP@ -
-d /run/ozma      0755 root        root         -
+# The supervisor writes its QMP/audio state under /run/ozma, while QEMU/libvirt
+# (the kvm group) must traverse it to reach /run/ozma/qmp. Keep the service
+# user as owner but allow group/other traversal.
+d /run/ozma      0755 @OZMA_USER@ @OZMA_GROUP@ -
 d /run/ozma/qmp  0770 root        @QMP_GROUP@  -

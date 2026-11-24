@@ -14,14 +14,18 @@
 //! * [`seat`] defines profiles, seat configuration, launch commands, and
 //!   diagnostics.
 //! * [`status`] is the controller-facing capability/status shape where one
-//!   seat is one node.
-//! * [`supervisor`] is the start/stop/status contract. A subprocess launcher is
-//!   deliberately not implemented yet; [`fake::FakeSeatSupervisor`] is the test
-//!   double.
+//!   seat is one node, plus a bounded Prometheus metrics renderer.
+//! * [`host`] joins a display backend and an input backend and refuses to plan
+//!   when display enumeration fails or reports no displays.
+//! * [`supervisor`] starts, health-checks, restarts, stops, and reports real
+//!   `ozma-node --profile desktop` children. [`fake`] contains the test-only
+//!   launcher, readiness probe, backends, and `FakeSeatSupervisor`.
 //!
 //! The crate performs no input injection, opens no evdev node, creates no
-//! virtual display, allocates no PipeWire sink, and spawns no process. It
-//! contains no `unsafe` code.
+//! virtual display, and allocates no PipeWire sink. The supervisor only spawns
+//! the planned node process; display/input ownership, evdev grabs, audio sink
+//! creation, and game launching remain outside this crate. It contains no
+//! `unsafe` code (the Unix SIGTERM helper is the safe `nix` API).
 //!
 //! Test fakes in [`fake`] never touch the host. Production code must not select
 //! them from detection.
@@ -32,6 +36,7 @@ pub mod display;
 pub mod drm;
 pub mod error;
 pub mod fake;
+pub mod host;
 pub mod input;
 pub mod planner;
 pub mod seat;
@@ -46,7 +51,10 @@ pub use drm::{
     DEFAULT_DRM_ROOT,
 };
 pub use error::MultiseatError;
-pub use fake::{FakeDisplayBackend, FakeInputBackend, FakeSeatSupervisor};
+pub use fake::{
+    FakeDisplayBackend, FakeInputBackend, FakeNodeLauncher, FakeReadinessProbe, FakeSeatSupervisor,
+};
+pub use host::HostTopology;
 pub use input::{
     classify_capabilities, group_inputs, usb_hub_path_from_sysfs, InputBackend, InputDevice,
     InputDeviceKind, InputGroup, SysfsInputBackend, DEFAULT_INPUT_DEV_ROOT,
@@ -57,5 +65,11 @@ pub use seat::{
     CapturePlan, DiagnosticCode, MultiseatPlan, NodeCommand, PlanDiagnostic, ProfileDefaults,
     SeatConfig, SeatPlan, SeatPorts, SeatProfile, SeatRuntimeStatus, SeatState, SeatStatus,
 };
-pub use status::{MultiseatCapability, MultiseatStatus};
-pub use supervisor::SeatSupervisor;
+pub use status::{render_metrics, MultiseatCapability, MultiseatStatus};
+pub use supervisor::{
+    restart_delay, ChildExit, ChildHandle, HttpHealthProbe, NodeLaunchSpec, NodeLauncher,
+    PortProbe, ProcessLauncher, ProcessSeatSupervisor, ReadinessProbe, SeatSupervisor,
+    SupervisorOptions, DEFAULT_HEALTHY_UPTIME, DEFAULT_HEALTH_PATH, DEFAULT_NODE_BIN,
+    DEFAULT_READINESS_POLL, DEFAULT_READINESS_TIMEOUT, DEFAULT_RESTART_BACKOFF,
+    DEFAULT_RESTART_BACKOFF_MAX, TERMINATE_GRACE,
+};

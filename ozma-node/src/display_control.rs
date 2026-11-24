@@ -20,6 +20,11 @@
 //! failure and never returns a success-shaped body for a switch that did not
 //! happen. Single-head providers stay honestly unsupported: their advertised
 //! limitation is preserved and a different console is a typed 409.
+//!
+//! Non-active consoles are still available to controller previews through the
+//! separate bounded [`crate::display_broker::ConsoleBroker`]; it caches D-Bus
+//! sources for `?console=` snapshots/info without swapping this control's active
+//! registry or disturbing HLS/WebRTC.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -358,6 +363,15 @@ impl DisplayControl {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .selection
             .active_console
+    }
+
+    /// Snapshot of the current advertised outputs and active console.
+    pub fn selection(&self) -> DisplayOutputSelection {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .selection
+            .clone()
     }
 
     /// Monotonic successful-switch generation (0 before any switch).

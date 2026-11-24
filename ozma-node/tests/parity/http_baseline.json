@@ -38,7 +38,8 @@
     "snapshot_available": "bool",
     "snapshot_encoding": "string",
     "dimensions_source": "string",
-    "last_error": "string-or-null"
+    "last_error": "string-or-null",
+    "active": "bool"
   },
   "ui_hints": {
     "ok": "bool",

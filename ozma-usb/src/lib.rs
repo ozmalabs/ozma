@@ -10,8 +10,10 @@
 //!   mass storage, UAC2, FunctionFS vendor) and validate it before any
 //!   filesystem work. [`Uac2Config`] models descriptor capabilities and
 //!   ConfigFS attributes; [`FunctionFsConfig`] models endpoint/string
-//!   descriptors and explicit userspace-daemon readiness. Neither starts an
-//!   audio bridge or a FunctionFS daemon.
+//!   descriptors and explicit userspace-daemon readiness. The
+//!   [`FunctionFsDaemonCore`] additionally encodes the FunctionFS `ep0`
+//!   descriptor/string blobs, handles standard control requests, and services
+//!   injected endpoints; it still does not mount FunctionFS or spawn a daemon.
 //! * [`VirtualMedia`] / [`MassStorageImage`] model a backing image, disk vs
 //!   CD-ROM presentation, read-only policy, declared [`MediaFormat`], size,
 //!   and attach/detach state.
@@ -78,6 +80,7 @@ pub mod error;
 pub mod fake;
 pub mod fat32;
 pub mod functionfs;
+pub mod functionfs_daemon;
 pub mod iso;
 pub mod media;
 pub mod nbd;
@@ -102,10 +105,24 @@ pub use fat32::{
 };
 pub use functionfs::{
     is_functionfs_function_dir, require_functionfs_ready, FunctionFsConfig, FunctionFsDaemon,
-    FunctionFsDaemonSpec, FunctionFsDescriptorSet, FunctionFsEndpoint, FunctionFsReadiness,
+    FunctionFsDaemonSpec, FunctionFsDaemonStatus, FunctionFsDescriptorSet, FunctionFsEndpoint,
+    FunctionFsOsDescriptor, FunctionFsOsDescriptorKind, FunctionFsOsProperty, FunctionFsReadiness,
     FunctionFsStatus, FunctionFsStrings, FunctionFsTransfer, MissingFunctionFsDaemon,
     ObservedFunctionFsDaemon, MAX_FUNCTIONFS_DESCRIPTOR_BYTES, MAX_FUNCTIONFS_ENDPOINTS,
-    MAX_FUNCTIONFS_STRING_BYTES,
+    MAX_FUNCTIONFS_OS_DESCRIPTORS, MAX_FUNCTIONFS_OS_DESCRIPTOR_BYTES, MAX_FUNCTIONFS_STRING_BYTES,
+};
+pub use functionfs_daemon::{
+    handle_control_request, parse_descriptor_blob, parse_string_blob, FakeFunctionFsDaemon,
+    FileEndpointIo, FileEndpointOpener, FileEp0Io, FileFunctionFsDaemon, FunctionFsControlRequest,
+    FunctionFsControlResponse, FunctionFsDaemonCore, FunctionFsDaemonStats, FunctionFsDescriptors,
+    FunctionFsDirection, FunctionFsEndpointIo, FunctionFsEndpointOpener,
+    FunctionFsEndpointTransfer, FunctionFsEp0Io, FunctionFsEvent, FunctionFsEventOutcome,
+    FunctionFsEventType, FunctionFsMount, FunctionFsWriteReport, LoopbackEndpoint,
+    LoopbackEndpointOpener, LoopbackFunctionFsDaemon, MemoryEp0, ParsedFunctionFsDescriptors,
+    FUNCTIONFS_DESCRIPTORS_MAGIC_V2, FUNCTIONFS_EVENT_BYTES, FUNCTIONFS_HAS_FS_DESC,
+    FUNCTIONFS_HAS_HS_DESC, FUNCTIONFS_HAS_MS_OS_DESC, FUNCTIONFS_HAS_SS_DESC,
+    FUNCTIONFS_STRINGS_MAGIC, MAX_FUNCTIONFS_ENDPOINT_TRANSFER_BYTES,
+    MAX_FUNCTIONFS_EP0_WRITE_BYTES,
 };
 pub use iso::{
     parse_iso_volume_descriptors, validate_iso_image, IsoImage, IsoVolumeDescriptor,

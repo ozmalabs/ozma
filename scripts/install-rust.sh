@@ -178,6 +178,8 @@ render_unit() {
             -e "s|@RUNTIME_DIR@|$RUNTIME_DIR|g" \
             -e "s|@SUPERVISOR_STATE_DIR@|$SUP_STATE_DIR|g" \
             -e "s|@SUPERVISOR_RUNTIME_DIR@|$SUP_RUNTIME_DIR|g" \
+            -e "s|@OZMA_USER@|ozma-node|g" \
+            -e "s|@OZMA_GROUP@|ozma-node|g" \
             "$template"
     )
 

@@ -5,23 +5,31 @@
 ## Status (2026-11-25)
 
 The Python baseline in [`agent/multiseat`](../agent/multiseat) remains the
-runnable multi-seat implementation. A Rust planning foundation now exists in
-[`ozma-multiseat`](../ozma-multiseat) and is documented in
-[`multiseat-rust.md`](multiseat-rust.md):
+runnable multi-seat implementation. The Rust [`ozma-multiseat`](../ozma-multiseat)
+crate now covers planning **and** a real subprocess supervisor with a CLI, as
+documented in [`multiseat-rust.md`](multiseat-rust.md):
 
 - Linux Xrandr output enumeration and DRM connector detection.
 - Read-only sysfs/evdev enumeration and USB-hub input grouping.
 - Deterministic seat planning: one seat per display, sequential UDP/HTTP ports,
   input assignment, profiles, and per-seat `ozma-node --profile desktop` argv
   (uinput input, X11 or explicitly targeted PipeWire capture, audio sink).
-- Controller capability/status shape where one seat is one node.
-- `SeatSupervisor` start/stop/status trait with a test-only fake.
+- `ProcessSeatSupervisor`: spawn the planned node argv/environment, wait for
+  `/health` or a bounded port check, restart with bounded exponential backoff,
+  stop/reap, and report pid/ports/state/restarts/last error.
+- `ozma-multiseat` CLI: enumerate topology, print/validate the plan, dry-run,
+  or supervise seats, with optional loopback `/status`, `/metrics`, and
+  `/health`.
+- Controller capability/status shape where one seat is one node, plus bounded
+  Prometheus metrics.
 
-Not yet delivered: node integration, a real subprocess supervisor, OS-level
-display/input ownership, audio sink creation, hotplug/persistence, game launch,
-per-seat streaming, or any Windows (DXGI/IDD/Raw Input/WASAPI) path. The phase
-timeline below is unchanged; the Rust crate covers the planner/backends layer
-of Phase 1, not the Phase 1 deliverable.
+Not yet delivered: node/controller integration, OS-level display ownership,
+physical input routing/grabs, per-seat uinput targeting, audio sink creation,
+hotplug/persistence, game launch, per-seat streaming, supervisor isolation
+(cgroups/namespaces/log rotation), or any Windows (DXGI/IDD/Raw Input/WASAPI)
+path. The phase timeline below is unchanged; the Rust crate covers the
+planner/backends and subprocess-supervision layers of Phase 1, not the full
+Phase 1 deliverable.
 
 ## Architecture
 

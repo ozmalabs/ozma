@@ -10,6 +10,7 @@
 //! 5. run the UAC2 audio bridge when the `audio` capability is present.
 
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use clap::Parser;
 use ozma_audio::{
@@ -35,10 +36,11 @@ use ozma_node::{
         DEFAULT_USB_GADGET_NAME, DEFAULT_USB_MASS_STORAGE_INSTANCE,
     },
     controller_compat::{self, AudioControl, CodecControl},
+    display_broker::{ConsoleBroker, ConsoleBrokerConfig},
     display_compat::SnapshotControl,
     display_control::{
-        ConfigConsoleFactory, DisplayControl, HlsPipelineSwitch, SwitchablePipeline,
-        WebRtcPipelineSwitch,
+        ConfigConsoleFactory, ConsoleSourceFactory, DisplayControl, HlsPipelineSwitch,
+        SwitchablePipeline, WebRtcPipelineSwitch,
     },
     hls::{
         HlsConfig, HlsController, HlsEncoder, HlsError, HlsPixelFormat, HlsSourceFactory, HlsStatus,
@@ -1664,11 +1666,12 @@ async fn run() -> std::process::ExitCode {
             display_pipelines.push(WebRtcPipelineSwitch::new(control.clone(), webrtc_config));
         }
     }
+    let console_factory: Arc<dyn ConsoleSourceFactory> = Arc::new(ConfigConsoleFactory::new(
+        config.clone(),
+        shared_qmp.clone(),
+    ));
     let display_control = match DisplayControl::new(
-        Arc::new(ConfigConsoleFactory::new(
-            config.clone(),
-            shared_qmp.clone(),
-        )),
+        console_factory.clone(),
         registry_slot.clone(),
         display_pipelines,
     ) {
@@ -1682,6 +1685,13 @@ async fn run() -> std::process::ExitCode {
             None
         }
     };
+    // The broker is a separate snapshot/info path for advertised consoles. It
+    // never replaces `registry_slot`, so the active HLS/WebRTC source keeps its
+    // console. Sources for other consoles are opened lazily, bounded, and idle
+    // evicted.
+    let console_broker = display_control
+        .as_ref()
+        .map(|_| ConsoleBroker::new(console_factory, ConsoleBrokerConfig::default()));
     let capture_provider = config
         .capture_provider_name()
         .ok()
@@ -1706,12 +1716,42 @@ async fn run() -> std::process::ExitCode {
             .with_snapshot(Some(SnapshotControl::from_shared(registry_slot.clone())))
             .with_display_outputs(display_outputs_value, display_capture)
             .with_display_control(display_control)
+            .with_console_broker(console_broker.clone())
             .with_capture(capture_status);
     // Control routes stay behind the bearer guard; the controller's read-only
     // probes are mounted after it so the unmodified controller works with
     // `--api-token`. See `controller_compat::{compat_router, public_router}`.
     let compat_router = controller_compat::compat_router(compat_state.clone());
     let public_compat_router = controller_compat::public_router(compat_state);
+
+    // Idle console sources must not stay open forever when no snapshot is
+    // requested. The timer uses the same shutdown token as the other tasks.
+    if let Some(broker) = console_broker.clone() {
+        let broker_shutdown = shutdown.clone();
+        background.push((
+            "display-broker-idle",
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(5));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        _ = broker_shutdown.cancelled() => break,
+                        _ = ticker.tick() => {
+                            let evicted =
+                                broker.evict_idle(std::time::Instant::now()).await;
+                            if evicted > 0 {
+                                info!(
+                                    evicted,
+                                    "display broker evicted idle console sources"
+                                );
+                            }
+                        }
+                    }
+                }
+                broker.shutdown().await;
+            }),
+        ));
+    }
 
     // Start the controller-facing UDP HID listener only when the node
     // advertises the `hid` capability.
@@ -1988,6 +2028,18 @@ async fn run() -> std::process::ExitCode {
         .is_none()
         {
             warn!("WebRTC helper did not stop within its bound");
+        }
+    }
+    if let Some(broker) = console_broker.as_ref() {
+        if shutdown::with_timeout(
+            "display-broker-stop",
+            shutdown::TASK_STOP_TIMEOUT,
+            broker.shutdown(),
+        )
+        .await
+        .is_none()
+        {
+            warn!("display snapshot broker did not stop within its bound");
         }
     }
 

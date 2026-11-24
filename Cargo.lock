@@ -3542,10 +3542,13 @@ dependencies = [
 name = "ozma-multiseat"
 version = "0.1.0"
 dependencies = [
+ "clap",
+ "nix 0.30.1",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]

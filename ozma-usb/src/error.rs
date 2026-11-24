@@ -185,6 +185,81 @@ pub enum UsbError {
         reason: String,
     },
 
+    /// A FunctionFS mount directory is absent or is not a directory.
+    #[error("FunctionFS mount {0} does not exist or is not a directory")]
+    MissingFunctionFsMount(PathBuf),
+
+    /// A FunctionFS mount directory has no `ep0` file.
+    #[error("FunctionFS mount {0} has no ep0 file")]
+    MissingFunctionFsEp0(PathBuf),
+
+    /// A declared FunctionFS endpoint file is absent.
+    #[error("FunctionFS endpoint file {0} does not exist")]
+    MissingFunctionFsEndpoint(PathBuf),
+
+    /// FunctionFS descriptor bytes are malformed, misaligned, or truncated.
+    #[error("invalid FunctionFS descriptors: {reason}")]
+    InvalidFunctionFsDescriptor {
+        /// Why the descriptor set was rejected.
+        reason: String,
+    },
+
+    /// A FunctionFS control request is not modelled.
+    #[error(
+        "unsupported FunctionFS control request bmRequestType=0x{bm_request_type:02x} \
+         bRequest=0x{b_request:02x}: {reason}"
+    )]
+    UnsupportedFunctionFsControl {
+        /// `bmRequestType` byte.
+        bm_request_type: u8,
+        /// `bRequest` byte.
+        b_request: u8,
+        /// Why the request was rejected.
+        reason: String,
+    },
+
+    /// A FunctionFS daemon state transition is invalid.
+    #[error("invalid FunctionFS daemon state: {reason}")]
+    InvalidFunctionFsState {
+        /// Why the transition was rejected.
+        reason: String,
+    },
+
+    /// A bounded FunctionFS buffer would be exceeded.
+    #[error("FunctionFS {context} exceeds {limit} bytes (requested {requested})")]
+    FunctionFsBuffer {
+        /// Buffer purpose (`ep0 write`, `endpoint write`, ...).
+        context: &'static str,
+        /// Maximum permitted bytes.
+        limit: usize,
+        /// Requested bytes.
+        requested: usize,
+    },
+
+    /// FunctionFS `ep0` I/O failed.
+    #[error("FunctionFS ep0 {operation} failed at {path}: {source}")]
+    FunctionFsEp0Io {
+        /// Operation that failed (`open`, `write`, `read`).
+        operation: &'static str,
+        /// `ep0` path, or a synthetic marker for in-memory writers.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: io::Error,
+    },
+
+    /// A FunctionFS data-endpoint transfer failed.
+    #[error("FunctionFS endpoint 0x{address:02x} {operation} failed: {source}")]
+    FunctionFsEndpointIo {
+        /// Endpoint address.
+        address: u8,
+        /// Operation that failed (`read`, `write`, `flush`).
+        operation: &'static str,
+        /// Underlying I/O error.
+        #[source]
+        source: io::Error,
+    },
+
     /// No ALSA/USB audio bridge is available for a UAC2 function.
     #[error("UAC2 audio bridge for {instance:?} is not implemented")]
     UnsupportedUac2Bridge {
@@ -223,6 +298,15 @@ impl UsbError {
             Self::Spawn { .. } => "spawn",
             Self::CommandFailed { .. } => "command-failed",
             Self::UnsupportedFunctionFs { .. } => "unsupported-functionfs",
+            Self::MissingFunctionFsMount(_) => "missing-functionfs-mount",
+            Self::MissingFunctionFsEp0(_) => "missing-functionfs-ep0",
+            Self::MissingFunctionFsEndpoint(_) => "missing-functionfs-endpoint",
+            Self::InvalidFunctionFsDescriptor { .. } => "invalid-functionfs-descriptor",
+            Self::UnsupportedFunctionFsControl { .. } => "unsupported-functionfs-control",
+            Self::InvalidFunctionFsState { .. } => "invalid-functionfs-state",
+            Self::FunctionFsBuffer { .. } => "functionfs-buffer-too-large",
+            Self::FunctionFsEp0Io { .. } => "functionfs-ep0-io",
+            Self::FunctionFsEndpointIo { .. } => "functionfs-endpoint-io",
             Self::UnsupportedUac2Bridge { .. } => "unsupported-uac2-bridge",
             Self::UnsupportedPlatform => "unsupported-platform",
         }

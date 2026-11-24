@@ -3507,14 +3507,28 @@ function openStream(nodeId) {
 function _startSnapshotPolling(nodeId) {
   const img = $('modal-img');
   img.style.display = 'block';
-  const snapUrl = `/api/v1/streams/${encodeURIComponent(nodeId)}/snapshot`;
-  img.src = snapUrl + '?t=' + Date.now();
+  let snapUrl = `/api/v1/streams/${encodeURIComponent(nodeId)}/snapshot`;
+  // Follow the picker: the proxy forwards ?console= so a preview can target an
+  // advertised console instead of only the active HLS/WebRTC head. Only use a
+  // value that this node actually advertises, so a stale picker from a previous
+  // node cannot turn the preview into a 404.
+  const display = nodeDisplay[nodeId] || {};
+  const outputs = display.display_outputs || [];
+  const picked = $('kvm-display-select')?.value;
+  const selectedConsole = outputs.some(o => String(o.index) === String(picked))
+    ? String(picked)
+    : '';
+  if (selectedConsole !== undefined && selectedConsole !== null && selectedConsole !== '') {
+    snapUrl += `?console=${encodeURIComponent(selectedConsole)}`;
+  }
+  const stampSep = snapUrl.includes('?') ? '&' : '?';
+  img.src = snapUrl + stampSep + 't=' + Date.now();
   if (kvmSnapInterval) clearInterval(kvmSnapInterval);
   kvmSnapInterval = setInterval(() => {
     if ($('modal-overlay').classList.contains('open')) {
       const next = new Image();
       next.onload = () => { img.src = next.src; };
-      next.src = snapUrl + '?t=' + Date.now();
+      next.src = snapUrl + stampSep + 't=' + Date.now();
     }
   }, 500);
   $('kvm-status').textContent = 'snapshot';

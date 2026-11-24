@@ -276,7 +276,7 @@ The rendered layout is:
 /etc/apparmor.d/abstractions/libvirt-qemu.d/ozma
 /etc/tmpfiles.d/ozma-node.conf
 /etc/modules-load.d/ozma-node.conf
-/var/lib/ozma-node, /var/lib/ozma, /run/ozma-node, /run/ozma/qmp
+/var/lib/ozma-node, /var/lib/ozma, /run/ozma-node, /run/ozma, /run/ozma/qmp
 ```
 
 ### System user and groups
@@ -367,15 +367,21 @@ files; that is an operator decision, not an installer default.
 ```bash
 scripts/verify-system-install.sh
 # ...
-# 54 passed, 0 failed, 1 skipped
+# 77 passed, 0 failed, 1 skipped
 # RESULT: PASS
 ```
 
 The check renders every profile into a temporary root, validates
 `--dry-run`/`--force`/idempotence, checks modes, rejects uncommented secrets and
-world-writable paths, verifies the rendered units, and runs `udevadm verify`;
-AppArmor syntax is checked when `apparmor_parser` exists and otherwise reported
-as SKIP. It never needs root and removes its temp roots unless `--keep` is set.
+world-writable paths, verifies profile groups, tmpfiles/runtime-dir agreement,
+the copy-only libvirt snippet, and the desktop user-unit caveat, verifies the
+rendered units, and runs `udevadm verify`; AppArmor syntax is checked when
+`apparmor_parser` exists and otherwise reported as SKIP. The count drops when a
+tool is absent (a minimal container reports 75 passed, 0 failed, 3 skipped for
+`udevadm`, `apparmor_parser`, and `systemd-analyze`). It never needs root and
+removes its temp roots unless `--keep` is set. Full host/container evidence and
+the root-only follow-up steps are in
+[`phase4-system-install-report.md`](phase4-system-install-report.md).
 
 ### Rollback
 
@@ -485,7 +491,7 @@ Independent checks that do not need the moving libraries still pass:
 
 ```bash
 scripts/systemd/verify-units.sh          # PASS (3 system + 3 user, systemd 262)
-scripts/verify-system-install.sh         # PASS (54 passed, 0 failed, 1 skipped)
+scripts/verify-system-install.sh         # PASS (77 passed, 0 failed, 1 skipped)
 scripts/clean-host/run.sh --check-deps   # PASS (host; shellcheck/apparmor SKIP)
 scripts/install-rust.sh --dry-run ...    # exit 0, no files written
 scripts/install-system.sh --dry-run ...  # exit 0, no files written

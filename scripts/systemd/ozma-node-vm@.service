@@ -10,8 +10,8 @@ Type=simple
 ExecStart=@BIN_DIR@/ozma-node --profile vm --name %i $OZMA_NODE_ARGS
 EnvironmentFile=-@ENV_DIR@/vm-%i.env
 
-User=ozma-node
-Group=ozma-node
+User=@OZMA_USER@
+Group=@OZMA_GROUP@
 SupplementaryGroups=kvm input render
 
 Restart=on-failure

@@ -344,6 +344,10 @@ impl SeatPlan {
             capture: self.config.capture.clone(),
             input_devices: self.config.input_devices.clone(),
             state,
+            pid: None,
+            restarts: 0,
+            last_error: None,
+            next_restart_in_ms: None,
             message,
         }
     }
@@ -380,12 +384,36 @@ impl SeatState {
 }
 
 /// State transition reported by a [`crate::supervisor::SeatSupervisor`].
+///
+/// The state fields are a superset of the original `state`/`message` pair so a
+/// subprocess supervisor can report the child pid, planned ports, restart
+/// count, and the most recent failure without a second status document. They
+/// are optional/defaulted, so status documents written by the planner or the
+/// test fake remain valid.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeatRuntimeStatus {
     /// Seat id the status belongs to.
     pub seat_id: String,
     /// Current state.
     pub state: SeatState,
+    /// Child process id, when a live child exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// Planned UDP HID port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_port: Option<u16>,
+    /// Planned HTTP API port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_port: Option<u16>,
+    /// Successful (re)starts after the initial spawn.
+    #[serde(default)]
+    pub restarts: u32,
+    /// Most recent spawn, readiness, or exit error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// Milliseconds until the next scheduled restart, when one is pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_restart_in_ms: Option<u64>,
     /// Optional operator-facing message.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -397,6 +425,12 @@ impl SeatRuntimeStatus {
         Self {
             seat_id: seat_id.into(),
             state,
+            pid: None,
+            udp_port: None,
+            http_port: None,
+            restarts: 0,
+            last_error: None,
+            next_restart_in_ms: None,
             message: None,
         }
     }
@@ -404,6 +438,32 @@ impl SeatRuntimeStatus {
     /// Attach a message.
     pub fn with_message(mut self, message: impl Into<String>) -> Self {
         self.message = Some(message.into());
+        self
+    }
+
+    /// Attach process and port details.
+    pub fn with_process(mut self, pid: Option<u32>, udp_port: u16, http_port: u16) -> Self {
+        self.pid = pid;
+        self.udp_port = Some(udp_port);
+        self.http_port = Some(http_port);
+        self
+    }
+
+    /// Attach the restart count.
+    pub fn with_restarts(mut self, restarts: u32) -> Self {
+        self.restarts = restarts;
+        self
+    }
+
+    /// Attach the most recent failure.
+    pub fn with_last_error(mut self, error: impl Into<String>) -> Self {
+        self.last_error = Some(error.into());
+        self
+    }
+
+    /// Attach the pending restart delay.
+    pub fn with_next_restart_in_ms(mut self, delay_ms: u64) -> Self {
+        self.next_restart_in_ms = Some(delay_ms);
         self
     }
 }
@@ -434,6 +494,18 @@ pub struct SeatStatus {
     pub input_devices: Vec<String>,
     /// Lifecycle state.
     pub state: SeatState,
+    /// Child process id, when a live child exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// Successful (re)starts after the initial spawn.
+    #[serde(default)]
+    pub restarts: u32,
+    /// Most recent spawn, readiness, or exit error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// Milliseconds until the next scheduled restart, when one is pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_restart_in_ms: Option<u64>,
     /// Optional state message.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,

@@ -56,6 +56,8 @@ render() {
         -e 's|@RUNTIME_DIR@|/run/ozma-node|g' \
         -e 's|@SUPERVISOR_STATE_DIR@|/var/lib/ozma|g' \
         -e 's|@SUPERVISOR_RUNTIME_DIR@|/run/ozma|g' \
+        -e 's|@OZMA_USER@|ozma-node|g' \
+        -e 's|@OZMA_GROUP@|ozma-node|g' \
         "$src" >"$dest"
 }
 

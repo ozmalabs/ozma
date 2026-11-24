@@ -7,19 +7,23 @@
 //! capture source once, reads exactly one [`Frame`], and encodes it with
 //! [`ozma_encode::encode_jpeg_frame`].
 //!
-//! Capture is deliberately one-shot: opening a QMP/D-Bus/VNC source for every
-//! request is slower than a framebuffer tap, but it avoids inventing a shared
-//! frame protocol and never claims a stream that the node is not producing.
-//! Enumeration and frame production are bounded by a timeout supplied by the
-//! caller; a missing source or a busy device becomes a typed error that the
-//! HTTP layer maps to a 503 with remediation.
+//! Capture is deliberately one-shot by default: opening a QMP/D-Bus/VNC source
+//! for every request is slower than a framebuffer tap, but it avoids inventing a
+//! shared frame protocol and never claims a stream that the node is not
+//! producing. The bounded per-console broker
+//! ([`crate::display_broker::ConsoleBroker`]) opts into
+//! [`SnapshotControl::with_source_cache`] for non-active consoles, so repeated
+//! `?console=` previews reuse one provider connection while the default active
+//! route stays one-shot. Enumeration and frame production are bounded by a
+//! timeout supplied by the caller; a missing source or a busy device becomes a
+//! typed error that the HTTP layer maps to a 503 with remediation.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use axum::http::StatusCode;
 use ozma_capture::CaptureRegistry;
-use ozma_media::{CaptureSource, FrameFormat, MediaError};
+use ozma_media::{CaptureSource, Frame, FrameFormat, MediaError};
 use ozma_protocol::{codes, ApiError, CaptureCapability};
 use serde::Serialize;
 
@@ -54,6 +58,13 @@ pub struct DisplayInfo {
     pub dimensions_source: &'static str,
     /// Most recent snapshot failure, kept honest instead of implying success.
     pub last_error: Option<String>,
+    /// Console index this document describes, when the node advertises VM
+    /// consoles. `None` keeps the host-output/backward-compatible shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub console: Option<u32>,
+    /// True when this console is the active HLS/WebRTC capture console.
+    #[serde(default)]
+    pub active: bool,
 }
 
 /// A successfully encoded snapshot.
@@ -112,6 +123,31 @@ pub enum SnapshotError {
     /// The blocking capture task failed to join.
     #[error("display snapshot task failed: {0}")]
     Task(String),
+    /// A console query named a console that the node does not advertise.
+    #[error("console {requested:?} is not among the advertised display outputs")]
+    UnknownConsole {
+        /// Raw query value, when one was supplied.
+        requested: Option<String>,
+        /// Advertised console indexes.
+        available: Vec<u32>,
+    },
+    /// The configured provider exposes one default head and cannot capture
+    /// another console independently.
+    #[error(
+        "the {provider} capture provider exposes one default console and cannot capture \
+         Console_{requested} independently"
+    )]
+    SingleHead {
+        /// Provider name (`qmp`, `vnc`, `looking_glass`, ...).
+        provider: String,
+        /// Console the provider actually captures.
+        active: u32,
+        /// Console that was requested.
+        requested: u32,
+    },
+    /// A console query was supplied but no per-console broker/selector exists.
+    #[error("multi-console snapshots are not configured on this node")]
+    ConsoleUnsupported,
 }
 
 impl SnapshotError {
@@ -121,6 +157,9 @@ impl SnapshotError {
             Self::Timeout { .. } => StatusCode::GATEWAY_TIMEOUT,
             Self::EncodeTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
             Self::Task(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::UnknownConsole { .. } => StatusCode::NOT_FOUND,
+            Self::SingleHead { .. } => StatusCode::CONFLICT,
+            Self::ConsoleUnsupported => StatusCode::NOT_IMPLEMENTED,
             Self::NotConfigured
             | Self::NoSource { .. }
             | Self::Open(_)
@@ -219,6 +258,54 @@ impl SnapshotError {
             .retryable(),
             Self::Task(error) => ApiError::new(codes::INTERNAL, error.clone())
                 .with_remediation("Retry the snapshot; check the node log for the task failure."),
+            Self::UnknownConsole {
+                requested,
+                available,
+            } => ApiError::new(
+                codes::NOT_FOUND,
+                match requested.as_deref() {
+                    Some(value) => format!(
+                        "Console `{value}` is not among the advertised display outputs."
+                    ),
+                    None => "The requested console is not advertised by this node.".to_owned(),
+                },
+            )
+            .with_details(serde_json::json!({
+                "requested": requested,
+                "available": available,
+            }))
+            .with_remediation(
+                "Use a console index or label from GET /api/v1/connection.display_outputs.",
+            ),
+            Self::SingleHead {
+                provider,
+                active,
+                requested,
+            } => ApiError::new(
+                codes::CONFLICT,
+                format!(
+                    "the {provider} capture provider exposes one default console and cannot \
+                     capture Console_{requested} independently"
+                ),
+            )
+            .with_details(serde_json::json!({
+                "provider": provider,
+                "active_console": active,
+                "requested_console": requested,
+                "single_head": true,
+            }))
+            .with_remediation(format!(
+                "Use the active Console_{active} snapshot, or configure \
+                 --capture-provider dbus for per-console capture."
+            )),
+            Self::ConsoleUnsupported => ApiError::new(
+                codes::CAPTURE_UNAVAILABLE,
+                "This node has no VM console selector or multi-console snapshot broker.",
+            )
+            .with_remediation(
+                "Configure --profile vm with --capture-provider dbus and advertise consoles \
+                 with --display-output before requesting ?console=.",
+            ),
         }
     }
 }
@@ -234,6 +321,17 @@ struct CachedCapture {
 struct SnapshotCache {
     last: Option<CachedCapture>,
     last_error: Option<String>,
+}
+
+/// A capture source held open by an opt-in cached snapshot control.
+///
+/// The broker uses this so one console keeps one D-Bus/VNC/QMP source open
+/// between requests instead of reconnecting for every JPEG. The capability is
+/// retained with the source so frame metadata still describes the selected
+/// console after the source is cached.
+struct OpenSource {
+    capability: CaptureCapability,
+    source: Box<dyn CaptureSource>,
 }
 
 /// Where a snapshot control reads its capture registry.
@@ -268,6 +366,9 @@ pub struct SnapshotControl {
     timeout: Duration,
     quality: u8,
     cache: Arc<Mutex<SnapshotCache>>,
+    /// Opt-in source caching for the multi-console broker.
+    cache_source: bool,
+    open: Arc<tokio::sync::Mutex<Option<OpenSource>>>,
 }
 
 impl SnapshotControl {
@@ -279,6 +380,8 @@ impl SnapshotControl {
             timeout: DEFAULT_SNAPSHOT_TIMEOUT,
             quality: DEFAULT_JPEG_QUALITY,
             cache: Arc::new(Mutex::new(SnapshotCache::default())),
+            cache_source: false,
+            open: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -290,6 +393,31 @@ impl SnapshotControl {
             timeout: DEFAULT_SNAPSHOT_TIMEOUT,
             quality: DEFAULT_JPEG_QUALITY,
             cache: Arc::new(Mutex::new(SnapshotCache::default())),
+            cache_source: false,
+            open: Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Keep the opened capture source between snapshot calls.
+    ///
+    /// The default is one-shot: open, read one frame, stop. The bounded console
+    /// broker opts in so `GET /display/snapshot?console=N` does not reconnect to
+    /// QEMU for every preview poll. `shutdown()` stops a cached source.
+    pub fn with_source_cache(mut self, enabled: bool) -> Self {
+        self.cache_source = enabled;
+        self
+    }
+
+    /// True when this control keeps an opened source between calls.
+    pub fn caches_source(&self) -> bool {
+        self.cache_source
+    }
+
+    /// Stop a cached source, if any. Idempotent.
+    pub async fn shutdown(&self) {
+        let mut open = self.open.lock().await;
+        if let Some(mut cached) = open.take() {
+            let _ = cached.source.stop().await;
         }
     }
 
@@ -344,6 +472,8 @@ impl SnapshotControl {
                         snapshot_encoding: "jpeg",
                         dimensions_source: "last-frame",
                         last_error: cached.last_error,
+                        console: None,
+                        active: false,
                     }
                 } else {
                     DisplayInfo {
@@ -357,6 +487,8 @@ impl SnapshotControl {
                         snapshot_encoding: "jpeg",
                         dimensions_source: "capability-max",
                         last_error: cached.last_error,
+                        console: None,
+                        active: false,
                     }
                 }
             }
@@ -371,6 +503,8 @@ impl SnapshotControl {
                 snapshot_encoding: "jpeg",
                 dimensions_source: "none",
                 last_error: cached.last_error,
+                console: None,
+                active: false,
             },
             Ok(Err(error)) => DisplayInfo {
                 ok: true,
@@ -383,6 +517,8 @@ impl SnapshotControl {
                 snapshot_encoding: "jpeg",
                 dimensions_source: "none",
                 last_error: cached.last_error.or(Some(error.message)),
+                console: None,
+                active: false,
             },
             Err(error) => DisplayInfo {
                 ok: true,
@@ -395,38 +531,19 @@ impl SnapshotControl {
                 snapshot_encoding: "jpeg",
                 dimensions_source: "none",
                 last_error: cached.last_error.or(Some(error.to_string())),
+                console: None,
+                active: false,
             },
         }
     }
 
     /// Open the selected source, read exactly one frame, and encode it as JPEG.
+    ///
+    /// One-shot controls stop the source before returning. A control built with
+    /// [`Self::with_source_cache`] keeps it open and reads the next frame from
+    /// the same provider connection on each call.
     pub async fn capture(&self) -> Result<SnapshotFrame, SnapshotError> {
-        let (capability, mut source) = self.open_source().await?;
-        let source_id = capability.id.clone();
-
-        let frame = match tokio::time::timeout(self.timeout, source.next_frame()).await {
-            Ok(Ok(frame)) => frame,
-            Ok(Err(error)) => {
-                let _ = source.stop().await;
-                let message = format!("{error}");
-                self.cache().last_error = Some(message);
-                return Err(SnapshotError::Capture { source_id, error });
-            }
-            Err(_) => {
-                let _ = source.stop().await;
-                let message = format!(
-                    "capture source `{source_id}` did not produce a frame within {:?}",
-                    self.timeout
-                );
-                self.cache().last_error = Some(message);
-                return Err(SnapshotError::Timeout {
-                    source_id,
-                    timeout: self.timeout,
-                });
-            }
-        };
-        let _ = source.stop().await;
-
+        let (capability, frame) = self.next_frame_from_source().await?;
         let format = frame.format();
         let quality = self.quality;
         let encoding = tokio::time::timeout(
@@ -466,6 +583,69 @@ impl SnapshotControl {
             source_name: capability.name,
             format,
         })
+    }
+
+    async fn next_frame_from_source(&self) -> Result<(CaptureCapability, Frame), SnapshotError> {
+        if !self.cache_source {
+            let (capability, mut source) = self.open_source().await?;
+            let source_id = capability.id.clone();
+            let frame = match tokio::time::timeout(self.timeout, source.next_frame()).await {
+                Ok(Ok(frame)) => frame,
+                Ok(Err(error)) => {
+                    let _ = source.stop().await;
+                    let message = format!("{error}");
+                    self.cache().last_error = Some(message);
+                    return Err(SnapshotError::Capture { source_id, error });
+                }
+                Err(_) => {
+                    let _ = source.stop().await;
+                    let message = format!(
+                        "capture source `{source_id}` did not produce a frame within {:?}",
+                        self.timeout
+                    );
+                    self.cache().last_error = Some(message);
+                    return Err(SnapshotError::Timeout {
+                        source_id,
+                        timeout: self.timeout,
+                    });
+                }
+            };
+            let _ = source.stop().await;
+            return Ok((capability, frame));
+        }
+
+        let mut open = self.open.lock().await;
+        if open.is_none() {
+            let (capability, source) = self.open_source().await?;
+            *open = Some(OpenSource { capability, source });
+        }
+        let cached = open.as_mut().expect("cached source was just installed");
+        let source_id = cached.capability.id.clone();
+        match tokio::time::timeout(self.timeout, cached.source.next_frame()).await {
+            Ok(Ok(frame)) => Ok((cached.capability.clone(), frame)),
+            Ok(Err(error)) => {
+                let message = format!("{error}");
+                let mut failed = open.take().expect("cached source");
+                let _ = failed.source.stop().await;
+                drop(open);
+                self.cache().last_error = Some(message);
+                Err(SnapshotError::Capture { source_id, error })
+            }
+            Err(_) => {
+                let mut failed = open.take().expect("cached source");
+                let _ = failed.source.stop().await;
+                drop(open);
+                let message = format!(
+                    "capture source `{source_id}` did not produce a frame within {:?}",
+                    self.timeout
+                );
+                self.cache().last_error = Some(message);
+                Err(SnapshotError::Timeout {
+                    source_id,
+                    timeout: self.timeout,
+                })
+            }
+        }
     }
 
     async fn open_source(

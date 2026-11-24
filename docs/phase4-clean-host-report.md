@@ -260,7 +260,9 @@ test python_zeroconf_browses_the_rust_advertisement ... ok
 ## Follow-up: system install surface (2026-11-25)
 
 The privileged fresh-host install is now scripted and rootlessly verified. It
-has still not been run on a real host, and no sudo was used by this work.
+has still not been run on a real host, and no sudo was used by this work. The
+2026-11-25 follow-up (script fixes plus host/container reruns) is in
+[`phase4-system-install-report.md`](phase4-system-install-report.md).
 
 | Surface | Status | Evidence |
 |---|---|---|
@@ -268,7 +270,7 @@ has still not been run on a real host, and no sudo was used by this work.
 | udev assets | added | `scripts/system/udev/70-ozma-node-{uinput,input,hidg,v4l2,render,gadget}.rules.in`; selected by profile; `udevadm verify -N never` PASS for all six. |
 | AppArmor | added | `scripts/system/apparmor/libvirt-qemu.d-ozma` installed to the libvirt-qemu abstraction directory. Syntax check is SKIP on this host (`apparmor_parser` absent), not a failure. |
 | libvirt | copy-only | `scripts/system/libvirt/qemu-cgroup_device_acl.conf.snippet` installed to `/etc/ozma/libvirt-qemu-cgroup_device_acl.conf`; merging into `/etc/libvirt/qemu.conf` remains an operator step. |
-| Verification | added | `scripts/verify-system-install.sh`: 54 passed, 0 failed, 1 skipped. Renders all profiles, checks dry-run/force/idempotence/modes/secrets/world-writable paths, validates udev syntax, and runs system+user unit verification. |
+| Verification | added | `scripts/verify-system-install.sh`: 77 passed, 0 failed, 1 skipped (host; 75/0/3 in a minimal rootless container). Renders all profiles, checks dry-run/force/idempotence/modes/profile groups/tmpfiles/secrets/world-writable paths, validates udev syntax, and runs system+user unit verification. See [`phase4-system-install-report.md`](phase4-system-install-report.md). |
 | Unit verification | extended | `scripts/systemd/verify-units.sh` now verifies 3 system units and 3 least-privilege user units (PASS, systemd 262). |
 | Clean-host harness | extended | `scripts/clean-host/in-container.sh` runs the rootless system verification; `check-deps.sh` reports `udevadm`, `apparmor_parser`, and `systemd-tmpfiles` as optional tools. |
 

@@ -7,12 +7,15 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 
 use crate::display::{DisplayBackend, DisplayOutput};
 use crate::error::MultiseatError;
 use crate::input::{InputBackend, InputDevice};
 use crate::seat::{SeatPlan, SeatRuntimeStatus, SeatState};
-use crate::supervisor::SeatSupervisor;
+use crate::supervisor::{
+    ChildExit, ChildHandle, NodeLaunchSpec, NodeLauncher, ReadinessProbe, SeatSupervisor,
+};
 
 /// Deterministic in-memory display backend.
 #[derive(Debug)]
@@ -270,5 +273,213 @@ impl SeatSupervisor for FakeSeatSupervisor {
                 status
             })
             .collect()
+    }
+}
+
+#[derive(Debug, Default)]
+struct FakeLauncherState {
+    next_pid: u32,
+    spawns: Vec<NodeLaunchSpec>,
+    stops: Vec<String>,
+    running: BTreeMap<u32, bool>,
+    latest: BTreeMap<String, u32>,
+    fail_forever: BTreeSet<String>,
+    fail_once: BTreeSet<String>,
+}
+
+/// Test-only process launcher. It never executes anything; it records spawn
+/// specifications and lets a test simulate exits, spawn failures, and stop
+/// requests.
+#[derive(Clone, Debug, Default)]
+pub struct FakeNodeLauncher {
+    state: Arc<Mutex<FakeLauncherState>>,
+}
+
+impl FakeNodeLauncher {
+    /// An empty launcher whose spawns succeed.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Make every subsequent spawn for `seat_id` fail.
+    pub fn fail_spawn(&self, seat_id: impl Into<String>) {
+        self.state
+            .lock()
+            .expect("fake launcher lock")
+            .fail_forever
+            .insert(seat_id.into());
+    }
+
+    /// Make only the next spawn for `seat_id` fail.
+    pub fn fail_spawn_once(&self, seat_id: impl Into<String>) {
+        self.state
+            .lock()
+            .expect("fake launcher lock")
+            .fail_once
+            .insert(seat_id.into());
+    }
+
+    /// Simulate the latest child for `seat_id` exiting.
+    pub fn exit(&self, seat_id: &str) {
+        let mut state = self.state.lock().expect("fake launcher lock");
+        if let Some(pid) = state.latest.get(seat_id).copied() {
+            state.running.insert(pid, false);
+        }
+    }
+
+    /// Spawn specifications recorded so far, oldest first.
+    pub fn spawns(&self) -> Vec<NodeLaunchSpec> {
+        self.state
+            .lock()
+            .expect("fake launcher lock")
+            .spawns
+            .clone()
+    }
+
+    /// Number of spawn attempts recorded.
+    pub fn spawn_count(&self) -> usize {
+        self.state.lock().expect("fake launcher lock").spawns.len()
+    }
+
+    /// Seat ids passed to `terminate`, in order.
+    pub fn stopped(&self) -> Vec<String> {
+        self.state.lock().expect("fake launcher lock").stops.clone()
+    }
+
+    /// Whether the latest child for `seat_id` is still running.
+    pub fn active(&self, seat_id: &str) -> bool {
+        let state = self.state.lock().expect("fake launcher lock");
+        state
+            .latest
+            .get(seat_id)
+            .and_then(|pid| state.running.get(pid))
+            .copied()
+            .unwrap_or(false)
+    }
+}
+
+impl NodeLauncher for FakeNodeLauncher {
+    fn spawn(&self, spec: &NodeLaunchSpec) -> Result<Box<dyn ChildHandle>, MultiseatError> {
+        let mut state = self.state.lock().expect("fake launcher lock");
+        if state.fail_once.remove(&spec.seat_id) || state.fail_forever.contains(&spec.seat_id) {
+            return Err(MultiseatError::Supervisor(format!(
+                "injected spawn failure for {}",
+                spec.seat_id
+            )));
+        }
+        state.next_pid = state.next_pid.saturating_add(1);
+        let pid = state.next_pid;
+        state.spawns.push(spec.clone());
+        state.running.insert(pid, true);
+        state.latest.insert(spec.seat_id.clone(), pid);
+        drop(state);
+
+        Ok(Box::new(FakeChildHandle {
+            pid,
+            seat_id: spec.seat_id.clone(),
+            state: Arc::clone(&self.state),
+        }))
+    }
+}
+
+struct FakeChildHandle {
+    pid: u32,
+    seat_id: String,
+    state: Arc<Mutex<FakeLauncherState>>,
+}
+
+impl ChildHandle for FakeChildHandle {
+    fn pid(&self) -> Option<u32> {
+        Some(self.pid)
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ChildExit>> {
+        let running = self
+            .state
+            .lock()
+            .expect("fake launcher lock")
+            .running
+            .get(&self.pid)
+            .copied()
+            .unwrap_or(false);
+        Ok(if running {
+            None
+        } else {
+            Some(ChildExit {
+                success: false,
+                code: Some(1),
+            })
+        })
+    }
+
+    fn terminate(&mut self) -> Result<(), MultiseatError> {
+        let mut state = self.state.lock().expect("fake launcher lock");
+        if state.running.insert(self.pid, false).unwrap_or(false) {
+            state.stops.push(self.seat_id.clone());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct FakeProbeState {
+    calls: usize,
+    not_ready_calls: usize,
+    fail_reason: Option<String>,
+}
+
+/// Test-only readiness probe with deterministic first-call and failure
+/// behavior.
+#[derive(Clone, Debug, Default)]
+pub struct FakeReadinessProbe {
+    state: Arc<Mutex<FakeProbeState>>,
+}
+
+impl FakeReadinessProbe {
+    /// A probe that is ready on the first call.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A probe that always succeeds.
+    pub fn always_ready() -> Self {
+        Self::default()
+    }
+
+    /// A probe that always reports a typed failure.
+    pub fn failing(reason: impl Into<String>) -> Self {
+        let probe = Self::default();
+        probe.state.lock().expect("fake probe lock").fail_reason = Some(reason.into());
+        probe
+    }
+
+    /// A probe that is never ready, causing a readiness timeout.
+    pub fn not_ready() -> Self {
+        let probe = Self::default();
+        probe.state.lock().expect("fake probe lock").not_ready_calls = usize::MAX;
+        probe
+    }
+
+    /// A probe that reports not-ready for the first `polls` calls, then ready.
+    pub fn ready_after(polls: usize) -> Self {
+        let probe = Self::default();
+        probe.state.lock().expect("fake probe lock").not_ready_calls = polls;
+        probe
+    }
+
+    /// Number of probe calls made.
+    pub fn calls(&self) -> usize {
+        self.state.lock().expect("fake probe lock").calls
+    }
+}
+
+impl ReadinessProbe for FakeReadinessProbe {
+    fn probe(&self, _spec: &NodeLaunchSpec) -> Result<bool, MultiseatError> {
+        let mut state = self.state.lock().expect("fake probe lock");
+        state.calls = state.calls.saturating_add(1);
+        if let Some(reason) = &state.fail_reason {
+            return Err(MultiseatError::Supervisor(reason.clone()));
+        }
+        Ok(state.calls > state.not_ready_calls)
     }
 }

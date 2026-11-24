@@ -5,9 +5,11 @@
 //! HID, mass storage, or UAC2, the kernel does not take the descriptors from
 //! ConfigFS: a userspace daemon must mount FunctionFS, write the device,
 //! configuration, and string descriptors to `ep0`, and then service the
-//! endpoints. This module models that contract but never mounts FunctionFS,
+//! endpoints. This module models that contract and never mounts FunctionFS,
 //! opens an endpoint, spawns a daemon, or claims a daemon is ready without a
-//! filesystem marker.
+//! filesystem marker. The executable daemon core lives in
+//! [`crate::functionfs_daemon`], which encodes the `ep0` blobs and services
+//! injected endpoints without mounting anything either.
 
 use std::path::{Path, PathBuf};
 
@@ -15,6 +17,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::is_safe_identifier;
 use crate::error::UsbError;
+use crate::functionfs_daemon::{
+    FunctionFsDescriptors, FunctionFsEndpointIo, FunctionFsEvent, FunctionFsEventOutcome,
+    FunctionFsWriteReport,
+};
 
 /// Maximum number of non-control endpoints a FunctionFS function may declare.
 pub const MAX_FUNCTIONFS_ENDPOINTS: usize = 15;
@@ -24,6 +30,12 @@ pub const MAX_FUNCTIONFS_DESCRIPTOR_BYTES: usize = 4096;
 
 /// Maximum length of one USB string descriptor value, in bytes.
 pub const MAX_FUNCTIONFS_STRING_BYTES: usize = 126;
+
+/// Maximum encoded size of one Microsoft OS descriptor feature block.
+pub const MAX_FUNCTIONFS_OS_DESCRIPTOR_BYTES: usize = 1024;
+
+/// Maximum number of Microsoft OS descriptor feature blocks.
+pub const MAX_FUNCTIONFS_OS_DESCRIPTORS: usize = 4;
 
 /// USB transfer type for one FunctionFS endpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,6 +249,264 @@ impl Default for FunctionFsEndpoint {
     }
 }
 
+/// Microsoft OS descriptor flavour accepted by FunctionFS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FunctionFsOsDescriptorKind {
+    /// Extended compatibility ID (`wIndex = 4`).
+    CompatibleId,
+    /// Extended properties (`wIndex = 5`).
+    Properties,
+}
+
+/// One Microsoft OS extended property.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunctionFsOsProperty {
+    /// Property name encoded as UTF-16LE on the wire.
+    pub name: String,
+    /// Property payload bytes.
+    pub data: Vec<u8>,
+    /// `dwPropertyDataType`; 1 (REG_SZ) is the common default.
+    #[serde(default = "default_os_property_type")]
+    pub data_type: u32,
+}
+
+fn default_os_property_type() -> u32 {
+    1
+}
+
+impl FunctionFsOsProperty {
+    /// A `REG_SZ` property.
+    pub fn new(name: impl Into<String>, data: impl Into<Vec<u8>>) -> Self {
+        Self {
+            name: name.into(),
+            data: data.into(),
+            data_type: 1,
+        }
+    }
+
+    /// Override `dwPropertyDataType` (1..=7).
+    pub fn with_data_type(mut self, data_type: u32) -> Self {
+        self.data_type = data_type;
+        self
+    }
+}
+
+/// One Microsoft OS feature descriptor for a FunctionFS interface.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FunctionFsOsDescriptor {
+    /// Extended compatibility descriptor (`wIndex = 4`).
+    CompatibleId {
+        /// Interface number this descriptor belongs to (0 for the modelled interface).
+        #[serde(default)]
+        interface: u8,
+        /// Compatible ID, at most eight ASCII bytes.
+        compatible_id: String,
+        /// Sub-compatible ID, at most eight ASCII bytes.
+        #[serde(default)]
+        sub_compatible_id: String,
+    },
+    /// Extended properties descriptor (`wIndex = 5`).
+    Properties {
+        /// Interface number this descriptor belongs to (0 for the modelled interface).
+        #[serde(default)]
+        interface: u8,
+        /// Properties in wire order.
+        properties: Vec<FunctionFsOsProperty>,
+    },
+}
+
+impl FunctionFsOsDescriptor {
+    /// A WinUSB-style compatible ID descriptor for interface 0.
+    pub fn compatible_id(
+        compatible_id: impl Into<String>,
+        sub_compatible_id: impl Into<String>,
+    ) -> Self {
+        Self::CompatibleId {
+            interface: 0,
+            compatible_id: compatible_id.into(),
+            sub_compatible_id: sub_compatible_id.into(),
+        }
+    }
+
+    /// An extended properties descriptor for interface 0.
+    pub fn properties(properties: impl IntoIterator<Item = FunctionFsOsProperty>) -> Self {
+        Self::Properties {
+            interface: 0,
+            properties: properties.into_iter().collect(),
+        }
+    }
+
+    /// The `wIndex` value selecting this descriptor type.
+    pub fn kind(&self) -> FunctionFsOsDescriptorKind {
+        match self {
+            Self::CompatibleId { .. } => FunctionFsOsDescriptorKind::CompatibleId,
+            Self::Properties { .. } => FunctionFsOsDescriptorKind::Properties,
+        }
+    }
+
+    /// Validate interface, IDs, names, and payload bounds.
+    pub fn validate(&self) -> Result<(), UsbError> {
+        match self {
+            Self::CompatibleId {
+                interface,
+                compatible_id,
+                sub_compatible_id,
+            } => {
+                if *interface != 0 {
+                    return Err(UsbError::InvalidField {
+                        field: "function.functionfs.os_descriptor.interface",
+                        reason: "the modelled FunctionFS interface is 0".to_owned(),
+                    });
+                }
+                validate_os_id("compatible_id", compatible_id, false)?;
+                validate_os_id("sub_compatible_id", sub_compatible_id, true)
+            }
+            Self::Properties {
+                interface,
+                properties,
+            } => {
+                if *interface != 0 {
+                    return Err(UsbError::InvalidField {
+                        field: "function.functionfs.os_descriptor.interface",
+                        reason: "the modelled FunctionFS interface is 0".to_owned(),
+                    });
+                }
+                if properties.is_empty() || properties.len() > 16 {
+                    return Err(UsbError::InvalidField {
+                        field: "function.functionfs.os_descriptor.properties",
+                        reason: "an OS properties descriptor must contain 1..=16 properties"
+                            .to_owned(),
+                    });
+                }
+                let mut total = 0usize;
+                for property in properties {
+                    if property.name.is_empty()
+                        || property.name.chars().count() > 64
+                        || property.name.chars().any(char::is_control)
+                    {
+                        return Err(UsbError::InvalidField {
+                            field: "function.functionfs.os_descriptor.property.name",
+                            reason: "property names must be 1..=64 non-control characters"
+                                .to_owned(),
+                        });
+                    }
+                    if !(1..=7).contains(&property.data_type) {
+                        return Err(UsbError::InvalidField {
+                            field: "function.functionfs.os_descriptor.property.data_type",
+                            reason: "property data type must be 1..=7".to_owned(),
+                        });
+                    }
+                    if property.data.len() > MAX_FUNCTIONFS_OS_DESCRIPTOR_BYTES {
+                        return Err(UsbError::InvalidField {
+                            field: "function.functionfs.os_descriptor.property.data",
+                            reason: format!(
+                                "property payload must be at most \
+                                 {MAX_FUNCTIONFS_OS_DESCRIPTOR_BYTES} bytes"
+                            ),
+                        });
+                    }
+                    let name_bytes = (property.name.chars().count() + 1) * 2;
+                    total = total
+                        .checked_add(10 + name_bytes + 4 + property.data.len())
+                        .unwrap_or(usize::MAX);
+                    if total > MAX_FUNCTIONFS_OS_DESCRIPTOR_BYTES {
+                        return Err(UsbError::InvalidField {
+                            field: "function.functionfs.os_descriptor",
+                            reason: format!(
+                                "one OS properties descriptor must be at most \
+                                 {MAX_FUNCTIONFS_OS_DESCRIPTOR_BYTES} bytes"
+                            ),
+                        });
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Serialize this descriptor including its 11-byte FunctionFS OS header.
+    pub fn encode(&self) -> Result<Vec<u8>, UsbError> {
+        self.validate()?;
+        match self {
+            Self::CompatibleId {
+                interface,
+                compatible_id,
+                sub_compatible_id,
+            } => {
+                // usb_os_desc_header (11 bytes) + one usb_ext_compat_desc
+                // (24 bytes). dwLength includes the interface byte and the
+                // header, matching the kernel's ffs parser.
+                let mut bytes = Vec::with_capacity(35);
+                bytes.push(*interface);
+                bytes.extend_from_slice(&35u32.to_le_bytes());
+                bytes.extend_from_slice(&0x0100u16.to_le_bytes());
+                bytes.extend_from_slice(&4u16.to_le_bytes());
+                bytes.push(1); // bCount
+                bytes.push(0); // Reserved
+                bytes.push(0); // bFirstInterfaceNumber
+                bytes.push(1); // Reserved1, must be 1
+                bytes.extend_from_slice(&padded_os_id(compatible_id));
+                bytes.extend_from_slice(&padded_os_id(sub_compatible_id));
+                bytes.extend_from_slice(&[0; 6]);
+                Ok(bytes)
+            }
+            Self::Properties {
+                interface,
+                properties,
+            } => {
+                let mut body = Vec::new();
+                for property in properties {
+                    let mut name = Vec::with_capacity((property.name.chars().count() + 1) * 2);
+                    for unit in property.name.encode_utf16() {
+                        name.extend_from_slice(&unit.to_le_bytes());
+                    }
+                    name.extend_from_slice(&0u16.to_le_bytes());
+                    let size = 10 + name.len() + 4 + property.data.len();
+                    body.extend_from_slice(&(size as u32).to_le_bytes());
+                    body.extend_from_slice(&property.data_type.to_le_bytes());
+                    body.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                    body.extend_from_slice(&name);
+                    body.extend_from_slice(&(property.data.len() as u32).to_le_bytes());
+                    body.extend_from_slice(&property.data);
+                }
+                let total = 11 + body.len();
+                let mut bytes = Vec::with_capacity(total);
+                bytes.push(*interface);
+                bytes.extend_from_slice(&(total as u32).to_le_bytes());
+                bytes.extend_from_slice(&0x0100u16.to_le_bytes());
+                bytes.extend_from_slice(&5u16.to_le_bytes());
+                bytes.extend_from_slice(&(properties.len() as u16).to_le_bytes());
+                bytes.extend_from_slice(&body);
+                Ok(bytes)
+            }
+        }
+    }
+}
+
+fn validate_os_id(field: &'static str, value: &str, allow_empty: bool) -> Result<(), UsbError> {
+    if value.is_empty() && !allow_empty {
+        return Err(UsbError::InvalidField {
+            field,
+            reason: "OS compatibility ID must not be empty".to_owned(),
+        });
+    }
+    if value.len() > 8 || !value.is_ascii() || value.chars().any(char::is_control) {
+        return Err(UsbError::InvalidField {
+            field,
+            reason: "OS compatibility ID must be at most eight ASCII characters".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn padded_os_id(value: &str) -> [u8; 8] {
+    let mut padded = [0u8; 8];
+    padded[..value.len()].copy_from_slice(value.as_bytes());
+    padded
+}
+
 /// String descriptors supplied by the FunctionFS daemon.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FunctionFsStrings {
@@ -430,6 +700,14 @@ pub struct FunctionFsConfig {
     pub protocol: u8,
     /// Declared non-control endpoints.
     pub endpoints: Vec<FunctionFsEndpoint>,
+    /// Additional class-specific descriptors inserted after the interface
+    /// descriptor (for example a HID or vendor-class functional descriptor).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub class_descriptors: Vec<Vec<u8>>,
+    /// Optional Microsoft OS feature descriptors written with the FunctionFS
+    /// descriptor blob.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub os_descriptors: Vec<FunctionFsOsDescriptor>,
     /// String descriptors.
     pub strings: FunctionFsStrings,
     /// Optional daemon metadata and readiness source.
@@ -457,6 +735,8 @@ impl FunctionFsConfig {
             subclass: 0,
             protocol: 0,
             endpoints: Vec::new(),
+            class_descriptors: Vec::new(),
+            os_descriptors: Vec::new(),
             daemon: None,
         }
     }
@@ -490,6 +770,27 @@ impl FunctionFsConfig {
         self
     }
 
+    /// Append a class-specific descriptor after the interface descriptor.
+    pub fn with_class_descriptor(mut self, descriptor: impl Into<Vec<u8>>) -> Self {
+        self.class_descriptors.push(descriptor.into());
+        self
+    }
+
+    /// Append a Microsoft OS feature descriptor.
+    pub fn with_os_descriptor(mut self, descriptor: FunctionFsOsDescriptor) -> Self {
+        self.os_descriptors.push(descriptor);
+        self
+    }
+
+    /// Append several Microsoft OS feature descriptors.
+    pub fn with_os_descriptors(
+        mut self,
+        descriptors: impl IntoIterator<Item = FunctionFsOsDescriptor>,
+    ) -> Self {
+        self.os_descriptors.extend(descriptors);
+        self
+    }
+
     /// Attach daemon metadata.
     pub fn with_daemon(mut self, daemon: FunctionFsDaemonSpec) -> Self {
         self.daemon = Some(daemon);
@@ -518,6 +819,11 @@ impl FunctionFsConfig {
     /// Total generated descriptor bytes.
     pub fn descriptor_bytes(&self) -> usize {
         self.descriptors().total_len()
+    }
+
+    /// Build the FunctionFS `ep0` descriptor/string blob.
+    pub fn ep0_descriptors(&self) -> Result<FunctionFsDescriptors, UsbError> {
+        FunctionFsDescriptors::from_config(self)
     }
 
     /// Fail with a typed unsupported state unless the daemon is ready.
@@ -581,6 +887,26 @@ impl FunctionFsConfig {
                 )));
             }
         }
+        if self.class_descriptors.len() > 8 {
+            return Err(UsbError::InvalidField {
+                field: "function.functionfs.class_descriptors",
+                reason: "at most eight class-specific descriptors are supported".to_owned(),
+            });
+        }
+        for descriptor in &self.class_descriptors {
+            validate_class_descriptor(descriptor)?;
+        }
+        if self.os_descriptors.len() > MAX_FUNCTIONFS_OS_DESCRIPTORS {
+            return Err(UsbError::InvalidField {
+                field: "function.functionfs.os_descriptors",
+                reason: format!(
+                    "at most {MAX_FUNCTIONFS_OS_DESCRIPTORS} Microsoft OS descriptors are supported"
+                ),
+            });
+        }
+        for descriptor in &self.os_descriptors {
+            descriptor.validate()?;
+        }
         self.strings.validate()?;
         if let Some(daemon) = &self.daemon {
             daemon.validate()?;
@@ -617,7 +943,8 @@ impl FunctionFsConfig {
         device.push(3); // iSerialNumber
         device.push(1); // bNumConfigurations
 
-        let total = 9 + 9 + self.endpoints.len() * 7;
+        let class_bytes: usize = self.class_descriptors.iter().map(Vec::len).sum();
+        let total = 9 + 9 + class_bytes + self.endpoints.len() * 7;
         let mut configuration = Vec::with_capacity(total);
         configuration.push(9); // bLength
         configuration.push(0x02); // CONFIGURATION
@@ -637,6 +964,10 @@ impl FunctionFsConfig {
         configuration.push(self.subclass);
         configuration.push(self.protocol);
         configuration.push(0); // iInterface
+
+        for descriptor in &self.class_descriptors {
+            configuration.extend_from_slice(descriptor);
+        }
 
         for endpoint in &self.endpoints {
             configuration.extend_from_slice(&endpoint.descriptor());
@@ -671,7 +1002,68 @@ impl FunctionFsDescriptorSet {
 
     /// Number of declared endpoints.
     pub fn endpoint_count(&self) -> usize {
-        (self.configuration.len().saturating_sub(18)) / 7
+        count_descriptor_type(self.configuration.get(9..).unwrap_or(&[]), 0x05)
+    }
+
+    /// Non-control descriptors after the configuration descriptor. These are
+    /// the descriptors FunctionFS accepts on `ep0`; device and configuration
+    /// descriptors are reserved for the composite gadget.
+    pub fn function_descriptors(&self) -> &[u8] {
+        self.configuration.get(9..).unwrap_or(&[])
+    }
+}
+
+fn count_descriptor_type(bytes: &[u8], descriptor_type: u8) -> usize {
+    let mut count = 0;
+    let mut offset = 0;
+    while offset + 2 <= bytes.len() {
+        let length = bytes[offset] as usize;
+        if length < 2 || offset + length > bytes.len() {
+            break;
+        }
+        if bytes[offset + 1] == descriptor_type {
+            count += 1;
+        }
+        offset += length;
+    }
+    count
+}
+
+/// Observed live state of a FunctionFS daemon core.
+///
+/// `live` is only true when both the descriptor blob and strings were accepted
+/// by `ep0` and the function has been enabled by the host/UDC. A configured
+/// daemon marker never satisfies this on its own.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunctionFsDaemonStatus {
+    /// Descriptor and string writes completed and the function is enabled.
+    pub live: bool,
+    /// The descriptor blob was written to `ep0`.
+    pub ep0_written: bool,
+    /// The string table was written to `ep0`.
+    pub strings_written: bool,
+    /// The host/UDC enabled the function.
+    pub enabled: bool,
+    /// `SET_CONFIGURATION` selected a non-zero configuration.
+    pub configured: bool,
+    /// Endpoint files currently open.
+    pub open_endpoints: u8,
+    /// Encoded FunctionFS descriptor blob length.
+    pub descriptor_bytes: usize,
+    /// Microsoft OS descriptors included in the blob.
+    pub os_descriptors: u8,
+    /// Total bytes read from OUT endpoints.
+    pub bytes_read: u64,
+    /// Total bytes written to IN endpoints.
+    pub bytes_written: u64,
+    /// Control requests handled on `ep0`.
+    pub control_requests: u64,
+}
+
+impl FunctionFsDaemonStatus {
+    /// Whether descriptors have been fully accepted but the function is not yet enabled.
+    pub fn configured_only(&self) -> bool {
+        self.ep0_written && self.strings_written && !self.enabled
     }
 }
 
@@ -693,6 +1085,9 @@ pub struct FunctionFsStatus {
     pub endpoints: u8,
     /// Generated descriptor byte count.
     pub descriptor_bytes: usize,
+    /// Live daemon-core state, present only when a daemon core produced it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon: Option<FunctionFsDaemonStatus>,
 }
 
 impl FunctionFsStatus {
@@ -707,7 +1102,22 @@ impl FunctionFsStatus {
             daemon_path: config.daemon.as_ref().map(|daemon| daemon.program.clone()),
             endpoints: config.endpoints.len() as u8,
             descriptor_bytes: config.descriptors().total_len(),
+            daemon: None,
         }
+    }
+
+    /// Status derived from a live daemon core.
+    ///
+    /// The marker-based readiness is only upgraded when `daemon.live` is true,
+    /// which requires both `ep0` writes and an enable event.
+    pub fn from_daemon(config: &FunctionFsConfig, daemon: FunctionFsDaemonStatus) -> Self {
+        let mut status = Self::from_config(config);
+        if daemon.live {
+            status.readiness = FunctionFsReadiness::Ready;
+            status.ready = true;
+        }
+        status.daemon = Some(daemon);
+        status
     }
 
     /// Status for a ConfigFS reader that has no daemon/descriptor metadata.
@@ -720,6 +1130,7 @@ impl FunctionFsStatus {
             daemon_path: None,
             endpoints: 0,
             descriptor_bytes: 0,
+            daemon: None,
         }
     }
 
@@ -733,17 +1144,57 @@ impl FunctionFsStatus {
             daemon_path: None,
             endpoints: 0,
             descriptor_bytes: 0,
+            daemon: None,
         }
     }
 }
 
-/// A userspace FunctionFS daemon status source.
+/// A userspace FunctionFS daemon status/lifecycle source.
 ///
-/// Implementations only observe readiness. They must not report `Ready` unless
-/// the daemon has actually written descriptors and opened its endpoints.
+/// Implementations must not report `live` readiness unless `ep0` descriptor and
+/// string writes succeeded and the function was enabled. Status-only
+/// implementations leave the lifecycle methods at their typed-unsupported
+/// defaults.
 pub trait FunctionFsDaemon {
     /// Status for one FunctionFS function.
     fn status(&self, config: &FunctionFsConfig) -> FunctionFsStatus;
+
+    /// Write the descriptor blob and string table to `ep0`.
+    fn write_descriptors(
+        &mut self,
+        config: &FunctionFsConfig,
+        descriptors: &FunctionFsDescriptors,
+    ) -> Result<FunctionFsWriteReport, UsbError> {
+        let _ = descriptors;
+        Err(UsbError::UnsupportedFunctionFs {
+            instance: config.instance.clone(),
+            reason: "daemon has no FunctionFS ep0 descriptor writer".to_owned(),
+        })
+    }
+
+    /// Handle one decoded FunctionFS event (enable/disable/setup/...).
+    fn handle_event(
+        &mut self,
+        config: &FunctionFsConfig,
+        event: FunctionFsEvent,
+    ) -> Result<FunctionFsEventOutcome, UsbError> {
+        Err(UsbError::UnsupportedFunctionFs {
+            instance: config.instance.clone(),
+            reason: format!(
+                "daemon does not handle FunctionFS {} events",
+                event.event_type().as_str()
+            ),
+        })
+    }
+
+    /// Access one open data endpoint by USB address.
+    fn endpoint_mut(&mut self, _address: u8) -> Option<&mut dyn FunctionFsEndpointIo> {
+        None
+    }
+
+    /// Close ep0/endpoint state. Implementations must not report `live` after
+    /// this returns.
+    fn shutdown(&mut self) {}
 }
 
 /// A daemon that is known to be absent; always reports `DaemonMissing`.
@@ -778,6 +1229,28 @@ pub fn is_functionfs_function_dir(path: impl AsRef<Path>) -> bool {
         .and_then(|name| name.to_str())
         .and_then(|name| name.split_once('.'))
         .is_some_and(|(prefix, instance)| prefix == "ffs" && !instance.is_empty())
+}
+
+fn validate_class_descriptor(descriptor: &[u8]) -> Result<(), UsbError> {
+    if descriptor.len() < 2 || descriptor.len() > u8::MAX as usize {
+        return Err(UsbError::InvalidField {
+            field: "function.functionfs.class_descriptor",
+            reason: "class descriptors must be 2..=255 bytes".to_owned(),
+        });
+    }
+    if descriptor[0] as usize != descriptor.len() {
+        return Err(UsbError::InvalidField {
+            field: "function.functionfs.class_descriptor",
+            reason: "class descriptor bLength must equal its encoded length".to_owned(),
+        });
+    }
+    if matches!(descriptor[1], 0x01..=0x05) {
+        return Err(UsbError::InvalidField {
+            field: "function.functionfs.class_descriptor",
+            reason: "class descriptors cannot replace device, configuration, string, interface, or endpoint descriptors".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_string(field: &'static str, value: &str, allow_empty: bool) -> Result<(), UsbError> {

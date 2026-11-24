@@ -61,7 +61,14 @@ impl MultiseatStatus {
                     .rev()
                     .find(|status| status.seat_id == seat.config.id)
                 {
-                    Some(status) => seat.status(status.state, status.message.clone()),
+                    Some(status) => {
+                        let mut seat_status = seat.status(status.state, status.message.clone());
+                        seat_status.pid = status.pid;
+                        seat_status.restarts = status.restarts;
+                        seat_status.last_error = status.last_error.clone();
+                        seat_status.next_restart_in_ms = status.next_restart_in_ms;
+                        seat_status
+                    }
                     None => seat.status(SeatState::Planned, None),
                 }
             })
@@ -81,4 +88,100 @@ impl MultiseatStatus {
             diagnostics: plan.diagnostics.clone(),
         }
     }
+}
+
+/// Render the bounded Prometheus text surface for a multi-seat status document.
+///
+/// Labels are seat ids and fixed state/port kinds only. Node argv, environment,
+/// audio sink names, and error strings stay out of metrics so a scrape cannot
+/// leak host paths or operator messages. `seat_count`/`node_count` are always
+/// emitted together and are equal by construction.
+pub fn render_metrics(status: &MultiseatStatus) -> String {
+    let mut out = String::new();
+
+    out.push_str(
+        "# HELP ozma_multiseat_nodes Controller-visible nodes (one per seat).\n\
+         # TYPE ozma_multiseat_nodes gauge\n",
+    );
+    out.push_str(&format!(
+        "ozma_multiseat_nodes {}\n",
+        status.capability.node_count
+    ));
+
+    out.push_str(
+        "# HELP ozma_multiseat_seats Planned seats by supervisor state.\n\
+         # TYPE ozma_multiseat_seats gauge\n",
+    );
+    for state in [
+        SeatState::Planned,
+        SeatState::Starting,
+        SeatState::Running,
+        SeatState::Stopped,
+        SeatState::Failed,
+    ] {
+        let count = status
+            .seats
+            .iter()
+            .filter(|seat| seat.state == state)
+            .count();
+        out.push_str(&format!(
+            "ozma_multiseat_seats{{state=\"{}\"}} {}\n",
+            escape_label(state.as_str()),
+            count
+        ));
+    }
+
+    out.push_str(
+        "# HELP ozma_multiseat_seat_up Whether a node process is running for this seat.\n\
+         # TYPE ozma_multiseat_seat_up gauge\n",
+    );
+    for seat in &status.seats {
+        out.push_str(&format!(
+            "ozma_multiseat_seat_up{{seat=\"{}\"}} {}\n",
+            escape_label(&seat.seat_id),
+            u8::from(seat.state == SeatState::Running)
+        ));
+    }
+
+    out.push_str(
+        "# HELP ozma_multiseat_seat_restarts_total Successful node restarts after failures.\n\
+         # TYPE ozma_multiseat_seat_restarts_total counter\n",
+    );
+    for seat in &status.seats {
+        out.push_str(&format!(
+            "ozma_multiseat_seat_restarts_total{{seat=\"{}\"}} {}\n",
+            escape_label(&seat.seat_id),
+            seat.restarts
+        ));
+    }
+
+    out.push_str(
+        "# HELP ozma_multiseat_seat_port Planned node port, by kind.\n\
+         # TYPE ozma_multiseat_seat_port gauge\n",
+    );
+    for seat in &status.seats {
+        for (kind, value) in [("udp", seat.udp_port), ("http", seat.http_port)] {
+            out.push_str(&format!(
+                "ozma_multiseat_seat_port{{seat=\"{}\",kind=\"{}\"}} {}\n",
+                escape_label(&seat.seat_id),
+                escape_label(kind),
+                value
+            ));
+        }
+    }
+
+    out
+}
+
+fn escape_label(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
 }

@@ -160,6 +160,18 @@ if [ "$STAGING" -eq 0 ] && [ "$IS_ROOT" -ne 1 ] && [ "$DRY_RUN" -ne 1 ]; then
     die "a live system install requires root; use --root DIR for a rootless temp-prefix test, or --dry-run"
 fi
 
+# The account name is copied into sed-rendered unit/tmpfiles/udev files and
+# into operator commands. Reject characters that sed would interpret or that
+# cannot be a valid group/user name.
+case "$SYS_USER" in
+    ""|*[[:space:]\&\|@/:]*)
+        die_usage "--user must be a non-empty account name without whitespace, '&', '|', '@', '/', or ':'" ;;
+esac
+case "$SYS_GROUP" in
+    ""|*[[:space:]\&\|@/:]*)
+        die_usage "--group must be a non-empty group name without whitespace, '&', '|', '@', '/', or ':'" ;;
+esac
+
 # ---------------------------------------------------------------------------
 # Paths. ROOT is empty for a live install, so these are the real paths; with
 # --root they are all staged under that directory.
@@ -352,7 +364,10 @@ if [ "$DO_DIRS" -eq 1 ]; then
     install_dir "$STATE_DIR/hls" 0750 "$SYS_USER" "$SYS_GROUP"
     install_dir "$SUP_STATE_DIR" 0750 "$SYS_USER" "$SYS_GROUP"
     install_dir "$RUNTIME_DIR" 0750 "$SYS_USER" "$SYS_GROUP"
-    install_dir "$SUP_RUNTIME_DIR" 0750 "$SYS_USER" "$SYS_GROUP"
+    # /run/ozma holds the supervisor's state and the QMP directory. The
+    # service user owns it (so it can write audio-provision.json/markers), but
+    # other users must be able to traverse it to reach /run/ozma/qmp sockets.
+    install_dir "$SUP_RUNTIME_DIR" 0755 "$SYS_USER" "$SYS_GROUP"
     install_dir "$QMP_DIR" 0770 root "$QMP_GROUP"
 fi
 
@@ -555,6 +570,11 @@ if [ "$DRY_RUN" -eq 0 ]; then
         echo "# Keep $ENV_DIR if it contains tokens; remove it only deliberately."
         echo "# userdel $SYS_USER; groupdel $SYS_GROUP    # only if no other use"
     } >"$OP_RENDER"
+    # The operator file lives under ENV_DIR. The normal dirs, env, or libvirt
+    # sections create it; ensure it exists when all three were disabled.
+    if [ "$DO_DIRS" -eq 0 ] && [ "$DO_ENV" -eq 0 ] && [ "$DO_LIBVIRT" -eq 0 ]; then
+        install_dir "$ENV_DIR" 0750 root "$SYS_GROUP"
+    fi
     install_prepared "$OP_RENDER" "$OPERATOR_FILE" 0640 root "$SYS_GROUP"
     say ""
     say "Wrote operator commands to $OPERATOR_FILE"

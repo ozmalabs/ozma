@@ -12,8 +12,10 @@ one-release overlap.
 | `env/*.env.example` | Environment-file examples. Copy, do not edit in place. |
 
 `@BIN_DIR@`, `@ENV_DIR@`, `@STATE_DIR@`, `@RUNTIME_DIR@`,
-`@SUPERVISOR_STATE_DIR@`, and `@SUPERVISOR_RUNTIME_DIR@` are substituted by
-`scripts/install-rust.sh`. The defaults in a system install are
+`@SUPERVISOR_STATE_DIR@`, `@SUPERVISOR_RUNTIME_DIR@`, `@OZMA_USER@`, and
+`@OZMA_GROUP@` are substituted by `scripts/install-rust.sh` (and by
+`scripts/install-system.sh`, which also renders the host assets). The defaults
+in a system install are
 `/usr/local/bin`, `/etc/ozma`, `/var/lib/ozma-node`, `/run/ozma-node`,
 `/var/lib/ozma`, and `/run/ozma`.
 

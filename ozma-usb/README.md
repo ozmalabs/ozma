@@ -17,7 +17,10 @@ gadget creation on a hardware profile.
 |---|---|
 | Composite gadget model | `UsbGadgetConfig`, `UsbFunction`, `UsbFunctionKind`, `HidProtocol` |
 | Functions | HID keyboard/mouse/custom, mass storage, UAC2 (`Uac2Config`), FunctionFS vendor (`FunctionFsConfig`) |
-| FunctionFS model | `FunctionFsConfig`, `FunctionFsEndpoint`, `FunctionFsStrings`, `FunctionFsDaemonSpec`, `FunctionFsReadiness`, `FunctionFsStatus`, `FunctionFsDaemon`/`MissingFunctionFsDaemon`/`ObservedFunctionFsDaemon`, generated device/config/string descriptors |
+| FunctionFS model | `FunctionFsConfig`, `FunctionFsEndpoint`, `FunctionFsStrings`, `FunctionFsDaemonSpec`, `FunctionFsReadiness`, `FunctionFsStatus`, `FunctionFsDaemon`/`MissingFunctionFsDaemon`/`ObservedFunctionFsDaemon`, generated device/config/string descriptors, class-specific descriptors, Microsoft OS descriptors |
+| FunctionFS daemon core | `FunctionFsMount`, `FunctionFsDescriptors` (v2 `ep0` blob + strings), `FunctionFsDaemonCore`, `LoopbackFunctionFsDaemon`/`FakeFunctionFsDaemon`, `FileFunctionFsDaemon`, `FunctionFsControlRequest`/`FunctionFsControlResponse`, `FunctionFsEvent`, injectable `FunctionFsEp0Io`/`FunctionFsEndpointIo`, bounded endpoint loops |
+| FunctionFS control | Standard `GET_DESCRIPTOR` (device/configuration/string), `SET_CONFIGURATION`, `GET_CONFIGURATION`, `GET/SET_INTERFACE`, `GET_STATUS`, feature requests; typed rejection for class/vendor and unknown requests |
+| FunctionFS status | `FunctionFsDaemonStatus` nested in `FunctionFsStatus.daemon`: `live` only when the descriptor blob, string table, and enable event all succeeded |
 | UAC2 model | `Uac2Config`, `Uac2Mode::{Microphone,Headset,Speaker}`, `Uac2DescriptorSet`, `Uac2Status`, `Uac2BridgeStatus::Unsupported` |
 | Validation | Safe gadget/function names, VID/PID, strings, power, duplicate links, HID report shape, UAC2 rates/sizes/channels/modes, FunctionFS endpoint bounds/descriptor size, CD-ROM read-only |
 | Virtual media | `MassStorageImage`, `VirtualMedia`, `MediaMode::{Disk,CdRom}`, `MediaFormat::{Raw,Iso9660,Fat32,Nbd}`, `MediaState::{Attached,Detached}` |
@@ -196,29 +199,81 @@ let gadget = UsbGadgetConfig::new("ozma", "dummy_udc.0")
 ```
 
 `FunctionFsConfig::descriptors()` generates the 18-byte device descriptor,
-configuration/interface/endpoint descriptors, and string descriptors that a
-daemon writes to `ep0`. Bounds are validated before any ConfigFS write:
-1–15 non-control endpoints, unique endpoint addresses in `0x01..=0x0f` /
-`0x81..=0x8f`, bulk packets ≤512 bytes, interrupt/isochronous packets ≤1024
-bytes, intervals 1..=16 for interrupt/isochronous, strings ≤126 bytes, and a
-total descriptor set ≤4096 bytes.
+configuration/interface/endpoint descriptors, and standard string descriptors
+used by status/control surfaces. `FunctionFsConfig::ep0_descriptors()` builds
+what FunctionFS actually accepts on `ep0`:
+
+- a v2 descriptor header (magic `3`, length, flags, FS/HS/OS counts);
+- function-scoped full-speed and high-speed descriptor sets (interface,
+  optional class-specific descriptors, endpoints; device and configuration
+  descriptors are reserved for the composite gadget);
+- optional Microsoft OS compatible-ID/properties blocks (`wIndex` 4/5);
+- a separate UTF-8, NUL-terminated string table with one `0x0409` language.
+
+Bounds are validated before any write: 1–15 non-control endpoints, unique
+endpoint addresses in `0x01..=0x0f` / `0x81..=0x8f`, bulk packets ≤512 bytes,
+interrupt/isochronous packets ≤1024 bytes, intervals 1..=16 for
+interrupt/isochronous, strings ≤126 bytes, class descriptors 2–255 bytes,
+bounded OS properties, and a descriptor blob ≤4096 bytes. The full-speed set
+clamps bulk/interrupt packets to 64 and isochronous packets to 1023; the
+high-speed set keeps the configured sizes. Malformed magic, length, `bLength`,
+reserved gadget descriptors, trailing bytes, and truncated OS descriptors are
+typed `invalid-functionfs-descriptor` failures.
 
 ConfigFS only gets the `functions/ffs.<instance>` directory and the
-configuration symlink. The kernel does **not** take descriptors from ConfigFS:
-the daemon must mount FunctionFS, write the generated descriptors to `ep0`, and
-service the endpoints. Readiness is explicit and never assumed:
+configuration symlink. The kernel does **not** take descriptors from ConfigFS.
+The daemon core models the userspace contract without mounting anything:
+
+```rust
+use ozma_usb::{
+    FunctionFsConfig, FunctionFsDaemon, FunctionFsEndpoint, FunctionFsEvent,
+    FakeFunctionFsDaemon,
+};
+
+let config = FunctionFsConfig::new("vendor0", 0x1209, 0x0001)
+    .with_endpoint(FunctionFsEndpoint::bulk_out(1, 512))
+    .with_endpoint(FunctionFsEndpoint::bulk_in(2, 512));
+let descriptors = config.ep0_descriptors()?;
+let mut daemon = FakeFunctionFsDaemon::new(config.clone())?;
+daemon.write_descriptors(&config, &descriptors)?; // two ep0 writes
+daemon.handle_event(&config, FunctionFsEvent::Enable)?; // opens endpoints
+if let Some(endpoint) = daemon.endpoint_mut(0x01) {
+    // read/write through an injectable FunctionFsEndpointIo
+}
+# Ok::<(), ozma_usb::UsbError>(())
+```
+
+`FunctionFsMount::new` / `for_instance` validates a mount directory and `ep0`
+(regular test file, character device, or FIFO) and `write_descriptors` writes
+the blob then the string table. `FunctionFsDaemonCore` takes injectable
+`FunctionFsEp0Io` and `FunctionFsEndpointOpener`; `LoopbackFunctionFsDaemon`
+uses in-memory endpoints, and `FileFunctionFsDaemon::open` uses an explicitly
+supplied mount (endpoint files open lazily on enable, as FunctionFS creates
+them after descriptors). Read/write loops reject wrong-direction transfers and
+buffers over 64 KiB. `handle_control_request` answers standard
+`GET_DESCRIPTOR` (device/configuration/string), `SET_CONFIGURATION`,
+`GET_CONFIGURATION`, `GET/SET_INTERFACE`, `GET_STATUS`, and feature requests;
+class/vendor and unknown requests return typed
+`unsupported-functionfs-control` errors.
+
+Readiness is explicit and never assumed:
 
 | `FunctionFsReadiness` | Meaning |
 |---|---|
 | `daemon_not_configured` | No daemon path is modelled. |
 | `daemon_missing` | A configured daemon path does not exist. |
 | `daemon_not_ready` | The program exists but the readiness marker does not. |
-| `ready` | Program **and** readiness marker exist. |
+| `ready` | Marker present, or a live daemon core reported ready. |
 | `unknown` | A ConfigFS status reader has no daemon metadata. |
 
-`FunctionFsStatus` is embedded in `FunctionStatus.function_fs`. The
-`FunctionFsDaemon` trait (`MissingFunctionFsDaemon`, `ObservedFunctionFsDaemon`)
-and `FunctionFsConfig::require_ready()` provide a typed
+`FunctionFsStatus` is embedded in `FunctionStatus.function_fs`. Its optional
+`daemon` field reports `ep0_written`, `strings_written`, `enabled`,
+`configured`, open endpoints, and counters. `daemon.live` is true only after
+both `ep0` writes succeeded **and** an enable event opened the endpoints; a
+marker file alone never sets it. The `FunctionFsDaemon` trait
+(`MissingFunctionFsDaemon`, `ObservedFunctionFsDaemon`,
+`LoopbackFunctionFsDaemon`, `FileFunctionFsDaemon`) and
+`FunctionFsConfig::require_ready()` provide a typed
 `unsupported-functionfs` failure when no daemon is ready. No daemon is spawned
 and no vendor protocol is implemented.
 
@@ -395,6 +450,7 @@ Relevant suites:
 | `tests/fat32_image.rs` | BPB/FAT/root entries/file clusters, LFN + 8.3 collisions, read-only attributes, directory import, bounds, corrupt BPB |
 | `tests/media_formats.rs` | ISO PVD/read-only media, `MediaFormat` consistency/JSON, FAT32 attach probe, NBD descriptors and framing |
 | `tests/functionfs.rs` | FunctionFS descriptor generation, endpoint/string/daemon bounds, explicit readiness states, ConfigFS `ffs.<instance>` creation/status, fake status |
+| `tests/functionfs_daemon.rs` | v2 descriptor/string encoding and alignment, class/OS descriptors, temporary-mount `ep0` writes, standard control requests, enable/disable/live status, endpoint read/write/loopback, malformed/oversized inputs, lazily opened file endpoints |
 | `tests/uac2.rs` | UAC2 descriptor/channel/rate/size consistency, microphone/speaker/headset modes, invalid rates/channels/modes, ConfigFS attribute writes, unsupported bridge status |
 | `tests/usbip_controller.rs` | exact argv, list/port parsing (IPv4/IPv6), attach/detach state, disabled/missing/non-zero typed errors, config validation, host/token allow-list enforcement, no real `usbip` |
 | `tests/nbd_server.rs` | newstyle handshake, export name/list/info/go, read/write/flush/disc, request bounds, read-only write rejection, malformed/truncated frames, injected transport/clock deadline, concurrent loopback clients, Unix socket, server stop, file/media backends |
@@ -410,6 +466,17 @@ OZMA_USB_CONFIGFS_TEST=1 OZMA_USB_UDC=dummy_udc.0 \
 It still requires root, a mounted ConfigFS root (optionally
 `OZMA_USB_CONFIGFS_ROOT`), and a free UDC. It creates only HID functions and
 removes the test gadget.
+
+The real FunctionFS descriptor write is also ignored and env-gated:
+
+```bash
+OZMA_FUNCTIONFS_MOUNT=/dev/ffs-ozma-test \
+  cargo test -p ozma-usb --test functionfs_daemon -- --ignored
+```
+
+It requires an existing FunctionFS mount (made by the caller; no mount or sudo
+is performed), opens `ep0`, writes descriptors/strings, and asserts that the
+status is not `live` without an observed enable event.
 
 ## Remaining integration and security gaps
 
@@ -432,11 +499,14 @@ removes the test gadget.
   replies, TLS, write-zeroes, cache, multi-conn, or persistent export state.
   Node wiring is one loopback export behind the existing `--usb-gadget` state
   and is not exposed through capabilities or registration.
-- FunctionFS now models descriptors, endpoints, bounded daemon metadata, and
-  explicit readiness, but the real userspace daemon (mount FunctionFS, write
-  `ep0`, service endpoints, run a vendor protocol) is still absent. UAC2 now
-  models descriptors/capabilities and writes the primary ConfigFS attributes,
-  but there is no ALSA or isochronous USB audio bridge; status always reports
+- FunctionFS now has an `ep0`/endpoint daemon core, but mounting the function,
+  creating the ConfigFS link, reacting to real UDC events, and exposing a
+  vendor protocol are not automated. Class/vendor control requests are rejected
+  with typed errors until a protocol handler exists; there is no persistent
+  daemon process, restart supervision, or node route that starts one. Suspend
+  and resume events are accepted but not acted on. UAC2 still models
+  descriptors/capabilities and writes the primary ConfigFS attributes, but
+  there is no ALSA or isochronous USB audio bridge; status always reports
   `bridge: "unsupported"`. Node flags exist (`--usb-uac2`, `--usb-vendor`,
   `--usb-vendor-daemon`), but `/usb` surfaces readiness/absence rather than
   starting either backend.

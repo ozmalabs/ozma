@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use axum::extract::rejection::JsonRejection;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{header, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -60,6 +60,7 @@ use serde_json::Value;
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
+use crate::display_broker::ConsoleBroker;
 use crate::display_compat::{DisplayInfo, SnapshotControl, SnapshotError};
 use crate::display_control::{DisplayControl, DisplayStatus, SelectConsoleRequest};
 use crate::hls::{HlsController, HlsEncoder, HlsError, HlsStatus};
@@ -1794,6 +1795,9 @@ pub struct ConnectionState {
     /// `/api/v1/connection.display_outputs`/`display_capture` and backs
     /// `POST /display/select`.
     pub display_control: Option<DisplayControl>,
+    /// Bounded per-console broker used by `?console=` snapshots/info. It never
+    /// swaps the active HLS/WebRTC registry.
+    pub console_broker: Option<ConsoleBroker>,
     /// Live capture transport/source for `/api/v1/connection`.
     pub capture: CaptureStatus,
 }
@@ -1818,6 +1822,7 @@ impl ConnectionState {
             display_outputs: serde_json::json!([]),
             display_capture: DisplayCaptureStatus::default(),
             display_control: None,
+            console_broker: None,
             capture: CaptureStatus::default(),
         }
     }
@@ -1856,6 +1861,16 @@ impl ConnectionState {
     /// `POST /display/select` is visible immediately.
     pub fn with_display_control(mut self, control: Option<DisplayControl>) -> Self {
         self.display_control = control;
+        self
+    }
+
+    /// Attach the bounded multi-console snapshot broker.
+    ///
+    /// The broker serves `GET /display/snapshot?console=N` and
+    /// `GET /display/info?console=N` for advertised consoles without replacing
+    /// the active registry used by HLS/WebRTC and the default snapshot route.
+    pub fn with_console_broker(mut self, broker: Option<ConsoleBroker>) -> Self {
+        self.console_broker = broker;
         self
     }
 
@@ -2292,21 +2307,69 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
     })
 }
 
-async fn display_snapshot(State(state): State<ConnectionState>) -> Response {
-    let Some(control) = state.snapshot else {
+#[derive(Debug, Default, serde::Deserialize)]
+struct DisplayConsoleQuery {
+    #[serde(default)]
+    console: Option<String>,
+}
+
+async fn display_snapshot(
+    State(state): State<ConnectionState>,
+    Query(query): Query<DisplayConsoleQuery>,
+) -> Response {
+    let Some(requested) = query.console.as_deref() else {
+        return default_snapshot(&state).await;
+    };
+
+    let Some(control) = state.display_control.as_ref() else {
+        return snapshot_error_response(SnapshotError::ConsoleUnsupported);
+    };
+    let Some(broker) = state.console_broker.as_ref() else {
+        return snapshot_error_response(SnapshotError::ConsoleUnsupported);
+    };
+    let selection = control.selection();
+    let console = match broker.resolve_console(Some(requested), &selection) {
+        Ok(console) => console,
+        Err(error) => return snapshot_error_response(error),
+    };
+
+    if console == selection.active_console {
+        // Backward-compatible active path: the shared registry snapshot control
+        // follows exactly the same console as HLS/WebRTC.
+        let Some(snapshot) = state.snapshot.as_ref() else {
+            return snapshot_error_response(SnapshotError::NotConfigured);
+        };
+        return match snapshot.capture().await {
+            Ok(snapshot) => jpeg_response(snapshot),
+            Err(error) => snapshot_error_response(error),
+        };
+    }
+
+    match broker.snapshot(console, &selection).await {
+        Ok(snapshot) => jpeg_response(snapshot),
+        Err(error) => snapshot_error_response(error),
+    }
+}
+
+async fn default_snapshot(state: &ConnectionState) -> Response {
+    let Some(control) = state.snapshot.as_ref() else {
         return snapshot_error_response(SnapshotError::NotConfigured);
     };
     match control.capture().await {
-        Ok(snapshot) => (
-            [
-                (header::CONTENT_TYPE, "image/jpeg"),
-                (header::CACHE_CONTROL, "no-store"),
-            ],
-            snapshot.jpeg,
-        )
-            .into_response(),
+        Ok(snapshot) => jpeg_response(snapshot),
         Err(error) => snapshot_error_response(error),
     }
+}
+
+fn jpeg_response(snapshot: crate::display_compat::SnapshotFrame) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "image/jpeg"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        snapshot.jpeg,
+    )
+        .into_response()
 }
 
 fn snapshot_error_response(error: SnapshotError) -> Response {
@@ -2327,23 +2390,70 @@ fn snapshot_error_response(error: SnapshotError) -> Response {
     (status, Json(body)).into_response()
 }
 
-async fn display_info(State(state): State<ConnectionState>) -> Json<DisplayInfo> {
-    let info = match state.snapshot {
-        Some(control) => control.info().await,
-        None => DisplayInfo {
-            ok: true,
-            source_id: None,
-            source_name: None,
-            width: 0,
-            height: 0,
-            pixel_format: None,
-            snapshot_available: false,
-            snapshot_encoding: "jpeg",
-            dimensions_source: "none",
-            last_error: Some("display snapshot support is not configured".to_owned()),
-        },
+async fn display_info(
+    State(state): State<ConnectionState>,
+    Query(query): Query<DisplayConsoleQuery>,
+) -> Response {
+    let Some(requested) = query.console.as_deref() else {
+        let mut info = match state.snapshot.as_ref() {
+            Some(control) => control.info().await,
+            None => unavailable_display_info(Some(
+                "display snapshot support is not configured".to_owned(),
+            )),
+        };
+        if let Some(control) = state.display_control.as_ref() {
+            let selection = control.selection();
+            info.console = Some(selection.active_console);
+            info.active = true;
+        }
+        return Json(info).into_response();
     };
-    Json(info)
+
+    let Some(control) = state.display_control.as_ref() else {
+        return snapshot_error_response(SnapshotError::ConsoleUnsupported);
+    };
+    let Some(broker) = state.console_broker.as_ref() else {
+        return snapshot_error_response(SnapshotError::ConsoleUnsupported);
+    };
+    let selection = control.selection();
+    let console = match broker.resolve_console(Some(requested), &selection) {
+        Ok(console) => console,
+        Err(error) => return snapshot_error_response(error),
+    };
+
+    let mut info = if console == selection.active_console {
+        match state.snapshot.as_ref() {
+            Some(snapshot) => snapshot.info().await,
+            None => unavailable_display_info(Some(
+                "display snapshot support is not configured".to_owned(),
+            )),
+        }
+    } else {
+        match broker.info(console, &selection).await {
+            Ok(info) => info,
+            Err(error) => return snapshot_error_response(error),
+        }
+    };
+    info.console = Some(console);
+    info.active = console == selection.active_console;
+    Json(info).into_response()
+}
+
+fn unavailable_display_info(last_error: Option<String>) -> DisplayInfo {
+    DisplayInfo {
+        ok: true,
+        source_id: None,
+        source_name: None,
+        width: 0,
+        height: 0,
+        pixel_format: None,
+        snapshot_available: false,
+        snapshot_encoding: "jpeg",
+        dimensions_source: "none",
+        last_error,
+        console: None,
+        active: false,
+    }
 }
 
 async fn display_mjpeg(State(_state): State<ConnectionState>) -> Response {
@@ -2385,7 +2495,18 @@ async fn display_select(
         );
     };
     match control.select(&request).await {
-        Ok(response) => Json(response).into_response(),
+        Ok(response) => {
+            if let Some(broker) = state.console_broker.as_ref() {
+                let selection = control.selection();
+                let available: Vec<u32> = selection
+                    .outputs
+                    .iter()
+                    .map(|output| output.index)
+                    .collect();
+                broker.on_select(response.active_console, &available).await;
+            }
+            Json(response).into_response()
+        }
         Err(error) => api_error_response(error.status, error.error),
     }
 }
@@ -5095,6 +5216,166 @@ mod tests {
                 Some(console),
             )
         }
+    }
+
+    struct SingleHeadConsoleFactory;
+
+    impl crate::display_control::ConsoleSourceFactory for SingleHeadConsoleFactory {
+        fn provider(&self) -> Option<ozma_display::vm::VmConsoleBackend> {
+            Some(ozma_display::vm::VmConsoleBackend::Qmp)
+        }
+
+        fn default_console(&self) -> u32 {
+            0
+        }
+
+        fn supports_console_switch(&self) -> bool {
+            false
+        }
+
+        fn registry(&self, _console: u32) -> Result<CaptureRegistry, String> {
+            Ok(CaptureRegistry::new()
+                .with(FakeCaptureProvider::new().with_identity("qmp0", "QMP display")))
+        }
+
+        fn selection(
+            &self,
+            console: u32,
+        ) -> Result<crate::display_outputs::DisplayOutputSelection, String> {
+            crate::display_outputs::outputs_from_specs(
+                &[
+                    "0:Console_0:1024x768:primary:qmp".to_owned(),
+                    "1:Console_1:800x600:qmp".to_owned(),
+                ],
+                ozma_display::vm::VmConsoleBackend::Qmp,
+                Some("qmp0"),
+                Some(console),
+            )
+        }
+    }
+
+    fn console_state(
+        factory: Arc<dyn crate::display_control::ConsoleSourceFactory>,
+    ) -> ConnectionState {
+        let slot = Arc::new(std::sync::RwLock::new(
+            factory.registry(0).expect("active registry"),
+        ));
+        let control =
+            DisplayControl::new(factory.clone(), slot, Vec::new()).expect("display control");
+        let broker = crate::display_broker::ConsoleBroker::new(
+            factory,
+            crate::display_broker::ConsoleBrokerConfig::default(),
+        );
+        ConnectionState::new(
+            ConnectionInfo::new(
+                "vm-a._ozma._udp.local.",
+                "vm",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_snapshot(Some(SnapshotControl::new(
+            CaptureRegistry::new().with(FakeCaptureProvider::new()),
+        )))
+        .with_display_control(Some(control))
+        .with_console_broker(Some(broker))
+    }
+
+    #[tokio::test]
+    async fn display_snapshot_and_info_accept_a_per_console_query() {
+        let app = public_router(console_state(Arc::new(SwitchConsoleFactory)));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/display/snapshot?console=Console_1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/jpeg");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.starts_with(&[0xFF, 0xD8]));
+        let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(&body));
+        decoder.decode().expect("valid JPEG");
+
+        let (status, info) = get_json(&app, "/display/info?console=1").await;
+        assert_eq!(status, StatusCode::OK, "{info}");
+        assert_eq!(info["console"], 1);
+        assert_eq!(info["active"], false);
+        assert_eq!(info["source_id"], "console-1");
+        assert_eq!(info["snapshot_available"], true);
+
+        // The default route still describes the active console (backward
+        // compatible shape with the new console metadata).
+        let (status, info) = get_json(&app, "/display/info").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(info["console"], 0);
+        assert_eq!(info["active"], true);
+        assert_eq!(info["source_id"], "fake0");
+
+        let (status, body) = get_json(&app, "/display/snapshot?console=Console_9").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["code"], "not_found");
+        assert_eq!(body["details"]["available"], serde_json::json!([0, 1]));
+
+        let (status, body) = get_json(&app, "/display/info?console=9").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn display_snapshot_rejects_a_single_head_console_query() {
+        let app = public_router(console_state(Arc::new(SingleHeadConsoleFactory)));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/display/snapshot?console=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "conflict");
+        assert_eq!(body["details"]["single_head"], true);
+        assert_eq!(body["details"]["provider"], "qmp");
+        assert_eq!(body["details"]["requested_console"], 1);
+
+        // Info explains unavailability instead of inventing a source.
+        let (status, info) = get_json(&app, "/display/info?console=1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(info["console"], 1);
+        assert_eq!(info["active"], false);
+        assert_eq!(info["snapshot_available"], false);
+        assert!(info["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("one default console"));
+
+        // The active console still snapshots normally.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/display/snapshot?console=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/jpeg");
     }
 
     #[tokio::test]

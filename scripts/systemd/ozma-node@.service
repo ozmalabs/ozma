@@ -12,10 +12,10 @@ ExecStart=@BIN_DIR@/ozma-node --profile %i $OZMA_NODE_ARGS
 EnvironmentFile=-@ENV_DIR@/ozma-node-%i.env
 
 # Dedicated system user created by the administrator/package (not by this
-# unit). The desktop profile is usually better as a systemd --user unit, see
-# scripts/systemd/README.md.
-User=ozma-node
-Group=ozma-node
+# unit; the installer defaults to ozma-node). The desktop profile is usually
+# better as a systemd --user unit, see scripts/systemd/README.md.
+User=@OZMA_USER@
+Group=@OZMA_GROUP@
 SupplementaryGroups=video input render
 
 Restart=on-failure

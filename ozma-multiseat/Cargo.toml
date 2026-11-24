@@ -2,13 +2,18 @@
 name = "ozma-multiseat"
 version = "0.1.0"
 edition = "2021"
-description = "Multi-seat display/input planning and per-seat ozma-node launch plans."
+description = "Multi-seat planning, per-seat ozma-node launch plans, and a real seat supervisor."
 license = "AGPL-3.0-only"
 
 [dependencies]
+clap = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = "1"
+tokio = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30", features = ["signal"] }
 
 [dev-dependencies]
-serde_json = { workspace = true }
 tempfile = "3"

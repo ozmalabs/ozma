@@ -11,8 +11,10 @@ console switch previously truncated the playlist and reset
 `#EXT-X-MEDIA-SEQUENCE` to 0. It now appends with
 `#EXT-X-DISCONTINUITY`, and that behavior is unit- and live-tested.
 
-This is not a simultaneous-multi-console claim. The node still has one active
-capture source and one live encoder pair at a time.
+This is not a simultaneous-multi-console encoder claim. The node still has one
+active HLS/WebRTC capture source and one live encoder pair at a time. A
+follow-up snapshot/info broker (§13) adds simultaneous JPEG previews for
+advertised D-Bus consoles without switching the active stream.
 
 ## 1. Environment
 
@@ -405,3 +407,74 @@ it needs the binary and `python3`. Accepted QUIC/WebTransport session tasks are
 dropped at process exit rather than individually awaited. UAC2 configfs teardown
 is still best-effort. libmdns owns a detached responder thread; dropping the
 handle does not join it, but it cannot block `main` from returning.
+
+## 13. Multi-console snapshot broker (follow-up)
+
+`GET /display/snapshot?console=<N|label|Console_N|source-id>` and
+`GET /display/info?console=...` now use a bounded broker
+(`ozma-node/src/display_broker.rs`). The active console — no query, or a query
+resolving to the active index — still uses the one-shot snapshot control on the
+shared active registry. Other advertised consoles get a per-console registry
+from `ConsoleSourceFactory` and a cached `SnapshotControl`; the source is opened
+lazily and reused between preview polls.
+
+Bounds and lifecycle:
+
+- `max_open` defaults to 4 console sources; the least-recently-used console is
+  stopped before a fifth is opened.
+- `idle_timeout` defaults to 30 s. A background task (5 s tick) and every
+  request evict idle sources.
+- `POST /display/select` stops/forgets the broker source for the newly active
+  console (it returns to the active HLS/WebRTC snapshot path) and for consoles
+  removed from `display_outputs`.
+- Node shutdown stops every broker source with a bounded wait.
+- The broker never writes `registry_slot`, so it cannot replace the active
+  HLS/WebRTC source.
+
+Provider honesty:
+
+- D-Bus per-console sources are opened independently and share the node's
+  single QMP control client.
+- QMP, VNC, and Looking Glass advertise one default head. A non-active
+  `?console=` is a typed `409 conflict` with
+  `details:{provider,active_console,requested_console,single_head:true}`; info
+  reports `snapshot_available:false` and the reason instead of inventing a
+  frame.
+- An invalid/unadvertised console is a typed `404 not_found` with
+  `details.available`.
+- Registry/open/frame failures remain typed `503`s with remediation. No frame
+  or source id is fabricated.
+
+The controller forwards the optional console through
+`/api/v1/streams/{node}/snapshot?console=...`, adds
+`/api/v1/nodes/{node}/display/info?console=...`, and the dashboard snapshot
+modal includes the console picker's value.
+
+**Live smoke (2026-11-25, QEMU 11.1.3, Alpine 3.21, disposable two-head D-Bus).**
+The node advertised `Console_0` 1280x800 (active) and `Console_1` 720x400.
+Both snapshots succeeded while the active console stayed `0`:
+
+```text
+GET /display/snapshot?console=0 -> 200 image/jpeg 99050 B, 1280x800
+GET /display/snapshot?console=1 -> 200 image/jpeg  8084 B,  720x400
+hashes differ (45f9152d… vs 3c79f959…)
+GET /display/info?console=1     -> console:1, active:false, last-frame 720x400
+GET /display/snapshot?console=9 -> 404 not_found, details.available:[0,1]
+POST /display/select remained untouched; /api/v1/connection stayed active:0
+SIGTERM -> exit in ~200 ms
+```
+
+Tests: `cargo test -p ozma-node` (322 lib tests plus integration/parity),
+including new `display_broker::tests` for independent capture, open-source
+reuse, max/idle eviction, single-head conflict, unknown console, info shape, and
+switch/shutdown cleanup; `controller_compat::tests` route tests for
+`?console=`, 404, and single-head 409; focused controller pytest.
+
+**Remaining simultaneous-console gaps.** Snapshot/info are now concurrent for
+advertised D-Bus consoles, but HLS and WebRTC still follow exactly one active
+capture source and one encoder pair. The broker does not feed either encoder and
+does not claim simultaneous encoded streams. True simultaneous HLS/WebRTC would
+need one pipeline/encoder per console, a bounded provider/encoder budget, and a
+control/status model for multiple active streams. Each D-Bus console also holds
+its own QEMU display listener, so `max_open` is a real resource bound, not just
+a cache size. QMP/VNC/Looking Glass remain single-head by design.

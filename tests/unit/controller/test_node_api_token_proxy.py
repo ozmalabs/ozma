@@ -263,6 +263,47 @@ def test_display_select_updates_cached_outputs_after_node_success(fake_node, tmp
     assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
 
 
+def test_snapshot_proxy_forwards_a_console_query(fake_node, tmp_path):
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).get(
+        f"/api/v1/streams/{NODE_ID}/snapshot", params={"console": "Console_1"}
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"] == "image/jpeg"
+    record = fake_node.requests[-1]
+    assert record["path"] == "/display/snapshot?console=Console_1"
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_display_info_proxy_forwards_a_console_query(fake_node, tmp_path):
+    fake_node.responder = lambda method, record: (
+        200,
+        {
+            "ok": True,
+            "console": 1,
+            "active": False,
+            "source_id": "dbus0",
+            "width": 1280,
+            "height": 1024,
+            "snapshot_available": True,
+        },
+        "application/json",
+    )
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).get(
+        f"/api/v1/nodes/{NODE_ID}/display/info", params={"console": "1"}
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["console"] == 1
+    record = fake_node.requests[-1]
+    assert record["path"] == "/display/info?console=1"
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
 def test_display_select_preserves_single_head_409_without_updating_state(
     fake_node, tmp_path
 ):

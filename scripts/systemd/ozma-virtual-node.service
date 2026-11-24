@@ -14,8 +14,8 @@ EnvironmentFile=-@ENV_DIR@/ozma-virtual-node.env
 # Needs libvirt access for discovery/power and input access only if
 # --provision-evdev is enabled. Do not add the libvirt group unless the host
 # actually uses libvirt.
-User=ozma-node
-Group=ozma-node
+User=@OZMA_USER@
+Group=@OZMA_GROUP@
 SupplementaryGroups=libvirt kvm input video render
 
 Restart=on-failure

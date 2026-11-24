@@ -84,6 +84,40 @@ run_install_quiet() {
     "$INSTALL" "$@" >"$log" 2>&1
 }
 
+group_exists() { getent group "$1" >/dev/null 2>&1; }
+profile_groups() {
+    case "$1" in
+        hardware) echo "video input render" ;;
+        vm) echo "input render kvm libvirt" ;;
+        desktop) echo "input video render" ;;
+        all) echo "video input render kvm libvirt" ;;
+        *) echo "" ;;
+    esac
+}
+
+# Compare the usermod line with the groups that exist on this host. Missing
+# conventional groups are intentionally omitted by the installer.
+check_profile_groups() {
+    profile=$1
+    file=$2
+    if ! command -v getent >/dev/null 2>&1; then
+        skip "profile $profile groups (getent unavailable)"
+        return
+    fi
+    want=""
+    for g in $(profile_groups "$profile"); do
+        group_exists "$g" && want="${want:+$want,}$g"
+    done
+    got=$(sed -n 's/^usermod -aG \([^ ]*\) .*/\1/p' "$file" 2>/dev/null | head -n1)
+    want_sorted=$(printf '%s\n' "$want" | tr ',' '\n' | sed '/^$/d' | sort)
+    got_sorted=$(printf '%s\n' "$got" | tr ',' '\n' | sed '/^$/d' | sort)
+    if [ "$want_sorted" = "$got_sorted" ]; then
+        pass "profile $profile groups: ${want:-none}"
+    else
+        fail "profile $profile groups: got '${got:-none}', want '${want:-none}'"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 section "Shell syntax"
 for script in "$INSTALL" "$VERIFY_UNITS" "$SCRIPT_DIR/verify-system-install.sh"; do
@@ -172,6 +206,26 @@ check_file "$TMP/profile-desktop/etc/udev/rules.d/70-ozma-node-uinput.rules"
 check_absent "$TMP/profile-desktop/etc/udev/rules.d/70-ozma-node-hidg.rules"
 
 # ---------------------------------------------------------------------------
+section "Profile groups and udev contents"
+check_profile_groups hardware "$TMP/profile-hardware/etc/ozma/install-operator-commands.txt"
+check_profile_groups vm "$TMP/profile-vm/etc/ozma/install-operator-commands.txt"
+check_profile_groups desktop "$TMP/profile-desktop/etc/ozma/install-operator-commands.txt"
+check_profile_groups all "$R/etc/ozma/install-operator-commands.txt"
+
+qmp_group=kvm
+group_exists kvm || qmp_group=root
+if grep -q 'GROUP="ozma-node"' "$R/etc/udev/rules.d/70-ozma-node-uinput.rules" &&
+   grep -q 'GROUP="ozma-node"' "$R/etc/udev/rules.d/70-ozma-node-hidg.rules" &&
+   grep -q 'GROUP="ozma-node"' "$R/etc/udev/rules.d/70-ozma-node-gadget.rules" &&
+   grep -q 'GROUP="render"' "$R/etc/udev/rules.d/70-ozma-node-render.rules" &&
+   grep -q 'GROUP="video"' "$R/etc/udev/rules.d/70-ozma-node-v4l2.rules" &&
+   grep -q "GROUP=\"$qmp_group\"" "$R/etc/udev/rules.d/70-ozma-node-input.rules"; then
+    pass "udev rules use the service, render, video, and QMP groups"
+else
+    fail "udev rule group rendering is inconsistent"
+fi
+
+# ---------------------------------------------------------------------------
 section "Dry-run and toggles"
 if run_install "$TMP/install-dry.log" --root "$TMP/dry" --dry-run --profile all --usb-gadget; then
     check_absent "$TMP/dry"
@@ -200,6 +254,20 @@ if run_install "$TMP/install-no-user.log" --root "$TMP/no-user" --profile hardwa
     fi
 else
     fail "install-system.sh --no-user"
+fi
+
+# --no-env and --no-dirs must still leave the operator file readable, and must
+# not silently create the skipped env/unit outputs.
+MIN="$TMP/minimal"
+if run_install "$TMP/install-minimal.log" --root "$MIN" --profile hardware \
+        --no-user --no-env --no-dirs --no-units --no-udev --no-apparmor \
+        --no-libvirt --no-tmpfiles --no-modules; then
+    pass "install-system.sh composes --no-env with --no-dirs"
+    check_file "$MIN/etc/ozma/install-operator-commands.txt"
+    check_absent "$MIN/etc/ozma/ozma-node-hardware.env.example"
+    check_absent "$MIN/usr/local/lib/systemd/system/ozma-node@.service"
+else
+    fail "install-system.sh composes --no-env with --no-dirs"
 fi
 
 # ---------------------------------------------------------------------------
@@ -238,6 +306,54 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+section "Custom service account and copy-only libvirt snippet"
+CA="$TMP/custom-account"
+if run_install "$TMP/install-custom-account.log" --root "$CA" --profile hardware \
+        --user ozma-test --group ozma-test-grp; then
+    account_ok=1
+    for unit in ozma-node@.service ozma-node-vm@.service ozma-virtual-node.service; do
+        if ! grep -q '^User=ozma-test$' "$CA/usr/local/lib/systemd/system/$unit" ||
+           ! grep -q '^Group=ozma-test-grp$' "$CA/usr/local/lib/systemd/system/$unit"; then
+            account_ok=0
+        fi
+    done
+    grep -Eq '^d /run/ozma-node[[:space:]]+0750[[:space:]]+ozma-test[[:space:]]+ozma-test-grp[[:space:]]+-' \
+        "$CA/etc/tmpfiles.d/ozma-node.conf" || account_ok=0
+    grep -Eq '^d /run/ozma[[:space:]]+0755[[:space:]]+ozma-test[[:space:]]+ozma-test-grp[[:space:]]+-' \
+        "$CA/etc/tmpfiles.d/ozma-node.conf" || account_ok=0
+    grep -q 'GROUP="ozma-test-grp"' "$CA/etc/udev/rules.d/70-ozma-node-hidg.rules" || account_ok=0
+    grep -q 'usermod -aG .* ozma-test$' "$CA/etc/ozma/install-operator-commands.txt" || account_ok=0
+    if [ "$account_ok" -eq 1 ]; then
+        pass "custom --user/--group rendered into units, tmpfiles, udev, and commands"
+    else
+        fail "custom --user/--group is inconsistent across rendered assets"
+    fi
+else
+    fail "install-system.sh --user/--group"
+fi
+
+# An existing qemu.conf must never be edited; only the snippet is written.
+LR="$TMP/libvirt-existing"
+mkdir -p "$LR/etc/libvirt"
+printf '# sentinel\ncgroup_device_acl = [ "/dev/null" ]\n' >"$LR/etc/libvirt/qemu.conf"
+cp "$LR/etc/libvirt/qemu.conf" "$TMP/qemu.conf.before"
+if run_install "$TMP/install-libvirt-existing.log" --root "$LR" --profile vm --no-user; then
+    if cmp -s "$TMP/qemu.conf.before" "$LR/etc/libvirt/qemu.conf"; then
+        pass "existing libvirt qemu.conf is unchanged"
+    else
+        fail "installer modified an existing libvirt qemu.conf"
+    fi
+    check_file "$LR/etc/ozma/libvirt-qemu-cgroup_device_acl.conf"
+    if grep -q 'has cgroup_device_acl' "$TMP/install-libvirt-existing.log"; then
+        pass "installer reports the existing cgroup_device_acl for manual merge"
+    else
+        fail "installer did not report the existing cgroup_device_acl"
+    fi
+else
+    fail "install-system.sh with an existing libvirt qemu.conf"
+fi
+
+# ---------------------------------------------------------------------------
 section "Secrets and permissions"
 if grep -RInE '^[[:space:]]*OZMA_[A-Z_]*(TOKEN|SECRET|PASSWORD)[[:space:]]*=' "$R/etc/ozma" >/dev/null 2>&1; then
     fail "uncommented token/secret assignment in /etc/ozma"
@@ -267,7 +383,41 @@ check_mode "$R/etc/ozma/ozma-node-hardware.env.example" 640
 check_mode "$R/etc/ozma/libvirt-qemu-cgroup_device_acl.conf" 640
 check_mode "$R/usr/local/lib/systemd/system/ozma-node@.service" 644
 check_mode "$R/etc/udev/rules.d/70-ozma-node-uinput.rules" 644
+check_mode "$R/run/ozma-node" 750
+check_mode "$R/run/ozma" 755
+check_mode "$R/run/ozma/qmp" 770
+check_mode "$R/var/lib/ozma-node" 750
+check_mode "$R/var/lib/ozma" 750
 check_absent "$R/etc/libvirt/qemu.conf"
+
+# The tmpfiles snippet is applied at boot, so it must agree with the modes and
+# owners the installer just created (especially /run/ozma, which the
+# supervisor writes).
+TMPFILES="$R/etc/tmpfiles.d/ozma-node.conf"
+if grep -Eq '^d /run/ozma-node[[:space:]]+0750[[:space:]]+ozma-node[[:space:]]+ozma-node[[:space:]]+-$' "$TMPFILES" &&
+   grep -Eq '^d /run/ozma[[:space:]]+0755[[:space:]]+ozma-node[[:space:]]+ozma-node[[:space:]]+-$' "$TMPFILES" &&
+   grep -Eq "^d /run/ozma/qmp[[:space:]]+0770[[:space:]]+root[[:space:]]+$qmp_group[[:space:]]+-$" "$TMPFILES"; then
+    pass "tmpfiles ownership matches the installer-created runtime dirs"
+else
+    fail "tmpfiles ownership disagrees with the installer-created runtime dirs"
+fi
+
+if grep -q 'systemd --user' "$R/etc/ozma/install-operator-commands.txt" &&
+   grep -q 'Prefer a systemd --user unit' "$R/etc/ozma/ozma-node-desktop.env.example"; then
+    pass "desktop system-vs-user caveat is documented"
+else
+    fail "desktop system-vs-user caveat is missing"
+fi
+
+# ---------------------------------------------------------------------------
+section "Script safety"
+for script in "$INSTALL" "$SCRIPT_DIR/install-rust.sh" "$VERIFY_UNITS"; do
+    if grep -nE '(^|[;&|])[[:space:]]*sudo[[:space:]]' "$script" >/dev/null 2>&1; then
+        fail "sudo invocation in ${script#"$REPO_ROOT"/}"
+    else
+        pass "no sudo invocation in ${script#"$REPO_ROOT"/}"
+    fi
+done
 
 # ---------------------------------------------------------------------------
 section "udev and AppArmor syntax"
