@@ -6,13 +6,21 @@
 
 **HEAD at report time:** `2d7b226491fc7de06020f0f50db316496a15ee1f` (`2d7b226`, `fix(ci): authenticate buf setup action`), with 25 modified/untracked files from concurrent sessions. See [Provenance and the frozen-tree caveat](#provenance-and-the-frozen-tree-caveat).
 
+> **Later frozen-tree rerun (2026-11-24):** the tree was frozen at
+> `f5e08e20b6c7156e7bb5acab7e135d201c493937` and the complete E2E scenario
+> was rerun with the landed pause/resume fixes. HEAD stayed at `f5e08e2` for
+> the whole run. **Gate 2 is satisfied at `f5e08e2`; see
+> [§9](#9-frozen-tree-rerun--2026-11-24-f5e08e2).** Sections 1–8 below remain
+> the historical `ef99c9e` run and its earlier caveats.
+
 **Verdict:**
 
 | Claim | Result |
 |---|---|
 | Consolidated Gate 2 scenario against `ef99c9e` (real Alpine guest, unmodified controller copy, Rust node, HLS, input, WebRTC, codec, audio, force-off) | **PASS**; every required row has captured evidence |
-| Gate 2 against current HEAD `2d7b226` | **NOT CLAIMED**; not run |
-| “Frozen-tree” Gate 2 | **NOT CLAIMABLE**; the repository moved to two new commits and had tracked source edits during this run |
+| Gate 2 against HEAD `2d7b226` | **NOT CLAIMED**; not run |
+| “Frozen-tree” Gate 2 for the historical `ef99c9e` run | **NOT CLAIMABLE**; the repository moved during that run |
+| Frozen-tree Gate 2 at `f5e08e2` (later rerun) | **PASS**; see §9 |
 
 This run made **no code changes and no commits**. It created only this report. All runtime processes, the temporary venv, the temporary controller copy, QEMU, the null sink, and the evidence root were removed after the evidence below was captured.
 
@@ -429,3 +437,190 @@ The QEMU process exited after `/power/stop`. Node, QEMU, socket directory, and p
 - `docs/gate2-live-controller-webrtc-report.md` and `docs/parity-matrix.md`: controller `/codec` proxy now recorded as live-tested through a real Rust node (`applied:true`, `pending_restart:false`, HLS restarted, next segment H.264).
 - The stale node startup warning now says `POST /codec` restarts a running HLS pipeline and stores `pending_restart` only when HLS is off.
 - `controller/static/dashboard.html`, `index.html`, and `desk3d.html` requested `/static/favicon.ico` / `/static/logo.svg`, but the controller mounts `controller/static` at `/`; the paths are now `/favicon.ico` and `/logo.svg`, so those 404s are gone.
+
+---
+
+## 9. Frozen-tree rerun — 2026-11-24 (`f5e08e2`)
+
+### 9.1 Frozen-tree proof
+
+| Check | Value |
+|---|---|
+| Frozen commit | `f5e08e20b6c7156e7bb5acab7e135d201c493937` (`f5e08e2`) |
+| `git rev-parse HEAD` at start | `f5e08e20b6c7156e7bb5acab7e135d201c493937` |
+| `git rev-parse HEAD` at end | `f5e08e20b6c7156e7bb5acab7e135d201c493937` |
+| HEAD checks during run | twelve checks, all `f5e08e2` |
+| Working tree at start and end | same four pre-existing docs edits only (`docs/display-client.md`, `routing/audio.md`, `routing/endpoints.md`, `routing/formats.md`); no code file changed |
+| Runtime source | `git archive f5e08e2` expanded under `/tmp`; node built separately from that archive |
+| Node binary SHA-256 | `8b6bfd1c13da75d4ef86d7d554050d31082b111a93d43fc8688a37949789f7da` |
+| Controller provenance | `/tmp` controller copy; `controller/api.py`, `main.py`, `static/dashboard.html`, and `stream.py` hashes all match `git show f5e08e2:<path>` |
+| WebRTC worker provenance | `$ROOT/src-f5e08e2/softnode/gst_webrtc_worker.py` |
+| Run window | 2026-11-24 09:31:58Z to approximately 09:37:40Z |
+
+**No concurrent commit moved HEAD during this run.** The frozen-tree claim is therefore valid for `f5e08e2`.
+
+### 9.2 Environment
+
+| Component | Version / identity |
+|---|---|
+| Guest | Alpine Linux 3.21 live, kernel `6.12.13-0-virt`, read-only ISO |
+| QEMU | 11.1.3, KVM (`accel=kvm:tcg`) |
+| Node | `ozma-node 0.1.0`, f5e08e2 archive build |
+| Controller | f5e08e2 copy, Python 3.14.10, FastAPI 0.164.0, Uvicorn 0.54.0, Strawberry 0.341.3, PyNaCl 1.6.2 |
+| ffmpeg/ffprobe | n9.1 |
+| GStreamer | 1.28.9 |
+| Browser | Chrome for Testing 145.0.7632.77 headless, Playwright 1.58.0 |
+| Ports | controller 43180, node HTTP 53882, HID 55831, QUIC 53884 |
+| Audio | PipeWire null sink `ozma-g2-frozen`, 48 kHz stereo |
+
+The QEMU command was the same validated shape as §3.1: read-only Alpine ISO, extracted kernel/initramfs, `console=ttyS0 console=tty0`, `VGA` plus `virtio-gpu-pci`, `qemu-xhci`/USB keyboard/tablet, Intel HDA on the null sink, QMP, and serial log. `modprobe.blacklist=virtio_gpu` kept the VGA console as the QMP-captured framebuffer; the virtio-gpu device still appeared in the PCI topology.
+
+The controller was the unmodified f5e08e2 copy. The node ran with:
+
+```text
+--profile vm --qmp-socket <run>/qemu/qmp.sock --input-provider qmp --power-provider qmp
+--hls --hls-fps 5 --hls-bitrate-kbps 1000
+--webrtc-helper /usr/bin/python3 --webrtc-helper-script <archive>/softnode/gst_webrtc_worker.py
+--webrtc-width 1280 --webrtc-height 800 --webrtc-fps 15
+--webrtc-audio-source ozma-g2-frozen.monitor --audio-router pipewire --audio-sink ozma-g2-frozen
+--register-url http://127.0.0.1:43180 --register-host 127.0.0.1 --heartbeat-interval 5
+```
+
+### 9.3 PASS/FAIL/SKIP matrix
+
+| Gate 2 row | Result | Frozen-run evidence |
+|---|---|---|
+| Frozen commit / no movement | **PASS** | start and end HEAD both `f5e08e2`; twelve in-run checks identical |
+| Discovery / registration / heartbeat | **PASS** | one controller node with correct ports/caps; activation `{"ok":true,...}`; heartbeat every 5 s |
+| Dashboard card / activation | **PASS** | card shows `HID VIDEO AUDIO POWER` and PipeWire sink; activated to `ACTIVE`; no console/page/request errors |
+| `/api/v1/connection` | **PASS** | `hls/webrtc/audio: running`; QMP input `injecting:true`; power `available:true,status:running` |
+| HLS playlist advance | **PASS** | `MEDIA-SEQUENCE:38 → 44` in 5 s; `TARGETDURATION:1`; `#EXTINF:1.000000` |
+| HLS segment decode | **PASS** | node + controller segment identical, SHA-256 `fa5a848a…c8cf0`; `ffprobe` H.264 1280x800, duration 1.000000 |
+| Node + controller snapshot | **PASS** | both HTTP 200 JPEG 1280x800; differing hashes are cursor-blink timing, not proxy failure |
+| Guest input `/input/type` | **PASS** | login and marker command typed through node; serial received `OZMA-FROZEN-F5E08E2-SERIAL` and `uname -a`; mouse move/click `{"ok":true}` |
+| `/power/pause` | **PASS** | controller `{"action":"pause","ok":true}`; node state `paused`; two paused snapshots byte-identical |
+| `/power/resume` | **PASS** | controller `{"action":"resume","ok":true}`; node state `running` |
+| `/power/reset` | **PASS** | controller `{"action":"reset","ok":true}`; serial 28,442 → 56,499 bytes; fresh login |
+| `/power/on` | **PASS** | controller `{"action":"on","ok":true}` |
+| `/power/off` | **PASS** | with guest `acpid` running, controller `{"action":"off","ok":true}`; serial `reboot: Power down`; QEMU exited in 1.6 s |
+| `/power/stop` remains hard force-off | **PASS** | controller `{"action":"force-off","ok":true}`; QEMU exited in 200 ms |
+| `/power/force-off` | **PASS** | controller HTTP 200 `{"action":"force-off","ok":true}`; QEMU exited in 200 ms |
+| WebRTC through controller, GStreamer | **PASS** | 9/9 candidates; ICE `completed`; 152 H.264 buffers 1280x800 15 fps; 521 Opus buffers 48 kHz stereo |
+| WebRTC through controller, Chromium dashboard | **PASS** | connected/ICE connected; 90 frames at ~14–15 fps; 314 audio packets; status `WebRTC 90f 15fps 540KB` |
+| `/codec` GET/POST through controller | **PASS** | GET advertised h264/hevc + software/vaapi; POST software H.264 1500k returned `applied:true`, `pending_restart:false`, `encoder:"libx264"`; next segment H.264 1280x800; invalid `vp8` typed 400 |
+| `/audio/*` through controller | **PASS** | apply/play/stop/remove all `ok:true`; 523 Hz reference peak −21.1 dBFS |
+| `check-node.sh` | **PASS** | `12 passed, 0 failed, 0 warnings, 0 skipped`; exit 0 |
+| Guest audio playback | **SKIP (optional)** | HDA/`/dev/snd` present; Alpine live has no playback utility |
+| DE/FR dead-key input | **SKIP (optional)** | not exercised; US input row passed |
+| 10-bit/HDR | **SKIP (not required)** | guest uses standard 8-bit H.264; standard 1280x800 HLS confirmed |
+| STUN/TURN/trickle | **SKIP (not required)** | same-host dashboard/WebRTC path needs no STUN/TURN |
+| Cleanup | **PASS** | no run processes, ports free, null sink removed, temp root removed |
+
+### 9.4 Pause/resume and power evidence
+
+Pause/resume is now a real node/controller route:
+
+```text
+POST /api/v1/nodes/<id>/power/pause   -> {"action":"pause","ok":true}
+GET  /power/state                     -> {"available":true,"status":"paused"}
+POST /api/v1/nodes/<id>/power/resume  -> {"action":"resume","ok":true}
+GET  /power/state                     -> {"available":true,"status":"running"}
+```
+
+Two node snapshots taken two seconds apart while paused were byte-identical:
+
+```text
+212544fa228975889189def98fc0bb71e190cbb05aad5572c2753699af0051a6  paused-node-a.jpg
+212544fa228975889189def98fc0bb71e190cbb05aad5572c2753699af0051a6  paused-node-b.jpg
+```
+
+`/power/stop` still maps to hard force-off and is not a pause; the live call returned `{"action":"force-off","ok":true}` and the QEMU process exited in 200 ms. `/power/force-off` likewise exited QEMU in 200 ms. `/power/off` was also exercised with a real guest `acpid`; the guest logged `reboot: Power down` and QEMU exited in 1.6 s. The QEMU instances used for `off`, `force-off`, and the `stop` alias were disposable; each was restarted only to prove the next destructive action.
+
+### 9.5 WebRTC and dashboard
+
+GStreamer peer through the controller:
+
+```json
+{
+  "ok": true,
+  "answer_type": "answer",
+  "offer_candidates": 9,
+  "answer_candidates": 9,
+  "connection_state": "connected",
+  "ice_connection_state": "completed",
+  "ice_gathering_state": "complete",
+  "media": {
+    "video": {"buffers": 152, "caps": "I420 1280x800 15/1"},
+    "audio": {"buffers": 521, "caps": "S16LE 48000 Hz 2 channels"}
+  },
+  "bitrate": {"ok": true, "body": {"bitrate": 4000000, "ok": true}}
+}
+```
+
+Headless Chromium dashboard through the controller:
+
+```json
+{
+  "connectionState": "connected",
+  "iceConnectionState": "connected",
+  "videoWidth": 1280,
+  "videoHeight": 800,
+  "framesDecoded": 90,
+  "framesPerSecond": 14,
+  "audio": {"packetsReceived": 314, "bytesReceived": 75914, "jitter": 0.002},
+  "consoleErrors": 0,
+  "pageErrors": 0,
+  "failedRequests": 0
+}
+```
+
+The dashboard used its real WebRTC modal (`/api/v1/streams/{id}/webrtc`), not HLS fallback, and the previously observed static-asset 404s were gone.
+
+### 9.6 HLS, snapshots, codec, audio, harness
+
+- HLS: `MEDIA-SEQUENCE:38 → 44`; `seg_00044.ts`, SHA-256 `fa5a848a884d70100dbf11510637b427553417956005a0230c5b6af3992c8cf0`; `ffprobe` `codec_name=h264`, `width=1280`, `height=800`, `duration=1.000000`.
+- Snapshots: node JPEG SHA-256 `75a48e52…4a86508`, controller JPEG `9d230d36…40709e5`, both 1280x800 and HTTP 200.
+- Input: `root\n` = 10 events; marker command = 132 events; `uname -a` = 48 events; serial received both marker and kernel line exactly.
+- Codec: POST `{"codec":"h264","bitrate":"1500k","hw_accel":"software"}` applied a real HLS restart; the next segment remained H.264 1280x800. Invalid `vp8` returned HTTP 400 with available capabilities.
+- Audio: apply/play/stop/remove all `ok:true`; monitor capture `max_volume: -21.1 dB`, `mean_volume: -25.0 dB`.
+- Harness: `check-node.sh` `12 passed, 0 failed, 0 warnings, 0 skipped`, exit 0.
+
+Optional rows not exercised: DE/FR dead-key input, 10-bit/HDR HLS, and STUN/TURN/trickle. None is required for the Alpine 1280x800 same-host dashboard scenario.
+
+### 9.7 Frozen-run artifact hashes
+
+Artifact root (removed after this report): `/tmp/opencode/ozma-gate2-frozen-20261124-203158/`.
+
+Full manifest: `$ROOT/evidence/artifact-manifest.txt`, SHA-256 `1a7469e27bb67d8e951ed57c406de77fd04679adbfc6db9292f253cd62900988`.
+
+| Artifact | SHA-256 |
+|---|---|
+| Node binary (f5e08e2 archive build) | `8b6bfd1c13da75d4ef86d7d554050d31082b111a93d43fc8688a37949789f7da` |
+| Controller source provenance | `a6bd25a17efdc40c5e2f4edc905441ea1e30c15e425f9dbecd73b83e9508330a` |
+| HLS segment `seg_00044.ts` | `fa5a848a884d70100dbf11510637b427553417956005a0230c5b6af3992c8cf0` |
+| Playlist 1 / 2 | `5a65dae2…9c28a7` / `dee5bba5…9f3b` |
+| ffprobe output | `7154f9f7…a33c9` |
+| Node / controller snapshot | `75a48e52…4a86508` / `9d230d36…40709e5` |
+| Paused snapshots A/B | `212544fa…0051a6` (identical) |
+| WebRTC report | `92ec8d97…ffce1` |
+| Dashboard result | `c6bece50…5a652` |
+| Audio capture | `59f91cb7…2bcdb4` |
+| `check-node.sh` log | `fb2c8473…05b177` |
+| `versions.txt` | `d7c7881c…b1be91` |
+| `git-end-head.txt` | `a2b9e8a7…aa36d` |
+
+### 9.8 Cleanup
+
+- Node and controller stopped on SIGINT; node logged `Ozma node shutting down`; controller logged graceful shutdown.
+- All disposable QEMU instances were already exited by the tested power actions (`off`, `force-off`, `stop`) before teardown.
+- No `qemu-system`, `ozma-node`, `gst_webrtc_worker`, controller, browser, tone, or `parec` process from this run remained.
+- Ports 43180, 53882, 55831, and 53884 were free.
+- Null sink `ozma-g2-frozen` was unloaded.
+- The temp root, venv, wheelhouse, source archive, browser profile, and all evidence files were removed after the manifest and this section were written.
+- Post-cleanup verification: `git rev-parse HEAD` was still `f5e08e20b6c7156e7bb5acab7e135d201c493937`; no `qemu-system`, `ozma-node`, controller, WebRTC helper, tone, or `parec` process from the run remained; ports 43180/53882/55831/53884 were free; `pactl list short sinks` no longer listed `ozma-g2-frozen`; `/tmp/opencode/ozma-gate2-frozen-*` was absent. The only changed file from this rerun is this report; the four pre-existing docs edits remained untouched.
+
+### 9.9 Frozen-tree Gate 2 claim
+
+**Gate 2 is satisfied at `f5e08e20b6c7156e7bb5acab7e135d201c493937`.** The tree did not move during the run; the node was built from an explicit `git archive f5e08e2`, the controller copy matched `f5e08e2` file-for-file, and every required row above has captured evidence. Pause/resume now work through the node/controller power API, while `/power/stop` and `/power/force-off` remain hard force-off.
+
+The only remaining gaps are explicitly optional: DE/FR dead-key input, 10-bit/HDR HLS, and STUN/TURN/trickle. No required Gate 2 row is blocked.

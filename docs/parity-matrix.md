@@ -37,6 +37,13 @@ row itself is the Rust behavior under test.
   connection and prove one `SharedQmpClient` serves power, screendump, and
   input. No real QEMU is needed for the default suite.
 
+**Gate 2 status:** the required end-to-end scenario passed on the frozen tree at
+`f5e08e20b6c7156e7bb5acab7e135d201c493937` with a real Alpine guest, the
+repaired unmodified controller, headless Chromium, HLS, WebRTC video/audio,
+guest input, snapshots, power actions, codec switching, and audio routes. See
+[`gate2-final-e2e-report.md`](gate2-final-e2e-report.md). The rows below still
+record optional breadth, regression, and explicitly deferred items.
+
 ## Matrix
 
 | Area | Status | What is asserted today | Evidence | Gap / next gate |
@@ -187,7 +194,7 @@ external processes:
 `ozma-power/tests/qmp_power.rs` reuse the same protocol shape. Real QEMU tests
 remain `#[ignore]`/environment-gated.
 
-## Remaining Gate 2 gaps
+## Optional / post-Gate-2 gaps
 
 - Native WebRTC (`webrtc-rs`/`str0m`) is not implemented. `/webrtc/offer` and
   `/webrtc/bitrate` run through a supervised external GStreamer helper; the
