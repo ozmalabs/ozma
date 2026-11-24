@@ -4,6 +4,9 @@ CLAUDE.md
 
 # Internal architecture docs (moved to ozmalabs/internal)
 system/
+# ...but keep the tracked system install assets under scripts/system/
+!scripts/system/
+!scripts/system/**
 
 # Controller runtime state (generated locally)
 controller/scenarios.json

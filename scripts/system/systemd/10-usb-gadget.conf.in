@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
+#
+# Ozma: opt-in USB gadget support for ozma-node@.service.
+# Installed by scripts/install-system.sh --usb-gadget. ConfigFS lives under
+# /sys/kernel/config; ProtectKernelTunables=yes makes /sys read-only, so this
+# drop-in relaxes that for the gadget case only. The leading '-' on
+# ReadWritePaths keeps the unit valid when ConfigFS is not mounted.
+[Service]
+ProtectKernelTunables=no
+ReadWritePaths=-/sys/kernel/config/usb_gadget

@@ -8,7 +8,10 @@
 //!
 //! * [`UsbGadgetConfig`] / [`UsbFunction`] describe a composite gadget (HID,
 //!   mass storage, UAC2, FunctionFS vendor) and validate it before any
-//!   filesystem work.
+//!   filesystem work. [`Uac2Config`] models descriptor capabilities and
+//!   ConfigFS attributes; [`FunctionFsConfig`] models endpoint/string
+//!   descriptors and explicit userspace-daemon readiness. Neither starts an
+//!   audio bridge or a FunctionFS daemon.
 //! * [`VirtualMedia`] / [`MassStorageImage`] model a backing image, disk vs
 //!   CD-ROM presentation, read-only policy, declared [`MediaFormat`], size,
 //!   and attach/detach state.
@@ -74,12 +77,14 @@ pub mod controller;
 pub mod error;
 pub mod fake;
 pub mod fat32;
+pub mod functionfs;
 pub mod iso;
 pub mod media;
 pub mod nbd;
 pub mod nbd_server;
 pub mod status;
 pub mod subprocess;
+pub mod uac2;
 pub mod usbip;
 
 pub use config::{
@@ -94,6 +99,13 @@ pub use fat32::{
     build_fat32_image, fat32_image_from_directory, parse_fat32_boot_sector, parse_fat32_image,
     validate_fat32_boot_sector, Fat32BootInfo, Fat32EntryInfo, Fat32Image, Fat32ImageBuilder,
     Fat32Info, Fat32Layout, Fat32Node, Fat32Options, FAT32_DEFAULT_CLUSTER_SIZE,
+};
+pub use functionfs::{
+    is_functionfs_function_dir, require_functionfs_ready, FunctionFsConfig, FunctionFsDaemon,
+    FunctionFsDaemonSpec, FunctionFsDescriptorSet, FunctionFsEndpoint, FunctionFsReadiness,
+    FunctionFsStatus, FunctionFsStrings, FunctionFsTransfer, MissingFunctionFsDaemon,
+    ObservedFunctionFsDaemon, MAX_FUNCTIONFS_DESCRIPTOR_BYTES, MAX_FUNCTIONFS_ENDPOINTS,
+    MAX_FUNCTIONFS_STRING_BYTES,
 };
 pub use iso::{
     parse_iso_volume_descriptors, validate_iso_image, IsoImage, IsoVolumeDescriptor,
@@ -114,6 +126,12 @@ pub use status::{FunctionStatus, GadgetStatus, UsbGadgetCapabilities};
 pub use subprocess::{
     CommandOutput, CommandRunner, CommandSpec, SubprocessUsbController, SystemCommandRunner,
     UsbIpControl, UsbIpDevice,
+};
+pub use uac2::{
+    Uac2BridgeStatus, Uac2Config, Uac2DescriptorSet, Uac2DescriptorSummary, Uac2Mode, Uac2Status,
+    Uac2StreamStatus, UAC2_CAPTURE_ENDPOINT, UAC2_MAX_CHANNELS, UAC2_MAX_DESCRIPTOR_BYTES,
+    UAC2_MAX_SAMPLE_RATE, UAC2_MAX_SAMPLE_RATES, UAC2_MAX_SAMPLE_SIZES, UAC2_MIN_SAMPLE_RATE,
+    UAC2_PLAYBACK_ENDPOINT,
 };
 pub use usbip::{
     SubprocessUsbIpController, UsbIpAttachment, UsbIpAuthorization, UsbIpConfig, UsbIpController,

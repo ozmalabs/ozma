@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
+#
+# Ozma: DRM render nodes used by VAAPI/EGL hardware encode paths.
+# `render` is the conventional Linux group; scripts/install-system.sh adds the
+# service user.
+SUBSYSTEM=="drm", KERNEL=="renderD*", GROUP="render", MODE="0660"

@@ -1217,6 +1217,12 @@ pub struct NodeConfig {
     pub usb_media_ro: bool,
     /// Present the image as a read-only CD-ROM (`--usb-media-cdrom`).
     pub usb_media_cdrom: bool,
+    /// Add a UAC2 audio function (`--usb-uac2`).
+    pub usb_uac2: bool,
+    /// Add a FunctionFS vendor function (`--usb-vendor`).
+    pub usb_vendor: bool,
+    /// Optional absolute FunctionFS daemon path (`--usb-vendor-daemon`).
+    pub usb_vendor_daemon: Option<PathBuf>,
 }
 
 impl NodeConfig {
@@ -1614,6 +1620,20 @@ impl NodeConfig {
         if self.usb_media_cdrom && self.usb_media.is_none() {
             return Err("--usb-media-cdrom requires --usb-media".to_owned());
         }
+        if (self.usb_uac2 || self.usb_vendor) && !self.usb_gadget {
+            return Err("--usb-uac2/--usb-vendor require --usb-gadget".to_owned());
+        }
+        if self.usb_vendor_daemon.is_some() && !self.usb_vendor {
+            return Err("--usb-vendor-daemon requires --usb-vendor".to_owned());
+        }
+        if let Some(path) = self.usb_vendor_daemon.as_deref() {
+            if !path.is_absolute() {
+                return Err(format!(
+                    "--usb-vendor-daemon {} must be an absolute path",
+                    path.display()
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -1911,6 +1931,9 @@ mod tests {
             usb_media: None,
             usb_media_ro: false,
             usb_media_cdrom: false,
+            usb_uac2: false,
+            usb_vendor: false,
+            usb_vendor_daemon: None,
         }
     }
 
@@ -2838,9 +2861,30 @@ mod tests {
         media_without_gadget.usb_media = Some(PathBuf::from("/srv/installer.iso"));
         assert!(media_without_gadget.validate().is_err());
 
+        let mut uac2_without_gadget = config.clone();
+        uac2_without_gadget.usb_uac2 = true;
+        assert!(uac2_without_gadget.validate().is_err());
+
+        let mut vendor_without_gadget = config.clone();
+        vendor_without_gadget.usb_vendor = true;
+        assert!(vendor_without_gadget.validate().is_err());
+
         config.usb_gadget = true;
         config.usb_udc = Some("dummy_udc.0".into());
         assert!(config.validate().is_ok());
+
+        let mut extras = config.clone();
+        extras.usb_uac2 = true;
+        assert!(extras.validate().is_ok());
+        extras.usb_vendor = true;
+        assert!(extras.validate().is_ok());
+        extras.usb_vendor_daemon = Some(PathBuf::from("/usr/local/bin/ozma-ffs"));
+        assert!(extras.validate().is_ok());
+        extras.usb_vendor_daemon = Some(PathBuf::from("relative-daemon"));
+        assert!(extras.validate().is_err());
+        extras.usb_vendor = false;
+        extras.usb_vendor_daemon = Some(PathBuf::from("/usr/local/bin/ozma-ffs"));
+        assert!(extras.validate().is_err());
 
         // UDC names are written verbatim to ConfigFS and must stay safe.
         for bad in ["", "a/b", "dummy udc.0", "../udc", ".hidden"] {

@@ -1,12 +1,14 @@
 # Clean-host Phase 4 harness
 
-Status: **harness, Rust-first systemd assets, install layout, and the demo
-Rust switch are implemented. Gate 4 is not yet met**: the container harness
-builds and smoke-tests, but its bounded node test run is red on in-progress
-product code from parallel workstreams (see
-[Known blocker](#known-blocker-moving-tree)), the fresh-host
-install has not been run end-to-end, and the Python trees are intentionally
-still present for one release.
+Status: **harness, Rust-first systemd assets, user and system install layouts,
+the host integration surface (user/group, udev, AppArmor, libvirt snippet), and
+the demo Rust switch are implemented. Gate 4 is not yet met**: the privileged
+fresh-host install has not been run end-to-end on a real host (the new system
+surface is scripted and validated with `--dry-run`/`--root` instead), the
+controller is still Python, and the Python trees are intentionally still
+present for one release. The last recorded container run also had a red
+bounded node test selection in parallel product work (see
+[Known blocker](#known-blocker-moving-tree)).
 
 This page is the operational companion to
 [`rust-reconciliation-plan.md`](rust-reconciliation-plan.md) Phase 4 and
@@ -28,7 +30,12 @@ installing anything globally:
 5. Runs shell syntax checks and, when `systemd-analyze` is available, verifies
    the rendered unit files.
 6. Runs `scripts/install-rust.sh --dry-run` and checks it writes nothing.
-7. Starts `ozma-node --profile desktop` with synthetic capture/recording input
+7. Renders the system install surface (user/group commands, units, env examples,
+   udev, AppArmor, libvirt snippet, tmpfiles, modules-load, USB-gadget opt-in)
+   into a temporary root with `scripts/verify-system-install.sh`; it checks
+   profile selection, idempotence, `--force`, file modes, no secrets or
+   world-writable paths, and udev/AppArmor syntax when those tools exist.
+8. Starts `ozma-node --profile desktop` with synthetic capture/recording input
    and requires `/health` to return `ok: true`.
 
 By default steps 1–7 run inside a rootless Podman or Docker container built
@@ -124,15 +131,22 @@ Files live in `scripts/systemd/`:
 - `ozma-virtual-node.service` — discovery/supervisor process.
 - `env/*.env.example` — one example per profile plus the supervisor.
 - `verify-units.sh` — renders placeholders to a temporary directory and runs
-  `systemd-analyze verify`; no install required.
+  `systemd-analyze verify` for both the system units and least-privilege user
+  units; no install required.
 
 Validate:
 
 ```bash
 scripts/systemd/verify-units.sh
-# PASS  ozma-node@.service
-# PASS  ozma-node-vm@.service
-# PASS  ozma-virtual-node.service
+# PASS  system ozma-node@.service
+# PASS  system ozma-node-vm@.service
+# PASS  system ozma-virtual-node.service
+# PASS  user ozma-node@.service
+# PASS  user ozma-node-vm@.service
+# PASS  user ozma-virtual-node.service
+
+scripts/systemd/verify-units.sh --system-only
+scripts/systemd/verify-units.sh --user-only
 ```
 
 `systemd-analyze` absent is a SKIP, not a failure. The units are system units by
@@ -166,6 +180,229 @@ It never enables or starts a unit and never deletes `softnode/`, `node/`,
 `--system --prefix /usr/local` run by an administrator; the script never invokes
 sudo. See `scripts/systemd/README.md` for user creation, state-directory
 ownership, udev/group notes, and why `--provision*` stays off by default.
+
+## System install (fresh host)
+
+`scripts/install-system.sh` completes the system-wide host integration that
+`scripts/install-rust.sh` deliberately leaves to the administrator. It is
+idempotent, never invokes sudo, never enables or starts a unit, and never edits
+`/etc/libvirt/qemu.conf`. It installs units and env examples itself, so a host
+can be staged before the binaries exist.
+
+### Scripted vs operator-only
+
+| Step | Scripted | How |
+|---|---|---|
+| `ozma-node` system user/group plus existing `video`/`input`/`render`/`kvm`/`libvirt` groups | yes, as root | `install-system.sh` |
+| State/runtime/config dirs with least-privilege modes | yes, as root | `install-system.sh` |
+| Units, env examples, tmpfiles and modules-load snippets | yes | `install-system.sh` |
+| udev rules for uinput, hidg, V4L2, render, optional gadget | yes, as root | `install-system.sh` |
+| AppArmor libvirt-qemu drop-in | yes, as root | `install-system.sh` |
+| libvirt `cgroup_device_acl` | **no** — copy-only snippet | merge into `qemu.conf` |
+| Enable/start a unit | **no** — exact commands are printed | `systemctl enable --now ...` |
+| USB gadget ConfigFS setup / UDC binding | **no** — opt-in assets and guidance | operator |
+| Real host validation | **no** on this checkout | run on a fresh host |
+
+### Runtime packages
+
+Build packages are in [Build packages](#build-packages). The system integration
+adds these runtime packages:
+
+| Dependency | Why | Debian/Ubuntu | Fedora/RHEL | Arch |
+|---|---|---|---|---|
+| systemd/udev | units, udev, tmpfiles | `systemd udev` | `systemd` | `systemd` |
+| AppArmor (optional) | QEMU evdev access | `apparmor` | `apparmor` | `apparmor` |
+| libvirt/QEMU (optional) | VM profile and input-linux | `libvirt-daemon-system qemu-system-x86` | `libvirt qemu-kvm` | `libvirt qemu-full` |
+| PipeWire/PulseAudio tools | desktop/VM audio routing | `pipewire pulseaudio-utils` | `pipewire pulseaudio-utils` | `pipewire libpulse` |
+| ffmpeg | HLS/VNC/X11 capture | `ffmpeg` | `ffmpeg` | `ffmpeg` |
+| kmod | modules-load snippet | `kmod` | `kmod` | `kmod` |
+| shadow/passwd | `useradd`/`groupadd` | `passwd` | `shadow-utils` | `shadow` |
+
+### Exact fresh-host commands
+
+```bash
+# 0. Build or copy the binaries (run as root; install-rust.sh never uses sudo)
+scripts/install-rust.sh --build --system --prefix /usr/local
+
+# 1. Preview the host integration (writes nothing)
+scripts/install-system.sh --dry-run --profile hardware
+
+# 2. Install it (run as root)
+scripts/install-system.sh --profile hardware
+# every profile plus the USB-gadget opt-in:
+# scripts/install-system.sh --profile all --usb-gadget
+
+# 3. Rootless review of the exact rendered layout (no root, temp root)
+scripts/verify-system-install.sh --keep
+
+# 4. Read the exact skipped/host commands, then edit the env file
+cat /etc/ozma/install-operator-commands.txt
+$EDITOR /etc/ozma/ozma-node-hardware.env
+chmod 0600 /etc/ozma/ozma-node-hardware.env   # once it contains a token
+
+# 5. Apply host state (the installer does not do this)
+systemctl daemon-reload
+udevadm control --reload-rules
+udevadm trigger --action=change
+systemd-tmpfiles --create /etc/tmpfiles.d/ozma-node.conf
+systemctl reload apparmor        # only if AppArmor is active
+
+# 6. Merge the libvirt snippet only if you use QEMU input-linux
+$EDITOR /etc/libvirt/qemu.conf   # add or extend cgroup_device_acl
+systemctl restart libvirtd
+
+# 7. Enable a profile (the installer never enables or starts anything)
+systemctl enable --now ozma-node@hardware.service
+# or, on a hypervisor:
+systemctl enable --now ozma-virtual-node.service
+```
+
+`install-rust.sh --system` installs the binaries, units, and env examples;
+`install-system.sh` re-renders the same units/env and adds the host assets. Run
+`install-rust.sh` first so `/usr/local/bin/ozma-node` exists before a unit
+starts. Either order is safe because both steps are idempotent.
+
+The rendered layout is:
+
+```text
+/usr/local/lib/systemd/system/ozma-node@.service
+/usr/local/lib/systemd/system/ozma-node-vm@.service
+/usr/local/lib/systemd/system/ozma-virtual-node.service
+/usr/local/lib/systemd/system/ozma-node@.service.d/10-usb-gadget.conf  # opt-in
+/etc/ozma/*.env.example
+/etc/ozma/install-operator-commands.txt
+/etc/ozma/libvirt-qemu-cgroup_device_acl.conf
+/etc/udev/rules.d/70-ozma-node-*.rules
+/etc/apparmor.d/abstractions/libvirt-qemu.d/ozma
+/etc/tmpfiles.d/ozma-node.conf
+/etc/modules-load.d/ozma-node.conf
+/var/lib/ozma-node, /var/lib/ozma, /run/ozma-node, /run/ozma/qmp
+```
+
+### System user and groups
+
+The installer creates a dedicated, non-login service account and adds only the
+supplementary groups that exist on the host:
+
+```bash
+groupadd --system ozma-node
+useradd --system --gid ozma-node --home-dir /var/lib/ozma-node \
+    --shell /usr/sbin/nologin --no-create-home ozma-node
+usermod -aG video,input,render,kvm,libvirt ozma-node   # existing groups only
+```
+
+Group selection follows the profile: `hardware` gets `video input render`;
+`vm` gets `input render kvm libvirt`; `desktop` gets `input video render`.
+`--profile all` takes the union. The node never runs as root and is not given
+`CAP_SYS_ADMIN`. Use `--no-user` to keep account creation entirely manual.
+
+### udev rules
+
+| Rule | Devices | Profiles |
+|---|---|---|
+| `70-ozma-node-uinput.rules` | `/dev/uinput` | vm, desktop |
+| `70-ozma-node-input.rules` | `/dev/input/event*`, virtual `ozma-kbd-*`/`ozma-mouse-*` | vm, desktop |
+| `70-ozma-node-hidg.rules` | `/dev/hidg*` | hardware, `--usb-gadget` |
+| `70-ozma-node-v4l2.rules` | `/dev/video*` | hardware |
+| `70-ozma-node-render.rules` | `/dev/dri/renderD*` | all |
+| `70-ozma-node-gadget.rules` | UDC/gadget class nodes | `--usb-gadget` |
+
+Rules use the conventional `video`, `input`, and `render` groups, the
+`ozma-node` group for uinput/hidg, and `kvm` (or `root` when no `kvm` group
+exists) for QEMU-consumed virtual devices. `uinput` is loaded by the
+modules-load snippet. The installer prints the exact reload commands and does
+not run them unless `--reload` is passed.
+
+### AppArmor and libvirt
+
+The AppArmor drop-in lets QEMU read `/dev/input/event*` for `input-linux`:
+
+```text
+/etc/apparmor.d/abstractions/libvirt-qemu.d/ozma
+```
+
+Reload AppArmor only when it is active. If AppArmor is absent, the drop-in is
+harmless and remains for a later install. The node process itself is confined by
+the systemd sandbox in `ozma-node@.service`, not by this drop-in.
+
+libvirt is never edited. The installer writes a mergeable snippet to
+`/etc/ozma/libvirt-qemu-cgroup_device_acl.conf`; the operator adds it to
+`/etc/libvirt/qemu.conf`, restarts libvirtd, and restarts the VMs. If
+`qemu.conf` already has `cgroup_device_acl`, merge only the missing input event
+entries rather than appending a second key.
+
+QMP socket creation is separate from this installer. Use the Rust supervisor's
+opt-in `--provision` path or an existing libvirt hook; neither is enabled by
+default, and the installer never edits domain XML.
+
+### USB gadget opt-in
+
+`--usb-gadget` adds the gadget udev rule, `libcomposite` to modules-load, and
+`ozma-node@.service.d/10-usb-gadget.conf` (which sets `ProtectKernelTunables=no`
+and `ReadWritePaths=-/sys/kernel/config/usb_gadget`). ConfigFS entries are
+created by the kernel as root; the node does not receive `CAP_SYS_ADMIN`. The
+operator must mount ConfigFS, provide a hardware UDC, and arrange writable
+gadget ownership or run the gadget setup as root. Set `OZMA_USB_GADGET=1`,
+`OZMA_USB_UDC`, and `OZMA_USB_CONFIGFS_ROOT` in the env file (or pass the
+matching `--usb-*` flags through `OZMA_NODE_ARGS`). Without a usable UDC or root
+the node stays up, advertises no USB capability, and `/usb` returns a typed 503.
+
+### Desktop profile caveat
+
+A system unit runs as `ozma-node` and cannot see a logged-in user's PipeWire
+server or `XDG_RUNTIME_DIR`. Prefer a user unit:
+
+```bash
+scripts/install-rust.sh --build --prefix "$HOME/.local"
+systemctl --user daemon-reload
+systemctl --user enable --now ozma-node@desktop.service
+```
+
+A system `ozma-node@desktop.service` only works if the desktop session is granted
+explicitly and `ProtectHome`/`ReadWritePaths` are relaxed for the captured
+files; that is an operator decision, not an installer default.
+
+### Verify the system surface
+
+```bash
+scripts/verify-system-install.sh
+# ...
+# 54 passed, 0 failed, 1 skipped
+# RESULT: PASS
+```
+
+The check renders every profile into a temporary root, validates
+`--dry-run`/`--force`/idempotence, checks modes, rejects uncommented secrets and
+world-writable paths, verifies the rendered units, and runs `udevadm verify`;
+AppArmor syntax is checked when `apparmor_parser` exists and otherwise reported
+as SKIP. It never needs root and removes its temp roots unless `--keep` is set.
+
+### Rollback
+
+```bash
+systemctl disable --now ozma-node@hardware.service
+# repeat for any other enabled unit (ozma-node@vm, ozma-virtual-node, ...)
+rm -f /usr/local/lib/systemd/system/ozma-node@.service \
+      /usr/local/lib/systemd/system/ozma-node-vm@.service \
+      /usr/local/lib/systemd/system/ozma-virtual-node.service
+rm -rf /usr/local/lib/systemd/system/ozma-node@.service.d
+rm -f /etc/udev/rules.d/70-ozma-node-*.rules
+rm -f /etc/apparmor.d/abstractions/libvirt-qemu.d/ozma
+rm -f /etc/tmpfiles.d/ozma-node.conf /etc/modules-load.d/ozma-node.conf
+rm -f /etc/ozma/libvirt-qemu-cgroup_device_acl.conf
+# keep /etc/ozma if it contains tokens; remove it only deliberately
+userdel ozma-node
+groupdel ozma-node
+systemctl daemon-reload
+udevadm control --reload-rules
+systemctl reload apparmor          # if active
+# revert /etc/libvirt/qemu.conf manually if you merged the snippet, then:
+systemctl restart libvirtd
+```
+
+The Python trees are untouched and remain the rollback path:
+`OZMA_DEMO_BACKEND=python`, `bash demo/run_demo.sh --python`, or checking out
+the rollback tag. No Python tree is removed by this install surface.
 
 ## Demo switch
 
@@ -247,9 +484,11 @@ scripts/clean-host/run.sh --container --full   # workspace suite
 Independent checks that do not need the moving libraries still pass:
 
 ```bash
-scripts/systemd/verify-units.sh          # PASS (3 units, systemd 262)
-scripts/clean-host/run.sh --check-deps   # PASS (host; shellcheck SKIP)
+scripts/systemd/verify-units.sh          # PASS (3 system + 3 user, systemd 262)
+scripts/verify-system-install.sh         # PASS (54 passed, 0 failed, 1 skipped)
+scripts/clean-host/run.sh --check-deps   # PASS (host; shellcheck/apparmor SKIP)
 scripts/install-rust.sh --dry-run ...    # exit 0, no files written
+scripts/install-system.sh --dry-run ...  # exit 0, no files written
 ./target/debug/ozma-node --help          # exit 0
 ./target/debug/ozma-virtual-node --help  # exit 0
 ```

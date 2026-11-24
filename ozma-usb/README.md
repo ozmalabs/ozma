@@ -16,8 +16,10 @@ gadget creation on a hardware profile.
 | Area | API |
 |---|---|
 | Composite gadget model | `UsbGadgetConfig`, `UsbFunction`, `UsbFunctionKind`, `HidProtocol` |
-| Functions | HID keyboard/mouse/custom, mass storage, UAC2, FunctionFS vendor |
-| Validation | Safe gadget/function names, VID/PID, strings, power, duplicate links, HID report shape, UAC2 rates/sizes, CD-ROM read-only |
+| Functions | HID keyboard/mouse/custom, mass storage, UAC2 (`Uac2Config`), FunctionFS vendor (`FunctionFsConfig`) |
+| FunctionFS model | `FunctionFsConfig`, `FunctionFsEndpoint`, `FunctionFsStrings`, `FunctionFsDaemonSpec`, `FunctionFsReadiness`, `FunctionFsStatus`, `FunctionFsDaemon`/`MissingFunctionFsDaemon`/`ObservedFunctionFsDaemon`, generated device/config/string descriptors |
+| UAC2 model | `Uac2Config`, `Uac2Mode::{Microphone,Headset,Speaker}`, `Uac2DescriptorSet`, `Uac2Status`, `Uac2BridgeStatus::Unsupported` |
+| Validation | Safe gadget/function names, VID/PID, strings, power, duplicate links, HID report shape, UAC2 rates/sizes/channels/modes, FunctionFS endpoint bounds/descriptor size, CD-ROM read-only |
 | Virtual media | `MassStorageImage`, `VirtualMedia`, `MediaMode::{Disk,CdRom}`, `MediaFormat::{Raw,Iso9660,Fat32,Nbd}`, `MediaState::{Attached,Detached}` |
 | Controller trait | `UsbGadgetController` (`create`, `bind`, `unbind`, `status`, `list`, `attach_media`, `detach_media`, `media_state`, `capabilities`) |
 | Linux ConfigFS | `ConfigFsUsbController`, injectable root, default `/sys/kernel/config/usb_gadget` |
@@ -28,7 +30,7 @@ gadget creation on a hardware profile.
 | ISO media | `IsoImage::inspect`, `parse_iso_volume_descriptors`, read-only `MediaFormat::Iso9660` |
 | NBD model | `NbdExport`, `NbdExportDescriptor`, `NbdHandshake`, `NbdRequest`/`NbdReply` framing, newstyle option constants |
 | NBD server | `NbdServer`/`NbdServerHandle` over TCP or Unix sockets, `NbdExportCatalog`, `NbdExportSource`, `NbdMemoryImage`, `NbdFileImage`, injected `NbdTransport`/`NbdClock`, bounded read/write/flush/trim/disc, read-only exports |
-| Capabilities/status | `UsbGadgetCapabilities`, `GadgetStatus`, `FunctionStatus`; `protocol_capability()` projects onto `ozma_protocol::UsbCapability` |
+| Capabilities/status | `UsbGadgetCapabilities`, `GadgetStatus`, `FunctionStatus` (`media`, `uac2`, `function_fs` details); `protocol_capability()` projects onto `ozma_protocol::UsbCapability` |
 
 ## Quick start
 
@@ -69,12 +71,15 @@ The node now selects the controller from configuration:
 ```bash
 ozma-node --usb-gadget --usb-udc dummy_udc.0 \
   --usb-configfs-root /sys/kernel/config/usb_gadget \
-  --usb-media /srv/installer.iso --usb-media-cdrom
+  --usb-media /srv/installer.iso --usb-media-cdrom \
+  --usb-uac2 --usb-vendor --usb-vendor-daemon /usr/local/bin/ozma-ffs
 ```
 
 Equivalent environment variables are `OZMA_USB_GADGET`, `OZMA_USB_CONFIGFS_ROOT`,
-`OZMA_USB_UDC`, `OZMA_USB_MEDIA`, `OZMA_USB_MEDIA_RO`, and
-`OZMA_USB_MEDIA_CDROM`. The node builds a HID keyboard + mouse gadget and
+`OZMA_USB_UDC`, `OZMA_USB_MEDIA`, `OZMA_USB_MEDIA_RO`,
+`OZMA_USB_MEDIA_CDROM`, `OZMA_USB_UAC2`, `OZMA_USB_VENDOR`, and
+`OZMA_USB_VENDOR_DAEMON`. The node builds a HID keyboard + mouse gadget,
+optionally a mass-storage LUN, and opt-in UAC2/FunctionFS vendor functions, then
 optionally a mass-storage LUN, then creates and binds it only when a UDC is
 supplied and the root exists. A missing UDC/root/permission/media or a bind
 failure is logged with its typed `kind()`; the node keeps running, advertises no
@@ -87,7 +92,7 @@ When bound, `ozma-node` advertises `usb` in capabilities, TXT/registration, and
 
 | Route | Behaviour |
 |---|---|
-| `GET /usb` | Bearer-guarded read-only gadget status, function list, capabilities, and LUN media state (no backing paths). |
+| `GET /usb` | Bearer-guarded read-only gadget status, function list, capabilities, LUN media state, UAC2 descriptor/bridge status, and FunctionFS daemon readiness (no backing paths). |
 | `POST /usb/media/attach` | Attach an existing absolute regular file to a mass-storage instance; enforces read-only/CD-ROM. |
 | `POST /usb/media/detach` | Clear the LUN `file` attribute; the function/gadget stay in place. |
 | `GET /usb/nbd` | Running loopback NBD export summary and counters (`running`, URL, export, size, read-only, stats). |
@@ -137,7 +142,7 @@ root. It creates:
     hid.<instance>/{protocol,subclass,report_length,report_desc}
     mass_storage.<instance>/{stall,lun.0/{file,ro,cdrom,removable}}
     uac2.<instance>/{p_chmask,c_chmask,p_srate,c_srate,p_ssize,c_ssize,req_number}
-    ffs.<instance>/        (FunctionFS descriptors come from userspace)
+    ffs.<instance>/        (FunctionFS daemon supplies descriptors/endpoints)
 ```
 
 - `create_gadget` leaves the gadget **unbound**; `bind` writes `UDC`, or
@@ -154,6 +159,112 @@ root. It creates:
   stable `kind()` strings.
 - The implementation does not call `mount`, open block devices, or use
   `unsafe`.
+
+## FunctionFS and UAC2
+
+### FunctionFS vendor functions
+
+`FunctionFsConfig` models the descriptor contract a userspace daemon must
+satisfy. `UsbFunction::vendor_with_config` embeds it in a gadget; the older
+`UsbFunction::vendor(instance, vid, pid)` constructor still creates a
+vendor-class function with the default strings.
+
+```rust
+use ozma_usb::{
+    FunctionFsConfig, FunctionFsDaemonSpec, FunctionFsEndpoint, FunctionFsStrings,
+    UsbFunction, UsbGadgetConfig,
+};
+
+let vendor = FunctionFsConfig::new("vendor0", 0x1209, 0x0001)
+    .with_interface(0xff, 0x00, 0x00)
+    .with_strings(FunctionFsStrings {
+        manufacturer: "Ozma Labs".into(),
+        product: "Ozma Vendor".into(),
+        serial_number: "OZMA-VENDOR-1".into(),
+        configuration: "Vendor Configuration".into(),
+    })
+    .with_endpoint(FunctionFsEndpoint::bulk_out(1, 512))
+    .with_endpoint(FunctionFsEndpoint::bulk_in(2, 512))
+    .with_daemon(
+        FunctionFsDaemonSpec::new("/usr/local/bin/ozma-ffs")
+            .with_arg("--instance")
+            .with_arg("vendor0")
+            .with_ready_marker("/run/ozma/ffs-vendor0.ready"),
+    );
+let gadget = UsbGadgetConfig::new("ozma", "dummy_udc.0")
+    .with_function(UsbFunction::vendor_with_config(vendor));
+```
+
+`FunctionFsConfig::descriptors()` generates the 18-byte device descriptor,
+configuration/interface/endpoint descriptors, and string descriptors that a
+daemon writes to `ep0`. Bounds are validated before any ConfigFS write:
+1–15 non-control endpoints, unique endpoint addresses in `0x01..=0x0f` /
+`0x81..=0x8f`, bulk packets ≤512 bytes, interrupt/isochronous packets ≤1024
+bytes, intervals 1..=16 for interrupt/isochronous, strings ≤126 bytes, and a
+total descriptor set ≤4096 bytes.
+
+ConfigFS only gets the `functions/ffs.<instance>` directory and the
+configuration symlink. The kernel does **not** take descriptors from ConfigFS:
+the daemon must mount FunctionFS, write the generated descriptors to `ep0`, and
+service the endpoints. Readiness is explicit and never assumed:
+
+| `FunctionFsReadiness` | Meaning |
+|---|---|
+| `daemon_not_configured` | No daemon path is modelled. |
+| `daemon_missing` | A configured daemon path does not exist. |
+| `daemon_not_ready` | The program exists but the readiness marker does not. |
+| `ready` | Program **and** readiness marker exist. |
+| `unknown` | A ConfigFS status reader has no daemon metadata. |
+
+`FunctionFsStatus` is embedded in `FunctionStatus.function_fs`. The
+`FunctionFsDaemon` trait (`MissingFunctionFsDaemon`, `ObservedFunctionFsDaemon`)
+and `FunctionFsConfig::require_ready()` provide a typed
+`unsupported-functionfs` failure when no daemon is ready. No daemon is spawned
+and no vendor protocol is implemented.
+
+### UAC2 audio functions
+
+`Uac2Config` expands the previous flat channel/rate/depth tuple with multiple
+advertised rates/sizes, microphone/headset/speaker modes, and optional
+volume/mute:
+
+```rust
+use ozma_usb::{Uac2Config, UsbFunction};
+
+let audio = Uac2Config::headset(2, 1, 48_000, 24)
+    .with_sample_rates([44_100, 48_000])
+    .with_sample_sizes([16, 24])
+    .with_volume(true)
+    .with_mute(true);
+let function = UsbFunction::uac2_with_config("audio", audio);
+```
+
+Validation requires at least one direction, 0..=8 channels per direction, a
+mode consistent with the enabled channels, rates in 8000..=192000 Hz, sample
+sizes of 16/24/32 bits, unique advertised values containing the primary value,
+and isochronous packets ≤1024 bytes. `Uac2Config::descriptors()` produces the
+Audio Control interface (clock, terminals, optional feature unit) and Audio
+Streaming interfaces (format type I with all advertised rates, isochronous
+endpoint) with a compact `Uac2DescriptorSummary`.
+
+The kernel's `uac2.<instance>` ConfigFS attributes only accept one primary rate
+and sample size per direction. The controller writes:
+
+```text
+p_chmask = (1 << playback_channels) - 1     c_chmask = (1 << capture_channels) - 1
+p_srate  = sample_rate_hz                   c_srate  = sample_rate_hz
+p_ssize  = bit_depth / 8                    c_ssize  = bit_depth / 8
+req_number = 2
+```
+
+Additional advertised rates/sizes stay in the descriptor/status model and are
+not written to ConfigFS. The generated format descriptor carries every
+advertised rate at the primary sample size; additional sample sizes are
+capability metadata because one UAC2 format-type-I descriptor has a single
+subframe size. `FunctionStatus.uac2` reports the mode, both stream models,
+descriptor shape, and `bridge: "unsupported"`: no ALSA device is opened, no
+isochronous data is moved, and `Uac2Config::require_bridge()` returns the typed
+`unsupported-uac2-bridge` error.
 
 ## USB/IP
 
@@ -283,6 +394,8 @@ Relevant suites:
 |---|---|
 | `tests/fat32_image.rs` | BPB/FAT/root entries/file clusters, LFN + 8.3 collisions, read-only attributes, directory import, bounds, corrupt BPB |
 | `tests/media_formats.rs` | ISO PVD/read-only media, `MediaFormat` consistency/JSON, FAT32 attach probe, NBD descriptors and framing |
+| `tests/functionfs.rs` | FunctionFS descriptor generation, endpoint/string/daemon bounds, explicit readiness states, ConfigFS `ffs.<instance>` creation/status, fake status |
+| `tests/uac2.rs` | UAC2 descriptor/channel/rate/size consistency, microphone/speaker/headset modes, invalid rates/channels/modes, ConfigFS attribute writes, unsupported bridge status |
 | `tests/usbip_controller.rs` | exact argv, list/port parsing (IPv4/IPv6), attach/detach state, disabled/missing/non-zero typed errors, config validation, host/token allow-list enforcement, no real `usbip` |
 | `tests/nbd_server.rs` | newstyle handshake, export name/list/info/go, read/write/flush/disc, request bounds, read-only write rejection, malformed/truncated frames, injected transport/clock deadline, concurrent loopback clients, Unix socket, server stop, file/media backends |
 | `tests/nbd_qemu.rs` | live `qemu-img info` on generated FAT32 + read-only ISO, `qemu-io` read and read-only write refusal; opt-in QMP USB attachment |
@@ -319,8 +432,14 @@ removes the test gadget.
   replies, TLS, write-zeroes, cache, multi-conn, or persistent export state.
   Node wiring is one loopback export behind the existing `--usb-gadget` state
   and is not exposed through capabilities or registration.
-- FunctionFS vendor daemon (descriptors, endpoints, userspace I/O) and real
-  UAC2 playback/capture bridging.
+- FunctionFS now models descriptors, endpoints, bounded daemon metadata, and
+  explicit readiness, but the real userspace daemon (mount FunctionFS, write
+  `ep0`, service endpoints, run a vendor protocol) is still absent. UAC2 now
+  models descriptors/capabilities and writes the primary ConfigFS attributes,
+  but there is no ALSA or isochronous USB audio bridge; status always reports
+  `bridge: "unsupported"`. Node flags exist (`--usb-uac2`, `--usb-vendor`,
+  `--usb-vendor-daemon`), but `/usb` surfaces readiness/absence rather than
+  starting either backend.
 - Node-side gadget teardown/recovery across restart, and hardware-profile
   validation. Mounting, block-device I/O, and real USB/IP transport remain
   deliberately outside this crate.

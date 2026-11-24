@@ -1,0 +1,14 @@
+[package]
+name = "ozma-multiseat"
+version = "0.1.0"
+edition = "2021"
+description = "Multi-seat display/input planning and per-seat ozma-node launch plans."
+license = "AGPL-3.0-only"
+
+[dependencies]
+serde = { workspace = true }
+thiserror = "1"
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = "3"

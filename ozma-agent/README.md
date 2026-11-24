@@ -47,8 +47,12 @@ real provider or a documented product decision:
    enumerated `pw-dump` audio nodes and proxied a room-correction sweep. The Rust
    node returns typed 501 stubs for both.
 5. **Multiseat.** The Python agent has `multiseat/` seat assignment and device
-   ownership. The desktop profile is one process/one seat and has no seat
-   manager.
+   ownership. The Rust planning foundation now lives in
+   [`ozma-multiseat`](../ozma-multiseat) (display/input backends, hub grouping,
+   seat plans, per-seat `ozma-node` argv, supervisor trait, status shape), but
+   it is not wired into `ozma-node` and has no real subprocess supervisor or
+   OS-level display/input ownership yet. See
+   [`docs/multiseat-rust.md`](../docs/multiseat-rust.md).
 6. **Tray, installer, and service integration.** The Python/Rust legacy agent
    owns tray UI, Windows/Linux installers, service units, and update hooks. The
    node is a daemon; packaging parity is not complete.

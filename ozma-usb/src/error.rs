@@ -176,6 +176,22 @@ pub enum UsbError {
         stderr: String,
     },
 
+    /// A FunctionFS function has no ready userspace daemon.
+    #[error("FunctionFS {instance:?} is not ready: {reason}")]
+    UnsupportedFunctionFs {
+        /// Function instance.
+        instance: String,
+        /// Explicit readiness reason.
+        reason: String,
+    },
+
+    /// No ALSA/USB audio bridge is available for a UAC2 function.
+    #[error("UAC2 audio bridge for {instance:?} is not implemented")]
+    UnsupportedUac2Bridge {
+        /// Function instance.
+        instance: String,
+    },
+
     /// The operation is not available on this platform.
     #[error("operation is not supported on this platform")]
     UnsupportedPlatform,
@@ -206,6 +222,8 @@ impl UsbError {
             Self::MissingCommand { .. } => "missing-command",
             Self::Spawn { .. } => "spawn",
             Self::CommandFailed { .. } => "command-failed",
+            Self::UnsupportedFunctionFs { .. } => "unsupported-functionfs",
+            Self::UnsupportedUac2Bridge { .. } => "unsupported-uac2-bridge",
             Self::UnsupportedPlatform => "unsupported-platform",
         }
     }

@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
+#
+# Ozma: optional USB gadget/UDC access, installed only with --usb-gadget.
+#
+# ConfigFS lives at /sys/kernel/config/usb_gadget and is created by the kernel
+# with root-owned entries. udev cannot grant write access to arbitrary ConfigFS
+# files; this rule only covers the gadget/UDC class nodes. The operator-owned
+# ConfigFS steps are documented in docs/clean-host.md. Do not grant the node
+# CAP_SYS_ADMIN just to bypass ConfigFS ownership.
+SUBSYSTEM=="udc", KERNEL=="*", GROUP="@OZMA_GROUP@", MODE="0660"
+SUBSYSTEM=="usb_gadget", KERNEL=="*", GROUP="@OZMA_GROUP@", MODE="0660"

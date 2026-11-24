@@ -44,24 +44,37 @@ systemctl --user enable --now ozma-node@vm.service
 
 ## System install (operator, requires root)
 
-The installer itself never uses sudo. A system-wide deployment runs the same
-layout with root and then:
+`scripts/install-system.sh` is the scripted path for the host-level pieces
+(user/group, directories, udev, AppArmor, tmpfiles/modules-load, and the
+copy-only libvirt snippet). It also renders these units/env examples, never
+enables or starts a unit, and never edits `/etc/libvirt/qemu.conf`. See
+[`docs/clean-host.md`](../../docs/clean-host.md#system-install-fresh-host) for
+the full fresh-host flow and rollback.
+
+The equivalent manual sequence, if you prefer to run each step yourself, is:
 
 ```bash
-sudo useradd --system --home /var/lib/ozma-node --shell /usr/sbin/nologin ozma-node
+sudo groupadd --system ozma-node
+sudo useradd --system --gid ozma-node --home /var/lib/ozma-node \
+    --shell /usr/sbin/nologin --no-create-home ozma-node
+sudo usermod -aG video,input,render ozma-node    # existing groups only
 sudo install -d -m 0750 -o ozma-node -g ozma-node \
     /var/lib/ozma-node /run/ozma-node /run/ozma/qmp
 sudo scripts/install-rust.sh --from-target target/release --system --prefix /usr/local
-sudo cp /usr/local/share/ozma/env/*.env.example /etc/ozma/
-# edit /etc/ozma/*.env, then:
+# copy and edit /etc/ozma/*.env.example, then:
 sudo systemctl daemon-reload
 sudo systemctl enable --now ozma-node@hardware.service
 # or, on a hypervisor:
 sudo systemctl enable --now ozma-virtual-node.service
 ```
 
+The installer itself never uses sudo.
+
 `install-rust.sh` does not create the system user or chown directories; that is
-an administrative decision and is left explicit.
+an administrative decision and is left explicit. `scripts/install-system.sh`
+performs those steps (and the udev/AppArmor/libvirt-snippet work) when run as
+root, or records them in `/etc/ozma/install-operator-commands.txt` under
+`--root`/`--dry-run`.
 
 ## Least privilege
 
@@ -99,8 +112,10 @@ SKIP by `scripts/clean-host/check-deps.sh`.
 
 ## Host-level udev/AppArmor/libvirt configuration
 
-The Python `softnode/install/install.sh` still owns the privileged udev rule,
-AppArmor drop-in, and libvirt `cgroup_device_acl` setup. It works for the Rust
-VM profile because both use the same `/dev/input/event*` and uinput paths. Port
-that script into a Rust-owned installer before deleting `softnode/`; this
-directory does not silently duplicate or replace it.
+`scripts/install-system.sh` and the assets under `scripts/system/` now own the
+Rust-side udev rules, AppArmor libvirt-qemu drop-in, and libvirt
+`cgroup_device_acl` snippet. The Python `softnode/install/install.sh` is still
+present for the one-release rollback and remains compatible with the same
+`/dev/input/event*` and uinput paths, but it is no longer the only owner of
+these steps. The libvirt `qemu.conf` merge stays an explicit operator action;
+the installer only writes a snippet under `/etc/ozma/`.

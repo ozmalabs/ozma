@@ -20,8 +20,8 @@ use ozma_power::{LibvirtPower, PowerBackend, QmpPower};
 use ozma_protocol::NodeId;
 use ozma_qmp::SharedQmpClient;
 use ozma_usb::{
-    ConfigFsUsbController, MassStorageImage, UsbError, UsbFunction, UsbGadgetConfig,
-    UsbGadgetController,
+    ConfigFsUsbController, FunctionFsConfig, FunctionFsDaemonSpec, MassStorageImage, UsbError,
+    UsbFunction, UsbGadgetConfig, UsbGadgetController,
 };
 use tracing::{error, info, warn};
 
@@ -434,6 +434,19 @@ pub struct Args {
     /// Present the mass-storage image as a read-only CD-ROM.
     #[arg(long, env = "OZMA_USB_MEDIA_CDROM")]
     pub usb_media_cdrom: bool,
+
+    /// Add a UAC2 audio function (descriptors only; no ALSA bridge).
+    #[arg(long, env = "OZMA_USB_UAC2")]
+    pub usb_uac2: bool,
+
+    /// Add a FunctionFS vendor function (requires a userspace daemon before it
+    /// can enumerate).
+    #[arg(long, env = "OZMA_USB_VENDOR")]
+    pub usb_vendor: bool,
+
+    /// Optional absolute daemon path reported as FunctionFS readiness metadata.
+    #[arg(long, env = "OZMA_USB_VENDOR_DAEMON", value_name = "PATH")]
+    pub usb_vendor_daemon: Option<std::path::PathBuf>,
 
     /// Require local consent for workstation-class sessions.
     #[arg(long)]
@@ -949,6 +962,9 @@ async fn run() -> std::process::ExitCode {
         usb_media: args.usb_media.clone(),
         usb_media_ro: args.usb_media_ro,
         usb_media_cdrom: args.usb_media_cdrom,
+        usb_uac2: args.usb_uac2,
+        usb_vendor: args.usb_vendor,
+        usb_vendor_daemon: args.usb_vendor_daemon.clone(),
     };
 
     // A configured power backend must be visible to the controller dashboard.
@@ -2158,6 +2174,21 @@ fn usb_gadget_config(config: &NodeConfig) -> Result<UsbGadgetConfig, UsbError> {
             Some(image),
         ));
     }
+    if config.usb_uac2 {
+        // Descriptors and ConfigFS attributes only. No ALSA bridge is started;
+        // status reports `bridge: unsupported`.
+        gadget = gadget.with_function(UsbFunction::uac2("audio", 2, 1, 48_000, 16));
+    }
+    if config.usb_vendor {
+        let mut vendor = FunctionFsConfig::new("vendor0", 0x1d6b, 0x0106)
+            .with_interface(0xff, 0x00, 0x00)
+            .with_endpoint(ozma_usb::FunctionFsEndpoint::bulk_out(1, 512))
+            .with_endpoint(ozma_usb::FunctionFsEndpoint::bulk_in(2, 512));
+        if let Some(daemon) = config.usb_vendor_daemon.as_ref() {
+            vendor = vendor.with_daemon(FunctionFsDaemonSpec::new(daemon));
+        }
+        gadget = gadget.with_function(UsbFunction::vendor_with_config(vendor));
+    }
     Ok(gadget)
 }
 
@@ -2842,6 +2873,9 @@ mod tests {
         assert!(defaults.usb_media.is_none());
         assert!(!defaults.usb_media_ro);
         assert!(!defaults.usb_media_cdrom);
+        assert!(!defaults.usb_uac2);
+        assert!(!defaults.usb_vendor);
+        assert!(defaults.usb_vendor_daemon.is_none());
 
         let args = Args::parse_from([
             "ozma-node",
@@ -2854,6 +2888,10 @@ mod tests {
             "/srv/installer.iso",
             "--usb-media-ro",
             "--usb-media-cdrom",
+            "--usb-uac2",
+            "--usb-vendor",
+            "--usb-vendor-daemon",
+            "/usr/local/bin/ozma-ffs",
         ]);
         assert!(args.usb_gadget);
         assert_eq!(
@@ -2867,6 +2905,12 @@ mod tests {
         );
         assert!(args.usb_media_ro);
         assert!(args.usb_media_cdrom);
+        assert!(args.usb_uac2);
+        assert!(args.usb_vendor);
+        assert_eq!(
+            args.usb_vendor_daemon.as_deref(),
+            Some(std::path::Path::new("/usr/local/bin/ozma-ffs"))
+        );
     }
 
     #[test]

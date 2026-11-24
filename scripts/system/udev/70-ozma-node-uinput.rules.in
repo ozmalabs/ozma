@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
+#
+# Ozma: allow the node service group to create virtual input devices.
+# Installed by scripts/install-system.sh for the vm and desktop profiles.
+# The uinput module is loaded by /etc/modules-load.d/ozma-node.conf.
+KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="@OZMA_GROUP@", MODE="0660", OPTIONS+="static_node=uinput"

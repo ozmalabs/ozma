@@ -294,6 +294,7 @@ scripted transport for denial/timeout/missing-service fallback and a fake
 See [`ozma-agent/README.md`](../ozma-agent/README.md) for the maintained list.
 Short version: PipeWire fd-connect for portal-only compositors, portal
 restore-token persistence, desktop sink creation, `/audio/nodes` enumeration,
-`POST /audio/sweep`, multiseat, tray/installer, Windows/macOS capture/input,
-mesh/Connect relay, and any agent-specific response fields the controller still
-reads.
+`POST /audio/sweep`, multiseat node integration (the `ozma-multiseat` planning
+foundation exists; see [`multiseat-rust.md`](multiseat-rust.md)), tray/installer,
+Windows/macOS capture/input, mesh/Connect relay, and any agent-specific response
+fields the controller still reads.

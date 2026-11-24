@@ -116,6 +116,8 @@ for script in \
     scripts/clean-host/in-container.sh \
     scripts/clean-host/check-deps.sh \
     scripts/install-rust.sh \
+    scripts/install-system.sh \
+    scripts/verify-system-install.sh \
     scripts/systemd/verify-units.sh \
     demo/run_demo.sh; do
     if bash -n "$script" 2>/dev/null; then
@@ -148,6 +150,14 @@ if scripts/install-rust.sh --dry-run --from-target "$TARGET_DIR/debug" --prefix 
     fi
 else
     fail "install-rust.sh --dry-run"
+fi
+
+# Rootless temp-prefix check for the system user/udev/AppArmor/libvirt surface.
+if system_verify_output=$(scripts/verify-system-install.sh 2>&1); then
+    pass "system install surface (rootless temp-prefix)"
+else
+    fail "system install surface (rootless temp-prefix)"
+    printf '%s\n' "$system_verify_output" >&2
 fi
 
 # ---------------------------------------------------------------------------

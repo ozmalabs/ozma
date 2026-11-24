@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
+#
+# Ozma: evdev event nodes for local input and VM input-linux provisioning.
+# The node service user is added to the conventional `input` group by
+# scripts/install-system.sh.
+SUBSYSTEM=="input", KERNEL=="event*", GROUP="input", MODE="0660"
+
+# Virtual ozma devices consumed by QEMU input-linux when that opt-in path is
+# used. QEMU/libvirt guests normally run in the kvm group; fall back to root
+# when the host has no kvm group.
+SUBSYSTEM=="input", ATTRS{name}=="ozma-kbd-*", GROUP="@QMP_GROUP@", MODE="0660"
+SUBSYSTEM=="input", ATTRS{name}=="ozma-mouse-*", GROUP="@QMP_GROUP@", MODE="0660"

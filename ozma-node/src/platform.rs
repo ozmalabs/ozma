@@ -739,6 +739,9 @@ mod tests {
             usb_media: None,
             usb_media_ro: false,
             usb_media_cdrom: false,
+            usb_uac2: false,
+            usb_vendor: false,
+            usb_vendor_daemon: None,
         }
     }
 

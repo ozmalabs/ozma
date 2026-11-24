@@ -12,6 +12,7 @@ Technical documentation for the Ozma software-defined KVM fabric.
 - [Video over USB plan](usb-video-plan.md) — virtual display sink, UVC camera, and raw Ozma USB link design
 - [Rust reconciliation plan](rust-reconciliation-plan.md) — replacing the Python node stack with `ozma-node` profiles, providers, and parity gates
 - [Multi-seat plan](multi-seat-plan.md) — multiple users on one physical PC, each seat exposed as an Ozma node
+- [Rust multi-seat foundation](multiseat-rust.md) — planning crate (`ozma-multiseat`), current scope, and remaining node/OS integration
 - [Node ↔ Hermes parity plan](node-hermes-parity.md) — Rust node feature parity, remote displays, session/media architecture, UX, roadmap
 - [Remote scene graph integration plan](remote-scene-integration.md) — native presentation, media resources, adaptive rendering, and compatibility
 - [Protobuf-core protocol plan](protobuf-core-plan.md) — protobuf negotiation/meta contract, JSON display definitions, field tables, and compact updates

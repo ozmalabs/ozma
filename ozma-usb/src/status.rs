@@ -6,7 +6,9 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::config::UsbFunctionKind;
+use crate::functionfs::FunctionFsStatus;
 use crate::media::MediaState;
+use crate::uac2::Uac2Status;
 
 /// Capability advertisement for a node's USB/media subsystem.
 ///
@@ -118,6 +120,12 @@ pub struct FunctionStatus {
     /// Current media state for a mass-storage function.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<MediaState>,
+    /// UAC2 descriptor/capability and bridge status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uac2: Option<Uac2Status>,
+    /// FunctionFS descriptor/daemon readiness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function_fs: Option<FunctionFsStatus>,
 }
 
 /// Observed state of one composite gadget.

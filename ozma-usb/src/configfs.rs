@@ -32,10 +32,12 @@ use crate::config::{
 };
 use crate::controller::UsbGadgetController;
 use crate::error::{configfs_error, UsbError};
+use crate::functionfs::{FunctionFsConfig, FunctionFsStatus};
 use crate::media::{
     resolve_mass_storage_function, MassStorageImage, MediaMode, MediaState, VirtualMedia,
 };
 use crate::status::{FunctionStatus, GadgetStatus, UsbGadgetCapabilities};
+use crate::uac2::{Uac2Config, Uac2Status};
 
 /// Default ConfigFS composite-gadget root.
 pub const DEFAULT_CONFIGFS_ROOT: &str = "/sys/kernel/config/usb_gadget";
@@ -244,31 +246,18 @@ impl ConfigFsUsbController {
                     self.write_attr(&lun.join("file"), "")?;
                 }
             }
-            UsbFunction::Uac2 {
-                playback_channels,
-                capture_channels,
-                sample_rate_hz,
-                bit_depth,
-                ..
-            } => {
-                let channel_mask = |channels: u8| -> u32 {
-                    if channels == 0 {
-                        0
-                    } else {
-                        (1u32 << channels) - 1
-                    }
-                };
+            UsbFunction::Uac2 { config, .. } => {
                 self.write_attr(
                     &dir.join("p_chmask"),
-                    channel_mask(*playback_channels).to_string(),
+                    Uac2Config::channel_mask(config.playback_channels).to_string(),
                 )?;
                 self.write_attr(
                     &dir.join("c_chmask"),
-                    channel_mask(*capture_channels).to_string(),
+                    Uac2Config::channel_mask(config.capture_channels).to_string(),
                 )?;
-                self.write_attr(&dir.join("p_srate"), sample_rate_hz.to_string())?;
-                self.write_attr(&dir.join("c_srate"), sample_rate_hz.to_string())?;
-                let sample_size = bit_depth / 8;
+                self.write_attr(&dir.join("p_srate"), config.sample_rate_hz.to_string())?;
+                self.write_attr(&dir.join("c_srate"), config.sample_rate_hz.to_string())?;
+                let sample_size = config.sample_size_bytes();
                 self.write_attr(&dir.join("p_ssize"), sample_size.to_string())?;
                 self.write_attr(&dir.join("c_ssize"), sample_size.to_string())?;
                 self.write_attr(&dir.join("req_number"), "2")?;
@@ -315,6 +304,85 @@ impl ConfigFsUsbController {
             read_only,
             size_bytes,
         })
+    }
+
+    fn read_uac2_status(&self, function_dir: &Path, instance: &str) -> Option<Uac2Status> {
+        let playback_channels = self
+            .read_attr_opt(&function_dir.join("p_chmask"))
+            .and_then(|value| value.parse::<u32>().ok())
+            .map(|mask| mask.count_ones() as u8)?;
+        let capture_channels = self
+            .read_attr_opt(&function_dir.join("c_chmask"))
+            .and_then(|value| value.parse::<u32>().ok())
+            .map(|mask| mask.count_ones() as u8)?;
+        if playback_channels == 0 && capture_channels == 0 {
+            return None;
+        }
+        let (rate_key, size_key) = if playback_channels > 0 {
+            ("p_srate", "p_ssize")
+        } else {
+            ("c_srate", "c_ssize")
+        };
+        let sample_rate_hz = self
+            .read_attr_opt(&function_dir.join(rate_key))
+            .and_then(|value| value.parse::<u32>().ok())?;
+        let bit_depth = self
+            .read_attr_opt(&function_dir.join(size_key))
+            .and_then(|value| value.parse::<u8>().ok())
+            .and_then(|bytes| bytes.checked_mul(8))?;
+        let config = Uac2Config::new(
+            playback_channels,
+            capture_channels,
+            sample_rate_hz,
+            bit_depth,
+        );
+        if config.validate().is_err() {
+            return None;
+        }
+        Some(Uac2Status::from_config(instance, &config))
+    }
+
+    /// Status for one FunctionFS function, using the model's daemon path and
+    /// readiness marker without executing the daemon.
+    pub fn function_fs_status(
+        &self,
+        gadget: &str,
+        config: &FunctionFsConfig,
+    ) -> Result<FunctionFsStatus, UsbError> {
+        config.validate()?;
+        let gadget_dir = self.existing_gadget(gadget)?;
+        let function = config.configfs_name();
+        let dir = gadget_dir.join("functions").join(&function);
+        if !dir.is_dir() {
+            return Err(UsbError::MissingFunction {
+                gadget: gadget.to_owned(),
+                function,
+            });
+        }
+        Ok(config.status())
+    }
+
+    /// Observed UAC2 ConfigFS attributes for one instance or full function
+    /// name (`audio` or `uac2.audio`).
+    pub fn uac2_status(&self, gadget: &str, function: &str) -> Result<Uac2Status, UsbError> {
+        let name = resolve_function_name(function, "uac2")?;
+        let gadget_dir = self.existing_gadget(gadget)?;
+        let dir = gadget_dir.join("functions").join(&name);
+        if !dir.is_dir() {
+            return Err(UsbError::MissingFunction {
+                gadget: gadget.to_owned(),
+                function: name,
+            });
+        }
+        let instance = name
+            .split_once('.')
+            .map(|(_, instance)| instance)
+            .unwrap_or(name.as_str());
+        self.read_uac2_status(&dir, instance)
+            .ok_or_else(|| UsbError::InvalidField {
+                field: "function.uac2",
+                reason: format!("ConfigFS function {name:?} has no usable UAC2 attributes"),
+            })
     }
 
     fn remove_file(&self, path: &Path) -> Result<(), UsbError> {
@@ -530,17 +598,30 @@ impl UsbGadgetController for ConfigFsUsbController {
                     fs::symlink_metadata(dir.join("configs").join(CONFIG_NAME).join(&name))
                         .map(|metadata| metadata.file_type().is_symlink())
                         .unwrap_or(false);
+                let instance = name
+                    .split_once('.')
+                    .map(|(_, instance)| instance)
+                    .unwrap_or(name.as_str());
                 let media = if kind == UsbFunctionKind::MassStorage {
                     Some(self.read_lun_state(&path.join("lun.0"))?)
                 } else {
                     None
                 };
+                let uac2 = if kind == UsbFunctionKind::Uac2 {
+                    self.read_uac2_status(&path, instance)
+                } else {
+                    None
+                };
+                let function_fs = (kind == UsbFunctionKind::Vendor)
+                    .then(|| FunctionFsStatus::unobserved(instance));
                 functions.push(FunctionStatus {
                     name,
                     kind,
                     linked,
                     requires_userspace: kind == UsbFunctionKind::Vendor,
                     media,
+                    uac2,
+                    function_fs,
                 });
             }
         }
@@ -606,6 +687,26 @@ impl UsbGadgetController for ConfigFsUsbController {
     fn capabilities(&self) -> UsbGadgetCapabilities {
         UsbGadgetCapabilities::at(&self.root)
     }
+}
+
+fn resolve_function_name(function: &str, prefix: &str) -> Result<String, UsbError> {
+    let function = function.trim();
+    if let Some(instance) = function
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('.'))
+    {
+        if is_safe_identifier(instance) {
+            return Ok(format!("{prefix}.{instance}"));
+        }
+    } else if is_safe_identifier(function) {
+        return Ok(format!("{prefix}.{function}"));
+    }
+    Err(UsbError::InvalidField {
+        field: "function",
+        reason: format!(
+            "{function:?} must be a {prefix} instance name containing only letters, digits, '-' or '_'"
+        ),
+    })
 }
 
 fn validate_gadget_name(name: &str) -> Result<(), UsbError> {

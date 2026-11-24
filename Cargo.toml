@@ -37,6 +37,7 @@ members = [
     "ozma-clipboard",
     "ozma-pipewire",
     "ozma-usb",
+    "ozma-multiseat",
 ]
 
 [workspace.dependencies]

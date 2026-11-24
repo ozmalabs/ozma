@@ -2,6 +2,27 @@
 
 > 4 users, 1 PC, no VMs. Windows + Linux. Each seat = an ozma node.
 
+## Status (2026-11-25)
+
+The Python baseline in [`agent/multiseat`](../agent/multiseat) remains the
+runnable multi-seat implementation. A Rust planning foundation now exists in
+[`ozma-multiseat`](../ozma-multiseat) and is documented in
+[`multiseat-rust.md`](multiseat-rust.md):
+
+- Linux Xrandr output enumeration and DRM connector detection.
+- Read-only sysfs/evdev enumeration and USB-hub input grouping.
+- Deterministic seat planning: one seat per display, sequential UDP/HTTP ports,
+  input assignment, profiles, and per-seat `ozma-node --profile desktop` argv
+  (uinput input, X11 or explicitly targeted PipeWire capture, audio sink).
+- Controller capability/status shape where one seat is one node.
+- `SeatSupervisor` start/stop/status trait with a test-only fake.
+
+Not yet delivered: node integration, a real subprocess supervisor, OS-level
+display/input ownership, audio sink creation, hotplug/persistence, game launch,
+per-seat streaming, or any Windows (DXGI/IDD/Raw Input/WASAPI) path. The phase
+timeline below is unchanged; the Rust crate covers the planner/backends layer
+of Phase 1, not the Phase 1 deliverable.
+
 ## Architecture
 
 ```

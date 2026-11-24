@@ -18,13 +18,22 @@ guests. Two Phase 4 requirements remain open:
 2. WebRTC was not exercised; the node correctly returns a typed
    `503 webrtc-not-configured` without `--webrtc-helper`.
 
-The privileged fresh-host install (system user, udev, AppArmor, libvirt) and the
-Python-free install were not performed, and Python was intentionally not
-deleted. See [Remaining Phase 4 blockers](#remaining-phase-4-blockers).
+The privileged fresh-host install (system user, udev, AppArmor, libvirt) is now
+scripted and rootlessly verified but was not performed on this host, and the
+Python-free install was not performed; Python was intentionally not deleted.
+See [Follow-up: system install surface](#follow-up-system-install-surface-2026-11-25)
+and [Remaining Phase 4 blockers](#remaining-phase-4-blockers).
 
 > **Follow-up (2026-11-25):** blocker 1, Rust-node mDNS discovery, is fixed.
 > Root cause, fix, and live browser/controller evidence are in
 > [Follow-up: Rust mDNS discovery fix](#follow-up-rust-mdns-discovery-fix-2026-11-25).
+>
+> **Live demo rerun (2026-11-25):** the default `--rust` demo now discovers both
+> nodes by mDNS and passes switching, HLS, snapshot, input, dashboard, and
+> shutdown checks. See
+> [`phase4-live-demo-report.md`](phase4-live-demo-report.md). WebRTC's helper
+> path was proven with a separate probe, but the demo does not wire the helper
+> and still returns the typed 503. Phase 4 itself remains incomplete.
 
 ## Frozen commit
 
@@ -248,6 +257,41 @@ test python_zeroconf_browses_the_rust_advertisement ... ok
 - No checked-in test covers multi-interface selection or avahi goodbye
   behaviour; both were inspected manually.
 
+## Follow-up: system install surface (2026-11-25)
+
+The privileged fresh-host install is now scripted and rootlessly verified. It
+has still not been run on a real host, and no sudo was used by this work.
+
+| Surface | Status | Evidence |
+|---|---|---|
+| `scripts/install-system.sh` | added | Creates the `ozma-node` user/group (existing groups only, per hardware/vm/desktop profile), state/runtime/config dirs, units and env examples, udev rules, AppArmor drop-in, tmpfiles/modules-load snippets, and a copy-only libvirt snippet. Supports `--dry-run`, `--prefix`, `--root`, `--force`, `--usb-gadget`, `--no-user`, and `--no-*` toggles. Never invokes sudo, enables/starts a unit, or edits `qemu.conf`. |
+| udev assets | added | `scripts/system/udev/70-ozma-node-{uinput,input,hidg,v4l2,render,gadget}.rules.in`; selected by profile; `udevadm verify -N never` PASS for all six. |
+| AppArmor | added | `scripts/system/apparmor/libvirt-qemu.d-ozma` installed to the libvirt-qemu abstraction directory. Syntax check is SKIP on this host (`apparmor_parser` absent), not a failure. |
+| libvirt | copy-only | `scripts/system/libvirt/qemu-cgroup_device_acl.conf.snippet` installed to `/etc/ozma/libvirt-qemu-cgroup_device_acl.conf`; merging into `/etc/libvirt/qemu.conf` remains an operator step. |
+| Verification | added | `scripts/verify-system-install.sh`: 54 passed, 0 failed, 1 skipped. Renders all profiles, checks dry-run/force/idempotence/modes/secrets/world-writable paths, validates udev syntax, and runs system+user unit verification. |
+| Unit verification | extended | `scripts/systemd/verify-units.sh` now verifies 3 system units and 3 least-privilege user units (PASS, systemd 262). |
+| Clean-host harness | extended | `scripts/clean-host/in-container.sh` runs the rootless system verification; `check-deps.sh` reports `udevadm`, `apparmor_parser`, and `systemd-tmpfiles` as optional tools. |
+
+Operator/root-only steps that remain:
+
+1. Run `sudo scripts/install-system.sh --profile ...` on a fresh host (not done
+   here; this checkout is not root).
+2. Merge `/etc/ozma/libvirt-qemu-cgroup_device_acl.conf` into
+   `/etc/libvirt/qemu.conf`, restart libvirtd, and restart VMs.
+3. Apply the printed udev/tmpfiles/AppArmor reloads and enable/start the
+   selected unit. Exact commands are in
+   `/etc/ozma/install-operator-commands.txt`; the installer never runs them.
+4. USB gadget: mount ConfigFS, provide a hardware UDC, and arrange writable
+   gadget ownership. The node does not get `CAP_SYS_ADMIN`.
+5. Desktop: prefer a systemd `--user` unit; a system unit cannot see a logged-in
+   user's PipeWire session by default.
+6. QMP sockets for the VM profile: use the Rust supervisor's opt-in
+   `--provision` path or an existing libvirt hook. The installer does not
+   create QMP sockets or edit domain XML.
+
+No Gate 4 claim changes: a Python-free fresh-host install and the privileged
+host run are still outstanding.
+
 ## Exact commands
 
 ```bash
@@ -296,8 +340,11 @@ removed.
    the controller is still Python. Gate 4's "fresh-host install uses no Python"
    is unproven and cannot be claimed from this run.
 4. **Privileged install assets.** System user creation, udev rules, the AppArmor
-   drop-in, and libvirt `cgroup_device_acl` remain owned by
-   `softnode/install/install.sh` and require root. They were not run (no sudo).
+   drop-in, and the libvirt `cgroup_device_acl` snippet are now scripted by
+   `scripts/install-system.sh` and rootlessly verified by
+   `scripts/verify-system-install.sh`; the privileged run on a real host remains
+   outstanding. `softnode/install/install.sh` is no longer the only owner of
+   these steps.
 5. **Rollback tag.** `rust-cutover-<version>-python-rollback` was not created,
    because this task prohibited commits/tags.
 6. **Python deletion.** `softnode/`, `node/`, `agent/`, and `src/` remain in
@@ -308,3 +355,27 @@ removed.
 
 No Gate 4 completion is claimed. The full Rust suite is green and the Rust node
 is live-demo capable, but default discovery and WebRTC are not.
+
+## Live demo rerun (2026-11-25)
+
+A rerun from frozen commit `d2b83e923f692b0b15181c3c68302c90b7a0d3e8` used
+`git archive` + a fresh `cargo build -p ozma-node` and the two disposable
+Alpine/QEMU demo VMs. Results:
+
+- Default mDNS: **PASS**. Both Rust nodes appeared in the unmodified controller
+  without `--register-url` (controller log and `/api/v1/nodes`), and an
+  independent `avahi-browse` resolved the corrected `_ozma._udp` record.
+- Live demo: **PASS**. Health, node detail, dashboard cards (2 node cards,
+  2 scenario cards in headless Firefox), per-node HLS, snapshots, QMP input,
+  paste, and `tests/test_e2e_switching.py --no-audio` (24 PASS) all passed.
+- WebRTC: **PASS for the helper path** in a separate fake-capture probe
+  (`webrtc-client.py`: connected, ICE completed, 123 video buffers, I420
+  320×240). The demo launcher still does not pass `--webrtc-helper`, so demo
+  nodes correctly return 503 `webrtc-not-configured`.
+- Shutdown: **PASS**. SIGTERM exited both nodes in 102 ms with no surviving
+  ffmpeg/helper children; the checked-in process test also passed.
+- Harnesses: clean-host `--host` 17/17 PASS, controller pytest 2496 passed.
+
+Full matrix and artifacts: [`phase4-live-demo-report.md`](phase4-live-demo-report.md).
+The Python-free install, controller cutover, privileged assets, rollback tag,
+and Python-tree deletion remain blockers; Gate 4 is still not complete.

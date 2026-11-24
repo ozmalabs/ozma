@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
+#
+# Ozma: allow QEMU/libvirt to read virtual evdev devices for input-linux.
+# Installed by scripts/install-system.sh to:
+#   /etc/apparmor.d/abstractions/libvirt-qemu.d/ozma
+# Reload with: systemctl reload apparmor   (only when AppArmor is active)
+#
+# The node itself is confined by the systemd sandbox in
+# scripts/systemd/ozma-node@.service, not by this drop-in.
+/dev/input/event* rw,

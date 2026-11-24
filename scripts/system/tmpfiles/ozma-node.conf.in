@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
+#
+# Ozma node runtime directories. Installed by scripts/install-system.sh to
+# /etc/tmpfiles.d/ozma-node.conf. Apply with:
+#   systemd-tmpfiles --create /etc/tmpfiles.d/ozma-node.conf
+# Type Path        Mode User        Group        Age Argument
+d /run/ozma-node 0750 @OZMA_USER@ @OZMA_GROUP@ -
+d /run/ozma      0755 root        root         -
+d /run/ozma/qmp  0770 root        @QMP_GROUP@  -

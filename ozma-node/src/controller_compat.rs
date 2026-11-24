@@ -50,9 +50,10 @@ use ozma_protocol::{
 };
 use ozma_usb::MediaFormat as UsbMediaFormat;
 use ozma_usb::{
-    is_safe_identifier, FunctionStatus, GadgetStatus, MassStorageImage, MediaState,
-    NbdExportCatalog, NbdExportSource, NbdServer, NbdServerConfig, NbdServerHandle, NbdServerStats,
-    UsbError, UsbFunctionKind, UsbGadgetCapabilities, UsbGadgetController, VirtualMedia,
+    is_safe_identifier, FunctionFsStatus, FunctionStatus, GadgetStatus, MassStorageImage,
+    MediaState, NbdExportCatalog, NbdExportSource, NbdServer, NbdServerConfig, NbdServerHandle,
+    NbdServerStats, Uac2Status, UsbError, UsbFunctionKind, UsbGadgetCapabilities,
+    UsbGadgetController, VirtualMedia,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1519,6 +1520,10 @@ pub struct UsbFunctionSnapshot {
     pub requires_userspace: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media: Option<UsbMediaStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uac2: Option<Uac2Status>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function_fs: Option<FunctionFsStatus>,
 }
 
 impl UsbFunctionSnapshot {
@@ -1538,6 +1543,8 @@ impl UsbFunctionSnapshot {
                 .media
                 .as_ref()
                 .map(|media| UsbMediaStatus::from_state(instance, media)),
+            uac2: function.uac2.clone(),
+            function_fs: function.function_fs.clone(),
         }
     }
 }
@@ -8748,6 +8755,48 @@ mod tests {
         )
         .with_usb(Some(UsbControl::configured(fake.clone(), "ozma")));
         (state, fake)
+    }
+
+    #[tokio::test]
+    async fn usb_status_reports_uac2_bridge_and_functionfs_readiness_absence() {
+        let fake = Arc::new(FakeUsbGadgetController::new());
+        let config = UsbGadgetConfig::new("ozma", "dummy_udc.0")
+            .with_function(UsbFunction::uac2("audio", 2, 1, 48_000, 16))
+            .with_function(UsbFunction::vendor("vendor0", 0x1d6b, 0x0106));
+        fake.create_gadget(&config).unwrap();
+        fake.bind("ozma", "dummy_udc.0").unwrap();
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_usb(Some(UsbControl::configured(fake, "ozma")));
+
+        let (status, body) = get_json(&usb_router(state), "/usb").await;
+        assert_eq!(status, StatusCode::OK);
+        let functions = body["gadget"]["functions"].as_array().unwrap();
+        let audio = functions
+            .iter()
+            .find(|function| function["name"] == "uac2.audio")
+            .unwrap();
+        assert_eq!(audio["subtype"], "audio-uac2");
+        assert_eq!(audio["uac2"]["bridge"], "unsupported");
+        assert_eq!(audio["uac2"]["mode"], "headset");
+        assert_eq!(audio["uac2"]["descriptors"]["endpoints"], 2);
+        let vendor = functions
+            .iter()
+            .find(|function| function["name"] == "ffs.vendor0")
+            .unwrap();
+        assert_eq!(vendor["subtype"], "vendor");
+        assert_eq!(vendor["requires_userspace"], true);
+        assert_eq!(vendor["function_fs"]["ready"], false);
+        assert_eq!(vendor["function_fs"]["readiness"], "daemon_not_configured");
     }
 
     #[tokio::test]

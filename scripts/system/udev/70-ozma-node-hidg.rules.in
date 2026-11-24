@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
+#
+# Ozma: USB HID gadget endpoints (/dev/hidg0, /dev/hidg1) created by ConfigFS.
+# Installed by scripts/install-system.sh for the hardware profile and when
+# --usb-gadget is enabled. The node writes these nodes; ConfigFS itself is
+# operator-owned (see docs/clean-host.md).
+SUBSYSTEM=="hidg", KERNEL=="hidg*", GROUP="@OZMA_GROUP@", MODE="0660"

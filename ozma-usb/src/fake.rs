@@ -9,11 +9,13 @@
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 
-use crate::config::{is_safe_identifier, UsbFunctionKind, UsbGadgetConfig};
+use crate::config::{is_safe_identifier, UsbFunction, UsbFunctionKind, UsbGadgetConfig};
 use crate::controller::UsbGadgetController;
 use crate::error::UsbError;
+use crate::functionfs::FunctionFsStatus;
 use crate::media::{resolve_mass_storage_function, MediaState, VirtualMedia};
 use crate::status::{FunctionStatus, GadgetStatus, UsbGadgetCapabilities};
+use crate::uac2::Uac2Status;
 
 /// An in-memory [`UsbGadgetController`].
 #[derive(Debug)]
@@ -97,12 +99,23 @@ impl FakeUsbGadgetController {
                 } else {
                     None
                 };
+                let (uac2, function_fs) = match function {
+                    UsbFunction::Uac2 { instance, config } => {
+                        (Some(Uac2Status::from_config(instance, config)), None)
+                    }
+                    UsbFunction::Vendor { config } => {
+                        (None, Some(FunctionFsStatus::from_config(config)))
+                    }
+                    _ => (None, None),
+                };
                 FunctionStatus {
                     name,
                     kind: function.kind(),
                     linked: true,
                     requires_userspace: function.requires_userspace(),
                     media,
+                    uac2,
+                    function_fs,
                 }
             })
             .collect();

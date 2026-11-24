@@ -9,7 +9,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::UsbError;
+use crate::functionfs::FunctionFsConfig;
 use crate::media::MassStorageImage;
+use crate::uac2::Uac2Config;
 
 /// Standard boot-keyboard HID report descriptor (8-byte reports).
 pub const KEYBOARD_REPORT_DESCRIPTOR: [u8; 65] = [
@@ -144,25 +146,13 @@ pub enum UsbFunction {
     Uac2 {
         /// Instance name (the part after `uac2.`).
         instance: String,
-        /// Playback channel count (`0` disables playback).
-        playback_channels: u8,
-        /// Capture channel count (`0` disables capture).
-        capture_channels: u8,
-        /// Sample rate in Hz.
-        sample_rate_hz: u32,
-        /// Sample size in bits (`16`, `24`, or `32`).
-        bit_depth: u8,
+        /// Expanded descriptor/capability model.
+        config: Uac2Config,
     },
     /// FunctionFS vendor function.
     Vendor {
-        /// Instance name (the part after `ffs.`).
-        instance: String,
-        /// Vendor ID written into the vendor descriptor.
-        vendor_id: u16,
-        /// Product ID written into the vendor descriptor.
-        product_id: u16,
-        /// Device release number.
-        bcd_device: u16,
+        /// Expanded FunctionFS descriptor/daemon contract.
+        config: FunctionFsConfig,
     },
 }
 
@@ -208,21 +198,33 @@ impl UsbFunction {
     ) -> Self {
         Self::Uac2 {
             instance: instance.into(),
-            playback_channels,
-            capture_channels,
-            sample_rate_hz,
-            bit_depth,
+            config: Uac2Config::new(
+                playback_channels,
+                capture_channels,
+                sample_rate_hz,
+                bit_depth,
+            ),
+        }
+    }
+
+    /// A UAC2 function with an expanded descriptor/capability model.
+    pub fn uac2_with_config(instance: impl Into<String>, config: Uac2Config) -> Self {
+        Self::Uac2 {
+            instance: instance.into(),
+            config,
         }
     }
 
     /// A FunctionFS vendor function.
     pub fn vendor(instance: impl Into<String>, vendor_id: u16, product_id: u16) -> Self {
         Self::Vendor {
-            instance: instance.into(),
-            vendor_id,
-            product_id,
-            bcd_device: 0x0100,
+            config: FunctionFsConfig::new(instance, vendor_id, product_id),
         }
+    }
+
+    /// A FunctionFS vendor function with descriptors and daemon metadata.
+    pub fn vendor_with_config(config: FunctionFsConfig) -> Self {
+        Self::Vendor { config }
     }
 
     /// Function instance name.
@@ -230,8 +232,8 @@ impl UsbFunction {
         match self {
             Self::Hid { instance, .. }
             | Self::MassStorage { instance, .. }
-            | Self::Uac2 { instance, .. }
-            | Self::Vendor { instance, .. } => instance,
+            | Self::Uac2 { instance, .. } => instance,
+            Self::Vendor { config } => &config.instance,
         }
     }
 
@@ -318,49 +320,11 @@ impl UsbFunction {
                     image.validate()?;
                 }
             }
-            Self::Uac2 {
-                playback_channels,
-                capture_channels,
-                sample_rate_hz,
-                bit_depth,
-                ..
-            } => {
-                if *playback_channels == 0 && *capture_channels == 0 {
-                    return Err(UsbError::InvalidField {
-                        field: "function.uac2",
-                        reason: "UAC2 needs at least one playback or capture channel".to_owned(),
-                    });
-                }
-                if *playback_channels > 8 || *capture_channels > 8 {
-                    return Err(UsbError::InvalidField {
-                        field: "function.uac2",
-                        reason: "UAC2 channel count must be 0..=8".to_owned(),
-                    });
-                }
-                if !(8_000..=192_000).contains(sample_rate_hz) {
-                    return Err(UsbError::InvalidField {
-                        field: "function.sample_rate_hz",
-                        reason: "sample rate must be 8000..=192000 Hz".to_owned(),
-                    });
-                }
-                if !matches!(bit_depth, 16 | 24 | 32) {
-                    return Err(UsbError::InvalidField {
-                        field: "function.bit_depth",
-                        reason: "sample size must be 16, 24, or 32 bits".to_owned(),
-                    });
-                }
+            Self::Uac2 { config, .. } => {
+                config.validate()?;
             }
-            Self::Vendor {
-                vendor_id,
-                product_id,
-                ..
-            } => {
-                if *vendor_id == 0 || *product_id == 0 {
-                    return Err(UsbError::InvalidField {
-                        field: "function.vendor",
-                        reason: "vendor and product IDs must be non-zero".to_owned(),
-                    });
-                }
+            Self::Vendor { config } => {
+                config.validate()?;
             }
         }
 

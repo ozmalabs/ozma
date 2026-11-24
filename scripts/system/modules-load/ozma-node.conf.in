@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
+#
+# Ozma node kernel modules. Installed by scripts/install-system.sh to
+# /etc/modules-load.d/ozma-node.conf.
+uinput
+@USB_GADGET_MODULE@

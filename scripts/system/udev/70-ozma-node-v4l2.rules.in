@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
+#
+# Ozma: V4L2 capture nodes for the hardware profile. `video` is the
+# conventional Linux group; scripts/install-system.sh adds the service user.
+SUBSYSTEM=="video4linux", KERNEL=="video*", GROUP="video", MODE="0660"
