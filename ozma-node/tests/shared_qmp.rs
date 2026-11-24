@@ -150,7 +150,7 @@ async fn serve(
 
         match name.as_str() {
             "qmp_capabilities" | "system_powerdown" | "system_reset" | "stop" | "cont"
-            | "input-send-event" | "add_client" | "getfd" => {
+            | "input-send-event" | "add_client" | "getfd" | "quit" => {
                 write_half.write_all(b"{\"return\":{}}\n").await?;
             }
             "query-status" => {

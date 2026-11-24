@@ -124,7 +124,9 @@ async fn serve(
 
         let response = match name.as_str() {
             "qmp_capabilities" | "system_powerdown" | "system_reset" | "stop" | "cont"
-            | "screendump" | "input-send-event" | "add_client" | "getfd" => json!({"return": {}}),
+            | "screendump" | "input-send-event" | "add_client" | "getfd" | "quit" => {
+                json!({"return": {}})
+            }
             "query-status" => json!({"return": {"status": "running", "running": true}}),
             other => json!({
                 "error": {
@@ -181,6 +183,24 @@ async fn shared_clients_issue_commands_over_one_connection() {
     // A clone still sees the same live connection, and no second control
     // connection was attempted.
     assert!(shared.is_connected().await);
+    assert_eq!(server.connections(), 1);
+}
+
+#[tokio::test]
+async fn shared_quit_uses_the_one_connection_and_disconnects() {
+    let mut server = SingleConnectionServer::spawn().await;
+    let shared = SharedQmpClient::connect(
+        QmpConfig::new(server.path()).with_connect_timeout(Duration::from_secs(2)),
+    )
+    .await
+    .unwrap();
+
+    shared.quit().await.unwrap();
+    assert_eq!(
+        server.recv_command_named("quit").await,
+        json!({"execute": "quit"})
+    );
+    assert!(!shared.is_connected().await);
     assert_eq!(server.connections(), 1);
 }
 

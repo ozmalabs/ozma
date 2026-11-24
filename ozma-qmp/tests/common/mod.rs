@@ -176,7 +176,7 @@ async fn serve(
                 "return": {"status": "running", "running": true}
             }),
             "screendump" | "system_powerdown" | "system_reset" | "stop" | "cont"
-            | "input-send-event" | "add_client" | "getfd" => json!({"return": {}}),
+            | "input-send-event" | "add_client" | "getfd" | "quit" => json!({"return": {}}),
             _ => json!({
                 "error": {
                     "class": "CommandNotFound",

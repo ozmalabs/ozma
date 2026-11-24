@@ -159,7 +159,7 @@ async fn serve(
             "query-status" => json!({
                 "return": {"status": options.status, "running": options.running}
             }),
-            "system_powerdown" | "system_reset" | "stop" | "cont" => json!({"return": {}}),
+            "system_powerdown" | "system_reset" | "stop" | "cont" | "quit" => json!({"return": {}}),
             _ => json!({
                 "error": {
                     "class": "CommandNotFound",

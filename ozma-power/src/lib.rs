@@ -82,6 +82,10 @@ pub trait PowerBackend: Send + Sync {
     async fn cont(&mut self) -> Result<(), PowerError>;
 
     /// Request an orderly ACPI shutdown.
+    ///
+    /// This is a request to the guest, not a host-side power cut; QEMU keeps
+    /// running until the guest handles it. Use [`PowerBackend::stop`] for a
+    /// hard power-off.
     async fn system_powerdown(&mut self) -> Result<(), PowerError>;
 
     /// Reset the VM.
@@ -89,7 +93,10 @@ pub trait PowerBackend: Send + Sync {
 
     /// Force the VM off (destroy, not a guest-requested shutdown).
     ///
-    /// [`QmpPower`] delegates to QEMU's `stop`, which pauses rather than
-    /// destroys; see its implementation docs.
+    /// This is the hard power-off used by `/power/force-off`, `/power/stop`,
+    /// and `PowerAction::Stop`. [`LibvirtPower`] runs `virsh destroy`;
+    /// [`QmpPower`] sends QEMU's `quit`, which terminates the QEMU process
+    /// without letting the guest flush. It is distinct from
+    /// [`PowerBackend::system_powerdown`], which only requests ACPI shutdown.
     async fn stop(&mut self) -> Result<(), PowerError>;
 }

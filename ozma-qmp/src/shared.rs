@@ -138,10 +138,24 @@ impl SharedQmpClient {
     }
 
     /// Pause the VM (`stop`).
+    ///
+    /// This only pauses emulation. Use [`SharedQmpClient::quit`] for a hard
+    /// power-off or [`SharedQmpClient::system_powerdown`] for ACPI shutdown.
     pub async fn stop(&self) -> Result<(), QmpError> {
         let _guard = self.commands.lock().await;
         self.ensure_connected_locked().await?;
         self.client.stop().await
+    }
+
+    /// Terminate the QEMU process (`quit`).
+    ///
+    /// This is the hard power-off for the QMP backend: the QEMU process exits,
+    /// so the shared control connection cannot serve further commands until a
+    /// new QEMU is started and a command reconnects.
+    pub async fn quit(&self) -> Result<(), QmpError> {
+        let _guard = self.commands.lock().await;
+        self.ensure_connected_locked().await?;
+        self.client.quit().await
     }
 
     /// Resume the VM (`cont`).

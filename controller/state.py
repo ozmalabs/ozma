@@ -45,6 +45,10 @@ class NodeInfo:
     stream_path: str | None = None    # path, e.g. /stream/stream.m3u8
     # HTTP API port (health + /usb + HLS if video); same as stream_port when both present
     api_port: int | None = None
+    # Node HTTP API bearer token, supplied by the node at registration when it
+    # uses `--api-token`. Never serialized by to_dict()/events/dashboard JSON.
+    # Empty means "use the controller-wide OZMA_NODE_API_TOKEN, if configured".
+    api_token: str = field(default="", repr=False)
     # Audio routing (V0.3)
     audio_type: str | None = None        # "pipewire" | "vban" | None
     audio_sink: str | None = None        # PW null-sink name (pipewire nodes)
@@ -152,11 +156,30 @@ class NodeInfo:
         return d
 
 
+def node_api_token(node: Any, fallback: str = "") -> str:
+    """Resolve the bearer token used for a node's HTTP API.
+
+    A per-node token captured at registration wins; otherwise the
+    controller-wide configured token is used. The token is never logged here.
+    """
+    token = getattr(node, "api_token", "") or fallback or ""
+    return str(token).strip()
+
+
+def node_api_headers(node: Any, fallback: str = "") -> dict[str, str]:
+    """Return Authorization headers for a node request, or {} when unset."""
+    token = node_api_token(node, fallback)
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 class AppState:
     def __init__(self) -> None:
         import time
         self.nodes: dict[str, NodeInfo] = {}
         self.active_node_id: str | None = None
+        # Controller-wide fallback bearer token for node HTTP APIs
+        # (OZMA_NODE_API_TOKEN). Per-node tokens from registration win.
+        self.node_api_token: str = ""
         self._lock = asyncio.Lock()
         # Start time for uptime calculation
         self._start_time: float = time.monotonic()
@@ -248,6 +271,8 @@ class AppState:
                 node.stream_port = node.stream_port or existing.stream_port
                 node.stream_path = node.stream_path or existing.stream_path
                 node.api_port = node.api_port or existing.api_port
+                # Keep the node bearer token across re-registrations that omit it.
+                node.api_token = node.api_token or existing.api_token
                 # Preserve machine_class if the incoming registration doesn't set one
                 if node.machine_class == "workstation" and existing.machine_class != "workstation":
                     node.machine_class = existing.machine_class

@@ -93,13 +93,86 @@ async fn power_commands_are_sent_in_order() {
         server.recv_command().await,
         json!({"execute": "qmp_capabilities"})
     );
-    for expected in ["system_powerdown", "system_reset", "cont", "stop"] {
+    for expected in ["system_powerdown", "system_reset", "cont", "quit"] {
         assert_eq!(
             server.recv_command().await,
             json!({"execute": expected}),
             "unexpected wire command for {expected}"
         );
     }
+}
+
+#[tokio::test]
+async fn force_off_sends_quit_and_leaves_power_unavailable() {
+    let (mut power, mut server) = connected(FakeQmpOptions::default()).await;
+
+    power.stop().await.unwrap();
+
+    // Hard power-off is QEMU `quit`, not the pause command.
+    assert_eq!(
+        server.recv_command_named("quit").await,
+        json!({"execute": "quit"})
+    );
+    assert!(!power.is_connected());
+
+    // The QEMU process is expected to be gone, so a later state query is a
+    // typed backend error rather than a fabricated `shutoff`.
+    assert!(matches!(
+        power.query_status().await.unwrap_err(),
+        PowerError::NotConnected
+    ));
+}
+
+#[tokio::test]
+async fn acpi_powerdown_keeps_qemu_running_and_connected() {
+    let (mut power, mut server) = connected(FakeQmpOptions::default()).await;
+
+    power.system_powerdown().await.unwrap();
+
+    assert_eq!(
+        server.recv_command_named("system_powerdown").await,
+        json!({"execute": "system_powerdown"})
+    );
+    assert!(power.is_connected());
+    assert_eq!(power.query_status().await.unwrap(), PowerState::running());
+}
+
+#[tokio::test]
+async fn force_off_treats_a_closed_socket_as_a_successful_qemu_exit() {
+    let mut server = FakeQmpServer::spawn_with(FakeQmpOptions {
+        close_on: Some("quit".to_string()),
+        ..FakeQmpOptions::default()
+    })
+    .await;
+    let mut power = QmpPower::connect(config(&server)).await.unwrap();
+
+    power.stop().await.unwrap();
+    assert_eq!(
+        server.recv_command_named("quit").await,
+        json!({"execute": "quit"})
+    );
+    assert!(!power.is_connected());
+}
+
+#[tokio::test]
+async fn force_off_refused_by_qmp_is_a_typed_error_and_keeps_the_connection() {
+    let (mut power, mut server) = connected(FakeQmpOptions {
+        error_on: Some("quit".to_string()),
+        ..FakeQmpOptions::default()
+    })
+    .await;
+
+    let error = power.stop().await.unwrap_err();
+    match &error {
+        PowerError::Qmp(QmpError::Command { command, .. }) => assert_eq!(command, "quit"),
+        other => panic!("expected Qmp(Command), got {other:?}"),
+    }
+    assert_eq!(error.kind(), "qmp-command");
+    server.recv_command_named("quit").await;
+
+    // QEMU refused, so it is still running and the backend can retry.
+    assert!(power.is_connected());
+    assert_eq!(power.query_status().await.unwrap(), PowerState::running());
 }
 
 #[tokio::test]
@@ -180,6 +253,22 @@ async fn shared_client_power_commands_use_the_supplied_connection() {
 
     // Power did not take ownership of the shared connection.
     assert!(shared.is_connected().await);
+}
+
+#[tokio::test]
+async fn shared_client_force_off_sends_quit_and_disconnects() {
+    let mut server = FakeQmpServer::spawn().await;
+    let shared = SharedQmpClient::connect(config(&server)).await.unwrap();
+    let mut power = QmpPower::with_shared_client(shared.clone());
+
+    power.stop().await.unwrap();
+
+    assert_eq!(
+        server.recv_command_named("quit").await,
+        json!({"execute": "quit"})
+    );
+    assert!(!power.is_connected());
+    assert!(!shared.is_connected().await);
 }
 
 #[tokio::test]

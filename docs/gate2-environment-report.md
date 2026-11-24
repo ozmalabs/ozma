@@ -348,6 +348,19 @@ header, or an environment dump. The metrics document exposes host resource
 totals by design (the controller's metrics panel consumes them) and names every
 metric it cannot measure instead of reporting a zero.
 
+**Controller token propagation (implemented after this audit).** The controller
+now reads `OZMA_NODE_API_TOKEN` into `Config.node_api_token`/`AppState.node_api_token`
+and accepts an optional `api_token` in direct registration (stored on
+`NodeInfo` with `repr=False`). Per-node registration tokens take precedence over
+the global token. The snapshot, hints, metrics, power, codec, WebRTC, input and
+audio proxy helpers send `Authorization: Bearer <token>` only when a token is
+resolved, so the previous unauthenticated behavior is unchanged when none is
+configured. A node 401/403 is passed through on raw/codec proxies and mapped to
+a clear token-free controller 502 elsewhere. The token is never written to
+`NodeInfo.to_dict()`, events, dashboard JSON, or logs. See §7.2 for the remaining
+limits. The public-route split in the table remains as-is: those routes still do
+not require a token, and the controller's token is additive.
+
 1. **P0 — `GET /display/snapshot` was missing on the Rust node. Resolved in code
    (not yet live-validated).** The controller consumes a raw-JPEG snapshot at
    several places:
@@ -381,8 +394,9 @@ metric it cannot measure instead of reporting a zero.
    `http://<node>:<api_port>/ui/hints?level=...`. The node now returns the
    minimal shape (`windows`, `focused_window`, `controls`, `focused_control`,
    `level`) with an empty hints list and `available:false`, because no in-guest
-   accessibility agent is connected. It never invents windows or controls. It is
-   public (merged after the bearer guard) because both callers send no token.
+   accessibility agent is connected. It never invents windows or controls. It
+   remains public (merged after the bearer guard) for callers that do not send a
+   token; the controller now sends a configured node token when one exists.
 3. **P1 — `/agent/metrics` path mismatch. Resolved as an honest JSON
    document.** `controller/device_metrics.py:340` polls `/agent/metrics`,
    decodes JSON, and calls `update_batch`, which only records top-level numbers.
@@ -395,7 +409,8 @@ metric it cannot measure instead of reporting a zero.
    `statvfs`; there is no subprocess or network poll. Missing values (CPU
    temperature, GPU, fan, power draw, or a first network sample) are omitted
    and listed in `unavailable`; they are never reported as invented zeros. The
-   route is public because the controller poller sends no token.
+   route remains public for unauthenticated polling; the controller's metrics
+   poller sends a configured node token when one exists.
 4. **P2 — Other controller-consumed node routes.** `GET /node/status` is
    public and aliases the connection/health summary (`controller/mesh_intelligence.py`
    polls it without a token). `GET /audio/nodes` and `POST /audio/sweep` are
@@ -429,6 +444,25 @@ metric it cannot measure instead of reporting a zero.
    `/stream/{file}` served without a bearer token, and the `stream_url`
    composition (`http://<host>:<stream_port>/stream/stream.m3u8`). The public/
    guarded split is in §7.1.
+
+### 7.2 Controller node bearer-token status
+
+| Item | Status |
+|---|---|
+| Global config | `OZMA_NODE_API_TOKEN` → `Config.node_api_token` → `AppState.node_api_token` / `build_app(node_api_token=...)` |
+| Per-node token | Optional `api_token` field on `DirectRegisterRequest`; stored on `NodeInfo` with `repr=False`; preserved across re-registration |
+| Header sent | `Authorization: Bearer <token>` on JSON input/audio, raw WebRTC, snapshot, hints, metrics poller, power/current/RGB/USB, codec and remote-screenshot proxies |
+| No token configured | No `Authorization` header; previous behavior preserved |
+| Node 401/403 | Raw WebRTC and codec responses pass the node status/body through; other proxies return controller 502 with a clear “Node rejected the controller's bearer token (HTTP 401)” detail |
+| Secret exposure | Token excluded from `NodeInfo.to_dict()`, node events, dashboard/list responses, and logs; tests assert it never appears in response text or captured logs |
+
+Remaining limitations: there is no per-node token store, rotation, or controller
+UI/registration field in the dashboard; a global token is applied to every node
+that does not register its own; the node still exposes read-only compat routes
+publicly by design; and direct registration sends `api_token` in cleartext, so
+it is only safe on a trusted/loopback link or over TLS/SSH tunneling. A node
+that was started with `--api-token` and whose token does not match will now
+return a typed controller 502 instead of silently reading controller-local data.
 
 ## 8. Next-run checklist
 
@@ -493,7 +527,9 @@ cargo test -p ozma-node --test gate2_live -- --ignored --nocapture
 #    two HLS playlist fetches, browser WebRTC media, dashboard screenshots.
 ```
 
-Do not set `--api-token`/`OZMA_API_TOKEN` for controller-proxied validation (the
-unmodified controller proxy sends no node bearer token). Do not call
-`/power/{off,stop,reset}` on a VM you care about. Never use `virsh destroy` on a
-VM you did not create for this run.
+Set the controller's `OZMA_NODE_API_TOKEN` to the same value as the node's
+`--api-token` to exercise token-protected control proxies (the controller sends
+it as a bearer token; the read-only compat routes remain public). Do not enable
+`OZMA_AUTH`/controller user auth for this harness unless the dashboard token is
+also configured. Do not call `/power/{off,stop,reset}` on a VM you care about.
+Never use `virsh destroy` on a VM you did not create for this run.

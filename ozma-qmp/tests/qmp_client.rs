@@ -90,6 +90,10 @@ async fn control_commands_when_disconnected() {
         QmpError::NotConnected
     ));
     assert!(matches!(
+        client.quit().await.unwrap_err(),
+        QmpError::NotConnected
+    ));
+    assert!(matches!(
         client.add_client("dbus", "dbus-fd").await.unwrap_err(),
         QmpError::NotConnected
     ));
@@ -416,6 +420,83 @@ async fn send_input_reports_immediate_qmp_error_in_single_mode() {
         .unwrap_err();
     assert!(matches!(&error, QmpError::Command { .. }), "{error:?}");
     let _ = server.recv_command_named("input-send-event").await;
+}
+
+// ---------------------------------------------------------------------------
+// quit (hard QEMU exit)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn quit_sends_quit_and_invalidates_the_control_connection() {
+    let mut server = FakeQmpServer::spawn().await;
+    let client = QmpClient::connect(
+        QmpConfig::new(server.path()).with_connect_timeout(Duration::from_secs(2)),
+    )
+    .await
+    .unwrap();
+    server.recv_command_named("qmp_capabilities").await;
+
+    client.quit().await.unwrap();
+    assert_eq!(
+        server.recv_command_named("quit").await,
+        json!({"execute": "quit"})
+    );
+
+    // QEMU is expected to be gone; the socket must not be advertised as
+    // reusable, and a second quit cannot silently succeed.
+    assert!(!client.control_connected());
+    assert!(!client.is_connected());
+    assert!(matches!(
+        client.quit().await.unwrap_err(),
+        QmpError::NotConnected
+    ));
+}
+
+#[tokio::test]
+async fn quit_succeeds_when_qemu_exits_without_a_reply() {
+    let server = FakeQmpServer::spawn_with(FakeQmpOptions {
+        close_on: Some("quit".to_string()),
+        ..FakeQmpOptions::default()
+    })
+    .await;
+    let client = QmpClient::connect(
+        QmpConfig::new(server.path()).with_connect_timeout(Duration::from_secs(2)),
+    )
+    .await
+    .unwrap();
+
+    // The fake closes after reading quit. The command was delivered, so a
+    // missing reply is the expected "QEMU exited" outcome, not an error.
+    client.quit().await.unwrap();
+    assert!(!client.control_connected());
+}
+
+#[tokio::test]
+async fn quit_returns_a_typed_error_when_qmp_refuses_and_keeps_the_connection() {
+    let mut server = FakeQmpServer::spawn_with(FakeQmpOptions {
+        error_on: Some("quit".to_string()),
+        ..FakeQmpOptions::default()
+    })
+    .await;
+    let client = QmpClient::connect(
+        QmpConfig::new(server.path()).with_connect_timeout(Duration::from_secs(2)),
+    )
+    .await
+    .unwrap();
+
+    let error = client.quit().await.unwrap_err();
+    match &error {
+        QmpError::Command { command, message } => {
+            assert_eq!(command, "quit");
+            assert!(message.contains("injected failure"));
+        }
+        other => panic!("expected QmpError::Command, got {other:?}"),
+    }
+    server.recv_command_named("quit").await;
+
+    // A refusal means QEMU is still alive, so the connection remains usable.
+    assert!(client.is_connected());
+    assert_eq!(client.query_status().await.unwrap().status, "running");
 }
 
 // ---------------------------------------------------------------------------

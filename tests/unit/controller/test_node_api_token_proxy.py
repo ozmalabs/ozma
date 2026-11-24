@@ -1,0 +1,358 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
+"""Controller → node bearer-token propagation tests.
+
+The controller proxies snapshot, hints, metrics, power, codec, WebRTC and input
+calls to a node's HTTP API. When that node runs with `--api-token`, the proxy
+must send `Authorization: Bearer <token>`; without a configured token it must
+keep the previous unauthenticated behavior. These tests use a real local HTTP
+server as the fake node and assert the header, 401 handling, and that the token
+never leaks into responses or logs.
+"""
+
+import json
+import logging
+import socket
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import pytest
+
+from api import build_app
+from auth import AuthConfig
+from config import Config
+from device_metrics import MetricSource, MetricsCollector
+from scenarios import ScenarioManager
+from state import AppState, NodeInfo
+from stream import StreamManager
+
+pytestmark = pytest.mark.unit
+
+NODE_ID = "fake-token-node._ozma._udp.local."
+TOKEN = "test-node-secret-token"
+JPEG = b"\xff\xd8\xff\xe0fake-jpeg\xff\xd9"
+
+
+class _FakeNodeHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _handle(self, method: str) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b""
+        record = {
+            "method": method,
+            "path": self.path,
+            "headers": {k.lower(): v for k, v in self.headers.items()},
+            "body": json.loads(raw) if raw else None,
+        }
+        self.server.requests.append(record)
+        status, body, content_type = self.server.responder(method, record)
+        if isinstance(body, (dict, list)):
+            payload = json.dumps(body).encode()
+        else:
+            payload = body
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self) -> None:  # noqa: N802 — http.server API
+        self._handle("GET")
+
+    def do_POST(self) -> None:  # noqa: N802 — http.server API
+        self._handle("POST")
+
+    def log_message(self, *args) -> None:
+        pass
+
+
+def _default_responder(method: str, record: dict):
+    path = record["path"]
+    if path.startswith("/display/snapshot"):
+        return 200, JPEG, "image/jpeg"
+    if path.startswith("/webrtc/offer"):
+        return 200, {"type": "answer", "sdp": "v=0"}, "application/json"
+    if path.startswith("/agent/metrics"):
+        return 200, {"cpu_usage": 1.0, "uptime": 2.0}, "application/json"
+    return 200, {"ok": True}, "application/json"
+
+
+@pytest.fixture
+def fake_node():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeNodeHandler)
+    server.requests = []
+    server.responder = _default_responder
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_mesh_config(monkeypatch, tmp_path):
+    """Keep build_app from writing controller/mesh_network.json in the repo."""
+    import mesh_network
+
+    monkeypatch.setattr(mesh_network, "CONFIG_PATH", tmp_path / "mesh_network.json")
+
+
+def _node(port: int, *, api_token: str = "") -> NodeInfo:
+    return NodeInfo(
+        id=NODE_ID,
+        host="127.0.0.1",
+        port=7331,
+        role="compute",
+        hw="x86_64",
+        fw_version="0.1.0",
+        proto_version=1,
+        capabilities=["hid", "video", "audio", "power"],
+        stream_port=port,
+        stream_path="/stream/stream.m3u8",
+        api_port=port,
+        api_token=api_token,
+    )
+
+
+def _build_app(
+    port: int,
+    tmp_path: Path,
+    *,
+    global_token: str = "",
+    node_token: str = "",
+    auth_enabled: bool = False,
+):
+    state = AppState()
+    state.node_api_token = global_token
+    node = _node(port, api_token=node_token)
+    state.nodes[NODE_ID] = node
+    streams = StreamManager(state, static_dir=tmp_path / "streams")
+    streams.register_node(node)
+    scenarios = ScenarioManager(tmp_path / "scenarios.json", state)
+    app = build_app(
+        state,
+        scenarios,
+        streams=streams,
+        auth_config=AuthConfig(enabled=auth_enabled),
+        node_api_token=global_token,
+    )
+    return app, state
+
+
+def _client(app):
+    from fastapi.testclient import TestClient
+
+    return TestClient(app)
+
+
+# (method, controller URL, request JSON, expected node path prefix)
+PROXY_CASES = [
+    ("post", f"/api/v1/nodes/{NODE_ID}/proxy/input/key", {"key": "a"}, "/input/key"),
+    ("post", "/api/v1/audio/room-correction/apply",
+     {"node_id": NODE_ID, "profile_id": "p1"}, "/audio/apply"),
+    ("post", f"/api/v1/streams/{NODE_ID}/webrtc",
+     {"type": "offer", "sdp": "v=0"}, "/webrtc/offer"),
+    ("get", f"/api/v1/streams/{NODE_ID}/snapshot", None, "/display/snapshot"),
+    ("get", f"/api/v1/nodes/{NODE_ID}/ui/hints", None, "/ui/hints"),
+    ("get", f"/api/v1/nodes/{NODE_ID}/power/state", None, "/power/state"),
+    ("get", f"/api/v1/nodes/{NODE_ID}/usb", None, "/usb"),
+    ("get", f"/api/v1/streams/{NODE_ID}/codec", None, "/codec"),
+    ("get", f"/api/v1/remote/{NODE_ID}/screenshot", None, "/display/snapshot"),
+]
+
+
+@pytest.mark.parametrize("method,url,body,node_path", PROXY_CASES)
+def test_proxy_sends_configured_bearer_token(
+    fake_node, tmp_path, method, url, body, node_path
+):
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+    client = _client(app)
+
+    response = client.get(url) if method == "get" else client.post(url, json=body)
+
+    assert response.status_code == 200, response.text
+    assert fake_node.requests, f"{url} did not reach the node"
+    record = fake_node.requests[-1]
+    assert record["path"].startswith(node_path)
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+@pytest.mark.parametrize("method,url,body,node_path", PROXY_CASES)
+def test_proxy_omits_authorization_when_no_token_configured(
+    fake_node, tmp_path, method, url, body, node_path
+):
+    app, _ = _build_app(fake_node.server_address[1], tmp_path)
+    client = _client(app)
+
+    response = client.get(url) if method == "get" else client.post(url, json=body)
+
+    assert response.status_code == 200, response.text
+    record = fake_node.requests[-1]
+    assert "authorization" not in record["headers"]
+
+
+def test_per_node_registration_token_wins_over_global(fake_node, tmp_path):
+    app, _ = _build_app(
+        fake_node.server_address[1], tmp_path,
+        global_token="global-token", node_token="per-node-token",
+    )
+
+    response = _client(app).get(f"/api/v1/nodes/{NODE_ID}/power/state")
+
+    assert response.status_code == 200, response.text
+    assert fake_node.requests[-1]["headers"]["authorization"] == "Bearer per-node-token"
+
+
+def test_registration_accepts_token_without_serializing_it(fake_node, tmp_path):
+    app, state = _build_app(fake_node.server_address[1], tmp_path, global_token="global-token")
+    client = _client(app)
+
+    registered = client.post(
+        "/api/v1/nodes/register",
+        json={
+            "id": NODE_ID,
+            "host": "127.0.0.1",
+            "api_port": str(fake_node.server_address[1]),
+            "stream_port": str(fake_node.server_address[1]),
+            "cap": "hid,video,audio,power",
+            "api_token": "registered-node-token",
+        },
+    )
+
+    assert registered.status_code == 200, registered.text
+    assert "registered-node-token" not in registered.text
+    assert "api_token" not in registered.json()["node"]
+    assert state.nodes[NODE_ID].api_token == "registered-node-token"
+
+    listed = client.get("/api/v1/nodes")
+    assert listed.status_code == 200
+    assert "registered-node-token" not in listed.text
+    assert "api_token" not in listed.text
+
+    proxied = client.get(f"/api/v1/nodes/{NODE_ID}/power/state")
+    assert proxied.status_code == 200, proxied.text
+    assert fake_node.requests[-1]["headers"]["authorization"] == "Bearer registered-node-token"
+
+
+def test_webrtc_raw_proxy_passes_node_401_through(fake_node, tmp_path):
+    fake_node.responder = lambda method, record: (
+        401, {"error": "unauthorized"}, "application/json"
+    )
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).post(
+        f"/api/v1/streams/{NODE_ID}/webrtc", json={"type": "offer", "sdp": "v=0"}
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"error": "unauthorized"}
+    assert TOKEN not in response.text
+
+
+def test_codec_proxy_passes_node_401_through(fake_node, tmp_path):
+    fake_node.responder = lambda method, record: (
+        401, {"ok": False, "error": "unauthorized"}, "application/json"
+    )
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).get(f"/api/v1/streams/{NODE_ID}/codec")
+
+    assert response.status_code == 401
+    assert response.json() == {"ok": False, "error": "unauthorized"}
+    assert TOKEN not in response.text
+
+
+@pytest.mark.parametrize("url", [
+    f"/api/v1/nodes/{NODE_ID}/power/state",
+    f"/api/v1/streams/{NODE_ID}/snapshot",
+    f"/api/v1/nodes/{NODE_ID}/ui/hints",
+])
+def test_node_401_maps_to_clear_token_free_controller_error(fake_node, tmp_path, url):
+    fake_node.responder = lambda method, record: (
+        401, {"error": "unauthorized"}, "application/json"
+    )
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).get(url)
+
+    assert response.status_code == 502
+    detail = response.json()["detail"]
+    assert "401" in detail
+    assert "bearer token" in detail.lower()
+    assert TOKEN not in response.text
+
+
+def test_json_input_proxy_maps_node_401_to_clear_error(fake_node, tmp_path):
+    fake_node.responder = lambda method, record: (
+        401, {"error": "unauthorized"}, "application/json"
+    )
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).post(
+        f"/api/v1/nodes/{NODE_ID}/proxy/input/key", json={"key": "a"}
+    )
+
+    assert response.status_code == 502
+    assert "401" in response.json()["detail"]
+    assert TOKEN not in response.text
+
+
+def test_token_never_appears_in_responses_or_logs(fake_node, tmp_path, caplog):
+    caplog.set_level(logging.DEBUG)
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+    client = _client(app)
+
+    responses = [
+        client.get(f"/api/v1/streams/{NODE_ID}/snapshot"),
+        client.get(f"/api/v1/nodes/{NODE_ID}/ui/hints"),
+        client.get(f"/api/v1/nodes/{NODE_ID}/power/state"),
+        client.post(f"/api/v1/streams/{NODE_ID}/webrtc",
+                    json={"type": "offer", "sdp": "v=0"}),
+    ]
+
+    for response in responses:
+        assert TOKEN not in response.text
+    assert TOKEN not in caplog.text
+
+
+async def test_metrics_poller_sends_global_token(fake_node):
+    state = AppState()
+    state.node_api_token = TOKEN
+    node = _node(fake_node.server_address[1])
+    collector = MetricsCollector(state)
+    source = MetricSource(id=NODE_ID, name="fake")
+
+    assert await collector._fetch_agent(node, source) is True
+    assert fake_node.requests[-1]["path"] == "/agent/metrics"
+    assert fake_node.requests[-1]["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+async def test_metrics_poller_omits_header_without_token(fake_node):
+    state = AppState()
+    node = _node(fake_node.server_address[1])
+    collector = MetricsCollector(state)
+    source = MetricSource(id=NODE_ID, name="fake")
+
+    assert await collector._fetch_agent(node, source) is True
+    assert "authorization" not in fake_node.requests[-1]["headers"]
+
+
+def test_config_reads_node_api_token_from_env(monkeypatch):
+    monkeypatch.setenv("OZMA_NODE_API_TOKEN", TOKEN)
+    assert Config.from_env().node_api_token == TOKEN
+
+
+def test_node_info_to_dict_excludes_api_token():
+    node = _node(_unused_port(), api_token=TOKEN)
+    assert "api_token" not in node.to_dict()
+    assert TOKEN not in json.dumps(node.to_dict())
+
+
+def _unused_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]

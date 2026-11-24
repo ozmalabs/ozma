@@ -7,14 +7,135 @@ HLS proxy, and dashboard rendering through the repaired Python controller.
 **This is not a Gate 2 claim.** It covers power *actions* on an OS-less
 disposable QEMU process and the controller/dashboard HTTP and browser paths for
 one registered Rust node. It does not cover a real guest OS, guest-visible
-input, WebRTC media, audio, D-Bus display capture, or hard power-off/destroy on
-a real VM. See [Remaining Gate 2 blocker](#remaining-gate-2-blocker).
+input, WebRTC media, audio, or D-Bus display capture on a real VM. The original
+run did not cover hard power-off; §0 records the follow-up fix and live re-run
+that does. See [Remaining Gate 2 blocker](#remaining-gate-2-blocker).
 
 > No `sudo`, no libvirt domain, no `virsh` mutating verb, and no package install
 > outside a `/tmp` venv were used. The only VM was a direct, headless
 > `qemu-system-x86_64` TCG process with a temporary QMP Unix socket, no disk,
 > and no network device. Every process, port, venv, and temporary file was
 > removed at the end; see [Cleanup](#cleanup).
+
+## 0. Update — hard power-off fixed and revalidated (2026-11-24)
+
+The original run below found that `/power/stop` only paused QEMU. That gap is
+fixed in the tree; this section records the follow-up live run. The rest of the
+report is the original run's evidence and keeps its historical timestamps.
+
+### 0.1 Change
+
+- `ozma-qmp`: added `QmpClient::quit()` and `SharedQmpClient::quit()`, which
+  send `{"execute":"quit"}` and invalidate the control connection. A QMP
+  `{"error": ...}` reply is a typed `QmpError::Command` and keeps the connection
+  usable; a socket close after the command was fully written is treated as
+  QEMU exiting (not as a failed force-off).
+- `ozma-power`: `QmpPower::stop` now calls `quit`. Therefore these all terminate
+  QEMU: `POST /power/stop`, `/power/force-off`, `/power/force_off`,
+  `/power/destroy`, and `PowerAction::Stop`.
+- `ozma-power`: `system_powerdown` is unchanged and remains the ACPI request.
+  `POST /power/off`, `/power/shutdown`, `/power/powerdown`, and
+  `PowerAction::Shutdown` still send ACPI `system_powerdown`; they do not exit
+  QEMU when the guest does not handle the request.
+- `ozma-node`: action aliases were verified against the backend methods:
+  `on|start|cont|resume` → `cont`, `off|shutdown|powerdown` → ACPI
+  `system_powerdown`, `reset` → `system_reset`,
+  `force-off|force_off|stop|destroy` → `stop` → QMP `quit`. Power failures now
+  carry a stable `code` (`qmp-command`, `qmp-closed`, `qmp-connect`, ...) in the
+  typed 502 body instead of only prose.
+- `ozma-node`: `QmpClient::stop` (QEMU pause) is no longer used by the power
+  backend. The method remains in `ozma-qmp` for callers that really want a
+  paused VM.
+
+### 0.2 Live run
+
+| Item | Value |
+|---|---|
+| Run | 2026-11-24 17:20–17:21 AEDT (2026-11-24T06:20–06:21Z) |
+| Repo | `/home/matt/ozma/ozma`, HEAD `27ccbe1`, plus the uncommitted fix |
+| QEMU | `qemu-system-x86_64` 11.1.3, TCG, headless, no disk/network |
+| Node | `target/debug/ozma-node`, `--profile vm --power-provider qmp --input-provider recording --audio-provider none`, shared QMP control |
+| Temp root | `/tmp/opencode/ozma-power-quit-live` (removed) |
+| Ports | node HTTP 44917, QUIC 44919, HID/UDP 60743 |
+| QEMU PIDs | 4187072 (first), 4188418 (restart) |
+| Node PID | 4187375 |
+
+First QEMU (PID 4187072), direct route sequence:
+
+```text
+GET  /power/state                 -> 200 {"available":true,"status":"running"}
+POST /power/stop                  -> 200 {"action":"force-off","ok":true}
+GET  /power/state (after stop)    -> 502 {"available":false,"status":"unknown",
+                                          "code":"qmp-connect",
+                                          "error":"... No such file or directory (os error 2)"}
+POST /power/stop (again)          -> 502 {"action":"force-off","ok":false,
+                                          "code":"qmp-connect", ...}
+```
+
+Process/socket check after the first stop:
+
+```text
+$ ps -p 4187072 -o pid,stat,args
+(no output: pid_4187072=absent)
+$ test -S .../qemu/qmp.sock
+(absent; QEMU removed the socket and its pidfile)
+```
+
+The node did not fabricate `shutoff`; `GET /api/v1/connection` reported
+`{"available":false,"status":"unknown"}`, and the node logged the typed warning
+`Power state query failed ... failed to connect to QMP socket`.
+
+Second QEMU (PID 4188418, restarted on the same socket path), with the same
+running node:
+
+```text
+GET  /power/state                 -> 200 {"available":true,"status":"running"}
+POST /power/on                    -> 200 {"action":"on","ok":true}
+GET  /power/state                 -> 200 {"available":true,"status":"running"}
+POST /power/reset                 -> 200 {"action":"reset","ok":true}
+GET  /power/state                 -> 200 {"available":true,"status":"running"}
+POST /power/off (ACPI)            -> 200 {"action":"off","ok":true}
+GET  /power/state                 -> 200 {"available":true,"status":"running"}
+                                  (QEMU PID 4188418 still alive: OS-less guest
+                                   cannot handle the ACPI request)
+POST /power/stop                  -> 200 {"action":"force-off","ok":true}
+                                  (QEMU PID 4188418 exited; state -> typed 502)
+```
+
+This confirms both semantics on real QEMU: `quit` terminates the process, while
+`system_powerdown` only sends the guest an ACPI request. It also confirms the
+node reconnects its shared QMP client to a *restarted* QEMU, so `on`/`reset`/`off`
+keep working after a hard stop followed by a new QEMU process.
+
+### 0.3 Tests added/updated (default suite, no QEMU required)
+
+- `ozma-qmp/tests/qmp_client.rs`: `quit` wire command, disconnect after success,
+  close-without-reply, and refused-command typed error.
+- `ozma-qmp/tests/shared_client.rs`: shared `quit` over the one connection.
+- `ozma-power/tests/qmp_power.rs`: `stop` sends `quit` and leaves power
+  unavailable; ACPI `system_powerdown` stays connected; refused/closed `quit`
+  cases; shared-client `quit`.
+- `ozma-node/tests/power_routes_qmp.rs`: fake QMP server drives the real
+  `/power/*` router through off, reset, on, state, and stop; verifies the
+  `quit` wire command and the typed 502 afterwards.
+- `ozma-node/src/controller_compat.rs` unit tests: every alias maps to the
+  expected backend method; closed QMP maps to `code:"qmp-closed"`.
+
+Results from this run:
+
+```text
+cargo test -p ozma-qmp -p ozma-power -p ozma-node
+  -> all tests pass, 0 failed, 6 ignored (real-QEMU/ffmpeg opt-ins)
+cargo check --workspace --all-targets
+  -> Finished successfully
+```
+
+### 0.4 Cleanup (update run)
+
+Node 4187375 received SIGINT and logged `Ozma node shutting down`; QEMU
+4187072 and 4188418 exited via `quit`; temp root
+`/tmp/opencode/ozma-power-quit-live` was removed; no matching processes or
+listening ports remained. No libvirt domain and no `sudo` were used.
 
 ## 1. Run metadata
 
@@ -109,7 +230,12 @@ ROOT=/tmp/opencode/ozma-gate2-power-controller
 parity. The QMP control client is shared by power, capture, snapshots, and HLS;
 no second QMP connection was opened.
 
-## 4. Power routes — PASS
+## 4. Power routes — PASS (original run, pre-fix force-off)
+
+> **Pre-fix note:** this section describes the original 14:05 run. At that time
+> `QmpPower::stop` sent QEMU `stop` (pause). §0 records the fixed behavior:
+> force-off now sends `quit` and terminates QEMU, while `/power/off` remains
+> ACPI `system_powerdown`.
 
 The sequence was run directly against the node. Each state value is read back
 through `/power/state`, which issues QMP `query-status` over the shared client.
@@ -117,7 +243,7 @@ through `/power/state`, which issues QMP `query-status` over the shared client.
 | Step | Response | Observed state |
 |---|---|---|
 | `GET /power/state` (initial) | `200` `{"available":true,"status":"running"}` | running |
-| `POST /power/stop` | `200` `{"action":"force-off","ok":true}` | paused |
+| `POST /power/stop` (pre-fix) | `200` `{"action":"force-off","ok":true}` | paused |
 | `GET /power/state` | `200` `{"available":true,"status":"paused"}` | paused |
 | `POST /power/on` | `200` `{"action":"on","ok":true}` | running |
 | `GET /power/state` | `200` `{"available":true,"status":"running"}` | running |
@@ -127,14 +253,15 @@ through `/power/state`, which issues QMP `query-status` over the shared client.
 
 Findings:
 
-* `POST /power/stop` is accepted as an alias for `force-off`, but on QMP it
-  delegates to QEMU `stop`, which **pauses** the guest. It does not destroy it.
-  The `{"action":"force-off"}` response is therefore semantically misleading;
-  a caller must not treat it as a hard power-off.
+* **Pre-fix:** `POST /power/stop` was accepted as an alias for `force-off`, but
+  on QMP it delegated to QEMU `stop`, which **pauses** the guest. It did not
+  destroy it, so the `{"action":"force-off"}` response was semantically
+  misleading. §0 fixes this by sending QEMU `quit`; the live run above confirms
+  the process exits.
 * `POST /power/off` (ACPI powerdown) and destructive `force-off`/`destroy` were
-  deliberately **not** called. On this OS-less disposable QEMU there is no guest
-  to handle ACPI, and the task preferred stop/on/reset. Hard power-off remains
-  unvalidated.
+  deliberately **not** called in the original run. On this OS-less disposable
+  QEMU there is no guest to handle ACPI, and the task preferred stop/on/reset.
+  §0 exercises both: ACPI leaves QEMU running, hard force-off exits it.
 * No panic, QMP timeout, or failed-command log line appeared during the
   sequence.
 
@@ -217,7 +344,7 @@ All requests used the registered node id
 | Check | Result |
 |---|---|
 | `GET /api/v1/nodes/{id}/power/state` | `200` `{"available":true,"status":"running"}` |
-| `POST /api/v1/nodes/{id}/power/stop` | `200` `{"action":"force-off","ok":true}` |
+| `POST /api/v1/nodes/{id}/power/stop` | `200` `{"action":"force-off","ok":true}` (pre-fix; now exits QEMU, §0.2) |
 | `GET /api/v1/nodes/{id}/power/state` after stop | `200` `{"available":true,"status":"paused"}` |
 | `POST /api/v1/nodes/{id}/power/on` | `200` `{"action":"on","ok":true}` |
 | `GET /api/v1/nodes/{id}/power/state` after on | `200` `{"available":true,"status":"running"}` |
@@ -297,11 +424,12 @@ Cosmetic/integration gaps observed:
 |---|---|---|
 | Disposable QEMU + QMP greeting/query/screendump | **PASS** | TCG, `-display none`, VGA |
 | Node `/power/state` | **PASS** | real QMP `query-status` |
-| Node `POST /power/stop` → pause | **PASS** | QEMU `stop`; state `paused` |
+| Node `POST /power/stop` → pause (pre-fix) | **PASS** | QEMU `stop`; state `paused`; superseded by §0 |
 | Node `POST /power/on` → resume | **PASS** | QEMU `cont`; state `running` |
 | Node `POST /power/reset` | **PASS** | QEMU `system_reset`; state `running` |
 | Invalid power action | **PASS** (400) | typed error |
-| Hard `force-off`/destroy | **SKIP** | not called; QMP `stop` is a pause |
+| Hard `force-off`/destroy | **PASS** (fix, §0.2) | QEMU `quit`; process exits; state typed 502 |
+| ACPI `/power/off` | **PASS** (fix, §0.2) | QEMU stays running on OS-less guest |
 | Controller registration + heartbeat | **PASS** | `last_seen` increased |
 | Controller list/detail | **PASS** | one node, correct ports/caps |
 | Controller power state proxy | **PASS** | 200 `running` |
@@ -315,9 +443,12 @@ Cosmetic/integration gaps observed:
 
 ## 9. Failures and remaining work
 
-1. **Power semantics.** `/power/stop` is named `force-off` in its response but
-   only pauses QEMU. A hard destroy is not implemented on the QMP backend. This
-   must be documented or changed before claiming hard power-off parity.
+1. **Power semantics — resolved in §0.** `/power/stop` used to be named
+   `force-off` in its response while only pausing QEMU. The QMP backend now
+   sends `quit` (hard process exit) for `force-off`/`stop`/`destroy`, and keeps
+   ACPI `system_powerdown` for `off`/`shutdown`/`powerdown`. A hard stop leaves
+   no QEMU for `on` until a supervisor or operator starts a new process; the
+   node reconnects to that new QMP socket.
 2. **Controller shutdown traceback.** On SIGINT the repaired daemon logged:
 
    ```text
@@ -349,7 +480,9 @@ real disposable QMP source. Gate 2 still cannot be claimed because:
 
 * there is **no guest OS**, so guest-visible behavior (ACPI handling, a key or
   pointer observed in a guest, resolution changes) is unproven;
-* hard power-off/destroy was not exercised, and the QMP backend cannot destroy;
+* hard power-off/destroy was not exercised in the original run; §0 now does so
+  on a disposable QEMU (QMP `quit` exits the process). A guest-visible ACPI
+  shutdown and a real VM destroy under libvirt are still unproven;
 * WebRTC negotiation/media, audio, and D-Bus display capture were not exercised
   here and remain separately blocked;
 * controller graceful shutdown/cleanup and the dashboard static/capability gaps

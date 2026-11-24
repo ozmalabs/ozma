@@ -58,6 +58,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
+from state import node_api_headers
+
 log = logging.getLogger("ozma.metrics")
 
 DEFAULT_HISTORY_SIZE = 300    # 5 min at 1s
@@ -183,6 +185,11 @@ class MetricsCollector:
         self._sources: dict[str, MetricSource] = {}
         self._http_pull_configs: list[dict] = []  # URL → source_id mapping
         self._task: asyncio.Task | None = None
+
+    def _node_headers(self, node: Any) -> dict[str, str]:
+        """Bearer header for a node poll; never logged."""
+        fallback = getattr(self._state, "node_api_token", "") or ""
+        return node_api_headers(node, fallback)
 
     async def start(self) -> None:
         self._task = asyncio.create_task(self._collect_loop(), name="metrics-collector")
@@ -339,7 +346,8 @@ class MetricsCollector:
             loop = asyncio.get_running_loop()
             url = f"http://{node.host}:{node.api_port}/agent/metrics"
             def _f():
-                with urllib.request.urlopen(url, timeout=2) as r:
+                req = urllib.request.Request(url, headers=self._node_headers(node))
+                with urllib.request.urlopen(req, timeout=2) as r:
                     return json.loads(r.read())
             data = await loop.run_in_executor(None, _f)
             src.update_batch(data)
@@ -363,7 +371,8 @@ class MetricsCollector:
             try:
                 url = f"http://{node.host}:{node.api_port}{endpoint}"
                 def _f(u=url):
-                    with urllib.request.urlopen(u, timeout=2) as r:
+                    req = urllib.request.Request(u, headers=self._node_headers(node))
+                    with urllib.request.urlopen(req, timeout=2) as r:
                         return json.loads(r.read())
                 data = await loop.run_in_executor(None, _f)
                 for src_key, dst_key in mapping.items():

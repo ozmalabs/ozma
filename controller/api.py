@@ -47,7 +47,7 @@ except (ImportError, Exception):
     _gql_add_graphiql_route = None  # type: ignore[assignment]
     _GRAPHQL_AVAILABLE = False
 
-from state import AppState, NodeInfo
+from state import AppState, NodeInfo, node_api_headers
 from permissions import (
     check_node_permission, check_destructive_warnings, warnings_to_dict,
     get_user_seats, get_user_permission_level, PERMISSION_LEVELS,
@@ -219,6 +219,9 @@ class DirectRegisterRequest(BaseModel):
     vnc_host: str = ""
     vnc_port: str = ""
     api_port: str = ""
+    # Optional node HTTP bearer token (present only when the node uses
+    # --api-token and chooses to send it). Never returned by the API.
+    api_token: str = ""
     audio_type: str = ""
     audio_sink: str = ""
     audio_vban_port: str = ""
@@ -234,7 +237,7 @@ class DirectRegisterRequest(BaseModel):
     pci_devices: str = ""     # JSON-encoded list of PCI addresses (GPU passthrough)
 
 
-def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None, sunshine: Any | None = None, msp_mgr: MSPDashboardManager | None = None, msp_portal: MSPPortalManager | None = None, auto_configure: Any | None = None, cam_connect: Any | None = None, grid: Any | None = None, parental: ParentalControlsManager | None = None, backup_nudge: BackupNudgeService | None = None, dns_filter: Any | None = None, local_proxy: Any | None = None, file_sharing: Any | None = None, zfs: Any | None = None, failover: Any | None = None, ups_monitor: Any | None = None, ddns: Any | None = None, speedtest: Any | None = None, dns_verifier: Any | None = None) -> FastAPI:
+def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManager | None = None, audio: AudioRouter | None = None, controls: ControlManager | None = None, rgb_out: RGBOutputManager | None = None, motion: MotionManager | None = None, bt: BluetoothManager | None = None, kdeconnect: KDEConnectBridge | None = None, wifi_audio: WiFiAudioManager | None = None, captures: DisplayCaptureManager | None = None, paste_typer: PasteTyper | None = None, kbd_mgr: KeyboardManager | None = None, macro_mgr: MacroManager | None = None, sched: Scheduler | None = None, notifier: NotificationManager | None = None, recorder: SessionRecorder | None = None, net_health: NetworkHealthMonitor | None = None, ocr_triggers: OCRTriggerManager | None = None, auto_engine: AutomationEngine | None = None, metrics_collector: MetricsCollector | None = None, screen_mgr: ScreenManager | None = None, codec_mgr: CodecManager | None = None, camera_mgr: CameraManager | None = None, obs_studio: OBSStudioManager | None = None, stream_router: StreamRouter | None = None, guac_mgr: GuacamoleManager | None = None, provision_mgr: ProvisioningManager | None = None, connect: OzmaConnect | None = None, mesh_ca: MeshCA | None = None, sess_mgr: SessionManager | None = None, room_correction: Any = None, testbench: Any = None, agent_engine: Any = None, test_runner: Any = None, auth_config: AuthConfig | None = None, user_manager: UserManager | None = None, service_proxy: ServiceProxyManager | None = None, idp: IdentityProvider | None = None, sharing: SharingManager | None = None, ext_publish: ExternalPublishManager | None = None, node_reconciler=None, update_mgr=None, transcription_mgr=None, discovery=None, doorbell_mgr=None, alert_mgr=None, vaultwarden: VaultwardenManager | None = None, email_security: EmailSecurityMonitor | None = None, cloud_backup: CloudBackupManager | None = None, iot: IoTNetworkManager | None = None, wg: WGPeeringManager | None = None, itsm: ITSMManager | None = None, license_mgr: LicenseManager | None = None, mdm: MDMBridgeManager | None = None, job_queue: JobQueue | None = None, net_scan: NetworkScanManager | None = None, key_store: KeyStore | None = None, dlp: DLPManager | None = None, saas_mgr: SaaSManager | None = None, threat_intel: ThreatIntelligenceEngine | None = None, compliance: ComplianceReportEngine | None = None, cam_rec: Any | None = None, wifi_ap: Any | None = None, router: Any | None = None, backup_tracker: Any | None = None, mobile_cam: Any | None = None, sunshine: Any | None = None, msp_mgr: MSPDashboardManager | None = None, msp_portal: MSPPortalManager | None = None, auto_configure: Any | None = None, cam_connect: Any | None = None, grid: Any | None = None, parental: ParentalControlsManager | None = None, backup_nudge: BackupNudgeService | None = None, dns_filter: Any | None = None, local_proxy: Any | None = None, file_sharing: Any | None = None, zfs: Any | None = None, failover: Any | None = None, ups_monitor: Any | None = None, ddns: Any | None = None, speedtest: Any | None = None, dns_verifier: Any | None = None, node_api_token: str = "") -> FastAPI:
     app = FastAPI(title="Ozma Controller", version="0.1.0")
 
     app.add_middleware(
@@ -249,6 +252,21 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     _auth = auth_config or AuthConfig(enabled=False)
     _signing_key = mesh_ca.controller_keypair if mesh_ca else None
     _verify_key = _signing_key.public_key if _signing_key else None
+
+    # Bearer token for node HTTP APIs. Per-node registration tokens win; then
+    # the controller-wide OZMA_NODE_API_TOKEN. Never log or serialize it.
+    _node_api_token = (node_api_token or getattr(state, "node_api_token", "") or "").strip()
+
+    def _node_headers(node: Any | None = None) -> dict[str, str]:
+        """Authorization header for a node request, or {} when unconfigured."""
+        return node_api_headers(node, _node_api_token)
+
+    def _node_auth_error(status: int) -> str:
+        """Clear, token-free message for a node 401/403."""
+        return (
+            "Node rejected the controller's bearer token "
+            f"(HTTP {status}); configure OZMA_NODE_API_TOKEN to match the node"
+        )
 
     # Paths that don't require authentication
     _AUTH_EXEMPT = {
@@ -1027,6 +1045,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             stream_port=stream_port,
             stream_path=req.stream_path or None,
             api_port=api_port,
+            api_token=req.api_token.strip(),
             audio_type=req.audio_type or None,
             audio_sink=req.audio_sink or None,
             audio_vban_port=int(req.audio_vban_port) if req.audio_vban_port.isdigit() else None,
@@ -1496,7 +1515,8 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         try:
             loop = asyncio.get_running_loop()
             def _fetch() -> dict:
-                with urllib.request.urlopen(url, timeout=5) as r:
+                req = urllib.request.Request(url, headers=_node_headers(node))
+                with urllib.request.urlopen(req, timeout=5) as r:
                     return json.loads(r.read())
             return await loop.run_in_executor(None, _fetch)
         except Exception as e:
@@ -1506,6 +1526,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     async def _proxy_node(node_id: str, path: str, method: str = "GET", body: dict | None = None) -> dict:
         """Proxy a request to a node's HTTP API."""
+        import urllib.error
         import urllib.request
         node = state.nodes.get(node_id)
         if node is None:
@@ -1520,13 +1541,18 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
                 if method == "POST":
                     data = json.dumps(body or {}).encode()
                     req = urllib.request.Request(url, data=data,
-                                                headers={"Content-Type": "application/json"},
+                                                headers={"Content-Type": "application/json",
+                                                         **_node_headers(node)},
                                                 method="POST")
                 else:
-                    req = urllib.request.Request(url)
+                    req = urllib.request.Request(url, headers=_node_headers(node))
                 with urllib.request.urlopen(req, timeout=5) as r:
                     return json.loads(r.read())
             return await loop.run_in_executor(None, _fetch)
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise HTTPException(status_code=502, detail=_node_auth_error(e.code))
+            raise HTTPException(status_code=502, detail=f"Node returned HTTP {e.code}")
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Node unreachable: {e}")
 
@@ -2430,7 +2456,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         node_id = body.get("node_id", "")
         node = state.nodes.get(node_id) if node_id else None
         if node and node.api_port:
-            return await _proxy_to_node(node, "/audio/apply", {"profile_id": profile_id})
+            return await _proxy_to_audio_node(node, "/audio/apply", {"profile_id": profile_id})
         if not room_correction:
             raise HTTPException(status_code=503, detail="Room correction not available")
         ok = await room_correction.apply_correction(profile_id)
@@ -2444,7 +2470,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         node_id = body.get("node_id", "") if body else ""
         node = state.nodes.get(node_id) if node_id else None
         if node and node.api_port:
-            return await _proxy_to_node(node, "/audio/remove", {})
+            return await _proxy_to_audio_node(node, "/audio/remove", {})
         if not room_correction:
             raise HTTPException(status_code=503, detail="Room correction not available")
         await room_correction.remove_correction()
@@ -2459,7 +2485,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         node = state.nodes.get(node_id) if node_id else None
         if not node or not node.api_port:
             raise HTTPException(status_code=400, detail="node_id with api_port required")
-        return await _proxy_to_node(node, "/audio/play", {"track": track, "sink": sink})
+        return await _proxy_to_audio_node(node, "/audio/play", {"track": track, "sink": sink})
 
     @app.post("/api/v1/audio/room-correction/stop")
     async def stop_playback(body: dict) -> dict[str, Any]:
@@ -2468,24 +2494,30 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         node = state.nodes.get(node_id) if node_id else None
         if not node or not node.api_port:
             raise HTTPException(status_code=400, detail="node_id with api_port required")
-        return await _proxy_to_node(node, "/audio/stop", {})
+        return await _proxy_to_audio_node(node, "/audio/stop", {})
 
-    async def _proxy_to_node(node: Any, path: str, body: dict) -> dict:
+    async def _proxy_to_audio_node(node: Any, path: str, body: dict) -> dict:
         """Proxy a JSON POST request to a node's HTTP API."""
+        import urllib.error
         import urllib.request
         url = f"http://{node.host}:{node.api_port}{path}"
+        headers = {"Content-Type": "application/json", **_node_headers(node)}
         try:
             loop = asyncio.get_running_loop()
             payload = json.dumps(body).encode()
             def _do():
                 req = urllib.request.Request(
                     url, data=payload,
-                    headers={"Content-Type": "application/json"},
+                    headers=headers,
                     method="POST",
                 )
                 with urllib.request.urlopen(req, timeout=30) as r:
                     return json.loads(r.read())
             return await loop.run_in_executor(None, _do)
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                return {"ok": False, "status": e.code, "error": _node_auth_error(e.code)}
+            return {"ok": False, "status": e.code, "error": f"Node returned HTTP {e.code}"}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -2681,9 +2713,16 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
                 async with session.post(
                     f"http://{host}:{api_port}{path}",
                     json=body,
+                    headers=_node_headers(node),
                     timeout=_aiohttp.ClientTimeout(total=5),
                 ) as resp:
+                    if resp.status in (401, 403):
+                        raise HTTPException(
+                            status_code=502, detail=_node_auth_error(resp.status)
+                        )
                     return await resp.json()
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=502, detail=str(e))
 
@@ -3440,6 +3479,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
                 async with session.post(
                     f"http://127.0.0.1:{api_port}{path}",
                     json=body,
+                    headers=_node_headers(node),
                     timeout=_aiohttp.ClientTimeout(total=10),
                 ) as resp:
                     data = await resp.read()
@@ -3462,11 +3502,18 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             async with _aiohttp.ClientSession() as session:
                 async with session.get(
                     f"http://127.0.0.1:{api_port}/display/snapshot",
+                    headers=_node_headers(node),
                     timeout=_aiohttp.ClientTimeout(total=10),
                 ) as resp:
+                    if resp.status in (401, 403):
+                        raise HTTPException(
+                            status_code=502, detail=_node_auth_error(resp.status)
+                        )
                     if resp.status == 200 and resp.content_type.startswith("image/"):
                         data = await resp.read()
                         return Response(content=data, media_type="image/jpeg")
+        except HTTPException:
+            raise
         except Exception:
             pass
         raise HTTPException(status_code=503, detail="Snapshot unavailable")
@@ -3975,11 +4022,18 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     f"http://{node.host}:{api_port}/ui/hints?level={level}",
+                    headers=_node_headers(node),
                     timeout=aiohttp.ClientTimeout(total=3),
                 ) as resp:
+                    if resp.status in (401, 403):
+                        raise HTTPException(
+                            status_code=502, detail=_node_auth_error(resp.status)
+                        )
                     if resp.status == 200:
                         return await resp.json()
                     return {"error": f"Agent returned {resp.status}"}
+        except HTTPException:
+            raise
         except Exception as e:
             return {"error": f"Agent not reachable: {e}", "hint": "Agent may not be installed on target machine"}
 
@@ -4206,7 +4260,8 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     # --- Codec endpoints ---
 
     async def _proxy_node_codec(
-        method: str, endpoint: tuple[str, int], body: dict | None = None
+        method: str, endpoint: tuple[str, int], body: dict | None = None,
+        node: Any | None = None,
     ) -> JSONResponse:
         """Proxy a codec request to a remote node's HTTP API.
 
@@ -4219,12 +4274,13 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
         host, port = endpoint
         url = f"http://{host}:{port}/codec"
+        headers = _node_headers(node)
         try:
             async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
                 if method == "POST":
-                    resp = await client.post(url, json=body or {})
+                    resp = await client.post(url, json=body or {}, headers=headers)
                 else:
-                    resp = await client.get(url)
+                    resp = await client.get(url, headers=headers)
         except httpx.TimeoutException:
             raise HTTPException(status_code=502, detail="Node codec request timed out")
         except httpx.HTTPError as e:
@@ -4291,7 +4347,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if endpoint:
             # `hls-remote` encoders live on the node; pass its honest status
             # through instead of reporting controller-local probe data.
-            return await _proxy_node_codec("GET", endpoint)
+            return await _proxy_node_codec("GET", endpoint, node=state.nodes.get(node_id))
         stats = streams.get_stream_stats(node_id)
         override = streams._codec_overrides.get(node_id)
         ocr_mode = node_id in streams._ocr_nodes
@@ -4330,7 +4386,9 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if endpoint:
             # Forward the controller's CodecConfig shape; the node evaluates it
             # against its own encoders and returns typed 400/502 errors.
-            result = await _proxy_node_codec("POST", endpoint, cfg.to_dict())
+            result = await _proxy_node_codec(
+                "POST", endpoint, cfg.to_dict(), node=state.nodes.get(node_id)
+            )
             if result.status_code < 400:
                 try:
                     payload = json.loads(result.body or b"{}")
@@ -5612,7 +5670,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         snapshot_url = f"http://127.0.0.1:{node.api_port}/display/snapshot"
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(snapshot_url)
+                resp = await client.get(snapshot_url, headers=_node_headers(node))
                 if resp.status_code == 200:
                     return Response(content=resp.content, media_type="image/jpeg",
                                     headers={"Content-Disposition": f"inline; filename=\"{node_id}.jpg\""})

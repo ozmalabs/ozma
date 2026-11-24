@@ -74,6 +74,32 @@ pub enum PowerError {
     InvalidState(String),
 }
 
+impl PowerError {
+    /// Stable machine-readable kind for HTTP/API responses and logs.
+    ///
+    /// The display string is for humans; this value lets a controller
+    /// distinguish, for example, a refused/closed QMP connection from an
+    /// unsupported operation without parsing prose.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Unsupported(_) => "unsupported",
+            Self::NotConnected => "not-connected",
+            Self::InvalidConfig { .. } => "invalid-config",
+            Self::MissingCommand { .. } => "missing-command",
+            Self::Spawn { .. } => "spawn",
+            Self::CommandFailed { .. } => "command-failed",
+            Self::Qmp(error) => match error {
+                QmpError::Command { .. } => "qmp-command",
+                QmpError::ConnectionClosed => "qmp-closed",
+                QmpError::Connect { .. } => "qmp-connect",
+                QmpError::Timeout { .. } => "qmp-timeout",
+                _ => "qmp",
+            },
+            Self::InvalidState(_) => "invalid-state",
+        }
+    }
+}
+
 impl From<QmpError> for PowerError {
     fn from(error: QmpError) -> Self {
         match error {

@@ -113,8 +113,8 @@ impl QmpPower {
 
     async fn stop_command(&self) -> Result<(), PowerError> {
         match &self.client {
-            QmpHandle::Owned(client) => Ok(client.stop().await?),
-            QmpHandle::Shared(shared) => Ok(shared.stop().await?),
+            QmpHandle::Owned(client) => Ok(client.quit().await?),
+            QmpHandle::Shared(shared) => Ok(shared.quit().await?),
         }
     }
 }
@@ -149,13 +149,16 @@ impl PowerBackend for QmpPower {
         self.reset_command().await
     }
 
-    /// Delegate to QEMU's `stop` command.
+    /// Force the VM off by terminating QEMU (`quit`).
     ///
-    /// QEMU's `stop` **pauses** the guest; it does not force a power cut. The
-    /// Python QMP power backend has the same limitation (it exposes no `stop`
-    /// method at all, so `force-off` falls back to ACPI powerdown). Use
-    /// [`crate::LibvirtPower`] for a real `destroy`, or extend `ozma-qmp` with
-    /// QEMU's `quit` command before treating this as a hard power-off.
+    /// QEMU's `quit` command exits the emulator process, matching the trait's
+    /// destroy/force-off contract. It is not an ACPI request: the guest gets no
+    /// chance to flush or shut down. Use [`QmpPower::system_powerdown`] for an
+    /// orderly guest-requested shutdown.
+    ///
+    /// After a successful call the control connection is gone; the node must
+    /// start a new QEMU (or reconnect to the restarted server) before querying
+    /// or sending another power command.
     async fn stop(&mut self) -> Result<(), PowerError> {
         self.stop_command().await
     }

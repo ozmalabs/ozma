@@ -38,7 +38,7 @@ and QSV/V4L2M2M after a real encode check.
 | `queen` kernel | `6.8.0-147-generic` x86_64 (Ubuntu 24.04) |
 | `queen` ffmpeg | 6.1.1-3ubuntu5 (`/usr/bin/ffmpeg`) |
 | `queen` GPU driver | NVIDIA 610.57.04, CUDA UMD 13.3 |
-| Temp dirs | `/tmp/opencode/ozma-gate2-hw`, `/tmp/queen-nvenc-*` (removed) |
+| Temp dirs | `/tmp/opencode/ozma-gate2-hw`, `/tmp/queen-nvenc-*`, `/tmp/ozma-gate2-queen` (all removed) |
 | Ports | HTTP 47333–47350, HID 60333–60350 (released) |
 
 ## 2. Device and tool inventory
@@ -190,9 +190,99 @@ seg_00000.ts
 
 **What this proves:** NVENC H.264 and HEVC really encode the node's argv,
 including `-preset p4 -tune ll -rc cbr`, the GOP/`force_key_frames` shape, and
-the chroma fix. **What it does not prove:** a full `ozma-node` NVENC run on
-`queen`; that binary has no HLS flags. No current binary/source was copied or
-built there.
+the chroma fix. It did not, by itself, prove the full node wrapper. That was
+completed in §4.3 with the current local binary copied to `queen`; `queen`'s
+checked-out binary predates `--hls`.
+
+### 4.3 Full-node NVENC on `queen`
+
+`queen`'s `/applications/data/projects/ozma` checkout is HEAD `79b41c73`
+(2026-04-14) and its binary has no `--hls`/`--hls-encoder`, so the current local
+`target/debug/ozma-node` was copied instead:
+
+| Item | Value |
+|---|---|
+| Binary | local `target/debug/ozma-node`, 282,311,152 B, built 2026-11-24 15:19 AEDT |
+| Compatibility | max GLIBC 2.39; `queen` has Ubuntu GLIBC 2.39; all shared libs resolved |
+| Provenance | built from the local working tree that already contained the NVENC registry detection (later committed locally as `27ccbe1`); not rebuilt after that commit |
+| `queen` copy | `/tmp/ozma-gate2-queen/ozma-node` (removed after the run) |
+| QEMU | 8.2.2, TCG, disposable VGA + one QMP socket |
+| Node options | `--profile vm --qmp-socket ... --input-provider recording --power-provider qmp --cap video --hls --hls-fps 5 --hls-bitrate-kbps 1000` |
+| Encoders | `--hls-encoder h264_nvenc`/`hevc_nvenc`; `/codec` with `hw_accel:"nvenc"` |
+
+Disposable VM and node:
+
+```bash
+qemu-system-x86_64 -name ozma-gate2-queen -machine pc,accel=tcg -m 256 \
+  -nodefaults -device VGA -display none \
+  -qmp unix:/tmp/ozma-gate2-queen/qmp.sock,server=on,wait=off \
+  -pidfile /tmp/ozma-gate2-queen/qemu.pid -daemonize
+
+OZMA_TEST_NVENC_GPU=0 /tmp/ozma-gate2-queen/ozma-node \
+  --name ozma-queen-nvenc --profile vm \
+  --qmp-socket /tmp/ozma-gate2-queen/qmp.sock \
+  --input-provider recording --power-provider qmp --cap video \
+  --http-port 47468 --hid-udp-port 60468 \
+  --hls --hls-dir /tmp/ozma-gate2-queen/hls --hls-fps 5 \
+  --hls-bitrate-kbps 1000 --hls-encoder h264_nvenc \
+  --ffmpeg-bin /tmp/ozma-gate2-queen/ffmpeg-gpu.py
+```
+
+The node has no NVENC GPU-selector flag, so a test-only `--ffmpeg-bin` wrapper
+inserted `-gpu <N>` immediately after `-c:v h264_nvenc|hevc_nvenc` and
+`exec`ed `/usr/bin/ffmpeg`. No node code was changed for this; the wrapper is
+part of the disposable test harness.
+
+Results (both codecs through the CLI and `/codec`, both GPUs):
+
+| nvidia-smi GPU | UUID | CLI start | `/codec` request | `applied` | Segment after restart |
+|---|---|---|---|---|---|
+| RTX 3090 (index 1) | `GPU-84baadff…` | `h264_nvenc` | `{"codec":"hevc","hw_accel":"nvenc"}` | **true**, HTTP 200 | hevc **Main**, 720x400, **yuv420p**, 5/1, 5 frames, 1.000000 s |
+| GTX 1660 (index 0) | `GPU-e88e2536…` | `hevc_nvenc` | `{"codec":"h264","hw_accel":"nvenc"}` | **true**, HTTP 200 | h264 **Main**, 720x400, **yuv420p**, 5/1, 5 frames, 1.000000 s |
+
+The GPU was identified by correlating the node's live ffmpeg child PID with
+`nvidia-smi --query-compute-apps=pid,gpu_uuid`, not by the `-gpu` number alone.
+On this host CUDA ordinals are reversed relative to nvidia-smi indices:
+`-gpu 0` (and `CUDA_VISIBLE_DEVICES=0`) selected the RTX 3090 (UUID 84ba),
+while `-gpu 1` selected the GTX 1660 (UUID e88e).
+
+`/stream` was fetched over HTTP from the node:
+
+```text
+GET /stream/stream.m3u8  -> 200 (playlist; first segment listed)
+GET /stream/seg_00000.ts -> 200, h264 Main 720x400 yuv420p, 5 frames, 1.000 s
+POST /codec hevc+nvenc   -> 200 applied:true, encoder hevc_nvenc
+GET /stream/seg_00018.ts -> 200, hevc Main 720x400 yuv420p, 5 frames, 1.000 s
+GET /stream/seg_00017.ts -> 200, h264 Main 720x400 yuv420p, 5 frames, 1.000 s
+```
+
+After the HEVC restart, `/api/v1/connection` reported
+`available:["h264","hevc"]`, `backends:["software","nvenc"]`,
+`current_encoder:"hevc_nvenc"`, `applied:true`, `pending_restart:false`.
+
+Honesty checks:
+
+- `POST /codec {"codec":"h264","hw_accel":"qsv"}` → HTTP 400
+  `encoder.unavailable` / `requested_backend_unavailable`; the HEVC NVENC
+  pipeline stayed `running`. No silent fallback.
+- `POST /codec {"codec":"hevc","hw_accel":"hevc_nvenc"}` → HTTP 400
+  `invalid_request`: `hw_accel` accepts the alias `nvenc`, not an ffmpeg
+  encoder name. The error lists the real advertised capabilities.
+- The `/codec` restart returned `applied:true` only after the node's hardware
+  runtime probe encoded a segment, and a post-restart segment fetched over
+  `/stream` decoded as the requested codec.
+
+Local test evidence for the same tree:
+
+```text
+cargo test -p ozma-node --lib hls::
+  test result: ok. 34 passed; 0 failed; 1 ignored
+cargo test -p ozma-node --lib controller_compat::tests::codec
+  test result: ok. 13 passed; 0 failed; 0 ignored
+cargo test -p ozma-encode
+  lib: 68 passed; 0 failed; 0 ignored
+  integration: 17 passed; 0 failed; 0 ignored
+```
 
 ## 5. Live local node HLS runs
 
@@ -266,6 +356,11 @@ Three seconds after that response `/api/v1/connection` still reported
 `"hls":"running"`, `"applied":false`, `"current_encoder":"h264"`. Before the
 fix the same request returned `applied:true, hls:"running"` and then the
 pipeline died.
+
+> These local `/codec` rows were captured before the §6.4 registry
+> advertisement fix. On the current binary and on `queen`, `/codec` advertises
+> software H.264 plus device-proven VAAPI/NVENC H.264+HEVC; the full-node NVENC
+> evidence is in §4.3.
 
 ## 6. Bugs found and fixed
 
@@ -426,10 +521,11 @@ checks fail, matching §7.2 and §7.3.
 
 ## 7. Remaining hardware gaps and findings
 
-1. **No local NVIDIA device.** NVENC is validated on `queen` only. A full
-   `ozma-node --hls-encoder h264_nvenc` run on `queen` was not possible because
-   its checked-out binary predates `--hls`. The exact current argv is validated
-   there; the node wrapper is not.
+1. **No local NVIDIA device; full-node NVENC is now validated on `queen`.**
+   The full wrapper (`--hls-encoder h264_nvenc`/`hevc_nvenc` and
+   `POST /codec` with `hw_accel:"nvenc"`) ran on both the GTX 1660 and RTX 3090
+   using the copied current binary (§4.3). The remaining local gap is that all
+   NVENC evidence is remote.
 2. **QSV fails locally.** ffmpeg lists `h264_qsv`/`hevc_qsv`, `vainfo` shows
    VAAPI encode, but oneVPL/MFX returns `Error creating a MFX session: -9`
    (device creation failed). QSV argv/rate control therefore remains
@@ -463,19 +559,33 @@ checks fail, matching §7.2 and §7.3.
 7. **Probe dimensions are 320x240.** The VAAPI and QSV/V4L2M2M checks prove the
    device/driver and encoder wrapper, not 1080p/4K, HEVC 10-bit, or HDR. The
    advertised envelope remains 1920x1080 at 60 fps; larger frames need a
-   device-specific run. NVENC is validated only on `queen` at 720x400, and its
-   registry advertisement relies on the listing plus a CUDA/NVML node, with the
-   HLS runtime probe before `applied:true`.
+   device-specific run. Full-node NVENC is validated on both `queen` GPUs at
+   720x400, 5 fps, 1 Mbps. Its registry advertisement relies on the ffmpeg
+   listing plus a CUDA/NVML node; the HLS runtime probe is the gate before
+   `applied:true`. NVENC rate-control accuracy (CBR adherence) and 10-bit/HDR
+   remain unmeasured.
 8. **Post-probe failure is still possible.** `applied:true` now requires a real
    probe segment, but a device that disappears after the probe can still make
    the live pipeline fail later; `/api/v1/connection` then reports `failed`.
    The probe narrows, but does not eliminate, that window.
-9. **No browser/controller playback.** Segments were validated with `ffprobe`;
-   no live HTTP `/stream/*` playback, controller proxy, or browser decode was
-   run for hardware HLS.
+9. **No browser/controller playback.** Segments were fetched over the node's
+   real HTTP `/stream/*` route on `queen` and decoded with `ffprobe`; no
+   browser, GStreamer, or controller-proxy decode session was run for hardware
+   HLS.
 10. **Probe cost.** A hardware start/restart now blocks for one short encode
     (bounded at 10 s) before reporting success. On this host it completed in
     well under a second for VAAPI.
+11. **No node NVENC GPU selector.** The node exposes no `--nvenc-gpu`/`-gpu`
+    flag, so the two-GPU run injected `-gpu` through a test-only
+    `--ffmpeg-bin` wrapper. CUDA ordinals were reversed relative to nvidia-smi
+    indices on `queen` (`-gpu 0` → RTX 3090, `-gpu 1` → GTX 1660), so a raw
+    device number is not self-describing. This is a usability gap for
+    multi-GPU hosts, not a correctness gap.
+12. **Binary provenance for the full-node run.** The copied binary was built
+    from the local working tree immediately before local commit `27ccbe1` and
+    was not rebuilt after that commit. Its `/codec` output already showed the
+    NVENC registry detection, but a rebuild and re-run at the final HEAD is
+    still the clean reproducibility step.
 
 ## 8. Cleanup
 
@@ -492,12 +602,19 @@ Local:
 
 `queen`:
 
-- `ssh -o BatchMode=yes -J ha.hrdwrbob.net matt@queen` was used. No package,
-  driver, service, or repository change was made.
+- SSH used `-J ha.hrdwrbob.net matt@queen` with a temporary
+  `UserKnownHostsFile` under `/tmp`; that file was removed locally. No
+  package, driver, service, or repository change was made.
 - `/tmp/queen-nvenc-*` was removed by the remote `trap`; no test ffmpeg
   processes remain.
-- The temporary `queen` host-key entry created for this run was removed from
-  the local `~/.ssh/known_hosts`; `ssh-keygen` rotated its `.old` backup file.
+- Full-node follow-up: `/tmp/ozma-gate2-queen` (copied binary, `ffmpeg-gpu.py`
+  test wrapper, QEMU pid/socket, HLS dirs, fetched segments, logs) was removed
+  after killing the disposable QEMU and all test nodes. Ports
+  47460–47469/TCP and 60460–60469/UDP are free. `queen`'s repo status was
+  unchanged; nothing under `/applications/data/projects/ozma` was edited.
+- The earlier temporary `queen` host-key entry was removed from the local
+  `~/.ssh/known_hosts`; `ssh-keygen` rotated its `.old` backup file. The
+  follow-up avoided a persistent known_hosts entry entirely.
 
 > Note: cleanup first used a broad `pkill` pattern that also matched an
 > unrelated disposable test node (`ozma-gate2-dbusupdate`, HTTP 47337). That

@@ -12,9 +12,17 @@ no `/dev/snd`. Controller/dashboard is **SKIP** because an unrelated controller
 from another session owns the controller's fixed auxiliary ports and
 `/dev/video0`; starting a second one would interfere.
 
+**Post-fix status (2026-11-24 17:16–17:19 AEDT):** the HLS resolution-change
+failure in §9 is now **fixed and live-verified** on the same disposable Alpine
+guest. Three node-issued resets reproduced `1280x800 -> 720x400 -> 1280x800`
+each time; HLS stayed `running`, the playlist advanced across two
+`#EXT-X-DISCONTINUITY` markers per reset, and old/new segments decoded at
+720x400 and 1280x800 respectively. See [§0](#0-post-fix-live-rerun). The
+pre-fix sections below are retained as history.
+
 **This is not a Gate 2 claim.** It closes the previous "no guest OS" blocker for
-the paths below, but the HLS resolution-change failure in §9 and the audio,
-mouse-pointer, controller/dashboard, and WebRTC-media gaps remain.
+the paths below. Audio, mouse-pointer, controller/dashboard, D-Bus live
+mode-transition rerun, and WebRTC-media gaps remain.
 
 > No `sudo`, no libvirt domain, no `virsh` mutating verb, no network download,
 > and no package install were used. The only VM was a direct headless QEMU
@@ -22,6 +30,223 @@ mouse-pointer, controller/dashboard, and WebRTC-media gaps remain.
 > existing libvirt image was opened for write. The original ISO/hash is
 > unchanged. All QEMU/node processes, sockets, ports, and temporary files were
 > removed; see [Cleanup](#cleanup).
+
+## 0. Post-fix live rerun
+
+**Result: PASS for the QMP HLS resolution-change path.** The same read-only
+Alpine live ISO was booted with QMP/VGA/serial, the node ran with shared QMP and
+`--input-provider recording --power-provider qmp --hls --hls-fps 5`, and the
+guest was reset three times with `POST /power/reset`. Each reset reproduced
+`1280x800 -> 720x400 -> 1280x800`; HLS stayed `running`, the playlist advanced
+with a `#EXT-X-DISCONTINUITY` at both switches, and segments decoded at their
+own resolutions.
+
+### 0.1 Build and run metadata
+
+| Item | Value |
+|---|---|
+| Run | 2026-11-24 17:16–17:19 AEDT (2026-11-24T06:16–06:19Z) |
+| HEAD | `27ccbe1113b840ddf05436bc0cf88e9b4cc4d514` (`27ccbe1`) |
+| Build | `cargo build -p ozma-node` exited 0; Cargo reported the crate up to date |
+| Node binary | `target/debug/ozma-node`, 282,311,152 bytes, `ozma-node 0.1.0` |
+| QEMU | `qemu-system-x86_64` 11.1.3, KVM (`accel=kvm:tcg`) |
+| ffmpeg | n9.1 |
+| Guest | Alpine Linux 3.21 live, kernel `6.12.13-0-virt`, root in tmpfs |
+| Temp root | `/tmp/opencode/ozma-gate2-guest-postfix-20261124-171636` (removed) |
+| Node ports | HTTP 47341, QUIC/UDP 47343, HID/UDP 60341 |
+
+The working tree was dirty from concurrent sessions (controller, power, QMP,
+and docs edits). This rerun did not edit or commit those files; it only updated
+this report.
+
+### 0.2 Boot and node command
+
+```bash
+ROOT=/tmp/opencode/ozma-gate2-guest-postfix-20261124-171636
+ISO='/home/matt/ozma/ozmanew/demo/cache/alpine-virt-3.21.3-x86_64.iso'
+xorriso -osirrox on -indev "$ISO" \
+  -extract /boot/vmlinuz-virt "$ROOT/qemu/vmlinuz-virt" \
+  -extract /boot/initramfs-virt "$ROOT/qemu/initramfs-virt"
+
+qemu-system-x86_64 \
+  -name ozma-gate2-guest-postfix \
+  -machine pc,accel=kvm:tcg -cpu host -smp 2 -m 512 \
+  -nodefaults \
+  -kernel "$ROOT/qemu/vmlinuz-virt" \
+  -initrd "$ROOT/qemu/initramfs-virt" \
+  -append "console=ttyS0 console=tty0 modules=loop,squashfs,sd-mod,usb-storage alpine_dev=cdrom" \
+  -drive "file=$ISO,media=cdrom,readonly=on" \
+  -device VGA -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
+  -display none \
+  -serial "file:$ROOT/qemu/serial.log" \
+  -qmp "unix:$ROOT/qemu/qmp.sock,server=on,wait=off" \
+  -pidfile "$ROOT/qemu/qemu.pid" -daemonize
+
+./target/debug/ozma-node \
+  --name ozma-gate2-guest-postfix \
+  --profile vm \
+  --qmp-socket "$ROOT/qemu/qmp.sock" \
+  --input-provider recording \
+  --power-provider qmp \
+  --http-port 47341 \
+  --hid-udp-port 60341 \
+  --cap hid,video \
+  --hls \
+  --hls-dir "$ROOT/node/hls" \
+  --hls-fps 5 \
+  --hls-bitrate-kbps 1000 \
+  --ffmpeg-bin /usr/bin/ffmpeg
+```
+
+Baseline before reset: `/display/snapshot` was a valid 1280×800 JPEG (97,897
+bytes, SHA-256 `78247e0e…2519`); `/api/v1/connection` reported
+`hls: "running"`, `hls_error: null`, `power.status: "running"`.
+
+### 0.3 Live reset transitions
+
+Three resets were issued through the node:
+
+```bash
+curl -sS -X POST http://127.0.0.1:47341/power/reset
+# {"action":"reset","ok":true}
+```
+
+| Reset | Start time | Observed sequence | HLS status |
+|---|---|---|---|
+| 1 | 06:17:11Z | 1280×800 → 720×400 → 1280×800 | `running` throughout |
+| 2 | 06:17:58Z | 1280×800 → 720×400 → 1280×800 | `running` throughout |
+| 3 | 06:18:49Z | 1280×800 → 720×400 → 1280×800 | `running` throughout |
+
+A 50 ms `/proc/*/cmdline` watcher captured the restart command. The 720×400
+generation was:
+
+```text
+/usr/bin/ffmpeg -hide_banner -loglevel warning -f rawvideo -pix_fmt rgb24 \
+  -s 720x400 -r 5 -i - -an -c:v libx264 -preset veryfast -tune zerolatency \
+  -b:v 1000k -pix_fmt yuv420p -g 5 -keyint_min 5 -sc_threshold 0 \
+  -force_key_frames expr:gte(t,n_forced*1) -f hls -hls_time 1 -hls_list_size 4 \
+  -hls_flags delete_segments+append_list+discont_start \
+  -hls_segment_filename .../node/hls/seg_%05d.ts .../node/hls/stream.m3u8
+```
+
+The generation before and after it used `-s 1280x800` with the same flags. The
+resumed 1280×800 generation was the live ffmpeg child after each reset.
+
+### 0.4 Playlist and discontinuity evidence
+
+Playlist snapshot from the first reset, with both switches:
+
+```text
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:1
+#EXT-X-MEDIA-SEQUENCE:19
+#EXTINF:1.000000,
+seg_00019.ts
+#EXT-X-DISCONTINUITY
+#EXTINF:1.000000,
+seg_00020.ts
+#EXTINF:1.000000,
+seg_00021.ts
+#EXT-X-DISCONTINUITY
+#EXTINF:1.000000,
+seg_00022.ts
+```
+
+Playlist snapshot from the second reset:
+
+```text
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:1
+#EXT-X-MEDIA-SEQUENCE:65
+#EXTINF:1.000000,
+seg_00065.ts
+#EXT-X-DISCONTINUITY
+#EXTINF:1.000000,
+seg_00066.ts
+#EXTINF:1.000000,
+seg_00067.ts
+#EXT-X-DISCONTINUITY
+#EXTINF:1.000000,
+seg_00068.ts
+```
+
+The monitor recorded media-sequence advance from 14 to 36 during the first
+20-second window and from 65 to 79 during the second. The discontinuity lines
+scrolled out of the 4-segment live window after the switch; the snapshots above
+are the live playlists at the transition.
+
+### 0.5 Segment resolutions (ffprobe)
+
+| Segment | Resolution | Size | SHA-256 |
+|---|---|---|---|
+| `seg_00065.ts` | h264 1280×800 | 98,324 | `34d00bdd…2cf7` |
+| `seg_00066.ts` | h264 720×400 | 283,880 | `46c79f3d…fd42` |
+| `seg_00067.ts` | h264 720×400 | 175,216 | `e3728a4a…5f08` |
+| `seg_00068.ts` | h264 1280×800 | 84,224 | `48998a69…4c17` |
+
+The first reset produced the same pattern with `seg_00019.ts` (1280×800),
+`seg_00020.ts`/`seg_00021.ts` (720×400), and `seg_00022.ts` (1280×800). Every
+archived segment was a valid MPEG-TS with one H.264 video stream.
+
+Frame OCR from the second reset:
+
+```text
+seg_00065.ts (1280x800): Alpine boot/login console
+seg_00066.ts (720x400):  SeaBIOS (version Arch Linux 1.17.0-2-2)
+seg_00068.ts (1280x800): Alpine kernel boot: Mounting modloop ... [ ok ]
+```
+
+This proves both directions: the pipeline scaled down `1280x800 -> 720x400`
+and back up `720x400 -> 1280x800` on every reset.
+
+### 0.6 Snapshots across the transition
+
+A 150 ms snapshot poller run across the third reset captured:
+
+| Time after reset | Snapshot | Size |
+|---|---|---|
+| 0.159 s | `snapshot_1280x800.jpg`, valid JPEG | 97,887 bytes |
+| 2.183 s | `snapshot_720x400.jpg`, valid JPEG; OCR `SeaBIOS` | 8,336 bytes |
+| after reset | `after-reset3.jpg`, valid JPEG 1280×800 | 97,897 bytes |
+
+Hashes: 1280×800 `485db7e8…de7`; 720×400 `d2c7c013…5f35`. All were real JFIF
+JPEGs, not empty placeholders. Snapshots did not fail while HLS was restarting.
+
+### 0.7 HLS status and harness
+
+A 200 ms connection poller recorded `hls: "running"`, `hls_error: null`, and
+`power.status: "running"` for the entire window before and after all resets;
+there was no `failed` interval. The node log had no `error`, `fail`, or `panic`
+lines.
+
+After the resets, `scripts/gate2/check-node.sh` passed:
+
+```text
+PASS  /health returned 200 and ok=true
+PASS  /api/v1/connection returned 200 ... (profile 'vm')
+PASS  /power/state reports available=true (status 'running')
+PASS  /stream/stream.m3u8 returned 200 and starts with #EXTM3U
+PASS  HLS playlist advanced within 1s
+SKIP  WebRTC offer POST disabled (OZMA_GATE2_SKIP_WEBRTC_OFFER=1)
+SKIP  controller checks disabled (OZMA_CONTROLLER_URL is not set)
+Summary: 5 passed, 0 failed, 0 warnings, 2 skipped
+```
+
+### 0.8 Post-fix cleanup
+
+| Item | Final state |
+|---|---|
+| QEMU (PID 4169498) | `quit`; exited |
+| Node and HLS ffmpeg | SIGINT; node logged `Ozma node shutting down`; ffmpeg reaped |
+| Temp root `/tmp/opencode/ozma-gate2-guest-postfix-20261124-171636` | removed |
+| Monitor/helper scripts | removed |
+| Ports 47341/47343/60341 | no listeners |
+| Original Alpine ISO | unchanged; SHA-256 `f28171c3…90f2d` |
+
+No `sudo`, no writable disk, no libvirt domain, no network download, and no
+commit were used. The only repository change from this rerun is this report.
 
 ## 1. Run metadata
 
@@ -184,7 +409,7 @@ node route, not just `{"ok":true}`.
 Note: `/power/stop` is still labelled `force-off` but QMP `stop` is a pause, not
 a destroy. Hard power-off/destroy was not tested.
 
-## 6. Node shared-QMP, snapshot, and HLS — PASS with a reset caveat
+## 6. Node shared-QMP, snapshot, and HLS — PASS (historical pre-fix reset caveat)
 
 Node command:
 
@@ -232,8 +457,8 @@ localhost:™#
 That is HLS content derived from the running guest's display, not a static
 placeholder.
 
-**Reset caveat / failure:** after the guest was reset by the node, the next
-`check-node.sh` run failed with:
+**Historical pre-fix reset failure:** after the guest was reset by the node,
+the then-current node failed with:
 
 ```text
 FAIL  HLS is configured but failed: frame dimensions 720x400 do not match the HLS input 1280x800
@@ -255,7 +480,9 @@ SKIP  controller checks disabled (OZMA_CONTROLLER_URL is not set)
 Summary: 5 passed, 0 failed, 0 warnings, 2 skipped
 ```
 
-The failure is retained as a finding in §9; it is not hidden by the later pass.
+The failure is retained as the historical pre-fix finding in §9; it is not
+hidden by the later pass. The post-fix live rerun in §0 now passes the same
+`1280x800 -> 720x400 -> 1280x800` transition without a node restart.
 
 ## 7. D-Bus display — PASS for snapshots and post-boot HLS
 
@@ -312,17 +539,18 @@ localhost:™#
 
 D-Bus HLS segment `seg_00024.ts` was 119,004 bytes, H.264 1280×800.
 
-**Startup caveat / failure:** the first D-Bus node start happened while the
-guest was still in the initial 640×480 VGA mode. It logged console properties
-`640x480`, then received 1280×800 frames and failed HLS with:
+**Historical pre-fix startup failure (D-Bus):** the first D-Bus node start
+happened while the guest was still in the initial 640×480 VGA mode. It logged
+console properties `640x480`, then received 1280×800 frames and failed HLS with:
 
 ```text
 hls_error: "frame dimensions 1280x800 do not match the HLS input 640x480"
 ```
 
 Stopping and restarting the node after boot (at 1280×800) made D-Bus HLS run.
-This is the same resolution-change limitation as §6, seen from the D-Bus
-provider.
+This was the same resolution-change limitation as §6, seen from the D-Bus
+provider. It was **not re-run** in the post-fix follow-up, which covered the QMP
+reset path only; D-Bus mode-change tolerance remains unproven live.
 
 ## 8. Audio — SKIP
 
@@ -351,9 +579,12 @@ still unproven.
    appends to the existing playlist with
    `-hls_flags delete_segments+append_list+discont_start`, marks the switch as
    `#EXT-X-DISCONTINUITY`, and rebases `FramePacer`. Pinned dimensions instead
-   produce a typed `HlsError::FrameDimensions`. This is covered by fake-spawner
-   unit tests only; a live guest rerun is still required. The failure above
-   remains the last live result for this path.
+   produce a typed `HlsError::FrameDimensions`. **Post-fix live result
+   (2026-11-24 17:16–17:19 AEDT):** three QMP resets each reproduced
+   `1280x800 -> 720x400 -> 1280x800`; HLS stayed `running`, the playlist
+   advanced across two discontinuities per reset, and segments decoded at
+   720x400 and 1280x800. See [§0](#0-post-fix-live-rerun). The paragraph above
+   remains the historical pre-fix finding.
 2. **QMP preflight cannot connect while the node holds the socket.** With the
    node running, `scripts/gate2/qemu-preflight.sh` reported:
    `QMP control socket ... exists but did not answer with a QMP greeting`.
@@ -385,12 +616,13 @@ still unproven.
 | Node QMP input visible in guest | **PASS** | `echo ozma-node-input` in snapshot/HLS |
 | Node shared QMP + snapshot | **PASS** | one client, 1280×800 JPEG |
 | Node HLS from guest | **PASS** (before reset) | `seg_00050.ts`, h264 1280×800, OCR |
-| HLS across guest reset | **FAIL (pre-fix)** | 720×400 vs 1280×800 dimension error |
+| HLS across guest reset | **PASS (post-fix)** | 3 resets, `1280x800 -> 720x400 -> 1280x800`, two discontinuities per reset; see §0 |
+| Snapshots during/after resolution change | **PASS (post-fix)** | valid 1280×800 and 720×400 JPEGs during the third reset |
 | Manual QMP pause/resume/reset | **PASS** | frozen serial/screen, resume, reboot |
 | Node power stop/on/reset | **PASS** | paused → running, marker after resume, reboot |
 | D-Bus snapshot of guest | **PASS** | 1280×800 JPEG, login OCR |
 | D-Bus HLS after boot | **PASS** | `seg_00024.ts`, h264 1280×800, OCR |
-| D-Bus HLS during/after mode change | **FAIL (pre-fix)** | 640×480 vs 1280×800 dimension error |
+| D-Bus HLS during/after mode change | **FAIL (pre-fix), not rerun** | 640×480 vs 1280×800 dimension error; the post-fix run covered QMP resets only |
 | Audio | **SKIP** | no audio device/backend; no `/dev/snd` |
 | Mouse pointer | **SKIP** | text console has no pointer artifact |
 | Controller/dashboard | **SKIP** | unrelated controller owns aux ports and `/dev/video0` |
@@ -424,10 +656,10 @@ Guest-visible display, keyboard input, pause/resume/reset, node snapshots, and
 QMP/D-Bus HLS have now been demonstrated on a real Alpine guest. Gate 2 still
 cannot be claimed end to end because:
 
-* HLS resolution-change handling is fixed in code and unit-tested, but the
-  guest-reset and D-Bus mode-change paths have not been re-run live since the
-  restart/append-list fix; until that rerun, a live guest cannot be claimed to
-  survive a resolution change;
+* HLS resolution-change handling is fixed and the **QMP guest-reset path is
+  now live-verified** (§0); the D-Bus startup/mode-change path has not been
+  re-run live since the restart/append-list fix, so D-Bus HLS across a mode
+  change remains unproven;
 * audio was not produced or captured;
 * mouse-pointer behavior was not guest-visible on a text console;
 * the unmodified controller/dashboard was not run against this guest in this
@@ -437,7 +669,7 @@ cannot be claimed end to end because:
   outstanding from the earlier reports;
 * hard power-off/destroy remains untested and `/power/stop` is a pause.
 
-## 13. Resolution-change fix and required rerun
+## 13. Resolution-change fix and live verification
 
 The failure recorded in §6 and §9 (finding 1) is addressed in
 `ozma-node/src/hls.rs`:
@@ -458,9 +690,10 @@ The failure recorded in §6 and §9 (finding 1) is addressed in
   `HlsError::FrameDimensions` failure (no scaling).
 
 Default tests use the fake source/spawner only:
-`cargo test -p ozma-node --lib hls::` (34 passed, 1 ignored). A live guest rerun
-still has to reproduce the exact QMP reset sequence (1280×800 -> 720×400 ->
-1280×800) and the D-Bus startup transition (640×480 -> 1280×800), then verify
-that `stream.m3u8` advances across `#EXT-X-DISCONTINUITY`, that old and new
-segments decode at their own sizes, and that `/api/v1/connection` stays
-`running` throughout.
+`cargo test -p ozma-node --lib hls::` (34 passed, 1 ignored). The live QMP
+guest rerun is now complete: three resets reproduced `1280x800 -> 720x400 ->
+1280x800`, `stream.m3u8` advanced across two `#EXT-X-DISCONTINUITY` markers per
+reset, old and new segments decoded at 720x400 and 1280x800, snapshots stayed
+valid JPEGs at both sizes, and `/api/v1/connection` stayed `running` throughout
+(§0). The D-Bus startup transition (`640x480 -> 1280x800`) still needs the same
+live rerun; it was not repeated in this follow-up.

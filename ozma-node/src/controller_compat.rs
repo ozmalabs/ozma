@@ -1787,6 +1787,7 @@ async fn power_state(State(state): State<ConnectionState>) -> axum::response::Re
                 Json(serde_json::json!({
                     "status": "unknown",
                     "available": false,
+                    "code": error.kind(),
                     "error": error.to_string(),
                 })),
             )
@@ -1842,6 +1843,7 @@ async fn power_action(
                 Json(serde_json::json!({
                     "ok": false,
                     "action": action.as_str(),
+                    "code": error.kind(),
                     "error": error.to_string(),
                 })),
             )
@@ -2860,7 +2862,7 @@ mod tests {
     struct FakePower {
         status: String,
         fail: bool,
-        calls: Vec<&'static str>,
+        calls: Arc<Mutex<Vec<&'static str>>>,
     }
 
     impl FakePower {
@@ -2868,7 +2870,7 @@ mod tests {
             Self {
                 status: "running".into(),
                 fail: false,
-                calls: Vec::new(),
+                calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -2876,7 +2878,7 @@ mod tests {
             Self {
                 status: "unknown".into(),
                 fail: true,
-                calls: Vec::new(),
+                calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -2886,11 +2888,20 @@ mod tests {
             ))
         }
 
+        /// Share the backend and return its call log for assertions.
+        fn shared_recording(self) -> (SharedPower, Arc<Mutex<Vec<&'static str>>>) {
+            let calls = Arc::clone(&self.calls);
+            let power = Arc::new(tokio::sync::Mutex::new(
+                Box::new(self) as Box<dyn PowerBackend>
+            ));
+            (power, calls)
+        }
+
         fn record(&mut self, action: &'static str) -> Result<(), PowerError> {
             if self.fail {
                 return Err(PowerError::NotConnected);
             }
-            self.calls.push(action);
+            lock(&self.calls).push(action);
             Ok(())
         }
     }
@@ -2919,6 +2930,33 @@ mod tests {
 
         async fn stop(&mut self) -> Result<(), PowerError> {
             self.record("force-off")
+        }
+    }
+
+    /// A backend whose QMP connection has closed underneath it, as it does
+    /// after a hard `quit`. The node must report a typed 502, not a fake state.
+    struct ClosedQmpPower;
+
+    #[async_trait]
+    impl PowerBackend for ClosedQmpPower {
+        async fn query_status(&mut self) -> Result<PowerState, PowerError> {
+            Err(PowerError::Qmp(ozma_qmp::QmpError::ConnectionClosed))
+        }
+
+        async fn cont(&mut self) -> Result<(), PowerError> {
+            Err(PowerError::Qmp(ozma_qmp::QmpError::ConnectionClosed))
+        }
+
+        async fn system_powerdown(&mut self) -> Result<(), PowerError> {
+            Err(PowerError::Qmp(ozma_qmp::QmpError::ConnectionClosed))
+        }
+
+        async fn system_reset(&mut self) -> Result<(), PowerError> {
+            Err(PowerError::Qmp(ozma_qmp::QmpError::ConnectionClosed))
+        }
+
+        async fn stop(&mut self) -> Result<(), PowerError> {
+            Err(PowerError::Qmp(ozma_qmp::QmpError::ConnectionClosed))
         }
     }
 
@@ -3902,6 +3940,90 @@ mod tests {
             assert_eq!(json["ok"], true, "{path}");
             assert_eq!(json["action"], canonical, "{path}");
         }
+    }
+
+    #[tokio::test]
+    async fn power_actions_map_to_backend_methods() {
+        for (path, expected) in [
+            ("/power/on", "on"),
+            ("/power/start", "on"),
+            ("/power/cont", "on"),
+            ("/power/resume", "on"),
+            ("/power/off", "off"),
+            ("/power/shutdown", "off"),
+            ("/power/powerdown", "off"),
+            ("/power/reset", "reset"),
+            ("/power/force-off", "force-off"),
+            ("/power/force_off", "force-off"),
+            ("/power/stop", "force-off"),
+            ("/power/destroy", "force-off"),
+        ] {
+            let (power, calls) = FakePower::running().shared_recording();
+            let app = power_router(vm_state(Some(power)));
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let json = json_body(response).await;
+            assert_eq!(json["ok"], true, "{path}");
+            assert_eq!(
+                *lock(&calls),
+                vec![expected],
+                "{path} must call the {expected} backend method"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn power_action_reports_closed_qmp_connection_as_typed_502() {
+        let power: SharedPower = Arc::new(tokio::sync::Mutex::new(
+            Box::new(ClosedQmpPower) as Box<dyn PowerBackend>
+        ));
+        let app = power_router(vm_state(Some(Arc::clone(&power))));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/power/stop")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let json = json_body(response).await;
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["action"], "force-off");
+        assert_eq!(json["code"], "qmp-closed");
+        assert!(json["error"]
+            .as_str()
+            .unwrap()
+            .contains("connection closed"));
+
+        // A later state read is unavailable and typed, not a fabricated state.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/power/state")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let json = json_body(response).await;
+        assert_eq!(json["status"], "unknown");
+        assert_eq!(json["available"], false);
+        assert_eq!(json["code"], "qmp-closed");
     }
 
     #[tokio::test]

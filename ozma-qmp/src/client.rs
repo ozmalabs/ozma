@@ -324,8 +324,71 @@ impl QmpClient {
     }
 
     /// Pause the VM (`stop`).
+    ///
+    /// This is QEMU's monitor pause, not a power-off. Use [`QmpClient::quit`]
+    /// to terminate the QEMU process, or [`QmpClient::system_powerdown`] to
+    /// request an ACPI shutdown from the guest.
     pub async fn stop(&self) -> Result<(), QmpError> {
         self.control_command("stop", None).await.map(|_| ())
+    }
+
+    /// Terminate the QEMU process (`quit`).
+    ///
+    /// Unlike [`QmpClient::stop`], which only pauses the VM, `quit` asks QEMU
+    /// to exit. The command has no reply guarantee: QEMU can close the monitor
+    /// (and the client socket) before or while the success reply is read, so a
+    /// closed socket after the command was fully written is treated as success.
+    /// A QMP `{"error": ...}` reply is returned as [`QmpError::Command`] and
+    /// leaves the control connection reusable.
+    ///
+    /// The control connection is always invalidated when this call returns
+    /// success; a later command reports [`QmpError::NotConnected`] until it is
+    /// reconnected to a live QEMU.
+    pub async fn quit(&self) -> Result<(), QmpError> {
+        let payload = encode_command("quit", None)?;
+
+        let mut guard = self.control.lock().await;
+        let Some(mut connection) = guard.take() else {
+            self.control_connected.store(false, Ordering::SeqCst);
+            return Err(QmpError::NotConnected);
+        };
+
+        // QEMU is expected to exit. Do not advertise the control socket as
+        // reusable while the command is in flight or after it succeeds.
+        self.control_connected.store(false, Ordering::SeqCst);
+
+        let written = timeout(
+            self.config.command_timeout,
+            connection.writer.write_all(&payload),
+        )
+        .await;
+
+        match written {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(QmpError::Io(error)),
+            Err(_) => {
+                return Err(QmpError::Timeout {
+                    command: "quit".to_string(),
+                    timeout: self.config.command_timeout,
+                })
+            }
+        }
+
+        // The command is on the wire. QEMU may reply and then exit, or exit
+        // without flushing a reply; both mean the process was asked to quit.
+        match read_response(&mut connection.reader, "quit", self.config.command_timeout).await {
+            Ok(_) => Ok(()),
+            Err(QmpError::ConnectionClosed) => Ok(()),
+            Err(QmpError::Io(error)) if is_peer_disconnect(&error) => Ok(()),
+            Err(error @ QmpError::Command { .. }) => {
+                // QEMU refused the command and is still running; keep the
+                // connection available for a later retry.
+                *guard = Some(connection);
+                self.control_connected.store(true, Ordering::SeqCst);
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Resume the VM (`cont`).
@@ -461,6 +524,21 @@ fn encode_command(command: &str, arguments: Option<Value>) -> Result<Vec<u8>, Qm
         .map_err(|error| QmpError::Protocol(format!("cannot encode QMP command: {error}")))?;
     payload.push(b'\n');
     Ok(payload)
+}
+
+/// True when an I/O error means the peer closed the socket.
+///
+/// `quit` can race QEMU's exit against the reply read; these errors after a
+/// completed write are expected and do not mean the command was rejected.
+fn is_peer_disconnect(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::NotConnected
+    )
 }
 
 async fn execute_control(

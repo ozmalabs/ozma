@@ -15,6 +15,7 @@ Environment variables (override defaults):
   OZMA_API_HOST       bind address for REST/WS server (default 0.0.0.0)
   OZMA_API_PORT       port for REST/WS server (default 7380)
   OZMA_NODE_PORT      UDP port on nodes (default 7331)
+  OZMA_NODE_API_TOKEN bearer token forwarded to node HTTP APIs (optional)
   OZMA_KBD_DEVICE     path to keyboard evdev device
   OZMA_MOUSE_DEVICE   path to mouse evdev device
   OZMA_DEBUG          set to 1 to enable debug logging
@@ -155,6 +156,9 @@ log = logging.getLogger("ozma")
 
 async def run(config: Config) -> None:
     state = AppState()
+    # Controller-wide fallback token for node HTTP APIs. Per-node tokens from
+    # registration take precedence. Never log either value.
+    state.node_api_token = config.node_api_token.strip()
     
     # Start Rust drivers subprocess
     rust_driver_process = None
@@ -825,7 +829,7 @@ async def run(config: Config) -> None:
     wg_mgr = WGPeeringManager(controller_id=_ctrl_id_for_wg, api_port=config.api_port)
 
     # Build the FastAPI app — all managers must be created before this point
-    app = build_app(state, scenarios, streams, audio, controls, rgb_out, motion, bt, kdeconnect, wifi_audio, captures, paste_typer, kbd_mgr, macro_mgr, sched, notifier, recorder, net_health, ocr_triggers, auto_engine, metrics_collector, screen_mgr, codec_mgr=codec_mgr, camera_mgr=camera_mgr, obs_studio=obs_studio, stream_router=stream_router, guac_mgr=guac_mgr, provision_mgr=provision_mgr, connect=connect, mesh_ca=mesh_ca, sess_mgr=sess_mgr, room_correction=room_corr, testbench=testbench, agent_engine=agent_engine, test_runner=test_runner, auth_config=auth_cfg, user_manager=user_mgr, service_proxy=svc_proxy, idp=idp_instance, sharing=sharing_mgr, ext_publish=ext_pub, node_reconciler=reconciler, update_mgr=update_mgr, transcription_mgr=transcription_mgr, discovery=discovery, doorbell_mgr=doorbell_mgr, alert_mgr=alert_mgr, vaultwarden=vault_mgr, email_security=email_sec, cloud_backup=cloud_backup, iot=iot_mgr, wg=wg_mgr, itsm=itsm_mgr, license_mgr=license_mgr, mdm=mdm_mgr, job_queue=job_queue, net_scan=net_scan_mgr, key_store=key_store, dlp=dlp_mgr, saas_mgr=saas_mgr, threat_intel=threat_intel, compliance=compliance_engine, cam_rec=cam_rec_mgr, wifi_ap=wifi_ap_mgr, router=router_mgr, backup_tracker=backup_tracker, mobile_cam=mob_cam, sunshine=sunshine_mgr, msp_mgr=msp_mgr, msp_portal=msp_portal_mgr, auto_configure=auto_configure_mgr, cam_connect=cam_connect_mgr, grid=grid_svc, parental=parental_mgr, backup_nudge=backup_nudge, dns_filter=dns_filter_mgr, local_proxy=local_proxy_mgr, file_sharing=file_sharing_mgr, zfs=zfs_mgr, failover=failover_mgr, ups_monitor=ups_monitor, ddns=ddns_mgr, speedtest=speedtest_mgr, dns_verifier=dns_verifier)
+    app = build_app(state, scenarios, streams, audio, controls, rgb_out, motion, bt, kdeconnect, wifi_audio, captures, paste_typer, kbd_mgr, macro_mgr, sched, notifier, recorder, net_health, ocr_triggers, auto_engine, metrics_collector, screen_mgr, codec_mgr=codec_mgr, camera_mgr=camera_mgr, obs_studio=obs_studio, stream_router=stream_router, guac_mgr=guac_mgr, provision_mgr=provision_mgr, connect=connect, mesh_ca=mesh_ca, sess_mgr=sess_mgr, room_correction=room_corr, testbench=testbench, agent_engine=agent_engine, test_runner=test_runner, auth_config=auth_cfg, user_manager=user_mgr, service_proxy=svc_proxy, idp=idp_instance, sharing=sharing_mgr, ext_publish=ext_pub, node_reconciler=reconciler, update_mgr=update_mgr, transcription_mgr=transcription_mgr, discovery=discovery, doorbell_mgr=doorbell_mgr, alert_mgr=alert_mgr, vaultwarden=vault_mgr, email_security=email_sec, cloud_backup=cloud_backup, iot=iot_mgr, wg=wg_mgr, itsm=itsm_mgr, license_mgr=license_mgr, mdm=mdm_mgr, job_queue=job_queue, net_scan=net_scan_mgr, key_store=key_store, dlp=dlp_mgr, saas_mgr=saas_mgr, threat_intel=threat_intel, compliance=compliance_engine, cam_rec=cam_rec_mgr, wifi_ap=wifi_ap_mgr, router=router_mgr, backup_tracker=backup_tracker, mobile_cam=mob_cam, sunshine=sunshine_mgr, msp_mgr=msp_mgr, msp_portal=msp_portal_mgr, auto_configure=auto_configure_mgr, cam_connect=cam_connect_mgr, grid=grid_svc, parental=parental_mgr, backup_nudge=backup_nudge, dns_filter=dns_filter_mgr, local_proxy=local_proxy_mgr, file_sharing=file_sharing_mgr, zfs=zfs_mgr, failover=failover_mgr, ups_monitor=ups_monitor, ddns=ddns_mgr, speedtest=speedtest_mgr, dns_verifier=dns_verifier, node_api_token=config.node_api_token)
 
     uv_config = uvicorn.Config(
         app,
