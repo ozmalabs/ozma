@@ -93,6 +93,9 @@ pub use lookingglass::{
     LookingGlassProviderConfig, LookingGlassSource, LOOKING_GLASS_DEFAULT_FPS,
     LOOKING_GLASS_DEFAULT_ID, LOOKING_GLASS_DEFAULT_NAME, LOOKING_GLASS_DEFAULT_SHM_PATH,
 };
+/// The native PipeWire stream target used by [`PipeWireOptions::target`].
+#[cfg(target_os = "linux")]
+pub use ozma_pipewire::StreamTarget;
 #[cfg(target_os = "linux")]
 pub use pipewire::{
     capability_for, capability_id, map_pipewire_error, target_for_capability, target_matches,

@@ -21,6 +21,7 @@ anyhow             = { workspace = true }
 serde              = { version = "1", features = ["derive"] }
 serde_json         = "1"
 clap               = { version = "4", features = ["derive"] }
+axum               = { workspace = true }
 glob               = "0.3"
 async-trait        = { workspace = true }
 thiserror          = { workspace = true }
@@ -46,3 +47,4 @@ evdev = "0.12"
 
 [dev-dependencies]
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

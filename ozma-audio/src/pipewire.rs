@@ -66,6 +66,24 @@ impl PipeWireCapture {
         Self::open(capture_config_for_target(&target)).await
     }
 
+    /// Open a named source/microphone target.
+    ///
+    /// This is the explicit source-side name for [`PipeWireCapture::open_target`].
+    /// PipeWire object names are usually `alsa_input.*` for microphones and
+    /// `<sink>.monitor` for monitor capture.
+    pub async fn open_source(target: AudioTarget) -> Result<Self, AudioError> {
+        Self::open_target(target).await
+    }
+
+    /// Open a microphone/source by PipeWire object name.
+    ///
+    /// The name is validated before a stream is opened. The source must already
+    /// exist in the graph; use [`crate::AudioRouter::ensure_source`] when a
+    /// named remap source must be created first.
+    pub async fn open_named_source(name: &str) -> Result<Self, AudioError> {
+        Self::open_source(AudioTarget::object(name)?).await
+    }
+
     /// Capture the monitor of a named sink.
     ///
     /// PipeWire names a sink's monitor `<sink>.monitor`.  The sink and its
@@ -144,6 +162,16 @@ impl PipeWireCapture {
     }
 
     /// Always fails on non-Linux platforms.
+    pub async fn open_source(_target: AudioTarget) -> Result<Self, AudioError> {
+        Err(unsupported())
+    }
+
+    /// Always fails on non-Linux platforms.
+    pub async fn open_named_source(_name: &str) -> Result<Self, AudioError> {
+        Err(unsupported())
+    }
+
+    /// Always fails on non-Linux platforms.
     pub async fn open_sink_monitor(_sink: &str) -> Result<Self, AudioError> {
         Err(unsupported())
     }
@@ -178,6 +206,27 @@ mod tests {
         assert_eq!(config.stream_name, CaptureConfig::default().stream_name);
     }
 
+    #[test]
+    fn named_source_config_targets_the_object() {
+        let config =
+            capture_config_for_target(&AudioTarget::Object("alsa_input.usb-mic".to_owned()));
+        assert_eq!(
+            config.target,
+            StreamTarget::Object("alsa_input.usb-mic".to_owned())
+        );
+        assert_eq!(config.sample_rate, CaptureConfig::default().sample_rate);
+        assert_eq!(config.channels, CaptureConfig::default().channels);
+    }
+
+    #[tokio::test]
+    async fn open_named_source_rejects_an_empty_name_without_a_session() {
+        let error = match PipeWireCapture::open_named_source("").await {
+            Ok(_) => panic!("empty source must be rejected before opening"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, AudioError::InvalidTarget(_)));
+    }
+
     #[tokio::test]
     async fn open_sink_monitor_rejects_an_empty_sink_without_a_session() {
         let error = match PipeWireCapture::open_sink_monitor("").await {
@@ -198,13 +247,19 @@ mod tests {
         if let Err(error) = PipeWireCapture::open_target(AudioTarget::Default).await {
             errors.push(error);
         }
+        if let Err(error) = PipeWireCapture::open_source(AudioTarget::Default).await {
+            errors.push(error);
+        }
+        if let Err(error) = PipeWireCapture::open_named_source("mic").await {
+            errors.push(error);
+        }
         if let Err(error) = PipeWireCapture::open_sink_monitor("ozma-vm1").await {
             errors.push(error);
         }
         if let Err(error) = PipeWireCapture::default_source().await {
             errors.push(error);
         }
-        assert_eq!(errors.len(), 3, "every constructor must fail on non-Linux");
+        assert_eq!(errors.len(), 5, "every constructor must fail on non-Linux");
         for error in errors {
             assert!(matches!(error, AudioError::Unavailable { .. }));
             assert!(error.to_string().contains("Linux"));

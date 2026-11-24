@@ -22,11 +22,12 @@ use ozma_qmp::SharedQmpClient;
 use tracing::{error, info, warn};
 
 use ozma_node::{
-    api,
+    api, audio_runtime,
     config::{
-        AudioRouterKind, NodeConfig, NodeProfile, PowerProvider, ProviderOverrides,
-        ProviderSelection, VmProviderConfig, DEFAULT_FAKE_FPS, DEFAULT_FAKE_HEIGHT,
-        DEFAULT_FAKE_WIDTH, DEFAULT_QMP_COMMAND_TIMEOUT_MS, DEFAULT_QMP_CONNECT_TIMEOUT_MS,
+        AudioRouterKind, DesktopCaptureTarget, NodeConfig, NodeProfile, PowerProvider,
+        ProviderOverrides, ProviderSelection, VmProviderConfig, DEFAULT_FAKE_FPS,
+        DEFAULT_FAKE_HEIGHT, DEFAULT_FAKE_WIDTH, DEFAULT_QMP_COMMAND_TIMEOUT_MS,
+        DEFAULT_QMP_CONNECT_TIMEOUT_MS,
     },
     controller_compat::{self, AudioControl, CodecControl},
     display_compat::SnapshotControl,
@@ -201,6 +202,59 @@ pub struct Args {
     /// DEV/TEST ONLY: synthetic capture frame rate for `--capture-provider fake`.
     #[arg(long, env = "OZMA_FAKE_FPS", value_name = "FPS")]
     pub fake_fps: Option<u32>,
+
+    /// Desktop PipeWire capture target: `default`, `name:<node.name>`,
+    /// `object:<node.name>`, or `node:<id>`. The ScreenCast portal handshake is
+    /// not performed by this process; point this at the `Video/Source` node it
+    /// produced. Without a target the graph default is used.
+    #[arg(
+        long,
+        env = "OZMA_DESKTOP_CAPTURE_TARGET",
+        default_value = "default",
+        value_name = "TARGET"
+    )]
+    pub desktop_capture_target: String,
+
+    /// Optional PipeWire remote instance name for desktop capture.
+    #[arg(long, env = "OZMA_DESKTOP_CAPTURE_REMOTE", value_name = "NAME")]
+    pub desktop_capture_remote: Option<String>,
+
+    /// Requested desktop capture width in pixels (must be non-zero).
+    #[arg(
+        long,
+        env = "OZMA_DESKTOP_CAPTURE_WIDTH",
+        default_value_t = 1920,
+        value_name = "PIXELS"
+    )]
+    pub desktop_capture_width: u32,
+
+    /// Requested desktop capture height in pixels (must be non-zero).
+    #[arg(
+        long,
+        env = "OZMA_DESKTOP_CAPTURE_HEIGHT",
+        default_value_t = 1080,
+        value_name = "PIXELS"
+    )]
+    pub desktop_capture_height: u32,
+
+    /// Requested desktop capture frame rate (must be non-zero).
+    #[arg(
+        long,
+        env = "OZMA_DESKTOP_CAPTURE_FPS",
+        default_value_t = 30,
+        value_name = "FPS"
+    )]
+    pub desktop_capture_fps: u32,
+
+    /// PipeWire audio capture target: `default`, `object:<name>`, `node:<id>`,
+    /// or `monitor:<sink>` for a named sink's monitor.
+    #[arg(
+        long,
+        env = "OZMA_AUDIO_CAPTURE_TARGET",
+        default_value = "default",
+        value_name = "TARGET"
+    )]
+    pub audio_capture_target: String,
 
     /// Audio routing backend for `/audio/*`: `none`, `pipewire`, or
     /// `pulseaudio`. It controls an existing audio server; it never starts one.
@@ -578,6 +632,20 @@ async fn main() {
         error!("{error}");
         std::process::exit(2);
     }
+    let desktop_capture_target = match args.desktop_capture_target.parse::<DesktopCaptureTarget>() {
+        Ok(target) => target,
+        Err(error) => {
+            error!("Invalid --desktop-capture-target: {error}");
+            std::process::exit(2);
+        }
+    };
+    let audio_capture_target = match args.audio_capture_target.parse::<ozma_audio::AudioTarget>() {
+        Ok(target) => target,
+        Err(error) => {
+            error!("Invalid --audio-capture-target: {error}");
+            std::process::exit(2);
+        }
+    };
     let mut config = NodeConfig {
         name: args.name.clone(),
         node_id: node_id.clone(),
@@ -632,6 +700,12 @@ async fn main() {
         fake_width: args.fake_width.unwrap_or(DEFAULT_FAKE_WIDTH),
         fake_height: args.fake_height.unwrap_or(DEFAULT_FAKE_HEIGHT),
         fake_fps: args.fake_fps.unwrap_or(DEFAULT_FAKE_FPS),
+        desktop_capture_width: args.desktop_capture_width,
+        desktop_capture_height: args.desktop_capture_height,
+        desktop_capture_fps: args.desktop_capture_fps,
+        desktop_capture_target,
+        desktop_capture_remote: args.desktop_capture_remote.clone(),
+        audio_capture_target,
         audio_router: args.audio_router,
         audio_track_root: args.audio_track_root.clone(),
         ffmpeg_bin: args.ffmpeg_bin.clone(),
@@ -663,10 +737,22 @@ async fn main() {
         }
     }
 
+    // A monitor capture target names an existing sink; advertise that sink to
+    // the controller unless --audio-sink already did.
+    if config.audio_sink.is_none() {
+        if let ozma_audio::AudioTarget::SinkMonitor(sink) = &config.audio_capture_target {
+            config.audio_sink = Some(sink.clone());
+            if args.audio_sink.is_none() {
+                args.audio_sink = Some(sink.clone());
+            }
+        }
+    }
+
     if let Err(error) = config.validate() {
         error!("Invalid node configuration: {error}");
         std::process::exit(2);
     }
+    audio_runtime::configure_target(config.audio_capture_target.clone());
 
     let vm_providers = match config.vm_providers() {
         Ok(providers) => providers,
@@ -732,6 +818,44 @@ async fn main() {
         );
     }
     let mut capabilities = platform::detect_with_registry(&config, &capture_registry);
+    if config.profile == NodeProfile::Desktop && !config.fake_capture_requested() {
+        if capabilities.capture.is_empty() {
+            for scan in capture_registry.scan() {
+                if let Some(error) = scan.error {
+                    warn!(
+                        kind = ?scan.kind,
+                        error = %error.message,
+                        "desktop capture: provider discovery failed; no source is advertised"
+                    );
+                }
+            }
+            warn!(
+                target = %config.desktop_capture_target,
+                remote = ?config.desktop_capture_remote,
+                "desktop capture: no PipeWire Video/Source node was discovered; the node keeps \
+                 running without video (no fake source is substituted). The XDG ScreenCast \
+                 portal consent/selection flow is not implemented: start the portal/screen-cast \
+                 client, then pass the resulting node id or name as --desktop-capture-target."
+            );
+        } else {
+            let first = &capabilities.capture[0];
+            info!(
+                target = %config.desktop_capture_target,
+                sources = capabilities.capture.len(),
+                source_id = %first.id,
+                source_name = %first.name,
+                "desktop capture: PipeWire video source discovered"
+            );
+        }
+    }
+    // Advertise the discovered desktop source to the controller instead of
+    // leaving `capture_device` blank. An explicit --capture-device still wins.
+    if config.profile == NodeProfile::Desktop && config.capture_device.is_none() {
+        if let Some(source) = capabilities.capture.first() {
+            config.capture_device = Some(source.id.clone());
+            args.capture_device = Some(source.id.clone());
+        }
+    }
     let quic_port = config.http_port.saturating_add(2);
 
     // One input sink is shared by session input and the controller's UDP HID
@@ -752,6 +876,22 @@ async fn main() {
         input_select::select_input(&input_factory, &vm_providers.input_chain).await;
     let input_sink = selected_input.sink;
     let sink_kind = sink_kind_name(selected_input.kind);
+    // Report only the input modes the selected sink can actually inject. A
+    // recording-only fallback (uinput/QMP/HID unavailable) advertises none.
+    capabilities.input = platform::input_capability_for(Some(selected_input.kind));
+    if config.profile == NodeProfile::Desktop && selected_input.kind == SinkKind::Recording {
+        warn!(
+            "desktop input: no injection sink opened; input is recorded but NOT injected. \
+             /dev/uinput access (udev rule or input group) is required for host input. \
+             The node stays up and advertises no keyboard/pointer injection."
+        );
+    }
+    if config.profile == NodeProfile::Desktop && !capabilities.input.keyboard {
+        warn!(
+            selected = %selected_input.kind,
+            "desktop input: selected sink does not advertise keyboard/pointer injection"
+        );
+    }
     let _input_qmp_handle = selected_input.handle;
     info!(sink = sink_kind, "Input sink ready");
 
@@ -1074,32 +1214,53 @@ async fn main() {
         info!("HID capability not advertised; UDP HID listener disabled");
     }
 
-    if config.profile != NodeProfile::Hardware {
-        let capture = vm_providers.capture.as_deref().unwrap_or("none");
-        let power = vm_providers
-            .power
-            .map(PowerProvider::as_str)
-            .unwrap_or("none");
-        warn!(
-            profile = %config.profile,
-            capture = %capture,
-            input = ?vm_providers.input_chain_names(),
-            audio = %config.providers.audio,
-            audio_router = %config.audio_router,
-            display = %config.providers.display,
-            power = %power,
-            "Profile '{}' is PARTIALLY WIRED: QMP/D-Bus/VNC capture, uinput/QMP input \
-             injection, QMP/libvirt power control, and optional PipeWire/PulseAudio routing \
-             start when their flags are configured. Local HLS is opt-in via `--hls` and feeds \
-             `/stream/*` from the first capture source. WebRTC runs only through an external \
-             helper and only when `--webrtc-helper` is set. POST /codec validates an override and, \
-             when HLS is running, restarts the pipeline with the mapped encoder; with HLS off it \
-             is stored with pending_restart. Still not \
-             implemented: native WebRTC, live D-Bus/VNC validation in CI, per-VM provisioning \
-             (ozma-softnode supervisor), and WebRTC audio. Do not treat WebRTC as functional \
-             without a configured helper.",
-            config.profile
-        );
+    match config.profile {
+        NodeProfile::Hardware => {}
+        NodeProfile::Vm => {
+            let capture = vm_providers.capture.as_deref().unwrap_or("none");
+            let power = vm_providers
+                .power
+                .map(PowerProvider::as_str)
+                .unwrap_or("none");
+            warn!(
+                profile = %config.profile,
+                capture = %capture,
+                input = ?vm_providers.input_chain_names(),
+                audio = %config.providers.audio,
+                audio_router = %config.audio_router,
+                display = %config.providers.display,
+                power = %power,
+                "Profile 'vm' is PARTIALLY WIRED: QMP/D-Bus/VNC capture, uinput/QMP input \
+                 injection, QMP/libvirt power control, and optional PipeWire/PulseAudio routing \
+                 start when their flags are configured. Local HLS is opt-in via `--hls` and feeds \
+                 `/stream/*` from the first capture source. WebRTC runs only through an external \
+                 helper and only when `--webrtc-helper` is set. POST /codec validates an override \
+                 and, when HLS is running, restarts the pipeline with the mapped encoder; with HLS \
+                 off it is stored with pending_restart. Still not implemented: native WebRTC, live \
+                 D-Bus/VNC validation in CI, per-VM provisioning (ozma-softnode supervisor), and \
+                 WebRTC audio. Do not treat WebRTC as functional without a configured helper."
+            );
+        }
+        NodeProfile::Desktop => {
+            warn!(
+                profile = "desktop",
+                capture = %vm_providers.capture.as_deref().unwrap_or("none"),
+                capture_target = %config.desktop_capture_target,
+                input = ?vm_providers.input_chain_names(),
+                audio = %config.providers.audio,
+                audio_capture_target = %config.audio_capture_target,
+                audio_router = %config.audio_router,
+                "Profile 'desktop' runs real PipeWire video capture, the uinput -> QMP/HID -> \
+                 recording input chain, and PipeWire audio capture. /health, /status, /snapshot \
+                 (and /display/snapshot), /display/info, /node/status, /api/v1/connection, and the \
+                 configured /audio/* routes are available. Not implemented: the XDG Desktop \
+                 Portal ScreenCast consent/selection handshake (run a portal client and pass its \
+                 Video/Source node as --desktop-capture-target), an X11 screen-capture fallback, \
+                 automatic PipeWire audio node enumeration for /audio/nodes, and desktop sink \
+                 creation. Capture or input failures downgrade capabilities; the node keeps \
+                 running rather than claiming a source it did not open."
+            );
+        }
     }
 
     info!(
@@ -1107,8 +1268,10 @@ async fn main() {
         node_id = %node_id,
         profile = %config.profile,
         capture_provider = %vm_providers.capture.as_deref().unwrap_or("none"),
+        desktop_capture_target = %config.desktop_capture_target,
         input_provider = ?vm_providers.input_chain_names(),
         audio_provider = %config.providers.audio,
+        audio_capture_target = %config.audio_capture_target,
         audio_router = %config.audio_router,
         display_provider = %config.providers.display,
         power_provider = %vm_providers.power.map(PowerProvider::as_str).unwrap_or("none"),
@@ -1152,7 +1315,7 @@ async fn main() {
         });
     }
 
-    if config.has_capability("audio") {
+    if config.has_capability("audio") && config.profile != NodeProfile::Desktop {
         tokio::spawn(async move {
             match usb_audio::UsbAudioGadget::open(true).await {
                 Ok(gadget) => {
@@ -1163,6 +1326,11 @@ async fn main() {
                 Err(error) => tracing::error!("UAC2 gadget init failed: {error:#}"),
             }
         });
+    } else if config.profile == NodeProfile::Desktop {
+        info!(
+            target = %config.audio_capture_target,
+            "Desktop audio uses PipeWire capture; no UAC2 USB gadget is created"
+        );
     }
 
     let http_port = config.http_port;
@@ -1793,6 +1961,45 @@ mod tests {
         assert_eq!(args.hls_color_primaries.as_deref(), Some("bt2020"));
         assert_eq!(args.hls_color_transfer.as_deref(), Some("smpte2084"));
         assert_eq!(args.hls_color_matrix.as_deref(), Some("bt2020nc"));
+    }
+
+    #[test]
+    fn desktop_capture_and_audio_target_flags_parse() {
+        let defaults = Args::parse_from(["ozma-node", "--profile", "desktop"]);
+        assert_eq!(defaults.desktop_capture_target, "default");
+        assert_eq!(defaults.desktop_capture_width, 1920);
+        assert_eq!(defaults.desktop_capture_height, 1080);
+        assert_eq!(defaults.desktop_capture_fps, 30);
+        assert_eq!(defaults.audio_capture_target, "default");
+        assert!(defaults.desktop_capture_remote.is_none());
+
+        let args = Args::parse_from([
+            "ozma-node",
+            "--profile",
+            "desktop",
+            "--desktop-capture-target",
+            "node:42",
+            "--desktop-capture-remote",
+            "ozma-desktop",
+            "--desktop-capture-width",
+            "2560",
+            "--desktop-capture-height",
+            "1440",
+            "--desktop-capture-fps",
+            "60",
+            "--audio-capture-target",
+            "monitor:ozma-desktop",
+        ]);
+        assert_eq!(args.desktop_capture_target, "node:42");
+        assert_eq!(args.desktop_capture_remote.as_deref(), Some("ozma-desktop"));
+        assert_eq!(
+            (args.desktop_capture_width, args.desktop_capture_height),
+            (2560, 1440)
+        );
+        assert_eq!(args.desktop_capture_fps, 60);
+        assert_eq!(args.audio_capture_target, "monitor:ozma-desktop");
+
+        assert!(Args::try_parse_from(["ozma-node", "--desktop-capture-fps", "abc"]).is_err());
     }
 
     #[test]

@@ -265,6 +265,152 @@ impl fmt::Display for AudioRouterKind {
     }
 }
 
+/// The PipeWire video node a desktop node captures.
+///
+/// `Default` lets the graph choose. A screen-cast session returns a normal
+/// `Video/Source` node, so there is no portal-specific variant here: the portal
+/// handshake happens outside this process, and the resulting node id/name is
+/// passed as configuration. Parsing accepts the same forms as the capture
+/// capability ids (`pipewire:name:...`, `pipewire:node:...`) plus the short
+/// `name:`/`object:`/`node:` forms.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum DesktopCaptureTarget {
+    /// Use the graph's default video source.
+    #[default]
+    Default,
+    /// A named PipeWire object (`node.name`).
+    Object(String),
+    /// A numeric PipeWire node id.
+    NodeId(u32),
+}
+
+impl DesktopCaptureTarget {
+    /// Human-readable description for logs and diagnostics.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Default => "default PipeWire video source".to_owned(),
+            Self::Object(name) => format!("PipeWire object `{name}`"),
+            Self::NodeId(id) => format!("PipeWire node {id}"),
+        }
+    }
+}
+
+impl fmt::Display for DesktopCaptureTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Default => formatter.write_str("default"),
+            Self::Object(name) => write!(formatter, "object:{name}"),
+            Self::NodeId(id) => write!(formatter, "node:{id}"),
+        }
+    }
+}
+
+impl FromStr for DesktopCaptureTarget {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Err(
+                "--desktop-capture-target must not be empty; use `default` or a node/object name"
+                    .to_owned(),
+            );
+        }
+        if raw == "default" || raw == "pipewire:default" {
+            return Ok(Self::Default);
+        }
+        for prefix in ["object:", "name:", "pipewire:name:"] {
+            if let Some(name) = raw.strip_prefix(prefix) {
+                validate_capture_name(name)?;
+                return Ok(Self::Object(name.to_owned()));
+            }
+        }
+        for prefix in ["node:", "pipewire:node:"] {
+            if let Some(id) = raw.strip_prefix(prefix) {
+                let id = id.parse::<u32>().map_err(|_| {
+                    format!(
+                        "--desktop-capture-target `{raw}` has a non-numeric node id; \
+                         use `node:<u32>`"
+                    )
+                })?;
+                return Ok(Self::NodeId(id));
+            }
+        }
+        // A bare name is accepted as a convenience; it is still an exact
+        // PipeWire object name, not a fuzzy match.
+        validate_capture_name(raw)?;
+        Ok(Self::Object(raw.to_owned()))
+    }
+}
+
+fn validate_capture_name(name: &str) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("--desktop-capture-target name must not be empty".to_owned());
+    }
+    if name.chars().any(char::is_control) {
+        return Err("--desktop-capture-target name must not contain control characters".to_owned());
+    }
+    Ok(())
+}
+
+/// The desktop profile's resolved capture/input/audio selection.
+///
+/// This is pure like [`VmProviderConfig`]: it never probes or opens a source.
+/// The capture provider is always PipeWire for a real desktop capture path;
+/// `fake` is the explicit dev/test source. X11 capture is not implemented.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DesktopProviderConfig {
+    /// PipeWire capture target. `None` means the explicit dev/test fake source
+    /// was requested (the registry handles it separately).
+    pub capture_target: Option<DesktopCaptureTarget>,
+    /// Remote PipeWire instance name, when configured.
+    pub capture_remote: Option<String>,
+    /// Requested capture width.
+    pub capture_width: u32,
+    /// Requested capture height.
+    pub capture_height: u32,
+    /// Requested capture frame rate.
+    pub capture_fps: u32,
+    /// Ordered input sinks to try. Never empty and never contains QMP unless a
+    /// QMP socket was configured.
+    pub input_chain: Vec<SinkKind>,
+    /// PipeWire audio capture target (default source or a sink monitor).
+    pub audio_capture: ozma_audio::AudioTarget,
+}
+
+impl DesktopProviderConfig {
+    /// Resolve the desktop profile from configuration. Performs no I/O.
+    pub fn resolve(config: &NodeConfig) -> Result<Self, String> {
+        config.validate()?;
+        let capture_provider = resolve_capture(config)?;
+        let capture_target = match capture_provider.as_deref() {
+            Some("fake") => None,
+            Some("pipewire") => Some(config.desktop_capture_target.clone()),
+            Some(other) => {
+                return Err(format!(
+                    "capture provider `{other}` is not a desktop capture path; expected \
+                     pipewire or fake (dev/test)"
+                ));
+            }
+            None => None,
+        };
+        Ok(Self {
+            capture_target,
+            capture_remote: config.desktop_capture_remote.clone(),
+            capture_width: config.desktop_capture_width,
+            capture_height: config.desktop_capture_height,
+            capture_fps: config.desktop_capture_fps,
+            input_chain: resolve_input_chain(config)?,
+            audio_capture: config.audio_capture_target.clone(),
+        })
+    }
+
+    /// Human-readable input chain for logs.
+    pub fn input_chain_names(&self) -> Vec<&'static str> {
+        self.input_chain.iter().map(|kind| kind.as_str()).collect()
+    }
+}
+
 /// The VM profile's resolved capture/input/power selection.
 ///
 /// This is deliberately separate from [`ProviderSelection`]: the nominal
@@ -450,9 +596,35 @@ fn resolve_capture(config: &NodeConfig) -> Result<Option<String>, String> {
                 }
                 Ok(Some("fake".to_owned()))
             }
+            "pipewire" => {
+                if config.profile != NodeProfile::Desktop {
+                    // The hardware registry already includes PipeWire; keep the
+                    // historical permissive override (it is not used to build
+                    // the hardware registry) outside the desktop profile.
+                    return Ok(Some("pipewire".to_owned()));
+                }
+                if vnc_requested || dbus_requested {
+                    return Err(
+                        "--capture-provider pipewire conflicts with the VM display flags; \
+                         remove --vnc-host/--vnc-port and the D-Bus display flags"
+                            .to_owned(),
+                    );
+                }
+                Ok(Some("pipewire".to_owned()))
+            }
+            "x11" => Err(
+                "--capture-provider x11 is not implemented; X11 screen capture needs a \
+                 separate XGetImage/XShm provider. Use the PipeWire ScreenCast node instead"
+                    .to_owned(),
+            ),
             _ if config.profile == NodeProfile::Vm => Err(format!(
                 "unknown capture provider {value:?} for the vm profile; expected qmp, dbus, vnc, \
                  or fake (dev/test)"
+            )),
+            _ if config.profile == NodeProfile::Desktop => Err(format!(
+                "unknown capture provider {value:?} for the desktop profile; expected pipewire \
+                 or fake (dev/test). X11 screen capture is not implemented; use a PipeWire \
+                 ScreenCast node."
             )),
             _ if vnc_requested => Err(format!(
                 "--capture-provider {value:?} conflicts with --vnc-host/--vnc-port; \
@@ -663,6 +835,19 @@ pub struct NodeConfig {
     pub fake_height: u32,
     /// Dev/test synthetic capture frame rate (`--fake-fps`).
     pub fake_fps: u32,
+    /// Requested desktop PipeWire capture width.
+    pub desktop_capture_width: u32,
+    /// Requested desktop PipeWire capture height.
+    pub desktop_capture_height: u32,
+    /// Requested desktop PipeWire capture frame rate.
+    pub desktop_capture_fps: u32,
+    /// Desktop PipeWire video node (default, object name, or node id).
+    pub desktop_capture_target: DesktopCaptureTarget,
+    /// Optional PipeWire remote instance for desktop capture.
+    pub desktop_capture_remote: Option<String>,
+    /// PipeWire audio capture target (`default`, `object:...`, `node:N`, or
+    /// `monitor:<sink>`). A monitor target captures an existing sink's audio.
+    pub audio_capture_target: ozma_audio::AudioTarget,
     /// Audio routing backend. `none` leaves `/audio/*` at typed 501.
     pub audio_router: AudioRouterKind,
     /// Directory containing reference tracks for `POST /audio/play`.
@@ -784,6 +969,34 @@ impl NodeConfig {
                 self.fake_fps
             ));
         }
+        if self.desktop_capture_width == 0 || self.desktop_capture_height == 0 {
+            return Err(
+                "--desktop-capture-width/--desktop-capture-height must be greater than zero"
+                    .to_owned(),
+            );
+        }
+        if self.desktop_capture_width > MAX_FAKE_DIMENSION
+            || self.desktop_capture_height > MAX_FAKE_DIMENSION
+        {
+            return Err(format!(
+                "--desktop-capture-width/--desktop-capture-height exceed the \
+                 {MAX_FAKE_DIMENSION}-pixel bound"
+            ));
+        }
+        if self.desktop_capture_fps == 0 || self.desktop_capture_fps > MAX_FAKE_FPS {
+            return Err(format!(
+                "--desktop-capture-fps must be between 1 and {MAX_FAKE_FPS}, got {}",
+                self.desktop_capture_fps
+            ));
+        }
+        if let Some(remote) = &self.desktop_capture_remote {
+            if remote.trim().is_empty() {
+                return Err("--desktop-capture-remote must not be empty or whitespace".to_owned());
+            }
+        }
+        self.audio_capture_target
+            .validate()
+            .map_err(|error| format!("--audio-capture-target: {error}"))?;
         validate_path("--audio-track-root", self.audio_track_root.as_deref())?;
         if self
             .webrtc_audio_source
@@ -809,6 +1022,11 @@ impl NodeConfig {
     /// Resolve the profile's capture/input/power providers from flags.
     pub fn vm_providers(&self) -> Result<VmProviderConfig, String> {
         VmProviderConfig::resolve(self)
+    }
+
+    /// Resolve the desktop profile's capture/input/audio selection.
+    pub fn desktop_providers(&self) -> Result<DesktopProviderConfig, String> {
+        DesktopProviderConfig::resolve(self)
     }
 }
 
@@ -988,6 +1206,12 @@ mod tests {
             fake_width: DEFAULT_FAKE_WIDTH,
             fake_height: DEFAULT_FAKE_HEIGHT,
             fake_fps: DEFAULT_FAKE_FPS,
+            desktop_capture_width: DEFAULT_FAKE_WIDTH,
+            desktop_capture_height: DEFAULT_FAKE_HEIGHT,
+            desktop_capture_fps: DEFAULT_FAKE_FPS,
+            desktop_capture_target: DesktopCaptureTarget::Default,
+            desktop_capture_remote: None,
+            audio_capture_target: ozma_audio::AudioTarget::Default,
             audio_router: AudioRouterKind::None,
             audio_track_root: None,
             ffmpeg_bin: PathBuf::from("ffmpeg"),
@@ -1451,6 +1675,146 @@ mod tests {
 
         let mut config = test_config(NodeProfile::Vm);
         config.audio_track_root = Some(PathBuf::new());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn desktop_profile_resolves_pipewire_capture_input_and_audio() {
+        let config = test_config(NodeProfile::Desktop);
+        let resolved = config.desktop_providers().unwrap();
+
+        assert_eq!(resolved.capture_target, Some(DesktopCaptureTarget::Default));
+        assert_eq!(
+            resolved.input_chain,
+            vec![SinkKind::Uinput, SinkKind::HidGadget, SinkKind::Recording]
+        );
+        assert_eq!(resolved.audio_capture, ozma_audio::AudioTarget::Default);
+        assert_eq!(resolved.capture_width, DEFAULT_FAKE_WIDTH);
+        assert_eq!(resolved.capture_fps, DEFAULT_FAKE_FPS);
+
+        // QMP is only added when an input socket was configured.
+        let mut with_qmp = test_config(NodeProfile::Desktop);
+        with_qmp.qmp_socket = Some(PathBuf::from("/run/ozma/ctrl.qmp"));
+        assert_eq!(
+            with_qmp.desktop_providers().unwrap().input_chain,
+            vec![
+                SinkKind::Uinput,
+                SinkKind::Qmp,
+                SinkKind::HidGadget,
+                SinkKind::Recording
+            ]
+        );
+
+        // The explicit dev/test source is not a PipeWire target.
+        let mut fake = test_config(NodeProfile::Desktop);
+        fake.provider_overrides = ProviderOverrides::from_cli("fake", "", "", "", "");
+        fake.providers = ProviderSelection::for_profile(NodeProfile::Desktop)
+            .with_overrides(&fake.provider_overrides);
+        assert_eq!(fake.desktop_providers().unwrap().capture_target, None);
+    }
+
+    #[test]
+    fn desktop_capture_target_parses_node_and_object_forms() {
+        for (raw, expected) in [
+            ("default", DesktopCaptureTarget::Default),
+            ("pipewire:default", DesktopCaptureTarget::Default),
+            (
+                "object:screen-cast",
+                DesktopCaptureTarget::Object("screen-cast".into()),
+            ),
+            (
+                "name:screen-cast",
+                DesktopCaptureTarget::Object("screen-cast".into()),
+            ),
+            (
+                "pipewire:name:screen-cast",
+                DesktopCaptureTarget::Object("screen-cast".into()),
+            ),
+            ("node:42", DesktopCaptureTarget::NodeId(42)),
+            ("pipewire:node:42", DesktopCaptureTarget::NodeId(42)),
+            (
+                "bare-name",
+                DesktopCaptureTarget::Object("bare-name".into()),
+            ),
+        ] {
+            assert_eq!(
+                raw.parse::<DesktopCaptureTarget>().unwrap(),
+                expected,
+                "{raw}"
+            );
+        }
+
+        for raw in [
+            "",
+            "  ",
+            "object:",
+            "name:",
+            "node:",
+            "node:not-a-number",
+            "pipewire:node:",
+            "screen\u{7}",
+        ] {
+            assert!(
+                raw.parse::<DesktopCaptureTarget>().is_err(),
+                "{raw:?} should be rejected"
+            );
+        }
+
+        assert_eq!(DesktopCaptureTarget::NodeId(7).to_string(), "node:7");
+    }
+
+    #[test]
+    fn desktop_rejects_non_pipewire_capture_and_x11() {
+        let mut config = test_config(NodeProfile::Desktop);
+        config.provider_overrides = ProviderOverrides::from_cli("v4l2", "", "", "", "");
+        config.providers = ProviderSelection::for_profile(NodeProfile::Desktop)
+            .with_overrides(&config.provider_overrides);
+        let error = config.desktop_providers().unwrap_err();
+        assert!(error.contains("PipeWire"), "{error}");
+
+        let mut x11 = test_config(NodeProfile::Desktop);
+        x11.provider_overrides = ProviderOverrides::from_cli("x11", "", "", "", "");
+        x11.providers = ProviderSelection::for_profile(NodeProfile::Desktop)
+            .with_overrides(&x11.provider_overrides);
+        let error = x11.desktop_providers().unwrap_err();
+        assert!(error.contains("not implemented"), "{error}");
+
+        let mut pipewire = test_config(NodeProfile::Desktop);
+        pipewire.provider_overrides = ProviderOverrides::from_cli("pipewire", "", "", "", "");
+        pipewire.providers = ProviderSelection::for_profile(NodeProfile::Desktop)
+            .with_overrides(&pipewire.provider_overrides);
+        assert_eq!(
+            pipewire.desktop_providers().unwrap().capture_target,
+            Some(DesktopCaptureTarget::Default)
+        );
+    }
+
+    #[test]
+    fn desktop_audio_capture_target_and_capture_bounds_validate() {
+        let mut config = test_config(NodeProfile::Desktop);
+        config.audio_capture_target = "monitor:ozma-desktop".parse().unwrap();
+        config.desktop_capture_target = "node:12".parse().unwrap();
+        config.desktop_capture_width = 2560;
+        config.desktop_capture_height = 1440;
+        config.desktop_capture_fps = 60;
+        assert!(config.validate().is_ok());
+        let resolved = config.desktop_providers().unwrap();
+        assert_eq!(
+            resolved.audio_capture,
+            ozma_audio::AudioTarget::SinkMonitor("ozma-desktop".into())
+        );
+        assert_eq!(
+            resolved.capture_target,
+            Some(DesktopCaptureTarget::NodeId(12))
+        );
+
+        config.desktop_capture_width = 0;
+        assert!(config.validate().is_err());
+        config.desktop_capture_width = 2560;
+        config.desktop_capture_fps = 0;
+        assert!(config.validate().is_err());
+        config.desktop_capture_fps = 60;
+        config.desktop_capture_remote = Some("   ".into());
         assert!(config.validate().is_err());
     }
 }

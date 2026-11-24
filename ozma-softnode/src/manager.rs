@@ -39,10 +39,12 @@ use crate::evdev_provisioning::{EvdevPaths, EvdevProvisioner, UinputEvdevProvisi
 use crate::provisioning::{
     LibvirtProvisioner, ProvisionConfig, ProvisionHints, TokioCommandRunner, VmProvisioner,
 };
+use crate::status::{SupervisorStatus, VmStatus};
 use crate::supervisor::{
-    build_node_spec, restart_delay, NodeHandle, NodeLauncher, NodeSpec, PortAllocator,
-    ProcessNodeLauncher, DEFAULT_BASE_PORT, DEFAULT_NODE_BIN, DEFAULT_NODE_HTTP_BASE,
-    DEFAULT_RESTART_BACKOFF_MAX_MS, DEFAULT_RESTART_BACKOFF_MS, HEALTHY_UPTIME,
+    build_node_spec, restart_delay, NodeExitStatus, NodeHandle, NodeLauncher, NodeSpec,
+    PortAllocator, ProcessNodeLauncher, DEFAULT_BASE_PORT, DEFAULT_NODE_BIN,
+    DEFAULT_NODE_HTTP_BASE, DEFAULT_RESTART_BACKOFF_MAX_MS, DEFAULT_RESTART_BACKOFF_MS,
+    HEALTHY_UPTIME,
 };
 use crate::vm_info::VMInfo;
 
@@ -112,10 +114,59 @@ struct ManagedVm {
     /// `None` when auto-management is off, the VM has no QMP socket, or no
     /// ports could be allocated.
     node: Option<NodeState>,
+    /// Why there is no child yet. `None` while a node is tracked.
+    skip: Option<VmSkipState>,
+    /// Most recent provisioning/socket error, reported by `/status`.
+    last_error: Option<String>,
+    /// evdev devices this supervisor created for the VM, when provisioning
+    /// ran. `None` leaves `--evdev-*` out of the child argv.
+    evdev: Option<EvdevPaths>,
+    /// Per-VM audio sink passed to the child. Kept so status still reports it
+    /// after the node spec has been built.
+    audio_sink: Option<String>,
     /// Suppress repeated "defined; restart required" warnings.
     provision_restart_warned: bool,
     /// Suppress repeated provisioning-failure warnings.
     provision_failure_warned: bool,
+}
+
+impl ManagedVm {
+    fn new(vm: VMInfo, node: Option<NodeState>) -> Self {
+        Self {
+            vm,
+            agent_provisioned: false,
+            agent_check_failures: 0,
+            node,
+            skip: None,
+            last_error: None,
+            evdev: None,
+            audio_sink: None,
+            provision_restart_warned: false,
+            provision_failure_warned: false,
+        }
+    }
+}
+
+/// Why a tracked VM has no supervised child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VmSkipState {
+    DiscoveryOnly,
+    NoQmp,
+    NeedsRestart,
+    AwaitingSocket,
+    ProvisionFailed,
+}
+
+impl VmSkipState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DiscoveryOnly => "discovery-only",
+            Self::NoQmp => "skipped",
+            Self::NeedsRestart => "needs-restart",
+            Self::AwaitingSocket => "awaiting-socket",
+            Self::ProvisionFailed => "failed",
+        }
+    }
 }
 
 struct NodeState {
@@ -123,8 +174,14 @@ struct NodeState {
     handle: Option<NodeHandle>,
     /// Consecutive failures, used for the exponential restart delay.
     attempts: u32,
+    /// Successful (re)starts after the initial spawn, for status/metrics.
+    restarts: u32,
     next_restart: Option<Instant>,
     started_at: Option<Instant>,
+    /// Last observed child exit, or `None` before the first exit.
+    last_exit: Option<NodeExitStatus>,
+    /// Most recent spawn/exit error.
+    last_error: Option<String>,
     /// Guards against a second spawn while an async `launcher.spawn()` is in
     /// flight.
     spawning: bool,
@@ -136,8 +193,11 @@ impl NodeState {
             spec,
             handle: None,
             attempts: 0,
+            restarts: 0,
             next_restart: Some(Instant::now()),
             started_at: None,
+            last_exit: None,
+            last_error: None,
             spawning: false,
         }
     }
@@ -146,6 +206,10 @@ impl NodeState {
 struct SupervisorState {
     vms: HashMap<String, ManagedVm>,
     ports: PortAllocator,
+    /// Every VM name in the last discovery snapshot, before exclusion.
+    discovered: HashSet<String>,
+    /// VM names filtered out by `--exclude` in the last snapshot.
+    excluded: HashSet<String>,
 }
 
 // ── VirtualNodeManager ─────────────────────────────────────────────────────
@@ -223,6 +287,8 @@ impl VirtualNodeManager {
             state: Mutex::new(SupervisorState {
                 vms: HashMap::new(),
                 ports: PortAllocator::new(options.base_port, options.node_http_base),
+                discovered: HashSet::new(),
+                excluded: HashSet::new(),
             }),
         });
         Self {
@@ -342,6 +408,48 @@ impl VirtualNodeManager {
         let _ = self.stop_tx.send(true);
     }
 
+    /// A receiver that becomes `true` when shutdown starts. The status server
+    /// uses it to stop accepting requests alongside the children.
+    pub fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
+        self.stop_rx.clone()
+    }
+
+    /// Snapshot the aggregated multi-VM status.
+    ///
+    /// This only reads in-memory supervisor state: it never polls a child,
+    /// opens a QMP socket, or runs a provisioning command.
+    pub async fn status(&self) -> SupervisorStatus {
+        let state = self.inner.state.lock().await;
+        let now = Instant::now();
+        let mut vms = Vec::with_capacity(state.vms.len() + state.excluded.len());
+
+        for managed in state.vms.values() {
+            vms.push(vm_status(
+                managed,
+                self.options.auto_agent,
+                self.options.provision_config.evdev.enabled,
+                now,
+            ));
+        }
+        for name in &state.excluded {
+            vms.push(VmStatus::excluded(name.clone()));
+        }
+        vms.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let discovered = state.discovered.len();
+        let next_ports = state.ports.next_ports();
+        drop(state);
+
+        SupervisorStatus::new(discovered, next_ports, vms)
+    }
+
+    /// Test-only entry point: apply one discovery snapshot and poll children.
+    #[cfg(test)]
+    pub(crate) async fn sync_for_test(&self, vms: Vec<VMInfo>) {
+        self.inner.reconcile(vms).await;
+        self.inner.supervise().await;
+    }
+
     fn log_startup(&self) {
         info!(
             "Virtual Node Manager starting ({} mode)...",
@@ -453,6 +561,8 @@ enum ProvisionOutcome {
     Ready {
         qmp_socket: String,
         qmp_input_socket: Option<String>,
+        /// evdev devices created/reused for this VM, when provisioning ran.
+        evdev: Option<EvdevPaths>,
     },
     /// XML was defined but the VM has not been restarted, so no socket exists.
     NeedsRestart {
@@ -580,6 +690,7 @@ impl ManagerInner {
             return ProvisionOutcome::Ready {
                 qmp_socket: discovered.to_owned(),
                 qmp_input_socket,
+                evdev: None,
             };
         }
 
@@ -600,6 +711,7 @@ impl ManagerInner {
             Ok(provisioned) => ProvisionOutcome::Ready {
                 qmp_socket: provisioned.qmp_socket.display().to_string(),
                 qmp_input_socket: Some(provisioned.qmp_input_socket.display().to_string()),
+                evdev: hints.evdev.clone(),
             },
             Err(error) => ProvisionOutcome::Failed(error),
         }
@@ -621,10 +733,19 @@ impl ManagerInner {
         {
             let mut state = self.state.lock().await;
 
+            // Record the full discovered set, including excluded VMs, so
+            // totals and exclusion are visible without tracking child state.
+            state.discovered = current.clone();
+            state.excluded = vms
+                .iter()
+                .filter(|vm| self.is_excluded(&vm.name))
+                .map(|vm| vm.name.clone())
+                .collect();
+
             let removed: Vec<String> = state
                 .vms
                 .keys()
-                .filter(|name| !current.contains(*name))
+                .filter(|name| !current.contains(*name) || self.is_excluded(name))
                 .cloned()
                 .collect();
             for name in removed {
@@ -636,7 +757,7 @@ impl ManagerInner {
                     }
                     state.ports.release(&name);
                     removed_names.push(name.clone());
-                    info!("VM no longer running: {}", name);
+                    info!("VM no longer running or is excluded: {}", name);
                 }
             }
 
@@ -722,6 +843,7 @@ impl ManagerInner {
                 ProvisionOutcome::Ready {
                     qmp_socket,
                     qmp_input_socket,
+                    evdev,
                 } => {
                     let mut ready = vm;
                     ready.qmp_path = qmp_socket;
@@ -737,6 +859,7 @@ impl ManagerInner {
                     } else {
                         None
                     };
+                    let audio_sink_name = audio_sink.as_ref().map(|sink| sink.name.clone());
                     let mut state = self.state.lock().await;
 
                     let node = if need_node {
@@ -746,7 +869,7 @@ impl ManagerInner {
                                 ports,
                                 &self.options.node_bin,
                                 &self.options.controller_url,
-                                audio_sink.as_ref().map(|sink| sink.name.as_str()),
+                                audio_sink_name.as_deref(),
                             ))),
                             Err(error) => {
                                 warn!("VM {}: cannot allocate per-VM ports: {}", ready.name, error);
@@ -757,25 +880,25 @@ impl ManagerInner {
                         None
                     };
 
-                    if let Some(managed) = state.vms.get_mut(&ready.name) {
+                    let name = ready.name.clone();
+                    if let Some(managed) = state.vms.get_mut(&name) {
                         managed.vm = ready;
                         if managed.node.is_none() {
                             managed.node = node;
                         }
+                        if need_node {
+                            managed.evdev = evdev;
+                            managed.audio_sink = audio_sink_name;
+                        }
+                        managed.skip = None;
+                        managed.last_error = None;
                         managed.provision_restart_warned = false;
                         managed.provision_failure_warned = false;
                     } else {
-                        state.vms.insert(
-                            ready.name.clone(),
-                            ManagedVm {
-                                vm: ready,
-                                agent_provisioned: false,
-                                agent_check_failures: 0,
-                                node,
-                                provision_restart_warned: false,
-                                provision_failure_warned: false,
-                            },
-                        );
+                        let mut managed = ManagedVm::new(ready, node);
+                        managed.evdev = evdev;
+                        managed.audio_sink = audio_sink_name;
+                        state.vms.insert(name, managed);
                     }
                 }
                 ProvisionOutcome::NeedsRestart {
@@ -801,20 +924,21 @@ impl ManagerInner {
                         );
                     }
 
+                    let reason = format!(
+                        "ozma QMP/display defined ({} / {}); VM restart required",
+                        qmp_socket.display(),
+                        display_socket.display()
+                    );
                     if let Some(managed) = state.vms.get_mut(&vm.name) {
+                        managed.skip = Some(VmSkipState::NeedsRestart);
+                        managed.last_error = Some(reason);
                         managed.provision_restart_warned = true;
                     } else {
-                        state.vms.insert(
-                            vm.name.clone(),
-                            ManagedVm {
-                                vm,
-                                agent_provisioned: false,
-                                agent_check_failures: 0,
-                                node: None,
-                                provision_restart_warned: true,
-                                provision_failure_warned: false,
-                            },
-                        );
+                        let mut managed = ManagedVm::new(vm, None);
+                        managed.skip = Some(VmSkipState::NeedsRestart);
+                        managed.last_error = Some(reason);
+                        managed.provision_restart_warned = true;
+                        state.vms.insert(managed.vm.name.clone(), managed);
                     }
                 }
                 ProvisionOutcome::AwaitingSocket { qmp_socket } => {
@@ -836,20 +960,20 @@ impl ManagerInner {
                         );
                     }
 
+                    let reason = format!(
+                        "QMP socket {} is configured but does not exist yet",
+                        qmp_socket.display()
+                    );
                     if let Some(managed) = state.vms.get_mut(&vm.name) {
+                        managed.skip = Some(VmSkipState::AwaitingSocket);
+                        managed.last_error = Some(reason);
                         managed.provision_restart_warned = true;
                     } else {
-                        state.vms.insert(
-                            vm.name.clone(),
-                            ManagedVm {
-                                vm,
-                                agent_provisioned: false,
-                                agent_check_failures: 0,
-                                node: None,
-                                provision_restart_warned: true,
-                                provision_failure_warned: false,
-                            },
-                        );
+                        let mut managed = ManagedVm::new(vm, None);
+                        managed.skip = Some(VmSkipState::AwaitingSocket);
+                        managed.last_error = Some(reason);
+                        managed.provision_restart_warned = true;
+                        state.vms.insert(managed.vm.name.clone(), managed);
                     }
                 }
                 ProvisionOutcome::NoQmp => {
@@ -862,18 +986,12 @@ impl ManagerInner {
                             vm.name
                         );
                     }
-                    if !state.vms.contains_key(&vm.name) {
-                        state.vms.insert(
-                            vm.name.clone(),
-                            ManagedVm {
-                                vm,
-                                agent_provisioned: false,
-                                agent_check_failures: 0,
-                                node: None,
-                                provision_restart_warned: false,
-                                provision_failure_warned: false,
-                            },
-                        );
+                    if let Some(managed) = state.vms.get_mut(&vm.name) {
+                        managed.skip = Some(VmSkipState::NoQmp);
+                    } else if !state.vms.contains_key(&vm.name) {
+                        let mut managed = ManagedVm::new(vm, None);
+                        managed.skip = Some(VmSkipState::NoQmp);
+                        state.vms.insert(managed.vm.name.clone(), managed);
                     }
                 }
                 ProvisionOutcome::Failed(error) => {
@@ -889,34 +1007,22 @@ impl ManagerInner {
                     }
 
                     if let Some(managed) = state.vms.get_mut(&vm.name) {
+                        managed.skip = Some(VmSkipState::ProvisionFailed);
+                        managed.last_error = Some(error.to_string());
                         managed.provision_failure_warned = true;
                     } else {
-                        state.vms.insert(
-                            vm.name.clone(),
-                            ManagedVm {
-                                vm,
-                                agent_provisioned: false,
-                                agent_check_failures: 0,
-                                node: None,
-                                provision_restart_warned: false,
-                                provision_failure_warned: true,
-                            },
-                        );
+                        let mut managed = ManagedVm::new(vm, None);
+                        managed.skip = Some(VmSkipState::ProvisionFailed);
+                        managed.last_error = Some(error.to_string());
+                        managed.provision_failure_warned = true;
+                        state.vms.insert(managed.vm.name.clone(), managed);
                     }
                 }
                 ProvisionOutcome::DiscoveryOnly => {
                     if !state.vms.contains_key(&vm.name) {
-                        state.vms.insert(
-                            vm.name.clone(),
-                            ManagedVm {
-                                vm,
-                                agent_provisioned: false,
-                                agent_check_failures: 0,
-                                node: None,
-                                provision_restart_warned: false,
-                                provision_failure_warned: false,
-                            },
-                        );
+                        let mut managed = ManagedVm::new(vm, None);
+                        managed.skip = Some(VmSkipState::DiscoveryOnly);
+                        state.vms.insert(managed.vm.name.clone(), managed);
                     }
                 }
             }
@@ -990,6 +1096,11 @@ impl ManagerInner {
             node.attempts = node.attempts.saturating_add(1);
             node.next_restart = Some(Instant::now() + delay);
             node.started_at = None;
+            node.last_exit = status;
+            node.last_error = Some(match status {
+                Some(status) => format!("child exited ({status})"),
+                None => "child is no longer pollable".to_owned(),
+            });
 
             match status {
                 Some(status) => warn!(
@@ -1040,9 +1151,13 @@ impl ManagerInner {
                     let mut state = self.state.lock().await;
                     if let Some(managed) = state.vms.get_mut(&name) {
                         if let Some(node) = managed.node.as_mut() {
+                            if node.attempts > 0 {
+                                node.restarts = node.restarts.saturating_add(1);
+                            }
                             node.handle = Some(handle);
                             node.started_at = Some(Instant::now());
                             node.spawning = false;
+                            node.last_error = None;
                             info!(
                                 "Started ozma-node for VM {} (pid={}, hid_udp={}, http={})",
                                 name,
@@ -1068,6 +1183,7 @@ impl ManagerInner {
                     if let Some(managed) = state.vms.get_mut(&name) {
                         if let Some(node) = managed.node.as_mut() {
                             node.spawning = false;
+                            node.last_error = Some(error.to_string());
                             let delay = restart_delay(
                                 self.options.restart_backoff,
                                 self.options.restart_backoff_max,
@@ -1187,6 +1303,100 @@ impl ManagerInner {
                 }
             }
         }
+    }
+}
+
+// ── Status assembly ────────────────────────────────────────────────────────
+
+/// Build one VM's status entry from live supervisor state.
+fn vm_status(managed: &ManagedVm, auto_agent: bool, evdev_enabled: bool, now: Instant) -> VmStatus {
+    let node = managed.node.as_ref();
+
+    let state = match node {
+        Some(node) if node.spawning => "starting",
+        Some(node) if node.handle.is_some() => "running",
+        Some(node) if node.next_restart.is_some() => "backoff",
+        Some(_) => "stopped",
+        None => managed.skip.unwrap_or(VmSkipState::NoQmp).as_str(),
+    };
+    let spawned = node.and_then(|node| node.handle.as_ref()).is_some();
+    let restart_in_ms = node
+        .and_then(|node| node.next_restart)
+        .map(|at| at.saturating_duration_since(now).as_millis() as u64);
+    let last_error = node
+        .and_then(|node| node.last_error.clone())
+        .or_else(|| managed.last_error.clone());
+    let last_exit = node
+        .and_then(|node| node.last_exit)
+        .map(|status| status.to_string());
+
+    let (hid_udp_port, http_port, qmp_socket, audio_sink) = match node {
+        Some(node) => (
+            Some(node.spec.hid_udp_port),
+            Some(node.spec.http_port),
+            node.spec.qmp_socket.clone(),
+            managed
+                .audio_sink
+                .clone()
+                .or_else(|| node.spec.audio_sink.clone()),
+        ),
+        None => (
+            None,
+            None,
+            managed.vm.qmp_path.clone(),
+            managed.audio_sink.clone(),
+        ),
+    };
+
+    let agent_status = if !auto_agent {
+        "disabled"
+    } else if managed.agent_provisioned {
+        "provisioned"
+    } else if managed.vm.has_gpu_passthrough {
+        // GPU passthrough VMs keep retrying forever: the agent is the only
+        // display path.
+        "retrying"
+    } else if managed.agent_check_failures > 5 {
+        "failed"
+    } else if managed.agent_check_failures == 0 {
+        "pending"
+    } else {
+        "retrying"
+    };
+
+    let (evdev_status, evdev_keyboard, evdev_mouse) = match &managed.evdev {
+        Some(paths) => (
+            "ready".to_owned(),
+            Some(paths.keyboard.display().to_string()),
+            Some(paths.mouse.display().to_string()),
+        ),
+        None if evdev_enabled => ("unavailable".to_owned(), None, None),
+        None => ("not-configured".to_owned(), None, None),
+    };
+
+    VmStatus {
+        name: managed.vm.name.clone(),
+        state: state.to_owned(),
+        qmp_socket,
+        hid_udp_port,
+        http_port,
+        child_pid: node
+            .and_then(|node| node.handle.as_ref())
+            .and_then(NodeHandle::pid),
+        spawned,
+        skipped: !spawned,
+        needs_restart: state == VmSkipState::NeedsRestart.as_str(),
+        excluded: false,
+        restart_count: node.map(|node| node.restarts).unwrap_or(0),
+        restart_in_ms,
+        last_exit,
+        last_error,
+        evdev_status,
+        evdev_keyboard,
+        evdev_mouse,
+        audio_sink,
+        agent_status: agent_status.to_owned(),
+        agent_checks: managed.agent_check_failures,
     }
 }
 
@@ -2108,5 +2318,299 @@ mod tests {
                 http: 7500
             }
         );
+    }
+
+    #[test]
+    fn port_allocator_reports_the_next_pair_and_bounds() {
+        let mut allocator = PortAllocator::new(7400, 7500);
+        assert_eq!(
+            allocator.next_ports(),
+            Some(NodePorts {
+                hid_udp: 7400,
+                http: 7500,
+            })
+        );
+        allocator.allocate("vm-a").unwrap();
+        assert_eq!(
+            allocator.next_ports(),
+            Some(NodePorts {
+                hid_udp: 7401,
+                http: 7501,
+            })
+        );
+
+        let mut exhausted = PortAllocator::new(u16::MAX, u16::MAX);
+        // Overlapping bases with no room for a distinct pair: reject instead
+        // of wrapping around.
+        assert!(exhausted.allocate("vm-a").is_err());
+        assert_eq!(exhausted.next_ports(), None);
+    }
+
+    #[tokio::test]
+    async fn status_aggregates_started_skipped_and_excluded_vms() {
+        let launcher = Arc::new(FakeNodeLauncher::new());
+        let mgr = manager(
+            ManagerOptions {
+                exclude_patterns: vec!["template-*".to_owned()],
+                ..options(true)
+            },
+            Arc::clone(&launcher),
+        );
+
+        mgr.inner
+            .reconcile(vec![
+                vm("vm-a", "/run/ozma/a.qmp"),
+                vm("vm-b", ""),
+                vm("template-win11", "/run/ozma/template.qmp"),
+            ])
+            .await;
+        mgr.inner.supervise().await;
+
+        let status = mgr.status().await;
+        assert!(status.ok);
+        assert_eq!(status.profile, "hypervisor");
+        assert_eq!(status.node_id, crate::status::SUPERVISOR_NODE_ID);
+        assert_eq!(status.supervisor.discovered, 3);
+        assert_eq!(status.supervisor.tracked, 2);
+        assert_eq!(status.supervisor.running, 1);
+        assert_eq!(status.supervisor.failed, 0);
+        assert_eq!(status.supervisor.skipped, 1);
+        assert_eq!(status.supervisor.excluded, 1);
+        assert_eq!(status.supervisor.next_hid_port, Some(7401));
+        assert_eq!(status.supervisor.next_http_port, Some(7501));
+
+        let vm_a = status.vms.iter().find(|vm| vm.name == "vm-a").unwrap();
+        assert_eq!(vm_a.state, "running");
+        assert!(vm_a.spawned);
+        assert!(!vm_a.skipped);
+        assert_eq!(vm_a.hid_udp_port, Some(7400));
+        assert_eq!(vm_a.http_port, Some(7500));
+        assert_eq!(vm_a.child_pid, Some(1));
+        assert_eq!(vm_a.qmp_socket, "/run/ozma/a.qmp");
+        assert_eq!(vm_a.agent_status, "pending");
+
+        let vm_b = status.vms.iter().find(|vm| vm.name == "vm-b").unwrap();
+        assert_eq!(vm_b.state, "skipped");
+        assert!(vm_b.skipped);
+        assert_eq!(vm_b.hid_udp_port, None);
+        assert_eq!(vm_b.qmp_socket, "");
+
+        let excluded = status
+            .vms
+            .iter()
+            .find(|vm| vm.name == "template-win11")
+            .unwrap();
+        assert_eq!(excluded.state, "excluded");
+        assert!(excluded.excluded);
+        assert!(excluded.skipped);
+        assert_eq!(excluded.hid_udp_port, None);
+    }
+
+    #[tokio::test]
+    async fn status_reports_failure_backoff_restart_and_recovery() {
+        let launcher = Arc::new(FakeNodeLauncher::new());
+        let mgr = manager(options(true), Arc::clone(&launcher));
+
+        mgr.inner
+            .reconcile(vec![vm("vm-a", "/run/ozma/a.qmp")])
+            .await;
+        mgr.inner.supervise().await;
+        assert_eq!(launcher.spawns().len(), 1);
+
+        launcher.exit("vm-a");
+        mgr.inner.supervise().await;
+
+        let status = mgr.status().await;
+        let vm_a = &status.vms[0];
+        assert_eq!(vm_a.state, "backoff");
+        assert!(!vm_a.spawned);
+        assert_eq!(vm_a.restart_count, 0);
+        assert_eq!(vm_a.last_exit.as_deref(), Some("exit code 1"));
+        assert!(vm_a.last_error.as_deref().unwrap().contains("exit code 1"));
+        assert!(vm_a.restart_in_ms.is_some());
+        assert_eq!(status.supervisor.failed, 1);
+        assert_eq!(status.supervisor.running, 0);
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        mgr.inner.supervise().await;
+
+        let status = mgr.status().await;
+        let vm_a = &status.vms[0];
+        assert_eq!(vm_a.state, "running");
+        assert!(vm_a.spawned);
+        assert_eq!(vm_a.restart_count, 1);
+        assert_eq!(vm_a.last_exit.as_deref(), Some("exit code 1"));
+        assert!(
+            vm_a.last_error.is_none(),
+            "a successful start clears the error"
+        );
+        assert_eq!(vm_a.restart_in_ms, None);
+        assert_eq!(status.supervisor.failed, 0);
+        assert_eq!(status.supervisor.running, 1);
+    }
+
+    #[tokio::test]
+    async fn status_reports_spawn_failures_without_fabricating_a_pid() {
+        let launcher = Arc::new(FakeNodeLauncher::new());
+        launcher.fail_spawn("vm-a");
+        let mgr = manager(options(true), Arc::clone(&launcher));
+
+        mgr.inner
+            .reconcile(vec![vm("vm-a", "/run/ozma/a.qmp")])
+            .await;
+        mgr.inner.supervise().await;
+
+        let status = mgr.status().await;
+        let vm_a = &status.vms[0];
+        assert_eq!(vm_a.state, "backoff");
+        assert!(!vm_a.spawned);
+        assert_eq!(vm_a.child_pid, None);
+        assert_eq!(vm_a.restart_count, 0);
+        assert!(vm_a.restart_in_ms.is_some());
+        assert!(vm_a
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("injected spawn failure"));
+        assert_eq!(status.supervisor.failed, 1);
+    }
+
+    #[tokio::test]
+    async fn status_drops_removed_vms_and_keeps_port_bookkeeping() {
+        let launcher = Arc::new(FakeNodeLauncher::new());
+        let mgr = manager(options(true), Arc::clone(&launcher));
+
+        mgr.inner
+            .reconcile(vec![
+                vm("vm-a", "/run/ozma/a.qmp"),
+                vm("vm-b", "/run/ozma/b.qmp"),
+            ])
+            .await;
+        mgr.inner.supervise().await;
+        assert_eq!(mgr.status().await.supervisor.running, 2);
+
+        mgr.inner
+            .reconcile(vec![vm("vm-a", "/run/ozma/a.qmp")])
+            .await;
+
+        let status = mgr.status().await;
+        assert_eq!(status.supervisor.discovered, 1);
+        assert_eq!(status.supervisor.tracked, 1);
+        assert_eq!(status.supervisor.running, 1);
+        assert!(status.vms.iter().all(|vm| vm.name == "vm-a"));
+        // vm-b held offset 1; the allocator stays monotonic and deterministic.
+        assert_eq!(status.supervisor.next_hid_port, Some(7402));
+        assert_eq!(status.supervisor.next_http_port, Some(7502));
+    }
+
+    #[tokio::test]
+    async fn status_reports_needs_restart_and_provisioning_failure() {
+        let launcher = Arc::new(FakeNodeLauncher::new());
+        let provisioner = Arc::new(FakeVmProvisioner::new(FakeOutcome::NeedsRestart));
+        let mgr = manager_with_provisioner(
+            ManagerOptions {
+                provision: true,
+                ..options(true)
+            },
+            Arc::clone(&launcher),
+            Arc::clone(&provisioner),
+        );
+
+        mgr.inner.reconcile(vec![vm("vm-a", "")]).await;
+        mgr.inner.supervise().await;
+
+        let status = mgr.status().await;
+        let vm_a = &status.vms[0];
+        assert_eq!(vm_a.state, "needs-restart");
+        assert!(vm_a.needs_restart);
+        assert!(vm_a.skipped);
+        assert!(vm_a
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("restart required"));
+        assert_eq!(status.supervisor.skipped, 1);
+
+        provisioner.set_outcome(FakeOutcome::Failed);
+        mgr.inner.reconcile(vec![vm("vm-a", "")]).await;
+
+        let status = mgr.status().await;
+        let vm_a = &status.vms[0];
+        assert_eq!(vm_a.state, "failed");
+        assert!(vm_a
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("fake dumpxml failure"));
+        assert_eq!(status.supervisor.failed, 1);
+        assert_eq!(status.supervisor.skipped, 0);
+    }
+
+    #[tokio::test]
+    async fn status_reports_evdev_audio_sink_and_agent_state() {
+        let launcher = Arc::new(FakeNodeLauncher::new());
+        let provisioner = Arc::new(FakeVmProvisioner::new(FakeOutcome::Ready));
+        let evdev = Arc::new(FakeEvdevProvisioner::new("/dev/input"));
+        let audio = Arc::new(FakeAudioSinkProvisioner::new("ozma-"));
+        let mut opts = ManagerOptions {
+            provision: true,
+            audio: AudioProvisionConfig {
+                enabled: true,
+                backend: AudioBackend::PipeWire,
+                ..AudioProvisionConfig::default()
+            },
+            ..options(true)
+        };
+        opts.provision_config.evdev.enabled = true;
+        let mgr = manager_with_device_provisioners(
+            opts,
+            Arc::clone(&launcher),
+            Arc::clone(&provisioner),
+            Some(Arc::clone(&evdev)),
+            Some(Arc::clone(&audio)),
+        );
+
+        mgr.inner.reconcile(vec![vm("vm-a", "")]).await;
+        mgr.inner.supervise().await;
+
+        let status = mgr.status().await;
+        let vm_a = &status.vms[0];
+        assert_eq!(vm_a.state, "running");
+        assert_eq!(vm_a.evdev_status, "ready");
+        assert_eq!(vm_a.evdev_keyboard.as_deref(), Some("/dev/input/vm-a-kbd"));
+        assert_eq!(vm_a.evdev_mouse.as_deref(), Some("/dev/input/vm-a-mouse"));
+        assert_eq!(vm_a.audio_sink.as_deref(), Some("ozma-vm-a"));
+        assert_eq!(vm_a.agent_status, "pending");
+
+        // Simulate agent outcomes without touching a guest.
+        {
+            let mut state = mgr.inner.state.lock().await;
+            let managed = state.vms.get_mut("vm-a").unwrap();
+            managed.agent_provisioned = true;
+        }
+        assert_eq!(mgr.status().await.vms[0].agent_status, "provisioned");
+    }
+
+    #[tokio::test]
+    async fn status_reports_discovery_only_and_agent_disabled() {
+        let launcher = Arc::new(FakeNodeLauncher::new());
+        let mgr = manager(
+            ManagerOptions {
+                auto_agent: false,
+                ..options(false)
+            },
+            Arc::clone(&launcher),
+        );
+
+        mgr.inner
+            .reconcile(vec![vm("vm-a", "/run/ozma/a.qmp")])
+            .await;
+        mgr.inner.supervise().await;
+
+        let status = mgr.status().await;
+        let vm_a = &status.vms[0];
+        assert_eq!(vm_a.state, "discovery-only");
+        assert_eq!(vm_a.agent_status, "disabled");
+        assert!(launcher.spawns().is_empty());
     }
 }

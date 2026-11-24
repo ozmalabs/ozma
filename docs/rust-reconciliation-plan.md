@@ -2,8 +2,11 @@
 
 Status: **Phase 0 implemented; Phase 1 core and the Phase 2 VM-provider, HLS,
 controller-input, softnode-supervisor, and helper-first WebRTC work implemented.
-Live D-Bus/VNC/audio validation, native/live WebRTC validation, the remaining
-device/audio provisioning, and Phases 3–5 remain plans.** See
+The Phase 3 desktop profile (PipeWire capture/audio, uinput/QMP/HID input,
+snapshots/status/audio routes) is implemented except the XDG ScreenCast portal
+and X11 capture paths. Live D-Bus/VNC/audio validation, native/live WebRTC
+validation, the remaining device/audio provisioning, multi-VM breadth, and
+Phases 4–5 remain plans.** See
 [`plan-execution-status.md`](plan-execution-status.md) and
 [`parity-matrix.md`](parity-matrix.md) for the evidence and remaining gaps.
 Scope: the Python `softnode/`, `node/`, and `agent/` processes are replaced by the

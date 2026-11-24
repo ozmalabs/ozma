@@ -3514,6 +3514,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "chrono",
  "clap",
  "evdev",
@@ -3530,6 +3531,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "uuid",

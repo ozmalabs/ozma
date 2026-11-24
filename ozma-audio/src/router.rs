@@ -19,10 +19,14 @@
 //!   stable and symmetric, which is what idempotent per-VM provisioning
 //!   needs.
 //! - This is **not room correction**. [`AudioProfile`] is a routing preset:
-//!   sink selection plus optional volume and mute. Equalisation, convolution,
-//!   filter chains, and other DSP are deliberately out of scope. A profile
-//!   that asks for `source` routing fails with
-//!   [`AudioError::Unsupported`] instead of silently ignoring it.
+//!   sink/source selection plus optional volume and mute. Equalisation,
+//!   convolution, filter chains, and other DSP are deliberately out of scope.
+//! - Microphone/source support is selection and graph control, not capture:
+//!   [`AudioSourceSpec`] creates or reuses a named `module-remap-source` from
+//!   an existing source or `<sink>.monitor`, [`AudioSourceRef`] moves an
+//!   existing source-output onto a named source, and [`AudioSourceProfile`]
+//!   applies source volume/mute. The source is then captured by
+//!   [`crate::PipeWireCapture::open_source`] or `open_named_source`.
 //! - Every command is an argv vector. There is no shell, no string
 //!   interpolation, and no quoting: a sink name such as `ozma-vm1` is exactly
 //!   one argument.
@@ -39,8 +43,14 @@
 //! | find module | `pactl list short modules` |
 //! | remove sink | `pactl unload-module <module-id>` |
 //! | move stream | `pactl move-sink-input <sink-input-index> <sink>` |
+//! | create source | `pactl load-module module-remap-source master=<master> source_name=<name> source_properties=device.description=<description> channels=<channels>` |
+//! | find source | `pactl list short sources` |
+//! | remove source | `pactl unload-module <module-id>` (the `module-remap-source`) |
+//! | move source-output | `pactl move-source-output <source-output-index> <source>` |
 //! | volume | `pactl set-sink-volume <sink> <percent>%` |
 //! | mute | `pactl set-sink-mute <sink> yes\|no` |
+//! | source volume | `pactl set-source-volume <source> <percent>%` |
+//! | source mute | `pactl set-source-mute <source> yes\|no` |
 //! | play (PipeWire) | `pw-play --target <sink> <track-path>` |
 //! | play (PulseAudio) | `paplay --device=<sink> <track-path>` |
 //!
@@ -93,12 +103,18 @@ pub const PW_PLAY: &str = "pw-play";
 pub const PAPLAY: &str = "paplay";
 /// PulseAudio module loaded for a named null sink.
 pub const NULL_SINK_MODULE: &str = "module-null-sink";
+/// PulseAudio module loaded for a named source remapped from a master.
+pub const REMAP_SOURCE_MODULE: &str = "module-remap-source";
 /// Lowest accepted null-sink sample rate.
 pub const MIN_SINK_RATE: u32 = 8_000;
 /// Highest accepted null-sink sample rate.
 pub const MAX_SINK_RATE: u32 = 192_000;
 /// Highest accepted null-sink channel count.
 pub const MAX_SINK_CHANNELS: u16 = 32;
+/// Highest accepted remap-source channel count.
+pub const MAX_SOURCE_CHANNELS: u16 = 32;
+/// Default remap-source channel count.
+pub const DEFAULT_SOURCE_CHANNELS: u16 = 2;
 /// Default null-sink sample rate, matching [`crate::frame::SAMPLE_RATE`].
 pub const DEFAULT_SINK_RATE: u32 = 48_000;
 /// Default null-sink channel count, matching [`crate::frame::CHANNELS`].
@@ -236,21 +252,210 @@ impl AudioStreamRef {
     }
 }
 
-/// A routing/volume preset for one sink.
+/// A request to create (or reuse) a named input source.
+///
+/// A PulseAudio source is created as a `module-remap-source` over an existing
+/// source or a sink monitor. `master` is the existing object to remap:
+/// `alsa_input.usb-mic` for a microphone, or `<sink>.monitor` for VM output.
+/// When the source already exists, `master` is only reported and no module is
+/// loaded; when it does not exist and `master` is `None`, creation is refused
+/// instead of inventing a source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioSourceSpec {
+    /// Source name, for example `ozma-vm1-mic`.
+    pub name: String,
+    /// `device.description` property for the remapped source.
+    pub description: String,
+    /// Existing source or `<sink>.monitor` to remap. Required for creation.
+    pub master: Option<String>,
+    /// Channel count requested from `module-remap-source`.
+    pub channels: u16,
+}
+
+impl AudioSourceSpec {
+    /// A validated request that only selects an existing source.
+    ///
+    /// [`AudioRouter::ensure_source`] returns the existing source, or a typed
+    /// refusal when it is missing because there is no master to create from.
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Result<Self, AudioError> {
+        let spec = Self {
+            name: name.into(),
+            description: description.into(),
+            master: None,
+            channels: DEFAULT_SOURCE_CHANNELS,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    /// A validated request that remaps `master` into a named source.
+    pub fn from_master(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        master: impl Into<String>,
+    ) -> Result<Self, AudioError> {
+        let spec = Self {
+            name: name.into(),
+            description: description.into(),
+            master: Some(master.into()),
+            channels: DEFAULT_SOURCE_CHANNELS,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    /// A validated request that remaps the monitor of `sink`.
+    ///
+    /// The resulting source is not the monitor itself; it is a named
+    /// `module-remap-source` whose master is `<sink>.monitor`.
+    pub fn monitor(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        sink: &str,
+    ) -> Result<Self, AudioError> {
+        validate_token("source monitor sink", sink)?;
+        Self::from_master(name, description, AudioTarget::monitor_name(sink))
+    }
+
+    /// Set the master source or monitor, validating the result.
+    pub fn with_master(mut self, master: impl Into<String>) -> Result<Self, AudioError> {
+        self.master = Some(master.into());
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Set the channel count, validating the result.
+    pub fn with_channels(mut self, channels: u16) -> Result<Self, AudioError> {
+        self.channels = channels;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Validate every field before any command runs.
+    pub fn validate(&self) -> Result<(), AudioError> {
+        validate_token("source name", &self.name)?;
+        validate_token("source description", &self.description)?;
+        if let Some(master) = &self.master {
+            validate_token("source master", master)?;
+        }
+        if self.channels == 0 || self.channels > MAX_SOURCE_CHANNELS {
+            return Err(invalid_spec(
+                "source channels",
+                format!(
+                    "must be between 1 and {MAX_SOURCE_CHANNELS}, got {}",
+                    self.channels
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The result of ensuring a source exists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioSourceState {
+    /// Source name, exactly as requested.
+    pub name: String,
+    /// Master source or monitor recorded at creation/selection.
+    pub master: Option<String>,
+    /// `true` when this call loaded a new `module-remap-source`.
+    pub created: bool,
+}
+
+/// A record stream to move between sources.
+///
+/// This names a PulseAudio *source-output* index, the numeric id printed by
+/// `pactl list short source-outputs`. Playback (sink input) streams use
+/// [`AudioStreamRef`] instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AudioSourceRef {
+    /// Source-output index.
+    pub index: u32,
+}
+
+impl AudioSourceRef {
+    /// Build a reference for a source-output index.
+    pub fn new(index: u32) -> Self {
+        Self { index }
+    }
+}
+
+/// A volume/mute preset for one input source.
+///
+/// This is not a capture or DSP profile. See the module documentation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioSourceProfile {
+    /// Stable profile identifier.
+    pub id: String,
+    /// Source the profile applies to.
+    pub source: String,
+    /// Optional source volume in percent, `0..=100`.
+    pub volume: Option<u8>,
+    /// Optional mute state.
+    pub muted: Option<bool>,
+}
+
+impl AudioSourceProfile {
+    /// Build a validated source profile with no volume or mute.
+    pub fn new(id: impl Into<String>, source: impl Into<String>) -> Result<Self, AudioError> {
+        let profile = Self {
+            id: id.into(),
+            source: source.into(),
+            volume: None,
+            muted: None,
+        };
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    /// Set the source volume, validating the result.
+    pub fn with_volume(mut self, volume: u8) -> Result<Self, AudioError> {
+        self.volume = Some(volume);
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Set the mute state.
+    pub fn with_muted(mut self, muted: bool) -> Self {
+        self.muted = Some(muted);
+        self
+    }
+
+    /// Validate every field before any command runs.
+    pub fn validate(&self) -> Result<(), AudioError> {
+        validate_token("source profile id", &self.id)?;
+        validate_token("source profile source", &self.source)?;
+        if let Some(volume) = self.volume {
+            if volume > 100 {
+                return Err(invalid_spec(
+                    "source profile volume",
+                    format!("must be 0..=100 percent, got {volume}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A routing/volume preset for one sink, optionally with a named source.
 ///
 /// This is not an equalisation profile. See the module documentation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AudioProfile {
     /// Stable profile identifier.
     pub id: String,
-    /// Sink the profile applies to.
+    /// Sink the profile applies to. Empty only for a source-only profile.
     pub sink: String,
-    /// Optional source name. Currently rejected at apply time because
-    /// source-output routing needs an explicit stream index.
+    /// Optional source name. When set, the same `volume`/`muted` values are
+    /// applied to the named source as well. Moving a source-output needs
+    /// [`AudioRouter::move_source_output`] with an explicit index.
     pub source: Option<String>,
-    /// Optional sink volume in percent, `0..=100`.
+    /// Optional sink/source volume in percent, `0..=100`.
     pub volume: Option<u8>,
-    /// Optional mute state.
+    /// Optional sink/source mute state.
     pub muted: Option<bool>,
 }
 
@@ -268,8 +473,23 @@ impl AudioProfile {
         Ok(profile)
     }
 
-    /// Attach a source name. Applying the profile will fail until source
-    /// routing is implemented.
+    /// Build a validated source-only profile (no sink).
+    pub fn for_source(
+        id: impl Into<String>,
+        source: impl Into<String>,
+    ) -> Result<Self, AudioError> {
+        let profile = Self {
+            id: id.into(),
+            sink: String::new(),
+            source: Some(source.into()),
+            volume: None,
+            muted: None,
+        };
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    /// Attach a named source. The same `volume`/`muted` values apply to it.
     pub fn with_source(mut self, source: impl Into<String>) -> Result<Self, AudioError> {
         self.source = Some(source.into());
         self.validate()?;
@@ -289,10 +509,24 @@ impl AudioProfile {
         self
     }
 
+    /// Whether this profile has no sink and only names a source.
+    pub fn is_source_only(&self) -> bool {
+        self.sink.is_empty() && self.source.is_some()
+    }
+
     /// Validate every field before any command runs.
     pub fn validate(&self) -> Result<(), AudioError> {
         validate_token("profile id", &self.id)?;
-        validate_token("profile sink", &self.sink)?;
+        if self.sink.is_empty() {
+            if self.source.is_none() {
+                return Err(invalid_spec(
+                    "profile sink",
+                    "must not be empty unless a source is set",
+                ));
+            }
+        } else {
+            validate_token("profile sink", &self.sink)?;
+        }
         if let Some(source) = &self.source {
             validate_token("profile source", source)?;
         }
@@ -530,6 +764,42 @@ pub trait AudioRouter: Send + Sync {
     /// Move a playback stream onto `sink`.
     async fn move_stream(&self, stream: AudioStreamRef, sink: &str) -> Result<(), AudioError>;
 
+    /// Create or reuse a named source (a `module-remap-source` of `master`).
+    ///
+    /// An existing source with the same name is reused. When it is missing and
+    /// `spec.master` is `None`, creation is refused instead of inventing a
+    /// source. Backends without source support return a typed error.
+    async fn ensure_source(&self, spec: AudioSourceSpec) -> Result<AudioSourceState, AudioError> {
+        spec.validate()?;
+        Err(source_unsupported("ensure_source"))
+    }
+
+    /// Unload the `module-remap-source` that owns `name`.
+    ///
+    /// An unknown source is a successful no-op; a source that exists but is not
+    /// an Ozma remap module is refused.
+    async fn remove_source(&self, name: &str) -> Result<(), AudioError> {
+        validate_token("source name", name)?;
+        Err(source_unsupported("remove_source"))
+    }
+
+    /// Move a record stream onto `source`.
+    async fn move_source_output(
+        &self,
+        stream: AudioSourceRef,
+        source: &str,
+    ) -> Result<(), AudioError> {
+        validate_token("source name", source)?;
+        let _ = stream;
+        Err(source_unsupported("move_source_output"))
+    }
+
+    /// Apply source routing/volume/mute for a profile.
+    async fn apply_source_profile(&self, profile: AudioSourceProfile) -> Result<(), AudioError> {
+        profile.validate()?;
+        Err(source_unsupported("apply_source_profile"))
+    }
+
     /// Apply sink routing/volume/mute for a profile.
     async fn apply_profile(&self, profile: AudioProfile) -> Result<(), AudioError>;
 
@@ -587,11 +857,18 @@ struct AppliedProfile {
     mute_applied: bool,
 }
 
+struct AppliedSourceProfile {
+    source: String,
+    volume_applied: bool,
+    mute_applied: bool,
+}
+
 struct RouterCore {
     runner: Arc<dyn CommandRunner>,
     config: RouterConfig,
     tool: PlaybackTool,
     profiles: Mutex<HashMap<String, AppliedProfile>>,
+    source_profiles: Mutex<HashMap<String, AppliedSourceProfile>>,
     playback: tokio::sync::Mutex<Option<ChildId>>,
 }
 
@@ -602,6 +879,7 @@ impl RouterCore {
             config,
             tool,
             profiles: Mutex::new(HashMap::new()),
+            source_profiles: Mutex::new(HashMap::new()),
             playback: tokio::sync::Mutex::new(None),
         }
     }
@@ -622,6 +900,19 @@ impl RouterCore {
         let argv = short_list_argv("modules");
         let output = self.run(argv).await?;
         parse_null_sink_module(&output.stdout, name)
+    }
+
+    async fn source_exists(&self, name: &str) -> Result<bool, AudioError> {
+        let argv = short_list_argv("sources");
+        let output = self.run(argv).await?;
+        let exists = parse_source_names(&output.stdout).any(|candidate| candidate == name);
+        Ok(exists)
+    }
+
+    async fn find_remap_source_module(&self, name: &str) -> Result<Option<u32>, AudioError> {
+        let argv = short_list_argv("modules");
+        let output = self.run(argv).await?;
+        parse_remap_source_module(&output.stdout, name)
     }
 
     async fn ensure_sink(&self, spec: AudioSinkSpec) -> Result<AudioSinkState, AudioError> {
@@ -689,6 +980,96 @@ impl RouterCore {
         }
     }
 
+    async fn ensure_source(&self, spec: AudioSourceSpec) -> Result<AudioSourceState, AudioError> {
+        spec.validate()?;
+
+        if self.source_exists(&spec.name).await? {
+            return Ok(source_state(&spec.name, spec.master, false));
+        }
+
+        let Some(master) = spec.master.as_deref() else {
+            return Err(AudioError::Refused {
+                operation: "ensure_source".to_owned(),
+                reason: format!(
+                    "source `{}` does not exist and no master source or monitor was supplied",
+                    spec.name
+                ),
+                remediation: "Pass an existing master source such as `alsa_input.usb-mic` or a \
+                              sink monitor `<sink>.monitor` so a `module-remap-source` can be \
+                              created, or select an existing source name."
+                    .to_owned(),
+            });
+        };
+
+        let argv = vec![
+            PACTL.to_owned(),
+            "load-module".to_owned(),
+            REMAP_SOURCE_MODULE.to_owned(),
+            format!("master={master}"),
+            format!("source_name={}", spec.name),
+            format!("source_properties=device.description={}", spec.description),
+            format!("channels={}", spec.channels),
+        ];
+        let output = self.run(argv.clone()).await?;
+        parse_module_id(&output.stdout, &argv)?;
+        Ok(source_state(&spec.name, spec.master, true))
+    }
+
+    async fn remove_source(&self, name: &str) -> Result<(), AudioError> {
+        validate_token("source name", name)?;
+
+        let module_id = self.find_remap_source_module(name).await?;
+
+        let Some(module_id) = module_id else {
+            if self.source_exists(name).await? {
+                return Err(AudioError::Refused {
+                    operation: "remove_source".to_owned(),
+                    reason: format!(
+                        "source `{name}` exists but is not a `{REMAP_SOURCE_MODULE}` owned by Ozma"
+                    ),
+                    remediation: "Only Ozma-created remap sources can be removed. Reconfigure a \
+                                  hardware source through the audio server instead."
+                        .to_owned(),
+                });
+            }
+            return Ok(());
+        };
+
+        let argv = vec![
+            PACTL.to_owned(),
+            "unload-module".to_owned(),
+            module_id.to_string(),
+        ];
+        match self.run(argv).await {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                // A concurrent removal can make `unload-module` fail after the
+                // source is already gone. That is the documented unknown-source
+                // success case, not a failure.
+                if !self.source_exists(name).await.unwrap_or(true) {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    async fn move_source_output(
+        &self,
+        stream: AudioSourceRef,
+        source: &str,
+    ) -> Result<(), AudioError> {
+        validate_token("source name", source)?;
+        let argv = vec![
+            PACTL.to_owned(),
+            "move-source-output".to_owned(),
+            stream.index.to_string(),
+            source.to_owned(),
+        ];
+        self.run(argv).await.map(|_| ())
+    }
+
     async fn move_stream(&self, stream: AudioStreamRef, sink: &str) -> Result<(), AudioError> {
         validate_token("sink name", sink)?;
         let argv = vec![
@@ -703,21 +1084,56 @@ impl RouterCore {
     async fn apply_profile(&self, profile: AudioProfile) -> Result<(), AudioError> {
         profile.validate()?;
 
-        if let Some(source) = &profile.source {
-            return Err(AudioError::Unsupported {
-                feature: format!("audio profile source routing (`{source}`)"),
-                remediation: "Apply sink volume/mute only. Moving source-outputs requires an \
-                              explicit PulseAudio source-output index, which this router does \
-                              not accept; route the source in the audio graph directly."
-                    .to_owned(),
-            });
+        if !profile.sink.is_empty() {
+            if let Some(volume) = profile.volume {
+                let argv = vec![
+                    PACTL.to_owned(),
+                    "set-sink-volume".to_owned(),
+                    profile.sink.clone(),
+                    format!("{volume}%"),
+                ];
+                self.run(argv).await?;
+            }
+            if let Some(muted) = profile.muted {
+                let argv = vec![
+                    PACTL.to_owned(),
+                    "set-sink-mute".to_owned(),
+                    profile.sink.clone(),
+                    if muted { "yes" } else { "no" }.to_owned(),
+                ];
+                self.run(argv).await?;
+            }
+
+            lock(&self.profiles).insert(
+                profile.id.clone(),
+                AppliedProfile {
+                    sink: profile.sink.clone(),
+                    volume_applied: profile.volume.is_some(),
+                    mute_applied: profile.muted.is_some(),
+                },
+            );
         }
+
+        if let Some(source) = profile.source {
+            self.apply_source_profile(AudioSourceProfile {
+                id: profile.id,
+                source,
+                volume: profile.volume,
+                muted: profile.muted,
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn apply_source_profile(&self, profile: AudioSourceProfile) -> Result<(), AudioError> {
+        profile.validate()?;
 
         if let Some(volume) = profile.volume {
             let argv = vec![
                 PACTL.to_owned(),
-                "set-sink-volume".to_owned(),
-                profile.sink.clone(),
+                "set-source-volume".to_owned(),
+                profile.source.clone(),
                 format!("{volume}%"),
             ];
             self.run(argv).await?;
@@ -725,17 +1141,17 @@ impl RouterCore {
         if let Some(muted) = profile.muted {
             let argv = vec![
                 PACTL.to_owned(),
-                "set-sink-mute".to_owned(),
-                profile.sink.clone(),
+                "set-source-mute".to_owned(),
+                profile.source.clone(),
                 if muted { "yes" } else { "no" }.to_owned(),
             ];
             self.run(argv).await?;
         }
 
-        lock(&self.profiles).insert(
+        lock(&self.source_profiles).insert(
             profile.id.clone(),
-            AppliedProfile {
-                sink: profile.sink,
+            AppliedSourceProfile {
+                source: profile.source,
                 volume_applied: profile.volume.is_some(),
                 mute_applied: profile.muted.is_some(),
             },
@@ -746,27 +1162,48 @@ impl RouterCore {
     async fn remove_profile(&self, profile_id: &str) -> Result<(), AudioError> {
         validate_token("profile id", profile_id)?;
         let applied = lock(&self.profiles).remove(profile_id);
-        let Some(applied) = applied else {
-            return Ok(());
-        };
+        let applied_source = lock(&self.source_profiles).remove(profile_id);
 
-        if applied.mute_applied {
-            let unmute = vec![
-                PACTL.to_owned(),
-                "set-sink-mute".to_owned(),
-                applied.sink.clone(),
-                "no".to_owned(),
-            ];
-            self.run(unmute).await?;
+        if let Some(applied) = applied {
+            if applied.mute_applied {
+                let unmute = vec![
+                    PACTL.to_owned(),
+                    "set-sink-mute".to_owned(),
+                    applied.sink.clone(),
+                    "no".to_owned(),
+                ];
+                self.run(unmute).await?;
+            }
+            if applied.volume_applied {
+                let volume = vec![
+                    PACTL.to_owned(),
+                    "set-sink-volume".to_owned(),
+                    applied.sink,
+                    format!("{DEFAULT_VOLUME_PERCENT}%"),
+                ];
+                self.run(volume).await?;
+            }
         }
-        if applied.volume_applied {
-            let volume = vec![
-                PACTL.to_owned(),
-                "set-sink-volume".to_owned(),
-                applied.sink,
-                format!("{DEFAULT_VOLUME_PERCENT}%"),
-            ];
-            self.run(volume).await?;
+
+        if let Some(applied) = applied_source {
+            if applied.mute_applied {
+                let unmute = vec![
+                    PACTL.to_owned(),
+                    "set-source-mute".to_owned(),
+                    applied.source.clone(),
+                    "no".to_owned(),
+                ];
+                self.run(unmute).await?;
+            }
+            if applied.volume_applied {
+                let volume = vec![
+                    PACTL.to_owned(),
+                    "set-source-volume".to_owned(),
+                    applied.source,
+                    format!("{DEFAULT_VOLUME_PERCENT}%"),
+                ];
+                self.run(volume).await?;
+            }
         }
         Ok(())
     }
@@ -885,6 +1322,32 @@ macro_rules! impl_audio_router {
                 self.core.move_stream(stream, sink).await
             }
 
+            async fn ensure_source(
+                &self,
+                spec: AudioSourceSpec,
+            ) -> Result<AudioSourceState, AudioError> {
+                self.core.ensure_source(spec).await
+            }
+
+            async fn remove_source(&self, name: &str) -> Result<(), AudioError> {
+                self.core.remove_source(name).await
+            }
+
+            async fn move_source_output(
+                &self,
+                stream: AudioSourceRef,
+                source: &str,
+            ) -> Result<(), AudioError> {
+                self.core.move_source_output(stream, source).await
+            }
+
+            async fn apply_source_profile(
+                &self,
+                profile: AudioSourceProfile,
+            ) -> Result<(), AudioError> {
+                self.core.apply_source_profile(profile).await
+            }
+
             async fn apply_profile(&self, profile: AudioProfile) -> Result<(), AudioError> {
                 self.core.apply_profile(profile).await
             }
@@ -915,6 +1378,24 @@ fn sink_state(name: &str, created: bool) -> AudioSinkState {
     }
 }
 
+fn source_state(name: &str, master: Option<String>, created: bool) -> AudioSourceState {
+    AudioSourceState {
+        name: name.to_owned(),
+        master,
+        created,
+    }
+}
+
+fn source_unsupported(operation: &str) -> AudioError {
+    AudioError::Unsupported {
+        feature: format!("audio source routing (`{operation}`)"),
+        remediation: "Use a router backed by a PulseAudio-compatible server (`pactl`), or \
+                      select an existing source with `default`/`object:<name>`/`monitor:<sink>` \
+                      for capture. No source graph change was attempted."
+            .to_owned(),
+    }
+}
+
 fn short_list_argv(kind: &str) -> Vec<String> {
     vec![
         PACTL.to_owned(),
@@ -924,16 +1405,25 @@ fn short_list_argv(kind: &str) -> Vec<String> {
     ]
 }
 
-fn parse_sink_names(stdout: &str) -> impl Iterator<Item = &str> {
+fn parse_short_names(stdout: &str) -> impl Iterator<Item = &str> {
     stdout.lines().filter_map(|line| {
-        // `pactl list short sinks` is tab-separated on current releases;
-        // fall back to whitespace so older/mocked output still parses.
+        // `pactl list short sinks|sources` is tab-separated on current
+        // releases; fall back to whitespace so older/mocked output still
+        // parses.
         let mut fields = line.split('\t');
         match (fields.next(), fields.next()) {
             (Some(_), Some(name)) if !name.trim().is_empty() => Some(name.trim()),
             _ => line.split_whitespace().nth(1),
         }
     })
+}
+
+fn parse_sink_names(stdout: &str) -> impl Iterator<Item = &str> {
+    parse_short_names(stdout)
+}
+
+fn parse_source_names(stdout: &str) -> impl Iterator<Item = &str> {
+    parse_short_names(stdout)
 }
 
 fn parse_module_id(stdout: &str, argv: &[String]) -> Result<u32, AudioError> {
@@ -945,18 +1435,23 @@ fn parse_module_id(stdout: &str, argv: &[String]) -> Result<u32, AudioError> {
     })
 }
 
-fn parse_null_sink_module(stdout: &str, sink: &str) -> Result<Option<u32>, AudioError> {
+fn parse_named_module(
+    stdout: &str,
+    module: &str,
+    key: &str,
+    value: &str,
+) -> Result<Option<u32>, AudioError> {
     let command = render_command(&short_list_argv("modules"));
-    let wanted = format!("sink_name={sink}");
+    let wanted = format!("{key}={value}");
     for line in stdout.lines() {
         let mut words = line.split_whitespace();
         let Some(id_raw) = words.next() else {
             continue;
         };
-        let Some(module) = words.next() else {
+        let Some(found_module) = words.next() else {
             continue;
         };
-        if module != NULL_SINK_MODULE {
+        if found_module != module {
             continue;
         }
         if !words.any(|word| word == wanted) {
@@ -970,6 +1465,14 @@ fn parse_null_sink_module(stdout: &str, sink: &str) -> Result<Option<u32>, Audio
         return Ok(Some(id));
     }
     Ok(None)
+}
+
+fn parse_null_sink_module(stdout: &str, sink: &str) -> Result<Option<u32>, AudioError> {
+    parse_named_module(stdout, NULL_SINK_MODULE, "sink_name", sink)
+}
+
+fn parse_remap_source_module(stdout: &str, source: &str) -> Result<Option<u32>, AudioError> {
+    parse_named_module(stdout, REMAP_SOURCE_MODULE, "source_name", source)
 }
 
 fn validate_token(field: &str, value: &str) -> Result<(), AudioError> {
@@ -1160,10 +1663,21 @@ mod tests {
         CommandOutput::success(format!("3\t{name}\tPipeWire\ts16le 2ch 48000Hz\tRUNNING\n"))
     }
 
+    fn source_list(name: &str) -> CommandOutput {
+        CommandOutput::success(format!("5\t{name}\tPipeWire\ts16le 2ch 48000Hz\tRUNNING\n"))
+    }
+
     fn module_list(sink: &str, id: u32) -> CommandOutput {
         CommandOutput::success(format!(
             "{id}\t{NULL_SINK_MODULE}\tsink_name={sink} \
              sink_properties=device.description=Ozma-VM1 rate=48000 channels=2\n"
+        ))
+    }
+
+    fn source_module_list(source: &str, id: u32) -> CommandOutput {
+        CommandOutput::success(format!(
+            "{id}\t{REMAP_SOURCE_MODULE}\tmaster=ozma-vm1.monitor \
+             source_name={source} source_properties=device.description=Ozma-VM1-Mic channels=2\n"
         ))
     }
 
@@ -1367,6 +1881,227 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn move_source_output_uses_the_source_output_index() {
+        let fake = Arc::new(FakeRunner::default());
+        let router = pipewire(fake.clone());
+
+        router
+            .move_source_output(AudioSourceRef::new(23), "ozma-vm1-mic")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fake.calls()[0].argv,
+            argv(&["pactl", "move-source-output", "23", "ozma-vm1-mic"])
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_source_creates_a_remap_source_from_a_monitor() {
+        let fake = Arc::new(FakeRunner::with_responses(vec![
+            Ok(CommandOutput::success("")),
+            Ok(CommandOutput::success("44\n")),
+        ]));
+        let router = pipewire(fake.clone());
+
+        let state = router
+            .ensure_source(
+                AudioSourceSpec::monitor("ozma-vm1-mic", "Ozma-VM1-Mic", "ozma-vm1").unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state,
+            AudioSourceState {
+                name: "ozma-vm1-mic".to_owned(),
+                master: Some("ozma-vm1.monitor".to_owned()),
+                created: true,
+            }
+        );
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].argv, argv(&["pactl", "list", "short", "sources"]));
+        assert_eq!(
+            calls[1].argv,
+            argv(&[
+                "pactl",
+                "load-module",
+                "module-remap-source",
+                "master=ozma-vm1.monitor",
+                "source_name=ozma-vm1-mic",
+                "source_properties=device.description=Ozma-VM1-Mic",
+                "channels=2",
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_source_reuses_an_existing_source_by_name() {
+        let fake = Arc::new(FakeRunner::with_responses(vec![Ok(source_list(
+            "alsa_input.usb-mic",
+        ))]));
+        let router = pipewire(fake.clone());
+
+        let state = router
+            .ensure_source(AudioSourceSpec::new("alsa_input.usb-mic", "USB-Mic").unwrap())
+            .await
+            .unwrap();
+
+        assert!(!state.created);
+        assert_eq!(state.master, None);
+        assert_eq!(fake.calls().len(), 1);
+        assert_eq!(
+            fake.calls()[0].argv,
+            argv(&["pactl", "list", "short", "sources"])
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_source_without_a_master_refuses_to_invent_a_source() {
+        let fake = Arc::new(FakeRunner::with_responses(vec![Ok(
+            CommandOutput::success(""),
+        )]));
+        let router = pipewire(fake.clone());
+
+        let error = router
+            .ensure_source(AudioSourceSpec::new("ozma-vm9-mic", "Ozma-VM9-Mic").unwrap())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, AudioError::Refused { .. }));
+        assert!(error.to_string().contains("master"));
+        assert!(
+            fake.calls()
+                .iter()
+                .all(|call| call.argv[1] != "load-module"),
+            "no source may be loaded without a master"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_source_finds_the_remap_module_then_noops_when_already_gone() {
+        let fake = Arc::new(FakeRunner::with_responses(vec![
+            Ok(source_module_list("ozma-vm1-mic", 12)),
+            Ok(CommandOutput::success("")),
+            Ok(CommandOutput::success("")),
+            Ok(CommandOutput::success("")),
+        ]));
+        let router = pipewire(fake.clone());
+
+        router.remove_source("ozma-vm1-mic").await.unwrap();
+        let calls = fake.calls();
+        assert_eq!(calls[0].argv, argv(&["pactl", "list", "short", "modules"]));
+        assert_eq!(calls[1].argv, argv(&["pactl", "unload-module", "12"]));
+
+        // Unknown source: query modules and sources, then succeed without an
+        // unload command.
+        let before = fake.calls().len();
+        router.remove_source("ozma-vm1-mic").await.unwrap();
+        let calls = fake.calls();
+        assert_eq!(
+            calls[before].argv,
+            argv(&["pactl", "list", "short", "modules"])
+        );
+        assert_eq!(
+            calls[before + 1].argv,
+            argv(&["pactl", "list", "short", "sources"])
+        );
+        assert!(
+            calls[before..]
+                .iter()
+                .all(|call| call.argv[1] != "unload-module"),
+            "an unknown source must be a typed no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_source_refuses_to_unload_a_non_ozma_source() {
+        let fake = Arc::new(FakeRunner::with_responses(vec![
+            Ok(CommandOutput::success("")),
+            Ok(source_list("alsa_input.usb-mic")),
+        ]));
+        let router = pipewire(fake.clone());
+
+        let error = router
+            .remove_source("alsa_input.usb-mic")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, AudioError::Refused { .. }));
+        assert!(fake
+            .calls()
+            .iter()
+            .all(|call| call.argv[1] != "unload-module"));
+    }
+
+    #[tokio::test]
+    async fn apply_source_profile_sets_volume_and_mute_and_remove_restores_defaults() {
+        let fake = Arc::new(FakeRunner::default());
+        let router = pipewire(fake.clone());
+        let profile = AudioSourceProfile::new("mic", "ozma-vm1-mic")
+            .unwrap()
+            .with_volume(35)
+            .unwrap()
+            .with_muted(true);
+
+        router.apply_source_profile(profile).await.unwrap();
+        let calls = fake.calls();
+        assert_eq!(
+            calls[0].argv,
+            argv(&["pactl", "set-source-volume", "ozma-vm1-mic", "35%"])
+        );
+        assert_eq!(
+            calls[1].argv,
+            argv(&["pactl", "set-source-mute", "ozma-vm1-mic", "yes"])
+        );
+
+        router.remove_profile("mic").await.unwrap();
+        let calls = fake.calls();
+        assert_eq!(
+            calls[2].argv,
+            argv(&["pactl", "set-source-mute", "ozma-vm1-mic", "no"])
+        );
+        assert_eq!(
+            calls[3].argv,
+            argv(&["pactl", "set-source-volume", "ozma-vm1-mic", "100%"])
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_profile_with_a_source_applies_both_sides() {
+        let fake = Arc::new(FakeRunner::default());
+        let router = pipewire(fake.clone());
+        let profile = AudioProfile::new("duplex", "ozma-vm1")
+            .unwrap()
+            .with_source("ozma-vm1-mic")
+            .unwrap()
+            .with_volume(50)
+            .unwrap();
+
+        router.apply_profile(profile).await.unwrap();
+
+        let calls: Vec<Vec<String>> = fake.calls().into_iter().map(|call| call.argv).collect();
+        assert_eq!(
+            calls,
+            vec![
+                argv(&["pactl", "set-sink-volume", "ozma-vm1", "50%"]),
+                argv(&["pactl", "set-source-volume", "ozma-vm1-mic", "50%"]),
+            ]
+        );
+
+        router.remove_profile("duplex").await.unwrap();
+        let calls: Vec<Vec<String>> = fake.calls().into_iter().map(|call| call.argv).collect();
+        assert_eq!(
+            calls[2..],
+            [
+                argv(&["pactl", "set-sink-volume", "ozma-vm1", "100%"]),
+                argv(&["pactl", "set-source-volume", "ozma-vm1-mic", "100%"]),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn invalid_names_are_rejected_before_any_command_runs() {
         let fake = Arc::new(FakeRunner::default());
         let router = pipewire(fake.clone());
@@ -1472,20 +2207,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn profile_source_routing_fails_loudly() {
+    async fn invalid_source_names_are_rejected_before_any_command_runs() {
         let fake = Arc::new(FakeRunner::default());
         let router = pipewire(fake.clone());
-        let profile = AudioProfile::new("mic", "ozma-vm1")
-            .unwrap()
-            .with_source("alsa_input.usb-mic")
-            .unwrap()
-            .with_volume(40)
-            .unwrap();
+        let profile = AudioSourceProfile {
+            id: "mic".to_owned(),
+            source: "bad source".to_owned(),
+            volume: Some(40),
+            muted: None,
+        };
 
-        let error = router.apply_profile(profile).await.unwrap_err();
+        let error = router.apply_source_profile(profile).await.unwrap_err();
 
-        assert!(matches!(error, AudioError::Unsupported { .. }));
-        assert!(fake.calls().is_empty(), "no partial apply may run");
+        assert!(matches!(error, AudioError::InvalidSpec { .. }));
+        assert!(fake.calls().is_empty(), "no command may run");
     }
 
     #[tokio::test]
@@ -1700,6 +2435,36 @@ mod tests {
         assert!(AudioProfile::new("harman", "ozma-vm1")
             .unwrap()
             .with_source("bad source")
+            .is_err());
+        assert!(AudioProfile::for_source("mic", "").is_err());
+        assert!(AudioProfile::for_source("mic", "bad source").is_err());
+        assert!(AudioProfile::for_source("mic", "ozma-vm1-mic")
+            .unwrap()
+            .is_source_only());
+        assert!(!AudioProfile::new("harman", "ozma-vm1")
+            .unwrap()
+            .is_source_only());
+
+        assert!(AudioSourceSpec::new("", "Mic").is_err());
+        assert!(AudioSourceSpec::new("ozma-vm1-mic", "").is_err());
+        assert!(AudioSourceSpec::new("ozma vm1 mic", "Mic").is_err());
+        assert!(AudioSourceSpec::from_master("ozma-vm1-mic", "Mic", "bad master").is_err());
+        assert!(AudioSourceSpec::monitor("ozma-vm1-mic", "Mic", "ozma-vm1").is_ok());
+        assert!(AudioSourceSpec::monitor("ozma-vm1-mic", "Mic", "").is_err());
+        assert!(AudioSourceSpec::monitor("ozma-vm1-mic", "Mic", "bad sink").is_err());
+        let source_spec = AudioSourceSpec::new("ozma-vm1-mic", "Mic").unwrap();
+        assert!(source_spec.clone().with_channels(0).is_err());
+        assert!(source_spec
+            .clone()
+            .with_channels(MAX_SOURCE_CHANNELS + 1)
+            .is_err());
+        assert!(source_spec.with_channels(1).is_ok());
+
+        assert!(AudioSourceProfile::new("", "ozma-vm1-mic").is_err());
+        assert!(AudioSourceProfile::new("mic", "").is_err());
+        assert!(AudioSourceProfile::new("mic", "ozma-vm1-mic")
+            .unwrap()
+            .with_volume(101)
             .is_err());
 
         assert!(AudioPlaybackSpec::new("../sweep.flac", "ozma-vm1").is_err());

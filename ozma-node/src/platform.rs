@@ -12,6 +12,7 @@ use ozma_capture::{
     CaptureRegistry, DBusDisplayConfig, FakeCaptureProvider, QmpDisplayConfig, VncDisplayConfig,
     DBUS_DEFAULT_ID, QMP_DEFAULT_ID, QMP_DEFAULT_MAX_FPS, VNC_DEFAULT_ID,
 };
+use ozma_input::SinkKind;
 use ozma_media::FrameFormat;
 use ozma_qmp::SharedQmpClient;
 
@@ -41,8 +42,54 @@ pub fn capture_registry_with_qmp_shared(
 ) -> CaptureRegistry {
     match config.profile {
         NodeProfile::Vm => vm_capture_registry(config, shared),
-        NodeProfile::Desktop if config.fake_capture_requested() => fake_capture_registry(config),
-        NodeProfile::Hardware | NodeProfile::Desktop => CaptureRegistry::system_with_pipewire(),
+        NodeProfile::Desktop => desktop_capture_registry(config),
+        NodeProfile::Hardware => CaptureRegistry::system_with_pipewire(),
+    }
+}
+
+/// The desktop profile's capture registry.
+///
+/// Real desktop capture is PipeWire only: a ScreenCast portal session exposes
+/// the selected monitor as a normal `Video/Source` node, and `--desktop-capture-target`
+/// names that node. The portal consent/selection handshake is not implemented
+/// here (it belongs in a separate front-end); without it the graph default is
+/// used and the discovered node is advertised truthfully, not relabelled as a
+/// screen. V4L2 is deliberately absent: a desktop seat's camera is not its
+/// screen. X11 capture is not implemented.
+fn desktop_capture_registry(config: &NodeConfig) -> CaptureRegistry {
+    if config.fake_capture_requested() {
+        return fake_capture_registry(config);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let options = ozma_capture::PipeWireOptions {
+            target: stream_target_for(&config.desktop_capture_target),
+            remote: config.desktop_capture_remote.clone(),
+            width: config.desktop_capture_width,
+            height: config.desktop_capture_height,
+            fps: config.desktop_capture_fps,
+            ..ozma_capture::PipeWireOptions::default()
+        };
+        CaptureRegistry::new().with(ozma_capture::PipeWireCaptureProvider::with_options(options))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        // PipeWire screen capture is Linux-only and there is no honest
+        // non-Linux desktop capture provider in this build.
+        CaptureRegistry::new()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn stream_target_for(target: &crate::config::DesktopCaptureTarget) -> ozma_capture::StreamTarget {
+    match target {
+        crate::config::DesktopCaptureTarget::Default => ozma_capture::StreamTarget::Default,
+        crate::config::DesktopCaptureTarget::Object(name) => {
+            ozma_capture::StreamTarget::Object(name.clone())
+        }
+        crate::config::DesktopCaptureTarget::NodeId(id) => ozma_capture::StreamTarget::NodeId(*id),
     }
 }
 
@@ -286,7 +333,57 @@ pub fn detect(config: &NodeConfig) -> NodeCapabilities {
 
 /// Build capabilities with an injected capture registry, for tests and
 /// unusual deployments.
+///
+/// Input is reported separately (see [`detect_with_registry_and_input`]) because
+/// only the node knows which sink actually opened. This form reports no
+/// keyboard/pointer injection rather than claiming the protocol's fake input
+/// set.
 pub fn detect_with_registry(config: &NodeConfig, capture: &CaptureRegistry) -> NodeCapabilities {
+    let mut caps = detect_base(config, capture);
+    caps.input = InputCapability::default();
+    caps
+}
+
+/// Build capabilities and report the input path that actually opened.
+///
+/// `sink` is the selected sink: uinput/QMP/HID gadget advertise only the
+/// keyboard and pointer modes that sink implements, and the recording-only
+/// fallback advertises no injection at all.
+pub fn detect_with_registry_and_input(
+    config: &NodeConfig,
+    capture: &CaptureRegistry,
+    sink: Option<SinkKind>,
+) -> NodeCapabilities {
+    let mut caps = detect_base(config, capture);
+    caps.input = input_capability_for(sink);
+    caps
+}
+
+/// Truthful input capabilities for a selected sink.
+pub fn input_capability_for(sink: Option<SinkKind>) -> InputCapability {
+    match sink {
+        Some(SinkKind::Uinput) => InputCapability {
+            keyboard: true,
+            // `UinputSink::open` uses the default absolute pointer device; it
+            // rejects relative events, so do not advertise them.
+            mouse_absolute: true,
+            mouse_relative: false,
+            release_all: true,
+            ..InputCapability::default()
+        },
+        Some(SinkKind::Qmp) | Some(SinkKind::HidGadget) => InputCapability {
+            keyboard: true,
+            mouse_absolute: true,
+            mouse_relative: true,
+            release_all: true,
+            ..InputCapability::default()
+        },
+        // A recording sink validates events but injects nothing.
+        Some(SinkKind::Recording) | None => InputCapability::default(),
+    }
+}
+
+fn detect_base(config: &NodeConfig, capture: &CaptureRegistry) -> NodeCapabilities {
     let mut caps = NodeCapabilities::fake(config.node_id.clone());
     caps.name = config.name.clone();
     caps.platform = config.hw.clone();
@@ -429,6 +526,12 @@ mod tests {
             fake_width: crate::config::DEFAULT_FAKE_WIDTH,
             fake_height: crate::config::DEFAULT_FAKE_HEIGHT,
             fake_fps: crate::config::DEFAULT_FAKE_FPS,
+            desktop_capture_width: crate::config::DEFAULT_FAKE_WIDTH,
+            desktop_capture_height: crate::config::DEFAULT_FAKE_HEIGHT,
+            desktop_capture_fps: crate::config::DEFAULT_FAKE_FPS,
+            desktop_capture_target: crate::config::DesktopCaptureTarget::Default,
+            desktop_capture_remote: None,
+            audio_capture_target: ozma_audio::AudioTarget::Default,
             audio_router: crate::config::AudioRouterKind::None,
             audio_track_root: None,
             ffmpeg_bin: std::path::PathBuf::from("ffmpeg"),
@@ -704,5 +807,62 @@ mod tests {
             .scan()
             .iter()
             .all(|scan| scan.kind != ozma_protocol::CaptureKind::Vnc));
+    }
+
+    #[test]
+    fn desktop_profile_registers_pipewire_only() {
+        let desktop = config("hid,video,audio");
+        let mut desktop = desktop;
+        desktop.profile = crate::config::NodeProfile::Desktop;
+        desktop.providers = crate::config::ProviderSelection::for_profile(desktop.profile);
+
+        let registry = capture_registry(&desktop);
+        #[cfg(target_os = "linux")]
+        assert_eq!(registry.provider_count(), 1);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(registry.provider_count(), 0);
+
+        // The explicit dev/test source still works and stays labelled Fake.
+        desktop.provider_overrides =
+            crate::config::ProviderOverrides::from_cli("fake", "", "", "", "");
+        desktop.providers = crate::config::ProviderSelection::for_profile(desktop.profile)
+            .with_overrides(&desktop.provider_overrides);
+        let registry = capture_registry(&desktop);
+        assert_eq!(registry.provider_count(), 1);
+        assert_eq!(registry.scan()[0].kind, ozma_protocol::CaptureKind::Fake);
+    }
+
+    #[test]
+    fn desktop_capabilities_follow_the_selected_input_sink() {
+        let mut desktop = config("hid,video,audio");
+        desktop.profile = crate::config::NodeProfile::Desktop;
+        let registry = CaptureRegistry::new().with(FakeCaptureProvider::new());
+
+        let uinput = detect_with_registry_and_input(&desktop, &registry, Some(SinkKind::Uinput));
+        assert!(uinput.input.keyboard);
+        assert!(uinput.input.mouse_absolute);
+        assert!(!uinput.input.mouse_relative);
+        assert!(uinput.input.release_all);
+        assert!(!uinput.input.clipboard);
+
+        let recording =
+            detect_with_registry_and_input(&desktop, &registry, Some(SinkKind::Recording));
+        assert_eq!(recording.input, InputCapability::default());
+        assert!(!recording.input.keyboard);
+
+        // Without a selected sink, detect_with_registry must not claim the
+        // protocol's fake input set.
+        let unknown = detect_with_registry(&desktop, &registry);
+        assert_eq!(unknown.input, InputCapability::default());
+    }
+
+    #[test]
+    fn desktop_without_capture_reports_no_video_or_display() {
+        let mut desktop = config("hid,video,audio");
+        desktop.profile = crate::config::NodeProfile::Desktop;
+        let caps = detect_with_registry(&desktop, &CaptureRegistry::new());
+        assert!(caps.capture.is_empty());
+        assert!(caps.encode.is_empty());
+        assert!(!caps.display.supported);
     }
 }

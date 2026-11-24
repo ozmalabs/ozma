@@ -22,6 +22,7 @@ mod discovery;
 mod evdev_provisioning;
 mod manager;
 mod provisioning;
+mod status;
 mod supervisor;
 mod vm_info;
 
@@ -105,6 +106,14 @@ struct Args {
     /// Maximum restart delay after repeated per-VM node failures, in milliseconds
     #[arg(long, default_value_t = 30000)]
     restart_backoff_max_ms: u64,
+
+    /// Read-only supervisor status/metrics HTTP port (0 disables it)
+    ///
+    /// Serves `/health`, `/status`, `/metrics`, and `/api/v1/connection` for
+    /// the whole hypervisor. The document aggregates every supervised VM,
+    /// including skipped and excluded ones. No secrets are exposed.
+    #[arg(long, default_value_t = 0)]
+    status_port: u16,
 
     /// Opt in to defining ozma QMP/display XML on libvirt domains
     ///
@@ -260,6 +269,23 @@ async fn main() -> anyhow::Result<()> {
     // spawning any work.
     mgr.validate()?;
 
+    // Optional read-only status/metrics listener for the whole supervisor.
+    if args.status_port != 0 {
+        let listener = status::bind(args.status_port).await?;
+        let bound_port = listener.local_addr()?.port();
+        info!(
+            "Supervisor status API listening on http://0.0.0.0:{}/ (health, status, metrics)",
+            bound_port
+        );
+        let status_mgr = Arc::clone(&mgr);
+        let shutdown = mgr.subscribe_shutdown();
+        tokio::spawn(async move {
+            if let Err(error) = status::serve(status_mgr, listener, bound_port, shutdown).await {
+                tracing::warn!("Supervisor status API stopped: {}", error);
+            }
+        });
+    }
+
     // Graceful shutdown on SIGINT / SIGTERM. `run` stops every child and waits
     // before returning.
     let mgr_signal = Arc::clone(&mgr);
@@ -299,6 +325,7 @@ mod tests {
         assert_eq!(args.node_http_base, 7382);
         assert_eq!(args.restart_backoff_ms, 1000);
         assert_eq!(args.restart_backoff_max_ms, 30000);
+        assert_eq!(args.status_port, 0);
         assert!(!args.no_auto_manage);
         assert!(!args.no_auto_agent);
         assert!(!args.provision);
@@ -351,6 +378,16 @@ mod tests {
         assert_eq!(args.xdg_runtime_dir.as_deref(), Some("/run/user/1000"));
         assert_eq!(args.evdev_kbd, Some(PathBuf::from("/dev/input/event5")));
         assert_eq!(args.evdev_mouse, Some(PathBuf::from("/dev/input/event6")));
+    }
+
+    #[test]
+    fn status_port_flag_parses_and_zero_disables_it() {
+        let args = Args::try_parse_from(["ozma-virtual-node", "--status-port", "9555"])
+            .expect("parse status port");
+        assert_eq!(args.status_port, 9555);
+
+        let defaults = Args::try_parse_from(["ozma-virtual-node"]).expect("parse defaults");
+        assert_eq!(defaults.status_port, 0);
     }
 
     #[test]

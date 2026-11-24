@@ -428,7 +428,8 @@ Starlette’s `httpx` TestClient deprecation.
    `f072c7a`; startup now logs a warning and disables that registry. Do not
    reintroduce it without a replacement design.
 6. **Environment/version test drift remains unchanged** (`10 failed, 2347
-   passed, 4 skipped, 1 error`):
+   passed, 4 skipped, 1 error`) — **superseded by §9**, which records the
+   2026-11-24 cleanup (`0 failed, 0 errors`):
    - GraphQL/strawberry drift: `start_event_router` import bug and cascading
      global event-router leakage; `schema.introspect()` shape; direct fixture
      call under pytest 9; `test_graphql_mutations.py` imports names not exported
@@ -467,4 +468,104 @@ Starlette’s `httpx` TestClient deprecation.
   (`ozma-node/src/*`, `ozma-capture/src/*`, `ozma-qmp/src/*`, docs,
   `Cargo.lock`, plus untracked reports). Those are not this repair's changes and
   were left untouched.
+
+## 9. Controller test-suite cleanup (2026-11-24)
+
+Follow-up drift cleanup for Phase 3 / clean-host readiness. This section
+supersedes §6 and §7 item 6. Only controller tests, their fixtures, and docs
+changed; no Rust source and no product behaviour was modified.
+
+### 9.1 Environment
+
+| Item | Value |
+|---|---|
+| Audit window | 2026-11-24 20:45–21:10 AEDT |
+| Repo | `/home/matt/ozma/ozma`, HEAD `4bd7539` (dirty tree: unrelated Rust/docs edits from another process) |
+| Python | 3.14.10, disposable `/tmp/ozma-ctrl-venv` (removed after the run) |
+| Dependencies | `controller/requirements.txt` + `pytest`, `pytest-asyncio`, `pytest-timeout` |
+| Container check | rootless `podman`, official `python:3.14` image, repo mounted read-only, venv inside the container |
+
+### 9.2 Before/after counts
+
+Command (identical in the host venv and the container):
+
+```console
+$ python -m pytest tests/unit/controller -q --continue-on-collection-errors \
+    --timeout=20 --timeout-method=signal -p no:cacheprovider
+```
+
+| Run | Result |
+|---|---|
+| Before (host `/tmp` venv) | **9 failed, 2463 passed, 6 skipped, 1 error** (`test_graphql_mutations.py` collection) in 138.06 s |
+| After (host `/tmp` venv) | **2481 passed, 6 skipped, 1 xfailed, 0 failed, 0 errors** in 60.48 s |
+| After (clean `python:3.14` container) | **2481 passed, 6 skipped, 1 xfailed, 0 failed, 0 errors** in 59.00 s |
+| Focused: `tests/test_node_reconciler.py` | **10 passed** (before and after) |
+
+The pass-count increase is the rewritten mutation module (10 current tests that
+previously did not collect: 9 pass and 1 strict xfail) plus the seven
+subscription tests and two capture tests that were failing. The single
+`xfailed` test is an explicit, strict marker for the product drift in §9.4.
+
+### 9.3 Drift fixed (tests only)
+
+| Test / file | Root cause | Fix |
+|---|---|---|
+| `test_graphql_mutations.py` (collection error) | Imported `Mutation`, `GraphQLError`, `Node`, `ScenarioInput`, `_require_write_scope`, … from `controller.gql`, but commit d939c61 moved the module to `controller/gql_router.py`; Task #51 had already removed those classes. `controller.gql` exports only `schema`. | Retargeted to `controller.gql_router` and the API that actually exists: schema contains `activateNode`, `NodeInfo` fields, `RequireWritePermission` (write/read/unauthenticated), `Mutation.activate_node` success, and `Query.active_node`/`nodes`. 27 obsolete tests for removed mutations were replaced by 10 current tests (9 pass + 1 strict xfail for the product error-path drift below). |
+| `test_graphql_subscriptions.py::test_event_routing` | `start_event_router` was not imported. The `NameError` fired before the `finally`, leaving the module-global router task and registry behind and hanging later tests. | Import `start_event_router`/`stop_event_router`; added an autouse fixture that cancels/clears the global router task and subscription registry before and after every test. |
+| `test_graphql_subscriptions.py` new-node/new-scenario/new-alert/updated-alert | Stale expectations assumed an initial snapshot was always yielded. Empty mock state produced 0 initial values, so the generators waited forever for 2–3 results. | Seed the initial state where the original intent was "initial + event"; otherwise wait for the one event actually produced. The scenario test now also asserts both the snapshot and the activation. |
+| `test_graphql_subscriptions.py::test_audio_level...` | Called the `audio_router` fixture directly (rejected by pytest 9). | Injected the fixture as a parameter. |
+| `test_graphql_subscriptions.py::test_schema_has_all_subscription_fields` | `schema.introspect()` returns `{"__schema": ...}` in the installed graphql-core/strawberry versions, not `{"data": {...}}`. | Accept both shapes; use `controller.gql.schema` instead of the shadow `gql.schema` path. |
+| `test_capture_to_moonlight.py` missing-device tests (2) | Assumed `/dev/video0` did not exist; this host has real capture devices. | Use a guaranteed-missing path under pytest's `tmp_path`. The product's `Path(card.path).exists()` check is still exercised. |
+| `test_moonlight_pairing.py::test_serverinfo_endpoint_unpaired` | Already fixed in the working tree: the handler is called directly and no longer binds the fixed `0.0.0.0:47984` port. The `47984` assertion is response data only. | Verified; no test binds 47984/47996. |
+
+No test was skipped to make it pass. No coverage of existing product behaviour
+was removed; the only deleted tests covered mutation classes that no longer
+exist.
+
+### 9.4 Remaining drift (not test-only)
+
+- **Product GraphQL error paths:** `controller/gql_router.py` and
+  `controller/graphql_api.py` still call `strawberry.ExceptionField`, which the
+  installed Strawberry version does not export. Missing-node activation
+  therefore raises `AttributeError` instead of a typed `NOT_FOUND`. This is
+  marked by the strict xfail in `test_graphql_mutations.py`; fixing it is a
+  product decision, outside this test-only cleanup.
+- **Duplicate/unmounted GraphQL modules:** `main.py` mounts `graphql_api.py`
+  through `api.py`, while `gql_router.py` is the module exercised by
+  `test_graphql.py` and now `test_graphql_mutations.py`. `graphql_api.py`'s
+  `activate_node` uses `app_state.activate_node` (the real `AppState` exposes
+  `set_active_node`) and runs the coroutine with
+  `run_coroutine_threadsafe(...).result()` from the calling loop. These are
+  product drift, not test drift.
+- Optional packages `argon2-cffi` and `mnemonic` are still absent from
+  `requirements.txt`; `main.py --help` starts with a "mnemonic not installed"
+  warning only. Not a blocker.
+- Host-dependent tests that remain skipped are unchanged (6 skips, all with
+  their existing reasons).
+
+### 9.5 Clean-host install
+
+The controller installs and tests cleanly without sudo:
+
+```console
+$ python3 -m venv /tmp/ozma-ctrl-venv
+$ /tmp/ozma-ctrl-venv/bin/pip install -r controller/requirements.txt \
+    pytest pytest-asyncio pytest-timeout
+$ cd controller && /tmp/ozma-ctrl-venv/bin/python main.py --help   # exit 0
+$ cd .. && /tmp/ozma-ctrl-venv/bin/python -m pytest tests/unit/controller -q \
+    --continue-on-collection-errors --timeout=20 --timeout-method=signal
+2481 passed, 6 skipped, 1 xfailed
+```
+
+The same commands were run in a read-only rootless container
+(`python:3.14`, repo mounted at `/src:ro`, venv at `/tmp/v`), with identical
+results. No repository data directory was needed to collect/run the suite.
+`controller/mesh_network.json` is written into the repo by the suite and was
+removed after the run; a clean host should still treat that as a test artifact.
+
+### 9.6 Cleanup
+
+`/tmp/ozma-ctrl-venv`, the container (removed with `--rm`), and the test-written
+`controller/mesh_network.json` were removed. No global package was installed, no
+sudo was used, and no commit was made.
 

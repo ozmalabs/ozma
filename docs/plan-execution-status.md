@@ -18,7 +18,7 @@ The migration from the Python `softnode/`, `node/`, and `agent/` processes to th
 | Dead `src/` prototypes deleted | Done | `src/agent`, `src/softnode`, `src/main.rs`, and `src/streamdeck.rs` removed; they were outside the workspace and had no references |
 | `ozma-agent` frozen and marked deprecated | Done | module doc, `Cargo.toml` description, and `--help` all point to `ozma-node --profile desktop` |
 | `ozma-softnode` no longer spawns a nonexistent binary | Done | child-process spawn removed; auto-management fails fast with an actionable error; `--no-auto-manage` is discovery-only |
-| `ozma-node --profile {hardware,vm,desktop}` | Done (configuration) | `NodeProfile` and `ProviderSelection` plus CLI overrides; `vm`/`desktop` log a configuration-only warning until Phases 1/3 |
+| `ozma-node --profile {hardware,vm,desktop}` | Done (vm/desktop runtime wired) | `NodeProfile` and `ProviderSelection` plus CLI overrides; VM providers and the desktop runtime (PipeWire capture/audio, input chain, routes) are wired in Phases 1–3; see the Phase 3 table below |
 | Controller compatibility skeleton | Done | real UDP HID v1 listener, `/api/v1/connection`, registration payload parity, bearer-guarded compat router; `cargo test -p ozma-node --lib` (136 tests, 2 ignored) |
 | Parity harness and matrix | Done | `ozma-node/tests/parity.rs` (16 tests, CI-safe fake controller) and [`parity-matrix.md`](parity-matrix.md); `cargo test --workspace` green |
 | `ozma-aperture` rollout step 1 | Done | pure meet/provenance/recourse/receipt crate with policy loader; 9 integration tests plus doctest |
@@ -42,7 +42,7 @@ power, VM provisioning, or real EVDI. Those remain Phase 1–3 work and are mark
 | VNC display provider | Partial (ffmpeg transition) | `VncDisplayProvider`/`VncDisplaySource` enumerate without I/O, spawn ffmpeg `-f vnc` lazily, read raw RGB24 frames with monotonic PTS/sequence, bound stderr, and map EOF/short frames to typed errors; fake-child tests; real VNC test ignored (`OZMA_VNC_TEST=1`) |
 | D-Bus framebuffer provider | Done (unit/fake) | `DBusDisplayProvider`/`DBusDisplaySource`, a small D-Bus wire codec, QMP `getfd`/`add_client`, SCM_RIGHTS listener, `Scanout`/`Update` BGRA frames, and scripted-transport tests; VM profile selection via `--capture-provider dbus` or `--dbus-console`/`--dbus-width`/`--dbus-height`/`--dbus-fps` with `--qmp-socket`. Real QEMU test ignored (`OZMA_DBUS_TEST_QMP`) |
 | VM display model | Done (model) | `VmConsole`/`VmDisplayTopology`, placements, primary/validation, `Console_N` ids; 14 tests |
-| Audio target selection | Done (model + routing) | `AudioTarget`, `<sink>.monitor` naming, `PipeWireCapture::open_target/open_sink_monitor`; `AudioRouter`/`PipeWireAudioRouter`/`PulseAudioAudioRouter` create/remove null sinks, apply profiles, move streams, and play reference tracks through `pactl`/`pw-play`/`paplay` with a fake command runner in tests |
+| Audio target selection | Done (model + routing) | `AudioTarget`, `<sink>.monitor` naming, `PipeWireCapture::open_target/open_source/open_named_source/open_sink_monitor`; `AudioRouter`/`PipeWireAudioRouter`/`PulseAudioAudioRouter` create/remove null sinks and named `module-remap-source`s, move sink-inputs/source-outputs, apply sink/source profiles, and play reference tracks through `pactl`/`pw-play`/`paplay` with a fake command runner in tests |
 | VM profile wiring | Partial | `--qmp-socket`/`--qmp-input-socket`/`--libvirt-domain`, QMP capture registry, `--vnc-host`/`--vnc-port`/`--vnc-width`/`--vnc-height`/`--vnc-fps`, D-Bus display flags/`--capture-provider dbus`, input sink chain (single-socket QMP fallback), QMP/libvirt power, `--audio-router`/`--audio-track-root`, `/power/state`, `/power/{action}`, `/codec`, `/audio/*`, and connection summaries; 136 `ozma-node` lib tests |
 | HLS pipeline | Partial | `HlsPipeline` reads RGB24/BGRA `CaptureSource` frames into ffmpeg HLS with software encoders (`libx264`, `libx265`, `libsvtav1`, `libaom-av1`, `mjpeg`), `-hls_flags delete_segments`, and a restartable controller that swaps encoders; `/stream/*` serves the output dir; connection reports `running`/`failed`/`not-configured` |
 | Controller input compat | Done (recording/fake in CI) | `/input/key`, `/input/mouse`, `/input/type`, `GET/POST /codec`, `/audio/apply|remove|play|stop`, bearer-guarded; HLS codec overrides restart the real HLS pipeline and report `applied: true` only on success, while WebRTC keeps its encoder; audio routes call a real router when configured; real injection/audio is hardware/QMP/audio-server opt-in |
@@ -57,6 +57,33 @@ WebRTC video/audio, guest input, snapshots, power pause/resume/reset/off/force-o
 codec switching, and audio routes all passed with captured evidence. See
 [`gate2-final-e2e-report.md`](gate2-final-e2e-report.md). Optional breadth and
 the controller pytest/clean-host regression remain in the parity matrix.
+
+## Rust reconciliation — Phase 3: desktop profile
+
+| Item | Status | Evidence |
+|---|---|---|
+| `ozma-node --profile desktop` runtime | Done (except portal/X11) | real `UinputSink`-first input chain, PipeWire video capture with a configurable target, PipeWire audio capture target, snapshots/status, and desktop input gating; [`desktop-profile.md`](desktop-profile.md) |
+| Desktop capture registry | Done | desktop registers `PipeWireCaptureProvider` with `--desktop-capture-target` (`default`, `name:/object:`, `node:<id>`), `--desktop-capture-remote`, width/height/fps; V4L2 and the fake source are not silently substituted; `cargo test -p ozma-node --lib platform::tests::desktop_` |
+| Desktop input | Done (uinput opt-in) | chain is `uinput -> [qmp only if a QMP socket is set] -> hid-gadget -> recording`; a missing `/dev/uinput` leaves the node running with recording-only input and no keyboard/pointer injection capability; `cargo test -p ozma-node --lib platform::tests::desktop_capabilities` |
+| Desktop audio | Partial | `--audio-capture-target default|object:|node:|monitor:<sink>` configures session capture; `--audio-router pipewire|pulseaudio` drives `/audio/*` over an existing graph; default capture target is PipeWire then ALSA/fake. `/audio/nodes` still returns the typed 501 graph stub |
+| Desktop compatibility routes | Done | public `/status` (alias of `/node/status`) and `/snapshot` (alias of `/display/snapshot`), plus `/display/info`, `/health`, `/api/v1/connection`, `/agent/metrics`, `/ui/hints`; `/audio/*` control routes work when a router is configured and are typed 501 otherwise |
+| Desktop startup/route test | Done | `cargo test -p ozma-node --test desktop_profile` starts the real binary with fake capture + recording input, then checks `/health`, `/status`, `/snapshot`, `/display/snapshot`, `/display/info`, `/api/v1/connection`, `/api/v1/capabilities`, and `/audio/*` without PipeWire/uinput/X11 |
+| XDG ScreenCast portal consent/selection | Not implemented | documented in [`desktop-profile.md`](desktop-profile.md); an external portal client must select a monitor and pass the resulting `Video/Source` node as `--desktop-capture-target` |
+| X11 capture fallback | Not implemented | `--capture-provider x11` is a typed startup error; no XGetImage/XShm provider exists |
+| Delete `ozma-agent` | Blocked on parity | kept deprecated; remaining items are listed in [`ozma-agent/README.md`](../ozma-agent/README.md) |
+
+Desktop live smoke on this host (2026-11-24): the host has a PipeWire session
+and a writable `/dev/uinput`, but no X11/Wayland display (`XDG_SESSION_TYPE=tty`,
+empty `DISPLAY`/`WAYLAND_DISPLAY`) and no portal ScreenCast session. A desktop
+node with `--capture-provider fake --input-provider fake-recording` served
+`/health`, `/status`, `/snapshot`, `/display/snapshot`, `/display/info`, and
+`/api/v1/connection`; no desktop input was injected. The default PipeWire
+provider advertised the host's real camera node (not a screen), and `/snapshot`
+returned a typed 503 because that camera negotiates `yuyv`, which the JPEG
+snapshot path does not convert; a missing configured target
+(`--desktop-capture-target node:999999`) left capture empty with an explicit
+log. `/audio/nodes` remained a typed 501. See
+[`desktop-profile.md`](desktop-profile.md) for the exact limitations.
 
 ## M0 — Contract and cleanup
 
@@ -128,7 +155,7 @@ authentication, and Xpra video are being extended in separate workstreams.
 ## Verification
 
 ```bash
-cargo test --workspace                                   # 1640 passed, 17 ignored (current)
+cargo test --workspace                                   # 1676 passed, 17 ignored (current)
 cargo test -p ozma-node --test parity                    # Python/controller parity baseline (16)
 cargo test -p ozma-node --lib                            # node API, compat, session unit tests (136, 2 ignored)
 cargo test -p ozma-qmp -p ozma-input -p ozma-power       # QMP, uinput/QMP sinks, power (166)
@@ -161,12 +188,17 @@ OZMA_TEST_CAPTURE_DEVICE=/dev/video0 \
 - `PowerAction::Stop` over QMP calls QEMU `stop` (pause), not destroy; a
   force-off falls back to ACPI powerdown. The libvirt backend uses `virsh`, not
   the libvirt API.
-- Audio target selection builds `<sink>.monitor` names, and the `AudioRouter`
-  can create/remove a named null sink, apply volume/mute, move streams, and play
-  a reference track through `pactl`/`pw-play`/`paplay` when
-  `--audio-router pipewire|pulseaudio` is set. It does not implement DSP/room
-  correction, a mic/source path, per-VM sink provisioning, or a live audio-server
-  validation; default tests use a fake router.
+- Audio target selection builds `<sink>.monitor` and named-source targets, and
+  the `AudioRouter` can create/remove a named null sink, create/reuse a named
+  `module-remap-source` over an existing source/monitor, move sink-inputs and
+  source-outputs, apply sink/source volume and mute, and play a reference track
+  through `pactl`/`pw-play`/`paplay` when `--audio-router pipewire|pulseaudio`
+  is set. `/audio/apply` accepts a named `source` (source-only profiles need no
+  sink). It does not implement DSP/room correction, per-VM source/mic
+  provisioning, VBAN/UAC2 mic transport, or a live audio-server validation;
+  default tests use a fake router. Capturing a mic/source uses the existing
+  PipeWire `StreamTarget::Object` path, so the source must already exist in the
+  graph.
 - HLS is a local rawvideo→ffmpeg pipeline and does not delete old segments.
   WebRTC is helper-first only: it supervises the external GStreamer/Python
   worker, has no native stack or audio, and the current worker does not

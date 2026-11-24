@@ -220,6 +220,19 @@ impl PortAllocator {
         self.used.clear();
         self.next_offset = 0;
     }
+
+    /// The port pair the next new VM would receive, when one is still free.
+    pub fn next_ports(&self) -> Option<NodePorts> {
+        let hid = u32::from(self.hid_base).checked_add(self.next_offset)?;
+        let http = u32::from(self.http_base).checked_add(self.next_offset)?;
+        if hid > u32::from(u16::MAX) || http > u32::from(u16::MAX) {
+            return None;
+        }
+        Some(NodePorts {
+            hid_udp: hid as u16,
+            http: http as u16,
+        })
+    }
 }
 
 /// Bounded exponential restart delay: `initial * 2^attempt`, capped at `max`.

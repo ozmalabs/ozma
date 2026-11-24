@@ -29,8 +29,10 @@
 //! - create or reuse a named `module-null-sink` and report its
 //!   `<sink>.monitor` capture target,
 //! - remove a null sink it owns (and refuse to unload a non-Ozma sink),
-//! - move a playback stream onto a sink,
-//! - apply sink volume/mute presets, and
+//! - create or reuse a named `module-remap-source` over an existing source or
+//!   monitor, and remove it again,
+//! - move a playback stream onto a sink or a record stream onto a source,
+//! - apply sink/source volume and mute presets, and
 //! - play and stop a reference track.
 //!
 //! Graph commands go through an injectable [`CommandRunner`] that takes an
@@ -62,9 +64,11 @@
 //!   it. Use [`AudioRouter::ensure_sink`] to create the null sink and monitor,
 //!   then hand [`AudioSinkState::monitor_target`] back to
 //!   [`PipeWireCapture::open_sink_monitor`].
-//! - The router is not a room-correction engine: [`AudioProfile`] carries
-//!   only sink, volume, and mute. Source routing is rejected with a typed
-//!   error instead of being ignored.
+//! - The router is not a room-correction engine: [`AudioProfile`] and
+//!   [`AudioSourceProfile`] carry only graph selection, volume, and mute.
+//!   Source capture is selection: a named source must already exist, and
+//!   [`AudioRouter::ensure_source`] creates a remap of an existing master
+//!   rather than a signal generator or DSP block.
 //! - `audiopus` and `alsa` are native dependencies (libopus, ALSA). No OpenSSL
 //!   or other TLS stack is involved. On non-Linux platforms the
 //!   [`PipeWireCapture`] constructors fail with `AudioError::Unavailable`
@@ -110,11 +114,12 @@ pub use frame::{
 pub use opus::{default_config, OpusDecoder, OpusEncoder, MAX_OPUS_PACKET_BYTES, OPUS_ENCODER_ID};
 pub use pipewire::PipeWireCapture;
 pub use router::{
-    AudioPlaybackSpec, AudioProfile, AudioRouter, AudioSinkSpec, AudioSinkState, AudioStreamRef,
-    ChildId, CommandOutput, CommandRunner, PipeWireAudioRouter, PulseAudioAudioRouter,
-    RouterConfig, TokioCommandRunner, DEFAULT_SINK_CHANNELS, DEFAULT_SINK_RATE,
-    DEFAULT_VOLUME_PERCENT, MAX_SINK_CHANNELS, MAX_SINK_RATE, MIN_SINK_RATE, NULL_SINK_MODULE,
-    PACTL, PAPLAY, PW_PLAY,
+    AudioPlaybackSpec, AudioProfile, AudioRouter, AudioSinkSpec, AudioSinkState,
+    AudioSourceProfile, AudioSourceRef, AudioSourceSpec, AudioSourceState, AudioStreamRef, ChildId,
+    CommandOutput, CommandRunner, PipeWireAudioRouter, PulseAudioAudioRouter, RouterConfig,
+    TokioCommandRunner, DEFAULT_SINK_CHANNELS, DEFAULT_SINK_RATE, DEFAULT_SOURCE_CHANNELS,
+    DEFAULT_VOLUME_PERCENT, MAX_SINK_CHANNELS, MAX_SINK_RATE, MAX_SOURCE_CHANNELS, MIN_SINK_RATE,
+    NULL_SINK_MODULE, PACTL, PAPLAY, PW_PLAY, REMAP_SOURCE_MODULE,
 };
 pub use target::{AudioTarget, MONITOR_PREFIX, NODE_PREFIX, OBJECT_PREFIX};
 pub use traits::{AudioEncoder, AudioSource, EncodedAudio, EncoderConfig};

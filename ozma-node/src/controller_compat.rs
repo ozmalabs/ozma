@@ -37,7 +37,7 @@ use axum::http::{header, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use ozma_audio::{AudioError, AudioPlaybackSpec, AudioProfile, AudioRouter};
+use ozma_audio::{AudioError, AudioPlaybackSpec, AudioProfile, AudioRouter, AudioSourceProfile};
 use ozma_encode::{
     backend_name, CodecOverrideState, CodecPreference, EncoderOverride, EncoderRegistry,
     OverrideReceipt,
@@ -1229,20 +1229,25 @@ impl AudioControl {
     }
 
     fn sink_or_default(&self, sink: Option<String>) -> Result<String, Response> {
+        self.optional_sink(sink).ok_or_else(|| {
+            compat_error_with_remediation(
+                StatusCode::BAD_REQUEST,
+                "audio-missing-sink",
+                "missing `sink` and no default sink is configured",
+                Some(
+                    "Pass a sink name in the request, or start ozma-node with \
+                     --audio-sink <name>.",
+                ),
+            )
+        })
+    }
+
+    /// Resolve an explicit sink or the configured default, without requiring
+    /// one. A source-only profile has no sink.
+    fn optional_sink(&self, sink: Option<String>) -> Option<String> {
         sink.map(|sink| sink.trim().to_owned())
             .filter(|sink| !sink.is_empty())
             .or_else(|| self.default_sink.clone())
-            .ok_or_else(|| {
-                compat_error_with_remediation(
-                    StatusCode::BAD_REQUEST,
-                    "audio-missing-sink",
-                    "missing `sink` and no default sink is configured",
-                    Some(
-                        "Pass a sink name in the request, or start ozma-node with \
-                         --audio-sink <name>.",
-                    ),
-                )
-            })
     }
 
     fn remember_profile(&self, profile_id: &str) {
@@ -1540,8 +1545,10 @@ pub fn compat_router(state: ConnectionState) -> Router {
 pub fn public_router(state: ConnectionState) -> Router {
     Router::new()
         .route("/display/snapshot", get(display_snapshot))
+        .route("/snapshot", get(display_snapshot))
         .route("/display/info", get(display_info))
         .route("/node/status", get(node_status))
+        .route("/status", get(node_status))
         .route("/agent/metrics", get(agent_metrics))
         .route("/ui/hints", get(ui_hints))
         .route("/audio/nodes", get(audio_nodes))
@@ -2563,32 +2570,31 @@ async fn audio_apply(
         Ok(router) => router.clone(),
         Err(response) => return response,
     };
-    if request
+    let source = request
         .source
         .as_deref()
-        .is_some_and(|source| !source.trim().is_empty())
-    {
-        return compat_error_with_remediation(
-            StatusCode::NOT_IMPLEMENTED,
-            "audio-source-unsupported",
-            "audio source routing unsupported",
-            Some(
-                "This node routes playback sinks only. Microphone/source routing needs an \
-                 explicit source-output index and is not implemented.",
-            ),
-        );
+        .map(str::trim)
+        .filter(|source| !source.is_empty())
+        .map(str::to_owned);
+    let requested_sink = request
+        .sink
+        .as_deref()
+        .map(str::trim)
+        .filter(|sink| !sink.is_empty())
+        .map(str::to_owned);
+    let sink = match requested_sink {
+        Some(sink) => Some(sink),
+        // A source-only profile must not mutate the configured default sink.
+        None if source.is_some() => None,
+        None => control.optional_sink(None),
+    };
+    if sink.is_none() && source.is_none() {
+        // Preserve the typed 400 for a request that names neither side.
+        return control.sink_or_default(None).unwrap_err();
     }
     let profile_id = match required_profile_id(request.profile_id.as_deref()) {
         Ok(value) => value,
         Err(response) => return response,
-    };
-    let sink = match control.sink_or_default(request.sink) {
-        Ok(sink) => sink,
-        Err(response) => return response,
-    };
-    let mut profile = match AudioProfile::new(profile_id.clone(), sink.clone()) {
-        Ok(profile) => profile,
-        Err(error) => return audio_error_response(error),
     };
     if let Some(volume) = request.volume {
         if !(0..=100).contains(&volume) {
@@ -2598,22 +2604,62 @@ async fn audio_apply(
                 format!("volume {volume} is outside 0..=100"),
             );
         }
-        profile = match profile.with_volume(volume as u8) {
-            Ok(profile) => profile,
-            Err(error) => return audio_error_response(error),
-        };
     }
-    if let Some(muted) = request.muted {
-        profile = profile.with_muted(muted);
-    }
+    let volume = request.volume.map(|volume| volume as u8);
+    let muted = request.muted;
 
-    match router.apply_profile(profile).await {
+    let result = match sink.clone() {
+        Some(sink) => {
+            let mut profile = match AudioProfile::new(profile_id.clone(), sink.clone()) {
+                Ok(profile) => profile,
+                Err(error) => return audio_error_response(error),
+            };
+            if let Some(source) = &source {
+                profile = match profile.with_source(source.clone()) {
+                    Ok(profile) => profile,
+                    Err(error) => return audio_error_response(error),
+                };
+            }
+            if let Some(volume) = volume {
+                profile = match profile.with_volume(volume) {
+                    Ok(profile) => profile,
+                    Err(error) => return audio_error_response(error),
+                };
+            }
+            if let Some(muted) = muted {
+                profile = profile.with_muted(muted);
+            }
+            router.apply_profile(profile).await
+        }
+        None => {
+            let mut profile = match AudioSourceProfile::new(
+                profile_id.clone(),
+                source.clone().unwrap_or_default(),
+            ) {
+                Ok(profile) => profile,
+                Err(error) => return audio_error_response(error),
+            };
+            if let Some(volume) = volume {
+                profile = match profile.with_volume(volume) {
+                    Ok(profile) => profile,
+                    Err(error) => return audio_error_response(error),
+                };
+            }
+            if let Some(muted) = muted {
+                profile = profile.with_muted(muted);
+            }
+            router.apply_source_profile(profile).await
+        }
+    };
+
+    match result {
         Ok(()) => {
             control.remember_profile(&profile_id);
             Json(serde_json::json!({
                 "ok": true,
                 "profile_id": profile_id,
                 "sink": sink,
+                "source": source,
                 "backend": control.backend(),
             }))
             .into_response()
@@ -3258,7 +3304,10 @@ mod tests {
         }
     }
 
-    use ozma_audio::{audio_codes, AudioSinkSpec, AudioSinkState, AudioStreamRef};
+    use ozma_audio::{
+        audio_codes, AudioSinkSpec, AudioSinkState, AudioSourceProfile, AudioSourceRef,
+        AudioSourceSpec, AudioSourceState, AudioStreamRef,
+    };
 
     struct FakeAudioRouter {
         calls: Arc<Mutex<Vec<String>>>,
@@ -3312,10 +3361,44 @@ mod tests {
             self.record(format!("move:{}:{sink}", stream.index))
         }
 
+        async fn ensure_source(
+            &self,
+            spec: AudioSourceSpec,
+        ) -> Result<AudioSourceState, AudioError> {
+            self.record(format!("ensure-source:{}", spec.name))?;
+            Ok(AudioSourceState {
+                name: spec.name,
+                master: spec.master,
+                created: false,
+            })
+        }
+
+        async fn remove_source(&self, name: &str) -> Result<(), AudioError> {
+            self.record(format!("remove-source:{name}"))
+        }
+
+        async fn move_source_output(
+            &self,
+            stream: AudioSourceRef,
+            source: &str,
+        ) -> Result<(), AudioError> {
+            self.record(format!("move-source:{}:{source}", stream.index))
+        }
+
+        async fn apply_source_profile(
+            &self,
+            profile: AudioSourceProfile,
+        ) -> Result<(), AudioError> {
+            self.record(format!(
+                "apply-source:{}:{}:{:?}:{:?}",
+                profile.id, profile.source, profile.volume, profile.muted
+            ))
+        }
+
         async fn apply_profile(&self, profile: AudioProfile) -> Result<(), AudioError> {
             self.record(format!(
-                "apply:{}:{}:{:?}:{:?}",
-                profile.id, profile.sink, profile.volume, profile.muted
+                "apply:{}:{}:{:?}:{:?}:{:?}",
+                profile.id, profile.sink, profile.source, profile.volume, profile.muted
             ))
         }
 
@@ -3898,6 +3981,21 @@ mod tests {
         assert_eq!(info["snapshot_encoding"], "jpeg");
         assert_eq!(info["dimensions_source"], "last-frame");
         assert!(info["last_error"].is_null());
+
+        // The desktop profile's legacy /snapshot alias serves the same JPEG.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/jpeg");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.starts_with(&[0xFF, 0xD8]));
     }
 
     #[tokio::test]
@@ -3996,6 +4094,13 @@ mod tests {
         assert_eq!(body["api_port"], 7382);
         assert_eq!(body["hid_udp_port"], 7331);
         assert_eq!(body["hls"], "not-configured");
+
+        // The desktop profile's legacy /status alias is the same document.
+        let (status, alias) = get_json(&app, "/status").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(alias["ok"], true);
+        assert_eq!(alias["node_id"], body["node_id"]);
+        assert_eq!(alias["profile"], body["profile"]);
     }
 
     #[tokio::test]
@@ -6949,14 +7054,88 @@ mod tests {
         assert_eq!(
             router.calls(),
             vec![
-                "apply:profile-a:ozma-vm1:Some(42):Some(true)",
-                "apply:profile-b:ozma-default:Some(0):None",
+                "apply:profile-a:ozma-vm1:None:Some(42):Some(true)",
+                "apply:profile-b:ozma-default:None:Some(0):None",
                 "remove:profile-a",
                 "remove:profile-b",
                 "play:sweep.flac:ozma-vm1",
                 "stop",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn audio_apply_routes_source_profiles_through_the_router() {
+        let router = Arc::new(FakeAudioRouter::new());
+        let app = audio_router(audio_state(Some(router.clone()), Some("ozma-default")));
+
+        // A source-only request needs no sink and must not fall back to the
+        // configured default sink.
+        let (status, body) = post_json(
+            &app,
+            "/audio/apply",
+            serde_json::json!({
+                "profile_id": "mic-profile",
+                "source": "ozma-vm1-mic",
+                "volume": 30,
+                "muted": true,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["profile_id"], "mic-profile");
+        assert!(body["sink"].is_null());
+        assert_eq!(body["source"], "ozma-vm1-mic");
+
+        // With a sink the same route applies both sides through one profile.
+        let (status, body) = post_json(
+            &app,
+            "/audio/apply",
+            serde_json::json!({
+                "profile_id": "duplex",
+                "sink": "ozma-vm1",
+                "source": "ozma-vm1-mic",
+                "volume": 40,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["sink"], "ozma-vm1");
+        assert_eq!(body["source"], "ozma-vm1-mic");
+
+        let (status, body) = post_json(
+            &app,
+            "/audio/remove",
+            serde_json::json!({"profile_id": "mic-profile"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        assert_eq!(
+            router.calls(),
+            vec![
+                "apply-source:mic-profile:ozma-vm1-mic:Some(30):Some(true)",
+                "apply:duplex:ozma-vm1:Some(\"ozma-vm1-mic\"):Some(40):None",
+                "remove:mic-profile",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn audio_apply_source_request_without_a_router_is_a_typed_501() {
+        let (state, _) = input_state(SINK_FAKE_RECORDING);
+        let app = audio_router(state);
+
+        let (status, body) = post_json(
+            &app,
+            "/audio/apply",
+            serde_json::json!({"profile_id": "mic", "source": "ozma-vm1-mic"}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(body["code"], "audio-routing-unsupported");
     }
 
     #[tokio::test]
@@ -6982,8 +7161,8 @@ mod tests {
             ),
             (
                 "/audio/apply",
-                serde_json::json!({"profile_id": "p", "sink": "s", "source": "mic"}),
-                "audio-source-unsupported",
+                serde_json::json!({"profile_id": "p", "source": "bad source"}),
+                audio_codes::AUDIO_INVALID_SPEC,
             ),
             (
                 "/audio/play",
@@ -6997,15 +7176,7 @@ mod tests {
             ),
         ] {
             let (status, response) = post_json(&app, path, body).await;
-            assert_eq!(
-                status,
-                if code == "audio-source-unsupported" {
-                    StatusCode::NOT_IMPLEMENTED
-                } else {
-                    StatusCode::BAD_REQUEST
-                },
-                "{path}: {response}"
-            );
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {response}");
             assert_eq!(response["code"], code, "{path}: {response}");
         }
         assert!(router.calls().is_empty());

@@ -316,7 +316,7 @@ class TestListMoonlightApps:
 
         # Mock display capture with a card but missing device
         mock_card = MagicMock()
-        mock_card.path = "/dev/video0"
+        mock_card.path = str(tmp_path / "missing-video0")
         mock_card.name = "Missing Card"
 
         mock_display_source = MagicMock()
@@ -572,7 +572,7 @@ class TestStartCaptureSession:
         await manager.start()
 
         mock_card = MagicMock()
-        mock_card.path = "/dev/video0"
+        mock_card.path = str(tmp_path / "missing-video0")
         mock_card.name = "Missing Card"
 
         mock_display_source = MagicMock()

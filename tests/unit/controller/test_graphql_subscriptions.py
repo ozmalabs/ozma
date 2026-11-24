@@ -48,6 +48,34 @@ def alert_mgr():
     return mgr
 
 
+@pytest.fixture(autouse=True)
+def _reset_event_router():
+    """Isolate tests from the module-global event-router task and registry.
+
+    ``start_event_router``/``stop_event_router`` operate on module globals.
+    Without a hard reset, a router task or subscription queue left behind by an
+    earlier (possibly failing) test is reused by later tests, so their events
+    are never routed and the async generators wait forever.
+    """
+    from controller.gql import subscriptions as subs
+
+    def reset():
+        task = subs._event_router_task
+        if task is not None:
+            try:
+                task.cancel()
+            except RuntimeError:
+                # The owning event loop has already been closed.
+                pass
+            subs._event_router_task = None
+        subs._subscription_registry._queues.clear()
+        subs._subscription_registry._event_type_filters.clear()
+
+    reset()
+    yield
+    reset()
+
+
 # ── NodeType Tests ────────────────────────────────────────────────────────────
 
 class TestNodeType:
@@ -280,7 +308,11 @@ class TestEventRouter:
 
     async def test_event_routing(self, state):
         """Test that events are routed to subscription queues."""
-        from controller.gql.subscriptions import _subscription_registry, _event_router_task
+        from controller.gql.subscriptions import (
+            _subscription_registry,
+            start_event_router,
+            stop_event_router,
+        )
 
         # Start event router
         start_event_router(state)
@@ -356,6 +388,21 @@ class TestNodeStateChanged:
             EVENT_NODE_ONLINE, _subscription_registry
         )
         from controller.state import NodeInfo
+
+        # Seed one existing node so the initial snapshot yields once; the
+        # subscription then yields once more for the node that comes online.
+        state.nodes["existing-node"] = NodeInfo(
+            id="existing-node",
+            host="192.168.1.1",
+            port=7331,
+            role="compute",
+            hw="raspberrypi",
+            fw_version="0.1.0",
+            proto_version=1,
+            capabilities=[],
+            machine_class="workstation",
+            last_seen=1234567890.0,
+        )
 
         start_event_router(state)
 
@@ -447,6 +494,7 @@ class TestScenarioActivated:
         # Set up scenario manager
         scenario = MagicMock(id="scenario1", name="Scenario 1", node_id="node1", color="#FF0000", index=0, config={})
         scenario_mgr.get_scenario.return_value = scenario
+        scenario_mgr.list_scenarios.return_value = [scenario]
 
         # Create subscription
         subscription = Subscription()
@@ -457,7 +505,7 @@ class TestScenarioActivated:
             results = []
             async for item in subscription.scenarioActivated(info):
                 results.append(item)
-                if len(results) >= 3:  # Initial + 1 activation
+                if len(results) >= 2:  # Initial snapshot + 1 activation
                     break
             return results
 
@@ -474,9 +522,9 @@ class TestScenarioActivated:
         await asyncio.sleep(0.2)
 
         results = await task
-        # Find the activation result
+        # Find the activation results (one initial snapshot + one activation)
         activation_results = [r for r in results if r.id == "scenario1"]
-        assert len(activation_results) >= 1
+        assert len(activation_results) >= 2
 
         stop_event_router()
 
@@ -484,7 +532,7 @@ class TestScenarioActivated:
 # ── audioLevelUpdate Subscription Tests ───────────────────────────────────────
 
 class TestAudioLevelUpdate:
-    async def test_audio_level_subscription_yields_levels(self, state):
+    async def test_audio_level_subscription_yields_levels(self, state, audio_router):
         """Test that audioLevelUpdate yields audio level updates."""
         from controller.gql.subscriptions import (
             Subscription, start_event_router, stop_event_router,
@@ -496,7 +544,7 @@ class TestAudioLevelUpdate:
         # Create subscription
         subscription = Subscription()
         info = MagicMock()
-        info.context = {"state": state, "audio_router": audio_router()}
+        info.context = {"state": state, "audio_router": audio_router}
 
         async def run_subscription():
             results = []
@@ -590,7 +638,7 @@ class TestAlertFired:
             results = []
             async for item in subscription.alertFired(info):
                 results.append(item)
-                if len(results) >= 2:  # Initial (none) + new alert
+                if len(results) >= 1:  # No initial alerts, then one new alert
                     break
             return results
 
@@ -653,7 +701,7 @@ class TestAlertFired:
             results = []
             async for item in subscription.alertFired(info):
                 results.append(item)
-                if len(results) >= 2:  # Initial + update
+                if len(results) >= 1:  # No initial alerts, then one updated alert
                     break
             return results
 
@@ -688,11 +736,14 @@ class TestAlertFired:
 class TestGraphQLSchemaIntegration:
     def test_schema_has_all_subscription_fields(self):
         """Test that the GraphQL schema includes all subscription fields."""
-        from gql.schema import schema
+        from controller.gql import schema
 
+        # graphql-core >=3.2 returns the introspection payload directly
+        # (``{"__schema": ...}``); older versions wrapped it in ``{"data": ...}``.
         schema_dict = schema.introspect()
+        schema_data = schema_dict.get("data", schema_dict)
         subscription_type = None
-        for t in schema_dict["data"]["__schema"]["types"]:
+        for t in schema_data["__schema"]["types"]:
             if t["name"] == "Subscription":
                 subscription_type = t
                 break

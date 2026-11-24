@@ -6,17 +6,38 @@
 //! bounded channel; the session transport sends them on the audio channel.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 use ozma_audio::PipeWireCapture;
 use ozma_audio::{
-    AlsaCapture, AlsaCaptureConfig, AudioEncoder, AudioSource, EncodedAudio, EncoderConfig,
-    FakeAudioSource, OpusEncoder,
+    AlsaCapture, AlsaCaptureConfig, AudioEncoder, AudioSource, AudioTarget, EncodedAudio,
+    EncoderConfig, FakeAudioSource, OpusEncoder,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
+
+/// Process-wide PipeWire audio capture target.
+///
+/// The node configures it once at startup; sessions inherit it. This keeps the
+/// target out of the session protocol while still allowing a desktop node to
+/// capture `monitor:<sink>` instead of the default microphone.
+static AUDIO_TARGET: OnceLock<AudioTarget> = OnceLock::new();
+
+/// Configure the capture target used by future [`AudioRuntime::start`] calls.
+///
+/// The first call wins: provider selection is startup configuration, not a
+/// per-session override.
+pub fn configure_target(target: AudioTarget) {
+    let _ = AUDIO_TARGET.set(target);
+}
+
+/// The configured target, or the backend default.
+pub fn configured_target() -> AudioTarget {
+    AUDIO_TARGET.get().cloned().unwrap_or_default()
+}
 
 /// A running audio capture/encode loop.
 pub struct AudioRuntime {
@@ -54,14 +75,15 @@ impl AudioRuntime {
                 return Self::start_alsa();
             }
             "pipewire" => {
-                tracing::info!("Using PipeWire audio source only (OZMA_AUDIO_SOURCE=pipewire)");
-                return Self::start_pipewire().await;
+                info!("Using PipeWire audio source only (OZMA_AUDIO_SOURCE=pipewire)");
+                return Self::start_pipewire(configured_target()).await;
             }
             _ => {}
         }
         #[cfg(target_os = "linux")]
         {
-            match PipeWireCapture::default_source().await {
+            let target = configured_target();
+            match PipeWireCapture::open_target(target.clone()).await {
                 Ok(mut capture) => {
                     // A suspended/idle PipeWire source may negotiate a format
                     // but not deliver a frame. Do not let that stall a session;
@@ -70,20 +92,20 @@ impl AudioRuntime {
                         .await
                     {
                         Ok(Ok(first)) => {
-                            tracing::info!("Using PipeWire audio capture");
+                            info!(target = %target, "Using PipeWire audio capture");
                             return Self::spawn(Box::new(capture), Some(first));
                         }
                         Ok(Err(error)) => {
-                            warn!(error = %error, "PipeWire capture produced no frame; trying ALSA");
+                            warn!(target = %target, error = %error, "PipeWire capture produced no frame; trying ALSA");
                         }
                         Err(_) => {
-                            warn!("PipeWire capture produced no frame in time; trying ALSA");
+                            warn!(target = %target, "PipeWire capture produced no frame in time; trying ALSA");
                         }
                     }
                     let _ = capture.stop().await;
                 }
                 Err(error) => {
-                    warn!(error = %error, "PipeWire capture unavailable; trying ALSA");
+                    warn!(target = %target, error = %error, "PipeWire capture unavailable; trying ALSA");
                 }
             }
         }
@@ -111,12 +133,17 @@ impl AudioRuntime {
         Self::spawn(Box::new(FakeAudioSource::new().unlimited()), None)
     }
 
-    async fn start_pipewire() -> Self {
+    async fn start_pipewire(target: AudioTarget) -> Self {
         #[cfg(target_os = "linux")]
         {
-            match PipeWireCapture::default_source().await {
-                Ok(capture) => return Self::spawn(Box::new(capture), None),
-                Err(error) => warn!(error = %error, "PipeWire audio capture unavailable"),
+            match PipeWireCapture::open_target(target.clone()).await {
+                Ok(capture) => {
+                    info!(target = %target, "Using PipeWire audio capture");
+                    return Self::spawn(Box::new(capture), None);
+                }
+                Err(error) => {
+                    warn!(target = %target, error = %error, "PipeWire audio capture unavailable")
+                }
             }
         }
         Self::spawn(Box::new(FakeAudioSource::new().unlimited()), None)

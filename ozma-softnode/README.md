@@ -48,6 +48,73 @@ is the default. `--provision` adds the opt-in libvirt path described below.
 `--no-auto-manage` keeps discovery-only operation. `--no-auto-agent` keeps the
 existing switch for in-guest agent provisioning.
 
+## Aggregated status and metrics
+
+`--status-port <u16>` (default `0`, disabled) starts a small read-only HTTP
+listener for the whole supervisor. `0.0.0.0` is used so the controller or a
+Prometheus scraper can reach it; the surface is read-only and never opens QMP
+sockets, probes children, or runs `virsh` while answering. The listener is
+unauthenticated: `/status` exposes VM names and QMP socket paths (not secrets),
+so restrict it with the same network policy as the per-VM node ports.
+
+| Route | Content |
+|---|---|
+| `GET /health` | `{ok, version, profile, discovered, running, failed, skipped}` |
+| `GET /status` | Full aggregated document: supervisor totals plus one entry per tracked and excluded VM |
+| `GET /metrics` | Prometheus text (`text/plain; version=0.0.4`) |
+| `GET /api/v1/connection` | Connection-shaped summary: `ok`, `node_id`, `profile: "hypervisor"`, `version`, `api_port`, `quic_port: 0`, `hid_udp_port: 0`, `sink_kind: "supervisor"`, `supervisor` totals |
+
+`profile` is always `hypervisor` and `node_id` is `ozma-virtual-node`; per-VM
+ports and child details live in `/status`. A `status_port` of `0` starts no
+listener and is not an error.
+
+### `/status` schema
+
+`supervisor` totals:
+
+| Field | Meaning |
+|---|---|
+| `discovered` | VMs in the last discovery snapshot, including excluded ones |
+| `tracked` | Discovered VMs the supervisor tracks (excluding `--exclude` matches) |
+| `running` | VMs with a live child process |
+| `failed` | VMs whose child is waiting to restart, or whose provisioning failed |
+| `skipped` | Tracked VMs with no child (no QMP socket, awaiting restart, or discovery-only) |
+| `excluded` | VMs filtered by `--exclude` |
+| `next_hid_port`, `next_http_port` | Port pair the next new VM would receive, when available |
+
+Each `vms[]` entry has `name`, `state`, `qmp_socket`, `hid_udp_port`,
+`http_port`, `child_pid`, `spawned`, `skipped`, `needs_restart`, `excluded`,
+`restart_count`, `restart_in_ms`, `last_exit`, `last_error`, `evdev_status`,
+`evdev_keyboard`, `evdev_mouse`, `audio_sink`, `agent_status`, and
+`agent_checks`.
+
+`state` is one of `running`, `starting`, `backoff`, `stopped`, `skipped`,
+`needs-restart`, `awaiting-socket`, `failed`, `discovery-only`, or `excluded`.
+`restart_count` counts successful starts after the initial spawn; `last_exit`
+is the most recent exit (`exit code 1`, `signal`, ...); `last_error` is cleared
+by a successful start. `agent_status` is `provisioned`, `pending`, `retrying`,
+`failed`, or `disabled`. `evdev_status` is `ready`, `unavailable`, or
+`not-configured`.
+
+### Metrics
+
+The scrape surface is bounded by the hypervisor's VM set and deliberately does
+not carry QMP socket paths, error strings, or sink names:
+
+```text
+ozma_supervisor_vms{state="discovered|tracked|running|failed|skipped|excluded"} N
+ozma_supervisor_next_port{kind="hid_udp|http"} N
+ozma_supervisor_vm_up{vm="<name>"} 0|1
+ozma_supervisor_vm_restarts_total{vm="<name>"} N
+ozma_supervisor_vm_port{vm="<name>",kind="hid_udp|http"} N
+ozma_supervisor_vm_state{vm="<name>",state="<state>"} 1
+```
+
+The documents describe *supervisor* state only. They do not proxy each child's
+`/api/v1/connection`, capture, input, audio, or power status; use the allocated
+per-VM HTTP port for that. Restart/reset controls, a controller-side aggregate
+view, and per-VM API aggregation remain deferred.
+
 ## Opt-in libvirt provisioning
 
 Provisioning is **off by default**. Passing `--provision` allows the supervisor
@@ -195,6 +262,10 @@ deliberately **not** implemented here:
   restart against a real audio server/sink (ownership persistence itself is
   covered with a fake router and a temporary state file);
 * USB/media, Looking Glass, and VBAN/UAC2 audio;
+* aggregating each child's own API (`/api/v1/connection`, capture, input,
+  audio, power) into the supervisor document, a controller UI for the
+  multi-VM view, and supervisor-side reset/restart controls beyond the
+  automatic crash-restart loop;
 * a real libvirt/QEMU restart integration test (default tests use a fake
   command runner, fake evdev/audio provisioners, and XML fixtures; no test
   opens `/dev/uinput` or runs `pactl`);
