@@ -7,15 +7,39 @@
 //! hardware candidate is eligible, and the result says so.
 
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use ozma_media::{EncodedFrame, Encoder, FakeEncoder, Frame, FrameFormat, MediaError};
 use ozma_protocol::{codes, ApiError, Codec, EncodeCapability, EncoderBackend, MediaFormat};
+use tokio::process::Command as ProcessCommand;
 
 use crate::probe::{EncoderProbe, ProbeResult};
 use crate::software::H264SoftwareEncoder;
-use crate::vaapi::{unix_now, VaapiH264Encoder, VaapiProbe};
+use crate::vaapi::{detect_vaapi_device, ffmpeg_binary, unix_now, VaapiH264Encoder, VaapiProbe};
+
+/// Largest envelope advertised for a detected hardware encoder that has no
+/// device-specific 4K evidence yet.
+const DETECTED_HARDWARE_MAX_WIDTH: u32 = 1920;
+/// Largest height advertised for a detected hardware encoder.
+const DETECTED_HARDWARE_MAX_HEIGHT: u32 = 1080;
+/// Highest frame rate advertised for a detected hardware encoder.
+const DETECTED_HARDWARE_MAX_FPS: u32 = 60;
+
+/// How long `ffmpeg -encoders` may take during detection.
+const ENCODER_LIST_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a single one-frame QSV/V4L2M2M availability probe may take.
+const ENCODER_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Hardware encoders that are only advertised after a real encode check.
+///
+/// VAAPI has its own richer probe ([`VaapiProbe`]) that also validates the
+/// access unit. NVENC is not in this set: a `/dev/nvidia*` device plus the
+/// ffmpeg listing is enough to advertise it, because the HLS path
+/// runtime-probes the exact argv before applying it.
 
 fn probe_key(capability: &EncodeCapability) -> (Codec, EncoderBackend) {
     (capability.codec, capability.backend)
@@ -273,6 +297,255 @@ impl SelectionPolicy {
     }
 }
 
+/// Host facts used to decide which real encoders may be advertised.
+///
+/// This is deliberately a plain value: production fills it with
+/// [`EncoderEnvironment::detect`], while tests construct it directly so no
+/// GPU, driver, or ffmpeg process is needed. A backend is only advertised when
+/// its required device fact is present; an encoder name alone never proves a
+/// device exists.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EncoderEnvironment {
+    /// The VAAPI render node that exists and should be probed, if any.
+    ///
+    /// A configured `--vaapi-device` that does not exist is represented as
+    /// `None`; detection never silently falls back to a different node.
+    pub vaapi_device: Option<PathBuf>,
+    /// Exact names reported by `ffmpeg -encoders`.
+    pub ffmpeg_encoders: BTreeSet<String>,
+    /// A CUDA/NVML device node is present.
+    pub nvidia_device: bool,
+    /// Hardware encoders that passed a real one-frame encode check.
+    ///
+    /// This is used for QSV and V4L2M2M, where `ffmpeg -encoders` plus a device
+    /// node is not enough evidence: a wrapper can be compiled in while the
+    /// driver/device still refuses every session.
+    pub verified_encoders: BTreeSet<String>,
+}
+
+impl EncoderEnvironment {
+    /// An empty environment: no VAAPI, NVIDIA, or verified encoders.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record an existing VAAPI render node.
+    pub fn with_vaapi_device(mut self, device: impl Into<PathBuf>) -> Self {
+        self.vaapi_device = Some(device.into());
+        self
+    }
+
+    /// Record exact ffmpeg encoder names.
+    pub fn with_ffmpeg_encoders(
+        mut self,
+        encoders: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.ffmpeg_encoders = encoders.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Record whether a CUDA/NVML device node is present.
+    pub fn with_nvidia_device(mut self, present: bool) -> Self {
+        self.nvidia_device = present;
+        self
+    }
+
+    /// Record a hardware encoder that passed a real encode check.
+    pub fn with_verified_encoder(mut self, encoder: impl Into<String>) -> Self {
+        self.verified_encoders.insert(encoder.into());
+        self
+    }
+
+    /// True when ffmpeg advertised `name`.
+    pub fn has_ffmpeg_encoder(&self, name: &str) -> bool {
+        self.ffmpeg_encoders.contains(name)
+    }
+
+    /// True when a real encode check proved `name` works.
+    pub fn has_verified_encoder(&self, name: &str) -> bool {
+        self.verified_encoders.contains(name)
+    }
+
+    /// Detect the real host environment for `vaapi_device`.
+    ///
+    /// Only the configured VAAPI path is accepted when one is supplied; an
+    /// absent path records no VAAPI device rather than guessing another render
+    /// node. QSV/V4L2M2M run a bounded one-frame ffmpeg encode because their
+    /// mere presence in `ffmpeg -encoders` is not evidence that the device
+    /// works. NVENC deliberately does not run a full encode here; the HLS path
+    /// runtime-probes the exact argv before applying it.
+    pub async fn detect(vaapi_device: Option<&Path>) -> Self {
+        let vaapi_device = resolve_vaapi_device(vaapi_device);
+        let ffmpeg_encoders = ffmpeg_encoder_names().await;
+        let nvidia_device = nvidia_device_present();
+
+        let (qsv_h264, qsv_hevc, v4l2_h264, v4l2_hevc) = tokio::join!(
+            ffmpeg_encoder_encodes_if_listed(&ffmpeg_encoders, "h264_qsv"),
+            ffmpeg_encoder_encodes_if_listed(&ffmpeg_encoders, "hevc_qsv"),
+            ffmpeg_encoder_encodes_if_listed(&ffmpeg_encoders, "h264_v4l2m2m"),
+            ffmpeg_encoder_encodes_if_listed(&ffmpeg_encoders, "hevc_v4l2m2m"),
+        );
+
+        let mut verified_encoders = BTreeSet::new();
+        for (encoder, verified) in [
+            ("h264_qsv", qsv_h264),
+            ("hevc_qsv", qsv_hevc),
+            ("h264_v4l2m2m", v4l2_h264),
+            ("hevc_v4l2m2m", v4l2_hevc),
+        ] {
+            if verified {
+                verified_encoders.insert(encoder.to_owned());
+            }
+        }
+
+        Self {
+            vaapi_device,
+            ffmpeg_encoders,
+            nvidia_device,
+            verified_encoders,
+        }
+    }
+}
+
+/// Resolve the VAAPI node to probe.
+///
+/// An explicit path is honoured only when it exists. Without one, the normal
+/// `/dev/dri/renderD128`/lowest-node detection applies.
+fn resolve_vaapi_device(configured: Option<&Path>) -> Option<PathBuf> {
+    match configured {
+        Some(path) => path.exists().then(|| path.to_path_buf()),
+        None => detect_vaapi_device(),
+    }
+}
+
+/// True when a CUDA/NVML device node is present.
+fn nvidia_device_present() -> bool {
+    Path::new("/dev/nvidiactl").exists()
+        || Path::new("/dev/nvidia-uvm").exists()
+        || (0..8).any(|index| Path::new(&format!("/dev/nvidia{index}")).exists())
+}
+
+/// Run `ffmpeg -encoders` once with a bounded wait.
+async fn ffmpeg_encoder_names() -> BTreeSet<String> {
+    let binary = ffmpeg_binary();
+    let output = tokio::time::timeout(
+        ENCODER_LIST_TIMEOUT,
+        ProcessCommand::new(&binary)
+            .args(["-hide_banner", "-loglevel", "error", "-encoders"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output(),
+    )
+    .await;
+
+    match output {
+        Ok(Ok(output)) if output.status.success() => {
+            parse_ffmpeg_encoder_names(&String::from_utf8_lossy(&output.stdout))
+        }
+        _ => BTreeSet::new(),
+    }
+}
+
+/// Parse the encoder table printed by `ffmpeg -encoders`.
+fn parse_ffmpeg_encoder_names(output: &str) -> BTreeSet<String> {
+    let mut encoders = BTreeSet::new();
+    let mut in_table = false;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("------") {
+            in_table = true;
+            continue;
+        }
+        if !in_table {
+            continue;
+        }
+        let mut fields = trimmed.split_whitespace();
+        let flags = fields.next().unwrap_or_default();
+        if flags.len() < 5 {
+            continue;
+        }
+        if let Some(name) = fields.next() {
+            encoders.insert(name.to_owned());
+        }
+    }
+    encoders
+}
+
+/// Try a one-frame encode only when ffmpeg advertises the wrapper.
+async fn ffmpeg_encoder_encodes_if_listed(available: &BTreeSet<String>, encoder: &str) -> bool {
+    available.contains(encoder) && ffmpeg_encoder_encodes(encoder).await
+}
+
+/// Try one synthetic frame through `encoder` and require a clean ffmpeg exit.
+async fn ffmpeg_encoder_encodes(encoder: &str) -> bool {
+    let binary = ffmpeg_binary();
+    let pix_fmt = if encoder.ends_with("_qsv") {
+        "nv12"
+    } else {
+        "yuv420p"
+    };
+    let status = tokio::time::timeout(
+        ENCODER_CHECK_TIMEOUT,
+        ProcessCommand::new(&binary)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=1",
+                "-frames:v",
+                "1",
+                "-c:v",
+                encoder,
+                "-pix_fmt",
+                pix_fmt,
+                "-f",
+                "null",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status(),
+    )
+    .await;
+
+    matches!(status, Ok(Ok(status)) if status.success())
+}
+
+/// A capability for a detected hardware encoder whose device check passed.
+fn detected_hardware_capability(
+    codec: Codec,
+    backend: EncoderBackend,
+    profiles: &[&str],
+) -> EncodeCapability {
+    EncodeCapability {
+        codec,
+        backend,
+        hardware: true,
+        max_width: DETECTED_HARDWARE_MAX_WIDTH,
+        max_height: DETECTED_HARDWARE_MAX_HEIGHT,
+        max_fps: DETECTED_HARDWARE_MAX_FPS,
+        hdr: false,
+        profiles: profiles
+            .iter()
+            .map(|profile| (*profile).to_owned())
+            .collect(),
+    }
+}
+
+/// VAAPI HEVC uses the same device/driver evidence as the H.264 probe.
+fn vaapi_hevc_capability() -> EncodeCapability {
+    detected_hardware_capability(Codec::Hevc, EncoderBackend::Vaapi, &["main"])
+}
+
 /// A set of advertised encoders plus their latest probe results.
 #[derive(Clone, Debug, Default)]
 pub struct EncoderRegistry {
@@ -296,27 +569,118 @@ impl EncoderRegistry {
         Self::from_capabilities([H264SoftwareEncoder::capability()])
     }
 
-    /// A registry with the software fallback plus VAAPI H.264 only when a real
-    /// VAAPI probe succeeds.
+    /// A registry with every encoder this host can honestly advertise.
     ///
-    /// This is the production default for the M1 media path. On a host without
-    /// a render node, without `ffmpeg`, or without a libva encoder entrypoint
-    /// it returns exactly [`EncoderRegistry::with_software_h264`] and records
-    /// the failed VAAPI probe for diagnostics; it never advertises a hardware
-    /// backend that was not proven by encoding a frame. Selection therefore
-    /// prefers VAAPI when it is proven and otherwise selects
-    /// [`H264SoftwareEncoder`].
+    /// The software H.264 fallback is always present. Hardware is added only
+    /// after its required evidence:
+    ///
+    /// * VAAPI H.264 after a real [`VaapiProbe`] encode on the configured
+    ///   render node; VAAPI HEVC is added when that device probe passes and
+    ///   ffmpeg also lists `hevc_vaapi`.
+    /// * NVENC H.264/HEVC when ffmpeg lists the wrapper and a CUDA/NVML device
+    ///   node exists. The HLS path runtime-probes the exact argv before it
+    ///   reports success.
+    /// * QSV/V4L2M2M only when the name is listed **and** a real one-frame
+    ///   encode check passed.
+    ///
+    /// This uses the normal `/dev/dri` detection. Call
+    /// [`EncoderRegistry::with_detected_encoders_for_device`] when the node has
+    /// an explicit `--vaapi-device`.
     pub async fn with_detected_encoders() -> Self {
+        Self::with_detected_encoders_for_device(None).await
+    }
+
+    /// A registry detected against the configured VAAPI render node.
+    ///
+    /// `None` keeps the normal `/dev/dri/renderD128`/lowest-render-node
+    /// detection. `Some(path)` is honoured only when the path exists; an
+    /// absent configured path does not silently probe a different device.
+    pub async fn with_detected_encoders_for_device(device: Option<&Path>) -> Self {
+        let environment = EncoderEnvironment::detect(device).await;
+        Self::with_detected_encoders_in(&environment).await
+    }
+
+    /// A registry built from an already-detected host environment.
+    ///
+    /// Production uses this after [`EncoderEnvironment::detect`]; tests can
+    /// build a fake environment without touching hardware.
+    pub async fn with_detected_encoders_in(environment: &EncoderEnvironment) -> Self {
+        let probe = match environment.vaapi_device.as_deref() {
+            Some(device) => VaapiProbe::new().with_device(device),
+            None => VaapiProbe::new(),
+        };
+        Self::with_detected_encoders_and_probe(environment, &probe).await
+    }
+
+    /// A registry built from an environment plus an injected VAAPI probe.
+    ///
+    /// The probe is only consulted when the environment records an existing
+    /// VAAPI device, so a fake passing probe cannot invent hardware on a host
+    /// with no render node.
+    pub async fn with_detected_encoders_and_probe(
+        environment: &EncoderEnvironment,
+        vaapi_probe: &dyn EncoderProbe,
+    ) -> Self {
         let mut registry = Self::with_software_h264();
-        registry.detect_vaapi().await;
+
+        if environment.vaapi_device.is_some() {
+            let capability = VaapiH264Encoder::capability();
+            let result = vaapi_probe.probe(&capability).await;
+            let ok = result.is_ok();
+            registry.register_probe(result);
+            if ok {
+                registry.register(capability);
+                // The device is proven by the H.264 encode. HEVC uses the same
+                // node/driver; HLS runtime-probes the actual HEVC argv before
+                // applying it.
+                if environment.has_ffmpeg_encoder("hevc_vaapi") {
+                    registry.register(vaapi_hevc_capability());
+                }
+            }
+        }
+
+        if environment.nvidia_device {
+            if environment.has_ffmpeg_encoder("h264_nvenc") {
+                registry.register(detected_hardware_capability(
+                    Codec::H264,
+                    EncoderBackend::Nvenc,
+                    &["high"],
+                ));
+            }
+            if environment.has_ffmpeg_encoder("hevc_nvenc") {
+                registry.register(detected_hardware_capability(
+                    Codec::Hevc,
+                    EncoderBackend::Nvenc,
+                    &["main"],
+                ));
+            }
+        }
+
+        for (name, codec, backend) in [
+            ("h264_qsv", Codec::H264, EncoderBackend::Qsv),
+            ("hevc_qsv", Codec::Hevc, EncoderBackend::Qsv),
+            ("h264_v4l2m2m", Codec::H264, EncoderBackend::V4l2M2m),
+            ("hevc_v4l2m2m", Codec::Hevc, EncoderBackend::V4l2M2m),
+        ] {
+            if environment.has_ffmpeg_encoder(name) && environment.has_verified_encoder(name) {
+                let profiles: &[&str] = if codec == Codec::H264 {
+                    &["high"]
+                } else {
+                    &["main"]
+                };
+                registry.register(detected_hardware_capability(codec, backend, profiles));
+            }
+        }
+
         registry
     }
 
-    /// Probe VAAPI and advertise it only if the probe passed.
+    /// Probe VAAPI on the default render node and advertise it only when the
+    /// probe passed.
     ///
-    /// Returns the probe result for logging or diagnostics. A failed probe is
-    /// recorded but does not register the capability, so it cannot be
-    /// selected.
+    /// This is kept for callers that only need the VAAPI H.264 decision.
+    /// Device-aware detection should use
+    /// [`EncoderRegistry::with_detected_encoders_for_device`].
     pub async fn detect_vaapi(&mut self) -> ProbeResult {
         let capability = VaapiH264Encoder::capability();
         let result = VaapiProbe::new()
@@ -400,6 +764,31 @@ impl EncoderRegistry {
     /// Choose the best encoder for `requested` with the default policy.
     pub fn select(&self, requested: &MediaFormat) -> Result<EncoderSelection, ApiError> {
         self.select_with(requested, SelectionPolicy::default())
+    }
+
+    /// Choose the best encoder this crate can actually construct.
+    ///
+    /// [`EncoderSelection::build_encoder`] only implements software, VAAPI, and
+    /// fake backends. NVENC, QSV, and V4L2M2M are advertised so the HLS
+    /// controller can select and runtime-probe them, but a caller that needs a
+    /// concrete `ozma-encode` encoder (the session/native-media path) must use
+    /// this method so it does not select a backend `build_encoder` would reject.
+    pub fn select_buildable(&self, requested: &MediaFormat) -> Result<EncoderSelection, ApiError> {
+        let buildable = Self {
+            capabilities: self
+                .capabilities
+                .iter()
+                .filter(|capability| {
+                    matches!(
+                        capability.backend,
+                        EncoderBackend::Software | EncoderBackend::Vaapi | EncoderBackend::Fake
+                    )
+                })
+                .cloned()
+                .collect(),
+            probes: self.probes.clone(),
+        };
+        buildable.select(requested)
     }
 
     /// Choose the best encoder for `requested` under an explicit policy.
@@ -701,35 +1090,234 @@ mod tests {
         assert_eq!(error.code, codes::ENCODER_UNAVAILABLE);
     }
 
-    #[tokio::test]
-    async fn detected_registry_only_advertises_proven_vaapi() {
-        let registry = EncoderRegistry::with_detected_encoders().await;
-        let advertised = registry
-            .capabilities()
-            .iter()
-            .any(|capability| capability.backend == EncoderBackend::Vaapi);
-        let probe = registry.probe_result(Codec::H264, EncoderBackend::Vaapi);
+    #[test]
+    fn configured_vaapi_device_is_used_only_when_it_exists() {
+        let directory =
+            std::env::temp_dir().join(format!("ozma-encode-vaapi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create temp dir");
+        let device = directory.join("renderD129");
+        std::fs::write(&device, b"").expect("fake VAAPI device");
+
+        assert_eq!(resolve_vaapi_device(Some(&device)), Some(device.clone()));
         assert_eq!(
-            advertised,
-            probe.map(ProbeResult::is_ok).unwrap_or(false),
-            "VAAPI advertisement and probe evidence must agree"
-        );
-        assert!(
-            registry
-                .capabilities()
-                .iter()
-                .any(|capability| capability.backend == EncoderBackend::Software),
-            "the software fallback must always be advertised"
+            resolve_vaapi_device(Some(&directory.join("renderD999"))),
+            None,
+            "a missing configured device must not fall back to another render node"
         );
 
-        let selection = registry.select(&h264_request()).unwrap();
-        if advertised {
-            assert_eq!(selection.backend(), EncoderBackend::Vaapi);
-            assert!(selection.is_hardware());
-        } else {
-            assert_eq!(selection.backend(), EncoderBackend::Software);
-            assert!(!selection.is_hardware());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    fn has(registry: &EncoderRegistry, codec: Codec, backend: EncoderBackend) -> bool {
+        registry
+            .capabilities()
+            .iter()
+            .any(|capability| capability.codec == codec && capability.backend == backend)
+    }
+
+    #[tokio::test]
+    async fn device_probe_advertises_vaapi_h264_and_listed_hevc() {
+        let environment = EncoderEnvironment::new()
+            .with_vaapi_device("/dev/dri/renderD129")
+            .with_ffmpeg_encoders(["hevc_vaapi"]);
+        let registry =
+            EncoderRegistry::with_detected_encoders_and_probe(&environment, &FakeProbe::passing())
+                .await;
+
+        assert!(has(&registry, Codec::H264, EncoderBackend::Vaapi));
+        assert!(has(&registry, Codec::Hevc, EncoderBackend::Vaapi));
+        assert!(has(&registry, Codec::H264, EncoderBackend::Software));
+        assert!(
+            registry
+                .probe_result(Codec::H264, EncoderBackend::Vaapi)
+                .is_some_and(ProbeResult::is_ok),
+            "the device probe is the evidence for VAAPI H.264"
+        );
+
+        let hevc = MediaFormat::new(Codec::Hevc, 1920, 1080, 30, 8_000);
+        let selection = registry.select(&hevc).unwrap();
+        assert_eq!(selection.backend(), EncoderBackend::Vaapi);
+        assert!(selection.is_hardware());
+    }
+
+    #[tokio::test]
+    async fn no_device_or_a_failed_probe_never_advertises_vaapi() {
+        let no_device = EncoderEnvironment::new().with_ffmpeg_encoders(["hevc_vaapi"]);
+        let registry =
+            EncoderRegistry::with_detected_encoders_and_probe(&no_device, &FakeProbe::passing())
+                .await;
+        assert!(!has(&registry, Codec::H264, EncoderBackend::Vaapi));
+        assert!(!has(&registry, Codec::Hevc, EncoderBackend::Vaapi));
+        assert!(
+            registry
+                .probe_result(Codec::H264, EncoderBackend::Vaapi)
+                .is_none(),
+            "a probe must not run without a device"
+        );
+
+        let failed_device = EncoderEnvironment::new()
+            .with_vaapi_device("/dev/dri/renderD129")
+            .with_ffmpeg_encoders(["hevc_vaapi"]);
+        let registry = EncoderRegistry::with_detected_encoders_and_probe(
+            &failed_device,
+            &FakeProbe::failing(),
+        )
+        .await;
+        assert!(!has(&registry, Codec::H264, EncoderBackend::Vaapi));
+        assert!(!has(&registry, Codec::Hevc, EncoderBackend::Vaapi));
+        assert!(!registry
+            .probe_result(Codec::H264, EncoderBackend::Vaapi)
+            .unwrap()
+            .is_ok());
+        assert_eq!(
+            registry.select(&h264_request()).unwrap().backend(),
+            EncoderBackend::Software
+        );
+    }
+
+    #[tokio::test]
+    async fn vaapi_hevc_requires_the_ffmpeg_listing() {
+        let environment = EncoderEnvironment::new().with_vaapi_device("/dev/dri/renderD129");
+        let registry =
+            EncoderRegistry::with_detected_encoders_and_probe(&environment, &FakeProbe::passing())
+                .await;
+
+        assert!(has(&registry, Codec::H264, EncoderBackend::Vaapi));
+        assert!(
+            !has(&registry, Codec::Hevc, EncoderBackend::Vaapi),
+            "hevc_vaapi must be listed by ffmpeg before HEVC is advertised"
+        );
+    }
+
+    #[tokio::test]
+    async fn nvenc_requires_a_listed_encoder_and_an_nvidia_device() {
+        let both = EncoderEnvironment::new()
+            .with_nvidia_device(true)
+            .with_ffmpeg_encoders(["h264_nvenc", "hevc_nvenc"]);
+        let registry =
+            EncoderRegistry::with_detected_encoders_and_probe(&both, &FakeProbe::passing()).await;
+        assert!(has(&registry, Codec::H264, EncoderBackend::Nvenc));
+        assert!(has(&registry, Codec::Hevc, EncoderBackend::Nvenc));
+
+        let no_device = EncoderEnvironment::new()
+            .with_nvidia_device(false)
+            .with_ffmpeg_encoders(["h264_nvenc", "hevc_nvenc"]);
+        let registry =
+            EncoderRegistry::with_detected_encoders_and_probe(&no_device, &FakeProbe::passing())
+                .await;
+        assert!(!has(&registry, Codec::H264, EncoderBackend::Nvenc));
+        assert!(!has(&registry, Codec::Hevc, EncoderBackend::Nvenc));
+
+        let not_listed = EncoderEnvironment::new()
+            .with_nvidia_device(true)
+            .with_ffmpeg_encoders(["hevc_vaapi"]);
+        let registry =
+            EncoderRegistry::with_detected_encoders_and_probe(&not_listed, &FakeProbe::passing())
+                .await;
+        assert!(!has(&registry, Codec::H264, EncoderBackend::Nvenc));
+        assert!(!has(&registry, Codec::Hevc, EncoderBackend::Nvenc));
+    }
+
+    #[tokio::test]
+    async fn qsv_and_v4l2m2m_require_a_verified_encode() {
+        let names = ["h264_qsv", "hevc_qsv", "h264_v4l2m2m", "hevc_v4l2m2m"];
+
+        let unverified = EncoderEnvironment::new().with_ffmpeg_encoders(names);
+        let registry =
+            EncoderRegistry::with_detected_encoders_and_probe(&unverified, &FakeProbe::passing())
+                .await;
+        for (codec, backend) in [
+            (Codec::H264, EncoderBackend::Qsv),
+            (Codec::Hevc, EncoderBackend::Qsv),
+            (Codec::H264, EncoderBackend::V4l2M2m),
+            (Codec::Hevc, EncoderBackend::V4l2M2m),
+        ] {
+            assert!(
+                !has(&registry, codec, backend),
+                "an ffmpeg listing alone must not advertise {codec:?}/{backend:?}"
+            );
         }
+
+        let verified = EncoderEnvironment::new()
+            .with_ffmpeg_encoders(names)
+            .with_verified_encoder("h264_qsv")
+            .with_verified_encoder("hevc_qsv")
+            .with_verified_encoder("h264_v4l2m2m");
+        let registry =
+            EncoderRegistry::with_detected_encoders_and_probe(&verified, &FakeProbe::passing())
+                .await;
+        assert!(has(&registry, Codec::H264, EncoderBackend::Qsv));
+        assert!(has(&registry, Codec::Hevc, EncoderBackend::Qsv));
+        assert!(has(&registry, Codec::H264, EncoderBackend::V4l2M2m));
+        assert!(!has(&registry, Codec::Hevc, EncoderBackend::V4l2M2m));
+    }
+
+    #[tokio::test]
+    async fn detection_never_invents_hardware_or_fake() {
+        let environment = EncoderEnvironment::new().with_ffmpeg_encoders([
+            "h264_vaapi",
+            "hevc_vaapi",
+            "h264_nvenc",
+            "hevc_nvenc",
+            "h264_qsv",
+            "hevc_qsv",
+            "h264_v4l2m2m",
+            "hevc_v4l2m2m",
+        ]);
+        let registry =
+            EncoderRegistry::with_detected_encoders_and_probe(&environment, &FakeProbe::passing())
+                .await;
+
+        assert_eq!(
+            registry.capabilities().len(),
+            1,
+            "only the software fallback may remain without a device"
+        );
+        assert!(has(&registry, Codec::H264, EncoderBackend::Software));
+        assert!(registry
+            .capabilities()
+            .iter()
+            .all(|capability| capability.backend == EncoderBackend::Software));
+    }
+
+    #[test]
+    fn buildable_selection_skips_hls_only_hardware() {
+        let nvenc = capability(
+            Codec::H264,
+            EncoderBackend::Nvenc,
+            true,
+            1920,
+            1080,
+            60,
+            false,
+        );
+        let registry = EncoderRegistry::from_capabilities([h264_software(), nvenc]);
+
+        let advertised = registry.select(&h264_request()).unwrap();
+        assert_eq!(advertised.backend(), EncoderBackend::Nvenc);
+
+        let buildable = registry.select_buildable(&h264_request()).unwrap();
+        assert_eq!(buildable.backend(), EncoderBackend::Software);
+        assert_eq!(buildable.reason, SelectionReason::OnlyCandidate);
+    }
+
+    #[test]
+    fn ffmpeg_encoder_table_is_parsed_exactly() {
+        let output = "\
+Encoders:
+ V..... = Video
+ ------
+ V....D libx264              libx264 H.264 / AVC
+ V....D h264_vaapi           H.264/MPEG-4 AVC (VAAPI)
+ A....D aac                  AAC (Advanced Audio Coding)
+";
+        let parsed = parse_ffmpeg_encoder_names(output);
+        assert!(parsed.contains("libx264"));
+        assert!(parsed.contains("h264_vaapi"));
+        assert!(parsed.contains("aac"));
+        assert_eq!(parsed.len(), 3);
+        assert!(!parsed.contains("Encoders:"));
     }
 
     #[test]

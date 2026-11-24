@@ -15,6 +15,12 @@ GStreamer, not a browser, and the node still runs the external Python helper.
 > processes, sockets, shm files, the null sink, and the temp directory were
 > removed; see [Cleanup](#8-cleanup).
 
+> **Follow-up (2026-11-24):** the controller proxy and a headless Chromium
+> dashboard peer were validated later in
+> [`gate2-live-controller-webrtc-report.md`](gate2-live-controller-webrtc-report.md).
+> That run also fixed the worker's hard-coded H.264/Opus payload types (Chrome
+> uses 103/111, not 96/97), which this GStreamer-only report did not expose.
+
 | Item | Value |
 |---|---|
 | Date | 2026-11-24, ~14:13–14:26 AEDT (03:13–03:26Z), final rerun at 14:26 |
@@ -314,10 +320,13 @@ cargo test -p ozma-node --lib controller_compat::tests::webrtc_
 
 - **No native WebRTC.** `/webrtc/*` still depends on the external
   GStreamer/Python helper; `webrtc-rs`/`str0m` is future work.
-- **No browser or controller-dashboard run.** The live peer was GStreamer.
-  `POST /api/v1/streams/{node}/webrtc`, a browser's ICE/DTLS, and dashboard
-  media remain unvalidated. A browser test needs an available automation
-  driver (none was installed).
+- **No browser or controller-dashboard run in this report.** The live peer here
+  was GStreamer. A later run validated
+  `POST /api/v1/streams/{node}/webrtc`, Chromium ICE/DTLS, and dashboard media;
+  see
+  [`gate2-live-controller-webrtc-report.md`](gate2-live-controller-webrtc-report.md).
+  That run is one Chromium build on the same host; Firefox/Safari and a
+  NAT/STUN/TURN matrix remain open.
 - **No trickle ICE.** Candidates travel inside the offer/answer SDP after a
   bounded gather. There is no STUN/TURN and no mDNS obfuscation; host
   candidates only. A slow gather can return a candidate-less answer.

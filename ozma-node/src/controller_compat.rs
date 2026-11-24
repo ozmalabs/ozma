@@ -511,6 +511,10 @@ pub struct CodecStatus {
     pub override_setting: Option<EncoderOverride>,
     /// Video codecs the node advertises, in capability order.
     pub available: Vec<String>,
+    /// Unique encoder backends advertised for those codecs (for example
+    /// `software`, `vaapi`, `nvenc`).
+    #[serde(default)]
+    pub backends: Vec<String>,
     /// The last stored policy receipt, or `null` when none was evaluated.
     pub receipt: Option<OverrideReceipt>,
     /// True while a stored override has not been applied by a pipeline restart.
@@ -533,6 +537,7 @@ impl CodecStatus {
             current_encoder,
             override_setting: None,
             available,
+            backends: Vec::new(),
             receipt: None,
             pending_restart: false,
             applied: false,
@@ -547,6 +552,17 @@ fn video_codec_names(codecs: impl IntoIterator<Item = Codec>) -> Vec<String> {
             continue;
         }
         let name = codec.as_str().to_owned();
+        if !available.contains(&name) {
+            available.push(name);
+        }
+    }
+    available
+}
+
+fn video_backend_names(backends: impl IntoIterator<Item = EncoderBackend>) -> Vec<String> {
+    let mut available: Vec<String> = Vec::new();
+    for backend in backends {
+        let name = backend_name(backend).to_owned();
         if !available.contains(&name) {
             available.push(name);
         }
@@ -627,6 +643,12 @@ impl CodecControl {
                 .iter()
                 .map(|capability| capability.codec),
         );
+        let backends = video_backend_names(
+            self.registry
+                .capabilities()
+                .iter()
+                .map(|capability| capability.backend),
+        );
         let fallback_encoder = available.first().cloned();
         let state = lock(&self.state).clone();
         let applied = state
@@ -638,6 +660,7 @@ impl CodecControl {
             current_encoder: applied.clone().or(fallback_encoder),
             override_setting: state.override_state.requested,
             available,
+            backends,
             receipt: state.override_state.receipt,
             pending_restart,
             applied: applied.is_some(),
@@ -4466,6 +4489,34 @@ mod tests {
         }
     }
 
+    /// Advertises a hardware encoder by name, then fails the real runtime probe.
+    struct RejectingRuntimeProbe {
+        availability: EncoderAvailability,
+    }
+
+    impl RejectingRuntimeProbe {
+        fn new(encoders: impl IntoIterator<Item = HlsEncoder>) -> Self {
+            Self {
+                availability: EncoderAvailability::from_names(
+                    encoders.into_iter().map(HlsEncoder::ffmpeg_name),
+                ),
+            }
+        }
+    }
+
+    impl EncoderProbe for RejectingRuntimeProbe {
+        fn availability(
+            &self,
+            _ffmpeg_bin: &std::path::Path,
+        ) -> Result<EncoderAvailability, String> {
+            Ok(self.availability.clone())
+        }
+
+        fn runtime_check(&self, _config: &HlsConfig) -> Result<(), String> {
+            Err("synthetic runtime probe rejected the encoder".to_owned())
+        }
+    }
+
     fn pending_factory() -> HlsSourceFactory {
         Arc::new(|| {
             Ok(Box::new(PendingCapture {
@@ -4552,6 +4603,25 @@ mod tests {
         EncoderRegistry::from_capabilities([ozma_encode::H264SoftwareEncoder::capability()])
     }
 
+    fn hardware_registry(entries: &[(Codec, EncoderBackend)]) -> EncoderRegistry {
+        let mut capabilities = vec![ozma_encode::H264SoftwareEncoder::capability()];
+        capabilities.extend(
+            entries
+                .iter()
+                .map(|(codec, backend)| hardware_capability(*codec, *backend)),
+        );
+        EncoderRegistry::from_capabilities(capabilities)
+    }
+
+    fn mixed_hardware_registry() -> EncoderRegistry {
+        hardware_registry(&[
+            (Codec::H264, EncoderBackend::Vaapi),
+            (Codec::Hevc, EncoderBackend::Vaapi),
+            (Codec::H264, EncoderBackend::Nvenc),
+            (Codec::Hevc, EncoderBackend::Nvenc),
+        ])
+    }
+
     fn codec_state(control: Option<CodecControl>) -> ConnectionState {
         let state = ConnectionState::new(
             ConnectionInfo::new(
@@ -4613,6 +4683,145 @@ mod tests {
         assert_eq!(body["pending_restart"], true);
         assert_eq!(body["applied"], false);
         assert_eq!(body["available"], serde_json::json!(["h264"]));
+    }
+
+    #[tokio::test]
+    async fn codec_route_lists_real_codecs_and_backends_from_the_registry() {
+        let app = codec_router(codec_state(Some(codec_control(mixed_hardware_registry()))));
+
+        let (status, body) = get_json(&app, "/codec").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["current_encoder"], "h264");
+        assert_eq!(body["available"], serde_json::json!(["h264", "hevc"]));
+        assert_eq!(
+            body["backends"],
+            serde_json::json!(["software", "vaapi", "nvenc"])
+        );
+        assert!(body["receipt"].is_null());
+        assert_eq!(body["pending_restart"], false);
+        assert_eq!(body["applied"], false);
+    }
+
+    #[tokio::test]
+    async fn codec_route_selects_every_advertised_hardware_entry_without_hls() {
+        let registry = hardware_registry(&[
+            (Codec::H264, EncoderBackend::Vaapi),
+            (Codec::Hevc, EncoderBackend::Vaapi),
+            (Codec::H264, EncoderBackend::Nvenc),
+            (Codec::Hevc, EncoderBackend::Nvenc),
+            (Codec::H264, EncoderBackend::Qsv),
+            (Codec::Hevc, EncoderBackend::Qsv),
+            (Codec::H264, EncoderBackend::V4l2M2m),
+            (Codec::Hevc, EncoderBackend::V4l2M2m),
+        ]);
+        let app = codec_router(codec_state(Some(codec_control(registry))));
+
+        for (codec, hw_accel, backend, receipt_backend, encoder) in [
+            ("h264", "vaapi", "vaapi", "vaapi", "h264_vaapi"),
+            ("hevc", "vaapi", "vaapi", "vaapi", "hevc_vaapi"),
+            ("h264", "nvenc", "nvenc", "nvenc", "h264_nvenc"),
+            ("hevc", "nvenc", "nvenc", "nvenc", "hevc_nvenc"),
+            ("h264", "qsv", "qsv", "qsv", "h264_qsv"),
+            ("hevc", "qsv", "qsv", "qsv", "hevc_qsv"),
+            ("h264", "v4l2m2m", "v4l2m2m", "v4l2_m2m", "h264_v4l2m2m"),
+            ("hevc", "v4l2m2m", "v4l2m2m", "v4l2_m2m", "hevc_v4l2m2m"),
+        ] {
+            let (status, body) = post_json(
+                &app,
+                "/codec",
+                serde_json::json!({"codec": codec, "hw_accel": hw_accel}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{codec}/{hw_accel}: {body}");
+            // No HLS pipeline: selection is stored, never claimed live.
+            assert_eq!(body["applied"], false, "{codec}/{hw_accel}: {body}");
+            assert_eq!(body["pending_restart"], true, "{codec}/{hw_accel}: {body}");
+            assert!(body["encoder"].is_null(), "{codec}/{hw_accel}: {body}");
+            assert_eq!(
+                body["requested_encoder"], encoder,
+                "{codec}/{hw_accel}: {body}"
+            );
+            assert_eq!(body["backend"], backend, "{codec}/{hw_accel}: {body}");
+            assert_eq!(
+                body["receipt"]["selected"]["codec"], codec,
+                "{codec}/{hw_accel}: {body}"
+            );
+            assert_eq!(
+                body["receipt"]["selected"]["backend"], receipt_backend,
+                "{codec}/{hw_accel}: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn codec_route_never_applies_hardware_that_fails_the_runtime_probe() {
+        let directory = codec_test_dir("hardware-runtime-rejected");
+        std::fs::write(directory.join("stream.m3u8"), "#EXTM3U\n").expect("manifest");
+        let device = directory.join("renderD128");
+        std::fs::write(&device, b"").expect("fake VAAPI device");
+        let spawner = Arc::new(CodecSpawner::new(Vec::new()));
+        let controller = controller_with_probe(
+            &directory,
+            &device,
+            spawner.clone(),
+            Arc::new(RejectingRuntimeProbe::new([
+                HlsEncoder::H264,
+                HlsEncoder::Hevc,
+                HlsEncoder::VaapiH264,
+                HlsEncoder::VaapiHevc,
+            ])),
+        );
+        controller.start().await.expect("start HLS");
+
+        let registry = hardware_registry(&[(Codec::Hevc, EncoderBackend::Vaapi)]);
+        let control =
+            CodecControl::new(registry, MediaFormat::new(Codec::H264, 320, 240, 30, 4_000))
+                .with_hls(Some(controller.clone()));
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_hls_controller(Some(controller.clone()))
+        .with_codec_control(Some(control));
+        let app = codec_router(state);
+
+        let (status, body) = post_json(
+            &app,
+            "/codec",
+            serde_json::json!({"codec": "hevc", "hw_accel": "vaapi"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["code"], codes::ENCODER_UNAVAILABLE);
+        assert_eq!(body["details"]["encoder"], "hevc_vaapi");
+        assert_eq!(body["details"]["backend"], "vaapi");
+        assert!(
+            body.get("applied").is_none(),
+            "a failed runtime probe must not return applied"
+        );
+        assert_eq!(
+            spawner.spawns().len(),
+            2,
+            "the initial generation plus the restored H.264 generation"
+        );
+        assert!(controller.is_running(), "the old pipeline was restored");
+        assert_eq!(controller.config().video_encoder, HlsEncoder::H264);
+
+        let (status, body) = get_json(&app, "/codec").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["applied"], false);
+        assert!(body["override"].is_null());
+
+        controller.stop().await.expect("stop HLS");
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[tokio::test]

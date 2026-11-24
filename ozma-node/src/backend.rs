@@ -209,7 +209,7 @@ impl SessionBackend {
             30,
             2_000,
         );
-        let selection = self.encoders.select(&request)?;
+        let selection = self.encoders.select_buildable(&request)?;
         selection.build_encoder(input)
     }
 

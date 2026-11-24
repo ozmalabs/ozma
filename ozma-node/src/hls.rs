@@ -16,6 +16,14 @@
 //! * Only `rgb24` and `bgra` sources are accepted. `bgra` is converted to
 //!   `rgb24`; MJPEG/YUYV/NV12 are rejected with a typed error rather than being
 //!   mislabelled as RGB and fed to the encoder.
+//! * A source whose frame size changes (a guest reset or display mode switch)
+//!   restarts ffmpeg with the new `-s WxH` instead of failing. The new
+//!   generation appends to the existing playlist with
+//!   `-hls_flags delete_segments+append_list+discont_start`, so old segments
+//!   stay playable and the switch is marked as an HLS discontinuity. This is
+//!   only automatic when [`HlsConfig::width`]/[`HlsConfig::height`] are unset;
+//!   explicitly pinned dimensions are a contract, and a mismatched frame is a
+//!   typed [`HlsError::FrameDimensions`] failure (no silent scaling).
 //! * [`HlsStatus`] reports `running` only after the manifest exists. A spawned
 //!   ffmpeg whose playlist has not been written yet is `failed`, not a success.
 //!
@@ -180,6 +188,25 @@ impl HlsEncoder {
         }
     }
 
+    /// Pixel format the HLS muxer should receive for this encoder.
+    ///
+    /// The capture source is RGB24. Without an explicit target, ffmpeg may
+    /// negotiate a 4:4:4 format (`libx264` → `yuv444p`, NVENC → `gbrp`) that
+    /// most HLS/browser decoders cannot play. VAAPI already uploads NV12 via
+    /// its filter; QSV wants NV12; every other video encoder gets 4:2:0.
+    /// MJPEG keeps ffmpeg's default (`yuvj420p`/`yuvj444p`).
+    pub fn hls_pixel_format(self) -> Option<&'static str> {
+        match self {
+            Self::H264 | Self::Hevc | Self::Av1Svt | Self::Av1Aom => Some("yuv420p"),
+            Self::VaapiH264 | Self::VaapiHevc => None,
+            Self::NvencH264 | Self::NvencHevc | Self::V4l2m2mH264 | Self::V4l2m2mHevc => {
+                Some("yuv420p")
+            }
+            Self::QsvH264 | Self::QsvHevc => Some("nv12"),
+            Self::Mjpeg => None,
+        }
+    }
+
     /// Parse a controller/CLI encoder name.
     ///
     /// This accepts software names, the explicit hardware ffmpeg names
@@ -319,10 +346,13 @@ fn hw_alias(value: &str) -> Option<HwAccel> {
 
 /// Configuration for the ffmpeg-backed HLS pipeline.
 ///
-/// `width`/`height` optionally override the input size advertised to ffmpeg.
-/// When they are unset the source's declared format is used, or — for sources
-/// such as the QMP display, which reports `0x0` until the first screendump —
-/// the size of the first frame is learned lazily.
+/// `width`/`height` optionally pin the input size advertised to ffmpeg. When
+/// they are unset the source's declared format is used, or — for sources such
+/// as the QMP display, which reports `0x0` until the first screendump — the
+/// size of the first frame is learned lazily. In that dynamic mode a later
+/// frame of another size restarts ffmpeg at the new size ([`HlsPipeline`]).
+/// When both are set they are authoritative and a different frame size is a
+/// typed [`HlsError::FrameDimensions`] failure; the pipeline does not scale.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HlsConfig {
     /// Directory receiving `stream.m3u8` and `seg_%05d.ts`.
@@ -551,6 +581,10 @@ pub enum HlsError {
         actual: usize,
     },
     /// A frame's dimensions differ from the size advertised to ffmpeg.
+    ///
+    /// With dynamic dimensions the pipeline restarts ffmpeg instead. This
+    /// error is returned when [`HlsConfig::width`]/[`HlsConfig::height`] pinned
+    /// the input size: the frame is rejected rather than silently scaled.
     #[error(
         "frame dimensions {width}x{height} do not match the HLS input {expected_width}x{expected_height}"
     )]
@@ -862,6 +896,17 @@ impl FramePacer {
     pub fn next_deadline(&self) -> Instant {
         self.next_deadline
     }
+
+    /// Restart the pacing schedule after an encoder restart.
+    ///
+    /// The frame that triggered the restart has already been admitted, so the
+    /// next slot is one interval after `now`. Any accumulated catch-up debt is
+    /// discarded: a restart that took longer than an interval cannot make the
+    /// feeder burst frames into the new ffmpeg child. Counters are preserved
+    /// so status/evidence still describe the whole pipeline generation.
+    pub fn rebase(&mut self, now: Instant) {
+        self.next_deadline = now + self.interval;
+    }
 }
 
 /// Destination for converted raw frames.
@@ -896,6 +941,26 @@ pub trait FfmpegSpawner: Send + Sync {
     /// Spawn ffmpeg for `width`×`height` raw RGB24 input.
     fn spawn(&self, config: &HlsConfig, width: u32, height: u32)
         -> Result<SpawnedFfmpeg, HlsError>;
+
+    /// Spawn a ffmpeg generation that may be a restart after a frame-size
+    /// change.
+    ///
+    /// `restart` is false for the first generation. A new generation must
+    /// append to the existing playlist (`append_list`) and mark the switch as
+    /// a discontinuity (`discont_start`) while still pruning old segments
+    /// (`delete_segments`). The default delegates to [`Self::spawn`], so
+    /// injected test/embedding spawners keep working unchanged; the system
+    /// spawner overrides it to build the restart-aware argv.
+    fn spawn_generation(
+        &self,
+        config: &HlsConfig,
+        width: u32,
+        height: u32,
+        restart: bool,
+    ) -> Result<SpawnedFfmpeg, HlsError> {
+        let _ = restart;
+        self.spawn(config, width, height)
+    }
 }
 
 struct SystemFfmpegSpawner;
@@ -907,8 +972,18 @@ impl FfmpegSpawner for SystemFfmpegSpawner {
         width: u32,
         height: u32,
     ) -> Result<SpawnedFfmpeg, HlsError> {
+        self.spawn_generation(config, width, height, false)
+    }
+
+    fn spawn_generation(
+        &self,
+        config: &HlsConfig,
+        width: u32,
+        height: u32,
+        restart: bool,
+    ) -> Result<SpawnedFfmpeg, HlsError> {
         create_output_dir(config)?;
-        let argv = ffmpeg_argv(config, width, height);
+        let argv = ffmpeg_argv_for(config, width, height, restart);
         let mut command = Command::new(&argv[0]);
         command
             .args(&argv[1..])
@@ -1028,6 +1103,17 @@ impl FromIterator<String> for EncoderAvailability {
 pub trait EncoderProbe: Send + Sync {
     /// ffmpeg encoders available to `ffmpeg_bin`.
     fn availability(&self, ffmpeg_bin: &Path) -> Result<EncoderAvailability, String>;
+
+    /// Optional runtime evidence for a hardware encoder.
+    ///
+    /// `ffmpeg -encoders` proves only that a wrapper was compiled in; it does
+    /// not prove that a device, driver, or rate-control combination works on
+    /// this host. Production probes override this to run the exact HLS argv on
+    /// a short synthetic frame and require a non-empty segment. The default
+    /// succeeds so deterministic test probes do not need a GPU.
+    fn runtime_check(&self, _config: &HlsConfig) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// A deterministic probe over a fixed set of encoder names.
@@ -1137,6 +1223,163 @@ impl EncoderProbe for SystemEncoderProbe {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(availability.clone());
         Ok(availability)
     }
+
+    fn runtime_check(&self, config: &HlsConfig) -> Result<(), String> {
+        if !config.video_encoder.is_hardware() {
+            return Ok(());
+        }
+        probe_hardware_encode(config)
+    }
+}
+
+/// Upper bound on a real hardware encoder probe.
+const HARDWARE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Stderr retained from a failed probe (the tail carries the real cause).
+const HARDWARE_PROBE_STDERR_BYTES: usize = 4096;
+/// Upper bound on stderr read before keeping its tail.
+const HARDWARE_PROBE_STDERR_READ: u64 = 64 * 1024;
+
+/// Encode three synthetic RGB24 frames with the exact HLS argv and require a
+/// non-empty segment.
+///
+/// This is deliberately narrower than a full pipeline: it proves that ffmpeg
+/// can initialise the encoder on the configured device and write a segment.
+/// It runs in a throwaway directory and kills the child on timeout.
+fn probe_hardware_encode(config: &HlsConfig) -> Result<(), String> {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let directory = std::env::temp_dir().join(format!(
+        "ozma-hls-encoder-probe-{}-{sequence}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).map_err(|error| {
+        format!(
+            "could not create probe directory `{}`: {error}",
+            directory.display()
+        )
+    })?;
+
+    let (width, height) = (320, 240);
+    let probe_config = HlsConfig {
+        output_dir: directory.clone(),
+        fps: config.fps.clamp(1, 30),
+        segment_seconds: 1.0,
+        playlist_size: 4,
+        width: None,
+        height: None,
+        ..config.clone()
+    };
+    let mut argv = ffmpeg_argv(&probe_config, width, height);
+    // Use a real rawvideo file rather than a stdin pipe. A pipe write can block
+    // indefinitely if the encoder never starts reading; the file keeps the
+    // whole probe bounded by the process timeout.
+    let raw_path = directory.join("probe.rgb");
+    let mut frames = Vec::with_capacity(3 * (width as usize) * (height as usize) * 3);
+    for index in 0..3 {
+        frames.extend_from_slice(&probe_rgb24_frame(width, height, index));
+    }
+    std::fs::write(&raw_path, &frames)
+        .map_err(|error| format!("could not write probe frames: {error}"))?;
+    let input_index = argv
+        .iter()
+        .position(|argument| argument == "-i")
+        .ok_or_else(|| "the HLS argv has no `-i` input".to_owned())?;
+    if argv.get(input_index + 1).map(String::as_str) == Some("-") {
+        argv[input_index + 1] = raw_path.display().to_string();
+    }
+
+    let stderr_path = directory.join("ffmpeg.stderr");
+    let stderr_file = std::fs::File::create(&stderr_path)
+        .map_err(|error| format!("could not create probe stderr file: {error}"))?;
+
+    let mut child = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .map_err(|error| format!("could not execute `{}`: {error}", argv[0]))?;
+
+    let deadline = Instant::now() + HARDWARE_PROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let stderr = read_probe_stderr(&stderr_path);
+                let _ = std::fs::remove_dir_all(&directory);
+                return Err(format!(
+                    "waiting for the probe encode failed: {error}; ffmpeg stderr: {stderr}"
+                ));
+            }
+        }
+    };
+
+    let segment_written = std::fs::read_dir(&directory)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| {
+            let path = entry.path();
+            path.extension() == Some(std::ffi::OsStr::new("ts"))
+                && entry
+                    .metadata()
+                    .map(|metadata| metadata.len() > 0)
+                    .unwrap_or(false)
+        });
+    let stderr = read_probe_stderr(&stderr_path);
+    let _ = std::fs::remove_dir_all(&directory);
+
+    match status {
+        None => Err(format!(
+            "the encoder probe did not finish within {}s; ffmpeg stderr: {stderr}",
+            HARDWARE_PROBE_TIMEOUT.as_secs()
+        )),
+        Some(status) if !status.success() => {
+            Err(format!("ffmpeg exited with {status}; stderr: {stderr}"))
+        }
+        Some(_) if !segment_written => Err(
+            "ffmpeg exited cleanly but wrote no non-empty HLS segment; the encoder did not \
+             produce output"
+                .to_owned(),
+        ),
+        Some(_) => Ok(()),
+    }
+}
+
+fn read_probe_stderr(path: &Path) -> String {
+    let Ok(file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let mut bytes = Vec::new();
+    let _ = file
+        .take(HARDWARE_PROBE_STDERR_READ)
+        .read_to_end(&mut bytes);
+    if bytes.len() > HARDWARE_PROBE_STDERR_BYTES {
+        bytes.drain(..bytes.len() - HARDWARE_PROBE_STDERR_BYTES);
+    }
+    String::from_utf8_lossy(&bytes).trim().to_owned()
+}
+
+fn probe_rgb24_frame(width: u32, height: u32, index: u32) -> Vec<u8> {
+    let mut pixels = Vec::with_capacity((width as usize) * (height as usize) * 3);
+    for y in 0..height {
+        for x in 0..width {
+            pixels.push(((x * 4 + index) & 0xFF) as u8);
+            pixels.push(((y * 4) & 0xFF) as u8);
+            pixels.push((((x + y) * 2 + index) & 0xFF) as u8);
+        }
+    }
+    pixels
 }
 
 /// Check runtime-only requirements for the configured encoder.
@@ -1187,6 +1430,38 @@ fn validate_encoder_runtime(config: &HlsConfig, probe: &dyn EncoderProbe) -> Res
             available: availability.known_encoders(),
         });
     }
+
+    // A compiled-in wrapper is not proof that this host can encode. Run the
+    // exact argv on a short synthetic frame; a missing or unusable device must
+    // fail here, before a pipeline is reported as started/applied.
+    probe
+        .runtime_check(config)
+        .map_err(|message| HlsError::EncoderUnavailable {
+            encoder: encoder.ffmpeg_name().to_owned(),
+            backend: encoder.backend_label().to_owned(),
+            message: format!(
+                "the {} encoder failed a real encode probe: {message}",
+                encoder.ffmpeg_name()
+            ),
+            remediation: format!(
+            "Fix the {} device or driver (for example the VAAPI render node, NVENC/QSV device, \
+             or V4L2M2M node), choose another hardware backend, or explicitly allow a software \
+             fallback.",
+            encoder.backend_label()
+        ),
+            // Other hardware wrappers were only advertised, not runtime-proven.
+            // Listing them as "available" would repeat the misleading claim
+            // this probe exists to prevent, so report only software encoders.
+            available: availability
+                .known_encoders()
+                .into_iter()
+                .filter(|name| {
+                    HlsEncoder::parse(name)
+                        .map(|candidate| !candidate.is_hardware())
+                        .unwrap_or(false)
+                })
+                .collect(),
+        })?;
     Ok(())
 }
 
@@ -1817,7 +2092,64 @@ async fn run_pipeline(
         }
 
         let (width, height) = match expected {
-            Some(dimensions) => dimensions,
+            Some((expected_width, expected_height)) => {
+                let frame_width = frame.format().width;
+                let frame_height = frame.format().height;
+                if frame_width != expected_width || frame_height != expected_height {
+                    if !dimensions_are_dynamic(&config) {
+                        // Pinned dimensions are an explicit contract. Scaling is
+                        // deliberately not silent: a frame of another size is a
+                        // visible configuration failure, not a blurry stream.
+                        let error = HlsError::FrameDimensions {
+                            width: frame_width,
+                            height: frame_height,
+                            expected_width,
+                            expected_height,
+                        };
+                        status.set_failed(error.to_string());
+                        break;
+                    }
+                    if frame_width == 0 || frame_height == 0 {
+                        status.set_failed("capture frame has zero dimensions");
+                        break;
+                    }
+
+                    // The old child was started with the old `-s WxH`. Close
+                    // its stdin so a partial segment can be flushed, then reap
+                    // it before spawning the new generation. A dead child is
+                    // never fed again: if the restart fails the pipeline ends
+                    // as `failed`.
+                    if let Some(mut writer) = sink.take() {
+                        let _ = writer.close().await;
+                    }
+                    kill_child(&child).await;
+                    match spawner.spawn_generation(&config, frame_width, frame_height, true) {
+                        Ok(spawned) => {
+                            *child
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = spawned.child;
+                            sink = Some(spawned.sink);
+                        }
+                        Err(error) => {
+                            let error = HlsError::Restart {
+                                message: format!(
+                                    "ffmpeg could not restart for a frame-size change \
+                                     {expected_width}x{expected_height} -> \
+                                     {frame_width}x{frame_height}: {error}"
+                                ),
+                            };
+                            status.set_failed(error.to_string());
+                            break;
+                        }
+                    }
+                    expected = Some((frame_width, frame_height));
+                    // The frame that triggered the restart is already admitted.
+                    // Rebase so a slow restart cannot make the feeder burst a
+                    // backlog of frames into the new ffmpeg child.
+                    pacer.rebase(clock.now());
+                }
+                (frame_width, frame_height)
+            }
             None => {
                 let width = frame.format().width;
                 let height = frame.format().height;
@@ -1825,7 +2157,7 @@ async fn run_pipeline(
                     status.set_failed("capture frame has zero dimensions");
                     break;
                 }
-                match spawner.spawn(&config, width, height) {
+                match spawner.spawn_generation(&config, width, height, false) {
                     Ok(spawned) => {
                         *child
                             .lock()
@@ -1838,6 +2170,10 @@ async fn run_pipeline(
                     }
                 }
                 expected = Some((width, height));
+                // Starting ffmpeg can take longer than one frame interval.
+                // Rebase from the completed spawn rather than the frame's
+                // arrival time so the first second is not a catch-up burst.
+                pacer.rebase(clock.now());
                 (width, height)
             }
         };
@@ -1964,6 +2300,15 @@ fn initial_dimensions(config: &HlsConfig, declared: FrameFormat) -> Option<(u32,
     }
 }
 
+/// True when a later frame size may restart ffmpeg instead of failing.
+///
+/// Only a fully dynamic configuration may change size. Explicit
+/// [`HlsConfig::width`]/[`HlsConfig::height`] pin the input contract;
+/// [`HlsConfig::validate`] already rejects setting only one of them.
+fn dimensions_are_dynamic(config: &HlsConfig) -> bool {
+    config.width.is_none() && config.height.is_none()
+}
+
 fn create_output_dir(config: &HlsConfig) -> Result<(), HlsError> {
     std::fs::create_dir_all(&config.output_dir).map_err(|error| HlsError::OutputDirectory {
         path: config.output_dir.clone(),
@@ -1975,7 +2320,27 @@ fn create_output_dir(config: &HlsConfig) -> Result<(), HlsError> {
 ///
 /// The binary itself is the first element. Tests assert this list directly; the
 /// system spawner uses the same function, so argv and behavior cannot drift.
+/// This is the first-generation argv; a restart generation additionally uses
+/// [`ffmpeg_argv_for`] to append to the existing playlist.
 pub fn ffmpeg_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String> {
+    ffmpeg_argv_for(config, width, height, false)
+}
+
+/// Build the argv for a first run or for a restart after a frame-size change.
+///
+/// A restart keeps the same encoder, bitrate, segment duration, playlist size,
+/// and output paths, but adds `append_list` (keep the existing playlist),
+/// `discont_start` (mark the size change as an HLS discontinuity), and leaves
+/// `delete_segments` on so the rolling window still prunes old segments. With
+/// the default `-start_number 0`, ffmpeg continues segment file numbering from
+/// the last filename in the appended playlist instead of overwriting it; that
+/// was verified against ffmpeg n9.1 (`seg_00009.ts` was retained and followed
+/// by `seg_00010.ts`/`seg_00011.ts`, media sequence 6 -> 9).
+///
+/// ffmpeg owns the encoded media timeline: each generation restarts it at zero,
+/// and `discont_start` tells players not to interpolate across the boundary.
+/// The feeder writes raw bytes only, so frame sequence/PTS order is unchanged.
+fn ffmpeg_argv_for(config: &HlsConfig, width: u32, height: u32, restart: bool) -> Vec<String> {
     let bitrate = format!("{}k", config.bitrate_kbps);
     let mut argv = vec![
         config.ffmpeg_bin.display().to_string(),
@@ -2078,6 +2443,13 @@ pub fn ffmpeg_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String> {
         ]),
     }
 
+    // Pin the encoded chroma format. The raw input is RGB24, and without an
+    // explicit target ffmpeg may choose 4:4:4 (libx264 yuv444p, NVENC gbrp),
+    // which HLS/browser decoders commonly reject.
+    if let Some(pixel_format) = config.video_encoder.hls_pixel_format() {
+        argv.extend(["-pix_fmt".to_owned(), pixel_format.to_owned()]);
+    }
+
     // Keep GOPs aligned with segment boundaries. `-hls_time` can only cut a
     // segment at a keyframe, so without this libx264's default 250-frame GOP
     // made `-hls_time 1` produce 50-second segments at 5 fps (see
@@ -2110,9 +2482,16 @@ pub fn ffmpeg_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String> {
         "-hls_list_size".to_owned(),
         config.playlist_size.to_string(),
         // Remove segments that fall out of the rolling playlist. Without this
-        // flag the output directory grows without bound.
+        // flag the output directory grows without bound. A restart keeps the
+        // old entries and appends new ones instead of truncating the playlist;
+        // `discont_start` marks the dimensions/timebase switch so players do
+        // not decode across it as if it were continuous.
         "-hls_flags".to_owned(),
-        "delete_segments".to_owned(),
+        if restart {
+            "delete_segments+append_list+discont_start".to_owned()
+        } else {
+            "delete_segments".to_owned()
+        },
         "-hls_segment_filename".to_owned(),
         config.segment_pattern().display().to_string(),
         config.manifest_path().display().to_string(),
@@ -2271,6 +2650,7 @@ mod tests {
         writes: Arc<Mutex<Vec<Vec<u8>>>>,
         fail_write: bool,
         closed: Arc<AtomicBool>,
+        closed_token: Option<Arc<AtomicBool>>,
     }
 
     #[async_trait]
@@ -2291,6 +2671,9 @@ mod tests {
 
         async fn close(&mut self) -> io::Result<()> {
             self.closed.store(true, Ordering::SeqCst);
+            if let Some(token) = self.closed_token.as_ref() {
+                token.store(true, Ordering::SeqCst);
+            }
             Ok(())
         }
     }
@@ -2300,8 +2683,62 @@ mod tests {
         writes: Arc<Mutex<Vec<Vec<u8>>>>,
         spawns: Arc<Mutex<Vec<(u32, u32, Vec<String>)>>>,
         closed: Arc<AtomicBool>,
+        closed_sinks: Arc<Mutex<Vec<Arc<AtomicBool>>>>,
         fail_spawn: Option<String>,
+        /// 1-based spawn call that should fail, for restart-failure tests.
+        fail_spawn_on: Option<usize>,
         fail_write: bool,
+    }
+
+    impl RecordingSpawner {
+        fn record_spawn(
+            &self,
+            config: &HlsConfig,
+            width: u32,
+            height: u32,
+            restart: bool,
+        ) -> Result<SpawnedFfmpeg, HlsError> {
+            let call = self
+                .spawns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len()
+                + 1;
+            if let Some(message) = &self.fail_spawn {
+                return Err(HlsError::Spawn {
+                    bin: config.ffmpeg_bin.clone(),
+                    message: message.clone(),
+                });
+            }
+            if self.fail_spawn_on == Some(call) {
+                return Err(HlsError::Spawn {
+                    bin: config.ffmpeg_bin.clone(),
+                    message: format!("fake restart spawn failure #{call}"),
+                });
+            }
+            self.spawns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((
+                    width,
+                    height,
+                    ffmpeg_argv_for(config, width, height, restart),
+                ));
+            let closed_token = Arc::new(AtomicBool::new(false));
+            self.closed_sinks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(closed_token.clone());
+            Ok(SpawnedFfmpeg {
+                sink: Box::new(RecordingSink {
+                    writes: self.writes.clone(),
+                    fail_write: self.fail_write,
+                    closed: self.closed.clone(),
+                    closed_token: Some(closed_token),
+                }),
+                child: None,
+            })
+        }
     }
 
     impl FfmpegSpawner for RecordingSpawner {
@@ -2311,24 +2748,17 @@ mod tests {
             width: u32,
             height: u32,
         ) -> Result<SpawnedFfmpeg, HlsError> {
-            if let Some(message) = &self.fail_spawn {
-                return Err(HlsError::Spawn {
-                    bin: config.ffmpeg_bin.clone(),
-                    message: message.clone(),
-                });
-            }
-            self.spawns
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push((width, height, ffmpeg_argv(config, width, height)));
-            Ok(SpawnedFfmpeg {
-                sink: Box::new(RecordingSink {
-                    writes: self.writes.clone(),
-                    fail_write: self.fail_write,
-                    closed: self.closed.clone(),
-                }),
-                child: None,
-            })
+            self.record_spawn(config, width, height, false)
+        }
+
+        fn spawn_generation(
+            &self,
+            config: &HlsConfig,
+            width: u32,
+            height: u32,
+            restart: bool,
+        ) -> Result<SpawnedFfmpeg, HlsError> {
+            self.record_spawn(config, width, height, restart)
         }
     }
 
@@ -2459,6 +2889,29 @@ mod tests {
     }
 
     #[test]
+    fn pacer_rebase_discards_catch_up_debt_after_a_restart() {
+        let start = Instant::now();
+        let mut pacer = FramePacer::new(5, start);
+
+        assert!(pacer.should_emit(start));
+        assert_eq!(pacer.emitted(), 1);
+        // Simulate an encoder restart that finished much later than the old
+        // schedule. Rebase from the completion time: the next slot is one
+        // interval later, not a banked burst of catch-up frames.
+        let restarted_at = start + Duration::from_secs(3);
+        pacer.rebase(restarted_at);
+        assert_eq!(
+            pacer.next_deadline(),
+            restarted_at + Duration::from_millis(200)
+        );
+        assert!(!pacer.should_emit(restarted_at));
+        assert!(!pacer.should_emit(restarted_at + Duration::from_millis(199)));
+        assert!(pacer.should_emit(restarted_at + Duration::from_millis(200)));
+        assert_eq!(pacer.emitted(), 2, "rebase preserves emitted counters");
+        assert_eq!(pacer.dropped(), 2);
+    }
+
+    #[test]
     fn pacer_interval_is_a_positive_duration_for_every_valid_fps() {
         for fps in [1, 5, 24, 30, 60, u32::MAX] {
             assert!(
@@ -2535,6 +2988,8 @@ mod tests {
                 "zerolatency",
                 "-b:v",
                 "4000k",
+                "-pix_fmt",
+                "yuv420p",
                 "-g",
                 "30",
                 "-keyint_min",
@@ -2797,6 +3252,50 @@ mod tests {
                     .any(|window| window == ["-hls_flags", "delete_segments"]),
                 "{encoder:?} argv must prune segments"
             );
+        }
+    }
+
+    #[test]
+    fn ffmpeg_argv_pins_a_decodable_chroma_format() {
+        let base = HlsConfig {
+            output_dir: PathBuf::from("/tmp/ozma-stream-chroma"),
+            ..HlsConfig::default()
+        };
+
+        for (encoder, expected) in [
+            (HlsEncoder::H264, Some("yuv420p")),
+            (HlsEncoder::Hevc, Some("yuv420p")),
+            (HlsEncoder::Av1Svt, Some("yuv420p")),
+            (HlsEncoder::Av1Aom, Some("yuv420p")),
+            (HlsEncoder::Mjpeg, None),
+            (HlsEncoder::VaapiH264, None),
+            (HlsEncoder::VaapiHevc, None),
+            (HlsEncoder::NvencH264, Some("yuv420p")),
+            (HlsEncoder::NvencHevc, Some("yuv420p")),
+            (HlsEncoder::QsvH264, Some("nv12")),
+            (HlsEncoder::QsvHevc, Some("nv12")),
+            (HlsEncoder::V4l2m2mH264, Some("yuv420p")),
+            (HlsEncoder::V4l2m2mHevc, Some("yuv420p")),
+        ] {
+            let argv = ffmpeg_argv(
+                &HlsConfig {
+                    video_encoder: encoder,
+                    ..base.clone()
+                },
+                320,
+                240,
+            );
+            let formats: Vec<&str> = argv
+                .windows(2)
+                .filter(|window| window[0] == "-pix_fmt")
+                .map(|window| window[1].as_str())
+                .collect();
+            // The first value is always the rawvideo input format.
+            let expected: Vec<&str> = match expected {
+                Some(format) => vec!["rgb24", format],
+                None => vec!["rgb24"],
+            };
+            assert_eq!(formats, expected, "{encoder:?} chroma target");
         }
     }
 
@@ -3256,6 +3755,207 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn frame_size_change_restarts_ffmpeg_at_the_new_size_and_appends_the_playlist() {
+        let directory = temp_dir("resolution-change");
+        let format = FrameFormat::rgb24(0, 0);
+        let first = rgb_frame(640, 480, 0, 0x11);
+        let second = rgb_frame(1280, 800, 1, 0x22);
+        let clock = ManualClock::new(Instant::now());
+        let (source, stopped) = FakeSource::new(format, vec![Ok(first), Ok(second)], false);
+        let source = source.with_clock(clock.clone(), Duration::from_millis(200));
+
+        let recording = RecordingSpawner::default();
+        let writes = recording.writes.clone();
+        let spawns = recording.spawns.clone();
+        let closed_sinks = recording.closed_sinks.clone();
+        let mut pipeline = HlsPipeline::start_with_clock(
+            Box::new(source),
+            HlsConfig {
+                output_dir: directory.clone(),
+                fps: 5,
+                ..HlsConfig::default()
+            },
+            spawner(recording),
+            Arc::new(StaticEncoderProbe::software()),
+            clock,
+        )
+        .expect("start pipeline");
+
+        wait_until(|| writes.lock().unwrap().len() == 2 && stopped.load(Ordering::SeqCst)).await;
+        let spawns = spawns.lock().unwrap().clone();
+        assert_eq!(spawns.len(), 2, "a size change spawns one new generation");
+        assert_eq!((spawns[0].0, spawns[0].1), (640, 480));
+        assert_eq!((spawns[1].0, spawns[1].1), (1280, 800));
+        assert!(spawns[0].2.contains(&"640x480".to_owned()));
+        assert!(spawns[1].2.contains(&"1280x800".to_owned()));
+        assert!(
+            spawns[0].2.contains(&"delete_segments".to_owned())
+                && !spawns[0]
+                    .2
+                    .contains(&"delete_segments+append_list+discont_start".to_owned()),
+            "the first generation starts a fresh playlist"
+        );
+        assert!(
+            spawns[1]
+                .2
+                .contains(&"delete_segments+append_list+discont_start".to_owned()),
+            "a restart appends to the playlist and marks a discontinuity"
+        );
+        for expected in ["libx264", "4000k", "-hls_time", "1", "-hls_list_size", "4"] {
+            assert!(
+                spawns[1].2.contains(&expected.to_owned()),
+                "restart generation keeps `{expected}`: {:?}",
+                spawns[1].2
+            );
+        }
+        assert_eq!(
+            spawns[1].2.last().map(|argument| argument.as_str()),
+            Some(directory.join("stream.m3u8").to_str().unwrap()),
+            "a restart writes the same playlist path"
+        );
+
+        let sinks = closed_sinks.lock().unwrap();
+        assert_eq!(sinks.len(), 2);
+        // The fake spawner has no OS child, so the observable stop signal is
+        // its sink close; `run_pipeline` calls `kill_child` on the real child
+        // immediately after closing that sink.
+        assert!(
+            sinks[0].load(Ordering::SeqCst),
+            "the old ffmpeg generation's stdin/child must be stopped first"
+        );
+
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes[0].len(), 640 * 480 * 3);
+        assert_eq!(writes[1].len(), 1280 * 800 * 3);
+        assert_eq!(writes[0][0], 0x11);
+        assert_eq!(writes[1][0], 0x22);
+        drop(writes);
+
+        assert_eq!(pipeline.status().state(), HlsState::Stopped);
+        pipeline.stop().await.expect("stop");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn pinned_dimensions_reject_a_frame_size_change_instead_of_scaling() {
+        let directory = temp_dir("pinned-resolution");
+        let format = FrameFormat::rgb24(640, 480);
+        let clock = ManualClock::new(Instant::now());
+        let (source, stopped) = FakeSource::new(
+            format,
+            vec![
+                Ok(rgb_frame(640, 480, 0, 0x33)),
+                Ok(rgb_frame(1280, 800, 1, 0x44)),
+            ],
+            false,
+        );
+        let source = source.with_clock(clock.clone(), Duration::from_millis(200));
+
+        let recording = RecordingSpawner::default();
+        let spawns = recording.spawns.clone();
+        let writes = recording.writes.clone();
+        let mut pipeline = HlsPipeline::start_with_clock(
+            Box::new(source),
+            HlsConfig {
+                output_dir: directory.clone(),
+                fps: 5,
+                width: Some(640),
+                height: Some(480),
+                ..HlsConfig::default()
+            },
+            spawner(recording),
+            Arc::new(StaticEncoderProbe::software()),
+            clock,
+        )
+        .expect("start pipeline");
+
+        wait_until(|| {
+            stopped.load(Ordering::SeqCst) && pipeline.status().state() == HlsState::Failed
+        })
+        .await;
+        assert_eq!(
+            spawns.lock().unwrap().len(),
+            1,
+            "pinned dimensions never restart"
+        );
+        assert_eq!(
+            writes.lock().unwrap().len(),
+            1,
+            "the bad frame is not written"
+        );
+        let error = pipeline.status().error().unwrap_or_default();
+        assert!(
+            error.contains("frame dimensions 1280x800 do not match the HLS input 640x480"),
+            "unexpected error: {error}"
+        );
+        assert!(!pipeline.is_running());
+        pipeline.stop().await.expect("stop");
+        assert_eq!(pipeline.status().state(), HlsState::Failed);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn failed_restart_marks_the_pipeline_failed_and_does_not_feed_the_dead_child() {
+        let directory = temp_dir("resolution-restart-failure");
+        let format = FrameFormat::rgb24(640, 480);
+        let clock = ManualClock::new(Instant::now());
+        let (source, stopped) = FakeSource::new(
+            format,
+            vec![
+                Ok(rgb_frame(640, 480, 0, 0x55)),
+                Ok(rgb_frame(1280, 800, 1, 0x66)),
+            ],
+            false,
+        );
+        let source = source.with_clock(clock.clone(), Duration::from_millis(200));
+
+        let recording = RecordingSpawner {
+            fail_spawn_on: Some(2),
+            ..RecordingSpawner::default()
+        };
+        let spawns = recording.spawns.clone();
+        let writes = recording.writes.clone();
+        let closed_sinks = recording.closed_sinks.clone();
+        let mut pipeline = HlsPipeline::start_with_clock(
+            Box::new(source),
+            HlsConfig {
+                output_dir: directory.clone(),
+                fps: 5,
+                ..HlsConfig::default()
+            },
+            spawner(recording),
+            Arc::new(StaticEncoderProbe::software()),
+            clock,
+        )
+        .expect("start pipeline");
+
+        wait_until(|| {
+            stopped.load(Ordering::SeqCst) && pipeline.status().state() == HlsState::Failed
+        })
+        .await;
+        assert_eq!(spawns.lock().unwrap().len(), 1);
+        assert_eq!(
+            writes.lock().unwrap().len(),
+            1,
+            "the new-size frame is never written to the dead child"
+        );
+        let error = pipeline.status().error().unwrap_or_default();
+        assert!(
+            error.contains("HLS restart failed"),
+            "unexpected error: {error}"
+        );
+        assert!(error.contains("1280x800"), "unexpected error: {error}");
+        assert!(
+            closed_sinks.lock().unwrap()[0].load(Ordering::SeqCst),
+            "the old child is stopped even when the restart fails"
+        );
+        assert!(!pipeline.is_running());
+        pipeline.stop().await.expect("stop");
+        assert_eq!(pipeline.status().state(), HlsState::Failed);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
     async fn hls_status_never_claims_running_before_the_manifest_exists() {
         let directory = temp_dir("status");
         let manifest = directory.join("stream.m3u8");
@@ -3365,6 +4065,63 @@ mod tests {
             "{error}"
         );
         assert!(spawns.lock().unwrap().is_empty(), "no ffmpeg spawn");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    struct RejectingRuntimeProbe;
+
+    impl EncoderProbe for RejectingRuntimeProbe {
+        fn availability(&self, _ffmpeg_bin: &Path) -> Result<EncoderAvailability, String> {
+            Ok(EncoderAvailability::from_names([
+                HlsEncoder::H264.ffmpeg_name(),
+                HlsEncoder::VaapiH264.ffmpeg_name(),
+            ]))
+        }
+
+        fn runtime_check(&self, _config: &HlsConfig) -> Result<(), String> {
+            Err("the fake device rejected the probe encode".to_owned())
+        }
+    }
+
+    #[tokio::test]
+    async fn hardware_start_rejects_a_failed_runtime_probe_before_spawning() {
+        let directory = temp_dir("hardware-runtime-probe");
+        let device = directory.join("renderD128");
+        std::fs::write(&device, b"").expect("fake device file");
+        let recording = RecordingSpawner::default();
+        let spawns = recording.spawns.clone();
+        let (source, _) = FakeSource::new(
+            FrameFormat::rgb24(2, 2),
+            vec![Ok(rgb_frame(2, 2, 0, 0))],
+            false,
+        );
+
+        let error = HlsPipeline::start_with_spawner_and_probe(
+            Box::new(source),
+            HlsConfig {
+                output_dir: directory.clone(),
+                video_encoder: HlsEncoder::VaapiH264,
+                vaapi_device: device,
+                ..HlsConfig::default()
+            },
+            spawner(recording),
+            Arc::new(RejectingRuntimeProbe),
+        )
+        .err()
+        .expect("a failed runtime probe must fail the start");
+
+        assert!(
+            matches!(error, HlsError::EncoderUnavailable { .. }),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("real encode probe"),
+            "the error must name the probe: {error}"
+        );
+        assert!(
+            spawns.lock().unwrap().is_empty(),
+            "no ffmpeg pipeline may start after a failed probe"
+        );
         let _ = std::fs::remove_dir_all(directory);
     }
 

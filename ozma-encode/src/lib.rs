@@ -24,10 +24,16 @@
 //!   never accepts a software encode as hardware evidence.
 //! * [`EncoderRegistry`] selects a backend deterministically, with hardware
 //!   preference and a software fallback.
-//!   [`EncoderRegistry::with_detected_encoders`] advertises VAAPI only after
-//!   [`VaapiProbe`] passes, and keeps [`H264SoftwareEncoder`] as the fallback.
+//!   [`EncoderRegistry::with_detected_encoders`] probes the host and advertises
+//!   only encoders whose device evidence is present: software H.264 always,
+//!   VAAPI H.264/HEVC after a real device probe, NVENC after an ffmpeg listing
+//!   plus a CUDA/NVML node, and QSV/V4L2M2M only after a real one-frame encode.
+//!   [`EncoderRegistry::with_detected_encoders_for_device`] honours an explicit
+//!   `--vaapi-device` instead of the default render node.
 //!   [`EncoderSelection::build_encoder`] builds the real encoder for software,
-//!   VAAPI, and fake selections.
+//!   VAAPI, and fake selections; use
+//!   [`EncoderRegistry::select_buildable`] when the caller needs a concrete
+//!   `ozma-encode` encoder rather than an HLS-only backend.
 //! * [`CodecPreference`] / [`EncoderOverride`] express a runtime codec
 //!   preference, and [`EncoderRegistry::select_with_override`] resolves it
 //!   against the advertised capabilities. The policy is pure and honest: an
@@ -77,8 +83,8 @@ pub use override_policy::{
 };
 pub use probe::{EncoderProbe, FakeProbe, ProbeResult, SoftwareProbe};
 pub use registry::{
-    backend_name, EncoderRegistry, EncoderSelection, SelectedEncoder, SelectionPolicy,
-    SelectionReason,
+    backend_name, EncoderEnvironment, EncoderRegistry, EncoderSelection, SelectedEncoder,
+    SelectionPolicy, SelectionReason,
 };
 pub use software::{
     annex_b_is_keyframe, annex_b_nal_types, H264SoftwareEncoder, ENCODE_FAILED, MAX_FPS,

@@ -96,6 +96,23 @@ class PipelineStringTests(unittest.TestCase):
                 640, 480, 30, worker.video_encoder_description(False), "alsasrc"
             )
 
+    def test_payload_types_follow_the_offer(self):
+        pipeline = worker.build_pipeline_string(
+            640,
+            480,
+            30,
+            worker.video_encoder_description(False),
+            "pulsesrc",
+            video_pt=103,
+            audio_pt=111,
+        )
+        self.assertIn("rtph264pay config-interval=-1 pt=103", pipeline)
+        self.assertIn("rtpopuspay pt=111", pipeline)
+        self.assertIn("payload=103", pipeline)
+        self.assertIn("payload=111", pipeline)
+        self.assertNotIn("pt=96", pipeline)
+        self.assertNotIn("pt=97", pipeline)
+
 
 class SdpCandidateTests(unittest.TestCase):
     SDP = (
@@ -151,6 +168,40 @@ class SdpCandidateTests(unittest.TestCase):
     def test_candidate_without_sdp_media_is_ignored(self):
         plain = "v=0\r\no=- 1 0 IN IP4 0.0.0.0\r\n"
         self.assertEqual(worker.append_ice_candidates(plain, [(0, "candidate:1")]), plain)
+
+
+class OfferedPayloadTypeTests(unittest.TestCase):
+    CHROME = (
+        "v=0\r\n"
+        "m=video 9 UDP/TLS/RTP/SAVPF 103 107 96\r\n"
+        "a=mid:0\r\n"
+        "a=rtpmap:103 H264/90000\r\n"
+        "a=rtpmap:107 H264/90000\r\n"
+        "a=rtpmap:96 VP8/90000\r\n"
+        "m=audio 9 UDP/TLS/RTP/SAVPF 111 96\r\n"
+        "a=mid:1\r\n"
+        "a=rtpmap:111 opus/48000/2\r\n"
+        "a=rtpmap:96 VP8/90000\r\n"
+    )
+    GST = (
+        "v=0\r\n"
+        "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n"
+        "a=rtpmap:96 H264/90000\r\n"
+        "m=audio 9 UDP/TLS/RTP/SAVPF 97\r\n"
+        "a=rtpmap:97 OPUS/48000\r\n"
+    )
+
+    def test_browser_offer_uses_chrome_payload_types(self):
+        self.assertEqual(worker.offered_payload_type(self.CHROME, "video", "H264"), 103)
+        self.assertEqual(worker.offered_payload_type(self.CHROME, "audio", "OPUS"), 111)
+
+    def test_gstreamer_offer_keeps_96_97(self):
+        self.assertEqual(worker.offered_payload_type(self.GST, "video", "H264"), 96)
+        self.assertEqual(worker.offered_payload_type(self.GST, "audio", "OPUS"), 97)
+
+    def test_missing_codec_returns_none(self):
+        self.assertIsNone(worker.offered_payload_type(self.GST, "video", "VP9"))
+        self.assertIsNone(worker.offered_payload_type("v=0\r\n", "video", "H264"))
 
 
 class ArgumentTests(unittest.TestCase):

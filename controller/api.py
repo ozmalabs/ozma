@@ -3471,13 +3471,6 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             pass
         raise HTTPException(status_code=503, detail="Snapshot unavailable")
 
-    @app.get("/api/v1/streams/{node_id:path}")
-    async def get_stream(node_id: str) -> dict[str, Any]:
-        url = streams.stream_url(node_id) if streams else None
-        if url is None:
-            raise HTTPException(status_code=404, detail="No stream for this node")
-        return {"node_id": node_id, "url": url, "type": streams.stream_type(node_id) if streams else "mjpeg"}
-
     # --- Device metrics ---
 
     @app.get("/api/v1/metrics")
@@ -4212,6 +4205,36 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     # --- Codec endpoints ---
 
+    async def _proxy_node_codec(
+        method: str, endpoint: tuple[str, int], body: dict | None = None
+    ) -> JSONResponse:
+        """Proxy a codec request to a remote node's HTTP API.
+
+        The node owns the encoder for `hls-remote` streams, so its status and
+        body are passed through unchanged, including typed 400/502 errors.
+        Transport failures become a controller 502 rather than a local,
+        success-shaped response.
+        """
+        import httpx
+
+        host, port = endpoint
+        url = f"http://{host}:{port}/codec"
+        try:
+            async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
+                if method == "POST":
+                    resp = await client.post(url, json=body or {})
+                else:
+                    resp = await client.get(url)
+        except httpx.TimeoutException:
+            raise HTTPException(status_code=502, detail="Node codec request timed out")
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"Node unreachable: {e}")
+        try:
+            content = resp.json()
+        except ValueError:
+            content = {"detail": resp.text or f"Node returned HTTP {resp.status_code}"}
+        return JSONResponse(status_code=resp.status_code, content=content)
+
     @app.get("/api/v1/codecs")
     async def list_codecs() -> dict[str, Any]:
         if not codec_mgr:
@@ -4259,11 +4282,16 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         }
 
     @app.get("/api/v1/streams/{node_id}/codec")
-    async def get_stream_codec(request: Request, node_id: str) -> dict[str, Any]:
+    async def get_stream_codec(request: Request, node_id: str) -> Any:
         """Get current codec info and available encoders for a stream."""
         _require_scope(request, SCOPE_READ)
         if not streams:
             raise HTTPException(status_code=503, detail="Streams not available")
+        endpoint = streams.node_api_endpoint(node_id)
+        if endpoint:
+            # `hls-remote` encoders live on the node; pass its honest status
+            # through instead of reporting controller-local probe data.
+            return await _proxy_node_codec("GET", endpoint)
         stats = streams.get_stream_stats(node_id)
         override = streams._codec_overrides.get(node_id)
         ocr_mode = node_id in streams._ocr_nodes
@@ -4292,14 +4320,34 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         }
 
     @app.post("/api/v1/streams/{node_id}/codec")
-    async def set_stream_codec(request: Request, node_id: str, body: dict = {}) -> dict[str, Any]:
+    async def set_stream_codec(request: Request, node_id: str, body: dict = {}) -> Any:
         """Switch the codec for a running stream. Triggers graceful restart."""
         _require_scope(request, SCOPE_WRITE)
         if not streams:
             raise HTTPException(status_code=503, detail="Streams not available")
+        cfg = CodecConfig.from_dict(body)
+        endpoint = streams.node_api_endpoint(node_id)
+        if endpoint:
+            # Forward the controller's CodecConfig shape; the node evaluates it
+            # against its own encoders and returns typed 400/502 errors.
+            result = await _proxy_node_codec("POST", endpoint, cfg.to_dict())
+            if result.status_code < 400:
+                try:
+                    payload = json.loads(result.body or b"{}")
+                except ValueError:
+                    payload = {}
+                if not isinstance(payload, dict):
+                    payload = {}
+                await state.events.put({
+                    "type": "stream.codec_changed",
+                    "node_id": node_id,
+                    "encoder": payload.get("encoder") or cfg.codec,
+                    "hw_type": cfg.hw_accel,
+                    "applied": bool(payload.get("applied", False)),
+                })
+            return result
         if not codec_mgr:
             raise HTTPException(status_code=503, detail="Codec manager not available")
-        cfg = CodecConfig.from_dict(body)
         resolved = codec_mgr.resolve(cfg)
         ok = await streams.switch_codec(node_id, cfg)
         if not ok:
@@ -4335,6 +4383,16 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if not stats:
             return {"node_id": node_id, "active": False}
         return stats.to_dict()
+
+    # Keep this catch-all after the specific `/streams/...` GET routes above: a
+    # `{node_id:path}` GET shadows `/codec` and `/stats` if it is registered
+    # first, making those routes unreachable.
+    @app.get("/api/v1/streams/{node_id:path}")
+    async def get_stream(node_id: str) -> dict[str, Any]:
+        url = streams.stream_url(node_id) if streams else None
+        if url is None:
+            raise HTTPException(status_code=404, detail="No stream for this node")
+        return {"node_id": node_id, "url": url, "type": streams.stream_type(node_id) if streams else "mjpeg"}
 
     # --- Camera endpoints ---
 

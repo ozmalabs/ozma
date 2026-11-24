@@ -243,6 +243,7 @@ mod tests {
             audio_router: crate::config::AudioRouterKind::None,
             audio_track_root: None,
             ffmpeg_bin: std::path::PathBuf::from("ffmpeg"),
+            vaapi_device: std::path::PathBuf::from("/dev/dri/renderD128"),
             audio_sink: None,
             webrtc_audio_source: None,
             webrtc_audio_backend: crate::webrtc::WebRtcAudioBackend::Auto,

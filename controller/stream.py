@@ -23,6 +23,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncIterator
+from urllib.parse import urlsplit
 
 import asyncvnc
 import numpy as np
@@ -436,6 +437,30 @@ class StreamManager:
         if entry is not None:
             return "mjpeg"
         return "none"
+
+    def node_api_endpoint(self, node_id: str) -> tuple[str, int] | None:
+        """Return ``(host, port)`` for a remote node's HTTP API, if known.
+
+        Only ``hls-remote`` streams are proxied: their encoder is owned by the
+        node, so controller-side codec data would describe the wrong pipeline.
+        The registered ``api_port`` is preferred; when registration omitted it,
+        fall back to the authority of the remote HLS URL.
+        """
+        entry = self._captures.get(node_id)
+        if not isinstance(entry, _RemoteStream):
+            return None
+        node = self._state.nodes.get(node_id)
+        if node is not None:
+            port = node.api_port or node.stream_port
+            if node.host and port:
+                return (node.host, int(port))
+        try:
+            parsed = urlsplit(entry.remote_url)
+            if parsed.hostname and parsed.port:
+                return (parsed.hostname, parsed.port)
+        except ValueError:
+            pass
+        return None
 
     def list_streams(self) -> list[dict]:
         out = []

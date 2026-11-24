@@ -460,6 +460,7 @@ async fn main() {
         audio_router: args.audio_router,
         audio_track_root: args.audio_track_root.clone(),
         ffmpeg_bin: args.ffmpeg_bin.clone(),
+        vaapi_device: args.vaapi_device.clone(),
         audio_sink: args.audio_sink.clone(),
         webrtc_audio_source: args.webrtc_audio_source.clone(),
         webrtc_audio_backend: args.webrtc_audio_backend,
@@ -608,7 +609,7 @@ async fn main() {
             bitrate_kbps: args.hls_bitrate_kbps,
             video_encoder: encoder,
             ffmpeg_bin: args.ffmpeg_bin.clone(),
-            vaapi_device: args.vaapi_device.clone(),
+            vaapi_device: config.vaapi_device.clone(),
             ..HlsConfig::default()
         };
         if let Err(error) = hls_config.validate() {
@@ -737,7 +738,10 @@ async fn main() {
     // pipeline with the selected software encoder; when HLS is off the override
     // is stored for a future start. WebRTC keeps its existing encoder.
     let codec_control = if config.has_capability("video") && !capabilities.encode.is_empty() {
-        let registry = ozma_encode::EncoderRegistry::with_detected_encoders().await;
+        let registry = ozma_encode::EncoderRegistry::with_detected_encoders_for_device(Some(
+            config.vaapi_device.as_path(),
+        ))
+        .await;
         let format = ozma_protocol::MediaFormat::new(
             ozma_protocol::Codec::H264,
             1920,

@@ -59,6 +59,12 @@ class Client:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.node = args.node_url.rstrip("/")
+        self.offer_url = (
+            args.offer_url or (self.node + "/webrtc/offer")
+        ).rstrip()
+        self.bitrate_url = (
+            args.bitrate_url or (self.node + "/webrtc/bitrate")
+        ).rstrip()
         self.pipeline = Gst.Pipeline.new("gate2-webrtc-client")
         self.webrtc = Gst.ElementFactory.make("webrtcbin", "webrtc")
         if self.webrtc is None:
@@ -162,7 +168,7 @@ class Client:
             with open(self.args.offer_out, "w", encoding="utf-8") as handle:
                 handle.write(sdp)
         answer = post_json(
-            self.node + "/webrtc/offer",
+            self.offer_url,
             {"sdp": sdp, "type": "offer"},
             timeout=self.args.http_timeout,
         )
@@ -308,7 +314,7 @@ class Client:
     def request_bitrate(self) -> None:
         try:
             body = post_json(
-                self.node + "/webrtc/bitrate",
+                self.bitrate_url,
                 {"bitrate": self.args.bitrate},
                 timeout=self.args.http_timeout,
             )
@@ -483,6 +489,20 @@ def parse_args() -> argparse.Namespace:
         description="Live GStreamer WebRTC client for a running ozma-node"
     )
     parser.add_argument("--node-url", required=True)
+    parser.add_argument(
+        "--offer-url",
+        default=None,
+        help=(
+            "override the offer endpoint (default: NODE_URL/webrtc/offer); "
+            "use for the controller proxy "
+            "/api/v1/streams/<node-id>/webrtc"
+        ),
+    )
+    parser.add_argument(
+        "--bitrate-url",
+        default=None,
+        help="override the bitrate endpoint (default: NODE_URL/webrtc/bitrate)",
+    )
     parser.add_argument(
         "--audio",
         action="store_true",

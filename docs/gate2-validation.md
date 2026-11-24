@@ -399,8 +399,10 @@ player screenshot if possible.
 The helper is configured and `connection.webrtc` is `running`. A real browser
 offer is required for a meaningful dashboard negotiation; a synthetic SDP only
 tests the route. For a browserless real negotiation, use
-`scripts/gate2/webrtc-client.py` (below); its live run is recorded in
-[`gate2-live-webrtc-report.md`](gate2-live-webrtc-report.md).
+`scripts/gate2/webrtc-client.py` (below); its direct run is recorded in
+[`gate2-live-webrtc-report.md`](gate2-live-webrtc-report.md), and its controller
+proxy plus headless Chromium dashboard run is recorded in
+[`gate2-live-controller-webrtc-report.md`](gate2-live-controller-webrtc-report.md).
 
 1. In the browser console (or the dashboard), create a receive-only offer and
    wait for ICE gathering:
@@ -443,7 +445,10 @@ curl -sS -X POST "$CTRL/api/v1/streams/$NODE_ID/webrtc" \
 ```
 
 Expected: the same answer shape. The controller proxies to the node's
-`/webrtc/offer`.
+`/webrtc/offer`. Live evidence: a real GStreamer offer through this route
+returned 9 host candidates and a DTLS fingerprint, then completed ICE/DTLS and
+decoded video/audio; see
+[`gate2-live-controller-webrtc-report.md`](gate2-live-controller-webrtc-report.md).
 
 Bitrate behavior:
 
@@ -473,8 +478,12 @@ python3 scripts/gate2/webrtc-client.py \
 
 This creates a real receive-only offer, completes ICE/DTLS, counts decoded
 H.264 (and Opus when `--audio` is configured) buffers, and prints/exits
-nonzero when media does not arrive. A browser run is still required to prove
-the controller dashboard path.
+nonzero when media does not arrive. To target the controller, add
+`--offer-url "$CTRL/api/v1/streams/$NODE_ID/webrtc"` and
+`--bitrate-url "$CTRL/api/v1/nodes/$NODE_ID/proxy/webrtc/bitrate"`. A browser
+run is still required to prove the controller dashboard path; the headless
+Chromium 145 run is in
+[`gate2-live-controller-webrtc-report.md`](gate2-live-controller-webrtc-report.md).
 
 Artifact: the offer, the node answer, the controller answer, a browser
 screenshot/video with media, and optionally a `chrome://webrtc-internals` dump.
@@ -488,7 +497,9 @@ Open `http://127.0.0.1:7380` in a browser:
 2. Activating it succeeds.
 3. The dashboard's live view/HLS path renders.
 4. Dashboard input reaches the guest (key and pointer).
-5. The WebRTC path returns an answer and renders media.
+5. The WebRTC path returns an answer and renders media. The live Chromium run
+   reported `connected`, 720x400 video, and audio packets; see
+   [`gate2-live-controller-webrtc-report.md`](gate2-live-controller-webrtc-report.md).
 
 This is the row that proves the **unmodified controller** path. The harness's
 controller checks cover health, registration, node detail, power proxy, HLS
@@ -577,11 +588,14 @@ parity matrix until the underlying work lands.
    `{"ok":true,...}` acknowledgement (typed 502 otherwise) and clamps to
    500 kbps–50 Mbps. ICE is non-trickle: the worker accepts candidates embedded
    in the offer and appends its gathered host candidates to the answer; there
-   is no STUN/TURN. A live GStreamer peer completed ICE/DTLS and decoded H.264
-   and Opus in [`gate2-live-webrtc-report.md`](gate2-live-webrtc-report.md),
-   but a browser/controller-dashboard run is still required. `running` by
-   itself means the helper's Unix socket is connected, not that a peer
-   completed ICE/DTLS.
+   is no STUN/TURN. A live GStreamer peer (direct and controller proxy) and a
+   default headless Chromium dashboard completed ICE/DTLS and decoded H.264 and
+   Opus in [`gate2-live-webrtc-report.md`](gate2-live-webrtc-report.md) and
+   [`gate2-live-controller-webrtc-report.md`](gate2-live-controller-webrtc-report.md).
+   The browser run is one Chromium build on the same host; Firefox/Safari,
+   NAT/TURN, multiple peers, and reconnect are untested. `running` by itself
+   means the helper's Unix socket is connected, not that a peer completed
+   ICE/DTLS.
 4. **HLS does not delete old segments.** The ffmpeg argv has no
    `-hls_flags delete_segments`; retained `.ts` files accumulate. The playlist
    keeps four entries by default. `/stream/*` is unauthenticated by design so

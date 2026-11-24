@@ -617,6 +617,8 @@ pub struct NodeConfig {
     pub audio_track_root: Option<PathBuf>,
     /// ffmpeg executable used by VNC capture and HLS.
     pub ffmpeg_bin: PathBuf,
+    /// VAAPI render node used by encoder detection and the HLS VAAPI argv.
+    pub vaapi_device: PathBuf,
     /// Audio sink name advertised to the controller.
     pub audio_sink: Option<String>,
     /// Optional PulseAudio/PipeWire monitor source for WebRTC audio.
@@ -896,6 +898,7 @@ mod tests {
             audio_router: AudioRouterKind::None,
             audio_track_root: None,
             ffmpeg_bin: PathBuf::from("ffmpeg"),
+            vaapi_device: PathBuf::from("/dev/dri/renderD128"),
             audio_sink: None,
             webrtc_audio_source: None,
             webrtc_audio_backend: WebRtcAudioBackend::Auto,

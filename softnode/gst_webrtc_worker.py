@@ -134,6 +134,8 @@ def build_pipeline_string(
     fps: int,
     encoder: str,
     audio_element: str | None = None,
+    video_pt: int = 96,
+    audio_pt: int = 97,
 ) -> str:
     """Build the ``gst_parse_launch`` string.
 
@@ -141,9 +143,17 @@ def build_pipeline_string(
     pipeline.  With it set, video and audio are linked as separate request
     pads on one bundled ``webrtcbin``; the monitor name itself is applied with
     ``set_property`` afterwards so it never has to be escaped into the string.
+
+    ``video_pt``/``audio_pt`` must be the payload types from the peer's offer.
+    A browser does not use the GStreamer client's 96/97 (Chrome, for example,
+    maps 96 to VP8), so a hard-coded payloader PT makes the answer unusable.
     """
     if audio_element not in (None, "pulsesrc", "pipewiresrc"):
         raise ValueError(f"unsupported audio source element: {audio_element}")
+    if not 0 < video_pt < 128:
+        raise ValueError(f"invalid video payload type: {video_pt}")
+    if not 0 < audio_pt < 128:
+        raise ValueError(f"invalid audio payload type: {audio_pt}")
 
     video_chain = (
         f"appsrc name=src format=time is-live=true do-timestamp=true "
@@ -152,7 +162,7 @@ def build_pipeline_string(
         f"! videoconvert "
         f"! {encoder} "
         f"! video/x-h264,profile=baseline "
-        f"! rtph264pay config-interval=-1 pt=96 "
+        f"! rtph264pay config-interval=-1 pt={video_pt} "
     )
 
     if audio_element is None:
@@ -168,15 +178,15 @@ def build_pipeline_string(
         f"! audioresample "
         f"! audio/x-raw,format=S16LE,rate=48000,channels=2 "
         f"! opusenc name=aenc bitrate=96000 "
-        f"! rtpopuspay pt=97 "
+        f"! rtpopuspay pt={audio_pt} "
         f"! application/x-rtp,media=audio,encoding-name=OPUS,"
-        f"payload=97,clock-rate=48000 "
+        f"payload={audio_pt},clock-rate=48000 "
         f"! webrtc."
     )
     return (
         f"webrtcbin name=webrtc bundle-policy=max-bundle "
         + video_chain
-        + "! application/x-rtp,media=video,encoding-name=H264,payload=96 "
+        + f"! application/x-rtp,media=video,encoding-name=H264,payload={video_pt} "
         + "! webrtc. "
         + audio_chain
     )
@@ -225,6 +235,37 @@ def remote_ice_candidates(sdp: str) -> list[tuple[int, str]]:
             if candidate and not candidate.startswith("candidate:end-of-candidates"):
                 candidates.append((index, candidate))
     return candidates
+
+
+def offered_payload_type(sdp: str, media: str, encoding: str) -> int | None:
+    """Return the peer's payload type for ``encoding`` on the ``media`` m-line.
+
+    A browser chooses dynamic payload types (Chrome often maps 96 to VP8 and
+    H.264 to 103+), so the answer must reuse the offered value rather than a
+    fixed 96/97.  Only the first matching m-line is considered; ``None`` means
+    the peer did not offer that codec.
+    """
+    _, sections = split_sdp_media_sections(sdp)
+    for section in sections:
+        header = section[0].split()
+        if len(header) < 4 or header[0] != f"m={media}":
+            continue
+        offered = set(header[3:])
+        for line in section[1:]:
+            if not line.startswith("a=rtpmap:"):
+                continue
+            try:
+                pt_text, encoding_text = line[len("a=rtpmap:"):].split(None, 1)
+                payload_type = int(pt_text)
+            except (ValueError, IndexError):
+                continue
+            if (
+                str(payload_type) in offered
+                and encoding_text.split("/", 1)[0].lower() == encoding.lower()
+            ):
+                return payload_type
+        return None
+    return None
 
 
 def append_ice_candidates(
@@ -365,7 +406,9 @@ class WebRTCWorker:
             return None
         return selected
 
-    def _build_pipeline(self, use_nvenc: bool):
+    def _build_pipeline(
+        self, use_nvenc: bool, video_pt: int = 96, audio_pt: int = 97
+    ):
         """Build the session pipeline, degrading to video-only on audio errors."""
         encoder = video_encoder_description(use_nvenc)
         audio = self._select_audio()
@@ -379,6 +422,8 @@ class WebRTCWorker:
                     self.fps,
                     encoder,
                     audio_element,
+                    video_pt,
+                    audio_pt,
                 )
             )
             if audio is not None:
@@ -400,7 +445,7 @@ class WebRTCWorker:
             )
             pipeline = Gst.parse_launch(
                 build_pipeline_string(
-                    self.width, self.height, self.fps, encoder, None
+                    self.width, self.height, self.fps, encoder, None, video_pt
                 )
             )
             audio = None
@@ -421,8 +466,16 @@ class WebRTCWorker:
         import uuid
         sid = uuid.uuid4().hex[:8]
 
+        # Reuse the payload types the peer actually offered.  Browsers do not
+        # use the GStreamer client's 96/97 (Chrome maps 96 to VP8), and a
+        # mismatched payloader makes webrtcbin answer the m-line `inactive`.
+        video_pt = offered_payload_type(offer_sdp, "video", "H264") or 96
+        audio_pt = offered_payload_type(offer_sdp, "audio", "OPUS") or 97
+
         nvenc = Gst.ElementFactory.find("nvh264enc")
-        pipeline, audio_enabled = self._build_pipeline(bool(nvenc))
+        pipeline, audio_enabled = self._build_pipeline(
+            bool(nvenc), video_pt, audio_pt
+        )
         webrtc = pipeline.get_by_name("webrtc")
         appsrc = pipeline.get_by_name("src")
         video_encoder = pipeline.get_by_name(VIDEO_ENCODER_NAME)

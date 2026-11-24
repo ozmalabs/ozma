@@ -36,6 +36,11 @@
 //! row by row; a non-32-bpp pixman format is rejected instead of being
 //! mislabelled as BGRA.
 //!
+//! A display-mode change can arrive as a console `PropertiesChanged` signal
+//! before the listener's first `Update` bands. The source tracks that geometry
+//! and resizes its framebuffer, and it treats an `Update` that still does not
+//! fit as a mode transition rather than a fatal capture error.
+//!
 //! ## Lifecycle and testing
 //!
 //! [`DBusDisplayProvider::enumerate`] only checks the configured QMP socket
@@ -61,6 +66,7 @@ use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -422,16 +428,22 @@ fn expect_string(value: DBusValue, field: &str) -> Result<Option<String>, DBusEr
 /// Parse a `a{sv}` property dictionary body.
 pub fn parse_properties(body: &[u8]) -> Result<BTreeMap<String, DBusValue>, DBusError> {
     let mut cursor = Cursor::new(body);
+    parse_properties_cursor(&mut cursor)
+}
+
+fn parse_properties_cursor(
+    cursor: &mut Cursor<'_>,
+) -> Result<BTreeMap<String, DBusValue>, DBusError> {
     let array_len = cursor.array_len()?;
     cursor.align(8)?;
     let end = cursor
         .position()
         .checked_add(array_len)
         .ok_or_else(|| DBusError::protocol("property array length overflows"))?;
-    if end > body.len() {
+    if end > cursor.data.len() {
         return Err(DBusError::protocol(format!(
             "property array ends at {end}; body is {} bytes",
-            body.len()
+            cursor.data.len()
         )));
     }
 
@@ -443,7 +455,7 @@ pub fn parse_properties(body: &[u8]) -> Result<BTreeMap<String, DBusValue>, DBus
         }
         let key = cursor.string()?;
         let signature = cursor.signature()?;
-        let value = parse_variant_value(&mut cursor, &signature)?;
+        let value = parse_variant_value(cursor, &signature)?;
         if cursor.position() > end {
             return Err(DBusError::protocol(format!(
                 "property `{key}` overruns the property array"
@@ -453,6 +465,37 @@ pub fn parse_properties(body: &[u8]) -> Result<BTreeMap<String, DBusValue>, DBus
     }
     cursor.seek(end)?;
     Ok(properties)
+}
+
+/// Read the console size from a `PropertiesChanged` signal body.
+///
+/// QEMU updates the console's `Width`/`Height` properties when the guest
+/// changes display mode. The listener's `Update` rectangles use the new
+/// geometry, so the capture source uses this signal to resize its held
+/// framebuffer before applying them.
+fn parse_console_size_signal(body: &[u8]) -> Option<(u32, u32)> {
+    let mut cursor = Cursor::new(body);
+    if cursor.string().ok()? != DBUS_CONSOLE_INTERFACE {
+        return None;
+    }
+    let properties = parse_properties_cursor(&mut cursor).ok()?;
+    let width = properties.get("Width").and_then(DBusValue::as_u32)?;
+    let height = properties.get("Height").and_then(DBusValue::as_u32)?;
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+/// Right/bottom extent of an `Update` body, if it is a positive rectangle.
+fn update_extent(body: &[u8]) -> Option<(u32, u32)> {
+    let x = read_le_i32(body, 0)?;
+    let y = read_le_i32(body, 4)?;
+    let width = read_le_i32(body, 8)?;
+    let height = read_le_i32(body, 12)?;
+    if x < 0 || y < 0 || width <= 0 || height <= 0 {
+        return None;
+    }
+    let right = (x as u32).checked_add(width as u32)?;
+    let bottom = (y as u32).checked_add(height as u32)?;
+    Some((right, bottom))
 }
 
 /// Encode a method call with an already encoded body.
@@ -1146,6 +1189,32 @@ impl Framebuffer {
         Ok(())
     }
 
+    /// Resize the framebuffer, preserving the overlapping top-left region and
+    /// zero-filling newly exposed pixels.
+    ///
+    /// QEMU can change the display mode (and thus the console geometry) between
+    /// the last `Scanout` and the following `Update` bands. Resizing lets the
+    /// capture source apply the new geometry instead of failing the pipeline.
+    fn resize(&mut self, width: u32, height: u32) {
+        if width == self.width && height == self.height {
+            return;
+        }
+        let row_bytes = width as usize * 4;
+        let mut pixels = vec![0u8; row_bytes * height as usize];
+        let copy_width = width.min(self.width) as usize * 4;
+        let copy_height = height.min(self.height) as usize;
+        let old_stride = self.width as usize * 4;
+        for row in 0..copy_height {
+            let source = row * old_stride;
+            let destination = row * row_bytes;
+            pixels[destination..destination + copy_width]
+                .copy_from_slice(&self.pixels[source..source + copy_width]);
+        }
+        self.width = width;
+        self.height = height;
+        self.pixels = pixels;
+    }
+
     /// Framebuffer width in pixels.
     pub fn width(&self) -> u32 {
         self.width
@@ -1651,6 +1720,10 @@ pub struct DBusDisplaySource {
     listener: Option<Box<dyn DBusTransport>>,
     listener_peer: Option<StdUnixStream>,
     framebuffer: Option<Framebuffer>,
+    /// Console `Width`/`Height` from the most recent `PropertiesChanged`
+    /// signal, consumed by the next `Update`. A pending value is `None` when the
+    /// last framebuffer geometry is already current.
+    console_size: Arc<Mutex<Option<(u32, u32)>>>,
     format: FrameFormat,
     origin: Instant,
     serial: u32,
@@ -1696,6 +1769,7 @@ impl DBusDisplaySource {
             listener: None,
             listener_peer: None,
             framebuffer: None,
+            console_size: Arc::new(Mutex::new(None)),
             format: FrameFormat::new(PixelFormat::Bgra, 0, 0),
             origin: Instant::now(),
             serial: 0,
@@ -1819,10 +1893,39 @@ impl DBusDisplaySource {
         };
         let id = self.config.id.clone();
         let max_body = self.config.max_message_body();
+        let console_size = Arc::clone(&self.console_size);
         self.display_drain = Some(tokio::spawn(async move {
             loop {
                 match read_message(display.as_mut(), max_body, None).await {
-                    Ok(_) => {}
+                    Ok(message) => {
+                        // QEMU updates the console Width/Height properties when
+                        // the display mode changes. Keep the latest geometry
+                        // available to the listener before its Update bands use
+                        // it. Everything else on this connection is an
+                        // unhandled signal and is discarded.
+                        if message.header.member.as_deref() == Some("PropertiesChanged") {
+                            match parse_console_size_signal(&message.body) {
+                                Some((width, height)) => {
+                                    tracing::debug!(
+                                        id = %id,
+                                        width,
+                                        height,
+                                        "D-Bus console size signal received"
+                                    );
+                                    *console_size
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                        Some((width, height));
+                                }
+                                None => {
+                                    tracing::debug!(
+                                        id = %id,
+                                        "D-Bus console PropertiesChanged had no usable Width/Height"
+                                    );
+                                }
+                            }
+                        }
+                    }
                     Err(error) => {
                         tracing::debug!(id = %id, %error, "D-Bus console drain stopped");
                         break;
@@ -2177,31 +2280,142 @@ impl DBusDisplaySource {
 
             match message.header.member.as_deref() {
                 Some("Scanout") => {
-                    let framebuffer = Framebuffer::from_scanout(
+                    let mut framebuffer = Framebuffer::from_scanout(
                         &message.body,
                         self.config.width,
                         self.config.height,
                     )
                     .map_err(|error| error.to_media_error(&self.config.id))?;
+                    // The console and listener are separate connections, so a
+                    // PropertiesChanged for a newer mode can arrive before the
+                    // listener's older Scanout. Apply the latest reported size
+                    // to the fresh surface; the next Update bands paint it.
+                    let pending_size = self
+                        .console_size
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    if let Some((width, height)) = pending_size {
+                        if width > 0
+                            && height > 0
+                            && width <= self.config.width
+                            && height <= self.config.height
+                            && (framebuffer.width != width || framebuffer.height != height)
+                        {
+                            tracing::debug!(
+                                id = %self.config.id,
+                                width,
+                                height,
+                                "D-Bus console geometry changed; resizing Scanout"
+                            );
+                            framebuffer.resize(width, height);
+                        }
+                    }
                     self.framebuffer = Some(framebuffer);
                     return self.make_frame().map(Some);
                 }
                 Some("Update") => {
-                    {
-                        let framebuffer = self.framebuffer.as_mut().ok_or_else(|| {
-                            MediaError::capture(
-                                &self.config.id,
-                                "QEMU sent Update before any Scanout",
-                            )
-                        })?;
-                        framebuffer
-                            .apply_update(&message.body)
-                            .map_err(|error| error.to_media_error(&self.config.id))?;
+                    // QEMU emits a console PropertiesChanged signal before the
+                    // listener Update bands that use the new display mode. If it
+                    // has arrived, resize to the geometry QEMU actually reports.
+                    let pending_size = self
+                        .console_size
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    if let Some((width, height)) = pending_size {
+                        if width > 0
+                            && height > 0
+                            && width <= self.config.width
+                            && height <= self.config.height
+                        {
+                            if let Some(framebuffer) = self.framebuffer.as_mut() {
+                                if framebuffer.width != width || framebuffer.height != height {
+                                    tracing::debug!(
+                                        id = %self.config.id,
+                                        width,
+                                        height,
+                                        "D-Bus console geometry changed; resizing framebuffer"
+                                    );
+                                    framebuffer.resize(width, height);
+                                }
+                            }
+                        }
                     }
+
+                    let Some(framebuffer) = self.framebuffer.as_mut() else {
+                        // A partial update cannot be rendered without a base
+                        // surface. QEMU can send one immediately after a
+                        // console is created or resized; keep reading for the
+                        // Scanout that establishes the surface.
+                        tracing::debug!(
+                            id = %self.config.id,
+                            "D-Bus Update before a Scanout; waiting for a full frame"
+                        );
+                        continue;
+                    };
+                    match framebuffer.apply_update(&message.body) {
+                        Ok(()) => {}
+                        Err(DBusError::Geometry(error)) => {
+                            let Some((right, bottom)) = update_extent(&message.body) else {
+                                return Err(
+                                    DBusError::Geometry(error).to_media_error(&self.config.id)
+                                );
+                            };
+                            if right > self.config.width || bottom > self.config.height {
+                                tracing::debug!(
+                                    id = %self.config.id,
+                                    right,
+                                    bottom,
+                                    "D-Bus Update exceeds the configured limit; waiting for a new Scanout"
+                                );
+                                self.framebuffer = None;
+                                self.format = FrameFormat::new(PixelFormat::Bgra, 0, 0);
+                                continue;
+                            }
+                            // No console-size signal caught up with this band.
+                            // QEMU changes the display mode without always
+                            // sending a fresh Scanout first (640x480 graphics
+                            // -> 720x400 text mode), so grow the surface to
+                            // cover the damage. A later PropertiesChanged
+                            // corrects the exact size.
+                            let width = framebuffer.width.max(right);
+                            let height = framebuffer.height.max(bottom);
+                            tracing::debug!(
+                                id = %self.config.id,
+                                %error,
+                                width,
+                                height,
+                                "D-Bus Update does not fit the current framebuffer; resizing for a display mode change"
+                            );
+                            framebuffer.resize(width, height);
+                            if let Err(error) = framebuffer.apply_update(&message.body) {
+                                tracing::debug!(
+                                    id = %self.config.id,
+                                    %error,
+                                    "D-Bus Update still does not fit; waiting for a new Scanout"
+                                );
+                                self.framebuffer = None;
+                                self.format = FrameFormat::new(PixelFormat::Bgra, 0, 0);
+                                continue;
+                            }
+                        }
+                        Err(error) => return Err(error.to_media_error(&self.config.id)),
+                    }
+                    let (width, height) = (framebuffer.width, framebuffer.height);
+                    self.format = FrameFormat::new(PixelFormat::Bgra, width, height);
                     return self.make_frame().map(Some);
                 }
                 Some("Disable") => {
+                    tracing::debug!(
+                        id = %self.config.id,
+                        "D-Bus Disable received; framebuffer cleared"
+                    );
                     self.framebuffer = None;
+                    *self
+                        .console_size
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                     self.format = FrameFormat::new(PixelFormat::Bgra, 0, 0);
                 }
                 _ => {}
@@ -3011,21 +3225,118 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_before_scanout_is_a_typed_error() {
+    async fn update_before_scanout_waits_for_a_scanout() {
         let config = test_config();
         let console = config.console_path();
+        let pixels = vec![9u8; 16];
         let mut listener = listener_script(&console);
+        // QEMU can emit an Update band while the console is still being set
+        // up. It must not end the capture; the following Scanout establishes
+        // the surface.
         listener.extend(listener_message(
             2,
             "Update",
             "iiiiuuay",
             &update_body(0, 0, 1, 1, 4, PIXMAN_X8R8G8B8, &[1, 2, 3, 4]),
         ));
+        listener.extend(listener_message(
+            3,
+            "Scanout",
+            "uuuuaay",
+            &scanout_body(2, 2, 8, PIXMAN_X8R8G8B8, &pixels),
+        ));
 
         let mut source = source_with(config, display_script(2, 2), listener);
-        let error = source.next_frame().await.unwrap_err();
-        assert!(matches!(error, MediaError::Capture { .. }));
-        assert!(error.to_string().contains("Update before any Scanout"));
+        let frame = source.next_frame().await.unwrap();
+        assert_eq!(frame.format().width, 2);
+        assert_eq!(frame.format().height, 2);
+        assert_eq!(frame.data(), pixels.as_slice());
+    }
+
+    #[tokio::test]
+    async fn oversized_update_grows_the_framebuffer_instead_of_failing() {
+        let config = test_config();
+        let console = config.console_path();
+        // 2x2 scanout: row 0 is [1; 8], row 1 is [2; 8].
+        let mut first_pixels = vec![1u8; 8];
+        first_pixels.extend(vec![2u8; 8]);
+        // 3x1 update at the top-left, wider than the current surface.
+        let band = vec![7u8; 12];
+
+        let mut listener = listener_script(&console);
+        listener.extend(listener_message(
+            2,
+            "Scanout",
+            "uuuuaay",
+            &scanout_body(2, 2, 8, PIXMAN_X8R8G8B8, &first_pixels),
+        ));
+        listener.extend(listener_message(
+            3,
+            "Update",
+            "iiiiuuay",
+            &update_body(0, 0, 3, 1, 12, PIXMAN_X8R8G8B8, &band),
+        ));
+
+        let mut source = source_with(config, display_script(2, 2), listener);
+        let first = source.next_frame().await.unwrap();
+        assert_eq!((first.format().width, first.format().height), (2, 2));
+
+        let second = source.next_frame().await.unwrap();
+        assert_eq!((second.format().width, second.format().height), (3, 2));
+        assert_eq!(second.data().len(), 24);
+        assert_eq!(&second.data()[..12], band.as_slice());
+        // The old second row is preserved in the overlapping columns.
+        assert_eq!(&second.data()[12..20], &[2u8; 8]);
+        // The newly exposed column starts zero-filled.
+        assert_eq!(&second.data()[20..24], &[0u8; 4]);
+    }
+
+    #[test]
+    fn console_properties_changed_signal_carries_width_and_height() {
+        let mut body = encode_string_body(DBUS_CONSOLE_INTERFACE);
+        while body.len() % 8 != 0 {
+            body.push(0);
+        }
+        body.extend(
+            encode_properties_body(&[
+                ("Width", DBusValue::U32(720)),
+                ("Height", DBusValue::U32(400)),
+            ])
+            .unwrap(),
+        );
+        assert_eq!(parse_console_size_signal(&body), Some((720, 400)));
+
+        let mut other = encode_string_body("org.example.NotAConsole");
+        while other.len() % 8 != 0 {
+            other.push(0);
+        }
+        other.extend(
+            encode_properties_body(&[
+                ("Width", DBusValue::U32(640)),
+                ("Height", DBusValue::U32(480)),
+            ])
+            .unwrap(),
+        );
+        assert_eq!(parse_console_size_signal(&other), None);
+    }
+
+    #[test]
+    fn framebuffer_resize_preserves_the_overlap_and_zero_fills() {
+        let mut framebuffer = Framebuffer {
+            width: 2,
+            height: 2,
+            pixels: vec![1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2],
+        };
+        framebuffer.resize(3, 3);
+        assert_eq!(framebuffer.width(), 3);
+        assert_eq!(framebuffer.height(), 3);
+        assert_eq!(framebuffer.stride(), 12);
+        assert_eq!(framebuffer.pixels().len(), 36);
+        assert_eq!(&framebuffer.pixels()[0..8], &[1u8; 8]);
+        assert_eq!(&framebuffer.pixels()[8..12], &[0u8; 4]);
+        assert_eq!(&framebuffer.pixels()[12..20], &[2u8; 8]);
+        assert_eq!(&framebuffer.pixels()[20..24], &[0u8; 4]);
+        assert_eq!(&framebuffer.pixels()[24..36], &[0u8; 12]);
     }
 
     #[tokio::test]
