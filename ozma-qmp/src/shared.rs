@@ -184,6 +184,23 @@ impl SharedQmpClient {
         self.client.getfd(fdname, fd).await
     }
 
+    /// Pass `fd` and immediately attach a client to it (`getfd` + `add_client`).
+    ///
+    /// Both commands run while holding the shared command lock: `getfd` names
+    /// a descriptor in the QMP monitor and `add_client` consumes that name, so
+    /// an interleaved command or lazy reconnect must not land between them.
+    pub async fn getfd_and_add_client(
+        &self,
+        fdname: &str,
+        fd: RawFd,
+        protocol: &str,
+    ) -> Result<(), QmpError> {
+        let _guard = self.commands.lock().await;
+        self.ensure_connected_locked().await?;
+        self.client.getfd(fdname, fd).await?;
+        self.client.add_client(protocol, fdname).await
+    }
+
     async fn ensure_connected_locked(&self) -> Result<(), QmpError> {
         if self.client.is_connected() {
             return Ok(());

@@ -44,6 +44,16 @@
 //! not crash node startup. The default test suite injects scripted
 //! [`DBusTransport`]s through [`DBusDisplaySource::with_transports`]; the real
 //! QEMU test is `#[ignore]`d and gated by `OZMA_DBUS_TEST_QMP`.
+//!
+//! ## Shared QMP
+//!
+//! QEMU accepts one client per `-qmp` chardev. A node that already owns a
+//! [`SharedQmpClient`] for power, snapshots, or input must build the source
+//! with [`DBusDisplaySource::with_shared_client`] (or register the provider
+//! with [`crate::CaptureRegistry::with_dbus_display_shared`]): `getfd` and
+//! `add_client` then run on that connection and no second control socket is
+//! opened. Without a shared client the source owns and closes its own QMP
+//! connection.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -58,7 +68,7 @@ use nix::errno::Errno;
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
 use ozma_media::{CaptureSource, Frame, FrameFormat, MediaError, PixelFormat};
 use ozma_protocol::{codes, ApiError, CaptureCapability, CaptureKind};
-use ozma_qmp::{QmpClient, QmpConfig};
+use ozma_qmp::{QmpClient, QmpConfig, SharedQmpClient};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
@@ -601,7 +611,8 @@ fn encode_message(message_type: u8, serial: u32, fields: &[Field<'_>], body: &[u
     let body_length = u32::try_from(body.len()).unwrap_or(u32::MAX);
     encoder.patch_u32(body_length_position, body_length);
     encoder.buf.extend_from_slice(body);
-    encoder.align(8);
+    // Do not pad after the body: the D-Bus body may end on any byte, and
+    // QEMU/GDBus treats trailing padding as the start of the next message.
     encoder.finish()
 }
 
@@ -1344,23 +1355,20 @@ pub async fn read_message(
     }
     let padded_fields = align_up(fields_len, 8);
 
-    let mut raw = Vec::with_capacity(align_up(16 + padded_fields + body_len, 8));
+    // The header (fixed fields + field array) is already 8-aligned because
+    // `padded_fields` is a multiple of 8 and the prefix is 16 bytes. The body
+    // is *not* padded: the D-Bus specification says "the message body need not
+    // end on an 8-byte boundary", and QEMU/GDBus sends exactly `body_len`
+    // bytes. Waiting for extra padding here stalls the handshake forever.
+    let mut raw = Vec::with_capacity(16 + padded_fields + body_len);
     raw.extend_from_slice(&fixed);
     raw.extend_from_slice(&fields_length);
     let mut fields = vec![0u8; padded_fields];
     transport.read_exact(&mut fields).await?;
     raw.extend_from_slice(&fields);
-    // The header (fixed fields + field array) is already 8-aligned because
-    // `padded_fields` is a multiple of 8 and the prefix is 16 bytes.
-    let body_padding = align_up(body_len, 8) - body_len;
-    raw.reserve(body_len + body_padding);
     let start = raw.len();
     raw.resize(start + body_len, 0);
     transport.read_exact(&mut raw[start..]).await?;
-    if body_padding > 0 {
-        let mut padding = vec![0u8; body_padding];
-        transport.read_exact(&mut padding).await?;
-    }
 
     parse_message(&raw)
 }
@@ -1542,17 +1550,39 @@ impl DBusDisplayConfig {
 #[derive(Clone, Debug)]
 pub struct DBusDisplayProvider {
     config: DBusDisplayConfig,
+    shared: Option<SharedQmpClient>,
 }
 
 impl DBusDisplayProvider {
-    /// Create a provider for `config`.
+    /// Create a provider that owns its own QMP connection when opened.
     pub fn new(config: DBusDisplayConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            shared: None,
+        }
+    }
+
+    /// Create a provider whose sources use one node-owned QMP client.
+    ///
+    /// QEMU accepts one client per `-qmp` chardev, so a node that already has
+    /// a [`SharedQmpClient`] for power, snapshots, or input must route the
+    /// D-Bus `getfd`/`add_client` handoff through it. The provider then never
+    /// opens a second control connection.
+    pub fn with_shared_client(config: DBusDisplayConfig, shared: SharedQmpClient) -> Self {
+        Self {
+            config,
+            shared: Some(shared),
+        }
     }
 
     /// The configuration this provider was built with.
     pub fn config(&self) -> &DBusDisplayConfig {
         &self.config
+    }
+
+    /// The shared QMP client this provider was built with, if any.
+    pub fn shared_client(&self) -> Option<&SharedQmpClient> {
+        self.shared.as_ref()
     }
 
     /// The capability advertised when the QMP socket path exists.
@@ -1603,14 +1633,21 @@ impl CaptureProvider for DBusDisplayProvider {
         if !self.config.qmp_socket.exists() {
             return Err(missing_socket_error(&self.config.qmp_socket));
         }
-        Ok(Box::new(DBusDisplaySource::new(self.config.clone())?))
+        Ok(Box::new(match &self.shared {
+            Some(shared) => {
+                DBusDisplaySource::with_shared_client(self.config.clone(), shared.clone())?
+            }
+            None => DBusDisplaySource::new(self.config.clone())?,
+        }))
     }
 }
 
 /// A [`CaptureSource`] fed by QEMU's D-Bus display listener.
 pub struct DBusDisplaySource {
     config: DBusDisplayConfig,
+    shared: Option<SharedQmpClient>,
     display: Option<Box<dyn DBusTransport>>,
+    display_drain: Option<tokio::task::JoinHandle<()>>,
     listener: Option<Box<dyn DBusTransport>>,
     listener_peer: Option<StdUnixStream>,
     framebuffer: Option<Framebuffer>,
@@ -1629,7 +1666,9 @@ impl fmt::Debug for DBusDisplaySource {
         formatter
             .debug_struct("DBusDisplaySource")
             .field("config", &self.config)
+            .field("has_shared_qmp", &self.shared.is_some())
             .field("has_display", &self.display.is_some())
+            .field("display_drained", &self.display_drain.is_some())
             .field("has_listener", &self.listener.is_some())
             .field("initialized", &self.initialized)
             .field("stopped", &self.stopped)
@@ -1651,7 +1690,9 @@ impl DBusDisplaySource {
         config.validate()?;
         Ok(Self {
             config,
+            shared: None,
             display: None,
+            display_drain: None,
             listener: None,
             listener_peer: None,
             framebuffer: None,
@@ -1664,6 +1705,25 @@ impl DBusDisplaySource {
             last_sequence: None,
             last_pts: None,
         })
+    }
+
+    /// Build a source that routes the QMP handoff through a node-owned client.
+    ///
+    /// The source never opens a second QMP control connection: `getfd` and
+    /// `add_client` are serialized through `shared` with power, snapshots, and
+    /// input. The shared connection is never disconnected by this source.
+    pub fn with_shared_client(
+        config: DBusDisplayConfig,
+        shared: SharedQmpClient,
+    ) -> Result<Self, ApiError> {
+        let mut source = Self::new(config)?;
+        source.shared = Some(shared);
+        Ok(source)
+    }
+
+    /// The shared QMP client this source was built with, if any.
+    pub fn shared_client(&self) -> Option<&SharedQmpClient> {
+        self.shared.as_ref()
     }
 
     /// Build a source over injected transports, for tests and embedding.
@@ -1729,7 +1789,11 @@ impl DBusDisplaySource {
         let id = self.config.id.clone();
         let timeout = self.config.connect_timeout;
         match tokio::time::timeout(timeout, self.initialize()).await {
-            Ok(result) => result,
+            Ok(result) => {
+                result?;
+                self.spawn_display_drain();
+                Ok(())
+            }
             Err(_) => Err(MediaError::capture(
                 &id,
                 format!(
@@ -1737,6 +1801,35 @@ impl DBusDisplaySource {
                 ),
             )),
         }
+    }
+
+    /// Consume console-connection messages after setup.
+    ///
+    /// Frames are pushed on the listener, not the console connection, so this
+    /// never takes a frame. It exists so QEMU's occasional console signals
+    /// (for example property changes) cannot fill the socket's send buffer and
+    /// back-pressure QEMU. The task is aborted by [`CaptureSource::stop`] or
+    /// when the source is dropped.
+    fn spawn_display_drain(&mut self) {
+        if self.display_drain.is_some() {
+            return;
+        }
+        let Some(mut display) = self.display.take() else {
+            return;
+        };
+        let id = self.config.id.clone();
+        let max_body = self.config.max_message_body();
+        self.display_drain = Some(tokio::spawn(async move {
+            loop {
+                match read_message(display.as_mut(), max_body, None).await {
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::debug!(id = %id, %error, "D-Bus console drain stopped");
+                        break;
+                    }
+                }
+            }
+        }));
     }
 
     async fn establish_real(&mut self) -> Result<(), MediaError> {
@@ -1747,39 +1840,62 @@ impl DBusDisplaySource {
             )));
         }
 
-        let qmp_config = QmpConfig::new(self.config.qmp_socket.clone())
-            .with_connect_timeout(self.config.connect_timeout);
-        let client = QmpClient::connect(qmp_config)
-            .await
-            .map_err(|error| MediaError::capture(&id, format!("QMP connect failed: {error}")))?;
-
+        // QEMU's `-qmp` chardev accepts one client. When the node already owns
+        // a shared control client, reuse its underlying connection instead of
+        // opening a second one that would never receive a greeting.
         let (display_ours, display_theirs) = StdUnixStream::pair().map_err(|error| {
             MediaError::capture(&id, format!("cannot create display socketpair: {error}"))
         })?;
         // A plain std socketpair is blocking, like the Python client's. Only
         // our end is switched to non-blocking for tokio; QEMU's duplicate keeps
         // the blocking file-status flags it expects.
-        if let Err(error) = client.getfd(DBUS_FD_NAME, display_theirs.as_raw_fd()).await {
-            client.disconnect().await;
-            return Err(MediaError::capture(
-                &id,
-                format!("QMP getfd for `{DBUS_FD_NAME}` failed: {error}"),
-            ));
+        match &self.shared {
+            Some(shared) => {
+                let handed = shared
+                    .getfd_and_add_client(
+                        DBUS_FD_NAME,
+                        display_theirs.as_raw_fd(),
+                        DBUS_ADD_CLIENT_PROTOCOL,
+                    )
+                    .await;
+                drop(display_theirs);
+                if let Err(error) = handed {
+                    return Err(MediaError::capture(
+                        &id,
+                        format!(
+                            "QMP getfd/add_client `{DBUS_ADD_CLIENT_PROTOCOL}` failed over the shared control socket: {error} (is QEMU running with -display dbus,p2p=yes?)"
+                        ),
+                    ));
+                }
+            }
+            None => {
+                let qmp_config = QmpConfig::new(self.config.qmp_socket.clone())
+                    .with_connect_timeout(self.config.connect_timeout);
+                let client = QmpClient::connect(qmp_config).await.map_err(|error| {
+                    MediaError::capture(&id, format!("QMP connect failed: {error}"))
+                })?;
+                if let Err(error) = client.getfd(DBUS_FD_NAME, display_theirs.as_raw_fd()).await {
+                    client.disconnect().await;
+                    return Err(MediaError::capture(
+                        &id,
+                        format!("QMP getfd for `{DBUS_FD_NAME}` failed: {error}"),
+                    ));
+                }
+                drop(display_theirs);
+                let added = client
+                    .add_client(DBUS_ADD_CLIENT_PROTOCOL, DBUS_FD_NAME)
+                    .await;
+                client.disconnect().await;
+                if let Err(error) = added {
+                    return Err(MediaError::capture(
+                        &id,
+                        format!(
+                            "QMP add_client `{DBUS_ADD_CLIENT_PROTOCOL}` failed: {error} (is QEMU running with -display dbus,p2p=yes?)"
+                        ),
+                    ));
+                }
+            }
         }
-        drop(display_theirs);
-        if let Err(error) = client
-            .add_client(DBUS_ADD_CLIENT_PROTOCOL, DBUS_FD_NAME)
-            .await
-        {
-            client.disconnect().await;
-            return Err(MediaError::capture(
-                &id,
-                format!(
-                    "QMP add_client `{DBUS_ADD_CLIENT_PROTOCOL}` failed: {error} (is QEMU running with -display dbus,p2p=yes?)"
-                ),
-            ));
-        }
-        client.disconnect().await;
 
         let (listener_ours, listener_theirs) = StdUnixStream::pair().map_err(|error| {
             MediaError::capture(&id, format!("cannot create listener socketpair: {error}"))
@@ -1825,10 +1941,12 @@ impl DBusDisplaySource {
         authenticate(display)
             .await
             .map_err(|error| error.to_media_error(&id))?;
+        tracing::debug!(id = %id, "D-Bus display connection authenticated");
         let (width, height) = self
             .read_console_properties(display)
             .await
             .map_err(|error| error.to_media_error(&id))?;
+        tracing::debug!(id = %id, width, height, "D-Bus console properties received");
         self.format = FrameFormat::new(PixelFormat::Bgra, width, height);
 
         let serial = self.next_serial();
@@ -1864,7 +1982,10 @@ impl DBusDisplaySource {
         authenticate(listener)
             .await
             .map_err(|error| error.to_media_error(&id))?;
-        self.reply_to_listener_getall(listener).await
+        tracing::debug!(id = %id, "D-Bus listener connection authenticated");
+        self.reply_to_listener_getall(listener).await?;
+        tracing::debug!(id = %id, "D-Bus listener registered; awaiting Scanout");
+        Ok(())
     }
 
     async fn read_console_properties(
@@ -2136,6 +2257,9 @@ impl CaptureSource for DBusDisplaySource {
         self.eof = true;
         self.framebuffer = None;
         self.listener_peer = None;
+        if let Some(drain) = self.display_drain.take() {
+            drain.abort();
+        }
         if let Some(mut listener) = self.listener.take() {
             let _ = listener.shutdown().await;
         }
@@ -2143,6 +2267,14 @@ impl CaptureSource for DBusDisplaySource {
             let _ = display.shutdown().await;
         }
         Ok(())
+    }
+}
+
+impl Drop for DBusDisplaySource {
+    fn drop(&mut self) {
+        if let Some(drain) = self.display_drain.take() {
+            drain.abort();
+        }
     }
 }
 
@@ -2450,6 +2582,18 @@ mod tests {
 
         assert!(provider.open(capability).is_ok());
 
+        // The shared-client form must not connect during construction/open.
+        let shared = SharedQmpClient::new(ozma_qmp::QmpConfig::new(&socket));
+        let shared_provider =
+            DBusDisplayProvider::with_shared_client(config.clone(), shared.clone());
+        assert!(shared_provider.shared_client().is_some());
+        let source = DBusDisplaySource::with_shared_client(config.clone(), shared.clone()).unwrap();
+        assert!(source.shared_client().is_some());
+        assert!(!source.is_connected());
+        let registry =
+            CaptureRegistry::new().with_dbus_display_shared(config.clone(), shared.clone());
+        assert_eq!(registry.provider_count(), 1);
+
         let missing = DBusDisplayConfig::new(directory.path().join("absent.sock"));
         assert!(DBusDisplayProvider::new(missing)
             .enumerate()
@@ -2682,6 +2826,53 @@ mod tests {
             read_message(&mut transport, 1024, Some(Duration::from_millis(10))).await,
             Err(DBusError::Idle(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn read_message_accepts_a_body_that_does_not_end_on_an_eight_byte_boundary() {
+        // QEMU/GDBus sends exactly `body_len` body bytes: the D-Bus
+        // specification says "the message body need not end on an 8-byte
+        // boundary". The real Console.GetAll reply is 285 bytes (5 mod 8);
+        // waiting for trailing padding stalls the handshake until the connect
+        // timeout. Emulate it with a 7-byte body and no trailing padding.
+        let body = encode_string_body("ab");
+        assert_eq!(body.len() % 8, 7);
+        let mut message = encode_method_return(1, 1, "s", &body);
+        let body_len = read_le_u32(&message, 4).unwrap() as usize;
+        let fields_len = read_le_u32(&message, 12).unwrap() as usize;
+        let body_start = align_up(16 + fields_len, 8);
+        message.truncate(body_start + body_len);
+        assert_ne!(message.len() % 8, 0, "wire message has no body padding");
+
+        let mut transport = FakeTransport::new(message);
+        let parsed = read_message(&mut transport, 1024, None).await.unwrap();
+        assert_eq!(parsed.header.message_type, DBUS_METHOD_RETURN);
+        assert_eq!(parsed.body, body);
+    }
+
+    #[test]
+    fn encoded_messages_have_no_trailing_body_padding() {
+        let body = encode_string_body("ab");
+        let message = encode_method_return(1, 1, "s", &body);
+        let body_len = read_le_u32(&message, 4).unwrap() as usize;
+        let fields_len = read_le_u32(&message, 12).unwrap() as usize;
+        assert_eq!(message.len(), align_up(16 + fields_len, 8) + body_len);
+        assert_ne!(body_len % 8, 0);
+    }
+
+    #[tokio::test]
+    async fn authenticate_sends_the_exact_sasl_sequence() {
+        let mut transport = FakeTransport::new(b"OK guid\r\nAGREE_UNIX_FD\r\n".to_vec());
+        authenticate(&mut transport).await.unwrap();
+
+        let uid = nix::unistd::getuid().as_raw().to_string();
+        let hex: String = uid.bytes().map(|byte| format!("{byte:02x}")).collect();
+        let expected = vec![
+            format!("\0AUTH EXTERNAL {hex}\r\n").into_bytes(),
+            b"NEGOTIATE_UNIX_FD\r\n".to_vec(),
+            b"BEGIN\r\n".to_vec(),
+        ];
+        assert_eq!(transport.log.writes.lock().unwrap().clone(), expected);
     }
 
     #[tokio::test]
@@ -2922,6 +3113,25 @@ mod tests {
         assert!(source.is_eof());
     }
 
+    /// Live check against a disposable QEMU. Start:
+    ///
+    /// ```text
+    /// qemu-system-x86_64 -machine pc,accel=tcg -m 256 -nodefaults \
+    ///   -device VGA -display dbus,p2p=yes \
+    ///   -qmp unix:/tmp/ozma-dbus/qmp.sock,server=on,wait=off -daemonize
+    /// ```
+    ///
+    /// then run with the socket in `OZMA_DBUS_TEST_QMP`:
+    ///
+    /// ```text
+    /// OZMA_DBUS_TEST_QMP=/tmp/ozma-dbus/qmp.sock \
+    ///   cargo test -p ozma-capture --lib -- --ignored --nocapture \
+    ///   real_qemu_dbus_display_pushes_a_frame
+    /// ```
+    ///
+    /// The test opens its own QMP control connection, so the socket must not
+    /// already be held by `ozma-node`. When it is, the node uses
+    /// [`DBusDisplaySource::with_shared_client`] instead.
     #[tokio::test]
     #[ignore = "requires a real QEMU with -display dbus,p2p=yes; set OZMA_DBUS_TEST_QMP"]
     async fn real_qemu_dbus_display_pushes_a_frame() {
@@ -2934,7 +3144,15 @@ mod tests {
         let mut source = DBusDisplaySource::new(config).unwrap();
         let frame = source.next_frame().await.unwrap();
         assert_eq!(frame.format().pixel_format, PixelFormat::Bgra);
+        assert!(frame.format().width > 0);
+        assert!(frame.format().height > 0);
         assert!(!frame.data().is_empty());
+        println!(
+            "live D-Bus Scanout: {}x{} {} bytes",
+            frame.format().width,
+            frame.format().height,
+            frame.data().len()
+        );
         source.stop().await.unwrap();
     }
 }

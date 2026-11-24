@@ -85,12 +85,72 @@ class PipelineStringTests(unittest.TestCase):
         self.assertIn("rtpopuspay pt=97", pipeline)
         self.assertIn("application/x-rtp,media=audio,encoding-name=OPUS", pipeline)
         self.assertIn("! webrtc.", pipeline)
+        # opusenc only accepts interleaved S16LE; F32LE makes the audio branch
+        # fail to link and silently degrades the session to video-only.
+        self.assertIn("audio/x-raw,format=S16LE,rate=48000,channels=2", pipeline)
+        self.assertNotIn("format=F32LE", pipeline)
 
     def test_unsupported_audio_element_is_rejected(self):
         with self.assertRaises(ValueError):
             worker.build_pipeline_string(
                 640, 480, 30, worker.video_encoder_description(False), "alsasrc"
             )
+
+
+class SdpCandidateTests(unittest.TestCase):
+    SDP = (
+        "v=0\r\n"
+        "o=- 1 0 IN IP4 0.0.0.0\r\n"
+        "s=-\r\n"
+        "t=0 0\r\n"
+        "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n"
+        "a=mid:video0\r\n"
+        "a=candidate:1 1 UDP 1 127.0.0.1 5000 typ host\r\n"
+        "a=end-of-candidates\r\n"
+        "m=audio 9 UDP/TLS/RTP/SAVPF 97\r\n"
+        "a=mid:audio1\r\n"
+        "a=candidate:2 1 UDP 1 127.0.0.1 6000 typ host\r\n"
+    )
+
+    def test_remote_candidates_are_grouped_by_mline(self):
+        self.assertEqual(
+            worker.remote_ice_candidates(self.SDP),
+            [
+                (0, "candidate:1 1 UDP 1 127.0.0.1 5000 typ host"),
+                (1, "candidate:2 1 UDP 1 127.0.0.1 6000 typ host"),
+            ],
+        )
+
+    def test_append_candidates_goes_after_the_matching_section(self):
+        result = worker.append_ice_candidates(
+            self.SDP, [(0, "candidate:3 1 UDP 1 127.0.0.1 7000 typ host")]
+        )
+        video_section, audio_section = result.split("m=audio", 1)
+        self.assertIn("candidate:3", video_section)
+        self.assertNotIn("candidate:3", audio_section)
+        self.assertTrue(result.endswith("\r\n"))
+
+    def test_append_candidates_is_idempotent(self):
+        once = worker.append_ice_candidates(
+            self.SDP, [(1, "candidate:3 1 UDP 1 127.0.0.1 7000 typ host")]
+        )
+        twice = worker.append_ice_candidates(
+            once, [(1, "candidate:3 1 UDP 1 127.0.0.1 7000 typ host")]
+        )
+        self.assertEqual(once, twice)
+        self.assertEqual(twice.count("candidate:3"), 1)
+
+    def test_candidates_stay_before_end_of_candidates(self):
+        result = worker.append_ice_candidates(
+            self.SDP, [(0, "candidate:3 1 UDP 1 127.0.0.1 7000 typ host")]
+        )
+        self.assertLess(
+            result.index("candidate:3"), result.index("a=end-of-candidates")
+        )
+
+    def test_candidate_without_sdp_media_is_ignored(self):
+        plain = "v=0\r\no=- 1 0 IN IP4 0.0.0.0\r\n"
+        self.assertEqual(worker.append_ice_candidates(plain, [(0, "candidate:1")]), plain)
 
 
 class ArgumentTests(unittest.TestCase):

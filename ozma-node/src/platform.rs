@@ -4,8 +4,8 @@
 //! Real V4L2/encoder probes plug in here without changing the API.
 
 use ozma_protocol::{
-    AudioCapability, InputCapability, NodeCapabilities, NodeId, ResourceBudget, TransportMode,
-    UsbCapability, VirtualDisplayCaps,
+    AudioCapability, InputCapability, NodeCapabilities, NodeId, PowerCapability, ResourceBudget,
+    TransportMode, UsbCapability, VirtualDisplayCaps,
 };
 
 use ozma_capture::{
@@ -77,13 +77,19 @@ fn vm_capture_registry(config: &NodeConfig, shared: Option<&SharedQmpClient>) ->
             None => CaptureRegistry::new(),
         },
         Some("dbus") => match &config.qmp_socket {
-            Some(socket) => CaptureRegistry::new().with_dbus_display(
-                DBusDisplayConfig::new(socket.clone())
+            Some(socket) => {
+                let display = DBusDisplayConfig::new(socket.clone())
                     .with_console_index(config.dbus_console)
                     .with_identity(DBUS_DEFAULT_ID, format!("{} D-Bus display", config.name))
                     .with_limits(config.dbus_width, config.dbus_height)
-                    .with_fps(config.dbus_fps),
-            ),
+                    .with_fps(config.dbus_fps);
+                match shared {
+                    Some(shared) => {
+                        CaptureRegistry::new().with_dbus_display_shared(display, shared.clone())
+                    }
+                    None => CaptureRegistry::new().with_dbus_display(display),
+                }
+            }
             None => CaptureRegistry::new(),
         },
         _ => CaptureRegistry::new(),
@@ -157,6 +163,18 @@ pub fn detect_with_registry(config: &NodeConfig, capture: &CaptureRegistry) -> N
             gadget: true,
             usbip: false,
             virtual_media: false,
+        };
+    }
+
+    if config
+        .vm_providers()
+        .map(|providers| providers.power.is_some())
+        .unwrap_or(false)
+    {
+        caps.power = PowerCapability {
+            reset: true,
+            power_off: true,
+            ..PowerCapability::default()
         };
     }
 
@@ -272,6 +290,22 @@ mod tests {
         let scans = registry.scan();
         assert_eq!(scans.len(), 1);
         assert_eq!(scans[0].kind, ozma_protocol::CaptureKind::Qmp);
+    }
+
+    #[test]
+    fn configured_power_backend_advertises_power_capability() {
+        let mut vm = config("hid,video,audio");
+        vm.profile = crate::config::NodeProfile::Vm;
+        vm.qmp_socket = Some(std::path::PathBuf::from("/run/ozma/ctrl.qmp"));
+
+        let caps = detect_with_registry(&vm, &CaptureRegistry::new());
+        assert!(caps.power.reset);
+        assert!(caps.power.power_off);
+
+        vm.qmp_socket = None;
+        let caps = detect_with_registry(&vm, &CaptureRegistry::new());
+        assert!(!caps.power.reset);
+        assert!(!caps.power.power_off);
     }
 
     #[test]

@@ -36,6 +36,11 @@ AUDIO_SOURCE_NAME = "asrc"
 MIN_BITRATE_BPS = 500_000
 MAX_BITRATE_BPS = 50_000_000
 
+#: Bounded wait for one SDP description operation, in seconds.
+DESCRIPTION_TIMEOUT_SECONDS = 5.0
+#: Bounded wait for ICE gathering after the local answer is set, in seconds.
+ICE_GATHER_TIMEOUT_SECONDS = 5.0
+
 #: Elements required by the optional audio branch (besides the source).
 AUDIO_PIPELINE_ELEMENTS = frozenset(
     {"queue", "audioconvert", "audioresample", "opusenc", "rtpopuspay"}
@@ -161,7 +166,7 @@ def build_pipeline_string(
         f"! queue "
         f"! audioconvert "
         f"! audioresample "
-        f"! audio/x-raw,format=F32LE,rate=48000,channels=2 "
+        f"! audio/x-raw,format=S16LE,rate=48000,channels=2 "
         f"! opusenc name=aenc bitrate=96000 "
         f"! rtpopuspay pt=97 "
         f"! application/x-rtp,media=audio,encoding-name=OPUS,"
@@ -180,6 +185,97 @@ def build_pipeline_string(
 def clamp_bitrate_bps(requested: int) -> int:
     """Clamp a requested bitrate to the supported 500 kbps–50 Mbps range."""
     return max(MIN_BITRATE_BPS, min(MAX_BITRATE_BPS, int(requested)))
+
+
+def split_sdp_media_sections(sdp: str) -> tuple[list[str], list[list[str]]]:
+    """Split an SDP into preamble and per-``m=`` sections.
+
+    Each section starts with its ``m=`` line and keeps every following line.
+    Line endings are normalised away so SDPs with CRLF and LF behave the same.
+    """
+    preamble: list[str] = []
+    sections: list[list[str]] = []
+    current: list[str] | None = None
+    for raw_line in sdp.splitlines():
+        line = raw_line.rstrip("\r")
+        if line.startswith("m="):
+            current = [line]
+            sections.append(current)
+        elif current is None:
+            preamble.append(line)
+        else:
+            current.append(line)
+    return preamble, sections
+
+
+def remote_ice_candidates(sdp: str) -> list[tuple[int, str]]:
+    """Return ``(mline_index, candidate)`` for every ``a=candidate:`` line.
+
+    The candidate string keeps its ``candidate:`` prefix, matching the value
+    emitted by webrtcbin's ``on-ice-candidate`` signal, so it can be passed
+    straight back to ``add-ice-candidate``.
+    """
+    _, sections = split_sdp_media_sections(sdp)
+    candidates: list[tuple[int, str]] = []
+    for index, lines in enumerate(sections):
+        for line in lines:
+            if not line.startswith("a=candidate:"):
+                continue
+            candidate = line[len("a=") :].strip()
+            if candidate and not candidate.startswith("candidate:end-of-candidates"):
+                candidates.append((index, candidate))
+    return candidates
+
+
+def append_ice_candidates(
+    sdp: str, candidates: list[tuple[int, str]]
+) -> str:
+    """Append ``a=candidate`` lines to their matching ``m=`` sections.
+
+    ``candidates`` entries use the same ``(mline_index, candidate)`` shape as
+    :func:`remote_ice_candidates`; the candidate may include or omit the
+    ``candidate:`` prefix.  Sections without a matching index are ignored, and
+    an SDP with no ``m=`` line is returned unchanged.
+    """
+    if not candidates:
+        return sdp
+    preamble, sections = split_sdp_media_sections(sdp)
+    if not sections:
+        return sdp
+
+    by_index: dict[int, list[str]] = {}
+    for index, candidate in candidates:
+        value = candidate.strip()
+        if value.startswith("a=candidate:"):
+            value = value[len("a=") :]
+        elif not value.startswith("candidate:"):
+            value = "candidate:" + value
+        by_index.setdefault(index, []).append(value)
+
+    lines = list(preamble)
+    for index, section in enumerate(sections):
+        existing = {line for line in section if line.startswith("a=candidate:")}
+        additions = [
+            "a=" + candidate
+            for candidate in by_index.get(index, [])
+            if "a=" + candidate not in existing
+        ]
+        if additions:
+            # Keep `a=end-of-candidates` as the last attribute in the section.
+            position = next(
+                (
+                    offset
+                    for offset, line in enumerate(section)
+                    if line.startswith("a=end-of-candidates")
+                ),
+                len(section),
+            )
+            lines.extend(section[:position])
+            lines.extend(additions)
+            lines.extend(section[position:])
+        else:
+            lines.extend(section)
+    return "\r\n".join(lines) + "\r\n"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -313,7 +409,15 @@ class WebRTCWorker:
     # -- sessions ---------------------------------------------------------
 
     def create_session(self, offer_sdp: str) -> str | None:
-        """Create a WebRTC session from an SDP offer. Returns answer SDP."""
+        """Create a WebRTC session from an SDP offer. Returns answer SDP.
+
+        ``webrtcbin`` only builds an answer once the bin is in ``PLAYING`` and
+        the remote description has been applied.  Those two operations are
+        asynchronous in GStreamer, so this waits on their promises and then
+        gathers host ICE candidates before returning.  The candidates are
+        appended to the answer SDP because the signaling protocol has no
+        trickle-ICE message.
+        """
         import uuid
         sid = uuid.uuid4().hex[:8]
 
@@ -323,34 +427,106 @@ class WebRTCWorker:
         appsrc = pipeline.get_by_name("src")
         video_encoder = pipeline.get_by_name(VIDEO_ENCODER_NAME)
 
-        # Set offer
+        # `create-answer` returns no answer when the bin is still in NULL.
+        pipeline.set_state(Gst.State.PLAYING)
+        result, _, _ = pipeline.get_state(Gst.CLOCK_TIME_NONE)
+        if result == Gst.StateChangeReturn.FAILURE:
+            pipeline.set_state(Gst.State.NULL)
+            print("WebRTC pipeline failed to reach PLAYING", file=sys.stderr,
+                  flush=True)
+            return None
+
+        # Apply the remote offer, then hand its embedded candidates to ICE.
         _, sdpmsg = GstSdp.SDPMessage.new_from_text(offer_sdp)
         offer = GstWebRTC.WebRTCSessionDescription.new(
             GstWebRTC.WebRTCSDPType.OFFER, sdpmsg)
-        webrtc.emit("set-remote-description", offer, None)
+        remote_done = threading.Event()
+        remote_error = []
 
-        # Create answer
-        answer_sdp = [None]
-        event = threading.Event()
-
-        def on_answer(promise):
+        def on_remote(promise):
             reply = promise.get_reply()
-            if reply:
-                answer = reply.get_value("answer")
-                if answer:
-                    webrtc.emit("set-local-description", answer, None)
-                    answer_sdp[0] = answer.sdp.as_text()
-            event.set()
+            error = reply.get_value("error") if reply else None
+            if error is not None:
+                remote_error.append(str(error))
+            remote_done.set()
 
-        promise = Gst.Promise.new_with_change_func(on_answer)
-        webrtc.emit("create-answer", None, promise)
-        event.wait(timeout=5)
-
-        if not answer_sdp[0]:
+        webrtc.emit(
+            "set-remote-description",
+            offer,
+            Gst.Promise.new_with_change_func(on_remote),
+        )
+        if not remote_done.wait(timeout=DESCRIPTION_TIMEOUT_SECONDS):
+            remote_error.append("timed out setting the remote description")
+        if remote_error:
+            print(
+                f"WebRTC remote description failed: {remote_error[0]}",
+                file=sys.stderr,
+                flush=True,
+            )
             pipeline.set_state(Gst.State.NULL)
             return None
 
-        pipeline.set_state(Gst.State.PLAYING)
+        remote_candidates = remote_ice_candidates(offer_sdp)
+        for mline, candidate in remote_candidates:
+            webrtc.emit("add-ice-candidate", mline, candidate)
+
+        # Collect local host candidates; they have to travel inside the answer.
+        local_candidates: list[tuple[int, str]] = []
+        gather_complete = threading.Event()
+
+        def on_candidate(_webrtc, mline, candidate):
+            if candidate:
+                local_candidates.append((int(mline), candidate))
+
+        def on_gathering_state(*_args):
+            state = webrtc.get_property("ice-gathering-state")
+            if state == GstWebRTC.WebRTCICEGatheringState.COMPLETE:
+                gather_complete.set()
+
+        webrtc.connect("on-ice-candidate", on_candidate)
+        webrtc.connect("notify::ice-gathering-state", on_gathering_state)
+
+        # Create the answer and install it as the local description.
+        answer_sdp = [None]
+        answer_done = threading.Event()
+        answer_error = []
+
+        def on_answer(promise):
+            reply = promise.get_reply()
+            error = reply.get_value("error") if reply else None
+            if error is not None:
+                answer_error.append(str(error))
+            answer = reply.get_value("answer") if reply else None
+            if answer:
+                webrtc.emit("set-local-description", answer, Gst.Promise.new())
+                answer_sdp[0] = answer.sdp.as_text()
+            answer_done.set()
+
+        webrtc.emit(
+            "create-answer",
+            None,
+            Gst.Promise.new_with_change_func(on_answer),
+        )
+        if not answer_done.wait(timeout=DESCRIPTION_TIMEOUT_SECONDS):
+            answer_error.append("timed out creating the answer")
+        if not answer_sdp[0] or answer_error:
+            if answer_error:
+                print(
+                    f"WebRTC create-answer failed: {answer_error[0]}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            pipeline.set_state(Gst.State.NULL)
+            return None
+
+        if not gather_complete.wait(timeout=ICE_GATHER_TIMEOUT_SECONDS):
+            print(
+                "WebRTC ICE gathering did not complete before the answer was "
+                f"sent; returning {len(local_candidates)} candidate(s) anyway",
+                file=sys.stderr,
+                flush=True,
+            )
+        answer_sdp[0] = append_ice_candidates(answer_sdp[0], local_candidates)
 
         self.sessions[sid] = {
             "pipeline": pipeline,
@@ -367,7 +543,9 @@ class WebRTCWorker:
         audio_name = f" audio={self.audio_source}" if audio_enabled else ""
         print(
             f"Session {sid}: {self.width}x{self.height}@{self.fps} "
-            f"{enc_name}{audio_name}",
+            f"{enc_name}{audio_name} "
+            f"ice_candidates={len(local_candidates)} "
+            f"remote_candidates={len(remote_candidates)}",
             flush=True,
         )
         return answer_sdp[0]

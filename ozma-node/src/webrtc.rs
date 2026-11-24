@@ -1823,7 +1823,7 @@ mod tests {
 
     #[tokio::test]
     async fn bitrate_without_an_ack_is_not_a_fake_success() {
-        // The real Python worker ignores `bitrate`, so no response arrives.
+        // A helper that ignores `bitrate` must not be reported as success.
         let (signaler, mut reader, _writer) = pair();
         tokio::spawn(async move {
             let mut line = String::new();

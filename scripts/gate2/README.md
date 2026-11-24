@@ -19,6 +19,7 @@ evidence, not a Gate 2 claim.
 |---|---|
 | `qemu-preflight.sh` | Read-only check of `virsh`/the domain state, QMP socket existence and greeting, ffmpeg VNC demuxer/HLS support, HLS output directory, WebRTC helper script and GStreamer elements, and optional controller health. |
 | `check-node.sh` | HTTP checks against the running node: `/health`, `/api/v1/connection`, `/power/state`, `/stream/stream.m3u8` when HLS is running, and `/webrtc/offer` only when a helper is configured. With `OZMA_CONTROLLER_URL`, also checks controller health, registration, the node/power proxy, and the HLS proxy. |
+| `webrtc-client.py` | Real GStreamer `webrtcbin` peer for a running node: receive-only H.264 offer (optional Opus), ICE/DTLS, decoded-media counters, optional `/webrtc/bitrate`. Uses system Python/GStreamer and installs nothing. |
 | `run-gate2.sh` | Runs both scripts and writes a timestamped report under `${OZMA_GATE2_REPORT_DIR:-/tmp/ozma-gate2}`. Exits non-zero if either stage fails. |
 
 ## Minimal usage
@@ -101,7 +102,8 @@ matching parity-matrix row.
 The scripts cannot prove:
 
 - guest-visible input (a key press and pointer move/click in the guest),
-- a browser receiving WebRTC media,
+- a browser receiving WebRTC media (`webrtc-client.py` proves a non-browser
+  GStreamer peer, not a browser/controller run),
 - the controller dashboard rendering and proxying its UI paths,
 - controller pytest/demo/clean-host regression.
 

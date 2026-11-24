@@ -16,18 +16,22 @@ controller, the dashboard, guest-visible input, WebRTC, audio, or power
 > QMP Unix socket and no disk or network device. Every process and temporary
 > file was removed at the end; see [Cleanup](#07-cleanup).
 
-> **Post-fix status (2026-11-24 02:47–02:51Z):** the shared-QMP single-socket
-> rerun now passes power, HLS, snapshots, and QMP input concurrently. See
-> [§0 Post-fix rerun](#0-post-fix-rerun). Sections 1–10 below are the
-> **before-fix historical run** and are retained as evidence.
+> **Post-fix status (2026-11-24 02:47–02:51Z, updated 03:04–03:12Z):** the
+> shared-QMP single-socket rerun passes power, HLS, snapshots, and QMP input
+> concurrently. The D-Bus display handshake timeout at 02:47Z was later
+> diagnosed and fixed; §0.5 is now a live **PASS** on QEMU 11.1.3, including
+> the node's shared-QMP path. See [§0 Post-fix rerun](#0-post-fix-rerun).
+> Sections 1–10 below are the **before-fix historical run** and are retained
+> as evidence.
 
 ## 0. Post-fix rerun
 
 **Result: PASS for the shared-QMP single-socket path.** With one `--qmp-socket`,
 `--power-provider qmp`, `--input-provider qmp`, and `--hls`, the node served
 power, HLS, snapshots, and QMP input concurrently without a second QMP
-connection or a greeting timeout. D-Bus display capture still fails; see
-[§0.5](#05-d-bus-still-fails).
+connection or a greeting timeout. The D-Bus display timeout in this run was
+later diagnosed and fixed; see
+[§0.5](#05-d-bus-display--fixed-and-live-verified).
 
 ### 0.1 Build and environment
 
@@ -198,15 +202,17 @@ $ grep -Ein 'greeting|timed out|QMP connect failed|QMP input send.*failed|QMP.*f
 (no QMP greeting/timeout/failure/ERROR lines)
 ```
 
-One pacing caveat remains: QMP capture still produces frames faster than the
-declared `--hls-fps 5` input timebase (playlist sequence advanced roughly six
-segments per wall-clock second), so media time is not wall-clock time. The
-segment duration itself is now correct at 1.0 s.
+One pacing caveat remains in this run: QMP capture still produced frames faster
+than the declared `--hls-fps 5` input timebase (playlist sequence advanced
+roughly six segments per wall-clock second), so media time was not wall-clock
+time. The segment duration itself was correct at 1.0 s. A wall-clock
+[`FramePacer`](../ozma-node/src/hls.rs) now drops early frames before they
+reach ffmpeg; see [§0.9](#09-wall-clock-pacer-code-complete-live-rerun-pending).
+That fix is **not** exercised by this historical run.
 
-### 0.5 D-Bus still fails
+### 0.5 D-Bus display — fixed and live-verified
 
-QEMU accepted `-display dbus,p2p=yes` in a second disposable TCG VM, but the
-current tree's ignored real-D-Bus test still fails identically:
+The 02:47Z run failed with:
 
 ```text
 thread 'dbus_display::tests::real_qemu_dbus_display_pushes_a_frame' panicked:
@@ -216,20 +222,98 @@ Capture { id: "dbus0",
 test result: FAILED. 0 passed; 1 failed; ... finished in 15.00s
 ```
 
-No `ozma-capture/src/dbus_display.rs` change was part of the two fixes, and the
-D-Bus handoff still uses its own QMP `getfd`/`add_client` path rather than the
-shared control client. D-Bus is therefore a **remaining failure**, not a
-regression from the post-fix QMP work.
+**Diagnosis.** The failure was reproduced against a fresh disposable QEMU
+11.1.3 (TCG, VGA, `-display dbus,p2p=yes`, QMP Unix socket) under `strace`.
+The QMP and display phases were both correct:
+
+```text
+connect(qmp.sock)                                  = 0
+recv <- {"QMP": {"version": {"qemu": {"major":11,"minor":1,"micro":3}}, ...}}
+send -> {"execute":"qmp_capabilities"}
+sendmsg(getfd, SCM_RIGHTS fd=11)                   -> {"return": {}}
+send   (add_client @dbus-display)                  -> {"return": {}}
+send   "\0AUTH EXTERNAL 31303030\r\n"              <- "OK 0f3ac7ea...\r\n"
+send   "NEGOTIATE_UNIX_FD\r\n"                     <- "AGREE_UNIX_FD\r\n"
+send   "BEGIN\r\n"
+send   GetAll(Console)                             <- method_return, body_len=285
+recv(fd, ..., 3)                                   = EAGAIN   # 15 s, then timeout
+```
+
+`recv(..., 3)` is the whole bug: the reader had already consumed the complete
+285-byte GetAll body, then asked for `align_up(285, 8) - 285 = 3` trailing NUL
+bytes. QEMU/GDBus never sends them, because the D-Bus specification says "the
+message body need not end on an 8-byte boundary". `RegisterListener` was never
+reached. `encode_message()` had the mirror bug: it appended that same
+non-existent padding to every outbound message. This is a codec bug, not a QEMU
+protocol-version or feature limitation; the Python baseline reads exactly
+`body_len` and has no padding step.
+
+**Fix.**
+
+* `read_message()` now stops exactly at the declared body length and
+  `encode_message()` no longer appends trailing body padding. Header padding
+  (between the header-field array and the body) is still honoured.
+* `DBusDisplayProvider` and `DBusDisplaySource` both gained
+  `with_shared_client`, and
+  `CaptureRegistry::with_dbus_display_shared` routes `getfd`/`add_client`
+  through the node's single `SharedQmpClient`. `platform::vm_capture_registry`
+  passes that client for `--capture-provider dbus`, so the node no longer
+  opens a second QMP connection while the shared client holds the only one.
+  An owned source still opens and closes its own connection.
+* `tracing::debug!` now marks display auth, console properties, listener auth,
+  and listener registration, so a future stall is visible at the failing step.
+* After setup, a background task drains the console connection (QEMU sends
+  frames on the listener, but it can emit console property signals). The task
+  is aborted by `stop()` or `Drop`, so it cannot leak; it never takes a frame.
+* Regression tests: an unpadded 7-byte body is read to completion; the encoder
+  emits no trailing padding; the SASL byte sequence is asserted exactly; the
+  shared-client constructors are side-effect free. The existing
+  `RegisterListener`/listener-`GetAll` ordering test still covers the push path.
+
+**Live result (2026-11-24 03:04–03:12Z, QEMU 11.1.3, TCG, no disk/network).**
+
+* Ignored real test against a fresh `-display dbus,p2p=yes` VM:
+
+  ```text
+  live D-Bus Scanout: 720x400 1152000 bytes
+  test dbus_display::tests::real_qemu_dbus_display_pushes_a_frame ... ok
+  test result: ok. 1 passed; 0 failed; ... finished in 0.00s
+  ```
+
+  A later rerun after the console-drain change reported `640x480 1228800
+  bytes`; QEMU's initial VGA mode varies with the boot state.
+
+* `cargo test -p ozma-capture --lib`: **122 passed, 0 failed, 4 ignored**.
+* Node with `--profile vm --capture-provider dbus --qmp-socket ... --hls`
+  (the path that previously opened a second QMP connection):
+
+  ```text
+  INFO  ozma_qmp::client: QMP control connected path=.../qmp.sock
+  DEBUG ozma_capture::dbus_display: D-Bus display connection authenticated id=dbus0
+  DEBUG ozma_capture::dbus_display: D-Bus console properties received id=dbus0 width=720 height=400
+  DEBUG ozma_capture::dbus_display: D-Bus listener connection authenticated id=dbus0
+  DEBUG ozma_capture::dbus_display: D-Bus listener registered; awaiting Scanout id=dbus0
+  ```
+
+  `ss -x` showed exactly **one** `ESTAB` pair on `qmp.sock`; HLS produced
+  `seg_00006.ts` … `seg_00010.ts` and `stream.m3u8` from the D-Bus frames.
+
+This resolves the D-Bus handshake failure. It does not by itself prove live
+`Update`/`Disable`, guest resolution changes, or D-Bus input; see the
+limitations in [§0.8](#08-remaining-gate-2-blockers-after-the-rerun).
 
 ### 0.6 Post-fix disposition of the historical findings
 
 * **Finding 1 (one QMP chardev = one client):** resolved for the single-socket
   QMP path by `SharedQmpClient`. Power, QMP capture, snapshots, and QMP input
-  serialized through one connection in this run. D-Bus is still not multiplexed.
+  serialized through one connection in this run. D-Bus now participates too:
+  `with_dbus_display_shared` serializes `getfd`/`add_client` through the same
+  client (§0.5).
 * **Finding 2 (50-second HLS segments):** resolved. The argv now carries
   `-g 5 -keyint_min 5 -sc_threshold 0 -force_key_frames expr:gte(t,n_forced*1)`,
   and ffprobe reports 1.000000-second segments. The media-time/wall-clock
-  pacing caveat above remains.
+  pacing caveat above was not fixed in this run; the subsequent `FramePacer`
+  change is described in [§0.9](#09-wall-clock-pacer-code-complete-live-rerun-pending).
 * **Finding 3 (stale `delete_segments` note):** still open as a documentation
   bug. `docs/gate2-validation.md` §7.4 still says the argv has no
   `-hls_flags delete_segments`, while the live argv does.
@@ -283,17 +367,72 @@ remaining Gate 2 work is outside this component rerun:
   reset, force-off/destroy, and ACPI behavior still need a disposable guest.
 * **WebRTC:** helper startup, real SDP offer/answer, browser ICE/DTLS, media.
 * **Audio:** still not implemented on this node surface.
-* **D-Bus display capture:** still times out establishing the QEMU D-Bus
-  connection (§0.5). The D-Bus QMP `getfd`/`add_client` handoff is not routed
-  through `SharedQmpClient`.
-* **HLS pacing:** segments are now 1.0 s, but capture still runs faster than
-  the declared 5 fps input timebase, so media time advances faster than
-  wall-clock time. Decide whether capture should be rate-limited to the
-  declared HLS rate.
+* **D-Bus display capture:** the 15 s handshake timeout is fixed and
+  live-verified (§0.5), including the node's shared-QMP path. Remaining gaps:
+  the live run sampled `Scanout` only (`Update`/`Disable` are unit-tested);
+  no live guest resolution change; one selected `Console_N`; only 32-bit
+  BGRA/pixman formats; the console connection is drained, but the listener is
+  read only while `next_frame` is polled, so a stalled consumer back-pressures
+  QEMU's frame pushes; D-Bus input is not implemented (the node uses
+  uinput/QMP/HID). The ignored test needs an exclusive QMP socket.
+* **HLS pacing:** segments are 1.0 s, but this run still produced media time
+  faster than wall time because capture outran the declared 5 fps input
+  timebase. The code now has a wall-clock `FramePacer` (§0.9), but **live
+  pacing validation has not been rerun**; do not claim wall-clock pacing until
+  it is.
 * **Documentation:** `docs/gate2-validation.md` §7.4 still claims there is no
   `delete_segments` flag; the live argv has it.
 * **Evidence:** re-run on a frozen tree before attaching the final Gate 2
   evidence to the parity matrix.
+
+### 0.9 Wall-clock pacer (code complete, live rerun pending)
+
+The post-fix run above showed `#EXT-X-MEDIA-SEQUENCE` advancing about six
+segments per wall-clock second at `--hls-fps 5`: QMP `screendump` supplied
+frames faster than ffmpeg's `-r 5` input timebase, so each written frame
+advanced media time by 0.2 s while only ~0.033 s of wall time passed.
+
+`ozma-node/src/hls.rs` now paces the raw-frame feeder against a monotonic
+`Instant` deadline (`FramePacer`, with an injectable `HlsClock` for tests):
+
+* The first frame is written immediately; the initial deadline is the pipeline
+  start time.
+* A frame observed before its `1 / fps` slot is dropped before conversion and
+  never reaches ffmpeg. The loop keeps reading (and remains cancel-aware)
+  rather than sleeping or busy-spinning on the clock.
+* A late frame is still written. The schedule then advances by one interval,
+  but if that deadline is already at or behind the current frame it is rebased
+  to `now + interval`, so a source or write stall cannot bank a burst of
+  catch-up frames.
+* ffmpeg's input timebase is unchanged at `-r <fps>`; the pacer is what makes
+  media time approximate wall time.
+* EOS and source errors use the existing clean-stop/failed paths.
+
+Expected live behavior at `--hls-fps 5`, `--hls-segment-seconds 1`: at most
+five raw frames written per wall-clock second, so the playlist's
+`#EXT-X-MEDIA-SEQUENCE` advances about one entry per wall-clock second instead
+of ~six. Segment durations should stay ~1.000 s. Across a capture stall media
+time may lag wall time (frames are dropped, never inserted), but it should not
+run ahead in bursts.
+
+Verification done without live QEMU:
+
+```text
+$ cargo test -p ozma-node --lib hls::
+test result: ok. 28 passed; 0 failed; 1 ignored
+```
+
+The pacer tests feed synthetic timestamps (no sleeps): 30 frames at 30 fps over
+1 s emit 30; the same 30 frames at 5 fps emit 5; early frames drop, late frames
+emit, catch-up debt is clamped, the first frame is immediate, and a
+pipeline-level test confirms 10 input frames at 10 fps against 2 fps write 2
+frames then stop cleanly at EOS.
+
+**Remaining validation:** this section is a code/test claim, not a live
+result. A real QEMU + node + ffmpeg rerun is still required to confirm the
+playlist advances ~1 segment per wall-clock second and that segment cadence
+holds over several minutes. Record that rerun here before marking HLS pacing
+complete in the parity matrix.
 
 ---
 
@@ -661,7 +800,7 @@ and `/api/v1/connection` contained `"power":{"available":true,"status":"running"
 A snapshot attempted against that node returned 503 with the same QMP greeting
 timeout, confirming that QMP power itself works but monopolizes the chardev.
 
-## 6. Optional D-Bus display test — FAIL (not part of the required path)
+## 6. Optional D-Bus display test — before-fix FAIL (resolved in §0.5)
 
 QEMU advertises the backend:
 
@@ -709,9 +848,12 @@ test result: FAILED. 0 passed; 1 failed; ... finished in 15.00s
 ```
 
 QEMU accepted `-display dbus,p2p=yes`; the handshake/listener setup in
-`DBusDisplaySource::connect` did not complete within its 15-second bound. The
-root cause was not investigated further because D-Bus is outside this run's
-required QMP/capture/HLS/snapshot scope. No D-Bus success is claimed.
+`DBusDisplaySource::connect` did not complete within its 15-second bound. This
+was later reproduced and fixed: `read_message` waited for non-existent trailing
+body padding after a valid `Console.GetAll` reply, so `RegisterListener` was
+never sent. [§0.5](#05-d-bus-display--fixed-and-live-verified) records the
+strace, the codec fix, and the live PASS on the same QEMU version. This section
+remains the historical before-fix evidence.
 
 ## 7. Before-fix findings (historical)
 

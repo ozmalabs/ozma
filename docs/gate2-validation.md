@@ -397,8 +397,10 @@ player screenshot if possible.
 ### Step 7 — WebRTC offer
 
 The helper is configured and `connection.webrtc` is `running`. A real browser
-offer is required for a meaningful negotiation; a synthetic SDP only tests the
-route.
+offer is required for a meaningful dashboard negotiation; a synthetic SDP only
+tests the route. For a browserless real negotiation, use
+`scripts/gate2/webrtc-client.py` (below); its live run is recorded in
+[`gate2-live-webrtc-report.md`](gate2-live-webrtc-report.md).
 
 1. In the browser console (or the dashboard), create a receive-only offer and
    wait for ICE gathering:
@@ -443,7 +445,7 @@ curl -sS -X POST "$CTRL/api/v1/streams/$NODE_ID/webrtc" \
 Expected: the same answer shape. The controller proxies to the node's
 `/webrtc/offer`.
 
-Bitrate behavior (expected honest failure with the current worker):
+Bitrate behavior:
 
 ```bash
 curl -sS -i -X POST "$NODE/webrtc/bitrate" \
@@ -451,12 +453,32 @@ curl -sS -i -X POST "$NODE/webrtc/bitrate" \
   -d '{"bitrate":4000000}'
 ```
 
-Expected: a typed **502** (`webrtc-helper-timeout`) with remediation, because
-`softnode/gst_webrtc_worker.py` does not acknowledge bitrate messages. Do not
-record this as a successful bitrate change.
+Expected with the checked-in worker: HTTP 200 and
+`{"ok":true,"bitrate":4000000}`. The route clamps to 500 kbps–50 Mbps, sends
+`{"type":"bitrate","bitrate":<bps>}` to the helper, and returns success only
+after the worker's acknowledgement. A helper that ignores the message or
+replies `{"ok":false,...}` is a typed 502. Live evidence is in
+[`gate2-live-webrtc-report.md`](gate2-live-webrtc-report.md).
+
+Automated GStreamer alternative (no browser automation required):
+
+```bash
+python3 scripts/gate2/webrtc-client.py \
+  --node-url "$NODE" \
+  --audio \
+  --duration 8 \
+  --bitrate 4000000 \
+  --report-json /tmp/gate2-webrtc.json
+```
+
+This creates a real receive-only offer, completes ICE/DTLS, counts decoded
+H.264 (and Opus when `--audio` is configured) buffers, and prints/exits
+nonzero when media does not arrive. A browser run is still required to prove
+the controller dashboard path.
 
 Artifact: the offer, the node answer, the controller answer, a browser
 screenshot/video with media, and optionally a `chrome://webrtc-internals` dump.
+For the GStreamer alternative, attach the offer/answer SDP and the report JSON.
 
 ### Step 8 — Controller dashboard proxy
 
@@ -510,7 +532,7 @@ Artifact: the process list after shutdown and the node's shutdown log.
 | Power | `check-node.sh` `/power/state` and controller proxy | 200, `available:true`, real status | Both responses |
 | Input key/mouse | Manual + optional controller release route | `ok:true` with `sink:"qmp"`/`"uinput"`, guest visible | Guest screenshot/video |
 | HLS | `check-node.sh` playlist fetch/advance; controller proxy | 200, `#EXTM3U`, playlist advances, proxy 200, H.264 segment | Two playlists, `ffprobe`, player screenshot |
-| WebRTC | `check-node.sh` real-SDP offer (if provided) + manual browser | 200 answer, non-empty SDP, browser media | Offer/answers, browser screenshot/internals |
+| WebRTC | `check-node.sh` real-SDP offer (if provided) + `webrtc-client.py` + manual browser | 200 answer with candidates; `webrtc-client.py` reaches ICE/DTLS connected and decodes H.264 (and optional Opus); browser media remains manual | Offer/answers, client report JSON, browser screenshot/internals |
 | Controller dashboard | Manual | Node visible, activate, live view, input, WebRTC | Dashboard screenshots |
 | Cleanup | Manual + `check-node.sh` not applicable | Node exits, child processes reaped, VM untouched | Process list/log |
 
@@ -527,6 +549,7 @@ negotiation was proven; a skipped HLS check means the node was not started with
 | `scripts/gate2/check-node.sh` | `/health`, `/api/v1/connection`, `/power/state`, HLS playlist + advance when running, `/webrtc/offer` only when a helper is configured, and optional controller health/registration/power/HLS/input-route checks. | `1` on any failed check; `0` with warnings/skips; `2` on usage errors. |
 | `scripts/gate2/run-gate2.sh` | Runs both and writes `$OZMA_GATE2_REPORT_DIR/gate2-<UTC>.log`. Tokens are reported only as configured/not-configured. | `1` if either stage failed. |
 | `ozma-node/tests/gate2_live.rs` | Rust HTTP checks for health/connection/power/HLS and an optional real-SDP WebRTC offer. | `#[ignore]` + env-gated; skips cleanly without `OZMA_GATE2_NODE_URL`. |
+| `scripts/gate2/webrtc-client.py` | Real GStreamer `webrtcbin` client: receive-only H.264 (+ optional Opus) offer, ICE/DTLS, decoded-media counters, optional `/webrtc/bitrate`. Uses system Python/GStreamer; installs nothing. | `0` when connected and at least one video buffer arrived; `1` on negotiation/media failure; `2` on usage/environment failure. |
 
 See [`scripts/gate2/README.md`](../scripts/gate2/README.md) for the full
 environment-variable table.
@@ -547,12 +570,18 @@ parity matrix until the underlying work lands.
    `Unknown format 'vnc'`. It supports unauthenticated loopback VNC only, scales
    every frame to the configured size, and carries no VNC audio or input. It is
    a transition path, not the destination.
-3. **WebRTC is helper-first.** There is no native `webrtc-rs`/`str0m` stack and
-   no WebRTC audio. `--webrtc-helper` is required; without it the node reports
-   `not-configured` and answers 503. A configured helper that fails is
-   `failed`, never `running`. `/webrtc/bitrate` returns a typed 502 because the
-   current worker does not acknowledge bitrate changes. `running` means the
-   helper's Unix socket is connected, not that a browser completed ICE/DTLS.
+3. **WebRTC is helper-first.** There is no native `webrtc-rs`/`str0m` stack.
+   `--webrtc-helper` is required; without it the node reports `not-configured`
+   and answers 503. A configured helper that fails is `failed`, never
+   `running`. `/webrtc/bitrate` returns success only on the worker's
+   `{"ok":true,...}` acknowledgement (typed 502 otherwise) and clamps to
+   500 kbps–50 Mbps. ICE is non-trickle: the worker accepts candidates embedded
+   in the offer and appends its gathered host candidates to the answer; there
+   is no STUN/TURN. A live GStreamer peer completed ICE/DTLS and decoded H.264
+   and Opus in [`gate2-live-webrtc-report.md`](gate2-live-webrtc-report.md),
+   but a browser/controller-dashboard run is still required. `running` by
+   itself means the helper's Unix socket is connected, not that a peer
+   completed ICE/DTLS.
 4. **HLS does not delete old segments.** The ffmpeg argv has no
    `-hls_flags delete_segments`; retained `.ts` files accumulate. The playlist
    keeps four entries by default. `/stream/*` is unauthenticated by design so

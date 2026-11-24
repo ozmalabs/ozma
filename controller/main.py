@@ -998,7 +998,7 @@ async def run(config: Config) -> None:
             rust_driver_process.wait()
         log.info("Rust drivers subprocess terminated")
     # Stop GraphQL subscription event router
-    from controller.gql.subscriptions import stop_event_router
+    from gql.subscriptions import stop_event_router
     stop_event_router()
     await hid.stop()
     await controls.stop()

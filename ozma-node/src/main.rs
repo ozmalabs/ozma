@@ -386,7 +386,7 @@ fn default_hw() -> String {
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
+    let mut args = Args::parse();
 
     let level = if args.debug { "debug" } else { "info" };
     tracing_subscriber::fmt()
@@ -406,7 +406,7 @@ async fn main() {
     );
     let providers =
         ProviderSelection::for_profile(args.profile).with_overrides(&provider_overrides);
-    let config = NodeConfig {
+    let mut config = NodeConfig {
         name: args.name.clone(),
         node_id: node_id.clone(),
         hid_udp_port: args.hid_udp_port,
@@ -467,6 +467,24 @@ async fn main() {
         display_outputs_json: args.display_outputs_json.clone(),
         pci_devices_json: args.pci_devices_json.clone(),
     };
+
+    // A configured power backend must be visible to the controller dashboard.
+    // The controller renders power controls from the registration `cap` string,
+    // not from the protocol capability object, so keep both in sync.
+    let has_power_backend = config
+        .vm_providers()
+        .map(|providers| providers.power.is_some())
+        .unwrap_or(false);
+    if has_power_backend && !config.has_capability("power") {
+        config.capabilities.push("power".to_owned());
+        let advertised = args.cap.split(',').map(str::trim).collect::<Vec<_>>();
+        if !advertised.contains(&"power") {
+            if !args.cap.trim().is_empty() {
+                args.cap.push(',');
+            }
+            args.cap.push_str("power");
+        }
+    }
 
     if let Err(error) = config.validate() {
         error!("Invalid node configuration: {error}");

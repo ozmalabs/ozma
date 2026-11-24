@@ -165,6 +165,21 @@ impl CaptureRegistry {
         self
     }
 
+    /// Add a QEMU D-Bus display provider that shares the node's control client.
+    ///
+    /// QEMU accepts one client per `-qmp` chardev. When the node owns a single
+    /// [`ozma_qmp::SharedQmpClient`], register the D-Bus provider with this
+    /// method so its `getfd`/`add_client` handoff never opens a second control
+    /// connection.
+    pub fn with_dbus_display_shared(
+        mut self,
+        config: crate::dbus_display::DBusDisplayConfig,
+        shared: ozma_qmp::SharedQmpClient,
+    ) -> Self {
+        self.register(crate::dbus_display::DBusDisplayProvider::with_shared_client(config, shared));
+        self
+    }
+
     /// Add a Looking Glass KVMFR provider.
     ///
     /// Like the QMP provider, this is opt-in: a hardware node has no IVSHMEM

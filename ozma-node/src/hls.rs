@@ -28,7 +28,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axum::Router;
@@ -764,6 +764,106 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Monotonic clock used by [`FramePacer`].
+///
+/// Production uses [`SystemClock`]. Tests inject a manual clock so pacing is
+/// asserted from synthetic timestamps without sleeping.
+pub trait HlsClock: Send + Sync {
+    /// Current monotonic time.
+    fn now(&self) -> Instant;
+}
+
+/// The real monotonic clock.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemClock;
+
+impl HlsClock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+/// Wall-clock pacer for the raw-frame feeder.
+///
+/// ffmpeg is told the input is `-r fps`, so every frame written to its stdin
+/// advances media time by exactly `1 / fps`. A capture source can produce
+/// frames much faster than that (the QMP display polls its own ceiling and can
+/// run roughly six times faster than a 5 fps HLS timebase), which makes the
+/// playlist's media time run ahead of wall time. This pacer drops frames that
+/// arrive before their slot and admits at most `fps` frames per wall-clock
+/// second.
+///
+/// The first frame is admitted immediately: `start` is the initial deadline.
+/// After a written frame the deadline advances by one interval. A late frame
+/// is still written, but a schedule that fell more than one interval behind is
+/// reset to `now + interval` instead of banking a burst of catch-up frames.
+#[derive(Clone, Debug)]
+pub struct FramePacer {
+    interval: Duration,
+    next_deadline: Instant,
+    emitted: u64,
+    dropped: u64,
+}
+
+impl FramePacer {
+    /// Create a pacer for `fps` whose first frame is due at `start`.
+    ///
+    /// `fps` is clamped to at least one. [`HlsConfig::validate`] already
+    /// rejects zero before a pipeline starts; the clamp protects direct
+    /// callers of the pacer.
+    pub fn new(fps: u32, start: Instant) -> Self {
+        Self {
+            interval: Self::interval_for(fps),
+            next_deadline: start,
+            emitted: 0,
+            dropped: 0,
+        }
+    }
+
+    /// One frame interval for `fps`, at least one nanosecond.
+    pub fn interval_for(fps: u32) -> Duration {
+        let nanos = 1_000_000_000u64 / u64::from(fps.max(1));
+        Duration::from_nanos(nanos.max(1))
+    }
+
+    /// Decide whether a frame observed at `now` should be written.
+    ///
+    /// Early frames are dropped without being written. A late frame is
+    /// admitted; the following slot is one interval after `now` when the
+    /// schedule fell further behind than that, so a stall cannot accumulate
+    /// unbounded catch-up debt.
+    pub fn should_emit(&mut self, now: Instant) -> bool {
+        if now < self.next_deadline {
+            self.dropped += 1;
+            return false;
+        }
+        self.emitted += 1;
+        self.next_deadline += self.interval;
+        if self.next_deadline <= now {
+            // The source or an ffmpeg write stalled. Do not bank a burst of
+            // catch-up frames: the next slot is one interval from the frame
+            // that was just written.
+            self.next_deadline = now + self.interval;
+        }
+        true
+    }
+
+    /// Frames admitted by this pacer.
+    pub fn emitted(&self) -> u64 {
+        self.emitted
+    }
+
+    /// Frames dropped by this pacer.
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    /// Next scheduled slot.
+    pub fn next_deadline(&self) -> Instant {
+        self.next_deadline
+    }
+}
+
 /// Destination for converted raw frames.
 ///
 /// The ffmpeg child's stdin implements this; tests inject a recording sink so
@@ -1153,12 +1253,24 @@ impl HlsPipeline {
     /// Start with an injected process factory and encoder probe.
     ///
     /// Production uses [`SystemEncoderProbe`]; tests inject a static list so
-    /// no real ffmpeg or GPU is required.
+    /// no real ffmpeg or GPU is required. Pacing uses [`SystemClock`]; use the
+    /// crate-internal clock-aware constructor for deterministic tests.
     pub fn start_with_spawner_and_probe(
         source: Box<dyn CaptureSource>,
         config: HlsConfig,
         spawner: Arc<dyn FfmpegSpawner>,
         probe: Arc<dyn EncoderProbe>,
+    ) -> Result<Self, HlsError> {
+        Self::start_with_clock(source, config, spawner, probe, Arc::new(SystemClock))
+    }
+
+    /// Start with an injected process factory, encoder probe, and clock.
+    fn start_with_clock(
+        source: Box<dyn CaptureSource>,
+        config: HlsConfig,
+        spawner: Arc<dyn FfmpegSpawner>,
+        probe: Arc<dyn EncoderProbe>,
+        clock: Arc<dyn HlsClock>,
     ) -> Result<Self, HlsError> {
         let config = config.validated()?;
         validate_encoder_runtime(&config, probe.as_ref())?;
@@ -1200,6 +1312,7 @@ impl HlsPipeline {
             child_slot.clone(),
             cancel.clone(),
             sink,
+            clock,
         ));
 
         Ok(Self {
@@ -1663,7 +1776,9 @@ async fn run_pipeline(
     child: Arc<Mutex<Option<Child>>>,
     cancel: Arc<Notify>,
     mut sink: Option<Box<dyn FrameSink>>,
+    clock: Arc<dyn HlsClock>,
 ) {
+    let mut pacer = FramePacer::new(config.fps, clock.now());
     let mut wrote_frame = false;
     loop {
         let frame = match tokio::select! {
@@ -1684,6 +1799,13 @@ async fn run_pipeline(
                 break;
             }
         };
+
+        // ffmpeg's input timebase is `-r fps`, so only write frames that are
+        // due. Dropping here keeps playlist media time close to wall time and
+        // avoids converting a frame ffmpeg will never see.
+        if !pacer.should_emit(clock.now()) {
+            continue;
+        }
 
         if frame.format().pixel_format != declared.pixel_format {
             status.set_failed(format!(
@@ -2050,6 +2172,8 @@ mod tests {
         frames: VecDeque<Result<Frame, MediaError>>,
         hang_when_empty: bool,
         stopped: Arc<AtomicBool>,
+        clock: Option<(Arc<ManualClock>, Duration)>,
+        seen_frame: bool,
     }
 
     impl FakeSource {
@@ -2065,9 +2189,19 @@ mod tests {
                     frames: frames.into(),
                     hang_when_empty,
                     stopped: stopped.clone(),
+                    clock: None,
+                    seen_frame: false,
                 },
                 stopped,
             )
+        }
+
+        /// Timestamp frame `n` at `clock + n * step`, so the first frame is
+        /// due exactly when the pipeline starts and tests drive the pacer
+        /// without sleeping.
+        fn with_clock(mut self, clock: Arc<ManualClock>, step: Duration) -> Self {
+            self.clock = Some((clock, step));
+            self
         }
     }
 
@@ -2083,6 +2217,12 @@ mod tests {
 
         async fn next_frame(&mut self) -> Result<Frame, MediaError> {
             if let Some(frame) = self.frames.pop_front() {
+                if let Some((clock, step)) = self.clock.as_ref() {
+                    if self.seen_frame {
+                        clock.advance(*step);
+                    }
+                    self.seen_frame = true;
+                }
                 return frame;
             }
             if self.hang_when_empty {
@@ -2094,6 +2234,36 @@ mod tests {
         async fn stop(&mut self) -> Result<(), MediaError> {
             self.stopped.store(true, Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    /// Manually advanced monotonic clock for deterministic pacing tests.
+    struct ManualClock {
+        now: Mutex<Instant>,
+    }
+
+    impl ManualClock {
+        fn new(start: Instant) -> Arc<Self> {
+            Arc::new(Self {
+                now: Mutex::new(start),
+            })
+        }
+
+        fn advance(&self, step: Duration) {
+            let mut now = self
+                .now
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *now += step;
+        }
+    }
+
+    impl HlsClock for ManualClock {
+        fn now(&self) -> Instant {
+            *self
+                .now
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
         }
     }
 
@@ -2219,6 +2389,88 @@ mod tests {
         assert_eq!(config.gop_frames(), 30);
         assert_eq!(config.force_key_frames_expr(), "expr:gte(t,n_forced*1)");
         config.validate().expect("defaults are valid");
+    }
+
+    #[test]
+    fn pacer_emits_at_most_the_configured_frames_per_second() {
+        let start = Instant::now();
+
+        // 30 frames presented at a 30 fps cadence all fit the 30 fps budget.
+        let mut pacer = FramePacer::new(30, start);
+        let mut emitted = 0;
+        for index in 0..30 {
+            let now = start + Duration::from_secs_f64(f64::from(index) / 30.0);
+            if pacer.should_emit(now) {
+                emitted += 1;
+            }
+        }
+        assert_eq!(emitted, 30, "30 fps input fits the 30 fps budget");
+        assert_eq!(pacer.emitted(), 30);
+        assert_eq!(pacer.dropped(), 0);
+
+        // The same 30 frames against a 5 fps budget fit five slots in one
+        // second: 0.0, 0.2, 0.4, 0.6, and 0.8 s.
+        let mut pacer = FramePacer::new(5, start);
+        let mut emitted = 0;
+        for index in 0..30 {
+            let now = start + Duration::from_secs_f64(f64::from(index) / 30.0);
+            if pacer.should_emit(now) {
+                emitted += 1;
+            }
+        }
+        assert_eq!(emitted, 5, "5 fps budget emits five of thirty frames");
+        assert_eq!(pacer.emitted(), 5);
+        assert_eq!(pacer.dropped(), 25);
+    }
+
+    #[test]
+    fn pacer_drops_early_frames_and_admits_late_ones() {
+        let start = Instant::now();
+        let mut pacer = FramePacer::new(5, start);
+
+        // The first frame is due immediately.
+        assert!(pacer.should_emit(start), "first frame is emitted at once");
+        assert!(!pacer.should_emit(start + Duration::from_millis(199)));
+        assert!(pacer.should_emit(start + Duration::from_millis(200)));
+
+        // A late frame is still written.
+        assert!(pacer.should_emit(start + Duration::from_millis(650)));
+        // 650 ms is more than one 200 ms interval after the schedule, so the
+        // next slot is 850 ms, not a banked 400 ms catch-up slot.
+        assert_eq!(
+            pacer.next_deadline(),
+            start + Duration::from_millis(850),
+            "catch-up debt is clamped to one interval"
+        );
+        assert!(!pacer.should_emit(start + Duration::from_millis(849)));
+        assert!(pacer.should_emit(start + Duration::from_millis(850)));
+
+        // A slightly late frame (< one interval) keeps the original phase.
+        let mut pacer = FramePacer::new(10, start);
+        assert!(pacer.should_emit(start));
+        assert!(pacer.should_emit(start + Duration::from_millis(120)));
+        assert_eq!(
+            pacer.next_deadline(),
+            start + Duration::from_millis(200),
+            "small lateness does not rebase the schedule"
+        );
+        assert!(!pacer.should_emit(start + Duration::from_millis(199)));
+        assert!(pacer.should_emit(start + Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn pacer_interval_is_a_positive_duration_for_every_valid_fps() {
+        for fps in [1, 5, 24, 30, 60, u32::MAX] {
+            assert!(
+                FramePacer::interval_for(fps) >= Duration::from_nanos(1),
+                "fps {fps} must have a positive interval"
+            );
+        }
+        assert_eq!(FramePacer::interval_for(5), Duration::from_millis(200));
+        assert_eq!(
+            FramePacer::interval_for(30),
+            Duration::from_nanos(33_333_333)
+        );
     }
 
     #[test]
@@ -2782,16 +3034,20 @@ mod tests {
         let first = rgb_frame(2, 2, 0, 0x10);
         let second = rgb_frame(2, 2, 1, 0x20);
         let (source, stopped) = FakeSource::new(format, vec![Ok(first), Ok(second)], false);
+        let clock = ManualClock::new(Instant::now());
+        let source = source.with_clock(clock.clone(), Duration::from_millis(50));
 
         let recording = RecordingSpawner::default();
         let writes = recording.writes.clone();
-        let mut pipeline = HlsPipeline::start_with_spawner(
+        let mut pipeline = HlsPipeline::start_with_clock(
             Box::new(source),
             HlsConfig {
                 output_dir: directory.clone(),
                 ..HlsConfig::default()
             },
             spawner(recording),
+            Arc::new(StaticEncoderProbe::software()),
+            clock,
         )
         .expect("start pipeline");
 
@@ -2803,6 +3059,46 @@ mod tests {
         assert_eq!(writes[1], vec![0x20; 2 * 2 * 3]);
         assert!(!pipeline.is_running());
         assert_eq!(pipeline.status().state(), HlsState::Stopped);
+        pipeline.stop().await.expect("stop");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn pipeline_pacer_forwards_at_most_the_configured_rate_and_stops_on_eos() {
+        let directory = temp_dir("pacer-rate");
+        let format = FrameFormat::rgb24(1, 1);
+        let frames = (0..10)
+            .map(|sequence| Ok(rgb_frame(1, 1, sequence, sequence as u8)))
+            .collect();
+        let clock = ManualClock::new(Instant::now());
+        let (source, stopped) = FakeSource::new(format, frames, false);
+        // Ten frames arrive every 100 ms (10 fps of input) against a 2 fps
+        // HLS timebase. Slots are 500 ms, so only two frames are written.
+        let source = source.with_clock(clock.clone(), Duration::from_millis(100));
+
+        let recording = RecordingSpawner::default();
+        let writes = recording.writes.clone();
+        let closed = recording.closed.clone();
+        let mut pipeline = HlsPipeline::start_with_clock(
+            Box::new(source),
+            HlsConfig {
+                output_dir: directory.clone(),
+                fps: 2,
+                ..HlsConfig::default()
+            },
+            spawner(recording),
+            Arc::new(StaticEncoderProbe::software()),
+            clock,
+        )
+        .expect("start pipeline");
+
+        wait_until(|| stopped.load(Ordering::SeqCst) && writes.lock().unwrap().len() == 2).await;
+        // EOS is clean: the sink is closed, the source stops, and the status
+        // is `stopped`, not `failed`.
+        assert!(closed.load(Ordering::SeqCst));
+        assert_eq!(pipeline.status().state(), HlsState::Stopped);
+        assert!(!pipeline.is_running());
+        assert_eq!(writes.lock().unwrap().len(), 2);
         pipeline.stop().await.expect("stop");
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -3221,6 +3517,8 @@ mod tests {
             .map(|sequence| Ok(rgb_frame(64, 48, sequence, sequence as u8)))
             .collect();
         let (source, _) = FakeSource::new(format, frames, false);
+        let clock = ManualClock::new(Instant::now());
+        let source = source.with_clock(clock.clone(), Duration::from_millis(100));
         let config = HlsConfig {
             output_dir: directory.clone(),
             segment_seconds: 0.5,
@@ -3229,7 +3527,14 @@ mod tests {
             bitrate_kbps: 500,
             ..HlsConfig::default()
         };
-        let mut pipeline = HlsPipeline::start(Box::new(source), config).expect("start ffmpeg");
+        let mut pipeline = HlsPipeline::start_with_clock(
+            Box::new(source),
+            config,
+            Arc::new(SystemFfmpegSpawner),
+            Arc::new(StaticEncoderProbe::software()),
+            clock,
+        )
+        .expect("start ffmpeg");
 
         for _ in 0..200 {
             if pipeline.manifest_path().is_file() {
