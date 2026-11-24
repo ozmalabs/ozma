@@ -13,6 +13,7 @@ pub mod controller_compat;
 pub mod display_compat;
 pub mod hls;
 pub mod input_select;
+pub mod keyboard_layout;
 pub mod mdns;
 pub mod platform;
 pub mod registration;

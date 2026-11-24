@@ -52,6 +52,7 @@ use tracing::{debug, info, warn};
 
 use crate::display_compat::{DisplayInfo, SnapshotControl, SnapshotError};
 use crate::hls::{HlsController, HlsEncoder, HlsError, HlsStatus};
+use crate::keyboard_layout::{key_event, CharOutcome, KeyChord, KeyboardLayout};
 use crate::webrtc::{WebRtcControl, WebRtcError};
 
 /// HID packet type for an 8-byte boot keyboard report.
@@ -1232,6 +1233,8 @@ pub struct ConnectionState {
     pub hls_control: Option<HlsController>,
     /// The one sink shared with session input and the UDP HID listener.
     pub input_sink: Option<SharedSink>,
+    /// Guest keyboard layout used by `POST /input/type`.
+    pub keyboard_layout: KeyboardLayout,
     /// Base status derived from the advertised capabilities. When a
     /// [`CodecControl`] is attached its live status replaces this value.
     pub codecs: CodecStatus,
@@ -1258,6 +1261,7 @@ impl ConnectionState {
             hls: None,
             hls_control: None,
             input_sink: None,
+            keyboard_layout: KeyboardLayout::Us,
             codecs: CodecStatus::not_configured(),
             codec_control: None,
             audio: None,
@@ -1302,6 +1306,15 @@ impl ConnectionState {
     /// compatibility `/input/*` routes never open a second backend.
     pub fn with_input_sink(mut self, sink: Option<SharedSink>) -> Self {
         self.input_sink = sink;
+        self
+    }
+
+    /// Select the guest keyboard layout used to map typed text to HID usages.
+    ///
+    /// The layout must match the guest's console keymap (`us`, `uk`, `de`, or
+    /// `fr`). It is not detected from the guest.
+    pub fn with_keyboard_layout(mut self, layout: KeyboardLayout) -> Self {
+        self.keyboard_layout = layout;
         self
     }
 
@@ -1921,15 +1934,31 @@ struct TypeRequest {
 /// A text-to-keystroke mapping failure.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TextMappingError {
-    /// A character has no unambiguous US-layout HID keyboard usage.
+    /// A character has no direct key on the selected layout.
     #[error(
-        "unsupported character {character:?} at index {index}; only printable ASCII, newline, and tab are supported"
+        "unsupported character {character:?} at index {index} for keyboard layout `{layout}`; \
+         only characters the layout types directly are accepted, and IME/compose input is not supported"
     )]
     Unsupported {
         /// The offending character.
         character: char,
         /// Zero-based character (not byte) index.
         index: usize,
+        /// The selected layout.
+        layout: KeyboardLayout,
+    },
+    /// A character is only reachable through a dead-key sequence on this layout.
+    #[error(
+        "character {character:?} at index {index} requires a dead-key sequence on keyboard layout \
+         `{layout}`; dead keys and compose are not supported, so nothing was typed"
+    )]
+    DeadKey {
+        /// The offending character.
+        character: char,
+        /// Zero-based character (not byte) index.
+        index: usize,
+        /// The selected layout.
+        layout: KeyboardLayout,
     },
     /// The request exceeded [`MAX_TYPE_TEXT_CHARS`].
     #[error("text is {actual} characters; the limit is {limit}")]
@@ -1941,67 +1970,11 @@ pub enum TextMappingError {
     },
 }
 
-/// Map a printable-ASCII character to a US-layout HID usage and shift state.
-fn ascii_hid_usage(character: char) -> Option<(u8, bool)> {
-    match character {
-        'a'..='z' => Some(((character as u8 - b'a') + 0x04, false)),
-        'A'..='Z' => Some(((character as u8 - b'A') + 0x04, true)),
-        '1'..='9' => Some(((character as u8 - b'1') + 0x1E, false)),
-        '0' => Some((0x27, false)),
-        '\n' | '\r' => Some((0x28, false)), // Enter
-        '\t' => Some((0x2B, false)),        // Tab
-        ' ' => Some((0x2C, false)),         // Space
-        '-' => Some((0x2D, false)),
-        '_' => Some((0x2D, true)),
-        '=' => Some((0x2E, false)),
-        '+' => Some((0x2E, true)),
-        '[' => Some((0x2F, false)),
-        '{' => Some((0x2F, true)),
-        ']' => Some((0x30, false)),
-        '}' => Some((0x30, true)),
-        '\\' => Some((0x31, false)),
-        '|' => Some((0x31, true)),
-        ';' => Some((0x33, false)),
-        ':' => Some((0x33, true)),
-        '\'' => Some((0x34, false)),
-        '"' => Some((0x34, true)),
-        '`' => Some((0x35, false)),
-        '~' => Some((0x35, true)),
-        ',' => Some((0x36, false)),
-        '<' => Some((0x36, true)),
-        '.' => Some((0x37, false)),
-        '>' => Some((0x37, true)),
-        '/' => Some((0x38, false)),
-        '?' => Some((0x38, true)),
-        '!' => Some((0x1E, true)),
-        '@' => Some((0x1F, true)),
-        '#' => Some((0x20, true)),
-        '$' => Some((0x21, true)),
-        '%' => Some((0x22, true)),
-        '^' => Some((0x23, true)),
-        '&' => Some((0x24, true)),
-        '*' => Some((0x25, true)),
-        '(' => Some((0x26, true)),
-        ')' => Some((0x27, true)),
-        _ => None,
-    }
-}
-
-fn key_event(code: u32, down: bool) -> InputEvent {
-    InputEvent::Key {
-        code,
-        down,
-        modifiers: KeyModifiers(0),
-    }
-}
-
-/// Convert text into per-character key event chunks.
+/// Resolve text into one chord per character, validating the whole request.
 ///
-/// Each chunk is a key-down/up pair (plus left-shift down/up for shifted
-/// characters). The handler sleeps between chunks so the guest sees separate
-/// keystrokes; [`text_to_input_events`] flattens the same mapping for callers
-/// and tests that only need the event sequence.
-fn text_to_key_chunks(text: &str) -> Result<Vec<Vec<InputEvent>>, TextMappingError> {
+/// Validation finishes before any event or sink is touched, so an unsupported
+/// or dead-key-only character anywhere in the request is rejected atomically.
+fn text_to_chords(text: &str, layout: KeyboardLayout) -> Result<Vec<KeyChord>, TextMappingError> {
     let length = text.chars().count();
     if length > MAX_TYPE_TEXT_CHARS {
         return Err(TextMappingError::TooLong {
@@ -2010,33 +1983,60 @@ fn text_to_key_chunks(text: &str) -> Result<Vec<Vec<InputEvent>>, TextMappingErr
         });
     }
 
-    let mut chunks = Vec::with_capacity(length);
+    let mut chords = Vec::with_capacity(length);
     for (index, character) in text.chars().enumerate() {
-        let Some((usage, shift)) = ascii_hid_usage(character) else {
-            return Err(TextMappingError::Unsupported { character, index });
-        };
-        let usage = u32::from(usage);
-        let mut events = Vec::with_capacity(if shift { 4 } else { 2 });
-        if shift {
-            events.push(key_event(0xE1, true)); // left shift
+        match layout.chord(character) {
+            CharOutcome::Direct(chord) => chords.push(chord),
+            CharOutcome::DeadKey => {
+                return Err(TextMappingError::DeadKey {
+                    character,
+                    index,
+                    layout,
+                });
+            }
+            CharOutcome::Unsupported => {
+                return Err(TextMappingError::Unsupported {
+                    character,
+                    index,
+                    layout,
+                });
+            }
         }
-        events.push(key_event(usage, true));
-        events.push(key_event(usage, false));
-        if shift {
-            events.push(key_event(0xE1, false));
-        }
-        chunks.push(events);
     }
-    Ok(chunks)
+    Ok(chords)
+}
+
+/// Convert text into per-character key event chunks.
+///
+/// Each chunk contains the character's key-down/up pair plus any Shift and
+/// AltGr down/up events. The handler sleeps between chunks so the guest sees
+/// separate keystrokes; [`text_to_input_events`] flattens the same mapping for
+/// callers and tests that only need the event sequence.
+fn text_to_key_chunks(
+    text: &str,
+    layout: KeyboardLayout,
+) -> Result<Vec<Vec<InputEvent>>, TextMappingError> {
+    Ok(text_to_chords(text, layout)?
+        .into_iter()
+        .map(KeyChord::events)
+        .collect())
 }
 
 /// Map text to normalized key events without touching a sink.
 ///
 /// This is the pure, testable core of `POST /input/type`. Unsupported
 /// characters are rejected rather than silently dropped or mapped to an
-/// invented keycode.
-pub fn text_to_input_events(text: &str) -> Result<Vec<InputEvent>, TextMappingError> {
-    Ok(text_to_key_chunks(text)?.into_iter().flatten().collect())
+/// invented keycode. `layout` selects the guest's console keymap; the event
+/// sequence includes explicit left-Shift and right-Alt (AltGr) press/release
+/// pairs where the layout requires them.
+pub fn text_to_input_events(
+    text: &str,
+    layout: KeyboardLayout,
+) -> Result<Vec<InputEvent>, TextMappingError> {
+    Ok(text_to_key_chunks(text, layout)?
+        .into_iter()
+        .flatten()
+        .collect())
 }
 
 /// Map the controller's Linux mouse button code to a pointer button.
@@ -2259,13 +2259,22 @@ async fn input_mouse(
 /// Submit one character's events, holding the non-modifier key down long
 /// enough for the guest to observe it.
 ///
-/// `text_to_key_chunks` emits either `[key down, key up]` or
-/// `[shift down, key down, key up, shift up]`. Shift-down can share a USB
-/// report with the key-down, and shift-up can share one with the key-up, but the
-/// key-down/key-up pair must straddle a guest poll. If a submit fails midway,
-/// the caller's `release_all` recovers the modifiers and keys already sent.
+/// A chunk starts with zero to two modifier-down events, followed by the
+/// character key-down/up pair and the matching modifier-up events. Modifier
+/// down can share a USB report with the key-down, and modifier up can share one
+/// with the key-up, but the key-down/key-up pair must straddle a guest poll. If
+/// a submit fails midway, the caller's `release_all` recovers the modifiers and
+/// keys already sent.
 async fn submit_key_chunk(sink: &SharedSink, chunk: &[InputEvent]) -> Result<usize, Response> {
-    let press_index = if chunk.len() >= 4 { 1 } else { 0 };
+    let press_index = chunk
+        .iter()
+        .position(|event| match event {
+            InputEvent::Key {
+                code, down: true, ..
+            } => !(0xE0..=0xE7).contains(code),
+            _ => false,
+        })
+        .unwrap_or(0);
     let Some(press) = chunk.get(press_index) else {
         return Ok(0);
     };
@@ -2291,14 +2300,37 @@ async fn input_type(
         Err(error) => return json_rejection(error),
     };
 
-    let chunks = match text_to_key_chunks(&request.text) {
+    // Validate the complete request against the configured layout before the
+    // sink is consulted, so a bad character never produces a partial keystroke
+    // sequence.
+    let chunks = match text_to_key_chunks(&request.text, state.keyboard_layout) {
         Ok(chunks) => chunks,
         Err(error) => {
-            let code = match error {
-                TextMappingError::TooLong { .. } => "text-too-long",
-                TextMappingError::Unsupported { .. } => "unsupported-character",
+            let (code, remediation) = match &error {
+                TextMappingError::TooLong { .. } => ("text-too-long", None),
+                TextMappingError::Unsupported { .. } => (
+                    "unsupported-character",
+                    Some(
+                        "Select the guest's layout with --keyboard-layout (us, uk, de, fr) and \
+                         send characters that layout types directly. IME/compose input is not \
+                         supported; send raw /input/key events for anything else. Nothing was typed.",
+                    ),
+                ),
+                TextMappingError::DeadKey { .. } => (
+                    "dead-key-required",
+                    Some(
+                        "Dead-key sequences and compose are not implemented. Use a layout that \
+                         types the character directly, or send raw /input/key events. Nothing was \
+                         typed.",
+                    ),
+                ),
             };
-            return compat_error(StatusCode::BAD_REQUEST, code, error.to_string());
+            return compat_error_with_remediation(
+                StatusCode::BAD_REQUEST,
+                code,
+                error.to_string(),
+                remediation,
+            );
         }
     };
 
@@ -4191,6 +4223,13 @@ mod tests {
     }
 
     fn input_state(kind: &str) -> (ConnectionState, Arc<RecordingSink<FakeInputSink>>) {
+        input_state_with_layout(kind, KeyboardLayout::Us)
+    }
+
+    fn input_state_with_layout(
+        kind: &str,
+        layout: KeyboardLayout,
+    ) -> (ConnectionState, Arc<RecordingSink<FakeInputSink>>) {
         let recording = Arc::new(RecordingSink::new(FakeInputSink::new()));
         let sink: SharedSink = recording.clone();
         let state = ConnectionState::new(
@@ -4204,7 +4243,8 @@ mod tests {
             ),
             CompatStats::default(),
         )
-        .with_input_sink(Some(sink));
+        .with_input_sink(Some(sink))
+        .with_keyboard_layout(layout);
         (state, recording)
     }
 
@@ -4247,7 +4287,7 @@ mod tests {
 
     #[test]
     fn text_mapping_covers_ascii_letters_digits_punctuation_and_whitespace() {
-        let events = |text: &str| text_to_input_events(text).unwrap();
+        let events = |text: &str| text_to_input_events(text, KeyboardLayout::Us).unwrap();
 
         assert_eq!(events("a"), vec![key(0x04, true), key(0x04, false)]);
         assert_eq!(events("z"), vec![key(0x1D, true), key(0x1D, false)]);
@@ -4458,28 +4498,31 @@ mod tests {
         events
     }
 
+    fn us_direct(character: char) -> (u8, bool) {
+        match KeyboardLayout::Us.chord(character) {
+            CharOutcome::Direct(chord) => (chord.usage, chord.shift),
+            other => panic!("US {character:?} is {other:?}"),
+        }
+    }
+
     #[test]
     fn text_mapping_covers_every_printable_ascii_character_exactly_once() {
         for &(character, usage) in UNSHIFTED_HID {
             assert_eq!(
-                ascii_hid_usage(character),
-                Some((usage, false)),
+                us_direct(character),
+                (usage, false),
                 "unshifted {character:?}"
             );
             assert_eq!(
-                text_to_input_events(&character.to_string()).unwrap(),
+                text_to_input_events(&character.to_string(), KeyboardLayout::Us).unwrap(),
                 expected_char_events(usage, false),
                 "events for {character:?}"
             );
         }
         for &(character, usage) in SHIFTED_HID {
+            assert_eq!(us_direct(character), (usage, true), "shifted {character:?}");
             assert_eq!(
-                ascii_hid_usage(character),
-                Some((usage, true)),
-                "shifted {character:?}"
-            );
-            assert_eq!(
-                text_to_input_events(&character.to_string()).unwrap(),
+                text_to_input_events(&character.to_string(), KeyboardLayout::Us).unwrap(),
                 expected_char_events(usage, true),
                 "events for {character:?}"
             );
@@ -4499,8 +4542,8 @@ mod tests {
     #[test]
     fn every_shift_pair_shares_a_usage_and_differs_only_in_shift() {
         for &(plain, shifted) in SHIFT_PAIRS {
-            let (plain_usage, plain_shift) = ascii_hid_usage(plain).unwrap();
-            let (shifted_usage, shifted_shift) = ascii_hid_usage(shifted).unwrap();
+            let (plain_usage, plain_shift) = us_direct(plain);
+            let (shifted_usage, shifted_shift) = us_direct(shifted);
             assert!(!plain_shift, "{plain:?} must not require shift");
             assert!(shifted_shift, "{shifted:?} must require shift");
             assert_eq!(
@@ -4513,23 +4556,25 @@ mod tests {
     #[test]
     fn text_mapping_rejects_unsupported_characters_and_oversized_text() {
         assert_eq!(
-            text_to_input_events("aé").unwrap_err(),
+            text_to_input_events("aé", KeyboardLayout::Us).unwrap_err(),
             TextMappingError::Unsupported {
                 character: 'é',
                 index: 1,
+                layout: KeyboardLayout::Us,
             }
         );
         assert_eq!(
-            text_to_input_events("日本").unwrap_err(),
+            text_to_input_events("日本", KeyboardLayout::Us).unwrap_err(),
             TextMappingError::Unsupported {
                 character: '日',
                 index: 0,
+                layout: KeyboardLayout::Us,
             }
         );
 
         let oversized = "a".repeat(MAX_TYPE_TEXT_CHARS + 1);
         assert_eq!(
-            text_to_input_events(&oversized).unwrap_err(),
+            text_to_input_events(&oversized, KeyboardLayout::Us).unwrap_err(),
             TextMappingError::TooLong {
                 actual: MAX_TYPE_TEXT_CHARS + 1,
                 limit: MAX_TYPE_TEXT_CHARS,
@@ -4538,9 +4583,212 @@ mod tests {
         // The exact bound is accepted.
         let at_limit = "a".repeat(MAX_TYPE_TEXT_CHARS);
         assert_eq!(
-            text_to_input_events(&at_limit).unwrap().len(),
+            text_to_input_events(&at_limit, KeyboardLayout::Us)
+                .unwrap()
+                .len(),
             MAX_TYPE_TEXT_CHARS * 2
         );
+    }
+
+    #[test]
+    fn uk_layout_uses_iso_positions_for_shifted_punctuation() {
+        let events = |text: &str| text_to_input_events(text, KeyboardLayout::Uk).unwrap();
+
+        assert_eq!(
+            events("\""),
+            vec![
+                key(0xE1, true),
+                key(0x1F, true),
+                key(0x1F, false),
+                key(0xE1, false),
+            ]
+        );
+        assert_eq!(
+            events("£"),
+            vec![
+                key(0xE1, true),
+                key(0x20, true),
+                key(0x20, false),
+                key(0xE1, false),
+            ]
+        );
+        assert_eq!(events("#"), vec![key(0x32, true), key(0x32, false)]);
+        assert_eq!(
+            events("~"),
+            vec![
+                key(0xE1, true),
+                key(0x32, true),
+                key(0x32, false),
+                key(0xE1, false),
+            ]
+        );
+        assert_eq!(
+            events("@"),
+            vec![
+                key(0xE1, true),
+                key(0x34, true),
+                key(0x34, false),
+                key(0xE1, false),
+            ]
+        );
+        assert_eq!(events("\\"), vec![key(0x64, true), key(0x64, false)]);
+        assert_eq!(
+            events("|"),
+            vec![
+                key(0xE1, true),
+                key(0x64, true),
+                key(0x64, false),
+                key(0xE1, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn de_layout_uses_qwertz_altgr_and_umlauts() {
+        let events = |text: &str| text_to_input_events(text, KeyboardLayout::De).unwrap();
+
+        assert_eq!(events("z"), vec![key(0x1C, true), key(0x1C, false)]);
+        assert_eq!(events("y"), vec![key(0x1D, true), key(0x1D, false)]);
+        assert_eq!(events("ä"), vec![key(0x34, true), key(0x34, false)]);
+        assert_eq!(events("ß"), vec![key(0x2D, true), key(0x2D, false)]);
+        assert_eq!(events("#"), vec![key(0x32, true), key(0x32, false)]);
+        assert_eq!(
+            events("'"),
+            vec![
+                key(0xE1, true),
+                key(0x32, true),
+                key(0x32, false),
+                key(0xE1, false),
+            ]
+        );
+        assert_eq!(
+            events("@"),
+            vec![
+                key(0xE6, true),
+                key(0x14, true),
+                key(0x14, false),
+                key(0xE6, false),
+            ]
+        );
+        assert_eq!(
+            events("€"),
+            vec![
+                key(0xE6, true),
+                key(0x08, true),
+                key(0x08, false),
+                key(0xE6, false),
+            ]
+        );
+        assert_eq!(
+            events("|"),
+            vec![
+                key(0xE6, true),
+                key(0x64, true),
+                key(0x64, false),
+                key(0xE6, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn fr_layout_uses_azerty_shifted_digits_and_altgr_punctuation() {
+        let events = |text: &str| text_to_input_events(text, KeyboardLayout::Fr).unwrap();
+
+        assert_eq!(events("a"), vec![key(0x14, true), key(0x14, false)]);
+        assert_eq!(events("q"), vec![key(0x04, true), key(0x04, false)]);
+        assert_eq!(events("m"), vec![key(0x33, true), key(0x33, false)]);
+        assert_eq!(
+            events("1"),
+            vec![
+                key(0xE1, true),
+                key(0x1E, true),
+                key(0x1E, false),
+                key(0xE1, false),
+            ]
+        );
+        assert_eq!(events("&"), vec![key(0x1E, true), key(0x1E, false)]);
+        assert_eq!(events("é"), vec![key(0x1F, true), key(0x1F, false)]);
+        assert_eq!(
+            events("@"),
+            vec![
+                key(0xE6, true),
+                key(0x27, true),
+                key(0x27, false),
+                key(0xE6, false),
+            ]
+        );
+        assert_eq!(
+            events("^"),
+            vec![
+                key(0xE6, true),
+                key(0x26, true),
+                key(0x26, false),
+                key(0xE6, false),
+            ]
+        );
+        assert_eq!(
+            events("~"),
+            vec![
+                key(0xE6, true),
+                key(0x1F, true),
+                key(0x1F, false),
+                key(0xE6, false),
+            ]
+        );
+        // Alpine's `fr-latin9` places grave on AltGr+7; AltGr must be released
+        // after the character key.
+        assert_eq!(
+            events("`"),
+            vec![
+                key(0xE6, true),
+                key(0x24, true),
+                key(0x24, false),
+                key(0xE6, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn text_mapping_rejects_dead_keys_and_layout_specific_characters_atomically() {
+        // German `^`, `~`, and `` ` `` are dead keys in `de-latin1`; emitting
+        // the dead key alone would swallow the next character.
+        for character in ['^', '~', '`'] {
+            assert_eq!(
+                text_to_input_events(&format!("ab{character}"), KeyboardLayout::De).unwrap_err(),
+                TextMappingError::DeadKey {
+                    character,
+                    index: 2,
+                    layout: KeyboardLayout::De,
+                }
+            );
+        }
+
+        // Non-ASCII is accepted only where the layout has a direct key.
+        assert_eq!(
+            text_to_input_events("ä", KeyboardLayout::Us).unwrap_err(),
+            TextMappingError::Unsupported {
+                character: 'ä',
+                index: 0,
+                layout: KeyboardLayout::Us,
+            }
+        );
+        assert_eq!(
+            text_to_input_events("é", KeyboardLayout::Uk).unwrap_err(),
+            TextMappingError::Unsupported {
+                character: 'é',
+                index: 0,
+                layout: KeyboardLayout::Uk,
+            }
+        );
+        assert!(!text_to_input_events("é", KeyboardLayout::Fr)
+            .unwrap()
+            .is_empty());
+        assert!(!text_to_input_events("ä", KeyboardLayout::De)
+            .unwrap()
+            .is_empty());
+        assert!(!text_to_input_events("£", KeyboardLayout::Uk)
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -4853,6 +5101,81 @@ mod tests {
         let (status, body) = post_json(&app, "/input/type", serde_json::json!({})).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["events"], 0);
+    }
+
+    #[tokio::test]
+    async fn input_type_route_uses_the_configured_layout_and_releases_altgr() {
+        let (state, recording) = input_state_with_layout(SINK_FAKE_RECORDING, KeyboardLayout::De);
+        let app = input_router(state);
+
+        let (status, body) =
+            post_json(&app, "/input/type", serde_json::json!({"text": "z@€"})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["events"], 10);
+        assert_eq!(
+            recording.take_events(),
+            vec![
+                key(0x1C, true),
+                key(0x1C, false),
+                key(0xE6, true),
+                key(0x14, true),
+                key(0x14, false),
+                key(0xE6, false),
+                key(0xE6, true),
+                key(0x08, true),
+                key(0x08, false),
+                key(0xE6, false),
+            ]
+        );
+        assert!(
+            recording.held().is_empty(),
+            "AltGr and the character keys must be released"
+        );
+    }
+
+    #[tokio::test]
+    async fn input_type_route_rejects_dead_keys_and_unsupported_characters_before_typing() {
+        let (state, recording) = input_state_with_layout(SINK_FAKE_RECORDING, KeyboardLayout::De);
+        let app = input_router(state);
+
+        let (status, body) =
+            post_json(&app, "/input/type", serde_json::json!({"text": "ab^"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "dead-key-required");
+        assert!(body["remediation"].is_string());
+        assert!(recording.events().is_empty());
+
+        let (state, recording) = input_state(SINK_FAKE_RECORDING);
+        let app = input_router(state);
+        let (status, body) =
+            post_json(&app, "/input/type", serde_json::json!({"text": "okä"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "unsupported-character");
+        assert!(body["remediation"].is_string());
+        assert!(recording.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn input_type_route_fr_layout_accepts_french_accents_and_altgr() {
+        let (state, recording) = input_state_with_layout(SINK_FAKE_RECORDING, KeyboardLayout::Fr);
+        let app = input_router(state);
+
+        let (status, body) =
+            post_json(&app, "/input/type", serde_json::json!({"text": "é@"})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["events"], 6);
+        assert_eq!(
+            recording.take_events(),
+            vec![
+                key(0x1F, true),
+                key(0x1F, false),
+                key(0xE6, true),
+                key(0x27, true),
+                key(0x27, false),
+                key(0xE6, false),
+            ]
+        );
+        assert!(recording.held().is_empty());
     }
 
     struct PendingCapture {

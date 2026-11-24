@@ -280,6 +280,7 @@ def test_rotation_api_returns_generated_token_once_and_proxies_it(
     body = response.json()
     assert body["rotated"] is True
     assert body["token_returned_once"] is True
+    assert body["fallback_configured"] is False
     new_token = body["token"]
     assert new_token and new_token != TOKEN
 
@@ -292,6 +293,7 @@ def test_rotation_api_returns_generated_token_once_and_proxies_it(
     meta = client.get(f"/api/v1/nodes/{NODE_ID}/token")
     assert meta.status_code == 200
     assert meta.json()["configured"] is True
+    assert meta.json()["fallback_configured"] is False
     assert "token" not in meta.json()
     assert new_token not in meta.text
 
@@ -358,6 +360,10 @@ def test_revocation_falls_back_to_global_token(fake_node, tmp_path):
     client = _client(app)
 
     assert client.delete(f"/api/v1/nodes/{NODE_ID}/token").status_code == 200
+    meta = client.get(f"/api/v1/nodes/{NODE_ID}/token")
+    assert meta.status_code == 200
+    assert meta.json()["fallback_configured"] is True
+    assert "global-fallback" not in meta.text
     assert client.get(f"/api/v1/nodes/{NODE_ID}/power/state").status_code == 200
 
     auth = fake_node.requests[-1]["headers"]["authorization"]

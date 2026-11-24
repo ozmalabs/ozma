@@ -837,10 +837,12 @@ mod tests {
         assert_eq!(hid_usage_to_linux_keycode(0x80), Some(115)); // Volume up
         assert_eq!(hid_usage_to_linux_keycode(0xB5), Some(163)); // Next track
 
+        // ISO Non-US #~ position shares KEY_BACKSLASH with the US key.
+        assert_eq!(hid_usage_to_linux_keycode(0x32), Some(43));
+
         // Reserved / unmapped usages.
         assert_eq!(hid_usage_to_linux_keycode(0x00), None);
         assert_eq!(hid_usage_to_linux_keycode(0x02), None);
-        assert_eq!(hid_usage_to_linux_keycode(0x32), None);
         assert_eq!(hid_usage_to_linux_keycode(0xFF), None);
     }
 

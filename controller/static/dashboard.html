@@ -768,6 +768,116 @@ select option { background: var(--surface); }
 #modal-img.kvm-active { cursor: none; }
 #modal-video { width: 100%; height: 100%; display: block; background: #000; object-fit: contain; }
 
+/* ── Node API token dialog ─────────────────────────────────────────────────── */
+#token-overlay {
+  display: none;
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,0.82);
+  z-index: 220;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+}
+#token-overlay.open { display: flex; }
+#token-modal {
+  width: min(560px, 96vw);
+  max-height: 92vh;
+  overflow: auto;
+  background: var(--surface);
+  border: 1px solid var(--border2);
+  border-radius: 10px;
+  box-shadow: 0 18px 60px rgba(0,0,0,0.55);
+}
+.token-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.token-head h3 { font-size: 14px; color: #fff; line-height: 1.3; }
+.token-head .token-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.token-head .token-close {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 4px;
+}
+.token-head .token-close:hover { color: #fff; }
+.token-body { padding: 14px 16px 16px; }
+.token-meta {
+  display: grid;
+  grid-template-columns: minmax(90px, auto) 1fr;
+  gap: 6px 12px;
+  font-size: 12px;
+}
+.token-meta .k {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  padding-top: 2px;
+}
+.token-meta .v { color: var(--text); word-break: break-word; }
+.token-meta .v.ok { color: var(--green); font-weight: 600; }
+.token-meta .v.warn { color: var(--yellow); font-weight: 600; }
+.token-meta .v.bad { color: var(--red); font-weight: 600; }
+.token-note {
+  margin-top: 12px;
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface2);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.token-error {
+  margin-top: 10px;
+  padding: 9px 11px;
+  border: 1px solid rgba(242,100,100,0.35);
+  border-radius: 6px;
+  background: rgba(242,100,100,0.08);
+  color: var(--red);
+  font-size: 12px;
+}
+.token-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+.token-reveal {
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid rgba(240,185,74,0.5);
+  border-radius: 7px;
+  background: rgba(240,185,74,0.08);
+}
+.token-reveal .token-warning {
+  color: var(--yellow);
+  font-size: 12px;
+  font-weight: 700;
+  margin-bottom: 5px;
+}
+.token-reveal p { color: var(--text); font-size: 11px; line-height: 1.5; margin-bottom: 9px; }
+.token-reveal-row { display: flex; gap: 8px; align-items: stretch; }
+.token-reveal code {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+  background: #050507;
+  border: 1px solid var(--border2);
+  border-radius: 5px;
+  color: var(--accent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  word-break: break-all;
+  user-select: all;
+}
+.token-reveal .token-dismiss { margin-top: 9px; }
+
 /* ── Responsive ────────────────────────────────────────────────────────────── */
 @media (max-width: 700px) {
   #main { grid-template-columns: 1fr; }
@@ -1312,6 +1422,45 @@ select option { background: var(--surface); }
   </div>
 </div>
 
+<!-- ── Node API token dialog ─────────────────────────────────────────────────── -->
+<div id="token-overlay" role="dialog" aria-modal="true" aria-labelledby="token-title">
+  <div id="token-modal">
+    <div class="token-head">
+      <div>
+        <h3 id="token-title">Node API token</h3>
+        <div class="token-sub" id="token-subtitle"></div>
+      </div>
+      <button class="token-close" id="token-close" type="button" title="Close" aria-label="Close">✕</button>
+    </div>
+    <div class="token-body">
+      <div id="token-loading" style="font-size:12px;color:var(--muted)">Loading token metadata…</div>
+      <div id="token-error" class="token-error" style="display:none"></div>
+      <div id="token-content" style="display:none">
+        <div class="token-meta" id="token-meta"></div>
+        <div class="token-note" id="token-note"></div>
+        <div class="token-actions">
+          <button class="btn sm primary" id="token-rotate" type="button">Generate token</button>
+          <button class="btn sm danger" id="token-revoke" type="button">Revoke token</button>
+          <button class="btn sm" id="token-done" type="button">Close</button>
+        </div>
+        <div class="token-reveal" id="token-reveal" style="display:none">
+          <div class="token-warning">⚠ New token — shown once</div>
+          <p>
+            Copy this token now and configure it on the node. It is not stored in
+            this browser and the controller will not show it again. Closing or
+            dismissing this panel discards it; rotate again if it is lost.
+          </p>
+          <div class="token-reveal-row">
+            <code id="token-reveal-value"></code>
+            <button class="btn sm" id="token-copy" type="button">Copy</button>
+          </div>
+          <button class="btn sm token-dismiss" id="token-dismiss" type="button">I've stored it — hide token</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
 // ── State ─────────────────────────────────────────────────────────────────────
 let nodes     = {};   // id → NodeInfo
@@ -1345,9 +1494,21 @@ async function api(method, path, body) {
     if (data.auth_enabled) {
       location.href = '/auth/login?redirect_to=' + encodeURIComponent(location.pathname);
     }
-    throw new Error('Unauthorized');
+    const err = new Error('Unauthorized');
+    err.status = 401;
+    throw err;
   }
-  if (!r.ok) throw new Error(`${method} ${path} → ${r.status}`);
+  if (!r.ok) {
+    let detail = '';
+    try {
+      const data = await r.json();
+      if (data && typeof data.detail === 'string') detail = data.detail;
+    } catch (_) { /* non-JSON error body */ }
+    const err = new Error(`${method} ${path} → ${r.status}`);
+    err.status = r.status;
+    err.detail = detail;
+    throw err;
+  }
   return r.json();
 }
 
@@ -1432,6 +1593,245 @@ function confirmLogout() {
   return false;
 }
 
+// ── Node API token status / rotation / revocation ─────────────────────────────
+// The controller only returns token-free metadata from GET. A generated token
+// is returned once by PUT; it lives only in the reveal element below until the
+// operator dismisses it. Never write it to storage, logs, or other requests.
+let tokenNodeId = null;
+let tokenBusy = false;
+let tokenConfiguredStatus = false;
+
+function tokenTimestamp(value) {
+  const ts = Number(value);
+  if (!Number.isFinite(ts) || ts <= 0) return '—';
+  try {
+    return new Date(ts * 1000).toLocaleString();
+  } catch (_) {
+    return '—';
+  }
+}
+
+function tokenSourceLabel(source) {
+  switch (String(source || '')) {
+    case 'registration': return 'registration (adopted from the node)';
+    case 'rotation': return 'rotation (set from this controller)';
+    case 'manual': return 'manual (store edit)';
+    case '': return '—';
+    default: return String(source);
+  }
+}
+
+function tokenSetError(message) {
+  const el = $('token-error');
+  if (!el) return;
+  el.textContent = message || '';
+  el.style.display = message ? '' : 'none';
+}
+
+function tokenShowError(err) {
+  const status = err && err.status;
+  let message = 'Could not update node token metadata.';
+  if (status === 401) {
+    message = 'Your session is not authenticated. Sign in and try again.';
+  } else if (status === 403) {
+    message = 'Not permitted — generating or revoking a node token requires write or admin scope.';
+  } else if (status === 404) {
+    message = 'Node not found — it may have been removed.';
+  } else if (status === 400) {
+    message = 'The controller rejected the request.';
+  }
+  tokenSetError(message);
+  $('token-loading').style.display = 'none';
+  $('token-content').style.display = 'none';
+}
+
+function tokenClearReveal() {
+  const value = $('token-reveal-value');
+  if (value) value.textContent = '';
+  const reveal = $('token-reveal');
+  if (reveal) reveal.style.display = 'none';
+  const copy = $('token-copy');
+  if (copy) copy.textContent = 'Copy';
+}
+
+function tokenRenderMeta(meta) {
+  const data = meta || {};
+  const configured = !!data.configured;
+  const revoked = !!data.revoked;
+  const fallback = !!data.fallback_configured;
+  tokenConfiguredStatus = configured;
+
+  const statusText = configured ? 'Configured' : (revoked ? 'Revoked' : 'Not configured');
+  const statusClass = configured ? 'ok' : (revoked ? 'warn' : '');
+  $('token-meta').innerHTML = `
+    <div class="k">status</div><div class="v ${statusClass}">${statusText}</div>
+    <div class="k">source</div><div class="v">${esc(tokenSourceLabel(data.source))}</div>
+    <div class="k">updated</div><div class="v">${tokenTimestamp(data.updated_at)}</div>`;
+
+  let note;
+  if (configured) {
+    note = 'A per-node token is stored by the controller. Rotating replaces it immediately; the node must be reconfigured with the new value out-of-band.';
+  } else if (revoked) {
+    note = fallback
+      ? 'The per-node token is revoked (no re-registration will re-adopt the old value). The controller-wide OZMA_NODE_API_TOKEN fallback will be used.'
+      : 'The per-node token is revoked (no re-registration will re-adopt the old value), and no global fallback is configured; requests will be sent without an Authorization header.';
+  } else {
+    note = fallback
+      ? 'No per-node token is configured. The controller-wide OZMA_NODE_API_TOKEN fallback will be used.'
+      : 'No per-node token and no global fallback are configured; requests will be sent without an Authorization header.';
+  }
+  $('token-note').textContent = note;
+  $('token-rotate').textContent = configured ? 'Rotate token' : 'Generate token';
+  $('token-revoke').disabled = !configured;
+  $('token-loading').style.display = 'none';
+  $('token-content').style.display = '';
+}
+
+async function loadNodeToken() {
+  const id = tokenNodeId;
+  if (!id) return;
+  tokenSetError('');
+  $('token-loading').style.display = '';
+  $('token-content').style.display = 'none';
+  try {
+    const meta = await api('GET', `/nodes/${encodeURIComponent(id)}/token`);
+    if (id !== tokenNodeId) return;
+    tokenRenderMeta(meta);
+  } catch (err) {
+    if (id === tokenNodeId) tokenShowError(err);
+  }
+}
+
+function openNodeToken(nodeId) {
+  if (!nodeId) return;
+  tokenNodeId = nodeId;
+  tokenConfiguredStatus = false;
+  tokenClearReveal();
+  tokenSetError('');
+  $('token-title').textContent = 'Node API token';
+  $('token-subtitle').textContent = shortId(nodeId);
+  $('token-loading').style.display = '';
+  $('token-content').style.display = 'none';
+  $('token-overlay').classList.add('open');
+  loadNodeToken();
+}
+
+function closeNodeToken(force) {
+  const reveal = $('token-reveal');
+  const visible = reveal && reveal.style.display !== 'none';
+  if (visible && !force) {
+    if (!confirm('Discard the one-time token? It will not be shown again.')) return;
+  }
+  tokenClearReveal();
+  tokenNodeId = null;
+  tokenConfiguredStatus = false;
+  tokenSetError('');
+  $('token-content').style.display = 'none';
+  $('token-loading').style.display = '';
+  $('token-overlay').classList.remove('open');
+}
+
+async function rotateNodeToken() {
+  const id = tokenNodeId;
+  if (!id || tokenBusy) return;
+  if (!confirm(`Rotate the API token for ${shortId(id)}?\n\nA new token will be generated and shown once. The node must be reconfigured with it.`)) return;
+
+  tokenBusy = true;
+  tokenClearReveal();
+  tokenSetError('');
+  $('token-rotate').disabled = true;
+  $('token-revoke').disabled = true;
+  try {
+    const data = await api('PUT', `/nodes/${encodeURIComponent(id)}/token`, {});
+    if (id !== tokenNodeId) return;
+    const revealValue = data && data.token_returned_once ? data.token : '';
+    const oneTime = typeof revealValue === 'string' ? revealValue : '';
+    if (data) delete data.token;
+    tokenRenderMeta(data || {});
+    if (oneTime) {
+      $('token-reveal-value').textContent = oneTime;
+      $('token-reveal').style.display = '';
+      $('token-copy').textContent = 'Copy';
+      $('token-copy').focus();
+    } else {
+      tokenSetError('The controller did not return a one-time token. If you supplied a token it is active; otherwise rotate again.');
+    }
+  } catch (err) {
+    if (id === tokenNodeId) tokenShowError(err);
+  } finally {
+    tokenBusy = false;
+    if (id === tokenNodeId) {
+      $('token-rotate').disabled = false;
+      $('token-revoke').disabled = !tokenConfiguredStatus;
+    }
+  }
+}
+
+async function copyNodeToken() {
+  const valueEl = $('token-reveal-value');
+  const value = valueEl ? valueEl.textContent : '';
+  if (!value) return;
+  try {
+    if (!navigator.clipboard || !navigator.clipboard.writeText) throw new Error('clipboard unavailable');
+    await navigator.clipboard.writeText(value);
+    $('token-copy').textContent = 'Copied';
+  } catch (_) {
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(valueEl);
+      const selection = window.getSelection();
+      if (selection) {
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
+      $('token-copy').textContent = 'Select & copy';
+    } catch (_) {
+      $('token-copy').textContent = 'Copy failed';
+    }
+  }
+}
+
+async function revokeNodeToken() {
+  const id = tokenNodeId;
+  if (!id || tokenBusy) return;
+  if (!confirm(`Revoke the API token for ${shortId(id)}?\n\nThe node will fall back to the global controller token if configured; otherwise requests will be sent without an Authorization header.`)) return;
+
+  tokenBusy = true;
+  tokenClearReveal();
+  tokenSetError('');
+  $('token-rotate').disabled = true;
+  $('token-revoke').disabled = true;
+  try {
+    const data = await api('DELETE', `/nodes/${encodeURIComponent(id)}/token`);
+    if (id !== tokenNodeId) return;
+    tokenRenderMeta(data || {});
+  } catch (err) {
+    if (id === tokenNodeId) tokenShowError(err);
+  } finally {
+    tokenBusy = false;
+    if (id === tokenNodeId) {
+      $('token-rotate').disabled = false;
+      $('token-revoke').disabled = !tokenConfiguredStatus;
+    }
+  }
+}
+
+$('token-close').addEventListener('click', () => closeNodeToken(false));
+$('token-done').addEventListener('click', () => closeNodeToken(false));
+$('token-rotate').addEventListener('click', rotateNodeToken);
+$('token-revoke').addEventListener('click', revokeNodeToken);
+$('token-copy').addEventListener('click', copyNodeToken);
+$('token-dismiss').addEventListener('click', tokenClearReveal);
+$('token-overlay').addEventListener('click', e => {
+  if (e.target === $('token-overlay')) closeNodeToken(false);
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && $('token-overlay').classList.contains('open')) {
+    e.stopPropagation();
+    closeNodeToken(false);
+  }
+}, true);
+
 // ── Render: nodes ─────────────────────────────────────────────────────────────
 function renderNodes() {
   const list = $('nodes-list');
@@ -1455,6 +1855,7 @@ function renderNodes() {
             <div style="font-size:11px;color:${isActive ? 'var(--accent)' : 'var(--muted)'};font-weight:600;margin-top:2px">${isActive ? 'Active' : 'Ready'}</div>
           </div>
           ${!isActive ? `<button class="btn sm primary" style="font-size:13px;padding:6px 16px" onclick="activateNode('${eid}')">Switch</button>` : ''}
+          <button class="btn sm" style="font-size:13px;padding:6px 12px" onclick="openNodeToken('${eid}')" title="Node API token status, rotate, revoke">🔑 Token</button>
         </div>
       </div>`;
     }).join('');
@@ -1517,6 +1918,7 @@ function renderNodes() {
         ${hasStream ? `<button class="btn sm" onclick="openConsole('${eid}')" title="Full KVM console">🖥 Console</button>` : ''}
         <button class="btn sm" onclick="openTerminal('${eid}')" title="VGA text terminal (BIOS/console — no stream required)">▶ Terminal</button>
         ${hasUsb ? `<button class="btn sm" id="usb-btn-${eid}" onclick="toggleUsb('${eid}')">⬡ USB</button>` : ''}
+        <button class="btn sm" onclick="openNodeToken('${eid}')" title="Node API token status, rotate, revoke">🔑 Token</button>
       </div>
       ${hasUsb ? `<div class="usb-panel" id="usb-panel-${eid}"><div class="usb-loading">Loading…</div></div>` : ''}
     </div>`;

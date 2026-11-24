@@ -25,13 +25,15 @@ use ozma_node::{
     api,
     config::{
         AudioRouterKind, NodeConfig, NodeProfile, PowerProvider, ProviderOverrides,
-        ProviderSelection, VmProviderConfig, DEFAULT_QMP_COMMAND_TIMEOUT_MS,
-        DEFAULT_QMP_CONNECT_TIMEOUT_MS,
+        ProviderSelection, VmProviderConfig, DEFAULT_FAKE_FPS, DEFAULT_FAKE_HEIGHT,
+        DEFAULT_FAKE_WIDTH, DEFAULT_QMP_COMMAND_TIMEOUT_MS, DEFAULT_QMP_CONNECT_TIMEOUT_MS,
     },
     controller_compat::{self, AudioControl, CodecControl},
     display_compat::SnapshotControl,
     hls::{HlsConfig, HlsController, HlsEncoder, HlsError, HlsSourceFactory, HlsStatus},
-    input_select, mdns, platform, registration, usb_audio,
+    input_select,
+    keyboard_layout::KeyboardLayout,
+    mdns, platform, registration, usb_audio,
     webrtc::{WebRtcAudioBackend, WebRtcConfig, WebRtcControl, WebRtcHelper},
 };
 
@@ -86,6 +88,18 @@ pub struct Args {
     /// Override the profile's input provider (e.g. `hid-gadget`, `uinput`).
     #[arg(long, default_value = "")]
     pub input_provider: String,
+
+    /// Guest keyboard layout used by `POST /input/type` (`us`, `uk`, `de`, `fr`).
+    ///
+    /// This must match the guest's console keymap; it is not detected. Dead
+    /// keys and IME/compose are not supported and are rejected before typing.
+    #[arg(
+        long,
+        env = "OZMA_KEYBOARD_LAYOUT",
+        value_enum,
+        default_value_t = KeyboardLayout::Us
+    )]
+    pub keyboard_layout: KeyboardLayout,
 
     /// Override the profile's audio provider (e.g. `pipewire`, `alsa`).
     #[arg(long, default_value = "")]
@@ -168,6 +182,23 @@ pub struct Args {
     /// selects D-Bus capture on a VM node.
     #[arg(long, env = "OZMA_DBUS_FPS", value_name = "FPS")]
     pub dbus_fps: Option<u32>,
+
+    /// DEV/TEST ONLY: synthetic capture width for `--capture-provider fake`.
+    ///
+    /// The fake source is a deterministic RGB24 generator for validating the
+    /// HLS/hardware-encode path on a host with no real capture device. It is
+    /// rejected for the hardware profile, is never a profile default, and the
+    /// node logs a warning when it is used.
+    #[arg(long, env = "OZMA_FAKE_WIDTH", value_name = "PIXELS")]
+    pub fake_width: Option<u32>,
+
+    /// DEV/TEST ONLY: synthetic capture height for `--capture-provider fake`.
+    #[arg(long, env = "OZMA_FAKE_HEIGHT", value_name = "PIXELS")]
+    pub fake_height: Option<u32>,
+
+    /// DEV/TEST ONLY: synthetic capture frame rate for `--capture-provider fake`.
+    #[arg(long, env = "OZMA_FAKE_FPS", value_name = "FPS")]
+    pub fake_fps: Option<u32>,
 
     /// Audio routing backend for `/audio/*`: `none`, `pipewire`, or
     /// `pulseaudio`. It controls an existing audio server; it never starts one.
@@ -398,6 +429,32 @@ fn default_hw() -> String {
     std::env::consts::ARCH.to_string()
 }
 
+/// The dev/test synthetic capture flags only make sense with the fake provider.
+///
+/// Keeping this check pure makes the CLI contract testable without starting a
+/// node or opening a capture device. It deliberately does not accept the flags
+/// on their own: silently switching a hardware-profile node to a synthetic
+/// source would hide a missing real capture device.
+fn validate_fake_flags(
+    capture_provider: &str,
+    fake_width: Option<u32>,
+    fake_height: Option<u32>,
+    fake_fps: Option<u32>,
+) -> Result<(), String> {
+    let fake = capture_provider.trim().eq_ignore_ascii_case("fake");
+    let supplied = [fake_width, fake_height, fake_fps]
+        .into_iter()
+        .any(|value| value.is_some());
+    if supplied && !fake {
+        return Err(
+            "--fake-width/--fake-height/--fake-fps are dev/test settings and require \
+             --capture-provider fake"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let mut args = Args::parse();
@@ -420,6 +477,15 @@ async fn main() {
     );
     let providers =
         ProviderSelection::for_profile(args.profile).with_overrides(&provider_overrides);
+    if let Err(error) = validate_fake_flags(
+        &args.capture_provider,
+        args.fake_width,
+        args.fake_height,
+        args.fake_fps,
+    ) {
+        error!("{error}");
+        std::process::exit(2);
+    }
     let mut config = NodeConfig {
         name: args.name.clone(),
         node_id: node_id.clone(),
@@ -471,6 +537,9 @@ async fn main() {
             || args.dbus_width.is_some()
             || args.dbus_height.is_some()
             || args.dbus_fps.is_some(),
+        fake_width: args.fake_width.unwrap_or(DEFAULT_FAKE_WIDTH),
+        fake_height: args.fake_height.unwrap_or(DEFAULT_FAKE_HEIGHT),
+        fake_fps: args.fake_fps.unwrap_or(DEFAULT_FAKE_FPS),
         audio_router: args.audio_router,
         audio_track_root: args.audio_track_root.clone(),
         ffmpeg_bin: args.ffmpeg_bin.clone(),
@@ -514,6 +583,17 @@ async fn main() {
             std::process::exit(2);
         }
     };
+
+    if config.fake_capture_requested() {
+        warn!(
+            width = config.fake_width,
+            height = config.fake_height,
+            fps = config.fake_fps,
+            "DEV/TEST SYNTHETIC CAPTURE: `--capture-provider fake` is producing a \
+             deterministic RGB24 pattern. This is not a real camera, guest, or hardware \
+             source; never use it outside development/validation."
+        );
+    }
 
     // QEMU accepts one client per `-qmp` chardev. The node creates exactly one
     // shared control client here and hands clones to power, QMP capture,
@@ -782,6 +862,7 @@ async fn main() {
             .with_hls(Some(hls_status))
             .with_hls_controller(hls_controller.clone())
             .with_input_sink(Some(input_sink.clone()))
+            .with_keyboard_layout(args.keyboard_layout)
             .with_codecs(codec_status)
             .with_codec_control(codec_control)
             .with_audio(audio_control)
@@ -1343,6 +1424,27 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_layout_defaults_to_us_and_parses_supported_names() {
+        let defaults = Args::parse_from(["ozma-node"]);
+        assert_eq!(defaults.keyboard_layout, KeyboardLayout::Us);
+
+        for (name, expected) in [
+            ("us", KeyboardLayout::Us),
+            ("uk", KeyboardLayout::Uk),
+            ("gb", KeyboardLayout::Uk),
+            ("de", KeyboardLayout::De),
+            ("fr", KeyboardLayout::Fr),
+        ] {
+            let args = Args::parse_from(["ozma-node", "--keyboard-layout", name]);
+            assert_eq!(args.keyboard_layout, expected, "{name}");
+        }
+        assert!(
+            Args::try_parse_from(["ozma-node", "--keyboard-layout", "dvorak"]).is_err(),
+            "unknown layouts must fail rather than guess"
+        );
+    }
+
+    #[test]
     fn webrtc_audio_flags_parse_and_default_to_disabled() {
         let args = Args::parse_from([
             "ozma-node",
@@ -1416,6 +1518,42 @@ mod tests {
 
         assert!(Args::try_parse_from(["ozma-node", "--nvenc-gpu", "abc"]).is_err());
         assert!(Args::try_parse_from(["ozma-node", "--nvenc-gpu", "-1"]).is_err());
+    }
+
+    #[test]
+    fn fake_capture_flags_parse_and_require_the_fake_provider() {
+        let defaults = Args::parse_from(["ozma-node"]);
+        assert_eq!(defaults.fake_width, None);
+        assert_eq!(defaults.fake_height, None);
+        assert_eq!(defaults.fake_fps, None);
+
+        let args = Args::parse_from([
+            "ozma-node",
+            "--profile",
+            "vm",
+            "--capture-provider",
+            "fake",
+            "--fake-width",
+            "3840",
+            "--fake-height",
+            "2160",
+            "--fake-fps",
+            "30",
+        ]);
+        assert_eq!(
+            (args.fake_width, args.fake_height, args.fake_fps),
+            (Some(3_840), Some(2_160), Some(30))
+        );
+        assert!(
+            validate_fake_flags("fake", args.fake_width, args.fake_height, args.fake_fps).is_ok()
+        );
+
+        // The geometry flags are dev/test settings, not a stealth way to
+        // switch a real provider to a synthetic source.
+        let error = validate_fake_flags("", Some(3_840), None, None).unwrap_err();
+        assert!(error.contains("--capture-provider fake"), "{error}");
+        assert!(validate_fake_flags("v4l2", None, None, Some(60)).is_err());
+        assert!(validate_fake_flags("", None, None, None).is_ok());
     }
 
     #[test]

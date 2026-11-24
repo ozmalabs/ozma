@@ -628,8 +628,10 @@ parity matrix until the underlying work lands.
 8. **Input defaults and scope.** The default VM chain tries `uinput` first; use
    `--input-provider qmp` to guarantee guest injection through QMP. uinput
    needs `/dev/uinput` and group/udev access. Keyboard/pointer only; touch,
-   pen, horizontal wheel, and clipboard are rejected rather than faked. Text is
-   US-layout printable ASCII.
+   pen, horizontal wheel, and clipboard are rejected rather than faked. Text
+   uses `--keyboard-layout us|uk|de|fr` (default `us`); dead-key-only,
+   IME/compose, and non-ASCII characters without a direct key are typed 400
+   before any event.
 9. **Power semantics.** QMP `stop` is a pause, not a destroy; force-off falls
    back to ACPI powerdown. `LibvirtPower` shells out to `virsh`. The harness
    never invokes a power action, so action parity remains manual and must use a

@@ -1127,7 +1127,13 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         _require_scope(request, SCOPE_READ)
         if node_id not in state.nodes:
             raise HTTPException(status_code=404, detail="Node not found")
-        return state.token_metadata(node_id)
+        # ``fallback_configured`` is boolean only: it tells the dashboard
+        # whether OZMA_NODE_API_TOKEN will be used when no per-node token is
+        # active. The fallback value itself is never returned.
+        return {
+            **state.token_metadata(node_id),
+            "fallback_configured": bool(_node_api_token),
+        }
 
     @app.put("/api/v1/nodes/{node_id}/token")
     async def set_node_token(
@@ -1161,6 +1167,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             "node_id": node_id,
             "rotated": True,
             "changed": changed,
+            "fallback_configured": bool(_node_api_token),
             **state.token_metadata(node_id),
         }
         if generate:
@@ -1192,7 +1199,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             "ok": True,
             "node_id": node_id,
             "cleared": removed,
-            "fallback_configured": bool(state.node_api_token),
+            "fallback_configured": bool(_node_api_token),
             **state.token_metadata(node_id),
         }
 

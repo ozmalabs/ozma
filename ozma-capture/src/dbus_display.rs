@@ -31,10 +31,12 @@
 //! QEMU sends 32-bit pixman formats. `Scanout` carries the full framebuffer;
 //! `Update` carries a damaged rectangle that is applied to the frame currently
 //! held by the source; `Disable` drops the framebuffer and produces no frame.
-//! Every emitted frame is an owned, tightly packed BGRA buffer, so QEMU cannot
-//! mutate a frame that has already entered the pipeline. Strides are repacked
-//! row by row; a non-32-bpp pixman format is rejected instead of being
-//! mislabelled as BGRA.
+//! GL listeners instead send `ScanoutDMABUF` (or the advertised multi-plane
+//! `ScanoutDMABUF2`) plus `UpdateDMABUF` damage rectangles; those are mapped and
+//! converted by [`crate::dbus_dmabuf`]. Every emitted frame is an owned, tightly
+//! packed BGRA buffer, so QEMU cannot mutate a frame that has already entered
+//! the pipeline. Strides are repacked row by row; a non-32-bpp pixman format is
+//! rejected instead of being mislabelled as BGRA.
 //!
 //! A display-mode change can arrive as a console `PropertiesChanged` signal
 //! before the listener's first `Update` bands. The source tracks that geometry
@@ -78,7 +80,7 @@ use ozma_qmp::{QmpClient, QmpConfig, SharedQmpClient};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-use crate::dbus_dmabuf::{self, DmaBufError, MappedDmaBuf, ScanoutDmabuf};
+use crate::dbus_dmabuf::{self, DmaBufError, MappedDmaBuf};
 use crate::provider::CaptureProvider;
 use crate::v4l2::{monotonic_pts, next_sequence};
 
@@ -103,6 +105,17 @@ pub const DBUS_DEFAULT_FPS: u32 = 30;
 /// Default bound on connecting, authenticating, and waiting for a frame.
 pub const DBUS_DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long an all-black first GL scanout is held back before it is treated as
+/// the real guest content.
+///
+/// The first `ScanoutDMABUF` can arrive before the GL texture has been drawn
+/// (especially after a reset). QEMU immediately follows it with an
+/// `UpdateDMABUF` damage rectangle once there is content; waiting briefly
+/// avoids publishing an all-black snapshot/HLS frame as if it were the guest
+/// screen. A genuinely black screen is still served after this grace period,
+/// so this is a delay rather than a permanent filter.
+const DMABUF_INITIAL_BLACK_GRACE: Duration = Duration::from_millis(750);
+
 /// Largest width or height accepted from a `Scanout` message.
 ///
 /// This is a sanity bound against corrupt or hostile messages, not a product
@@ -124,6 +137,9 @@ pub const DBUS_CONSOLE_INTERFACE: &str = "org.qemu.Display1.Console";
 
 /// `org.qemu.Display1.Listener` interface.
 pub const DBUS_LISTENER_INTERFACE: &str = "org.qemu.Display1.Listener";
+
+/// Optional listener interface that carries multi-plane DMA-BUF scanouts.
+pub const DBUS_LISTENER_DMABUF2_INTERFACE: &str = "org.qemu.Display1.Listener.Unix.ScanoutDMABUF2";
 
 /// `org.freedesktop.DBus.Properties` interface.
 pub const DBUS_PROPERTIES_INTERFACE: &str = "org.freedesktop.DBus.Properties";
@@ -1821,9 +1837,14 @@ pub struct DBusDisplaySource {
     listener: Option<Box<dyn DBusTransport>>,
     listener_peer: Option<StdUnixStream>,
     framebuffer: Option<Framebuffer>,
-    /// Mapped DMA-BUF from the most recent `ScanoutDMABUF`. It is the active
-    /// surface while present; `UpdateDMABUF` re-snapshots it.
+    /// Mapped DMA-BUF from the most recent `ScanoutDMABUF`/`ScanoutDMABUF2`.
     dmabuf: Option<MappedDmaBuf>,
+    /// Owned BGRA snapshot of `dmabuf`, updated by damage rectangles.
+    dmabuf_frame: Option<Vec<u8>>,
+    /// Set when the first scanout after connect/reset was entirely black. The
+    /// value is the time it arrived; the frame is held back until damage paints
+    /// content or the grace period expires.
+    dmabuf_black_since: Option<Instant>,
     /// Console `Width`/`Height` from the most recent `PropertiesChanged`
     /// signal, consumed by the next `Update`. A pending value is `None` when the
     /// last framebuffer geometry is already current.
@@ -1861,6 +1882,8 @@ impl fmt::Debug for DBusDisplaySource {
                     .as_ref()
                     .map(|dmabuf| (dmabuf.width(), dmabuf.height())),
             )
+            .field("dmabuf_frame", &self.dmabuf_frame.as_ref().map(Vec::len))
+            .field("dmabuf_black_since", &self.dmabuf_black_since)
             .finish()
     }
 }
@@ -1881,6 +1904,8 @@ impl DBusDisplaySource {
             listener_peer: None,
             framebuffer: None,
             dmabuf: None,
+            dmabuf_frame: None,
+            dmabuf_black_since: None,
             console_size: Arc::new(Mutex::new(None)),
             format: FrameFormat::new(PixelFormat::Bgra, 0, 0),
             origin: Instant::now(),
@@ -2332,7 +2357,10 @@ impl DBusDisplaySource {
         {
             let body = encode_properties_body(&[(
                 "Interfaces",
-                DBusValue::StrArray(vec![DBUS_LISTENER_INTERFACE.to_owned()]),
+                DBusValue::StrArray(vec![
+                    DBUS_LISTENER_INTERFACE.to_owned(),
+                    DBUS_LISTENER_DMABUF2_INTERFACE.to_owned(),
+                ]),
             )])?;
             Ok(encode_method_return(serial, reply_serial, "a{sv}", &body))
         } else {
@@ -2342,7 +2370,14 @@ impl DBusDisplaySource {
 
     fn make_frame(&mut self) -> Result<Frame, MediaError> {
         let (width, height, pixels) = if let Some(dmabuf) = self.dmabuf.as_ref() {
-            (dmabuf.width(), dmabuf.height(), dmabuf.snapshot_bgra())
+            let pixels = match self.dmabuf_frame.as_ref() {
+                Some(frame) => frame.clone(),
+                None => dmabuf
+                    .snapshot_bgra()
+                    .map_err(DBusError::from)
+                    .map_err(|error| error.to_media_error(&self.config.id))?,
+            };
+            (dmabuf.width(), dmabuf.height(), pixels)
         } else {
             let framebuffer = self.framebuffer.as_ref().ok_or_else(|| {
                 MediaError::capture(&self.config.id, "no framebuffer has been received")
@@ -2363,34 +2398,87 @@ impl DBusDisplaySource {
         Ok(frame)
     }
 
-    /// Take the descriptor named by a `ScanoutDMABUF` body out of the message's
-    /// fd list. Any other descriptor is dropped (and closed) by the caller.
-    fn take_dmabuf_fd(
-        &self,
-        header: &ScanoutDmabuf,
-        fds: &mut Vec<OwnedFd>,
-    ) -> Result<OwnedFd, DBusError> {
-        let index = usize::try_from(header.fd_index).map_err(|_| {
-            DBusError::protocol(format!(
-                "ScanoutDMABUF fd index {} overflows",
-                header.fd_index
-            ))
-        })?;
-        if index >= fds.len() {
-            return Err(DBusError::protocol(format!(
-                "ScanoutDMABUF names fd index {index}, but the message carried {} descriptors",
-                fds.len()
-            )));
+    /// Install a freshly imported DMA-BUF and cache its first BGRA snapshot.
+    ///
+    /// Returns `None` when the whole scanout is black: that is almost always
+    /// QEMU's initial GL texture before the guest has drawn, so hold it back
+    /// until the first damage update or the grace period. Returns `Some` for a
+    /// ready frame.
+    fn install_dmabuf(&mut self, mapped: MappedDmaBuf) -> Result<Option<Frame>, MediaError> {
+        let snapshot = mapped
+            .snapshot_bgra()
+            .map_err(DBusError::from)
+            .map_err(|error| error.to_media_error(&self.config.id))?;
+        let black = dbus_dmabuf::bgra_is_all_black(&snapshot);
+        let (width, height) = (mapped.width(), mapped.height());
+        self.dmabuf = Some(mapped);
+        self.framebuffer = None;
+        self.dmabuf_frame = Some(snapshot);
+        self.dmabuf_black_since = if black { Some(Instant::now()) } else { None };
+        self.format = FrameFormat::new(PixelFormat::Bgra, width, height);
+        if black {
+            tracing::debug!(
+                id = %self.config.id,
+                width,
+                height,
+                "D-Bus DMA-BUF scanout is all black; waiting briefly for damage"
+            );
+            Ok(None)
+        } else {
+            self.make_frame().map(Some)
         }
-        Ok(fds.remove(index))
+    }
+
+    /// Take the descriptors named by a scanout body out of the message's fd
+    /// list. Unused descriptors are dropped (and closed) by the caller.
+    fn take_dmabuf_fds(
+        &self,
+        indexes: &[u32],
+        fds: &mut Vec<OwnedFd>,
+    ) -> Result<Vec<OwnedFd>, DBusError> {
+        let mut slots: Vec<Option<OwnedFd>> = std::mem::take(fds).into_iter().map(Some).collect();
+        let mut taken = Vec::with_capacity(indexes.len());
+        let descriptor_count = slots.len();
+        for &index in indexes {
+            let slot_index = usize::try_from(index)
+                .map_err(|_| DBusError::protocol(format!("DMA-BUF fd index {index} overflows")))?;
+            let slot = slots.get_mut(slot_index).ok_or_else(|| {
+                DBusError::protocol(format!(
+                    "DMA-BUF names fd index {slot_index}, but the message carried {descriptor_count} descriptors"
+                ))
+            })?;
+            let fd = slot.take().ok_or_else(|| {
+                DBusError::protocol(format!(
+                    "DMA-BUF names fd index {slot_index} more than once"
+                ))
+            })?;
+            taken.push(fd);
+        }
+        Ok(taken)
     }
 
     async fn read_until_frame(&mut self) -> Result<Option<Frame>, MediaError> {
         loop {
+            if let Some(since) = self.dmabuf_black_since {
+                if since.elapsed() >= DMABUF_INITIAL_BLACK_GRACE {
+                    self.dmabuf_black_since = None;
+                    tracing::debug!(
+                        id = %self.config.id,
+                        "D-Bus DMA-BUF scanout is still black; serving the real black screen"
+                    );
+                    return self.make_frame().map(Some);
+                }
+            }
+
             let read = {
                 let id = self.config.id.clone();
                 let max_body = self.config.max_message_body();
-                let timeout = self.config.connect_timeout;
+                let timeout = match self.dmabuf_black_since {
+                    Some(since) => DMABUF_INITIAL_BLACK_GRACE
+                        .saturating_sub(since.elapsed())
+                        .max(Duration::from_millis(1)),
+                    None => self.config.connect_timeout,
+                };
                 let Some(listener) = self.listener.as_mut() else {
                     return Err(MediaError::capture(id, "listener transport is closed"));
                 };
@@ -2399,7 +2487,16 @@ impl DBusDisplaySource {
 
             let (message, mut fds) = match read {
                 Ok(message) => message,
-                Err(DBusError::Idle(_)) => return Ok(None),
+                Err(DBusError::Idle(_)) => {
+                    if let Some(since) = self.dmabuf_black_since {
+                        if since.elapsed() >= DMABUF_INITIAL_BLACK_GRACE {
+                            self.dmabuf_black_since = None;
+                            return self.make_frame().map(Some);
+                        }
+                        continue;
+                    }
+                    return Ok(None);
+                }
                 Err(error) => {
                     // A framing/transport failure means the byte stream can no
                     // longer be trusted; later reads report end of stream.
@@ -2441,9 +2538,11 @@ impl DBusDisplaySource {
                     let header = dbus_dmabuf::parse_scanout_dmabuf(&message.body)
                         .map_err(DBusError::from)
                         .map_err(|error| error.to_media_error(&self.config.id))?;
-                    let fd = self
-                        .take_dmabuf_fd(&header, &mut fds)
+                    let index = [header.fd_index];
+                    let mut plane_fds = self
+                        .take_dmabuf_fds(&index, &mut fds)
                         .map_err(|error| error.to_media_error(&self.config.id))?;
+                    let fd = plane_fds.remove(0);
                     let mapped =
                         MappedDmaBuf::import(&header, fd, self.config.width, self.config.height)
                             .map_err(DBusError::from)
@@ -2466,11 +2565,60 @@ impl DBusDisplaySource {
                         y0_top = header.y0_top,
                         "D-Bus DMA-BUF scanout imported"
                     );
-                    let (width, height) = (mapped.width(), mapped.height());
-                    self.dmabuf = Some(mapped);
-                    self.framebuffer = None;
-                    self.format = FrameFormat::new(PixelFormat::Bgra, width, height);
-                    return self.make_frame().map(Some);
+                    if let Some(frame) = self.install_dmabuf(mapped)? {
+                        return Ok(Some(frame));
+                    }
+                }
+                Some("ScanoutDMABUF2") => {
+                    let signature = message.header.signature.as_deref().unwrap_or("");
+                    if signature != dbus_dmabuf::SCANOUT_DMABUF2_SIGNATURE {
+                        return Err(DBusError::Unsupported(format!(
+                            "ScanoutDMABUF2 signature {signature:?}; expected {:?}",
+                            dbus_dmabuf::SCANOUT_DMABUF2_SIGNATURE
+                        ))
+                        .to_media_error(&self.config.id));
+                    }
+                    let header = dbus_dmabuf::parse_scanout_dmabuf2(&message.body)
+                        .map_err(DBusError::from)
+                        .map_err(|error| error.to_media_error(&self.config.id))?;
+                    let plane_fds = self
+                        .take_dmabuf_fds(&header.fd_indexes, &mut fds)
+                        .map_err(|error| error.to_media_error(&self.config.id))?;
+                    let mapped = MappedDmaBuf::import_v2(
+                        &header,
+                        plane_fds,
+                        self.config.width,
+                        self.config.height,
+                    )
+                    .map_err(DBusError::from)
+                    .map_err(|error| {
+                        tracing::warn!(
+                            id = %self.config.id,
+                            fourcc = header.fourcc,
+                            modifier = format_args!("{:#018x}", header.modifier),
+                            planes = header.num_planes,
+                            %error,
+                            "D-Bus multi-plane DMA-BUF scanout is not importable"
+                        );
+                        error.to_media_error(&self.config.id)
+                    })?;
+                    tracing::debug!(
+                        id = %self.config.id,
+                        width = mapped.width(),
+                        height = mapped.height(),
+                        planes = header.num_planes,
+                        x = header.x,
+                        y = header.y,
+                        backing_width = header.backing_width,
+                        backing_height = header.backing_height,
+                        fourcc = header.fourcc,
+                        modifier = format_args!("{:#018x}", header.modifier),
+                        y0_top = header.y0_top,
+                        "D-Bus multi-plane DMA-BUF scanout imported"
+                    );
+                    if let Some(frame) = self.install_dmabuf(mapped)? {
+                        return Ok(Some(frame));
+                    }
                 }
                 Some("UpdateDMABUF") => {
                     let signature = message.header.signature.as_deref().unwrap_or("");
@@ -2511,22 +2659,66 @@ impl DBusDisplaySource {
                         }
                     };
                     if right > dmabuf.width() || bottom > dmabuf.height() {
-                        return Err(DBusError::Geometry(format!(
-                            "UpdateDMABUF rectangle {x},{y} {width}x{height} exceeds the {}x{} scanout",
-                            dmabuf.width(),
-                            dmabuf.height()
-                        ))
-                        .to_media_error(&self.config.id));
+                        // A display-mode change can deliver an old damage
+                        // rectangle after QEMU has already sent the new,
+                        // smaller scanout. The mapping cannot be resized, and
+                        // the update carries no pixels, so wait for the next
+                        // ScanoutDMABUF/2 instead of failing the whole capture.
+                        tracing::debug!(
+                            id = %self.config.id,
+                            x,
+                            y,
+                            width,
+                            height,
+                            scanout_width = dmabuf.width(),
+                            scanout_height = dmabuf.height(),
+                            "UpdateDMABUF exceeds the current scanout; waiting for a new scanout"
+                        );
+                        continue;
                     }
                     // UpdateDMABUF has no pixels of its own: the GPU wrote the
-                    // current mapping in place. Re-snapshot the whole buffer so
-                    // the emitted frame is coherent with the damage.
+                    // current mapping in place. Copy only the damaged rectangle
+                    // into the cached BGRA frame.
+                    if self.dmabuf_frame.is_none() {
+                        self.dmabuf_frame = Some(
+                            dmabuf
+                                .snapshot_bgra()
+                                .map_err(DBusError::from)
+                                .map_err(|error| error.to_media_error(&self.config.id))?,
+                        );
+                    }
+                    if let Some(frame) = self.dmabuf_frame.as_mut() {
+                        let stride = dmabuf.width() as usize * 4;
+                        dmabuf
+                            .copy_bgra_rect(
+                                x as u32,
+                                y as u32,
+                                width as u32,
+                                height as u32,
+                                frame,
+                                stride,
+                            )
+                            .map_err(DBusError::from)
+                            .map_err(|error| error.to_media_error(&self.config.id))?;
+                    }
+                    if let Some(since) = self.dmabuf_black_since {
+                        let still_black = self
+                            .dmabuf_frame
+                            .as_ref()
+                            .map_or(true, |frame| dbus_dmabuf::bgra_is_all_black(frame));
+                        if still_black && since.elapsed() < DMABUF_INITIAL_BLACK_GRACE {
+                            continue;
+                        }
+                        self.dmabuf_black_since = None;
+                    }
                     return self.make_frame().map(Some);
                 }
                 Some("Scanout") => {
                     // The active surface is a pixman byte array again; close
                     // any DMA-BUF mapping from an earlier GL scanout.
                     self.dmabuf = None;
+                    self.dmabuf_frame = None;
+                    self.dmabuf_black_since = None;
                     let mut framebuffer = Framebuffer::from_scanout(
                         &message.body,
                         self.config.width,
@@ -2660,6 +2852,8 @@ impl DBusDisplaySource {
                     );
                     self.framebuffer = None;
                     self.dmabuf = None;
+                    self.dmabuf_frame = None;
+                    self.dmabuf_black_since = None;
                     *self
                         .console_size
                         .lock()
@@ -2712,7 +2906,7 @@ impl CaptureSource for DBusDisplaySource {
             Ok(None) => {
                 // A bounded idle wait re-emits the latest complete framebuffer
                 // so a static guest screen does not look like a dead source.
-                if self.framebuffer.is_some() {
+                if self.framebuffer.is_some() || self.dmabuf_frame.is_some() {
                     self.make_frame()
                 } else {
                     Err(MediaError::capture(
@@ -2735,6 +2929,9 @@ impl CaptureSource for DBusDisplaySource {
         self.stopped = true;
         self.eof = true;
         self.framebuffer = None;
+        self.dmabuf = None;
+        self.dmabuf_frame = None;
+        self.dmabuf_black_since = None;
         self.listener_peer = None;
         if let Some(drain) = self.display_drain.take() {
             drain.abort();
@@ -3017,6 +3214,64 @@ mod tests {
         body
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn dmabuf2_body(
+        fd_indexes: &[u32],
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        offsets: &[u32],
+        strides: &[u32],
+        fourcc: u32,
+        backing_width: u32,
+        backing_height: u32,
+        modifier: u64,
+        y0_top: bool,
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&u32::try_from(fd_indexes.len() * 4).unwrap().to_le_bytes());
+        for index in fd_indexes {
+            body.extend_from_slice(&index.to_le_bytes());
+        }
+        for value in [x, y, width, height] {
+            body.extend_from_slice(&value.to_le_bytes());
+        }
+        body.extend_from_slice(&u32::try_from(offsets.len() * 4).unwrap().to_le_bytes());
+        for offset in offsets {
+            body.extend_from_slice(&offset.to_le_bytes());
+        }
+        body.extend_from_slice(&u32::try_from(strides.len() * 4).unwrap().to_le_bytes());
+        for stride in strides {
+            body.extend_from_slice(&stride.to_le_bytes());
+        }
+        for value in [
+            u32::try_from(fd_indexes.len()).unwrap(),
+            fourcc,
+            backing_width,
+            backing_height,
+        ] {
+            body.extend_from_slice(&value.to_le_bytes());
+        }
+        while body.len() % 8 != 0 {
+            body.push(0);
+        }
+        body.extend_from_slice(&modifier.to_le_bytes());
+        body.extend_from_slice(&u32::from(y0_top).to_le_bytes());
+        body
+    }
+
+    fn dmabuf2_listener_message(serial: u32, body: &[u8], fd_count: u32) -> Vec<u8> {
+        let fields = vec![
+            Field::Path("/org/qemu/Display1/Console_0"),
+            Field::Interface(DBUS_LISTENER_INTERFACE),
+            Field::Member("ScanoutDMABUF2"),
+            Field::Signature(dbus_dmabuf::SCANOUT_DMABUF2_SIGNATURE),
+            Field::UnixFds(fd_count),
+        ];
+        encode_message(DBUS_METHOD_CALL, serial, &fields, body)
+    }
+
     fn temp_pixels(pixels: &[u8]) -> std::fs::File {
         use std::io::{Seek, SeekFrom, Write};
         let mut file = tempfile::tempfile().unwrap();
@@ -3028,6 +3283,23 @@ mod tests {
 
     fn fd_at(file: &std::fs::File, at: usize) -> (usize, OwnedFd) {
         (at, nix::unistd::dup(file).unwrap())
+    }
+
+    fn fd_identity(fd: RawFd) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(format!("/proc/self/fd/{fd}")).unwrap();
+        (metadata.dev(), metadata.ino())
+    }
+
+    /// True when `fd` no longer refers to the inode captured by
+    /// [`fd_identity`]. A reused descriptor number has a different inode, so
+    /// this never closes or corrupts another test's descriptor.
+    fn fd_is_closed(fd: RawFd, identity: (u64, u64)) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::metadata(format!("/proc/self/fd/{fd}")) {
+            Err(_) => true,
+            Ok(metadata) => (metadata.dev(), metadata.ino()) != identity,
+        }
     }
 
     fn test_config() -> DBusDisplayConfig {
@@ -3537,7 +3809,8 @@ mod tests {
         assert_eq!(
             interfaces.get("Interfaces"),
             Some(&DBusValue::StrArray(vec![
-                DBUS_LISTENER_INTERFACE.to_owned()
+                DBUS_LISTENER_INTERFACE.to_owned(),
+                DBUS_LISTENER_DMABUF2_INTERFACE.to_owned(),
             ]))
         );
         let scanout_reply = listener_writes
@@ -3548,6 +3821,177 @@ mod tests {
         assert!(listener_writes
             .iter()
             .any(|message| message.header.reply_serial == Some(3)));
+    }
+
+    #[tokio::test]
+    async fn oversized_update_dmabuf_waits_for_the_next_scanout() {
+        let config = test_config();
+        let console = config.console_path();
+        let first_pixels: Vec<u8> = (0..16).map(|value| 1 + value as u8).collect();
+        let second_pixels: Vec<u8> = (0..16).map(|value| 40 + value as u8).collect();
+        let first_file = temp_pixels(&first_pixels);
+        let second_file = temp_pixels(&second_pixels);
+
+        let mut listener = listener_script(&console);
+        let first_at = listener.len();
+        listener.extend(dmabuf_listener_message(
+            2,
+            "ScanoutDMABUF",
+            &dmabuf_scanout_body(2, 2, 8, dbus_dmabuf::DRM_FORMAT_ABGR8888, 0, true),
+        ));
+        listener.extend(dmabuf_listener_message(
+            3,
+            "UpdateDMABUF",
+            &dmabuf_update_body(0, 0, 4, 4),
+        ));
+        let second_at = listener.len();
+        listener.extend(dmabuf_listener_message(
+            4,
+            "ScanoutDMABUF",
+            &dmabuf_scanout_body(2, 2, 8, dbus_dmabuf::DRM_FORMAT_ABGR8888, 0, true),
+        ));
+
+        let first_fd = fd_at(&first_file, first_at);
+        let second_fd = fd_at(&second_file, second_at);
+        let mut source = DBusDisplaySource::with_transports(
+            config,
+            Box::new(FakeTransport::new(display_script(2, 2))),
+            Box::new(FakeTransport::with_fds(listener, vec![first_fd, second_fd])),
+        )
+        .unwrap();
+
+        assert_eq!(
+            source.next_frame().await.unwrap().data(),
+            &[3, 2, 1, 4, 7, 6, 5, 8, 11, 10, 9, 12, 15, 14, 13, 16]
+        );
+        // The stale 4x4 damage is ignored; the following Scanout establishes
+        // the new surface and is emitted intact.
+        assert_eq!(
+            source.next_frame().await.unwrap().data(),
+            &[42, 41, 40, 43, 46, 45, 44, 47, 50, 49, 48, 51, 54, 53, 52, 55]
+        );
+    }
+
+    #[tokio::test]
+    async fn source_imports_multi_plane_dmabuf2_and_applies_damage() {
+        let config = test_config();
+        let console = config.console_path();
+        // NV12 white: full-range Y plus neutral chroma.
+        let luma = vec![235u8; 4];
+        let chroma = vec![128u8; 2];
+        let mut luma_file = temp_pixels(&luma);
+        let chroma_file = temp_pixels(&chroma);
+
+        let mut listener = listener_script(&console);
+        let scanout_at = listener.len();
+        listener.extend(dmabuf2_listener_message(
+            2,
+            &dmabuf2_body(
+                &[0, 1],
+                0,
+                0,
+                2,
+                2,
+                &[0, 0],
+                &[2, 2],
+                dbus_dmabuf::DRM_FORMAT_NV12,
+                2,
+                2,
+                0,
+                true,
+            ),
+            2,
+        ));
+        listener.extend(dmabuf_listener_message(
+            3,
+            "UpdateDMABUF",
+            &dmabuf_update_body(0, 0, 1, 1),
+        ));
+
+        let first_fd = fd_at(&luma_file, scanout_at);
+        let second_fd = fd_at(&chroma_file, scanout_at);
+        let mut source = DBusDisplaySource::with_transports(
+            config,
+            Box::new(FakeTransport::new(display_script(2, 2))),
+            Box::new(FakeTransport::with_fds(listener, vec![first_fd, second_fd])),
+        )
+        .unwrap();
+
+        let first = source.next_frame().await.unwrap();
+        assert_eq!(first.format(), FrameFormat::new(PixelFormat::Bgra, 2, 2));
+        assert_eq!(
+            first.data(),
+            &[255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255]
+        );
+
+        // Only the first luma sample changes; UpdateDMABUF reports a 1x1
+        // damage rectangle, so the other three pixels must remain white.
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            luma_file.seek(SeekFrom::Start(0)).unwrap();
+            luma_file.write_all(&[16u8]).unwrap();
+            luma_file.flush().unwrap();
+        }
+        let second = source.next_frame().await.unwrap();
+        assert_eq!(
+            second.data(),
+            &[0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255]
+        );
+
+        drop(source);
+        // `MappedDmaBuf` owns both plane descriptors; dropping the source
+        // releases them. The raw-number close check is intentionally left to
+        // the single-plane test to avoid cross-thread fd-number reuse races.
+    }
+
+    #[test]
+    fn initial_black_dmabuf_is_held_back() {
+        let config = test_config();
+        let file = temp_pixels(&[0u8; 16]);
+        let header = dbus_dmabuf::parse_scanout_dmabuf(&dmabuf_scanout_body(
+            2,
+            2,
+            8,
+            dbus_dmabuf::DRM_FORMAT_ABGR8888,
+            0,
+            true,
+        ))
+        .unwrap();
+        let mapped =
+            MappedDmaBuf::import(&header, nix::unistd::dup(&file).unwrap(), 64, 64).unwrap();
+        let mut source = DBusDisplaySource::new(config).unwrap();
+        assert!(source.install_dmabuf(mapped).unwrap().is_none());
+        assert!(source.dmabuf_black_since.is_some());
+        assert_eq!(source.dmabuf_frame.as_ref().unwrap().len(), 16);
+    }
+
+    #[tokio::test]
+    async fn dmabuf2_without_enough_descriptors_is_a_protocol_error() {
+        let config = test_config();
+        let console = config.console_path();
+        let mut listener = listener_script(&console);
+        listener.extend(dmabuf2_listener_message(
+            2,
+            &dmabuf2_body(
+                &[0, 1],
+                0,
+                0,
+                2,
+                2,
+                &[0, 0],
+                &[2, 2],
+                dbus_dmabuf::DRM_FORMAT_NV12,
+                2,
+                2,
+                0,
+                true,
+            ),
+            2,
+        ));
+
+        let mut source = source_with(config, display_script(2, 2), listener);
+        let error = source.next_frame().await.unwrap_err();
+        assert!(error.to_string().contains("unix descriptors"), "{error}");
     }
 
     #[tokio::test]
@@ -3573,6 +4017,7 @@ mod tests {
 
         let fd = fd_at(&file, scanout_at);
         let raw = fd.1.as_raw_fd();
+        let identity = fd_identity(raw);
         let mut source = DBusDisplaySource::with_transports(
             config,
             Box::new(FakeTransport::new(display_script(2, 2))),
@@ -3605,7 +4050,7 @@ mod tests {
 
         drop(source);
         assert!(
-            nix::unistd::close(raw).is_err(),
+            fd_is_closed(raw, identity),
             "the imported ScanoutDMABUF descriptor {raw} was not closed"
         );
     }
@@ -3632,6 +4077,7 @@ mod tests {
 
         let fd = fd_at(&file, scanout_at);
         let raw = fd.1.as_raw_fd();
+        let identity = fd_identity(raw);
         let mut source = DBusDisplaySource::with_transports(
             config,
             Box::new(FakeTransport::new(display_script(2, 2))),
@@ -3645,7 +4091,7 @@ mod tests {
         assert!(message.contains("0x0100000000000001"), "{message}");
         assert!(message.contains("'XB24'"), "{message}");
         drop(source);
-        assert!(nix::unistd::close(raw).is_err());
+        assert!(fd_is_closed(raw, identity));
     }
 
     #[tokio::test]
@@ -3680,6 +4126,7 @@ mod tests {
 
         let fd = fd_at(&file, scanout_at);
         let raw = fd.1.as_raw_fd();
+        let identity = fd_identity(raw);
         let mut source = DBusDisplaySource::with_transports(
             config,
             Box::new(FakeTransport::new(display_script(2, 2))),
@@ -3691,8 +4138,10 @@ mod tests {
         // Disable clears the surface; the next read reaches end of stream.
         assert!(source.next_frame().await.is_err());
         assert!(source.dmabuf.is_none());
+        assert!(source.dmabuf_frame.is_none());
+        assert!(source.dmabuf_black_since.is_none());
         assert_eq!(source.format().width, 0);
-        assert!(nix::unistd::close(raw).is_err());
+        assert!(fd_is_closed(raw, identity));
     }
 
     #[tokio::test]

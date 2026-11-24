@@ -21,6 +21,20 @@ pub const DEFAULT_QMP_CONNECT_TIMEOUT_MS: u64 = 3_000;
 /// Default QMP control-command timeout, matching `ozma-qmp`.
 pub const DEFAULT_QMP_COMMAND_TIMEOUT_MS: u64 = 5_000;
 
+/// Default dev/test synthetic capture width.
+pub const DEFAULT_FAKE_WIDTH: u32 = 1280;
+/// Default dev/test synthetic capture height.
+pub const DEFAULT_FAKE_HEIGHT: u32 = 720;
+/// Default dev/test synthetic capture frame rate.
+pub const DEFAULT_FAKE_FPS: u32 = 30;
+/// Largest dev/test synthetic capture dimension accepted.
+///
+/// 4K (3840x2160) is the validation target; this bound leaves room for 8K
+/// without letting a typo allocate an unbounded RGB24 frame.
+pub const MAX_FAKE_DIMENSION: u32 = 8_192;
+/// Highest dev/test synthetic capture frame rate accepted.
+pub const MAX_FAKE_FPS: u32 = 240;
+
 /// Which deployment shape this node is running as.
 ///
 /// Profiles select honest provider defaults. The hardware runtime and the VM
@@ -408,8 +422,37 @@ fn resolve_capture(config: &NodeConfig) -> Result<Option<String>, String> {
                 }
                 Ok(Some("dbus".to_owned()))
             }
+            // Dev/test only: a synthetic RGB24 source for validating the
+            // encode/HLS path on a host with no real capture device. It is
+            // deliberately unavailable on the hardware profile so it can never
+            // become a production default or mask a missing V4L2 source.
+            "fake" => {
+                if config.profile == NodeProfile::Hardware {
+                    return Err(
+                        "--capture-provider fake is a dev/test synthetic source and is not \
+                         available in the hardware profile; use --profile vm or desktop"
+                            .to_owned(),
+                    );
+                }
+                if vnc_requested {
+                    return Err(
+                        "--capture-provider fake conflicts with --vnc-host/--vnc-port; \
+                         remove the VNC flags"
+                            .to_owned(),
+                    );
+                }
+                if dbus_requested {
+                    return Err(
+                        "--capture-provider fake conflicts with the D-Bus display flags; \
+                         remove --dbus-console/--dbus-width/--dbus-height/--dbus-fps"
+                            .to_owned(),
+                    );
+                }
+                Ok(Some("fake".to_owned()))
+            }
             _ if config.profile == NodeProfile::Vm => Err(format!(
-                "unknown capture provider {value:?} for the vm profile; expected qmp, dbus, or vnc"
+                "unknown capture provider {value:?} for the vm profile; expected qmp, dbus, vnc, \
+                 or fake (dev/test)"
             )),
             _ if vnc_requested => Err(format!(
                 "--capture-provider {value:?} conflicts with --vnc-host/--vnc-port; \
@@ -611,6 +654,15 @@ pub struct NodeConfig {
     /// True when any D-Bus display flag was supplied explicitly. A default
     /// console index of 0 must not select D-Bus capture on its own.
     pub dbus_requested: bool,
+    /// Dev/test synthetic capture width (`--fake-width`).
+    ///
+    /// Only used when the capture provider is `fake`, which is rejected for the
+    /// hardware profile. Never a production default.
+    pub fake_width: u32,
+    /// Dev/test synthetic capture height (`--fake-height`).
+    pub fake_height: u32,
+    /// Dev/test synthetic capture frame rate (`--fake-fps`).
+    pub fake_fps: u32,
     /// Audio routing backend. `none` leaves `/audio/*` at typed 501.
     pub audio_router: AudioRouterKind,
     /// Directory containing reference tracks for `POST /audio/play`.
@@ -643,6 +695,17 @@ impl NodeConfig {
         self.capabilities
             .iter()
             .any(|value| value.trim() == capability)
+    }
+
+    /// True when the dev/test synthetic capture provider was requested.
+    ///
+    /// This is only ever true for an explicit `--capture-provider fake`; no
+    /// profile default selects it.
+    pub fn fake_capture_requested(&self) -> bool {
+        self.provider_overrides
+            .capture
+            .as_deref()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("fake"))
     }
 
     pub fn node_id_from_name(name: &str) -> NodeId {
@@ -705,6 +768,20 @@ impl NodeConfig {
             return Err(format!(
                 "--dbus-width/--dbus-height exceed the {}-pixel bound",
                 ozma_capture::MAX_DBUS_DIMENSION
+            ));
+        }
+        if self.fake_width == 0 || self.fake_height == 0 {
+            return Err("--fake-width/--fake-height must be greater than zero".to_owned());
+        }
+        if self.fake_width > MAX_FAKE_DIMENSION || self.fake_height > MAX_FAKE_DIMENSION {
+            return Err(format!(
+                "--fake-width/--fake-height exceed the {MAX_FAKE_DIMENSION}-pixel dev/test bound"
+            ));
+        }
+        if self.fake_fps == 0 || self.fake_fps > MAX_FAKE_FPS {
+            return Err(format!(
+                "--fake-fps must be between 1 and {MAX_FAKE_FPS}, got {}",
+                self.fake_fps
             ));
         }
         validate_path("--audio-track-root", self.audio_track_root.as_deref())?;
@@ -908,6 +985,9 @@ mod tests {
             dbus_height: ozma_capture::DBUS_DEFAULT_HEIGHT,
             dbus_fps: ozma_capture::DBUS_DEFAULT_FPS,
             dbus_requested: false,
+            fake_width: DEFAULT_FAKE_WIDTH,
+            fake_height: DEFAULT_FAKE_HEIGHT,
+            fake_fps: DEFAULT_FAKE_FPS,
             audio_router: AudioRouterKind::None,
             audio_track_root: None,
             ffmpeg_bin: PathBuf::from("ffmpeg"),
@@ -1055,6 +1135,58 @@ mod tests {
     }
 
     #[test]
+    fn fake_capture_is_dev_only_and_keeps_requested_geometry() {
+        // Explicit synthetic capture is accepted for the VM profile...
+        let config = vm_config_with_overrides("fake", "", "");
+        assert_eq!(
+            config.vm_providers().unwrap().capture.as_deref(),
+            Some("fake")
+        );
+        assert!(config.fake_capture_requested());
+
+        // ...and for the dev desktop profile.
+        let mut desktop = test_config(NodeProfile::Desktop);
+        desktop.provider_overrides = ProviderOverrides::from_cli("fake", "", "", "", "");
+        desktop.providers = ProviderSelection::for_profile(NodeProfile::Desktop)
+            .with_overrides(&desktop.provider_overrides);
+        assert_eq!(
+            desktop.vm_providers().unwrap().capture.as_deref(),
+            Some("fake")
+        );
+
+        // It must never be selectable on the hardware profile.
+        let mut hardware = test_config(NodeProfile::Hardware);
+        hardware.provider_overrides = ProviderOverrides::from_cli("fake", "", "", "", "");
+        hardware.providers = ProviderSelection::for_profile(NodeProfile::Hardware)
+            .with_overrides(&hardware.provider_overrides);
+        let error = hardware.vm_providers().unwrap_err();
+        assert!(error.contains("dev/test"), "{error}");
+        assert!(error.contains("hardware profile"), "{error}");
+
+        // 4K geometry and 30 fps are valid; zero/oversized values are not.
+        let mut config = vm_config_with_overrides("fake", "", "");
+        config.fake_width = 3_840;
+        config.fake_height = 2_160;
+        config.fake_fps = 30;
+        assert!(config.validate().is_ok());
+
+        for (width, height, fps) in [(0, 2_160, 30), (3_840, 0, 30), (3_840, 2_160, 0)] {
+            let mut config = vm_config_with_overrides("fake", "", "");
+            config.fake_width = width;
+            config.fake_height = height;
+            config.fake_fps = fps;
+            assert!(config.validate().is_err(), "{width}x{height}@{fps}");
+        }
+
+        let mut config = vm_config_with_overrides("fake", "", "");
+        config.fake_width = MAX_FAKE_DIMENSION + 1;
+        assert!(config.validate().is_err());
+        config.fake_width = MAX_FAKE_DIMENSION;
+        config.fake_fps = MAX_FAKE_FPS + 1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn empty_paths_domains_and_zero_timeouts_are_rejected() {
         let mut config = test_config(NodeProfile::Vm);
         config.qmp_socket = Some(PathBuf::new());
@@ -1155,7 +1287,10 @@ mod tests {
 
         let config = vm_config_with_overrides("v4l2", "", "");
         let error = config.vm_providers().unwrap_err();
-        assert!(error.contains("expected qmp, dbus, or vnc"), "{error}");
+        assert!(
+            error.contains("expected qmp, dbus, vnc, or fake"),
+            "{error}"
+        );
     }
 
     #[test]

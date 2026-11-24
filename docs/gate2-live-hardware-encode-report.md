@@ -20,6 +20,15 @@ and QSV/V4L2M2M after a real encode check. A later follow-up adds a first-class
 `--nvenc-gpu`/`OZMA_NVENC_GPU` selector and reruns both `queen` GPUs with no
 external ffmpeg wrapper (§4.4): `-gpu n` is emitted only for NVENC, preserved
 across `/codec` restarts, and rejected for non-NVENC startup selections.
+A final follow-up (§9) adds a clearly labelled dev/test synthetic capture path
+and measures 1080p and 4K at 1-second segments on local VAAPI (H.264 and HEVC
+on both Intel and AMD) and both `queen` NVENC GPUs (H.264 and HEVC). It
+also fixes VAAPI rate control: the old argv left `rc_mode=auto`, which overshot
+the requested bitrate by 22-26% on Intel; naming `-rc_mode CBR` brings the
+steady-state mean to +6-7%. NVENC CBR holds at +3-6% for 1080p/4K on both GPUs.
+HEVC Main10/p010 encodes directly on both VAAPI devices, but the HLS path is
+still SDR 8-bit only: it uploads `nv12`, pins `yuv420p`, and has no 10-bit/HDR
+signaling.
 
 > No `sudo`, package install, driver/module change, VM definition, or commit was
 > made. The only VM was a direct, headless `qemu-system-x86_64` process with a
@@ -41,8 +50,8 @@ across `/codec` restarts, and rejected for non-NVENC startup selections.
 | `queen` kernel | `6.8.0-147-generic` x86_64 (Ubuntu 24.04) |
 | `queen` ffmpeg | 6.1.1-3ubuntu5 (`/usr/bin/ffmpeg`) |
 | `queen` GPU driver | NVIDIA 610.57.04, CUDA UMD 13.3 |
-| Temp dirs | `/tmp/opencode/ozma-gate2-hw`, `/tmp/queen-nvenc-*`, `/tmp/ozma-gate2-queen`, `/tmp/ozma-gate2-queen2` (all removed) |
-| Ports | HTTP 47333–47350, HID 60333–60350 (released) |
+| Temp dirs | `/tmp/opencode/ozma-gate2-hw`, `/tmp/opencode/ozma-synth`, `/tmp/queen-nvenc-*`, `/tmp/ozma-gate2-queen`, `/tmp/ozma-gate2-queen2`, `/tmp/ozma-gate2-synth` (all removed) |
+| Ports | HTTP 47333–47350 and 47520–47747, HID 60333–60350 and 60520–60747 (released) |
 
 ## 2. Device and tool inventory
 
@@ -656,16 +665,18 @@ checks fail, matching §7.2 and §7.3.
    cannot tell the request fell back. The unit tests cover the HLS-level
    fallback path (where the receipt and top level agree), not this
    policy-level path.
-7. **Probe dimensions are 320x240.** The VAAPI and QSV/V4L2M2M checks prove the
-   device/driver and encoder wrapper, not 1080p/4K, HEVC 10-bit, or HDR. The
-   advertised envelope remains 1920x1080 at 60 fps; larger frames need a
-   device-specific run. Full-node NVENC is validated on both `queen` GPUs at
-   720x400, 5 fps, 1 Mbps (§4.3 and the selector rerun in §4.4). No 1080p/4K
-   guest or X display was available on `queen` (its libvirt domain list was
-   empty), so node-level 1080p/4K stays unmeasured. `-pix_fmt yuv420p` is
-   pinned, so HDR and 10-bit NVENC output are not implemented by this argv.
-   NVENC rate-control accuracy (CBR adherence) and 10-bit/HDR remain
-   unmeasured.
+7. **Probe dimensions are 320x240; 1080p/4K is now measured via the
+   dev/test source.** The VAAPI and QSV/V4L2M2M checks prove the
+   device/driver and encoder wrapper. The advertised envelope remains
+   1920x1080 at 60 fps; larger frames still need a device-specific run before
+   they are advertised. The synthetic-capture follow-up (§9) measured real
+   HLS 1080p and 4K at 30 fps for libx264, Intel/AMD VAAPI H.264, Intel VAAPI
+   HEVC, and both `queen` NVENC GPUs with 1-second segments. This is not a
+   camera/guest workload, so per-device 4K camera capture remains unmeasured.
+   `-pix_fmt yuv420p` is pinned, so HDR and 10-bit HLS output are still not
+   implemented; VAAPI Main10/p010 works only in a direct ffmpeg test, not
+   through the node argv. NVENC CBR adherence is now measured on both GPUs
+   (§9), including at 4K.
 8. **Post-probe failure is still possible.** `applied:true` now requires a real
    probe segment, but a device that disappears after the probe can still make
    the live pipeline fail later; `/api/v1/connection` then reports `failed`.
@@ -734,3 +745,195 @@ Local:
 > process was terminated by the pattern; cleanup then switched to recorded PIDs
 > only. No production VM, libvirt domain, persistent service, or non-test
 > process was touched.
+
+## 9. Synthetic capture: 1080p/4K and CBR follow-up
+
+**Why:** the disposable QEMU VGA is only 720x400 without a guest, so the
+hardware HLS path had no 1080p/4K source. This follow-up adds a clearly labelled
+dev/test synthetic capture provider, then measures 1080p and 4K H.264/HEVC with
+1-second segments on both local VAAPI devices and both `queen` NVENC GPUs. It is
+evidence for the HLS/hardware path only; it is not a camera, guest, or
+production source.
+
+**Run provenance:** local HEAD `f645ae9` plus uncommitted working-tree changes
+(the tree already contained unrelated edits from concurrent sessions). The
+release binary was built from that tree and copied to `queen`; nothing was
+committed. Only `ozma-node/src/{config,platform,main,hls}.rs`,
+`ozma-capture/src/fake.rs`, and these two docs were changed by this follow-up.
+
+### 9.1 Dev/test synthetic capture
+
+| Item | Value |
+|---|---|
+| Flag | `--capture-provider fake` |
+| Geometry | `--fake-width` (default 1280), `--fake-height` (default 720), `--fake-fps` (default 30); env `OZMA_FAKE_WIDTH/HEIGHT/FPS` |
+| Bounds | dimensions 1–8192, fps 1–240 (`NodeConfig::validate`) |
+| Profiles | explicit `--profile vm` or `--profile desktop`; **rejected on `hardware`** with a typed exit-2 error |
+| Guard | `--fake-width/--fake-height/--fake-fps` without `--capture-provider fake` is an exit-2 error |
+| Log | `WARN ... DEV/TEST SYNTHETIC CAPTURE ... not a real camera, guest, or hardware source` |
+| Provider | `ozma_capture::FakeCaptureProvider`, id `fake0`, name `<node> synthetic capture (dev/test)`, RGB24 |
+| Pattern | `FakePattern::Blocks`: deterministic 32×32 full-color blocks, reseeded each frame |
+| Defaults | no profile selects `fake`; the default encoder, bitrate, and segment settings are unchanged |
+
+The 32×32 mosaic was chosen after two extremes made CBR measurement
+meaningless: the historical byte ramp is so compressible that VAAPI undershot a
+20 Mbps 4K target at 8.6 Mbps (H.264) / 5.6 Mbps (HEVC), while full per-pixel
+noise is so expensive that the encoder's minimum-QP floor overshot at 25.9 Mbps
+(Intel) / 55.2 Mbps (AMD). A block mosaic sits between those regimes and still
+has deterministic, frame-varying detail. `FakePattern::Ramp` remains the
+provider default for CI; only the node's dev path calls `with_blocks()`.
+
+A clean local run needs no QEMU or QMP socket:
+
+```bash
+target/release/ozma-node --name synth --profile vm \
+  --capture-provider fake --fake-width 3840 --fake-height 2160 --fake-fps 30 \
+  --input-provider fake-recording --cap video \
+  --hls --hls-dir /tmp/opencode/ozma-synth/hls --hls-fps 30 \
+  --hls-bitrate-kbps 20000 --hls-encoder h264_vaapi \
+  --vaapi-device /dev/dri/renderD128
+```
+
+### 9.2 Local 1080p/4K results
+
+Method: release binary, 30 fps, `-hls_time 1`, 12 s steady window after startup;
+`ffprobe` reports one 1.000 s video segment per file. The mean excludes the
+first two startup segments; min/max are per-segment. CPU is node + live ffmpeg
+child, normalized to one core = 100% (so 265% is 2.65 cores). All output was
+`yuv420p`; H.264 was **High**, HEVC **Main**.
+
+| Device | Encoder | Requested | Steady mean | Error | Segment min–max | CPU | Segment cadence |
+|---|---|---:|---:|---:|---:|---:|---|
+| Intel Arc B580 (`renderD128`) | `libx264` | 4,000 kbps | 4,398.9 | +10.0% | 4,287.9–4,630.8 | 90.5% | ~1/s |
+| Intel Arc B580 | `h264_vaapi` (`-rc_mode CBR`) | 4,000 | 4,239.8 | +6.0% | 3,981.1–4,784.2 | 28.7% | ~1/s |
+| Intel Arc B580 | `hevc_vaapi` (`-rc_mode CBR`) | 4,000 | 4,266.7 | +6.7% | 4,158.6–4,606.8 | 29.4% | ~1/s |
+| AMD Radeon 610M (`renderD129`) | `h264_vaapi` (`-rc_mode CBR`) | 4,000 | 4,043.4 | +1.1% | 4,030.7–4,060.8 | 31.2% | ~1/s |
+| AMD Radeon 610M (`renderD129`) | `hevc_vaapi` (`-rc_mode CBR`) | 4,000 | 4,406.7 | +10.2% | 4,202.2–4,456.4 | 31.7% | ~1/s |
+| Intel Arc B580 | `libx264` | 20,000 | 21,134.4 | +5.7% | 20,929.7–21,420.0 | 265.3% | ~1/s |
+| Intel Arc B580 | `h264_vaapi` (`-rc_mode CBR`) | 20,000 | 21,346.5 | +6.7% | 19,088.8–22,948.0 | 70.9% | ~1/s |
+| Intel Arc B580 | `hevc_vaapi` (`-rc_mode CBR`) | 20,000 | 21,400.2 | +7.0% | 16,122.9–24,292.6 | 78.5% | ~1/s |
+| AMD Radeon 610M | `h264_vaapi` (`-rc_mode CBR`) | 20,000 | 19,958.1 | −0.2% | 19,888.9–20,033.3 | 74.2% | ~1/s |
+| AMD Radeon 610M | `hevc_vaapi` (`-rc_mode CBR`) | 20,000 | 22,274.0 | +11.4% | 22,236.6–22,337.4 | 74.6% | ~1/s |
+
+4K was real-time in this path: one 1-second segment completed per wall-clock
+second, with 30 fps input. Software 4K used ~2.65 cores; VAAPI used ~0.7–0.8 of
+one core on the node+ffmpeg side and encoded on the GPU. Concurrent `gputop`
+samples during 4K H.264 showed ffmpeg engine utilization of 2.5–8.1% on the
+Intel device and 4.3–35.6% on the AMD device (the driver-specific engine column
+labels differ); AMD's `gpu_busy_percent` sysfs value stayed 0 in these short
+runs, so it is not used as evidence.
+
+**VAAPI rate-control fix.** With the old argv (`-b:v` only, `rc_mode=auto`),
+Intel overshot the same 32×32-block content:
+
+| Case | Before (`auto`) | After (`-rc_mode CBR`) |
+|---|---:|---:|
+| Intel `h264_vaapi` 1080p | +26.1% (5,044.1 kbps) | +6.0% (4,239.8 kbps) |
+| Intel `h264_vaapi` 4K | +22.5% (24,490.1 kbps) | +6.7% (21,346.5 kbps) |
+| Intel `hevc_vaapi` 1080p | +6.3% (4,251.1 kbps) | +6.7% (4,266.7 kbps) |
+| Intel `hevc_vaapi` 4K | +14.1% (22,810.3 kbps) | +7.0% (21,400.2 kbps) |
+| AMD `h264_vaapi` 1080p/4K | +1.1% / −0.2% | unchanged |
+
+The node now emits `-rc_mode CBR` for `h264_vaapi`/`hevc_vaapi`. Per-segment
+variation remains (GOP boundaries and VAAPI's rate control), so this is
+steady-state accuracy, not a per-segment byte guarantee. A direct ffmpeg check
+with `testsrc2`, `smptehdbars`, `testsrc`, and `mandelbrot` at 1080p/4 Mbps also
+held at 4.1–4.2 Mbps with CBR.
+
+### 9.3 `queen` NVENC results
+
+The current `target/release/ozma-node` (24,794,480 B; max GLIBC 2.39) was copied
+to `/tmp/ozma-gate2-synth/ozma-node`; `queen` has GLIBC 2.39 and resolved every
+shared library. No QEMU was used: the synthetic source feeds the node directly.
+Same 30 fps, 1-second segments, 12 s window, steady mean excluding two startup
+segments.
+
+**CUDA ordinal mapping on `queen` is reversed relative to `nvidia-smi`:**
+verbose `h264_nvenc` output lists `GPU #0 - RTX 3090` and
+`GPU #1 - GTX 1660 SUPER`, while `nvidia-smi` lists index 0 = GTX 1660 SUPER,
+index 1 = RTX 3090. The table uses the node's `--nvenc-gpu`/CUDA ordinal.
+`nvidia-smi` encoder utilization and the live ffmpeg child confirmed the
+requested device was used.
+
+| `--nvenc-gpu` (CUDA) | Device | Encoder | Requested | Steady mean | Error | Segment min–max | CPU |
+|---:|---|---|---:|---:|---:|---:|---:|
+| 0 | RTX 3090 | `h264_nvenc` | 4,000 | 4,124.0 | +3.1% | 4,065.3–4,160.1 | 45.9% |
+| 0 | RTX 3090 | `hevc_nvenc` | 4,000 | 4,171.9 | +4.3% | 3,997.6–4,500.0 | 46.6% |
+| 0 | RTX 3090 | `h264_nvenc` | 20,000 | 20,682.1 | +3.4% | 20,397.2–21,635.0 | 105.9% |
+| 0 | RTX 3090 | `hevc_nvenc` | 20,000 | 21,105.3 | +5.5% | 20,448.4–21,462.1 | 106.7% |
+| 1 | GTX 1660 SUPER | `h264_nvenc` | 4,000 | 4,126.1 | +3.2% | 4,062.3–4,179.6 | 46.8% |
+| 1 | GTX 1660 SUPER | `hevc_nvenc` | 4,000 | 4,171.9 | +4.3% | 3,997.6–4,500.0 | 47.2% |
+| 1 | GTX 1660 SUPER | `h264_nvenc` | 20,000 | 20,650.8 | +3.3% | 20,156.6–21,638.0 | 107.6% |
+| 1 | GTX 1660 SUPER | `hevc_nvenc` | 20,000 | 20,979.0 | +4.9% | 20,448.4–21,462.1 | 106.1% |
+
+All segments were H.264 **Main** or HEVC **Main**, `yuv420p`, 3840x2160 or
+1920x1080, 30 fps, 1.000 s. NVENC kept CBR within +3.1–5.5% including MPEG-TS
+overhead, on both GPUs and both resolutions. The GTX 1660 SUPER was
+concurrently running Frigate CUDA/ffmpeg work (nvidia-smi 20–45% GPU, 15–18%
+encoder during a probe), and the RTX 3090 had ~22.8 GB used by an unrelated
+resident workload but 0% utilization; neither prevented the encode or broke the
+CBR result. CPU is again node+ffmpeg normalized to one core.
+
+### 9.4 HEVC 10-bit/HDR status (not implemented in HLS)
+
+Direct `ffmpeg` proof on both local VAAPI devices:
+
+```bash
+ffmpeg -f lavfi -i testsrc2=size=1920x1080:rate=30 -t 3 \
+  -vaapi_device /dev/dri/renderD128 \
+  -vf format=p010,hwupload -c:v hevc_vaapi -profile:v main10 \
+  -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc out.mkv
+```
+
+Both `renderD128` (Intel) and `renderD129` (AMD) produced
+`hevc Main 10 yuv420p10le 1920x1080`. That is a device capability, **not** an
+HLS feature:
+
+- The HLS VAAPI filter is hard-coded to `format=nv12,hwupload`; there is no
+  `p010`/`Main10` option and no bit-depth flag.
+- Software/NVENC/QSV paths pin `-pix_fmt yuv420p` (8-bit 4:2:0).
+- The only accepted capture formats are `rgb24`/`bgra`; the dev source is
+  RGB24. There is no 10-bit source path.
+- Even the direct test did not preserve HDR signaling: `ffprobe` reported
+  `color_space=bt2020nc` but `color_transfer=unknown` and
+  `color_primaries=unknown`.
+
+So HLS remains SDR 8-bit. 10-bit/HDR is reported as a gap, not claimed.
+
+### 9.5 Tests added
+
+- `ozma-node/src/config.rs`: fake capture is accepted for VM/desktop, rejected
+  for hardware, and geometry/fps bounds are enforced.
+- `ozma-node/src/platform.rs`: a VM fake registry advertises id `fake0`,
+  requested geometry/fps, kind `Fake`, and opens a source with the same format.
+- `ozma-node/src/main.rs`: `--fake-*` flags parse only with
+  `--capture-provider fake`.
+- `ozma-node/src/hls.rs`: 4K argv carries `3840x2160`, the requested bitrate,
+  1-second segments, NVENC `-gpu`/`-rc cbr`, VAAPI `-rc_mode CBR` + `nv12`
+  upload, and the 8-bit `yuv420p` pin.
+- `ozma-capture/src/fake.rs`: the block pattern is deterministic per sequence,
+  differs between frames, and the first 32×32 block is uniform.
+- Existing `ffmpeg_argv_carries_each_hardware_encoder_upload_and_rate_control`
+  now asserts VAAPI `-rc_mode CBR`.
+
+Default tests use no real GPU: 38 HLS lib tests (1 ignored), 155 `ozma-capture`
+tests (4 ignored), and the parity suite pass without hardware.
+
+### 9.6 Cleanup
+
+Local:
+
+- `/tmp/opencode/ozma-synth` (case HLS dirs, copied segments, logs, raw noise
+  and block inputs, direct 10-bit outputs) removed.
+- All synth node processes were killed by process group; no test ffmpeg child
+  or listener remained. Ports 47520–47747/TCP and 60520–60747/UDP were only
+  used for these runs and are free.
+- No package, driver, module, or repo change; no commit.
+
+`queen`:
+
+- `/tmp/ozma-gate2-synth` (copied binary, HLS dirs, segments, logs, probe
+  dirs) removed; every synth node process group and its ffmpeg child was
+  killed. Ports 47701–47747/TCP are free.
+- The existing Frigate workload was not touched; no package, driver, service,
+  or repository change was made on `queen`.

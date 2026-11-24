@@ -68,6 +68,9 @@ pub const HID_TO_QCODE: &[(u8, &str)] = &[
     (0x2F, "bracket_left"),
     (0x30, "bracket_right"),
     (0x31, "backslash"),
+    // ISO "Non-US # and ~" key occupies the same physical position as the US
+    // backslash key; QEMU's qcode table has one name for that position.
+    (0x32, "backslash"),
     (0x33, "semicolon"),
     (0x34, "apostrophe"),
     (0x35, "grave_accent"),

@@ -2453,6 +2453,12 @@ fn ffmpeg_argv_for(config: &HlsConfig, width: u32, height: u32, restart: bool) -
             "format=nv12,hwupload".to_owned(),
             "-c:v".to_owned(),
             config.video_encoder.ffmpeg_name().to_owned(),
+            // VAAPI's `auto` rate-control mode is not a CBR contract: on Intel
+            // iHD it overshot a `-b:v` target by 22-25% on moderate content.
+            // Naming CBR selects the driver's constant-bitrate mode instead of
+            // leaving it to a VBR-ish auto choice. Both iHD and Mesa expose it.
+            "-rc_mode".to_owned(),
+            "CBR".to_owned(),
             "-b:v".to_owned(),
             bitrate,
         ]),
@@ -3217,13 +3223,19 @@ mod tests {
             (
                 HlsEncoder::VaapiH264,
                 "h264_vaapi",
-                vec![("-vaapi_device", "/dev/dri/renderD129")],
+                vec![
+                    ("-vaapi_device", "/dev/dri/renderD129"),
+                    ("-rc_mode", "CBR"),
+                ],
                 Some("format=nv12,hwupload"),
             ),
             (
                 HlsEncoder::VaapiHevc,
                 "hevc_vaapi",
-                vec![("-vaapi_device", "/dev/dri/renderD129")],
+                vec![
+                    ("-vaapi_device", "/dev/dri/renderD129"),
+                    ("-rc_mode", "CBR"),
+                ],
                 Some("format=nv12,hwupload"),
             ),
             (
@@ -3304,6 +3316,83 @@ mod tests {
                     .any(|window| window == ["-hls_flags", "delete_segments"]),
                 "{encoder:?} argv must prune segments"
             );
+        }
+    }
+
+    #[test]
+    fn ffmpeg_argv_keeps_4k_geometry_and_requested_cbr_bitrate() {
+        let base = HlsConfig {
+            output_dir: PathBuf::from("/tmp/ozma-stream-4k"),
+            fps: 30,
+            bitrate_kbps: 20_000,
+            ..HlsConfig::default()
+        };
+
+        for (encoder, gpu) in [
+            (HlsEncoder::VaapiH264, None),
+            (HlsEncoder::VaapiHevc, None),
+            (HlsEncoder::NvencH264, Some(1)),
+            (HlsEncoder::NvencHevc, Some(0)),
+        ] {
+            let argv = ffmpeg_argv(
+                &HlsConfig {
+                    video_encoder: encoder,
+                    nvenc_gpu: gpu,
+                    ..base.clone()
+                },
+                3_840,
+                2_160,
+            );
+            assert!(
+                argv.windows(2).any(|window| window == ["-s", "3840x2160"]),
+                "{encoder:?} must carry the 4K input geometry: {argv:?}"
+            );
+            assert!(argv.contains(&"20000k".to_owned()), "{encoder:?}");
+            assert!(
+                argv.windows(2).any(|window| window == ["-hls_time", "1"]),
+                "{encoder:?} must keep 1-second segments"
+            );
+            if encoder.is_nvenc() {
+                let gpu = gpu.unwrap().to_string();
+                assert!(
+                    argv.windows(2)
+                        .any(|window| window == ["-gpu", gpu.as_str()]),
+                    "{encoder:?} must select CUDA ordinal {gpu}: {argv:?}"
+                );
+                assert!(
+                    argv.windows(2).any(|window| window == ["-rc", "cbr"]),
+                    "{encoder:?} must keep NVENC CBR"
+                );
+            } else {
+                assert!(
+                    !argv.iter().any(|argument| argument == "-gpu"),
+                    "{encoder:?} must not receive the NVENC-only -gpu option"
+                );
+            }
+            if encoder == HlsEncoder::VaapiH264 || encoder == HlsEncoder::VaapiHevc {
+                assert_eq!(
+                    encoder.hls_pixel_format(),
+                    None,
+                    "VAAPI uploads nv12 via -vf and does not pin an output pix_fmt"
+                );
+                assert!(
+                    argv.windows(2)
+                        .any(|window| window == ["-vf", "format=nv12,hwupload"]),
+                    "{encoder:?} must upload nv12"
+                );
+                assert!(
+                    argv.windows(2).any(|window| window == ["-rc_mode", "CBR"]),
+                    "{encoder:?} must request CBR, not the driver's auto mode: {argv:?}"
+                );
+            } else {
+                // SDR 8-bit 4:2:0 is explicit; 10-bit HDR is not supported by
+                // this HLS path and must not be implied by a 4K size.
+                assert!(
+                    argv.windows(2)
+                        .any(|window| window == ["-pix_fmt", "yuv420p"]),
+                    "{encoder:?} must pin 8-bit 4:2:0: {argv:?}"
+                );
+            }
         }
     }
 

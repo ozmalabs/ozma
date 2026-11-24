@@ -9,9 +9,10 @@ use ozma_protocol::{
 };
 
 use ozma_capture::{
-    CaptureRegistry, DBusDisplayConfig, QmpDisplayConfig, VncDisplayConfig, DBUS_DEFAULT_ID,
-    QMP_DEFAULT_ID, QMP_DEFAULT_MAX_FPS, VNC_DEFAULT_ID,
+    CaptureRegistry, DBusDisplayConfig, FakeCaptureProvider, QmpDisplayConfig, VncDisplayConfig,
+    DBUS_DEFAULT_ID, QMP_DEFAULT_ID, QMP_DEFAULT_MAX_FPS, VNC_DEFAULT_ID,
 };
+use ozma_media::FrameFormat;
 use ozma_qmp::SharedQmpClient;
 
 use crate::config::{NodeConfig, NodeProfile};
@@ -39,8 +40,29 @@ pub fn capture_registry_with_qmp_shared(
 ) -> CaptureRegistry {
     match config.profile {
         NodeProfile::Vm => vm_capture_registry(config, shared),
+        NodeProfile::Desktop if config.fake_capture_requested() => fake_capture_registry(config),
         NodeProfile::Hardware | NodeProfile::Desktop => CaptureRegistry::system_with_pipewire(),
     }
+}
+
+/// A dev/test-only synthetic RGB24 source.
+///
+/// This exists so the HLS/hardware-encode path can be validated on a host with
+/// no real capture device. It is never a profile default and the hardware
+/// profile rejects it in [`NodeConfig::vm_providers`], so it cannot silently
+/// replace a missing V4L2/PipeWire/guest source in production.
+fn fake_capture_registry(config: &NodeConfig) -> CaptureRegistry {
+    let format = FrameFormat::rgb24(config.fake_width, config.fake_height);
+    CaptureRegistry::new().with(
+        FakeCaptureProvider::new()
+            .with_identity(
+                "fake0",
+                format!("{} synthetic capture (dev/test)", config.name),
+            )
+            .with_format(format)
+            .with_blocks()
+            .with_fps(config.fake_fps),
+    )
 }
 
 fn vm_capture_registry(config: &NodeConfig, shared: Option<&SharedQmpClient>) -> CaptureRegistry {
@@ -50,6 +72,7 @@ fn vm_capture_registry(config: &NodeConfig, shared: Option<&SharedQmpClient>) ->
         .and_then(|providers| providers.capture);
 
     match capture.as_deref() {
+        Some("fake") => fake_capture_registry(config),
         Some("vnc") => match (config.vnc_host.as_deref(), config.vnc_port) {
             (Some(host), Some(port)) => CaptureRegistry::new().with_vnc_display(
                 VncDisplayConfig::new(host, port)
@@ -240,6 +263,9 @@ mod tests {
             dbus_height: ozma_capture::DBUS_DEFAULT_HEIGHT,
             dbus_fps: ozma_capture::DBUS_DEFAULT_FPS,
             dbus_requested: false,
+            fake_width: crate::config::DEFAULT_FAKE_WIDTH,
+            fake_height: crate::config::DEFAULT_FAKE_HEIGHT,
+            fake_fps: crate::config::DEFAULT_FAKE_FPS,
             audio_router: crate::config::AudioRouterKind::None,
             audio_track_root: None,
             ffmpeg_bin: std::path::PathBuf::from("ffmpeg"),
@@ -378,6 +404,49 @@ mod tests {
         assert_eq!(caps.capture[0].kind, ozma_protocol::CaptureKind::Dbus);
 
         let _ = std::fs::remove_file(socket);
+    }
+
+    #[test]
+    fn vm_fake_capture_advertises_the_requested_dev_geometry() {
+        let mut vm = config("hid,video,audio");
+        vm.profile = crate::config::NodeProfile::Vm;
+        vm.provider_overrides = crate::config::ProviderOverrides::from_cli("fake", "", "", "", "");
+        vm.providers = crate::config::ProviderSelection::for_profile(vm.profile)
+            .with_overrides(&vm.provider_overrides);
+        vm.fake_width = 3_840;
+        vm.fake_height = 2_160;
+        vm.fake_fps = 30;
+
+        let registry = capture_registry(&vm);
+        assert_eq!(registry.provider_count(), 1);
+        let scans = registry.scan();
+        assert_eq!(scans.len(), 1);
+        assert_eq!(scans[0].kind, ozma_protocol::CaptureKind::Fake);
+        assert_eq!(scans[0].capabilities.len(), 1);
+        let capability = &scans[0].capabilities[0];
+        assert_eq!(capability.id, "fake0");
+        assert!(capability.name.contains("dev/test"));
+        assert_eq!(
+            (capability.max_width, capability.max_height),
+            (3_840, 2_160)
+        );
+        assert_eq!(capability.max_fps, 30);
+        assert_eq!(capability.formats, vec!["rgb24".to_owned()]);
+        assert_eq!(capability.kind, ozma_protocol::CaptureKind::Fake);
+
+        // The synthetic geometry reaches NodeCapabilities, and the fake source
+        // opens with exactly the advertised frame format.
+        let caps = detect_with_registry(&vm, &registry);
+        assert_eq!(caps.capture.len(), 1);
+        assert_eq!(caps.capture[0].max_width, 3_840);
+        let source = registry
+            .open(&caps.capture[0])
+            .expect("fake source must open");
+        assert_eq!(
+            source.format(),
+            ozma_media::FrameFormat::rgb24(3_840, 2_160)
+        );
+        assert_eq!(source.id(), "fake0");
     }
 
     #[test]

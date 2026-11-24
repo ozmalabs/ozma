@@ -99,6 +99,8 @@ fn arrow_keys_mapped() {
     assert_eq!(hid_to_qcode(0x50), Some("left"));
     assert_eq!(hid_to_qcode(0x51), Some("down"));
     assert_eq!(hid_to_qcode(0x52), Some("up"));
+    // ISO "Non-US # and ~" shares the US backslash physical position.
+    assert_eq!(hid_to_qcode(0x32), Some("backslash"));
 }
 
 #[test]
@@ -111,7 +113,7 @@ fn no_empty_values() {
 
 #[test]
 fn unknown_usages_return_none() {
-    for hid in [0x00u8, 0x01, 0x02, 0x32, 0x74, 0x82, 0xFF] {
+    for hid in [0x00u8, 0x01, 0x02, 0x74, 0x82, 0xFF] {
         assert_eq!(hid_to_qcode(hid), None, "HID 0x{hid:02X} should be None");
     }
 }

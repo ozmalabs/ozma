@@ -11,10 +11,16 @@
 //!
 //! A few HID usages can legitimately share one Linux keycode. For those the
 //! table order is the tie-breaker: the first matching entry is the canonical
-//! HID usage, so the primary key wins over a secondary one. The only shared
-//! entry today is `KEY_PAUSE` (119), used by both `0x48` (Pause) and `0xB1`
-//! (the media-page Pause); `0x48` is listed first and therefore resolves the
-//! reverse direction.
+//! HID usage, so the primary key wins over a secondary one. Two pairs are
+//! shared today:
+//!
+//! * `KEY_PAUSE` (119), used by both `0x48` (Pause) and `0xB1` (the media-page
+//!   Pause); `0x48` is listed first and therefore resolves the reverse
+//!   direction.
+//! * `KEY_BACKSLASH` (43), used by `0x31` (`\` and `|`, the US position) and
+//!   `0x32` (Non-US `#` and `~`, the same ISO position used by UK/German/
+//!   French layouts). `0x31` is listed first and resolves the reverse
+//!   direction; the forward direction still distinguishes the two for typing.
 //!
 //! Table order otherwise matches ascending HID usage id and is covered by a
 //! test, so adding an entry in the wrong place is caught before it can affect
@@ -73,6 +79,7 @@ const KEYMAP: &[(u8, u16)] = &[
     (0x2F, 26), // [
     (0x30, 27), // ]
     (0x31, 43), // backslash
+    (0x32, 43), // Non-US # and ~ (ISO position; KEY_BACKSLASH)
     (0x33, 39), // ;
     (0x34, 40), // '
     (0x35, 41), // `
@@ -219,6 +226,9 @@ mod tests {
         // 0x48 (Pause) and 0xB1 (media Pause) both use KEY_PAUSE (119).
         // 0x48 is the primary keyboard Pause and wins the reverse lookup.
         (0xB1, 0x48),
+        // 0x31 (US \|) and 0x32 (ISO #~ position) both map to
+        // KEY_BACKSLASH (43); 0x31 is the canonical reverse mapping.
+        (0x32, 0x31),
     ];
 
     #[test]
@@ -263,7 +273,7 @@ mod tests {
         }
         assert_eq!(
             shared,
-            vec![(119, 0x48, 0xB1)],
+            vec![(43, 0x31, 0x32), (119, 0x48, 0xB1)],
             "unexpected shared Linux keycode; document it in SHARED_LINUX_CODES"
         );
     }

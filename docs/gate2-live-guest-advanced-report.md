@@ -18,11 +18,12 @@ DMA-BUF importer is a follow-up in §5.2. The important qualifications are:
 | Guest-initiated `reboot` through node `/input/type` | **PASS** — `reboot: Restarting system`; QEMU stays alive |
 | Guest-initiated `poweroff` through node `/input/type` and manual QMP | **PASS** — `reboot: Power down`; QEMU exits |
 | Node `/input/type` full ASCII punctuation string (+ tab probe) | **PASS after fix (follow-up)** — exact body echoed to the serial console, `0x09` tab captured, no stuck key; see §7.1 |
+| Node `/input/type` selectable US/UK/DE/FR layouts | **PASS (follow-up)** — exact serial echoes for all four guest keymaps, AltGr/Shift released, dead-key and unsupported characters typed 400 atomically; see §7.2 |
 | Guest audio | **PASS** — 440.1 Hz tone captured from QEMU's host audio monitor; peak −6.94 dBFS, tone RMS −9.96 dBFS |
 | Node `/audio/*` routing | **PASS** — 523 Hz reference played to the null sink and captured; peak −26.89 dBFS |
 | D-Bus 2D capture | **PASS** — BGRA `Scanout`/`Update`, snapshot and HLS |
 | D-Bus `Disable` | **PASS on the GL path only** — QEMU emitted two `Disable` messages on reset; 2D VGA emitted none |
-| D-Bus GL capture | **PASS (follow-up)** — `ScanoutDMABUF`/`UpdateDMABUF` importer maps linear XBGR/ABGR DMA-BUFs; live 1280×800 HLS, snapshot, `UpdateDMABUF`, and reset `Disable` verified. Tiled/compressed modifiers remain typed unsupported |
+| D-Bus GL capture | **PASS (follow-up)** — `ScanoutDMABUF`/`ScanoutDMABUF2`/`UpdateDMABUF` importer maps linear packed and multi-plane YUV DMA-BUFs, issues `DMA_BUF_IOCTL_SYNC`, applies damage-only updates, and holds the initial all-black GL scanout briefly; live 1280×800 HLS, snapshot, v2 scanout, `UpdateDMABUF`, and reset `Disable` verified. Tiled/compressed modifiers remain typed unsupported |
 | Secondary `Console_1` selection + live Scanout | **PASS with a second VGA device**; a guest-programmed second virtio-gpu head was **not** achieved |
 
 > No `sudo`, no package download, no libvirt mutation, and no write to an
@@ -38,7 +39,8 @@ DMA-BUF importer is a follow-up in §5.2. The important qualifications are:
 | Run | 2026-11-24 17:36–18:03 AEDT (2026-11-24T06:36–07:03Z) |
 | Repo | `/home/matt/ozma/ozma` |
 | HEAD at finish | `e600c43630185d92df29099eff1931c65b61c0d7` (`e600c43`) |
-| Working tree | Dirty from concurrent sessions; this run added the D-Bus fix, this report, short follow-up notes in existing reports, and the `/input/type` key-hold fix (§7.1) |
+| Working tree | Dirty from concurrent sessions; this run added the D-Bus fix, this report, short follow-up notes in existing reports, the `/input/type` key-hold fix (§7.1), and the selectable keyboard-layout change (§7.2) |
+| Layout follow-up (§7.2) | 2026-11-24 ~19:15–19:35 AEDT; HEAD `9f0edc2` plus the uncommitted layout change; temp root `/tmp/opencode/ozma-kbd-layout-20261124` (removed) |
 | Build | `cargo build -p ozma-node` → exit 0; `cargo test -p ozma-capture --lib dbus_display` → 26 passed, 1 ignored |
 | Node binary | `target/debug/ozma-node`, 283,021,464 bytes, `ozma-node 0.1.0` |
 | QEMU | `qemu-system-x86_64` 11.1.3, KVM (`accel=kvm:tcg`) |
@@ -530,15 +532,13 @@ built from this tree and started with `--capture-provider dbus --dbus-console 0
   720×400 and 1280×800 scanouts. The DMABUF mapping and framebuffer were
   cleared and re-established, and HLS continued.
 
-**Remaining GL limits:** non-linear/tiled/compressed modifiers and multi-plane
-`ScanoutDMABUF2` are rejected with a typed error; `NV12` is accepted only in the
-single-fd contiguous layout the v1 signature can describe; there is no explicit
-`DMA_BUF_IOCTL_SYNC` (the path relies on QEMU's `glFlush` before
-`UpdateDMABUF` and coherent x86 mappings); `UpdateDMABUF` re-snapshots the full
-buffer rather than only the damage rectangle. A one-shot snapshot taken
-immediately after listener registration can catch the initial black scanout on
-GL; the continuous HLS pipeline is the authoritative live path. The real-QEMU
-test remains opt-in and is not in CI.
+**Remaining GL limits:** non-linear/tiled/compressed modifiers are rejected with a
+typed error naming the modifier and fourcc; they are not interpreted as linear
+pixels. The 2026-11-24 v2 follow-up (see §5.7) added multi-plane
+`ScanoutDMABUF2`, `DMA_BUF_IOCTL_SYNC`, damage-only `UpdateDMABUF` copies, and
+an initial-black hold. Its live QEMU host exported only linear single-plane
+buffers, so the multi-plane and tiled paths are unit-covered but not
+live-exercised. The real-QEMU test remains opt-in and is not in CI.
 
 ### 5.3 `Disable` — live on GL, absent on 2D
 
@@ -667,6 +667,92 @@ test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 No `ozma-power`/ACPI change was needed. `POST /power/stop` already calls QMP
 `quit`; the live process-exit test confirms the documented force-off semantics.
 
+### 5.7 DMABUF v2, sync, damage, and initial-black follow-up (2026-11-24)
+
+**Scope.** Extend the GL importer beyond the v1 single-plane message:
+
+- Advertise `org.qemu.Display1.Listener.Unix.ScanoutDMABUF2` in the listener's
+  `Interfaces` property. QEMU 11.1.3 then uses `ScanoutDMABUF2` for every
+  DMA-BUF scanout (`ui/dbus-listener.c`), while the v1 `ScanoutDMABUF` arm
+  remains for older peers.
+- Parse the variable-size `ahuuuuauauuuuutb` body: `ah` fd indices, `x/y` origin,
+  `width/height`, per-plane `au` offsets and strides, `num_planes`, fourcc,
+  backing geometry, modifier, and `y0_top`. The parser validates array lengths,
+  plane count (`1..=4`), fd/offset/stride equality, D-Bus alignment, and rejects
+  trailing non-zero bytes.
+- Import each plane into its own read-only `memmap2` mapping with checked
+  `offset + stride × rows` bounds and a per-plane minimum row size. Supported
+  linear layouts are packed XBGR/ABGR/XRGB/ARGB/BGRA/RGBA, two-plane
+  NV12/NV21, three-plane YUV420/YVU420, and v1 single-fd contiguous NV12.
+  A tiled/compressed modifier is still a typed unsupported error naming the
+  modifier and fourcc.
+- Issue `DMA_BUF_IOCTL_SYNC` start/end read around every snapshot and damage
+  copy. `ENOTTY`/`EINVAL`/`EOPNOTSUPP` are treated as a coherent exporter
+  (needed for the tempfile unit tests); any other sync failure is a typed
+  error. Live QEMU produced no “sync is not supported” diagnostic, so the real
+  DMA-BUFs accepted the ioctl.
+- Keep an owned BGRA frame for the mapped scanout. `UpdateDMABUF` now copies
+  only the damaged rectangle into that frame instead of re-snapshotting the
+  whole buffer, including the `y0_top` row flip and multi-plane chroma
+  addressing. A stale damage rectangle larger than the current scanout (QEMU
+  sends one during a mode change) is logged and ignored until the next
+  `ScanoutDMABUF`/`ScanoutDMABUF2`, instead of failing HLS.
+- Hold an all-black first scanout for at most 750 ms. QEMU frequently sends the
+  initial GL texture before the guest has drawn; if the first damage makes the
+  frame non-black it is emitted immediately. A genuinely black screen is
+  served after the grace period, so this is a delay rather than a permanent
+  filter.
+
+**Live run.** 2026-11-24 19:17–19:30 AEDT, QEMU 11.1.3, Alpine 3.21 live
+(read-only ISO, unchanged), `virtio-vga-gl`, `-display dbus,p2p=yes,gl=on`,
+temp root `/tmp/opencode/ozma-dmabuf2-20261124-191747` (removed), node HTTP
+port 47851. The node ran with `--capture-provider dbus --dbus-console 0
+--dbus-width 1280 --dbus-height 800 --hls`.
+
+- The ignored real-QEMU test passed: `1280x800`, `4,096,000` bytes.
+- Node debug logs show `D-Bus multi-plane DMA-BUF scanout imported` with
+  `planes=1`, `x=0`, `y=0`, backing `1280x800`, fourcc `875709016` (`XB24`)
+  `y0_top=false`, then fourcc `875708993` (`AB24`) `y0_top=true`, both with
+  modifier `0x0000000000000000`. This proves the live v2 message is parsed and
+  imported, not a v1 fallback.
+- The first scanout was all black and logged as held; the following non-black
+  scanout started HLS. A snapshot taken during a later reset returned a
+  720×400 frame with 4,246 non-black samples, not an all-black JPEG.
+- `DMA_BUF_IOCTL_SYNC` produced no “not supported” diagnostic; capture and HLS
+  continued, so the real exporter accepted the sync ioctl.
+- HLS reported `hls: "running"`, `hls_error: null`; segments decoded as
+  `1280x800 yuv420p` and were non-black. `GET /display/snapshot` returned a
+  1280×800 JPEG (about 126 KB).
+- A guest `printf` wrote red, green, and blue background blocks. In both the
+  snapshot and a decoded HLS segment the blocks appeared left-to-right as
+  red x=0–15, green x=16–31, blue x=32–47 at y=752–766, confirming the channel
+  order and the `y0_top` flip direction on the live scanout.
+- `POST /power/reset` produced `D-Bus Disable received; framebuffer cleared`,
+  then fresh 1280×800 and 720×400 scanouts and (during the transition) a stale
+  `UpdateDMABUF` rectangle of 1280×800 against the 720×400 scanout. The stale
+  update was ignored, HLS stayed `running`, and the next scanout restored
+  frames. A second reset reproduced the same recovery.
+
+**Multi-plane/tiled live limit.** The host renderer exported only linear,
+single-plane buffers for the GL console (`planes=1`, modifier `0`), so a live
+multi-plane scanout was not available and no tiled modifier was observed. The
+multi-plane conversion and fd/offset/stride validation are covered by unit
+tests with separate luma/chroma fds, offsets, and strides. Importing a tiled or
+compressed modifier would require a real GBM/EGL importer (EGL display + GBM
+buffer import + GL readback). This tree has no `libgbm`/EGL Rust bindings, and
+doing it with raw FFI would be unsafe-heavy; the exact blocker is therefore the
+absence of both a tiled live source and a safe importer crate. Tiled input is
+still refused with a typed error rather than misread.
+
+**Tests.** `cargo test -p ozma-capture --lib dbus_`: **54 passed, 0 failed, 1
+ignored**. The full `cargo test -p ozma-capture` run passed too. New tests cover
+v2 body parsing (including array/plane mismatches), two-plane NV12 with
+offsets/strides, packed sub-rectangles, damage-only copies, tiled-modifier
+rejection, v2 fd-count protocol errors, initial-black hold, stale oversized
+damage recovery, and descriptor ownership. The fd-cleanup tests compare the
+descriptor's `/proc/self/fd` inode instead of closing a raw number, avoiding
+cross-test fd-reuse corruption under the parallel runner.
+
 ## 6. Pass / fail / skip
 
 | Area | Result | Evidence |
@@ -731,10 +817,11 @@ No `ozma-power`/ACPI change was needed. `POST /power/stop` already calls QMP
    auto-repeated). The earlier run's frozen line and non-responsive input were
    this stuck-key state, not a hung HTTP handler: QMP had accepted every event.
    The fix in `ozma-node/src/controller_compat.rs` holds each non-modifier key
-   for 20 ms, keeps the 15 ms inter-character delay, sends explicit left-shift
-   down/up around shifted characters, releases each key and shift, releases any
-   held state on a submit error, and rejects unsupported text before sending the
-   first event. See §7.1 for the live re-run.
+   for 20 ms, keeps the 15 ms inter-character delay, sends explicit left-Shift
+   and right-Alt (AltGr) down/up around the character, releases each key and
+   modifier in reverse order, releases any held state on a submit error, and
+   rejects unsupported text before sending the first event. See §7.1 for the
+   live re-run and §7.2 for selectable layouts.
 7. **Not in this run:** WebRTC media, controller/dashboard, mouse-pointer
    artifacts (text console), and non-linear/multi-plane DMA-BUF capture. D-Bus
    GL with linear DMA-BUFs is covered by the follow-up in §5.2.
@@ -777,13 +864,82 @@ then an endless `5` auto-repeat; the here-doc terminator was never accepted and
 serial received no body. That pre-fix guest was discarded without being used as
 PASS evidence.
 
-**Remaining keyboard-layout limitations:** text is US layout only. A guest
-whose keymap is not US will produce that layout's characters for these HID
-usages; dead keys, compose, IME, and non-ASCII characters are not supported and
-return a typed 400 before typing. Typing is paced at a fixed 20 ms key hold plus
-15 ms between characters, not by guest acknowledgement; the 4096-character
-limit therefore takes about 2.5 minutes, and an unusually slow guest may still
-need a larger hold or a guest-side keymap check.
+**Keyboard-layout follow-up:** this run was US-only. §7.2 adds selectable
+`us`/`uk`/`de`/`fr` layouts and live evidence for all four. Dead-key sequences,
+compose, and IME remain unsupported and are typed 400 before any event. Typing
+is still paced at a fixed 20 ms key hold plus 15 ms between characters, not by
+guest acknowledgement; the 4096-character limit therefore takes about
+2.5 minutes, and an unusually slow guest may still need a larger hold or a
+guest-side keymap check.
+
+### 7.2 Follow-up: selectable keyboard layouts (2026-11-24)
+
+`POST /input/type` now takes `--keyboard-layout us|uk|de|fr`
+(`OZMA_KEYBOARD_LAYOUT`, default `us`). The node maps each character to the
+physical HID usage plus the Shift/AltGr state that produces it on the selected
+guest console keymap. The complete request is validated before the sink is
+touched, so a dead-key-only or non-ASCII character anywhere in the text produces
+a typed 400 without typing anything.
+
+This follow-up ran on HEAD `9f0edc2` with the uncommitted layout change, a fresh
+disposable Alpine 3.21 guest, QEMU 11.1.3, `-device usb-kbd`, and the QMP input
+provider. The guest keymaps came from the ISO's
+`kbd-bkeymaps-2.6.4-r2.apk`, extracted under `/tmp` and loaded with busybox
+`loadkmap`:
+
+```text
+zcat /tmp/bmaps/usr/share/bkeymaps/de/de.bmap.gz > /tmp/de.bmap
+loadkmap < /tmp/de.bmap
+zcat /tmp/bmaps/usr/share/bkeymaps/gb/gb.bmap.gz > /tmp/gb.bmap
+loadkmap < /tmp/gb.bmap
+zcat /tmp/bmaps/usr/share/bkeymaps/fr/fr-latin9_nodeadkeys.bmap.gz > /tmp/fr.bmap
+loadkmap < /tmp/fr.bmap
+```
+
+A node was restarted with the matching `--keyboard-layout` for each keymap.
+Each test used a here-doc that the guest wrote to `/dev/ttyS0`, so the serial log
+shows the guest's interpretation of the injected usages, not the request body.
+All four echoes matched exactly:
+
+```text
+US azAZ09 _ > | ~ : " < ? + = - , . / ; ' \ [ ] ` { } ! @ # $ % ^ & * ( )
+US-LAYOUT-OK
+UK azAZ09 " @ # ~ £ ¬ \ | < > = + - _ ; : ' , . / ? ! $ % ^ & * ( )
+UK-LAYOUT-OK
+DE azAZ09 äöüß ÄÖÜ @ € {[]} \ | < > = + - _ # ' ? ; : , .
+DE-LAYOUT-OK
+DE-NO-STUCK
+FR azAZ09 aqzwm éèàçù @ # ~ ^ ` {[]} \ | < > 1&2é 9ç 0à
+FR-LAYOUT-OK
+```
+
+The requests returned `{"ok":true}` with 346 (US), 332 (UK), 316 (DE), and 312
+(FR) events. The `DE-NO-STUCK` marker was typed after an AltGr sequence and
+executed, and every marker needed a working Shift release, so no modifier was
+left held.
+
+Atomic rejection was checked against the German keymap. `ab^` (German `^` is
+`dead_circumflex`) returned HTTP 400 `{"code":"dead-key-required"}` and `abé`
+(no direct German key) returned HTTP 400
+`{"code":"unsupported-character"}`; the serial log's byte count was unchanged
+(28175 before and after both requests), so no partial text reached the guest.
+
+**French keymap variance:** plain `fr-latin9` was tried first. Its AltGr+7 is
+`dead_grave`, so the backtick consumed the following space and the serial line
+became ``... ^ `{[]} ...`` instead of ``... ^ ` {[]} ...``. The FR table therefore
+targets `fr-latin9_nodeadkeys` (and Alpine's matching bmap), which produced the
+exact line above. The layout is configured, not detected; a guest with plain
+`fr-latin9` should use that keymap's nodeadkeys variant or send raw
+`/input/key` events for the grave key.
+
+**Remaining layout gaps:** dead-key sequences, compose, and IME are not
+implemented. German `^`, `~`, and the grave key are rejected as dead-key-only;
+the French dead-key accents `¨`, `´`, and `¸` are rejected. Non-ASCII text with
+no direct key on the selected layout (CJK, emoji, combining marks, and `é` on
+US/UK/DE) is rejected. The node does not inspect the guest keymap, so
+`--keyboard-layout` must match it. The ISO `#~` position (HID `0x32`) needed a
+new mapping to `KEY_BACKSLASH`/QEMU `backslash`; it is covered by
+`cargo test -p ozma-input --lib keymap` and `cargo test -p ozma-qmp`.
 
 ## 8. Cleanup
 
@@ -803,6 +959,10 @@ The final cleanup table is filled after the run:
 | D-Bus DMABUF follow-up ffmpeg | 297129 | exited with the node |
 | D-Bus DMABUF follow-up temp root | `/tmp/opencode/ozma-dmabuf` | removed |
 | D-Bus DMABUF follow-up ports | 47591/60591 | no listeners |
+| Keyboard-layout follow-up QEMU | 398049 (`qemu/qemu.pid`) | SIGTERM; exited |
+| Keyboard-layout follow-up nodes | `node/node.pid` (restarted per layout) | SIGTERM; exited |
+| Keyboard-layout follow-up temp root | `/tmp/opencode/ozma-kbd-layout-20261124` | removed |
+| Keyboard-layout follow-up ports | 47741/60741 | no listeners |
 | Serial bridges | 131746 and the per-run bridge PIDs | killed |
 | Null sink | `ozma-gate2-adv` (module 536870916) | unloaded; `pactl list short sinks` no longer shows it |
 | Temp root | `/tmp/opencode/ozma-gate2-adv-20261124-173623` | removed |
