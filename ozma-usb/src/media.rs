@@ -15,6 +15,57 @@ use serde::{Deserialize, Serialize};
 use crate::config::is_safe_identifier;
 use crate::error::UsbError;
 
+/// Backing format declared for a mass-storage image.
+///
+/// `Raw` is the historical default and imposes no content validation. The
+/// other variants add read-only or read-only-media policy checks and, where
+/// practical, a bounded content probe immediately before attach.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaFormat {
+    /// An opaque disk image (the existing behaviour).
+    #[default]
+    Raw,
+    /// An ISO 9660 image; CD-ROM and read-only.
+    Iso9660,
+    /// A FAT32 image produced by this crate or another tool.
+    Fat32,
+    /// A local file served through an NBD export.
+    Nbd,
+}
+
+impl MediaFormat {
+    /// Stable lower-case name used in JSON.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Iso9660 => "iso9660",
+            Self::Fat32 => "fat32",
+            Self::Nbd => "nbd",
+        }
+    }
+
+    /// Whether this is the default opaque image format.
+    pub fn is_raw(&self) -> bool {
+        matches!(self, Self::Raw)
+    }
+
+    /// Whether the format requires CD-ROM presentation.
+    pub fn requires_cdrom(self) -> bool {
+        matches!(self, Self::Iso9660)
+    }
+
+    /// Whether the format is intrinsically read-only.
+    pub fn is_read_only(self) -> bool {
+        matches!(self, Self::Iso9660)
+    }
+
+    /// Whether a ConfigFS LUN can use this format directly.
+    pub fn configfs_attachable(self) -> bool {
+        !matches!(self, Self::Nbd)
+    }
+}
+
 /// How the kernel should present a mass-storage LUN.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -54,6 +105,9 @@ pub struct MassStorageImage {
     pub mode: MediaMode,
     /// Whether the LUN is exposed read-only.
     pub read_only: bool,
+    /// Declared backing format.
+    #[serde(default, skip_serializing_if = "MediaFormat::is_raw")]
+    pub format: MediaFormat,
     /// Known image size, if the caller already knows it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
@@ -66,6 +120,7 @@ impl MassStorageImage {
             path: path.into(),
             mode: MediaMode::Disk,
             read_only: false,
+            format: MediaFormat::Raw,
             size_bytes: None,
         }
     }
@@ -76,8 +131,52 @@ impl MassStorageImage {
             path: path.into(),
             mode: MediaMode::CdRom,
             read_only: true,
+            format: MediaFormat::Raw,
             size_bytes: None,
         }
+    }
+
+    /// A read-only ISO 9660 CD-ROM image.
+    pub fn iso(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            mode: MediaMode::CdRom,
+            read_only: true,
+            format: MediaFormat::Iso9660,
+            size_bytes: None,
+        }
+    }
+
+    /// A read-only FAT32 image presented as a removable disk.
+    pub fn fat32(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            mode: MediaMode::Disk,
+            read_only: true,
+            format: MediaFormat::Fat32,
+            size_bytes: None,
+        }
+    }
+
+    /// A local file exposed through NBD (not attached directly to ConfigFS).
+    pub fn nbd(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            mode: MediaMode::Disk,
+            read_only: true,
+            format: MediaFormat::Nbd,
+            size_bytes: None,
+        }
+    }
+
+    /// Set the declared backing format.
+    ///
+    /// Consistency (for example ISO requires CD-ROM/read-only) is checked by
+    /// [`Self::validate`] and by [`Self::with_format`].
+    pub fn with_format(mut self, format: MediaFormat) -> Result<Self, UsbError> {
+        self.format = format;
+        self.validate()?;
+        Ok(self)
     }
 
     /// Set the read-only flag.
@@ -129,15 +228,56 @@ impl MassStorageImage {
                 "media image size must be greater than zero".to_owned(),
             ));
         }
+        match self.format {
+            MediaFormat::Raw => {}
+            MediaFormat::Iso9660 => {
+                if !self.mode.is_cdrom() {
+                    return Err(UsbError::UnsupportedMediaFormat {
+                        format: self.format.as_str(),
+                        reason: "ISO 9660 media must use CD-ROM presentation".to_owned(),
+                    });
+                }
+                if !self.read_only {
+                    return Err(UsbError::UnsupportedMediaFormat {
+                        format: self.format.as_str(),
+                        reason: "ISO 9660 media must be read-only".to_owned(),
+                    });
+                }
+            }
+            MediaFormat::Fat32 => {
+                if self.mode.is_cdrom() {
+                    return Err(UsbError::UnsupportedMediaFormat {
+                        format: self.format.as_str(),
+                        reason: "FAT32 media must use disk presentation".to_owned(),
+                    });
+                }
+            }
+            MediaFormat::Nbd => {
+                if self.mode.is_cdrom() {
+                    return Err(UsbError::UnsupportedMediaFormat {
+                        format: self.format.as_str(),
+                        reason: "NBD media must use disk presentation".to_owned(),
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
     /// Validate the model and require the backing file to exist.
     ///
     /// This is called immediately before a ConfigFS `file` attribute is
-    /// written. It never opens the image for read or write.
+    /// written. It never opens the image for writing or mounts it; ISO/FAT32
+    /// format probes read a small bounded header.
     pub fn validate_for_attach(&self) -> Result<u64, UsbError> {
         self.validate()?;
+        if !self.format.configfs_attachable() {
+            return Err(UsbError::UnsupportedMediaFormat {
+                format: self.format.as_str(),
+                reason: "NBD exports are served by the NBD layer and are not a ConfigFS LUN file"
+                    .to_owned(),
+            });
+        }
         let metadata = fs::metadata(&self.path).map_err(|source| {
             if source.kind() == std::io::ErrorKind::NotFound {
                 UsbError::MediaNotFound(self.path.clone())
@@ -154,6 +294,15 @@ impl MassStorageImage {
                 "media image {} is empty",
                 self.path.display()
             )));
+        }
+        match self.format {
+            MediaFormat::Iso9660 => {
+                crate::iso::validate_iso_image(&self.path)?;
+            }
+            MediaFormat::Fat32 => {
+                crate::fat32::validate_fat32_boot_sector(&self.path)?;
+            }
+            MediaFormat::Raw | MediaFormat::Nbd => {}
         }
         Ok(size)
     }
@@ -253,9 +402,42 @@ impl VirtualMedia {
         }
     }
 
+    /// An initially detached read-only ISO CD-ROM.
+    pub fn iso(function: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+        Self {
+            function: function.into(),
+            image: MassStorageImage::iso(path),
+            state: MediaState::Detached,
+        }
+    }
+
+    /// An initially detached read-only FAT32 disk.
+    pub fn fat32(function: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+        Self {
+            function: function.into(),
+            image: MassStorageImage::fat32(path),
+            state: MediaState::Detached,
+        }
+    }
+
+    /// An initially detached NBD-backed media descriptor.
+    pub fn nbd(function: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+        Self {
+            function: function.into(),
+            image: MassStorageImage::nbd(path),
+            state: MediaState::Detached,
+        }
+    }
+
     /// Set the image read-only flag.
     pub fn with_read_only(mut self, read_only: bool) -> Result<Self, UsbError> {
         self.image = self.image.with_read_only(read_only)?;
+        Ok(self)
+    }
+
+    /// Set the declared image format.
+    pub fn with_format(mut self, format: MediaFormat) -> Result<Self, UsbError> {
+        self.image = self.image.with_format(format)?;
         Ok(self)
     }
 

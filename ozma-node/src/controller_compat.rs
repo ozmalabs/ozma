@@ -58,6 +58,7 @@ use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
 use crate::display_compat::{DisplayInfo, SnapshotControl, SnapshotError};
+use crate::display_control::{DisplayControl, DisplayStatus, SelectConsoleRequest};
 use crate::hls::{HlsController, HlsEncoder, HlsError, HlsStatus};
 use crate::keyboard_layout::{
     key_event, resolve_compose_sequence, resolve_dead_key_sequence, CharOutcome, KeyChord,
@@ -1769,6 +1770,10 @@ pub struct ConnectionState {
     pub display_outputs: serde_json::Value,
     /// Live capture console/provider and any multi-console limitation.
     pub display_capture: DisplayCaptureStatus,
+    /// Runtime console selector. When present it is the source of truth for
+    /// `/api/v1/connection.display_outputs`/`display_capture` and backs
+    /// `POST /display/select`.
+    pub display_control: Option<DisplayControl>,
     /// Live capture transport/source for `/api/v1/connection`.
     pub capture: CaptureStatus,
 }
@@ -1792,6 +1797,7 @@ impl ConnectionState {
             metrics: crate::agent_metrics::AgentMetricsSampler::default(),
             display_outputs: serde_json::json!([]),
             display_capture: DisplayCaptureStatus::default(),
+            display_control: None,
             capture: CaptureStatus::default(),
         }
     }
@@ -1820,6 +1826,28 @@ impl ConnectionState {
         self.display_outputs = outputs;
         self.display_capture = capture;
         self
+    }
+
+    /// Attach the runtime console selector.
+    ///
+    /// Once attached, `/api/v1/connection` reads the live selection from this
+    /// shared control instead of the static values passed to
+    /// [`ConnectionState::with_display_outputs`], so a successful
+    /// `POST /display/select` is visible immediately.
+    pub fn with_display_control(mut self, control: Option<DisplayControl>) -> Self {
+        self.display_control = control;
+        self
+    }
+
+    /// Current display outputs and capture status.
+    pub fn display_status(&self) -> DisplayStatus {
+        match self.display_control.as_ref() {
+            Some(control) => control.status(),
+            None => DisplayStatus {
+                display_outputs: self.display_outputs.clone(),
+                display_capture: self.display_capture.clone(),
+            },
+        }
     }
 
     /// Attach a connected power backend.
@@ -2138,6 +2166,7 @@ pub fn usb_router(state: ConnectionState) -> Router {
 pub fn display_router(state: ConnectionState) -> Router {
     Router::new()
         .route("/display/mjpeg", get(display_mjpeg))
+        .route("/display/select", post(display_select))
         .with_state(state)
 }
 
@@ -2189,10 +2218,7 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
     };
     let (webrtc_audio_configured, webrtc_audio_source) = match &state.webrtc {
         None => (false, None),
-        Some(control) => (
-            control.audio_configured(),
-            control.audio_source().map(str::to_owned),
-        ),
+        Some(control) => (control.audio_configured(), control.audio_source()),
     };
     let input = InputStatus {
         sink_kind: info.sink_kind.clone(),
@@ -2213,6 +2239,7 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
         .as_ref()
         .map(CodecControl::status)
         .unwrap_or_else(|| state.codecs.clone());
+    let display = state.display_status();
     Json(ConnectionResponse {
         ok: true,
         node_id: info.node_id.clone(),
@@ -2234,8 +2261,8 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
         usb,
         webrtc_audio_configured,
         webrtc_audio_source,
-        display_outputs: state.display_outputs.clone(),
-        display_capture: state.display_capture.clone(),
+        display_outputs: display.display_outputs,
+        display_capture: display.display_capture,
         capture: state.capture.clone(),
     })
 }
@@ -2304,6 +2331,38 @@ async fn display_mjpeg(State(_state): State<ConnectionState>) -> Response {
              endpoint for previews. A real MJPEG stream is not implemented.",
         ),
     )
+}
+
+/// Runtime console selection.
+///
+/// Body: `{"index": <Console_N>}` or `{"id": "<label|Console_N|source-id>"}`.
+/// Only D-Bus exposes selectable console indexes today. QMP, VNC, and Looking
+/// Glass answer a typed 409 for a different console instead of pretending to
+/// switch; no display control at all answers 501. A pipeline failure rolls back
+/// where possible and returns 502, never a success-shaped body.
+async fn display_select(
+    State(state): State<ConnectionState>,
+    payload: Result<Json<SelectConsoleRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(error) => return json_rejection(error),
+    };
+    let Some(control) = state.display_control.as_ref() else {
+        return compat_error_with_remediation(
+            StatusCode::NOT_IMPLEMENTED,
+            "display.console_unsupported",
+            "This node has no runtime console selector.",
+            Some(
+                "Configure --profile vm with a display capture provider; only D-Bus supports \
+                 switching between advertised Console_N heads at runtime.",
+            ),
+        );
+    };
+    match control.select(&request).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => api_error_response(error.status, error.error),
+    }
 }
 
 async fn node_status(State(state): State<ConnectionState>) -> Json<ConnectionResponse> {
@@ -4726,6 +4785,109 @@ mod tests {
             json["display_capture"]["limitation"],
             "only Console_0 has a live capture source"
         );
+    }
+
+    struct SwitchConsoleFactory;
+
+    impl crate::display_control::ConsoleSourceFactory for SwitchConsoleFactory {
+        fn provider(&self) -> Option<ozma_display::vm::VmConsoleBackend> {
+            Some(ozma_display::vm::VmConsoleBackend::Dbus)
+        }
+
+        fn default_console(&self) -> u32 {
+            0
+        }
+
+        fn supports_console_switch(&self) -> bool {
+            true
+        }
+
+        fn registry(&self, console: u32) -> Result<CaptureRegistry, String> {
+            Ok(CaptureRegistry::new().with(
+                FakeCaptureProvider::new()
+                    .with_identity(format!("console-{console}"), format!("Console_{console}")),
+            ))
+        }
+
+        fn selection(
+            &self,
+            console: u32,
+        ) -> Result<crate::display_outputs::DisplayOutputSelection, String> {
+            crate::display_outputs::outputs_from_specs(
+                &[
+                    "0:Console_0:1920x1080:primary:dbus".to_owned(),
+                    "1:Console_1:1280x1024:dbus".to_owned(),
+                ],
+                ozma_display::vm::VmConsoleBackend::Dbus,
+                Some("dbus0"),
+                Some(console),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn display_select_updates_the_connection_shape_and_capture_source() {
+        let slot = Arc::new(std::sync::RwLock::new(
+            <SwitchConsoleFactory as crate::display_control::ConsoleSourceFactory>::registry(
+                &SwitchConsoleFactory,
+                0,
+            )
+            .expect("registry"),
+        ));
+        let control = DisplayControl::new(Arc::new(SwitchConsoleFactory), slot, Vec::new())
+            .expect("display control");
+        let state = ConnectionState::new(
+            ConnectionInfo::new("vm-a._ozma._udp.local.", "vm", 7382, 7384, 7331, SINK_QMP),
+            CompatStats::default(),
+        )
+        .with_display_control(Some(control.clone()));
+        let app = connection_router(state.clone());
+
+        let (status, first) = get_json(&app, "/api/v1/connection").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(first["display_capture"]["active_console"], 0);
+        assert_eq!(first["display_capture"]["provider"], "dbus");
+        assert_eq!(first["display_outputs"][0]["capture_source_id"], "dbus0");
+        assert_eq!(first["display_outputs"][1]["capture_source_id"], "");
+
+        let (status, selected) = post_json(
+            &display_router(state.clone()),
+            "/display/select",
+            serde_json::json!({"index": 1}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{selected}");
+        assert_eq!(selected["active_console"], 1);
+        assert_eq!(selected["previous_console"], 0);
+        assert_eq!(selected["changed"], true);
+        assert_eq!(selected["display_capture"]["active_console"], 1);
+        assert_eq!(selected["display_outputs"][0]["capture_source_id"], "");
+        assert_eq!(selected["display_outputs"][1]["capture_source_id"], "dbus0");
+
+        let (status, after) = get_json(&connection_router(state), "/api/v1/connection").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(after["display_capture"]["active_console"], 1);
+        assert_eq!(after["display_outputs"][0]["capture_source_id"], "");
+        assert_eq!(after["display_outputs"][1]["capture_source_id"], "dbus0");
+        assert!(after["display_capture"]["limitation"]
+            .as_str()
+            .is_some_and(|note| note.contains("Console_1")));
+    }
+
+    #[tokio::test]
+    async fn display_select_without_a_control_is_a_typed_501() {
+        let state = ConnectionState::new(
+            ConnectionInfo::new("vm-a._ozma._udp.local.", "vm", 7382, 7384, 7331, SINK_QMP),
+            CompatStats::default(),
+        );
+        let (status, body) = post_json(
+            &display_router(state),
+            "/display/select",
+            serde_json::json!({"index": 1}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(body["code"], "display.console_unsupported");
     }
 
     #[tokio::test]

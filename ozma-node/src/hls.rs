@@ -2252,6 +2252,67 @@ impl HlsController {
         }
     }
 
+    /// Start the pipeline from an already-open source.
+    ///
+    /// This is the console-switch path: the caller has rebuilt the capture
+    /// registry for a different `Console_N` and opened the source itself, so no
+    /// source factory is consulted. A failure leaves the controller stopped
+    /// with `failed` status; the caller is responsible for restoring the old
+    /// source (and should not report success).
+    pub async fn start_with_source(
+        &self,
+        source: Box<dyn CaptureSource>,
+    ) -> Result<HlsStatus, HlsError> {
+        let mut pipeline = self.pipeline.lock().await;
+        self.start_with_source_locked(&mut pipeline, source).await
+    }
+
+    async fn start_with_source_locked(
+        &self,
+        pipeline: &mut Option<HlsPipeline>,
+        source: Box<dyn CaptureSource>,
+    ) -> Result<HlsStatus, HlsError> {
+        if pipeline.is_some() {
+            return Ok(self.status());
+        }
+        let config = self.config();
+        match HlsPipeline::start_with_spawner_and_probe(
+            source,
+            config,
+            self.spawner.clone(),
+            self.probe.clone(),
+        ) {
+            Ok(started) => {
+                let status = started.status();
+                *lock(&self.status) = status.clone();
+                *pipeline = Some(started);
+                Ok(status)
+            }
+            Err(error) => {
+                *lock(&self.status) = HlsStatus::failed(error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    /// Replace the running generation with a new source, or start it when the
+    /// previous generation was already stopped.
+    ///
+    /// The old pipeline is stopped before the new source is used so capture
+    /// backends release their device/socket. A failed start leaves this
+    /// controller stopped; [`Self::start_with_source`] can restore a previous
+    /// source supplied by the caller.
+    pub async fn restart_or_start_with_source(
+        &self,
+        source: Box<dyn CaptureSource>,
+    ) -> Result<HlsStatus, HlsError> {
+        let mut pipeline = self.pipeline.lock().await;
+        if let Some(mut previous) = pipeline.take() {
+            let _ = previous.stop().await;
+        }
+        self.start_with_source_locked(&mut pipeline, source).await
+    }
+
     /// Stop and drop the current pipeline.
     ///
     /// Idempotent when no pipeline is running. The status is updated from the

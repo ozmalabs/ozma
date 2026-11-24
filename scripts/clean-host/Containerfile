@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH OzmaPluginException
+#
+# Build/test image for the clean-host Phase 4 harness.
+#
+# Build context is this directory only; the repository is bind-mounted at
+# /src at run time. Keep the Rust toolchain in step with rust.yml / Cargo.lock.
+#
+#   podman build -t ozma-clean-host:local -f Containerfile .
+#   docker build -t ozma-clean-host:local -f Containerfile .
+#
+# Native packages here are the build-time requirements reported by
+# scripts/clean-host/check-deps.sh. They are installed inside the image only;
+# nothing is installed on the host.
+
+FROM docker.io/library/rust:1.95-bookworm
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential \
+        pkg-config \
+        libudev-dev \
+        libasound2-dev \
+        libpipewire-0.3-dev \
+        libpam0g-dev \
+        libclang-dev \
+        clang \
+        cmake \
+        nasm \
+        git \
+        ca-certificates \
+        curl \
+        ffmpeg \
+        iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# bindgen needs a libclang; Debian's libclang-dev is discovered automatically.
+ENV CARGO_TERM_COLOR=always \
+    RUST_BACKTRACE=1
+
+WORKDIR /src

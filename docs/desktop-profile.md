@@ -166,6 +166,21 @@ capture.
   Glass capture one default head, so a different `--capture-console` is reported
   as `display_capture.limitation` instead of being silently applied. Multiple
   advertised consoles do not imply multiple live encoders.
+- **Runtime console switch (D-Bus):** `POST /display/select` (bearer-guarded)
+  accepts `{"index": <Console_N>}` or `{"id": "<label|Console_N|source-id>"}`.
+  The node validates the index against `display_outputs`, rebuilds the capture
+  registry for that console, and restarts HLS and WebRTC only if they were
+  running. A successful switch updates `/api/v1/connection.display_outputs` and
+  `.display_capture.active_console`/`provider` and returns the new outputs plus
+  `restarted: {hls, webrtc}`. A failed pipeline restart restores the previous
+  registry/console and returns a typed 502; it never reports success. Selecting
+  the already-active console is an idempotent 200 with `changed:false`.
+- QMP, VNC, and Looking Glass remain single-head: selecting a different console
+  returns a typed 409 (`code:"conflict"`, `details.single_head:true`) with the
+  provider and requested index, and instructs the operator to restart with
+  `--capture-console N`. A node with no VM display answers a typed 501. The
+  controller dashboard shows a picker populated from `display_outputs` and the
+  limitation; it does not pretend a single-head switch happened.
 - GPU passthrough: `--capture-provider looking-glass --looking-glass-shm
   /dev/shm/looking-glass` (or just the SHM flag) registers
   `LookingGlassProvider` with `--looking-glass-fps` (default 30),
@@ -174,10 +189,14 @@ capture.
   frame advertises no source. There is no synthetic fallback and no
   `v4l2loopback`/emulated-display claim. `--capture-provider looking-glass`
   requires `--profile vm` and `--looking-glass-shm`.
-- Remaining controller/GPU limits: there is no per-console capture broker or
-  live console switch in the controller yet (it can show the outputs and the
-  limitation but cannot attach a second encoder without a node restart), and
-  no real QEMU/GPU/VFIO or KVMFR host has been exercised in CI.
+- Remaining controller/GPU limits: the console switch is one active capture
+  source at a time, not a per-console capture broker or simultaneous encoders.
+  Only the D-Bus provider exposes runtime-selectable console indexes; QMP/VNC/
+  Looking Glass still require a node restart. WebRTC restarts keep its
+  configured dimensions unless the selected output advertises non-zero
+  geometry, so a console with a different mode may need matching
+  `--webrtc-width/--webrtc-height`. No real QEMU/GPU/VFIO or KVMFR host has
+  been exercised in CI.
 
 ## Input
 
@@ -213,7 +232,8 @@ capture.
 | `GET /status`, `/node/status` | Connection/health summary (`/api/v1/connection` shape). |
 | `GET /snapshot`, `/display/snapshot` | One JPEG frame from the first capture source (503 with a typed reason if none/unsupported). |
 | `GET /display/info` | Source id/name/geometry and last snapshot error. |
-| `GET /api/v1/connection` | Profile, ports, input sink/injection, power, codec, HLS, WebRTC, audio state, and the actual capture provider/kind/source. |
+| `POST /display/select` | Select an advertised VM `Console_N` at runtime (D-Bus). Typed 409 for QMP/VNC/Looking Glass, 501 without a selector, 502 on a failed restart with rollback. Bearer-guarded. |
+| `GET /api/v1/connection` | Profile, ports, input sink/injection, power, codec, HLS, WebRTC, audio state, live `display_outputs`/`display_capture`, and the actual capture provider/kind/source. |
 | `GET /api/v1/capabilities` | Real capture/encode/input/display capability document. |
 | `GET/POST /audio/*` | Typed 501 without a router; real router calls with `--audio-router`. |
 

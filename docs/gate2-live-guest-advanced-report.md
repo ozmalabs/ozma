@@ -24,7 +24,7 @@ DMA-BUF importer is a follow-up in §5.2. The important qualifications are:
 | Node `/audio/*` routing | **PASS** — 523 Hz reference played to the null sink and captured; peak −26.89 dBFS |
 | D-Bus 2D capture | **PASS** — BGRA `Scanout`/`Update`, snapshot and HLS |
 | D-Bus `Disable` | **PASS on the GL path only** — QEMU emitted two `Disable` messages on reset; 2D VGA emitted none |
-| D-Bus GL capture | **PASS (follow-up)** — `ScanoutDMABUF`/`ScanoutDMABUF2`/`UpdateDMABUF` importer maps linear packed and multi-plane YUV DMA-BUFs, issues `DMA_BUF_IOCTL_SYNC`, applies damage-only updates, and holds the initial all-black GL scanout briefly; live 1280×800 HLS, snapshot, v2 scanout, `UpdateDMABUF`, and reset `Disable` verified. Tiled/compressed modifiers remain typed unsupported |
+| D-Bus GL capture | **PASS (follow-up)** — `ScanoutDMABUF`/`ScanoutDMABUF2`/`UpdateDMABUF` importer maps linear packed and multi-plane YUV DMA-BUFs, issues `DMA_BUF_IOCTL_SYNC`, applies damage-only updates, holds the initial all-black GL scanout briefly, and has an optional GBM/EGL readback for named tiled modifiers. Live 1280×800 HLS/snapshot, v2 scanout, `UpdateDMABUF`, reset `Disable`, and an EGL/GBM probe were verified; QEMU exported linear on Intel and `DRM_FORMAT_MOD_INVALID` on AMD, so a live named tiled QEMU scanout is still unavailable; DCC/CCS and tiled YUV remain typed unsupported |
 | Secondary `Console_1` selection + live Scanout | **PASS with a second VGA device**; a guest-programmed second virtio-gpu head was **not** achieved |
 
 > No `sudo`, no package download, no libvirt mutation, and no write to an
@@ -534,13 +534,15 @@ built from this tree and started with `--capture-provider dbus --dbus-console 0
   720×400 and 1280×800 scanouts. The DMABUF mapping and framebuffer were
   cleared and re-established, and HLS continued.
 
-**Remaining GL limits:** non-linear/tiled/compressed modifiers are rejected with a
-typed error naming the modifier and fourcc; they are not interpreted as linear
-pixels. The 2026-11-24 v2 follow-up (see §5.7) added multi-plane
-`ScanoutDMABUF2`, `DMA_BUF_IOCTL_SYNC`, damage-only `UpdateDMABUF` copies, and
-an initial-black hold. Its live QEMU host exported only linear single-plane
-buffers, so the multi-plane and tiled paths are unit-covered but not
-live-exercised. The real-QEMU test remains opt-in and is not in CI.
+**Remaining GL limits:** non-linear/tiled/compressed modifiers without a named
+supported layout are rejected with a typed error naming the modifier and
+fourcc; they are not interpreted as linear pixels. The 2026-11-24 v2 follow-up
+(see §5.7) added multi-plane `ScanoutDMABUF2`, `DMA_BUF_IOCTL_SYNC`,
+damage-only `UpdateDMABUF` copies, and an initial-black hold. The 2026-11-25
+follow-up (§5.8) adds an optional GBM/EGL readback for named tiled modifiers and
+a host capability probe, but this host's QEMU still exports only linear or
+`DRM_FORMAT_MOD_INVALID`, so a live named tiled scanout remains unavailable.
+The real-QEMU test remains opt-in and is not in CI.
 
 ### 5.3 `Disable` — live on GL, absent on 2D
 
@@ -687,7 +689,9 @@ No `ozma-power`/ACPI change was needed. `POST /power/stop` already calls QMP
   linear layouts are packed XBGR/ABGR/XRGB/ARGB/BGRA/RGBA, two-plane
   NV12/NV21, three-plane YUV420/YVU420, and v1 single-fd contiguous NV12.
   A tiled/compressed modifier is still a typed unsupported error naming the
-  modifier and fourcc.
+  modifier and fourcc. The 2026-11-25 follow-up (§5.8) adds an optional
+  GBM/EGL readback for named packed-32-bit tiled modifiers; DCC/CCS and tiled
+  YUV remain typed unsupported.
 - Issue `DMA_BUF_IOCTL_SYNC` start/end read around every snapshot and damage
   copy. `ENOTTY`/`EINVAL`/`EOPNOTSUPP` are treated as a coherent exporter
   (needed for the tempfile unit tests); any other sync failure is a typed
@@ -755,6 +759,119 @@ damage recovery, and descriptor ownership. The fd-cleanup tests compare the
 descriptor's `/proc/self/fd` inode instead of closing a raw number, avoiding
 cross-test fd-reuse corruption under the parallel runner.
 
+### 5.8 Tiled/compressed DMA-BUF follow-up (2026-11-25)
+
+**Result.** The importer now has an optional GBM/EGL path for named tiled
+modifiers, and a public `dbus_display::tiled_import_probe()` capability report.
+A live QEMU scanout still did not produce a *named* tiled modifier on this host:
+QEMU's AMD render-node path reported `DRM_FORMAT_MOD_INVALID`, which is refused
+rather than guessed; its Intel path reported linear `0`. The EGL readback path
+was nevertheless exercised with real GBM tiled buffers created on both GPUs.
+
+**Host capability.** `dbus_display::tiled_import_probe()` reported Mesa EGL 1.5,
+`EGL_EXT_image_dma_buf_import`, and
+`EGL_EXT_image_dma_buf_import_modifiers` on all three render nodes:
+
+```text
+/dev/dri/renderD128  Mesa Intel(R) Arc(tm) B580 Graphics (BMG G21)
+  0x0000000000000000, 0x0100000000000001, 0x0100000000000009,
+  0x0100000000000011
+/dev/dri/renderD129  AMD Ryzen 5 9600X (radeonsi, raphael_mendocino)
+  0x0000000000000000, 0x0200000000000901, 0x0200000000401603,
+  0x0200000000401b03, 0x020000000056bb03
+/dev/dri/renderD130  llvmpipe (LLVM 23.1.5)
+  0x0000000000000000
+```
+
+The probe classifies `0x0100000000000011` (Intel `4_TILED_BMG_CCS`) and
+`0x020000000056bb03` (AMD `64K_R_X` with DCC) as unsupported compressed
+layouts, and the rest as importable. The exact values and reasons are in the
+probe's `supported_modifiers`/`unsupported_modifiers` fields.
+
+**QEMU live scanouts.** A disposable QEMU 11.1.3 guest (Alpine 3.21 live,
+read-only ISO, `virtio-vga-gl`, `-display dbus,p2p=yes,gl=on`) was run twice
+with an explicit render node:
+
+```text
+-rendernode=/dev/dri/renderD128 (Intel)
+  ScanoutDMABUF2 fourcc=0x34324241 ('AB24') modifier=0x0000000000000000
+  live frame: 1280x800, 4,096,000 bytes; real-QEMU test PASS
+
+-rendernode=/dev/dri/renderD129 (AMD)
+  ScanoutDMABUF2 fourcc=0x34324258 ('XB24')/0x34325241 ('AR24')
+  modifier=0x00ffffffffffffff (DRM_FORMAT_MOD_INVALID)
+  typed Unsupported: "fourcc 'XB24' ... uses modifier 0x00ffffffffffffff:
+  DRM_FORMAT_MOD_INVALID: the exporter did not report a concrete layout";
+  no frame was emitted
+```
+
+`gl=es` on the AMD node produced the same `DRM_FORMAT_MOD_INVALID`. Without an
+explicit `rendernode` QEMU selected the Intel node and exported linear `0`.
+This is the host limitation: QEMU/virglrenderer on the AMD render node cannot
+name the layout it exports, and the Intel path exports linear. A live *named*
+tiled QEMU scanout was therefore not available.
+
+**Importer implementation.** New private module
+`ozma-capture/src/dmabuf_egl.rs` (lazy `dlopen`, no build-time EGL/GBM headers or
+link dependencies):
+
+1. `classify_modifier` accepts packed 32-bit
+   `I915_FORMAT_MOD_{X,Y,Yf,4}_TILED` and the non-DCC AMD
+   `64K_S`/`4K_D_X`/`64K_R_X` sets. `DRM_FORMAT_MOD_INVALID`, Intel
+   CCS, AMD DCC/RETILE, and tiled YUV are typed unsupported with the exact
+   value and reason.
+2. `TiledEglBuffer::new` opens `/dev/dri/renderD*` (or
+   `OZMA_DMABUF_EGL_DEVICE`), creates a surfaceless EGL context, builds an
+   `EGLImage` with `EGL_EXT_image_dma_buf_import_modifiers`, binds it to a GL
+   texture, attaches the texture to an FBO, and checks
+   `GL_FRAMEBUFFER_COMPLETE`.
+3. `read_bgra` brackets the read with `DMA_BUF_IOCTL_SYNC` start/end, calls
+   `glReadPixels(GL_RGBA)`, `glFinish`, and swizzles R/B to BGRA. Rows are
+   returned in DMA-BUF row order; the existing `y0_top`, backing geometry,
+   sub-rectangle, and damage logic in `MappedDmaBuf` is reused unchanged.
+4. `MappedDmaBuf` holds either direct-mapped planes or one
+   `TiledEglBuffer`. The EGL context is made current immediately before each
+   GL call; it is `Send` but not `Sync`, and no source lock is held during
+   import or readback. The descriptor remains owned for the buffer lifetime and
+   is closed after GL teardown.
+5. `dbus_display::tiled_import_probe()` is the side-effect-free capability
+   report (render nodes, renderer, advertised/supported/unsupported modifiers,
+   and diagnostics). It never imports a scanout or emits a frame.
+
+The readback is a full backing-buffer copy per snapshot/damage update, not a
+per-rectangle GPU read. That is correct but a known performance gap.
+
+**Tests.** Unit tests cover modifier classification, the exact
+invalid/compressed rejection messages, the probe shape, descriptor cleanup on a
+failed tiled import, and `DMA_BUF_IOCTL_SYNC` fallback on non-DMA-BUF files.
+Ignored fixture tests use real GBM tiled buffers with a four-quadrant GL clear:
+
+```text
+OZMA_DMABUF_EGL_DEVICE=/dev/dri/renderD129 \
+OZMA_DMABUF_TILED_TEST=0x0200000000000901 \
+  cargo test -p ozma-capture --lib -- --ignored --nocapture real_tiled_
+  2 passed (0x0200000000000901, 0x0200000000401603,
+            0x0200000000401b03 also passed in separate runs)
+
+OZMA_DMABUF_EGL_DEVICE=/dev/dri/renderD128 \
+OZMA_DMABUF_TILED_TEST=0x0100000000000001 \
+  cargo test -p ozma-capture --lib -- --ignored --nocapture real_tiled_
+  2 passed (0x0100000000000009 also passed; 0x0100000000000002 could not be
+            allocated by GBM on this Intel Xe device)
+```
+
+The fixtures verify channel order, BGRA conversion, `y0_top=true` and
+`y0_top=false` orientation, `ScanoutDMABUF2` crop/backing geometry, and
+damage-rectangle copy bounds.
+
+**Remaining GL/tiled gaps.** A live QEMU tiled scanout is still unproven because
+this host's QEMU path returns either linear or `DRM_FORMAT_MOD_INVALID`. DCC/CCS
+compressed modifiers and tiled YUV are refused; supporting them needs either a
+driver guarantee that EGL import resolves compression or a format-specific
+decoder/shader. The EGL path tries render nodes in path order, so a multi-GPU
+host pays one failed context attempt per non-exporting GPU on the first tiled
+scanout.
+
 ## 6. Pass / fail / skip
 
 | Area | Result | Evidence |
@@ -774,7 +891,7 @@ cross-test fd-reuse corruption under the parallel runner.
 | D-Bus 2D `Scanout`/`Update`, snapshot, HLS | **PASS** | 1280×800 JPEG; HLS `running` |
 | D-Bus GL `ScanoutDMABUF` + `UpdateDMABUF` | **PASS (follow-up)** | live 1280×800 HLS (56,274 non-black px); snapshot JPEG 126,080 bytes; correct R/G/B order; `y0_top=false` flip verified |
 | D-Bus GL capture before the follow-up | **FAIL / BLOCKED (historical)** | 11 `ScanoutDMABUF`, 1724 `UpdateDMABUF`, zero BGRA frames |
-| D-Bus GL tiled/compressed modifier | **TYPED UNSUPPORTED** | `DBusError::Unsupported` names modifier + fourcc; no fake frame |
+| D-Bus GL tiled/compressed modifier | **PARTIAL** — named tiled packed-32-bit layouts have a real GBM/EGL readback and fixture tests; QEMU on this host exported only linear (`0`) or `DRM_FORMAT_MOD_INVALID`; DCC/CCS/tiled YUV are typed unsupported with the exact value/reason and emit no frame | §5.8: probe + fixtures; live QEMU AMD refuses `0x00ffffffffffffff`, Intel exports `0` |
 | D-Bus `Disable` on GL reset | **PASS** | two `Disable` messages; handler cleared framebuffer and DMABUF mapping |
 | D-Bus `Disable` on 2D reset/hotplug | **ABSENT, as expected** | no `Disable`; device_del not hotpluggable |
 | `Console_1` selection | **PASS** | `virtio-gpu-pci.1` / `VGA` labels |
@@ -793,16 +910,20 @@ cross-test fd-reuse corruption under the parallel runner.
    local static helper proved the QEMU/HDA/host-monitor path end to end, but it
    is a test artifact, not a guest package. Native `aplay`/`pw-play` evidence
    remains blocked by the ISO contents.
-3. **D-Bus GL is now a capture surface for linear DMABUFs.** The GL listener
-   emits `ScanoutDMABUF`/`UpdateDMABUF`; the provider now receives the
+3. **D-Bus GL is a capture surface for linear and named tiled DMABUFs.** The GL
+   listener emits `ScanoutDMABUF`/`UpdateDMABUF`; the provider receives the
    SCM_RIGHTS descriptor, maps linear XBGR/ABGR/XRGB/ARGB/BGRA/RGBA (and
    single-fd contiguous NV12), flips `y0_top=false`, and re-snapshots on
    `UpdateDMABUF`. Live 1280×800 HLS, snapshot, update, channel order, and
-   `Disable` on reset are verified. Remaining gaps are non-linear/tiled
-   modifiers (typed unsupported), multi-plane `ScanoutDMABUF2`, explicit
-   DMA-BUF sync on non-coherent hosts, and a damage-only update fast path. A
-   one-shot snapshot can still catch the initial black scanout; continuous HLS
-   is the reliable live path.
+   `Disable` on reset are verified. The 2026-11-25 follow-up adds multi-plane
+   `ScanoutDMABUF2`, explicit `DMA_BUF_IOCTL_SYNC`, a damage-only update fast
+   path, an optional GBM/EGL readback for named tiled packed-32-bit modifiers,
+   and `dbus_display::tiled_import_probe()`. A live *named tiled* QEMU scanout
+   is still unavailable on this host: QEMU on the AMD render node reports
+   `DRM_FORMAT_MOD_INVALID` and on the Intel node exports linear `0`. DCC/CCS
+   compressed modifiers and tiled YUV remain typed unsupported. A one-shot
+   snapshot can still catch the initial black scanout; continuous HLS is the
+   reliable live path.
 4. **Secondary console is live but not a guest second head.** `Console_1`
    selection and a live `Scanout` were demonstrated with a second VGA device.
    A `virtio-gpu-pci,max_outputs=2` guest kept `Virtual-2` disconnected and

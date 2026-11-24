@@ -9,7 +9,7 @@
 //! 4. serve the versioned node API;
 //! 5. run the UAC2 audio bridge when the `audio` capability is present.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use clap::Parser;
 use ozma_audio::{
@@ -36,6 +36,10 @@ use ozma_node::{
     },
     controller_compat::{self, AudioControl, CodecControl},
     display_compat::SnapshotControl,
+    display_control::{
+        ConfigConsoleFactory, DisplayControl, HlsPipelineSwitch, SwitchablePipeline,
+        WebRtcPipelineSwitch,
+    },
     hls::{
         HlsConfig, HlsController, HlsEncoder, HlsError, HlsPixelFormat, HlsSourceFactory, HlsStatus,
     },
@@ -1139,6 +1143,11 @@ async fn main() {
     };
     #[cfg(not(target_os = "linux"))]
     let capture_registry = platform::capture_registry_with_qmp_shared(&config, shared_qmp.as_ref());
+    // HLS, WebRTC, snapshots, and the runtime console selector all read this
+    // slot. A `POST /display/select` swaps it only after every running pipeline
+    // restarted from the new `Console_N`; a failed switch leaves the old
+    // registry in place.
+    let registry_slot = Arc::new(RwLock::new(capture_registry.clone()));
     if config.profile == NodeProfile::Vm && !vm_providers.has_capture() {
         warn!(
             "vm profile has no --qmp-socket, --vnc-host/--vnc-port, D-Bus display flags, or \
@@ -1342,8 +1351,12 @@ async fn main() {
             warn!("--hls was requested but the video capability is disabled; HLS is unavailable");
             HlsStatus::failed("video capability is disabled")
         } else {
-            let registry = capture_registry.clone();
+            let registry = registry_slot.clone();
             let source_factory: HlsSourceFactory = std::sync::Arc::new(move || {
+                let registry = registry
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
                 open_first_capture_source(&registry).map_err(|message| HlsError::Source { message })
             });
             let controller = HlsController::new(source_factory, hls_config);
@@ -1384,6 +1397,7 @@ async fn main() {
     // work). WebRTC is disabled unless `--webrtc-helper` is configured. A
     // configured helper that cannot start is reported as `failed`, never
     // `running`, and never crashes the node.
+    let mut webrtc_switch_config: Option<WebRtcConfig> = None;
     let webrtc_control: Option<WebRtcControl> = match args.webrtc_helper.clone() {
         None => None,
         Some(program) => {
@@ -1409,6 +1423,7 @@ async fn main() {
                 startup_timeout: std::time::Duration::from_secs(5),
                 offer_timeout: std::time::Duration::from_secs(10),
             };
+            webrtc_switch_config = Some(webrtc_config.clone());
             if let Err(error) = webrtc_config.validate() {
                 warn!(error = %error, "WebRTC unavailable: invalid helper configuration");
                 Some(WebRtcControl::failed_with_audio(
@@ -1591,6 +1606,40 @@ async fn main() {
             .map(|source| source.backend.as_str().to_owned()),
         display_selection.and_then(|selection| selection.limitation),
     );
+    // Runtime console selection. The selector shares the registry slot with
+    // HLS/WebRTC/snapshots and restarts only pipelines that are actually
+    // running. Single-head providers still construct a control so a request for
+    // their active console is an idempotent 200 and any other console is a
+    // typed 409.
+    let mut display_pipelines: Vec<Arc<dyn SwitchablePipeline>> = Vec::new();
+    if let Some(controller) = hls_controller.as_ref() {
+        display_pipelines.push(HlsPipelineSwitch::new(controller.clone()));
+    }
+    if let (Some(control), Some(webrtc_config)) =
+        (webrtc_control.as_ref(), webrtc_switch_config.clone())
+    {
+        if control.is_running() {
+            display_pipelines.push(WebRtcPipelineSwitch::new(control.clone(), webrtc_config));
+        }
+    }
+    let display_control = match DisplayControl::new(
+        Arc::new(ConfigConsoleFactory::new(
+            config.clone(),
+            shared_qmp.clone(),
+        )),
+        registry_slot.clone(),
+        display_pipelines,
+    ) {
+        Ok(control) => Some(control),
+        Err(error) => {
+            warn!(
+                error = %error,
+                "runtime display console selection is unavailable; the node keeps the \
+                 startup console and advertised outputs"
+            );
+            None
+        }
+    };
     let capture_provider = config
         .capture_provider_name()
         .ok()
@@ -1612,8 +1661,9 @@ async fn main() {
             .with_audio(audio_control)
             .with_usb(usb_control)
             .with_webrtc(webrtc_control.clone())
-            .with_snapshot(Some(SnapshotControl::new(capture_registry.clone())))
+            .with_snapshot(Some(SnapshotControl::from_shared(registry_slot.clone())))
             .with_display_outputs(display_outputs_value, display_capture)
+            .with_display_control(display_control)
             .with_capture(capture_status);
     // Control routes stay behind the bearer guard; the controller's read-only
     // probes are mounted after it so the unmodified controller works with

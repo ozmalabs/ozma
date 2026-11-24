@@ -1,0 +1,48 @@
+[Unit]
+Description=Ozma virtual-node supervisor
+Documentation=https://github.com/ozmalabs/ozma/blob/main/docs/clean-host.md
+After=network-online.target libvirtd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The supervisor discovers VMs and spawns one `ozma-node --profile vm` child
+# per VM. --provision (libvirt XML edits) is deliberately NOT enabled here.
+ExecStart=@BIN_DIR@/ozma-virtual-node --node-bin @BIN_DIR@/ozma-node --status-port 7390 $OZMA_VIRTUAL_NODE_ARGS
+EnvironmentFile=-@ENV_DIR@/ozma-virtual-node.env
+
+# Needs libvirt access for discovery/power and input access only if
+# --provision-evdev is enabled. Do not add the libvirt group unless the host
+# actually uses libvirt.
+User=ozma-node
+Group=ozma-node
+SupplementaryGroups=libvirt kvm input video render
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+UMask=0027
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=no
+DeviceAllow=/dev/uinput rw
+DeviceAllow=/dev/input/event* rw
+DeviceAllow=/dev/dri/renderD* rw
+# Reads QMP sockets and writes supervisor/audio state. libvirt's qemu state
+# directory is needed only by the opt-in provisioner.
+ReadWritePaths=@SUPERVISOR_STATE_DIR@ @SUPERVISOR_RUNTIME_DIR@ /var/lib/libvirt/qemu
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+LockPersonality=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

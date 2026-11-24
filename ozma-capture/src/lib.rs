@@ -3,20 +3,22 @@
 //! deterministic fake path, VM display providers, X11 `x11grab`, and the XDG
 //! Desktop Portal ScreenCast client.
 //!
-//! This crate is `unsafe`-free except for one isolated module. V4L2 discovery
-//! reads `/dev` and sysfs without opening a device; opening a source uses the
-//! safe [`v4l`] crate to query capabilities, negotiate a single-plane format,
-//! and stream MMAP buffers. A dedicated worker thread owns the blocking
+//! This crate is `unsafe`-free except for two isolated DMA-BUF modules. V4L2
+//! discovery reads `/dev` and sysfs without opening a device; opening a source
+//! uses the safe [`v4l`] crate to query capabilities, negotiate a single-plane
+//! format, and stream MMAP buffers. A dedicated worker thread owns the blocking
 //! device/stream pair so the async [`ozma_media::CaptureSource`] remains
 //! responsive. Tests use [`FakeCaptureProvider`] for CI; the real capture test
 //! is opt-in because it needs `/dev/video*` hardware.
 //!
-//! The exception is `dbus_dmabuf`, which maps a QEMU DMA-BUF with
-//! `memmap2`. That crate's mapping constructor is `unsafe` because a regular
-//! file can be truncated while mapped. A DMA-BUF's size is fixed for the
-//! lifetime of its export and the helper takes a read-only mapping, so the
-//! call is justified and confined to that module; the rest of the crate stays
-//! under `#![deny(unsafe_code)]`.
+//! The exceptions are `dbus_dmabuf` and its optional `dmabuf_egl` helper.
+//! `dbus_dmabuf` maps a linear QEMU DMA-BUF with `memmap2`; that crate's mapping
+//! constructor is `unsafe` because a regular file can be truncated while
+//! mapped. A DMA-BUF's size is fixed for the lifetime of its export and the
+//! helper takes a read-only mapping. `dmabuf_egl` uses `dlopen` plus the
+//! EGL/GLES C API to import a named tiled modifier and read it back through a
+//! framebuffer. Both are justified and confined to their modules; the rest of
+//! the crate stays under `#![deny(unsafe_code)]`.
 //!
 //! On Linux the optional [`PipeWireCaptureProvider`] adds graph-native video
 //! capture without replacing V4L2. [`CaptureRegistry::system`] remains
@@ -82,6 +84,10 @@ pub mod dbus_display;
 // `memmap2`'s read-only mapping constructor. See its module documentation.
 #[allow(unsafe_code)]
 mod dbus_dmabuf;
+// Optional GBM/EGL import for tiled DMA-BUFs. Lazy `dlopen` means a host
+// without EGL/GBM still builds and gets a typed capability result.
+#[allow(unsafe_code)]
+mod dmabuf_egl;
 pub mod fake;
 pub mod lookingglass;
 #[cfg(target_os = "linux")]

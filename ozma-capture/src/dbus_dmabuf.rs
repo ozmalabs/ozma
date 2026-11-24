@@ -25,13 +25,19 @@
 //!
 //! ## Supported layouts
 //!
-//! Only `DRM_FORMAT_MOD_LINEAR` (`0`) is mappable without a format-specific
-//! decoder. The packed 32-bit formats below are converted. Linear YUV 4:2:0 in
-//! the usual arrangements is supported: `NV12`/`NV21` two-plane (or, for the
-//! v1 signature only, single-fd contiguous `NV12`) and `YUV420`/`YVU420`
-//! three-plane. A tiled or compressed modifier is rejected with a typed error
-//! naming the modifier and fourcc rather than being interpreted as linear
-//! pixels.
+//! `DRM_FORMAT_MOD_LINEAR` (`0`) is mapped directly. The packed 32-bit formats
+//! below are converted from that mapping. Linear YUV 4:2:0 in the usual
+//! arrangements is supported: `NV12`/`NV21` two-plane (or, for the v1
+//! signature only, single-fd contiguous `NV12`) and `YUV420`/`YVU420`
+//! three-plane.
+//!
+//! A named tiled modifier that the optional GBM/EGL helper understands is
+//! imported through an EGLImage and read back as BGRA; see
+//! [`crate::dmabuf_egl`]. Compressed/DCC/CCS layouts, tiled YUV, and
+//! `DRM_FORMAT_MOD_INVALID` are rejected with a typed error naming the exact
+//! modifier, fourcc, and reason rather than being interpreted as linear pixels.
+//! QEMU's AMD render-node path is known to send `DRM_FORMAT_MOD_INVALID`; it is
+//! refused because the exporter has not reported a concrete layout.
 //!
 //! ## CPU access
 //!
@@ -59,7 +65,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use memmap2::Mmap;
 
-/// `DRM_FORMAT_MOD_LINEAR`: the only modifier this importer can interpret.
+/// `DRM_FORMAT_MOD_LINEAR`: the direct-mapping modifier.
 pub(crate) const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 
 /// Upper bound on a mapped DMABUF, matching the D-Bus body bound.
@@ -81,6 +87,46 @@ struct DmaBufSync {
     flags: u64,
 }
 
+/// Bracket CPU/GL access to one DMA-BUF with `DMA_BUF_IOCTL_SYNC`.
+///
+/// Exporters without cache operations (`ENOTTY`/`EINVAL`/`EOPNOTSUPP`) are
+/// treated as coherent. Any other failure is a typed error so stale pixels are
+/// never served silently.
+pub(crate) fn sync_fd(fd: RawFd, start: bool) -> Result<(), DmaBufError> {
+    let flags = DMA_BUF_SYNC_READ | if start { 0 } else { DMA_BUF_SYNC_END };
+    let request = DmaBufSync { flags };
+    // SAFETY: `DmaBufSync` is a plain `#[repr(C)]` 8-byte value matching
+    // `struct dma_buf_sync`, and `fd` is an open DMA-BUF/regular descriptor
+    // owned by the caller for the duration of the call. The ioctl only reads
+    // that value (the kernel documents the direction as `_IOW`).
+    let result = unsafe { nix::libc::ioctl(fd, DMA_BUF_IOCTL_SYNC, &request as *const DmaBufSync) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        // Not a DMA-BUF exporter with cache operations (test files, some host
+        // drivers). The mapping is coherent on this host; do not reject a
+        // perfectly readable buffer just because sync is a no-op.
+        Some(code)
+            if code == nix::libc::ENOTTY
+                || code == nix::libc::EINVAL
+                || code == nix::libc::EOPNOTSUPP =>
+        {
+            tracing::debug!(
+                fd,
+                %error,
+                "DMA_BUF_IOCTL_SYNC is not supported; assuming a coherent mapping"
+            );
+            Ok(())
+        }
+        _ => Err(DmaBufError::Unsupported(format!(
+            "DMA_BUF_IOCTL_SYNC {} failed: {error}",
+            if start { "start" } else { "end" }
+        ))),
+    }
+}
+
 const fn fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
     a as u32 | (b as u32) << 8 | (c as u32) << 16 | (d as u32) << 24
 }
@@ -95,6 +141,20 @@ pub(crate) const DRM_FORMAT_NV12: u32 = fourcc(b'N', b'V', b'1', b'2');
 pub(crate) const DRM_FORMAT_NV21: u32 = fourcc(b'N', b'V', b'2', b'1');
 pub(crate) const DRM_FORMAT_YUV420: u32 = fourcc(b'Y', b'U', b'1', b'2');
 pub(crate) const DRM_FORMAT_YVU420: u32 = fourcc(b'Y', b'V', b'1', b'2');
+
+/// True for the single-plane packed 32-bit formats the EGL tiled importer can
+/// read back as BGRA. Tiled YUV needs a colour-conversion shader and is refused.
+pub(crate) fn is_packed_fourcc(fourcc: u32) -> bool {
+    matches!(
+        fourcc,
+        DRM_FORMAT_XBGR8888
+            | DRM_FORMAT_ABGR8888
+            | DRM_FORMAT_XRGB8888
+            | DRM_FORMAT_ARGB8888
+            | DRM_FORMAT_BGRA8888
+            | DRM_FORMAT_RGBA8888
+    )
+}
 
 /// D-Bus signature of the `ScanoutDMABUF2` body.
 pub(crate) const SCANOUT_DMABUF2_SIGNATURE: &str = "ahuuuuauauuuuutb";
@@ -526,56 +586,23 @@ struct MappedPlane {
 
 impl MappedPlane {
     fn sync(&self, start: bool) -> Result<(), DmaBufError> {
-        let flags = DMA_BUF_SYNC_READ | if start { 0 } else { DMA_BUF_SYNC_END };
-        let request = DmaBufSync { flags };
-        // SAFETY: `DmaBufSync` is a plain `#[repr(C)]` 8-byte value matching
-        // `struct dma_buf_sync`, the descriptor is owned by `self.file`, and
-        // the ioctl only reads that value (the kernel documents the direction
-        // as `_IOW`). No Rust memory is mutated by the kernel here.
-        let result = unsafe {
-            nix::libc::ioctl(
-                self.file.as_raw_fd(),
-                DMA_BUF_IOCTL_SYNC,
-                &request as *const DmaBufSync,
-            )
-        };
-        if result == 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        match error.raw_os_error() {
-            // Not a DMA-BUF exporter with cache operations (test files, some
-            // host drivers). The mapping is coherent on this host; do not
-            // reject a perfectly readable buffer just because sync is a no-op.
-            Some(code)
-                if code == nix::libc::ENOTTY
-                    || code == nix::libc::EINVAL
-                    || code == nix::libc::EOPNOTSUPP =>
-            {
-                tracing::debug!(
-                    fd = self.file.as_raw_fd(),
-                    %error,
-                    "DMA_BUF_IOCTL_SYNC is not supported; assuming a coherent mapping"
-                );
-                Ok(())
-            }
-            _ => Err(DmaBufError::Unsupported(format!(
-                "DMA_BUF_IOCTL_SYNC {} failed: {error}",
-                if start { "start" } else { "end" }
-            ))),
-        }
+        sync_fd(self.file.as_raw_fd(), start)
     }
 }
 
 /// A validated, read-only mapping of the current QEMU scanout DMA-BUF.
 pub(crate) struct MappedDmaBuf {
     planes: Vec<MappedPlane>,
+    /// Set instead of `planes` for a tiled modifier imported through EGL.
+    tiled: Option<crate::dmabuf_egl::TiledEglBuffer>,
     width: u32,
     height: u32,
     x: u32,
     y: u32,
     backing_width: u32,
     backing_height: u32,
+    fourcc: u32,
+    modifier: u64,
     format: DmaBufFormat,
     y0_top: bool,
     /// The v1 signature can only describe `NV12` as one fd with Y then UV.
@@ -593,6 +620,12 @@ impl std::fmt::Debug for MappedDmaBuf {
             .field("backing_width", &self.backing_width)
             .field("backing_height", &self.backing_height)
             .field("planes", &self.planes.len())
+            .field(
+                "tiled",
+                &self.tiled.as_ref().map(|buffer| buffer.modifier()),
+            )
+            .field("fourcc", &fourcc_name(self.fourcc()))
+            .field("modifier", &format_args!("{:#018x}", self.modifier()))
             .field("format", &self.format)
             .field("y0_top", &self.y0_top)
             .finish_non_exhaustive()
@@ -674,15 +707,18 @@ fn validate_common(
     }
     let format = DmaBufFormat::from_fourcc(fourcc).ok_or_else(|| {
         DmaBufError::Unsupported(format!(
-            "fourcc {} is not a supported linear layout",
+            "fourcc {} is not a supported layout",
             fourcc_name(fourcc)
         ))
     })?;
     if modifier != DRM_FORMAT_MOD_LINEAR {
-        return Err(DmaBufError::Unsupported(format!(
-            "fourcc {} uses modifier {modifier:#018x}; only DRM_FORMAT_MOD_LINEAR (0) can be mapped",
-            fourcc_name(fourcc)
-        )));
+        crate::dmabuf_egl::classify_modifier(modifier, fourcc).map_err(|reason| {
+            DmaBufError::Unsupported(format!(
+                "fourcc {} uses modifier {}: {reason}",
+                fourcc_name(fourcc),
+                crate::dmabuf_egl::modifier_name(modifier)
+            ))
+        })?;
     }
     Ok(format)
 }
@@ -712,6 +748,46 @@ impl MappedDmaBuf {
             max_width,
             max_height,
         )?;
+
+        if header.modifier != DRM_FORMAT_MOD_LINEAR {
+            if !is_packed_fourcc(header.fourcc) || format.is_yuv() {
+                return Err(DmaBufError::Unsupported(format!(
+                    "tiled fourcc {} needs a colour-conversion shader; only packed 32-bit tiled scanouts are supported",
+                    fourcc_name(header.fourcc)
+                )));
+            }
+            let tiled = crate::dmabuf_egl::TiledEglBuffer::new(
+                fd,
+                header.width,
+                header.height,
+                header.fourcc,
+                header.modifier,
+                0,
+                header.stride,
+            )
+            .map_err(|reason| {
+                DmaBufError::Unsupported(format!(
+                    "fourcc {} modifier {} could not be imported through EGL/GBM: {reason}",
+                    fourcc_name(header.fourcc),
+                    crate::dmabuf_egl::modifier_name(header.modifier)
+                ))
+            })?;
+            return Ok(Self {
+                planes: Vec::new(),
+                tiled: Some(tiled),
+                width: header.width,
+                height: header.height,
+                x: 0,
+                y: 0,
+                backing_width: header.width,
+                backing_height: header.height,
+                fourcc: header.fourcc,
+                modifier: header.modifier,
+                format,
+                y0_top: header.y0_top,
+                contiguous_nv12: false,
+            });
+        }
 
         let width = header.width as usize;
         let height = header.height as usize;
@@ -757,12 +833,15 @@ impl MappedDmaBuf {
 
         Ok(Self {
             planes,
+            tiled: None,
             width: header.width,
             height: header.height,
             x: 0,
             y: 0,
             backing_width: header.width,
             backing_height: header.height,
+            fourcc: header.fourcc,
+            modifier: header.modifier,
             format,
             y0_top: header.y0_top,
             contiguous_nv12,
@@ -840,6 +919,49 @@ impl MappedDmaBuf {
             )));
         }
 
+        if header.modifier != DRM_FORMAT_MOD_LINEAR {
+            if num_planes != 1 || format.is_yuv() || !is_packed_fourcc(header.fourcc) {
+                return Err(DmaBufError::Unsupported(format!(
+                    "tiled fourcc {} with {num_planes} plane(s) needs a colour-conversion or multi-plane EGL path; only single-plane packed 32-bit tiled scanouts are supported",
+                    fourcc_name(header.fourcc)
+                )));
+            }
+            let fd = fds.into_iter().next().ok_or_else(|| {
+                DmaBufError::Protocol("tiled scanout lost its descriptor".to_owned())
+            })?;
+            let tiled = crate::dmabuf_egl::TiledEglBuffer::new(
+                fd,
+                backing_width,
+                backing_height,
+                header.fourcc,
+                header.modifier,
+                header.offsets[0],
+                header.strides[0],
+            )
+            .map_err(|reason| {
+                DmaBufError::Unsupported(format!(
+                    "fourcc {} modifier {} could not be imported through EGL/GBM: {reason}",
+                    fourcc_name(header.fourcc),
+                    crate::dmabuf_egl::modifier_name(header.modifier)
+                ))
+            })?;
+            return Ok(Self {
+                planes: Vec::new(),
+                tiled: Some(tiled),
+                width: header.width,
+                height: header.height,
+                x: header.x,
+                y: header.y,
+                backing_width,
+                backing_height,
+                fourcc: header.fourcc,
+                modifier: header.modifier,
+                format,
+                y0_top: header.y0_top,
+                contiguous_nv12: false,
+            });
+        }
+
         let mut planes = Vec::with_capacity(num_planes);
         for (index, fd) in fds.into_iter().enumerate() {
             let offset = header.offsets[index] as usize;
@@ -883,12 +1005,15 @@ impl MappedDmaBuf {
 
         Ok(Self {
             planes,
+            tiled: None,
             width: header.width,
             height: header.height,
             x: header.x,
             y: header.y,
             backing_width,
             backing_height,
+            fourcc: header.fourcc,
+            modifier: header.modifier,
             format,
             y0_top: header.y0_top,
             contiguous_nv12: false,
@@ -903,6 +1028,16 @@ impl MappedDmaBuf {
     /// Height in pixels.
     pub(crate) fn height(&self) -> u32 {
         self.height
+    }
+
+    /// DRM format fourcc of the imported scanout.
+    pub(crate) fn fourcc(&self) -> u32 {
+        self.fourcc
+    }
+
+    /// DRM format modifier of the imported scanout.
+    pub(crate) fn modifier(&self) -> u64 {
+        self.modifier
     }
 
     fn sync(&self, start: bool) -> Result<(), DmaBufError> {
@@ -1016,6 +1151,9 @@ impl MappedDmaBuf {
         destination: &mut [u8],
         destination_stride: usize,
     ) -> Result<(), DmaBufError> {
+        if self.tiled.is_some() {
+            return self.copy_tiled_inner(x, y, width, height, destination, destination_stride);
+        }
         for row in 0..height {
             let display_y = y
                 .checked_add(row)
@@ -1052,6 +1190,83 @@ impl MappedDmaBuf {
                 }
                 _ => self.copy_packed_row(source_y, source_x, width, destination_row)?,
             }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_tiled_inner(
+        &self,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        destination: &mut [u8],
+        destination_stride: usize,
+    ) -> Result<(), DmaBufError> {
+        let tiled = self
+            .tiled
+            .as_ref()
+            .ok_or_else(|| DmaBufError::Geometry("tiled buffer is missing".to_owned()))?;
+        let decoded = tiled.read_bgra().map_err(|reason| {
+            DmaBufError::Unsupported(format!(
+                "EGL readback of fourcc {} modifier {} failed: {reason}",
+                fourcc_name(self.fourcc),
+                crate::dmabuf_egl::modifier_name(tiled.modifier())
+            ))
+        })?;
+        let source_stride = self
+            .backing_width
+            .checked_mul(4)
+            .ok_or_else(|| DmaBufError::Geometry("tiled backing row overflows".to_owned()))?
+            as usize;
+        let required = source_stride
+            .checked_mul(self.backing_height as usize)
+            .ok_or_else(|| DmaBufError::Geometry("tiled backing size overflows".to_owned()))?;
+        if decoded.len() < required {
+            return Err(DmaBufError::Geometry(format!(
+                "EGL readback returned {} bytes; {required} are required for the {}x{} backing buffer",
+                decoded.len(),
+                self.backing_width,
+                self.backing_height
+            )));
+        }
+
+        for row in 0..height {
+            let display_y = y
+                .checked_add(row)
+                .ok_or_else(|| DmaBufError::Geometry("display row overflows".to_owned()))?;
+            let source_y = self.source_row(display_y)?;
+            let source_x = (self.x as usize)
+                .checked_add(x)
+                .ok_or_else(|| DmaBufError::Geometry("display column overflows".to_owned()))?;
+            let source_start = source_y
+                .checked_mul(source_stride)
+                .and_then(|base| base.checked_add(source_x * 4))
+                .ok_or_else(|| DmaBufError::Geometry("tiled source offset overflows".to_owned()))?;
+            let source_end = source_start
+                .checked_add(width * 4)
+                .ok_or_else(|| DmaBufError::Geometry("tiled source row overflows".to_owned()))?;
+            let source = decoded.get(source_start..source_end).ok_or_else(|| {
+                DmaBufError::Geometry(format!(
+                    "tiled row {source_y} at column {source_x} needs bytes {source_start}..{source_end}, but the decoded buffer is {} bytes",
+                    decoded.len()
+                ))
+            })?;
+
+            let destination_start = display_y
+                .checked_mul(destination_stride)
+                .and_then(|base| base.checked_add(x * 4))
+                .ok_or_else(|| DmaBufError::Geometry("destination offset overflows".to_owned()))?;
+            let destination_end = destination_start
+                .checked_add(width * 4)
+                .ok_or_else(|| DmaBufError::Geometry("destination row overflows".to_owned()))?;
+            let destination_row = destination
+                .get_mut(destination_start..destination_end)
+                .ok_or_else(|| {
+                    DmaBufError::Geometry("destination row is outside the frame".to_owned())
+                })?;
+            destination_row.copy_from_slice(source);
         }
         Ok(())
     }
@@ -1486,6 +1701,269 @@ mod tests {
         assert!(matches!(error, DmaBufError::Unsupported(_)));
         assert!(message.contains("0x0200000000000004"), "{message}");
         assert!(message.contains("'XB24'"), "{message}");
+    }
+
+    #[test]
+    fn classifies_supported_tiled_modifiers_and_explains_rejections() {
+        use crate::dmabuf_egl::{
+            classify_modifier, AMD_FMT_MOD_TILE_GFX9_64K_S, DRM_FORMAT_MOD_INVALID,
+            I915_FORMAT_MOD_X_TILED,
+        };
+
+        assert!(classify_modifier(0, DRM_FORMAT_XBGR8888).is_ok());
+        assert!(classify_modifier(I915_FORMAT_MOD_X_TILED, DRM_FORMAT_XBGR8888).is_ok());
+        assert!(classify_modifier(AMD_FMT_MOD_TILE_GFX9_64K_S, DRM_FORMAT_XBGR8888).is_ok());
+
+        let invalid = classify_modifier(DRM_FORMAT_MOD_INVALID, DRM_FORMAT_XBGR8888).unwrap_err();
+        assert!(invalid.contains("DRM_FORMAT_MOD_INVALID"), "{invalid}");
+        assert!(invalid.contains("did not report"), "{invalid}");
+
+        let dcc = classify_modifier(0x0200_0000_0056_bb03, DRM_FORMAT_XBGR8888).unwrap_err();
+        assert!(dcc.contains("DCC-compressed"), "{dcc}");
+        assert!(dcc.contains("0x020000000056bb03"), "{dcc}");
+
+        let tiled_yuv =
+            classify_modifier(AMD_FMT_MOD_TILE_GFX9_64K_S, DRM_FORMAT_NV12).unwrap_err();
+        assert!(tiled_yuv.contains("YUV"), "{tiled_yuv}");
+    }
+
+    #[test]
+    fn invalid_and_compressed_modifiers_name_the_exact_value() {
+        let body = scanout_body(
+            0,
+            2,
+            2,
+            8,
+            DRM_FORMAT_XBGR8888,
+            crate::dmabuf_egl::DRM_FORMAT_MOD_INVALID,
+            true,
+        );
+        let error = import(&body, temp_fd(&[0; 16]), 64, 64).unwrap_err();
+        let message = error.to_string();
+        assert!(matches!(error, DmaBufError::Unsupported(_)));
+        assert!(message.contains("0x00ffffffffffffff"), "{message}");
+        assert!(message.contains("'XB24'"), "{message}");
+        assert!(message.contains("did not report"), "{message}");
+
+        let body = scanout_body(0, 2, 2, 8, DRM_FORMAT_XBGR8888, 0x0200_0000_0056_bb03, true);
+        let error = import(&body, temp_fd(&[0; 16]), 64, 64).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("0x020000000056bb03"), "{message}");
+        assert!(message.contains("DCC-compressed"), "{message}");
+    }
+
+    #[test]
+    fn tiled_scanout_dmabuf2_rejects_out_of_bounds_crop_before_egl() {
+        let body = scanout2_body(
+            &[0],
+            31,
+            0,
+            2,
+            2,
+            &[0],
+            &[128],
+            DRM_FORMAT_XBGR8888,
+            32,
+            32,
+            crate::dmabuf_egl::I915_FORMAT_MOD_X_TILED,
+            true,
+        );
+        let error = import_v2(&body, vec![temp_fd(&[0; 128 * 4])], 64, 64).unwrap_err();
+        assert!(matches!(error, DmaBufError::Geometry(_)), "{error:?}");
+        assert!(error.to_string().contains("exceeds"), "{error}");
+    }
+
+    #[test]
+    fn a_tiled_modifier_on_a_non_dmabuf_is_typed_and_closes_the_descriptor() {
+        // A regular temp file is not a DMA-BUF. The EGL path must fail with a
+        // typed error and still drop the descriptor it was given.
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(16).unwrap();
+        let raw = file.as_raw_fd();
+        let identity = fd_identity(raw);
+        let body = scanout_body(
+            0,
+            2,
+            2,
+            8,
+            DRM_FORMAT_XBGR8888,
+            crate::dmabuf_egl::I915_FORMAT_MOD_X_TILED,
+            true,
+        );
+        let error = import(&body, file.into(), 64, 64).unwrap_err();
+        assert!(matches!(error, DmaBufError::Unsupported(_)));
+        assert!(
+            fd_is_closed(raw, identity),
+            "descriptor {raw} was not closed"
+        );
+    }
+
+    #[test]
+    fn tiled_probe_reports_egl_and_the_modifiers_it_refuses() {
+        let probe = crate::dbus_display::tiled_import_probe();
+        // A software-only CI host may have no render node. The probe must still
+        // be a well-formed, side-effect-free report rather than a panic.
+        if !probe.egl_available {
+            assert!(!probe.notes.is_empty(), "{probe:#?}");
+            return;
+        }
+        assert!(
+            probe.import_dma_buf || !probe.render_nodes.is_empty(),
+            "{probe:#?}"
+        );
+        for node in &probe.render_nodes {
+            assert!(node.path.starts_with("/dev/dri/renderD"), "{node:?}");
+            if node.available {
+                assert!(node.renderer.is_some(), "{node:?}");
+            } else {
+                assert!(node.error.is_some(), "{node:?}");
+            }
+        }
+        for modifier in &probe.supported_modifiers {
+            assert!(
+                crate::dmabuf_egl::classify_modifier(*modifier, DRM_FORMAT_XBGR8888).is_ok(),
+                "{modifier:#018x}"
+            );
+        }
+        for unsupported in &probe.unsupported_modifiers {
+            assert!(!unsupported.reason.is_empty(), "{unsupported:?}");
+            assert!(
+                unsupported.name.contains("0x")
+                    || unsupported.name.contains("DRM_FORMAT_MOD")
+                    || unsupported.name.contains("I915")
+                    || unsupported.name.contains("AMD"),
+                "{unsupported:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_fd_accepts_a_non_dmabuf_as_coherent() {
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(16).unwrap();
+        assert!(sync_fd(file.as_raw_fd(), true).is_ok());
+        assert!(sync_fd(file.as_raw_fd(), false).is_ok());
+    }
+
+    #[test]
+    #[ignore = "requires a render node/EGL and OZMA_DMABUF_TILED_TEST=<hex modifier>"]
+    fn real_tiled_scanout_dmabuf2_preserves_crop_and_damage() {
+        let Ok(value) = std::env::var("OZMA_DMABUF_TILED_TEST") else {
+            return;
+        };
+        let modifier = u64::from_str_radix(value.trim().trim_start_matches("0x"), 16).unwrap();
+        let colors = [
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0, 1.0],
+        ];
+        let (fd, stride) =
+            crate::dmabuf_egl::TiledEglBuffer::synthetic_fixture(modifier, 32, 32, colors).unwrap();
+        // Crop the lower 32x16 half of a 32x32 backing buffer.
+        let body = scanout2_body(
+            &[0],
+            0,
+            16,
+            32,
+            16,
+            &[0],
+            &[stride],
+            DRM_FORMAT_XRGB8888,
+            32,
+            32,
+            modifier,
+            true,
+        );
+        let mapped = import_v2(&body, vec![fd], 64, 64).unwrap();
+        let snapshot = mapped.snapshot_bgra().unwrap();
+        assert_eq!(&snapshot[0..4], &[255, 0, 0, 255], "blue BGRA");
+        assert_eq!(
+            &snapshot[16 * 4..16 * 4 + 4],
+            &[255, 255, 255, 255],
+            "white BGRA"
+        );
+
+        let mut frame = vec![0xaa; 32 * 16 * 4];
+        mapped
+            .copy_bgra_rect(16, 0, 16, 8, &mut frame, 32 * 4)
+            .unwrap();
+        assert_eq!(&frame[16 * 4..16 * 4 + 4], &[255, 255, 255, 255]);
+        assert_eq!(&frame[0..4], &[0xaa, 0xaa, 0xaa, 0xaa]);
+    }
+
+    #[test]
+    #[ignore = "prints the host EGL/GBM modifier report; run with --nocapture"]
+    fn live_tiled_import_probe_prints_host_capability() {
+        let probe = crate::dbus_display::tiled_import_probe();
+        println!("{probe:#?}");
+    }
+
+    #[test]
+    #[ignore = "requires a render node/EGL and OZMA_DMABUF_TILED_TEST=<hex modifier>"]
+    fn real_tiled_fixture_reads_back_bgra_with_correct_orientation() {
+        let Ok(value) = std::env::var("OZMA_DMABUF_TILED_TEST") else {
+            return;
+        };
+        let value = value.trim();
+        let modifier = u64::from_str_radix(value.trim_start_matches("0x"), 16).unwrap();
+        let colors = [
+            [1.0, 0.0, 0.0, 1.0], // buffer row 0, left (GL bottom-left)
+            [0.0, 1.0, 0.0, 1.0], // buffer row 0, right (GL bottom-right)
+            [0.0, 0.0, 1.0, 1.0], // buffer last row, left (GL top-left)
+            [1.0, 1.0, 1.0, 1.0], // buffer last row, right (GL top-right)
+        ];
+        let size = 32u32;
+        let (fd, stride) =
+            crate::dmabuf_egl::TiledEglBuffer::synthetic_fixture(modifier, size, size, colors)
+                .unwrap();
+
+        let body = scanout_body(0, size, size, stride, DRM_FORMAT_XRGB8888, modifier, true);
+        let mapped = import(&body, fd, 64, 64).unwrap();
+        let top_down = mapped.snapshot_bgra().unwrap();
+        let half_row = (size as usize / 2) * 4;
+        let last_row = (size as usize - 1) * size as usize * 4;
+        assert_eq!(&top_down[0..4], &[0, 0, 255, 255], "red BGRA");
+        assert_eq!(
+            &top_down[half_row..half_row + 4],
+            &[0, 255, 0, 255],
+            "green BGRA"
+        );
+        assert_eq!(
+            &top_down[last_row..last_row + 4],
+            &[255, 0, 0, 255],
+            "blue BGRA"
+        );
+        assert_eq!(
+            &top_down[last_row + half_row..last_row + half_row + 4],
+            &[255, 255, 255, 255],
+            "white BGRA"
+        );
+
+        // y0_top=false flips the backing rows: the buffer's first row is the
+        // display's bottom row.
+        let (fd, stride) =
+            crate::dmabuf_egl::TiledEglBuffer::synthetic_fixture(modifier, size, size, colors)
+                .unwrap();
+        let body = scanout_body(0, size, size, stride, DRM_FORMAT_XRGB8888, modifier, false);
+        let mapped = import(&body, fd, 64, 64).unwrap();
+        let bottom_up = mapped.snapshot_bgra().unwrap();
+        assert_eq!(&bottom_up[0..4], &[255, 0, 0, 255], "flipped blue BGRA");
+        assert_eq!(
+            &bottom_up[half_row..half_row + 4],
+            &[255, 255, 255, 255],
+            "flipped white BGRA"
+        );
+        assert_eq!(
+            &bottom_up[last_row..last_row + 4],
+            &[0, 0, 255, 255],
+            "flipped red BGRA"
+        );
+        assert_eq!(
+            &bottom_up[last_row + half_row..last_row + half_row + 4],
+            &[0, 255, 0, 255],
+            "flipped green BGRA"
+        );
     }
 
     #[test]

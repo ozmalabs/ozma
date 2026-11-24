@@ -1,25 +1,69 @@
 #!/usr/bin/env bash
-# demo/run_demo.sh — Full Ozma demo: Controller + two Soft Nodes + QEMU VMs.
+# demo/run_demo.sh — Full Ozma demo: Controller + two nodes + QEMU VMs.
 #
 # What this starts:
 #   1. Two QEMU VMs (vm1, vm2) via demo/start_vms.sh
-#   2. Two Soft Nodes pointing at those QMP sockets
+#   2. Two nodes pointing at those QMP sockets (Python by default)
 #   3. The Ozma Controller daemon
 #
 # Layout:
 #   Controller         → REST/WS on http://localhost:7380
-#   Soft Node vm1      → UDP 7332, QMP /tmp/ozma-vm1.qmp
-#   Soft Node vm2      → UDP 7333, QMP /tmp/ozma-vm2.qmp
+#   Node vm1           → UDP 7332, HTTP 7382, QMP /tmp/ozma-vm1.qmp
+#   Node vm2           → UDP 7333, HTTP 7383, QMP /tmp/ozma-vm2.qmp
 #
 # Usage:
-#   bash demo/run_demo.sh           # start everything
+#   bash demo/run_demo.sh           # Python soft nodes (rollback path)
+#   bash demo/run_demo.sh --rust    # Rust ozma-node --profile vm
+#   OZMA_DEMO_BACKEND=rust bash demo/run_demo.sh
 #   bash demo/run_demo.sh stop      # stop everything
 #   bash demo/run_demo.sh status    # check process status
+#
+# The Rust path uses the same VM/QMP sockets, mDNS node names, and controller.
+# Set OZMA_NODE_BIN to point at a specific ozma-node binary; otherwise the
+# script looks in target/release, target/debug, then $PATH.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# ---------------------------------------------------------------------------
+# Node backend: Python is the default/rollback path; --rust switches to the
+# Rust ozma-node --profile vm path. The variable is exported so the "test"
+# recursion below keeps the selection.
+DEMO_BACKEND="${OZMA_DEMO_BACKEND:-python}"
+case "${OZMA_DEMO_RUST:-0}" in
+    1|true|yes|on) DEMO_BACKEND=rust ;;
+esac
+
+ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --rust) DEMO_BACKEND=rust ;;
+        --python) DEMO_BACKEND=python ;;
+        *) ARGS+=("$arg") ;;
+    esac
+done
+set -- "${ARGS[@]}"
+case "$DEMO_BACKEND" in
+    rust|python) ;;
+    *)
+        echo "ERROR: OZMA_DEMO_BACKEND must be 'rust' or 'python' (got '$DEMO_BACKEND')" >&2
+        exit 1
+        ;;
+esac
+export OZMA_DEMO_BACKEND="$DEMO_BACKEND"
+
+RUST_NODE_BIN="${OZMA_NODE_BIN:-}"
+if [[ "$DEMO_BACKEND" == "rust" && -z "$RUST_NODE_BIN" ]]; then
+    for candidate in "$REPO_ROOT/target/release/ozma-node" "$REPO_ROOT/target/debug/ozma-node"; do
+        if [[ -x "$candidate" ]]; then
+            RUST_NODE_BIN="$candidate"
+            break
+        fi
+    done
+    [[ -z "$RUST_NODE_BIN" ]] && RUST_NODE_BIN="$(command -v ozma-node 2>/dev/null || true)"
+fi
 LOG_DIR="$SCRIPT_DIR/logs"
 SCENARIOS_SRC="$SCRIPT_DIR/scenarios.json"
 SCENARIOS_DEST="$REPO_ROOT/controller/scenarios.json"
@@ -47,6 +91,45 @@ _stop_processes() {
     echo "Done."
 }
 
+# start_vm_node <name> <hid-port> <qmp> <vnc-port> <audio-sink> <log> <pidfile>
+start_vm_node() {
+    local name="$1" port="$2" qmp="$3" vnc_port="$4" sink="$5" log="$6" pidfile="$7"
+
+    if [[ "$DEMO_BACKEND" == "rust" ]]; then
+        if [[ -z "$RUST_NODE_BIN" || ! -x "$RUST_NODE_BIN" ]]; then
+            echo "ERROR: --rust needs an ozma-node binary." >&2
+            echo "Build it (cargo build -p ozma-node) or set OZMA_NODE_BIN=/path/to/ozma-node." >&2
+            exit 1
+        fi
+        local http_port=$((port + 50))
+        local hls_dir="$LOG_DIR/hls-$name"
+        local audio_args=()
+        mkdir -p "$hls_dir"
+        if command -v pactl >/dev/null 2>&1; then
+            audio_args=(--audio-router pipewire --audio-capture-target "monitor:$sink" --audio-sink "$sink")
+        fi
+        "$RUST_NODE_BIN" \
+            --name "$name" \
+            --profile vm \
+            --qmp-socket "$qmp" \
+            --hid-udp-port "$port" \
+            --http-port "$http_port" \
+            --capture-provider qmp \
+            --input-provider qmp \
+            --hls --hls-dir "$hls_dir" --hls-fps 15 \
+            "${audio_args[@]}" \
+            >"$log" 2>&1 &
+    else
+        "$PYTHON" "$REPO_ROOT/softnode/soft_node.py" \
+            --name "$name" --port "$port" --qmp "$qmp" \
+            --vnc-host 127.0.0.1 --vnc-port "$vnc_port" \
+            --audio-sink "$sink" \
+            >"$log" 2>&1 &
+    fi
+    echo $! > "$pidfile"
+    echo "  node $name  backend=$DEMO_BACKEND  PID=$(cat "$pidfile")  log: $log"
+}
+
 stop_all() {
     _stop_processes
     exit 0
@@ -54,7 +137,8 @@ stop_all() {
 
 status_all() {
     echo "Ozma demo status:"
-    for name_pid in "controller:$PID_CTRL" "softnode-vm1:$PID_SN1" "softnode-vm2:$PID_SN2"; do
+    echo "  backend  $DEMO_BACKEND"
+    for name_pid in "controller:$PID_CTRL" "node-vm1:$PID_SN1" "node-vm2:$PID_SN2"; do
         name="${name_pid%%:*}"
         pidfile="${name_pid##*:}"
         if [[ -f "$pidfile" ]]; then
@@ -112,6 +196,12 @@ run_tests() {
 # "test" mode: start everything, run tests, stop everything, exit with test result
 if [[ "${1:-}" == "test" ]]; then
     shift
+    # The parent process needs the interpreter for run_tests after the child
+    # stack starts; resolve the same venv the child setup below uses.
+    PYTHON="${PYTHON:-python3}"
+    if [[ -f "$REPO_ROOT/.venv/bin/python" ]]; then
+        PYTHON="$REPO_ROOT/.venv/bin/python"
+    fi
     # Start the stack
     bash "$0" "$@"
     sleep 3  # extra settle time for all services to stabilise
@@ -149,25 +239,12 @@ if [[ "${1:-}" != "--no-vms" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 2. Start Soft Nodes
+# 2. Start nodes (Python soft nodes or Rust ozma-node, selected above)
 echo ""
-echo "Starting Soft Nodes..."
+echo "Starting nodes (backend: $DEMO_BACKEND)..."
 
-"$PYTHON" "$REPO_ROOT/softnode/soft_node.py" \
-    --name vm1 --port 7332 --qmp /tmp/ozma-vm1.qmp \
-    --vnc-host 127.0.0.1 --vnc-port 5901 \
-    --audio-sink ozma-vm1 \
-    >"$LOG_SN1" 2>&1 &
-echo $! > "$PID_SN1"
-echo "  soft-node vm1  PID=$(cat "$PID_SN1")  log: $LOG_SN1"
-
-"$PYTHON" "$REPO_ROOT/softnode/soft_node.py" \
-    --name vm2 --port 7333 --qmp /tmp/ozma-vm2.qmp \
-    --vnc-host 127.0.0.1 --vnc-port 5922 \
-    --audio-sink ozma-vm2 \
-    >"$LOG_SN2" 2>&1 &
-echo $! > "$PID_SN2"
-echo "  soft-node vm2  PID=$(cat "$PID_SN2")  log: $LOG_SN2"
+start_vm_node vm1 7332 /tmp/ozma-vm1.qmp 5901 ozma-vm1 "$LOG_SN1" "$PID_SN1"
+start_vm_node vm2 7333 /tmp/ozma-vm2.qmp 5922 ozma-vm2 "$LOG_SN2" "$PID_SN2"
 
 # ---------------------------------------------------------------------------
 # 3. Start Controller (virtual-only mode: capture ozma-virtual-* devices only)
@@ -200,6 +277,7 @@ echo ""
 echo "============================================================"
 echo "  Ozma Demo Running"
 echo "============================================================"
+echo "  Backend:      $DEMO_BACKEND"
 echo "  Web UI:       http://localhost:7380"
 echo "  API status:   http://localhost:7380/api/v1/status"
 echo "  Scenarios:    http://localhost:7380/api/v1/scenarios"

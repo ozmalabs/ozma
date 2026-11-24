@@ -1,0 +1,50 @@
+[Unit]
+Description=Ozma node (%i profile)
+Documentation=https://github.com/ozmalabs/ozma/blob/main/docs/clean-host.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# %i is hardware, vm, or desktop. Extra flags come from OZMA_NODE_ARGS in the
+# matching environment file (systemd splits that variable at whitespace).
+ExecStart=@BIN_DIR@/ozma-node --profile %i $OZMA_NODE_ARGS
+EnvironmentFile=-@ENV_DIR@/ozma-node-%i.env
+
+# Dedicated system user created by the administrator/package (not by this
+# unit). The desktop profile is usually better as a systemd --user unit, see
+# scripts/systemd/README.md.
+User=ozma-node
+Group=ozma-node
+SupplementaryGroups=video input render
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+UMask=0027
+
+# Least privilege. Start from this baseline and delete device rules the
+# selected profile does not need.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=no
+DeviceAllow=/dev/video* rw
+DeviceAllow=/dev/hidg* rw
+DeviceAllow=/dev/uinput rw
+DeviceAllow=/dev/input/event* rw
+DeviceAllow=/dev/dri/renderD* rw
+ReadWritePaths=@STATE_DIR@ @RUNTIME_DIR@
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+LockPersonality=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

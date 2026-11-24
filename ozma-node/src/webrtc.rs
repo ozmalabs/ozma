@@ -1082,6 +1082,10 @@ impl Drop for WebRtcHelper {
 /// node that never configured WebRTC omits the control entirely.
 #[derive(Clone)]
 pub struct WebRtcControl {
+    inner: Arc<std::sync::Mutex<WebRtcControlInner>>,
+}
+
+struct WebRtcControlInner {
     status: WebRtcStatus,
     helper: Option<Arc<tokio::sync::Mutex<WebRtcHelper>>>,
     /// Configured monitor source, retained even when the helper failed so the
@@ -1091,15 +1095,31 @@ pub struct WebRtcControl {
 }
 
 impl WebRtcControl {
+    fn lock(&self) -> std::sync::MutexGuard<'_, WebRtcControlInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn from_parts(
+        status: WebRtcStatus,
+        helper: Option<WebRtcHelper>,
+        audio_source: Option<String>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(WebRtcControlInner {
+                status,
+                helper: helper.map(|helper| Arc::new(tokio::sync::Mutex::new(helper))),
+                audio_source,
+            })),
+        }
+    }
+
     /// Wrap a started helper.
     pub fn from_helper(helper: WebRtcHelper) -> Self {
         let status = helper.status();
         let audio_source = helper.config().audio_source.clone();
-        Self {
-            status,
-            helper: Some(Arc::new(tokio::sync::Mutex::new(helper))),
-            audio_source,
-        }
+        Self::from_parts(status, Some(helper), audio_source)
     }
 
     /// A configured helper that could not be started.
@@ -1110,44 +1130,74 @@ impl WebRtcControl {
     /// A configured helper that could not be started, retaining the configured
     /// audio monitor for `/api/v1/connection`.
     pub fn failed_with_audio(message: impl Into<String>, audio_source: Option<String>) -> Self {
-        Self {
-            status: WebRtcStatus::failed(message),
-            helper: None,
-            audio_source,
-        }
+        Self::from_parts(WebRtcStatus::failed(message), None, audio_source)
     }
 
     /// Status shared with `/api/v1/connection`.
+    ///
+    /// This is a live snapshot: a console switch that restarts the helper
+    /// replaces the shared status, so callers do not need to rebuild the
+    /// connection state.
     pub fn status(&self) -> WebRtcStatus {
-        self.status.clone()
+        self.lock().status.clone()
     }
 
     /// Controller-facing status token.
     pub fn status_name(&self) -> &'static str {
-        self.status.status_name()
+        self.lock().status.status_name()
     }
 
     /// Why WebRTC is not running, when it is configured and failing.
     pub fn error(&self) -> Option<String> {
-        self.status.error()
+        self.lock().status.error()
     }
 
     /// Whether the helper was configured with an audio monitor source.
     pub fn audio_configured(&self) -> bool {
-        self.status.audio_configured() || self.audio_source.is_some()
+        let inner = self.lock();
+        inner.status.audio_configured() || inner.audio_source.is_some()
     }
 
     /// The configured monitor source, when one was supplied.
     ///
     /// This is only the PulseAudio/PipeWire monitor name; it is not proof that
     /// the worker opened the source or produced samples.
-    pub fn audio_source(&self) -> Option<&str> {
-        self.audio_source.as_deref()
+    pub fn audio_source(&self) -> Option<String> {
+        self.lock().audio_source.clone()
+    }
+
+    /// Replace the current helper after a successful restart.
+    ///
+    /// The caller stops the previous helper first (see [`Self::shutdown`]) so
+    /// the old capture source is released before the new one opens.
+    pub fn replace_helper(&self, helper: WebRtcHelper) {
+        let status = helper.status();
+        let audio_source = helper.config().audio_source.clone();
+        let mut inner = self.lock();
+        inner.status = status;
+        inner.helper = Some(Arc::new(tokio::sync::Mutex::new(helper)));
+        inner.audio_source = audio_source;
+    }
+
+    /// Record a failed restart without replacing the helper slot.
+    ///
+    /// The old helper is already stopped at this point; the status carries the
+    /// typed failure so `/api/v1/connection` cannot imply a live stream.
+    pub fn mark_failed(&self, message: impl Into<String>) {
+        let mut inner = self.lock();
+        inner.status = WebRtcStatus::failed(message);
+        inner.helper = None;
     }
 
     /// True only when a helper is connected and the feeder is running.
     pub fn available(&self) -> bool {
-        self.helper.is_some() && self.status.running()
+        self.is_running()
+    }
+
+    /// True only while the helper socket is connected and the feeder runs.
+    pub fn is_running(&self) -> bool {
+        let inner = self.lock();
+        inner.helper.is_some() && inner.status.running()
     }
 
     /// Reason the routes must answer 503, when they must.
@@ -1165,13 +1215,15 @@ impl WebRtcControl {
     /// Proxy one SDP offer to the helper.
     pub async fn offer(&self, sdp: &str) -> Result<String, WebRtcError> {
         let helper = self.require_helper()?;
-        helper.lock().await.offer(sdp).await
+        let answer = helper.lock().await.offer(sdp).await;
+        answer
     }
 
     /// Proxy one SDP offer and keep the helper session id for trickle.
     pub async fn offer_answer(&self, sdp: &str) -> Result<WebRtcAnswer, WebRtcError> {
         let helper = self.require_helper()?;
-        helper.lock().await.offer_answer(sdp).await
+        let answer = helper.lock().await.offer_answer(sdp).await;
+        answer
     }
 
     /// Forward one trickled remote ICE candidate to the helper.
@@ -1182,11 +1234,12 @@ impl WebRtcControl {
         sdp_mline_index: u32,
     ) -> Result<(), WebRtcError> {
         let helper = self.require_helper()?;
-        helper
+        let result = helper
             .lock()
             .await
             .add_ice_candidate(session, candidate, sdp_mline_index)
-            .await
+            .await;
+        result
     }
 
     /// Request a bitrate change in bits per second.
@@ -1202,12 +1255,17 @@ impl WebRtcControl {
         }
         let kbps = bitrate_bps / 1_000;
         let helper = self.require_helper()?;
-        helper.lock().await.set_bitrate(kbps.max(1)).await
+        let result = helper.lock().await.set_bitrate(kbps.max(1)).await;
+        result
     }
 
     /// Stop the helper. Idempotent and safe to call after a failed start.
+    ///
+    /// The helper slot is retained so a console switch can attempt a rollback;
+    /// a stopped helper reports `failed` and never claims a live stream.
     pub async fn shutdown(&self) {
-        let Some(helper) = self.helper.as_ref() else {
+        let helper = self.lock().helper.clone();
+        let Some(helper) = helper else {
             return;
         };
         let mut helper = helper.lock().await;
@@ -1216,11 +1274,15 @@ impl WebRtcControl {
         }
     }
 
-    fn require_helper(&self) -> Result<&Arc<tokio::sync::Mutex<WebRtcHelper>>, WebRtcError> {
-        if !self.available() {
+    fn require_helper(&self) -> Result<Arc<tokio::sync::Mutex<WebRtcHelper>>, WebRtcError> {
+        let inner = self.lock();
+        // A `WebRtcControl` only exists for a configured helper, so a failed or
+        // stopped helper is `NotRunning` (matching the pre-restart behaviour)
+        // rather than `NotConfigured`.
+        if !inner.status.running() {
             return Err(WebRtcError::NotRunning);
         }
-        self.helper.as_ref().ok_or(WebRtcError::NotConfigured)
+        inner.helper.clone().ok_or(WebRtcError::NotConfigured)
     }
 }
 

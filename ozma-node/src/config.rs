@@ -1422,9 +1422,16 @@ impl NodeConfig {
             }
         }
         let raw_display_outputs = self.display_outputs_json.trim();
+        // `main` mirrors the normalized `--display-output` topology into
+        // `display_outputs_json` for registration. That generated value is not
+        // a conflicting raw escape hatch, so validate against the serialized
+        // topology instead of rejecting every configured VM console.
+        let generated_display_outputs =
+            serde_json::to_string(&self.display_outputs).unwrap_or_default();
         if !self.display_output_specs.is_empty()
             && !raw_display_outputs.is_empty()
             && raw_display_outputs != "[]"
+            && raw_display_outputs != generated_display_outputs
         {
             return Err(
                 "--display-output and a non-empty --display-outputs-json are mutually exclusive; \
@@ -2384,6 +2391,21 @@ mod tests {
         assert_eq!(json.as_array().unwrap().len(), 2);
         assert_eq!(json[0]["source_type"], "qmp");
         assert_eq!(json[1]["capture_source_id"], "");
+
+        // `main` mirrors the resolved topology into `display_outputs_json`
+        // for registration. That generated value must not be mistaken for a
+        // conflicting raw --display-outputs-json escape hatch, otherwise a VM
+        // node with --display-output would build an empty capture registry.
+        let mut mirrored = config.clone();
+        mirrored.display_outputs = selection.outputs.clone();
+        mirrored.display_outputs_json = selection.to_json();
+        mirrored
+            .validate()
+            .expect("generated display JSON is valid");
+        assert_eq!(
+            mirrored.vm_providers().unwrap().capture.as_deref(),
+            Some("qmp")
+        );
 
         let mut two_primaries = config.clone();
         two_primaries.display_output_specs = vec![

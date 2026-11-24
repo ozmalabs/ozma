@@ -4,10 +4,12 @@ Safe USB gadget, virtual-media, and USB/IP control foundations for Ozma nodes.
 
 This crate is the model and controller layer of the Python
 `softnode/virtual_usb.py`, `softnode/usb_mass_storage.py`, and
-`softnode/virtual_media.py` paths. It is a pure library: it does not mount
-filesystems, synthesize FAT32, serve NBD, open `/dev/hidg*`, or write a block
-device. `ozma-node` now wires it behind explicit USB flags (see below); there is
-still no automatic gadget creation on a hardware profile.
+`softnode/virtual_media.py` paths. It is a pure library: it builds FAT32 images
+in memory and models ISO/NBD media, but it does not mount filesystems, serve
+NBD over a socket, open `/dev/hidg*`, or write a block device. `ozma-node` now
+wires the gadget layer behind explicit USB flags (see below); there is still no
+automatic gadget creation on a hardware profile, and the USB/IP/FAT32/ISO/NBD
+models are not exposed by node routes yet.
 
 ## What is implemented
 
@@ -16,11 +18,15 @@ still no automatic gadget creation on a hardware profile.
 | Composite gadget model | `UsbGadgetConfig`, `UsbFunction`, `UsbFunctionKind`, `HidProtocol` |
 | Functions | HID keyboard/mouse/custom, mass storage, UAC2, FunctionFS vendor |
 | Validation | Safe gadget/function names, VID/PID, strings, power, duplicate links, HID report shape, UAC2 rates/sizes, CD-ROM read-only |
-| Virtual media | `MassStorageImage`, `VirtualMedia`, `MediaMode::{Disk,CdRom}`, `MediaState::{Attached,Detached}` |
+| Virtual media | `MassStorageImage`, `VirtualMedia`, `MediaMode::{Disk,CdRom}`, `MediaFormat::{Raw,Iso9660,Fat32,Nbd}`, `MediaState::{Attached,Detached}` |
 | Controller trait | `UsbGadgetController` (`create`, `bind`, `unbind`, `status`, `list`, `attach_media`, `detach_media`, `media_state`, `capabilities`) |
 | Linux ConfigFS | `ConfigFsUsbController`, injectable root, default `/sys/kernel/config/usb_gadget` |
 | Test/dry-run fake | `FakeUsbGadgetController` |
-| USB/IP fallback | `SubprocessUsbController`, `UsbIpControl`, `CommandRunner`, `SystemCommandRunner` |
+| USB/IP model | `UsbIpConfig`, `UsbIpDevice`, `UsbIpState`, `UsbIpAttachment`, `UsbIpAuthorization`/`UsbIpKey` (advisory pairing metadata) |
+| USB/IP control | `UsbIpController`, `SubprocessUsbIpController`, argv-only `CommandRunner`; legacy `UsbIpControl`/`SubprocessUsbController` |
+| FAT32 builder | `Fat32ImageBuilder`, `Fat32Node`, `build_fat32_image`, `fat32_image_from_directory`, `parse_fat32_image`, `Fat32Info`/`Fat32Layout` |
+| ISO media | `IsoImage::inspect`, `parse_iso_volume_descriptors`, read-only `MediaFormat::Iso9660` |
+| NBD model | `NbdExport`, `NbdExportDescriptor`, `NbdHandshake`, `NbdRequest`/`NbdReply` framing (no socket server) |
 | Capabilities/status | `UsbGadgetCapabilities`, `GadgetStatus`, `FunctionStatus`; `protocol_capability()` projects onto `ozma_protocol::UsbCapability` |
 
 ## Quick start
@@ -87,6 +93,25 @@ When bound, `ozma-node` advertises `usb` in capabilities, TXT/registration, and
 Attach/detach write only ConfigFS `file`/`ro`/`cdrom` attributes. They do not
 mount, create, truncate, or write the backing image.
 
+Formats are declarative and additive. Existing `disk`/`cdrom` images keep the
+opaque `Raw` format, so their JSON and ConfigFS behaviour is unchanged:
+
+```rust
+use ozma_usb::{MassStorageImage, MediaFormat, VirtualMedia};
+
+let iso = MassStorageImage::iso("/srv/installer.iso"); // CD-ROM + read-only
+let fat = MassStorageImage::fat32("/srv/generated.img"); // disk + read-only
+let nbd = MassStorageImage::nbd("/srv/live.img"); // descriptor, not a LUN file
+assert_eq!(iso.format, MediaFormat::Iso9660);
+assert_eq!(fat.format, MediaFormat::Fat32);
+assert_eq!(nbd.format, MediaFormat::Nbd);
+```
+
+`MassStorageImage::validate_for_attach` probes an ISO primary volume descriptor
+or a FAT32 boot sector before ConfigFS attach. NBD media is rejected for direct
+ConfigFS attach with `unsupported-media-format`; use the NBD descriptor model
+and a userspace/NBD consumer instead.
+
 ## ConfigFS behavior
 
 `ConfigFsUsbController` uses ordinary `std::fs` calls against its injected
@@ -122,25 +147,81 @@ root. It creates:
 - The implementation does not call `mount`, open block devices, or use
   `unsafe`.
 
-## USB/IP fallback
+## USB/IP
 
-`SubprocessUsbController` builds `usbip` argv vectors and passes them to a
-`CommandRunner`; there is no shell and no interpolation. Bus IDs, hosts, and
-ports are validated and may not start with `-`. `list_local` parses
-`usbip list -l`. The production `SystemCommandRunner` maps a missing executable
-to `UsbError::MissingCommand` (install `usbip`).
+`UsbIpConfig` records whether USB/IP is enabled, the default host/port
+(`127.0.0.1:3240`), configured local/remote `UsbIpDevice`s, and optional
+advisory `UsbIpAuthorization` metadata (allowed hosts and key fingerprints).
+Validation rejects empty/malformed hosts, port 0, duplicate host+bus-id pairs,
+oversized key lists, malformed bus IDs, and option-like values beginning with
+`-`. Pairing metadata is **not cryptographic enforcement**: no USB/IP wire
+protocol, TLS, key exchange, daemon, or kernel `vhci_hcd` operation exists in
+this crate. An external `usbipd`, firewall, or TLS terminator must enforce it.
+
+`SubprocessUsbIpController` implements `UsbIpController` with an injected
+`CommandRunner`:
+
+| Method | `usbip` argv |
+|---|---|
+| `list()` | `list -l` |
+| `export(bus_id)` | `bind -b <bus_id>` |
+| `unexport(bus_id)` | `unbind -b <bus_id>` |
+| `attach(host, bus_id)` | `attach -r <host> -b <bus_id>` |
+| `detach(port)` | `detach -p <port>` |
+| `status()` | `port` (parsed into `UsbIpAttachment`s) |
+
+Every argument is passed as a separate argv element; there is no shell,
+interpolation, or `sudo`. `status()` on a disabled configuration returns a
+typed disabled `UsbIpState` without running a command; an enabled status whose
+`usbip port` call fails propagates `MissingCommand`/`CommandFailed` rather than
+fabricating devices. The legacy `SubprocessUsbController`/`UsbIpControl` API
+remains available for the existing node wiring.
+
+## FAT32, ISO, and NBD
+
+- **FAT32 builder** (`fat32`): `Fat32ImageBuilder` accepts in-memory
+  `Fat32Node`s, `add_file`/`add_directory`, `add_file_from_path` (bounded read),
+  and `add_directory_tree` (skips dotfiles and symlinks). It emits a complete
+  byte image with a valid FAT32 BPB, FSInfo sectors, two FATs, root directory,
+  LFN/8.3 entries, file clusters, and a backup boot sector. Defaults bound
+  files (64 MiB), total data (128 MiB), file count (4096), name length (255),
+  and depth (32); images use at least the FAT32 minimum cluster count. Files
+  carry the read-only attribute, and `Fat32Image::is_read_only()` is always
+  true. `parse_fat32_image`/`parse_fat32_boot_sector` validate an existing
+  image without mounting it. Cluster sizes 512–65536 bytes are supported;
+  the default is one 512-byte sector per cluster for compact test images.
+- **ISO** (`iso`): `IsoImage::inspect` reads at most 32 volume descriptors from
+  an existing file, verifies `CD001`, the primary descriptor, both-endian
+  size/block fields, and root-directory bounds. `MediaFormat::Iso9660` always
+  means CD-ROM + read-only. There is no ISO writing, El Torito parsing,
+  directory-tree extraction, or mounting.
+- **NBD** (`nbd`): `NbdExport` validates name/size/block size/read-only flags;
+  `NbdExportDescriptor` models TCP or Unix-socket endpoints; `NbdHandshake`,
+  `NbdRequestHeader`, `NbdRequest`, and `NbdReply` encode/decode bounded
+  big-endian framing with request-size limits. This is a framing model only:
+  no listener, socket, block device, write overlay, or userspace server is
+  started. QEMU/`nbdkit` integration remains node work.
 
 ## Tests
 
 Default tests are CI-safe and use a temporary ConfigFS-shaped root, a fake
-controller, and a recording command runner. They never create a real gadget,
-bind a real UDC, mount a filesystem, or write a block device.
+controller, recording/scripted command runners, synthetic ISO/FAT32/NBD bytes,
+and in-memory images. They never create a real gadget, bind a real UDC, run
+`usbip`, open an NBD socket, mount a filesystem, or write a block device.
 
 ```bash
 cargo test -p ozma-usb
 cargo check -p ozma-usb --all-targets
 cargo fmt -p ozma-usb
 ```
+
+Relevant suites:
+
+| Test | Coverage |
+|---|---|
+| `tests/fat32_image.rs` | BPB/FAT/root entries/file clusters, LFN + 8.3 collisions, read-only attributes, directory import, bounds, corrupt BPB |
+| `tests/media_formats.rs` | ISO PVD/read-only media, `MediaFormat` consistency/JSON, FAT32 attach probe, NBD descriptors and framing |
+| `tests/usbip_controller.rs` | exact argv, list/port parsing (IPv4/IPv6), attach/detach state, disabled/missing/non-zero typed errors, config validation, no real `usbip` |
 
 The one real-ConfigFS round trip is ignored and env-gated:
 
@@ -153,16 +234,26 @@ It still requires root, a mounted ConfigFS root (optionally
 `OZMA_USB_CONFIGFS_ROOT`), and a free UDC. It creates only HID functions and
 removes the test gadget.
 
-## Remaining integration work
+## Remaining integration and security gaps
 
 - Real gadget validation on `dummy_hcd` and hardware UDCs; currently only the
   ignored round trip exists, and node tests use a temp root/fake controller.
-- USB/IP pairing with the controller, authorization, and hotplug.
+- USB/IP security is not implemented: no TLS, no cryptographic pairing, no
+  challenge/response, no client authentication, and no kernel `vhci_hcd`
+  lifecycle. `UsbIpAuthorization` is advisory metadata for an external
+  `usbipd`/firewall/proxy. USB/IP hotplug and controller/API pairing remain
+  node work, and no route currently exposes `UsbIpController`.
+- The FAT32 builder is a static snapshot, not the Python live `FATSynthesiser`
+  (no sector-on-demand reads, inotify rescan, long-name rescan stability, or
+  write overlay). Generated images are read-only. Exposing a built image to a
+  gadget still requires writing it to a file/exported medium outside this
+  crate; `ozma-usb` never writes it.
+- ISO support validates descriptors only; no Joliet/Rock Ridge/El Torito
+  parsing, directory extraction, writing, or mounting.
+- NBD is a descriptor/framing model only; no socket server, negotiation loop,
+  write overlay, flush/trim execution, or QEMU integration.
 - FunctionFS vendor daemon (descriptors, endpoints, userspace I/O) and real
   UAC2 playback/capture bridging.
-- Virtual-media backends: FAT32 synthesis, NBD serving, ISO handling, and
-  read-write sync/overlay semantics from `virtual_media.py` /
-  `usb_mass_storage.py`.
 - Node-side gadget teardown/recovery across restart, and hardware-profile
-  validation. Mounting, image creation, and block-device I/O remain
+  validation. Mounting, block-device I/O, and real USB/IP/NBD transport remain
   deliberately outside this crate.

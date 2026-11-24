@@ -295,7 +295,9 @@ pub fn outputs_from_specs(
     } else if topology.consoles.len() > 1 {
         Some(format!(
             "only Console_{active} has a live capture source; the other consoles are \
-             advertised for layout/selection but require restarting with that console selected"
+             advertised for layout/selection. A provider that supports console indexes can \
+             switch at runtime with POST /display/select; single-head providers require a \
+             node restart with that console selected"
         ))
     } else {
         None

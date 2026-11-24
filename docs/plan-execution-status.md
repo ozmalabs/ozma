@@ -9,7 +9,7 @@ Capability and security policy (aperture) is planned in [`aperture-policy.md`](a
 
 USB video output (UVC basic + raw Ozma vendor mode) is planned in [`usb-video-plan.md`](usb-video-plan.md).
 
-The migration from the Python `softnode/`, `node/`, and `agent/` processes to the Rust stack is planned in [`rust-reconciliation-plan.md`](rust-reconciliation-plan.md). Parity evidence is tracked in [`parity-matrix.md`](parity-matrix.md).
+The migration from the Python `softnode/`, `node/`, and `agent/` processes to the Rust stack is planned in [`rust-reconciliation-plan.md`](rust-reconciliation-plan.md). Parity evidence is tracked in [`parity-matrix.md`](parity-matrix.md). Phase 4 cutover assets (clean-host harness, Rust-first units, installer, demo switch) are tracked below and in [`clean-host.md`](clean-host.md); the Python trees are retained for the one-release rollback.
 
 ## Rust reconciliation — Phase 0
 
@@ -97,9 +97,9 @@ convert. `/audio/nodes` remained a typed 501. See
 | Item | Status | Evidence |
 |---|---|---|
 | Multi-display registration/config | Done (VM consoles) | `--display-output <label:WxH[:primary][:source]>` (repeatable, indexed form accepted) parses into `VmDisplayTopology`, validates duplicate indices/zero geometry/multiple primaries, normalizes the primary, and writes registration/TXT `display_outputs` plus `/api/v1/connection.display_outputs`. `--display-outputs-json` remains the raw host-output escape hatch and conflicts with `--display-output`. An implicit single console is derived from QMP/D-Bus/VNC/Looking Glass when no spec is given. `cargo test -p ozma-node --lib display_outputs:: config::tests::display_output` |
-| Per-console capture selection | Partial | D-Bus honours `--capture-console N`/`--dbus-console`; QMP/VNC/Looking Glass capture one default head and the node reports `display_capture.limitation` instead of faking a second source. Only the selected console has a non-empty `capture_source_id`. `cargo test -p ozma-node --lib config::tests::capture_console platform::tests::multi_console` |
+| Per-console capture selection | Partial (D-Bus runtime switch) | D-Bus honours `--capture-console N`/`--dbus-console` and now also `POST /display/select` (`{"index":N}` or `{"id":"<label>"}`), which validates against `display_outputs`, rebuilds the capture registry for that `Console_N`, restarts running HLS/WebRTC from the shared registry, and updates `/api/v1/connection.display_outputs`/`display_capture`. Selecting the active console is idempotent; a failed pipeline restart restores the previous registry/pipelines and returns a typed 502. QMP/VNC/Looking Glass remain single-head and answer a typed 409 for a different console. Only the selected console has a non-empty `capture_source_id`. `cargo test -p ozma-node --lib display_control:: config::tests::display_output controller_compat::tests::display_select`; live QEMU 11.1.3 `virtio-gpu-pci,max_outputs=2` D-Bus run switched Console_0 → Console_1 and kept `capture.available=true` |
 | GPU passthrough / Looking Glass | Done (fixture) | `--capture-provider looking-glass` (or `--looking-glass-shm`) registers `LookingGlassProvider` with `--looking-glass-fps`/`id`/`name`. Missing/foreign SHM or an unpublished frame advertises no/placeholder source, never a hardware claim. `cargo test -p ozma-node --lib platform::tests::vm_profile_registers_looking_glass config::tests::looking_glass` |
-| Controller display picker | Not implemented | The controller can read `display_outputs`/`display_capture` and show the limitation, but has no live per-console encoder switch; changing consoles requires restarting the node with that console selected. |
+| Controller display picker | Done (proxy + dashboard) | `GET /api/v1/nodes/{id}/display` reads the node's `display_outputs`/`display_capture`; `POST /api/v1/nodes/{id}/display/select` forwards `{index|id}` to the node with the per-node/global bearer token, preserves typed 400/404/409/501 limitations, and updates the controller's cached outputs after success. The dashboard stream modal renders a console picker from `display_outputs`, shows the active console/limitation, and restarts the local/WebRTC view after a switch. `pytest tests/unit/controller/test_node_api_token_proxy.py tests/unit/controller/test_dashboard_display_picker.py`. |
 | Real GPU/VFIO/KVMFR validation | Not run | CI uses a temp KVMFR fixture only; no real QEMU IVSHMEM, VFIO/iommu group, GPU, or `/dev/shm/looking-glass` run. |
 
 ## Rust reconciliation — Phase 3: USB/media foundation
@@ -122,6 +122,29 @@ binds a real UDC, mounts anything, or writes a block device. The node-side USB
 tests extend this with a temp-root create/bind/attach/detach round trip, the
 fake controller, and typed unavailable-gadget fallbacks; they also never touch
 a real UDC, ConfigFS mount, or block device.
+
+## Rust reconciliation — Phase 4: cutover assets
+
+| Item | Status | Evidence |
+|---|---|---|
+| Clean-host harness | Partial (assets green; tests red) | `scripts/clean-host/run.sh` + `Containerfile` check native deps, build both binaries, run a bounded or full test selection, verify `--help`, shell/unit syntax, and a synthetic `/health` start. The 2026-11-25 container run passed dependency, build, `--help`, shell/unit, installer dry-run, `ozma-softnode` (111 tests), and synthetic `/health` checks. `cargo test -p ozma-node --lib` now passes 301 tests after the display-select/WebRTC status fixes (the earlier 2 failures were in parallel in-progress display/WebRTC work). Gate 4 is not claimed. See [`clean-host.md`](clean-host.md). |
+| Rust-first systemd units | Done (assets) | `scripts/systemd/ozma-node@.service`, `ozma-node-vm@.service`, `ozma-virtual-node.service`, per-profile env examples, and `verify-units.sh`; `systemd-analyze verify` PASS for all three rendered units (systemd 262). Least-privilege and user-unit notes are in `scripts/systemd/README.md`. |
+| Install layout | Done (script; not installed on this host) | `scripts/install-rust.sh` installs `ozma-node`/`ozma-virtual-node`, user or system units, and env examples without sudo or enabling units. `--dry-run` writes nothing; Python trees are untouched and remain the rollback path. |
+| Demo Rust switch | Partial (not run end-to-end) | `demo/run_demo.sh --rust`, `OZMA_DEMO_BACKEND=rust`, and `OZMA_DEMO_RUST=1` start `ozma-node --profile vm` per demo VM with QMP capture, HLS, and optional PipeWire monitor audio; Python remains the default and `--python` rolls back. The VM/controller demo was not started in this task. |
+| Fresh-host Python-free install | Not done | Depends on the checkout's own tests going green and an end-to-end run. `/usr/bin/env python` is still required only by the controller, not by the node units/installer. |
+| Port privileged `softnode/install` assets | Not done | udev rules, AppArmor drop-in, and libvirt `cgroup_device_acl` remain owned by `softnode/install/install.sh`; both Python and Rust VM profiles use the same device paths. |
+| Delete Python node trees | Not done (intentional) | One-release overlap. Deletion follows Gate 4 and the rollback tag, not this asset change. |
+
+Verification added by this work:
+
+```bash
+scripts/clean-host/run.sh --check-deps
+scripts/clean-host/run.sh --container          # 2026-11-25: node tests red in parallel work
+scripts/clean-host/run.sh --host --full
+scripts/systemd/verify-units.sh                # PASS (3 units)
+scripts/install-rust.sh --dry-run --from-target target/debug --prefix /tmp/ozma-install
+bash -n demo/run_demo.sh scripts/install-rust.sh scripts/clean-host/*.sh
+```
 
 ## M0 — Contract and cleanup
 
@@ -193,7 +216,7 @@ authentication, and Xpra video are being extended in separate workstreams.
 ## Verification
 
 ```bash
-cargo test --workspace                                   # 1797 passed, 20 ignored (current)
+cargo test --workspace                                   # 1836 passed, 23 ignored (current)
 cargo test -p ozma-node --test parity                    # Python/controller parity baseline (16)
 cargo test -p ozma-node --lib                            # node API, compat, session unit tests (136, 2 ignored)
 cargo test -p ozma-qmp -p ozma-input -p ozma-power       # QMP, uinput/QMP sinks, power (166)

@@ -141,6 +141,19 @@ pub const DBUS_LISTENER_INTERFACE: &str = "org.qemu.Display1.Listener";
 /// Optional listener interface that carries multi-plane DMA-BUF scanouts.
 pub const DBUS_LISTENER_DMABUF2_INTERFACE: &str = "org.qemu.Display1.Listener.Unix.ScanoutDMABUF2";
 
+pub use crate::dmabuf_egl::{RenderNodeProbe, TiledImportProbe, UnsupportedModifier};
+
+/// Probe the host's optional GBM/EGL tiled DMA-BUF importer.
+///
+/// The result is side-effect free: it opens `/dev/dri/renderD*`, creates a
+/// temporary surfaceless EGL context, and queries
+/// `eglQueryDmaBufFormatsEXT`/`eglQueryDmaBufModifiersEXT`. It never imports a
+/// QEMU scanout or invents a frame. Use it to explain why a tiled modifier was
+/// rejected, or to report which modifiers the host could actually export.
+pub fn tiled_import_probe() -> TiledImportProbe {
+    crate::dmabuf_egl::probe()
+}
+
 /// `org.freedesktop.DBus.Properties` interface.
 pub const DBUS_PROPERTIES_INTERFACE: &str = "org.freedesktop.DBus.Properties";
 
@@ -4421,12 +4434,23 @@ mod tests {
         assert!(frame.format().width > 0);
         assert!(frame.format().height > 0);
         assert!(!frame.data().is_empty());
-        println!(
-            "live D-Bus Scanout: {}x{} {} bytes",
-            frame.format().width,
-            frame.format().height,
-            frame.data().len()
-        );
+        if let Some(dmabuf) = source.dmabuf.as_ref() {
+            println!(
+                "live D-Bus Scanout: {}x{} {} bytes fourcc={:#010x} modifier={:#018x}",
+                frame.format().width,
+                frame.format().height,
+                frame.data().len(),
+                dmabuf.fourcc(),
+                dmabuf.modifier()
+            );
+        } else {
+            println!(
+                "live D-Bus Scanout: {}x{} {} bytes (pixman)",
+                frame.format().width,
+                frame.format().height,
+                frame.data().len()
+            );
+        }
         source.stop().await.unwrap();
     }
 }

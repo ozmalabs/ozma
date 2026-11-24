@@ -152,15 +152,30 @@ def _client(app):
 # (method, controller URL, request JSON, expected node path prefix)
 PROXY_CASES = [
     ("post", f"/api/v1/nodes/{NODE_ID}/proxy/input/key", {"key": "a"}, "/input/key"),
-    ("post", "/api/v1/audio/room-correction/apply",
-     {"node_id": NODE_ID, "profile_id": "p1"}, "/audio/apply"),
-    ("post", f"/api/v1/streams/{NODE_ID}/webrtc",
-     {"type": "offer", "sdp": "v=0"}, "/webrtc/offer"),
+    (
+        "post",
+        "/api/v1/audio/room-correction/apply",
+        {"node_id": NODE_ID, "profile_id": "p1"},
+        "/audio/apply",
+    ),
+    (
+        "post",
+        f"/api/v1/streams/{NODE_ID}/webrtc",
+        {"type": "offer", "sdp": "v=0"},
+        "/webrtc/offer",
+    ),
     ("get", f"/api/v1/streams/{NODE_ID}/snapshot", None, "/display/snapshot"),
     ("get", f"/api/v1/nodes/{NODE_ID}/ui/hints", None, "/ui/hints"),
     ("get", f"/api/v1/nodes/{NODE_ID}/power/state", None, "/power/state"),
     ("post", f"/api/v1/nodes/{NODE_ID}/power/pause", {}, "/power/pause"),
     ("post", f"/api/v1/nodes/{NODE_ID}/power/resume", {}, "/power/resume"),
+    ("get", f"/api/v1/nodes/{NODE_ID}/display", None, "/api/v1/connection"),
+    (
+        "post",
+        f"/api/v1/nodes/{NODE_ID}/display/select",
+        {"index": 1},
+        "/display/select",
+    ),
     ("get", f"/api/v1/nodes/{NODE_ID}/usb", None, "/usb"),
     ("get", f"/api/v1/streams/{NODE_ID}/codec", None, "/codec"),
     ("get", f"/api/v1/remote/{NODE_ID}/screenshot", None, "/display/snapshot"),
@@ -181,6 +196,99 @@ def test_proxy_sends_configured_bearer_token(
     record = fake_node.requests[-1]
     assert record["path"].startswith(node_path)
     assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_display_read_returns_node_outputs_and_uses_the_bearer_token(
+    fake_node, tmp_path
+):
+    fake_node.responder = lambda method, record: (
+        200,
+        {
+            "ok": True,
+            "display_outputs": [
+                {"index": 0, "name": "Console_0", "capture_source_id": "dbus0"},
+                {"index": 1, "name": "Console_1", "capture_source_id": ""},
+            ],
+            "display_capture": {
+                "active_console": 0,
+                "provider": "dbus",
+                "limitation": "only Console_0 has a live capture source",
+            },
+        },
+        "application/json",
+    )
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).get(f"/api/v1/nodes/{NODE_ID}/display")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["display_capture"]["active_console"] == 0
+    assert response.json()["display_outputs"][1]["capture_source_id"] == ""
+    record = fake_node.requests[-1]
+    assert record["path"] == "/api/v1/connection"
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_display_select_updates_cached_outputs_after_node_success(fake_node, tmp_path):
+    switched = [
+        {"index": 0, "name": "Console_0", "capture_source_id": ""},
+        {"index": 1, "name": "Console_1", "capture_source_id": "dbus0"},
+    ]
+    fake_node.responder = lambda method, record: (
+        200,
+        {
+            "ok": True,
+            "active_console": 1,
+            "previous_console": 0,
+            "display_outputs": switched,
+            "display_capture": {"active_console": 1, "provider": "dbus"},
+            "changed": True,
+            "restarted": {"hls": True, "webrtc": False},
+        },
+        "application/json",
+    )
+    app, state = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).post(
+        f"/api/v1/nodes/{NODE_ID}/display/select", json={"index": 1}
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["active_console"] == 1
+    assert state.nodes[NODE_ID].display_outputs == switched
+    record = fake_node.requests[-1]
+    assert record["method"] == "POST"
+    assert record["path"] == "/display/select"
+    assert record["body"] == {"index": 1}
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_display_select_preserves_single_head_409_without_updating_state(
+    fake_node, tmp_path
+):
+    original = [
+        {"index": 0, "name": "Console_0", "capture_source_id": "vnc0"},
+        {"index": 1, "name": "Console_1", "capture_source_id": ""},
+    ]
+    fake_node.responder = lambda method, record: (
+        409,
+        {
+            "ok": False,
+            "code": "conflict",
+            "error": "the vnc capture provider exposes one default console",
+        },
+        "application/json",
+    )
+    app, state = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+    state.nodes[NODE_ID].display_outputs = original
+
+    response = _client(app).post(
+        f"/api/v1/nodes/{NODE_ID}/display/select", json={"index": 1}
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "conflict"
+    assert state.nodes[NODE_ID].display_outputs == original
 
 
 @pytest.mark.parametrize("action", ["pause", "resume"])
@@ -214,8 +322,10 @@ def test_proxy_omits_authorization_when_no_token_configured(
 
 def test_per_node_registration_token_wins_over_global(fake_node, tmp_path):
     app, _ = _build_app(
-        fake_node.server_address[1], tmp_path,
-        global_token="global-token", node_token="per-node-token",
+        fake_node.server_address[1],
+        tmp_path,
+        global_token="global-token",
+        node_token="per-node-token",
     )
 
     response = _client(app).get(f"/api/v1/nodes/{NODE_ID}/power/state")
@@ -225,7 +335,9 @@ def test_per_node_registration_token_wins_over_global(fake_node, tmp_path):
 
 
 def test_registration_accepts_token_without_serializing_it(fake_node, tmp_path):
-    app, state = _build_app(fake_node.server_address[1], tmp_path, global_token="global-token")
+    app, state = _build_app(
+        fake_node.server_address[1], tmp_path, global_token="global-token"
+    )
     client = _client(app)
 
     registered = client.post(
@@ -252,12 +364,17 @@ def test_registration_accepts_token_without_serializing_it(fake_node, tmp_path):
 
     proxied = client.get(f"/api/v1/nodes/{NODE_ID}/power/state")
     assert proxied.status_code == 200, proxied.text
-    assert fake_node.requests[-1]["headers"]["authorization"] == "Bearer registered-node-token"
+    assert (
+        fake_node.requests[-1]["headers"]["authorization"]
+        == "Bearer registered-node-token"
+    )
 
 
 def test_webrtc_raw_proxy_passes_node_401_through(fake_node, tmp_path):
     fake_node.responder = lambda method, record: (
-        401, {"error": "unauthorized"}, "application/json"
+        401,
+        {"error": "unauthorized"},
+        "application/json",
     )
     app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
 
@@ -272,7 +389,9 @@ def test_webrtc_raw_proxy_passes_node_401_through(fake_node, tmp_path):
 
 def test_codec_proxy_passes_node_401_through(fake_node, tmp_path):
     fake_node.responder = lambda method, record: (
-        401, {"ok": False, "error": "unauthorized"}, "application/json"
+        401,
+        {"ok": False, "error": "unauthorized"},
+        "application/json",
     )
     app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
 
@@ -283,14 +402,19 @@ def test_codec_proxy_passes_node_401_through(fake_node, tmp_path):
     assert TOKEN not in response.text
 
 
-@pytest.mark.parametrize("url", [
-    f"/api/v1/nodes/{NODE_ID}/power/state",
-    f"/api/v1/streams/{NODE_ID}/snapshot",
-    f"/api/v1/nodes/{NODE_ID}/ui/hints",
-])
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"/api/v1/nodes/{NODE_ID}/power/state",
+        f"/api/v1/streams/{NODE_ID}/snapshot",
+        f"/api/v1/nodes/{NODE_ID}/ui/hints",
+    ],
+)
 def test_node_401_maps_to_clear_token_free_controller_error(fake_node, tmp_path, url):
     fake_node.responder = lambda method, record: (
-        401, {"error": "unauthorized"}, "application/json"
+        401,
+        {"error": "unauthorized"},
+        "application/json",
     )
     app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
 
@@ -305,7 +429,9 @@ def test_node_401_maps_to_clear_token_free_controller_error(fake_node, tmp_path,
 
 def test_json_input_proxy_maps_node_401_to_clear_error(fake_node, tmp_path):
     fake_node.responder = lambda method, record: (
-        401, {"error": "unauthorized"}, "application/json"
+        401,
+        {"error": "unauthorized"},
+        "application/json",
     )
     app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
 
@@ -327,8 +453,9 @@ def test_token_never_appears_in_responses_or_logs(fake_node, tmp_path, caplog):
         client.get(f"/api/v1/streams/{NODE_ID}/snapshot"),
         client.get(f"/api/v1/nodes/{NODE_ID}/ui/hints"),
         client.get(f"/api/v1/nodes/{NODE_ID}/power/state"),
-        client.post(f"/api/v1/streams/{NODE_ID}/webrtc",
-                    json={"type": "offer", "sdp": "v=0"}),
+        client.post(
+            f"/api/v1/streams/{NODE_ID}/webrtc", json={"type": "offer", "sdp": "v=0"}
+        ),
     ]
 
     for response in responses:

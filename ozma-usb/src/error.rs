@@ -71,11 +71,44 @@ pub enum UsbError {
     #[error("media is read-only: {0}")]
     ReadOnlyMedia(String),
 
+    /// A media image is not valid for its declared format.
+    #[error("invalid {format} media {path}: {reason}")]
+    InvalidMedia {
+        /// Media format name (`iso9660`, `fat32`, `nbd`).
+        format: &'static str,
+        /// Path that failed validation.
+        path: PathBuf,
+        /// Human-readable reason.
+        reason: String,
+    },
+
+    /// A media format cannot be used by the requested operation.
+    #[error("media format {format} is not supported here: {reason}")]
+    UnsupportedMediaFormat {
+        /// Media format name.
+        format: &'static str,
+        /// Human-readable reason.
+        reason: String,
+    },
+
     /// A USB/IP bus id, host, or port is malformed.
     #[error("invalid USB/IP {field}: {reason}")]
     InvalidUsbIp {
         /// Field name (`bus_id`, `host`, `port`).
         field: &'static str,
+        /// Human-readable reason.
+        reason: String,
+    },
+
+    /// A USB/IP operation was attempted while the feature is disabled.
+    #[error("USB/IP is disabled in the node configuration")]
+    UsbIpDisabled,
+
+    /// A `usbip`/NBD response could not be parsed.
+    #[error("invalid {protocol} response: {reason}")]
+    Protocol {
+        /// Protocol name (`usbip`, `nbd`).
+        protocol: &'static str,
         /// Human-readable reason.
         reason: String,
     },
@@ -153,7 +186,11 @@ impl UsbError {
             Self::MediaNotFound(_) => "media-not-found",
             Self::MediaNotFile(_) => "media-not-file",
             Self::ReadOnlyMedia(_) => "read-only-media",
+            Self::InvalidMedia { .. } => "invalid-media",
+            Self::UnsupportedMediaFormat { .. } => "unsupported-media-format",
             Self::InvalidUsbIp { .. } => "invalid-usbip",
+            Self::UsbIpDisabled => "usbip-disabled",
+            Self::Protocol { .. } => "protocol-error",
             Self::ConfigFs { .. } => "configfs-io",
             Self::Io { .. } => "io",
             Self::MissingCommand { .. } => "missing-command",

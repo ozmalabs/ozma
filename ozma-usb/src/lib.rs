@@ -10,19 +10,30 @@
 //!   mass storage, UAC2, FunctionFS vendor) and validate it before any
 //!   filesystem work.
 //! * [`VirtualMedia`] / [`MassStorageImage`] model a backing image, disk vs
-//!   CD-ROM presentation, read-only policy, size, and attach/detach state.
+//!   CD-ROM presentation, read-only policy, declared [`MediaFormat`], size,
+//!   and attach/detach state.
 //! * [`UsbGadgetController`] is the synchronous, object-safe controller trait.
 //! * [`ConfigFsUsbController`] implements it with safe `std::fs` calls against
 //!   an injectable root (default `/sys/kernel/config/usb_gadget`).
 //! * [`FakeUsbGadgetController`] mirrors the same contract entirely in memory.
 //! * [`SubprocessUsbController`] provides the USB/IP system-tool fallback with
 //!   a [`CommandRunner`] and argv-only, shell-free execution.
+//! * [`UsbIpConfig`] / [`UsbIpState`] and [`SubprocessUsbIpController`] model
+//!   USB/IP enablement, host/port, local exports, remote attachments, and
+//!   advisory pairing metadata without a shell.
+//! * [`Fat32ImageBuilder`] creates a bounded, read-only FAT32 image in memory
+//!   from files/directories; [`parse_fat32_image`] validates one read-only.
+//! * [`IsoImage`] inspects existing ISO 9660 images read-only, and
+//!   [`NbdExport`] / [`NbdRequest`] model NBD exports and framing without a
+//!   socket server.
 //!
 //! No code in this crate uses `unsafe`, mounts a filesystem, opens a block
-//! device, writes a disk image, or creates a real USB gadget. The ConfigFS
-//! implementation only creates/removes directories, writes attribute files,
-//! and creates configuration symlinks. Tests use a temporary root; the one
-//! real-ConfigFS test is `#[ignore]` and environment-gated.
+//! device, writes a block device, starts an NBD/USB/IP socket server, or
+//! creates a real USB gadget. The ConfigFS implementation only creates/removes
+//! directories, writes attribute files, and creates configuration symlinks.
+//! FAT32 construction is an in-memory byte buffer; ISO inspection reads only a
+//! bounded descriptor header. Tests use a temporary root and synthetic images;
+//! the one real-ConfigFS test is `#[ignore]` and environment-gated.
 //!
 //! # Example
 //!
@@ -60,9 +71,13 @@ pub mod configfs;
 pub mod controller;
 pub mod error;
 pub mod fake;
+pub mod fat32;
+pub mod iso;
 pub mod media;
+pub mod nbd;
 pub mod status;
 pub mod subprocess;
+pub mod usbip;
 
 pub use config::{
     is_safe_identifier, HidProtocol, UsbFunction, UsbFunctionKind, UsbGadgetConfig,
@@ -72,9 +87,27 @@ pub use configfs::{ConfigFsUsbController, DEFAULT_CONFIGFS_ROOT};
 pub use controller::UsbGadgetController;
 pub use error::UsbError;
 pub use fake::FakeUsbGadgetController;
-pub use media::{MassStorageImage, MediaMode, MediaState, VirtualMedia};
+pub use fat32::{
+    build_fat32_image, fat32_image_from_directory, parse_fat32_boot_sector, parse_fat32_image,
+    validate_fat32_boot_sector, Fat32BootInfo, Fat32EntryInfo, Fat32Image, Fat32ImageBuilder,
+    Fat32Info, Fat32Layout, Fat32Node, Fat32Options, FAT32_DEFAULT_CLUSTER_SIZE,
+};
+pub use iso::{
+    parse_iso_volume_descriptors, validate_iso_image, IsoImage, IsoVolumeDescriptor,
+    ISO9660_SECTOR_SIZE,
+};
+pub use media::{MassStorageImage, MediaFormat, MediaMode, MediaState, VirtualMedia};
+pub use nbd::{
+    validate_nbd_descriptor, NbdCommand, NbdExport, NbdExportDescriptor, NbdHandshake, NbdReply,
+    NbdRequest, NbdRequestHeader, NBD_DEFAULT_PORT, NBD_HANDSHAKE_LEN, NBD_MAX_REQUEST_BYTES,
+    NBD_REPLY_HEADER_LEN, NBD_REQUEST_HEADER_LEN,
+};
 pub use status::{FunctionStatus, GadgetStatus, UsbGadgetCapabilities};
 pub use subprocess::{
     CommandOutput, CommandRunner, CommandSpec, SubprocessUsbController, SystemCommandRunner,
     UsbIpControl, UsbIpDevice,
+};
+pub use usbip::{
+    SubprocessUsbIpController, UsbIpAttachment, UsbIpAuthorization, UsbIpConfig, UsbIpController,
+    UsbIpKey, UsbIpState, DEFAULT_USBIP_PORT,
 };

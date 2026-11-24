@@ -1418,6 +1418,11 @@ select option { background: var(--surface); }
       <span id="modal-title-text">Stream</span>
       <div id="kvm-toolbar">
         <span id="kvm-status"></span>
+        <select id="kvm-display-select" title="Active VM console"
+                onchange="selectDisplay(kvmNodeId, this.value)"
+                style="display:none;font-size:11px;padding:3px 6px;border-radius:6px;background:var(--surface);color:var(--text);border:1px solid var(--border)"></select>
+        <span id="kvm-display-note" title=""
+              style="display:none;font-size:10px;color:var(--muted);max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
         <button id="kvm-kbd-btn" title="Capture keyboard (Tab to release)">Keyboard</button>
         <button id="kvm-mouse-btn" title="Capture mouse (Esc to release)">Mouse</button>
         <button id="kvm-audio-btn" title="Unmute audio">Audio Off</button>
@@ -1479,6 +1484,7 @@ select option { background: var(--surface); }
 let nodes     = {};   // id → NodeInfo
 let scenarios = {};   // id → Scenario
 let streams   = {};   // node_id → stream info
+const nodeDisplay = {}; // node_id → {display_outputs, display_capture}
 let activeNodeId     = null;
 let activeScenarioId = null;
 let vmSupervisor     = null;  // last /supervisor/status document
@@ -3207,6 +3213,132 @@ const KVM_KEYMAP = {
   MetaLeft:125, MetaRight:126,
 };
 
+// ── VM console picker ─────────────────────────────────────────────────────────
+// The node advertises every Console_N in display_outputs but only the active
+// console has a capture_source_id. The controller proxy sends the node token;
+// a single-head provider answers a typed 409 and the note explains that a node
+// restart is required instead of pretending the switch happened.
+async function loadNodeDisplay(nodeId) {
+  try {
+    const resp = await fetch(`/api/v1/nodes/${encodeURIComponent(nodeId)}/display`);
+    if (!resp.ok) throw new Error(`display metadata: ${resp.status}`);
+    nodeDisplay[nodeId] = await resp.json();
+  } catch (err) {
+    const cached = nodes[nodeId] || {};
+    nodeDisplay[nodeId] = {
+      display_outputs: cached.display_outputs || [],
+      display_capture: {},
+    };
+    const note = $('kvm-display-note');
+    note.style.display = 'block';
+    note.textContent = `Console metadata unavailable: ${err.message || err}`;
+    note.title = note.textContent;
+    return;
+  }
+  renderDisplayPicker(nodeId);
+}
+
+function renderDisplayPicker(nodeId) {
+  const data = nodeDisplay[nodeId] || {};
+  const outputs = data.display_outputs || [];
+  const capture = data.display_capture || {};
+  const select = $('kvm-display-select');
+  const note = $('kvm-display-note');
+  if (!select || !note) return;
+
+  select.innerHTML = '';
+  if (!outputs.length) {
+    select.style.display = 'none';
+    note.style.display = capture.limitation ? 'block' : 'none';
+    note.textContent = capture.limitation || '';
+    note.title = note.textContent;
+    return;
+  }
+
+  for (const output of outputs) {
+    const option = document.createElement('option');
+    option.value = String(output.index);
+    const live = !!output.capture_source_id;
+    option.textContent = `${output.name || `Console_${output.index}`}${live ? ' ● live' : ''}`;
+    if (Number(output.index) === Number(capture.active_console)) option.selected = true;
+    select.appendChild(option);
+  }
+  if (capture.active_console !== undefined && capture.active_console !== null) {
+    select.value = String(capture.active_console);
+  }
+  // A single advertised console has nothing to pick; keep the UI honest and
+  // hide the control rather than looking interactive.
+  select.style.display = outputs.length > 1 ? 'inline-block' : 'none';
+  note.style.display = 'block';
+  note.textContent = capture.limitation ||
+    (outputs.length > 1 ? 'Only one console has a live capture source at a time.' : '');
+  note.title = note.textContent;
+}
+
+function _restartStreamView(nodeId) {
+  if (window._kvmPeerConnection) {
+    window._kvmPeerConnection.close();
+    window._kvmPeerConnection = null;
+  }
+  if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
+  if (kvmSnapInterval) { clearInterval(kvmSnapInterval); kvmSnapInterval = null; }
+  openStream(nodeId);
+}
+
+async function selectDisplay(nodeId, value) {
+  if (!nodeId) return;
+  const select = $('kvm-display-select');
+  const note = $('kvm-display-note');
+  // `onchange` has already applied the new value, so restore the console that
+  // was actually live before this request instead of reading the select box.
+  const active = nodeDisplay[nodeId]?.display_capture?.active_console;
+  const previous = (active !== undefined && active !== null)
+    ? String(active)
+    : (select ? select.value : '');
+  if (select) select.disabled = true;
+  try {
+    const resp = await fetch(
+      `/api/v1/nodes/${encodeURIComponent(nodeId)}/display/select`,
+      {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({index: Number(value)}),
+      },
+    );
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      const reason = body.error || body.detail || `console switch failed (${resp.status})`;
+      note.style.display = 'block';
+      note.textContent = reason;
+      note.title = reason;
+      $('kvm-status').textContent = `console ${value}: rejected`;
+      if (select) select.value = previous;
+      return;
+    }
+    nodeDisplay[nodeId] = {
+      display_outputs: body.display_outputs || [],
+      display_capture: body.display_capture || {},
+    };
+    const node = nodes[nodeId];
+    if (node && Array.isArray(body.display_outputs)) {
+      node.display_outputs = body.display_outputs;
+    }
+    renderDisplayPicker(nodeId);
+    $('kvm-status').textContent =
+      `Console ${body.active_console} active` +
+      (body.restarted && (body.restarted.hls || body.restarted.webrtc) ? ' (stream restarted)' : '');
+    if (body.changed) _restartStreamView(nodeId);
+  } catch (err) {
+    const reason = `console switch failed: ${err.message || err}`;
+    note.style.display = 'block';
+    note.textContent = reason;
+    note.title = reason;
+    if (select) select.value = previous;
+  } finally {
+    if (select) select.disabled = false;
+  }
+}
+
 function openStream(nodeId) {
   const s = streams[nodeId];
   if (!s) return;
@@ -3215,6 +3347,7 @@ function openStream(nodeId) {
   $('modal-title-text').textContent = shortId(nodeId);
   $('modal-overlay').classList.add('open');
   $('kvm-status').textContent = '';
+  loadNodeDisplay(nodeId);
 
   const img = $('modal-img');
   const video = $('modal-video');

@@ -236,10 +236,34 @@ struct SnapshotCache {
     last_error: Option<String>,
 }
 
+/// Where a snapshot control reads its capture registry.
+///
+/// The runtime console switch swaps the registry atomically; a shared slot lets
+/// one-shot snapshots follow the same active `Console_N` as HLS and WebRTC
+/// without rebuilding the compatibility state.
+#[derive(Clone)]
+enum SnapshotRegistry {
+    Owned(Arc<CaptureRegistry>),
+    Shared(Arc<std::sync::RwLock<CaptureRegistry>>),
+}
+
+impl SnapshotRegistry {
+    fn current(&self) -> Arc<CaptureRegistry> {
+        match self {
+            Self::Owned(registry) => registry.clone(),
+            Self::Shared(slot) => Arc::new(
+                slot.read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            ),
+        }
+    }
+}
+
 /// Shared, cloneable snapshot control backed by a capture registry.
 #[derive(Clone)]
 pub struct SnapshotControl {
-    registry: Arc<CaptureRegistry>,
+    registry: SnapshotRegistry,
     requested_source: Option<String>,
     timeout: Duration,
     quality: u8,
@@ -250,7 +274,18 @@ impl SnapshotControl {
     /// Use the first source from `registry` (or `requested_source`) for snapshots.
     pub fn new(registry: CaptureRegistry) -> Self {
         Self {
-            registry: Arc::new(registry),
+            registry: SnapshotRegistry::Owned(Arc::new(registry)),
+            requested_source: None,
+            timeout: DEFAULT_SNAPSHOT_TIMEOUT,
+            quality: DEFAULT_JPEG_QUALITY,
+            cache: Arc::new(Mutex::new(SnapshotCache::default())),
+        }
+    }
+
+    /// Follow a registry slot that a runtime console switch can replace.
+    pub fn from_shared(slot: Arc<std::sync::RwLock<CaptureRegistry>>) -> Self {
+        Self {
+            registry: SnapshotRegistry::Shared(slot),
             requested_source: None,
             timeout: DEFAULT_SNAPSHOT_TIMEOUT,
             quality: DEFAULT_JPEG_QUALITY,
@@ -285,7 +320,7 @@ impl SnapshotControl {
     /// Report the configured source and the last successful capture, without
     /// opening the device.
     pub async fn info(&self) -> DisplayInfo {
-        let registry = self.registry.clone();
+        let registry = self.registry.current();
         let requested = self.requested_source.clone();
         let discovered = tokio::task::spawn_blocking(move || {
             let capabilities = registry.enumerate()?;
@@ -436,7 +471,7 @@ impl SnapshotControl {
     async fn open_source(
         &self,
     ) -> Result<(CaptureCapability, Box<dyn CaptureSource>), SnapshotError> {
-        let registry = self.registry.clone();
+        let registry = self.registry.current();
         let requested = self.requested_source.clone();
         let task = tokio::task::spawn_blocking(move || {
             let capabilities = registry.enumerate().map_err(SnapshotError::Open)?;

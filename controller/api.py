@@ -1613,8 +1613,14 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
     # --- Node power/current/RGB proxy ---
 
-    async def _proxy_node(node_id: str, path: str, method: str = "GET", body: dict | None = None) -> dict:
-        """Proxy a request to a node's HTTP API."""
+    async def _proxy_node_response(
+        node_id: str, path: str, method: str = "GET", body: dict | None = None
+    ) -> tuple[int, Any]:
+        """Proxy a request and return the node's HTTP status plus decoded body.
+
+        Unlike ``_proxy_node`` this preserves typed node failures so callers can
+        surface a 409/501 limitation instead of flattening every failure to 502.
+        """
         import urllib.error
         import urllib.request
         node = state.nodes.get(node_id)
@@ -1624,26 +1630,87 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         if not port:
             raise HTTPException(status_code=503, detail="Node has no HTTP API")
         url = f"http://{node.host}:{port}{path}"
+
+        def _fetch() -> tuple[int, Any]:
+            if method == "POST":
+                data = json.dumps(body or {}).encode()
+                req = urllib.request.Request(url, data=data,
+                                            headers={"Content-Type": "application/json",
+                                                     **_node_headers(node)},
+                                            method="POST")
+            else:
+                req = urllib.request.Request(url, headers=_node_headers(node))
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    payload = r.read()
+                    try:
+                        return r.status, json.loads(payload)
+                    except ValueError:
+                        return r.status, payload.decode("utf-8", "replace")
+            except urllib.error.HTTPError as e:
+                payload = e.read()
+                try:
+                    decoded = json.loads(payload)
+                except ValueError:
+                    decoded = payload.decode("utf-8", "replace")
+                return e.code, decoded
+
         try:
             loop = asyncio.get_running_loop()
-            def _fetch() -> dict:
-                if method == "POST":
-                    data = json.dumps(body or {}).encode()
-                    req = urllib.request.Request(url, data=data,
-                                                headers={"Content-Type": "application/json",
-                                                         **_node_headers(node)},
-                                                method="POST")
-                else:
-                    req = urllib.request.Request(url, headers=_node_headers(node))
-                with urllib.request.urlopen(req, timeout=5) as r:
-                    return json.loads(r.read())
             return await loop.run_in_executor(None, _fetch)
-        except urllib.error.HTTPError as e:
-            if e.code in (401, 403):
-                raise HTTPException(status_code=502, detail=_node_auth_error(e.code))
-            raise HTTPException(status_code=502, detail=f"Node returned HTTP {e.code}")
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Node unreachable: {e}")
+
+    async def _proxy_node(node_id: str, path: str, method: str = "GET", body: dict | None = None) -> dict:
+        """Proxy a request to a node's HTTP API, requiring a success body."""
+        status, payload = await _proxy_node_response(node_id, path, method, body)
+        if status in (401, 403):
+            raise HTTPException(status_code=502, detail=_node_auth_error(status))
+        if status >= 400:
+            detail = payload.get("error") if isinstance(payload, dict) else None
+            raise HTTPException(
+                status_code=502,
+                detail=detail or f"Node returned HTTP {status}",
+            )
+        return payload
+
+    @app.get("/api/v1/nodes/{node_id}/display")
+    async def node_display(node_id: str) -> dict[str, Any]:
+        """Read a node's advertised consoles and active capture console."""
+        connection = await _proxy_node(node_id, "/api/v1/connection")
+        return {
+            "ok": True,
+            "display_outputs": connection.get("display_outputs") or [],
+            "display_capture": connection.get("display_capture") or {},
+        }
+
+    @app.post("/api/v1/nodes/{node_id}/display/select")
+    async def node_display_select(
+        node_id: str, body: dict[str, Any] | None = None
+    ) -> Any:
+        """Select a runtime VM console through the node, with its bearer token.
+
+        ``body`` is ``{"index": <Console_N>}`` or ``{"id": "<label>"}``. Typed
+        node limitations (409 single-head, 501 no selector, 400/404 unknown
+        console) are preserved so the dashboard can show the real reason. A
+        successful switch updates the controller's cached ``display_outputs``.
+        """
+        node = state.nodes.get(node_id)
+        if node is None:
+            raise HTTPException(status_code=404, detail="Node not found")
+        status, payload = await _proxy_node_response(
+            node_id, "/display/select", method="POST", body=body or {}
+        )
+        if status in (401, 403):
+            raise HTTPException(status_code=502, detail=_node_auth_error(status))
+        if status < 400:
+            if isinstance(payload, dict) and isinstance(payload.get("display_outputs"), list):
+                node.display_outputs = payload["display_outputs"]
+            return JSONResponse(status_code=status, content=payload)
+        if status in (400, 404, 409, 501) and isinstance(payload, dict):
+            return JSONResponse(status_code=status, content=payload)
+        detail = payload.get("error") if isinstance(payload, dict) else None
+        raise HTTPException(status_code=502, detail=detail or f"Node returned HTTP {status}")
 
     @app.get("/api/v1/nodes/{node_id}/power/state")
     async def node_power_state(node_id: str) -> dict[str, Any]:

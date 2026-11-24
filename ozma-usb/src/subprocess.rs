@@ -11,6 +11,8 @@ use std::process::{Command, Stdio};
 use serde::{Deserialize, Serialize};
 
 use crate::error::UsbError;
+pub use crate::usbip::UsbIpDevice;
+use crate::usbip::{parse_usbip_list, validate_bus_id, validate_host, validate_port_text};
 
 /// One argv-style command. `program` is element zero; it is never a shell.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,19 +129,6 @@ impl CommandRunner for SystemCommandRunner {
     }
 }
 
-/// A local USB device as reported by `usbip list -l`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UsbIpDevice {
-    /// USB/IP bus id (`1-1.2`).
-    pub bus_id: String,
-    /// Vendor ID when the listing includes one.
-    pub vendor_id: Option<u16>,
-    /// Product ID when the listing includes one.
-    pub product_id: Option<u16>,
-    /// Description line from the listing.
-    pub description: String,
-}
-
 /// USB/IP operations exposed by a subprocess controller.
 pub trait UsbIpControl: Send + Sync {
     /// List local exportable devices.
@@ -224,7 +213,7 @@ impl<R: CommandRunner> UsbIpControl for SubprocessUsbController<R> {
     }
 
     fn detach(&self, port: &str) -> Result<(), UsbError> {
-        validate_port(port)?;
+        validate_port_text(port)?;
         self.run(&["detach", "-p", port]).map(|_| ())
     }
 }
@@ -241,108 +230,4 @@ fn render_command(command: &CommandSpec) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn validate_bus_id(bus_id: &str) -> Result<(), UsbError> {
-    let valid = !bus_id.is_empty()
-        && bus_id.len() <= 32
-        && !bus_id.starts_with('-')
-        && bus_id.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '-' | '.' | ':' | '_')
-        })
-        && bus_id.chars().any(|character| character.is_ascii_digit());
-    if valid {
-        Ok(())
-    } else {
-        Err(UsbError::InvalidUsbIp {
-            field: "bus_id",
-            reason: format!(
-                "{bus_id:?} must be a non-empty USB/IP bus id (letters, digits, '-', '.', ':', '_')"
-            ),
-        })
-    }
-}
-
-fn validate_host(host: &str) -> Result<(), UsbError> {
-    let valid = !host.is_empty()
-        && host.len() <= 255
-        && !host.starts_with('-')
-        && host.chars().all(|character| {
-            character.is_ascii_alphanumeric()
-                || matches!(character, '.' | '-' | ':' | '_' | '[' | ']' | '%')
-        });
-    if valid {
-        Ok(())
-    } else {
-        Err(UsbError::InvalidUsbIp {
-            field: "host",
-            reason: format!(
-                "{host:?} must be a hostname or address without whitespace or option prefixes"
-            ),
-        })
-    }
-}
-
-fn validate_port(port: &str) -> Result<(), UsbError> {
-    if !port.is_empty()
-        && port.chars().all(|character| character.is_ascii_digit())
-        && port.parse::<u16>().is_ok_and(|value| value > 0)
-    {
-        Ok(())
-    } else {
-        Err(UsbError::InvalidUsbIp {
-            field: "port",
-            reason: format!("{port:?} must be a USB/IP port in 1..=65535"),
-        })
-    }
-}
-
-fn parse_usbip_list(output: &str) -> Vec<UsbIpDevice> {
-    let lines: Vec<&str> = output.lines().collect();
-    let mut devices = Vec::new();
-    let mut index = 0;
-    while index < lines.len() {
-        let trimmed = lines[index].trim();
-        let Some(rest) = trimmed.strip_prefix("- busid ") else {
-            index += 1;
-            continue;
-        };
-
-        let mut parts = rest.split_whitespace();
-        let Some(bus_id) = parts.next() else {
-            index += 1;
-            continue;
-        };
-        let ids = parts
-            .find(|token| token.starts_with('(') && token.ends_with(')'))
-            .and_then(parse_ids);
-        let (vendor_id, product_id) = match ids {
-            Some((vendor, product)) => (Some(vendor), Some(product)),
-            None => (None, None),
-        };
-
-        let mut description = String::new();
-        if index + 1 < lines.len() && !lines[index + 1].trim().starts_with("- busid ") {
-            description = lines[index + 1].trim().to_owned();
-            index += 1;
-        }
-
-        devices.push(UsbIpDevice {
-            bus_id: bus_id.to_owned(),
-            vendor_id,
-            product_id,
-            description,
-        });
-        index += 1;
-    }
-    devices
-}
-
-fn parse_ids(token: &str) -> Option<(u16, u16)> {
-    let inner = token.trim_start_matches('(').trim_end_matches(')');
-    let (vendor, product) = inner.split_once(':')?;
-    Some((
-        u16::from_str_radix(vendor, 16).ok()?,
-        u16::from_str_radix(product, 16).ok()?,
-    ))
 }
