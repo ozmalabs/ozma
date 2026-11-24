@@ -5,6 +5,11 @@ from pathlib import Path
 
 import pytest
 
+# This file is a standalone script that needs a live controller and a built
+# ozma-agent binary; its ``test_*`` helpers take arguments rather than pytest
+# fixtures, so they must not be collected as tests.
+collect_ignore = ["test_e2e_rust_agent.py"]
+
 # Fix imports: add all source directories to sys.path so that
 # `from agent_engine import AgentEngine` works from any CWD.
 _ROOT = Path(__file__).resolve().parent.parent

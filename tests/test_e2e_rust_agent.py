@@ -274,6 +274,14 @@ def test_scenario_round_trip(agent: AgentProcess, node_id: str) -> None:
     api_delete(BASE_CONTROLLER, f"/api/v1/scenarios/{scenario_id}")
 
 
+# These helpers are called by ``main`` with explicit arguments. They are not
+# pytest tests and must never be collected as such.
+test_agent_starts.__test__ = False
+test_agent_api.__test__ = False
+test_registered_with_controller.__test__ = False
+test_scenario_round_trip.__test__ = False
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 
