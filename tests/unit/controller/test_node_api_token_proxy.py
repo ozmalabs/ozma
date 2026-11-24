@@ -595,3 +595,23 @@ def test_hls_proxy_forwards_a_per_console_playlist_path(fake_node, tmp_path):
     assert response.content == playlist
     assert response.headers["content-type"].startswith("application/vnd.apple.mpegurl")
     assert fake_node.requests[-1]["path"] == "/stream/console-1/stream.m3u8"
+
+
+def test_software_inventory_ingest_is_exempt_from_controller_auth(fake_node, tmp_path):
+    """Node telemetry stays pushable when controller auth is enabled.
+
+    Only the ingest POST is exempt; the fleet read views remain guarded.
+    """
+    app, _ = _build_app(
+        fake_node.server_address[1], tmp_path, auth_enabled=True
+    )
+    client = _client(app)
+
+    ingest = client.post(
+        "/api/v1/software/hosts/node-1._ozma._udp.local./inventory",
+        json={"records": [], "reported_at": 1.0},
+    )
+    assert ingest.status_code == 200, ingest.text
+
+    read = client.get("/api/v1/software/hosts")
+    assert read.status_code == 401

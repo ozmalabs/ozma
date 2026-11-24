@@ -306,8 +306,16 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
         path = request.url.path
 
+        # Node software inventory is telemetry, like registration/heartbeat.
+        # Only the ingest POST is exempt; the GET fleet views stay authenticated.
+        software_ingest = (
+            request.method == "POST"
+            and path.startswith("/api/v1/software/hosts/")
+            and path.endswith("/inventory")
+        )
+
         # Skip auth for exempt paths, prefixes, and static files
-        if (path in _AUTH_EXEMPT or path.startswith("/static") or path == "/"
+        if (path in _AUTH_EXEMPT or software_ingest or path.startswith("/static") or path == "/"
                 or any(path.startswith(p) for p in _AUTH_EXEMPT_PREFIXES)):
             request.state.auth = AuthContext(
                 authenticated=True, scopes=ALL_SCOPES,
@@ -11645,6 +11653,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(400, "entries list required")
         dns_verifier.guard.remove_allowlist(set(entries))
         return {"ok": True, "removed": entries}
+
+    # Fleet software inventory (per-host snapshots from agent source adapters)
+    from software_inventory import SoftwareInventoryManager, build_router as _software_router
+    software_inventory = SoftwareInventoryManager()
+    app.include_router(_software_router(software_inventory))
 
     # GraphQL API (optional — requires strawberry-graphql)
     if _GRAPHQL_AVAILABLE and _gql_create_router is not None:
