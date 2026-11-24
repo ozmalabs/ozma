@@ -46,6 +46,7 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tower_http::services::ServeDir;
+use tracing::warn;
 
 /// Default HLS segment duration in seconds.
 pub const DEFAULT_SEGMENT_SECONDS: f32 = 1.0;
@@ -57,6 +58,9 @@ pub const DEFAULT_FPS: u32 = 30;
 pub const DEFAULT_BITRATE_KBPS: u32 = 4_000;
 /// Largest error string retained for `/api/v1/connection`.
 const MAX_STATUS_ERROR_CHARS: usize = 512;
+
+/// Upper bound on reaping a killed ffmpeg generation.
+const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Largest GOP value ffmpeg accepts for `-g`/`-keyint_min`.
 ///
@@ -2104,7 +2108,12 @@ impl HlsPipeline {
                 Err(_) => {
                     // A source that ignores cancellation cannot hold shutdown.
                     task.abort();
-                    let _ = task.await;
+                    if tokio::time::timeout(CHILD_EXIT_TIMEOUT, &mut task)
+                        .await
+                        .is_err()
+                    {
+                        warn!("HLS frame task did not stop after abort; abandoning it");
+                    }
                 }
             }
         }
@@ -2582,8 +2591,20 @@ async fn kill_child(child: &Arc<Mutex<Option<Child>>>) {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .take();
     if let Some(mut child) = child {
+        let pid = child.id();
+        // `start_kill` is SIGKILL on Unix. Wait for the reap, but never let a
+        // child stuck in uninterruptible sleep hold node shutdown open.
         let _ = child.start_kill();
-        let _ = child.wait().await;
+        if tokio::time::timeout(CHILD_EXIT_TIMEOUT, child.wait())
+            .await
+            .is_err()
+        {
+            warn!(
+                pid = ?pid,
+                timeout_ms = CHILD_EXIT_TIMEOUT.as_millis() as u64,
+                "ffmpeg did not exit after SIGKILL; abandoning the child handle"
+            );
+        }
     }
 }
 
@@ -3156,9 +3177,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use ozma_media::Frame;
-
     use super::*;
+    use ozma_media::Frame;
 
     fn temp_dir(label: &str) -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -3168,6 +3188,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).expect("create test directory");
         directory
+    }
+
+    #[tokio::test]
+    async fn kill_child_reaps_a_real_generation_process() {
+        let child = Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn a real child process");
+        let pid = child.id();
+        let slot = Arc::new(Mutex::new(Some(child)));
+
+        tokio::time::timeout(Duration::from_secs(5), kill_child(&slot))
+            .await
+            .expect("kill_child must not wait forever");
+        assert!(
+            slot.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_none(),
+            "the child handle must be taken and reaped"
+        );
+        #[cfg(target_os = "linux")]
+        if let Some(pid) = pid {
+            assert!(
+                !Path::new(&format!("/proc/{pid}")).exists(),
+                "child {pid} was not reaped"
+            );
+        }
     }
 
     fn frame(format: FrameFormat, sequence: u64, data: Vec<u8>) -> Frame {

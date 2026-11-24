@@ -16,6 +16,7 @@ use ozma_encode::EncoderRegistry;
 use ozma_input::{HidGadgetSink, SharedSink};
 use ozma_protocol::NodeCapabilities;
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
@@ -88,6 +89,7 @@ pub async fn serve_with_scene_replay(
         None,
         None,
         None,
+        CancellationToken::new(),
     )
     .await
 }
@@ -128,6 +130,7 @@ pub async fn serve_with_scene_replay_and_sink(
     public_compat_router: Option<Router>,
     capture_registry: Option<ozma_capture::CaptureRegistry>,
     hls_dir: Option<std::path::PathBuf>,
+    shutdown: CancellationToken,
 ) -> Result<()> {
     let backend = backend_with_encoders(SessionBackend::new(capabilities, consent_policy)).await;
     let backend = match capture_registry {
@@ -171,12 +174,23 @@ pub async fn serve_with_scene_replay_and_sink(
         quic.fingerprint(),
         quic.certificate_der(),
     );
+    let mut listeners: Vec<(&'static str, tokio::task::JoinHandle<()>)> = Vec::new();
+
     let quic_backend = backend.clone();
-    tokio::spawn(async move {
-        if let Err(error) = crate::transport::run(quic, quic_backend).await {
-            error!("Native QUIC listener exited: {error:#}");
-        }
-    });
+    let quic_shutdown = shutdown.clone();
+    listeners.push((
+        "quic-listener",
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = quic_shutdown.cancelled() => {}
+                result = crate::transport::run(quic, quic_backend) => {
+                    if let Err(error) = result {
+                        error!("Native QUIC listener exited: {error:#}");
+                    }
+                }
+            }
+        }),
+    ));
 
     // Browser WebTransport listener. Its ECDSA P-256 identity is separate from
     // the raw QUIC certificate because browsers only accept certificates with a
@@ -193,13 +207,23 @@ pub async fn serve_with_scene_replay_and_sink(
                     runtime.certificate_der(),
                 );
                 let webtransport_backend = backend.clone();
-                tokio::spawn(async move {
-                    if let Err(error) =
-                        crate::transport::run_webtransport(runtime, webtransport_backend).await
-                    {
-                        error!("WebTransport listener exited: {error:#}");
-                    }
-                });
+                let webtransport_shutdown = shutdown.clone();
+                listeners.push((
+                    "webtransport-listener",
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            _ = webtransport_shutdown.cancelled() => {}
+                            result = crate::transport::run_webtransport(
+                                runtime,
+                                webtransport_backend,
+                            ) => {
+                                if let Err(error) = result {
+                                    error!("WebTransport listener exited: {error:#}");
+                                }
+                            }
+                        }
+                    }),
+                ));
             }
             #[cfg(not(feature = "webtransport"))]
             {
@@ -215,24 +239,41 @@ pub async fn serve_with_scene_replay_and_sink(
 
     if rtsp_port != 0 {
         let rtsp_backend = backend.clone();
-        tokio::spawn(async move {
-            if let Err(error) = crate::rtsp_runtime::run(rtsp_port, rtsp_backend).await {
-                error!("RTSP listener exited: {error:#}");
-            }
-        });
+        let rtsp_shutdown = shutdown.clone();
+        listeners.push((
+            "rtsp-listener",
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = rtsp_shutdown.cancelled() => {}
+                    result = crate::rtsp_runtime::run(rtsp_port, rtsp_backend) => {
+                        if let Err(error) = result {
+                            error!("RTSP listener exited: {error:#}");
+                        }
+                    }
+                }
+            }),
+        ));
     }
 
     let expiry_backend = backend.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-        loop {
-            interval.tick().await;
-            let ended = expiry_backend.expire();
-            if ended > 0 {
-                info!(ended, "Expired idle sessions");
+    let expiry_shutdown = shutdown.clone();
+    listeners.push((
+        "session-expiry",
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                tokio::select! {
+                    _ = expiry_shutdown.cancelled() => break,
+                    _ = interval.tick() => {
+                        let ended = expiry_backend.expire();
+                        if ended > 0 {
+                            info!(ended, "Expired idle sessions");
+                        }
+                    }
+                }
             }
-        }
-    });
+        }),
+    ));
 
     let webtransport_info_backend = backend.clone();
     // The capture sink shares the same per-session hubs the QUIC/WebTransport
@@ -278,9 +319,14 @@ pub async fn serve_with_scene_replay_and_sink(
     let app = with_hls(app, hls_dir);
     let app = app.layer(dev_cors());
     info!(port, "Node API listening");
-    axum::serve(listener, app)
+    let served = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown.clone().cancelled_owned())
         .await
-        .context("serving node API")?;
+        .context("serving node API");
+    for (name, task) in listeners {
+        crate::shutdown::stop_task(task, name).await;
+    }
+    served?;
     Ok(())
 }
 

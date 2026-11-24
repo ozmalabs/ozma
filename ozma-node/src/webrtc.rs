@@ -61,7 +61,7 @@ use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Default WebRTC helper width.
 pub const DEFAULT_WIDTH: u32 = 640;
@@ -1033,7 +1033,12 @@ impl WebRtcHelper {
                 Ok(Err(error)) => task_error = Some(error.to_string()),
                 Err(_) => {
                     task.abort();
-                    let _ = task.await;
+                    if tokio::time::timeout(STOP_TASK_TIMEOUT, &mut task)
+                        .await
+                        .is_err()
+                    {
+                        warn!("WebRTC feeder did not stop after abort; abandoning it");
+                    }
                 }
             }
         }
@@ -1370,8 +1375,18 @@ async fn kill_child(child: &Arc<Mutex<Option<Child>>>) {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .take();
     if let Some(mut child) = child {
+        let pid = child.id();
         let _ = child.start_kill();
-        let _ = child.wait().await;
+        if tokio::time::timeout(STOP_TASK_TIMEOUT, child.wait())
+            .await
+            .is_err()
+        {
+            warn!(
+                pid = ?pid,
+                timeout_ms = STOP_TASK_TIMEOUT.as_millis() as u64,
+                "WebRTC helper did not exit after SIGKILL; abandoning the child handle"
+            );
+        }
     }
 }
 
@@ -1679,6 +1694,33 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn kill_child_reaps_a_real_helper_process() {
+        let child = Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn a real helper stand-in");
+        let pid = child.id();
+        let slot = Arc::new(Mutex::new(Some(child)));
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), kill_child(&slot))
+            .await
+            .expect("kill_child must not wait forever");
+        assert!(
+            slot.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_none(),
+            "the helper handle must be taken and reaped"
+        );
+        #[cfg(target_os = "linux")]
+        if let Some(pid) = pid {
+            assert!(
+                !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+                "helper stand-in {pid} was not reaped"
+            );
+        }
+    }
 
     struct PendingSource {
         format: FrameFormat,

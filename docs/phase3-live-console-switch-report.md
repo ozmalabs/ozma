@@ -330,7 +330,78 @@ above passed.
   width/height from the selected output spec. If the advertised geometry is
   wrong, the helper's frame-dimension check fails and rollback runs; it does not
   scale.
-- **Node shutdown observation (outside this change):** after `SIGTERM` the node
-  logged `Ozma node shutting down` but a worker remained at 99% CPU until
-  `SIGKILL`. This occurred on both the pre-fix and post-fix D-Bus runs and is not
-  attributed to console switching; it was not fixed here.
+- **Node shutdown (fixed):** see §12. The earlier observation — `SIGTERM`
+  logged `Ozma node shutting down` but a worker stayed at ~99% CPU until
+  `SIGKILL` — was a D-Bus transport readiness spin, not console switching. It
+  is now fixed and re-validated live.
+
+## 12. Graceful SIGTERM shutdown (follow-up fix)
+
+**Symptom.** After `SIGTERM` the node printed `Ozma node shutting down` but a
+tokio worker stayed at 93–100% CPU and the process needed `SIGKILL`. It
+reproduced on a live QEMU `-display dbus,p2p=yes` node even when only a single
+`GET /display/snapshot` had opened the D-Bus source; HLS and WebRTC were not
+required to trigger it. The process-level test and live runs below use the same
+binary that records the original observation (`HEAD ce4db16` + this patch).
+
+**Blocking resource.** `ozma-capture`'s `UnixDBusTransport::read_with_fds` /
+`write_with_fds` called raw `recvmsg`/`sendmsg` and then waited with tokio's
+`readable()`/`writable()`. The raw syscall bypassed tokio's readiness bookkeeping:
+when it returned `EAGAIN`, the socket's cached readiness was never cleared, so
+`readable().await` completed immediately forever. The console-drain task spun in
+user space, never reached an await point that could observe `abort()`, and
+tokio's runtime shutdown waited forever for that worker. A single snapshot was
+enough because it opens a D-Bus source and spawns its console drain.
+
+**Fix.**
+
+- `ozma-capture/src/dbus_display.rs`: wrap the raw syscalls in
+  `UnixStream::try_io(Interest::READABLE/WRITABLE, …)` and park on
+  `readable()`/`writable()` after `WouldBlock`; wait for the aborted drain to
+  finish with a bound in `stop()`.
+- `ozma-node/src/shutdown.rs` (new): one `CancellationToken` root, bounded
+  `stop_task` (abort + 2 s wait), bounded `with_timeout`, SIGINT/SIGTERM waiter.
+- `ozma-node/src/main.rs`: the process now builds its tokio runtime explicitly,
+  cancels the token on the first signal, stops HLS/WebRTC with a bound, stops the
+  API/QUIC/WebTransport/RTSP/UDP HID/heartbeat/UAC2/QMP-input tasks and the
+  shared QMP connection, drops the mDNS responder, then calls
+  `runtime.shutdown_timeout(5 s)`. A task that never yields cannot require
+  `SIGKILL`; a clean signal shutdown returns exit code 0, and non-zero remains
+  reserved for real startup/configuration failures.
+- `ozma-node/src/api.rs`: axum uses graceful shutdown; QUIC, WebTransport,
+  RTSP, and session-expiry tasks select on the same token and are joined with
+  the same bound.
+- HLS ffmpeg and WebRTC helper children are reaped with a bounded wait after
+  `SIGKILL`; a child stuck in uninterruptible sleep is abandoned only after
+  that bound.
+
+**Live evidence (2026-11-25, QEMU 11.1.3 with `-display dbus,p2p=yes`).**
+
+| Run | Before fix | After fix |
+|---|---|---|
+| D-Bus snapshot, idle | hot worker 93–100% CPU, `SIGTERM` hung > 20 s → `SIGKILL` | hot worker 0 ticks over 2 s, `SIGTERM` → exit **102 ms**, rc 0 |
+| D-Bus + HLS + WebRTC + UDP HID + API | hung > 20 s, `SIGKILL` | `SIGTERM` → exit **51 ms**, rc 0, no ffmpeg/helper left |
+
+Both post-fix runs logged `shutdown requested; stopping node tasks signal="SIGTERM"`
+followed by `Ozma node shutting down`, and the shell reaped the process without
+`SIGKILL`. `/proc` showed no surviving ffmpeg, helper, QMP socket, or helper
+socket.
+
+**Tests.**
+
+- `cargo test -p ozma-capture --lib dbus_display::tests::unix_transport_yields_while_idle_instead_of_spinning`
+  — regression for the readiness spin (fails/hangs on the old code).
+- `cargo test -p ozma-node --lib shutdown::tests` — token propagation, bounded
+  stop of a task that ignores abort, and bounded future waits.
+- `cargo test -p ozma-node --lib kill_child_reaps` — real HLS/WebRTC child
+  processes are taken and reaped.
+- `OZMA_NODE_SHUTDOWN_TEST=1 cargo test -p ozma-node --test shutdown -- --ignored --nocapture`
+  — starts the real binary with fake capture, HLS, a Python helper stand-in,
+  HTTP and UDP HID, sends `SIGTERM`, and asserts exit within 8 s (observed
+  under 1 s) with no surviving helper/ffmpeg pid.
+
+**Remaining gaps.** The process test is opt-in (`#[ignore]` + env gate) because
+it needs the binary and `python3`. Accepted QUIC/WebTransport session tasks are
+dropped at process exit rather than individually awaited. UAC2 configfs teardown
+is still best-effort. libmdns owns a detached responder thread; dropping the
+handle does not join it, but it cannot block `main` from returning.

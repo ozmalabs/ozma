@@ -45,7 +45,7 @@ use ozma_node::{
     },
     input_select,
     keyboard_layout::KeyboardLayout,
-    mdns, platform, registration, usb_audio,
+    mdns, platform, registration, shutdown, usb_audio,
     webrtc::{WebRtcAudioBackend, WebRtcConfig, WebRtcControl, WebRtcHelper},
 };
 
@@ -760,8 +760,26 @@ fn parse_x11_offset(raw: Option<&str>) -> Result<(u32, u32), String> {
     Ok((x, y))
 }
 
-#[tokio::main]
-async fn main() {
+fn main() -> std::process::ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("ozma-node: could not start the tokio runtime: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let code = runtime.block_on(run());
+    // Cooperative stops are bounded inside `run`. This final bound covers a
+    // task that never yields (a driver busy-loop): the process still exits
+    // instead of requiring SIGKILL.
+    runtime.shutdown_timeout(shutdown::RUNTIME_SHUTDOWN_TIMEOUT);
+    code
+}
+
+async fn run() -> std::process::ExitCode {
     let mut args = Args::parse();
 
     let level = if args.debug { "debug" } else { "info" };
@@ -771,6 +789,12 @@ async fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level)),
         )
         .init();
+
+    // One root token stops every node-owned task. It is cancelled after the
+    // first SIGINT/SIGTERM, then each owner gets a bounded chance to release
+    // its sockets, capture sources, and children.
+    let shutdown = shutdown::token();
+    let mut background: Vec<(&'static str, tokio::task::JoinHandle<()>)> = Vec::new();
 
     let node_id = NodeConfig::node_id_from_name(&args.name);
     let provider_overrides = ProviderOverrides::from_cli(
@@ -1273,7 +1297,9 @@ async fn main() {
             "desktop input: selected sink does not advertise keyboard/pointer injection"
         );
     }
-    let _input_qmp_handle = selected_input.handle;
+    if let Some(handle) = selected_input.handle {
+        background.push(("qmp-input", handle));
+    }
     info!(sink = sink_kind, "Input sink ready");
 
     let power = build_power(&vm_providers, shared_qmp.clone()).await;
@@ -1687,11 +1713,20 @@ async fn main() {
                     .map(|address| address.port())
                     .unwrap_or(config.hid_udp_port);
                 info!(port = actual_port, "UDP HID compatibility listener running");
-                tokio::spawn(async move {
-                    if let Err(error) = listener.run().await {
-                        error!("UDP HID listener exited: {error:#}");
-                    }
-                });
+                let hid_shutdown = shutdown.clone();
+                background.push((
+                    "udp-hid",
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            _ = hid_shutdown.cancelled() => {}
+                            result = listener.run() => {
+                                if let Err(error) = result {
+                                    error!("UDP HID listener exited: {error:#}");
+                                }
+                            }
+                        }
+                    }),
+                ));
             }
             Err(error) => {
                 error!(
@@ -1783,7 +1818,12 @@ async fn main() {
 
     let txt = build_txt(&args, &local_ip);
 
-    let _mdns_handle = match mdns::advertise(&config.name, config.hid_udp_port, &txt) {
+    let mdns_handle = match mdns::advertise_on(
+        &config.name,
+        config.hid_udp_port,
+        &txt,
+        local_ip.parse().ok(),
+    ) {
         Ok(handle) => {
             info!("mDNS advertising {}.{}", config.name, mdns::SERVICE_TYPE);
             mdns::Handle::Real(handle)
@@ -1805,22 +1845,38 @@ async fn main() {
         let url = url.clone();
         let node_id = node_id.clone();
         let interval = config.heartbeat_interval_secs;
-        tokio::spawn(async move {
-            registration::heartbeat_loop(&url, node_id.as_str(), interval).await;
-        });
+        let heartbeat_shutdown = shutdown.clone();
+        background.push((
+            "registration-heartbeat",
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = heartbeat_shutdown.cancelled() => {}
+                    _ = registration::heartbeat_loop(&url, node_id.as_str(), interval) => {}
+                }
+            }),
+        ));
     }
 
     if config.has_capability("audio") && config.profile != NodeProfile::Desktop {
-        tokio::spawn(async move {
-            match usb_audio::UsbAudioGadget::open(true).await {
-                Ok(gadget) => {
-                    if let Err(error) = gadget.run_bridge().await {
-                        tracing::error!("UAC2 bridge exited with error: {error:#}");
-                    }
+        let audio_shutdown = shutdown.clone();
+        background.push((
+            "uac2-bridge",
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = audio_shutdown.cancelled() => {}
+                    _ = async {
+                        match usb_audio::UsbAudioGadget::open(true).await {
+                            Ok(gadget) => {
+                                if let Err(error) = gadget.run_bridge().await {
+                                    tracing::error!("UAC2 bridge exited with error: {error:#}");
+                                }
+                            }
+                            Err(error) => tracing::error!("UAC2 gadget init failed: {error:#}"),
+                        }
+                    } => {}
                 }
-                Err(error) => tracing::error!("UAC2 gadget init failed: {error:#}"),
-            }
-        });
+            }),
+        ));
     } else if config.profile == NodeProfile::Desktop {
         info!(
             target = %config.audio_capture_target,
@@ -1864,38 +1920,84 @@ async fn main() {
     let consent_policy = config.consent_policy();
     let api_token = config.api_token.clone();
     let api_capture_registry = capture_registry.clone();
-    tokio::spawn(async move {
-        if let Err(error) = api::serve_with_scene_replay_and_sink(
-            http_port,
-            quic_port,
-            api_capabilities,
-            consent_policy,
-            scene_replay,
-            api_token,
-            config.rtsp_port,
-            webtransport,
-            Some(input_sink),
-            Some(compat_router),
-            Some(public_compat_router),
-            Some(api_capture_registry),
-            hls_output_dir,
-        )
-        .await
-        {
-            error!("Node API exited: {error:#}");
-        }
-    });
+    let api_shutdown = shutdown.clone();
+    background.push((
+        "node-api",
+        tokio::spawn(async move {
+            if let Err(error) = api::serve_with_scene_replay_and_sink(
+                http_port,
+                quic_port,
+                api_capabilities,
+                consent_policy,
+                scene_replay,
+                api_token,
+                config.rtsp_port,
+                webtransport,
+                Some(input_sink),
+                Some(compat_router),
+                Some(public_compat_router),
+                Some(api_capture_registry),
+                hls_output_dir,
+                api_shutdown,
+            )
+            .await
+            {
+                error!("Node API exited: {error:#}");
+            }
+        }),
+    ));
 
-    wait_for_shutdown().await;
+    let signal = shutdown::wait_for_signal().await;
+    info!(signal, "shutdown requested; stopping node tasks");
+    // Stop accepting new work first. Every long-lived listener selects on this
+    // token, so cancellation closes its socket instead of waiting for the next
+    // packet or poll timeout.
+    shutdown.cancel();
+
     if let Some(controller) = hls_controller.as_ref() {
-        if let Err(error) = controller.stop().await {
-            warn!(error = %error, "HLS pipeline did not stop cleanly");
+        if shutdown::with_timeout("hls-stop", shutdown::TASK_STOP_TIMEOUT, controller.stop())
+            .await
+            .is_none()
+        {
+            warn!("HLS pipeline did not stop within its bound");
         }
     }
     if let Some(control) = webrtc_control.as_ref() {
-        control.shutdown().await;
+        if shutdown::with_timeout(
+            "webrtc-stop",
+            shutdown::TASK_STOP_TIMEOUT,
+            control.shutdown(),
+        )
+        .await
+        .is_none()
+        {
+            warn!("WebRTC helper did not stop within its bound");
+        }
     }
+
+    // Stop the API/QUIC/HID/heartbeat tasks. `stop_task` aborts after the
+    // cooperative window, so a task that never yields cannot hold exit.
+    for (name, task) in background {
+        shutdown::stop_task(task, name).await;
+    }
+
+    // Close the shared QMP control socket only after the pipelines stopped
+    // using it. This is best-effort and bounded: QEMU may already be gone.
+    if let Some(shared) = shared_qmp.as_ref() {
+        let _ = shutdown::with_timeout(
+            "qmp-disconnect",
+            shutdown::TASK_STOP_TIMEOUT,
+            shared.disconnect(),
+        )
+        .await;
+    }
+
+    // Dropping the responder unregisters the mDNS record. It is a std thread
+    // with its own runtime, so it cannot block process exit even if it stalls.
+    drop(mdns_handle);
+
     info!("Ozma node shutting down");
+    std::process::ExitCode::SUCCESS
 }
 
 /// Default HLS output directory, with a filesystem-safe node name.
@@ -2325,23 +2427,6 @@ fn build_txt(args: &Args, local_ip: &str) -> std::collections::HashMap<String, S
     }
     txt.insert("host".into(), local_ip.to_string());
     txt
-}
-
-async fn wait_for_shutdown() {
-    use tokio::signal;
-    #[cfg(unix)]
-    {
-        let mut sigterm =
-            signal::unix::signal(signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
-        tokio::select! {
-            _ = signal::ctrl_c() => {},
-            _ = sigterm.recv() => {},
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        signal::ctrl_c().await.expect("Ctrl-C handler");
-    }
 }
 
 /// Keep `NodeId` imported in the binary's public surface for integrations that

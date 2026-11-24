@@ -22,6 +22,10 @@ The privileged fresh-host install (system user, udev, AppArmor, libvirt) and the
 Python-free install were not performed, and Python was intentionally not
 deleted. See [Remaining Phase 4 blockers](#remaining-phase-4-blockers).
 
+> **Follow-up (2026-11-25):** blocker 1, Rust-node mDNS discovery, is fixed.
+> Root cause, fix, and live browser/controller evidence are in
+> [Follow-up: Rust mDNS discovery fix](#follow-up-rust-mdns-discovery-fix-2026-11-25).
+
 ## Frozen commit
 
 | Item | Value |
@@ -68,7 +72,7 @@ was deleted after the run; the commit hash is the reproducible reference.
 | Real temp-prefix install | **PASS** | User layout under `/tmp/opencode/ozma-install-prefix`; both installed binaries run; 3 units and 4 env examples rendered. |
 | `bash demo/run_demo.sh --rust` startup | **PASS** | Two Alpine/QEMU VMs, two Rust VM-profile nodes, Python controller; controller API ready. |
 | Node health / display info | **PASS** | Both nodes `ok:true`, QMP capture source, `snapshot_available:true`. |
-| Controller mDNS discovery of Rust nodes | **FAIL** | `/api/v1/nodes` empty before direct registration. `avahi-browse` and an independent python-zeroconf browser see no `_ozma._udp` record, including at node startup. A zeroconf self-test in the same environment is discovered normally. |
+| Controller mDNS discovery of Rust nodes | **FAIL → FIXED** (follow-up, see below) | At run time: `/api/v1/nodes` empty before direct registration. `avahi-browse` and an independent python-zeroconf browser see no `_ozma._udp` record, including at node startup. A zeroconf self-test in the same environment is discovered normally. Follow-up (2026-11-25): after the `ozma-node/src/mdns.rs` fix, avahi and python-zeroconf resolve the Rust advertisement at `192.168.40.19:17331`; the controller's real `DiscoveryService` adds `mdnsprobe-final._ozma._udp.local.` with `api_port=17382`. |
 | Controller registration via `--register-url` | **PASS** | Both nodes appear with correct host/ports/capabilities; heartbeats accepted. |
 | Controller scenario activation | **PASS** | `vm1`/`vm2` activate, `active_node_id` tracks the scenario. |
 | HID routing (UDP → node → QMP) | **PASS** | `tests/test_e2e_switching.py --no-audio`: 24 PASS, including rapid switching. |
@@ -137,6 +141,113 @@ remaining controller checks pass. This localises the failure to the Rust
 controller, the demo script, or the host network. It is product code and was
 not modified by this task.
 
+## Follow-up: Rust mDNS discovery fix (2026-11-25)
+
+### Root cause
+
+`ozma-node/src/mdns.rs` passed the fully-qualified constant
+`SERVICE_TYPE = "_ozma._udp.local."` to
+`libmdns::Responder::register`. `libmdns` 0.9.1 appends `.local` itself
+(`format!("{}.local", svc_type)` and
+`format!("{}.{}.local", svc_name, svc_type)`), so the registered names became:
+
+```text
+type:     _ozma._udp.local..local
+instance: <name>._ozma._udp.local..local
+```
+
+`libmdns`'s DNS name writer splits on `.` and emits an empty length byte for
+the empty label (`local..local`). A DNS-SD parser stops at that zero byte, so
+the RR's type/class/TTL bytes were read from the trailing `local` text. The
+first two bytes `0x05 0x6c` decode as type 1388 (0x056c), which is exactly the
+warning the node logged:
+
+```text
+WARN libmdns::fsm: couldn't parse packet from 192.168.40.19:5353: type 1388 is invalid
+```
+
+Every announced PTR/SRV/TXT record was malformed. `avahi-browse` and
+python-zeroconf discarded the packets, so the controller discovered nothing.
+The controller, `_ozma._udp.local.` typing, and the host were not at fault.
+
+### Fix
+
+- Pass the unqualified `_ozma._udp` string to `libmdns`; the public
+  `SERVICE_TYPE` stays `_ozma._udp.local.` for logs/registration.
+- Add `mdns::advertise_on(name, port, txt, Some(ip))`, which uses
+  `Responder::new_with_ip_list` to publish only the address the node resolved
+  (or `--register-host`). Without this, `libmdns` published every non-loopback
+  interface and avahi could resolve the libvirt bridge (`192.168.122.1`)
+  instead of the LAN address (`192.168.40.19`); the controller takes
+  `parsed_addresses()[0]`.
+- Reject TXT `key=value` entries over 255 bytes with a typed error before
+  calling `libmdns`, which otherwise panics on them.
+- The node still advertises `hid_udp_port` as the SRV port and keeps
+  `api_port`/`stream_port`/`stream_path` in TXT, matching `node.py` and
+  `soft_node.py`.
+
+### Live evidence
+
+Before the fix, with `ozma-node --name mdnsprobe-before --profile vm
+--capture-provider fake --input-provider recording --hid-udp-port 17331
+--http-port 17382 --cap hid` and no `--register-url`:
+
+```text
+avahi-browse -rt _ozma._udp                  → no output
+python-zeroconf ServiceBrowser              → TOTAL 0
+node log                                    → libmdns ... type 1388 is invalid
+```
+
+After the fix (`ozma-node --name mdnsprobe-evidence ... --cap hid,video`):
+
+```text
+$ avahi-browse -rt _ozma._udp
++ enp9s0 IPv4 mdnsprobe-evidence    _ozma._udp    local
++ enp9s0 IPv6 mdnsprobe-evidence    _ozma._udp    local
+   hostname = [SFFPC.local]
+   address = [192.168.40.19]
+   port = [17331]
+   txt = ["proto=1" "role=compute" "hw=x86_64" "cap=hid,video"
+          "api_port=17382" "stream_port=17382" ...]
+
+$ python3 zeroconf ServiceBrowser(_ozma._udp.local.)
+Added mdnsprobe-evidence._ozma._udp.local.
+ type _ozma._udp.local. name mdnsprobe-evidence._ozma._udp.local.
+ server SFFPC.local. port 17331
+ addrs ['192.168.40.19'] props {b'proto': b'1', b'cap': b'hid,video',
+ b'api_port': b'17382', b'stream_port': b'17382', ...}
+```
+
+The controller's own discovery code (`controller/discovery.py`) was then run
+in-process against the same live advertisement:
+
+```text
+NODE mdnsprobe-evidence._ozma._udp.local. 192.168.40.19 17331 compute x86_64
+     ['hid', 'video'] 17382 17382
+```
+
+Finally, the checked-in opt-in regression test passed against a fresh
+advertisement:
+
+```text
+$ OZMA_MDNS_LIVE=1 cargo test -p ozma-node --test mdns_live -- --ignored --nocapture
+test python_zeroconf_browses_the_rust_advertisement ... ok
+```
+
+### Remaining mDNS gaps
+
+- `libmdns` always skips loopback interfaces, so a loopback-only node (the
+  soft-node development shape) still gets no A record. The main node path
+  resolves a LAN address and is unaffected.
+- The advertisement is IPv4-filtered when a local IPv4 is known. IPv6-only
+  hosts fall back to all interfaces and the controller does not bracket IPv6
+  literals when building URLs.
+- `libmdns` advertises the host's `hostname.local.` rather than a per-node
+  hostname; multiple Rust nodes share one SRV target and rely on distinct
+  instance names.
+- No checked-in test covers multi-interface selection or avahi goodbye
+  behaviour; both were inspected manually.
+
 ## Exact commands
 
 ```bash
@@ -172,10 +283,12 @@ removed.
 
 ## Remaining Phase 4 blockers
 
-1. **Rust mDNS discovery (product).** Fix `ozma-node` mDNS so the controller's
-   `zeroconf` browser discovers `_ozma._udp.local.` records, or make
-   `--register-url` the documented/default demo path. Retest the default
-   `bash demo/run_demo.sh --rust` with no direct-registration override.
+1. **Rust mDNS discovery (product) — fixed 2026-11-25.** The malformed
+   `libmdns` service type and multi-interface address selection are corrected;
+   avahi, python-zeroconf, and the controller `DiscoveryService` now see the
+   Rust node without `--register-url`. See
+   [Follow-up: Rust mDNS discovery fix](#follow-up-rust-mdns-discovery-fix-2026-11-25)
+   for evidence and the remaining IPv6/loopback limits.
 2. **WebRTC (product/configuration).** Provide a GStreamer WebRTC helper and
    verify offer/answer, ICE, and a rendered frame. The typed 503 is correct but
    is not parity evidence.

@@ -77,7 +77,7 @@ use nix::sys::socket::{recvmsg, sendmsg, ControlMessage, ControlMessageOwned, Ms
 use ozma_media::{CaptureSource, Frame, FrameFormat, MediaError, PixelFormat};
 use ozma_protocol::{codes, ApiError, CaptureCapability, CaptureKind};
 use ozma_qmp::{QmpClient, QmpConfig, SharedQmpClient};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
 use tokio::net::UnixStream;
 
 use crate::dbus_dmabuf::{self, DmaBufError, MappedDmaBuf};
@@ -1425,35 +1425,49 @@ impl DBusTransport for UnixDBusTransport {
         buffer: &mut [u8],
     ) -> Result<(usize, Vec<OwnedFd>), DBusError> {
         loop {
-            let mut iov = [IoSliceMut::new(buffer)];
-            let mut ancillary = nix::cmsg_space!([RawFd; 8]);
-            match recvmsg::<()>(
-                self.stream.as_raw_fd(),
-                &mut iov,
-                Some(&mut ancillary),
-                MsgFlags::MSG_CMSG_CLOEXEC,
-            ) {
-                Ok(message) => {
-                    if message.bytes == 0 {
-                        return Err(DBusError::Closed);
-                    }
-                    let mut fds = Vec::new();
-                    let cmsgs = message.cmsgs().map_err(|error| {
-                        DBusError::Io(io::Error::from_raw_os_error(error as i32))
-                    })?;
-                    for cmsg in cmsgs {
-                        if let ControlMessageOwned::ScmRights(raw) = cmsg {
-                            fds.extend(dbus_dmabuf::adopt_received_fds(raw));
+            // The raw syscall bypasses tokio's read helpers. `try_io` clears
+            // the socket's cached readiness when the kernel reports EAGAIN;
+            // without it the following `readable().await` returns immediately
+            // forever and the drain task spins at 100% CPU instead of parking.
+            //
+            // The closure returns only owned, `Send` data: `RecvMsg` borrows
+            // the iovec/control buffers and must not live across the await.
+            let received = self.stream.try_io(Interest::READABLE, || {
+                let mut iov = [IoSliceMut::new(buffer)];
+                let mut ancillary = nix::cmsg_space!([RawFd; 8]);
+                match recvmsg::<()>(
+                    self.stream.as_raw_fd(),
+                    &mut iov,
+                    Some(&mut ancillary),
+                    MsgFlags::MSG_CMSG_CLOEXEC,
+                ) {
+                    Ok(message) => {
+                        if message.bytes == 0 {
+                            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
                         }
+                        let mut fds = Vec::new();
+                        let cmsgs = message
+                            .cmsgs()
+                            .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+                        for cmsg in cmsgs {
+                            if let ControlMessageOwned::ScmRights(raw) = cmsg {
+                                fds.extend(dbus_dmabuf::adopt_received_fds(raw));
+                            }
+                        }
+                        Ok((message.bytes, fds))
                     }
-                    return Ok((message.bytes, fds));
+                    Err(error) => Err(errno_to_io(error)),
                 }
-                Err(Errno::EAGAIN) => {
+            });
+            match received {
+                Ok((bytes, fds)) => return Ok((bytes, fds)),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     self.stream.readable().await.map_err(map_io_error)?;
                 }
-                Err(error) => {
-                    return Err(DBusError::Io(io::Error::from_raw_os_error(error as i32)))
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                    return Err(DBusError::Closed);
                 }
+                Err(error) => return Err(DBusError::Io(error)),
             }
         }
     }
@@ -1466,13 +1480,19 @@ impl DBusTransport for UnixDBusTransport {
         let iov = [io::IoSlice::new(data)];
         let cmsgs = [ControlMessage::ScmRights(fds)];
         loop {
-            match sendmsg::<()>(
-                self.stream.as_raw_fd(),
-                &iov,
-                &cmsgs,
-                MsgFlags::MSG_NOSIGNAL,
-                None,
-            ) {
+            // As with `read_with_fds`, clear cached writability on EAGAIN so
+            // `writable().await` actually parks instead of spinning.
+            let sent = self.stream.try_io(Interest::WRITABLE, || {
+                sendmsg::<()>(
+                    self.stream.as_raw_fd(),
+                    &iov,
+                    &cmsgs,
+                    MsgFlags::MSG_NOSIGNAL,
+                    None,
+                )
+                .map_err(errno_to_io)
+            });
+            match sent {
                 Ok(sent) if sent == data.len() => return Ok(()),
                 Ok(sent) => {
                     return Err(DBusError::Io(io::Error::new(
@@ -1480,12 +1500,10 @@ impl DBusTransport for UnixDBusTransport {
                         format!("short sendmsg: wrote {sent} of {} bytes", data.len()),
                     )))
                 }
-                Err(Errno::EAGAIN) => {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     self.stream.writable().await.map_err(map_io_error)?;
                 }
-                Err(error) => {
-                    return Err(DBusError::Io(io::Error::from_raw_os_error(error as i32)))
-                }
+                Err(error) => return Err(DBusError::Io(error)),
             }
         }
     }
@@ -1493,6 +1511,19 @@ impl DBusTransport for UnixDBusTransport {
     async fn shutdown(&mut self) -> Result<(), DBusError> {
         let _ = self.stream.shutdown().await;
         Ok(())
+    }
+}
+
+/// Map a nix errno from a raw socket syscall to an `io::Error`.
+///
+/// `WouldBlock` is preserved so [`tokio::net::UnixStream::try_io`] can clear
+/// the socket's cached readiness and a caller can park on `readable`/
+/// `writable` instead of retrying a permanently-ready socket.
+fn errno_to_io(error: Errno) -> io::Error {
+    if error == Errno::EAGAIN {
+        io::Error::from(io::ErrorKind::WouldBlock)
+    } else {
+        io::Error::from_raw_os_error(error as i32)
     }
 }
 
@@ -2972,6 +3003,9 @@ impl CaptureSource for DBusDisplaySource {
         self.listener_peer = None;
         if let Some(drain) = self.display_drain.take() {
             drain.abort();
+            // Abort is cooperative: wait a bounded time so a source that is
+            // mid-read cannot hold the caller's shutdown forever.
+            let _ = tokio::time::timeout(Duration::from_secs(2), drain).await;
         }
         if let Some(mut listener) = self.listener.take() {
             let _ = listener.shutdown().await;
@@ -4377,6 +4411,43 @@ mod tests {
         assert_eq!(second.sequence(), 1);
         assert!(second.pts_micros() > first.pts_micros());
         assert_eq!(second.data(), first.data());
+    }
+
+    /// Regression: a raw `recvmsg` on an idle tokio Unix socket must park, not
+    /// spin. Before `try_io` cleared readiness on EAGAIN, `readable().await`
+    /// returned immediately forever, burning a worker at 100% CPU and making
+    /// `abort()`/runtime shutdown hang.
+    #[test]
+    fn unix_transport_yields_while_idle_instead_of_spinning() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            let result = runtime.block_on(async {
+                let (ours, theirs) = StdUnixStream::pair().expect("socketpair");
+                let mut transport =
+                    UnixDBusTransport::new(into_tokio_stream(ours).expect("non-blocking socket"));
+                let started = Instant::now();
+                let result =
+                    read_message(&mut transport, 1024, Some(Duration::from_millis(50))).await;
+                drop(theirs);
+                (result, started.elapsed())
+            });
+            let _ = sender.send(result);
+        });
+        let (result, elapsed) = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("an idle D-Bus transport must yield to the runtime");
+        assert!(
+            matches!(result, Err(DBusError::Idle(_))),
+            "expected an idle timeout, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "idle wait took {elapsed:?}"
+        );
     }
 
     #[tokio::test]
