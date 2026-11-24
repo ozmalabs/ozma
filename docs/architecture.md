@@ -2,7 +2,31 @@
 
 ## Overview
 
-Ozma is a **KVMA router** — a software-defined network fabric that routes Keyboard, Video, Mouse, and Audio signals between a Controller and any number of target machines. A **Controller** (any Linux machine on the local network) manages a set of **Nodes** (small SBCs, MCUs, or software agents) that each attach to a target PC via USB. The target PC sees the node as ordinary USB peripherals — keyboard, mouse, audio device, and camera — while all routing decisions live in the Controller.
+Ozma is a **general connection substrate**: a graph of participants, features,
+and connectivity that can join arbitrary devices and services. KVMA is an
+important use case, not a limit on what the substrate can connect. Users express
+intents—desired outcomes such as “put application X on screen Y”—and the graph
+resolves them against current capabilities, reachability, state, and policy.
+Users choose outcomes, not codecs, transports, or fixed pipelines.
+
+Intent interpretation and fulfilment may happen at different graph
+participants. Structured intents can be evaluated by a capable node or
+controller. Free-text intents need an interpreter service, and a service node
+may arbitrate with an external provider. These participants may be remote; the
+graph determines whether they are reachable and eligible. The resulting
+resolution and execution plan are derived from the intent and current graph
+state, and may change as that state changes.
+
+The core protocol is a language-neutral, extensible protobuf contract for
+connection negotiation, feature exchange, intent requests, resolutions, and
+lifecycle events. Features and intent kinds are open and namespaced rather than
+compiled into a closed catalogue. HTTP/JSON and browser interfaces are protocol
+bindings for appropriate use cases; media retains transports suited to its
+timing and bandwidth.
+
+A Controller coordinates a graph of Nodes, services, and external providers.
+In the KVMA case, nodes may attach to target PCs via USB, making the node appear
+as ordinary keyboard, mouse, audio, or camera peripherals.
 
 Traditional KVM products are *switches*: hardware in the signal path that physically moves a connection. Ozma is a *router*: the connections are permanent and the signals travel over the network. This distinction matters:
 
@@ -50,7 +74,12 @@ Traditional KVM products are *switches*: hardware in the signal path that physic
 
 ### Controller
 
-Any Linux computer. Hosts:
+Any Linux computer. A controller commonly hosts a graph view and resolver, but
+is not the only place where intent interpretation or arbitration can run.
+Remote graph services may provide those features or broker requests to
+external providers.
+
+Hosts:
 
 - **REST API + WebSocket** (port 7380) — primary control plane for UIs, scripts, and node command push.
 - **PipeWire** — audio session manager; routes microphone, speaker, and recording streams between nodes and local applications.
@@ -288,13 +317,18 @@ Two transport mechanisms:
 
 ## Scenario Model
 
-A **scenario** binds a name, colour, and node together. Switching scenarios changes the active node (and therefore which machine receives input, which audio source plays, which video stream is shown).
+A **scenario** is a named, selectable intent preset. Selecting it expresses a
+desired outcome; it does not directly command a fixed node or pipeline. The
+graph resolves the scenario against current state, so the selected devices,
+services, and transports may change as availability and capabilities change.
+Scenario definitions MAY include optional requirements and preferences, but
+need not prescribe implementation details.
 
 ```json
 {
   "id": "workstation",
   "name": "Workstation",
-  "node_id": "ozma-node-a3f2._ozma._udp.local.",
+  "intent": { "kind": "desktop", "target": "workstation" },
   "color": "#4A90D9"
 }
 ```

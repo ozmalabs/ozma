@@ -9,11 +9,28 @@ document are to be interpreted as described in [RFC 2119](https://www.ietf.org/r
 ## Abstract
 
 This document specifies the route calculation engine for the Ozma routing system.
-The router takes the graph (devices, ports, links), a source, a destination, and
-an intent, and produces the optimal pipeline. The specification covers the cost
-model with spatial zone awareness, constraint satisfaction, path computation with
-converter insertion, re-evaluation triggers, pipeline switching and activation,
-remediation with safety levels, and intent bindings with condition sources.
+The resolver takes a graph (participants, features, ports, links), an intent
+request, and applicable policy, then produces a resolution proposal. A proposal
+may identify interpreter or arbitrator services, outcomes, unmet requirements,
+and one or more candidate pipelines. Execution activates an accepted proposal.
+The specification covers pipeline cost, constraints, path computation,
+re-evaluation, activation, remediation, and intent bindings.
+
+Intent resolution is itself a graph operation. Structured requests may be
+resolved by a capable node or controller. Free-text requests require an
+advertised interpreter service; the graph may route them to a remote service
+over any available path, subject to authorization and policy. A service may
+then arbitrate among external providers or delegate parts of the request.
+Local-network membership is not a prerequisite: reachability and eligibility
+are graph properties. The resolver MUST preserve the original intent while
+recording interpretation and resolution as distinct derived state.
+
+The protocol substrate carries negotiation and lifecycle for these open-ended
+features. The canonical core schema uses protobuf for stable envelopes and
+typed core messages, while feature identifiers and extension payloads remain
+namespaced and extensible. No closed enum of all possible intent kinds or
+features is required. HTTP/JSON and browser bindings may expose equivalent
+operations; media continues on appropriate media transports.
 
 ---
 

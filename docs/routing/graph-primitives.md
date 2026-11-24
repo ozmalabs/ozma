@@ -20,7 +20,9 @@ chains. Every routing decision operates on these primitives.
 
 The routing graph is composed of four primitives: **Device**, **Port**, **Link**,
 and **Pipeline**. Together they describe the complete signal fabric from any
-source to any destination.
+source to any destination. Devices and services are graph participants: they
+may provide connectivity, features, interpretation, arbitration, or execution.
+They are not limited to physical endpoints that carry media.
 
 ### Device
 
@@ -144,6 +146,21 @@ field expresses this internal structure.
 A device MAY be **switchable** — an external KVM switch or HDMI matrix has
 multiple input ports and one or more output ports, with a configurable internal
 routing matrix. See §2.5 for the switch model.
+
+A device MAY be a **service participant**. A service participant advertises
+features it provides and the intents or operations it can handle. Examples
+include an intent interpreter, a policy arbitrator, a media catalog, a cloud
+provider adapter, or a service that executes an outcome. It MAY be remote from
+the user and from the devices it coordinates. Its eligibility is determined by
+graph reachability, advertised capability, authorization, policy, cost, and
+availability—not by LAN locality. The graph MUST represent the links or
+connectivity path by which a request can reach it and by which its result or
+actions can reach relevant participants.
+
+Unknown feature identifiers MUST be preservable by generic graph participants
+even when those participants cannot interpret or execute the feature. Feature
+identifiers are namespaced and extensible; the device type `service` does not
+imply a closed set of service capabilities.
 
 #### Location
 
@@ -417,8 +434,11 @@ quality.
 
 ### Pipeline
 
-A pipeline is an ordered chain of links assembled by the router to carry a
-signal from a source to a destination, satisfying a declared intent.
+A pipeline is an ordered chain of links assembled by a resolver or router to
+carry a signal from a source to a destination as part of realizing a resolved
+intent. It is a derived execution artefact, not the intent itself. A single
+intent may resolve to zero, one, or many pipelines, and the same intent may
+resolve to different pipelines as graph state changes.
 
 Every pipeline MUST have an `id`, `intent`, `source`, `destination`, `hops`,
 `aggregate`, `state`, and `warmth_policy`.
