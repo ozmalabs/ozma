@@ -49,6 +49,7 @@ use ozma_node::{
     keyboard_layout::KeyboardLayout,
     mdns,
     multi_hls::{MultiConsoleHls, MultiConsoleHlsConfig},
+    multi_webrtc::{MultiConsoleWebrtc, MultiConsoleWebrtcConfig},
     platform, registration, shutdown,
     software::report::{InventoryReporter, DEFAULT_REPORT_INTERVAL},
     usb_audio,
@@ -589,6 +590,42 @@ pub struct Args {
         value_name = "SECONDS"
     )]
     pub multi_console_hls_idle_seconds: u64,
+
+    /// Enable one independent WebRTC helper per advertised VM console.
+    ///
+    /// Opt-in and VM/D-Bus only: each advertised `Console_N` gets its own
+    /// helper process, signaling socket, and shared-memory framebuffer.
+    /// `POST /webrtc/offer?console=N` (or a `console`/`id` body field) selects
+    /// one; an offer without a selector targets the active console, preserving
+    /// the historical behavior. Single-head providers (QMP/VNC/Looking Glass)
+    /// keep the active helper and report a typed `unsupported` limitation.
+    /// Requires `--webrtc-helper`.
+    #[arg(
+        long,
+        env = "OZMA_MULTI_CONSOLE_WEBRTC",
+        visible_alias = "webrtc-per-console"
+    )]
+    pub multi_console_webrtc: bool,
+
+    /// Maximum simultaneous per-console WebRTC helpers (including the active
+    /// console). Bounded to at least one; default 2.
+    #[arg(
+        long,
+        env = "OZMA_MULTI_CONSOLE_WEBRTC_MAX",
+        default_value_t = 2,
+        value_name = "N"
+    )]
+    pub multi_console_webrtc_max: usize,
+
+    /// Stop a non-active per-console WebRTC helper after this many seconds
+    /// without an offer/candidate for that console (0 disables idle eviction).
+    #[arg(
+        long,
+        env = "OZMA_MULTI_CONSOLE_WEBRTC_IDLE_SECONDS",
+        default_value_t = 60,
+        value_name = "SECONDS"
+    )]
+    pub multi_console_webrtc_idle_seconds: u64,
 
     /// VAAPI render node used by `h264_vaapi`/`hevc_vaapi` HLS encoders.
     ///
@@ -1503,6 +1540,17 @@ async fn run() -> std::process::ExitCode {
     // work). WebRTC is disabled unless `--webrtc-helper` is configured. A
     // configured helper that cannot start is reported as `failed`, never
     // `running`, and never crashes the node.
+    // Per-console WebRTC only owns the helper set when the configured capture
+    // provider really exposes independent console indexes (D-Bus). A
+    // single-head provider keeps the historical active helper and the manager
+    // reports a typed `unsupported` limitation instead.
+    let webrtc_capture_provider = config
+        .capture_display_source()
+        .ok()
+        .flatten()
+        .map(|source| source.backend);
+    let multi_console_webrtc_owns = args.multi_console_webrtc
+        && webrtc_capture_provider == Some(ozma_display::vm::VmConsoleBackend::Dbus);
     let mut webrtc_switch_config: Option<WebRtcConfig> = None;
     let webrtc_control: Option<WebRtcControl> = match args.webrtc_helper.clone() {
         None => None,
@@ -1545,6 +1593,18 @@ async fn run() -> std::process::ExitCode {
                     "WebRTC unavailable: the video capability is disabled".to_owned(),
                     audio_source,
                 ))
+            } else if multi_console_webrtc_owns {
+                // The per-console manager starts one helper per advertised
+                // console (including the active console), so starting the
+                // historical single helper would duplicate that capture
+                // source and encoder. It is constructed after the display
+                // selector below.
+                info!(
+                    socket = %webrtc_config.socket_path.display(),
+                    shm = %webrtc_config.shm_path.display(),
+                    "per-console WebRTC manager owns the helper set; the single active helper is not started"
+                );
+                None
             } else {
                 match open_first_capture_source(&capture_registry).and_then(|source| {
                     WebRtcHelper::start(source, webrtc_config.clone())
@@ -1793,11 +1853,62 @@ async fn run() -> std::process::ExitCode {
     } else {
         None
     };
+    // Opt-in true simultaneous per-console WebRTC. Like the HLS manager, it
+    // reconciles the advertised consoles at startup and after every committed
+    // display selection. It is constructed even for a single-head provider so
+    // `/api/v1/connection` can report the typed limitation; in that case the
+    // legacy active helper above remains the stream source.
+    let multi_console_webrtc = if args.multi_console_webrtc && config.has_capability("video") {
+        match webrtc_switch_config.clone() {
+            None => {
+                warn!(
+                    "--multi-console-webrtc was requested without --webrtc-helper; no \
+                     per-console WebRTC helper can start"
+                );
+                None
+            }
+            Some(base) => {
+                let manager = MultiConsoleWebrtc::from_console_factory(
+                    console_factory.clone(),
+                    base,
+                    MultiConsoleWebrtcConfig {
+                        max_helpers: args.multi_console_webrtc_max,
+                        idle_timeout: Duration::from_secs(args.multi_console_webrtc_idle_seconds),
+                    },
+                );
+                let selection = display_control
+                    .as_ref()
+                    .map(DisplayControl::selection)
+                    .unwrap_or_else(|| {
+                        config.resolve_display_outputs().unwrap_or_else(|_| {
+                            ozma_node::display_outputs::DisplayOutputSelection::empty()
+                        })
+                    });
+                manager.sync(&selection).await;
+                let status = manager.status().await;
+                info!(
+                    max_helpers = status.max_helpers,
+                    active_console = status.active_console,
+                    consoles = status.consoles.len(),
+                    limitation = ?status.limitation,
+                    "per-console WebRTC manager reconciled advertised consoles"
+                );
+                Some(manager)
+            }
+        }
+    } else {
+        None
+    };
     if let Some(control) = codec_control.take() {
         codec_control = Some(control.with_multi_console_hls(multi_console_hls.clone()));
     }
-    if let (Some(control), Some(manager)) = (display_control.take(), multi_console_hls.clone()) {
-        display_control = Some(control.with_observer(std::sync::Arc::new(manager)));
+    if let Some(manager) = multi_console_hls.clone() {
+        display_control =
+            display_control.map(|control| control.with_observer(std::sync::Arc::new(manager)));
+    }
+    if let Some(manager) = multi_console_webrtc.clone() {
+        display_control =
+            display_control.map(|control| control.with_observer(std::sync::Arc::new(manager)));
     }
     // The broker is a separate snapshot/info path for advertised consoles. It
     // never replaces `registry_slot`, so the active HLS/WebRTC source keeps its
@@ -1884,6 +1995,32 @@ async fn run() -> std::process::ExitCode {
                                 info!(
                                     evicted,
                                     "per-console HLS evicted idle non-active pipelines"
+                                );
+                            }
+                        }
+                    }
+                }
+                manager.shutdown().await;
+            }),
+        ));
+    }
+
+    if let Some(manager) = multi_console_webrtc.clone() {
+        let manager_shutdown = shutdown.clone();
+        background.push((
+            "multi-console-webrtc-idle",
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(5));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        _ = manager_shutdown.cancelled() => break,
+                        _ = ticker.tick() => {
+                            let evicted = manager.evict_idle(std::time::Instant::now()).await;
+                            if evicted > 0 {
+                                info!(
+                                    evicted,
+                                    "per-console WebRTC evicted idle non-active helpers"
                                 );
                             }
                         }
@@ -2200,6 +2337,18 @@ async fn run() -> std::process::ExitCode {
         .is_none()
         {
             warn!("per-console HLS pipelines did not stop within their bound");
+        }
+    }
+    if let Some(manager) = multi_console_webrtc.as_ref() {
+        if shutdown::with_timeout(
+            "multi-console-webrtc-stop",
+            shutdown::TASK_STOP_TIMEOUT,
+            manager.shutdown(),
+        )
+        .await
+        .is_none()
+        {
+            warn!("per-console WebRTC helpers did not stop within their bound");
         }
     }
     if let Some(control) = webrtc_control.as_ref() {

@@ -3264,6 +3264,7 @@ dependencies = [
  "audiopus",
  "ozma-pipewire",
  "ozma-protocol",
+ "ozma-usb",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -3544,6 +3545,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "nix 0.30.1",
+ "ozma-audio",
  "serde",
  "serde_json",
  "tempfile",

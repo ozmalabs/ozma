@@ -464,6 +464,14 @@ Gate 4 evidence still required: a Python-free fresh-host install, the
 controller/demo regression against the Rust nodes, and a green
 `cargo test --workspace` on the release commit.
 
+Current state (2026-11-25): the only existing tag is annotated
+`rust-cutover-preview-4db92e1`, which dereferences to `4db92e1`; it is a
+preview, not the `rust-cutover-<version>-python-rollback` tag. A clean
+detached `4b3b875` run passed `scripts/clean-host/run.sh --host` 20/20
+(`ozma-node --lib` 390 passed / 3 ignored, `ozma-softnode` 111 passed).
+Deletion criteria, the full cutover matrix, the Gate 4a/4b split, and the
+staged plan are in [`phase4-cutover-audit.md`](phase4-cutover-audit.md).
+
 ## Known blocker (moving tree)
 
 On 2026-11-25 the container image built and the harness passed dependency,

@@ -27,7 +27,8 @@ profile.
 | FunctionFS lifecycle | `FunctionFsLifecycleConfig`, `FunctionFsLifecycle`, `FunctionFsLifecyclePhase`/`Status`, injectable `FunctionFsMounter` with `CommandFunctionFsMounter`/`FakeFunctionFsMounter`, deterministic `FunctionFsLifecycleClock`; ConfigFS function/link creation, mountpoint expectation, `ep0` descriptor write, readiness timeout, bind rollback, unbind/cleanup |
 | FunctionFS control | Standard `GET_DESCRIPTOR` (device/configuration/string), `SET_CONFIGURATION`, `GET_CONFIGURATION`, `GET/SET_INTERFACE`, `GET_STATUS`, feature requests; typed rejection for class/vendor and unknown requests |
 | FunctionFS status | `FunctionFsDaemonStatus` nested in `FunctionFsStatus.daemon`: `live` only when the descriptor blob, string table, and enable event all succeeded |
-| UAC2 model | `Uac2Config`, `Uac2Mode::{Microphone,Headset,Speaker}`, `Uac2DescriptorSet`, `Uac2Status`, `Uac2BridgeStatus::Unsupported` |
+| UAC2 model | `Uac2Config`, `Uac2Mode::{Microphone,Headset,Speaker}`, `Uac2DescriptorSet`, `Uac2Status`, `Uac2BridgeStatus::{Unsupported,Configured,Running,Stopped}` |
+| UAC2 bridge core | `Uac2Bridge`, `Uac2BridgeConfig`, injectable `Uac2EndpointIo` and `Uac2AudioSink`/`Uac2AudioSource`, `Uac2Packetizer`, `Uac2PcmFormat`/`Uac2SampleSize`, `convert_pcm`, `Uac2BridgeCounters`/`Uac2BridgeReport`, `FakeUac2Endpoint`/`FakeUac2AudioSink`/`FakeUac2AudioSource` |
 | Validation | Safe gadget/function names, VID/PID, strings, power, duplicate links, HID report shape, UAC2 rates/sizes/channels/modes, FunctionFS endpoint bounds/descriptor size, CD-ROM read-only |
 | Virtual media | `MassStorageImage`, `VirtualMedia`, `MediaMode::{Disk,CdRom}`, `MediaFormat::{Raw,Iso9660,Fat32,Nbd}`, `MediaState::{Attached,Detached}` |
 | Controller trait | `UsbGadgetController` (`create`, `bind`, `unbind`, `status`, `list`, `attach_media`, `detach_media`, `media_state`, `capabilities`) |
@@ -381,10 +382,72 @@ Additional advertised rates/sizes stay in the descriptor/status model and are
 not written to ConfigFS. The generated format descriptor carries every
 advertised rate at the primary sample size; additional sample sizes are
 capability metadata because one UAC2 format-type-I descriptor has a single
-subframe size. `FunctionStatus.uac2` reports the mode, both stream models,
-descriptor shape, and `bridge: "unsupported"`: no ALSA device is opened, no
-isochronous data is moved, and `Uac2Config::require_bridge()` returns the typed
-`unsupported-uac2-bridge` error.
+subframe size. `FunctionStatus.uac2` reports the mode, both stream models, and
+descriptor shape. Descriptor-only status remains `bridge: "unsupported"` unless
+a bridge report is attached.
+
+#### UAC2 isochronous bridge core
+
+`Uac2Bridge` is the transport-independent audio core. It never opens a real
+endpoint or sound device; the caller injects an isochronous endpoint handle and
+an audio path for each direction:
+
+- **Playback** (host → device, USB **OUT** `0x01`): OUT packets are read,
+  converted to the sink format, and pushed into a bounded frame-aligned ring.
+  The sink drains that ring, with short writes counted as backpressure.
+- **Capture** (device → host, USB **IN** `0x82`): source PCM is converted to the
+  USB format and packetised into sample-accurate isochronous IN packets.
+
+```rust
+use ozma_usb::{
+    FakeUac2AudioSink, FakeUac2AudioSource, FakeUac2Endpoint, Uac2Bridge,
+    Uac2BridgeConfig, Uac2BridgeInputs, Uac2Config,
+};
+
+let uac2 = Uac2Config::headset(2, 1, 48_000, 24);
+let config = Uac2BridgeConfig::from_uac2("audio", &uac2)?;
+let playback_format = config.playback.unwrap().format;
+let capture_format = config.capture.unwrap().format;
+let playback_out = FakeUac2Endpoint::out(64)?;
+let capture_in = FakeUac2Endpoint::in_endpoint(64)?;
+let mut bridge = Uac2Bridge::new(
+    config,
+    Uac2BridgeInputs {
+        playback_endpoint: Some(Box::new(playback_out)),
+        playback_sink: Some(Box::new(FakeUac2AudioSink::new(playback_format))),
+        capture_endpoint: Some(Box::new(capture_in)),
+        capture_source: Some(Box::new(FakeUac2AudioSource::silence(capture_format))),
+    },
+)?;
+bridge.start()?;
+bridge.pump()?;
+let status = bridge.status("audio", &uac2);
+```
+
+Formats are interleaved signed little-endian PCM at 16/24/32 bits, 1–8
+channels, and 8–192 kHz. `convert_pcm` scales bit depths, replicates mono,
+averages many-to-one downmixes, and zero-fills/truncates other channel-count
+changes. **Sample-rate conversion is never implicit**: a rate mismatch is a
+typed `uac2-format` error, so there is no hidden resampler.
+
+`Uac2Packetizer` accumulates `sample_rate * interval` over USB microframes, so
+44.1 kHz alternates 5- and 6-frame packets and sums to exactly 44 100 frames per
+second. Partial capture reads are padded with silence by default
+(`Uac2UnderrunPolicy::PadSilence`); `SkipPacket` writes only the available
+frames or skips an empty interval. Both modes count short packets, padding, and
+underruns.
+
+The bridge reports `configured`, `running`, or `stopped` only from real state:
+`running` requires PCM to have moved since the last start/flush, and a
+started-but-idle bridge stays `configured`. `Uac2BridgeReport` carries the
+per-direction format, endpoint, packet interval, maximum packet size, and
+cumulative `Uac2BridgeCounters` (packets/bytes/frames, drops, overflow events,
+sink backpressure, short/underrun counts). `Uac2Status::with_bridge_report`
+embeds it; `Uac2Status::with_bridge_unavailable` attaches a typed
+`bridge: "unsupported"` reason. `Uac2Bridge::new` fails with typed
+`uac2-missing-path`, `uac2-format`, `uac2-endpoint`, or `uac2-overflow` errors
+when an endpoint/audio path is absent or inconsistent; it never synthesises a
+successful fake.
 
 ## USB/IP
 
@@ -601,7 +664,8 @@ Relevant suites:
 | `tests/functionfs_daemon.rs` | v2 descriptor/string encoding and alignment, class/OS descriptors, temporary-mount `ep0` writes, standard control requests, enable/disable/live status, endpoint read/write/loopback, malformed/oversized inputs, lazily opened file endpoints |
 | `tests/functionfs_lifecycle.rs` | function/link creation, mountpoint validation, fake-mounter mount/unmount, `ep0` descriptor write, readiness success/timeout, bind failure rollback, unbind/cleanup, caller-supplied mount preservation, missing mount tool, config validation |
 | `tests/fat32_overlay.rs` | FAT32/raw writes and reads, base immutability, per-block copy-on-write, allocation ceiling and preflight atomicity, commit/reload, checksummed persistence corruption, discard/materialise |
-| `tests/uac2.rs` | UAC2 descriptor/channel/rate/size consistency, microphone/speaker/headset modes, invalid rates/channels/modes, ConfigFS attribute writes, unsupported bridge status |
+| `tests/uac2.rs` | UAC2 descriptor/channel/rate/size consistency, microphone/speaker/headset modes, invalid rates/channels/modes, ConfigFS attribute writes, descriptor-only unsupported bridge status |
+| `tests/uac2_bridge.rs` | sample-accurate 44.1/48 kHz packetization, 16/24/32-bit and mono/stereo conversion, no implicit resampling, playback ring drops/backpressure, partial/padded capture packets, flush/stop/restart, typed missing path/endpoint/overflow errors, status never live without data |
 | `tests/usbip_controller.rs` | exact argv, list/port parsing (IPv4/IPv6), attach/detach state, disabled/missing/non-zero typed errors, config validation, host/token allow-list enforcement, no real `usbip` |
 | `tests/usbip_security.rs` | server-side peer host/token/key-fingerprint pairing, constant-time token/fingerprint comparison, no secrets in errors/Debug, TLS-required fail-closed policy, bounded ordered hotplug events, JSON metadata, no real `usbip` |
 | `tests/nbd_server.rs` | newstyle handshake, export name/list/info/go, read/write/flush/disc, request bounds, read-only write rejection, malformed/truncated frames, injected transport/clock deadline, concurrent loopback clients, Unix socket, server stop, file/media backends |
@@ -632,6 +696,18 @@ is performed), opens `ep0`, writes descriptors/strings, and asserts that the
 status is not `live` without an observed enable event. The lifecycle helper's
 default tests use a temp root, a fake mounter, and a fake UDC name; they never
 mount or bind.
+
+The real ALSA → UAC2 capture-packetiser test is opt-in and lives in
+`ozma-audio`:
+
+```bash
+OZMA_AUDIO_TEST_DEVICE=default \
+  cargo test -p ozma-audio --test uac2_bridge_real -- --ignored
+```
+
+It opens a real ALSA capture device, captures one 20 ms 48 kHz stereo frame,
+and packetises it through the same `Uac2Bridge` core with an in-memory USB IN
+endpoint. The default UAC2 tests need no device and use the in-memory fakes.
 
 The live NBD boot test is also opt-in:
 
@@ -680,12 +756,15 @@ existing VM; the disposable QEMU is quit over QMP or killed on timeout.
   process, restart supervision, real UDC event loop, node route that starts the
   lifecycle, or vendor protocol. Class/vendor control requests are rejected
   with typed errors until a protocol handler exists. Suspend and resume events
-  are accepted but not acted on. UAC2 still models descriptors/capabilities and
-  writes the primary ConfigFS attributes, but there is no ALSA or isochronous
-  USB audio bridge; status always reports `bridge: "unsupported"`. Node flags
-  exist (`--usb-uac2`, `--usb-vendor`, `--usb-vendor-daemon`), but `/usb`
-  surfaces readiness/absence rather than starting either backend; the lifecycle
-  status is library-only for now.
+  are accepted but not acted on. UAC2 models descriptors/capabilities, writes
+  the primary ConfigFS attributes, and now includes a testable isochronous
+  bridge core (`Uac2Bridge`) with injectable endpoints and audio paths. It does
+  **not** yet service a real UDC/FunctionFS isochronous endpoint, open ALSA or
+  PipeWire, or wire the core to `dummy_hcd`/hardware; descriptor-only status
+  still reports `bridge: "unsupported"`, and no node path attaches a live bridge
+  report. Node flags exist (`--usb-uac2`, `--usb-vendor`,
+  `--usb-vendor-daemon`), but `/usb` surfaces readiness/absence rather than
+  starting either backend; the lifecycle status is library-only for now.
 - Node-side gadget teardown/recovery across restart, and hardware-profile
   validation. Mounting, block-device I/O, and real USB/IP transport remain
   deliberately outside this crate.

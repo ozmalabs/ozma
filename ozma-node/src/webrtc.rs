@@ -565,6 +565,19 @@ impl WebRtcStatus {
     }
 }
 
+#[cfg(test)]
+impl WebRtcStatus {
+    /// Test-only constructor for a helper status that is about to run.
+    pub(crate) fn starting_for_test() -> Self {
+        Self::starting()
+    }
+
+    /// Test-only transition to `running` with a synthetic pid.
+    pub(crate) fn mark_running_for_test(&self, helper_pid: Option<u32>) {
+        self.set_running(helper_pid);
+    }
+}
+
 fn bounded(message: String) -> String {
     if message.chars().count() <= MAX_STATUS_ERROR_CHARS {
         return message;

@@ -9,7 +9,10 @@
 //! * [`UsbGadgetConfig`] / [`UsbFunction`] describe a composite gadget (HID,
 //!   mass storage, UAC2, FunctionFS vendor) and validate it before any
 //!   filesystem work. [`Uac2Config`] models descriptor capabilities and
-//!   ConfigFS attributes; [`FunctionFsConfig`] models endpoint/string
+//!   ConfigFS attributes; [`Uac2Bridge`] is a testable isochronous ↔ PCM core
+//!   with injectable endpoint/audio traits, sample-accurate packetisation,
+//!   format conversion, bounded rings, counters, and honest status.
+//!   [`FunctionFsConfig`] models endpoint/string
 //!   descriptors and explicit userspace-daemon readiness. The
 //!   [`FunctionFsDaemonCore`] additionally encodes the FunctionFS `ep0`
 //!   descriptor/string blobs, handles standard control requests, and services
@@ -97,6 +100,7 @@ pub mod overlay;
 pub mod status;
 pub mod subprocess;
 pub mod uac2;
+pub mod uac2_bridge;
 pub mod usbip;
 
 pub use config::{
@@ -170,6 +174,15 @@ pub use uac2::{
     Uac2StreamStatus, UAC2_CAPTURE_ENDPOINT, UAC2_MAX_CHANNELS, UAC2_MAX_DESCRIPTOR_BYTES,
     UAC2_MAX_SAMPLE_RATE, UAC2_MAX_SAMPLE_RATES, UAC2_MAX_SAMPLE_SIZES, UAC2_MIN_SAMPLE_RATE,
     UAC2_PLAYBACK_ENDPOINT,
+};
+pub use uac2_bridge::{
+    convert_pcm, FakeUac2AudioSink, FakeUac2AudioSinkHandle, FakeUac2AudioSource,
+    FakeUac2AudioSourceHandle, FakeUac2Endpoint, FakeUac2EndpointHandle, Uac2AudioSink,
+    Uac2AudioSource, Uac2Bridge, Uac2BridgeConfig, Uac2BridgeCounters, Uac2BridgeInputs,
+    Uac2BridgeReport, Uac2BridgeStreamReport, Uac2Direction, Uac2Endpoint, Uac2EndpointIo,
+    Uac2PacketSpec, Uac2Packetizer, Uac2PcmFormat, Uac2PumpOutcome, Uac2SampleSize, Uac2StreamPlan,
+    Uac2Transfer, Uac2UnderrunPolicy, UAC2_DEFAULT_RING_BYTES, UAC2_MAX_PACKET_BYTES,
+    UAC2_MAX_PACKET_INTERVAL, UAC2_MICROFRAMES_PER_SECOND,
 };
 pub use usbip::{
     SubprocessUsbIpController, UsbIpAttachment, UsbIpAuthorization, UsbIpConfig, UsbIpController,

@@ -198,8 +198,10 @@ capture.
 - Remaining controller/GPU limits: the default console switch is one active
   capture source at a time. The bounded snapshot broker provides simultaneous
   JPEG previews, and opt-in `--multi-console-hls` provides bounded simultaneous
-  HLS encoders for advertised D-Bus consoles; WebRTC is still active-console
-  only and is not simultaneous. Only the D-Bus provider exposes
+  HLS encoders for advertised D-Bus consoles. WebRTC is active-console by
+  default; opt-in `--multi-console-webrtc` adds bounded simultaneous per-console
+  helpers (one socket/shm each) with `console`/`id` offer routing. Only the
+  D-Bus provider exposes
   runtime-selectable console indexes; QMP/VNC/Looking Glass still require a node
   restart (or keep the single active HLS path when `--multi-console-hls` is
   requested). WebRTC restarts keep their configured dimensions unless the

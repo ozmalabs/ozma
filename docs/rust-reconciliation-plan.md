@@ -6,9 +6,11 @@ The Phase 3 desktop profile (PipeWire capture/audio, uinput/QMP/HID input,
 snapshots/status/audio routes) is implemented except the XDG ScreenCast portal
 and X11 capture paths. Live D-Bus/VNC/audio validation, native/live WebRTC
 validation, the remaining device/audio provisioning, multi-VM breadth, and
-Phases 4–5 remain plans.** See
-[`plan-execution-status.md`](plan-execution-status.md) and
-[`parity-matrix.md`](parity-matrix.md) for the evidence and remaining gaps.
+Phases 4–5 remain plans.** The 2026-11-25 read-only cutover audit is in
+[`phase4-cutover-audit.md`](phase4-cutover-audit.md); it finds Phase 4
+incomplete and lists the exact blockers, per-tree deletion criteria, rollback
+tags, and staged plan. See [`plan-execution-status.md`](plan-execution-status.md)
+and [`parity-matrix.md`](parity-matrix.md) for the evidence and remaining gaps.
 Scope: the Python `softnode/`, `node/`, and `agent/` processes are replaced by the
 Rust `ozma-node` runtime plus its crates. The Python **controller** is a separate,
 much larger program and is handled as a later workstream with a compatibility
@@ -23,7 +25,7 @@ Three different Rust artifacts currently coexist:
 | `ozma-node` (+ `ozma-protocol`, `ozma-transport`, `ozma-capture`, `ozma-encode`, `ozma-decode`, `ozma-audio`, `ozma-input`, `ozma-api`, `ozma-auth`, clients) | The new stack. Real capture/encode/audio/transport/session/client/web work | **Target runtime** |
 | `ozma-softnode` | Discovery, manager loops, agent provisioning, meeting detection are real; the per-VM node is a stub; it spawns an `ozma-softnode` binary that does not exist | **Keep as hypervisor supervisor**, rewrite the runtime half |
 | `ozma-agent` | Legacy desktop-agent skeleton; `capture.rs` is a TODO; uses `ozma-proto` | **Retire**, fold into `ozma-node --profile desktop` |
-| `src/` (`src/softnode`, `src/agent`) | Dead prototypes, not in the workspace | **Delete** |
+| `src/` (`src/softnode`, `src/agent`) | Dead prototypes, not in the workspace | **Deleted in Phase 0** (absent at `4b3b875`) |
 
 Python footprint being replaced:
 
@@ -211,6 +213,14 @@ are no longer needed for demos; install script works on a clean Linux host.
 
 **Gate 4:** fresh-host install uses no Python; regression suite and demo pass;
 rollback is a tagged release.
+
+> **Audit clarification (2026-11-25):** split Gate 4 into **4a** (a fresh-host
+> *node* install uses no Python; achievable while the Python controller
+> remains) and **4b** (the whole stack, including the controller, uses no
+> Python; a Phase 5 controller concern). The Definition of Done allows the
+> Python controller to remain as a discovery/authorization client, so 4b must
+> not block deleting the Python node trees. See
+> [`phase4-cutover-audit.md`](phase4-cutover-audit.md) §12.
 
 ### Phase 5 — controller (separate program)
 

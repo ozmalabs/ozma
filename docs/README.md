@@ -20,6 +20,7 @@ Technical documentation for the Ozma software-defined KVM fabric.
 - [Software source management plan](software-source-management-plan.md) — Steam/Microsoft Store/native package sources, inventory, reporting, and update-state model
 - [Parity matrix](parity-matrix.md) — Python → Rust parity gates, current evidence, and gaps
 - [Plan execution status](plan-execution-status.md) — what is merged and tested so far
+- [Phase 4 cutover audit](phase4-cutover-audit.md) — current Python→Rust cutover matrix, blockers, deletion criteria, rollback tags, and staged plan (2026-11-25; Phase 4 not complete)
 
 ## Protocol Specifications
 

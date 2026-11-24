@@ -1,20 +1,25 @@
 # Rust multi-seat planning and supervision (`ozma-multiseat`)
 
 Status: **library + real subprocess supervisor + CLI + controller read-only
-grouping + opt-in input-routing/display-ownership execution (2026-11-25).**
+grouping + persisted seats/hotplug reconciliation + opt-in
+input-routing/display-ownership/audio execution (2026-11-25).**
 The crate enumerates display/input topology, plans one desktop seat per output,
 can spawn, health-check, restart, stop, and report one `ozma-node --profile
-desktop` child per seat, and models the two ownership layers: `xinput
-map-to-output` input routing with rollback, and per-seat `xrandr`
-output/mode/position ownership. The supervisor can now **apply those resources
-before spawning and release them on stop/remove/shutdown** when the explicit
-`--apply-ownership`/`--apply-routing` CLI flags (or the matching
-`SupervisorOptions` booleans) are enabled; both default to off, and dry-run
-still performs no action. It is **not wired into `ozma-node` or
-`ozma-softnode`**, and it creates no virtual display or audio sink. No real
-evdev grab is performed and no input is injected. The controller can group the
-independent per-seat node registrations for display, without merging them or
-taking over seat lifecycle.
+desktop` child per seat, and models the three opt-in resource layers: `xinput
+map-to-output` input routing with rollback, per-seat `xrandr`
+output/mode/position ownership, and per-seat PipeWire/PulseAudio null sinks. The
+supervisor **applies those resources before spawning and releases them on
+stop/remove/shutdown** when the explicit `--apply-ownership`/`--apply-routing`/
+`--audio-router` CLI flags (or the matching `SupervisorOptions`/builder calls)
+are enabled; all default to off, and dry-run still performs no action. A
+versioned `seats.json` store (`--seats-file`) preserves seat ids, display
+outputs, input hubs, ports, and audio sinks across replans; a sysfs hotplug
+model (`--hotplug`) reconciles add/remove display and input-hub events into
+seat start/stop with debounce. It is **not wired into `ozma-node` or
+`ozma-softnode`**, and it creates no virtual display. No real evdev grab is
+performed and no input is injected. The controller can group the independent
+per-seat node registrations for display, without merging them or taking over
+seat lifecycle.
 
 The Python baseline in [`agent/multiseat`](../agent/multiseat) remains the
 runnable multi-seat implementation. The plan and phase status are in
@@ -77,8 +82,33 @@ Implemented:
   already applied for earlier seats. Stop, remove, rollback, and `Drop` release
   routing before ownership, best effort, with failures kept in status.
 - Status carries `resources` (`ownership_applied`, `routing_applied`,
-  `ownership_released`, `routing_released`, and typed `errors`). The field is
-  omitted when no resource action happened, so default status is unchanged.
+  `audio_applied`, `ownership_released`, `routing_released`, `audio_released`,
+  and typed `errors`). The field is omitted when no resource action happened, so
+  default status is unchanged.
+- **Seat persistence** (`persistence`): a versioned `SeatStore`/`seats.json`
+  with explicit seat id, display output, input hub, device paths, UDP/HTTP
+  ports, audio sink, and profile. Loads validate ids/displays/ports/sinks and
+  migrate unversioned files; newer versions are rejected. Saves are atomic
+  (same-directory temp file, fsync, rename). `MultiseatPlanner::plan_with_store`
+  reuses a persisted identity only while its display is discovered, allocates
+  the first unused id/port pair for new displays, and emits
+  `PersistedSeatMissingDisplay` / `PersistedSeatMissingInput` diagnostics
+  instead of resurrecting missing hardware. Missing-display entries stay in the
+  store for replug.
+- **Hotplug reconciliation** (`hotplug`): a `HotplugMonitor` trait with a
+  fake queue and a read-only sysfs monitor (DRM by default, injectable
+  `DisplayBackend` for Xrandr), `HotplugEvent` add/remove events,
+  a quiet-window `HotplugDebounce` that cancels transient add+remove pairs, and
+  a `SeatReconciler` that replans, stops disappeared seats, starts new seats,
+  restarts changed plans, preserves backend labels, and reports typed action
+  diagnostics. Operator exclusions can skip a seat, display, or input hub.
+- **Opt-in per-seat audio**: `SeatAudioRouter` is the synchronous supervisor
+  seam; `OzmaAudioRouter` adapts `ozma_audio::AudioRouter` without nesting
+  runtimes. With a router installed, start ensures `ozma-seat-N` (and reports
+  `ozma-seat-N.monitor`), and stop/remove/shutdown unloads it. A missing
+  `pactl`/audio server is a typed `Audio` apply error in status, non-fatal to
+  the seat; a failed removal leaves the applied flag for retry. Dry-run and the
+  default (no-router) path run no audio command.
 - Read-only controller seat grouping (`GET /api/v1/seats`, dashboard Seats
   panel) that recognises the `<machine>-seat-<n>` names the planner produces,
   or explicit `seat_id`/`parent_node_id` metadata, and reports online state,
@@ -99,18 +129,27 @@ Deliberately not implemented yet:
   provides the execution seam, but the default backend is unsupported because
   the crate forbids `unsafe`; no privileged helper exists. udev/Xorg
   `InputDevice` sections are not generated.
-- **Automatic routing/ownership execution is opt-in.** The CLI now executes
-  the planned ownership/routing commands only with `--apply-ownership` and/or
-  `--apply-routing`; both default off, and `--print-plan`/`--dry-run` never
-  execute them. There is no policy engine, per-seat retry loop beyond the
-  supervisor's restart path, or automatic reconciliation after external X
-  layout changes. Evdev routing still requires an injected backend.
+- **Automatic routing/ownership/audio execution is opt-in.** The CLI executes
+  the planned ownership/routing/audio commands only with `--apply-ownership`,
+  `--apply-routing`, and/or `--audio-router`; all default off, and
+  `--print-plan`/`--dry-run` never execute them. There is no policy engine,
+  per-seat retry loop beyond the supervisor's restart path, or automatic
+  reconciliation after external X layout changes. Evdev routing still requires
+  an injected backend.
 - Per-seat uinput targeting at the kernel/compositor level; the node's uinput
   sink still does not choose an X screen. The environment now names the target
   seat, but the node must honour it.
-- Audio sink creation and per-process/per-seat routing.
-- Hotplug/auto-detection, persistence, scale up/down, and virtualization of
-  missing displays beyond the `DisplayBackend::create_virtual` contract.
+- **Per-process audio routing and DSP.** `ozma-audio` creates/removes the null
+  sink and exposes its monitor target; moving individual application streams,
+  microphone remaps, room correction, and a Windows virtual audio endpoint are
+  not wired into the multiseat supervisor.
+- **Hotplug is a polling model, not udev/netlink.** Polling the opt-in
+  `SysfsHotplugMonitor` compares a display snapshot and input-device snapshots;
+  it debounces in the caller. The CLI injects an `XrandrDisplayBackend` so
+  display names/screens match the initial plan; the library default uses DRM
+  connectors (no X screen) for side-effect-free detection. There is no
+  inotify/netlink subscription, no scale-up beyond discovered displays, and no
+  automatic store write from the library (the CLI owns the file).
 - OS isolation/resource control for children: cgroups/namespaces, user
   switching, CPU/GPU allocation, process-group/subreaper teardown, log
   files/rotation, restart-count limits, or supervision of a node that has no
@@ -128,7 +167,10 @@ Deliberately not implemented yet:
 | DRM | `drm::detect`, `drm::detect_at`, `DrmConnector`, `DrmStatus`, `DrmDetection` |
 | Input | `InputDevice`, `InputDeviceKind`, `InputGroup`, `InputBackend`, `SysfsInputBackend`, `group_inputs`, `classify_capabilities`, `usb_hub_path_from_sysfs` |
 | Host | `HostTopology` |
-| Planning | `PlannerOptions`, `CapturePreference`, `MultiseatPlanner`, `allocate_ports` |
+| Planning | `PlannerOptions`, `CapturePreference`, `MultiseatPlanner`, `PersistedPlan`, `allocate_ports` |
+| Persistence | `SeatStore`, `PersistedSeat`, `PersistedDisplay`, `SEAT_STORE_VERSION`, `DEFAULT_SEAT_STORE_NAME`, `default_seat_store_path` |
+| Hotplug | `HotplugMonitor`, `HotplugEvent`, `HotplugDebounce`, `HotplugOptions`, `SeatReconciler`, `ReconcileReport`, `SysfsHotplugMonitor` |
+| Audio | `SeatAudioRouter`, `SeatAudioSpec`, `SeatAudioState`, `OzmaAudioRouter` |
 | Seat | `SeatProfile`, `ProfileDefaults`, `SeatConfig`, `SeatPlan`, `CapturePlan`, `NodeCommand`, `SeatPorts`, `SeatState`, `SeatStatus`, `SeatRuntimeStatus` |
 | Input routing | `InputRouter`, `XInputRouter`, `EvdevGrabRouter`, `InputTarget`, `InputAssignment`, `InputRelease`, `InputRoutePlan`, `InputRoutingStrategy`, `assign_seats`, `parse_xinput_list`, `XInputDevice`, `RouteCommand`, `CommandRunner`, `ProcessCommandRunner`, `DeviceNameResolver`, `SysfsDeviceNameResolver`, `EvdevGrabBackend`, `EvdevGrabCommand`, `UnsupportedEvdevGrabBackend` |
 | Display ownership | `DisplayOwnership`, `DisplayOwnershipKind`, `DisplayOwnershipController`, `XrandrOwnershipController`, `apply_ownership` |
@@ -137,7 +179,7 @@ Deliberately not implemented yet:
 | Status | `MultiseatCapability`, `MultiseatStatus`, `render_metrics` |
 | Supervision | `SeatSupervisor`, `ProcessSeatSupervisor`, `SupervisorOptions`, `NodeLaunchSpec`, `NodeLauncher`, `ProcessLauncher`, `ChildHandle`, `ChildExit`, `ReadinessProbe`, `HttpHealthProbe`, `PortProbe`, `restart_delay` |
 | CLI | `ozma-multiseat` binary |
-| Test-only | `fake::FakeDisplayBackend`, `fake::FakeInputBackend`, `fake::FakeSeatSupervisor`, `fake::FakeNodeLauncher`, `fake::FakeReadinessProbe`, `fake::FakeCommandRunner`, `fake::FakeDeviceNameResolver`, `fake::FakeEvdevGrabBackend` |
+| Test-only | `fake::FakeDisplayBackend`, `fake::FakeInputBackend`, `fake::FakeSeatSupervisor`, `fake::FakeNodeLauncher`, `fake::FakeReadinessProbe`, `fake::FakeCommandRunner`, `fake::FakeDeviceNameResolver`, `fake::FakeEvdevGrabBackend`, `fake::FakeSeatAudioRouter`, `fake::FakeHotplugMonitor` |
 
 `fake` is not selected by detection and never touches `/dev`, sysfs, X11,
 PipeWire, or processes. Production code must choose `XrandrDisplayBackend` /
@@ -176,6 +218,17 @@ physical output count.
    - `PipeWire` requires a target for each display name/index in
      `CapturePreference::PipeWire::targets`; a missing target is a typed error.
 
+When a [`SeatStore`] is supplied through
+`MultiseatPlanner::plan_with_store` (or `HostTopology::plan_with_store`), a
+discovered display matches a persisted seat by output name and reuses its id,
+ports, audio sink, input hub, and profile even if display indexes were
+reordered. A new display gets the first unused `<machine>-seat-<n>` and the
+first unused UDP/HTTP pair at or above the configured bases. Persisted ids and
+ports remain reserved while their display is missing, so a replug restores the
+same identity. A persisted display or hub that is not discovered produces a
+`PersistedSeatMissingDisplay`/`PersistedSeatMissingInput` diagnostic and is not
+planned. Device paths missing from an otherwise present hub are also diagnosed.
+
 The default generated argv is ordered and stable. A two-seat X11 host produces,
 for seat 0:
 
@@ -202,9 +255,12 @@ For PipeWire, the capture flags are `--capture-provider pipewire`,
 `--desktop-capture-width/height/fps`. PipeWire seats carry no
 `DisplayOwnership`; the compositor owns outputs.
 
-The audio sink and `monitor:<sink>` capture target are **configuration intent**.
-Nothing in this crate creates the sink. The node reports a warned no-audio state
-if the sink does not exist.
+The audio sink and `monitor:<sink>` capture target are **configuration intent**
+in the plan. The default supervisor does not create the sink. With
+`--audio-router` (or `ProcessSeatSupervisor::with_audio_router`) the audio layer
+ensures the null sink before spawn and removes it after the child exits; a
+missing helper/audio server is a typed, non-fatal status error. The node reports
+a warned no-audio state if the sink does not exist.
 
 ## Input routing and display ownership
 
@@ -302,6 +358,12 @@ fn status(&self) -> Vec<SeatRuntimeStatus>;
   seats in reverse order. Controllers are installed with
   `with_ownership_controller`, `with_routing_controller`, and
   `with_evdev_routing_controller`; without the flags no controller is called.
+- **Audio (opt-in).** With a `SeatAudioRouter` installed, start ensures the
+  seat's `ozma-seat-N` null sink and records the `<sink>.monitor` target before
+  spawning; stop/remove/rollback/shutdown unload it. An ensure failure is
+  recorded as a typed `Audio` apply error and does **not** prevent the seat from
+  starting; a remove failure leaves `audio_applied=true` and retains the seat for
+  a later `remove` retry. Dry-run never calls the router.
 - **Start.** Spawn `plan.command.program` with its exact args and environment.
   The child inherits the supervisor's stdout/stderr. Wait until `GET /health`
   returns HTTP 200 (default) or a bounded TCP connect succeeds. A readiness
@@ -324,7 +386,14 @@ fn status(&self) -> Vec<SeatRuntimeStatus>;
   resource state. A planned seat with no runtime entry stays `planned`.
 - **Dry run.** `SupervisorOptions::dry_run` records the launch spec and reports
   `planned` with a `dry-run` message; it never spawns, probes, or invokes a
-  routing/ownership controller even when the apply flags are set.
+  routing/ownership/audio controller even when the flags are set.
+- **Persistence and hotplug.** `SeatStore::save_atomic` writes `seats.json`
+  through a same-directory temporary file and rename. `SeatReconciler` takes a
+  planner, store, current topology, and a `HotplugMonitor`; it replans, stops
+  seats whose displays disappeared, starts new displays, and restarts a seat
+  whose plan changed. `HotplugDebounce` waits for a quiet window and cancels a
+  transient add+remove pair. `HotplugOptions` excludes seat ids, displays, and
+  hubs from action.
 - **Tests.** `ProcessSeatSupervisor::with_parts` injects a `NodeLauncher` and a
   `ReadinessProbe`. `FakeNodeLauncher` records spawns, simulates exits and
   spawn failures, and records stop requests; `FakeReadinessProbe` can be ready,
@@ -377,8 +446,10 @@ stops any child still owned by the supervisor.
       "resources": {
         "ownership_applied": true,
         "routing_applied": true,
+        "audio_applied": true,
         "ownership_released": false,
-        "routing_released": false
+        "routing_released": false,
+        "audio_released": false
       }
     }
   ],
@@ -388,10 +459,11 @@ stops any child still owned by the supervisor.
 
 A failed seat also carries `last_error` and, while a restart is pending,
 `next_restart_in_ms`. Resource apply/release failures add entries such as
-`{"kind":"ownership","action":"release","message":"..."}` to
-`resources.errors`; the field is omitted entirely when both apply flags are off.
-`capability.node_count` always equals `capability.seat_count` and the number of
-seat entries. There is no merged super-node.
+`{"kind":"ownership","action":"release","message":"..."}` or
+`{"kind":"audio","action":"apply","message":"pactl is not installed"}` to
+`resources.errors`; the field is omitted entirely when no resource action
+happened. `capability.node_count` always equals `capability.seat_count` and the
+number of seat entries. There is no merged super-node.
 
 `render_metrics` emits a bounded text surface:
 
@@ -451,6 +523,12 @@ ozma-multiseat --display :0 \
 # Opt in to per-seat xrandr ownership and xinput routing. Both are off by
 # default; a failed apply stops the start and releases earlier seats.
 ozma-multiseat --display :0 --apply-ownership --apply-routing
+
+# Persist stable seat ids/ports/sinks across replans, reconcile sysfs hotplug,
+# and create/remove per-seat null sinks through PipeWire's pactl API.
+ozma-multiseat --display :0 \
+  --seats-file ~/.config/ozma/seats.json \
+  --hotplug --audio-router pipewire
 ```
 
 Configuration:
@@ -469,6 +547,9 @@ Configuration:
 | `--dry-run` | Record/print launch state without spawning or probing. |
 | `--apply-ownership` | Apply each seat's `xrandr` output ownership before spawn (default off). |
 | `--apply-routing` | Apply each seat's xinput/evdev input routing before spawn (default off). |
+| `--seats-file PATH` | Load/reuse and atomically update persisted seat identities. Never written by `--print-plan`/`--dry-run`. |
+| `--hotplug` | Poll read-only sysfs DRM/input snapshots, debounce, and start/stop/restart seats. |
+| `--audio-router [pipewire\|pulseaudio]` | Ensure/remove `ozma-seat-N` null sinks around the child lifecycle (default kind `pipewire`). |
 | `--machine-name NAME` | Seat id prefix. |
 | `--profile NAME` | Seat profile (capture defaults/label). |
 | `--seats N` | Requested seats (default one per display). |
@@ -487,10 +568,37 @@ resource before spawning it. A missing `xrandr`/`xinput`, a non-zero command, a
 non-xrandr ownership kind, or an evdev strategy without a backend is a typed
 failure: that seat is not spawned, and already-applied resources for earlier
 seats are released. On SIGINT/SIGTERM the CLI calls `stop_all`, which releases
-routing/ownership after each child exits. Output lists applied/released state
-and any release error; JSON carries `resources` on each seat. With the flags
-off (the default) the CLI never runs `xrandr` or `xinput` for ownership/routing,
-and `--print-plan`/`--dry-run` never run them even when the flags are present.
+routing/ownership/audio after each child exits. Output lists applied/released
+state and any release error; JSON carries `resources` on each seat. With the
+flags off (the default) the CLI never runs `xrandr`, `xinput`, or `pactl` for
+these resources, and `--print-plan`/`--dry-run` never run them even when the
+flags are present.
+
+`--seats-file` loads a versioned JSON store (a missing file is empty). The CLI
+reuses persisted ids/ports/hubs/sinks for discovered displays, assigns unused
+identities to new displays, prints missing-display/input diagnostics, and saves
+the updated store atomically after a successful replan. A corrupt file, a newer
+store version, or duplicate id/display/port is a typed startup error. Missing
+displays are retained in the file but are never started. The file is not read
+for side effects beyond loading and is not written by either no-spawn mode.
+
+`--hotplug` adds the opt-in `SysfsHotplugMonitor`: it snapshots the explicit
+Xrandr display (the CLI injects `XrandrDisplayBackend`) and classified input
+devices, debounces a quiet window, and asks the `SeatReconciler` to
+start/stop/restart seats. The monitor is polling and read-only; it does not
+subscribe to udev/netlink, and the library's DRM-only default does not claim an
+X screen for a connector. A display removal stops its seat, an addition
+gets the next deterministic id/port, a hub add/remove restarts the seat with the
+new input group (or a missing-input diagnostic), and a transient add+remove
+inside one debounce window is a no-op. The store is updated by the CLI when a
+reconciliation changes it.
+
+`--audio-router` installs `OzmaAudioRouter` around the real `ozma-audio` router.
+Start ensures the planned `ozma-seat-N` sink and its `<sink>.monitor` target
+before the node spawns; stop/remove/shutdown unloads it. A missing `pactl`, an
+unavailable audio server, or a non-null sink removal refusal is a typed `Audio`
+entry in `resources.errors`; an ensure failure does not prevent the seat from
+starting, and a remove failure leaves the applied flag so `remove` can retry.
 
 The optional status listener is bound to `127.0.0.1` and exposes only
 `/health`, `/status`, `/metrics`, and `/api/v1/connection`. It carries no
@@ -538,6 +646,21 @@ The default suite covers:
   typed unsupported (`tests/resource_supervisor.rs`).
 - Planner wiring of `SeatPlan.ownership`, `SeatPlan.input_route`, and the
   ownership/routing environment.
+- Seat persistence (`tests/persistence.rs`): atomic save/reload with no temp
+  file left behind, missing-file empty load, unversioned migration, corrupt and
+  newer-version typed errors, duplicate id/display/port/sink rejection, stable
+  id/port/sink mapping when displays reorder, missing-display retention without
+  planning, missing-hub/device diagnostics, first-unused allocation for new
+  displays, and persisted per-seat profile defaults.
+- Hotplug (`tests/hotplug.rs`): display add/remove start/stop, hub add/remove
+  restart with missing-input diagnostics, geometry-change restart with a stable
+  seat id, debounce cancellation of transient add+remove, no-op quiet polls,
+  excluded display/hub/seat policy, typed monitor failure, and a sysfs fixture
+  baseline/add/remove cycle.
+- Per-seat audio (`tests/audio_supervisor.rs`): ensure before spawn and remove
+  after stop, exact `ozma-seat-N`/`ozma-seat-N.monitor` names, per-seat sinks,
+  typed non-fatal ensure failure, best-effort remove failure with seat
+  retention/retry, and no audio call in dry-run.
 
 Controller-side grouping is covered by Python tests with fake nodes:
 
@@ -650,10 +773,15 @@ local status surface. Still required for parity:
 4. **Per-seat uinput targeting.** The environment now names the target seat
    (`OZMA_UINPUT_SEAT`), but injection still goes to the focused X
    window/server, not a specific seat output or compositor seat.
-5. **Audio isolation.** Create PipeWire null/remap sinks per seat, route
-   application streams, and add mic/room-correction/VBAN paths.
-6. **Auto-detection.** USB hotplug, seat persistence (`seats.json`), hub
-   add/remove, seat scale up/down, and virtual-display-on-demand.
+5. **Audio isolation.** Null-sink creation/removal and monitor targeting are
+   now opt-in through `ozma-audio`/`--audio-router`; moving application streams,
+   named microphone remaps, room correction/VBAN, and a Windows virtual endpoint
+   are still missing.
+6. **Auto-detection.** A versioned `seats.json` store, stable replan mapping, a
+   polling sysfs hotplug model, debounce, and start/stop/restart reconciliation
+   now exist. Still missing: a udev/netlink event source, Xrandr/DRM
+   re-enumeration inside the monitor, automatic store writes outside the CLI,
+   scale-up beyond discovered displays, and virtual-display-on-demand.
 7. **Profiles and games.** Launcher commands/environment, Steam/Lutris/Playnite
    discovery, per-seat GPU/encoder allocation, and isolation (`user`,
    `sandboxie`, namespaces, cgroups).

@@ -404,6 +404,8 @@ pub enum ResourceKind {
     Ownership,
     /// Per-seat `xinput`/evdev input routing.
     Routing,
+    /// Per-seat PipeWire/PulseAudio null sink.
+    Audio,
 }
 
 impl ResourceKind {
@@ -412,6 +414,7 @@ impl ResourceKind {
         match self {
             Self::Ownership => "ownership",
             Self::Routing => "routing",
+            Self::Audio => "audio",
         }
     }
 }
@@ -461,6 +464,9 @@ pub struct SeatResourceStatus {
     /// Routing was applied successfully and has not been released.
     #[serde(default)]
     pub routing_applied: bool,
+    /// A per-seat audio sink was ensured and has not been removed.
+    #[serde(default)]
+    pub audio_applied: bool,
     /// Ownership was released after being applied (or a previous release was
     /// retried successfully).
     #[serde(default)]
@@ -468,6 +474,9 @@ pub struct SeatResourceStatus {
     /// Routing was released after being applied.
     #[serde(default)]
     pub routing_released: bool,
+    /// Audio sink was removed after being ensured.
+    #[serde(default)]
+    pub audio_released: bool,
     /// Apply/release errors, in occurrence order. Best-effort release failures
     /// are reported here without hiding the seat's lifecycle state.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -479,8 +488,10 @@ impl SeatResourceStatus {
     pub fn is_empty(&self) -> bool {
         !self.ownership_applied
             && !self.routing_applied
+            && !self.audio_applied
             && !self.ownership_released
             && !self.routing_released
+            && !self.audio_released
             && self.errors.is_empty()
     }
 
@@ -662,6 +673,19 @@ pub enum DiagnosticCode {
     SeatWithoutInput,
     /// An input group had no seat left to assign it to.
     UnassignedInputGroup,
+    /// A persisted seat's display is no longer present. The seat is retained in
+    /// the store but is not planned/started.
+    PersistedSeatMissingDisplay,
+    /// A persisted seat's input hub or device path is no longer present.
+    PersistedSeatMissingInput,
+    /// A persisted seat conflicts with another persisted seat or with the
+    /// discovered topology.
+    PersistedSeatConflict,
+    /// Hotplug reconciliation could not plan or apply the current topology.
+    HotplugReconcileFailed,
+    /// A hotplug start/stop action failed; the supervisor state is unchanged or
+    /// keeps its existing retry path.
+    HotplugSeatActionFailed,
 }
 
 /// One non-fatal planning diagnostic.

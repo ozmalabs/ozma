@@ -3435,7 +3435,31 @@ function renderDisplayPicker(nodeId) {
       });
     }
   }
+  const multiWrtc = data.multi_console_webrtc;
+  if (multiWrtc && multiWrtc.enabled) {
+    const consoles = multiWrtc.consoles || [];
+    const running = consoles.filter(c => c.status === 'running');
+    note.appendChild(document.createElement('br'));
+    note.appendChild(document.createTextNode(
+      multiWrtc.limitation ||
+      `Per-console WebRTC: ${running.length}/${consoles.length} helpers (max ${multiWrtc.max_helpers}).`,
+    ));
+  }
   note.title = note.textContent;
+}
+
+// Console selected for the next WebRTC offer. A node without
+// --multi-console-webrtc keeps the historical active-console request (no
+// `console` query), so single-head providers are untouched.
+function _kvmWebrtcConsole(nodeId) {
+  const multi = nodeDisplay[nodeId]?.multi_console_webrtc;
+  if (!multi || !multi.enabled) return null;
+  const select = $('kvm-display-select');
+  if (select && select.value !== '') return select.value;
+  if (multi.active_console !== undefined && multi.active_console !== null) {
+    return String(multi.active_console);
+  }
+  return null;
 }
 
 function _restartStreamView(nodeId) {
@@ -3518,9 +3542,15 @@ function openStream(nodeId) {
   video.style.display = 'none';
   if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
 
-  // Display: WebRTC via go2rtc (lowest latency), fallback to HLS then snapshots
+  // Display: WebRTC (lowest latency), fallback to HLS then snapshots. With
+  // --multi-console-webrtc the picker value selects that console's helper; the
+  // default active-console request is unchanged otherwise.
   video.style.display = 'block';
-  const webrtcUrl = `/api/v1/streams/${encodeURIComponent(nodeId)}/webrtc`;
+  const webrtcBase = `/api/v1/streams/${encodeURIComponent(nodeId)}/webrtc`;
+  const webrtcConsole = _kvmWebrtcConsole(nodeId);
+  const webrtcUrl = webrtcConsole === null
+    ? webrtcBase
+    : `${webrtcBase}?console=${encodeURIComponent(webrtcConsole)}`;
 
   async function startWebRTC() {
     try {
@@ -3530,7 +3560,7 @@ function openStream(nodeId) {
         encodings: [{maxBitrate: 4000000}],
       });
       window._kvmPeerConnection = pc;
-      const candidateUrl = `${webrtcUrl}/candidate`;
+      const candidateUrl = `${webrtcBase}/candidate`;
       const pendingCandidates = [];
       let remoteSession = null;
       const sendCandidate = (candidate) => {
@@ -3542,6 +3572,7 @@ function openStream(nodeId) {
             session: remoteSession,
             candidate: candidate.candidate,
             sdpMLineIndex: candidate.sdpMLineIndex ?? 0,
+            ...(webrtcConsole !== null ? {console: webrtcConsole} : {}),
           }),
         }).catch(() => {});
       };
@@ -3579,7 +3610,9 @@ function openStream(nodeId) {
       };
       pc.onconnectionstatechange = () => {
         if (pc.connectionState === 'connected') {
-          $('kvm-status').textContent = 'WebRTC live';
+          $('kvm-status').textContent = webrtcConsole === null
+            ? 'WebRTC live'
+            : `WebRTC live · Console ${webrtcConsole}`;
           // Monitor video stats
           setInterval(async () => {
             if (!pc || pc.connectionState !== 'connected') return;

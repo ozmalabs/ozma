@@ -15,7 +15,8 @@
 use crate::display::{DisplayBackend, DisplayOutput};
 use crate::error::MultiseatError;
 use crate::input::{InputBackend, InputDevice};
-use crate::planner::MultiseatPlanner;
+use crate::persistence::SeatStore;
+use crate::planner::{MultiseatPlanner, PersistedPlan};
 use crate::seat::MultiseatPlan;
 
 /// The displays and input devices one host enumeration produced.
@@ -64,5 +65,18 @@ impl HostTopology {
         plan.display_backend = self.display_backend.clone();
         plan.input_backend = self.input_backend.clone();
         Ok(plan)
+    }
+
+    /// Plan while reusing persisted seat identities, preserving this topology's
+    /// backend labels in the plan.
+    pub fn plan_with_store(
+        &self,
+        planner: &MultiseatPlanner,
+        store: &SeatStore,
+    ) -> Result<PersistedPlan, MultiseatError> {
+        let mut persisted = planner.plan_with_store(&self.displays, &self.inputs, store)?;
+        persisted.plan.display_backend = self.display_backend.clone();
+        persisted.plan.input_backend = self.input_backend.clone();
+        Ok(persisted)
     }
 }

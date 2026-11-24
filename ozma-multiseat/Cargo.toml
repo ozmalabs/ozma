@@ -7,6 +7,7 @@ license = "AGPL-3.0-only"
 
 [dependencies]
 clap = { workspace = true }
+ozma-audio = { path = "../ozma-audio" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = "1"

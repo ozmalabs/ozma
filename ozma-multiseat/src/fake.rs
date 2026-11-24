@@ -6,11 +6,13 @@
 //! Production code must never select a fake from detection.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use crate::audio::{SeatAudioRouter, SeatAudioSpec, SeatAudioState};
 use crate::display::{DisplayBackend, DisplayOutput};
 use crate::error::MultiseatError;
+use crate::hotplug::{HotplugEvent, HotplugMonitor};
 use crate::input::{InputBackend, InputDevice};
 use crate::routing::{
     CommandOutput, CommandRunner, DeviceNameResolver, EvdevGrabBackend, EvdevGrabRequest,
@@ -767,5 +769,149 @@ impl EvdevGrabBackend for FakeEvdevGrabBackend {
             seat_id: request.seat_id.clone(),
         });
         Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct FakeSeatAudioState {
+    ensured: Vec<SeatAudioSpec>,
+    states: BTreeMap<String, SeatAudioState>,
+    removed: Vec<String>,
+    present: BTreeSet<String>,
+    fail_ensure: Option<String>,
+    fail_remove: Option<String>,
+}
+
+/// Test-only per-seat audio router. It records sink ensure/remove calls and can
+/// inject a typed failure. It never runs `pactl`, touches PipeWire, or reports a
+/// sink it did not record.
+#[derive(Clone, Debug, Default)]
+pub struct FakeSeatAudioRouter {
+    state: Arc<Mutex<FakeSeatAudioState>>,
+}
+
+impl FakeSeatAudioRouter {
+    /// A router with no sinks and no injected failures.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Make the next `ensure_sink` fail with a typed audio error.
+    pub fn fail_next_ensure(self, message: impl Into<String>) -> Self {
+        self.state.lock().expect("fake audio lock").fail_ensure = Some(message.into());
+        self
+    }
+
+    /// Make the next `remove_sink` fail with a typed audio error.
+    pub fn fail_next_remove(self, message: impl Into<String>) -> Self {
+        self.state.lock().expect("fake audio lock").fail_remove = Some(message.into());
+        self
+    }
+
+    /// Sink specs passed to `ensure_sink`, in call order.
+    pub fn ensured(&self) -> Vec<SeatAudioSpec> {
+        self.state.lock().expect("fake audio lock").ensured.clone()
+    }
+
+    /// Sink names passed to `remove_sink`, in call order.
+    pub fn removed(&self) -> Vec<String> {
+        self.state.lock().expect("fake audio lock").removed.clone()
+    }
+
+    /// Whether `ensure_sink` left a sink present.
+    pub fn is_present(&self, name: &str) -> bool {
+        self.state
+            .lock()
+            .expect("fake audio lock")
+            .present
+            .contains(name)
+    }
+}
+
+impl SeatAudioRouter for FakeSeatAudioRouter {
+    fn ensure_sink(&self, spec: &SeatAudioSpec) -> Result<SeatAudioState, MultiseatError> {
+        let mut state = self.state.lock().expect("fake audio lock");
+        if let Some(message) = state.fail_ensure.take() {
+            return Err(MultiseatError::Audio(message));
+        }
+        let created = state.present.insert(spec.name.clone());
+        let audio_state = SeatAudioState {
+            name: spec.name.clone(),
+            monitor_target: spec.monitor_target(),
+            created,
+        };
+        state.ensured.push(spec.clone());
+        state.states.insert(spec.name.clone(), audio_state.clone());
+        Ok(audio_state)
+    }
+
+    fn remove_sink(&self, name: &str) -> Result<(), MultiseatError> {
+        let mut state = self.state.lock().expect("fake audio lock");
+        if let Some(message) = state.fail_remove.take() {
+            return Err(MultiseatError::Audio(message));
+        }
+        state.removed.push(name.to_owned());
+        state.present.remove(name);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct FakeHotplugState {
+    pending: VecDeque<HotplugEvent>,
+    polls: usize,
+    fail_poll: Option<String>,
+}
+
+/// Test-only hotplug source backed by an in-memory event queue.
+#[derive(Clone, Debug, Default)]
+pub struct FakeHotplugMonitor {
+    state: Arc<Mutex<FakeHotplugState>>,
+}
+
+impl FakeHotplugMonitor {
+    /// A monitor with no queued events.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Queue one event.
+    pub fn push(&self, event: HotplugEvent) -> &Self {
+        self.state
+            .lock()
+            .expect("fake hotplug lock")
+            .pending
+            .push_back(event);
+        self
+    }
+
+    /// Queue several events.
+    pub fn push_many(&self, events: impl IntoIterator<Item = HotplugEvent>) -> &Self {
+        let mut state = self.state.lock().expect("fake hotplug lock");
+        state.pending.extend(events);
+        drop(state);
+        self
+    }
+
+    /// Make the next poll fail with a typed hotplug error.
+    pub fn fail_next_poll(&self, message: impl Into<String>) -> &Self {
+        self.state.lock().expect("fake hotplug lock").fail_poll = Some(message.into());
+        self
+    }
+
+    /// Number of polls served, including a failed poll.
+    pub fn polls(&self) -> usize {
+        self.state.lock().expect("fake hotplug lock").polls
+    }
+}
+
+impl HotplugMonitor for FakeHotplugMonitor {
+    fn poll(&mut self) -> Result<Vec<HotplugEvent>, MultiseatError> {
+        let mut state = self.state.lock().expect("fake hotplug lock");
+        state.polls += 1;
+        if let Some(message) = state.fail_poll.take() {
+            return Err(MultiseatError::Hotplug(message));
+        }
+        Ok(state.pending.drain(..).collect())
     }
 }

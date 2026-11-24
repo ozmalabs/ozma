@@ -9,12 +9,15 @@
 //! the primary rate/size onto the ConfigFS attributes the kernel accepts.
 //!
 //! No ALSA device is opened, no isochronous endpoint is serviced, and no
-//! audio is bridged. [`Uac2Status`] always reports the bridge as
+//! audio is bridged by the descriptor model itself. [`crate::Uac2Bridge`] is a
+//! transport-independent core with injectable endpoint I/O and audio
+//! source/sink fakes; without injected paths [`Uac2Status`] reports
 //! [`Uac2BridgeStatus::Unsupported`].
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::UsbError;
+use crate::uac2_bridge::Uac2BridgeReport;
 
 /// Lowest sample rate accepted by the model.
 pub const UAC2_MIN_SAMPLE_RATE: u32 = 8_000;
@@ -426,12 +429,16 @@ impl Uac2Config {
         }
     }
 
-    /// A bridge is deliberately absent from this crate.
+    /// Assert that this descriptor-only model has no live bridge attached.
+    ///
+    /// [`Uac2Bridge`](crate::Uac2Bridge) is the real bridge core; this legacy
+    /// helper reports the typed unsupported state for callers that cannot
+    /// supply an endpoint and audio path.
     pub fn require_bridge(&self) -> Result<(), UsbError> {
         self.require_bridge_for("uac2")
     }
 
-    /// A bridge is deliberately absent from this crate, reported for `instance`.
+    /// Assert that `instance` has no live bridge attached.
     pub fn require_bridge_for(&self, instance: &str) -> Result<(), UsbError> {
         Err(UsbError::UnsupportedUac2Bridge {
             instance: instance.to_owned(),
@@ -702,12 +709,25 @@ pub struct Uac2DescriptorSummary {
     pub capture_endpoint: Option<u8>,
 }
 
-/// Host audio bridge state. This crate never establishes one.
+/// Host audio bridge state.
+///
+/// `Unsupported` means this build or this function has no endpoint/audio
+/// path. `Configured` means every configured direction has an injected
+/// endpoint and audio source/sink, but no audio has moved yet. `Running` is
+/// only reported after at least one byte of PCM has actually been transferred,
+/// so a started-but-idle bridge never claims live audio. `Stopped` is reported
+/// after an explicit stop once audio had moved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Uac2BridgeStatus {
-    /// No ALSA/USB audio bridge is implemented or attached.
+    /// No ALSA/USB audio bridge is attached, or a required path is missing.
     Unsupported,
+    /// Endpoints and audio source/sink are wired, but no PCM has moved.
+    Configured,
+    /// PCM has moved through the bridge since it was started.
+    Running,
+    /// An explicit stop was requested after audio had moved.
+    Stopped,
 }
 
 impl Uac2BridgeStatus {
@@ -715,12 +735,20 @@ impl Uac2BridgeStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Unsupported => "unsupported",
+            Self::Configured => "configured",
+            Self::Running => "running",
+            Self::Stopped => "stopped",
         }
     }
 
-    /// Whether audio is actually bridged.
+    /// Whether endpoint and audio paths are available.
     pub fn is_supported(self) -> bool {
-        false
+        !matches!(self, Self::Unsupported)
+    }
+
+    /// Whether PCM has actually moved through the bridge.
+    pub fn is_live(self) -> bool {
+        matches!(self, Self::Running)
     }
 }
 
@@ -758,8 +786,15 @@ pub struct Uac2Status {
     pub mute: bool,
     /// Generated descriptor shape.
     pub descriptors: Uac2DescriptorSummary,
-    /// Host audio bridge state (always unsupported).
+    /// Host audio bridge state.
     pub bridge: Uac2BridgeStatus,
+    /// Runtime bridge detail, when a bridge configuration was supplied.
+    ///
+    /// Absent for descriptor-only status (the legacy model path). A report
+    /// with `bridge: "unsupported"` always carries a typed reason; a report
+    /// with `bridge: "running"` always has non-zero PCM counters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_report: Option<Uac2BridgeReport>,
 }
 
 impl Uac2Status {
@@ -785,11 +820,33 @@ impl Uac2Status {
             mute: config.mute,
             descriptors: config.descriptors().summary(),
             bridge: Uac2BridgeStatus::Unsupported,
+            bridge_report: None,
         }
     }
 
-    /// Whether a host audio bridge is available (always false).
+    /// Attach a runtime bridge report and mirror its status into `bridge`.
+    pub fn with_bridge_report(mut self, report: Uac2BridgeReport) -> Self {
+        self.bridge = report.status;
+        self.bridge_report = Some(report);
+        self
+    }
+
+    /// Report a typed reason why no bridge is available.
+    ///
+    /// The result always has `bridge: "unsupported"` and never claims live
+    /// audio, even if the caller supplies a misleading reason.
+    pub fn with_bridge_unavailable(self, reason: impl Into<String>) -> Self {
+        self.with_bridge_report(Uac2BridgeReport::unsupported(reason))
+    }
+
+    /// Whether a host audio bridge is available (configured, running, or
+    /// stopped after use).
     pub fn is_bridged(&self) -> bool {
         self.bridge.is_supported()
+    }
+
+    /// Whether PCM has actually moved through the bridge.
+    pub fn is_live(&self) -> bool {
+        self.bridge.is_live()
     }
 }

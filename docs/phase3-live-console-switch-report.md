@@ -16,7 +16,9 @@ node still has one active HLS/WebRTC capture source and one live encoder pair at
 a time unless the opt-in per-console HLS manager is enabled. A follow-up
 snapshot/info broker (§13) adds simultaneous JPEG previews for advertised D-Bus
 consoles without switching the active stream; the per-console HLS manager (§14)
-adds bounded simultaneous HLS encoders, while WebRTC remains active-console only.
+adds bounded simultaneous HLS encoders. Per-console WebRTC remains active-only
+by default and becomes simultaneous with the separate opt-in
+`--multi-console-webrtc` manager in §15.
 
 ## 1. Environment
 
@@ -474,9 +476,11 @@ switch/shutdown cleanup; `controller_compat::tests` route tests for
 
 **Remaining simultaneous-console gaps.** Snapshot/info are now concurrent for
 advertised D-Bus consoles; HLS is also concurrent when
-`--multi-console-hls` is enabled (§14). WebRTC still follows exactly one active
-capture source and one encoder pair, and the default single `--hls` path is
-unchanged. The broker does not feed WebRTC. Each D-Bus console also holds its
+`--multi-console-hls` is enabled (§14). WebRTC follows one active capture
+source/encoder pair by default and becomes simultaneous only when the separate
+`--multi-console-webrtc` manager is enabled (§15); the default single `--hls`
+path is unchanged. The snapshot broker does not feed WebRTC. Each D-Bus console
+also holds its
 own QEMU display listener, so `max_open`/`max_pipelines` are real resource
 bounds, not just cache sizes. QMP/VNC/Looking Glass remain single-head by
 design.
@@ -613,13 +617,119 @@ hardware rejection, per-console encoders, and the extra active single-HLS path).
 Controller pytest covers the per-console HLS proxy, `node/display` pass-through,
 and the codec fan-out result pass-through.
 
-**Remaining per-console gaps.** WebRTC is still active-console only; this
-manager does not create simultaneous WebRTC sessions, and the dashboard still
-uses WebRTC first for the active console. `/codec` now fans out across the
-per-console HLS pipelines, but it still cannot switch WebRTC (and never claims
-to). The encoder budget is a pipeline count, not a measured GPU/CPU capacity
-model, so `--multi-console-hls-max` must be chosen for the host's real encode
+**Remaining per-console gaps (superseded in part by §15).** This HLS manager
+does not create WebRTC sessions; the separate opt-in
+`--multi-console-webrtc` manager in §15 adds simultaneous per-console helpers,
+and the dashboard passes the picker's console to WebRTC. `/codec` still fans
+out only across HLS pipelines and cannot switch WebRTC (and never claims to).
+The encoder budget is a pipeline count, not a measured GPU/CPU capacity model,
+so `--multi-console-hls-max` must be chosen for the host's real encode
 capacity; a codec fan-out restarts at most that many pipelines. Idle eviction is
 driven by stream requests, not by playlist/segment reader counts. The controller
 UI links per-console playlists but does not yet render them side by side in the
 KVM modal.
+
+## 15. Per-console WebRTC helpers (follow-up)
+
+`--multi-console-webrtc` (visible alias `--webrtc-per-console`,
+`OZMA_MULTI_CONSOLE_WEBRTC=1`) enables simultaneous per-console WebRTC through
+the existing external GStreamer helper. It is opt-in and separate from HLS:
+without it the node keeps the historical single active `--webrtc-helper` path,
+and enabling it does not change HLS.
+
+Configuration and lifecycle:
+
+- Requires `--webrtc-helper` (and optionally `--webrtc-helper-script`); without
+  a helper no manager is created and WebRTC stays `not-configured`.
+- `--multi-console-webrtc-max N` (default 2,
+  `OZMA_MULTI_CONSOLE_WEBRTC_MAX`) bounds the total simultaneous helper
+  processes, including the active console. Clamped to `1..=MAX_VM_CONSOLES`.
+- `--multi-console-webrtc-idle-seconds` (default 60) stops a non-active helper
+  after that long without an offer/candidate for its console; `0` disables idle
+  eviction. The active console is never idle-evicted.
+- Each helper gets a derived socket and shm path from the base flags, for
+  example `--webrtc-socket /run/ozma/signal.sock` becomes
+  `signal-console-0.sock`, `signal-console-1.sock`; the same suffix applies to
+  `--webrtc-shm`. The helper's frame geometry is taken from that console's
+  advertised `width`/`height` when non-zero, so a 1280x800 and a 720x400 head
+  each feed matching BGRA frames.
+- Only D-Bus consoles are capturable independently. Each advertised output
+  whose `source_type` matches D-Bus gets its own helper; QMP, VNC, and Looking
+  Glass keep the legacy active helper and report a typed `unsupported`
+  limitation in `multi_console_webrtc`.
+- Startup and every committed `POST /display/select` reconcile the advertised
+  set. The active console is preferred, a console removed from
+  `display_outputs` is stopped, and a new console starts while capacity
+  remains. Selecting a console does not restart the independent helpers.
+- When the bound is reached, an offer for an omitted console rotates out the
+  least-recently-used non-active helper. The bound is never exceeded.
+- Node shutdown stops every helper and capture source with the existing bounded
+  `WebRtcHelper::stop` wait.
+
+Signaling and status:
+
+- `POST /webrtc/offer` accepts `console`/`id` in the query string or request
+  body (`0`, `Console_1`, `console-1`, a label, or the advertised capture
+  source id). It returns the answer plus `session` and the resolved `console`.
+  With no selector the offer targets the active console, exactly like the
+  single-helper path.
+- `POST /webrtc/candidate` routes by helper `session` (remembered from the
+  offer) or by an explicit `console`/`id`; a candidate without either targets
+  the active console. An unknown session is a typed 400 instead of being
+  silently applied to the wrong console.
+- `POST /webrtc/bitrate` accepts the same selector and changes that console's
+  helper; without one it changes the active helper.
+- `/api/v1/connection.webrtc` describes the active console's helper when the
+  manager owns independent consoles; the additive `multi_console_webrtc`
+  object carries `enabled`, `provider`, `max_helpers`,
+  `idle_timeout_seconds`, `active_console`, any `limitation`, and per-console
+  `status`/`error`/`pid`/`socket_path`/`shm_path`/`peers`/`sessions`. TURN
+  credentials and other secrets are never included.
+- `/api/v1/nodes/{node}/display` passes `multi_console_webrtc` through. The
+  controller proxies `?console=` on its WebRTC offer/candidate routes, and the
+  dashboard sends the console picker value plus per-console helper status.
+
+Tests: `multi_webrtc::tests` covers two simultaneous console offers, the max
+bound/LRU rotation, explicit versus default-active selection, session-routed
+candidates, add/remove and shutdown cleanup, single-head rejection, idle
+eviction, per-console status, and derived socket/shm paths using fake helpers
+(no GStreamer or capture device). `controller_compat::tests` covers the HTTP
+selector (`?console=` and body `console`), the per-console answer console, the
+per-console connection status, and the single-head 501.
+
+**Live smoke (2026-11-25, QEMU 11.1.3, Alpine 3.21, disposable two-head
+D-Bus).** QEMU used `-device virtio-vga -device VGA -display dbus,p2p=yes`
+(1280x800 and 720x400 heads). Two real GStreamer helpers ran from
+`softnode/gst_webrtc_worker.py` with derived sockets/framebuffers:
+
+```text
+run/signal-console-0.sock  run/frame-console-0.bgra  1280x800
+run/signal-console-1.sock  run/frame-console-1.bgra   720x400
+```
+
+Two simultaneous `scripts/gate2/webrtc-client.py` peers posted to
+`/webrtc/offer?console=0` and `?console=1`. Both completed ICE (`completed`),
+DTLS (`connected`), and decoded live video in the same run:
+
+```text
+console 0: 52-62 I420 buffers, 1280x800 @ 10 fps, bt709
+console 1: 52-62 I420 buffers,  720x400 @ 10 fps, bt601
+/webrtc/bitrate (console 0): {"ok":true,"bitrate":1500000}
+```
+
+`POST /display/select {"index":1}` returned
+`changed:true, restarted:{hls:false,webrtc:false}`; both helper PIDs stayed the
+same and `/api/v1/connection.multi_console_webrtc` reported both `running` with
+`peers:1`, `sessions:1`, and the new active console. Node-side BGRA snapshots
+differed (`sha256 72981c24…` vs `3a8baa33…`) and decoded to 1280x800 and
+720x400 PNGs. SIGTERM/cleanup left no node, QEMU, helper, or socket behind.
+
+**Cold-start geometry caveat.** The manager starts helpers at node startup. On
+this fixture the second head was initially 640x480, then settled at 720x400
+after the guest console was ready. A helper started with the final advertised
+720x400 geometry therefore failed its first frame
+(`frame dimensions 640x480 do not match ... 720x400`) until the node was
+restarted after the guest modeset. An offer for that console retries the
+start, so it recovers once the advertised geometry matches the live head; a
+future improvement is to restart the helper with the source's declared
+geometry instead of failing the generation.

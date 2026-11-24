@@ -72,6 +72,7 @@ use crate::multi_hls::{
     CodecFanoutTarget, ConsoleHlsStreamStatus, ControllerHlsPipeline, MultiConsoleCodecOutcome,
     MultiConsoleHls, MultiConsoleHlsStatus,
 };
+use crate::multi_webrtc::{MultiConsoleWebrtc, MultiConsoleWebrtcStatus};
 use crate::webrtc::{WebRtcControl, WebRtcError};
 
 /// HID packet type for an 8-byte boot keyboard report.
@@ -2130,6 +2131,9 @@ pub struct ConnectionState {
     /// Opt-in bounded per-console HLS manager. Its independent pipelines are
     /// never swapped into the active WebRTC/registry path.
     pub multi_console_hls: Option<MultiConsoleHls>,
+    /// Opt-in bounded per-console WebRTC manager. When it owns independent
+    /// D-Bus consoles it is also the source of truth for `webrtc`.
+    pub multi_console_webrtc: Option<MultiConsoleWebrtc>,
     /// Live capture transport/source for `/api/v1/connection`.
     pub capture: CaptureStatus,
 }
@@ -2156,6 +2160,7 @@ impl ConnectionState {
             display_control: None,
             console_broker: None,
             multi_console_hls: None,
+            multi_console_webrtc: None,
             capture: CaptureStatus::default(),
         }
     }
@@ -2214,6 +2219,17 @@ impl ConnectionState {
     /// `/display/info` includes the same per-console state.
     pub fn with_multi_console_hls(mut self, manager: Option<MultiConsoleHls>) -> Self {
         self.multi_console_hls = manager;
+        self
+    }
+
+    /// Attach the opt-in per-console WebRTC manager.
+    ///
+    /// When the manager owns independent consoles, `/api/v1/connection`
+    /// reports its active helper as `webrtc` and adds a per-console
+    /// `multi_console_webrtc` object. A single-head provider keeps the legacy
+    /// single helper and reports the manager's typed `unsupported` limitation.
+    pub fn with_multi_console_webrtc(mut self, manager: Option<MultiConsoleWebrtc>) -> Self {
+        self.multi_console_webrtc = manager;
         self
     }
 
@@ -2392,6 +2408,9 @@ pub struct ConnectionResponse {
     /// Opt-in simultaneous per-console HLS state, when enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub multi_console_hls: Option<MultiConsoleHlsStatus>,
+    /// Opt-in simultaneous per-console WebRTC state, when enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub multi_console_webrtc: Option<MultiConsoleWebrtcStatus>,
     /// Actual capture transport and enumerated source, or `available:false`.
     pub capture: CaptureStatus,
 }
@@ -2625,13 +2644,40 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
             (hls, error, None)
         }
     };
-    let (webrtc, webrtc_error) = match &state.webrtc {
-        None => ("not-configured", None),
-        Some(control) => (control.status_name(), control.error()),
+    let multi_console_webrtc = match state.multi_console_webrtc.as_ref() {
+        Some(manager) => Some(manager.status().await),
+        None => None,
     };
-    let (webrtc_audio_configured, webrtc_audio_source) = match &state.webrtc {
-        None => (false, None),
-        Some(control) => (control.audio_configured(), control.audio_source()),
+    // A manager that owns independent D-Bus consoles also owns the active
+    // console's helper, so `webrtc` must describe that helper. A single-head
+    // manager leaves the historical `webrtc` path untouched and only reports
+    // its typed `unsupported` limitation in `multi_console_webrtc`.
+    let webrtc_manager_owns = state
+        .multi_console_webrtc
+        .as_ref()
+        .is_some_and(MultiConsoleWebrtc::supports_independent_consoles);
+    let (webrtc, webrtc_error) = if webrtc_manager_owns {
+        let status = state
+            .multi_console_webrtc
+            .as_ref()
+            .expect("checked above")
+            .active_status()
+            .await;
+        (status.status_name(), status.error())
+    } else {
+        match &state.webrtc {
+            None => ("not-configured", None),
+            Some(control) => (control.status_name(), control.error()),
+        }
+    };
+    let (webrtc_audio_configured, webrtc_audio_source) = if webrtc_manager_owns {
+        let manager = state.multi_console_webrtc.as_ref().expect("checked above");
+        (manager.audio_configured(), manager.audio_source())
+    } else {
+        match &state.webrtc {
+            None => (false, None),
+            Some(control) => (control.audio_configured(), control.audio_source()),
+        }
     };
     let input = InputStatus {
         sink_kind: info.sink_kind.clone(),
@@ -2676,6 +2722,7 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
         display_outputs: display.display_outputs,
         display_capture: display.display_capture,
         multi_console_hls,
+        multi_console_webrtc,
         capture: state.capture.clone(),
     })
 }
@@ -4632,12 +4679,44 @@ fn api_error_response(status: StatusCode, error: ApiError) -> Response {
     (status, Json(body)).into_response()
 }
 
+/// Optional per-console WebRTC selector in the query string.
+#[derive(Debug, Default, Deserialize)]
+struct WebrtcConsoleQuery {
+    #[serde(default)]
+    console: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+}
+
+/// A `console` value that may be a JSON number or string.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum WebrtcConsoleSelector {
+    Index(u32),
+    Text(String),
+}
+
+impl WebrtcConsoleSelector {
+    fn as_text(&self) -> String {
+        match self {
+            Self::Index(index) => index.to_string(),
+            Self::Text(text) => text.clone(),
+        }
+    }
+}
+
 /// `POST /webrtc/offer` body, matching the controller/soft-node shape.
 #[derive(Debug, Deserialize)]
 struct WebrtcOfferRequest {
     sdp: String,
     #[serde(default, rename = "type")]
     kind: Option<String>,
+    /// Zero-based console index, `Console_N`, label, or source id.
+    #[serde(default)]
+    console: Option<WebrtcConsoleSelector>,
+    /// Console identifier (same accepted forms as `console`).
+    #[serde(default)]
+    id: Option<String>,
 }
 
 /// `POST /webrtc/offer` response, matching the soft node's answer shape.
@@ -4650,6 +4729,9 @@ struct WebrtcOfferResponse {
     /// the configured worker does not emit one (old helpers stay compatible).
     #[serde(skip_serializing_if = "Option::is_none")]
     session: Option<String>,
+    /// Console whose helper answered, when per-console WebRTC is active.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    console: Option<u32>,
 }
 
 /// `POST /webrtc/candidate` body; a late remote ICE candidate.
@@ -4660,6 +4742,10 @@ struct WebrtcCandidateRequest {
     candidate: String,
     #[serde(default, rename = "sdpMLineIndex")]
     sdp_mline_index: u32,
+    #[serde(default)]
+    console: Option<WebrtcConsoleSelector>,
+    #[serde(default)]
+    id: Option<String>,
 }
 
 /// `POST /webrtc/bitrate` body; `bitrate` is bits per second.
@@ -4667,6 +4753,51 @@ struct WebrtcCandidateRequest {
 struct WebrtcBitrateRequest {
     #[serde(default = "default_webrtc_bitrate_bps")]
     bitrate: u64,
+    #[serde(default)]
+    console: Option<WebrtcConsoleSelector>,
+    #[serde(default)]
+    id: Option<String>,
+}
+
+/// Resolve the optional `console`/`id` selector from query and body.
+async fn webrtc_requested_console(
+    state: &ConnectionState,
+    query: &WebrtcConsoleQuery,
+    body_console: Option<&WebrtcConsoleSelector>,
+    body_id: Option<&str>,
+) -> Result<Option<u32>, Response> {
+    let raw = query
+        .console
+        .clone()
+        .or_else(|| body_console.map(WebrtcConsoleSelector::as_text))
+        .or_else(|| query.id.clone())
+        .or_else(|| body_id.map(str::to_owned));
+    let Some(raw) = raw.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let Some(manager) = state.multi_console_webrtc.as_ref() else {
+        return Err(webrtc_console_unsupported(
+            "this node has no per-console WebRTC manager",
+        ));
+    };
+    if !manager.supports_independent_consoles() {
+        return Err(webrtc_console_unsupported(
+            "the configured capture provider exposes one default console",
+        ));
+    }
+    manager
+        .resolve_console(&raw)
+        .await
+        .map(Some)
+        .map_err(|message| compat_error(StatusCode::BAD_REQUEST, "unknown-console", message))
+}
+
+/// True when the per-console manager owns the active helper too.
+fn webrtc_manager_owns(state: &ConnectionState) -> bool {
+    state
+        .multi_console_webrtc
+        .as_ref()
+        .is_some_and(MultiConsoleWebrtc::supports_independent_consoles)
 }
 
 fn default_webrtc_bitrate_bps() -> u64 {
@@ -4678,6 +4809,7 @@ const WEBRTC_BITRATE_MAX_BPS: u64 = 50_000_000;
 
 async fn webrtc_offer(
     State(state): State<ConnectionState>,
+    Query(query): Query<WebrtcConsoleQuery>,
     payload: Result<Json<WebrtcOfferRequest>, JsonRejection>,
 ) -> Response {
     let Json(request) = match payload {
@@ -4701,6 +4833,43 @@ async fn webrtc_offer(
         );
     }
 
+    let requested = match webrtc_requested_console(
+        &state,
+        &query,
+        request.console.as_ref(),
+        request.id.as_deref(),
+    )
+    .await
+    {
+        Ok(requested) => requested,
+        Err(response) => return response,
+    };
+
+    if requested.is_some() || webrtc_manager_owns(&state) {
+        let Some(manager) = state.multi_console_webrtc.as_ref() else {
+            return webrtc_not_configured();
+        };
+        if !manager.supports_independent_consoles() {
+            return webrtc_console_unsupported(
+                "the configured capture provider exposes one default console",
+            );
+        }
+        let console = match requested {
+            Some(console) => Some(console),
+            None => Some(manager.active_console().await),
+        };
+        return match manager.offer(requested, &request.sdp).await {
+            Ok(answer) => Json(WebrtcOfferResponse {
+                sdp: answer.sdp,
+                kind: "answer",
+                session: answer.session,
+                console,
+            })
+            .into_response(),
+            Err(error) => webrtc_offer_failure(error),
+        };
+    }
+
     let Some(control) = state.webrtc.as_ref() else {
         return webrtc_not_configured();
     };
@@ -4713,6 +4882,7 @@ async fn webrtc_offer(
             sdp: answer.sdp,
             kind: "answer",
             session: answer.session,
+            console: None,
         })
         .into_response(),
         Err(error) => webrtc_offer_failure(error),
@@ -4721,6 +4891,7 @@ async fn webrtc_offer(
 
 async fn webrtc_candidate(
     State(state): State<ConnectionState>,
+    Query(query): Query<WebrtcConsoleQuery>,
     payload: Result<Json<WebrtcCandidateRequest>, JsonRejection>,
 ) -> Response {
     let Json(request) = match payload {
@@ -4734,6 +4905,36 @@ async fn webrtc_candidate(
             "invalid-candidate",
             "the `candidate` field must not be empty",
         );
+    }
+
+    let requested = match webrtc_requested_console(
+        &state,
+        &query,
+        request.console.as_ref(),
+        request.id.as_deref(),
+    )
+    .await
+    {
+        Ok(requested) => requested,
+        Err(response) => return response,
+    };
+
+    if requested.is_some() || webrtc_manager_owns(&state) {
+        let Some(manager) = state.multi_console_webrtc.as_ref() else {
+            return webrtc_not_configured();
+        };
+        return match manager
+            .candidate(
+                requested,
+                request.session.as_deref(),
+                candidate,
+                request.sdp_mline_index,
+            )
+            .await
+        {
+            Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+            Err(error) => webrtc_candidate_failure(error),
+        };
     }
 
     let Some(control) = state.webrtc.as_ref() else {
@@ -4758,6 +4959,7 @@ async fn webrtc_candidate(
 
 async fn webrtc_bitrate(
     State(state): State<ConnectionState>,
+    Query(query): Query<WebrtcConsoleQuery>,
     payload: Result<Json<WebrtcBitrateRequest>, JsonRejection>,
 ) -> Response {
     let Json(request) = match payload {
@@ -4769,6 +4971,31 @@ async fn webrtc_bitrate(
     let bitrate = request
         .bitrate
         .clamp(WEBRTC_BITRATE_MIN_BPS, WEBRTC_BITRATE_MAX_BPS);
+
+    let requested = match webrtc_requested_console(
+        &state,
+        &query,
+        request.console.as_ref(),
+        request.id.as_deref(),
+    )
+    .await
+    {
+        Ok(requested) => requested,
+        Err(response) => return response,
+    };
+
+    if requested.is_some() || webrtc_manager_owns(&state) {
+        let Some(manager) = state.multi_console_webrtc.as_ref() else {
+            return webrtc_not_configured();
+        };
+        return match manager
+            .set_bitrate(requested, (bitrate / 1_000).max(1) as u32)
+            .await
+        {
+            Ok(()) => Json(serde_json::json!({"ok": true, "bitrate": bitrate})).into_response(),
+            Err(error) => webrtc_bitrate_failure(error),
+        };
+    }
 
     let Some(control) = state.webrtc.as_ref() else {
         return webrtc_not_configured();
@@ -4808,11 +5035,25 @@ fn webrtc_unavailable(reason: &str) -> Response {
     )
 }
 
+fn webrtc_console_unsupported(reason: &str) -> Response {
+    compat_error_with_remediation(
+        StatusCode::NOT_IMPLEMENTED,
+        "webrtc-console-unsupported",
+        format!("per-console WebRTC is unavailable: {reason}"),
+        Some(
+            "Per-console WebRTC requires --multi-console-webrtc plus a D-Bus capture \
+             provider that exposes independent Console_N heads. Single-head providers keep \
+             the active WebRTC stream; use POST /display/select to change it.",
+        ),
+    )
+}
+
 fn webrtc_offer_failure(error: WebRtcError) -> Response {
     match &error {
         WebRtcError::InvalidConfig(_) => {
             compat_error(StatusCode::BAD_REQUEST, "invalid-sdp", error.to_string())
         }
+        WebRtcError::Unsupported(message) => webrtc_console_unsupported(message),
         _ => compat_error_with_remediation(
             StatusCode::SERVICE_UNAVAILABLE,
             "webrtc-unavailable",
@@ -4903,6 +5144,7 @@ mod tests {
         ffmpeg_argv, EncoderAvailability, EncoderProbe, FfmpegSpawner, FrameSink, HlsConfig,
         HlsController, HlsEncoder, HlsError, HlsSourceFactory, SpawnedFfmpeg, StaticEncoderProbe,
     };
+    use crate::webrtc::WebRtcStatus;
     use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -10489,6 +10731,211 @@ mod tests {
 
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_file(image).unwrap();
+    }
+
+    struct RouteWebRtcSession {
+        status: WebRtcStatus,
+        running: Arc<AtomicBool>,
+        socket: std::path::PathBuf,
+        shm: std::path::PathBuf,
+    }
+
+    impl RouteWebRtcSession {
+        fn new(console: u32) -> Self {
+            let status = WebRtcStatus::starting_for_test();
+            status.mark_running_for_test(Some(8000 + console));
+            Self {
+                status,
+                running: Arc::new(AtomicBool::new(true)),
+                socket: std::path::PathBuf::from(format!("/tmp/route-{console}.sock")),
+                shm: std::path::PathBuf::from(format!("/tmp/route-{console}.bgra")),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::multi_webrtc::ConsoleWebRtcSession for RouteWebRtcSession {
+        fn status(&self) -> WebRtcStatus {
+            self.status.clone()
+        }
+
+        fn is_running(&self) -> bool {
+            self.running.load(Ordering::SeqCst)
+        }
+
+        fn pid(&self) -> Option<u32> {
+            self.status.helper_pid()
+        }
+
+        fn socket_path(&self) -> std::path::PathBuf {
+            self.socket.clone()
+        }
+
+        fn shm_path(&self) -> std::path::PathBuf {
+            self.shm.clone()
+        }
+
+        async fn offer_answer(
+            &self,
+            _sdp: &str,
+        ) -> Result<crate::webrtc::WebRtcAnswer, WebRtcError> {
+            Ok(crate::webrtc::WebRtcAnswer {
+                sdp: format!("answer for {}", self.socket.display()),
+                session: Some(format!("route-{}", self.socket.display())),
+            })
+        }
+
+        async fn add_ice_candidate(
+            &self,
+            _session: Option<&str>,
+            _candidate: &str,
+            _sdp_mline_index: u32,
+        ) -> Result<(), WebRtcError> {
+            Ok(())
+        }
+
+        async fn set_bitrate(&self, _bitrate_kbps: u32) -> Result<(), WebRtcError> {
+            Ok(())
+        }
+
+        async fn stop(&self) -> Result<(), String> {
+            self.running.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct RouteWebRtcFactory {
+        provider: Option<ozma_display::vm::VmConsoleBackend>,
+    }
+
+    #[async_trait]
+    impl crate::multi_webrtc::ConsoleWebRtcFactory for RouteWebRtcFactory {
+        fn provider(&self) -> Option<ozma_display::vm::VmConsoleBackend> {
+            self.provider
+        }
+
+        async fn start(
+            &self,
+            console: u32,
+            _geometry: Option<(u32, u32)>,
+        ) -> Result<Arc<dyn crate::multi_webrtc::ConsoleWebRtcSession>, String> {
+            Ok(Arc::new(RouteWebRtcSession::new(console))
+                as Arc<dyn crate::multi_webrtc::ConsoleWebRtcSession>)
+        }
+    }
+
+    async fn route_webrtc_manager(
+        provider: ozma_display::vm::VmConsoleBackend,
+        active: u32,
+        consoles: &[u32],
+    ) -> MultiConsoleWebrtc {
+        let specs: Vec<String> = consoles
+            .iter()
+            .map(|index| format!("{index}:Console_{index}:1280x800:dbus"))
+            .collect();
+        let selection = crate::display_outputs::outputs_from_specs(
+            &specs,
+            ozma_display::vm::VmConsoleBackend::Dbus,
+            None,
+            Some(active),
+        )
+        .expect("selection");
+        let manager = MultiConsoleWebrtc::new(
+            Arc::new(RouteWebRtcFactory {
+                provider: Some(provider),
+            }),
+            crate::multi_webrtc::MultiConsoleWebrtcConfig {
+                max_helpers: 2,
+                idle_timeout: Duration::from_secs(60),
+            },
+        );
+        manager.sync(&selection).await;
+        manager
+    }
+
+    #[tokio::test]
+    async fn per_console_webrtc_offer_selects_console_and_reports_status() {
+        let manager =
+            route_webrtc_manager(ozma_display::vm::VmConsoleBackend::Dbus, 0, &[0, 1]).await;
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "vm",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_multi_console_webrtc(Some(manager));
+        let app = webrtc_router(state.clone());
+
+        let app_zero = app.clone();
+        let app_one = app.clone();
+        let (zero, one) = tokio::join!(
+            post_json(
+                &app_zero,
+                "/webrtc/offer?console=0",
+                serde_json::json!({"sdp": "v=0", "type": "offer"}),
+            ),
+            post_json(
+                &app_one,
+                "/webrtc/offer",
+                serde_json::json!({"sdp": "v=0", "type": "offer", "console": 1}),
+            ),
+        );
+        assert_eq!(zero.0, StatusCode::OK);
+        assert_eq!(zero.1["type"], "answer");
+        assert_eq!(zero.1["console"], 0);
+        assert!(zero.1["session"].is_string());
+        assert_eq!(one.0, StatusCode::OK);
+        assert_eq!(one.1["console"], 1);
+        assert!(one.1["answer"].is_null());
+        assert!(one.1["sdp"].as_str().unwrap().contains("/tmp/route-1.sock"));
+
+        let (status, body) = get_json(&connection_router(state), "/api/v1/connection").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["webrtc"], "running");
+        assert_eq!(body["multi_console_webrtc"]["enabled"], true);
+        assert_eq!(body["multi_console_webrtc"]["max_helpers"], 2);
+        assert_eq!(
+            body["multi_console_webrtc"]["consoles"][0]["status"],
+            "running"
+        );
+        assert_eq!(
+            body["multi_console_webrtc"]["consoles"][1]["status"],
+            "running"
+        );
+        assert_eq!(body["multi_console_webrtc"]["consoles"][1]["sessions"], 1);
+    }
+
+    #[tokio::test]
+    async fn per_console_webrtc_single_head_rejects_explicit_console() {
+        let manager = route_webrtc_manager(ozma_display::vm::VmConsoleBackend::Qmp, 0, &[0]).await;
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "vm",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_multi_console_webrtc(Some(manager));
+        let app = webrtc_router(state);
+
+        let (status, body) = post_json(
+            &app,
+            "/webrtc/offer?console=0",
+            serde_json::json!({"sdp": "v=0", "type": "offer"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(body["code"], "webrtc-console-unsupported");
+        assert!(body["remediation"].is_string());
     }
 
     async fn wait_for(mut predicate: impl FnMut() -> bool) {

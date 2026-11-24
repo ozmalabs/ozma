@@ -33,20 +33,31 @@ input-routing/display-ownership command layers, as documented in
 - `ozma-multiseat` CLI: enumerate topology, print/validate the plan, dry-run,
   or supervise seats, with optional loopback `/status`, `/metrics`, and
   `/health` and opt-in ownership/routing application.
+- Versioned `seats.json` persistence (`--seats-file`): stable explicit seat
+  id/display/input-hub/ports/audio-sink across replans, atomic writes,
+  validation, and migration. Missing displays/devices are retained but not
+  resurrected without a diagnostic.
+- Hotplug reconciliation (`--hotplug`): a fake and read-only sysfs/DRM
+  `HotplugMonitor`, display/input-hub add/remove events, quiet-window debounce,
+  start/stop/restart through the supervisor, and operator exclusions.
+- Opt-in per-seat audio (`--audio-router`): ensure/remove `ozma-seat-N` null
+  sinks and `<sink>.monitor` targets through `ozma-audio`; typed non-fatal
+  failures in status.
 - Controller capability/status shape where one seat is one node, plus bounded
   Prometheus metrics.
 
 Not yet delivered: node/controller integration, true per-seat screen isolation
 (separate X screens, per-seat compositor/X server, DRM leasing, Wayland),
 real privileged evdev grabs and udev/input-device policy, per-seat uinput
-targeting at the display layer, audio sink creation, hotplug/persistence, game
-launch, per-seat streaming, supervisor isolation (cgroups/namespaces/log
-rotation), or any Windows (DXGI/IDD/Raw Input/WASAPI) path. The ownership/routing
-commands are executable only through the explicit opt-in supervisor flags; there
-is no manager policy, reconciliation, or automatic hotplug path. The phase
-timeline below is unchanged; the Rust crate covers the planner/backends,
-subprocess supervision, and opt-in command execution of Phase 1, not the full
-Phase 1 deliverable.
+targeting at the display layer, per-process audio routing/mic remaps/room
+correction, udev/netlink hotplug and automatic store writes outside the CLI,
+game launch, per-seat streaming, supervisor isolation (cgroups/namespaces/log
+rotation), or any Windows (DXGI/IDD/Raw Input/WASAPI) path. The ownership/
+routing/audio commands are executable only through the explicit opt-in
+supervisor flags; the hotplug source is a polling sysfs model, not an event
+daemon. The phase timeline below is unchanged; the Rust crate covers the
+planner/backends, subprocess supervision, persistence, basic hotplug/audio, and
+opt-in command execution of Phase 1/4/5, not the full Phase 1 deliverable.
 
 ## Architecture
 

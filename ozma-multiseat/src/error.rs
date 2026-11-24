@@ -143,6 +143,54 @@ pub enum MultiseatError {
     /// compositor seat).
     #[error("unsupported operation: {0}")]
     Unsupported(String),
+
+    /// The persisted seat store could not be read.
+    #[error("failed to read seat store {path}: {message}")]
+    SeatStoreRead {
+        /// Seat store path.
+        path: String,
+        /// Underlying I/O or permission message.
+        message: String,
+    },
+
+    /// The persisted seat store is not valid JSON or has the wrong shape.
+    #[error("failed to parse seat store {path}: {message}")]
+    SeatStoreParse {
+        /// Seat store path.
+        path: String,
+        /// Parser detail.
+        message: String,
+    },
+
+    /// The persisted seat store was written by a newer version.
+    #[error("seat store {path} has version {found}, but this build supports at most version {supported}")]
+    SeatStoreVersion {
+        /// Seat store path.
+        path: String,
+        /// Version found on disk.
+        found: u32,
+        /// Highest supported version.
+        supported: u32,
+    },
+
+    /// The seat store itself is internally inconsistent (empty id, zero port,
+    /// duplicate display/port/id).
+    #[error("invalid seat store: {0}")]
+    SeatStoreInvalid(String),
+
+    /// Two persisted seats or a persisted seat and discovered topology
+    /// conflict in a way the planner cannot resolve deterministically.
+    #[error("seat store conflict: {0}")]
+    SeatStoreConflict(String),
+
+    /// Per-seat audio sink provisioning or removal failed. The caller keeps the
+    /// seat lifecycle non-fatal and reports this typed failure in status.
+    #[error("seat audio routing error: {0}")]
+    Audio(String),
+
+    /// A hotplug poll or topology reconciliation failed.
+    #[error("hotplug reconciliation error: {0}")]
+    Hotplug(String),
 }
 
 impl MultiseatError {

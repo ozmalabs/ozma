@@ -19,16 +19,17 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use ozma_multiseat::{
-    detect_drm, render_metrics, DrmDetection, EvdevGrabRouter, HostTopology, HttpHealthProbe,
-    MultiseatPlan, MultiseatPlanner, MultiseatStatus, PlannerOptions, PortProbe,
-    ProcessCommandRunner, ProcessLauncher, ProcessSeatSupervisor, ReadinessProbe, SeatProfile,
-    SeatResourceStatus, SeatState, SeatSupervisor, SupervisorOptions, SysfsInputBackend,
-    XInputRouter, XrandrDisplayBackend, XrandrOwnershipController, DEFAULT_HEALTH_PATH,
-    DEFAULT_NODE_BIN,
+    detect_drm, render_metrics, DrmDetection, EvdevGrabRouter, HostTopology, HotplugDebounce,
+    HotplugOptions, HttpHealthProbe, MultiseatPlan, MultiseatPlanner, MultiseatStatus,
+    OzmaAudioRouter, PlannerOptions, PortProbe, ProcessCommandRunner, ProcessLauncher,
+    ProcessSeatSupervisor, ReadinessProbe, SeatProfile, SeatReconciler, SeatResourceStatus,
+    SeatState, SeatStore, SeatSupervisor, SupervisorOptions, SysfsHotplugMonitor,
+    SysfsInputBackend, XInputRouter, XrandrDisplayBackend, XrandrOwnershipController,
+    DEFAULT_DEBOUNCE, DEFAULT_HEALTH_PATH, DEFAULT_NODE_BIN,
 };
 
 /// Plan and supervise one `ozma-node` per seat on this host.
@@ -43,7 +44,7 @@ use ozma_multiseat::{
                   failure or an empty output list aborts the plan. Input enumeration is \
                   read-only; a failure aborts rather than inventing devices. DRM connectors \
                   are reported for diagnostics only. No input is injected and no virtual \
-                  display or audio sink is created.\n\n\
+                  display is created; an audio sink is created only with `--audio-router`.\n\n\
                   `--print-plan` prints the plan and exits. `--dry-run` records and prints \
                   the launch plan without spawning. Without either flag the supervisor \
                   starts every seat, waits for `/health` (or a bounded port check), restarts \
@@ -51,7 +52,11 @@ use ozma_multiseat::{
                   SIGINT/SIGTERM. `--apply-ownership` and `--apply-routing` opt in to applying \
                   each seat's xrandr ownership and xinput/evdev routing before spawn; both \
                   default off, a failed apply stops that spawn, and earlier seats are released. \
-                  `--print-plan` and `--dry-run` never run routing or ownership commands."
+                  `--seats-file` loads/reuses and atomically updates persisted seat identities; \
+                  `--hotplug` reconciles read-only sysfs display/input events; and \
+                  `--audio-router` ensures/removes per-seat null sinks. `--print-plan` and \
+                  `--dry-run` never run routing, ownership, audio, or hotplug actions and never \
+                  write the seat file."
 )]
 struct Args {
     /// Node binary or path passed to every planned seat.
@@ -122,6 +127,26 @@ struct Args {
     #[arg(long)]
     seats: Option<usize>,
 
+    /// Persisted seat store. Existing seat ids/ports/audio sinks are reused and
+    /// the file is updated atomically after a successful replan. Reads/writes
+    /// are skipped by `--print-plan` and `--dry-run`.
+    #[arg(long, value_name = "PATH")]
+    seats_file: Option<PathBuf>,
+
+    /// Reconcile display/input hotplug events into seat start/stop.
+    #[arg(long)]
+    hotplug: bool,
+
+    /// Create per-seat null sinks through ozma-audio before start and remove
+    /// them after stop. Optional value: pipewire (default) or pulseaudio.
+    #[arg(
+        long,
+        value_name = "pipewire|pulseaudio",
+        num_args = 0..=1,
+        default_missing_value = "pipewire"
+    )]
+    audio_router: Option<String>,
+
     /// Explicit X display for `xrandr` (default: ambient DISPLAY).
     #[arg(long, value_name = "DISPLAY")]
     display: Option<String>,
@@ -174,7 +199,20 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
         x11_display: Some(display.clone()),
         ..PlannerOptions::default()
     });
-    let plan = topology.plan(&planner)?;
+    let (mut plan, mut store) = match args.seats_file.as_ref() {
+        Some(path) => {
+            let store = SeatStore::load(path)?;
+            let persisted = topology.plan_with_store(&planner, &store)?;
+            (persisted.plan, persisted.store)
+        }
+        None => {
+            let plan = topology.plan(&planner)?;
+            let store = SeatStore::from_plan(&plan);
+            (plan, store)
+        }
+    };
+    plan.display_backend = topology.display_backend.clone();
+    plan.input_backend = topology.input_backend.clone();
 
     if args.print_plan {
         print_plan_report(&args, &display, &topology, &drm, &plan)?;
@@ -226,6 +264,24 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
         // router wired means an explicit evdev strategy fails with the typed
         // unsupported error rather than pretending a grab happened.
         supervisor = supervisor.with_evdev_routing_controller(Box::new(EvdevGrabRouter::new()));
+    }
+    if let Some(kind) = args.audio_router.as_deref() {
+        let router: Box<dyn ozma_multiseat::SeatAudioRouter> = match kind {
+            "pipewire" => Box::new(OzmaAudioRouter::pipewire()),
+            "pulseaudio" => Box::new(OzmaAudioRouter::pulseaudio()),
+            other => {
+                return Err(ozma_multiseat::MultiseatError::Audio(format!(
+                    "unknown audio router {other:?}; expected pipewire or pulseaudio"
+                )))
+            }
+        };
+        supervisor = supervisor.with_audio_router(router);
+    }
+
+    // Persist the reconciled plan only in the real supervision path. Both
+    // `--print-plan` and `--dry-run` returned above without touching the file.
+    if let Some(path) = args.seats_file.as_ref() {
+        store.save_atomic(path)?;
     }
 
     let mut started = 0usize;
@@ -279,6 +335,32 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
         );
     }
 
+    let mut reconciler = if args.hotplug {
+        Some(
+            SeatReconciler::new(
+                planner.clone(),
+                store.clone(),
+                topology.displays.clone(),
+                topology.inputs.clone(),
+            )
+            .with_options(HotplugOptions {
+                debounce: DEFAULT_DEBOUNCE,
+                ..HotplugOptions::default()
+            })
+            .with_backend_names(
+                topology.display_backend.clone(),
+                topology.input_backend.clone(),
+            ),
+        )
+    } else {
+        None
+    };
+    // Hotplug display events use the same Xrandr surface (names, geometry, and
+    // X screen) as the initial plan, rather than the DRM-only model.
+    let mut hotplug_monitor = SysfsHotplugMonitor::new()
+        .with_display_backend(Box::new(XrandrDisplayBackend::new(display.clone())));
+    let mut hotplug_debounce = HotplugDebounce::new(DEFAULT_DEBOUNCE);
+
     let poll = Duration::from_millis(args.poll_interval_ms);
     let shutdown = wait_for_shutdown();
     tokio::pin!(shutdown);
@@ -291,6 +373,44 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
             }
             _ = tokio::time::sleep(poll) => {
                 supervisor.tick();
+                if let Some(reconciler) = reconciler.as_mut() {
+                    match reconciler.poll_and_reconcile(
+                        &mut hotplug_monitor,
+                        &mut hotplug_debounce,
+                        Instant::now(),
+                        &mut supervisor,
+                    ) {
+                        Ok(report) => {
+                            if let Some(updated) = report.plan {
+                                plan = updated;
+                            }
+                            for diagnostic in &report.diagnostics {
+                                eprintln!(
+                                    "hotplug diagnostic {:?}{}: {}",
+                                    diagnostic.code,
+                                    diagnostic
+                                        .seat_id
+                                        .as_deref()
+                                        .map(|seat| format!(" [{seat}]"))
+                                        .unwrap_or_default(),
+                                    diagnostic.message
+                                );
+                            }
+                            if let Some(path) = args.seats_file.as_ref() {
+                                if report.store != store {
+                                    match report.store.save_atomic(path) {
+                                        Ok(()) => store = report.store,
+                                        Err(error) => eprintln!(
+                                            "persisting seat store {} failed: {error}",
+                                            path.display()
+                                        ),
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => eprintln!("hotplug poll failed: {error}"),
+                    }
+                }
                 let status = MultiseatStatus::from_plan_with_runtime(&plan, &supervisor.status());
                 let changed = {
                     let previous = snapshot.read().expect("status snapshot lock");
@@ -349,6 +469,13 @@ fn validate(args: &Args) -> Result<(), ozma_multiseat::MultiseatError> {
             "unknown readiness probe {:?}; expected health or port",
             args.readiness
         )));
+    }
+    if let Some(kind) = args.audio_router.as_deref() {
+        if !matches!(kind, "pipewire" | "pulseaudio") {
+            return Err(ozma_multiseat::MultiseatError::Audio(format!(
+                "unknown audio router {kind:?}; expected pipewire or pulseaudio"
+            )));
+        }
     }
     Ok(())
 }
@@ -572,9 +699,10 @@ fn resource_state(applied: bool, released: bool) -> &'static str {
 
 fn resource_summary(resources: &SeatResourceStatus) -> String {
     let mut summary = format!(
-        " resources(ownership={} routing={})",
+        " resources(ownership={} routing={} audio={})",
         resource_state(resources.ownership_applied, resources.ownership_released),
         resource_state(resources.routing_applied, resources.routing_released),
+        resource_state(resources.audio_applied, resources.audio_released),
     );
     for error in &resources.errors {
         summary.push_str(&format!(

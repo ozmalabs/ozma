@@ -315,6 +315,51 @@ pub enum UsbError {
         instance: String,
     },
 
+    /// A UAC2 direction has no isochronous endpoint or no audio path.
+    #[error("UAC2 bridge for {instance:?} has no {path} path")]
+    Uac2MissingPath {
+        /// Function instance.
+        instance: String,
+        /// `playback`, `capture`, or `endpoint`.
+        path: &'static str,
+    },
+
+    /// A UAC2 PCM format or buffer does not match the configured format.
+    #[error("UAC2 format error: {reason}")]
+    Uac2Format {
+        /// Why the format or sample buffer was rejected.
+        reason: String,
+    },
+
+    /// A UAC2 isochronous endpoint operation failed or is invalid.
+    #[error("UAC2 endpoint 0x{address:02x} {operation} failed: {reason}")]
+    Uac2Endpoint {
+        /// Endpoint address.
+        address: u8,
+        /// Operation that failed (`open`, `read`, `write`, `flush`, ...).
+        operation: &'static str,
+        /// Human-readable reason.
+        reason: String,
+    },
+
+    /// A bounded UAC2 buffer would be exceeded.
+    #[error("UAC2 {buffer} overflow: limit {limit} bytes, requested {requested}")]
+    Uac2Overflow {
+        /// Buffer purpose (`ring`, `endpoint read`, ...).
+        buffer: &'static str,
+        /// Maximum permitted bytes.
+        limit: usize,
+        /// Requested bytes.
+        requested: usize,
+    },
+
+    /// A UAC2 bridge operation requires a started bridge.
+    #[error("UAC2 bridge for {instance:?} is not running")]
+    Uac2NotRunning {
+        /// Function instance.
+        instance: String,
+    },
+
     /// The operation is not available on this platform.
     #[error("operation is not supported on this platform")]
     UnsupportedPlatform,
@@ -361,6 +406,11 @@ impl UsbError {
             Self::FunctionFsEp0Io { .. } => "functionfs-ep0-io",
             Self::FunctionFsEndpointIo { .. } => "functionfs-endpoint-io",
             Self::UnsupportedUac2Bridge { .. } => "unsupported-uac2-bridge",
+            Self::Uac2MissingPath { .. } => "uac2-missing-path",
+            Self::Uac2Format { .. } => "uac2-format",
+            Self::Uac2Endpoint { .. } => "uac2-endpoint",
+            Self::Uac2Overflow { .. } => "uac2-overflow",
+            Self::Uac2NotRunning { .. } => "uac2-not-running",
             Self::UnsupportedPlatform => "unsupported-platform",
         }
     }

@@ -1708,6 +1708,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             "display_outputs": connection.get("display_outputs") or [],
             "display_capture": connection.get("display_capture") or {},
             "multi_console_hls": connection.get("multi_console_hls"),
+            "multi_console_webrtc": connection.get("multi_console_webrtc"),
         }
 
     @app.get("/api/v1/nodes/{node_id}/display/info")
@@ -3735,19 +3736,39 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         raise HTTPException(status_code=503, detail="HLS not available")
 
     @app.post("/api/v1/streams/{node_id:path}/webrtc")
-    async def stream_webrtc(node_id: str, body: dict) -> Response:
-        """WebRTC signaling — proxy to soft node's aiortc endpoint."""
-        return await _proxy_to_node_raw(node_id, "/webrtc/offer", body)
+    async def stream_webrtc(
+        node_id: str, body: dict, console: str | None = None
+    ) -> Response:
+        """WebRTC signaling — proxy to the node's helper endpoint.
+
+        ``console`` (query) or a ``console``/``id`` body field selects one
+        per-console helper when the node runs ``--multi-console-webrtc``. With
+        no selector the node keeps the historical active-console behavior.
+        """
+        path = "/webrtc/offer"
+        if console not in (None, ""):
+            from urllib.parse import quote
+
+            path += "?console=" + quote(str(console), safe="")
+        return await _proxy_to_node_raw(node_id, path, body)
 
     @app.post("/api/v1/streams/{node_id:path}/webrtc/candidate")
-    async def stream_webrtc_candidate(node_id: str, body: dict) -> Response:
+    async def stream_webrtc_candidate(
+        node_id: str, body: dict, console: str | None = None
+    ) -> Response:
         """Forward one late/trickled remote ICE candidate to the node.
 
         The browser includes the `session` id returned by the offer response;
         older nodes answer a typed error and the browser keeps its candidates
-        embedded in the original offer.
+        embedded in the original offer. A per-console node routes by the
+        session id, or by an explicit ``console``/``id``.
         """
-        return await _proxy_to_node_raw(node_id, "/webrtc/candidate", body)
+        path = "/webrtc/candidate"
+        if console not in (None, ""):
+            from urllib.parse import quote
+
+            path += "?console=" + quote(str(console), safe="")
+        return await _proxy_to_node_raw(node_id, path, body)
 
     async def _proxy_to_node_raw(node_id: str, path: str, body: dict) -> Response:
         node = state.nodes.get(node_id)

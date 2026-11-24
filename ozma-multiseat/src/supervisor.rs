@@ -22,6 +22,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::audio::{SeatAudioRouter, SeatAudioSpec};
 use crate::error::MultiseatError;
 use crate::input::InputGroup;
 use crate::ownership::{DisplayOwnership, DisplayOwnershipController};
@@ -387,6 +388,7 @@ pub fn restart_delay(initial: Duration, max: Duration, attempt: u32) -> Duration
 
 struct ManagedSeat {
     launch: NodeLaunchSpec,
+    audio_spec: SeatAudioSpec,
     ownership: Option<DisplayOwnership>,
     input: Option<InputGroup>,
     input_route: Option<InputRoutePlan>,
@@ -409,6 +411,7 @@ impl ManagedSeat {
     fn new(plan: &SeatPlan) -> Self {
         Self {
             launch: NodeLaunchSpec::from_plan(plan),
+            audio_spec: seat_audio_spec(plan),
             ownership: plan.ownership.clone(),
             input: plan.input.clone(),
             input_route: plan.input_route.clone(),
@@ -459,6 +462,7 @@ pub struct ProcessSeatSupervisor {
     ownership: Option<Box<dyn DisplayOwnershipController>>,
     routing: Option<Box<dyn InputRouter>>,
     evdev_routing: Option<Box<dyn InputRouter>>,
+    audio: Option<Box<dyn SeatAudioRouter>>,
     seats: BTreeMap<String, ManagedSeat>,
 }
 
@@ -485,6 +489,7 @@ impl ProcessSeatSupervisor {
             ownership: None,
             routing: None,
             evdev_routing: None,
+            audio: None,
             seats: BTreeMap::new(),
         }
     }
@@ -522,6 +527,18 @@ impl ProcessSeatSupervisor {
         self
     }
 
+    /// Install the per-seat audio sink router used by `--audio-router`.
+    ///
+    /// With a router installed, start ensures the seat's null sink (and its
+    /// `<sink>.monitor` target) before spawning, and stop/remove/shutdown
+    /// removes it after the child exits. An ensure/remove failure is recorded
+    /// as a typed [`ResourceKind::Audio`] error in status and does not abort the
+    /// seat lifecycle. Without a router no audio command is ever run.
+    pub fn with_audio_router(mut self, router: Box<dyn SeatAudioRouter>) -> Self {
+        self.audio = Some(router);
+        self
+    }
+
     /// Configuration in use.
     pub fn options(&self) -> &SupervisorOptions {
         &self.options
@@ -546,7 +563,44 @@ impl ProcessSeatSupervisor {
                 return Err(error);
             }
         }
+        self.ensure_seat_audio(seat_id);
         Ok(())
+    }
+
+    /// Ensure the seat's audio sink when a router is installed.
+    ///
+    /// Audio is intentionally non-fatal: a missing `pactl` or audio server is
+    /// recorded as a typed `Audio` apply error and the seat still starts. No
+    /// sink is reported as created unless the router returned success.
+    fn ensure_seat_audio(&mut self, seat_id: &str) {
+        let Some(spec) = self.seats.get(seat_id).map(|seat| seat.audio_spec.clone()) else {
+            return;
+        };
+        if self
+            .seats
+            .get(seat_id)
+            .is_some_and(|seat| seat.resources.audio_applied)
+        {
+            return;
+        }
+        let result = match self.audio.as_ref() {
+            Some(router) => router.ensure_sink(&spec),
+            None => return,
+        };
+        match result {
+            Ok(_) => {
+                if let Some(seat) = self.seats.get_mut(seat_id) {
+                    seat.resources.audio_applied = true;
+                    seat.resources.audio_released = false;
+                }
+            }
+            Err(error) => self.record_resource_error(
+                seat_id,
+                ResourceKind::Audio,
+                ResourceAction::Apply,
+                &error.to_string(),
+            ),
+        }
     }
 
     fn apply_ownership(&mut self, seat_id: &str) -> Result<(), MultiseatError> {
@@ -672,15 +726,17 @@ impl ProcessSeatSupervisor {
     /// release failure leaves the applied flag set, records a typed error, and
     /// does not hide the seat's lifecycle state.
     fn release_seat_resources(&mut self, seat_id: &str) {
-        let Some((routing_applied, ownership_applied, strategy)) =
+        let Some((routing_applied, ownership_applied, audio_applied, strategy, audio_sink)) =
             self.seats.get(seat_id).map(|seat| {
                 (
                     seat.resources.routing_applied,
                     seat.resources.ownership_applied,
+                    seat.resources.audio_applied,
                     seat.input_route
                         .as_ref()
                         .map(|route| route.strategy)
                         .unwrap_or(InputRoutingStrategy::XInputMapToOutput),
+                    seat.audio_spec.name.clone(),
                 )
             })
         else {
@@ -740,6 +796,29 @@ impl ProcessSeatSupervisor {
                 ),
             }
         }
+
+        if audio_applied {
+            let result = match self.audio.as_ref() {
+                Some(router) => router.remove_sink(&audio_sink),
+                None => Err(MultiseatError::Unsupported(format!(
+                    "seat {seat_id} has an applied audio sink but no audio router is configured"
+                ))),
+            };
+            match result {
+                Ok(()) => {
+                    if let Some(seat) = self.seats.get_mut(seat_id) {
+                        seat.resources.audio_applied = false;
+                        seat.resources.audio_released = true;
+                    }
+                }
+                Err(error) => self.record_resource_error(
+                    seat_id,
+                    ResourceKind::Audio,
+                    ResourceAction::Release,
+                    &error.to_string(),
+                ),
+            }
+        }
     }
 
     /// Release every applied resource in reverse seat order.
@@ -751,7 +830,11 @@ impl ProcessSeatSupervisor {
         let mut seat_ids: Vec<String> = self
             .seats
             .iter()
-            .filter(|(_, seat)| seat.resources.ownership_applied || seat.resources.routing_applied)
+            .filter(|(_, seat)| {
+                seat.resources.ownership_applied
+                    || seat.resources.routing_applied
+                    || seat.resources.audio_applied
+            })
             .map(|(seat_id, _)| seat_id.clone())
             .collect();
         seat_ids.reverse();
@@ -873,7 +956,10 @@ impl ProcessSeatSupervisor {
     /// the only handle to still-applied ownership/routing.
     pub fn remove(&mut self, seat_id: &str) -> Result<SeatRuntimeStatus, MultiseatError> {
         let status = self.stop(seat_id)?;
-        if status.resources.ownership_applied || status.resources.routing_applied {
+        if status.resources.ownership_applied
+            || status.resources.routing_applied
+            || status.resources.audio_applied
+        {
             return Ok(status);
         }
         self.seats.remove(seat_id);
@@ -1043,6 +1129,7 @@ impl ProcessSeatSupervisor {
                 .entry(seat_id.clone())
                 .or_insert_with(|| ManagedSeat::new(plan));
             seat.launch = spec;
+            seat.audio_spec = seat_audio_spec(plan);
             seat.ownership = plan.ownership.clone();
             seat.input = plan.input.clone();
             seat.input_route = plan.input_route.clone();
@@ -1095,6 +1182,10 @@ impl ProcessSeatSupervisor {
                 return Err(error);
             }
         }
+
+        // The audio sink is optional and non-fatal: a typed ensure failure is
+        // recorded in status but never prevents the node from starting.
+        self.ensure_seat_audio(&seat_id);
 
         // A start attempt owns the spawn/readiness sequence. On failure the
         // seat is retained in `failed` state with a scheduled restart so a
@@ -1182,6 +1273,14 @@ impl SeatSupervisor for ProcessSeatSupervisor {
         let now = Instant::now();
         self.seats.values().map(|seat| seat.status(now)).collect()
     }
+}
+
+fn seat_audio_spec(plan: &SeatPlan) -> SeatAudioSpec {
+    SeatAudioSpec::for_seat(
+        &plan.config.id,
+        plan.config.audio_sink.clone(),
+        plan.config.profile.defaults().audio_channels,
+    )
 }
 
 fn schedule_restart(options: &SupervisorOptions, seat: &mut ManagedSeat, now: Instant) {

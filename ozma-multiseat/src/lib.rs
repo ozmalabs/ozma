@@ -27,31 +27,46 @@
 //! * [`supervisor`] starts, health-checks, restarts, stops, and reports real
 //!   `ozma-node --profile desktop` children. [`fake`] contains the test-only
 //!   launcher, readiness probe, backends, command runner, and grab fake.
+//! * [`persistence`] is a versioned, atomically written seat store. It keeps
+//!   explicit ids/displays/hubs/ports/audio sinks stable across replans and
+//!   retains missing displays without resurrecting them.
+//! * [`hotplug`] debounces display/input-hub events and reconciles plan and
+//!   supervisor start/stop, with a fake and a read-only sysfs model.
+//! * [`audio`] is the synchronous per-seat null-sink seam over
+//!   [`ozma_audio::AudioRouter`]; it is only invoked when a router is installed.
 //!
 //! The crate performs no input injection, opens no evdev node, creates no
-//! virtual display, and allocates no PipeWire sink. Routing and ownership
-//! commands are only executed through an explicitly injected runner; the
-//! default evdev grab backend returns a typed unsupported error. It contains no
-//! `unsafe` code (the Unix SIGTERM helper is the safe `nix` API).
+//! virtual display, and allocates no PipeWire sink by default. Routing,
+//! ownership, and audio commands are only executed through explicitly injected
+//! runners/controllers; the default evdev grab backend returns a typed
+//! unsupported error. It contains no `unsafe` code (the Unix SIGTERM helper is
+//! the safe `nix` API).
 //!
 //! Test fakes in [`fake`] never touch the host. Production code must not select
 //! them from detection.
 
 #![forbid(unsafe_code)]
 
+pub mod audio;
 pub mod display;
 pub mod drm;
 pub mod error;
 pub mod fake;
 pub mod host;
+pub mod hotplug;
 pub mod input;
 pub mod ownership;
+pub mod persistence;
 pub mod planner;
 pub mod routing;
 pub mod seat;
 pub mod status;
 pub mod supervisor;
 
+pub use audio::{
+    OzmaAudioRouter, SeatAudioRouter, SeatAudioSpec, SeatAudioState, SEAT_AUDIO_CHANNELS,
+    SEAT_AUDIO_DESCRIPTION_PREFIX, SEAT_AUDIO_RATE,
+};
 pub use display::{
     parse_listactivemonitors, BackendDetection, DisplayBackend, DisplayOutput, XrandrDisplayBackend,
 };
@@ -62,10 +77,14 @@ pub use drm::{
 pub use error::MultiseatError;
 pub use fake::{
     FakeCommandRunner, FakeDeviceNameResolver, FakeDisplayBackend, FakeEvdevGrabBackend,
-    FakeGrabAction, FakeGrabEvent, FakeInputBackend, FakeNodeLauncher, FakeReadinessProbe,
-    FakeSeatSupervisor,
+    FakeGrabAction, FakeGrabEvent, FakeHotplugMonitor, FakeInputBackend, FakeNodeLauncher,
+    FakeReadinessProbe, FakeSeatAudioRouter, FakeSeatSupervisor,
 };
 pub use host::HostTopology;
+pub use hotplug::{
+    HotplugDebounce, HotplugEvent, HotplugMonitor, HotplugOptions, ReconcileReport, SeatReconciler,
+    SysfsHotplugMonitor, DEFAULT_DEBOUNCE,
+};
 pub use input::{
     classify_capabilities, group_inputs, usb_hub_path_from_sysfs, InputBackend, InputDevice,
     InputDeviceKind, InputGroup, SysfsInputBackend, DEFAULT_INPUT_DEV_ROOT,
@@ -76,7 +95,13 @@ pub use ownership::{
     XrandrOwnershipController, OZMA_DISPLAY_OWNERSHIP_ENV, OZMA_X11_MODE_ENV, OZMA_X11_OUTPUT_ENV,
     SINGLE_X_SERVER_LIMITATION, XRANDR_PROGRAM,
 };
-pub use planner::{allocate_ports, CapturePreference, MultiseatPlanner, PlannerOptions};
+pub use persistence::{
+    default_seat_store_path, PersistedDisplay, PersistedSeat, SeatStore, DEFAULT_SEAT_STORE_NAME,
+    SEAT_STORE_VERSION,
+};
+pub use planner::{
+    allocate_ports, CapturePreference, MultiseatPlanner, PersistedPlan, PlannerOptions,
+};
 pub use routing::{
     assign_seats, parse_xinput_list, route_environment, CommandOutput, CommandRunner,
     DeviceNameResolver, EvdevGrabBackend, EvdevGrabCommand, EvdevGrabRequest, EvdevGrabRouter,
