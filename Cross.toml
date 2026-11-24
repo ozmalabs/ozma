@@ -15,7 +15,7 @@ image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:edge"
 pre-build = [
     "dpkg --add-architecture $CROSS_DEB_ARCH",
     "apt-get update",
-    "apt-get install -y pkg-config libpipewire-0.3-dev:$CROSS_DEB_ARCH libspa-0.2-dev:$CROSS_DEB_ARCH libasound2-dev:$CROSS_DEB_ARCH libudev-dev:$CROSS_DEB_ARCH",
+    "apt-get install -y pkg-config libpipewire-0.3-dev:$CROSS_DEB_ARCH libspa-0.2-dev:$CROSS_DEB_ARCH libasound2-dev:$CROSS_DEB_ARCH libudev-dev:$CROSS_DEB_ARCH libpam0g-dev:$CROSS_DEB_ARCH",
 ]
 # Mount the host Cargo registry cache so crates aren't re-downloaded each run.
 volumes = ["$CARGO_HOME/registry:/root/.cargo/registry"]

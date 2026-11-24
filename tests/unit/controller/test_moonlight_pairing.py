@@ -82,29 +82,19 @@ class TestMoonlightPairingServer(AioHTTPTestCase):
 
     async def test_serverinfo_endpoint_unpaired(self):
         """Test /serverinfo endpoint when no clients are paired."""
+        import json
+
         server = MoonlightPairingServer(self.data_dir)
-        
-        # Mock the app runner to avoid actually starting the server
-        with patch.object(server, '_runner'), patch.object(server, '_site'):
-            await server.start()
-            
-            try:
-                info = {
-                    "hostname": "Ozma Moonlight Server",
-                    "uuid": server._server_id,
-                    "state": "UNPAIRED",
-                    "httpsPort": 47984,
-                    "httpPort": 0,
-                }
-                
-                # Since we can't easily test the actual HTTP endpoint without
-                # starting a real server, we'll test the logic directly
-                with patch('controller.gaming.moonlight_pairing.web') as mock_web:
-                    mock_request = Mock()
-                    response = await server._handle_serverinfo(mock_request)
-                    # We can't easily assert on the response without more mocking
-            finally:
-                await server.stop()
+
+        # Exercise the handler directly; starting the real listener would bind
+        # the fixed Moonlight port and can race with other tests or a running
+        # controller.
+        response = await server._handle_serverinfo(Mock())
+        assert response.status == 200
+        body = json.loads(response.body)
+        assert body["state"] == "UNPAIRED"
+        assert body["uuid"] == server._server_id
+        assert body["httpsPort"] == 47984
 
     async def test_applist_endpoint(self):
         """Test /applist endpoint returns empty list."""
