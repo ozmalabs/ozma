@@ -35,13 +35,22 @@ No product code was changed.
 The two blockers below were fixed after this run; the rest of this document keeps
 the original pre-fix evidence. See
 [`phase4-node-live-fixes-report.md`](phase4-node-live-fixes-report.md) for the
-implementation and full commands.
+first implementation and full commands, and
+[`phase4-v4l2-media-report.md`](phase4-v4l2-media-report.md) for the snapshot,
+`/video`, and compressed-HLS follow-up.
 
 * **HLS from V4L2: fixed.** The capture→HLS bridge now converts MJPEG, YUYV, and
   NV12 to packed RGB24 (and keeps RGB24/BGRA/P010 behavior). A second live run
   with dedicated `v4l2loopback` devices produced `hls:"running"` and a real
   H.264 640x480 10 fps segment for all three producer formats (10 decoded frames
-  in the probed segment). H.264/HEVC/AV1 pass-through is still a typed refusal.
+  in the probed segment).
+* **Compressed HLS pass-through: fixed.** When the capture source already emits
+  H.264/HEVC/AV1 and the selected encoder targets the same codec family, the
+  feeder writes the access units to a compressed ffmpeg input and ffmpeg only
+  muxes them (`-c:v copy`). A mismatched encoder decodes and re-encodes through
+  the same input instead of refusing the source. AV1 copy uses fragmented-MP4
+  HLS segments because mpegts carries AV1 as opaque private data. There is no
+  fake segment: if ffmpeg cannot produce a playlist, status stays failed.
 * **`--capture-device` selection: fixed.** The configured device path/id/name is
   used by snapshots, `/video`, HLS, WebRTC, the per-console managers, and the
   console broker. A missing device returns typed `capture.unavailable` and never
@@ -50,10 +59,12 @@ implementation and full commands.
   (`ozma-capture-test`) was requested, `connection.capture`, `/display/info`,
   snapshots, `/video`, and HLS all used `/dev/video42`; `/dev/video99` failed
   with `"refusing to fall back"` and wrote no playlist.
-* Snapshot and `/video` for YUYV/NV12 still return the existing typed
-  `503 display.unsupported_format`; only the HLS feeder was extended in this
-  fix. The live source selection, missing-device, and HLS results are unchanged
-  by that remaining gap.
+* **Snapshot and `/video` for YUYV/NV12: fixed.** The JPEG path now converts
+  YUYV and NV12 to RGB24 through `ozma_encode::to_rgb24` before encoding, and
+  MJPEG is still passed through as a real JPEG. Truly unsupported compressed
+  layouts (for example a capture source that exposes raw H.264 to the snapshot
+  route) keep the typed `503 display.unsupported_format`. See the media report
+  for the live loopback evidence.
 
 ## PASS / FAIL matrix
 

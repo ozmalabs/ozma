@@ -1947,6 +1947,8 @@ pub struct FakeDrmLeaseCard {
     pub connector_ids: BTreeMap<String, u32>,
     /// CRTC object ids.
     pub crtc_ids: Vec<u32>,
+    /// Plane object id to the CRTC ids it can drive.
+    pub planes: BTreeMap<u32, Vec<u32>>,
 }
 
 /// One in-memory lease record.
@@ -1962,6 +1964,8 @@ pub struct FakeLeaseRecord {
     pub connector_id: u32,
     /// CRTC object id.
     pub crtc_id: u32,
+    /// Explicitly requested plane object id.
+    pub plane_id: Option<u32>,
 }
 
 /// Injected one-shot lease failure.
@@ -2076,7 +2080,22 @@ impl FakeDrmLeaseBackend {
             },
             connector_ids,
             crtc_ids: crtc_ids.to_vec(),
+            planes: BTreeMap::new(),
         });
+        drop(state);
+        self
+    }
+
+    /// Add a plane object that can drive the given CRTC ids.
+    pub fn add_plane(&mut self, card_name: &str, plane_id: u32, crtc_ids: &[u32]) -> &mut Self {
+        let mut state = self.state.lock().expect("fake drm lease lock");
+        if let Some(card) = state
+            .cards
+            .iter_mut()
+            .find(|card| card.card.name == card_name)
+        {
+            card.planes.insert(plane_id, crtc_ids.to_vec());
+        }
         drop(state);
         self
     }
@@ -2213,7 +2232,9 @@ impl crate::drm_lease::DrmLeaseBackend for FakeDrmLeaseBackend {
         &self,
         request: &crate::drm_lease::DrmLeaseRequest,
     ) -> Result<Box<dyn crate::drm_lease::DrmLeaseHandle>, crate::drm_lease::DrmLeaseError> {
-        use crate::drm_lease::{DrmCardSelector, DrmCrtcSelector, DrmLeaseError, DrmObjectKind};
+        use crate::drm_lease::{
+            DrmCardSelector, DrmCrtcSelector, DrmLeaseError, DrmObjectKind, DrmPlaneSelector,
+        };
         let mut state = self.state.lock().expect("fake drm lease lock");
         state.requests.push(request.clone());
         if let Some(failure) = state.failure.take() {
@@ -2282,9 +2303,37 @@ impl crate::drm_lease::DrmLeaseBackend for FakeDrmLeaseBackend {
                     })?
             }
         };
+        let plane_id = match request.plane {
+            DrmPlaneSelector::Auto => None,
+            DrmPlaneSelector::Id(id) => {
+                let Some(crtcs) = card.planes.get(&id) else {
+                    return Err(DrmLeaseError::UnknownObject {
+                        card: card.card.path.display().to_string(),
+                        kind: DrmObjectKind::Plane,
+                        id,
+                    });
+                };
+                if !crtcs.contains(&crtc_id) {
+                    return Err(DrmLeaseError::IncompatiblePlane {
+                        card: card.card.path.display().to_string(),
+                        plane: id,
+                        crtc: crtc_id,
+                    });
+                }
+                Some(id)
+            }
+        };
+        let plane_ids: Vec<u32> = card
+            .planes
+            .iter()
+            .filter(|(_, crtcs)| crtcs.contains(&crtc_id))
+            .map(|(id, _)| *id)
+            .collect();
         if state.leases.values().any(|lease| {
             lease.card == card.card.path
-                && (lease.connector_id == connector_id || lease.crtc_id == crtc_id)
+                && (lease.connector_id == connector_id
+                    || lease.crtc_id == crtc_id
+                    || plane_id.is_some_and(|id| lease.plane_id == Some(id)))
         }) {
             return Err(DrmLeaseError::AlreadyLeased {
                 card: card.card.path.display().to_string(),
@@ -2305,12 +2354,13 @@ impl crate::drm_lease::DrmLeaseBackend for FakeDrmLeaseBackend {
             connector: request.connector.clone(),
             connector_id,
             crtc_id,
+            plane_id,
         };
         state.leases.insert(lessee_id, record.clone());
         drop(state);
         Ok(Box::new(FakeDrmLeaseHandle {
             record,
-            plane_ids: Vec::new(),
+            plane_ids,
             fd,
             active: true,
             state: Arc::clone(&self.state),
@@ -2359,6 +2409,10 @@ impl crate::drm_lease::DrmLeaseHandle for FakeDrmLeaseHandle {
 
     fn crtc_id(&self) -> u32 {
         self.record.crtc_id
+    }
+
+    fn plane_id(&self) -> Option<u32> {
+        self.record.plane_id
     }
 
     fn plane_ids(&self) -> &[u32] {
@@ -2456,6 +2510,8 @@ pub struct FakeDrmScanoutCard {
     pub crtc_id: u32,
     /// Advertised mode names.
     pub modes: Vec<String>,
+    /// Plane object ids that can drive this card's CRTC.
+    pub plane_ids: Vec<u32>,
 }
 
 /// Injected one-shot scanout failure.
@@ -2481,6 +2537,14 @@ pub enum FakeDrmScanoutFailure {
     VerificationFailure,
     /// Page flip is rejected after a successful commit.
     PageFlipUnavailable,
+    /// Atomic KMS is unsupported; the proof falls back to legacy.
+    AtomicUnsupported,
+    /// No compatible plane is available for the selected CRTC.
+    UnsupportedPlane,
+    /// The selected plane does not support XRGB8888.
+    InvalidFormat,
+    /// A required atomic property is missing.
+    MissingAtomicProperty,
 }
 
 #[derive(Debug, Default)]
@@ -2578,10 +2642,21 @@ impl FakeDrmScanoutBackend {
             connector_id,
             crtc_id,
             modes: modes.iter().map(|mode| (*mode).to_owned()).collect(),
+            plane_ids: vec![crtc_id.saturating_add(100)],
         };
         let mut state = self.state.lock().expect("fake scanout lock");
         state.cards.retain(|existing| existing.name != name);
         state.cards.push(card);
+        drop(state);
+        self
+    }
+
+    /// Add another plane id to a fake scanout card.
+    pub fn add_plane(&mut self, name: &str, plane_id: u32) -> &mut Self {
+        let mut state = self.state.lock().expect("fake scanout lock");
+        if let Some(card) = state.cards.iter_mut().find(|card| card.name == name) {
+            card.plane_ids.push(plane_id);
+        }
         drop(state);
         self
     }
@@ -2616,7 +2691,8 @@ impl crate::drm_scanout::DrmScanoutBackend for FakeDrmScanoutBackend {
     {
         use crate::drm_lease::DrmCardSelector;
         use crate::drm_scanout::{
-            DrmScanoutError, DrmScanoutNote, DrmScanoutNoteKind, DrmScanoutStatus, SCANOUT_PATTERN,
+            DrmScanoutCommit, DrmScanoutError, DrmScanoutNote, DrmScanoutNoteKind,
+            DrmScanoutStatus, SCANOUT_PATTERN,
         };
         let mut state = self.state.lock().expect("fake scanout lock");
         state.events.push(format!(
@@ -2626,6 +2702,7 @@ impl crate::drm_scanout::DrmScanoutBackend for FakeDrmScanoutBackend {
         ));
         let failure = state.failure.take();
         let mut page_flip_unavailable = false;
+        let mut atomic_unsupported = false;
         if let Some(failure) = failure {
             let card = request.lease.card.display_name();
             match failure {
@@ -2633,6 +2710,32 @@ impl crate::drm_scanout::DrmScanoutBackend for FakeDrmScanoutBackend {
                     // Keep the commit: the real backend records this as a
                     // non-fatal note rather than a start failure.
                     page_flip_unavailable = true;
+                }
+                FakeDrmScanoutFailure::AtomicUnsupported => {
+                    atomic_unsupported = true;
+                }
+                FakeDrmScanoutFailure::UnsupportedPlane => {
+                    return Err(DrmScanoutError::UnsupportedPlane {
+                        card,
+                        crtc: 201,
+                        reason: "injected missing plane".to_owned(),
+                    })
+                }
+                FakeDrmScanoutFailure::InvalidFormat => {
+                    return Err(DrmScanoutError::InvalidFormat {
+                        card,
+                        plane: 301,
+                        format: "XR24".to_owned(),
+                        reason: "injected format mismatch".to_owned(),
+                    })
+                }
+                FakeDrmScanoutFailure::MissingAtomicProperty => {
+                    return Err(DrmScanoutError::MissingAtomicProperty {
+                        card,
+                        object: "plane".to_owned(),
+                        id: 301,
+                        property: "FB_ID".to_owned(),
+                    })
                 }
                 FakeDrmScanoutFailure::NoDrm => {
                     return Err(DrmScanoutError::NoDrm {
@@ -2758,6 +2861,35 @@ impl crate::drm_scanout::DrmScanoutBackend for FakeDrmScanoutBackend {
         let mut bytes = vec![0u8; (pitch * height) as usize];
         let checksum = crate::drm_scanout::fill_pattern(&mut bytes, width, height, pitch);
 
+        let requested_plane = request.lease.plane_id();
+        if let Some(id) = requested_plane {
+            if !card.plane_ids.contains(&id) {
+                return Err(DrmScanoutError::UnsupportedPlane {
+                    card: card.path.display().to_string(),
+                    crtc: card.crtc_id,
+                    reason: format!("requested plane {id} is not leaseable on this card"),
+                });
+            }
+        }
+        let commit = if request.force_legacy || atomic_unsupported {
+            DrmScanoutCommit::Legacy
+        } else {
+            DrmScanoutCommit::Atomic
+        };
+        let plane_id = if commit == DrmScanoutCommit::Atomic {
+            Some(
+                requested_plane
+                    .or_else(|| card.plane_ids.first().copied())
+                    .ok_or_else(|| DrmScanoutError::UnsupportedPlane {
+                        card: card.path.display().to_string(),
+                        crtc: card.crtc_id,
+                        reason: "the fake card exposes no plane".to_owned(),
+                    })?,
+            )
+        } else {
+            requested_plane
+        };
+
         state.next_lessee = state.next_lessee.saturating_add(1);
         state.next_framebuffer = state.next_framebuffer.saturating_add(1);
         state.next_buffer = state.next_buffer.saturating_add(1);
@@ -2770,12 +2902,48 @@ impl crate::drm_scanout::DrmScanoutBackend for FakeDrmScanoutBackend {
             .push(format!("buffer {buffer_handle} {width}x{height}"));
         state.events.push(format!("fill {checksum}"));
         state.events.push(format!("framebuffer {framebuffer_id}"));
-        state
-            .events
-            .push(format!("set_crtc {} {framebuffer_id} {mode}", card.crtc_id));
-        state
-            .events
-            .push(format!("page_flip {} {framebuffer_id}", card.crtc_id));
+        match commit {
+            DrmScanoutCommit::Atomic => {
+                let plane = plane_id.unwrap_or(0);
+                state.events.push(format!(
+                    "atomic_property connector CRTC_ID {}",
+                    card.crtc_id
+                ));
+                state
+                    .events
+                    .push("atomic_property crtc ACTIVE 1".to_owned());
+                state.events.push(format!(
+                    "atomic_property crtc MODE_ID {}",
+                    framebuffer_id + 1000
+                ));
+                state
+                    .events
+                    .push(format!("atomic_property plane FB_ID {framebuffer_id}"));
+                state
+                    .events
+                    .push(format!("atomic_property plane CRTC_ID {}", card.crtc_id));
+                state.events.push(format!(
+                    "atomic_property plane SRC_W {}",
+                    u64::from(width) << 16
+                ));
+                state.events.push(format!(
+                    "atomic_commit {} {plane} {framebuffer_id} {mode}",
+                    card.crtc_id
+                ));
+                state.events.push(format!(
+                    "atomic_page_flip {} {framebuffer_id}",
+                    card.crtc_id
+                ));
+            }
+            DrmScanoutCommit::Legacy => {
+                state
+                    .events
+                    .push(format!("set_crtc {} {framebuffer_id} {mode}", card.crtc_id));
+                state
+                    .events
+                    .push(format!("page_flip {} {framebuffer_id}", card.crtc_id));
+            }
+        }
         state.active = true;
 
         let mut status = DrmScanoutStatus {
@@ -2783,6 +2951,8 @@ impl crate::drm_scanout::DrmScanoutBackend for FakeDrmScanoutBackend {
             connector: card.connector.clone(),
             connector_id: Some(card.connector_id),
             crtc_id: Some(card.crtc_id),
+            plane_id,
+            commit,
             lessee_id: Some(lessee_id),
             lessee_fd: Some(30 + i32::try_from(lessee_id).unwrap_or(0)),
             mode,
@@ -2805,6 +2975,26 @@ impl crate::drm_scanout::DrmScanoutBackend for FakeDrmScanoutBackend {
             DrmScanoutNoteKind::LesseeFd,
             format!("fake scanout uses lessee fd {}", 30 + lessee_id),
         ));
+        if let Some(plane_id) = plane_id {
+            status.push_note(DrmScanoutNote::new(
+                DrmScanoutNoteKind::PlaneLeased,
+                format!(
+                    "fake plane {plane_id} was committed through {} KMS",
+                    commit.as_str()
+                ),
+            ));
+        }
+        if request.force_legacy {
+            status.push_note(DrmScanoutNote::new(
+                DrmScanoutNoteKind::LegacyCommitForced,
+                "fake scanout forced the legacy commit path",
+            ));
+        } else if atomic_unsupported {
+            status.push_note(DrmScanoutNote::new(
+                DrmScanoutNoteKind::LegacyCommitFallback,
+                "fake atomic KMS was unsupported; fell back to set_crtc/page_flip",
+            ));
+        }
         if !card.virtual_card {
             status.push_note(DrmScanoutNote::new(
                 DrmScanoutNoteKind::RealGpuNamed,
@@ -2825,6 +3015,8 @@ impl crate::drm_scanout::DrmScanoutBackend for FakeDrmScanoutBackend {
                 card: card.path.clone(),
                 connector: card.connector.clone(),
                 crtc_id: card.crtc_id,
+                plane_id,
+                commit,
                 mode: mode_for_record,
                 width,
                 height,
@@ -2846,6 +3038,8 @@ struct FakeScanoutRecord {
     card: std::path::PathBuf,
     connector: String,
     crtc_id: u32,
+    plane_id: Option<u32>,
+    commit: crate::drm_scanout::DrmScanoutCommit,
     mode: String,
     width: u32,
     height: u32,
@@ -2895,6 +3089,9 @@ impl crate::drm_scanout::DrmScanoutHandle for FakeDrmScanoutHandle {
             crtc_position: (0, 0),
             connector_state: "connected".to_owned(),
             connector_crtc: Some(self.record.crtc_id),
+            plane_id: self.record.plane_id,
+            plane_crtc: self.record.plane_id.map(|_| self.record.crtc_id),
+            plane_framebuffer: self.record.plane_id.map(|_| self.record.framebuffer_id),
             framebuffer_id: self.record.framebuffer_id,
             framebuffer_size: (self.record.width, self.record.height),
             framebuffer_pitch: self.record.pitch,
@@ -2917,9 +3114,20 @@ impl crate::drm_scanout::DrmScanoutHandle for FakeDrmScanoutHandle {
             return Ok(());
         }
         let mut state = self.state.lock().expect("fake scanout lock");
-        state
-            .events
-            .push(format!("clear_crtc {}", self.record.crtc_id));
+        match self.record.commit {
+            crate::drm_scanout::DrmScanoutCommit::Atomic => {
+                state.events.push(format!(
+                    "atomic_disable {} {}",
+                    self.record.crtc_id,
+                    self.record.plane_id.unwrap_or(0)
+                ));
+            }
+            crate::drm_scanout::DrmScanoutCommit::Legacy => {
+                state
+                    .events
+                    .push(format!("clear_crtc {}", self.record.crtc_id));
+            }
+        }
         state.events.push(format!(
             "destroy_framebuffer {}",
             self.record.framebuffer_id

@@ -16,9 +16,16 @@
 //! * `rgb24`, `bgra`, `mjpeg`, `yuyv`, and `nv12` sources are accepted. BGRA,
 //!   MJPEG, YUYV, and NV12 are converted to packed RGB24 before they are fed to
 //!   ffmpeg, so a V4L2 device that negotiates any of those layouts can drive
-//!   HLS. P010 is passed through byte-for-byte as `p010le`. Other compressed
-//!   layouts (H.264/HEVC/AV1) remain a typed refusal rather than being
-//!   mislabelled as raw pixels.
+//!   HLS. P010 is passed through byte-for-byte as `p010le`.
+//! * Compressed H.264/HEVC/AV1 capture streams are copied into HLS when the
+//!   configured encoder targets the same codec family. A mismatched target
+//!   decodes and re-encodes through the same bitstream input. AV1 copy uses
+//!   fragmented-MP4 segments because mpegts treats AV1 as private data.
+//!   Timestamps for HEVC copy are assigned from the access-unit index at the
+//!   configured `fps`; H.264/AV1 keep the parser's timestamps. Segment
+//!   boundaries follow the source's real keyframes, and a source with no
+//!   keyframes writes no playlist rather than a fabricated one. Other layouts
+//!   remain a typed refusal rather than being mislabelled as raw pixels.
 //! * A source whose frame size changes (a guest reset or display mode switch)
 //!   restarts ffmpeg with the new `-s WxH` instead of failing. The new
 //!   generation appends to the existing playlist with
@@ -336,6 +343,71 @@ pub enum HlsEncoder {
 enum HwCodec {
     H264,
     Hevc,
+}
+
+/// A compressed capture stream that can be copied into HLS without decoding.
+///
+/// V4L2 devices can deliver H.264/HEVC access units (and some pipelines deliver
+/// AV1 OBUs) as the captured payload. When the configured encoder targets the
+/// same codec family, the feeder writes those bytes to ffmpeg unchanged and
+/// ffmpeg only muxes them (`-c:v copy`). A different target is decoded and
+/// re-encoded by ffmpeg through the same raw bitstream input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompressedCodec {
+    H264,
+    Hevc,
+    Av1,
+}
+
+impl CompressedCodec {
+    fn from_pixel_format(format: PixelFormat) -> Option<Self> {
+        match format {
+            PixelFormat::H264 => Some(Self::H264),
+            PixelFormat::Hevc => Some(Self::Hevc),
+            PixelFormat::Av1 => Some(Self::Av1),
+            _ => None,
+        }
+    }
+
+    /// ffmpeg input demuxer for this byte stream.
+    ///
+    /// V4L2 AV1 is the low-overhead OBU format, which ffmpeg names `obu`.
+    fn demuxer(self) -> &'static str {
+        match self {
+            Self::H264 => "h264",
+            Self::Hevc => "hevc",
+            Self::Av1 => "obu",
+        }
+    }
+
+    /// True when `encoder` produces this codec, so a copy needs no transcode.
+    fn matches_encoder(self, encoder: HlsEncoder) -> bool {
+        match self {
+            Self::H264 => matches!(
+                encoder,
+                HlsEncoder::H264
+                    | HlsEncoder::VaapiH264
+                    | HlsEncoder::NvencH264
+                    | HlsEncoder::QsvH264
+                    | HlsEncoder::V4l2m2mH264
+            ),
+            Self::Hevc => matches!(
+                encoder,
+                HlsEncoder::Hevc
+                    | HlsEncoder::VaapiHevc
+                    | HlsEncoder::NvencHevc
+                    | HlsEncoder::QsvHevc
+                    | HlsEncoder::V4l2m2mHevc
+            ),
+            Self::Av1 => matches!(encoder, HlsEncoder::Av1Svt | HlsEncoder::Av1Aom),
+        }
+    }
+
+    /// AV1 is carried in fragmented MP4 segments; mpegts muxes it as opaque
+    /// private data that players and `ffprobe` cannot decode.
+    fn uses_fmp4(self) -> bool {
+        matches!(self, Self::Av1)
+    }
 }
 
 impl HlsEncoder {
@@ -679,7 +751,8 @@ pub struct HlsConfig {
     /// [`HlsPipeline`] sets this from the opened source before spawning ffmpeg.
     /// The default is RGB24 so a directly constructed config produces the
     /// historical argv. P010 is fed as `p010le`; BGRA, MJPEG, YUYV, and NV12 are
-    /// converted to RGB24 by the feeder.
+    /// converted to RGB24 by the feeder. H.264, HEVC, and AV1 select a
+    /// compressed bitstream input instead of rawvideo.
     pub input_pixel_format: PixelFormat,
     /// Optional input width override.
     pub width: Option<u32>,
@@ -764,7 +837,12 @@ impl HlsConfig {
         }
         if !matches!(
             self.input_pixel_format,
-            PixelFormat::Rgb24 | PixelFormat::Bgra | PixelFormat::P010
+            PixelFormat::Rgb24
+                | PixelFormat::Bgra
+                | PixelFormat::P010
+                | PixelFormat::H264
+                | PixelFormat::Hevc
+                | PixelFormat::Av1
         ) {
             return Err(HlsError::UnsupportedFormat(self.input_pixel_format));
         }
@@ -971,10 +1049,10 @@ pub enum HlsError {
         /// What failed, including the restoration outcome.
         message: String,
     },
-    /// A pixel format cannot be fed to ffmpeg's raw RGB24 input.
+    /// A capture format cannot be fed to ffmpeg.
     #[error(
-        "HLS cannot feed `{0}` frames to ffmpeg as raw RGB24; rgb24, bgra, mjpeg, yuyv, nv12, \
-         and p010 are supported"
+        "HLS cannot feed `{0}` frames to ffmpeg; rgb24, bgra, mjpeg, yuyv, nv12, p010, h264, \
+         hevc, and av1 are supported"
     )]
     UnsupportedFormat(PixelFormat),
     /// A supported capture layout could not be converted to RGB24.
@@ -2025,19 +2103,28 @@ impl HlsPipeline {
         restart: bool,
     ) -> Result<Self, HlsError> {
         let mut config = config.validated()?;
-        validate_encoder_runtime(&config, probe.as_ref())?;
-        if let Err(error) = ensure_supported(source.format().pixel_format) {
+        let declared = source.format();
+        let compressed = CompressedCodec::from_pixel_format(declared.pixel_format);
+        let stream_copy =
+            compressed.is_some_and(|codec| codec.matches_encoder(config.video_encoder));
+        // A stream copy muxes the source bitstream and never invokes the
+        // configured encoder, so a hardware encoder that ffmpeg cannot start is
+        // irrelevant. Only a real (re-)encode requires the availability probe.
+        if !stream_copy {
+            validate_encoder_runtime(&config, probe.as_ref())?;
+        }
+        if let Err(error) = ensure_supported(declared.pixel_format) {
             return Err(error);
         }
         create_output_dir(&config)?;
 
         let manifest = config.manifest_path();
         let status = HlsStatus::starting(manifest.clone());
-        let declared = source.format();
         // The feeder converts BGRA/MJPEG/YUYV/NV12 to packed RGB24 in Rust;
-        // P010 is passed through byte-for-byte. Store the exact rawvideo layout
-        // so argv and the feeder cannot disagree after a `/codec` restart or
-        // size change.
+        // P010 is passed through byte-for-byte, and compressed H.264/HEVC/AV1
+        // access units are written to a compressed ffmpeg input. Store the exact
+        // layout so argv and the feeder cannot disagree after a `/codec` restart
+        // or size change.
         config.input_pixel_format = match declared.pixel_format {
             PixelFormat::Bgra | PixelFormat::Mjpeg | PixelFormat::Yuyv | PixelFormat::Nv12 => {
                 PixelFormat::Rgb24
@@ -2655,6 +2742,7 @@ async fn run_pipeline(
     restart: bool,
 ) {
     let mut pacer = FramePacer::new(config.fps, clock.now());
+    let compressed = CompressedCodec::from_pixel_format(config.input_pixel_format);
     let mut wrote_frame = false;
     loop {
         let frame = match tokio::select! {
@@ -2678,8 +2766,10 @@ async fn run_pipeline(
 
         // ffmpeg's input timebase is `-r fps`, so only write frames that are
         // due. Dropping here keeps playlist media time close to wall time and
-        // avoids converting a frame ffmpeg will never see.
-        if !pacer.should_emit(clock.now()) {
+        // avoids converting a frame ffmpeg will never see. Compressed streams
+        // are never paced away: dropping a non-keyframe would break the
+        // reference chain, so every access unit must reach the muxer.
+        if compressed.is_none() && !pacer.should_emit(clock.now()) {
             continue;
         }
 
@@ -2696,7 +2786,12 @@ async fn run_pipeline(
             Some((expected_width, expected_height)) => {
                 let frame_width = frame.format().width;
                 let frame_height = frame.format().height;
-                if frame_width != expected_width || frame_height != expected_height {
+                if compressed.is_some() {
+                    // A compressed bitstream carries its own sequence-header
+                    // geometry. ffmpeg handles an in-band change; there is no
+                    // `-s` to restart, so a different frame size is not a
+                    // configuration error here.
+                } else if frame_width != expected_width || frame_height != expected_height {
                     if !dimensions_are_dynamic(&config) {
                         // Pinned dimensions are an explicit contract. Scaling is
                         // deliberately not silent: a frame of another size is a
@@ -2869,7 +2964,10 @@ fn convert_frame(
             // 16-bit little-endian luma followed by interleaved 16-bit UV.
             Ok(data.to_vec())
         }
-        other => Err(HlsError::UnsupportedFormat(other)),
+        // A compressed access unit is written verbatim. ffmpeg owns the
+        // bitstream parser, keyframe detection, and muxing; the feeder must not
+        // reinterpret it as pixels.
+        PixelFormat::H264 | PixelFormat::Hevc | PixelFormat::Av1 => Ok(data.to_vec()),
     }
 }
 
@@ -2895,8 +2993,10 @@ fn ensure_supported(format: PixelFormat) -> Result<(), HlsError> {
         | PixelFormat::Mjpeg
         | PixelFormat::Yuyv
         | PixelFormat::Nv12
-        | PixelFormat::P010 => Ok(()),
-        other => Err(HlsError::UnsupportedFormat(other)),
+        | PixelFormat::P010
+        | PixelFormat::H264
+        | PixelFormat::Hevc
+        | PixelFormat::Av1 => Ok(()),
     }
 }
 
@@ -2907,6 +3007,16 @@ fn rawvideo_input_pixel_format(format: PixelFormat) -> Result<&'static str, HlsE
         PixelFormat::P010 => Ok("p010le"),
         other => Err(HlsError::UnsupportedFormat(other)),
     }
+}
+
+/// Compressed codec carried by the configured input, if any.
+fn compressed_input(config: &HlsConfig) -> Option<CompressedCodec> {
+    CompressedCodec::from_pixel_format(config.input_pixel_format)
+}
+
+/// True when the source bitstream can be muxed without invoking an encoder.
+fn input_is_stream_copy(config: &HlsConfig) -> bool {
+    compressed_input(config).is_some_and(|codec| codec.matches_encoder(config.video_encoder))
 }
 
 fn initial_dimensions(config: &HlsConfig, declared: FrameFormat) -> Option<(u32, u32)> {
@@ -2963,24 +3073,73 @@ pub fn ffmpeg_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String> {
 fn ffmpeg_argv_for(config: &HlsConfig, width: u32, height: u32, restart: bool) -> Vec<String> {
     let bitrate = format!("{}k", config.bitrate_kbps);
     let target = config.pixel_format;
-    let input_format = rawvideo_input_pixel_format(config.input_pixel_format).unwrap_or("rgb24");
+    let compressed = compressed_input(config);
+    let stream_copy = input_is_stream_copy(config);
     let mut argv = vec![
         config.ffmpeg_bin.display().to_string(),
         "-hide_banner".to_owned(),
         "-loglevel".to_owned(),
         "warning".to_owned(),
-        "-f".to_owned(),
-        "rawvideo".to_owned(),
-        "-pix_fmt".to_owned(),
-        input_format.to_owned(),
-        "-s".to_owned(),
-        format!("{width}x{height}"),
-        "-r".to_owned(),
-        config.fps.to_string(),
-        "-i".to_owned(),
-        "-".to_owned(),
-        "-an".to_owned(),
     ];
+
+    match compressed {
+        Some(codec) => {
+            // A compressed bitstream has no rawvideo geometry: ffmpeg parses
+            // the sequence header. `-r` is the fallback timestamp base for
+            // demuxers (notably raw HEVC) that do not synthesize PTS/DTS.
+            argv.extend([
+                "-f".to_owned(),
+                codec.demuxer().to_owned(),
+                "-r".to_owned(),
+                config.fps.to_string(),
+                "-i".to_owned(),
+                "-".to_owned(),
+                "-an".to_owned(),
+            ]);
+        }
+        None => {
+            let input_format =
+                rawvideo_input_pixel_format(config.input_pixel_format).unwrap_or("rgb24");
+            argv.extend([
+                "-f".to_owned(),
+                "rawvideo".to_owned(),
+                "-pix_fmt".to_owned(),
+                input_format.to_owned(),
+                "-s".to_owned(),
+                format!("{width}x{height}"),
+                "-r".to_owned(),
+                config.fps.to_string(),
+                "-i".to_owned(),
+                "-".to_owned(),
+                "-an".to_owned(),
+            ]);
+        }
+    }
+
+    if stream_copy {
+        // The configured encoder already matches the source codec. ffmpeg must
+        // only mux the access units; no encoder, filter, or profile option is
+        // emitted because they would force a transcode.
+        argv.extend(["-c:v".to_owned(), "copy".to_owned()]);
+        if compressed == Some(CompressedCodec::Hevc) {
+            // Raw HEVC demuxing leaves packet timestamps unset, which the
+            // mpegts muxer refuses. Assign PTS/DTS from the packet index at
+            // `-r fps` and tag the stream so players accept it as HEVC.
+            argv.extend([
+                "-bsf:v".to_owned(),
+                "setts=pts=N:dts=N".to_owned(),
+                "-tag:v".to_owned(),
+                "hvc1".to_owned(),
+            ]);
+        }
+        append_hls_output(
+            &mut argv,
+            config,
+            restart,
+            compressed.is_some_and(CompressedCodec::uses_fmp4),
+        );
+        return argv;
+    }
 
     // Convert the raw input to the requested 10-bit swscale format before a
     // software encoder. Hardware encoders either upload a P010 surface (VAAPI)
@@ -3154,6 +3313,29 @@ fn ffmpeg_argv_for(config: &HlsConfig, width: u32, height: u32, restart: bool) -
         config.force_key_frames_expr(),
     ]);
 
+    append_hls_output(&mut argv, config, restart, false);
+    argv
+}
+
+/// Append the shared HLS muxer arguments.
+///
+/// `fmp4` is used for an AV1 stream copy: mpegts muxes AV1 as opaque private
+/// data, while fragmented MP4 gives players a real AV1 track and an init
+/// segment. All other HLS output keeps the historical MPEG-TS segments.
+fn append_hls_output(argv: &mut Vec<String>, config: &HlsConfig, restart: bool, fmp4: bool) {
+    if fmp4 {
+        argv.extend([
+            "-hls_segment_type".to_owned(),
+            "fmp4".to_owned(),
+            "-hls_fmp4_init_filename".to_owned(),
+            "init.mp4".to_owned(),
+        ]);
+    }
+    let segment_pattern = if fmp4 {
+        config.output_dir.join("seg_%05d.m4s")
+    } else {
+        config.segment_pattern()
+    };
     argv.extend([
         "-f".to_owned(),
         "hls".to_owned(),
@@ -3173,10 +3355,9 @@ fn ffmpeg_argv_for(config: &HlsConfig, width: u32, height: u32, restart: bool) -
             "delete_segments".to_owned()
         },
         "-hls_segment_filename".to_owned(),
-        config.segment_pattern().display().to_string(),
+        segment_pattern.display().to_string(),
         config.manifest_path().display().to_string(),
     ]);
-    argv
 }
 
 fn format_seconds(value: f32) -> String {
@@ -5025,14 +5206,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_pixel_formats_are_rejected_before_spawning() {
-        let directory = temp_dir("h264");
-        let format = FrameFormat::new(PixelFormat::H264, 2, 2);
-        let (source, _) = FakeSource::new(format, vec![], false);
+    async fn h264_source_is_copied_into_hls_without_reencoding() {
+        let directory = temp_dir("h264-copy");
+        let format = FrameFormat::new(PixelFormat::H264, 320, 240);
+        let access_units = vec![
+            0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1e, 0x88, // SPS
+            0, 0, 0, 1, 0x68, 0xce, 0x3c, 0x80, // PPS
+            0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00, // IDR
+        ];
+        let (source, _) = FakeSource::new(
+            format,
+            vec![Ok(frame(format, 0, access_units.clone()))],
+            false,
+        );
         let recording = RecordingSpawner::default();
+        let writes = recording.writes.clone();
         let spawns = recording.spawns.clone();
-
-        let error = HlsPipeline::start_with_spawner(
+        let mut pipeline = HlsPipeline::start_with_spawner(
             Box::new(source),
             HlsConfig {
                 output_dir: directory.clone(),
@@ -5040,18 +5230,256 @@ mod tests {
             },
             spawner(recording),
         )
-        .err()
-        .expect("H.264 pass-through must be rejected");
+        .expect("H.264 copy source starts");
 
-        assert!(matches!(
-            error,
-            HlsError::UnsupportedFormat(PixelFormat::H264)
-        ));
+        wait_until(|| writes.lock().unwrap().len() == 1).await;
+        assert_eq!(writes.lock().unwrap()[0], access_units);
+        assert_eq!(pipeline.config().input_pixel_format, PixelFormat::H264);
+
+        let spawns = spawns.lock().unwrap();
+        assert_eq!(spawns.len(), 1);
+        let argv = &spawns[0].2;
         assert!(
-            spawns.lock().unwrap().is_empty(),
-            "ffmpeg must not be spawned for an unsupported format"
+            argv.windows(2).any(|window| window == ["-f", "h264"]),
+            "compressed H.264 input must use the h264 demuxer: {argv:?}"
         );
+        assert!(
+            argv.windows(2).any(|window| window == ["-c:v", "copy"]),
+            "matching encoder must stream-copy: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|argument| argument == "rawvideo"),
+            "compressed input must not be fed as rawvideo: {argv:?}"
+        );
+        assert!(
+            !argv
+                .iter()
+                .any(|argument| argument == "libx264" || argument == "-force_key_frames"),
+            "copy mode must not emit encoder/GOP options: {argv:?}"
+        );
+        drop(spawns);
+        pipeline.stop().await.expect("stop");
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn compressed_copy_does_not_require_the_selected_hardware_encoder() {
+        let directory = temp_dir("h264-copy-no-vaapi");
+        let format = FrameFormat::new(PixelFormat::H264, 320, 240);
+        let (source, _) = FakeSource::new(
+            format,
+            vec![Ok(frame(format, 0, vec![0, 0, 0, 1, 0x65, 0x88]))],
+            false,
+        );
+        let recording = RecordingSpawner::default();
+        let spawns = recording.spawns.clone();
+        // The conservative probe knows no hardware encoder and the configured
+        // render node does not exist. A stream copy must still start: it never
+        // invokes the encoder.
+        let mut pipeline = HlsPipeline::start_with_spawner_and_probe(
+            Box::new(source),
+            HlsConfig {
+                output_dir: directory.clone(),
+                video_encoder: HlsEncoder::VaapiH264,
+                vaapi_device: directory.join("missing-renderD128"),
+                ..HlsConfig::default()
+            },
+            spawner(recording),
+            Arc::new(StaticEncoderProbe::software()),
+        )
+        .expect("H.264 copy starts without a VAAPI device");
+
+        let spawns = spawns.lock().unwrap();
+        let argv = &spawns[0].2;
+        assert!(argv.windows(2).any(|window| window == ["-c:v", "copy"]));
+        assert!(!argv
+            .windows(2)
+            .any(|window| window == ["-c:v", "h264_vaapi"]));
+        drop(spawns);
+        pipeline.stop().await.expect("stop");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn hevc_source_is_copied_with_index_timestamps_and_hvc1_tag() {
+        let directory = temp_dir("hevc-copy");
+        let format = FrameFormat::new(PixelFormat::Hevc, 320, 240);
+        let access_units = vec![0, 0, 0, 1, 0x40, 0x01, 0x0c, 0x01, 0xff];
+        let (source, _) = FakeSource::new(
+            format,
+            vec![Ok(frame(format, 0, access_units.clone()))],
+            false,
+        );
+        let recording = RecordingSpawner::default();
+        let writes = recording.writes.clone();
+        let spawns = recording.spawns.clone();
+        let mut pipeline = HlsPipeline::start_with_spawner(
+            Box::new(source),
+            HlsConfig {
+                output_dir: directory.clone(),
+                video_encoder: HlsEncoder::Hevc,
+                ..HlsConfig::default()
+            },
+            spawner(recording),
+        )
+        .expect("HEVC copy source starts");
+
+        wait_until(|| writes.lock().unwrap().len() == 1).await;
+        assert_eq!(writes.lock().unwrap()[0], access_units);
+        let spawns = spawns.lock().unwrap();
+        let argv = &spawns[0].2;
+        assert!(argv.windows(2).any(|window| window == ["-f", "hevc"]));
+        assert!(argv.windows(2).any(|window| window == ["-c:v", "copy"]));
+        assert!(argv
+            .windows(2)
+            .any(|window| window == ["-bsf:v", "setts=pts=N:dts=N"]));
+        assert!(argv.windows(2).any(|window| window == ["-tag:v", "hvc1"]));
+        drop(spawns);
+        pipeline.stop().await.expect("stop");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn av1_source_copy_uses_fragmented_mp4_segments() {
+        let directory = temp_dir("av1-copy");
+        let format = FrameFormat::new(PixelFormat::Av1, 320, 240);
+        let access_units = vec![0x0a, 0x0b, 0x00, 0x00, 0x00, 0x04, 0x00];
+        let (source, _) = FakeSource::new(
+            format,
+            vec![Ok(frame(format, 0, access_units.clone()))],
+            false,
+        );
+        let recording = RecordingSpawner::default();
+        let writes = recording.writes.clone();
+        let spawns = recording.spawns.clone();
+        let mut pipeline = HlsPipeline::start_with_spawner(
+            Box::new(source),
+            HlsConfig {
+                output_dir: directory.clone(),
+                video_encoder: HlsEncoder::Av1Svt,
+                ..HlsConfig::default()
+            },
+            spawner(recording),
+        )
+        .expect("AV1 copy source starts");
+
+        wait_until(|| writes.lock().unwrap().len() == 1).await;
+        assert_eq!(writes.lock().unwrap()[0], access_units);
+        let spawns = spawns.lock().unwrap();
+        let argv = &spawns[0].2;
+        assert!(argv.windows(2).any(|window| window == ["-f", "obu"]));
+        assert!(argv.windows(2).any(|window| window == ["-c:v", "copy"]));
+        assert!(argv
+            .windows(2)
+            .any(|window| window == ["-hls_segment_type", "fmp4"]));
+        assert!(argv
+            .windows(2)
+            .any(|window| { window[0] == "-hls_fmp4_init_filename" && window[1] == "init.mp4" }));
+        assert!(
+            argv.iter()
+                .any(|argument| argument.ends_with("seg_%05d.m4s")),
+            "AV1 copy must not write mpegts segments: {argv:?}"
+        );
+        drop(spawns);
+        pipeline.stop().await.expect("stop");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn compressed_source_with_a_different_encoder_is_reencoded() {
+        let directory = temp_dir("h264-to-hevc");
+        let format = FrameFormat::new(PixelFormat::H264, 320, 240);
+        let access_units = vec![0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00];
+        let (source, _) = FakeSource::new(
+            format,
+            vec![Ok(frame(format, 0, access_units.clone()))],
+            false,
+        );
+        let recording = RecordingSpawner::default();
+        let writes = recording.writes.clone();
+        let spawns = recording.spawns.clone();
+        let mut pipeline = HlsPipeline::start_with_spawner(
+            Box::new(source),
+            HlsConfig {
+                output_dir: directory.clone(),
+                video_encoder: HlsEncoder::Hevc,
+                ..HlsConfig::default()
+            },
+            spawner(recording),
+        )
+        .expect("H.264 to HEVC re-encode starts");
+
+        wait_until(|| writes.lock().unwrap().len() == 1).await;
+        // The feeder still passes the compressed access unit through; ffmpeg
+        // decodes and re-encodes it because the target codec differs.
+        assert_eq!(writes.lock().unwrap()[0], access_units);
+        let spawns = spawns.lock().unwrap();
+        let argv = &spawns[0].2;
+        assert!(argv.windows(2).any(|window| window == ["-f", "h264"]));
+        assert!(argv.windows(2).any(|window| window == ["-c:v", "libx265"]));
+        assert!(
+            !argv.windows(2).any(|window| window == ["-c:v", "copy"]),
+            "mismatched encoder must not copy: {argv:?}"
+        );
+        drop(spawns);
+        pipeline.stop().await.expect("stop");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn compressed_frames_are_never_paced_away() {
+        let directory = temp_dir("h264-pacing");
+        let format = FrameFormat::new(PixelFormat::H264, 320, 240);
+        let frames: Vec<_> = (0..5)
+            .map(|sequence| {
+                Ok(frame(
+                    format,
+                    sequence,
+                    vec![0, 0, 0, 1, 0x41, sequence as u8],
+                ))
+            })
+            .collect();
+        let (source, stopped) = FakeSource::new(format, frames, false);
+        let recording = RecordingSpawner::default();
+        let writes = recording.writes.clone();
+        let mut pipeline = HlsPipeline::start_with_spawner(
+            Box::new(source),
+            HlsConfig {
+                output_dir: directory.clone(),
+                // A 1 fps pacer would drop four of five immediately arriving
+                // access units; copy mode must still write every one.
+                fps: 1,
+                ..HlsConfig::default()
+            },
+            spawner(recording),
+        )
+        .expect("H.264 copy source starts");
+
+        wait_until(|| writes.lock().unwrap().len() == 5).await;
+        wait_until(|| stopped.load(Ordering::SeqCst)).await;
+        assert_eq!(writes.lock().unwrap().len(), 5);
+        pipeline.stop().await.expect("stop");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn compressed_input_layouts_are_valid_configuration() {
+        for input in [PixelFormat::H264, PixelFormat::Hevc, PixelFormat::Av1] {
+            HlsConfig {
+                input_pixel_format: input,
+                ..HlsConfig::default()
+            }
+            .validate()
+            .unwrap_or_else(|error| panic!("{input} should be valid: {error}"));
+        }
+        assert!(matches!(
+            HlsConfig {
+                input_pixel_format: PixelFormat::Yuyv,
+                ..HlsConfig::default()
+            }
+            .validate(),
+            Err(HlsError::UnsupportedFormat(PixelFormat::Yuyv))
+        ));
     }
 
     #[tokio::test]
@@ -5654,6 +6082,157 @@ mod tests {
         assert!(argv.contains(&"3000k".to_owned()));
         controller.stop().await.expect("stop");
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// Opt-in real-ffmpeg pass-through test: generate genuine H.264, HEVC, and
+    /// AV1 access units, feed them as a fake compressed capture source, and
+    /// require `ffprobe` to see the matching codec and geometry in the produced
+    /// HLS playlist. Default CI must not need ffmpeg.
+    #[tokio::test]
+    #[ignore = "requires ffmpeg/ffprobe; set OZMA_FFMPEG_TEST=1 and run with --ignored"]
+    async fn real_ffmpeg_copies_compressed_access_units_with_probeable_segments() {
+        if std::env::var("OZMA_FFMPEG_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_err()
+        {
+            return;
+        }
+
+        for (label, pixel_format, encoder, source_args) in [
+            (
+                "h264",
+                PixelFormat::H264,
+                HlsEncoder::H264,
+                vec!["-c:v", "libx264", "-preset", "ultrafast", "-g", "15"],
+            ),
+            (
+                "hevc",
+                PixelFormat::Hevc,
+                HlsEncoder::Hevc,
+                vec![
+                    "-c:v",
+                    "libx265",
+                    "-preset",
+                    "ultrafast",
+                    "-x265-params",
+                    "log-level=error:keyint=15:min-keyint=15:scenecut=0",
+                ],
+            ),
+            (
+                "av1",
+                PixelFormat::Av1,
+                HlsEncoder::Av1Svt,
+                vec!["-c:v", "libsvtav1", "-preset", "10", "-g", "15"],
+            ),
+        ] {
+            let directory = temp_dir(&format!("compressed-{label}"));
+            let source_path = directory.join(format!("source.{label}"));
+            let mut command = std::process::Command::new("ffmpeg");
+            command.args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=64x48:rate=30:duration=2",
+            ]);
+            command.args(&source_args);
+            command.args([
+                "-pix_fmt",
+                "yuv420p",
+                "-f",
+                if label == "av1" { "obu" } else { label },
+                source_path.to_str().expect("utf-8 path"),
+            ]);
+            let status = command.status().expect("run source ffmpeg");
+            assert!(status.success(), "could not generate {label} source");
+
+            let bytes = std::fs::read(&source_path).expect("read source bitstream");
+            let format = FrameFormat::new(pixel_format, 64, 48);
+            let frame = Frame::with_data(format, 0, 0, true, bytes).expect("compressed frame");
+            let (source, _) = FakeSource::new(format, vec![Ok(frame)], false);
+            let config = HlsConfig {
+                output_dir: directory.clone(),
+                fps: 30,
+                segment_seconds: 0.5,
+                playlist_size: 4,
+                video_encoder: encoder,
+                ..HlsConfig::default()
+            };
+            let mut pipeline = HlsPipeline::start_with_spawner_and_probe(
+                Box::new(source),
+                config,
+                Arc::new(SystemFfmpegSpawner),
+                Arc::new(StaticEncoderProbe::software()),
+            )
+            .unwrap_or_else(|error| panic!("{label} copy pipeline did not start: {error}"));
+
+            for _ in 0..200 {
+                if pipeline.manifest_path().is_file()
+                    && std::fs::read_dir(pipeline.output_dir())
+                        .map(|entries| {
+                            entries.filter_map(Result::ok).any(|entry| {
+                                matches!(
+                                    entry.path().extension().and_then(|ext| ext.to_str()),
+                                    Some("ts" | "m4s")
+                                )
+                            })
+                        })
+                        .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(
+                pipeline.manifest_path().is_file(),
+                "{label}: ffmpeg did not write {}",
+                pipeline.manifest_path().display()
+            );
+
+            let probe = std::process::Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-count_frames",
+                    "-show_entries",
+                    "stream=codec_name,width,height,nb_read_frames",
+                    "-of",
+                    "default=nw=1",
+                ])
+                .arg(pipeline.manifest_path())
+                .output()
+                .expect("run ffprobe");
+            assert!(
+                probe.status.success(),
+                "{label}: ffprobe failed: {}",
+                String::from_utf8_lossy(&probe.stderr)
+            );
+            let report = String::from_utf8_lossy(&probe.stdout);
+            assert!(
+                report.contains(&format!("codec_name={label}")),
+                "{label}: ffprobe did not see the copied codec:\n{report}"
+            );
+            assert!(
+                report.contains("width=64") && report.contains("height=48"),
+                "{label}: ffprobe geometry mismatch:\n{report}"
+            );
+            assert!(
+                !report.contains("nb_read_frames=0"),
+                "{label}: ffprobe decoded no frames:\n{report}"
+            );
+
+            pipeline.stop().await.expect("stop");
+            let _ = std::fs::remove_dir_all(directory);
+        }
     }
 
     /// Opt-in real-ffmpeg smoke test. Default CI must not need ffmpeg.

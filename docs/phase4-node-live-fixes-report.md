@@ -219,8 +219,11 @@ conversion for:
   existing BGRA conversion);
 - converts each frame through `ozma_encode::to_rgb24` before writing;
 - passes P010 through unchanged as `p010le`, keeping the existing behavior;
-- still rejects H.264/HEVC/AV1 with a typed `UnsupportedFormat` rather than
-  feeding compressed bytes to a rawvideo pipe.
+- still had no H.264/HEVC/AV1 pass-through at that point; that was a typed
+  `UnsupportedFormat`. It is implemented in the follow-up documented by
+  [`phase4-v4l2-media-report.md`](phase4-v4l2-media-report.md): a matching
+  encoder now muxes the compressed access units with `-c:v copy`, a mismatched
+  encoder re-encodes, and AV1 copy uses fragmented-MP4 segments.
 
 Short buffers, odd YUV dimensions, and decoded-MJPEG geometry mismatches are
 typed conversion errors, not silent corruption.
@@ -251,9 +254,11 @@ and `GET /stream/stream.m3u8` listed a real segment. This removes the typed
 "only rgb24 and bgra are supported" blocker recorded by the original V4L2
 report.
 
-Snapshot and `/video` for YUYV/NV12 still return the existing typed
-`503 display.unsupported_format` because only the HLS feeder was extended. That
-was outside this fix's requested HLS scope and is recorded as a remaining gap.
+Snapshot and `/video` for YUYV/NV12 still returned the typed
+`503 display.unsupported_format` at that point because only the HLS feeder was
+extended. The media follow-up
+([`phase4-v4l2-media-report.md`](phase4-v4l2-media-report.md)) converts those
+layouts in the JPEG path too.
 
 ## Verification commands
 
@@ -284,9 +289,13 @@ Results:
   the path/display-based status probe; the operation itself returns the typed
   `503 desktop.no_display`. Probing the X server during status would violate the
   "advertise without running tools" policy.
-- HLS still refuses H.264/HEVC/AV1 V4L2 pass-through; only MJPEG/YUYV/NV12 were
-  requested and implemented. V4L2 snapshot/`/video` for YUYV/NV12 remain typed
-  503s until those layouts are converted in the JPEG encoder too.
+- HLS: the H.264/HEVC/AV1 typed refusal recorded here was replaced by real
+  compressed pass-through (matching encoder → `-c:v copy`, mismatch →
+  re-encode, AV1 copy → fMP4) in
+  [`phase4-v4l2-media-report.md`](phase4-v4l2-media-report.md). V4L2
+  snapshot/`/video` for YUYV/NV12 are also fixed there; the old typed
+  `display.unsupported_format` remains only for compressed layouts the JPEG
+  encoder genuinely cannot render.
 - The live desktop run used Xvfb rather than a physical Xorg because no input
   injection or GPU output was needed for clipboard/wallpaper/geometry. It used
   the same `xclip`/`feh`/`xrandr` binaries and the real command runner.

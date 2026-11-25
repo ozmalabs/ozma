@@ -49,6 +49,8 @@ pub const DRM_LEASE_CONNECTOR_ENV: &str = "OZMA_DRM_CONNECTOR";
 pub const DRM_LEASE_CONNECTOR_ID_ENV: &str = "OZMA_DRM_CONNECTOR_ID";
 /// Environment variable carrying the leased CRTC object id.
 pub const DRM_LEASE_CRTC_ID_ENV: &str = "OZMA_DRM_CRTC_ID";
+/// Environment variable carrying an explicitly requested plane object id.
+pub const DRM_LEASE_PLANE_ID_ENV: &str = "OZMA_DRM_PLANE_ID";
 /// Presence marker (`1`) for an exported lease.
 pub const DRM_LEASE_ENV: &str = "OZMA_DRM_LEASE";
 /// Driver name treated as a safe virtual card for automatic selection.
@@ -155,6 +157,51 @@ impl FromStr for DrmCrtcSelector {
     }
 }
 
+/// Which plane a lease should include.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DrmPlaneSelector {
+    /// Do not name a plane explicitly. The kernel still reports the planes it
+    /// associates with the leased CRTC, and the scanout proof can auto-select a
+    /// compatible primary plane for an atomic commit.
+    #[default]
+    Auto,
+    /// Lease exactly this plane object id after validating that it is
+    /// compatible with the selected CRTC.
+    Id(u32),
+}
+
+impl DrmPlaneSelector {
+    /// The explicit plane object id, if one was requested.
+    pub fn id(self) -> Option<u32> {
+        match self {
+            Self::Auto => None,
+            Self::Id(id) => Some(id),
+        }
+    }
+}
+
+impl FromStr for DrmPlaneSelector {
+    type Err = DrmLeaseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value.trim();
+        if value.is_empty() || value.eq_ignore_ascii_case("auto") {
+            return Ok(Self::Auto);
+        }
+        let id = value.parse::<u32>().map_err(|_| {
+            DrmLeaseError::InvalidRequest(value.to_owned(), "plane id must be a u32".to_owned())
+        })?;
+        if id == 0 {
+            return Err(DrmLeaseError::InvalidRequest(
+                value.to_owned(),
+                "plane id must be non-zero".to_owned(),
+            ));
+        }
+        Ok(Self::Id(id))
+    }
+}
+
 /// One connector known from sysfs or a card inspection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DrmLeaseConnector {
@@ -219,8 +266,10 @@ impl DrmCard {
 
 /// A validated lease request.
 ///
-/// The CLI form is `[SEAT=]CARD:CONNECTOR[@CRTC]`, for example
-/// `/dev/dri/card3:Virtual-1` or `auto:Virtual-1@31`.
+/// The CLI form is `[SEAT=]CARD:CONNECTOR[@CRTC][:PLANE]`, for example
+/// `/dev/dri/card3:Virtual-1`, `auto:Virtual-1@31`, or
+/// `/dev/dri/card3:Virtual-1@31:44`. A plane is validated against the selected
+/// CRTC before the lease ioctl and is reported alongside the connector/CRTC.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DrmLeaseRequest {
     /// Card selector.
@@ -229,6 +278,9 @@ pub struct DrmLeaseRequest {
     pub connector: String,
     /// CRTC selector.
     pub crtc: DrmCrtcSelector,
+    /// Optional explicit plane selector.
+    #[serde(default)]
+    pub plane: DrmPlaneSelector,
 }
 
 impl DrmLeaseRequest {
@@ -238,6 +290,7 @@ impl DrmLeaseRequest {
             card,
             connector: connector.into(),
             crtc: DrmCrtcSelector::Auto,
+            plane: DrmPlaneSelector::Auto,
         }
     }
 
@@ -246,6 +299,17 @@ impl DrmLeaseRequest {
         self.crtc = DrmCrtcSelector::Id(crtc);
         self
     }
+
+    /// Require a specific plane object id.
+    pub fn with_plane(mut self, plane: u32) -> Self {
+        self.plane = DrmPlaneSelector::Id(plane);
+        self
+    }
+
+    /// The explicit plane object id, if one was requested.
+    pub fn plane_id(&self) -> Option<u32> {
+        self.plane.id()
+    }
 }
 
 impl FromStr for DrmLeaseRequest {
@@ -253,12 +317,16 @@ impl FromStr for DrmLeaseRequest {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let value = value.trim();
-        let (card, rest) = value.rsplit_once(':').ok_or_else(|| {
+        let (card, rest) = value.split_once(':').ok_or_else(|| {
             DrmLeaseError::InvalidRequest(
                 value.to_owned(),
                 "expected CARD:CONNECTOR, for example /dev/dri/card3:Virtual-1".to_owned(),
             )
         })?;
+        let (rest, plane) = match rest.split_once(':') {
+            Some((rest, plane)) => (rest, DrmPlaneSelector::from_str(plane)?),
+            None => (rest, DrmPlaneSelector::Auto),
+        };
         let (connector, crtc) = match rest.split_once('@') {
             Some((connector, crtc)) => (connector, DrmCrtcSelector::from_str(crtc)?),
             None => (rest, DrmCrtcSelector::Auto),
@@ -274,6 +342,7 @@ impl FromStr for DrmLeaseRequest {
             card: DrmCardSelector::from_str(card)?,
             connector: connector.to_owned(),
             crtc,
+            plane,
         })
     }
 }
@@ -308,6 +377,10 @@ pub trait DrmLeaseHandle: Send {
     fn connector_id(&self) -> u32;
     /// Leased CRTC object id.
     fn crtc_id(&self) -> u32;
+    /// Explicitly requested plane object id, when the request named one.
+    fn plane_id(&self) -> Option<u32> {
+        None
+    }
     /// Leased plane object ids, when the kernel reports them.
     fn plane_ids(&self) -> &[u32];
     /// Lessee fd number while the lease is active.
@@ -408,8 +481,8 @@ pub enum DrmLeaseError {
         connector: String,
     },
 
-    /// A connector/CRTC is already leased, either by this process or another
-    /// lessee.
+    /// A connector/CRTC/plane is already leased, either by this process or
+    /// another lessee.
     #[error("DRM {kind} {id} on {card} is already leased")]
     AlreadyLeased {
         /// Card path or name.
@@ -418,6 +491,17 @@ pub enum DrmLeaseError {
         kind: DrmObjectKind,
         /// Object id.
         id: u32,
+    },
+
+    /// The requested plane cannot drive the selected CRTC.
+    #[error("DRM plane {plane} on {card} is not compatible with CRTC {crtc}")]
+    IncompatiblePlane {
+        /// Card path or name.
+        card: String,
+        /// Plane object id.
+        plane: u32,
+        /// CRTC object id.
+        crtc: u32,
     },
 
     /// The caller is not DRM master or lacks the capability required to lease.
@@ -473,6 +557,7 @@ impl DrmLeaseError {
             Self::UnknownObject { .. } => "unknown_object",
             Self::UnknownConnector { .. } => "unknown_object",
             Self::AlreadyLeased { .. } => "already_leased",
+            Self::IncompatiblePlane { .. } => "incompatible_plane",
             Self::CapabilityRequired { .. } => "capability_required",
             Self::UnknownCard(_) => "unknown_card",
             Self::InvalidRequest(_, _) => "invalid_request",
@@ -569,6 +654,9 @@ pub struct DrmLeaseStatus {
     /// CRTC object id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crtc_id: Option<u32>,
+    /// Explicitly requested plane object id, when the request named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plane_id: Option<u32>,
     /// Plane object ids reported by the kernel.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plane_ids: Vec<u32>,
@@ -597,6 +685,7 @@ impl DrmLeaseStatus {
             && self.lessee_id.is_none()
             && self.connector_id.is_none()
             && self.crtc_id.is_none()
+            && self.plane_id.is_none()
             && self.plane_ids.is_empty()
             && self.fd.is_none()
             && !self.applied
@@ -610,6 +699,7 @@ impl DrmLeaseStatus {
         Self {
             card: request.card.display_name(),
             connector: request.connector.clone(),
+            plane_id: request.plane_id(),
             ..Self::default()
         }
     }
@@ -622,6 +712,7 @@ impl DrmLeaseStatus {
             lessee_id: Some(handle.lessee_id()),
             connector_id: Some(handle.connector_id()),
             crtc_id: Some(handle.crtc_id()),
+            plane_id: handle.plane_id(),
             plane_ids: handle.plane_ids().to_vec(),
             fd: handle.fd(),
             applied: true,
@@ -693,6 +784,9 @@ pub fn apply_lease_environment(status: &DrmLeaseStatus, env: &mut BTreeMap<Strin
     if let Some(id) = status.crtc_id {
         env.insert(DRM_LEASE_CRTC_ID_ENV.to_owned(), id.to_string());
     }
+    if let Some(id) = status.plane_id {
+        env.insert(DRM_LEASE_PLANE_ID_ENV.to_owned(), id.to_string());
+    }
     match status.fd {
         Some(fd) => {
             env.insert(DRM_LEASE_FD_ENV.to_owned(), fd.to_string());
@@ -713,6 +807,7 @@ pub fn clear_lease_environment(env: &mut BTreeMap<String, String>) {
         DRM_LEASE_CONNECTOR_ENV,
         DRM_LEASE_CONNECTOR_ID_ENV,
         DRM_LEASE_CRTC_ID_ENV,
+        DRM_LEASE_PLANE_ID_ENV,
     ] {
         env.remove(key);
     }
@@ -873,7 +968,13 @@ fn registry_conflict(card: &Path, kind: DrmObjectKind, id: u32) -> Option<u32> {
         .copied()
 }
 
-fn register_lease(card: &Path, connector_id: u32, crtc_id: u32, lessee_id: u32) {
+fn register_lease(
+    card: &Path,
+    connector_id: u32,
+    crtc_id: u32,
+    plane_id: Option<u32>,
+    lessee_id: u32,
+) {
     let mut registry = lease_registry().lock().expect("DRM lease registry lock");
     registry.insert(
         (card.to_path_buf(), DrmObjectKind::Connector, connector_id),
@@ -883,12 +984,21 @@ fn register_lease(card: &Path, connector_id: u32, crtc_id: u32, lessee_id: u32) 
         (card.to_path_buf(), DrmObjectKind::Crtc, crtc_id),
         lessee_id,
     );
+    if let Some(plane_id) = plane_id {
+        registry.insert(
+            (card.to_path_buf(), DrmObjectKind::Plane, plane_id),
+            lessee_id,
+        );
+    }
 }
 
-fn unregister_lease(card: &Path, connector_id: u32, crtc_id: u32) {
+fn unregister_lease(card: &Path, connector_id: u32, crtc_id: u32, plane_id: Option<u32>) {
     let mut registry = lease_registry().lock().expect("DRM lease registry lock");
     registry.remove(&(card.to_path_buf(), DrmObjectKind::Connector, connector_id));
     registry.remove(&(card.to_path_buf(), DrmObjectKind::Crtc, crtc_id));
+    if let Some(plane_id) = plane_id {
+        registry.remove(&(card.to_path_buf(), DrmObjectKind::Plane, plane_id));
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -899,7 +1009,7 @@ mod real {
     use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
     use std::path::{Path, PathBuf};
 
-    use drm::control::{connector, Device as ControlDevice, RawResourceHandle};
+    use drm::control::{connector, plane, Device as ControlDevice, RawResourceHandle};
 
     use super::{
         enumerate_at, is_vkms_card, map_io, register_lease, registry_conflict, unregister_lease,
@@ -1102,6 +1212,46 @@ mod real {
                 DrmCrtcSelector::Auto => choose_crtc(&card, &card_info, &handles, connector_crtc)?,
             };
 
+            // A named plane must exist on this card and be able to drive the
+            // selected CRTC. This is checked against the current resource
+            // handles before the lease ioctl, so an incompatible pair is a
+            // typed request error rather than a generic kernel EINVAL.
+            let plane_id = match request.plane {
+                super::DrmPlaneSelector::Auto => None,
+                super::DrmPlaneSelector::Id(id) => {
+                    let plane_object =
+                        NonZeroU32::new(id).ok_or_else(|| DrmLeaseError::UnknownObject {
+                            card: card_info.path.display().to_string(),
+                            kind: DrmObjectKind::Plane,
+                            id,
+                        })?;
+                    let plane_handle = plane::Handle::from(RawResourceHandle::from(plane_object));
+                    let plane_info = card.get_plane(plane_handle).map_err(|error| {
+                        if error.raw_os_error() == Some(libc::ENOENT) {
+                            DrmLeaseError::UnknownObject {
+                                card: card_info.path.display().to_string(),
+                                kind: DrmObjectKind::Plane,
+                                id,
+                            }
+                        } else {
+                            map_control_error(&card_info.path, error)
+                        }
+                    })?;
+                    let compatible = handles
+                        .filter_crtcs(plane_info.possible_crtcs())
+                        .iter()
+                        .any(|handle| u32::from(*handle) == crtc_id);
+                    if !compatible {
+                        return Err(DrmLeaseError::IncompatiblePlane {
+                            card: card_info.path.display().to_string(),
+                            plane: id,
+                            crtc: crtc_id,
+                        });
+                    }
+                    Some(id)
+                }
+            };
+
             // Reject a same-process duplicate against our own active leases
             // before attempting SET_MASTER. Cross-process duplicates are still
             // reported by the kernel as EBUSY.
@@ -1120,6 +1270,15 @@ mod real {
                     id: crtc_id,
                 });
             }
+            if let Some(plane_id) = plane_id {
+                if registry_conflict(&card_info.path, DrmObjectKind::Plane, plane_id).is_some() {
+                    return Err(DrmLeaseError::AlreadyLeased {
+                        card: card_info.path.display().to_string(),
+                        kind: DrmObjectKind::Plane,
+                        id: plane_id,
+                    });
+                }
+            }
 
             // Setting DRM master is only safe/automatic for the virtual vkms
             // card. A real GPU usually already has a compositor as master;
@@ -1130,6 +1289,22 @@ mod real {
             if card_info.is_virtual() {
                 drm::Device::acquire_master_lock(&card)
                     .map_err(|error| map_master_error(&card_info.path, error))?;
+            }
+
+            // The kernel only inserts an explicitly requested plane without
+            // also auto-adding the CRTC's primary/cursor planes when the
+            // lessor has universal planes enabled. Without this capability an
+            // explicit primary plane collides with the auto-added one and the
+            // kernel reports ENOSPC from its object idr. With no explicit
+            // plane we keep the legacy connector+CRTC lease shape, where the
+            // kernel adds the CRTC planes for us.
+            if plane_id.is_some() {
+                drm::Device::set_client_capability(
+                    &card,
+                    drm::ClientCapability::UniversalPlanes,
+                    true,
+                )
+                .map_err(|error| map_control_error(&card_info.path, error))?;
             }
 
             let connector_object =
@@ -1143,15 +1318,25 @@ mod real {
                     message: "CRTC object id was zero".to_owned(),
                 })?;
 
-            let (lessee_id, fd) = card
-                .create_lease(
-                    &[
-                        RawResourceHandle::from(connector_object),
-                        RawResourceHandle::from(crtc_object),
-                    ],
-                    0,
-                )
-                .map_err(|error| map_lease_error(&card_info.path, connector_id, crtc_id, error))?;
+            let mut lease_objects = vec![
+                RawResourceHandle::from(connector_object),
+                RawResourceHandle::from(crtc_object),
+            ];
+            if let Some(plane_id) = plane_id {
+                let plane_object =
+                    NonZeroU32::new(plane_id).ok_or_else(|| DrmLeaseError::LeaseFailed {
+                        card: card_info.path.display().to_string(),
+                        message: "plane object id was zero".to_owned(),
+                    })?;
+                let raw = RawResourceHandle::from(plane_object);
+                if !lease_objects.contains(&raw) {
+                    lease_objects.push(raw);
+                }
+            }
+
+            let (lessee_id, fd) = card.create_lease(&lease_objects, 0).map_err(|error| {
+                map_lease_error(&card_info.path, connector_id, crtc_id, plane_id, error)
+            })?;
 
             let objects = match drm::control::get_lease(&fd) {
                 Ok(objects) => objects,
@@ -1169,7 +1354,13 @@ mod real {
                 .iter()
                 .map(|handle| u32::from(*handle))
                 .collect::<Vec<_>>();
-            register_lease(&card_info.path, connector_id, crtc_id, lessee_id.get());
+            register_lease(
+                &card_info.path,
+                connector_id,
+                crtc_id,
+                plane_id,
+                lessee_id.get(),
+            );
 
             Ok(Box::new(RealDrmLease {
                 card: Some(card),
@@ -1178,6 +1369,7 @@ mod real {
                 lessee_id: lessee_id.get(),
                 connector_id,
                 crtc_id,
+                plane_id,
                 plane_ids,
                 fd: Some(fd),
                 active: true,
@@ -1281,6 +1473,7 @@ mod real {
         card: &Path,
         connector_id: u32,
         crtc_id: u32,
+        plane_id: Option<u32>,
         error: io::Error,
     ) -> DrmLeaseError {
         match error.raw_os_error() {
@@ -1305,11 +1498,16 @@ mod real {
                 id: connector_id,
             },
             Some(libc::EINVAL) => {
-                // The kernel returns EINVAL for invalid combinations and for a
-                // CRTC already leased by another lessee. Connector ids are
-                // checked by EBUSY above; report the CRTC as the conflicting
-                // object rather than hiding the typed already-leased case.
-                if crtc_id != 0 {
+                // The kernel returns EINVAL for invalid combinations and for an
+                // object already leased by another lessee. An explicitly named
+                // plane is the most likely invalid combination, then the CRTC.
+                if let Some(plane_id) = plane_id {
+                    DrmLeaseError::IncompatiblePlane {
+                        card: card.display().to_string(),
+                        plane: plane_id,
+                        crtc: crtc_id,
+                    }
+                } else if crtc_id != 0 {
                     DrmLeaseError::AlreadyLeased {
                         card: card.display().to_string(),
                         kind: DrmObjectKind::Crtc,
@@ -1356,6 +1554,7 @@ mod real {
         lessee_id: u32,
         connector_id: u32,
         crtc_id: u32,
+        plane_id: Option<u32>,
         plane_ids: Vec<u32>,
         fd: Option<OwnedFd>,
         active: bool,
@@ -1380,6 +1579,10 @@ mod real {
 
         fn crtc_id(&self) -> u32 {
             self.crtc_id
+        }
+
+        fn plane_id(&self) -> Option<u32> {
+            self.plane_id
         }
 
         fn plane_ids(&self) -> &[u32] {
@@ -1475,7 +1678,12 @@ mod real {
             match result {
                 Ok(()) => {
                     let _ = drm::Device::release_master_lock(card);
-                    unregister_lease(&self.card_path, self.connector_id, self.crtc_id);
+                    unregister_lease(
+                        &self.card_path,
+                        self.connector_id,
+                        self.crtc_id,
+                        self.plane_id,
+                    );
                     self.active = false;
                     self.fd = None;
                     Ok(())
@@ -1498,7 +1706,12 @@ mod real {
             if let Some(card) = self.card.as_ref() {
                 let _ = drm::Device::release_master_lock(card);
             }
-            unregister_lease(&self.card_path, self.connector_id, self.crtc_id);
+            unregister_lease(
+                &self.card_path,
+                self.connector_id,
+                self.crtc_id,
+                self.plane_id,
+            );
         }
     }
 

@@ -10,8 +10,9 @@
 //!   lease-only handoff: it validates connector/CRTC object ids and returns an
 //!   owned lessee fd, but creates no scanout or compositor isolation.
 //!   [`drm_scanout`] is the opt-in KMS proof layered on that lease: it fills one
-//!   dumb buffer, programs one connector/CRTC, verifies the modeset, and tears
-//!   it down. It is not a compositor.
+//!   dumb buffer, programs one connector/CRTC/plane with an atomic commit (or
+//!   legacy `set_crtc` only when atomic KMS is unsupported), verifies the
+//!   modeset, and tears it down. It is not a compositor.
 //! * [`input`] reads evdev capability bits and groups devices by USB hub.
 //! * [`planner`] assigns one seat per display, allocates sequential UDP/HTTP
 //!   ports, attaches input groups, and emits the per-seat
@@ -107,17 +108,17 @@ pub use drm_lease::{
     enumerate_at as enumerate_drm_cards_at, DrmCard, DrmCardSelector, DrmCrtcSelector,
     DrmLeaseBackend, DrmLeaseConnector, DrmLeaseError, DrmLeaseErrorStatus, DrmLeaseHandle,
     DrmLeaseNote, DrmLeaseNoteKind, DrmLeaseObjects, DrmLeaseRequest, DrmLeaseStatus,
-    DrmObjectKind, DEFAULT_DRM_DEV_ROOT, DRM_LEASE_CARD_ENV, DRM_LEASE_CONNECTOR_ENV,
-    DRM_LEASE_CONNECTOR_ID_ENV, DRM_LEASE_CRTC_ID_ENV, DRM_LEASE_ENV, DRM_LEASE_FD_ENV,
-    DRM_LEASE_ID_ENV, VIRTUAL_DRM_DRIVER,
+    DrmObjectKind, DrmPlaneSelector, DEFAULT_DRM_DEV_ROOT, DRM_LEASE_CARD_ENV,
+    DRM_LEASE_CONNECTOR_ENV, DRM_LEASE_CONNECTOR_ID_ENV, DRM_LEASE_CRTC_ID_ENV, DRM_LEASE_ENV,
+    DRM_LEASE_FD_ENV, DRM_LEASE_ID_ENV, DRM_LEASE_PLANE_ID_ENV, VIRTUAL_DRM_DRIVER,
 };
 #[cfg(target_os = "linux")]
 pub use drm_scanout::RealDrmScanoutBackend;
 pub use drm_scanout::{
-    ensure_scanout_card, fill_pattern, pattern_checksum, DrmScanoutBackend, DrmScanoutError,
-    DrmScanoutErrorStatus, DrmScanoutHandle, DrmScanoutNote, DrmScanoutNoteKind, DrmScanoutRequest,
-    DrmScanoutStatus, DrmScanoutVerification, SCANOUT_BPP, SCANOUT_DEPTH, SCANOUT_FOURCC,
-    SCANOUT_PATTERN,
+    ensure_scanout_card, fill_pattern, pattern_checksum, DrmScanoutBackend, DrmScanoutCommit,
+    DrmScanoutError, DrmScanoutErrorStatus, DrmScanoutHandle, DrmScanoutNote, DrmScanoutNoteKind,
+    DrmScanoutRequest, DrmScanoutStatus, DrmScanoutVerification, SCANOUT_BPP, SCANOUT_DEPTH,
+    SCANOUT_FOURCC, SCANOUT_PATTERN,
 };
 pub use error::MultiseatError;
 pub use fake::{

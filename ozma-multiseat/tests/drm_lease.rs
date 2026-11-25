@@ -118,6 +118,63 @@ fn requests_parse_explicit_auto_and_crtc_ids() {
 }
 
 #[test]
+fn requests_parse_and_validate_explicit_planes() {
+    let plane_only: DrmLeaseRequest = "auto:Virtual-1:301".parse().expect("plane only");
+    assert_eq!(plane_only.crtc, DrmCrtcSelector::Auto);
+    assert_eq!(plane_only.plane_id(), Some(301));
+
+    let both: DrmLeaseRequest = "/dev/dri/card3:Virtual-1@201:301"
+        .parse()
+        .expect("crtc and plane");
+    assert_eq!(both.crtc, DrmCrtcSelector::Id(201));
+    assert_eq!(both.plane_id(), Some(301));
+
+    assert!("auto:Virtual-1:0".parse::<DrmLeaseRequest>().is_err());
+    assert!("auto:Virtual-1:nope".parse::<DrmLeaseRequest>().is_err());
+}
+
+#[test]
+fn fake_lease_includes_and_reports_a_compatible_plane() {
+    let mut backend = FakeDrmLeaseBackend::new();
+    backend.add_plane("card9", 301, &[201]);
+    backend.add_plane("card9", 302, &[999]);
+
+    let request = DrmLeaseRequest::new(DrmCardSelector::AutoVirtual, "Virtual-1")
+        .with_crtc(201)
+        .with_plane(301);
+    let lease = backend.acquire(&request).expect("plane lease");
+    assert_eq!(lease.plane_id(), Some(301));
+    assert!(lease.plane_ids().contains(&301));
+    let status = DrmLeaseStatus::from_handle(lease.as_ref());
+    assert_eq!(status.plane_id, Some(301));
+    assert!(status.plane_ids.contains(&301));
+
+    let incompatible = DrmLeaseRequest::new(DrmCardSelector::AutoVirtual, "Virtual-1")
+        .with_crtc(201)
+        .with_plane(302);
+    assert!(matches!(
+        backend.acquire(&incompatible),
+        Err(DrmLeaseError::IncompatiblePlane {
+            plane: 302,
+            crtc: 201,
+            ..
+        })
+    ));
+
+    let unknown = DrmLeaseRequest::new(DrmCardSelector::AutoVirtual, "Virtual-1")
+        .with_crtc(201)
+        .with_plane(999);
+    assert!(matches!(
+        backend.acquire(&unknown),
+        Err(DrmLeaseError::UnknownObject {
+            kind: DrmObjectKind::Plane,
+            id: 999,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn acquire_validates_objects_and_reports_ids_and_fd() {
     let backend = FakeDrmLeaseBackend::new();
     let mut lease = backend.acquire(&request()).expect("acquire");

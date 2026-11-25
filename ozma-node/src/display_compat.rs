@@ -252,8 +252,8 @@ impl SnapshotError {
             )
             .with_details(format.as_str())
             .with_remediation(
-                "Use a source that emits rgb24, bgra, or mjpeg (QMP, D-Bus, VNC, Looking Glass, \
-                 or a compatible V4L2 device).",
+                "Use a source that emits rgb24, bgra, mjpeg, yuyv, or nv12 (QMP, D-Bus, VNC, \
+                 Looking Glass, or a compatible V4L2 device).",
             ),
             Self::Encode(error) => ApiError::new("display.encode_failed", error.to_string())
                 .with_remediation("Retry the snapshot; check the node log for the encoder error."),
@@ -859,6 +859,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn yuyv_and_nv12_sources_are_encoded() {
+        for format in [
+            FrameFormat::new(PixelFormat::Yuyv, 16, 8),
+            FrameFormat::new(PixelFormat::Nv12, 16, 8),
+        ] {
+            let registry =
+                CaptureRegistry::new().with(FakeCaptureProvider::new().with_format(format));
+            let snapshot = SnapshotControl::new(registry)
+                .capture()
+                .await
+                .unwrap_or_else(|error| panic!("{format:?} snapshot failed: {error}"));
+            assert_eq!(snapshot.format, format);
+            assert!(snapshot.jpeg.starts_with(&[0xFF, 0xD8]));
+            assert_eq!(jpeg_dimensions(&snapshot.jpeg), (16, 8));
+        }
+    }
+
+    #[tokio::test]
     async fn no_source_is_a_typed_unavailable_error() {
         let control = SnapshotControl::new(CaptureRegistry::new());
         let error = control.capture().await.unwrap_err();
@@ -886,17 +904,17 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_frame_format_is_typed() {
-        let format = FrameFormat::new(PixelFormat::Nv12, 4, 4);
+        let format = FrameFormat::new(PixelFormat::H264, 4, 4);
         let registry = CaptureRegistry::new().with(FakeCaptureProvider::new().with_format(format));
         let error = SnapshotControl::new(registry).capture().await.unwrap_err();
         assert_eq!(
             error,
-            SnapshotError::Encode(ozma_encode::JpegError::UnsupportedFormat(PixelFormat::Nv12))
+            SnapshotError::Encode(ozma_encode::JpegError::UnsupportedFormat(PixelFormat::H264))
         );
         assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
         let api = error.api_error();
         assert_eq!(api.code, "display.unsupported_format");
-        assert!(api.remediation.unwrap().contains("rgb24"));
+        assert!(api.remediation.unwrap().contains("yuyv"));
     }
 
     #[tokio::test]
@@ -909,6 +927,82 @@ mod tests {
         let api = error.api_error();
         assert_eq!(api.code, "display.snapshot_timeout");
         assert!(api.remediation.is_some());
+    }
+
+    #[tokio::test]
+    async fn mjpeg_source_is_passed_through_unchanged() {
+        let jpeg = ozma_encode::encode_jpeg_rgb(&[200, 30, 40, 10, 220, 90], 2, 1, 95).unwrap();
+        let registry = CaptureRegistry::new().with(StaticFrameProvider {
+            id: "mjpeg0".to_owned(),
+            format: FrameFormat::new(PixelFormat::Mjpeg, 2, 1),
+            payload: jpeg.clone(),
+        });
+        let control = SnapshotControl::new(registry);
+        let snapshot = control.capture().await.expect("MJPEG snapshot");
+        assert_eq!(snapshot.jpeg, jpeg, "MJPEG must be passed through");
+        assert_eq!(snapshot.format.pixel_format, PixelFormat::Mjpeg);
+        let info = control.info().await;
+        assert_eq!(info.pixel_format.as_deref(), Some("mjpeg"));
+        assert_eq!((info.width, info.height), (2, 1));
+    }
+
+    struct StaticFrameProvider {
+        id: String,
+        format: FrameFormat,
+        payload: Vec<u8>,
+    }
+
+    impl ozma_capture::CaptureProvider for StaticFrameProvider {
+        fn kind(&self) -> CaptureKind {
+            CaptureKind::Fake
+        }
+
+        fn enumerate(&self) -> Result<Vec<CaptureCapability>, ApiError> {
+            Ok(vec![CaptureCapability {
+                id: self.id.clone(),
+                name: "Static test frame".to_owned(),
+                kind: CaptureKind::Fake,
+                formats: vec![self.format.pixel_format.as_str().to_owned()],
+                max_width: self.format.width,
+                max_height: self.format.height,
+                max_fps: 1,
+                compressed: self.format.pixel_format.is_compressed(),
+                hdr: false,
+                has_audio: false,
+            }])
+        }
+
+        fn open(
+            &self,
+            _capability: &CaptureCapability,
+        ) -> Result<Box<dyn CaptureSource>, ApiError> {
+            Ok(Box::new(StaticFrameSource {
+                id: self.id.clone(),
+                format: self.format,
+                payload: self.payload.clone(),
+            }))
+        }
+    }
+
+    struct StaticFrameSource {
+        id: String,
+        format: FrameFormat,
+        payload: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl CaptureSource for StaticFrameSource {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn format(&self) -> FrameFormat {
+            self.format
+        }
+
+        async fn next_frame(&mut self) -> Result<Frame, MediaError> {
+            Frame::with_data(self.format, 0, 0, true, self.payload.clone())
+        }
     }
 
     struct SlowProvider;

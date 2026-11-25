@@ -199,6 +199,9 @@ unrelated files.)
 
 - MJPEG only. `/video` does not encode H.264/H.265/AV1; high-resolution/high-fps
   streams consume substantially more bandwidth than `/stream/*` HLS or WebRTC.
+  Capture layouts are not limited to RGB/BGRA/MJPEG: YUYV and NV12 are converted
+  to RGB24 through `ozma_encode::to_rgb24` before JPEG encoding, and MJPEG is
+  passed through. See [`phase4-v4l2-media-report.md`](phase4-v4l2-media-report.md).
 - One capture source per stream. Providers that only allow a single client (for
   example an unshared VNC server) may reject a second stream with a typed error
   or end it when the provider fails; the node does not share frames between

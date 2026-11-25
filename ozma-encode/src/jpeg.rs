@@ -7,11 +7,12 @@
 //!
 //! * `rgb24` is encoded directly;
 //! * `bgra` is encoded directly (the alpha byte is ignored by JPEG);
-//! * `mjpeg` is passed through when it already starts with the JPEG SOI marker.
+//! * `mjpeg` is passed through when it already starts with the JPEG SOI marker;
+//! * `yuyv` and `nv12` are converted to packed RGB24 first.
 //!
 //! Everything else returns [`JpegError::UnsupportedFormat`]. Callers must map
-//! that to a typed error; silently treating NV12/YUYV/P010 bytes as RGB would
-//! produce a corrupt image.
+//! that to a typed error; silently treating unsupported compressed/P010 bytes
+//! as RGB would produce a corrupt image.
 
 use ozma_media::{Frame, PixelFormat};
 
@@ -40,8 +41,10 @@ pub enum JpegError {
         /// Frame height.
         height: u32,
     },
-    /// The frame layout is not RGB24, BGRA, or a JPEG pass-through.
-    #[error("cannot encode `{0}` frames as JPEG; only rgb24, bgra, and mjpeg are supported")]
+    /// The frame layout is not a supported RGB/YUV layout or JPEG pass-through.
+    #[error(
+        "cannot encode `{0}` frames as JPEG; only rgb24, bgra, yuyv, nv12, and mjpeg are supported"
+    )]
     UnsupportedFormat(PixelFormat),
     /// The buffer is shorter than the geometry requires.
     #[error(
@@ -62,6 +65,14 @@ pub enum JpegError {
     /// An `mjpeg` frame did not carry a JPEG stream.
     #[error("mjpeg frame does not start with a JPEG SOI marker")]
     NotJpeg,
+    /// A YUV capture layout could not be converted to RGB24.
+    #[error("cannot convert `{format}` frames to RGB24 for JPEG encoding: {message}")]
+    Convert {
+        /// Capture layout.
+        format: PixelFormat,
+        /// Conversion failure.
+        message: String,
+    },
     /// The encoder rejected the input.
     #[error("JPEG encoding failed: {0}")]
     Encode(String),
@@ -80,6 +91,14 @@ pub fn encode_jpeg_frame(frame: &Frame, quality: u8) -> Result<Vec<u8>, JpegErro
                 return Err(JpegError::NotJpeg);
             }
             Ok(frame.data().to_vec())
+        }
+        PixelFormat::Yuyv | PixelFormat::Nv12 => {
+            let rgb =
+                crate::to_rgb24(format, frame.data()).map_err(|error| JpegError::Convert {
+                    format: format.pixel_format,
+                    message: error.to_string(),
+                })?;
+            encode_jpeg_rgb(&rgb, format.width, format.height, quality)
         }
         other => Err(JpegError::UnsupportedFormat(other)),
     }
@@ -166,6 +185,7 @@ fn encode(
 mod tests {
     use super::*;
     use ozma_media::{Frame, FrameFormat};
+    use std::io::Cursor;
 
     fn decode_dimensions(jpeg: &[u8]) -> (u16, u16) {
         let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(jpeg));
@@ -224,18 +244,93 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_and_short_frames_with_typed_errors() {
+    fn yuyv_and_nv12_frames_are_converted_and_encoded() {
+        let yuyv = Frame::with_data(
+            FrameFormat::new(PixelFormat::Yuyv, 2, 2),
+            0,
+            0,
+            true,
+            vec![
+                16, 128, 235, 128, // row 0: limited-range black, then white
+                16, 128, 235, 128, // row 1
+            ],
+        )
+        .unwrap();
+        let jpeg = encode_jpeg_frame(&yuyv, 90).unwrap();
+        assert!(jpeg.starts_with(&JPEG_SOI));
+        assert_eq!(decode_dimensions(&jpeg), (2, 2));
+        let pixels = jpeg_decoder::Decoder::new(Cursor::new(&jpeg))
+            .decode()
+            .expect("valid YUYV JPEG");
+        assert!(
+            pixels[0] < 40 && pixels[1] < 40 && pixels[2] < 40,
+            "{pixels:?}"
+        );
+        assert!(
+            pixels[3] > 210 && pixels[4] > 210 && pixels[5] > 210,
+            "{pixels:?}"
+        );
+
         let nv12 = Frame::with_data(
             FrameFormat::new(PixelFormat::Nv12, 2, 2),
             0,
             0,
             true,
-            vec![0u8; PixelFormat::Nv12.nominal_len(2, 2).unwrap()],
+            vec![
+                16, 235, // Y row 0: black, white
+                16, 235, // Y row 1
+                128, 128, // neutral chroma
+            ],
+        )
+        .unwrap();
+        let jpeg = encode_jpeg_frame(&nv12, 90).unwrap();
+        assert!(jpeg.starts_with(&JPEG_SOI));
+        assert_eq!(decode_dimensions(&jpeg), (2, 2));
+        let pixels = jpeg_decoder::Decoder::new(Cursor::new(&jpeg))
+            .decode()
+            .expect("valid NV12 JPEG");
+        assert!(
+            pixels[0] < 40 && pixels[1] < 40 && pixels[2] < 40,
+            "{pixels:?}"
+        );
+        assert!(
+            pixels[3] > 210 && pixels[4] > 210 && pixels[5] > 210,
+            "{pixels:?}"
+        );
+    }
+
+    #[test]
+    fn short_yuv_payloads_are_typed_conversion_errors() {
+        let frame = Frame::with_data(
+            FrameFormat::new(PixelFormat::Nv12, 4, 4),
+            0,
+            0,
+            true,
+            vec![0u8; 4],
+        )
+        .unwrap();
+        assert!(matches!(
+            encode_jpeg_frame(&frame, 80),
+            Err(JpegError::Convert {
+                format: PixelFormat::Nv12,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_unsupported_and_short_frames_with_typed_errors() {
+        let h264 = Frame::with_data(
+            FrameFormat::new(PixelFormat::H264, 2, 2),
+            0,
+            0,
+            true,
+            vec![0u8; 16],
         )
         .unwrap();
         assert_eq!(
-            encode_jpeg_frame(&nv12, 80),
-            Err(JpegError::UnsupportedFormat(PixelFormat::Nv12))
+            encode_jpeg_frame(&h264, 80),
+            Err(JpegError::UnsupportedFormat(PixelFormat::H264))
         );
 
         assert!(matches!(

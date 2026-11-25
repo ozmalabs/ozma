@@ -51,11 +51,14 @@ pub const FALLBACK_HEIGHT: u32 = 480;
 /// How long a frame read may block before the source reports an error.
 pub const DEFAULT_FRAME_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Pixel formats in negotiation order: MJPEG, NV12, YUYV, then H.264
-/// passthrough. MJPEG is preferred because it keeps USB bandwidth low; NV12 is
-/// the best raw layout for hardware encoders; YUYV is the most compatible raw
-/// fallback.
-pub const PREFERRED_FOURCCS: [[u8; 4]; 4] = [*b"MJPG", *b"NV12", *b"YUYV", *b"H264"];
+/// Pixel formats in negotiation order: MJPEG, NV12, YUYV, then compressed
+/// passthrough (H.264, HEVC, AV1). MJPEG is preferred because it keeps USB
+/// bandwidth low; NV12 is the best raw layout for hardware encoders; YUYV is the
+/// most compatible raw fallback. Compressed formats are last because they are
+/// only useful when the HLS encoder matches; the snapshot path still needs a
+/// decodable layout.
+pub const PREFERRED_FOURCCS: [[u8; 4]; 6] =
+    [*b"MJPG", *b"NV12", *b"YUYV", *b"H264", *b"HEVC", *b"AV01"];
 
 /// Common resolutions considered for stepwise frame-size ranges.
 const COMMON_RESOLUTIONS: [(u32, u32); 6] = [
@@ -77,6 +80,7 @@ pub fn fourcc_to_pixel_format(fourcc: [u8; 4]) -> Option<PixelFormat> {
         b"YUYV" | b"YUY2" => Some(PixelFormat::Yuyv),
         b"H264" => Some(PixelFormat::H264),
         b"HEVC" => Some(PixelFormat::Hevc),
+        b"AV01" => Some(PixelFormat::Av1),
         _ => None,
     }
 }
@@ -792,7 +796,9 @@ fn open_device(node: &V4l2Node) -> Result<(Device, Format, PixelFormat), ApiErro
             ),
         )
         .with_details(node.id.clone())
-        .with_remediation("Try a device that advertises MJPEG, NV12, YUYV, or H.264 capture."));
+        .with_remediation(
+            "Try a device that advertises MJPEG, NV12, YUYV, H.264, HEVC, or AV1 capture.",
+        ));
     };
 
     if negotiated.width == 0 || negotiated.height == 0 {
@@ -847,7 +853,7 @@ fn select_fourcc(device: &Device, node: &V4l2Node) -> Result<[u8; 4], ApiError> 
         ),
     )
     .with_details(node.id.clone())
-    .with_remediation("A supported device advertises MJPEG, NV12, YUYV, or H.264."))
+    .with_remediation("A supported device advertises MJPEG, NV12, YUYV, H.264, HEVC, or AV1."))
 }
 
 fn frame_size_candidates(device: &Device, fourcc: [u8; 4]) -> Vec<(u32, u32)> {
@@ -1138,6 +1144,7 @@ mod tests {
         assert_eq!(fourcc_to_pixel_format(*b"YUY2"), Some(PixelFormat::Yuyv));
         assert_eq!(fourcc_to_pixel_format(*b"H264"), Some(PixelFormat::H264));
         assert_eq!(fourcc_to_pixel_format(*b"HEVC"), Some(PixelFormat::Hevc));
+        assert_eq!(fourcc_to_pixel_format(*b"AV01"), Some(PixelFormat::Av1));
         assert_eq!(fourcc_to_pixel_format(*b"RGB3"), None);
         assert_eq!(fourcc_to_pixel_format([0, 0, 0, 0]), None);
     }
@@ -1151,6 +1158,12 @@ mod tests {
         assert_eq!(preferred_fourcc(&[*b"YUYV", *b"NV12"]), Some(*b"NV12"));
         assert_eq!(preferred_fourcc(&[*b"YUYV"]), Some(*b"YUYV"));
         assert_eq!(preferred_fourcc(&[*b"H264", *b"RGB3"]), Some(*b"H264"));
+        assert_eq!(
+            preferred_fourcc(&[*b"HEVC", *b"AV01"]),
+            Some(*b"HEVC"),
+            "HEVC is preferred over AV1"
+        );
+        assert_eq!(preferred_fourcc(&[*b"AV01", *b"RGB3"]), Some(*b"AV01"));
         assert_eq!(preferred_fourcc(&[*b"RGB3"]), None);
         assert_eq!(preferred_fourcc(&[]), None);
     }

@@ -4,14 +4,17 @@
 //! A lease alone only hands object IDs to a lessee. This module goes one step
 //! further and proves the leased objects are actually usable for scanout:
 //!
-//! 1. acquire a lease for one connector and CRTC;
+//! 1. acquire a lease for one connector, one CRTC, and optionally one validated
+//!    plane;
 //! 2. choose one of the connector's advertised modes;
 //! 3. allocate a dumb buffer, fill a known pattern, and add a framebuffer;
-//! 4. program the CRTC/connector (`set_crtc`) and queue one page flip;
-//! 5. re-read CRTC/connector/framebuffer state and compare it with what was
-//!    requested;
-//! 6. clear the CRTC, destroy the framebuffer and dumb buffer, and revoke the
-//!    lease.
+//! 4. program the connector/CRTC/plane with an atomic property commit
+//!    (`set_plane` + `set_crtc` state) and a page-flip event, falling back to
+//!    legacy `set_crtc`/`page_flip` only when atomic KMS is unsupported;
+//! 5. re-read CRTC/plane/connector/framebuffer state and compare it with what
+//!    was requested;
+//! 6. clear the plane/CRTC, destroy the framebuffer and dumb buffer, and revoke
+//!    the lease.
 //!
 //! This is a **scanout proof**, not a compositor. It renders one static,
 //! generated pattern directly to one leased output. It does not accept client
@@ -43,30 +46,75 @@ pub const SCANOUT_DEPTH: u32 = 24;
 const BORDER_PX: u32 = 8;
 /// Diagonal thickness in pixels.
 const DIAGONAL_PX: u32 = 4;
+/// Upper bound on properties enumerated from one KMS object. A driver that
+/// reports more is treated as a typed failure rather than looping unbounded.
+const MAX_ATOMIC_PROPERTIES: usize = 256;
+
+/// Which KMS commit API actually programmed the scanout.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DrmScanoutCommit {
+    /// Atomic `set_plane` + `set_crtc` property commit with a page-flip event.
+    Atomic,
+    /// Legacy `set_crtc` followed by `page_flip`.
+    #[default]
+    Legacy,
+}
+
+impl DrmScanoutCommit {
+    /// Stable wire/status name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Atomic => "atomic",
+            Self::Legacy => "legacy",
+        }
+    }
+}
 
 /// A validated scanout request.
 ///
-/// The CLI form is the same `[SEAT=]CARD:CONNECTOR[@CRTC]` selector as
+/// The CLI form is the same `[SEAT=]CARD:CONNECTOR[@CRTC][:PLANE]` selector as
 /// [`DrmLeaseRequest`], with an optional explicit mode name.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DrmScanoutRequest {
-    /// Lease selector (card, connector, optional CRTC).
+    /// Lease selector (card, connector, optional CRTC, optional plane).
     pub lease: DrmLeaseRequest,
     /// Exact connector mode name. `None` selects the connector's first
     /// advertised (normally preferred) mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// Force the legacy `set_crtc` proof even when atomic KMS is available.
+    /// Used by the live test to establish a legacy baseline when vkms exposes
+    /// no leaseable plane.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub force_legacy: bool,
 }
 
 impl DrmScanoutRequest {
     /// Build a request with automatic mode selection.
     pub fn new(lease: DrmLeaseRequest) -> Self {
-        Self { lease, mode: None }
+        Self {
+            lease,
+            mode: None,
+            force_legacy: false,
+        }
     }
 
     /// Require an exact mode name.
     pub fn with_mode(mut self, mode: impl Into<String>) -> Self {
         self.mode = Some(mode.into());
+        self
+    }
+
+    /// Request an explicit plane object id in the underlying lease.
+    pub fn with_plane(mut self, plane: u32) -> Self {
+        self.lease = self.lease.with_plane(plane);
+        self
+    }
+
+    /// Force the legacy `set_crtc` path for a deliberate legacy baseline.
+    pub fn with_legacy_commit(mut self) -> Self {
+        self.force_legacy = true;
         self
     }
 }
@@ -91,6 +139,12 @@ pub enum DrmScanoutNoteKind {
     RealGpuNamed,
     /// A page flip could not be queued; the `set_crtc` commit was still made.
     PageFlipUnavailable,
+    /// Atomic KMS was unsupported, so the proof used the legacy commit path.
+    LegacyCommitFallback,
+    /// The proof deliberately used the legacy commit path as a baseline.
+    LegacyCommitForced,
+    /// The lease includes an explicitly validated plane.
+    PlaneLeased,
 }
 
 impl DrmScanoutNoteKind {
@@ -101,6 +155,9 @@ impl DrmScanoutNoteKind {
             Self::LesseeFd => "lessee_fd",
             Self::RealGpuNamed => "real_gpu_named",
             Self::PageFlipUnavailable => "page_flip_unavailable",
+            Self::LegacyCommitFallback => "legacy_commit_fallback",
+            Self::LegacyCommitForced => "legacy_commit_forced",
+            Self::PlaneLeased => "plane_leased",
         }
     }
 }
@@ -161,6 +218,15 @@ pub struct DrmScanoutVerification {
     /// CRTC currently bound through the connector's encoder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connector_crtc: Option<u32>,
+    /// Plane object id used by the proof, when one was selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plane_id: Option<u32>,
+    /// CRTC reported by the plane, when a plane was used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plane_crtc: Option<u32>,
+    /// Framebuffer reported by the plane, when a plane was used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plane_framebuffer: Option<u32>,
     /// Framebuffer object id.
     pub framebuffer_id: u32,
     /// Framebuffer width/height.
@@ -204,6 +270,12 @@ pub struct DrmScanoutStatus {
     /// CRTC object id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crtc_id: Option<u32>,
+    /// Plane object id used by the proof, when one was selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plane_id: Option<u32>,
+    /// Which commit API programmed scanout (`atomic` or `legacy`).
+    #[serde(default)]
+    pub commit: DrmScanoutCommit,
     /// Lessee id from the underlying lease.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lessee_id: Option<u32>,
@@ -261,6 +333,7 @@ impl DrmScanoutStatus {
             && self.connector.is_empty()
             && self.connector_id.is_none()
             && self.crtc_id.is_none()
+            && self.plane_id.is_none()
             && self.lessee_id.is_none()
             && self.lessee_fd.is_none()
             && self.mode.is_empty()
@@ -284,6 +357,7 @@ impl DrmScanoutStatus {
         Self {
             card: request.lease.card.display_name(),
             connector: request.lease.connector.clone(),
+            plane_id: request.lease.plane_id(),
             mode: request.mode.clone().unwrap_or_default(),
             pattern: SCANOUT_PATTERN.to_owned(),
             ..Self::default()
@@ -412,6 +486,65 @@ pub enum DrmScanoutError {
         reason: String,
     },
 
+    /// Atomic KMS is not supported by the driver or kernel.
+    #[error("atomic KMS is not supported on {card}: {reason}")]
+    AtomicUnsupported {
+        /// Card path or name.
+        card: String,
+        /// Kernel detail.
+        reason: String,
+    },
+
+    /// No leaseable plane can drive the selected CRTC.
+    #[error("no usable DRM plane for CRTC {crtc} on {card}: {reason}")]
+    UnsupportedPlane {
+        /// Card path or name.
+        card: String,
+        /// CRTC object id.
+        crtc: u32,
+        /// Detail.
+        reason: String,
+    },
+
+    /// A plane does not support the proof's pixel format.
+    #[error("DRM plane {plane} on {card} does not support format {format}: {reason}")]
+    InvalidFormat {
+        /// Card path or name.
+        card: String,
+        /// Plane object id.
+        plane: u32,
+        /// Required pixel format.
+        format: String,
+        /// Detail.
+        reason: String,
+    },
+
+    /// A required atomic property was absent from an object.
+    #[error("DRM {object} {id} on {card} has no atomic property {property:?}")]
+    MissingAtomicProperty {
+        /// Card path or name.
+        card: String,
+        /// Object kind.
+        object: String,
+        /// Object id.
+        id: u32,
+        /// Property name.
+        property: String,
+    },
+
+    /// Property enumeration exceeded the proof's fixed bound.
+    #[error("DRM {object} {id} on {card} reports more than {limit} properties")]
+    PropertyLimitExceeded {
+        /// Card path or name.
+        card: String,
+        /// Object kind.
+        object: String,
+        /// Object id.
+        id: u32,
+        /// Bound.
+        limit: usize,
+    },
+
     /// The requested mode is not advertised, or the kernel rejected the modeset.
     #[error("failed to set mode {mode:?} on {card}:{connector}: {reason}")]
     ModeFailed {
@@ -487,6 +620,11 @@ impl DrmScanoutError {
             Self::UnsupportedVkms { .. } => "unsupported_vkms",
             Self::RealCardRefused { .. } => "real_card_refused",
             Self::UnsupportedConnector { .. } => "unsupported_connector",
+            Self::AtomicUnsupported { .. } => "atomic_unsupported",
+            Self::UnsupportedPlane { .. } => "unsupported_plane",
+            Self::InvalidFormat { .. } => "invalid_format",
+            Self::MissingAtomicProperty { .. } => "missing_atomic_property",
+            Self::PropertyLimitExceeded { .. } => "property_limit_exceeded",
             Self::ModeFailed { .. } => "mode_failed",
             Self::BufferFailed { .. } => "buffer_failed",
             Self::FramebufferFailed { .. } => "framebuffer_failed",
@@ -537,21 +675,24 @@ fn drm_status_name(state: drm::control::connector::State) -> String {
 
 #[cfg(target_os = "linux")]
 mod real {
+    use std::collections::BTreeMap;
     use std::num::NonZeroU32;
     use std::os::fd::{AsFd, BorrowedFd};
     use std::path::Path;
 
     use drm::buffer::{Buffer, DrmFourcc};
     use drm::control::{
-        connector, crtc, framebuffer, Device as ControlDevice, Mode, PageFlipFlags,
-        RawResourceHandle,
+        atomic::AtomicModeReq, connector, crtc, framebuffer, plane, property, AtomicCommitFlags,
+        Device as ControlDevice, Mode, PageFlipFlags, RawResourceHandle, ResourceHandle,
     };
+    use drm::ClientCapability;
+    use drm::Device;
 
     use super::{
         drm_status_name, ensure_scanout_card, fill_pattern, pattern_checksum, DrmScanoutBackend,
-        DrmScanoutError, DrmScanoutHandle, DrmScanoutNote, DrmScanoutNoteKind, DrmScanoutRequest,
-        DrmScanoutStatus, DrmScanoutVerification, BORDER_PX, DIAGONAL_PX, SCANOUT_BPP,
-        SCANOUT_DEPTH, SCANOUT_FOURCC, SCANOUT_PATTERN,
+        DrmScanoutCommit, DrmScanoutError, DrmScanoutHandle, DrmScanoutNote, DrmScanoutNoteKind,
+        DrmScanoutRequest, DrmScanoutStatus, DrmScanoutVerification, BORDER_PX, DIAGONAL_PX,
+        MAX_ATOMIC_PROPERTIES, SCANOUT_BPP, SCANOUT_DEPTH, SCANOUT_FOURCC, SCANOUT_PATTERN,
     };
     use crate::drm_lease::{
         DrmCard, DrmCardSelector, DrmLeaseBackend, DrmLeaseHandle, RealDrmLeaseBackend,
@@ -682,44 +823,88 @@ mod real {
                     reason: error.to_string(),
                 })?;
 
-            if let Err(error) = device.set_crtc(
-                crtc_handle,
-                Some(framebuffer),
-                (0, 0),
-                &[connector_handle],
-                Some(mode),
-            ) {
-                let _ = device.destroy_framebuffer(framebuffer);
-                let _ = device.destroy_dumb_buffer(buffer);
-                return Err(DrmScanoutError::ModeFailed {
-                    card: card.path.display().to_string(),
-                    connector: request.lease.connector.clone(),
-                    mode: mode_name.clone(),
-                    reason: error.to_string(),
-                });
-            }
-
-            let page_flipped =
-                match device.page_flip(crtc_handle, framebuffer, PageFlipFlags::empty(), None) {
-                    Ok(()) => true,
+            let plane_ids = lease.plane_ids().to_vec();
+            let requested_plane = request.lease.plane_id();
+            let mut fallback_reason = None;
+            let mut forced_legacy = false;
+            let (commit, plane_id, page_flipped) = if request.force_legacy {
+                forced_legacy = true;
+                match legacy_commit(
+                    &device,
+                    &card.path,
+                    &request.lease.connector,
+                    crtc_handle,
+                    connector_handle,
+                    framebuffer,
+                    mode,
+                    &mode_name,
+                ) {
+                    Ok(page_flipped) => (DrmScanoutCommit::Legacy, requested_plane, page_flipped),
                     Err(error) => {
-                        // The CRTC commit above already programmed the mode. A
-                        // flip-less virtual driver is still a successful commit,
-                        // but the limitation is recorded honestly.
-                        eprintln!(
-                            "notice: page flip on {}:{} failed ({error}); set_crtc commit remains",
-                            card.path.display(),
-                            request.lease.connector
-                        );
-                        false
+                        let _ = device.destroy_framebuffer(framebuffer);
+                        let _ = device.destroy_dumb_buffer(buffer);
+                        return Err(error);
                     }
-                };
+                }
+            } else {
+                match try_atomic_commit(
+                    &device,
+                    &card.path,
+                    &request.lease.connector,
+                    connector_handle,
+                    connector_id,
+                    crtc_handle,
+                    crtc_id,
+                    framebuffer,
+                    mode,
+                    &mode_name,
+                    width,
+                    height,
+                    requested_plane,
+                    &plane_ids,
+                ) {
+                    Ok(outcome) => (
+                        DrmScanoutCommit::Atomic,
+                        Some(outcome.plane_id),
+                        outcome.page_flipped,
+                    ),
+                    Err(AtomicAttempt::Unsupported(reason)) => {
+                        fallback_reason = Some(reason);
+                        match legacy_commit(
+                            &device,
+                            &card.path,
+                            &request.lease.connector,
+                            crtc_handle,
+                            connector_handle,
+                            framebuffer,
+                            mode,
+                            &mode_name,
+                        ) {
+                            Ok(page_flipped) => {
+                                (DrmScanoutCommit::Legacy, requested_plane, page_flipped)
+                            }
+                            Err(error) => {
+                                let _ = device.destroy_framebuffer(framebuffer);
+                                let _ = device.destroy_dumb_buffer(buffer);
+                                return Err(error);
+                            }
+                        }
+                    }
+                    Err(AtomicAttempt::Failed(error)) => {
+                        let _ = device.destroy_framebuffer(framebuffer);
+                        let _ = device.destroy_dumb_buffer(buffer);
+                        return Err(error);
+                    }
+                }
+            };
 
             let mut status = DrmScanoutStatus {
                 card: card.path.display().to_string(),
                 connector: request.lease.connector.clone(),
                 connector_id: Some(connector_id),
                 crtc_id: Some(crtc_id),
+                plane_id,
+                commit,
                 lessee_id: Some(lease.lessee_id()),
                 lessee_fd: lease.fd(),
                 mode: mode_name,
@@ -747,21 +932,49 @@ mod real {
                     lease.fd().unwrap_or(-1)
                 ),
             ));
+            if let Some(plane_id) = plane_id {
+                status.push_note(DrmScanoutNote::new(
+                    DrmScanoutNoteKind::PlaneLeased,
+                    format!(
+                        "plane {plane_id} was validated against CRTC {crtc_id} and committed \
+                         through {} KMS",
+                        commit.as_str()
+                    ),
+                ));
+            }
             if !card.is_virtual() {
                 status.push_note(DrmScanoutNote::new(
                     DrmScanoutNoteKind::RealGpuNamed,
                     format!(
                         "operator explicitly named real card {} ({}); only the leased \
-                         connector/CRTC was programmed",
+                         connector/CRTC/plane was programmed",
                         card.path.display(),
                         card.driver
+                    ),
+                ));
+            }
+            if forced_legacy {
+                status.push_note(DrmScanoutNote::new(
+                    DrmScanoutNoteKind::LegacyCommitForced,
+                    "legacy set_crtc/page_flip was requested explicitly as a baseline",
+                ));
+            }
+            if let Some(reason) = fallback_reason {
+                status.push_note(DrmScanoutNote::new(
+                    DrmScanoutNoteKind::LegacyCommitFallback,
+                    format!(
+                        "atomic KMS was unsupported ({reason}); the proof fell back to legacy \
+                         set_crtc/page_flip"
                     ),
                 ));
             }
             if !page_flipped {
                 status.push_note(DrmScanoutNote::new(
                     DrmScanoutNoteKind::PageFlipUnavailable,
-                    "page_flip was rejected; the set_crtc commit still programmed the mode",
+                    format!(
+                        "page flip was rejected; the {} commit still programmed scanout",
+                        commit.as_str()
+                    ),
                 ));
             }
 
@@ -771,6 +984,7 @@ mod real {
                 connector_name: request.lease.connector.clone(),
                 connector_id,
                 crtc_id,
+                plane_id,
                 status,
                 framebuffer: Some(framebuffer),
                 buffer: Some(buffer),
@@ -785,6 +999,7 @@ mod real {
         connector_name: String,
         connector_id: u32,
         crtc_id: u32,
+        plane_id: Option<u32>,
         status: DrmScanoutStatus,
         framebuffer: Option<framebuffer::Handle>,
         buffer: Option<drm::control::dumbbuffer::DumbBuffer>,
@@ -839,6 +1054,21 @@ mod real {
                 .and_then(|encoder| device.get_encoder(encoder).ok())
                 .and_then(|encoder| encoder.crtc())
                 .map(u32::from);
+
+            let (plane_id, plane_crtc, plane_framebuffer) = match self.plane_id {
+                Some(id) => {
+                    let handle = plane_handle(id, &self.card)?;
+                    let info = device
+                        .get_plane(handle)
+                        .map_err(|error| map_io(&self.card, error))?;
+                    (
+                        Some(id),
+                        info.crtc().map(u32::from),
+                        info.framebuffer().map(u32::from),
+                    )
+                }
+                None => (None, None, None),
+            };
 
             let crtc_mode = crtc_info.mode().map(|mode| mode_name(&mode));
             let crtc_framebuffer = crtc_info.framebuffer().map(u32::from);
@@ -900,6 +1130,19 @@ mod real {
                     "connector encoder binds CRTC {:?}, expected {}",
                     connected_crtc, self.crtc_id
                 ));
+            } else if let Some(plane_id) = plane_id {
+                if plane_crtc != Some(self.crtc_id) {
+                    mismatch = Some(format!(
+                        "plane {plane_id} reports CRTC {:?}, expected {}",
+                        plane_crtc, self.crtc_id
+                    ));
+                } else if plane_framebuffer != Some(u32::from(framebuffer)) {
+                    mismatch = Some(format!(
+                        "plane {plane_id} reports framebuffer {:?}, expected {}",
+                        plane_framebuffer,
+                        u32::from(framebuffer)
+                    ));
+                }
             }
 
             let verification = DrmScanoutVerification {
@@ -909,6 +1152,9 @@ mod real {
                 crtc_position: crtc_info.position(),
                 connector_state: drm_status_name(connector_info.state()),
                 connector_crtc: connected_crtc,
+                plane_id,
+                plane_crtc,
+                plane_framebuffer,
                 framebuffer_id: u32::from(framebuffer),
                 framebuffer_size: framebuffer_info.size(),
                 framebuffer_pitch: framebuffer_info.pitch(),
@@ -951,14 +1197,50 @@ mod real {
             if let Some(lease) = self.lease.as_ref() {
                 if let Some(fd) = lease.as_fd() {
                     let device = LeaseDevice { fd };
-                    let crtc_handle = crtc_handle(self.crtc_id, &card)?;
-                    if let Err(error) = device.set_crtc(crtc_handle, None, (0, 0), &[], None) {
-                        first_error = Some(DrmScanoutError::ModeFailed {
-                            card: card.display().to_string(),
-                            connector: self.connector_name.clone(),
-                            mode: self.status.mode.clone(),
-                            reason: format!("clearing CRTC: {error}"),
-                        });
+                    let clear = match crtc_handle(self.crtc_id, &card) {
+                        Ok(crtc_handle) => {
+                            if self.status.commit == DrmScanoutCommit::Atomic {
+                                if let Some(plane_id) = self.plane_id {
+                                    match try_atomic_disable(
+                                        &device,
+                                        &card,
+                                        self.connector_id,
+                                        self.crtc_id,
+                                        plane_id,
+                                    ) {
+                                        Ok(()) => Ok(()),
+                                        Err(AtomicAttempt::Unsupported(_)) => legacy_clear(
+                                            &device,
+                                            &card,
+                                            &self.connector_name,
+                                            crtc_handle,
+                                            &self.status.mode,
+                                        ),
+                                        Err(AtomicAttempt::Failed(error)) => Err(error),
+                                    }
+                                } else {
+                                    legacy_clear(
+                                        &device,
+                                        &card,
+                                        &self.connector_name,
+                                        crtc_handle,
+                                        &self.status.mode,
+                                    )
+                                }
+                            } else {
+                                legacy_clear(
+                                    &device,
+                                    &card,
+                                    &self.connector_name,
+                                    crtc_handle,
+                                    &self.status.mode,
+                                )
+                            }
+                        }
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = clear {
+                        first_error = Some(error);
                     }
                     if let Some(framebuffer) = self.framebuffer {
                         if let Err(error) = device.destroy_framebuffer(framebuffer) {
@@ -983,12 +1265,13 @@ mod real {
                 }
             }
 
-            if first_error.is_none() {
-                if let Some(mut lease) = self.lease.take() {
-                    if let Err(error) = lease.revoke() {
-                        self.lease = Some(lease);
-                        first_error.get_or_insert(error.into());
-                    }
+            // Revoke even when a clear/destroy step failed, so the lease and
+            // lessee fd cannot leak. A second teardown then only retries the
+            // object cleanup that did not complete.
+            if let Some(mut lease) = self.lease.take() {
+                if let Err(error) = lease.revoke() {
+                    self.lease = Some(lease);
+                    first_error.get_or_insert(error.into());
                 }
             }
 
@@ -1049,6 +1332,482 @@ mod real {
         Ok(crtc::Handle::from(RawResourceHandle::from(raw)))
     }
 
+    fn plane_handle(id: u32, card: &Path) -> Result<plane::Handle, DrmScanoutError> {
+        let raw = NonZeroU32::new(id).ok_or_else(|| DrmScanoutError::UnsupportedPlane {
+            card: card.display().to_string(),
+            crtc: 0,
+            reason: "plane object id is zero".to_owned(),
+        })?;
+        Ok(plane::Handle::from(RawResourceHandle::from(raw)))
+    }
+
+    /// Bounded property name lookup for one KMS object.
+    struct AtomicProperties {
+        values: BTreeMap<String, (property::Handle, property::RawValue)>,
+    }
+
+    impl AtomicProperties {
+        fn read<T: ResourceHandle + Copy>(
+            device: &LeaseDevice<'_>,
+            handle: T,
+            card: &Path,
+            object: &str,
+            id: u32,
+        ) -> Result<Self, DrmScanoutError> {
+            let set = device
+                .get_properties(handle)
+                .map_err(|error| map_io(card, error))?;
+            let (prop_ids, prop_values) = set.as_props_and_values();
+            if prop_ids.len() > MAX_ATOMIC_PROPERTIES {
+                return Err(DrmScanoutError::PropertyLimitExceeded {
+                    card: card.display().to_string(),
+                    object: object.to_owned(),
+                    id,
+                    limit: MAX_ATOMIC_PROPERTIES,
+                });
+            }
+            let mut values = BTreeMap::new();
+            for (prop, value) in prop_ids.iter().zip(prop_values.iter()) {
+                let info = device
+                    .get_property(*prop)
+                    .map_err(|error| map_io(card, error))?;
+                let name = info.name().to_string_lossy().into_owned();
+                values.insert(name, (*prop, *value));
+            }
+            Ok(Self { values })
+        }
+
+        fn require(
+            &self,
+            card: &Path,
+            object: &str,
+            id: u32,
+            property: &str,
+        ) -> Result<property::Handle, DrmScanoutError> {
+            self.values
+                .get(property)
+                .map(|(handle, _)| *handle)
+                .ok_or_else(|| DrmScanoutError::MissingAtomicProperty {
+                    card: card.display().to_string(),
+                    object: object.to_owned(),
+                    id,
+                    property: property.to_owned(),
+                })
+        }
+
+        fn enum_name(
+            &self,
+            device: &LeaseDevice<'_>,
+            card: &Path,
+            property: &str,
+        ) -> Result<Option<String>, DrmScanoutError> {
+            let Some((handle, raw)) = self.values.get(property) else {
+                return Ok(None);
+            };
+            let info = device
+                .get_property(*handle)
+                .map_err(|error| map_io(card, error))?;
+            let value = info.value_type().convert_value(*raw);
+            Ok(value
+                .as_enum()
+                .map(|value| value.name().to_string_lossy().into_owned()))
+        }
+    }
+
+    struct AtomicOutcome {
+        plane_id: u32,
+        page_flipped: bool,
+    }
+
+    enum AtomicAttempt {
+        Unsupported(String),
+        Failed(DrmScanoutError),
+    }
+
+    fn is_unsupported_error(error: &std::io::Error) -> bool {
+        matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) | Some(libc::ENOTTY)
+        )
+    }
+
+    fn enable_atomic(device: &LeaseDevice<'_>, card: &Path) -> Result<(), AtomicAttempt> {
+        let _ = device.set_client_capability(ClientCapability::UniversalPlanes, true);
+        match device.set_client_capability(ClientCapability::Atomic, true) {
+            Ok(()) => Ok(()),
+            Err(error) if is_unsupported_error(&error) => {
+                Err(AtomicAttempt::Unsupported(error.to_string()))
+            }
+            Err(error) => Err(AtomicAttempt::Failed(map_io(card, error))),
+        }
+    }
+
+    /// Choose the explicit plane or the best compatible primary plane reported
+    /// by the lease. Format and CRTC compatibility are checked before any
+    /// property is written.
+    fn choose_plane(
+        device: &LeaseDevice<'_>,
+        card: &Path,
+        crtc_handle: crtc::Handle,
+        crtc_id: u32,
+        requested: Option<u32>,
+        lease_plane_ids: &[u32],
+    ) -> Result<plane::Handle, DrmScanoutError> {
+        let mut candidates: Vec<u32> = if let Some(id) = requested {
+            vec![id]
+        } else if !lease_plane_ids.is_empty() {
+            lease_plane_ids.to_vec()
+        } else {
+            device
+                .plane_handles()
+                .map_err(|error| map_io(card, error))?
+                .into_iter()
+                .map(u32::from)
+                .collect()
+        };
+        candidates.sort_unstable();
+        candidates.dedup();
+        if candidates.is_empty() {
+            return Err(DrmScanoutError::UnsupportedPlane {
+                card: card.display().to_string(),
+                crtc: crtc_id,
+                reason: "the lease reports no plane and the card exposes none".to_owned(),
+            });
+        }
+
+        let handles = device
+            .resource_handles()
+            .map_err(|error| map_io(card, error))?;
+        let format = DrmFourcc::Xrgb8888 as u32;
+        let mut best: Option<(u8, plane::Handle)> = None;
+        for id in candidates {
+            let handle = plane_handle(id, card)?;
+            let info = match device.get_plane(handle) {
+                Ok(info) => info,
+                Err(error) => {
+                    if requested == Some(id) {
+                        return Err(DrmScanoutError::UnsupportedPlane {
+                            card: card.display().to_string(),
+                            crtc: crtc_id,
+                            reason: format!("GET_PLANE failed: {error}"),
+                        });
+                    }
+                    continue;
+                }
+            };
+            let compatible = handles
+                .filter_crtcs(info.possible_crtcs())
+                .contains(&crtc_handle);
+            if !compatible {
+                if requested == Some(id) {
+                    return Err(DrmScanoutError::UnsupportedPlane {
+                        card: card.display().to_string(),
+                        crtc: crtc_id,
+                        reason: format!("plane {id} cannot drive CRTC {crtc_id}"),
+                    });
+                }
+                continue;
+            }
+            if !info.formats().contains(&format) {
+                if requested == Some(id) {
+                    return Err(DrmScanoutError::InvalidFormat {
+                        card: card.display().to_string(),
+                        plane: id,
+                        format: SCANOUT_FOURCC.to_owned(),
+                        reason: "the plane advertises a different format set".to_owned(),
+                    });
+                }
+                continue;
+            }
+            if requested == Some(id) {
+                return Ok(handle);
+            }
+            let rank = match AtomicProperties::read(device, handle, card, "plane", id)
+                .ok()
+                .and_then(|properties| properties.enum_name(device, card, "type").ok())
+                .flatten()
+                .as_deref()
+            {
+                Some("Primary") => 0,
+                Some("Cursor") => 2,
+                _ => 1,
+            };
+            if best.as_ref().is_none_or(|(best_rank, _)| rank < *best_rank) {
+                best = Some((rank, handle));
+            }
+        }
+        best.map(|(_, handle)| handle)
+            .ok_or_else(|| DrmScanoutError::UnsupportedPlane {
+                card: card.display().to_string(),
+                crtc: crtc_id,
+                reason: "no leaseable plane advertises the XRGB8888 format for this CRTC"
+                    .to_owned(),
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_atomic_commit(
+        device: &LeaseDevice<'_>,
+        card: &Path,
+        connector_name: &str,
+        connector_handle: connector::Handle,
+        connector_id: u32,
+        crtc_handle: crtc::Handle,
+        crtc_id: u32,
+        framebuffer: framebuffer::Handle,
+        mode: Mode,
+        mode_name: &str,
+        width: u32,
+        height: u32,
+        requested_plane: Option<u32>,
+        lease_plane_ids: &[u32],
+    ) -> Result<AtomicOutcome, AtomicAttempt> {
+        enable_atomic(device, card)?;
+        let plane_handle = choose_plane(
+            device,
+            card,
+            crtc_handle,
+            crtc_id,
+            requested_plane,
+            lease_plane_ids,
+        )
+        .map_err(AtomicAttempt::Failed)?;
+        let plane_id = u32::from(plane_handle);
+
+        let connector_props =
+            AtomicProperties::read(device, connector_handle, card, "connector", connector_id)
+                .map_err(AtomicAttempt::Failed)?;
+        let crtc_props = AtomicProperties::read(device, crtc_handle, card, "crtc", crtc_id)
+            .map_err(AtomicAttempt::Failed)?;
+        let plane_props = AtomicProperties::read(device, plane_handle, card, "plane", plane_id)
+            .map_err(AtomicAttempt::Failed)?;
+
+        let blob = device
+            .create_property_blob(&mode)
+            .map_err(|error| AtomicAttempt::Failed(map_io(card, error)))?;
+        let blob_id = match blob {
+            property::Value::Blob(id) => id,
+            _ => {
+                return Err(AtomicAttempt::Failed(DrmScanoutError::Io {
+                    path: card.display().to_string(),
+                    source: std::io::Error::other("MODE_ID property blob was not created"),
+                }))
+            }
+        };
+
+        let mut request = AtomicModeReq::new();
+        let connector_raw = RawResourceHandle::from(connector_handle);
+        let crtc_raw = RawResourceHandle::from(crtc_handle);
+        let plane_raw = RawResourceHandle::from(plane_handle);
+        let mode = (|| -> Result<(), DrmScanoutError> {
+            request.add_raw_property(
+                connector_raw,
+                connector_props.require(card, "connector", connector_id, "CRTC_ID")?,
+                u64::from(crtc_id),
+            );
+            request.add_raw_property(
+                crtc_raw,
+                crtc_props.require(card, "crtc", crtc_id, "ACTIVE")?,
+                1,
+            );
+            request.add_raw_property(
+                crtc_raw,
+                crtc_props.require(card, "crtc", crtc_id, "MODE_ID")?,
+                blob_id,
+            );
+            request.add_raw_property(
+                plane_raw,
+                plane_props.require(card, "plane", plane_id, "FB_ID")?,
+                u64::from(u32::from(framebuffer)),
+            );
+            request.add_raw_property(
+                plane_raw,
+                plane_props.require(card, "plane", plane_id, "CRTC_ID")?,
+                u64::from(crtc_id),
+            );
+            for (name, value) in [
+                ("SRC_X", 0),
+                ("SRC_Y", 0),
+                ("SRC_W", u64::from(width) << 16),
+                ("SRC_H", u64::from(height) << 16),
+                ("CRTC_X", 0),
+                ("CRTC_Y", 0),
+                ("CRTC_W", u64::from(width)),
+                ("CRTC_H", u64::from(height)),
+            ] {
+                request.add_raw_property(
+                    plane_raw,
+                    plane_props.require(card, "plane", plane_id, name)?,
+                    value,
+                );
+            }
+            Ok(())
+        })();
+        if let Err(error) = mode {
+            let _ = device.destroy_property_blob(blob_id);
+            return Err(AtomicAttempt::Failed(error));
+        }
+
+        let result = device.atomic_commit(
+            AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::PAGE_FLIP_EVENT,
+            request,
+        );
+        let _ = device.destroy_property_blob(blob_id);
+        match result {
+            Ok(()) => Ok(AtomicOutcome {
+                plane_id,
+                page_flipped: true,
+            }),
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) | Some(libc::ENOTTY)
+                ) =>
+            {
+                Err(AtomicAttempt::Unsupported(error.to_string()))
+            }
+            Err(error) => Err(AtomicAttempt::Failed(DrmScanoutError::ModeFailed {
+                card: card.display().to_string(),
+                connector: connector_name.to_owned(),
+                mode: mode_name.to_owned(),
+                reason: format!("atomic plane/CRTC commit: {error}"),
+            })),
+        }
+    }
+
+    fn try_atomic_disable(
+        device: &LeaseDevice<'_>,
+        card: &Path,
+        connector_id: u32,
+        crtc_id: u32,
+        plane_id: u32,
+    ) -> Result<(), AtomicAttempt> {
+        enable_atomic(device, card)?;
+        let connector = connector_handle(connector_id, card).map_err(AtomicAttempt::Failed)?;
+        let crtc = crtc_handle(crtc_id, card).map_err(AtomicAttempt::Failed)?;
+        let plane = plane_handle(plane_id, card).map_err(AtomicAttempt::Failed)?;
+        let connector_props =
+            AtomicProperties::read(device, connector, card, "connector", connector_id)
+                .map_err(AtomicAttempt::Failed)?;
+        let crtc_props = AtomicProperties::read(device, crtc, card, "crtc", crtc_id)
+            .map_err(AtomicAttempt::Failed)?;
+        let plane_props = AtomicProperties::read(device, plane, card, "plane", plane_id)
+            .map_err(AtomicAttempt::Failed)?;
+
+        let mut request = AtomicModeReq::new();
+        let connector_raw = RawResourceHandle::from(connector);
+        let crtc_raw = RawResourceHandle::from(crtc);
+        let plane_raw = RawResourceHandle::from(plane);
+        let build = (|| -> Result<(), DrmScanoutError> {
+            request.add_raw_property(
+                connector_raw,
+                connector_props.require(card, "connector", connector_id, "CRTC_ID")?,
+                0,
+            );
+            request.add_raw_property(
+                crtc_raw,
+                crtc_props.require(card, "crtc", crtc_id, "ACTIVE")?,
+                0,
+            );
+            request.add_raw_property(
+                crtc_raw,
+                crtc_props.require(card, "crtc", crtc_id, "MODE_ID")?,
+                0,
+            );
+            request.add_raw_property(
+                plane_raw,
+                plane_props.require(card, "plane", plane_id, "FB_ID")?,
+                0,
+            );
+            request.add_raw_property(
+                plane_raw,
+                plane_props.require(card, "plane", plane_id, "CRTC_ID")?,
+                0,
+            );
+            Ok(())
+        })();
+        if let Err(error) = build {
+            return Err(AtomicAttempt::Failed(error));
+        }
+        match device.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, request) {
+            Ok(()) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) | Some(libc::ENOTTY)
+                ) =>
+            {
+                Err(AtomicAttempt::Unsupported(error.to_string()))
+            }
+            Err(error) => Err(AtomicAttempt::Failed(DrmScanoutError::ModeFailed {
+                card: card.display().to_string(),
+                connector: connector_id.to_string(),
+                mode: "disable".to_owned(),
+                reason: format!("atomic plane/CRTC disable: {error}"),
+            })),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn legacy_commit(
+        device: &LeaseDevice<'_>,
+        card: &Path,
+        connector_name: &str,
+        crtc_handle: crtc::Handle,
+        connector_handle: connector::Handle,
+        framebuffer: framebuffer::Handle,
+        mode: Mode,
+        mode_name: &str,
+    ) -> Result<bool, DrmScanoutError> {
+        device
+            .set_crtc(
+                crtc_handle,
+                Some(framebuffer),
+                (0, 0),
+                &[connector_handle],
+                Some(mode),
+            )
+            .map_err(|error| DrmScanoutError::ModeFailed {
+                card: card.display().to_string(),
+                connector: connector_name.to_owned(),
+                mode: mode_name.to_owned(),
+                reason: error.to_string(),
+            })?;
+        Ok(
+            match device.page_flip(crtc_handle, framebuffer, PageFlipFlags::empty(), None) {
+                Ok(()) => true,
+                Err(error) => {
+                    // The CRTC commit above already programmed the mode. A
+                    // flip-less virtual driver is still a successful commit,
+                    // but the limitation is recorded honestly.
+                    eprintln!(
+                        "notice: page flip on {}:{} failed ({error}); set_crtc commit remains",
+                        card.display(),
+                        connector_name
+                    );
+                    false
+                }
+            },
+        )
+    }
+
+    fn legacy_clear(
+        device: &LeaseDevice<'_>,
+        card: &Path,
+        connector_name: &str,
+        crtc_handle: crtc::Handle,
+        mode: &str,
+    ) -> Result<(), DrmScanoutError> {
+        device
+            .set_crtc(crtc_handle, None, (0, 0), &[], None)
+            .map_err(|error| DrmScanoutError::ModeFailed {
+                card: card.display().to_string(),
+                connector: connector_name.to_owned(),
+                mode: mode.to_owned(),
+                reason: format!("clearing CRTC: {error}"),
+            })
+    }
+
     fn choose_mode(modes: &[Mode], requested: Option<&str>) -> Option<Mode> {
         match requested {
             Some(requested) => modes
@@ -1087,6 +1846,10 @@ mod real {
 
 #[cfg(target_os = "linux")]
 pub use real::RealDrmScanoutBackend;
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 
 /// Fill `bytes` with the documented XRGB8888 pattern and return its FNV-1a
 /// checksum. Rows are written with the buffer pitch, not `width * 4`.

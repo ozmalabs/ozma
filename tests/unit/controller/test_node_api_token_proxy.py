@@ -931,6 +931,94 @@ def test_backup_init_proxy_preserves_typed_missing_binary(fake_node, tmp_path):
     assert fake_node.requests[-1]["path"] == "/backup/init"
 
 
+def test_backup_stats_proxy_preserves_repository_statistics(fake_node, tmp_path):
+    expected = {
+        "ok": True,
+        "supported": True,
+        "repo": {"path": "/srv/ozma-backup", "state": "ready"},
+        "snapshots": {"count": 2},
+        "unique": {"size_bytes": 900, "file_count": 3},
+        "restore": {"size_bytes": 1200, "file_count": 4},
+        "repository": {
+            "size_bytes": 700,
+            "uncompressed_size_bytes": 1000,
+            "blob_count": 5,
+            "compression_ratio": 1.4,
+            "compression_space_saving_percent": 30.0,
+        },
+        "measured_with": "restic-stats",
+        "generated_at": 1,
+    }
+    fake_node.responder = lambda _method, _record: (200, expected, "application/json")
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).get(f"/api/v1/backup/nodes/{NODE_ID}/stats")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
+    assert TOKEN not in response.text
+    record = fake_node.requests[-1]
+    assert record["method"] == "GET"
+    assert record["path"] == "/backup/stats"
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_backup_verify_proxy_forwards_subset_and_preserves_typed_failure(
+    fake_node, tmp_path
+):
+    expected = {
+        "ok": False,
+        "supported": True,
+        "code": "backup.subset-invalid",
+        "error": "the read-data subset must be between 1 and 5 percent",
+        "remediation": "Send read_data_percent between 1 and 5.",
+    }
+    fake_node.responder = lambda _method, _record: (400, expected, "application/json")
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).post(
+        f"/api/v1/backup/nodes/{NODE_ID}/verify",
+        json={"read_data_percent": 9},
+    )
+
+    assert response.status_code == 400, response.text
+    assert response.json() == expected
+    assert TOKEN not in response.text
+    record = fake_node.requests[-1]
+    assert record["method"] == "POST"
+    assert record["path"] == "/backup/verify"
+    assert record["body"] == {"read_data_percent": 9}
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_backup_estimate_proxy_forwards_paths_and_preserves_typed_unsupported(
+    fake_node, tmp_path
+):
+    expected = {
+        "ok": False,
+        "supported": False,
+        "code": "backup.unsupported",
+        "capability": "backup",
+        "error": "estimate is not implemented",
+    }
+    fake_node.responder = lambda _method, _record: (501, expected, "application/json")
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).post(
+        f"/api/v1/backup/nodes/{NODE_ID}/estimate",
+        json={"paths": ["/srv/data"]},
+    )
+
+    assert response.status_code == 501, response.text
+    assert response.json() == expected
+    assert TOKEN not in response.text
+    record = fake_node.requests[-1]
+    assert record["method"] == "POST"
+    assert record["path"] == "/backup/estimate"
+    assert record["body"] == {"paths": ["/srv/data"]}
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
 def test_audio_nodes_proxy_preserves_real_graph_json(fake_node, tmp_path):
     expected = {
         "ok": True,

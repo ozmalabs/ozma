@@ -80,6 +80,9 @@ pub struct BackupTimeouts {
     pub snapshots: Duration,
     pub restore: Duration,
     pub forget: Duration,
+    pub stats: Duration,
+    pub check: Duration,
+    pub estimate: Duration,
 }
 
 impl Default for BackupTimeouts {
@@ -90,6 +93,9 @@ impl Default for BackupTimeouts {
             snapshots: Duration::from_secs(30),
             restore: Duration::from_secs(60 * 60),
             forget: Duration::from_secs(30 * 60),
+            stats: Duration::from_secs(5 * 60),
+            check: Duration::from_secs(60 * 60),
+            estimate: Duration::from_secs(60 * 60),
         }
     }
 }
@@ -162,6 +168,10 @@ pub enum BackupError {
     InvalidTag,
     #[error("the request mode is not supported by the local provider")]
     UnsupportedMode,
+    #[error("the read-data subset must be between 1 and 5 percent")]
+    InvalidSubset,
+    #[error("this restic version cannot produce a dry-run size estimate")]
+    EstimateUnsupported,
     #[error("another backup operation is already running")]
     Busy,
     #[error("restic {operation} failed: {detail}")]
@@ -196,6 +206,8 @@ impl BackupError {
             Self::SnapshotNotFound => "backup.snapshot-not-found",
             Self::InvalidTag => "backup.tag-invalid",
             Self::UnsupportedMode => "backup.mode-unsupported",
+            Self::InvalidSubset => "backup.subset-invalid",
+            Self::EstimateUnsupported => "backup.estimate-unsupported",
             Self::Busy => "backup.busy",
             Self::ResticFailed { .. } => "backup.restic-failed",
             Self::Timeout { .. } => "backup.timeout",
@@ -212,7 +224,7 @@ impl BackupError {
             Self::PermissionDenied | Self::PasswordPermissions | Self::RestoreEscape => {
                 StatusCode::FORBIDDEN
             }
-            Self::UnsupportedMode => StatusCode::NOT_IMPLEMENTED,
+            Self::UnsupportedMode | Self::EstimateUnsupported => StatusCode::NOT_IMPLEMENTED,
             Self::MissingBinary { .. } | Self::NotConfigured | Self::RestoreNotConfigured => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
@@ -272,6 +284,12 @@ impl BackupError {
             }
             Self::UnsupportedMode => {
                 "The local provider supports smart/files/manual selection over --backup-source roots only."
+            }
+            Self::InvalidSubset => {
+                "Send read_data_percent between 1 and 5, or a read_data_subset of '1%'..'5%'."
+            }
+            Self::EstimateUnsupported => {
+                "Upgrade restic to a version that supports backup --dry-run --json."
             }
             Self::Busy => "Wait for the running backup/restore operation to finish.",
             Self::ResticFailed { .. } => {
@@ -618,6 +636,234 @@ impl BackupService {
         }))
     }
 
+    /// `GET /backup/stats`. Reports repository and snapshot statistics from
+    /// `restic stats --json`; only known numeric fields are copied into the
+    /// response, so repository metadata cannot leak through unchanged.
+    pub async fn stats(&self) -> Result<Value, BackupError> {
+        validate_password_file(&self.inner.config.password_file)?;
+        self.resolve_program()?;
+        if !repo_initialized(&self.inner.config.repo) {
+            return Err(BackupError::Uninitialized);
+        }
+
+        let restore = self
+            .stats_raw("restore-size", self.inner.config.timeouts.stats)
+            .await?;
+        let unique = self
+            .stats_raw("files-by-contents", self.inner.config.timeouts.stats)
+            .await?;
+        let repository = self
+            .stats_raw("raw-data", self.inner.config.timeouts.stats)
+            .await?;
+
+        Ok(json!({
+            "ok": true,
+            "supported": true,
+            "repo": {
+                "path": self.inner.config.repo.display().to_string(),
+                "state": "ready",
+            },
+            "snapshots": {
+                "count": restore
+                    .get("snapshots_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            },
+            "unique": {
+                "size_bytes": unique
+                    .get("total_size")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                "file_count": unique
+                    .get("total_file_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            },
+            "restore": {
+                "size_bytes": restore
+                    .get("total_size")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                "file_count": restore
+                    .get("total_file_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            },
+            "repository": {
+                "size_bytes": repository
+                    .get("total_size")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                "uncompressed_size_bytes": repository
+                    .get("total_uncompressed_size")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                "blob_count": repository
+                    .get("total_blob_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                "compression_ratio": repository
+                    .get("compression_ratio")
+                    .and_then(Value::as_f64),
+                "compression_space_saving_percent": repository
+                    .get("compression_space_saving")
+                    .and_then(Value::as_f64),
+            },
+            "measured_with": "restic-stats",
+            "generated_at": now_secs(),
+        }))
+    }
+
+    /// `POST /backup/verify`. Runs `restic check` with a bounded read-data
+    /// subset. Integrity is only reported when restic exits 0 and its JSON
+    /// summary reports zero errors.
+    pub async fn verify(&self, request: VerifyRequest) -> Result<Value, BackupError> {
+        validate_password_file(&self.inner.config.password_file)?;
+        self.resolve_program()?;
+        if !repo_initialized(&self.inner.config.repo) {
+            return Err(BackupError::Uninitialized);
+        }
+        let percent = resolve_read_data_percent(
+            request.read_data_percent,
+            request.read_data_subset.as_deref(),
+        )?;
+        let subset = format!("{percent}%");
+
+        let _guard = self.try_lock()?;
+        let output = self
+            .invoke(
+                vec![
+                    "--no-cache".to_owned(),
+                    "check".to_owned(),
+                    "--read-data-subset".to_owned(),
+                    subset.clone(),
+                    "--json".to_owned(),
+                ],
+                self.inner.config.timeouts.check,
+                MAX_STDOUT_BYTES,
+            )
+            .await;
+        match output {
+            Ok(output) if output.code == Some(0) => {
+                let summary = parse_check_summary(&output.stdout).ok_or_else(|| {
+                    BackupError::ResticFailed {
+                        operation: "check",
+                        detail: "restic check returned no JSON summary".to_owned(),
+                    }
+                })?;
+                let errors = summary
+                    .get("num_errors")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                if errors > 0 {
+                    let error = check_error_from_summary(&summary);
+                    self.record_failure(&error);
+                    return Err(error);
+                }
+                Ok(json!({
+                    "ok": true,
+                    "supported": true,
+                    "verified": true,
+                    "integrity": "restic-check",
+                    "read_data_subset": subset,
+                    "read_data_percent": percent,
+                    "errors": 0,
+                    "summary": summary,
+                    "repo": {"state": "ready"},
+                    "checked_at": now_secs(),
+                }))
+            }
+            Ok(output) => {
+                let error = classify_check_failure(&output);
+                self.record_failure(&error);
+                Err(error)
+            }
+            Err(error) => {
+                self.record_failure(&error);
+                Err(error)
+            }
+        }
+    }
+
+    /// `POST /backup/estimate`. Uses `restic backup --dry-run --json` so the
+    /// source allow-list and exact argv rules are the same as a real run. It
+    /// never reports a snapshot as created.
+    pub async fn estimate(&self, request: EstimateRequest) -> Result<Value, BackupError> {
+        validate_password_file(&self.inner.config.password_file)?;
+        self.resolve_program()?;
+        if !repo_initialized(&self.inner.config.repo) {
+            return Err(BackupError::Uninitialized);
+        }
+        if self.inner.config.sources.is_empty() {
+            return Err(BackupError::NoSources);
+        }
+        let paths = self.resolve_run_paths(&request.paths)?;
+
+        let _guard = self.try_lock()?;
+        let mut args = vec![
+            "--no-cache".to_owned(),
+            "backup".to_owned(),
+            "--dry-run".to_owned(),
+            "--json".to_owned(),
+        ];
+        args.extend(paths.iter().map(|path| path.display().to_string()));
+
+        let output = self
+            .invoke(args, self.inner.config.timeouts.estimate, MAX_STDOUT_BYTES)
+            .await;
+        match output {
+            Ok(output) if output.code == Some(0) => {
+                let mut summary = parse_backup_summary(&output.stdout).ok_or_else(|| {
+                    BackupError::ResticFailed {
+                        operation: "estimate",
+                        detail: "restic dry-run returned no JSON summary".to_owned(),
+                    }
+                })?;
+                let estimated_bytes = summary
+                    .get("total_bytes_processed")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| BackupError::ResticFailed {
+                        operation: "estimate",
+                        detail: "restic dry-run summary had no total_bytes_processed".to_owned(),
+                    })?;
+                let file_count = summary.get("total_files_processed").and_then(Value::as_u64);
+                if let Value::Object(map) = &mut summary {
+                    // A dry-run summary id is not a stored snapshot.
+                    map.remove("snapshot_id");
+                }
+                Ok(json!({
+                    "ok": true,
+                    "supported": true,
+                    "estimated": true,
+                    "method": "restic-backup-dry-run",
+                    "paths": path_strings(&paths),
+                    "estimated_bytes": estimated_bytes,
+                    "file_count": file_count,
+                    "summary": summary,
+                    "repo": {"state": "ready"},
+                    "generated_at": now_secs(),
+                }))
+            }
+            Ok(output) => {
+                let lower = output.stderr.to_ascii_lowercase();
+                let error = if lower.contains("unknown flag")
+                    || lower.contains("unknown shorthand flag")
+                    || lower.contains("flag provided but not defined")
+                {
+                    BackupError::EstimateUnsupported
+                } else {
+                    classify_failure("estimate", &output)
+                };
+                self.record_failure(&error);
+                Err(error)
+            }
+            Err(error) => {
+                self.record_failure(&error);
+                Err(error)
+            }
+        }
+    }
+
     /// `POST /backup/restore`.
     pub async fn restore(&self, request: RestoreRequest) -> Result<Value, BackupError> {
         validate_password_file(&self.inner.config.password_file)?;
@@ -824,6 +1070,37 @@ impl BackupService {
         }
     }
 
+    async fn stats_raw(&self, mode: &str, timeout: Duration) -> Result<Value, BackupError> {
+        let output = self
+            .invoke(
+                vec![
+                    "--no-cache".to_owned(),
+                    "stats".to_owned(),
+                    "--mode".to_owned(),
+                    mode.to_owned(),
+                    "--json".to_owned(),
+                ],
+                timeout,
+                MAX_STDOUT_BYTES,
+            )
+            .await?;
+        if output.code != Some(0) {
+            return Err(classify_failure("stats", &output));
+        }
+        let value: Value =
+            serde_json::from_str(&output.stdout).map_err(|_| BackupError::ResticFailed {
+                operation: "stats",
+                detail: "restic stats did not return valid JSON".to_owned(),
+            })?;
+        if !value.is_object() {
+            return Err(BackupError::ResticFailed {
+                operation: "stats",
+                detail: "restic stats JSON was not an object".to_owned(),
+            });
+        }
+        Ok(value)
+    }
+
     fn resolve_run_paths(&self, requested: &[String]) -> Result<Vec<PathBuf>, BackupError> {
         if requested.len() > MAX_RUN_PATHS {
             return Err(BackupError::PathNotAllowed);
@@ -973,6 +1250,25 @@ pub struct RestoreRequest {
     pub target_path: Option<String>,
 }
 
+/// Body for `POST /backup/verify`. The percent is clamped to the safe 1–5%
+/// read-data subset already enforced by [`resolve_read_data_percent`].
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct VerifyRequest {
+    #[serde(default)]
+    pub read_data_percent: Option<u8>,
+    /// Restic-style subset such as `"2%"`; validated and never passed raw.
+    #[serde(default)]
+    pub read_data_subset: Option<String>,
+}
+
+/// Body for `POST /backup/estimate`. Unknown fields are ignored; `paths` uses
+/// the same allow-list and bounds as `POST /backup/run`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct EstimateRequest {
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct SnapshotQuery {
     limit: Option<usize>,
@@ -989,6 +1285,11 @@ pub fn router(service: Option<BackupService>) -> Router {
         .route("/backup/snapshots", get(snapshots_handler))
         .route("/backup/snapshots/:id", delete(delete_handler))
         .route("/backup/restore", post(restore_handler))
+        .route("/backup/stats", get(stats_handler))
+        .route("/backup/verify", post(verify_handler))
+        .route("/backup/estimate", post(estimate_handler))
+        .route("/backup/apps", get(apps_handler))
+        .route("/backup/apps/restore", post(restore_apps_handler))
         .with_state(BackupRouteState { service })
 }
 
@@ -1103,6 +1404,75 @@ async fn delete_handler(
         Ok(body) => json_no_store(StatusCode::OK, body),
         Err(error) => error.into_response(),
     }
+}
+
+async fn stats_handler(State(state): State<BackupRouteState>) -> Response {
+    let Some(service) = state.service else {
+        return not_configured();
+    };
+    match service.stats().await {
+        Ok(body) => json_no_store(StatusCode::OK, body),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn verify_handler(
+    State(state): State<BackupRouteState>,
+    Json(request): Json<VerifyRequest>,
+) -> Response {
+    let Some(service) = state.service else {
+        return not_configured();
+    };
+    match service.verify(request).await {
+        Ok(body) => json_no_store(StatusCode::OK, body),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn estimate_handler(
+    State(state): State<BackupRouteState>,
+    Json(request): Json<EstimateRequest>,
+) -> Response {
+    let Some(service) = state.service else {
+        return not_configured();
+    };
+    match service.estimate(request).await {
+        Ok(body) => json_no_store(StatusCode::OK, body),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn apps_handler(State(_state): State<BackupRouteState>) -> Response {
+    app_inventory_unsupported("/backup/apps")
+}
+
+async fn restore_apps_handler(State(_state): State<BackupRouteState>) -> Response {
+    app_inventory_unsupported("/backup/apps/restore")
+}
+
+/// App inventory is not derivable from a restic repository: snapshots contain
+/// file trees, not installed OS packages or app definitions. Keep the surface
+/// as an honest typed 501 instead of inventing an app list.
+fn app_inventory_unsupported(surface: &'static str) -> Response {
+    let reason = "This local restic provider does not record an OS application or \
+                  package inventory; repository snapshots only contain file trees.";
+    let body = json!({
+        "ok": false,
+        "supported": false,
+        "code": "backup.unsupported",
+        "surface": surface,
+        "capability": "backup",
+        "reason": reason,
+        "error": reason,
+        "python_reference": "agent/backup.py::BackupManager.get_app_inventory",
+        "remediation": "Use the Python desktop agent for app inventory/restore-apps, or \
+                        inspect snapshot file paths; this node does not fabricate an app list.",
+    });
+    let mut response = (StatusCode::NOT_IMPLEMENTED, Json(body)).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    response
 }
 
 fn json_no_store(status: StatusCode, body: Value) -> Response {
@@ -1230,6 +1600,26 @@ fn validate_mode(raw: Option<&str>) -> Result<String, BackupError> {
         "smart" | "files" | "manual" => Ok(mode),
         "disk_image" | "advanced" => Err(BackupError::UnsupportedMode),
         _ => Err(BackupError::UnsupportedMode),
+    }
+}
+
+fn resolve_read_data_percent(percent: Option<u8>, subset: Option<&str>) -> Result<u8, BackupError> {
+    if let Some(raw) = subset {
+        let trimmed = raw.trim();
+        let trimmed = trimmed.strip_suffix('%').unwrap_or(trimmed);
+        // Only bare integer percentages are accepted; restic's other subset
+        // syntaxes (n/t, byte sizes) are deliberately outside this bound.
+        let value: u8 = trimmed.parse().map_err(|_| BackupError::InvalidSubset)?;
+        return validate_subset_percent(value);
+    }
+    validate_subset_percent(percent.unwrap_or(1))
+}
+
+fn validate_subset_percent(value: u8) -> Result<u8, BackupError> {
+    if (1..=5).contains(&value) {
+        Ok(value)
+    } else {
+        Err(BackupError::InvalidSubset)
     }
 }
 
@@ -1430,6 +1820,66 @@ fn parse_backup_summary(stdout: &str) -> Option<Value> {
     None
 }
 
+/// Extract a bounded, secret-free summary from `restic check --json`. Error
+/// lines are ignored; only the final summary object is reported.
+fn parse_check_summary(stdout: &str) -> Option<Value> {
+    for line in stdout.lines().rev() {
+        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if value.get("message_type").and_then(Value::as_str) != Some("summary") {
+            continue;
+        }
+        let num_errors = value.get("num_errors").and_then(Value::as_u64)?;
+        let broken_packs = value
+            .get("broken_packs")
+            .and_then(Value::as_array)
+            .map(|packs| {
+                packs
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .take(16)
+                    .map(|pack| pack.chars().take(64).collect::<String>())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        return Some(json!({
+            "num_errors": num_errors,
+            "broken_packs": broken_packs,
+            "suggest_repair_index": value
+                .get("suggest_repair_index")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            "suggest_prune": value
+                .get("suggest_prune")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        }));
+    }
+    None
+}
+
+fn check_error_from_summary(summary: &Value) -> BackupError {
+    let errors = summary
+        .get("num_errors")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let broken = summary
+        .get("broken_packs")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let detail = if broken > 0 {
+        format!("restic check found {errors} error(s) and {broken} damaged pack file(s)")
+    } else {
+        format!("restic check found {errors} error(s)")
+    };
+    BackupError::ResticFailed {
+        operation: "check",
+        detail,
+    }
+}
+
 fn clean_stderr(stderr: &str) -> String {
     let cleaned: String = stderr
         .chars()
@@ -1445,7 +1895,28 @@ fn clean_stderr(stderr: &str) -> String {
     collapsed.chars().take(MAX_ERROR_DETAIL).collect()
 }
 
+fn classify_check_failure(output: &ResticOutput) -> BackupError {
+    // `restic check --json` reports repository damage on stdout, not stderr.
+    if let Some(summary) = parse_check_summary(&output.stdout) {
+        if summary
+            .get("num_errors")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            > 0
+        {
+            return check_error_from_summary(&summary);
+        }
+    }
+    classify_failure("check", output)
+}
+
 fn classify_failure(operation: &'static str, output: &ResticOutput) -> BackupError {
+    // Restic's documented exit codes are shared by check/stats/snapshots.
+    match output.code {
+        Some(10) => return BackupError::Uninitialized,
+        Some(12) => return BackupError::PasswordRejected,
+        _ => {}
+    }
     let lower = output.stderr.to_ascii_lowercase();
     if lower.contains("is there a repository at the following location")
         || lower.contains("repository does not exist")
@@ -1920,6 +2391,310 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stats_extracts_known_numbers_and_never_passes_extra_fields_through() {
+        let fixture = Fixture::new();
+        fixture.initialize_repo();
+        let runner = Arc::new(FakeRunner::new(fixture.repo.clone()));
+        runner.push(FakeResponse::ok(
+            &json!({
+                "total_size": 1000,
+                "total_file_count": 3,
+                "snapshots_count": 2,
+            })
+            .to_string(),
+        ));
+        runner.push(FakeResponse::ok(
+            &json!({
+                "total_size": 800,
+                "total_file_count": 2,
+                "snapshots_count": 2,
+            })
+            .to_string(),
+        ));
+        runner.push(FakeResponse::ok(
+            &json!({
+                "total_size": 600,
+                "total_uncompressed_size": 900,
+                "total_blob_count": 4,
+                "compression_ratio": 1.5,
+                "compression_space_saving": 33.3,
+                "snapshots_count": 2,
+                "unexpected": fixture.secret,
+            })
+            .to_string(),
+        ));
+        let service = fixture.service(runner.clone());
+
+        let body = service.stats().await.unwrap();
+        assert_eq!(body["snapshots"]["count"], 2);
+        assert_eq!(body["restore"]["size_bytes"], 1000);
+        assert_eq!(body["restore"]["file_count"], 3);
+        assert_eq!(body["unique"]["size_bytes"], 800);
+        assert_eq!(body["unique"]["file_count"], 2);
+        assert_eq!(body["repository"]["size_bytes"], 600);
+        assert_eq!(body["repository"]["uncompressed_size_bytes"], 900);
+        assert_eq!(body["repository"]["blob_count"], 4);
+        assert_eq!(body["repository"]["compression_ratio"], 1.5);
+        assert!(!body.to_string().contains(&fixture.secret));
+        assert!(body.get("unexpected").is_none());
+
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 3);
+        for (call, mode) in calls
+            .iter()
+            .zip(["restore-size", "files-by-contents", "raw-data"])
+        {
+            assert_eq!(
+                call.args,
+                vec![
+                    "--no-cache".to_owned(),
+                    "stats".to_owned(),
+                    "--mode".to_owned(),
+                    mode.to_owned(),
+                    "--json".to_owned(),
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_uses_a_bounded_read_data_subset_and_reports_success_only_from_restic() {
+        let fixture = Fixture::new();
+        fixture.initialize_repo();
+        let runner = Arc::new(FakeRunner::new(fixture.repo.clone()));
+        runner.push(FakeResponse::ok(
+            &json!({
+                "message_type": "summary",
+                "num_errors": 0,
+                "broken_packs": null,
+                "suggest_repair_index": false,
+                "suggest_prune": false,
+            })
+            .to_string(),
+        ));
+        let service = fixture.service(runner.clone());
+
+        let body = service
+            .verify(VerifyRequest {
+                read_data_percent: Some(2),
+                read_data_subset: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(body["verified"], true);
+        assert_eq!(body["integrity"], "restic-check");
+        assert_eq!(body["read_data_subset"], "2%");
+        assert_eq!(body["read_data_percent"], 2);
+        assert_eq!(body["errors"], 0);
+        assert_eq!(
+            runner.calls()[0].args,
+            vec![
+                "--no-cache".to_owned(),
+                "check".to_owned(),
+                "--read-data-subset".to_owned(),
+                "2%".to_owned(),
+                "--json".to_owned(),
+            ]
+        );
+
+        runner.push(FakeResponse::ok(
+            &json!({
+                "message_type": "summary",
+                "num_errors": 0,
+            })
+            .to_string(),
+        ));
+        let body = service
+            .verify(VerifyRequest {
+                read_data_percent: None,
+                read_data_subset: Some("5%".to_owned()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(body["read_data_subset"], "5%");
+    }
+
+    #[tokio::test]
+    async fn verify_failures_never_claim_integrity() {
+        let fixture = Fixture::new();
+        fixture.initialize_repo();
+        let runner = Arc::new(FakeRunner::new(fixture.repo.clone()));
+        let service = fixture.service(runner.clone());
+
+        for (percent, subset) in [
+            (Some(0), None),
+            (Some(6), None),
+            (None, Some("7%".to_owned())),
+            (None, Some("2/t".to_owned())),
+        ] {
+            let error = service
+                .verify(VerifyRequest {
+                    read_data_percent: percent,
+                    read_data_subset: subset,
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), "backup.subset-invalid");
+            assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        }
+        assert!(runner.calls().is_empty());
+
+        runner.push(FakeResponse {
+            code: Some(1),
+            stdout: json!({
+                "message_type": "summary",
+                "num_errors": 3,
+                "broken_packs": ["a".repeat(64)],
+            })
+            .to_string(),
+            stderr: String::new(),
+            create_repo: false,
+        });
+        let error = service.verify(VerifyRequest::default()).await.unwrap_err();
+        assert_eq!(error.code(), "backup.restic-failed");
+        assert_eq!(error.status(), StatusCode::BAD_GATEWAY);
+        let message = error.to_string();
+        assert!(message.contains("3 error"), "{message}");
+        assert!(!message.to_ascii_lowercase().contains("verified"));
+
+        runner.push(FakeResponse {
+            code: Some(0),
+            stdout: json!({
+                "message_type": "summary",
+                "num_errors": 2,
+            })
+            .to_string(),
+            stderr: String::new(),
+            create_repo: false,
+        });
+        let error = service.verify(VerifyRequest::default()).await.unwrap_err();
+        assert_eq!(error.code(), "backup.restic-failed");
+
+        runner.push(FakeResponse {
+            code: Some(0),
+            stdout: json!({"message_type": "summary"}).to_string(),
+            stderr: String::new(),
+            create_repo: false,
+        });
+        let error = service.verify(VerifyRequest::default()).await.unwrap_err();
+        assert_eq!(error.code(), "backup.restic-failed");
+    }
+
+    #[tokio::test]
+    async fn estimate_uses_the_run_allow_list_and_dry_run_argv() {
+        let fixture = Fixture::new();
+        fixture.initialize_repo();
+        let runner = Arc::new(FakeRunner::new(fixture.repo.clone()));
+        runner.push(FakeResponse::ok(
+            &json!({
+                "message_type": "summary",
+                "total_files_processed": 5,
+                "total_bytes_processed": 12345,
+                "snapshot_id": "not-a-real-snapshot",
+            })
+            .to_string(),
+        ));
+        let service = fixture.service(runner.clone());
+
+        let body = service
+            .estimate(EstimateRequest {
+                paths: vec![fixture.source.display().to_string()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(body["estimated"], true);
+        assert_eq!(body["estimated_bytes"], 12345);
+        assert_eq!(body["file_count"], 5);
+        assert_eq!(body["method"], "restic-backup-dry-run");
+        assert_eq!(body["paths"][0], fixture.source.display().to_string());
+        assert!(body["summary"].get("snapshot_id").is_none());
+        assert_eq!(
+            runner.calls()[0].args,
+            vec![
+                "--no-cache".to_owned(),
+                "backup".to_owned(),
+                "--dry-run".to_owned(),
+                "--json".to_owned(),
+                fixture.source.display().to_string(),
+            ]
+        );
+
+        let outside = fixture._temp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let error = service
+            .estimate(EstimateRequest {
+                paths: vec![outside.display().to_string()],
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "backup.path-not-allowed");
+        assert_eq!(runner.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn estimate_reports_unsupported_restic_versions_and_missing_summaries_typed() {
+        let fixture = Fixture::new();
+        fixture.initialize_repo();
+        let runner = Arc::new(FakeRunner::new(fixture.repo.clone()));
+        let service = fixture.service(runner.clone());
+
+        runner.push(FakeResponse::fail("unknown flag: --dry-run\n"));
+        let error = service
+            .estimate(EstimateRequest::default())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "backup.estimate-unsupported");
+        assert_eq!(error.status(), StatusCode::NOT_IMPLEMENTED);
+
+        runner.push(FakeResponse::ok(""));
+        let error = service
+            .estimate(EstimateRequest::default())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "backup.restic-failed");
+        assert!(!error.to_string().to_ascii_lowercase().contains("estimated"));
+    }
+
+    #[tokio::test]
+    async fn app_inventory_surfaces_stay_typed_501_and_do_not_invent_apps() {
+        let app = router(None);
+        let (status, body) = get(app.clone(), "/backup/apps").await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["supported"], false);
+        assert_eq!(body["capability"], "backup");
+        assert_eq!(body["code"], "backup.unsupported");
+        assert!(body["reason"]
+            .as_str()
+            .unwrap()
+            .contains("does not record an OS application"));
+        assert!(body.get("apps").is_none());
+
+        let (status, body) = post(app, "/backup/apps/restore", json!({"names": ["firefox"]})).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(body["code"], "backup.unsupported");
+        assert_eq!(body["surface"], "/backup/apps/restore");
+        assert!(body.get("restored").is_none());
+    }
+
+    #[tokio::test]
+    async fn stats_verify_estimate_routes_are_typed_not_configured_without_a_repo() {
+        let app = router(None);
+        let (status, body) = get(app.clone(), "/backup/stats").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "backup.not-configured");
+
+        for (uri, body) in [
+            ("/backup/verify", json!({})),
+            ("/backup/estimate", json!({})),
+        ] {
+            let (status, response) = post(app.clone(), uri, body).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+            assert_eq!(response["code"], "backup.not-configured", "{uri}");
+        }
+    }
+
+    #[tokio::test]
     async fn restore_rejects_traversal_symlink_and_unknown_roots() {
         let fixture = Fixture::new();
         fixture.initialize_repo();
@@ -2160,6 +2935,78 @@ mod tests {
         assert_eq!(body["paths"][0], fixture.source.display().to_string());
     }
 
+    #[tokio::test]
+    async fn routes_expose_stats_verify_and_estimate_documents() {
+        let fixture = Fixture::new();
+        fixture.initialize_repo();
+        let runner = Arc::new(FakeRunner::new(fixture.repo.clone()));
+        runner.push(FakeResponse::ok(
+            &json!({
+                "total_size": 1000,
+                "total_file_count": 3,
+                "snapshots_count": 1,
+            })
+            .to_string(),
+        ));
+        runner.push(FakeResponse::ok(
+            &json!({
+                "total_size": 800,
+                "total_file_count": 2,
+                "snapshots_count": 1,
+            })
+            .to_string(),
+        ));
+        runner.push(FakeResponse::ok(
+            &json!({
+                "total_size": 600,
+                "total_uncompressed_size": 900,
+                "total_blob_count": 4,
+                "snapshots_count": 1,
+            })
+            .to_string(),
+        ));
+        runner.push(FakeResponse::ok(
+            &json!({"message_type": "summary", "num_errors": 0}).to_string(),
+        ));
+        runner.push(FakeResponse::ok(
+            &json!({
+                "message_type": "summary",
+                "total_files_processed": 3,
+                "total_bytes_processed": 1000,
+                "snapshot_id": "dry-run",
+            })
+            .to_string(),
+        ));
+        let app = router(Some(fixture.service(runner)));
+
+        let (status, body) = get(app.clone(), "/backup/stats").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["snapshots"]["count"], 1);
+        assert_eq!(body["repository"]["size_bytes"], 600);
+        assert_eq!(body["unique"]["size_bytes"], 800);
+
+        let (status, body) = post(
+            app.clone(),
+            "/backup/verify",
+            json!({"read_data_percent": 1}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["verified"], true);
+        assert_eq!(body["read_data_subset"], "1%");
+
+        let (status, body) = post(
+            app,
+            "/backup/estimate",
+            json!({"paths": [fixture.source.display().to_string()]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["estimated_bytes"], 1000);
+        assert_eq!(body["file_count"], 3);
+        assert_eq!(body["method"], "restic-backup-dry-run");
+    }
+
     /// Live end-to-end against the real restic binary. Skips cleanly when the
     /// host has no restic, so the normal unit suite stays portable.
     #[tokio::test]
@@ -2246,5 +3093,92 @@ mod tests {
         assert_eq!(deleted["policy"], "exact-snapshot-only");
         let after = service.snapshots(Some(10)).await.unwrap();
         assert_eq!(after["count"], 0);
+    }
+
+    /// Live stats/estimate/verify evidence against a real restic repository,
+    /// including a real damaged-pack failure that must never report success.
+    #[tokio::test]
+    async fn live_restic_stats_estimate_verify_and_damaged_pack_failure() {
+        if std::process::Command::new("restic")
+            .arg("version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping live restic test: restic is not installed");
+            return;
+        }
+
+        let fixture = Fixture::new();
+        std::fs::write(fixture.source.join("hello.txt"), b"live stats and verify\n").unwrap();
+        std::fs::write(fixture.source.join("payload.bin"), vec![7u8; 8192]).unwrap();
+
+        let service = BackupService::new(fixture.config()).unwrap();
+        service.init().await.unwrap();
+        let run = service
+            .run(RunRequest {
+                mode: Some("smart".to_owned()),
+                paths: vec![],
+                tags: vec!["live-stats".to_owned()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(run["ok"], true);
+
+        let estimate = service.estimate(EstimateRequest::default()).await.unwrap();
+        assert_eq!(estimate["estimated"], true);
+        assert_eq!(estimate["method"], "restic-backup-dry-run");
+        assert!(
+            estimate["estimated_bytes"].as_u64().unwrap() >= 8192,
+            "{estimate}"
+        );
+        assert_eq!(estimate["file_count"], 2);
+
+        let stats = service.stats().await.unwrap();
+        assert_eq!(stats["snapshots"]["count"], 1);
+        assert!(stats["repository"]["size_bytes"].as_u64().unwrap() > 0);
+        assert!(stats["unique"]["size_bytes"].as_u64().unwrap() >= 8192);
+        assert!(stats["restore"]["file_count"].as_u64().unwrap() >= 2);
+
+        let verify = service
+            .verify(VerifyRequest {
+                read_data_percent: Some(1),
+                read_data_subset: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(verify["verified"], true);
+        assert_eq!(verify["read_data_subset"], "1%");
+        assert_eq!(verify["errors"], 0);
+
+        // Remove one pack file so restic check must report repository damage.
+        let mut pack = None;
+        for shard in std::fs::read_dir(fixture.repo.join("data")).unwrap() {
+            let shard = shard.unwrap();
+            if !shard.file_type().unwrap().is_dir() {
+                continue;
+            }
+            for entry in std::fs::read_dir(shard.path()).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_file() {
+                    pack = Some(entry.path());
+                    break;
+                }
+            }
+            if pack.is_some() {
+                break;
+            }
+        }
+        std::fs::remove_file(pack.expect("repository contains a pack file")).unwrap();
+
+        let error = service
+            .verify(VerifyRequest {
+                read_data_percent: Some(1),
+                read_data_subset: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "backup.restic-failed");
+        assert!(error.to_string().contains("error"), "{error}");
+        assert!(!error.to_string().to_ascii_lowercase().contains("verified"));
     }
 }

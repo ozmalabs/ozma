@@ -10992,6 +10992,40 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             node_id, "/backup/run", method="POST", body=body
         )
 
+    @app.get("/api/v1/backup/nodes/{node_id}/stats")
+    async def backup_node_stats(request: Request, node_id: str) -> Any:
+        """Read repository, unique-content, and snapshot statistics."""
+        _require_scope(request, SCOPE_READ)
+        return await _proxy_backup_surface(node_id, "/backup/stats")
+
+    @app.post("/api/v1/backup/nodes/{node_id}/verify")
+    async def backup_node_verify(request: Request, node_id: str) -> Any:
+        """Run a bounded restic check and preserve its typed result."""
+        _require_scope(request, SCOPE_WRITE)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            raise HTTPException(400, "Backup verify body must be a JSON object")
+        return await _proxy_backup_surface(
+            node_id, "/backup/verify", method="POST", body=body
+        )
+
+    @app.post("/api/v1/backup/nodes/{node_id}/estimate")
+    async def backup_node_estimate(request: Request, node_id: str) -> Any:
+        """Scan allow-listed sources for a dry-run size estimate."""
+        _require_scope(request, SCOPE_WRITE)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            raise HTTPException(400, "Backup estimate body must be a JSON object")
+        return await _proxy_backup_surface(
+            node_id, "/backup/estimate", method="POST", body=body
+        )
+
     @app.get("/api/v1/backup/nodes/{node_id}/apps")
     async def backup_node_apps(request: Request, node_id: str) -> dict[str, Any]:
         """List installed apps on a node (for selective restore)."""

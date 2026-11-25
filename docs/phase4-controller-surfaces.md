@@ -18,8 +18,8 @@ and the controller behaviour that preserves typed results.
 | `/api/v1/rpa/screenshot` (GET/POST) | `controller/api.py::node_rpa_screenshot` / `_node_rpa_proxy` | **Implemented** | Returns the real JPEG from the active capture source; `?console=` uses the same console broker as `/display/snapshot`. Missing sources stay typed errors. |
 | `/api/v1/rpa/ocr` (POST) | node-local / future controller callers | **Implemented when tesseract exists** | Captures one real frame and pipes it to the `tesseract` CLI. Without tesseract it returns 503 `rpa.ocr-unavailable`; it never invents text. |
 | remaining `/api/v1/rpa/*` (`screen`, `click`, `wait_for_text`, `script`, `enter_bios`, `set_boot_usb`) | `controller/api.py::_node_rpa_proxy` | **Typed stub** (501) | Python `node/rpa.py` has bitmap BIOS OCR, foreground script execution, text waits, click-by-text, and heuristic BIOS navigation. Rust has no script runner or BIOS policy; those routes keep the stable `rpa.unsupported` body. |
-| `/backup/{status,init,run,snapshots,restore}` and `DELETE /backup/snapshots/{id}` | `controller/api.py` backup proxy routes | **Implemented (opt-in, local only)** | Opt-in `--backup-repo` + `--backup-password-file` (0600) provider wrapping the local `restic` CLI. Sources and restore targets are explicit allow-lists; no cloud destination, app inventory, DB hooks, scheduling, or retention policy. See [`phase4-backup-report.md`](phase4-backup-report.md). |
-| remaining `/backup/*` (`config`, `apps`, `apps/restore`, `estimate`, `verify`, `onboarding`, cloud) | `controller/api.py` backup proxy routes | **Typed stub** (501) | Python `agent/backup.py` owns app inventory, cloud/S3/SFTP/REST destinations, estimate/verify, scheduling, macOS Time Machine, and DB hooks. The Rust node advertises and returns `backup.unsupported` for those sub-surfaces. |
+| `/backup/{status,init,run,snapshots,restore,stats,verify,estimate}` and `DELETE /backup/snapshots/{id}` | `controller/api.py` backup proxy routes | **Implemented (opt-in, local only)** | Opt-in `--backup-repo` + `--backup-password-file` (0600) provider wrapping the local `restic` CLI. Sources and restore targets are explicit allow-lists; stats/verify/estimate are local restic operations; no cloud destination, app inventory, DB hooks, scheduling, or retention policy. See [`phase4-backup-report.md`](phase4-backup-report.md). |
+| remaining `/backup/*` (`config`, `apps`, `apps/restore`, `onboarding`, cloud) | `controller/api.py` backup proxy routes | **Typed stub** (501) | Python `agent/backup.py` owns app inventory, cloud/S3/SFTP/REST destinations, scheduling, macOS Time Machine, and DB hooks. A restic repository cannot supply an OS app inventory, so the Rust node advertises and returns `backup.unsupported` for those sub-surfaces. |
 | `/ui/windows` | Python desktop agent (`agent/ozma_desktop_agent.py:996`); the controller consumes `/ui/hints` | **Typed stub** (501, public read-only) | Python `agent/ozma_desktop_agent.py` uses an in-guest accessibility provider. `ozma-node` has no in-guest agent and must not invent window titles or positions. `/ui/hints` keeps its existing empty-shape 200 with `available:false` for compatibility; `/ui/windows` is explicitly unsupported. |
 | `/serial/*` | `controller/serial_console.py::_poll_node_serial` and legacy panels | **Typed stub** (501) | Python `node/serial_capture.py` owns a real UART/USB-serial reader, ring buffer, SSE stream, and send path. `ozma-node` has no serialport dependency or serial session implementation. |
 | `/rgb/*` | `controller/api.py` RGB proxy, `controller/rgb_outputs.py::_push_node` | **Typed stub** (501) | Python `node/rgb_leds.py` drives WS2812B/SK6812 over SPI and runs effects. `ozma-usb`/`ozma-hid` are gadget/HID injectors, not SPI LED drivers; no WS2812 or SPI crate is used by the node. |
@@ -139,11 +139,16 @@ Endpoints (all guarded):
 | `GET /backup/snapshots?limit=N` | Bounded snapshot list (default 20, max 100), newest first, with only id/short_id/time/hostname/tags/paths/program_version. |
 | `POST /backup/restore` | Explicit snapshot (or `latest`) and target below a restore root. Restores through `restic restore`; `..`, exact-root targets, and symlink components are rejected. |
 | `DELETE /backup/snapshots/{id}` | Requires an 8–64 hex snapshot id (never `latest`), verifies it exists, then runs `restic forget <id> --prune`. Only unreferenced data is pruned; no retention rule touches other snapshots. |
+| `GET /backup/stats` | Three bounded `restic stats --json` modes: snapshot count, combined restore size/file count, unique-content size/file count, and packed repository size/blob count. Only known numeric fields are copied; no raw restic document passthrough. |
+| `POST /backup/verify` | `restic check --read-data-subset N% --json` with `N` validated to 1–5 (default 1). Serialized with mutations. Success requires exit 0 and `num_errors:0`; damaged packs/non-zero exits are typed failures. |
+| `POST /backup/estimate` | `restic backup --dry-run --json` over the same allow-listed sources/paths as run. Returns `estimated_bytes`/`file_count` from restic's scanned summary and never reports a stored snapshot. |
 
 Exact argv (no shell): `restic --no-cache init`; `restic --no-cache backup
 --json [--tag T]... PATH...`; `restic --no-cache snapshots --json`; `restic
 --no-cache restore ID --target PATH [--include PATH]`; `restic --no-cache
-forget ID --prune`. Each child gets a cleared environment with only
+forget ID --prune`; `restic --no-cache stats --mode MODE --json`; `restic
+--no-cache check --read-data-subset N% --json`; `restic --no-cache backup
+--dry-run --json PATH...`. Each child gets a cleared environment with only
 `RESTIC_REPOSITORY`, `RESTIC_PASSWORD_FILE`, `RESTIC_PROGRESS_FPS`, a minimal
 `PATH`, and `LANG`/`LC_ALL=C`.
 
@@ -237,10 +242,10 @@ Routes:
   `/api/v1/rpa/type`, `/api/v1/rpa/key`, `/api/v1/rpa/screenshot`,
   `/api/v1/rpa/ocr`
 - guarded implemented backup router (`backup::router`) and typed 501 fallback
-  (`controller_compat::legacy_router`): `/backup/{status,init,run,snapshots,restore}`
+  (`controller_compat::legacy_router`): `/backup/{status,init,run,snapshots,restore,stats,verify,estimate}`
   and `DELETE /backup/snapshots/{id}` are implemented; remaining `/backup/*`
-  (`config`, `apps`, `apps/restore`, `estimate`, `verify`, `onboarding`, cloud)
-  keep the stable `backup.unsupported` body.
+  (`config`, `apps`, `apps/restore`, `onboarding`, cloud) keep the stable
+  `backup.unsupported` body.
 - guarded typed 501 fallback (`controller_compat::legacy_router`): remaining
   `/api/v1/rpa/*`, `/serial/*`, `/rgb/state`, `/rgb/effect`, `/rgb/set`,
   `/rgb/off`, `/current`, `/current/history`
@@ -353,10 +358,13 @@ Controller (`python3 -m pytest tests/unit/controller/test_node_api_token_proxy.p
 - `test_backup_status_proxy_preserves_real_json_without_token_leak`,
   `test_backup_proxy_preserves_typed_errors_without_token_leak`,
   `test_backup_snapshots_proxy_preserves_node_document`,
-  `test_backup_delete_proxy_uses_delete_and_preserves_policy`, and
-  `test_backup_init_proxy_preserves_typed_missing_binary` prove real JSON and
-  `backup.*` typed errors survive without copying the bearer token into a
-  response.
+  `test_backup_delete_proxy_uses_delete_and_preserves_policy`,
+  `test_backup_init_proxy_preserves_typed_missing_binary`,
+  `test_backup_stats_proxy_preserves_repository_statistics`,
+  `test_backup_verify_proxy_forwards_subset_and_preserves_typed_failure`, and
+  `test_backup_estimate_proxy_forwards_paths_and_preserves_typed_unsupported`
+  prove real JSON and `backup.*` typed errors survive without copying the
+  bearer token into a response.
 - `test_rpa_screenshot_still_returns_real_jpeg_bytes` proves a real node
   screenshot is not broken by the typed-error path.
 
@@ -369,10 +377,10 @@ Controller (`python3 -m pytest tests/unit/controller/test_node_api_token_proxy.p
   without it reports `rpa.ocr-unavailable` instead of returning empty/guessed
   text.
 - The Python providers remain the only implementations of app inventory,
-  cloud/S3/SFTP/REST destinations, backup scheduling/verification/estimate,
-  serial capture, RGB output, current sensing, and in-guest window hints. The
-  Rust local provider deliberately stops at local init/run/snapshots/restore/
-  exact-snapshot delete.
+  cloud/S3/SFTP/REST destinations, backup scheduling, serial capture, RGB
+  output, current sensing, and in-guest window hints. The Rust local provider
+  covers local init/run/snapshots/restore/exact-snapshot delete plus bounded
+  stats/verify/estimate, but cannot derive an app inventory from the repository.
 - The node registration capability list (`capabilities` TXT/registration field)
   is owned by `main.rs` and is not changed here; discovery uses the connection
   document. A later registration change can mirror the same capability names.

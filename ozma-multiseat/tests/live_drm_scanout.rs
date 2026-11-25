@@ -12,10 +12,13 @@ use std::num::NonZeroU32;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::path::Path;
 
-use drm::control::{crtc, Device as ControlDevice, RawResourceHandle};
+use drm::buffer::DrmFourcc;
+use drm::control::{crtc, plane, property, Device as ControlDevice, RawResourceHandle};
+use drm::ClientCapability;
+use drm::Device as _;
 use ozma_multiseat::{
     enumerate_drm_cards, DrmCardSelector, DrmLeaseBackend, DrmLeaseRequest, DrmScanoutBackend,
-    DrmScanoutRequest, RealDrmLeaseBackend, RealDrmScanoutBackend,
+    DrmScanoutCommit, DrmScanoutRequest, RealDrmLeaseBackend, RealDrmScanoutBackend,
 };
 
 struct ReadCard(std::fs::File);
@@ -45,6 +48,71 @@ fn read_crtc(card: &Path, crtc_id: u32) -> Option<(Option<u32>, Option<String>, 
         info.mode()
             .map(|mode| mode.name().to_string_lossy().into_owned()),
         info.position(),
+    ))
+}
+
+/// Find a leaseable primary plane that can drive `crtc_id` and supports XRGB8888.
+///
+/// Uses the universal-plane client capability on a second card fd so the test
+/// can name a plane explicitly in the lease request.
+fn discover_primary_plane(card: &Path, crtc_id: u32) -> Option<u32> {
+    let file = OpenOptions::new().read(true).write(true).open(card).ok()?;
+    let card = ReadCard(file);
+    let _ = card.set_client_capability(ClientCapability::UniversalPlanes, true);
+    let raw = NonZeroU32::new(crtc_id)?;
+    let crtc_handle = crtc::Handle::from(RawResourceHandle::from(raw));
+    let resources = card.resource_handles().ok()?;
+    let mut planes = card
+        .plane_handles()
+        .ok()?
+        .into_iter()
+        .filter_map(|handle| {
+            let info = card.get_plane(handle).ok()?;
+            if !info.formats().contains(&(DrmFourcc::Xrgb8888 as u32)) {
+                return None;
+            }
+            if !resources
+                .filter_crtcs(info.possible_crtcs())
+                .contains(&crtc_handle)
+            {
+                return None;
+            }
+            Some(handle)
+        })
+        .collect::<Vec<_>>();
+    planes.sort_by_key(|handle| u32::from(*handle));
+    for handle in &planes {
+        let Ok(properties) = card.get_properties(*handle) else {
+            continue;
+        };
+        for (id, value) in properties.iter() {
+            let Ok(info) = card.get_property(*id) else {
+                continue;
+            };
+            if info.name().to_string_lossy() != "type" {
+                continue;
+            }
+            if let property::Value::Enum(Some(name)) = info.value_type().convert_value(*value) {
+                if name.name().to_string_lossy() == "Primary" {
+                    return Some(u32::from(*handle));
+                }
+            }
+        }
+    }
+    planes.first().map(|handle| u32::from(*handle))
+}
+
+/// Independently read a plane's `(crtc, framebuffer)` through a second card fd.
+fn read_plane(card: &Path, plane_id: u32) -> Option<(Option<u32>, Option<u32>)> {
+    let file = OpenOptions::new().read(true).write(true).open(card).ok()?;
+    let card = ReadCard(file);
+    let _ = card.set_client_capability(ClientCapability::UniversalPlanes, true);
+    let raw = NonZeroU32::new(plane_id)?;
+    let handle = plane::Handle::from(RawResourceHandle::from(raw));
+    let info = card.get_plane(handle).ok()?;
+    Some((
+        info.crtc().map(u32::from),
+        info.framebuffer().map(u32::from),
     ))
 }
 
@@ -110,28 +178,75 @@ fn vkms_scanout_pattern_verify_teardown() {
         .expect("vkms connector with object id");
     assert!(!inspected.crtcs.is_empty(), "vkms has no CRTC");
 
-    let request = DrmScanoutRequest::new(DrmLeaseRequest::new(
+    let crtc_id = connector
+        .crtc_id
+        .unwrap_or_else(|| *inspected.crtcs.first().expect("vkms CRTC"));
+    let plane_id = discover_primary_plane(&vkms.path, crtc_id);
+    eprintln!("requested crtc: {crtc_id} discovered plane: {plane_id:?}");
+    let lease = DrmLeaseRequest::new(
         DrmCardSelector::Explicit(vkms.path.clone()),
         connector.name.clone(),
-    ));
+    )
+    .with_crtc(crtc_id);
+    let mut expected_commit = DrmScanoutCommit::Atomic;
+    let mut request = DrmScanoutRequest::new(lease.clone());
+    if let Some(plane) = plane_id {
+        request = request.with_plane(plane);
+        eprintln!("using explicit lease plane {plane}");
+    } else {
+        eprintln!(
+            "blocker: vkms exposed no XRGB8888 primary plane for CRTC {crtc_id}; running the \
+             legacy set_crtc/page_flip baseline"
+        );
+        request = request.with_legacy_commit();
+        expected_commit = DrmScanoutCommit::Legacy;
+    }
     let backend = RealDrmScanoutBackend::new();
 
-    let mut handle = backend.start(&request).unwrap_or_else(|error| {
-        panic!(
+    let mut handle = match backend.start(&request) {
+        Ok(handle) => handle,
+        Err(error) if plane_id.is_some() => {
+            eprintln!(
+                "blocker: explicit plane/atomic proof failed ({error}); retrying the legacy \
+                 set_crtc/page_flip baseline"
+            );
+            request = DrmScanoutRequest::new(lease.with_crtc(crtc_id)).with_legacy_commit();
+            expected_commit = DrmScanoutCommit::Legacy;
+            backend.start(&request).unwrap_or_else(|error| {
+                panic!(
+                    "legacy scanout on {}:{} also failed: {error} (run as root or with DRM \
+                     master/CAP_SYS_ADMIN; a default vkms card is often mastered by \
+                     systemd-logind)",
+                    vkms.path.display(),
+                    connector.name
+                )
+            })
+        }
+        Err(error) => panic!(
             "scanout on {}:{} failed: {error} (run as root or with DRM master/CAP_SYS_ADMIN; a \
              default vkms card is often mastered by systemd-logind)",
             vkms.path.display(),
             connector.name
-        )
-    });
+        ),
+    };
     let status = handle.status().clone();
     eprintln!("scanout status: {status:#?}");
     assert!(status.applied, "scanout must be applied");
+    assert_eq!(
+        status.commit, expected_commit,
+        "status must report the commit path that ran"
+    );
+    if plane_id.is_some() && expected_commit == DrmScanoutCommit::Atomic {
+        assert_eq!(
+            status.plane_id, plane_id,
+            "the explicit lease plane must be reported"
+        );
+    }
     assert!(status.framebuffer_id.is_some());
     assert!(status.buffer_handle.is_some());
     assert_eq!(status.connector, connector.name);
     assert_eq!(status.connector_id, connector.object_id);
-    assert!(status.crtc_id.is_some());
+    assert_eq!(status.crtc_id, Some(crtc_id));
     assert_eq!(status.pattern, ozma_multiseat::SCANOUT_PATTERN);
     assert!(status.pattern_checksum.is_some());
     assert!(status.page_flipped, "vkms should accept a page flip");
@@ -157,6 +272,11 @@ fn vkms_scanout_pattern_verify_teardown() {
         Some(status.mode.as_str())
     );
     assert_eq!(verification.connector_crtc, status.crtc_id);
+    if let Some(plane_id) = status.plane_id {
+        assert_eq!(verification.plane_id, Some(plane_id));
+        assert_eq!(verification.plane_crtc, status.crtc_id);
+        assert_eq!(verification.plane_framebuffer, status.framebuffer_id);
+    }
     assert!(
         verification.framebuffer_buffer_handle.is_some(),
         "GETFB must report a backing buffer handle"
@@ -211,6 +331,18 @@ fn vkms_scanout_pattern_verify_teardown() {
                     "the proof framebuffer must not remain on the CRTC after teardown"
                 ),
             }
+        }
+    }
+    if let Some(plane_id) = status.plane_id {
+        if let Some((plane_crtc, plane_framebuffer)) = read_plane(&vkms.path, plane_id) {
+            eprintln!(
+                "post-teardown GET_PLANE: plane {plane_id} crtc={plane_crtc:?} \
+                 framebuffer={plane_framebuffer:?}"
+            );
+            assert_ne!(
+                plane_framebuffer, framebuffer_id,
+                "the proof framebuffer must not remain attached to the plane"
+            );
         }
     }
 

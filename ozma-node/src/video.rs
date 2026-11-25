@@ -364,6 +364,169 @@ pub fn spawn_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use ozma_capture::{CaptureProvider, CaptureRegistry, FakeCaptureProvider};
+    use ozma_media::{CaptureSource, Frame, FrameFormat, MediaError, PixelFormat};
+    use ozma_protocol::{ApiError, CaptureCapability, CaptureKind};
+
+    fn jpeg_body(part: &[u8]) -> &[u8] {
+        let marker = b"\r\n\r\n";
+        let start = part
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("part has a header terminator")
+            + marker.len();
+        assert!(part.ends_with(b"\r\n"), "part ends with CRLF");
+        &part[start..part.len() - 2]
+    }
+
+    fn jpeg_dimensions(jpeg: &[u8]) -> (u16, u16) {
+        let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(jpeg));
+        let pixels = decoder.decode().expect("valid JPEG");
+        assert!(!pixels.is_empty());
+        let info = decoder.info().expect("JPEG info");
+        (info.width, info.height)
+    }
+
+    struct StaticFrameProvider {
+        id: String,
+        format: FrameFormat,
+        payload: Vec<u8>,
+    }
+
+    impl CaptureProvider for StaticFrameProvider {
+        fn kind(&self) -> CaptureKind {
+            CaptureKind::Fake
+        }
+
+        fn enumerate(&self) -> Result<Vec<CaptureCapability>, ApiError> {
+            Ok(vec![CaptureCapability {
+                id: self.id.clone(),
+                name: "Static test frame".to_owned(),
+                kind: CaptureKind::Fake,
+                formats: vec![self.format.pixel_format.as_str().to_owned()],
+                max_width: self.format.width,
+                max_height: self.format.height,
+                max_fps: 1,
+                compressed: self.format.pixel_format.is_compressed(),
+                hdr: false,
+                has_audio: false,
+            }])
+        }
+
+        fn open(
+            &self,
+            _capability: &CaptureCapability,
+        ) -> Result<Box<dyn CaptureSource>, ApiError> {
+            Ok(Box::new(StaticFrameSource {
+                id: self.id.clone(),
+                format: self.format,
+                payload: self.payload.clone(),
+            }))
+        }
+    }
+
+    struct StaticFrameSource {
+        id: String,
+        format: FrameFormat,
+        payload: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl CaptureSource for StaticFrameSource {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn format(&self) -> FrameFormat {
+            self.format
+        }
+
+        async fn next_frame(&mut self) -> Result<Frame, MediaError> {
+            Frame::with_data(self.format, 0, 0, true, self.payload.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn mjpeg_source_streams_the_original_jpeg_bytes() {
+        let jpeg = ozma_encode::encode_jpeg_rgb(&[200, 30, 40, 10, 220, 90], 2, 1, 95).unwrap();
+        let registry = CaptureRegistry::new().with(StaticFrameProvider {
+            id: "mjpeg0".to_owned(),
+            format: FrameFormat::new(PixelFormat::Mjpeg, 2, 1),
+            payload: jpeg.clone(),
+        });
+        let control = SnapshotControl::new(registry).streaming(None);
+        let first = control.capture().await.expect("MJPEG first frame");
+        assert_eq!(first.jpeg, jpeg, "snapshot must pass MJPEG through");
+
+        let streams = VideoStreams::new(1);
+        let guard = streams.try_start().expect("stream slot");
+        let (mut receiver, task) = spawn_stream(
+            control,
+            first,
+            VideoOptions {
+                fps: 10,
+                quality: 85,
+            },
+            guard,
+        );
+        let part = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("first part before timeout")
+            .expect("part")
+            .expect("infallible");
+        assert_eq!(jpeg_body(&part), jpeg, "stream must pass MJPEG through");
+        assert_eq!(jpeg_dimensions(jpeg_body(&part)), (2, 1));
+
+        drop(receiver);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("stream task stops after disconnect")
+            .expect("stream task joins");
+    }
+
+    #[tokio::test]
+    async fn yuyv_and_nv12_sources_stream_real_jpeg_parts() {
+        for format in [
+            FrameFormat::new(PixelFormat::Yuyv, 16, 8),
+            FrameFormat::new(PixelFormat::Nv12, 16, 8),
+        ] {
+            let registry =
+                CaptureRegistry::new().with(FakeCaptureProvider::new().with_format(format));
+            let control = SnapshotControl::new(registry).streaming(None);
+            let first = control
+                .capture()
+                .await
+                .unwrap_or_else(|error| panic!("{format:?} first frame failed: {error}"));
+            let streams = VideoStreams::new(1);
+            let guard = streams.try_start().expect("stream slot");
+            let (mut receiver, task) = spawn_stream(
+                control,
+                first,
+                VideoOptions {
+                    fps: 10,
+                    quality: 85,
+                },
+                guard,
+            );
+
+            let part = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .expect("first part before timeout")
+                .expect("part")
+                .expect("infallible");
+            let body = jpeg_body(&part);
+            assert!(body.starts_with(&[0xFF, 0xD8]), "{format:?}");
+            assert_eq!(jpeg_dimensions(body), (16, 8), "{format:?}");
+
+            drop(receiver);
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("stream task stops after disconnect")
+                .expect("stream task joins");
+            assert_eq!(streams.active(), 0);
+        }
+    }
 
     #[test]
     fn defaults_are_bounded() {

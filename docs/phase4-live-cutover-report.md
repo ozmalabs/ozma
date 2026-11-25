@@ -2114,6 +2114,13 @@ A dedicated `v4l2loopback` device (`video_nr=42`, `card_label=ozma-capture-test`
   host the first source is the real `/dev/video0`, so the run used a private
   mount namespace that hid `/dev/video0-1` and exposed only `/dev/video42`.
   There is no command-line source-id selector for the hardware profile.
+
+> **Follow-up (2026-11-26):** all four failures above are fixed. HLS converts
+> MJPEG/YUYV/NV12 to RGB24, `--capture-device` selects the source, and YUYV/NV12
+> snapshots plus H.264/HEVC/AV1 compressed HLS pass-through are implemented. See
+> [`phase4-v4l2-live-report.md`](phase4-v4l2-live-report.md) and
+> [`phase4-v4l2-media-report.md`](phase4-v4l2-media-report.md). The bullet list
+> is the original before-fix evidence.
 - **Cleanup:** node and producer stopped, the loopback module unloaded,
   `/dev/video42` removed, and both real cameras (`/dev/video0-1`,
   `81,0`/`81,1`, root:video, same names) were unchanged. No persistent module

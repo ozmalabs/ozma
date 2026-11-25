@@ -8,8 +8,9 @@ use std::path::PathBuf;
 
 use ozma_multiseat::{
     ensure_scanout_card, fill_pattern, pattern_checksum, DrmCard, DrmCardSelector, DrmCrtcSelector,
-    DrmLeaseRequest, DrmScanoutBackend, DrmScanoutError, DrmScanoutNoteKind, DrmScanoutRequest,
-    DrmScanoutStatus, FakeDrmScanoutBackend, FakeDrmScanoutFailure, SCANOUT_PATTERN,
+    DrmLeaseRequest, DrmScanoutBackend, DrmScanoutCommit, DrmScanoutError, DrmScanoutNoteKind,
+    DrmScanoutRequest, DrmScanoutStatus, FakeDrmScanoutBackend, FakeDrmScanoutFailure,
+    SCANOUT_PATTERN,
 };
 
 fn request() -> DrmScanoutRequest {
@@ -88,6 +89,8 @@ fn fake_start_allocates_fills_commits_and_verifies() {
     assert_eq!(status.connector, "Virtual-1");
     assert_eq!(status.connector_id, Some(101));
     assert_eq!(status.crtc_id, Some(201));
+    assert_eq!(status.plane_id, Some(301));
+    assert_eq!(status.commit, DrmScanoutCommit::Atomic);
     assert_eq!(status.mode, "1024x768");
     assert_eq!((status.width, status.height), (1024, 768));
     assert_eq!(status.pitch, 1024 * 4);
@@ -109,6 +112,9 @@ fn fake_start_allocates_fills_commits_and_verifies() {
     assert_eq!(verification.crtc_mode.as_deref(), Some("1024x768"));
     assert_eq!(verification.connector_state, "connected");
     assert_eq!(verification.connector_crtc, Some(201));
+    assert_eq!(verification.plane_id, Some(301));
+    assert_eq!(verification.plane_crtc, Some(201));
+    assert_eq!(verification.plane_framebuffer, status.framebuffer_id);
     assert_eq!(verification.framebuffer_buffer_handle, status.buffer_handle);
     assert_eq!(
         verification.pattern_checksum,
@@ -122,14 +128,20 @@ fn fake_start_allocates_fills_commits_and_verifies() {
         "buffer",
         "fill",
         "framebuffer",
-        "set_crtc",
-        "page_flip",
+        "atomic_property plane FB_ID",
+        "atomic_property plane CRTC_ID",
+        "atomic_commit",
+        "atomic_page_flip",
     ] {
         assert!(
             joined.contains(expected),
             "missing {expected:?} event in {joined}"
         );
     }
+    assert!(
+        !joined.contains("set_crtc"),
+        "atomic path must not use legacy set_crtc: {joined}"
+    );
 
     handle.teardown().expect("teardown");
     let status = handle.status();
@@ -146,7 +158,7 @@ fn teardown_clears_before_destroying_and_revokes() {
     handle.teardown().expect("teardown");
     let events = backend.events();
     let tail = &events[events.len() - 4..];
-    assert!(tail[0].starts_with("clear_crtc "), "{tail:?}");
+    assert!(tail[0].starts_with("atomic_disable "), "{tail:?}");
     assert!(tail[1].starts_with("destroy_framebuffer "), "{tail:?}");
     assert!(tail[2].starts_with("destroy_buffer "), "{tail:?}");
     assert!(tail[3].starts_with("revoke "), "{tail:?}");
@@ -238,6 +250,12 @@ fn typed_failures_are_stable_codes() {
             FakeDrmScanoutFailure::FramebufferFailure,
             "framebuffer_failed",
         ),
+        (FakeDrmScanoutFailure::UnsupportedPlane, "unsupported_plane"),
+        (FakeDrmScanoutFailure::InvalidFormat, "invalid_format"),
+        (
+            FakeDrmScanoutFailure::MissingAtomicProperty,
+            "missing_atomic_property",
+        ),
     ];
     for (failure, code) in cases {
         let backend = FakeDrmScanoutBackend::new();
@@ -283,11 +301,73 @@ fn status_serializes_notes_ids_and_verification() {
     let encoded = serde_json::to_string(status).expect("serialize status");
     assert!(encoded.contains("\"connector_id\":101"));
     assert!(encoded.contains("\"crtc_id\":201"));
+    assert!(encoded.contains("\"plane_id\":301"));
+    assert!(encoded.contains("\"commit\":\"atomic\""));
     assert!(encoded.contains("\"framebuffer_id\""));
     assert!(encoded.contains("\"kind\":\"scanout_proof_only\""));
     assert!(encoded.contains("\"released\":true"));
     assert!(encoded.contains("\"ok\":true"));
     assert!(DrmScanoutStatus::default().is_empty());
+}
+
+#[test]
+fn explicit_plane_is_validated_and_used_by_atomic_commit() {
+    let backend = FakeDrmScanoutBackend::new();
+    let handle = backend
+        .start(&request().with_plane(301))
+        .expect("explicit plane");
+    assert_eq!(handle.status().plane_id, Some(301));
+    assert_eq!(handle.status().commit, DrmScanoutCommit::Atomic);
+    let events = backend.events().join("\n");
+    assert!(events.contains("atomic_property plane FB_ID"), "{events}");
+
+    let error = backend
+        .start(&request().with_plane(999))
+        .err()
+        .expect("unknown plane must fail");
+    assert!(matches!(error, DrmScanoutError::UnsupportedPlane { .. }));
+    assert_eq!(error.code(), "unsupported_plane");
+}
+
+#[test]
+fn atomic_unsupported_falls_back_to_legacy_with_note() {
+    let backend = FakeDrmScanoutBackend::new();
+    backend.fail_next(FakeDrmScanoutFailure::AtomicUnsupported);
+    let handle = backend.start(&request()).expect("legacy fallback");
+    let status = handle.status();
+    assert_eq!(status.commit, DrmScanoutCommit::Legacy);
+    assert!(status
+        .notes
+        .iter()
+        .any(|note| { note.kind == DrmScanoutNoteKind::LegacyCommitFallback }));
+    let events = backend.events().join("\n");
+    assert!(events.contains("set_crtc "), "{events}");
+    assert!(events.contains("page_flip "), "{events}");
+    assert!(!events.contains("atomic_commit "), "{events}");
+}
+
+#[test]
+fn forced_legacy_commit_is_explicit_and_clears_legacy() {
+    let backend = FakeDrmScanoutBackend::new();
+    let mut handle = backend
+        .start(&request().with_legacy_commit())
+        .expect("forced legacy");
+    assert_eq!(handle.status().commit, DrmScanoutCommit::Legacy);
+    assert!(handle
+        .status()
+        .notes
+        .iter()
+        .any(|note| note.kind == DrmScanoutNoteKind::LegacyCommitForced));
+    handle.teardown().expect("legacy teardown");
+    let events = backend.events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.starts_with("clear_crtc "))
+            .count(),
+        1,
+        "{events:?}"
+    );
 }
 
 #[test]

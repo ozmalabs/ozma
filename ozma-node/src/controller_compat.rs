@@ -3573,6 +3573,36 @@ pub const RPA_IMPLEMENTED_SURFACES: &[ControllerSurface] = &[
         code: "backup.delete",
         remediation: "",
     },
+    ControllerSurface {
+        surface: "/backup/stats",
+        capability: "backup.stats",
+        supported: true,
+        reason: "Reports repository, unique-content, and snapshot statistics from restic stats --json.",
+        python_reference: "agent/backup.py::BackupManager.get_status",
+        path_prefix: "/backup/stats",
+        code: "backup.stats",
+        remediation: "",
+    },
+    ControllerSurface {
+        surface: "/backup/verify",
+        capability: "backup.verify",
+        supported: true,
+        reason: "Runs restic check with a bounded 1-5% read-data subset and only reports integrity on restic success.",
+        python_reference: "agent/backup.py::BackupManager.verify",
+        path_prefix: "/backup/verify",
+        code: "backup.verify",
+        remediation: "",
+    },
+    ControllerSurface {
+        surface: "/backup/estimate",
+        capability: "backup.estimate",
+        supported: true,
+        reason: "Scans allow-listed sources with restic backup --dry-run --json without writing a snapshot.",
+        python_reference: "agent/backup.py::BackupManager.estimate_size",
+        path_prefix: "/backup/estimate",
+        code: "backup.estimate",
+        remediation: "",
+    },
 ];
 
 /// Controller-only surfaces that this node advertises as unsupported.
@@ -3598,11 +3628,11 @@ pub const CONTROLLER_ONLY_SURFACES: &[ControllerSurface] = &[
         surface: "/backup/*",
         capability: "backup",
         supported: false,
-        reason: "Only local status/init/run/snapshots/restore/delete are implemented; app inventory, config writes, estimate, verify, onboarding, and cloud destinations remain unsupported.",
+        reason: "Local status/init/run/snapshots/restore/delete/stats/verify/estimate are implemented; app inventory, config writes, onboarding, snapshot file browsing, and cloud destinations remain unsupported.",
         python_reference: "agent/backup.py (agent/ozma_desktop_agent.py)",
         path_prefix: "/backup",
         code: "backup.unsupported",
-        remediation: "Use /backup/status|init|run|snapshots|restore and DELETE /backup/snapshots/{id}, or run the Python desktop agent with restic for app inventory, cloud destinations, verification, and scheduling.",
+        remediation: "Use /backup/status|init|run|snapshots|restore|stats|verify|estimate and DELETE /backup/snapshots/{id}, or run the Python desktop agent with restic for app inventory, cloud destinations, and scheduling.",
     },
     ControllerSurface {
         surface: "/ui/windows",
@@ -9685,14 +9715,61 @@ mod tests {
             CompatStats::default(),
         )
         .with_snapshot(Some(SnapshotControl::new(CaptureRegistry::new().with(
-            FakeCaptureProvider::new().with_format(FrameFormat::new(PixelFormat::Nv12, 4, 4)),
+            FakeCaptureProvider::new().with_format(FrameFormat::new(PixelFormat::H264, 4, 4)),
         ))));
         let (status, body) = get_json(&public_router(state), "/display/snapshot").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["ok"], false);
         assert_eq!(body["code"], "display.unsupported_format");
-        assert!(body["error"].as_str().unwrap().contains("nv12"));
-        assert!(body["remediation"].as_str().unwrap().contains("rgb24"));
+        assert!(body["error"].as_str().unwrap().contains("h264"));
+        assert!(body["remediation"].as_str().unwrap().contains("yuyv"));
+    }
+
+    #[tokio::test]
+    async fn display_snapshot_encodes_yuyv_and_nv12_sources() {
+        for format in [
+            FrameFormat::new(PixelFormat::Yuyv, 16, 8),
+            FrameFormat::new(PixelFormat::Nv12, 16, 8),
+        ] {
+            let state = ConnectionState::new(
+                ConnectionInfo::new(
+                    "node-a._ozma._udp.local.",
+                    "hardware",
+                    7382,
+                    7384,
+                    7331,
+                    SINK_FAKE_RECORDING,
+                ),
+                CompatStats::default(),
+            )
+            .with_snapshot(Some(SnapshotControl::new(
+                CaptureRegistry::new().with(FakeCaptureProvider::new().with_format(format)),
+            )));
+            let app = public_router(state);
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/display/snapshot")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{format:?}");
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "image/jpeg");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(body.starts_with(&[0xFF, 0xD8]), "{format:?}");
+            let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(&body));
+            decoder.decode().expect("valid JPEG");
+            let info = decoder.info().expect("JPEG info");
+            assert_eq!((info.width, info.height), (16, 8), "{format:?}");
+
+            let (status, info) = get_json(&app, "/display/info").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(info["pixel_format"], format.pixel_format.as_str());
+            assert_eq!(info["dimensions_source"], "last-frame");
+        }
     }
 
     fn video_state(streams: Option<VideoStreams>) -> ConnectionState {
@@ -10148,6 +10225,9 @@ mod tests {
             ("/backup/snapshots", "GET"),
             ("/backup/restore", "POST"),
             ("/backup/snapshots/0123456789abcdef", "DELETE"),
+            ("/backup/stats", "GET"),
+            ("/backup/verify", "POST"),
+            ("/backup/estimate", "POST"),
         ] {
             let response = app
                 .clone()
@@ -10207,6 +10287,9 @@ mod tests {
             ("/backup/snapshots", "backup.snapshots"),
             ("/backup/restore", "backup.restore"),
             ("/backup/snapshots/{id}", "backup.delete"),
+            ("/backup/stats", "backup.stats"),
+            ("/backup/verify", "backup.verify"),
+            ("/backup/estimate", "backup.estimate"),
         ];
         let unsupported = [
             ("/api/v1/rpa/*", "rpa"),

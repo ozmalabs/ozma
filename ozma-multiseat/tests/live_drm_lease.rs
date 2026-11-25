@@ -75,6 +75,7 @@ fn vkms_lease_create_validate_duplicate_revoke() {
         card: DrmCardSelector::Explicit(vkms.path.clone()),
         connector: connector.name.clone(),
         crtc: DrmCrtcSelector::Auto,
+        plane: Default::default(),
     };
 
     let mut lease = backend.acquire(&request).unwrap_or_else(|error| {

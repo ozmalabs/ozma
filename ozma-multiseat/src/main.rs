@@ -67,10 +67,12 @@ use ozma_multiseat::{
                   read-only sysfs display/input events; and `--audio-router` ensures/removes \
                   per-seat null sinks. `--print-plan` and `--dry-run` never run routing, \
                   ownership, audio, input-isolation, or hotplug actions and never write the \
-                  seat file. `--seat-drm-lease [SEAT=]CARD:CONNECTOR[@CRTC]` is an opt-in, \
-                  lease-only handoff: it exports an inherited lessee fd to the seat child but \
-                  does not create scanout or compositor isolation; `auto` only selects a vkms \
-                  card, while real outputs must be named explicitly."
+                  seat file. `--seat-drm-lease [SEAT=]CARD:CONNECTOR[@CRTC][:PLANE]` is an \
+                  opt-in, lease-only handoff: it validates and leases an optional plane, exports \
+                  an inherited lessee fd to the seat child, but does not create scanout or \
+                  compositor isolation; `auto` only selects a vkms card, while real outputs must \
+                  be named explicitly. `--seat-drm-scanout` performs one atomic plane/CRTC proof \
+                  (legacy `set_crtc` only when atomic KMS is unsupported)."
 )]
 struct Args {
     /// Node binary or path passed to every planned seat.
@@ -191,21 +193,24 @@ struct Args {
     #[arg(long)]
     hotplug: bool,
 
-    /// Opt-in DRM lease for a seat: `[SEAT=]CARD:CONNECTOR[@CRTC]`. Repeat once
-    /// per seat, or give each request an explicit seat id/index prefix. `auto`
-    /// and `vkms` only select a virtual vkms card; real outputs must be named
-    /// explicitly. The lease is exported as an inherited fd in `OZMA_DRM_FD`
-    /// and does not create scanout or compositor isolation.
-    #[arg(long, value_name = "[SEAT=]CARD:CONNECTOR", action = clap::ArgAction::Append)]
+    /// Opt-in DRM lease for a seat: `[SEAT=]CARD:CONNECTOR[@CRTC][:PLANE]`.
+    /// Repeat once per seat, or give each request an explicit seat id/index
+    /// prefix. `auto` and `vkms` only select a virtual vkms card; real outputs
+    /// must be named explicitly. An explicit plane is validated against the
+    /// selected CRTC before leasing. The lease is exported as an inherited fd
+    /// in `OZMA_DRM_FD` and does not create scanout or compositor isolation.
+    #[arg(long, value_name = "[SEAT=]CARD:CONNECTOR[@CRTC][:PLANE]", action = clap::ArgAction::Append)]
     seat_drm_lease: Vec<String>,
 
-    /// Run the opt-in KMS scanout proof for `[SEAT=]CARD:CONNECTOR` and exit.
-    /// It acquires a DRM lease, allocates a dumb buffer, fills a known pattern,
-    /// programs one CRTC/connector, verifies the result, prints status, and
-    /// tears everything down. This proves scanout; it does not start a
-    /// compositor. `auto`/`vkms` only selects a vkms card; a real output must
-    /// be named as an explicit `/dev/dri/cardN`.
-    #[arg(long, value_name = "[SEAT=]CARD:CONNECTOR")]
+    /// Run the opt-in KMS scanout proof for
+    /// `[SEAT=]CARD:CONNECTOR[@CRTC][:PLANE]` and exit. It acquires a DRM
+    /// lease (including the plane when named), allocates a dumb buffer, fills a
+    /// known pattern, performs an atomic plane/CRTC commit (falling back to
+    /// legacy `set_crtc` only if atomic KMS is unsupported), verifies the
+    /// result, prints status, and tears everything down. This proves scanout;
+    /// it does not start a compositor. `auto`/`vkms` only selects a vkms card;
+    /// a real output must be named as an explicit `/dev/dri/cardN`.
+    #[arg(long, value_name = "[SEAT=]CARD:CONNECTOR[@CRTC][:PLANE]")]
     seat_drm_scanout: Option<String>,
 
     /// Exact connector mode for `--seat-drm-scanout` (default: the
@@ -743,11 +748,13 @@ fn run_scanout_proof(args: &Args, selector: &str) -> Result<(), ozma_multiseat::
 
 fn print_scanout_status(status: &DrmScanoutStatus) {
     println!(
-        "scanout: {}:{} connector_id={:?} crtc={:?} lessee={:?} fd={:?}",
+        "scanout: {}:{} connector_id={:?} crtc={:?} plane={:?} commit={} lessee={:?} fd={:?}",
         status.card,
         status.connector,
         status.connector_id,
         status.crtc_id,
+        status.plane_id,
+        status.commit.as_str(),
         status.lessee_id,
         status.lessee_fd
     );
@@ -767,12 +774,16 @@ fn print_scanout_status(status: &DrmScanoutStatus) {
     if let Some(verification) = &status.verification {
         println!(
             "  verify: ok={} crtc_mode={:?} crtc_framebuffer={:?} connector={} \
-             connector_crtc={:?} framebuffer_buffer={:?} buffer_size={}x{}",
+             connector_crtc={:?} plane={:?} plane_crtc={:?} plane_framebuffer={:?} \
+             framebuffer_buffer={:?} buffer_size={}x{}",
             verification.ok,
             verification.crtc_mode,
             verification.crtc_framebuffer,
             verification.connector_state,
             verification.connector_crtc,
+            verification.plane_id,
+            verification.plane_crtc,
+            verification.plane_framebuffer,
             verification.framebuffer_buffer_handle,
             verification.buffer_size.0,
             verification.buffer_size.1
@@ -1026,12 +1037,16 @@ fn print_plan_report(
         println!("    argv: {}", seat.node_argv().join(" "));
         if let Some(request) = drm_leases.get(&seat.config.id) {
             println!(
-                "    drm lease: {}:{} crtc={} (lease-only: no scanout/compositor isolation)",
+                "    drm lease: {}:{} crtc={} plane={} (lease-only: no scanout/compositor isolation)",
                 request.card.display_name(),
                 request.connector,
                 match request.crtc {
                     ozma_multiseat::DrmCrtcSelector::Auto => "auto".to_owned(),
                     ozma_multiseat::DrmCrtcSelector::Id(id) => id.to_string(),
+                },
+                match request.plane {
+                    ozma_multiseat::DrmPlaneSelector::Auto => "auto".to_owned(),
+                    ozma_multiseat::DrmPlaneSelector::Id(id) => id.to_string(),
                 }
             );
         }
@@ -1157,6 +1172,9 @@ fn lease_summary(lease: &DrmLeaseStatus) -> Option<String> {
     }
     if let Some(id) = lease.crtc_id {
         summary.push_str(&format!(" crtc_id={id}"));
+    }
+    if let Some(id) = lease.plane_id {
+        summary.push_str(&format!(" plane_id={id}"));
     }
     if let Some(fd) = lease.fd {
         summary.push_str(&format!(" fd={fd}"));
