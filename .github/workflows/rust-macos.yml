@@ -1,0 +1,61 @@
+name: Rust macOS Node
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "proto/**"
+      - "ozma-*/**"
+      - "softnode-qmp/**"
+      - ".github/workflows/rust-macos.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "proto/**"
+      - "ozma-*/**"
+      - "softnode-qmp/**"
+      - ".github/workflows/rust-macos.yml"
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Install build dependencies (cmake, opus)
+        run: brew install cmake opus
+
+      - name: Run Rust unit tests (ozma-input, ozma-capture, ozma-protocol)
+        run: cargo test -p ozma-input -p ozma-capture -p ozma-protocol
+
+      - name: Build ozma-node (aarch64-apple-darwin)
+        run: cargo build --release -p ozma-node --target aarch64-apple-darwin
+
+      - name: Build ozma-node (x86_64-apple-darwin)
+        run: cargo build --release -p ozma-node --target x86_64-apple-darwin
+
+      - name: Package universal binary and DMG
+        run: |
+          mkdir -p dist/ozma-node-macos
+          lipo -create \
+            target/aarch64-apple-darwin/release/ozma-node \
+            target/x86_64-apple-darwin/release/ozma-node \
+            -output dist/ozma-node-macos/ozma-node
+          chmod +x dist/ozma-node-macos/ozma-node
+          hdiutil create -volname "Ozma Node" -srcfolder dist/ozma-node-macos -ov -format UDZO dist/ozma-node-macos-universal.dmg
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ozma-node-macos-universal
+          path: dist/ozma-node-macos-universal.dmg

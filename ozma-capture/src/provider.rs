@@ -102,7 +102,11 @@ impl CaptureRegistry {
         {
             Self::new().with(crate::windows_display::WindowsDisplayProvider::new())
         }
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        #[cfg(target_os = "macos")]
+        {
+            Self::new().with(crate::macos_display::MacOsDisplayProvider::new())
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
         {
             Self::new()
         }

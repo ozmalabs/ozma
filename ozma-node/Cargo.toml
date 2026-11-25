@@ -79,7 +79,7 @@ usb-gadget         = { workspace = true }
 alsa               = { workspace = true }
 libc               = { workspace = true }
 
-[target.'cfg(target_os = "windows")'.dependencies]
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 sysinfo            = "0.30"
 
 [package.metadata.deb]

@@ -82,6 +82,8 @@ pub mod v4l2;
 #[cfg(target_os = "linux")]
 pub mod r#virtual;
 pub mod vnc_display;
+#[cfg(target_os = "macos")]
+pub mod macos_display;
 #[cfg(target_os = "windows")]
 #[allow(unsafe_code)]
 pub mod windows_display;

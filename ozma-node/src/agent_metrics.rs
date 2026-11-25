@@ -83,16 +83,16 @@ impl MetricsPaths {
 impl AgentMetricsSampler {
     /// Sample the host and build the controller-facing metrics document.
     pub fn collect(&self, node_id: &str) -> Value {
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
-            return self.collect_windows(node_id);
+            return self.collect_sysinfo(node_id);
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         self.collect_with(&MetricsPaths::host(), node_id)
     }
 
-    #[cfg(target_os = "windows")]
-    fn collect_windows(&self, node_id: &str) -> Value {
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn collect_sysinfo(&self, node_id: &str) -> Value {
         use sysinfo::{Disks, Networks, System};
 
         let mut sys = System::new_all();
@@ -121,9 +121,14 @@ impl AgentMetricsSampler {
         }
 
         let disks = Disks::new_with_refreshed_list();
+        let root_mount = if cfg!(target_os = "windows") {
+            Path::new("C:\\")
+        } else {
+            Path::new("/")
+        };
         let (disk_total, disk_used) = disks
             .iter()
-            .find(|d| d.mount_point() == Path::new("C:\\"))
+            .find(|d| d.mount_point() == root_mount)
             .or_else(|| disks.iter().next())
             .map(|d| (d.total_space(), d.total_space().saturating_sub(d.available_space())))
             .unwrap_or((0, 0));

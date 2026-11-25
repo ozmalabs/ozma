@@ -544,9 +544,9 @@ fn resolve_input_chain(config: &NodeConfig) -> Result<Vec<SinkKind>, String> {
     Ok(match config.profile {
         NodeProfile::Hardware => vec![SinkKind::HidGadget, SinkKind::Recording],
         NodeProfile::Vm | NodeProfile::Desktop => {
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
             let mut chain = vec![SinkKind::SendInput, SinkKind::Uinput];
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
             let mut chain = vec![SinkKind::Uinput];
             if config.qmp_socket.is_some() || config.qmp_input_socket.is_some() {
                 chain.push(SinkKind::Qmp);

@@ -6,7 +6,7 @@
 //! held state; on non-Windows targets [`WindowsSendInputSink::open`] returns
 //! [`codes::UNSUPPORTED`] so `ozma-input` compiles everywhere.
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::sync::Mutex;
 
 use ozma_protocol::input::InputEvent;
@@ -18,13 +18,13 @@ use crate::state::HeldInput;
 
 /// Windows `SendInput` input sink.
 pub struct WindowsSendInputSink {
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     inner: Mutex<WindowsInner>,
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     _private: (),
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 struct WindowsInner {
     enigo: enigo::Enigo,
     held: HeldInput,
@@ -33,7 +33,7 @@ struct WindowsInner {
 impl WindowsSendInputSink {
     /// Open a Windows `SendInput` injector.
     pub fn open() -> Result<Self, ApiError> {
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             let enigo = enigo::Enigo::new(&enigo::Settings::default()).map_err(|error| {
                 ApiError::new(
@@ -48,7 +48,7 @@ impl WindowsSendInputSink {
                 }),
             })
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
             Err(ApiError::new(
                 codes::UNSUPPORTED,
@@ -60,7 +60,7 @@ impl WindowsSendInputSink {
 
 impl InputSink for WindowsSendInputSink {
     fn submit_report(&self, event: &InputEvent) -> Result<SubmitReport, ApiError> {
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             use enigo::{Axis, Button, Coordinate, Direction, Keyboard, Mouse};
             use ozma_protocol::input::PointerButton;
@@ -192,7 +192,7 @@ impl InputSink for WindowsSendInputSink {
                 )),
             }
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
             let _ = event;
             Err(ApiError::new(
@@ -203,7 +203,7 @@ impl InputSink for WindowsSendInputSink {
     }
 
     fn release_all(&self) -> Result<(), ApiError> {
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             let mut inner = self
                 .inner
@@ -212,14 +212,14 @@ impl InputSink for WindowsSendInputSink {
             release_held(&mut inner);
             Ok(())
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
             Ok(())
         }
     }
 
     fn held(&self) -> HeldInput {
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             let inner = self
                 .inner
@@ -227,14 +227,14 @@ impl InputSink for WindowsSendInputSink {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             inner.held.clone()
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
             HeldInput::default()
         }
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn release_held(inner: &mut WindowsInner) {
     use enigo::{Direction, Keyboard};
     let keys: Vec<u8> = inner.held.keys.iter().copied().collect();
@@ -246,7 +246,7 @@ fn release_held(inner: &mut WindowsInner) {
     inner.held.keys.clear();
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn hid_usage_to_enigo_key(usage: u8) -> Option<enigo::Key> {
     use enigo::Key;
     match usage {
