@@ -33,9 +33,11 @@ use ozma_node::{
     hls::{HlsConfig, HlsController, HlsEncoder, HlsError, HlsSourceFactory, HlsStatus},
     input_select,
     keyboard_layout::KeyboardLayout,
-    mdns, platform, registration, usb_audio,
+    mdns, platform, registration,
     webrtc::{WebRtcAudioBackend, WebRtcConfig, WebRtcControl, WebRtcHelper},
 };
+#[cfg(target_os = "linux")]
+use ozma_node::usb_audio;
 
 /// Ozma hardware KVM node process.
 #[derive(Parser, Debug)]
@@ -525,14 +527,26 @@ async fn main() {
         vnc_width: args.vnc_width,
         vnc_height: args.vnc_height,
         vnc_fps: args.vnc_fps,
+        #[cfg(target_os = "linux")]
         dbus_console: args
             .dbus_console
             .unwrap_or(ozma_capture::DBUS_DEFAULT_CONSOLE_INDEX),
+        #[cfg(not(target_os = "linux"))]
+        dbus_console: args.dbus_console.unwrap_or(0),
+        #[cfg(target_os = "linux")]
         dbus_width: args.dbus_width.unwrap_or(ozma_capture::DBUS_DEFAULT_WIDTH),
+        #[cfg(not(target_os = "linux"))]
+        dbus_width: args.dbus_width.unwrap_or(1920),
+        #[cfg(target_os = "linux")]
         dbus_height: args
             .dbus_height
             .unwrap_or(ozma_capture::DBUS_DEFAULT_HEIGHT),
+        #[cfg(not(target_os = "linux"))]
+        dbus_height: args.dbus_height.unwrap_or(1080),
+        #[cfg(target_os = "linux")]
         dbus_fps: args.dbus_fps.unwrap_or(ozma_capture::DBUS_DEFAULT_FPS),
+        #[cfg(not(target_os = "linux"))]
+        dbus_fps: args.dbus_fps.unwrap_or(30),
         dbus_requested: args.dbus_console.is_some()
             || args.dbus_width.is_some()
             || args.dbus_height.is_some()
@@ -986,6 +1000,7 @@ async fn main() {
         });
     }
 
+    #[cfg(target_os = "linux")]
     if config.has_capability("audio") {
         tokio::spawn(async move {
             match usb_audio::UsbAudioGadget::open(true).await {
@@ -1273,16 +1288,33 @@ async fn probe_audio_server() -> Result<(), String> {
 
 /// Whether an executable named `name` exists on `PATH`.
 fn command_on_path(name: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-
     let Some(path) = std::env::var_os("PATH") else {
         return false;
     };
     std::env::split_paths(&path).any(|directory| {
-        let candidate = directory.join(name);
-        std::fs::metadata(&candidate)
-            .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let candidate = directory.join(name);
+            std::fs::metadata(&candidate)
+                .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        }
+        #[cfg(not(unix))]
+        {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return true;
+            }
+            #[cfg(windows)]
+            {
+                let exe = directory.join(format!("{name}.exe"));
+                if exe.is_file() {
+                    return true;
+                }
+            }
+            false
+        }
     })
 }
 
@@ -1290,6 +1322,7 @@ fn command_on_path(name: &str) -> bool {
 fn sink_kind_name(kind: SinkKind) -> &'static str {
     match kind {
         SinkKind::Uinput => controller_compat::SINK_UINPUT,
+        SinkKind::SendInput => controller_compat::SINK_SEND_INPUT,
         SinkKind::Qmp => controller_compat::SINK_QMP,
         SinkKind::HidGadget => controller_compat::SINK_HID_GADGET,
         SinkKind::Recording => controller_compat::SINK_FAKE_RECORDING,

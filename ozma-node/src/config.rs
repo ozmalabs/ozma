@@ -544,6 +544,9 @@ fn resolve_input_chain(config: &NodeConfig) -> Result<Vec<SinkKind>, String> {
     Ok(match config.profile {
         NodeProfile::Hardware => vec![SinkKind::HidGadget, SinkKind::Recording],
         NodeProfile::Vm | NodeProfile::Desktop => {
+            #[cfg(target_os = "windows")]
+            let mut chain = vec![SinkKind::SendInput, SinkKind::Uinput];
+            #[cfg(not(target_os = "windows"))]
             let mut chain = vec![SinkKind::Uinput];
             if config.qmp_socket.is_some() || config.qmp_input_socket.is_some() {
                 chain.push(SinkKind::Qmp);
@@ -762,6 +765,7 @@ impl NodeConfig {
         if self.dbus_fps == 0 {
             return Err("--dbus-fps must be greater than zero".to_owned());
         }
+        #[cfg(target_os = "linux")]
         if self.dbus_width > ozma_capture::MAX_DBUS_DIMENSION
             || self.dbus_height > ozma_capture::MAX_DBUS_DIMENSION
         {

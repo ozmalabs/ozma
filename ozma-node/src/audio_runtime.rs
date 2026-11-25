@@ -9,10 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
-use ozma_audio::PipeWireCapture;
+use ozma_audio::{AlsaCapture, AlsaCaptureConfig, PipeWireCapture};
 use ozma_audio::{
-    AlsaCapture, AlsaCaptureConfig, AudioEncoder, AudioSource, EncodedAudio, EncoderConfig,
-    FakeAudioSource, OpusEncoder,
+    AudioEncoder, AudioSource, EncodedAudio, EncoderConfig, FakeAudioSource, OpusEncoder,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -87,25 +86,29 @@ impl AudioRuntime {
                 }
             }
         }
-        match AlsaCapture::open(AlsaCaptureConfig::default()) {
-            Ok(mut capture) => {
-                match tokio::time::timeout(Duration::from_millis(1500), capture.next_frame()).await
-                {
-                    Ok(Ok(first)) => {
-                        tracing::info!("Using ALSA audio capture");
-                        return Self::spawn(Box::new(capture), Some(first));
+        #[cfg(target_os = "linux")]
+        {
+            match AlsaCapture::open(AlsaCaptureConfig::default()) {
+                Ok(mut capture) => {
+                    match tokio::time::timeout(Duration::from_millis(1500), capture.next_frame())
+                        .await
+                    {
+                        Ok(Ok(first)) => {
+                            tracing::info!("Using ALSA audio capture");
+                            return Self::spawn(Box::new(capture), Some(first));
+                        }
+                        Ok(Err(error)) => {
+                            warn!(error = %error, "ALSA capture produced no frame; using fake source");
+                        }
+                        Err(_) => {
+                            warn!("ALSA capture produced no frame in time; using fake source");
+                        }
                     }
-                    Ok(Err(error)) => {
-                        warn!(error = %error, "ALSA capture produced no frame; using fake source");
-                    }
-                    Err(_) => {
-                        warn!("ALSA capture produced no frame in time; using fake source");
-                    }
+                    let _ = capture.stop().await;
                 }
-                let _ = capture.stop().await;
-            }
-            Err(error) => {
-                warn!(error = %error, "ALSA capture unavailable; using fake audio source");
+                Err(error) => {
+                    warn!(error = %error, "ALSA capture unavailable; using fake audio source");
+                }
             }
         }
         Self::spawn(Box::new(FakeAudioSource::new().unlimited()), None)
@@ -123,13 +126,16 @@ impl AudioRuntime {
     }
 
     fn start_alsa() -> Self {
-        match AlsaCapture::open(AlsaCaptureConfig::default()) {
-            Ok(capture) => Self::spawn(Box::new(capture), None),
-            Err(error) => {
-                warn!(error = %error, "ALSA capture unavailable; using fake audio source");
-                Self::spawn(Box::new(FakeAudioSource::new().unlimited()), None)
+        #[cfg(target_os = "linux")]
+        {
+            match AlsaCapture::open(AlsaCaptureConfig::default()) {
+                Ok(capture) => return Self::spawn(Box::new(capture), None),
+                Err(error) => {
+                    warn!(error = %error, "ALSA capture unavailable; using fake audio source");
+                }
             }
         }
+        Self::spawn(Box::new(FakeAudioSource::new().unlimited()), None)
     }
 
     /// Start with the deterministic fake source, for tests and local harnesses.

@@ -573,7 +573,7 @@ async fn run_dedicated_input_task(
     debug!("QMP input channel closed; dedicated background task exiting");
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};

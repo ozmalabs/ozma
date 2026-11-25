@@ -26,9 +26,14 @@ tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow             = { workspace = true }
 thiserror          = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
 usb-gadget         = { workspace = true }
 alsa               = { workspace = true }
 libc               = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+sysinfo            = "0.30"
 
 # Ozma plan crates
 ozma-protocol = { path = "../ozma-protocol" }

@@ -61,23 +61,32 @@
 
 #![deny(unsafe_code)]
 
+#[cfg(target_os = "linux")]
 pub mod dbus_display;
 // The DMA-BUF importer isolates the one `unsafe` operation in this crate:
 // `memmap2`'s read-only mapping constructor. See its module documentation.
+#[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 mod dbus_dmabuf;
 pub mod fake;
+#[cfg(target_os = "linux")]
 pub mod lookingglass;
 #[cfg(target_os = "linux")]
 pub mod pipewire;
 pub mod provider;
 pub mod qmp_display;
+#[cfg(target_os = "linux")]
 pub mod v4l2;
 // `virtual` is a reserved Rust keyword; the raw identifier keeps the intended
 // module name and file (`virtual.rs`) while still compiling.
+#[cfg(target_os = "linux")]
 pub mod r#virtual;
 pub mod vnc_display;
+#[cfg(target_os = "windows")]
+#[allow(unsafe_code)]
+pub mod windows_display;
 
+#[cfg(target_os = "linux")]
 pub use dbus_display::{
     DBusDisplayConfig, DBusDisplayProvider, DBusDisplaySource, DBusError, DBusHeader, DBusMessage,
     DBusTransport, DBusValue, Framebuffer, UnixDBusTransport, DBUS_ADD_CLIENT_PROTOCOL,
@@ -87,6 +96,7 @@ pub use dbus_display::{
     DBUS_PROPERTIES_INTERFACE, MAX_DBUS_BODY_BYTES, MAX_DBUS_DIMENSION,
 };
 pub use fake::FakeCaptureProvider;
+#[cfg(target_os = "linux")]
 pub use lookingglass::{
     extract_frame, frame_format, parse_frame_header, parse_header, requires_conversion,
     validate_frame_bounds, KvmfrFrameHeader, KvmfrHeader, LookingGlassProvider,
@@ -104,12 +114,14 @@ pub use qmp_display::{
     QMP_DEFAULT_ID, QMP_DEFAULT_MAX_FPS, QMP_DEFAULT_MAX_HEIGHT, QMP_DEFAULT_MAX_WIDTH,
     QMP_DEFAULT_NAME,
 };
+#[cfg(target_os = "linux")]
 pub use r#virtual::{
     bounded_fps, next_device_number, ChildId, CommandOutput, CommandRunner, ProcessCommandRunner,
     V4l2SourceFactory, VirtualCapture, VirtualCaptureConfig, VirtualCaptureProvider,
     VirtualCaptureProviderConfig, VirtualCaptureSource, VirtualSourceFactory,
     VIRTUAL_CAPTURE_DEFAULT_DEV_ROOT, VIRTUAL_CAPTURE_DEFAULT_SYS_ROOT,
 };
+#[cfg(target_os = "linux")]
 pub use v4l2::{
     choose_resolution, discover_v4l2, fourcc_to_pixel_format, h264_access_unit_contains_idr,
     is_capture_like_name, keyframe_for, monotonic_pts, next_sequence, parse_video_index,

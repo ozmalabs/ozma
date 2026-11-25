@@ -59,19 +59,27 @@
 #![forbid(unsafe_code)]
 
 pub mod backoff;
+#[cfg(unix)]
 pub mod client;
+#[cfg(not(unix))]
+mod client_stub;
 pub mod config;
 pub mod error;
 pub mod hid;
 pub mod input_event;
+#[cfg(unix)]
 pub mod shared;
 
 pub use backoff::{backoff_delay, Backoff, BACKOFF_FACTOR, BACKOFF_INITIAL, BACKOFF_MAX};
+#[cfg(unix)]
 pub use client::{QmpClient, QmpStatus};
+#[cfg(not(unix))]
+pub use client_stub::{QmpClient, QmpStatus, SharedQmpClient};
 pub use config::{QmpConfig, DEFAULT_COMMAND_TIMEOUT, DEFAULT_CONNECT_TIMEOUT};
 pub use error::QmpError;
 pub use hid::{
     hid_to_qcode, KeyboardReportState, MouseReportState, RelativeMouseReportState, HID_TO_QCODE,
 };
 pub use input_event::{QmpInputEvent, QmpKeyValue};
+#[cfg(unix)]
 pub use shared::SharedQmpClient;

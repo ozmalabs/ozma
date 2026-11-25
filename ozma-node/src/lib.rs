@@ -20,6 +20,7 @@ pub mod registration;
 pub mod rtsp_runtime;
 pub mod scene_replay;
 pub mod transport;
+#[cfg(target_os = "linux")]
 pub mod usb_audio;
 pub mod webrtc;
 

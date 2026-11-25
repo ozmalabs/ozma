@@ -3099,6 +3099,7 @@ dependencies = [
  "tokio",
  "tracing",
  "v4l",
+ "windows 0.58.0",
 ]
 
 [[package]]
@@ -3291,6 +3292,7 @@ dependencies = [
 name = "ozma-input"
 version = "0.1.0"
 dependencies = [
+ "enigo",
  "evdev",
  "ozma-proto",
  "ozma-protocol",
@@ -3372,6 +3374,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sysinfo",
  "thiserror 1.0.69",
  "tokio",
  "tower",

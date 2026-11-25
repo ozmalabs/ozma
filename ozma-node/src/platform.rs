@@ -8,9 +8,11 @@ use ozma_protocol::{
     TransportMode, UsbCapability, VirtualDisplayCaps,
 };
 
+#[cfg(target_os = "linux")]
+use ozma_capture::{DBusDisplayConfig, DBUS_DEFAULT_ID};
 use ozma_capture::{
-    CaptureRegistry, DBusDisplayConfig, FakeCaptureProvider, QmpDisplayConfig, VncDisplayConfig,
-    DBUS_DEFAULT_ID, QMP_DEFAULT_ID, QMP_DEFAULT_MAX_FPS, VNC_DEFAULT_ID,
+    CaptureRegistry, FakeCaptureProvider, QmpDisplayConfig, VncDisplayConfig, QMP_DEFAULT_ID,
+    QMP_DEFAULT_MAX_FPS, VNC_DEFAULT_ID,
 };
 use ozma_media::FrameFormat;
 use ozma_qmp::SharedQmpClient;
@@ -99,6 +101,7 @@ fn vm_capture_registry(config: &NodeConfig, shared: Option<&SharedQmpClient>) ->
             }
             None => CaptureRegistry::new(),
         },
+        #[cfg(target_os = "linux")]
         Some("dbus") => match &config.qmp_socket {
             Some(socket) => {
                 let display = DBusDisplayConfig::new(socket.clone())

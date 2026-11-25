@@ -58,8 +58,7 @@ use ozma_protocol::{codes, ApiError, CaptureCapability, CaptureKind};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
-use crate::provider::CaptureProvider;
-use crate::v4l2::{monotonic_pts, next_sequence};
+use crate::provider::{monotonic_pts, next_sequence, CaptureProvider};
 
 /// Default source id (`vnc0`).
 pub const VNC_DEFAULT_ID: &str = "vnc0";

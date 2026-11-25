@@ -87,6 +87,7 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(target_os = "linux")]
 pub mod alsa;
 pub mod error;
 pub mod fake;
@@ -97,6 +98,7 @@ pub mod router;
 pub mod target;
 pub mod traits;
 
+#[cfg(target_os = "linux")]
 pub use alsa::{
     AlsaCapture, AlsaCaptureConfig, DEFAULT_BUFFER_PERIODS, DEFAULT_PERIOD_FRAMES,
     DEFAULT_START_TIMEOUT, FRAME_CHANNEL_CAPACITY,
