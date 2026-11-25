@@ -60,6 +60,15 @@ pub enum SeatDisplayBackend {
     Xvfb,
     /// One private `Xephyr` server nested inside the shared display.
     Xephyr,
+    /// One private real `Xorg` server per seat with a caller-supplied config.
+    ///
+    /// This is the backend that can consume helper-created uinput devices via
+    /// the libinput input driver. It needs a config whose `InputDevice`
+    /// identifiers are the helper's `ozma-seat-...` names, and it must run with
+    /// whatever privilege the host's `Xorg` wrapper requires (often root or the
+    /// console user). Without a config it is a typed unsupported error rather
+    /// than an implicit GPU probe.
+    Xorg,
 }
 
 impl SeatDisplayBackend {
@@ -69,6 +78,7 @@ impl SeatDisplayBackend {
             Self::Shared => "shared",
             Self::Xvfb => "xvfb",
             Self::Xephyr => "xephyr",
+            Self::Xorg => "xorg",
         }
     }
 
@@ -92,8 +102,9 @@ impl FromStr for SeatDisplayBackend {
             "shared" => Ok(Self::Shared),
             "xvfb" => Ok(Self::Xvfb),
             "xephyr" => Ok(Self::Xephyr),
+            "xorg" => Ok(Self::Xorg),
             other => Err(MultiseatError::SeatDisplay(format!(
-                "unknown seat display backend {other:?}; expected shared, xvfb, or xephyr"
+                "unknown seat display backend {other:?}; expected shared, xvfb, xephyr, or xorg"
             ))),
         }
     }
@@ -336,6 +347,11 @@ pub struct SeatDisplayOptions {
     /// Shared display used as the parent for `Xephyr`. `None` uses the seat's
     /// planned X11 capture display.
     pub parent_display: Option<String>,
+    /// Xorg config file for the `Xorg` backend. The config must define the
+    /// dummy/video device and the libinput `InputDevice` sections whose
+    /// identifiers match the helper's uinput names. `None` makes `Xorg` a
+    /// typed unsupported error instead of probing the host GPU.
+    pub xorg_config: Option<PathBuf>,
 }
 
 impl Default for SeatDisplayOptions {
@@ -348,6 +364,7 @@ impl Default for SeatDisplayOptions {
             ready_timeout: DEFAULT_DISPLAY_READY_TIMEOUT,
             ready_poll: DEFAULT_DISPLAY_READY_POLL,
             parent_display: None,
+            xorg_config: None,
         }
     }
 }
@@ -435,6 +452,9 @@ pub struct SeatDisplayPrograms {
     pub xvfb: PathBuf,
     /// `Xephyr` binary name or path.
     pub xephyr: PathBuf,
+    /// `Xorg` binary name or path. The distro wrapper may restrict non-console
+    /// users, so a deployment can point this at a privileged wrapper.
+    pub xorg: PathBuf,
     /// `xauth` binary name or path.
     pub xauth: PathBuf,
 }
@@ -444,6 +464,7 @@ impl Default for SeatDisplayPrograms {
         Self {
             xvfb: PathBuf::from("Xvfb"),
             xephyr: PathBuf::from("Xephyr"),
+            xorg: PathBuf::from("Xorg"),
             xauth: PathBuf::from("xauth"),
         }
     }
@@ -603,6 +624,7 @@ impl SeatDisplayLauncher for ProcessSeatDisplayLauncher {
             }
             SeatDisplayBackend::Xvfb => (self.programs.xvfb.clone(), "xvfb"),
             SeatDisplayBackend::Xephyr => (self.programs.xephyr.clone(), "xephyr"),
+            SeatDisplayBackend::Xorg => (self.programs.xorg.clone(), "xorg"),
         };
 
         let program = match resolve_program(&program) {
@@ -624,6 +646,14 @@ impl SeatDisplayLauncher for ProcessSeatDisplayLauncher {
                 };
             }
         };
+
+        if request.backend == SeatDisplayBackend::Xorg && self.options.xorg_config.is_none() {
+            return Err(MultiseatError::Unsupported(
+                "seat display backend xorg needs an explicit config file (`xorg_config`); \
+                 refusing to probe the host GPU with the default Xorg configuration"
+                    .to_owned(),
+            ));
+        }
 
         let parent = match request.backend {
             SeatDisplayBackend::Xephyr => {
@@ -665,6 +695,7 @@ impl SeatDisplayLauncher for ProcessSeatDisplayLauncher {
             request.size,
             auth.as_ref().map(|auth| auth.file.as_path()),
             &request.seat_id,
+            self.options.xorg_config.as_deref(),
         );
 
         let mut command = Command::new(&program);
@@ -1143,13 +1174,46 @@ pub fn probe_x11_display(
 }
 
 /// Build the argv for one private X server. Pure and used by tests.
+///
+/// `Xvfb`/`Xephyr` take geometry on the command line. `Xorg` takes geometry,
+/// video, and input configuration from `xorg_config`; it is started with
+/// `-novtswitch -sharevts` so a throwaway seat does not steal a VT, and with
+/// `-noreset` so the server survives its last client exactly like a supervised
+/// seat server. `-nolisten tcp` is unconditional for every backend.
 pub fn display_server_args(
     backend: SeatDisplayBackend,
     display: &str,
     size: SeatDisplaySize,
     auth_file: Option<&Path>,
     seat_id: &str,
+    xorg_config: Option<&Path>,
 ) -> Vec<String> {
+    if backend == SeatDisplayBackend::Xorg {
+        let mut args = vec![display.to_owned()];
+        if let Some(config) = xorg_config {
+            args.push("-config".to_owned());
+            args.push(config.display().to_string());
+            let number = parse_display_number(display).unwrap_or(0);
+            let log = config.with_file_name(format!("Xorg-{number}.log"));
+            args.push("-logfile".to_owned());
+            args.push(log.display().to_string());
+        }
+        args.extend(
+            [
+                "-nolisten",
+                "tcp",
+                "-noreset",
+                "-novtswitch",
+                "-sharevts",
+                "-keeptty",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        push_auth_args(&mut args, auth_file);
+        return args;
+    }
+
     let mut args = vec![
         display.to_owned(),
         "-screen".to_owned(),
@@ -1162,6 +1226,11 @@ pub fn display_server_args(
     }
     args.push("-nolisten".to_owned());
     args.push("tcp".to_owned());
+    push_auth_args(&mut args, auth_file);
+    args
+}
+
+fn push_auth_args(args: &mut Vec<String>, auth_file: Option<&Path>) {
     match auth_file {
         Some(file) => {
             args.push("-auth".to_owned());
@@ -1169,7 +1238,6 @@ pub fn display_server_args(
         }
         None => args.push("-ac".to_owned()),
     }
-    args
 }
 
 /// Map a typed display error into a stable status kind.
@@ -1181,5 +1249,131 @@ pub fn display_error_kind(error: &MultiseatError) -> &'static str {
         MultiseatError::SeatDisplayCrashed { .. } => "crashed",
         MultiseatError::Unsupported(_) => "unsupported",
         _ => "error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn size() -> SeatDisplaySize {
+        SeatDisplaySize::new(1280, 800).expect("size")
+    }
+
+    #[test]
+    fn backend_names_include_xorg() {
+        assert_eq!(SeatDisplayBackend::Xorg.as_str(), "xorg");
+        assert_eq!(
+            "xorg".parse::<SeatDisplayBackend>().expect("parse xorg"),
+            SeatDisplayBackend::Xorg
+        );
+        assert!(SeatDisplayBackend::Xorg.is_nested());
+    }
+
+    #[test]
+    fn xorg_args_use_config_no_vt_switch_and_the_auth_cookie() {
+        let args = display_server_args(
+            SeatDisplayBackend::Xorg,
+            ":90",
+            size(),
+            Some(Path::new("/tmp/seat/Xauthority")),
+            "seat-a",
+            Some(Path::new("/tmp/seat/xorg.conf")),
+        );
+        assert_eq!(
+            args,
+            vec![
+                ":90",
+                "-config",
+                "/tmp/seat/xorg.conf",
+                "-logfile",
+                "/tmp/seat/Xorg-90.log",
+                "-nolisten",
+                "tcp",
+                "-noreset",
+                "-novtswitch",
+                "-sharevts",
+                "-keeptty",
+                "-auth",
+                "/tmp/seat/Xauthority",
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg == "-screen"));
+    }
+
+    #[test]
+    fn xorg_without_xauth_uses_socket_only_ac() {
+        let args = display_server_args(
+            SeatDisplayBackend::Xorg,
+            ":91",
+            size(),
+            None,
+            "seat-b",
+            Some(Path::new("/tmp/seat/xorg.conf")),
+        );
+        assert_eq!(args.last().map(String::as_str), Some("-ac"));
+        assert_eq!(
+            args.iter()
+                .filter(|arg| arg.as_str() == "-nolisten")
+                .count(),
+            1
+        );
+        assert!(args.windows(2).any(|pair| pair == ["-nolisten", "tcp"]));
+    }
+
+    #[test]
+    fn xvfb_args_keep_geometry_and_do_not_gain_xorg_flags() {
+        let args = display_server_args(
+            SeatDisplayBackend::Xvfb,
+            ":90",
+            size(),
+            Some(Path::new("/tmp/seat/Xauthority")),
+            "seat-a",
+            Some(Path::new("/tmp/seat/xorg.conf")),
+        );
+        assert_eq!(
+            args,
+            vec![
+                ":90",
+                "-screen",
+                "0",
+                "1280x800x24",
+                "-nolisten",
+                "tcp",
+                "-auth",
+                "/tmp/seat/Xauthority",
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg == "-novtswitch"));
+        assert!(!args.iter().any(|arg| arg == "-config"));
+    }
+
+    #[test]
+    fn xorg_without_config_is_typed_unsupported_instead_of_a_gpu_probe() {
+        let options = SeatDisplayOptions {
+            backend: SeatDisplayBackend::Xorg,
+            xorg_config: None,
+            ..SeatDisplayOptions::default()
+        };
+        let programs = SeatDisplayPrograms {
+            xorg: std::env::current_exe().expect("current exe"),
+            ..SeatDisplayPrograms::default()
+        };
+        let launcher = ProcessSeatDisplayLauncher::new(options).with_programs(programs);
+        let request = SeatDisplayRequest {
+            seat_id: "seat-a".to_owned(),
+            backend: SeatDisplayBackend::Xorg,
+            size: size(),
+            parent_display: None,
+        };
+        let error = match launcher.spawn(&request) {
+            Ok(_) => panic!("spawning Xorg without a config must fail"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, MultiseatError::Unsupported(_)),
+            "unexpected error: {error}"
+        );
+        assert!(error.to_string().contains("config file"));
     }
 }

@@ -379,7 +379,7 @@ pub struct SupervisorOptions {
     /// starts. `Strict` prevents the spawn. `Off` never runs `xinput`.
     pub input_targeting: InputTargetingMode,
     /// Opt-in per-seat X server strategy. `Shared` (the default) starts
-    /// nothing; `Xvfb`/`Xephyr` start a private display before the node and stop
+    /// nothing; `Xvfb`/`Xephyr`/`Xorg` start a private display before the node and stop
     /// it after the node.
     pub seat_display: SeatDisplayOptions,
     /// Opt-in DRM leases keyed by seat id. Empty by default. A lease hands the
@@ -576,7 +576,7 @@ impl ProcessSeatSupervisor {
     }
 
     /// Install the private-X-server spawner used when
-    /// [`SupervisorOptions::seat_display`] selects `xvfb` or `xephyr`.
+    /// [`SupervisorOptions::seat_display`] selects `xvfb`, `xephyr`, or `xorg`.
     ///
     /// Without a launcher, a nested start fails with a typed `Unsupported`
     /// error before a node is spawned. The CLI installs
@@ -636,7 +636,7 @@ impl ProcessSeatSupervisor {
     /// seat's helper-created uinput devices.
     ///
     /// Applied after the helper confirms its grab and before the node child is
-    /// spawned, only when the display backend is `Xvfb`/`Xephyr`. Without a
+    /// spawned, only when the display backend is `Xvfb`/`Xephyr`/`Xorg`. Without a
     /// targeter a private display is left unrestricted and a typed
     /// `input_targeting_failed` note is recorded under the default warn
     /// policy; strict policy refuses to spawn.

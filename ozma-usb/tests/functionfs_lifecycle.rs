@@ -193,7 +193,9 @@ fn descriptors_readiness_bind_unbind_and_cleanup() {
     assert_eq!(status.phase, FunctionFsLifecyclePhase::Ready);
     assert!(!status.bound);
     assert_eq!(
-        fs::read_to_string(fixture.gadget().join("UDC")).unwrap(),
+        fs::read_to_string(fixture.gadget().join("UDC"))
+            .unwrap()
+            .trim(),
         ""
     );
 

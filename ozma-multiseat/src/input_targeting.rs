@@ -292,7 +292,8 @@ impl SeatInputTargeter for ProcessSeatInputTargeter {
         if !missing.is_empty() {
             return Err(MultiseatError::InputTargeting(format!(
                 "seat {} uinput device(s) not visible on {display}: {}; the private X server is \
-                 not consuming the helper's devices",
+                 not consuming the helper's devices (an Xorg InputDevice Identifier must equal \
+                 the helper uinput name)",
                 request.seat_id,
                 missing.join(", ")
             )));

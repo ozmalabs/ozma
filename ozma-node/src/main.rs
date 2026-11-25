@@ -24,11 +24,11 @@ use ozma_protocol::NodeId;
 use ozma_qmp::SharedQmpClient;
 use ozma_thermal::ThermalStatus;
 use ozma_usb::{
-    ConfigFsUsbController, FunctionFsConfig, FunctionFsDaemonSpec, LinuxUsbIpHostBackend,
-    LinuxUsbIpKernelDataEndpoint, MassStorageImage, MediaFormat, MediaRestartPolicy,
-    NoUsbIpKernelDataEndpoint, SystemCommandRunner, UsbError, UsbFunction, UsbGadgetConfig,
-    UsbGadgetController, UsbIpDaemon, UsbIpDaemonConfig, UsbIpKernelDataEndpoint, UsbIpKernelSysfs,
-    UsbIpServer, UsbIpServerConfig,
+    CommandFunctionFsMounter, ConfigFsUsbController, FunctionFsConfig, FunctionFsDaemonSpec,
+    FunctionFsHandoff, LinuxUsbIpHostBackend, LinuxUsbIpKernelDataEndpoint, MassStorageImage,
+    MediaFormat, MediaRestartPolicy, NoUsbIpKernelDataEndpoint, SystemCommandRunner, UsbError,
+    UsbFunction, UsbGadgetConfig, UsbGadgetController, UsbIpDaemon, UsbIpDaemonConfig,
+    UsbIpKernelDataEndpoint, UsbIpKernelSysfs, UsbIpServer, UsbIpServerConfig,
 };
 use tracing::{error, info, warn};
 
@@ -608,12 +608,15 @@ pub struct Args {
     #[arg(long, env = "OZMA_USB_VENDOR_DAEMON", value_name = "PATH")]
     pub usb_vendor_daemon: Option<std::path::PathBuf>,
 
-    /// Mounted FunctionFS directory the background media daemon opens.
+    /// Absolute FunctionFS mountpoint the node creates after the `ffs.vendor0`
+    /// function exists and before it binds the UDC.
     ///
-    /// The node never mounts FunctionFS itself. Requires `--usb-gadget`,
-    /// `--usb-vendor`, and `--usb-media-export`; the daemon waits for the
-    /// kernel `ENABLE` event and services the SCSI loop over
-    /// `PollingFileBulkTransport`.
+    /// In the supported auto-start path the node creates the ConfigFS function,
+    /// mounts FunctionFS at this path (requires root), starts the daemon, waits
+    /// for its `ep0` descriptor writes, then binds. An operator does not need to
+    /// pre-mount it. Requires `--usb-gadget`, `--usb-vendor`, and
+    /// `--usb-media-export`; the daemon waits for the kernel `ENABLE` event and
+    /// services the SCSI loop over `PollingFileBulkTransport`.
     #[arg(long, env = "OZMA_USB_FUNCTIONFS_MOUNT", value_name = "PATH")]
     pub usb_functionfs_mount: Option<std::path::PathBuf>,
 
@@ -3345,6 +3348,70 @@ fn build_usb_control(config: &NodeConfig) -> Option<controller_compat::UsbContro
     }
 
     let controller = Arc::new(ConfigFsUsbController::new(config.usb_configfs_root.clone()));
+    if let Some(mountpoint) = config.usb_functionfs_mount.clone() {
+        let instance = gadget_config
+            .functions
+            .iter()
+            .find_map(|function| match function {
+                UsbFunction::Vendor { config } => Some(config.instance.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "vendor0".to_owned());
+        let mut handoff = match FunctionFsHandoff::new(
+            controller.clone(),
+            DEFAULT_USB_GADGET_NAME,
+            instance,
+            gadget_config.udc.clone(),
+            mountpoint.clone(),
+        ) {
+            Ok(handoff) => handoff.with_mounter(CommandFunctionFsMounter::new()),
+            Err(error) => {
+                warn!(
+                    kind = error.kind(),
+                    error = %error,
+                    mount = %mountpoint.display(),
+                    "USB FunctionFS handoff is invalid; no gadget was created"
+                );
+                return Some(controller_compat::UsbControl::failed(format!(
+                    "{}: {error}",
+                    error.kind()
+                )));
+            }
+        };
+        if let Err(error) = handoff.prepare(&gadget_config) {
+            warn!(
+                kind = error.kind(),
+                error = %error,
+                "USB gadget unavailable: FunctionFS prepare failed and was rolled back"
+            );
+            return Some(controller_compat::UsbControl::failed(format!(
+                "{}: {error}",
+                error.kind()
+            )));
+        }
+        if let Err(error) = handoff.mount() {
+            warn!(
+                kind = error.kind(),
+                error = %error,
+                mount = %mountpoint.display(),
+                "USB FunctionFS mount failed after function creation and was rolled back"
+            );
+            return Some(controller_compat::UsbControl::failed(format!(
+                "{}: {error}",
+                error.kind()
+            )));
+        }
+        info!(
+            gadget = DEFAULT_USB_GADGET_NAME,
+            udc = gadget_config.udc.as_str(),
+            mount = %mountpoint.display(),
+            "USB FunctionFS function created and mounted; waiting for the daemon before UDC bind"
+        );
+        let control =
+            controller_compat::UsbControl::configured(controller, DEFAULT_USB_GADGET_NAME);
+        control.set_functionfs_handoff(Some(handoff));
+        return Some(control);
+    }
     match controller.create_and_bind(&gadget_config) {
         Ok(status) => {
             info!(
@@ -3506,8 +3573,18 @@ fn usb_gadget_config(config: &NodeConfig) -> Result<UsbGadgetConfig, UsbError> {
         gadget = gadget.with_function(UsbFunction::uac2("audio", 2, 1, 48_000, 16));
     }
     if config.usb_vendor {
+        // The userspace media daemon speaks SCSI Bulk-Only Transport on this
+        // FunctionFS interface, so advertise Mass Storage / SCSI transparent /
+        // Bulk-Only when it is the export path. A plain vendor function stays
+        // class 0xff.
+        let (class, subclass, protocol) =
+            if config.usb_functionfs_mount.is_some() && config.usb_media_export.is_some() {
+                (0x08, 0x06, 0x50)
+            } else {
+                (0xff, 0x00, 0x00)
+            };
         let mut vendor = FunctionFsConfig::new("vendor0", 0x1d6b, 0x0106)
-            .with_interface(0xff, 0x00, 0x00)
+            .with_interface(class, subclass, protocol)
             .with_endpoint(ozma_usb::FunctionFsEndpoint::bulk_out(1, 512))
             .with_endpoint(ozma_usb::FunctionFsEndpoint::bulk_in(2, 512));
         if let Some(daemon) = config.usb_vendor_daemon.as_ref() {

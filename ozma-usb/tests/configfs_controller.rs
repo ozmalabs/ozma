@@ -165,6 +165,11 @@ fn bind_unbind_and_list() {
     let unbound = fixture.controller.unbind("ozma-test").unwrap();
     assert!(!unbound.bound);
     assert_eq!(fixture.read(fixture.gadget().join("UDC")), "");
+    assert_eq!(
+        fs::read(fixture.gadget().join("UDC")).unwrap(),
+        b"\n",
+        "unbind must write a newline; a zero-byte ConfigFS write is a no-op"
+    );
 
     // Unbinding again is idempotent.
     assert!(!fixture.controller.unbind("ozma-test").unwrap().bound);

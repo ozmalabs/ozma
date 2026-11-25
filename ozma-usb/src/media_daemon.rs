@@ -22,7 +22,7 @@
 //! is given and still never mounts anything itself.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,12 @@ pub const MEDIA_DAEMON_MAX_EVENT_TIMEOUT_MS: u64 = MAX_FUNCTIONFS_ENDPOINT_TIMEO
 
 /// Largest accepted idle poll interval.
 pub const MEDIA_DAEMON_MAX_IDLE_POLL_MS: u64 = 1_000;
+
+/// Default bound for waiting for a stopped worker to flush and exit.
+///
+/// The worker only observes the stop flag between bounded `ep0` waits and SCSI
+/// transfer deadlines, so this must exceed the configured transfer timeout.
+pub const MEDIA_DAEMON_DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 10_000;
 
 /// Device state exposed by `/usb/media`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -259,6 +265,7 @@ pub struct MediaDaemonHandle {
     status: Arc<Mutex<MediaDaemonStatus>>,
     stop: Arc<AtomicBool>,
     join: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+    done: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl std::fmt::Debug for MediaDaemonHandle {
@@ -290,12 +297,44 @@ impl MediaDaemonHandle {
     }
 
     /// Request stop and wait for the worker to flush and exit.
+    ///
+    /// The wait is bounded by [`MEDIA_DAEMON_DEFAULT_SHUTDOWN_TIMEOUT_MS`] so a
+    /// stalled transport cannot hold node shutdown forever. No UDC unbind is
+    /// required to make the worker leave: callers should unbind the gadget
+    /// before this to quiesce host traffic, then this flushes and closes the
+    /// endpoints.
     pub fn shutdown(&self) {
+        let _ = self.shutdown_timeout(Duration::from_millis(
+            MEDIA_DAEMON_DEFAULT_SHUTDOWN_TIMEOUT_MS,
+        ));
+    }
+
+    /// Bounded variant of [`Self::shutdown`].
+    ///
+    /// Returns `true` when the worker finished within `timeout`; `false` means
+    /// the worker is still winding down (for example a transport transfer hit
+    /// its own deadline) and the caller should not wait indefinitely. The stop
+    /// flag remains set, so a later call can reap it.
+    pub fn shutdown_timeout(&self, timeout: Duration) -> bool {
         self.request_stop();
-        let handle = self.join.lock().ok().and_then(|mut join| join.take());
-        if let Some(handle) = handle {
-            let _ = handle.join();
+        let (done, ready) = &*self.done;
+        let guard = match done.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let (guard, _) = match ready.wait_timeout_while(guard, timeout, |done| !*done) {
+            Ok(result) => result,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let finished = *guard;
+        drop(guard);
+        if finished {
+            let handle = self.join.lock().ok().and_then(|mut join| join.take());
+            if let Some(handle) = handle {
+                let _ = handle.join();
+            }
         }
+        finished
     }
 }
 
@@ -480,6 +519,8 @@ impl FunctionFsMediaDaemon {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_status = Arc::clone(&status);
         let worker_stop = Arc::clone(&stop);
+        let done = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_done = Arc::clone(&done);
         let join = std::thread::Builder::new()
             .name(thread_name.into())
             .spawn(move || {
@@ -491,6 +532,11 @@ impl FunctionFsMediaDaemon {
                 if let Ok(mut published) = worker_status.lock() {
                     *published = self.status.clone();
                 }
+                let (finished, ready) = &*worker_done;
+                if let Ok(mut finished) = finished.lock() {
+                    *finished = true;
+                }
+                ready.notify_all();
             })
             .map_err(|source| UsbError::Spawn {
                 command: "usb-media-daemon".to_owned(),
@@ -500,6 +546,7 @@ impl FunctionFsMediaDaemon {
             status,
             stop,
             join: Arc::new(Mutex::new(Some(join))),
+            done,
         })
     }
 
@@ -1185,6 +1232,33 @@ mod tests {
         assert!(persist.exists(), "shutdown must commit the overlay");
         assert_eq!(fs::read(&base).unwrap(), contents, "base stays immutable");
         assert!(transport.flushes() > 0);
+    }
+
+    #[test]
+    fn spawned_shutdown_is_bounded_and_needs_no_external_unbind() {
+        let transport = SharedTransport::default();
+        let mut daemon = read_only_daemon(transport, MediaRestartPolicy::disabled());
+        daemon.write_descriptors().unwrap();
+        daemon.push_event(FunctionFsEvent::Enable).unwrap();
+        let handle = daemon.spawn("bounded-shutdown-test").unwrap();
+
+        // Wait until the worker attached its endpoint transport; the UDC is
+        // still "bound" because this test never sends an UNBIND event.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !handle.status().enabled && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(handle.status().enabled);
+
+        let started = Instant::now();
+        assert!(
+            handle.shutdown_timeout(Duration::from_secs(2)),
+            "the worker exits within its bound without a second UDC unbind"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let status = handle.status();
+        assert_eq!(status.state, MediaDaemonState::Stopped);
+        assert_eq!(status.counters.unbinds, 0);
     }
 
     #[test]

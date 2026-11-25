@@ -393,6 +393,20 @@ impl ConfigFsUsbController {
         }
     }
 
+    fn remove_default_group(&self, path: &Path) -> Result<(), UsbError> {
+        match self.remove_tree(path) {
+            // ConfigFS owns the `strings` default group and removes it with its
+            // gadget/configuration; an explicit rmdir returns EPERM. The group
+            // is gone once the parent directory is removed, so this is benign.
+            Err(UsbError::ConfigFs { source, .. })
+                if source.kind() == ErrorKind::PermissionDenied =>
+            {
+                Ok(())
+            }
+            other => other,
+        }
+    }
+
     /// Remove a directory with a regular-filesystem fallback.
     ///
     /// On ConfigFS, `rmdir` removes a function/configuration and its virtual
@@ -469,7 +483,9 @@ impl UsbGadgetController for ConfigFsUsbController {
 
         if let Ok(udc) = self.read_attr(&dir.join("UDC")) {
             if !udc.is_empty() {
-                if let Err(error) = self.write_attr(&dir.join("UDC"), "") {
+                // ConfigFS ignores a zero-byte write; clearing the UDC needs a
+                // newline, exactly like `echo '' > UDC`.
+                if let Err(error) = self.write_attr(&dir.join("UDC"), "\n") {
                     first_error.get_or_insert(error);
                 }
             }
@@ -500,7 +516,7 @@ impl UsbGadgetController for ConfigFsUsbController {
                     {
                         first_error.get_or_insert(error);
                     }
-                    if let Err(error) = self.remove_tree(&config.join("strings")) {
+                    if let Err(error) = self.remove_default_group(&config.join("strings")) {
                         first_error.get_or_insert(error);
                     }
                     if let Err(error) = self.remove_tree(&config) {
@@ -530,7 +546,7 @@ impl UsbGadgetController for ConfigFsUsbController {
         if let Err(error) = self.remove_tree(&dir.join("strings").join(LANGUAGE_ID)) {
             first_error.get_or_insert(error);
         }
-        if let Err(error) = self.remove_tree(&dir.join("strings")) {
+        if let Err(error) = self.remove_default_group(&dir.join("strings")) {
             first_error.get_or_insert(error);
         }
         if let Err(error) = self.remove_tree(&dir) {
@@ -569,7 +585,10 @@ impl UsbGadgetController for ConfigFsUsbController {
     fn unbind(&self, name: &str) -> Result<GadgetStatus, UsbError> {
         let dir = self.existing_gadget(name)?;
         if self.read_attr_opt(&dir.join("UDC")).is_some() {
-            self.write_attr(&dir.join("UDC"), "")?;
+            // A zero-byte write is a no-op for the ConfigFS UDC attribute; the
+            // conventional newline write is what actually unbinds and wakes
+            // pending FunctionFS endpoint I/O.
+            self.write_attr(&dir.join("UDC"), "\n")?;
         }
         self.status(name)
     }

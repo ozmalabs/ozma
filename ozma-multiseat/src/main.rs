@@ -58,7 +58,7 @@ use ozma_multiseat::{
                   default off, a failed apply stops that spawn, and earlier seats are released. \
                   `--input-isolation helper` instead asks the privileged `ozma-seat-input` \
                   helper to EVIOCGRAB each seat's devices and create per-seat uinput devices; \
-                  with `--seat-display xvfb|xephyr`, `--input-targeting off|warn|strict` then uses \
+                  with `--seat-display xvfb|xephyr|xorg`, `--input-targeting off|warn|strict` then uses \
                   `xinput` to restrict the private display to those devices. A missing helper \
                   or failed grab stops that spawn; a targeting failure warns and continues by \
                   default, or stops the spawn with `--input-targeting strict`. `--seats-file` \
@@ -135,22 +135,30 @@ struct Args {
     input_isolation: String,
 
     /// Per-seat display: `shared` (default, one X root), `xvfb` (private Xvfb
-    /// server per seat), or `xephyr` (private Xephyr nested in the shared
-    /// display). Nested backends are opt-in and stopped with the seat.
-    #[arg(long, default_value = "shared", value_name = "shared|xvfb|xephyr")]
+    /// server per seat), `xephyr` (private Xephyr nested in the shared
+    /// display), or `xorg` (real Xorg with a config file and libinput). Nested
+    /// backends are opt-in and stopped with the seat.
+    #[arg(long, default_value = "shared", value_name = "shared|xvfb|xephyr|xorg")]
     seat_display: String,
 
     /// Private X screen size for `--seat-display xvfb|xephyr`, for example
-    /// `1280x800`.
+    /// `1280x800`. `xorg` takes geometry from its config file.
     #[arg(long, default_value = "1280x800", value_name = "WxH")]
     seat_display_size: String,
+
+    /// Xorg config file for `--seat-display xorg`. The config must select the
+    /// video driver and define the libinput devices; the Id of each
+    /// `InputDevice` section must match the helper's `ozma-seat-...` uinput
+    /// name so `--input-targeting` can find it.
+    #[arg(long, value_name = "PATH")]
+    seat_display_xorg_config: Option<PathBuf>,
 
     /// Helper binary used by `--input-isolation helper`.
     #[arg(long, default_value = ozma_multiseat::HELPER_PROGRAM, value_name = "PATH")]
     input_helper: PathBuf,
 
     /// Private-display input targeting policy for `--input-isolation helper`
-    /// with `--seat-display xvfb|xephyr`: `warn` (default) records a typed
+    /// with `--seat-display xvfb|xephyr|xorg`: `warn` (default) records a typed
     /// error and continues, `strict` prevents the seat from spawning, and `off`
     /// never runs `xinput`.
     #[arg(long, default_value = "warn", value_name = "off|warn|strict")]
@@ -289,6 +297,7 @@ async fn main() -> Result<(), ozma_multiseat::MultiseatError> {
     let seat_display_options = SeatDisplayOptions {
         backend: seat_display_backend,
         size: seat_display_size,
+        xorg_config: args.seat_display_xorg_config.clone(),
         ..SeatDisplayOptions::default()
     };
 
@@ -650,11 +659,24 @@ fn validate(args: &Args) -> Result<(), ozma_multiseat::MultiseatError> {
             args.input_isolation
         )));
     }
-    if !matches!(args.seat_display.as_str(), "shared" | "xvfb" | "xephyr") {
+    if !matches!(
+        args.seat_display.as_str(),
+        "shared" | "xvfb" | "xephyr" | "xorg"
+    ) {
         return Err(ozma_multiseat::MultiseatError::SeatDisplay(format!(
-            "unknown seat display {:?}; expected shared, xvfb, or xephyr",
+            "unknown seat display {:?}; expected shared, xvfb, xephyr, or xorg",
             args.seat_display
         )));
+    }
+    if args.seat_display == "xorg" && args.seat_display_xorg_config.is_none() {
+        return Err(ozma_multiseat::MultiseatError::SeatDisplay(
+            "--seat-display xorg requires --seat-display-xorg-config PATH".to_owned(),
+        ));
+    }
+    if args.seat_display != "xorg" && args.seat_display_xorg_config.is_some() {
+        return Err(ozma_multiseat::MultiseatError::SeatDisplay(
+            "--seat-display-xorg-config is only valid with --seat-display xorg".to_owned(),
+        ));
     }
     if !matches!(args.input_targeting.as_str(), "off" | "warn" | "strict") {
         return Err(ozma_multiseat::MultiseatError::InputTargeting(format!(

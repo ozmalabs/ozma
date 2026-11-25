@@ -19,6 +19,9 @@
 //!   injected endpoints; [`FunctionFsLifecycle`] sequences ConfigFS
 //!   function/link creation, an injected mount, descriptor writes, readiness
 //!   polling, UDC bind/unbind, and cleanup without mounting by default.
+//!   [`FunctionFsHandoff`] is the node-facing mount-before-bind order: create
+//!   the function unbound, mount, let the daemon write `ep0`, bind, then unbind
+//!   once and remove the mount/function with typed rollback at every phase.
 //!   [`FunctionFsMediaDaemon`] is the supervised background owner: it waits for
 //!   `ENABLE`/`UNBIND` on a polling `ep0`, attaches a
 //!   [`PollingFileBulkTransport`], services the SCSI loop, applies the bounded
@@ -131,6 +134,7 @@ pub mod fake;
 pub mod fat32;
 pub mod functionfs;
 pub mod functionfs_daemon;
+pub mod functionfs_handoff;
 pub mod functionfs_lifecycle;
 pub mod iso;
 pub mod mass_storage;
@@ -191,6 +195,7 @@ pub use functionfs_daemon::{
     MAX_FUNCTIONFS_ENDPOINT_TIMEOUT_MS, MAX_FUNCTIONFS_ENDPOINT_TRANSFER_BYTES,
     MAX_FUNCTIONFS_EP0_WRITE_BYTES,
 };
+pub use functionfs_handoff::{FunctionFsHandoff, FunctionFsHandoffPhase, FunctionFsHandoffStatus};
 pub use functionfs_lifecycle::{
     CommandFunctionFsMounter, FakeFunctionFsMounter, FunctionFsDeviceState, FunctionFsDeviceStatus,
     FunctionFsLifecycle, FunctionFsLifecycleClock, FunctionFsLifecycleConfig,
@@ -219,8 +224,8 @@ pub use media_daemon::{
     FunctionFsMediaDaemon, MediaDaemonConfig, MediaDaemonCounters, MediaDaemonError,
     MediaDaemonHandle, MediaDaemonState, MediaDaemonStatus, MediaDeviceFactory,
     MediaTransportFactory, MEDIA_DAEMON_DEFAULT_EVENT_TIMEOUT_MS,
-    MEDIA_DAEMON_DEFAULT_IDLE_POLL_MS, MEDIA_DAEMON_MAX_EVENT_TIMEOUT_MS,
-    MEDIA_DAEMON_MAX_IDLE_POLL_MS,
+    MEDIA_DAEMON_DEFAULT_IDLE_POLL_MS, MEDIA_DAEMON_DEFAULT_SHUTDOWN_TIMEOUT_MS,
+    MEDIA_DAEMON_MAX_EVENT_TIMEOUT_MS, MEDIA_DAEMON_MAX_IDLE_POLL_MS,
 };
 pub use media_hotplug::{
     UsbMediaHotplugEvent, UsbMediaHotplugKind, UsbMediaHotplugLog, MAX_USB_MEDIA_HOTPLUG_EVENTS,

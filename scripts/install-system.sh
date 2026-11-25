@@ -399,7 +399,18 @@ if [ "$DO_ENV" -eq 1 ]; then
     for src in "$SCRIPT_DIR"/systemd/env/*.env.example; do
         dest="$ENV_DIR/$(basename "$src")"
         if [ -e "$dest" ]; then
-            say "  kept existing $dest"
+            # install-rust.sh --system may have created the example first with
+            # the caller's group; keep the content but enforce the service
+            # group/mode so the node account can read it.
+            if [ "$DRY_RUN" -eq 1 ]; then
+                printf 'CHGRP %s (%s, mode 0640)\n' "$dest" "$SYS_GROUP"
+            elif [ "$IS_ROOT" -eq 1 ] && [ "$STAGING" -eq 0 ] && owner_ok root "$SYS_GROUP"; then
+                chown root:"$SYS_GROUP" "$dest"
+                chmod 0640 "$dest"
+                say "  normalized $dest"
+            else
+                say "  kept existing $dest"
+            fi
         elif [ "$DRY_RUN" -eq 1 ]; then
             printf 'FILE  %s (mode 0640)\n' "$dest"
         else

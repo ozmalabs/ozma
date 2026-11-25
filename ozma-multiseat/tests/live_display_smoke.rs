@@ -119,6 +119,7 @@ fn two_private_displays_start_with_distinct_display_strings_and_stop_cleanly() {
         ready_timeout: Duration::from_secs(10),
         ready_poll: Duration::from_millis(50),
         parent_display: None,
+        xorg_config: None,
     };
     let displays = vec![
         DisplayOutput::new(0, "screen-0", 640, 480, 0, 0, ":0"),

@@ -209,7 +209,7 @@ pub enum MultiseatError {
         "seat display backend {backend:?} requires {program:?}, which is unavailable: {reason}"
     )]
     SeatDisplayTool {
-        /// Backend that needs the program (`xvfb` or `xephyr`).
+        /// Backend that needs the program (`xvfb`, `xephyr`, or `xorg`).
         backend: String,
         /// Program name or path.
         program: String,

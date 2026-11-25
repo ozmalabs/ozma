@@ -12,16 +12,19 @@ map-to-output` input routing with rollback, per-seat `xrandr`
 output/mode/position ownership, per-seat PipeWire/PulseAudio null sinks, a
 privileged `ozma-seat-input` helper that performs real `EVIOCGRAB` and per-seat
 uinput creation, `xinput` targeting that restricts a private display to one
-seat's helper devices, and opt-in `Xvfb`/`Xephyr` private X servers per seat. The
-supervisor **applies those resources before spawning and releases them on
-stop/remove/shutdown** when the explicit
+seat's helper devices, and opt-in `Xvfb`/`Xephyr`/`Xorg` private X servers per
+seat. The real-Xorg path was validated with dummy video, libinput, per-seat
+`Xauthority`, two throwaway displays, and XInput event routing; see
+`phase4-xorg-seat-report.md`. The supervisor **applies those resources before
+spawning and releases them on stop/remove/shutdown** when the explicit
 `--apply-ownership`/`--apply-routing`/`--audio-router`/`--input-isolation
 helper`/`--input-targeting`/`--seat-display` CLI flags (or the matching
 `SupervisorOptions`/builder calls) are enabled; all default to off, and dry-run
 still performs no action. The default input path remains the xinput strategy;
 the helper path is never selected implicitly. The default display backend
-remains `shared` (one X root); `xvfb`/`xephyr` start a real private server only
-when requested. A versioned `seats.json` store (`--seats-file`) preserves seat
+remains `shared` (one X root); `xvfb`/`xephyr`/`xorg` start a real private
+server only when requested. A versioned `seats.json` store (`--seats-file`)
+preserves seat
 ids, display outputs, input hubs, ports, and audio sinks across replans; a sysfs
 hotplug model (`--hotplug`) reconciles add/remove display and input-hub events
 into seat start/stop with debounce. `ozma-node` can load that same store with
@@ -100,7 +103,7 @@ Implemented:
   explicitly opts in. Helper uinput names carry the seat, capability class, and
   source event node (`ozma-seat-<seat>-<kbd|mouse|pad|other>-<eventN>`).
 - **Private-display input targeting** (`input_targeting`): once a private
-  `Xvfb`/`Xephyr` display is ready and the helper has confirmed its grab,
+  `Xvfb`/`Xephyr`/`Xorg` display is ready and the helper has confirmed its grab,
   `ProcessSeatInputTargeter` runs `xinput list --short` on that seat's
   `DISPLAY`/`XAUTHORITY`, enables the seat's own helper uinput names, and
   disables every other `ozma-seat-...` device. Core pointer/keyboard/XTEST
@@ -108,7 +111,9 @@ Implemented:
   `xinput` invocation. `InputTargetingMode::Warn` (default) records a typed
   `input_targeting` error and continues; `Strict` prevents the spawn; `Off`
   never runs `xinput`. Targeting is only claimed after every own device was
-  found and enabled, and the disabled devices are exposed in status.
+  found and enabled, and the disabled devices are exposed in status. A real
+  Xorg seat with libinput exposes the helper's uinput nodes and passes this
+  check; `Xvfb` exposes only core/XTEST devices and fails honestly.
 - `ownership`: `DisplayOwnership` and `XrandrOwnershipController` model
   per-seat output ownership as
   `xrandr --output <output> --mode <mode> --pos <x>x<y>`, with apply/release
@@ -129,8 +134,10 @@ Implemented:
   `targeted_devices`, `disabled_devices`, and typed `errors`). The field is
   omitted when no resource action happened, so default status is unchanged.
 - **Opt-in per-seat displays** (`seat_display`): `shared` (default, one X root),
-  `xvfb` (private `Xvfb :N -screen 0 WxHx24 -nolisten tcp` per seat), and
-  `xephyr` (private X server nested as a window in the shared display). The
+  `xvfb` (private `Xvfb :N -screen 0 WxHx24 -nolisten tcp` per seat),
+  `xephyr` (private X server nested as a window in the shared display), and
+  `xorg` (a real Xorg server with a caller-supplied config and libinput; it needs
+  the host's Xorg privilege rules and refuses to start without a config). The
   supervisor allocates a free display number, creates a per-display `xauth`
   cookie (or falls back to `-ac` on the Unix-socket-only listener), completes a
   real X11 connection setup handshake before exporting `DISPLAY`/`XAUTHORITY`
@@ -199,7 +206,9 @@ Deliberately not implemented yet:
 - **Real exclusive evdev grabs by default.** `EvdevGrabRouter` still models
   `EVIOCGRAB` with an unsupported default backend. The real path is the
   separate opt-in `ozma-seat-input` helper (`--input-isolation helper`);
-  udev/Xorg `InputDevice` sections are still not generated.
+  Xorg `InputDevice` sections are still not generated automatically. The
+  operator supplies an Xorg config whose `InputDevice` identifiers equal the
+  helper's `ozma-seat-...` names, as the live smoke does.
 - **Automatic routing/ownership/audio/isolation execution is opt-in.** The CLI
   executes the planned ownership/routing/audio commands only with
   `--apply-ownership`, `--apply-routing`, and/or `--audio-router`, and the
@@ -211,14 +220,15 @@ Deliberately not implemented yet:
   physical pointer to map and is reported as a typed
   `xinput_routing_unsupported` note instead of a fake success.
 - **Compositor integration for private displays.** `Xvfb`/`Xephyr` prove real
-  per-seat display isolation for X11 applications, but no window manager,
-  compositor, DRM scanout, physical-output handoff, or per-node compositor
-  launch is managed. `xinput` targeting now restricts a private display to the
-  seat's helper uinput devices, but the OS/compositor must actually enumerate
-  those uinput nodes (for example an Xorg/libinput or Wayland compositor seat);
-  `Xvfb` itself exposes only core/XTEST devices, so a live `Xvfb` targeting
-  attempt honestly fails with `input_targeting_failed`. Kernel evdev ownership
-  (`EVIOCGRAB`) remains with the helper, not a DRM-lease/compositor seat.
+  per-seat display isolation for X11 applications, and a real `Xorg` with dummy
+  video + libinput proves per-display uinput enumeration and event routing, but
+  no window manager, compositor, DRM scanout, physical-output handoff, or
+  per-node compositor launch is managed. `xinput` targeting restricts a private
+  display to the seat's helper uinput devices; `Xvfb` exposes only core/XTEST
+  devices, so a live `Xvfb` targeting attempt honestly fails with
+  `input_targeting_failed`, while the validated Xorg path passes. Kernel evdev
+  ownership (`EVIOCGRAB`) remains with the helper, not a DRM-lease/compositor
+  seat.
 - **Kernel/compositor seat targeting for the helper's uinput devices.** The
   helper creates, names, and relays to per-seat uinput devices and the
   supervisor restricts a private X display to those names. There is still no
@@ -525,10 +535,13 @@ The display backend is selected per supervisor run, not per seat:
 | `shared` (default) | No server is started. Every seat uses the host's one X root; `DISPLAY` comes from the plan. Existing behavior is unchanged. |
 | `xvfb` | Start `Xvfb :N -screen 0 WxHx24 -nolisten tcp` per seat, on a free display number. |
 | `xephyr` | Start `Xephyr :N -screen WxHx24` with `DISPLAY` set to the shared display, so the private X root is a window inside the operator's desktop. If `Xephyr` is unavailable the start fails with a typed `Unsupported` error. |
+| `xorg` | Start a real `Xorg :N -config <file> -logfile <file> -nolisten tcp -noreset -novtswitch -sharevts -keeptty -auth <Xauthority>` per seat. Geometry, dummy/video, and libinput devices come from the config. Without `xorg_config` the start is a typed `Unsupported` error instead of a host GPU probe. |
 
 `SeatDisplayOptions` carries `backend`, `size` (default `1280x800`), the display
-number range (default `90..=199`), readiness timeout/poll, and an optional
-shared parent for Xephyr. `ProcessSeatDisplayLauncher` is the production
+number range (default `90..=199`), readiness timeout/poll, an optional shared
+parent for Xephyr, and `xorg_config` for the Xorg backend. `SeatDisplaySize` is
+command-line geometry for Xvfb/Xephyr; Xorg takes geometry from its config.
+`ProcessSeatDisplayLauncher` is the production
 spawner; it is installed automatically by `ProcessSeatSupervisor::new` when the
 backend is nested. `with_parts` (used by tests and the CLI) requires an explicit
 `with_display_launcher(...)`.
@@ -569,10 +582,13 @@ Lifecycle and honesty rules:
   With a nested display they are **not executed**; the seat reports typed
   `ownership_unsupported` / `xinput_routing_unsupported` notes instead of a
   fake applied flag. `--input-isolation helper` still runs before the node and
-  is not regressed: the helper grabs the physical devices, creates the per-seat
-  uinput devices, and `--input-targeting warn|strict` restricts the private
-  display to those names with `xinput`. A display that does not expose those
-  uinput nodes reports `input_targeting_failed` rather than claiming isolation.
+  is not regressed: the helper grabs the devices, creates the per-seat uinput
+  devices, and `--input-targeting warn|strict` restricts the private display to
+  those names with `xinput`. A display that does not expose those uinput nodes
+  (for example `Xvfb`) reports `input_targeting_failed` rather than claiming
+  isolation; a real Xorg/libinput display exposes them and passes. On the live
+  Xorg smoke, disabling seat B's devices on `:90` and seat A's on `:91` also
+  stopped injected events from crossing displays.
 - **Status.** Each seat carries `display_backend`, `display`, `display_pid`,
   `display_ready`, `display_notes`, and a typed `display_error`
   (`missing_binary`, `number_exhausted`, `startup_timeout`, `crashed`,
@@ -703,9 +719,9 @@ fn status(&self) -> Vec<SeatRuntimeStatus>;
   private display still exists. `InputTargetingMode` is `Warn` by default;
   `Strict` aborts the seat, `Off` skips it. The shared display backend is always
   a targeting no-op.
-- **Private displays (opt-in).** With `seat_display.backend = Xvfb` or `Xephyr`,
-  start spawns and handshakes the server before resource reservation and
-  rewrites the launch spec. Stop releases resources and then stops the server.
+- **Private displays (opt-in).** With `seat_display.backend = Xvfb`, `Xephyr`,
+  or `Xorg`, start spawns and handshakes the server before resource reservation
+  and rewrites the launch spec. Stop releases resources and then stops the server.
   A failed display start never spawns a node; a display crash stops the node and
   restarts both. Dry-run reports the would-be server without allocating or
   spawning it. Tests inject `FakeSeatDisplayLauncher`.

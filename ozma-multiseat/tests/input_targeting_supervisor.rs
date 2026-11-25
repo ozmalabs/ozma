@@ -194,6 +194,7 @@ fn seat_display_options(backend: SeatDisplayBackend) -> SeatDisplayOptions {
         ready_timeout: Duration::from_millis(40),
         ready_poll: Duration::from_millis(1),
         parent_display: None,
+        xorg_config: None,
     }
 }
 

@@ -48,6 +48,7 @@ fn real_targeter_lists_enables_and_reports_a_missing_device_on_a_throwaway_displ
         ready_timeout: DEFAULT_DISPLAY_READY_TIMEOUT,
         ready_poll: Duration::from_millis(100),
         parent_display: None,
+        xorg_config: None,
     };
     let launcher = ProcessSeatDisplayLauncher::new(options);
     let request = SeatDisplayRequest {

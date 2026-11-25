@@ -395,3 +395,49 @@ already-installed host. Re-run as the normal user:
 **82 passed, 0 failed, 1 skipped (AppArmor) — RESULT: PASS**. Running the
 verifier as root is not supported because it probes the user systemd manager.
 
+## Release-profile install (2026-11-25 20:11–20:19)
+
+The follow-up closed the §7.3 debug-binary deviation on the same host, now at
+`8b951af` **plus uncommitted work** (no commit/tag).
+
+```bash
+cargo build --release -j 4 -p ozma-node -p ozma-softnode -p ozma-multiseat
+# rc 0, 105 s; builds ozma-node, ozma-virtual-node, ozma-multiseat,
+# and ozma-meeting-detect
+sudo -n scripts/install-rust.sh --system --prefix /usr/local \
+  --from-target target/release --force          # rc 0 (debug binaries differed)
+scripts/install-rust.sh --prefix "$HOME/.local" \
+  --from-target target/release --force          # rc 0
+sudo -n scripts/install-system.sh --profile all --usb-gadget  # rc 0, idempotent
+sudo -n systemctl daemon-reload                 # rc 0; nothing enabled/started
+```
+
+Release artifacts (all four hashes match the system and user installs):
+
+| Binary | Bytes | SHA-256 prefix |
+|---|---:|---|
+| `ozma-node` | 37,527,256 | `e87a3743` |
+| `ozma-virtual-node` | 10,010,344 | `9c67fe78` |
+| `ozma-multiseat` | 4,206,808 | `0cf25836` |
+| `ozma-meeting-detect` | 2,917,248 | `c5efb0be` |
+
+Verification: `verify-units.sh` **8/8 PASS**; `systemd-analyze verify` on the
+four installed system units, the `ozma-node@hardware.service` instance (with
+the USB-gadget drop-in), and the four installed user units all `rc=0`;
+`verify-system-install.sh` **82 passed, 0 failed, 1 skipped (AppArmor),
+RESULT: PASS**; transient `systemd-run --wait --pipe --collect` units as
+`ozma-node` returned success for `ozma-node --version` (`ozma-node 0.1.0`),
+`ozma-node --help`, `ozma-virtual-node --help`, and `ozma-multiseat --help`.
+All transient units were collected; no unit is enabled or active.
+
+One mismatch was fixed: the five `/etc/ozma/*.env.example` files were
+`0640 root:root`; `chgrp ozma-node` made them `0640 root:ozma-node`
+(content/mode unchanged). The installer-side cause from §7.2 remains. Optional
+`ozma-node@hardware` with a fake capture provider was **skipped by design**:
+`--capture-provider fake` is rejected for the hardware profile at parse time
+(rc 2, no service). `ozma-meeting-detect` has no help/version mode (unknown
+args start the detector), so it was not run under `systemd-run`.
+
+Full evidence, deviations, leftover state, and remaining privileged gaps:
+[`phase4-release-install-report.md`](phase4-release-install-report.md).
+

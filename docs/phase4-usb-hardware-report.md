@@ -15,7 +15,7 @@ was used. Nothing was committed. `docs/parity-matrix.md` and
 |---|---|---|
 | 1. ConfigFS mass-storage gadget + host SCSI disk | **PASS** | `usb 8-1` enumerated as `1d6b:0104`; `usb-storage` created `/dev/sda` (32 MiB); mount + write + read-back succeeded |
 | 2. Node `--usb-gadget` mass-storage | **PASS** | node bound gadget `ozma` with 3 functions; `/usb` reported `available=true`; `/dev/sda` mount + write + read-back succeeded |
-| 3. FunctionFS + `FunctionFsMediaDaemon` (real CBW/CSW) | **PASS** | `usb-storage` drove the daemon; 109 CBWs / 109 CSWs, 18 writes, 27,648 OUT bytes, 387,194 IN bytes; file written and read back |
+| 3. FunctionFS + `FunctionFsMediaDaemon` (real CBW/CSW) | **PASS** | node created + mounted `ffs.vendor0`, daemon wrote `ep0`, UDC bound; host `usb-storage` drove 62 CBWs / 62 CSWs, 1 write, 65,536 OUT bytes; matching read-back; SIGTERM shut down in 0.228 s with one unbind and no leftovers |
 | 4. UAC2 gadget + host sound card | **FAIL (kernel block)** | `afunc_bind:1251 Error!` / `-ENODEV`; `dummy_hcd` has no isochronous endpoints by design |
 | 4a. UAC2 bridge core + ALSA adapters (supporting) | **PARTIAL PASS** | 16/16 bridge tests, 7/7 adapter tests, real ALSA loopback capture→packetiser test passed; no real UAC2 endpoint |
 | 5. USB/IP kernel host path (`usbip bind` + `vhci_hcd`) | **PASS** | vhci port 00 in use, `usb 9-1` enumerated, `/dev/sda` read through the imported device |
@@ -158,26 +158,48 @@ After `SIGTERM`, the node process exited, the block device disappeared, and the
 ## 3. FunctionFS + `FunctionFsMediaDaemon` (PASS)
 
 `dummy_hcd` supports bulk endpoints, so the FunctionFS SCSI path is usable.
-Because the node creates and binds the gadget before it opens
-`--usb-functionfs-mount`, the mount cannot exist early enough in a normal node
-startup. To exercise the real daemon we used the crate's own
-`FunctionFsMediaDaemon::file` in the canonical order:
+The node now performs the mount-before-bind handoff itself instead of requiring
+an operator to pre-mount:
 
 1. create the ConfigFS gadget + `ffs.vendor0` + config link, **unbound**;
-2. `mount -t functionfs vendor0 /tmp/opencode/usb-lab/ffs`;
-3. build/spawn `FunctionFsMediaDaemon` (writes the ep0 descriptor blob);
+2. create and `mount -t functionfs vendor0 <--usb-functionfs-mount>`;
+3. spawn `FunctionFsMediaDaemon` and wait (bounded) for its `ep0` descriptor and
+   string writes;
 4. write the UDC to bind;
 5. let the host `usb-storage` issue real CBWs.
 
-The temporary example declared the interface as class `0x08`/subclass `0x06`/
-protocol `0x50` (Mass Storage / SCSI transparent / Bulk-Only Transport), bulk
-OUT EP1 and bulk IN EP2, so the host bound `usb-storage` automatically.
+`FunctionFsHandoff` records these typed phases (`prepared`, `mounted`,
+`daemon_started`, `bound`, `unbound`, `failed`, `torn_down`). A failure at
+prepare, mount, daemon start, or bind rolls back the steps already performed and
+returns the exact typed error. When `--usb-functionfs-mount` and
+`--usb-media-export` are configured the FunctionFS interface advertises class
+`0x08`/subclass `0x06`/protocol `0x50` (Mass Storage / SCSI transparent /
+Bulk-Only Transport), bulk OUT EP1 and bulk IN EP2, so the host binds
+`usb-storage` automatically.
+
+Live node invocation used for this lab (fixture services only; no real USB
+hardware):
 
 ```bash
-# gadget + FunctionFS mount + daemon + bind are performed by the example;
-# its effective commands were:
-mount -t functionfs vendor0 /tmp/opencode/usb-lab/ffs
-# FunctionFsMediaDaemon::file(...) -> spawn() -> controller.bind("ozma-ffs-lab", "dummy_udc.0")
+LAB=/tmp/opencode/usb-lab
+truncate -s 32M "$LAB/disk.img"
+sudo ./target/debug/ozma-node \
+  --name usb-lab --profile vm --capture-provider fake \
+  --hid-udp-port 17331 --http-port 17382 --rtsp-port 0 --webtransport-port 0 \
+  --usb-gadget --usb-udc dummy_udc.0 --usb-vendor \
+  --usb-media-export "$LAB/disk.img" --usb-media-export-read-write \
+  --usb-media-export-persist "$LAB/overlay.bin" \
+  --usb-media-export-timeout-ms 2000 \
+  --usb-functionfs-mount "$LAB/ffs"
+```
+
+Node log evidence:
+
+```text
+USB FunctionFS function created and mounted; waiting for the daemon before UDC bind
+  gadget="ozma" udc="dummy_udc.0" mount=/tmp/opencode/usb-lab/ffs
+userspace SCSI media daemon started over FunctionFS polling endpoints and bound after ep0 descriptors
+USB gadget created and bound; usb capability advertised
 ```
 
 Kernel evidence:
@@ -187,48 +209,75 @@ file system registered
 read descriptors
 read strings
 usb 8-1: new high-speed USB device number 2 using dummy_hcd
-usb-storage 8-1:1.0: USB Mass Storage device detected
+usb-storage 8-1:1.2: USB Mass Storage device detected
 scsi 6:0:0:0: Direct-Access OZMA Virtual Media 1.0
 sd 6:0:0:0: [sda] 65536 512-byte logical blocks: (33.6 MB/32.0 MiB)
 sd 6:0:0:0: [sda] Attached SCSI disk
 ```
 
-Daemon counters from the shared `MediaDaemonStatus`:
+Daemon counters from `GET /usb/media` (final run):
 
 ```text
 # after host enumeration only
-state=Running live=true enabled=true attached=true running=true
-commands=50 cbws=50 csws=50 data_out=0 data_in=341114
-reads=38 writes=0 flush=0 check=1 transport_errors=0 timeouts=0 bound_errors=0
+state=running commands=50 cbws=50 csws=50 writes=0
+data_out=0 data_in=~0.4 MB timeouts=0 transport_errors=0
+daemon_stats descriptor_writes=1 string_writes=1
 
-# after mounting, writing, syncing and reading back a file
-state=Running live=true enabled=true attached=true running=true
-commands=109 cbws=109 csws=109 data_out=27648 data_in=387194
-reads=79 writes=18 flush=0 check=1 transport_errors=0 timeouts=0 bound_errors=0
+# after the host raw write + sync + read-back
+state=running commands=62 cbws=62 csws=62 writes=1 reads=49
+data_out=65536 data_in=425082 timeouts=0 transport_errors=0
 ```
 
 The write path was a real SCSI WRITE through the FunctionFS bulk OUT endpoint:
 
 ```bash
-sudo mount -t ext4 /dev/sda /tmp/opencode/usb-lab/mnt-ffs
-echo "ozma-ffs-transfer-OK $(date -u +%s)" | sudo tee /tmp/opencode/usb-lab/mnt-ffs/ozma-ffs-proof.txt
+python3 - <<'PY'
+data = bytes((i * 37 + 11) & 0xff for i in range(65536))
+open('/tmp/opencode/usb-lab/write.bin', 'wb').write(data)
+PY
+sudo dd if=/tmp/opencode/usb-lab/write.bin of=/dev/sda bs=4096 seek=256 count=16 conv=fsync
 sudo sync
-sudo cat /tmp/opencode/usb-lab/mnt-ffs/ozma-ffs-proof.txt   # ozma-ffs-transfer-OK 1795593632
-sudo umount /tmp/opencode/usb-lab/mnt-ffs
+sudo dd if=/dev/sda of=/tmp/opencode/usb-lab/readback.bin bs=4096 skip=256 count=16
+cmp /tmp/opencode/usb-lab/write.bin /tmp/opencode/usb-lab/readback.bin
+# both sha256: 6fc179cfd193754e6109ad043f56d146c7e7d7c3623ffceae318266286f58388
 ```
 
-`writes=18`, `data_out=27648`, and a successful read-back prove the CSW/read/
-write loop, not just descriptor negotiation.
+`writes=1`, `data_out=65536`, and the matching read-back prove the SCSI
+write/read loop, not just descriptor negotiation.
 
-### FunctionFS shutdown observation
+### FunctionFS shutdown (fixed)
 
-Graceful shutdown was slow: the helper's first `controller.unbind()` returned
-without clearing the gadget `UDC` attribute (its error was ignored by the
-helper), and `MediaDaemonHandle::shutdown()` then waited until the UDC was
-unbound a second time by hand. After the second `echo '' > UDC`, the daemon
-exited, unmounted FunctionFS, and removed the gadget. This did not affect the
-data path, but it is a real shutdown-ordering gap worth fixing or asserting in
-the daemon/node.
+The first implementation wrote a zero-byte value to the ConfigFS `UDC`
+attribute. ConfigFS ignores a zero-byte write, so the first unbind was a no-op
+and the daemon stayed blocked in a pending FunctionFS endpoint read until a
+second manual `echo '' > UDC` wrote a newline. The fix is:
+
+- `ConfigFsUsbController::unbind` and `remove_gadget` clear the UDC with `"\n"`;
+- node shutdown unbinds the UDC **once** before stopping the daemon;
+- `MediaDaemonHandle::shutdown_timeout` bounds the worker join
+  (`MEDIA_DAEMON_DEFAULT_SHUTDOWN_TIMEOUT_MS`, 10 s);
+- the daemon detaches/stops the SCSI loop, flushes the persistence policy,
+  force-closes its endpoints, then the handoff unmounts FunctionFS before
+  removing the function and gadget.
+
+Final live SIGTERM evidence:
+
+```text
+shutdown requested; stopping node tasks signal="SIGTERM"
+userspace SCSI media export stopped; persistence policy applied
+Ozma node shutting down
+shutdown_seconds=0.228
+
+gadget:             removed
+UDC:                dummy_udc.0 (empty, no gadget)
+FunctionFS mount:   none
+host /dev/sda:      none
+overlay:            /tmp/opencode/usb-lab/overlay.bin (65,824 bytes)
+stray node process: none
+```
+
+One unbind was enough; no second external unbind or manual unmount was needed.
+
 
 ## 4. UAC2 (FAIL — blocked by `dummy_hcd`)
 
@@ -415,17 +464,16 @@ No commit was made.
    validated on a real UDC (or another UDC that implements ISO). The node
    surfaces the failure cleanly (`/usb` typed `configfs-io`, warning), but
    host-visible UAC2 PCM movement remains unproven.
-2. **Node `--usb-functionfs-mount` startup ordering.** The node creates and
-   binds the gadget in one step and only then opens the supplied FunctionFS
-   mount. The mount only becomes possible after the `ffs.*` ConfigFS function
-   exists, so a normal node startup cannot mount in time. This lab exercised the
-   same `FunctionFsMediaDaemon` directly. The node path needs an explicit
-   mount-before-bind handoff (or a start-route field for the mountpoint) to be
-   usable end-to-end.
-3. **FunctionFS daemon shutdown ordering.** A first UDC unbind during
-   `MediaDaemonHandle::shutdown()` did not clear the UDC and the daemon join
-   stalled until a second unbind. This should be reproduced and fixed; the
-   data path itself is healthy.
+2. **Resolved — node `--usb-functionfs-mount` startup ordering.** The node now
+   creates the gadget/function unbound, mounts FunctionFS at the configured path,
+   starts the daemon, waits for its `ep0` writes, and only then binds the UDC.
+   `FunctionFsHandoff` makes each phase typed and rolls back on failure. The live
+   path above needed no operator pre-mount.
+3. **Resolved — FunctionFS daemon shutdown ordering.** The root cause was a
+   zero-byte ConfigFS `UDC` write, which the kernel ignores. Unbind now writes
+   `"\n"`, node shutdown unbinds once before stopping the daemon, and the worker
+   join is bounded. The final live run completed in 0.228 s with one unbind, a
+   flushed overlay, and no leaked mount/function/UDC.
 4. **USB/IP ISO support.** Even with `vhci_hcd`, UAC2/isochronous devices over
    USB/IP are not validated here; `usbip`/vhci paths are exercised with
    bulk/control (mass storage) only.

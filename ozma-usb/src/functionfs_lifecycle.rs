@@ -1199,6 +1199,14 @@ impl FunctionFsLifecycle {
     /// by this lifecycle. Idempotent.
     pub fn cleanup(&mut self) -> Result<(), UsbError> {
         let mut first_error: Option<UsbError> = None;
+        // FunctionFS must be unmounted before ConfigFS removes the function.
+        if self.mounted_by_us {
+            if let Some(mounter) = &self.mounter {
+                if let Err(error) = mounter.unmount(&self.mountpoint()) {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
         if !matches!(
             self.phase,
             FunctionFsLifecyclePhase::Idle | FunctionFsLifecyclePhase::TornDown
@@ -1206,12 +1214,7 @@ impl FunctionFsLifecycle {
             match self.controller.remove_gadget(&self.config.gadget) {
                 Ok(()) => {}
                 Err(UsbError::MissingGadget(_)) => {}
-                Err(error) => first_error = Some(error),
-            }
-        }
-        if self.mounted_by_us {
-            if let Some(mounter) = &self.mounter {
-                if let Err(error) = mounter.unmount(&self.mountpoint()) {
+                Err(error) => {
                     first_error.get_or_insert(error);
                 }
             }
@@ -1260,12 +1263,12 @@ impl FunctionFsLifecycle {
 
     fn rollback(&mut self) {
         let _ = self.controller.unbind(&self.config.gadget);
-        let _ = self.controller.remove_gadget(&self.config.gadget);
         if self.mounted_by_us {
             if let Some(mounter) = &self.mounter {
                 let _ = mounter.unmount(&self.mountpoint());
             }
         }
+        let _ = self.controller.remove_gadget(&self.config.gadget);
         self.mounted = false;
         self.mounted_by_us = false;
         self.ep0_written = false;

@@ -1,7 +1,7 @@
 # Phase 4 multi-seat input isolation report
 
 Status: **opt-in privileged input isolation plus private-display targeting
-implemented (2026-11-25).**
+implemented and validated on real Xorg + libinput (2026-11-25).**
 Scope: `ozma-multiseat/` plus this report. No commit was made by this task.
 
 ## Problem closed
@@ -19,10 +19,11 @@ This change adds the missing execution path without weakening the default:
 - `--input-isolation helper` starts a privileged helper that opens the seat's
   `/dev/input/event*` nodes, issues `EVIOCGRAB`, creates per-seat uinput
   devices, and relays events.
-- With a private `--seat-display xvfb|xephyr`, `--input-targeting warn|strict`
-  makes the private X server consume only the seat's helper uinput devices and
-  disables other seats' `ozma-seat-...` devices. Core/XTEST devices are left
-  alone.
+- With a private `--seat-display xvfb|xephyr|xorg`, `--input-targeting
+  warn|strict` makes the private X server consume only the seat's helper uinput
+  devices and disables other seats' `ozma-seat-...` devices. Core/XTEST devices
+  are left alone. A real Xorg + libinput display enumerates the helper devices;
+  `Xvfb` exposes only core/XTEST devices and fails honestly.
 - Isolation is never reported as applied unless the helper confirms every grab
   and every uinput device; targeting is never reported applied unless
   `xinput` confirms every own device. A targeting failure is a typed error and
@@ -112,7 +113,8 @@ CLI:
 --input-isolation xinput|helper          (default xinput)
 --input-helper PATH                      (default ozma-seat-input)
 --input-targeting off|warn|strict        (default warn)
---seat-display shared|xvfb|xephyr        (default shared)
+--seat-display shared|xvfb|xephyr|xorg   (default shared)
+--seat-display-xorg-config PATH          (required with xorg)
 ```
 
 `helper` is mutually exclusive with `--apply-routing`: a grabbed device cannot
@@ -245,16 +247,52 @@ missing `ozma-seat-...` name is a typed `input_targeting` error, releases, and
 stops the server. It creates no evdev/uinput device and never touches the
 operator's desktop.
 
-Live evidence (2026-11-25): the smoke passed against Xvfb `:90`; `xinput` saw 6
+Live evidence (2026-11-25): the Xvfb smoke passed against `:90`; `xinput` saw 6
 devices, the targeter enabled `Virtual core pointer`, the missing-device case
 reported `uinput device(s) not visible on :90`, and the server stopped with no
-`Xvfb` process or `X90` socket left behind.
+`Xvfb` process or `X90` socket left behind. That run could not show helper
+uinput isolation because Xvfb exposes only core/XTEST devices.
+
+### Real Xorg + libinput live evidence
+
+A second opt-in smoke, `tests/live_xorg_seat_smoke.rs`, replaces the Xvfb-only
+device evidence:
+
+```bash
+sudo pacman -S --needed --noconfirm xf86-video-dummy xorg-xev
+OZMA_MULTISEAT_REAL_XORG=1 \
+  cargo test -p ozma-multiseat --test live_xorg_seat_smoke \
+  -- --ignored --nocapture
+```
+
+It creates throwaway uinput keyboard/mouse sources, starts the real
+`ozma-seat-input --backend real` helper and grabs them, writes per-display
+`Xauthority` cookies, starts two real `/usr/lib/Xorg` servers on `:90` and `:91`
+with `dummy` video + `libinput`, and uses `ProcessSeatInputTargeter`. Observed:
+
+```text
+seat A uinput=[ozma-seat-seat-a-kbd-event22, ozma-seat-seat-a-mouse-event23]
+seat B uinput=[ozma-seat-seat-b-kbd-event24, ozma-seat-seat-b-mouse-event25]
+both displays enumerated all four helper uinput devices
+:90 targeting=enabled A kbd+mouse, disabled B kbd+mouse
+:91 targeting=enabled B kbd+mouse, disabled A kbd+mouse
+xinput confirmed per-display enable/disable state
+event routing: A key only on :90, B key only on :91
+release re-enabled the other seat's devices on both displays
+```
+
+`xinput list-props` confirmed `Device Enabled: 1` for own devices and `0` for
+foreign devices on each display. Injecting a key through source A's uinput
+device produced `keysym 0x61, a` in `xev -root` on `:90` and nothing on `:91`;
+the reverse held for source B. Both servers, auth dirs, helper, and uinput nodes
+were gone afterwards, with no `X90`/`X91` socket or lock left. Full setup and
+cleanup are in `docs/phase4-xorg-seat-report.md`.
 
 ## Verification
 
 ```text
 cargo test -p ozma-multiseat
-  163 passed, 0 failed, 10 ignored (incl. the opt-in live targeting smoke)
+  180 passed, 0 failed, 12 ignored (incl. the opt-in live Xorg smoke)
 
 cargo check -p ozma-multiseat --all-targets
   clean (only pre-existing ozma-pipewire warnings)
@@ -271,24 +309,25 @@ and uses only `:90` under `-nolisten tcp`.
 ## Remaining OS-isolation gaps
 
 1. **Compositor/OS seat consumption.** The helper creates per-seat uinput devices
-   with stable kind-prefixed names and the supervisor now restricts a private X
-   display to those names with `xinput`. That is not the same as an OS/compositor
-   seat: `Xvfb` itself exposes only core/XTEST devices, so a live private
-   `Xvfb` targeting attempt honestly fails (`input_targeting_failed`). A real
-   Xorg/libinput seat, Wayland compositor seat, compositor device selection, or
-   DRM lease is still required. `ozma-node`/`ozma-softnode` also do not yet
-   consume the names as the seat's input source, so physical events reach the
-   uinput nodes but end-to-end seat input depends on the display stack exposing
-   them.
+   with stable kind-prefixed names and the supervisor restricts a private X
+   display to those names with `xinput`. A real Xorg + libinput display now
+   enumerates them and the live smoke proves per-display event routing; `Xvfb`
+   exposes only core/XTEST devices and still fails honestly
+   (`input_targeting_failed`). This is still an X11/Xorg seat, not a full
+   OS/compositor seat: no Wayland compositor, per-seat cgroup/session manager,
+   physical scanout ownership, or DRM lease is launched. `ozma-node`/
+   `ozma-softnode` also do not yet consume the names as one session.
 2. **Device permissions.** `ozma-seat-input` needs read/write access to the
    configured evdev nodes and `/dev/uinput`. There is no installer/udev policy
    in this task; operators must grant capabilities (preferred) or group access.
    The helper is privileged by design and validates the protocol input.
 3. **udev/Xorg policy.** No `InputDevice` Xorg sections are generated, and the
-   helper uses sysfs/evdev grouping only. The `xinput` targeter assumes a display
-   has already enumerated the helper's uinput nodes; it does not configure the
-   Xorg/libinput/compositor device backend that would do so. Hotplug re-grabbing
-   is driven by the supervisor's sysfs poll, not udev/netlink.
+   helper uses sysfs/evdev grouping only. An operator must supply an Xorg config
+   whose `InputDevice` identifiers equal the helper's uinput names; the new
+   `--seat-display xorg` backend requires that config and refuses to probe the
+   host GPU without it. The `xinput` targeter assumes the display has already
+   enumerated the helper's uinput nodes. Hotplug re-grabbing is driven by the
+   supervisor's sysfs poll, not udev/netlink.
 4. **Capability mirroring.** Keys, relative/absolute axes, switches, and
    standard input events are mirrored with a default ABS range. Force feedback,
    LEDs, and exotic event types are not forwarded. A relay thread that fails

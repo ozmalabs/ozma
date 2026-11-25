@@ -121,6 +121,12 @@ fn missing_own_uinput_device_is_typed_and_changes_nothing() {
         ]))
         .expect_err("missing own device");
     assert!(error.to_string().contains("not visible"));
+    assert!(
+        error
+            .to_string()
+            .contains("InputDevice Identifier must equal the helper uinput name"),
+        "the error should point at the Xorg identifier/name mismatch: {error}"
+    );
     assert_eq!(runner.commands().len(), 1, "only the list may run");
     assert!(!targeter.status_for("host-seat-0").is_some());
 }

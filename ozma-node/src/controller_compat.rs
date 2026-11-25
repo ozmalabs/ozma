@@ -30,7 +30,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
@@ -53,15 +53,16 @@ use ozma_protocol::{
 use ozma_usb::MediaFormat as UsbMediaFormat;
 use ozma_usb::{
     is_safe_identifier, polling_transport_factory, BoxedMassStorageTransport, FunctionFsConfig,
-    FunctionFsEndpoint, FunctionFsMediaDaemon, FunctionFsMount, FunctionFsStatus, FunctionStatus,
-    GadgetStatus, IdleBulkTransport, MassStorageDevice, MassStorageImage, MassStorageLoop,
-    MassStorageLoopConfig, MassStorageLoopStats, MassStorageOverlayStatus,
-    MassStoragePersistPolicy, MediaDaemonConfig, MediaDaemonHandle, MediaRestartPolicy,
-    MediaRestartTracker, MediaState, NbdExportCatalog, NbdExportSource, NbdOverlayPolicy,
-    NbdServer, NbdServerConfig, NbdServerHandle, NbdServerStats, OverlayConfig, Uac2Status,
-    UsbError, UsbFunctionKind, UsbGadgetCapabilities, UsbGadgetController, UsbMediaHotplugKind,
-    UsbMediaHotplugLog, VirtualMedia, MASS_STORAGE_DEFAULT_TIMEOUT_MS, SCSI_MAX_TRANSFER_BYTES,
-    SCSI_SECTOR_BYTES,
+    FunctionFsEndpoint, FunctionFsHandoff, FunctionFsHandoffPhase, FunctionFsMediaDaemon,
+    FunctionFsMount, FunctionFsStatus, FunctionStatus, GadgetStatus, IdleBulkTransport,
+    MassStorageDevice, MassStorageImage, MassStorageLoop, MassStorageLoopConfig,
+    MassStorageLoopStats, MassStorageOverlayStatus, MassStoragePersistPolicy, MediaDaemonConfig,
+    MediaDaemonHandle, MediaRestartPolicy, MediaRestartTracker, MediaState, NbdExportCatalog,
+    NbdExportSource, NbdOverlayPolicy, NbdServer, NbdServerConfig, NbdServerHandle, NbdServerStats,
+    OverlayConfig, Uac2Status, UsbError, UsbFunctionKind, UsbGadgetCapabilities,
+    UsbGadgetController, UsbMediaHotplugKind, UsbMediaHotplugLog, VirtualMedia,
+    MASS_STORAGE_DEFAULT_TIMEOUT_MS, MEDIA_DAEMON_DEFAULT_SHUTDOWN_TIMEOUT_MS,
+    SCSI_MAX_TRANSFER_BYTES, SCSI_SECTOR_BYTES,
 };
 #[cfg(test)]
 use ozma_usb::{MassStorageBulkTransport, MassStorageCommandOutcome};
@@ -126,6 +127,13 @@ pub const MAX_POINTER_COORDINATE: i64 = 32767;
 
 /// HID usage id of the first keyboard modifier (left control).
 const HID_MODIFIER_FIRST: u32 = 0xE0;
+
+/// Time allowed for the FunctionFS media daemon to write `ep0` descriptors
+/// before the handoff immediately binds the UDC.
+const FUNCTIONFS_DAEMON_START_TIMEOUT_MS: u64 = 5_000;
+
+/// Poll interval while waiting for the daemon's `ep0` writes.
+const FUNCTIONFS_DAEMON_START_POLL_MS: u64 = 10;
 /// Number of modifier bits in the boot keyboard report.
 const HID_MODIFIER_COUNT: usize = 8;
 
@@ -1631,6 +1639,7 @@ pub struct UsbControl {
     nbd: Arc<Mutex<Option<NbdRuntime>>>,
     media: Arc<Mutex<Option<MassStorageMediaRuntime>>>,
     media_daemon: Arc<Mutex<Option<MediaDaemonRuntime>>>,
+    functionfs: Arc<Mutex<Option<FunctionFsHandoff>>>,
     media_auto: Arc<Mutex<MediaAutoStartState>>,
     hotplug: Arc<Mutex<UsbMediaHotplugState>>,
     uac2_bridge: Option<Uac2BridgeShared>,
@@ -2092,6 +2101,7 @@ impl MediaRestore {
 struct MediaAutoStartState {
     config: Option<UsbMediaAutoStartConfig>,
     last_error: Option<MassStorageMediaError>,
+    stopped: bool,
 }
 
 /// Path-free error summary for a failed media export.
@@ -2165,6 +2175,40 @@ impl UsbMediaOverlayStatus {
             persist_on_flush: status.persist_on_flush,
             persist_on_stop: status.persist_on_stop,
         }
+    }
+}
+
+/// Wait until the media daemon wrote both `ep0` blobs.
+///
+/// Binding before this would make the kernel reject an empty FunctionFS
+/// function or bind a function with no descriptors. The wait is bounded and
+/// never treats a failed daemon as ready.
+fn wait_for_functionfs_descriptors(
+    handle: &MediaDaemonHandle,
+    timeout_ms: u64,
+) -> Result<(), UsbError> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        let status = handle.status();
+        if status.daemon_stats.descriptor_writes > 0 && status.daemon_stats.string_writes > 0 {
+            return Ok(());
+        }
+        if let Some(error) = &status.last_error {
+            return Err(UsbError::InvalidFunctionFsState {
+                reason: format!(
+                    "media daemon failed before writing ep0 descriptors: {}: {}",
+                    error.kind, error.message
+                ),
+            });
+        }
+        if Instant::now() >= deadline {
+            return Err(UsbError::FunctionFsReadinessTimeout {
+                instance: "vendor0".to_owned(),
+                timeout_ms,
+                readiness: "ep0_not_written",
+            });
+        }
+        std::thread::sleep(Duration::from_millis(FUNCTIONFS_DAEMON_START_POLL_MS));
     }
 }
 
@@ -2259,6 +2303,7 @@ impl UsbControl {
             nbd: Arc::new(Mutex::new(None)),
             media: Arc::new(Mutex::new(None)),
             media_daemon: Arc::new(Mutex::new(None)),
+            functionfs: Arc::new(Mutex::new(None)),
             media_auto: Arc::new(Mutex::new(MediaAutoStartState::default())),
             hotplug: Arc::new(Mutex::new(UsbMediaHotplugState::default())),
             uac2_bridge: None,
@@ -2276,6 +2321,7 @@ impl UsbControl {
             nbd: Arc::new(Mutex::new(None)),
             media: Arc::new(Mutex::new(None)),
             media_daemon: Arc::new(Mutex::new(None)),
+            functionfs: Arc::new(Mutex::new(None)),
             media_auto: Arc::new(Mutex::new(MediaAutoStartState::default())),
             hotplug: Arc::new(Mutex::new(UsbMediaHotplugState::default())),
             uac2_bridge: None,
@@ -2286,6 +2332,19 @@ impl UsbControl {
     /// Attach a started USB/IP listener status.
     pub fn set_usbip_runtime(&self, runtime: Option<UsbIpRuntime>) {
         *lock(&self.usbip) = runtime;
+    }
+
+    /// Install a prepared FunctionFS handoff (gadget created, function mounted,
+    /// UDC not yet bound). The media auto-start then starts the daemon and binds.
+    pub fn set_functionfs_handoff(&self, handoff: Option<FunctionFsHandoff>) {
+        *lock(&self.functionfs) = handoff;
+    }
+
+    /// Current FunctionFS handoff phase, if one is installed.
+    pub fn functionfs_phase(&self) -> Option<FunctionFsHandoffPhase> {
+        lock(&self.functionfs)
+            .as_ref()
+            .map(FunctionFsHandoff::phase)
     }
 
     /// Stop the USB/IP listener and return its final counters, if running.
@@ -2330,7 +2389,13 @@ impl UsbControl {
                 let auto_failed = auto_enabled && auto.last_error.is_some();
                 serde_json::json!({
                     "ok": true,
-                    "state": if auto_failed { "failed" } else { "not-configured" },
+                    "state": if auto_failed {
+                        "failed"
+                    } else if auto_enabled && auto.stopped {
+                        "stopped"
+                    } else {
+                        "not-configured"
+                    },
                     "running": false,
                     "configured": false,
                     "auto_start": auto_enabled,
@@ -2424,11 +2489,17 @@ impl UsbControl {
     /// The export is `configured`, never `running`; no transport is attached
     /// and no transfer is claimed. A typed failure is retained and surfaced by
     /// `/usb` and `/usb/media` instead of crashing the node.
-    pub fn auto_start_media_export(&self, config: &UsbMediaAutoStartConfig) {
+    ///
+    /// When a FunctionFS mount is configured, the gadget was already created
+    /// and mounted by [`build_usb_control`](crate::build_usb_control); this
+    /// starts the daemon, waits for its `ep0` descriptor writes, and only then
+    /// binds the UDC.
+    pub fn auto_start_media_export(&mut self, config: &UsbMediaAutoStartConfig) {
         {
             let mut auto = lock(&self.media_auto);
             auto.config = Some(config.clone());
             auto.last_error = None;
+            auto.stopped = false;
         }
         if let Err(error) = config.restart.validate() {
             let error = MassStorageMediaError::from_usb(&error);
@@ -2445,20 +2516,23 @@ impl UsbControl {
             .unwrap_or_else(|_| crate::config::DEFAULT_USB_MASS_STORAGE_INSTANCE.to_owned());
         let spec = config.spec();
         if let Some(mount) = config.functionfs_mount.clone() {
-            match self.start_media_daemon(&spec, &function, mount) {
+            match self.start_functionfs_media_export(&spec, &function, mount) {
                 Ok(()) => {
                     info!(
                         function = function.as_str(),
                         restart_max_attempts = config.restart.max_attempts,
-                        "userspace SCSI media daemon started over FunctionFS polling endpoints"
+                        "userspace SCSI media daemon started over FunctionFS polling endpoints \
+                         and bound after ep0 descriptors"
                     );
                 }
                 Err(error) => {
                     warn!(
                         kind = error.kind(),
+                        error = %error,
                         "userspace SCSI media daemon did not start"
                     );
                     self.note_auto_start_failure(&error);
+                    self.error = Some(format!("{}: {error}", error.kind()));
                 }
             }
             return;
@@ -2492,15 +2566,79 @@ impl UsbControl {
         }
     }
 
-    /// Start the supervised FunctionFS media daemon for an explicit mount.
-    fn start_media_daemon(
-        &self,
+    /// Start the supervised FunctionFS media daemon for the prepared handoff,
+    /// wait until it wrote the descriptor/string blobs, then bind the UDC.
+    fn start_functionfs_media_export(
+        &mut self,
         spec: &MediaExportSpec,
         function: &str,
         mount: PathBuf,
     ) -> Result<(), UsbError> {
+        let mut guard = lock(&self.functionfs);
+        let handoff = guard
+            .as_mut()
+            .ok_or_else(|| UsbError::FunctionFsLifecycle {
+                operation: "start-daemon",
+                path: mount.clone(),
+                reason: "no prepared FunctionFS handoff is installed".to_owned(),
+            })?;
+        if handoff.phase() != FunctionFsHandoffPhase::Mounted {
+            return Err(UsbError::FunctionFsLifecycle {
+                operation: "start-daemon",
+                path: handoff.mountpoint().to_path_buf(),
+                reason: format!(
+                    "the FunctionFS handoff must be mounted before the daemon starts; phase is {}",
+                    handoff.phase().as_str()
+                ),
+            });
+        }
+        if handoff.mountpoint() != mount.as_path() {
+            return Err(UsbError::FunctionFsLifecycle {
+                operation: "start-daemon",
+                path: mount,
+                reason: "the configured mount does not match the handoff mountpoint".to_owned(),
+            });
+        }
+        let mount = handoff.mountpoint().to_path_buf();
+        let runtime = self.spawn_media_daemon(spec, function, mount)?;
+        if let Err(error) =
+            wait_for_functionfs_descriptors(&runtime.handle, FUNCTIONFS_DAEMON_START_TIMEOUT_MS)
+        {
+            runtime.handle.shutdown();
+            handoff.rollback();
+            return Err(error);
+        }
+        if let Err(error) = handoff.daemon_started() {
+            runtime.handle.shutdown();
+            handoff.rollback();
+            return Err(error);
+        }
+        if let Err(error) = handoff.bind() {
+            runtime.handle.shutdown();
+            return Err(error);
+        }
+        *lock(&self.media_daemon) = Some(runtime);
+        *lock(&self.media) = None;
+        self.record_media_hotplug(
+            UsbMediaHotplugKind::ExportStart,
+            Some(function.to_owned()),
+            Some("auto-start".to_owned()),
+        );
+        Ok(())
+    }
+
+    /// Build and spawn the supervised FunctionFS media daemon without falling
+    /// back to the in-process runner.
+    fn spawn_media_daemon(
+        &self,
+        spec: &MediaExportSpec,
+        function: &str,
+        mount: PathBuf,
+    ) -> Result<MediaDaemonRuntime, UsbError> {
         let function_config = FunctionFsConfig::new("vendor0", 0x1d6b, 0x0106)
-            .with_interface(0xff, 0x00, 0x00)
+            // Mass Storage / SCSI transparent / Bulk-Only Transport so the
+            // host's usb-storage driver binds the FunctionFS interface.
+            .with_interface(0x08, 0x06, 0x50)
             .with_endpoint(FunctionFsEndpoint::bulk_out(1, 512))
             .with_endpoint(FunctionFsEndpoint::bulk_in(2, 512));
         let mount = FunctionFsMount::new(mount);
@@ -2529,20 +2667,12 @@ impl UsbControl {
             },
         )?;
         let handle = daemon.spawn("usb-media-daemon")?;
-        let runtime = MediaDaemonRuntime {
+        Ok(MediaDaemonRuntime {
             handle,
             function: function.to_owned(),
             source: spec.clone(),
             auto_start: true,
-        };
-        *lock(&self.media_daemon) = Some(runtime);
-        *lock(&self.media) = None;
-        self.record_media_hotplug(
-            UsbMediaHotplugKind::ExportStart,
-            Some(function.to_owned()),
-            Some("auto-start".to_owned()),
-        );
-        Ok(())
+        })
     }
 
     fn note_auto_start_failure(&self, error: &UsbError) {
@@ -2648,47 +2778,83 @@ impl UsbControl {
     }
 
     /// Stop the export and apply its persistence policy during node shutdown.
+    ///
+    /// The order is deliberate and deterministic: unbind the UDC once to
+    /// quiesce host traffic, signal the daemon, wait for its bounded join (which
+    /// flushes the overlay and force-closes the endpoint files), then unmount
+    /// FunctionFS and remove the function/gadget. A worker that overruns its
+    /// bound does not hold node exit, and no second external unbind is needed.
     pub fn shutdown_media_export(&self) -> Result<(), UsbError> {
+        let mut handoff = lock(&self.functionfs).take();
+        let mut first_error = None;
+        if let Some(handoff) = handoff.as_mut() {
+            if handoff.phase() == FunctionFsHandoffPhase::Bound {
+                if let Err(error) = handoff.unbind_once() {
+                    first_error = Some(error);
+                }
+            }
+        }
+
         if let Some(daemon) = lock(&self.media_daemon).take() {
             let function = Some(daemon.function.clone());
-            daemon.handle.shutdown();
+            let finished = daemon.handle.shutdown_timeout(Duration::from_millis(
+                MEDIA_DAEMON_DEFAULT_SHUTDOWN_TIMEOUT_MS,
+            ));
+            if !finished {
+                warn!(
+                    timeout_ms = MEDIA_DAEMON_DEFAULT_SHUTDOWN_TIMEOUT_MS,
+                    "FunctionFS media daemon did not finish within its shutdown bound"
+                );
+            }
+            lock(&self.media_auto).stopped = true;
             self.record_media_hotplug(
                 UsbMediaHotplugKind::ExportStop,
                 function,
                 Some("shutdown".to_owned()),
             );
-            return Ok(());
-        }
-        let mut slot = lock(&self.media);
-        let Some(runtime) = slot.as_mut() else {
-            return Ok(());
-        };
-        if runtime.state == MassStorageMediaState::Stopped {
-            return Ok(());
-        }
-        let result = runtime.runner.stop();
-        match &result {
-            Ok(()) => {
-                runtime.state = MassStorageMediaState::Stopped;
-                runtime.last_error = None;
+        } else {
+            let mut slot = lock(&self.media);
+            if let Some(runtime) = slot.as_mut() {
+                if runtime.state != MassStorageMediaState::Stopped {
+                    let result = runtime.runner.stop();
+                    match &result {
+                        Ok(()) => {
+                            runtime.state = MassStorageMediaState::Stopped;
+                            runtime.last_error = None;
+                        }
+                        Err(error) => {
+                            runtime.state = MassStorageMediaState::Failed;
+                            runtime.last_error = Some(MassStorageMediaError::from_usb(error));
+                            first_error.get_or_insert_with(|| UsbError::MassStorageTransport {
+                                operation: "stop",
+                                reason: error.kind().to_owned(),
+                            });
+                        }
+                    }
+                    let function = Some(runtime.function.clone());
+                    drop(slot);
+                    self.record_media_hotplug(
+                        UsbMediaHotplugKind::ExportStop,
+                        function,
+                        Some(if result.is_ok() {
+                            "shutdown".to_owned()
+                        } else {
+                            "failed".to_owned()
+                        }),
+                    );
+                }
             }
-            Err(error) => {
-                runtime.state = MassStorageMediaState::Failed;
-                runtime.last_error = Some(MassStorageMediaError::from_usb(error));
+        }
+
+        if let Some(handoff) = handoff.as_mut() {
+            if let Err(error) = handoff.cleanup() {
+                first_error.get_or_insert(error);
             }
         }
-        let function = Some(runtime.function.clone());
-        drop(slot);
-        self.record_media_hotplug(
-            UsbMediaHotplugKind::ExportStop,
-            function,
-            Some(if result.is_ok() {
-                "shutdown".to_owned()
-            } else {
-                "failed".to_owned()
-            }),
-        );
-        result
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Record a media export/attachment transition.
@@ -4882,9 +5048,20 @@ async fn usb_media_stop(State(state): State<ConnectionState>) -> Response {
     let Some(control) = state.usb.as_ref() else {
         return usb_not_configured();
     };
-    if let Some(daemon) = lock(&control.media_daemon).as_ref() {
+    let daemon_runtime = lock(&control.media_daemon).take();
+    if let Some(daemon) = daemon_runtime.as_ref() {
         let function = Some(daemon.function.clone());
+        let mut handoff = lock(&control.functionfs).take();
+        if let Some(handoff) = handoff.as_mut() {
+            if handoff.phase() == FunctionFsHandoffPhase::Bound {
+                let _ = handoff.unbind_once();
+            }
+        }
         daemon.handle.shutdown();
+        lock(&control.media_auto).stopped = true;
+        if let Some(handoff) = handoff.as_mut() {
+            let _ = handoff.cleanup();
+        }
         let body = daemon.status_json();
         control.record_media_hotplug(
             UsbMediaHotplugKind::ExportStop,
@@ -7362,9 +7539,9 @@ mod tests {
     use ozma_media::{CaptureSource, Frame, FrameFormat, MediaError, PixelFormat};
     use ozma_power::{PowerBackend, PowerError, PowerState};
     use ozma_usb::{
-        BulkTransportFault, ConfigFsUsbController, FakeUsbGadgetController, MassStorageDevice,
-        MassStorageImage, MemoryBulkTransport, OverlayConfig, ScsiStatus, UsbFunction,
-        UsbGadgetConfig, SCSI_SECTOR_BYTES,
+        BulkTransportFault, ConfigFsUsbController, FakeFunctionFsMounter, FakeUsbGadgetController,
+        FunctionFsHandoff, MassStorageDevice, MassStorageImage, MemoryBulkTransport, OverlayConfig,
+        ScsiStatus, UsbFunction, UsbGadgetConfig, SCSI_SECTOR_BYTES,
     };
     use serde_json::Value;
     use std::time::Duration;
@@ -13497,12 +13674,34 @@ mod tests {
 
     #[tokio::test]
     async fn media_auto_start_selects_the_polling_functionfs_daemon() {
-        let (state, _) = usb_fake_state();
-        let control = state.usb.as_ref().unwrap().clone();
         let temp = tempfile::tempdir().unwrap();
         let base = temp.path().join("base.img");
         std::fs::write(&base, vec![0u8; SCSI_SECTOR_BYTES * 4]).unwrap();
-        std::fs::write(temp.path().join("ep0"), b"").unwrap();
+        let mountpoint = temp.path().join("dev/ffs-vendor0");
+
+        let fake = Arc::new(FakeUsbGadgetController::new());
+        let gadget = UsbGadgetConfig::new("ozma", "dummy_udc.0")
+            .with_function(UsbFunction::vendor("vendor0", 0x1d6b, 0x0106));
+        let mut handoff =
+            FunctionFsHandoff::new(fake.clone(), "ozma", "vendor0", "dummy_udc.0", &mountpoint)
+                .unwrap()
+                .with_mounter(FakeFunctionFsMounter::new().with_endpoints([1, 2]));
+        handoff.prepare(&gadget).unwrap();
+        handoff.mount().unwrap();
+        let mut control = UsbControl::configured(fake.clone(), "ozma");
+        control.set_functionfs_handoff(Some(handoff));
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_usb(Some(control.clone()));
 
         let auto = UsbMediaAutoStartConfig {
             path: base,
@@ -13515,9 +13714,14 @@ mod tests {
             timeout_ms: Some(50),
             max_transfer_bytes: None,
             restart: MediaRestartPolicy::default(),
-            functionfs_mount: Some(temp.path().to_path_buf()),
+            functionfs_mount: Some(mountpoint.clone()),
         };
         control.auto_start_media_export(&auto);
+        assert!(fake.is_bound("ozma"), "the daemon wrote ep0 before bind");
+        assert_eq!(
+            control.functionfs_phase(),
+            Some(FunctionFsHandoffPhase::Bound)
+        );
 
         // The worker writes descriptors and waits for ENABLE; no fake transport
         // may report `running` before a real command cycle.
@@ -13546,6 +13750,17 @@ mod tests {
         let (_, body) = get_json(&usb_router(state), "/usb/media").await;
         assert_eq!(body["state"], "stopped");
         assert_eq!(body["running"], false);
+        assert_eq!(
+            fake.unbind_calls(),
+            1,
+            "shutdown must unbind once and not require a second external unbind"
+        );
+        assert!(
+            fake.status("ozma").is_err(),
+            "the function and gadget were removed after shutdown"
+        );
+        assert!(!mountpoint.exists(), "the FunctionFS mount was removed");
+        assert_eq!(control.functionfs_phase(), None);
         control.shutdown_media_export().unwrap();
     }
 
@@ -14389,7 +14604,7 @@ mod tests {
     #[tokio::test]
     async fn usb_media_auto_start_reports_not_configured_configured_and_no_fake_running() {
         let (state, _fake) = usb_fake_state();
-        let control = state.usb.as_ref().unwrap().clone();
+        let mut control = state.usb.as_ref().unwrap().clone();
         let app = usb_router(state);
         let image = temp_file("media-auto-start", &vec![0u8; 4096]);
 
@@ -14447,7 +14662,7 @@ mod tests {
             CompatStats::default(),
         )
         .with_usb(Some(UsbControl::configured(fake, "ozma")));
-        let control = state.usb.as_ref().unwrap().clone();
+        let mut control = state.usb.as_ref().unwrap().clone();
         let app = usb_router(state);
         let missing = temp_path("media-auto-missing");
 
@@ -14480,7 +14695,7 @@ mod tests {
     #[tokio::test]
     async fn usb_media_transport_error_restarts_with_backoff_and_recovers() {
         let (state, _fake) = usb_fake_state();
-        let control = state.usb.as_ref().unwrap().clone();
+        let mut control = state.usb.as_ref().unwrap().clone();
         let app = usb_router(state);
         let image = temp_file("media-restart-recover", &vec![0u8; 4096]);
 
@@ -14556,7 +14771,7 @@ mod tests {
     #[tokio::test]
     async fn usb_media_repeated_failures_hit_the_attempt_cap_and_stay_failed() {
         let (state, _fake) = usb_fake_state();
-        let control = state.usb.as_ref().unwrap().clone();
+        let mut control = state.usb.as_ref().unwrap().clone();
         let app = usb_router(state);
         let image = temp_file("media-restart-cap", &vec![0u8; 4096]);
         control.auto_start_media_export(&auto_media_config(
@@ -14611,7 +14826,7 @@ mod tests {
     #[tokio::test]
     async fn usb_media_overlay_survives_restart_and_shutdown_flush() {
         let (state, _fake) = usb_fake_state();
-        let control = state.usb.as_ref().unwrap().clone();
+        let mut control = state.usb.as_ref().unwrap().clone();
         let app = usb_router(state);
         let base = temp_file("media-restart-overlay", &vec![0u8; 4096]);
         let persistence = temp_path("media-restart-overlay-persist");
@@ -14705,7 +14920,7 @@ mod tests {
     #[tokio::test]
     async fn usb_media_functionfs_unbind_reloads_and_is_logged() {
         let (state, fake) = usb_fake_state();
-        let control = state.usb.as_ref().unwrap().clone();
+        let mut control = state.usb.as_ref().unwrap().clone();
         let app = usb_router(state);
         let image = temp_file("media-rebind", &vec![0u8; 4096]);
         control.auto_start_media_export(&auto_media_config(&image, MediaRestartPolicy::default()));

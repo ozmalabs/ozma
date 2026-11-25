@@ -26,6 +26,11 @@ bounded command loop, then exposes it through node routes:
   a `PollingFileBulkTransport`, services the SCSI loop continuously, detaches on
   `DISABLE`/`UNBIND`, applies the restart policy, and flushes on shutdown.
   `--usb-functionfs-mount` opts a node into this daemon.
+- `FunctionFsHandoff` sequences the real mount-before-bind contract: create the
+  gadget/function unbound, mount FunctionFS at the configured path, start the
+  daemon, wait for its `ep0` writes, then bind the UDC. Each phase is typed and
+  a failure rolls back the steps already taken. The operator no longer needs to
+  pre-mount FunctionFS.
 - `MediaRestartPolicy` bounds recovery after a bulk-transport error or an
   observed FunctionFS unbind, with capped attempts/backoff and typed last error.
   Counters stay visible across a rebuild and the persisted overlay is reloaded
@@ -116,7 +121,7 @@ and related types). It owns the long-lived FunctionFS + SCSI state:
 | Transport failure | A timeout after a CBW started (or any non-timeout transport error) marks `failed`, detaches/stops the runner, commits the overlay, and schedules the next bounded attempt. |
 | DISABLE | Detach and stop the runner (persistence policy applied); state `waiting-for-enable`. |
 | UNBIND | Detach, record an unbind, schedule the restart; the next ENABLE attaches a device rebuilt with `reload_overlay` per policy. |
-| Stop | `shutdown()` stops the runner, closes `ep0`/endpoints, applies the persistence policy, and publishes `stopped`. `MediaDaemonHandle::shutdown()` joins the worker. |
+| Stop | `shutdown()` stops the runner, closes `ep0`/endpoints, applies the persistence policy, and publishes `stopped`. `MediaDaemonHandle::shutdown_timeout()` bounds the join; `shutdown()` uses the same 10 s default. A FunctionFS node unbinds the UDC once *before* signalling the daemon so a pending endpoint read is woken, then unmounts and removes the function/gadget only after the worker has flushed and exited. |
 
 `MediaDaemonStatus` exposes `state`, `live`/`enabled`/`attached`/`running`,
 preserved `MassStorageLoopStats`, `FunctionFsDaemonStats`, lifecycle counters
@@ -126,12 +131,30 @@ transport factories are injected; `FunctionFsMediaDaemon::file` is the real
 explicit-mount constructor and still never mounts FunctionFS.
 
 Node selection: `--usb-functionfs-mount PATH` requires `--usb-gadget`,
-`--usb-vendor`, and `--usb-media-export`. The node builds the same `vendor0`
-bulk-OUT-1/bulk-IN-2 FunctionFS model, the polling transport factory, and the
-daemon, then stores its shared handle. `/usb/media` reports `transport.kind =
-"polling-file"` and the daemon counters; a transfer is still required before
-`running` is true. The node does not use the blocking `FileBulkTransport` for
-this path.
+`--usb-vendor`, and `--usb-media-export`. The node creates the `ffs.vendor0`
+function and mounts FunctionFS at `PATH` itself (root required), then builds the
+same bulk-OUT-1/bulk-IN-2 FunctionFS model, the polling transport factory, and
+the daemon, waits up to 5 s for the daemon's `ep0` writes, and binds the UDC.
+`/usb/media` reports `transport.kind = "polling-file"` and the daemon counters;
+a transfer is still required before `running` is true. The node does not use the
+blocking `FileBulkTransport` for this path.
+
+The ordered handoff is in `ozma-usb/src/functionfs_handoff.rs`:
+
+| Phase | Work |
+|---|---|
+| `prepared` | `create_gadget` created the full composite gadget and linked `ffs.<instance>`; UDC empty. |
+| `mounted` | The configured mount was validated, or `CommandFunctionFsMounter` ran `mount -t functionfs <instance> <path>`. |
+| `daemon_started` | Caller's daemon wrote the descriptor/string blobs; bind is still rejected before this. |
+| `bound` | UDC written exactly once. |
+| `unbound` | UDC cleared once with `"\n"` (ConfigFS ignores a zero-byte write). |
+| `torn_down` | Owned mount unmounted first, then function/gadget removed. |
+
+Failure at prepare/mount/bind rolls back the gadget, mount, and UDC in reverse
+order and returns the original typed error. Cleanup leaves a caller-owned
+pre-existing mount alone. The FunctionFS interface advertises Mass Storage /
+SCSI transparent / Bulk-Only (`0x08/0x06/0x50`) for this media path so the host
+binds `usb-storage` automatically.
 
 ## 2. Node routes
 
@@ -163,7 +186,7 @@ Node startup options mirror those fields:
 | `--usb-media-restart-max-attempts` (default 3) | Bounded restart cap; `0` disables restart. |
 | `--usb-media-restart-backoff-ms` / `--usb-media-restart-max-backoff-ms` (250/4000) | Capped exponential backoff. |
 | `--usb-media-restart-no-overlay-reload` | Rebuild from the base image instead of the persisted overlay. |
-| `--usb-functionfs-mount PATH` | Opt into the background daemon over an explicitly mounted FunctionFS directory; requires `--usb-gadget --usb-vendor --usb-media-export`. |
+| `--usb-functionfs-mount PATH` | Opt into the background daemon and the node-owned mount-before-bind handoff; requires `--usb-gadget --usb-vendor --usb-media-export`. The node mounts this path itself (root) after creating the `ffs` function. |
 
 Semantics:
 
@@ -188,8 +211,10 @@ Semantics:
 - Auto-start is opt-in. Without `--usb-media-export`, `/usb` reports
   `media_export.state: "not-configured"` and no userspace export is created.
   A failed auto-start records the typed reason and leaves `running: false`.
-- On SIGINT/SIGTERM the export is stopped and its overlay is flushed according
-  to `persist_on_stop`.
+- On SIGINT/SIGTERM the node unbinds the UDC once, stops the daemon with a
+  bounded join, flushes the overlay according to `persist_on_stop`, unmounts
+  FunctionFS, and removes the function/gadget. No second unbind or manual
+  unmount is required.
 
 ## 3. Restart supervision
 
@@ -230,7 +255,7 @@ New library suite: `ozma-usb/tests/mass_storage_loop.rs` (10 tests):
 - `FunctionFsBulkTransport` drives the SCSI loop through enabled FunctionFS
   loopback endpoints and observes daemon bytes read/written.
 
-New `ozma-usb` daemon tests in `media_daemon::tests` (6 tests, in-memory
+New `ozma-usb` daemon tests in `media_daemon::tests` (7 tests, in-memory
 endpoints/fakes only):
 
 - enable → attach → serve one CSW → disable → detach, with no transfer claimed
@@ -241,17 +266,36 @@ endpoints/fakes only):
   and attaches with the reloaded device;
 - shutdown stops the runner, commits the persistent overlay, leaves the base
   image untouched, and flushes the endpoint;
+- a spawned worker exits within its bounded shutdown even though no UNBIND event
+  or second external UDC unbind was supplied (`counters.unbinds == 0`);
 - invalid event/idle bounds are typed;
 - bulk endpoint selection requires one non-zero OUT and one IN endpoint.
+
+New `ozma-usb` handoff tests in `tests/functionfs_handoff.rs` (7 tests):
+
+- prepare → mount → daemon-started → bind ordering, with bind rejected before
+  the mount/daemon phase;
+- one unbind on shutdown, a repeated `unbind_once` no-op, and idempotent cleanup
+  (`unbind_calls == 1` is the single-unbind regression);
+- mount failure rolls the created function back and returns the typed error;
+- bind failure unbinds/removes the function and unmounts;
+- preparing over an existing gadget is typed `gadget-exists` and leaves it alone;
+- a missing mount without a mounter is typed and rolls back;
+- a caller-supplied mount is not unmounted by cleanup.
+
+`ozma-usb/tests/configfs_controller.rs` also asserts that unbind writes `"\n"`
+(not a zero-byte no-op) to the UDC attribute.
 
 New `ozma-node` tests (2):
 
 - `/usb` defaults `usbip` to `not-configured`, adapter `kernel-required`,
   `kernel_required: true`, and zero data sessions;
-- media auto-start with `functionfs_mount` selects the polling daemon, reaches
-  `waiting-for-enable` without claiming `running`, reports
-  `transport.kind: "polling-file"`, and stops cleanly through
-  `POST /usb/media/stop`.
+- media auto-start with `functionfs_mount` installs a prepared/mounted
+  `FunctionFsHandoff`, starts the polling daemon, observes its `ep0` writes
+  before binding, reaches `waiting-for-enable` without claiming `running`,
+  reports `transport.kind: "polling-file"`, and stops through
+  `POST /usb/media/stop` with exactly one fake-controller unbind, no leaked
+  gadget, and no leaked mount.
 
 New `ozma-usb` restart-policy tests in `media_restart::tests` (5 tests):
 
@@ -284,10 +328,40 @@ New node tests in `controller_compat::tests` (11 media tests total; 5 added):
 Verification run:
 
 ```text
-cargo test -p ozma-usb -p ozma-node --lib          # 548 passed, 3 ignored
-cargo check -p ozma-usb -p ozma-node --all-targets
-rustfmt --edition 2021 --check <touched rust files>
+cargo test -p ozma-usb -p ozma-node --lib
+  # ozma-node: 551 passed, 4 ignored
+  # ozma-usb:   28 passed
+cargo test -p ozma-usb --test functionfs_handoff --test configfs_controller \
+  --test functionfs_lifecycle
+  # 7 + 12 + 8 passed
+cargo check -p ozma-usb -p ozma-node --all-targets     # PASS
+rustfmt --edition 2021 --check <touched rust files>    # PASS
 ```
+
+Live `dummy_hcd` validation (same node invocation as the hardware report):
+
+```text
+USB FunctionFS function created and mounted; waiting for the daemon before UDC bind
+userspace SCSI media daemon started over FunctionFS polling endpoints and bound after ep0 descriptors
+usb-storage 8-1:1.2: USB Mass Storage device detected
+scsi 6:0:0:0: Direct-Access OZMA Virtual Media 1.0
+[sda] 65536 512-byte logical blocks: (33.6 MB/32.0 MiB)
+
+GET /usb/media after host raw write + sync + read-back:
+  state=running commands=62 cbws=62 csws=62 writes=1 reads=49
+  data_out=65536 data_in=425082 timeouts=0
+  daemon descriptor_writes=1 string_writes=1
+
+SIGTERM:
+  userspace SCSI media export stopped; persistence policy applied
+  shutdown_seconds=0.228
+  gadget removed, UDC empty, FunctionFS unmounted, /dev/sda gone,
+  overlay flushed (65,824 bytes), no stray node process
+```
+
+The host write used `dd of=/dev/sda bs=4096 seek=256 count=16 conv=fsync`,
+`sync`, then `dd if=/dev/sda ... skip=256 count=16`; both files matched
+`sha256 6fc179cfd193754e6109ad043f56d146c7e7d7c3623ffceae318266286f58388`.
 
 ## 5. Remaining real-UDC/kernel gaps
 
@@ -298,10 +372,12 @@ rustfmt --edition 2021 --check <touched rust files>
   `PollingFileEp0Io`; the blocking `FileEndpointIo` remains available for
   callers that supply their own host/UDC timeout. Hardware deadlines are proven
   only against OS pipes/FIFOs; a real UDC transfer remains env-gated.
-- The daemon requires an already-mounted FunctionFS directory. The node never
-  mounts, configures the UDC, or reconciles the `--usb-media` ConfigFS LUN with
-  the userspace FunctionFS function. `FunctionFsLifecycle` can perform the
-  privileged mount/bind when an embedder opts in.
+- The daemon no longer requires an operator-supplied mount in the node path:
+  `FunctionFsHandoff` creates the function, mounts FunctionFS, starts the
+  daemon, waits for `ep0`, and binds the UDC. This needs root (or the relevant
+  mount/ConfigFS privileges); without them mount/bind failures are typed and
+  rolled back. The daemon still does not reconcile the `--usb-media` ConfigFS
+  kernel LUN with the userspace FunctionFS function.
 - `--usb-media-export` auto-starts the userspace SCSI export, but it is separate
   from the `--usb-media` ConfigFS kernel LUN; the node does not reconcile or
   switch between the two paths.

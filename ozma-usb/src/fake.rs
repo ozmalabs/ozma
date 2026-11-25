@@ -7,6 +7,7 @@
 //! node tests, controller dry runs, and API shape tests.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::config::{is_safe_identifier, UsbFunction, UsbFunctionKind, UsbGadgetConfig};
@@ -27,6 +28,9 @@ pub struct FakeUsbGadgetController {
 #[derive(Debug, Default)]
 struct FakeState {
     gadgets: BTreeMap<String, FakeGadget>,
+    binds: AtomicU64,
+    unbinds: AtomicU64,
+    fail_bind: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +77,21 @@ impl FakeUsbGadgetController {
             .gadgets
             .get(name)
             .is_some_and(|gadget| gadget.bound.is_some())
+    }
+
+    /// Number of `bind` calls (including idempotent repeats).
+    pub fn bind_calls(&self) -> u64 {
+        self.lock().binds.load(Ordering::SeqCst)
+    }
+
+    /// Number of `unbind` calls (including idempotent repeats).
+    pub fn unbind_calls(&self) -> u64 {
+        self.lock().unbinds.load(Ordering::SeqCst)
+    }
+
+    /// Make every subsequent `bind` fail with a typed error.
+    pub fn set_fail_bind(&self, fail: bool) {
+        self.lock().fail_bind.store(fail, Ordering::SeqCst);
     }
 
     fn lock(&self) -> MutexGuard<'_, FakeState> {
@@ -184,6 +203,13 @@ impl UsbGadgetController for FakeUsbGadgetController {
             });
         }
         let mut state = self.lock();
+        state.binds.fetch_add(1, Ordering::SeqCst);
+        if state.fail_bind.load(Ordering::SeqCst) {
+            return Err(UsbError::InvalidField {
+                field: "udc",
+                reason: "fake controller was configured to reject the UDC bind".to_owned(),
+            });
+        }
         let gadget = state
             .gadgets
             .get_mut(name)
@@ -203,6 +229,7 @@ impl UsbGadgetController for FakeUsbGadgetController {
 
     fn unbind(&self, name: &str) -> Result<GadgetStatus, UsbError> {
         let mut state = self.lock();
+        state.unbinds.fetch_add(1, Ordering::SeqCst);
         let gadget = state
             .gadgets
             .get_mut(name)

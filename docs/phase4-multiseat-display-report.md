@@ -18,11 +18,11 @@ New module: `ozma-multiseat/src/seat_display.rs`.
 
 | Type | Purpose |
 |---|---|
-| `SeatDisplayBackend` | `shared` (default), `xvfb`, `xephyr`; serialized as snake case. |
+| `SeatDisplayBackend` | `shared` (default), `xvfb`, `xephyr`, `xorg`; serialized as snake case. |
 | `SeatDisplaySize` | validated `WxH`, parses `--seat-display-size`. |
-| `SeatDisplayOptions` | backend, size, number range (default `90..=199`), readiness timeout/poll, optional Xephyr parent. |
+| `SeatDisplayOptions` | backend, size, number range (default `90..=199`), readiness timeout/poll, optional Xephyr parent, optional Xorg config. |
 | `SeatDisplayRequest` / `SeatDisplayHandle` / `SeatDisplayLauncher` | spawn seam; handle exposes `display`, `pid`, `xauthority`, `auth_disabled`, `is_ready`, `try_wait`, `terminate`. |
-| `ProcessSeatDisplayLauncher` | production `Xvfb`/`Xephyr` spawner with a shared `DisplayNumberAllocator`. |
+| `ProcessSeatDisplayLauncher` | production `Xvfb`/`Xephyr`/`Xorg` spawner with a shared `DisplayNumberAllocator`. |
 | `DisplayNumberAllocator` | first-free allocation, reuse after release, skips existing X sockets/locks, typed exhaustion. |
 | `SeatDisplayStatus` / `SeatDisplayError` / `SeatDisplayNote` | flattened status state and typed failures/notes. |
 
@@ -35,10 +35,19 @@ Xvfb :N -screen 0 WxHx24 -nolisten tcp -ac
 
 DISPLAY=<shared> Xephyr :N -screen WxHx24 -title ozma-<seat> \
   -nolisten tcp -auth <Xauthority>
+
+Xorg :N -config <file> -logfile <file> -nolisten tcp -noreset \
+  -novtswitch -sharevts -keeptty -auth <Xauthority>
+# or, when xauth is absent/failed: the same command with -ac
 ```
 
 `-nolisten tcp` is always present. The `-ac` fallback is therefore limited to
-the Unix socket, never a TCP listener.
+the Unix socket, never a TCP listener. `Xorg` takes its geometry, video driver,
+and input devices from the config; it is started with `-novtswitch -sharevts` so
+the seat does not steal a VT, `-noreset` so it survives its last client, and
+`-keeptty` so the supervisor still owns the child pid. `Xorg` without an
+explicit config is a typed `Unsupported` error rather than an implicit host GPU
+probe.
 
 ### Readiness and auth
 
@@ -64,17 +73,18 @@ is absent or fails, the server starts with `-ac` and the status carries a typed
 | `MultiseatError::Unsupported` (Xephyr absent/no parent) | `unsupported` |
 
 `Xephyr` is optional: a missing `Xephyr` is a typed `Unsupported` error. A
-missing `Xvfb` is the typed missing-binary error. A display is never stored or
-reported ready after a timeout or crash; the handle is terminated and the number
-released first.
+missing `Xvfb` or `Xorg` is the typed missing-binary error. A display is never
+stored or reported ready after a timeout or crash; the handle is terminated and
+the number released first.
 
 ## Supervisor integration
 
 `SupervisorOptions` gained `seat_display: SeatDisplayOptions`. The CLI gained:
 
 ```text
---seat-display shared|xvfb|xephyr   (default shared)
---seat-display-size WxH             (default 1280x800)
+--seat-display shared|xvfb|xephyr|xorg   (default shared)
+--seat-display-size WxH                 (default 1280x800; xorg uses its config)
+--seat-display-xorg-config PATH         (required with --seat-display xorg)
 ```
 
 `ProcessSeatSupervisor::new` installs the production spawner for nested
@@ -136,7 +146,8 @@ flatten), and the status round-trip test covers them.
 
 ## Tests
 
-New `tests/display_supervisor.rs` (15 tests) uses only fakes:
+New `tests/display_supervisor.rs` (15 tests) uses only fakes, plus unit tests in
+`seat_display.rs` for the Xorg argument builder and the missing-config refusal:
 
 - default `shared` is a no-op and its status omits private fields;
 - `Xvfb` starts before the node, exports `DISPLAY`, rewrites capture args, and
@@ -162,7 +173,10 @@ released numbers. It never opens a socket or runs a process.
 New opt-in `tests/live_display_smoke.rs` is ignored unless
 `OZMA_MULTISEAT_REAL_DISPLAY=1`. It starts two throwaway seats on the first free
 numbers at or above `:90`, records each fake node's inherited `DISPLAY`, and
-verifies the servers/sockets are gone after `stop_all`.
+verifies the servers/sockets are gone after `stop_all`. New opt-in
+`tests/live_xorg_seat_smoke.rs` is ignored unless
+`OZMA_MULTISEAT_REAL_XORG=1` and performs the real-Xorg device/event isolation
+above.
 
 ## Live smoke evidence
 
@@ -206,11 +220,41 @@ The `MESA` messages come from Xvfb probing the host GPU and are harmless; the
 private displays themselves passed the X11 handshake. The real desktop (`:0`)
 was never used or changed.
 
+## Real Xorg follow-up (2026-11-25)
+
+The Xvfb smoke proved a private X root but could not prove input isolation:
+Xvfb exposes only core/XTEST devices, so helper-created uinput nodes were never
+enumerated. A second live smoke now starts two real Xorg servers on `:90` and
+`:91` with throwaway dummy video and libinput:
+
+```bash
+sudo pacman -S --needed --noconfirm xf86-video-dummy xorg-xev
+OZMA_MULTISEAT_REAL_XORG=1 \
+  cargo test -p ozma-multiseat --test live_xorg_seat_smoke \
+  -- --ignored --nocapture
+```
+
+The test creates source uinput devices, has the real `ozma-seat-input` helper
+grab and relay them, writes a per-display `Xauthority`, starts
+`sudo -n /usr/lib/Xorg :90` and `:91` with a generated config (`dummy` video,
+libinput `InputDevice` sections, `-nolisten tcp`, `-novtswitch -sharevts
+-noreset -keeptty`), applies `ProcessSeatInputTargeter`, and injects keys. It
+passed with both displays initially enumerating all four helper devices, seat
+A's devices enabled only on `:90`, seat B's only on `:91`, and each key reaching
+only its own `xev -root`. Full evidence and cleanup are in
+`docs/phase4-xorg-seat-report.md`.
+
+Important config rule discovered live: an explicit Xorg `InputDevice`
+identifier must be the helper uinput name (`ozma-seat-...`), otherwise XInput
+reports the config's identifier and `--input-targeting` honestly fails. The new
+`xorg` backend therefore requires a caller-supplied config and refuses to start
+without one.
+
 ## Verification
 
 ```text
 cargo test -p ozma-multiseat
-  145 passed, 0 failed, 9 ignored (across lib, bin, and integration tests)
+  180 passed, 0 failed, 12 ignored (across lib, bin, and integration tests)
 
 cargo check -p ozma-multiseat --all-targets
   clean (only pre-existing ozma-pipewire warnings)
@@ -225,14 +269,20 @@ rustfmt --edition 2021 --check <touched files>
   private X root, but there is no DRM leasing, KMS scanout ownership, window
   manager, compositor launch, or physical-output handoff. The private root is a
   virtual display, not a claimed monitor.
-- **Input delivery into the private seat.** The helper confirms physical
-  `EVIOCGRAB` and creates per-seat uinput devices, but nothing yet injects those
-  devices into the private X server or a compositor seat. The helper path is not
-  regressed, but end-to-end private-display input is not complete.
+- **Input delivery into the private seat.** The helper confirms `EVIOCGRAB` and
+  creates per-seat uinput devices. A real Xorg + libinput seat now enumerates
+  those devices, and `--input-targeting` restricts each display to its own set;
+  the live smoke proves keys do not cross displays. This is still an X11/Xorg
+  seat, not a compositor/OS seat: no Wayland compositor, per-seat cgroups,
+  physical output handoff, or session manager is launched.
 - **Xephyr availability.** Xephyr was not installed on this host, so the nested
   window path is covered by typed-unsupported and command-construction tests,
   not a live window. `weston` was also absent; there is no Wayland compositor
-  backend.
+  backend. The real Xorg path was validated instead with dummy video/libinput.
+- **Xorg privilege and config.** The distro `Xorg` wrapper allows only console
+  users; the live smoke uses `sudo -n /usr/lib/Xorg`. Production still needs a
+  privileged launcher/helper and generated Xorg configs with helper uinput
+  identifiers. The backend documents this and does not auto-escalate.
 - **xauth fallback.** When `xauth` is missing, the server uses `-ac` on a
   Unix-socket-only listener and reports `auth_disabled`. That is honest but
   weaker than a cookie; `-ac` is never exposed over TCP.
