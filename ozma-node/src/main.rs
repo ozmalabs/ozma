@@ -2616,6 +2616,19 @@ async fn run() -> std::process::ExitCode {
         capture_provider,
         capabilities.capture.first(),
     );
+    let desktop_controls = (config.profile == NodeProfile::Desktop).then(|| {
+        let x11_display = config
+            .x11_display
+            .clone()
+            .or_else(|| std::env::var("DISPLAY").ok())
+            .map(|display| display.trim().to_owned())
+            .filter(|display| !display.is_empty());
+        let wayland_display = std::env::var("WAYLAND_DISPLAY")
+            .ok()
+            .map(|display| display.trim().to_owned())
+            .filter(|display| !display.is_empty());
+        ozma_node::desktop_compat::DesktopControls::system(x11_display, wayland_display)
+    });
     let compat_state =
         controller_compat::ConnectionState::new(connection_info, compat_stats.clone())
             .with_power(power)
@@ -2635,7 +2648,8 @@ async fn run() -> std::process::ExitCode {
             .with_multi_console_hls(multi_console_hls.clone())
             .with_multi_console_webrtc(multi_console_webrtc.clone())
             .with_capture(capture_status)
-            .with_vnc_registration(vnc_registration);
+            .with_vnc_registration(vnc_registration)
+            .with_desktop_controls(desktop_controls);
     // Control routes stay behind the bearer guard; the controller's read-only
     // probes are mounted after it so the unmodified controller works with
     // `--api-token`. See `controller_compat::{compat_router, public_router}`.
@@ -2920,13 +2934,16 @@ async fn run() -> std::process::ExitCode {
                  handshake), the uinput -> QMP/HID -> recording input chain, and PipeWire audio \
                  capture. /health, /status, /snapshot (and /display/snapshot), /display/info, \
                  /node/status, /api/v1/connection, and the configured /audio/* routes are \
-                 available. Portal consent runs at startup; a denial, timeout, or missing portal \
-                 leaves the node running without capture (never a fake source). Remaining \
-                 limits: a compositor that exposes the screen only through the portal fd cannot \
-                 be opened by the current PipeWire backend (typed error), returned portal restore \
-                 tokens are not persisted, /audio/nodes is still a typed 501, and desktop sink \
-                 creation is not implemented. Capture or input failures downgrade capabilities; \
-                 the node keeps running rather than claiming a source it did not open."
+                 available. /display/geometry, /clipboard, and /wallpaper use xrandr, \
+                 xclip/xsel, and feh/xwallpaper/swaybg when present; a missing tool or display \
+                 is a typed 503, never a fabricated success. Portal consent runs at startup; a \
+                 denial, timeout, or missing portal leaves the node running without capture \
+                 (never a fake source). Remaining limits: a compositor that exposes the screen \
+                 only through the portal fd cannot be opened by the current PipeWire backend \
+                 (typed error), returned portal restore tokens are not persisted, /audio/nodes \
+                 is still a typed 501, and desktop sink creation is not implemented. Capture or \
+                 input failures downgrade capabilities; the node keeps running rather than \
+                 claiming a source it did not open."
             );
         }
     }

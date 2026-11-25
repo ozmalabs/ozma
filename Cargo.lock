@@ -3727,6 +3727,7 @@ dependencies = [
  "bytes 1.11.1",
  "clap",
  "flate2",
+ "futures-util",
  "hostname 0.4.2",
  "http-body-util",
  "jpeg-decoder",

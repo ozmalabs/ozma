@@ -1813,3 +1813,224 @@ the detached worktree and was removed with it. The worktree, venvs, node build
 target, clean-host targets, and temporary `/tmp/opencode/final-artifacts`
 evidence directory were removed after this section was written. Pre-existing
 `/tmp/ozma-webrtc-*` directories from earlier sessions were left untouched.
+
+## Media validation at e40e62c (2026-11-25)
+
+Date: 2026-11-25, 16:10-16:30 local (05:10-05:30 UTC).
+Host: CachyOS, Linux 7.3.5-2-cachyos, x86_64.
+Checkout: the live tree was **dirty with unrelated AIDA64 work**, so this run
+used a detached worktree at `/tmp/opencode/media-val-e40e62c`.
+HEAD: `e40e62c955619a79e362188e330c5391d8d80549`
+(`feat(phase4): node MJPEG video, mesh packet pump, USB media daemon`).
+Node binary: offline `cargo build -p ozma-node --bin ozma-node` (exit 0,
+45.55 s; `ozma-node 0.1.0`). Controller venv:
+`/tmp/opencode/media-val-venv` (offline `uv` install of
+`controller/requirements.txt` plus `pytest`). `demo/cache` was symlinked to the
+existing Alpine 3.21.3 ISO cache because the worktree lives on `/tmp`.
+
+This was validation only. No product source was changed and nothing was
+committed; the live checkout received only this report section.
+
+### Result summary
+
+| Check | Result | Evidence |
+|---|---|---|
+| Build `ozma-node` at HEAD | **PASS** | offline `cargo build` exit 0 in 45.55 s; `ozma-node 0.1.0` |
+| Default `demo/run_demo.sh` (Rust) | **PASS** | two Rust VM nodes + controller started; `Backend: rust (default: rust)` |
+| mDNS discovery by unmodified controller | **PASS** | `/api/v1/nodes` returned `vm1._ozma._udp.local.` and `vm2._ozma._udp.local.` with ports 7332/7333 and `api_port` 7382/7383 |
+| Node health | **PASS** | `/health` 200 `ok:true` on 7382 and 7383 |
+| Local HLS | **PASS** | `stream.m3u8` 200; media sequence 127 → 131 in 4 s; `seg_00130.ts` 100,392 B |
+| Controller HLS proxy | **PASS** | `/api/v1/streams/<id>/hls/stream.m3u8` and segment 200 `video/mp2t`, 100,392 B |
+| Snapshot, node and controller proxy | **PASS** | node `/display/snapshot` 200 JPEG 1280x800 ~96.5 KB; controller proxy 200 `image/jpeg` 96,554 B |
+| QMP input | **PASS** | `/input/type` 200 `{"events":2,"ok":true}` on both nodes |
+| Graceful stop / no orphans | **PASS** | `demo stop` exit 0 in 0.014 s; nodes logged `SIGTERM` + `Ozma node shutting down`; controller `Application shutdown complete`; no processes, ports, sockets afterwards |
+| `/video` MJPEG stream | **PASS** | 8 JPEG parts, 1280x800, exact multipart content type, 2 distinct frames |
+| `/video` fps/quality bounds | **PASS** | `fps=0`→1, `fps=999`→30, `quality=0`→1, `quality=999`→100; `/display/mjpeg` alias identical |
+| `/video` invalid query | **PASS** | `fps=abc`, `quality=abc`, `fps=-1`, `fps=1.5` all typed `400 video.invalid_query` |
+| `/video` unknown console | **PASS** | `?console=bogus` typed `404 not_found` with `details.available=[]` |
+| `/video` concurrency / disconnect | **PASS** | 4 slots active, 5th `503 video.stream_limit`, `active_streams` 4→0 after close, new stream 200 |
+| VNC server bind + auth | **PASS** | `--vnc-server --vnc-server-port 0 --vnc-password-file`; bound `127.0.0.1:32987`, `security="vnc-auth"`, geometry 1280x800 |
+| VNC frames via password auth | **PASS** | `asyncvnc` correct password: `(800,1280,4)` frames, 16 changed pixels between refreshes |
+| VNC input reaches guest | **PASS** | typing `ab`, Return, pointer move/click changed 309 pixels, bbox `(0,626)-(150,651)` |
+| VNC wrong password rejected | **PASS** | client `PermissionError: Auth failed`; server `VNC authentication failed` |
+| TigerVNC RFB 3.8 + VncAuth | **PASS** | TigerVNC 1.16.2: `Server offers security type VncAuth(2)`, `Authentication success!`, `Initialisation done` |
+| TigerVNC ZRLE negotiation/decoding | **PASS** | server `count=27 preferred=Zrle cursor=true`; Xvfb screenshot had 29,494 non-black pixels / 339 colours |
+| VNC registration advertises bound port | **PASS** | `/api/v1/connection.registration.vnc` = `{"state":"configured","host":"127.0.0.1","port":32987}`; `ss` showed PID fd on 32987 |
+| VNC registration retracts on source stop | **PASS** | after QMP source ended: `{"state":"not-configured"}`; listener closed; `/health` still 200 |
+| `demo test` suite | **FAIL (non-media)** | core audio `[14]` link FAIL; extended 70 passed / 5 failed / 0 skipped (F19, F20, F25, F26 x2) |
+| `demo test` cleanup on failure | **PASS** | failing suite still printed `Stopping Ozma demo...`, killed controller/nodes/VMs, no leftovers |
+| Clean-host `--host` | **PASS** | 22 passed / 0 failed / 0 skipped; `ozma-node --lib` 515 passed / 3 ignored; `ozma-softnode` 139 passed; synthetic `/health` PASS |
+| Process/socket/temp cleanup | **PASS** | no run processes, demo listeners, QMP sockets, pidfiles, `/dev/shm/ozma-*`, or Xvfb `:99` state |
+
+### `/video` evidence
+
+The demo node at 7382 served the real QMP screendump source. Request:
+`GET /video?fps=10&quality=70`.
+
+```text
+200
+Content-Type: multipart/x-mixed-replace; boundary=ozma-frame
+Cache-Control: no-store
+Pragma: no-cache
+X-Accel-Buffering: no
+X-Ozma-Fps: 10
+X-Ozma-Quality: 70
+Transfer-Encoding: chunked
+
+part 0: bytes=76435 jpeg=ok size=(1280, 800) sha256=5d37f19acbf77c31
+part 2: bytes=76417 jpeg=ok size=(1280, 800) sha256=9f73ce4c6c4de048
+...
+distinct 2 of 8
+```
+
+Every part had a real `Content-Length` and decoded as a JPEG; the two hashes are
+the QMP console's changing frames. The alias `/display/mjpeg?fps=5&quality=60`
+returned the same content type and headers. No bearer token was supplied, so
+the documented public read-only media surface is also confirmed.
+
+Concurrency used four held `fps=1` streams:
+
+```text
+before (0, 4)
+stream0..3 status 200
+while-4 (4, 4)
+stream5 status 503
+{"code":"video.stream_limit","error":"This node is already serving its limit of 4 MJPEG stream(s).", ...}
+while-5 (4, 4)
+after-close (0, 4)
+recover status 200 active (1, 4)
+final (0, 4)
+```
+
+### VNC evidence
+
+The isolated node used the real QMP head and started with:
+
+```bash
+./target/debug/ozma-node \
+  --name media1 --profile vm --qmp-socket /tmp/ozma-vm1.qmp \
+  --hid-udp-port 17331 --http-port 17382 \
+  --capture-provider qmp --input-provider qmp \
+  --vnc-server --vnc-server-port 0 \
+  --vnc-password-file /tmp/opencode/vnc-pass.txt \
+  --vnc-bind 127.0.0.1 --cap hid,video
+```
+
+Server log:
+
+```text
+RFB 3.8 VNC server listening bind=127.0.0.1:32987 loopback=true
+  security="vnc-auth" encrypted=false encoding="raw,zrle"
+VNC capture source published its first frame; ServerInit geometry fixed
+  width=1280 height=800
+```
+
+`asyncvnc` (which sends only ZLib in `SetEncodings`) negotiated Raw, so it was
+the Raw path; TigerVNC below supplied the ZRLE path. It decoded frames and
+input:
+
+```text
+wrong_password -> PermissionError: Auth failed
+shot1 (800, 1280, 4) mean 4.44
+shot2 changed_pixels 16
+shot3 after input changed_pixels 309 bbox (0,626)-(150,651)
+correct_password -> input_sent_ok
+```
+
+The server recorded the failed handshake and the Raw preference:
+
+```text
+VNC handshake failed client=1 peer=127.0.0.1:39458
+  error=VNC authentication failed
+VNC client encoding preferences applied client=2 count=1 preferred=Raw cursor=false
+```
+
+TigerVNC 1.16.2 under Xvfb connected with VncAuth, completed RFB 3.8
+initialisation, and the server selected ZRLE from the real 27-entry list:
+
+```text
+CConnection: Server supports RFB protocol version 3.8
+CConnection: Server offers security type VncAuth(2)
+CConnection: Authentication success!
+CConnection: Initialisation done
+
+VNC client encoding preferences applied client=3 count=27
+  preferred=Zrle cursor=true
+```
+
+The Xvfb root screenshot taken while the viewer was connected contained 29,494
+non-black pixels across 339 colours, confirming the viewer decoded and drew
+frames rather than showing an empty/black window.
+
+Registration before the source ended:
+
+```json
+{"state":"configured","host":"127.0.0.1","port":32987}
+```
+
+`ss` showed `LISTEN 127.0.0.1:32987` owned by node PID 3538301. Killing the QMP
+VM ended the capture source; the node logged
+`VNC capture source failed; the VNC listener is stopping` and reported:
+
+```json
+{"state":"not-configured"}
+```
+
+The listener socket was gone and `/health` still returned 200.
+
+### `demo test` and cleanup
+
+`bash demo/run_demo.sh test` exited 1. The core switching/audio suite had one
+failure:
+
+```text
+[14] Audio state correct after rapid switching
+  FAIL  ozma-vm1 monitor linked after rapid switching
+```
+
+The extended suite ended `70 passed, 5 failed, 0 skipped`:
+
+```text
+[F19] GET /api/v1/macros returns data          FAIL
+      (macro recording start/stop both PASS)
+[F20] automation script accepted               FAIL
+[F25] AI setups used: 0                        FAIL
+[F26] noise_cancellation blocked on free tier  FAIL
+[F26] reason mentions upgrade:                 FAIL
+```
+
+These are the same controller-only Connect assertions recorded earlier plus
+the known macro/automation environment failures; no node, `/video`, VNC, HLS,
+or switching assertion failed. The audio link failure is a controller/PipeWire
+routing check, outside the media surfaces under test.
+
+Cleanup still ran on the failing suite: `Stopping Ozma demo...`, controller and
+both node PIDs killed, both QEMU VMs stopped, and no listeners or processes
+remained.
+
+### Clean-host and cleanup
+
+Because the detached worktree is on `/tmp`, clean-host used
+`OZMA_CLEAN_HOST_TARGET=/home/matt/.cache/ozma-clean-host-media`:
+
+```text
+PASS  cargo build -p ozma-node -p ozma-softnode -p ozma-multiseat --bins
+test result: ok. 515 passed; 0 failed; 3 ignored
+PASS  cargo test -p ozma-node --lib
+test result: ok. 139 passed; 0 failed
+PASS  cargo test -p ozma-softnode
+PASS  ozma-node desktop profile answered /health on port 35144
+22 passed, 0 failed, 0 skipped
+RESULT: PASS
+```
+
+After the runs there were no `ozma-node`, controller, QEMU, HLS ffmpeg, VNC
+viewer, or Xvfb processes from this run; no demo listeners on
+7380/7332/7333/7382/7383/5901/5922/17382; no `/tmp/ozma-vm*.qmp`, demo
+pidfiles, `/dev/shm/ozma-*`, or Xvfb `:99` lock. The detached worktree, build
+target, venv, clean-host target, password files, and evidence logs were removed
+after this section was written. A pre-existing `/tmp/ozma-clean-host-1000`
+directory (13:06, before this run) and pre-existing `/tmp/ozma-webrtc-*`
+directories were left untouched. The only matching process at final check was
+an unrelated parallel session's `cargo test -p ozma-node --test
+desktop_profile` in the main checkout.

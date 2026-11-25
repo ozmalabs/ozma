@@ -71,7 +71,7 @@ use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
 use crate::display_broker::ConsoleBroker;
-use crate::display_compat::{DisplayInfo, SnapshotControl, SnapshotError};
+use crate::display_compat::{DisplayInfo, SnapshotControl, SnapshotError, SnapshotFrame};
 use crate::display_control::{DisplayControl, DisplayStatus, SelectConsoleRequest};
 use crate::hls::{HlsController, HlsEncoder, HlsError, HlsStatus};
 use crate::keyboard_layout::{
@@ -83,6 +83,7 @@ use crate::multi_hls::{
     MultiConsoleHls, MultiConsoleHlsStatus,
 };
 use crate::multi_webrtc::{MultiConsoleWebrtc, MultiConsoleWebrtcStatus};
+use crate::rpa::{key_events, modifier_bit, named_key_usage, OcrControl, OcrError};
 use crate::usb_uac2::{Uac2BridgeError, Uac2BridgeShared};
 use crate::video::{
     VideoParams, VideoStatus, VideoStreams, ALIAS as VIDEO_ALIAS, ROUTE as VIDEO_ROUTE,
@@ -3267,34 +3268,83 @@ impl ConnectionInfo {
     }
 }
 
-/// One controller-only surface and whether this node serves it.
+/// One controller-facing surface and whether this node serves it.
 ///
 /// The fields are serialized into `/api/v1/connection.controller_surfaces` so a
-/// controller can discover Python-node/agent-only surfaces without probing
-/// them. `path_prefix`, `code`, and `remediation` are internal stub details and
-/// are deliberately not part of the advertised document.
+/// controller can discover both implemented RPA primitives and Python-node/
+/// agent-only surfaces without probing them. Implemented entries have
+/// `supported:true`; unsupported entries are backed by a typed 501.
+/// `path_prefix`, `code`, and `remediation` are internal stub details and are
+/// deliberately not part of the advertised document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct ControllerSurface {
-    /// Controller-facing surface name, for example `/api/v1/rpa/*`.
+    /// Controller-facing surface name, for example `/api/v1/rpa/ocr`.
     pub surface: &'static str,
     /// Capability name used by the parity matrix and the typed error code.
     pub capability: &'static str,
-    /// Whether this node implements the surface. Always `false` for a stub.
+    /// Whether this node implements the surface.
     pub supported: bool,
-    /// Why the surface is absent, in operator terms.
+    /// Why the surface is implemented or absent, in operator terms.
     pub reason: &'static str,
     /// Python provider the controller used before the cutover.
     pub python_reference: &'static str,
     /// Request path prefix matched by the typed 501 handler.
     #[serde(skip)]
     pub path_prefix: &'static str,
-    /// Stable typed error code returned by the stub.
+    /// Stable typed error code returned by an unsupported stub.
     #[serde(skip)]
     pub code: &'static str,
-    /// Actionable remediation returned by the stub.
+    /// Actionable remediation returned by an unsupported stub.
     #[serde(skip)]
     pub remediation: &'static str,
 }
+
+/// RPA sub-surfaces this node now implements for real.
+///
+/// These are advertised alongside [`CONTROLLER_ONLY_SURFACES`] so a controller
+/// can tell an implemented primitive from a typed 501 without probing.
+pub const RPA_IMPLEMENTED_SURFACES: &[ControllerSurface] = &[
+    ControllerSurface {
+        surface: "/api/v1/rpa/type",
+        capability: "rpa.type",
+        supported: true,
+        reason: "Types text through the configured input sink using the selected guest keyboard layout.",
+        python_reference: "node/rpa.py::NodeRPA.type_text (node/node.py:402-405)",
+        path_prefix: "/api/v1/rpa/type",
+        code: "rpa.type",
+        remediation: "",
+    },
+    ControllerSurface {
+        surface: "/api/v1/rpa/key",
+        capability: "rpa.key",
+        supported: true,
+        reason: "Sends named keys, printable characters, and modifier combinations through the configured input sink.",
+        python_reference: "node/rpa.py::NodeRPA.key (node/node.py:394-397)",
+        path_prefix: "/api/v1/rpa/key",
+        code: "rpa.key",
+        remediation: "",
+    },
+    ControllerSurface {
+        surface: "/api/v1/rpa/screenshot",
+        capability: "rpa.screenshot",
+        supported: true,
+        reason: "Returns a real JPEG from the configured display capture source; ?console= selects an advertised console.",
+        python_reference: "node/rpa.py::NodeRPA.grab_frame (node/node.py:428-435)",
+        path_prefix: "/api/v1/rpa/screenshot",
+        code: "rpa.screenshot",
+        remediation: "",
+    },
+    ControllerSurface {
+        surface: "/api/v1/rpa/ocr",
+        capability: "rpa.ocr",
+        supported: true,
+        reason: "Runs the optional tesseract CLI on a captured frame; without tesseract the route returns 503 rpa.ocr-unavailable.",
+        python_reference: "node/rpa.py::NodeRPA.read_screen (node/node.py:382-393)",
+        path_prefix: "/api/v1/rpa/ocr",
+        code: "rpa.ocr",
+        remediation: "",
+    },
+];
 
 /// Controller-only surfaces that this node advertises as unsupported.
 ///
@@ -3307,12 +3357,12 @@ pub const CONTROLLER_ONLY_SURFACES: &[ControllerSurface] = &[
         surface: "/api/v1/rpa/*",
         capability: "rpa",
         supported: false,
-        reason: "This node has no RPA/OCR engine or script runner.",
+        reason: "This node has no RPA script runner, wait_for_text, bitmap screen OCR, click helper, or BIOS automation.",
         python_reference: "node/rpa.py (node/node.py:437-445)",
         path_prefix: "/api/v1/rpa",
         code: "rpa.unsupported",
-        remediation: "Keep the Python hardware node that owns the RPA/OCR engine, or use \
-                      /display/snapshot plus /input/* for manual control; this node does not \
+        remediation: "Use the implemented /api/v1/rpa/{type,key,screenshot,ocr} routes, or keep \
+                      the Python hardware node for script/BIOS automation; this node does not \
                       claim an RPA action ran.",
     },
     ControllerSurface {
@@ -3413,6 +3463,11 @@ pub struct ConnectionState {
     /// One-shot display snapshot control. `None` leaves `/display/snapshot`
     /// at a typed 503 rather than fabricating an image.
     pub snapshot: Option<SnapshotControl>,
+    /// Optional tesseract OCR control for `POST /api/v1/rpa/ocr`.
+    ///
+    /// The default resolves `tesseract` on `PATH`; without it the route keeps
+    /// the typed 503 `rpa.ocr-unavailable` result.
+    pub ocr: OcrControl,
     /// Bounded `/video` MJPEG stream accounting. Always present; the route
     /// itself reports a typed 503 when no snapshot control/source exists.
     pub video_streams: VideoStreams,
@@ -3444,6 +3499,10 @@ pub struct ConnectionState {
     /// listener stops being advertised instead of leaving a dead port in the
     /// registration document. External QEMU endpoints remain the fallback.
     pub vnc_registration: Option<VncRegistrationState>,
+    /// Desktop-profile geometry/clipboard/wallpaper controls. `None` on other
+    /// profiles keeps those routes at a typed 501; on `desktop` it is always
+    /// attached and reports tool absence through typed 503s.
+    pub desktop_controls: Option<crate::desktop_compat::DesktopControls>,
 }
 
 /// Registration view of the optional internal RFB listener.
@@ -3511,6 +3570,7 @@ impl ConnectionState {
             usb: None,
             webrtc: None,
             snapshot: None,
+            ocr: OcrControl::detect(),
             video_streams: VideoStreams::default(),
             metrics: crate::agent_metrics::AgentMetricsSampler::default(),
             hardware: None,
@@ -3522,6 +3582,7 @@ impl ConnectionState {
             multi_console_webrtc: None,
             capture: CaptureStatus::default(),
             vnc_registration: None,
+            desktop_controls: None,
         }
     }
 
@@ -3715,6 +3776,18 @@ impl ConnectionState {
         self
     }
 
+    /// Attach desktop-profile geometry, clipboard, and wallpaper controls.
+    ///
+    /// Only `--profile desktop` installs these. On other profiles the routes
+    /// stay at a typed 501 instead of probing the host seat.
+    pub fn with_desktop_controls(
+        mut self,
+        controls: Option<crate::desktop_compat::DesktopControls>,
+    ) -> Self {
+        self.desktop_controls = controls;
+        self
+    }
+
     /// Attach the one-shot display snapshot control.
     ///
     /// `None` keeps `GET /display/snapshot` at a typed 503; attaching an empty
@@ -3722,6 +3795,15 @@ impl ConnectionState {
     /// `GET /display/info` describe the node.
     pub fn with_snapshot(mut self, snapshot: Option<SnapshotControl>) -> Self {
         self.snapshot = snapshot;
+        self
+    }
+
+    /// Attach the optional tesseract control used by `/api/v1/rpa/ocr`.
+    ///
+    /// The default detects `tesseract` on `PATH`. Tests and nodes without OCR
+    /// can install [`OcrControl::unavailable`] to keep the typed 503 path.
+    pub fn with_ocr(mut self, ocr: OcrControl) -> Self {
+        self.ocr = ocr;
         self
     }
 
@@ -3812,13 +3894,17 @@ pub struct ConnectionResponse {
     /// Optional registration fields (seat, guest IP, VNC) plus typed entries for
     /// controller registration fields this node does not implement.
     pub registration: crate::registration::RegistrationExtras,
-    /// Controller-only surfaces this node does not implement.
+    /// Controller-facing surfaces with an explicit `supported` flag.
     ///
-    /// Each entry is a typed, discoverable advertisement (`supported:false`)
-    /// with the capability name, reason, and Python provider. The controller can
-    /// read this document instead of probing every proxy and guessing from a
-    /// 404 or timeout.
-    pub controller_surfaces: &'static [ControllerSurface],
+    /// Implemented RPA primitives (`supported:true`) are listed next to the
+    /// controller-only surfaces this node does not implement (`supported:false`,
+    /// with a typed 501). The controller can read this document instead of
+    /// probing every proxy and guessing from a 404 or timeout.
+    pub controller_surfaces: Vec<ControllerSurface>,
+    /// Desktop-profile geometry/clipboard/wallpaper availability. Omitted on
+    /// other profiles. Availability is a `PATH` lookup, not a probe command.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desktop_controls: Option<crate::desktop_compat::DesktopControlsStatus>,
 }
 
 /// Build the control compatibility router. Mount it before the node API auth
@@ -3836,11 +3922,13 @@ pub fn compat_router(state: ConnectionState) -> Router {
     connection_router(state.clone())
         .merge(power_router(state.clone()))
         .merge(input_router(state.clone()))
+        .merge(rpa_router(state.clone()))
         .merge(codec_router(state.clone()))
         .merge(webrtc_router(state.clone()))
         .merge(audio_router(state.clone()))
         .merge(usb_router(state.clone()))
         .merge(display_router(state.clone()))
+        .merge(crate::desktop_compat::router(state.clone()))
         .merge(legacy_router(state))
 }
 
@@ -3904,6 +3992,25 @@ pub fn input_router(state: ConnectionState) -> Router {
         .route("/input/key", post(input_key))
         .route("/input/mouse", post(input_mouse))
         .route("/input/type", post(input_type))
+        .with_state(state)
+}
+
+/// Controller RPA routes backed by the real node primitives.
+///
+/// Type/key use the same [`SharedSink`], keyboard layout, and hold timing as
+/// `/input/*`. Screenshot uses the configured capture source and console broker
+/// (the same path as `/display/snapshot`). OCR captures one frame and runs the
+/// optional tesseract CLI; it never synthesizes text. The remaining
+/// `/api/v1/rpa/*` sub-surfaces stay in [`legacy_router`] as typed 501s.
+pub fn rpa_router(state: ConnectionState) -> Router {
+    Router::new()
+        .route("/api/v1/rpa/type", post(rpa_type))
+        .route("/api/v1/rpa/key", post(rpa_key))
+        .route(
+            "/api/v1/rpa/screenshot",
+            get(rpa_screenshot).post(rpa_screenshot),
+        )
+        .route("/api/v1/rpa/ocr", post(rpa_ocr))
         .with_state(state)
 }
 
@@ -4145,7 +4252,15 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
         multi_console_webrtc,
         capture: state.capture.clone(),
         video,
-        controller_surfaces: CONTROLLER_ONLY_SURFACES,
+        controller_surfaces: RPA_IMPLEMENTED_SURFACES
+            .iter()
+            .chain(CONTROLLER_ONLY_SURFACES)
+            .copied()
+            .collect(),
+        desktop_controls: state
+            .desktop_controls
+            .as_ref()
+            .map(|controls| controls.status()),
     })
 }
 
@@ -4155,55 +4270,60 @@ struct DisplayConsoleQuery {
     console: Option<String>,
 }
 
-async fn display_snapshot(
-    State(state): State<ConnectionState>,
-    Query(query): Query<DisplayConsoleQuery>,
-) -> Response {
-    let Some(requested) = query.console.as_deref() else {
-        return default_snapshot(&state).await;
+/// Capture one frame through the active snapshot control or a console broker.
+///
+/// Shared by `/display/snapshot`, `/api/v1/rpa/screenshot`, and
+/// `/api/v1/rpa/ocr` so all three return the same real frame (and the same
+/// typed errors) for a given `?console=` selection. No frame is synthesized.
+async fn capture_display_frame(
+    state: &ConnectionState,
+    requested: Option<&str>,
+) -> Result<SnapshotFrame, SnapshotError> {
+    let Some(requested) = requested else {
+        return state
+            .snapshot
+            .as_ref()
+            .ok_or(SnapshotError::NotConfigured)?
+            .capture()
+            .await;
     };
 
-    let Some(control) = state.display_control.as_ref() else {
-        return snapshot_error_response(SnapshotError::ConsoleUnsupported);
-    };
-    let Some(broker) = state.console_broker.as_ref() else {
-        return snapshot_error_response(SnapshotError::ConsoleUnsupported);
-    };
+    let control = state
+        .display_control
+        .as_ref()
+        .ok_or(SnapshotError::ConsoleUnsupported)?;
+    let broker = state
+        .console_broker
+        .as_ref()
+        .ok_or(SnapshotError::ConsoleUnsupported)?;
     let selection = control.selection();
-    let console = match broker.resolve_console(Some(requested), &selection) {
-        Ok(console) => console,
-        Err(error) => return snapshot_error_response(error),
-    };
+    let console = broker.resolve_console(Some(requested), &selection)?;
 
     if console == selection.active_console {
         // Backward-compatible active path: the shared registry snapshot control
         // follows exactly the same console as HLS/WebRTC.
-        let Some(snapshot) = state.snapshot.as_ref() else {
-            return snapshot_error_response(SnapshotError::NotConfigured);
-        };
-        return match snapshot.capture().await {
-            Ok(snapshot) => jpeg_response(snapshot),
-            Err(error) => snapshot_error_response(error),
-        };
+        return state
+            .snapshot
+            .as_ref()
+            .ok_or(SnapshotError::NotConfigured)?
+            .capture()
+            .await;
     }
 
-    match broker.snapshot(console, &selection).await {
+    broker.snapshot(console, &selection).await
+}
+
+async fn display_snapshot(
+    State(state): State<ConnectionState>,
+    Query(query): Query<DisplayConsoleQuery>,
+) -> Response {
+    match capture_display_frame(&state, query.console.as_deref()).await {
         Ok(snapshot) => jpeg_response(snapshot),
         Err(error) => snapshot_error_response(error),
     }
 }
 
-async fn default_snapshot(state: &ConnectionState) -> Response {
-    let Some(control) = state.snapshot.as_ref() else {
-        return snapshot_error_response(SnapshotError::NotConfigured);
-    };
-    match control.capture().await {
-        Ok(snapshot) => jpeg_response(snapshot),
-        Err(error) => snapshot_error_response(error),
-    }
-}
-
-fn jpeg_response(snapshot: crate::display_compat::SnapshotFrame) -> Response {
+fn jpeg_response(snapshot: SnapshotFrame) -> Response {
     (
         [
             (header::CONTENT_TYPE, "image/jpeg"),
@@ -5577,6 +5697,35 @@ struct TypeRequest {
     text: String,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct RpaTypeRequest {
+    #[serde(default)]
+    text: String,
+    /// Optional per-character delay in seconds, as accepted by the Python node.
+    /// Bounded and clamped by the handler.
+    #[serde(default)]
+    delay: Option<f64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RpaKeyRequest {
+    /// Named key or one printable character.
+    #[serde(default)]
+    key: String,
+    /// USB HID boot-keyboard modifier bitmask, as used by the Python node.
+    #[serde(default)]
+    modifier: Option<i64>,
+    /// Modifier names (`ctrl`, `shift`, `alt`, `meta`, `altgr`, ...).
+    #[serde(default)]
+    modifiers: Vec<String>,
+    /// Controller hotkey form: modifier names followed by one final key.
+    #[serde(default)]
+    keys: Vec<String>,
+}
+
+/// Largest per-character delay accepted by `POST /api/v1/rpa/type`.
+const MAX_RPA_TYPE_DELAY: Duration = Duration::from_millis(100);
+
 /// A text-to-keystroke mapping failure.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TextMappingError {
@@ -5958,19 +6107,18 @@ async fn submit_key_chunk(sink: &SharedSink, chunk: &[InputEvent]) -> Result<usi
     Ok(chunk.len())
 }
 
-async fn input_type(
-    State(state): State<ConnectionState>,
-    payload: Result<Json<TypeRequest>, JsonRejection>,
-) -> Response {
-    let Json(request) = match payload {
-        Ok(payload) => payload,
-        Err(error) => return json_rejection(error),
-    };
-
-    // Validate the complete request against the configured layout before the
-    // sink is consulted, so a bad character never produces a partial keystroke
-    // sequence.
-    let chunks = match text_to_key_chunks(&request.text, state.keyboard_layout) {
+/// Validate, map, and type text through the shared sink.
+///
+/// Used by both `/input/type` and `/api/v1/rpa/type` so the RPA route is
+/// layout-aware in exactly the same way. The complete request is validated
+/// before the sink is consulted, so a bad character never produces a partial
+/// keystroke sequence.
+async fn type_text_through_sink(
+    state: &ConnectionState,
+    text: &str,
+    char_delay: Duration,
+) -> Result<usize, Response> {
+    let chunks = match text_to_key_chunks(text, state.keyboard_layout) {
         Ok(chunks) => chunks,
         Err(error) => {
             let (code, remediation) = match &error {
@@ -5993,19 +6141,16 @@ async fn input_type(
                     ),
                 ),
             };
-            return compat_error_with_remediation(
+            return Err(compat_error_with_remediation(
                 StatusCode::BAD_REQUEST,
                 code,
                 error.to_string(),
                 remediation,
-            );
+            ));
         }
     };
 
-    let sink = match require_input_sink(&state) {
-        Ok(sink) => sink,
-        Err(response) => return response,
-    };
+    let sink = require_input_sink(state)?;
 
     let mut submitted = 0usize;
     // `submit_report` is synchronous and releases the sink lock before it
@@ -6018,15 +6163,293 @@ async fn input_type(
                 // A failed chunk may have left a modifier or key logically down
                 // in the sink. Release everything before reporting the error.
                 release_held_input(&sink);
-                return response;
+                return Err(response);
             }
         }
-        if index + 1 < chunks.len() {
-            tokio::time::sleep(TYPE_CHAR_DELAY).await;
+        if index + 1 < chunks.len() && !char_delay.is_zero() {
+            tokio::time::sleep(char_delay).await;
         }
     }
 
-    Json(serde_json::json!({"ok": true, "events": submitted})).into_response()
+    Ok(submitted)
+}
+
+fn input_result_body(state: &ConnectionState) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "ok": true,
+        "sink": state.info.sink_kind,
+    });
+    if state.input_is_recording_only() {
+        body["injected"] = serde_json::Value::Bool(false);
+    }
+    body
+}
+
+async fn input_type(
+    State(state): State<ConnectionState>,
+    payload: Result<Json<TypeRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(error) => return json_rejection(error),
+    };
+
+    match type_text_through_sink(&state, &request.text, TYPE_CHAR_DELAY).await {
+        Ok(submitted) => Json(serde_json::json!({"ok": true, "events": submitted})).into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn rpa_type(
+    State(state): State<ConnectionState>,
+    payload: Result<Json<RpaTypeRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(error) => return json_rejection(error),
+    };
+
+    let delay = match request.delay {
+        None => TYPE_CHAR_DELAY,
+        Some(seconds) if seconds.is_finite() && seconds >= 0.0 => {
+            Duration::from_secs_f64(seconds.min(MAX_RPA_TYPE_DELAY.as_secs_f64()))
+        }
+        Some(seconds) => {
+            return compat_error(
+                StatusCode::BAD_REQUEST,
+                "invalid-delay",
+                format!("delay {seconds} must be a finite, non-negative number of seconds"),
+            );
+        }
+    };
+
+    match type_text_through_sink(&state, &request.text, delay).await {
+        Ok(submitted) => {
+            let mut body = input_result_body(&state);
+            body["events"] = serde_json::json!(submitted);
+            Json(body).into_response()
+        }
+        Err(response) => response,
+    }
+}
+
+/// Resolve an RPA key request to one HID usage plus modifier bits.
+fn resolve_rpa_key(state: &ConnectionState, request: &RpaKeyRequest) -> Result<(u8, u8), Response> {
+    let mut bits = 0u8;
+    if let Some(modifier) = request.modifier {
+        if !(0..=i64::from(u8::MAX)).contains(&modifier) {
+            return Err(compat_error(
+                StatusCode::BAD_REQUEST,
+                "invalid-modifier",
+                format!("modifier {modifier} is outside the USB HID boot-keyboard byte range"),
+            ));
+        }
+        bits |= modifier as u8;
+    }
+    for name in &request.modifiers {
+        let Some(bit) = modifier_bit(name) else {
+            return Err(compat_error(
+                StatusCode::BAD_REQUEST,
+                "unknown-modifier",
+                format!("unknown modifier {name:?}; use ctrl, shift, alt, meta/gui, or altgr"),
+            ));
+        };
+        bits |= bit;
+    }
+
+    let key_name = if request.keys.is_empty() {
+        if request.key.is_empty() {
+            return Err(compat_error(
+                StatusCode::BAD_REQUEST,
+                "invalid-key",
+                "missing `key` (name such as enter/f1 or one printable character)",
+            ));
+        }
+        request.key.as_str()
+    } else {
+        let mut final_key: Option<&str> = None;
+        for name in &request.keys {
+            if let Some(bit) = modifier_bit(name) {
+                bits |= bit;
+            } else if final_key.is_some() {
+                return Err(compat_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid-combo",
+                    "a key combo must contain modifiers and exactly one non-modifier key",
+                ));
+            } else {
+                final_key = Some(name.as_str());
+            }
+        }
+        match final_key {
+            Some(key) => key,
+            None => {
+                return Err(compat_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid-combo",
+                    "a key combo must contain one non-modifier key",
+                ));
+            }
+        }
+    };
+
+    if let Some(usage) = named_key_usage(key_name) {
+        return Ok((usage, bits));
+    }
+
+    let mut characters = key_name.chars();
+    match (characters.next(), characters.next()) {
+        (Some(character), None) => match state.keyboard_layout.chord(character) {
+            CharOutcome::Direct(chord) => {
+                // A layout shift/AltGr requirement is additive to any requested
+                // modifiers, but never duplicates an already-selected side.
+                if chord.shift && bits & (0x02 | 0x20) == 0 {
+                    bits |= 0x02;
+                }
+                if chord.altgr && bits & 0x40 == 0 {
+                    bits |= 0x40;
+                }
+                Ok((chord.usage, bits))
+            }
+            CharOutcome::DeadKey => Err(compat_error_with_remediation(
+                StatusCode::BAD_REQUEST,
+                "dead-key-required",
+                format!(
+                    "dead key {character:?} cannot be sent alone on keyboard layout `{}`",
+                    state.keyboard_layout
+                ),
+                Some(
+                    "Send the dead key followed by a composable base character through \
+                     /api/v1/rpa/type, or use /api/v1/rpa/key with a named key.",
+                ),
+            )),
+            CharOutcome::Unsupported => Err(compat_error(
+                StatusCode::BAD_REQUEST,
+                "unsupported-character",
+                format!(
+                    "keyboard layout `{}` has no direct key for {character:?}",
+                    state.keyboard_layout
+                ),
+            )),
+        },
+        _ => Err(compat_error(
+            StatusCode::BAD_REQUEST,
+            "unknown-key",
+            format!(
+                "unknown key {key_name:?}; use a named key (enter, esc, f1, up, ...) or one printable character"
+            ),
+        )),
+    }
+}
+
+async fn rpa_key(
+    State(state): State<ConnectionState>,
+    payload: Result<Json<RpaKeyRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(error) => return json_rejection(error),
+    };
+
+    let (usage, modifiers) = match resolve_rpa_key(&state, &request) {
+        Ok(resolved) => resolved,
+        Err(response) => return response,
+    };
+    let events = key_events(usage, modifiers);
+    let sink = match require_input_sink(&state) {
+        Ok(sink) => sink,
+        Err(response) => return response,
+    };
+
+    match submit_key_chunk(&sink, &events).await {
+        Ok(submitted) => {
+            let mut body = input_result_body(&state);
+            body["events"] = serde_json::json!(submitted);
+            Json(body).into_response()
+        }
+        Err(response) => {
+            release_held_input(&sink);
+            response
+        }
+    }
+}
+
+async fn rpa_screenshot(
+    State(state): State<ConnectionState>,
+    Query(query): Query<DisplayConsoleQuery>,
+) -> Response {
+    match capture_display_frame(&state, query.console.as_deref()).await {
+        Ok(frame) => jpeg_response(frame),
+        Err(error) => snapshot_error_response(error),
+    }
+}
+
+async fn rpa_ocr(
+    State(state): State<ConnectionState>,
+    Query(query): Query<DisplayConsoleQuery>,
+) -> Response {
+    if !state.ocr.is_available() {
+        return ocr_error_response(OcrError::Unavailable);
+    }
+
+    let frame = match capture_display_frame(&state, query.console.as_deref()).await {
+        Ok(frame) => frame,
+        Err(error) => return snapshot_error_response(error),
+    };
+    let text = match state
+        .ocr
+        .recognise(&frame.jpeg, frame.format.width, frame.format.height)
+        .await
+    {
+        Ok(text) => text,
+        Err(error) => return ocr_error_response(error),
+    };
+
+    Json(serde_json::json!({
+        "ok": true,
+        "available": true,
+        "engine": "tesseract",
+        "text": text.clone(),
+        "full_text": text,
+        "width": frame.format.width,
+        "height": frame.format.height,
+        "source_id": frame.source_id,
+        "source_name": frame.source_name,
+        "text_regions": [],
+    }))
+    .into_response()
+}
+
+fn ocr_error_response(error: OcrError) -> Response {
+    match &error {
+        OcrError::Unavailable => compat_error_with_remediation(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "rpa.ocr-unavailable",
+            "tesseract is not installed or not on PATH",
+            Some(
+                "Install the tesseract-ocr package (or expose a tesseract binary on PATH) and \
+                 retry. No OCR text is invented when the engine is absent.",
+            ),
+        ),
+        OcrError::FrameTooLarge { .. } | OcrError::FrameTooManyPixels { .. } => compat_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "rpa.ocr-frame-too-large",
+            error.to_string(),
+        ),
+        OcrError::Timeout { .. } => compat_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "rpa.ocr-timeout",
+            error.to_string(),
+        ),
+        OcrError::OutputTooLarge { .. } => compat_error(
+            StatusCode::BAD_GATEWAY,
+            "rpa.ocr-output-too-large",
+            error.to_string(),
+        ),
+        OcrError::Spawn(_) | OcrError::Io(_) | OcrError::Failed { .. } => {
+            compat_error(StatusCode::BAD_GATEWAY, "rpa.ocr-failed", error.to_string())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -8888,7 +9311,8 @@ mod tests {
             ("/session/init", "POST", "session.init_unsupported"),
             ("/serial/buffer?lines=50", "GET", "serial.unsupported"),
             ("/api/v1/rpa/screen", "GET", "rpa.unsupported"),
-            ("/api/v1/rpa/key", "POST", "rpa.unsupported"),
+            ("/api/v1/rpa/script", "POST", "rpa.unsupported"),
+            ("/api/v1/rpa/enter_bios", "POST", "rpa.unsupported"),
             ("/backup/snapshots", "GET", "backup.unsupported"),
             ("/backup/run", "POST", "backup.unsupported"),
         ] {
@@ -8933,7 +9357,13 @@ mod tests {
         let advertised = connection["controller_surfaces"]
             .as_array()
             .expect("controller_surfaces must be an array");
-        let expected = [
+        let implemented = [
+            ("/api/v1/rpa/type", "rpa.type"),
+            ("/api/v1/rpa/key", "rpa.key"),
+            ("/api/v1/rpa/screenshot", "rpa.screenshot"),
+            ("/api/v1/rpa/ocr", "rpa.ocr"),
+        ];
+        let unsupported = [
             ("/api/v1/rpa/*", "rpa"),
             ("/backup/*", "backup"),
             ("/ui/windows", "ui_windows"),
@@ -8941,8 +9371,21 @@ mod tests {
             ("/rgb/*", "rgb"),
             ("/current", "current"),
         ];
-        assert_eq!(advertised.len(), expected.len());
-        for (surface, capability) in expected {
+        assert_eq!(advertised.len(), implemented.len() + unsupported.len());
+        for (surface, capability) in implemented {
+            let entry = advertised
+                .iter()
+                .find(|entry| entry["capability"] == capability)
+                .unwrap_or_else(|| panic!("missing advertised capability {capability}"));
+            assert_eq!(entry["surface"], surface);
+            assert_eq!(entry["supported"], true);
+            assert!(entry["reason"].is_string());
+            let reference = entry["python_reference"]
+                .as_str()
+                .expect("python_reference is a string");
+            assert!(reference.contains("node/") || reference.contains("agent/"));
+        }
+        for (surface, capability) in unsupported {
             let entry = advertised
                 .iter()
                 .find(|entry| entry["capability"] == capability)
@@ -8959,8 +9402,11 @@ mod tests {
         let app = compat_router(state.clone()).merge(public_router(state));
         for (uri, method, capability) in [
             ("/api/v1/rpa/screen", "GET", "rpa"),
-            ("/api/v1/rpa/screenshot", "GET", "rpa"),
-            ("/api/v1/rpa/key", "POST", "rpa"),
+            ("/api/v1/rpa/script", "POST", "rpa"),
+            ("/api/v1/rpa/enter_bios", "POST", "rpa"),
+            ("/api/v1/rpa/set_boot_usb", "POST", "rpa"),
+            ("/api/v1/rpa/wait_for_text", "POST", "rpa"),
+            ("/api/v1/rpa/click", "POST", "rpa"),
             ("/backup/snapshots", "GET", "backup"),
             ("/backup/restore", "POST", "backup"),
             ("/ui/windows", "GET", "ui_windows"),
@@ -8989,6 +9435,271 @@ mod tests {
             assert!(body["reason"].is_string(), "{uri}");
             assert!(body["python_reference"].is_string(), "{uri}");
         }
+    }
+
+    #[tokio::test]
+    async fn rpa_type_route_dispatches_layout_aware_events_through_the_sink() {
+        let (state, recording) = input_state(SINK_FAKE_RECORDING);
+        let app = rpa_router(state);
+
+        let (status, body) =
+            post_json(&app, "/api/v1/rpa/type", serde_json::json!({"text": "Hi!"})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["events"], 10);
+        assert_eq!(body["sink"], SINK_FAKE_RECORDING);
+        assert_eq!(body["injected"], false);
+        assert_eq!(
+            recording.take_events(),
+            vec![
+                key(0xE1, true),
+                key(0x0B, true),
+                key(0x0B, false),
+                key(0xE1, false),
+                key(0x0C, true),
+                key(0x0C, false),
+                key(0xE1, true),
+                key(0x1E, true),
+                key(0x1E, false),
+                key(0xE1, false),
+            ]
+        );
+        assert!(recording.held().is_empty(), "every key must be released");
+
+        let no_sink = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        );
+        let (status, body) = post_json(
+            &rpa_router(no_sink),
+            "/api/v1/rpa/type",
+            serde_json::json!({"text": "a"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["code"], "input-unavailable");
+    }
+
+    #[tokio::test]
+    async fn rpa_key_route_supports_named_keys_characters_and_combos() {
+        let (state, recording) = input_state(SINK_FAKE_RECORDING);
+        let app = rpa_router(state);
+
+        let (status, body) =
+            post_json(&app, "/api/v1/rpa/key", serde_json::json!({"key": "enter"})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["events"], 2);
+        assert_eq!(body["injected"], false);
+        assert_eq!(
+            recording.take_events(),
+            vec![key(0x28, true), key(0x28, false)]
+        );
+
+        // Controller hotkey form: modifiers followed by one final key.
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/rpa/key",
+            serde_json::json!({"keys": ["ctrl", "c"]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["events"], 4);
+        assert_eq!(
+            recording.take_events(),
+            vec![
+                key(0xE0, true),
+                key(0x06, true),
+                key(0x06, false),
+                key(0xE0, false),
+            ]
+        );
+
+        // A printable character is resolved through the selected layout.
+        let (status, body) =
+            post_json(&app, "/api/v1/rpa/key", serde_json::json!({"key": "?"})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["events"], 4);
+        assert_eq!(
+            recording.take_events(),
+            vec![
+                key(0xE1, true),
+                key(0x38, true),
+                key(0x38, false),
+                key(0xE1, false),
+            ]
+        );
+
+        // The Python node's integer modifier bitmask is also accepted.
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/rpa/key",
+            serde_json::json!({"key": "c", "modifier": 2}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["events"], 4);
+        assert_eq!(
+            recording.take_events(),
+            vec![
+                key(0xE1, true),
+                key(0x06, true),
+                key(0x06, false),
+                key(0xE1, false),
+            ]
+        );
+
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/rpa/key",
+            serde_json::json!({"key": "not-a-key"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "unknown-key");
+        assert!(recording.events().is_empty());
+
+        let no_sink = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        );
+        let (status, body) = post_json(
+            &rpa_router(no_sink),
+            "/api/v1/rpa/key",
+            serde_json::json!({"key": "enter"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "input-unavailable");
+    }
+
+    #[tokio::test]
+    async fn rpa_screenshot_returns_real_jpeg_and_honours_console_selection() {
+        let app = rpa_router(video_console_state());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/rpa/screenshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/jpeg");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..2], &[0xFF, 0xD8], "must be a real JPEG");
+        assert_eq!(jpeg_size(&bytes), (32, 24));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/rpa/screenshot?console=Console_1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/jpeg");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(jpeg_size(&bytes), (64, 48));
+
+        // No configured source stays a typed error, never a fabricated image.
+        let no_source = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        );
+        let (status, body) = get_json(&rpa_router(no_source), "/api/v1/rpa/screenshot").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["code"], "capture.unavailable");
+    }
+
+    #[tokio::test]
+    async fn rpa_ocr_without_tesseract_is_a_typed_503() {
+        let state = video_state(None).with_ocr(OcrControl::unavailable());
+        let (status, body) =
+            post_json(&rpa_router(state), "/api/v1/rpa/ocr", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["code"], "rpa.ocr-unavailable");
+        assert!(body["error"].as_str().unwrap().contains("tesseract"));
+        assert!(body["remediation"].is_string());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rpa_ocr_returns_exactly_the_engine_text() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("fake-tesseract");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\ncat >/dev/null\nprintf 'HELLO 123\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let state = video_state(None).with_ocr(OcrControl::with_program(program));
+        let (status, body) =
+            post_json(&rpa_router(state), "/api/v1/rpa/ocr", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["available"], true);
+        assert_eq!(body["engine"], "tesseract");
+        assert_eq!(body["text"], "HELLO 123");
+        assert_eq!(body["full_text"], "HELLO 123");
+        assert_eq!(body["width"], 320);
+        assert_eq!(body["height"], 240);
+        assert_eq!(body["source_id"], "fake0");
+        assert_eq!(body["text_regions"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn rpa_ocr_runs_installed_tesseract_over_a_real_frame() {
+        let state = video_state(None);
+        if !state.ocr.is_available() {
+            eprintln!("skipping: tesseract is not installed");
+            return;
+        }
+
+        let (status, body) =
+            post_json(&rpa_router(state), "/api/v1/rpa/ocr", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["engine"], "tesseract");
+        assert!(body["text"].is_string());
+        assert_eq!(body["width"], 320);
+        assert_eq!(body["height"], 240);
     }
 
     #[tokio::test]
@@ -12554,12 +13265,46 @@ mod tests {
             ("POST", "/usb/nbd/start", Some(serde_json::json!({}))),
             ("POST", "/usb/nbd/stop", Some(serde_json::json!({}))),
             ("GET", "/api/v1/rpa/screen", None),
-            ("POST", "/api/v1/rpa/key", Some(serde_json::json!({}))),
+            (
+                "POST",
+                "/api/v1/rpa/type",
+                Some(serde_json::json!({"text": "hi"})),
+            ),
+            (
+                "POST",
+                "/api/v1/rpa/key",
+                Some(serde_json::json!({"key": "enter"})),
+            ),
+            ("GET", "/api/v1/rpa/screenshot", None),
+            ("POST", "/api/v1/rpa/ocr", Some(serde_json::json!({}))),
+            (
+                "POST",
+                "/api/v1/rpa/script",
+                Some(serde_json::json!({"script": "key enter"})),
+            ),
             ("GET", "/backup/snapshots", None),
             ("POST", "/backup/run", Some(serde_json::json!({}))),
             ("GET", "/rgb/state", None),
             ("GET", "/current", None),
             ("GET", "/serial/state", None),
+            ("GET", "/display/geometry", None),
+            (
+                "POST",
+                "/display/geometry",
+                Some(serde_json::json!({"output": "DP-1", "mode": "1280x720"})),
+            ),
+            ("GET", "/clipboard", None),
+            (
+                "POST",
+                "/clipboard",
+                Some(serde_json::json!({"text": "hi"})),
+            ),
+            ("GET", "/wallpaper", None),
+            (
+                "POST",
+                "/wallpaper",
+                Some(serde_json::json!({"path": "/tmp/a.png"})),
+            ),
         ] {
             let builder = Request::builder().method(method).uri(uri);
             let request = match body {
@@ -12593,6 +13338,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+
+        // The desktop routes are behind the same guard; an authorized request
+        // on a non-desktop state reaches the typed profile error.
+        let response = app
+            .clone()
+            .oneshot(authorized("GET", "/display/geometry"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
 
         let response = app
             .clone()

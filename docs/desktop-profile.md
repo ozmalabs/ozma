@@ -2,10 +2,11 @@
 
 Status: **real runtime for PipeWire, X11 (`x11grab`), and XDG Portal
 ScreenCast desktop capture selection, uinput/QMP/HID input, PipeWire audio
-target selection, snapshots/status, and the controller-compatible `/audio/*`
-surface. `--capture-provider x11` now registers the real `X11CaptureProvider`
-with an explicit `--x11-display`; `--capture-provider portal` runs the bounded
-portal consent/selection handshake in `ozma-node` before capture starts. A
+target selection, snapshots/status, display geometry/clipboard/wallpaper
+controls, and the controller-compatible `/audio/*` surface. `--capture-provider
+x11` now registers the real `X11CaptureProvider` with an explicit
+`--x11-display`; `--capture-provider portal` runs the bounded portal
+consent/selection handshake in `ozma-node` before capture starts. A
 denied/timed-out portal, a missing portal service, or a missing X display is a
 warned no-capture state, never a fake source. The remaining portal limits are
 the PipeWire fd handoff (the backend has no fd-connect API; compositors that
@@ -238,6 +239,38 @@ capture.
 - `GET /audio/nodes` remains a typed 501: this node does not enumerate the
   PipeWire graph. `POST /audio/sweep` (room correction) is not implemented.
 
+## Desktop controls (geometry, clipboard, wallpaper)
+
+These routes close the `ozma_agent.py` desktop items. They use real X11 tools
+through an injectable runner; missing tools or an unreachable display are typed
+503s, never success-shaped no-ops.
+
+- `GET /display/geometry` parses `xrandr --display <D> --query` into the rich
+  output list plus the Python agent's `screens` shape. `POST /display/geometry`
+  validates one output's mode/position/rotation against the advertised modes,
+  applies one exact argv, re-queries to verify, and rolls back to the previous
+  mode on failure. Reports `applied` only after the read-back matches.
+- `GET/POST /clipboard` read/write UTF-8 text through `xclip` or `xsel`, capped
+  at 64 KiB. Non-UTF-8/NUL content is a typed 400 and oversize is 413. A write
+  succeeds only when the tool exits zero.
+- `GET/POST /wallpaper` accepts a local regular image (PNG/JPEG/WebP/BMP/GIF,
+  at most 64 MiB) and applies it with `feh`, `xwallpaper`, or `swaybg`. URLs are
+  rejected; there is no download path. `GET` reports the last path this node
+  applied (`verified:false`) because those tools have no read-back command.
+- `GET /api/v1/connection.desktop_controls` advertises geometry/clipboard/
+  wallpaper availability by looking up tools in `PATH`; it never runs them. The
+  display is `--x11-display`, then ambient `DISPLAY`; wallpaper can also use
+  `WAYLAND_DISPLAY` with `swaybg`. Other profiles answer typed
+  `desktop.not_enabled` 501.
+- The X11 display is explicit or ambient for these controls. Unlike capture,
+  the node never scans X servers. A Wayland-only seat without XWayland gets a
+  typed 503 for clipboard/geometry.
+- All six routes are mounted in `compat_router`, behind the same bearer guard as
+  `/input/*`, `/power/*`, `/audio/*`, `/usb/*`, and `/display/select`.
+
+See [`phase4-desktop-compat-report.md`](phase4-desktop-compat-report.md) for the
+argv, rollback, validation, and live-Xvfb evidence.
+
 ## Routes
 
 | Route | Behavior |
@@ -247,13 +280,18 @@ capture.
 | `GET /snapshot`, `/display/snapshot` | One JPEG frame from the first capture source (503 with a typed reason if none/unsupported). |
 | `GET /display/info` | Source id/name/geometry and last snapshot error. |
 | `POST /display/select` | Select an advertised VM `Console_N` at runtime (D-Bus). Typed 409 for QMP/VNC/Looking Glass, 501 without a selector, 502 on a failed restart with rollback. Bearer-guarded. |
+| `GET/POST /display/geometry` | Query or set one X11 output's mode/position/rotation through `xrandr`; typed 503 without a display/tool, 400 for an unadvertised mode, 502 on apply/verification failure with rollback. Bearer-guarded. |
+| `GET/POST /clipboard` | Read/write bounded UTF-8 text through `xclip`/`xsel`; typed 503 if absent, 413/400 for oversize/binary text, 502 on tool failure. Bearer-guarded. |
+| `GET/POST /wallpaper` | Report the last applied path or set a validated local image through `feh`/`xwallpaper`/`swaybg`; URLs rejected, typed 503 without a tool/session. Bearer-guarded. |
 | `GET /api/v1/connection` | Profile, ports, input sink/injection, power, codec, HLS, WebRTC, audio state, live `display_outputs`/`display_capture`, and the actual capture provider/kind/source. |
 | `GET /api/v1/capabilities` | Real capture/encode/input/display capability document. |
 | `GET/POST /audio/*` | Typed 501 without a router; real router calls with `--audio-router`. |
 
-`/snapshot`, `/status`, `/health`, `/display/*`, `/agent/metrics`, `/ui/hints`,
-and `/audio/nodes|sweep` are mounted read-only outside the bearer guard for the
-unmodified controller. Mutating routes stay guarded when `--api-token` is set.
+`/snapshot`, `/status`, `/health`, `/display/snapshot`, `/display/info`,
+`/agent/metrics`, `/ui/hints`, and `/audio/nodes|sweep` are mounted read-only
+outside the bearer guard for the unmodified controller. The desktop controls
+(`/display/geometry`, `/clipboard`, `/wallpaper`) and every other mutating route
+stay guarded when `--api-token` is set.
 
 ## Capability honesty
 
@@ -272,11 +310,15 @@ unmodified controller. Mutating routes stay guarded when `--api-token` is set.
 - Registration `capture_device` is filled with the first discovered source id
   when `--capture-device` was not set explicitly.
 - `machine_class` defaults to `workstation`; an explicit `--machine-class` wins.
+- `desktop_controls` is a `PATH` lookup plus the resolved display, not a probe
+  command. It reports `available:false` with a reason when a tool or session is
+  absent; it never claims a geometry/clipboard/wallpaper change happened.
 
 ## Verification
 
 ```bash
 cargo test -p ozma-node --lib desktop
+cargo test -p ozma-node --lib desktop_compat
 cargo test -p ozma-node --lib portal_tests
 cargo test -p ozma-node --bin ozma-node desktop_x11
 cargo test -p ozma-node --test desktop_profile
@@ -284,6 +326,11 @@ cargo test -p ozma-node -p ozma-capture -p ozma-input
 cargo test -p ozma-capture x11::
 cargo test -p ozma-capture portal::
 ```
+
+`OZMA_DESKTOP_LIVE=1 cargo test -p ozma-node --lib
+live_xvfb_geometry_query_and_idempotent_set -- --ignored` starts a throwaway
+`Xvfb`, queries geometry, and performs an idempotent set on that private
+display; it never attaches to the operator's desktop.
 
 `tests/desktop_profile.rs` starts the real binary with fake capture and a
 recording input sink, so it needs no PipeWire, `/dev/uinput`, X11, portal, or
@@ -297,6 +344,9 @@ scripted transport for denial/timeout/missing-service fallback and a fake
 ## Remaining parity before deleting `ozma-agent`
 
 See [`ozma-agent/README.md`](../ozma-agent/README.md) for the maintained list.
+Display geometry, clipboard, and local wallpaper are now covered by
+[`phase4-desktop-compat-report.md`](phase4-desktop-compat-report.md) (with the
+remaining Wayland clipboard/read-back limits documented there).
 Short version: PipeWire fd-connect for portal-only compositors, portal
 restore-token persistence, desktop sink creation, `/audio/nodes` enumeration,
 `POST /audio/sweep`, multiseat node/controller integration (the
