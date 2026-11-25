@@ -26,6 +26,15 @@ pub enum MeshError {
     #[error("mDNS error: {0}")]
     Mdns(String),
 
+    #[error("invalid mesh peer advertisement: {0}")]
+    DiscoveryInvalid(String),
+
+    #[error("unauthorized mesh peer advertisement: {0}")]
+    DiscoveryUnauthorized(String),
+
+    #[error("mesh peer discovery conflict: {0}")]
+    DiscoveryConflict(String),
+
     #[error("Mesh dataplane error: {0}")]
     Dataplane(String),
 

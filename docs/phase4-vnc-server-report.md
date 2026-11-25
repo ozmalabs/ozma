@@ -3,23 +3,23 @@
 Status: implemented and tested in `ozma-node`. The node can serve its own
 opt-in RFB 3.8 endpoint for the controller's VNC consumers instead of only
 registering an external QEMU VNC endpoint. Standard RFB VNC password
-authentication (security type 2) is now available. The server now offers
-**ZRLE** (encoding 16) when the client advertises it, keeping **Raw** as the
-always-valid fallback, and answers the **Cursor** pseudo-encoding with a
-typed empty cursor. **The transport is still plain TCP: VNC authentication is
-not encryption and there is no TLS, and ZRLE is compression, not
-encryption.** No commit was made.
+authentication (security type 2) is now available. The server offers **ZRLE**
+(encoding 16), **Hextile** (5), and **ZLib** (6) when the client advertises
+them, keeping **Raw** as the always-valid fallback, and answers the **Cursor**
+pseudo-encoding with a typed empty cursor. **The transport is still plain TCP:
+VNC authentication is not encryption and there is no TLS. ZRLE and ZLib are
+compression, not encryption.** No commit was made.
 
 ## Scope
 
 Added:
 
 - `ozma-node/src/vnc_server.rs` — a bound RFB listener, handshake, optional
-  RFB security type 2 (DES challenge/response), Raw and ZRLE framebuffer
-  encoders, Cursor pseudo-encoding, client-message parser, input adapter, and
-  per-listener counters.
-- `ozma-node/Cargo.toml` — the `flate2` dependency for the per-client ZRLE
-  zlib stream (already present in `Cargo.lock` through the image stack).
+  RFB security type 2 (DES challenge/response), Raw, Hextile, ZLib, and ZRLE
+  framebuffer encoders, Cursor pseudo-encoding, client-message parser, input
+  adapter, and per-listener counters.
+- `ozma-node/Cargo.toml` — the `flate2` dependency for the per-client ZRLE and
+  ZLib zlib streams (already present in `Cargo.lock` through the image stack).
 - `ozma-node/src/main.rs` — `--vnc-server`, `--vnc-bind`,
   `--vnc-server-port`, `--vnc-password-file`, `--vnc-allow-unauthenticated`,
   `--vnc-max-clients`, and `--vnc-idle-timeout-seconds`, startup/shutdown
@@ -32,8 +32,8 @@ Added:
 - `ozma-node/src/platform.rs` — test-config field updates.
 - This report.
 
-No changes were made to the Rust/WebRTC/USB/multiseat paths, the controller, or
-the Python node.
+No changes were made to the WebRTC/USB/multiseat paths, the controller, or the
+Python node.
 
 The VNC rows in `docs/parity-matrix.md`,
 `docs/phase4-registration-parity.md`, and `docs/phase4-cutover-audit.md` were
@@ -127,7 +127,7 @@ The server advertises **RFB 003.008** and accepts clients that negotiate 3.3,
 | Type | Message | Behavior |
 |---|---|---|
 | `0` | `SetPixelFormat` | Accepts 32-bit true-colour with 8 bits per channel and either RGB (r16/g8/b0) or BGR (r0/g8/b16) shifts, little- or big-endian. Any other format closes the connection; RFB has no per-message error, and continuing would send pixels in a format the client did not request. |
-| `2` | `SetEncodings` | Parsed with a 1024-entry bound. The first supported entry wins: ZRLE (16) or Raw (0), in the client's stated preference order. The Cursor pseudo-encoding (-239) is remembered. Unsupported entries (Hextile, Tight, ZLib, ...) are ignored, and an empty or all-unsupported list falls back to Raw. |
+| `2` | `SetEncodings` | Parsed with a 1024-entry bound. Every supported entry is kept in the client's stated order: Raw (0), Hextile (5), ZLib (6), and ZRLE (16). The first usable entry is used; if it fails during encoding only that encoding is disabled and the next listed encoding (or Raw) is used. Unsupported entries (Tight, JPEG, H.264, ...) are ignored, and an empty or all-unsupported list falls back to Raw. The Cursor pseudo-encoding (-239) is remembered. |
 | `3` | `FramebufferUpdateRequest` | Full (`incremental=0`) or incremental (`incremental=1`), with bounded rectangle clipping. Multiple pending requests are merged into at most eight rectangles. |
 | `4` | `KeyEvent` | Keysym → USB HID usage, forwarded to the shared `InputSink`. Unknown keysyms are counted and dropped rather than guessed. |
 | `5` | `PointerEvent` | Absolute pointer position (scaled to the sink's 0..=32767 report space) plus button/wheel transitions. |
@@ -137,7 +137,8 @@ The server advertises **RFB 003.008** and accepts clients that negotiate 3.3,
 ### Framebuffer updates
 
 - Each update is `FramebufferUpdate` + one or more rectangles. Rectangles use
-  Raw (0) or ZRLE (16) according to the client's `SetEncodings` preference.
+  Raw (0), Hextile (5), ZLib (6), or ZRLE (16) according to the client's
+  `SetEncodings` preference order.
 - Raw rectangles carry 32-bit pixels in the client's negotiated channel order.
   RGB24 and BGRA capture sources are encoded directly; no color conversion
   library or fake intermediate format is used.
@@ -148,11 +149,65 @@ The server advertises **RFB 003.008** and accepts clients that negotiate 3.3,
 - `ClientCutText` and unsupported encodings do not desynchronise the message
   stream.
 
+### Encoding preference and fallback
+
+- The client's `SetEncodings` order decides between all supported encodings.
+  Duplicates are collapsed and unsupported entries are ignored; the first
+  advertised encoding that has not failed is used. With no advertised
+  supported encoding, Raw is used.
+- If an encoder returns an error, that rectangle and the rest of the update
+  fall back to Raw, and only that encoding is disabled for the rest of the
+  connection. If the client advertised another supported encoding, later
+  updates use it; otherwise they stay on Raw.
+- ZRLE and ZLib keep **separate** per-client zlib streams. A ZRLE failure does
+  not reset or disable ZLib, and switching between them never mixes stream
+  state.
+- Raw is always legal in RFB, so a client that advertised only a compressed
+  encoding still receives a valid Raw rectangle when compression fails.
+
+### Hextile
+
+Hextile (5) is used only when the client lists it before the other usable
+encodings. It uses the RFC 6143 layout:
+
+- 16x16 tiles, left-to-right and top-to-bottom, with smaller edge tiles when
+  the rectangle is not a multiple of 16.
+- The encoder chooses the smaller of a Raw tile and a
+  background/foreground-plus-subrect tile. A solid tile that already matches
+  the current background is one zero subencoding byte; a new solid colour is a
+  BackgroundColour subencoding.
+- The background is the most frequent tile colour, keeping the previous
+  background on a tie. Remaining pixels become maximal same-colour rectangles
+  (up to 16x16 pixels). All subrects share the ForegroundColour subencoding
+  when they have one colour, otherwise every subrect uses the SubrectsColoured
+  form with its own PIXEL.
+- Background and foreground colours persist across tiles in one rectangle,
+  and are explicitly specified until the client has learned them. They are
+  reset at the start of every rectangle; a Raw tile does not change them.
+- Subrect coordinates are tile-relative; width and height are encoded as
+  `value - 1` in the high/low nibbles. Subrects never cross their tile.
+- PIXEL is four bytes for the accepted 32-bit true-colour formats; RGB and BGR
+  channel order, little- and big-endian are all honoured. Hextile does not use
+  ZRLE's three-byte CPIXEL.
+
+### ZLib
+
+ZLib (6) is used only when the client lists it before the other usable
+encodings.
+
+- One zlib stream per client, separate from the ZRLE stream, continued across
+  rectangles and updates. Each rectangle starts with the 4-byte compressed
+  length and is sync-flushed after the rectangle.
+- The uncompressed rectangle payload is exactly the Raw encoding's pixels in
+  the client's negotiated format and channel order.
+- A single rectangle's compressed payload is bounded by `MAX_ZLIB_RECT_BYTES`
+  (64 MiB frame + 8 MiB headroom). An encode error disables ZLib for the rest
+  of the connection and falls back to Raw for that update.
+
 ### ZRLE
 
-ZRLE is used only when the client listed encoding 16 before Raw (the first
-supported entry in `SetEncodings` wins). It is never sent to a client that did
-not advertise it.
+ZRLE is used only when the client listed encoding 16 before the other usable
+encodings. It is never sent to a client that did not advertise it.
 
 - One zlib stream per client, created when the viewer's write loop starts and
   continued across rectangles and updates. Each rectangle starts with the
@@ -175,7 +230,8 @@ not advertise it.
 - If a ZRLE encode fails (invalid geometry, compressed-size bound, or zlib
   error), that update falls back to Raw and ZRLE is disabled for the rest of
   the connection, because the partially written zlib stream cannot be trusted.
-  Raw is always legal in RFB, so the client stream stays valid.
+  The ZLib stream and the client's next preferred encoding remain usable. Raw
+  is always legal in RFB, so the client stream stays valid.
 
 ### Cursor pseudo-encoding
 
@@ -200,8 +256,8 @@ not advertise it.
   `frames_coalesced`, not queued.
 - Bounded:
   - 16 megapixels / 64 MiB per frame (4K fits; 8K is refused at startup);
-  - 64x64 ZRLE tiles and a 72 MiB compressed-rectangle bound
-    (`MAX_ZRLE_RECT_BYTES`);
+  - 16x16 Hextile tiles, 64x64 ZRLE tiles, and 72 MiB compressed-rectangle
+    bounds (`MAX_ZRLE_RECT_BYTES`, `MAX_ZLIB_RECT_BYTES`);
   - 255-byte RFB desktop name;
   - 1..=32 concurrent viewers (default 4, `--vnc-max-clients`);
   - optional idle timeout of 1..=86400 seconds
@@ -258,33 +314,57 @@ not advertise it.
 
 ### Automated
 
-`cargo test -p ozma-node --lib vnc` — **42 passed, 0 failed** for the RFB,
+`cargo test -p ozma-node --lib vnc` — **49 passed, 0 failed** for the RFB,
 config, and registration coverage. The wider `ozma-node` lib suite is
-**491 passed, 0 failed, 3 ignored**; the ignored tests are pre-existing opt-in
+**552 passed, 0 failed, 4 ignored**; the ignored tests are pre-existing opt-in
 WebRTC/GStreamer live tests.
 
 Because the main working tree contained unrelated in-progress changes that do
-not compile (`ozma-multiseat`), validation ran in a detached worktree at the
-same HEAD with only the VNC source/Cargo change applied. No product change was
-made outside `ozma-node/src/vnc_server.rs`, `ozma-node/Cargo.toml`, and this
-report.
+not compile (`ozma-mesh` references a missing `discovery` module), validation
+ran in a detached worktree at the same HEAD with only
+`ozma-node/src/vnc_server.rs` replaced. No product change was made outside that
+file and this report.
 
 New encoding tests in `ozma-node/src/vnc_server.rs`:
 
+- `hextile_all_subencodings_decode_in_rgb_and_bgr` — a test-side Hextile
+  decoder (Raw, background/foreground, AnySubrects, coloured subrects)
+  decodes a crafted 64x32 tile pattern in RGB and BGR order. The pattern is
+  designed to produce a solid-background reuse tile, a new background, a
+  foreground-only subrect tile, a coloured-subrect tile, and a raw tile.
+- `hextile_handles_edge_tiles_and_rectangle_offsets` — a 20x17 rectangle at a
+  non-zero offset in a 40x40 frame decodes correctly, covering 16x16 edge tiles.
+- `hextile_frames_decode_over_the_wire_in_rgb_and_bgr` — the same Hextile
+  pattern crosses a real RFB connection and is decoded from the wire in RGB
+  little-endian, BGR little-endian, and BGR big-endian.
+- `zlib_stream_encodes_multiple_rectangles_in_rgb_and_bgr` — one persistent
+  ZLib encoder/decoder pair processes three successive rectangles in RGB,
+  BGR, and a depth-32 format.
+- `zlib_and_zrle_use_independent_persistent_streams` — a live connection sends
+  two ZLib rectangles, switches to ZRLE, then returns to ZLib; both decoders
+  keep their own stream state and every rectangle decodes to the expected
+  framebuffer.
+- `encoding_preference_honours_all_supported_codecs_in_client_order` — every
+  single supported encoding is used as advertised; Raw/ZRLE, Hextile/ZLib,
+  Hextile/ZRLE, and ZLib/ZRLE pairs follow the client's order; an unsupported
+  Tight entry is ignored; all-unsupported and empty lists fall back to Raw.
+- `encoding_selection_skips_only_disabled_encodings` — disabling Hextile selects
+  the next listed ZLib (and then ZRLE), not Raw, and Raw remains available.
+- `compressed_encoding_failure_falls_back_to_raw_and_disables_only_that_encoding`
+  — a frame the encoders cannot read forces ZRLE, Hextile, and ZLib errors;
+  each update is emitted as Raw, reports that one failed encoding, and a
+  selection with no usable stream still produces Raw without a new failure.
+- `hextile_and_zlib_bounds_are_rejected_before_writing` — zero-sized and
+  out-of-frame Hextile/ZLib rectangles return `InvalidInput` without appending
+  bytes or touching a zlib stream.
 - `zrle_decodes_the_known_framebuffer_in_rgb_and_bgr_formats` — a test-side
   ZRLE decoder (Raw, solid, packed palette, plain RLE, palette RLE, CPIXEL
   reassembly) decodes a 256x64 pattern in RGB little-endian, BGR little-endian,
   and BGR big-endian. The same connection and decoder process three successive
   ZRLE rectangles, proving the per-client zlib stream continues correctly.
-- `encoding_preference_selects_zrle_or_raw_without_claiming_extra_codecs` —
-  ZRLE-only selects ZRLE; Raw-only, Raw-before-ZRLE, Hextile-only, and an empty
-  list select Raw; ZRLE-before-Raw selects ZRLE.
 - `cursor_pseudo_encoding_sends_a_typed_empty_cursor_only_when_requested` —
   one 0x0 Cursor rectangle after the pixel rectangle, sent once, and never sent
   to a client that did not request it.
-- `zrle_bounds_and_unavailable_stream_fall_back_to_raw` — an out-of-frame ZRLE
-  rectangle is rejected before touching the stream, and a ZRLE selection with
-  no usable stream produces a valid Raw rectangle.
 - `oversized_set_encodings_is_rejected_typed` — more than 1024 encodings closes
   the viewer with a protocol error.
 
@@ -372,6 +452,41 @@ protocol or zlib error, including the empty Cursor rectangle. This is live
 evidence for ZRLE selection and the Cursor pseudo-encoding over a real RFB 3.8
 client, not just the in-process decoder test.
 
+### Live Hextile/ZLib smoke (2026-11-25)
+
+The same fake-source node command was used at `127.0.0.1:15999` with
+TigerVNC 1.16.2 under Xvfb and an external Python stdlib RFB probe.
+
+TigerVNC's default run advertised 27 encodings in the order
+`[Zrle, Hextile, Raw]` plus pseudo-encodings, so the server correctly selected
+**ZRLE**. Running with `-AutoSelect=0 -PreferredEncoding=Hextile` changed the
+advertised order to `[Hextile, Zrle, Raw]`; the server logged:
+
+```text
+VNC client encoding preferences applied client=2 count=27 order=[Hextile, Zrle, Raw] cursor=true
+```
+
+and the viewer decoded Hextile frames for the full 6 s test window with no
+protocol or decode error.
+
+The external probe connected twice:
+
+- Advertising only Hextile, it received one 1280x720 rectangle with encoding
+  **5**. Consuming every tile succeeded, and the fake source produced
+  subencodings `[0, 2]` (solid background reuse and BackgroundSpecified),
+  which is expected for its mostly solid test pattern.
+- Advertising only ZLib, it received one 1280x720 rectangle with encoding
+  **6**. `zlib.decompressobj()` returned exactly `1280 * 720 * 4` bytes, so the
+  4-byte length prefix, sync flush, and raw-pixel payload all matched.
+
+This is live wire evidence for Hextile and ZLib selection and decoding, not
+just the in-process decoders. It does not claim a live run for Tight, JPEG, or
+H.264, which remain unimplemented.
+
+Earlier in this pass, the `asyncvnc` client advertised only ZLib before ZLib
+support existed and therefore received Raw. That historical result is no longer
+representative: the same client would now receive ZLib.
+
 ### Commands
 
 ```sh
@@ -381,9 +496,10 @@ cargo check -p ozma-node --all-targets
 rustfmt --edition 2021 --check ozma-node/src/vnc_server.rs
 ```
 
-All passed: 42 vnc tests, 491 lib tests (3 ignored), check clean, rustfmt exit
-0. The commands were run in a detached HEAD worktree because unrelated
-in-progress `ozma-multiseat` edits in the main tree do not compile.
+All passed: **49 vnc tests**, **552 lib tests (4 ignored)**, check clean (one
+pre-existing `unused_mut` warning in `controller_compat.rs`), rustfmt exit 0.
+The commands were run in a detached HEAD worktree because unrelated
+in-progress `ozma-mesh` edits in the main tree do not compile.
 
 ## Remaining VNC gaps
 
@@ -401,11 +517,11 @@ in-progress `ozma-multiseat` edits in the main tree do not compile.
   networks.
 - **No password rotation while running.** The file is read once at startup; a
   changed password requires a node restart.
-- **Raw + ZRLE only.** No Hextile, Tight, JPEG, or ZLib (6) encoding. A client
-  that advertises only an unimplemented encoding still gets Raw, as RFB permits,
-  but cannot receive that codec's compression. ZRLE is chosen only when the
-  client lists it before Raw; a client that lists Raw first gets Raw even if it
-  also supports ZRLE.
+- **No Tight, JPEG, or H.264.** Raw (0), Hextile (5), ZLib (6), and ZRLE (16)
+  are implemented. A client that advertises only an unimplemented encoding
+  still gets Raw, as RFB permits, and the server honours the client's order
+  across all four supported encodings. An encode failure disables only the
+  failing encoding for that connection and falls back to Raw for that update.
 - **Cursor is always the empty shape.** There is no cursor-shape source in the
   capture pipeline, so the node tells a requesting client that there is no
   local cursor. It does not inspect QMP/QEMU cursor state or synthesize a
@@ -416,7 +532,8 @@ in-progress `ozma-multiseat` edits in the main tree do not compile.
   reconnect and node restart.
 - **Only packed RGB24/BGRA capture sources.** YUYV, NV12, P010, and compressed
   sources are refused at startup; this server does not convert pixel layouts.
-  ZRLE still sends only 32-bit true-colour client formats (depth 24/32).
+  Raw, Hextile, ZLib, and ZRLE still send only 32-bit true-colour client
+  formats (depth 24/32).
 - **No frame-rate pacing in the server.** The capture pump runs at the source's
   own pace even when no viewer is connected; the snapshot is overwritten rather
   than queued.

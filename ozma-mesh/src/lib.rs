@@ -8,6 +8,7 @@
 //! |--------|----------|
 //! | [`error`] | [`MeshError`] enum and `Result<T>` alias |
 //! | [`node`]  | [`MeshNode`], [`WgPublicKey`], [`WgPrivateKey`] |
+//! | [`discovery`] | mDNS browse, advertisement validation, dedupe/expiry |
 //! | [`manager`] | [`MeshManager`] — lifecycle, peer table, tunnels, mDNS |
 //!
 //! ## Quick start
@@ -39,6 +40,7 @@
 //! ```
 
 pub mod dataplane;
+pub mod discovery;
 pub mod error;
 pub mod keys;
 pub mod manager;
@@ -51,8 +53,12 @@ pub use dataplane::{
     CommandRunner, CommandSpec, DataplaneConfig, DataplaneError, DataplaneState, DataplaneStatus,
     FileOpener, MeshDataplane, NatConfig, Sysfs,
 };
+pub use discovery::{
+    DiscoveredPeer, DiscoveryAction, DiscoveryConfig, DiscoveryCounters, DiscoveryEngine,
+    DiscoveryStatus, MdnsBrowser, RawAdvertisement, TrustedPeer, MDNS_FQDN, MDNS_SERVICE_TYPE,
+};
 pub use error::{MeshError, Result};
-pub use manager::{MeshManager, PeerStatus};
+pub use manager::{MeshManager, PeerChange, PeerOrigin, PeerStatus};
 pub use node::{MeshNode, WgPrivateKey, WgPublicKey};
 pub use pump::{
     ManagerPacketIo, PacketPump, PumpConfig, PumpError, PumpState, PumpStats, PumpStatus,

@@ -21,13 +21,15 @@
 //!   copied into the last published snapshot; a slow client gets the newest
 //!   frame, and intermediate frames are counted as coalesced, never queued
 //!   without bound.
-//! * Two pixel encodings are available: Raw (always valid in RFB) and ZRLE
-//!   (encoding 16), selected from the client's `SetEncodings` preference
-//!   order. ZRLE uses one zlib stream per client, 64x64 tiles, and the Raw,
-//!   solid, packed-palette, plain-RLE, and palette-RLE sub-encodings. The
-//!   server never sends an encoding the client did not advertise, falls back
-//!   to Raw if a ZRLE encode fails, and never claims Hextile, Tight, or
-//!   another codec it does not implement.
+//! * Four pixel encodings are available: Raw (always valid in RFB), ZRLE
+//!   (16), Hextile (5), and ZLib (6), selected from the client's
+//!   `SetEncodings` preference order. ZRLE and ZLib each use their own
+//!   per-client zlib stream; Hextile uses the standard 16x16 tiles and its
+//!   Raw, BackgroundColour, ForegroundColour, AnySubrects, and
+//!   SubrectsColoured sub-encodings. The server never sends an encoding the
+//!   client did not advertise, falls back to Raw if an encode fails, disables
+//!   only the failing encoding for the rest of the connection, and never
+//!   claims Tight or another codec it does not implement.
 //! * A client may request the Cursor pseudo-encoding (-239). Because this
 //!   server has no cursor-shape source, it sends a typed 0x0 empty cursor
 //!   once per connection; it never fabricates a visible pointer shape.
@@ -111,12 +113,28 @@ const MAX_PENDING_RECTS: usize = 8;
 const CLIENT_COMMAND_QUEUE: usize = 64;
 /// RFB Raw encoding number.
 pub const ENCODING_RAW: i32 = 0;
+/// RFB Hextile encoding number (RFC 6143 section 7.7.4).
+pub const ENCODING_HEXTILE: i32 = 5;
+/// RFB ZLib encoding number (RFC 6143 section 7.7.7).
+pub const ENCODING_ZLIB: i32 = 6;
 /// RFB ZRLE encoding number (RFC 6143 section 7.7.6).
 pub const ENCODING_ZRLE: i32 = 16;
 /// RFB Cursor pseudo-encoding number (RFC 6143 section 7.8.1).
 pub const ENCODING_CURSOR: i32 = -239;
 /// ZRLE tile edge in pixels.
 const ZRLE_TILE_SIZE: usize = 64;
+/// Hextile tile edge in pixels.
+const HEXTILE_TILE_SIZE: usize = 16;
+/// Hextile subencoding bit: a raw tile follows.
+const HEXTILE_RAW: u8 = 1;
+/// Hextile subencoding bit: a background PIXEL follows.
+const HEXTILE_BACKGROUND_SPECIFIED: u8 = 2;
+/// Hextile subencoding bit: a foreground PIXEL follows.
+const HEXTILE_FOREGROUND_SPECIFIED: u8 = 4;
+/// Hextile subencoding bit: a subrect count and subrects follow.
+const HEXTILE_ANY_SUBRECTS: u8 = 8;
+/// Hextile subencoding bit: each subrect carries its own PIXEL.
+const HEXTILE_SUBRECTS_COLOURED: u8 = 16;
 /// Largest palette ZRLE may send as a packed palette sub-encoding.
 const ZRLE_MAX_PACKED_PALETTE: usize = 16;
 /// Largest palette ZRLE may send as a palette-RLE sub-encoding.
@@ -125,6 +143,10 @@ const ZRLE_MAX_RLE_PALETTE: usize = 127;
 /// is at most 64 MiB as four-byte pixels; deflate can expand stored data by a
 /// small constant factor, so leave headroom rather than trusting the length.
 const MAX_ZRLE_RECT_BYTES: usize = MAX_FRAME_BYTES + 8 * 1024 * 1024;
+/// Bound on one rectangle's compressed ZLib payload. The ZLib encoding carries
+/// the same uncompressed rectangle as Raw, so the same headroom over a
+/// four-byte-per-pixel frame is enough for deflate's stored-data overhead.
+const MAX_ZLIB_RECT_BYTES: usize = MAX_FRAME_BYTES + 8 * 1024 * 1024;
 /// How long a viewer may take to complete the handshake.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long one framebuffer update write may block before the viewer is closed.
@@ -819,7 +841,7 @@ pub async fn start(
         loopback = bound_addr.ip().is_loopback(),
         security = if auth_enabled { "vnc-auth" } else { "none" },
         encrypted = false,
-        encoding = "raw,zrle",
+        encoding = "raw,hextile,zlib,zrle",
         "RFB 3.8 VNC server listening (transport is plain TCP; VNC auth is not encryption)"
     );
 
@@ -1098,27 +1120,91 @@ impl Default for ClientPixelFormat {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UpdateEncoding {
     Raw,
+    Hextile,
+    ZLib,
     Zrle,
 }
 
-/// Per-client encoding preferences. ZRLE is used only when the client listed
-/// it (and listed it before Raw); Raw remains the safe fallback.
+/// Encodings disabled for the rest of one connection after an encode error.
+/// Raw is never disabled because it is always a legal fallback.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DisabledEncodings {
+    hextile: bool,
+    zlib: bool,
+    zrle: bool,
+}
+
+impl DisabledEncodings {
+    fn is_disabled(self, encoding: UpdateEncoding) -> bool {
+        match encoding {
+            UpdateEncoding::Raw => false,
+            UpdateEncoding::Hextile => self.hextile,
+            UpdateEncoding::ZLib => self.zlib,
+            UpdateEncoding::Zrle => self.zrle,
+        }
+    }
+
+    fn disable(&mut self, encoding: UpdateEncoding) {
+        match encoding {
+            UpdateEncoding::Raw => {}
+            UpdateEncoding::Hextile => self.hextile = true,
+            UpdateEncoding::ZLib => self.zlib = true,
+            UpdateEncoding::Zrle => self.zrle = true,
+        }
+    }
+}
+
+/// Per-client encoding preferences: the supported encodings in the order the
+/// client listed them, plus whether the Cursor pseudo-encoding was requested.
+/// An empty list (or a list with no supported entry) selects Raw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ClientEncodingState {
-    preferred: UpdateEncoding,
+    order: [UpdateEncoding; 4],
+    count: usize,
     cursor: bool,
 }
 
 impl Default for ClientEncodingState {
     fn default() -> Self {
         Self {
-            preferred: UpdateEncoding::Raw,
+            order: [UpdateEncoding::Raw; 4],
+            count: 0,
             cursor: false,
         }
     }
 }
 
+impl ClientEncodingState {
+    fn push(&mut self, encoding: UpdateEncoding) {
+        // Duplicates add no preference information and would otherwise grow
+        // the order without bound. Keeping the first occurrence preserves the
+        // client's relative order.
+        if self.order[..self.count].contains(&encoding) {
+            return;
+        }
+        if self.count < self.order.len() {
+            self.order[self.count] = encoding;
+            self.count += 1;
+        }
+    }
+
+    /// The first advertised encoding that has not failed, or Raw.
+    fn select(self, disabled: DisabledEncodings) -> UpdateEncoding {
+        self.order[..self.count]
+            .iter()
+            .copied()
+            .find(|encoding| !disabled.is_disabled(*encoding))
+            .unwrap_or(UpdateEncoding::Raw)
+    }
+}
+
 impl ClientPixelFormat {
+    /// A PIXEL is four bytes for every 32-bit true-colour format this server
+    /// accepts (Raw and Hextile both use PIXEL, not ZRLE's CPIXEL).
+    fn pixel_len(&self) -> usize {
+        4
+    }
+
     /// ZRLE's CPIXEL is three bytes when 32-bit true-colour pixels have all
     /// colour bits in either the least- or most-significant three bytes and
     /// depth is at most 24 (RFC 6143 section 7.7.5). Otherwise it is a full
@@ -1815,33 +1901,27 @@ async fn read_set_encodings(
         .await
         .map_err(ProtocolError::io)?;
 
-    // The first encoding we support wins; unsupported entries and
-    // pseudo-encodings do not disturb the order. Raw is always acceptable in
-    // RFB, so an all-unsupported or empty list falls back to Raw.
-    let mut preferred = UpdateEncoding::Raw;
-    let mut selected = false;
-    let mut cursor = false;
+    // Supported encodings keep the client's stated order; unsupported entries
+    // and pseudo-encodings do not disturb it. Raw is always acceptable in RFB,
+    // so an all-unsupported or empty list falls back to Raw.
+    let mut state = ClientEncodingState::default();
     for chunk in encodings.chunks_exact(4) {
         let encoding = i32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         match encoding {
-            ENCODING_ZRLE if !selected => {
-                preferred = UpdateEncoding::Zrle;
-                selected = true;
-            }
-            ENCODING_RAW if !selected => {
-                preferred = UpdateEncoding::Raw;
-                selected = true;
-            }
-            ENCODING_CURSOR => cursor = true,
+            ENCODING_RAW => state.push(UpdateEncoding::Raw),
+            ENCODING_HEXTILE => state.push(UpdateEncoding::Hextile),
+            ENCODING_ZLIB => state.push(UpdateEncoding::ZLib),
+            ENCODING_ZRLE => state.push(UpdateEncoding::Zrle),
+            ENCODING_CURSOR => state.cursor = true,
             _ => {}
         }
     }
-    *lock(&context.encoding) = ClientEncodingState { preferred, cursor };
+    *lock(&context.encoding) = state;
     debug!(
         client = context.id,
         count,
-        preferred = ?preferred,
-        cursor,
+        order = ?&state.order[..state.count],
+        cursor = state.cursor,
         "VNC client encoding preferences applied"
     );
     Ok(())
@@ -2024,17 +2104,20 @@ async fn client_write_loop(
 ) -> Result<(), ProtocolError> {
     let mut pending: Option<PendingUpdate> = None;
     let mut last_sent_generation = 0u64;
-    // One zlib stream per client, continuing across rectangles and updates.
-    // If an encode ever fails the stream state is untrustworthy, so ZRLE is
-    // disabled for the rest of the connection and Raw is used.
+    // One zlib stream per client per compressed encoding, continuing across
+    // rectangles and updates. ZRLE and ZLib are independent streams. If an
+    // encode fails its stream state is untrustworthy, so only that encoding is
+    // disabled for the rest of the connection and the next preference is used.
     let mut zrle = ZlibEncoder::new(Vec::new(), Compression::default());
-    let mut zrle_failed = false;
+    let mut zlib = ZlibEncoder::new(Vec::new(), Compression::default());
+    let mut disabled = DisabledEncodings::default();
     let mut cursor_sent = false;
 
     loop {
         if let Some(request) = pending.take() {
             let snapshot = { frames.borrow().clone() };
             let encoding = *lock(&context.encoding);
+            let preferred = encoding.select(disabled);
             let cursor_pending = encoding.cursor && !cursor_sent;
             let should_send = snapshot.as_ref().is_some_and(|frame| {
                 !request.incremental || frame.generation > last_sent_generation || cursor_pending
@@ -2047,8 +2130,13 @@ async fn client_write_loop(
                 // An incremental request with no new frame may still carry the
                 // one-time cursor shape; do not re-send unchanged pixels.
                 let rects: &[Rect] = if newer_frame { &request.rects } else { &[] };
-                let stream = if encoding.preferred == UpdateEncoding::Zrle && !zrle_failed {
+                let zrle_stream = if preferred == UpdateEncoding::Zrle {
                     Some(&mut zrle)
+                } else {
+                    None
+                };
+                let zlib_stream = if preferred == UpdateEncoding::ZLib {
+                    Some(&mut zlib)
                 } else {
                     None
                 };
@@ -2056,14 +2144,20 @@ async fn client_write_loop(
                     &frame,
                     pixel,
                     rects,
-                    encoding.preferred,
-                    stream,
+                    preferred,
+                    zrle_stream,
+                    zlib_stream,
                     cursor_pending,
                 );
-                if built.zrle_failed {
-                    zrle_failed = true;
-                    // Drop the poisoned stream and release its buffer.
-                    zrle = ZlibEncoder::new(Vec::new(), Compression::default());
+                if let Some(failed) = built.failed_encoding {
+                    disabled.disable(failed);
+                    // Drop the poisoned stream and release its buffer, leaving
+                    // any other encoder usable.
+                    if failed == UpdateEncoding::Zrle {
+                        zrle = ZlibEncoder::new(Vec::new(), Compression::default());
+                    } else if failed == UpdateEncoding::ZLib {
+                        zlib = ZlibEncoder::new(Vec::new(), Compression::default());
+                    }
                 }
                 match tokio::time::timeout(write_timeout, write.write_all(&built.bytes)).await {
                     Ok(Ok(())) => {
@@ -2125,7 +2219,9 @@ async fn client_write_loop(
 struct BuiltUpdate {
     bytes: Vec<u8>,
     payload_bytes: usize,
-    zrle_failed: bool,
+    /// The encoding that failed while building this update, if any. Only that
+    /// encoding is disabled for the rest of the connection.
+    failed_encoding: Option<UpdateEncoding>,
     cursor_sent: bool,
 }
 
@@ -2137,36 +2233,86 @@ fn push_rect_header(out: &mut Vec<u8>, rect: Rect, encoding: i32) {
     out.extend_from_slice(&encoding.to_be_bytes());
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_update(
     frame: &FrameSnapshot,
     pixel: ClientPixelFormat,
     rects: &[Rect],
     preferred: UpdateEncoding,
     mut zrle: Option<&mut ZlibEncoder<Vec<u8>>>,
+    mut zlib: Option<&mut ZlibEncoder<Vec<u8>>>,
     send_cursor: bool,
 ) -> BuiltUpdate {
     let non_empty = clip_rects(rects, frame.format.width, frame.format.height);
     let mut body = Vec::new();
     let mut payload_bytes = 0usize;
-    let mut zrle_failed = false;
+    let mut failed_encoding: Option<UpdateEncoding> = None;
+    let mut hextile = Vec::new();
 
     for rect in &non_empty {
-        if preferred == UpdateEncoding::Zrle && !zrle_failed && zrle.is_some() {
-            let stream = zrle.as_deref_mut().expect("checked above");
-            match encode_zrle_rect(frame, pixel, *rect, stream) {
-                Ok(data) => {
-                    push_rect_header(&mut body, *rect, ENCODING_ZRLE);
-                    body.extend_from_slice(&(data.len() as u32).to_be_bytes());
-                    body.extend_from_slice(&data);
-                    payload_bytes += data.len();
-                    continue;
+        // Until an encoder fails, use the client's first usable preference.
+        // A failure falls back to Raw for this rectangle and every remaining
+        // rectangle in the update; the caller disables that one encoding.
+        if failed_encoding.is_none() {
+            match preferred {
+                UpdateEncoding::Raw => {}
+                UpdateEncoding::Zrle => {
+                    if let Some(stream) = zrle.as_deref_mut() {
+                        match encode_zrle_rect(frame, pixel, *rect, stream) {
+                            Ok(data) => {
+                                push_rect_header(&mut body, *rect, ENCODING_ZRLE);
+                                body.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                                body.extend_from_slice(&data);
+                                payload_bytes += data.len();
+                                continue;
+                            }
+                            Err(error) => {
+                                debug!(
+                                    error = %error,
+                                    "ZRLE rectangle encode failed; falling back to Raw"
+                                );
+                                failed_encoding = Some(UpdateEncoding::Zrle);
+                            }
+                        }
+                    }
                 }
-                Err(error) => {
-                    debug!(
-                        error = %error,
-                        "ZRLE rectangle encode failed; falling back to Raw for this client"
-                    );
-                    zrle_failed = true;
+                UpdateEncoding::Hextile => {
+                    hextile.clear();
+                    match encode_hextile_rect(frame, pixel, *rect, &mut hextile) {
+                        Ok(()) => {
+                            push_rect_header(&mut body, *rect, ENCODING_HEXTILE);
+                            payload_bytes += hextile.len();
+                            body.extend_from_slice(&hextile);
+                            continue;
+                        }
+                        Err(error) => {
+                            debug!(
+                                error = %error,
+                                "Hextile rectangle encode failed; falling back to Raw"
+                            );
+                            failed_encoding = Some(UpdateEncoding::Hextile);
+                        }
+                    }
+                }
+                UpdateEncoding::ZLib => {
+                    if let Some(stream) = zlib.as_deref_mut() {
+                        match encode_zlib_rect(frame, pixel, *rect, stream) {
+                            Ok(data) => {
+                                push_rect_header(&mut body, *rect, ENCODING_ZLIB);
+                                body.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                                payload_bytes += data.len();
+                                body.extend_from_slice(&data);
+                                continue;
+                            }
+                            Err(error) => {
+                                debug!(
+                                    error = %error,
+                                    "ZLib rectangle encode failed; falling back to Raw"
+                                );
+                                failed_encoding = Some(UpdateEncoding::ZLib);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2201,7 +2347,7 @@ fn build_update(
     BuiltUpdate {
         bytes,
         payload_bytes,
-        zrle_failed,
+        failed_encoding,
         cursor_sent: send_cursor,
     }
 }
@@ -2256,6 +2402,304 @@ fn source_rgb(frame: &FrameSnapshot, x: usize, y: usize) -> io::Result<(u8, u8, 
         ),
         _ => unreachable!("matched above"),
     })
+}
+
+/// Encode one Hextile rectangle (RFC 6143 section 7.7.4).
+///
+/// The rectangle is split into 16x16 tiles. Each tile is encoded as the
+/// smaller of a raw tile and a background/foreground plus maximal same-colour
+/// subrects. Background and foreground colours persist across the tiles of one
+/// rectangle, but are reset for every rectangle.
+fn encode_hextile_rect(
+    frame: &FrameSnapshot,
+    pixel: ClientPixelFormat,
+    rect: Rect,
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
+    let width = usize::from(rect.width);
+    let height = usize::from(rect.height);
+    if width == 0 || height == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Hextile rectangle is empty",
+        ));
+    }
+    let left = usize::from(rect.x);
+    let top = usize::from(rect.y);
+    if left + width > frame.format.width as usize || top + height > frame.format.height as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Hextile rectangle exceeds the captured frame",
+        ));
+    }
+
+    let mut state = HextileState::default();
+    let mut scratch = HextileTileScratch::default();
+    for tile_y in (0..height).step_by(HEXTILE_TILE_SIZE) {
+        let tile_height = HEXTILE_TILE_SIZE.min(height - tile_y);
+        for tile_x in (0..width).step_by(HEXTILE_TILE_SIZE) {
+            let tile_width = HEXTILE_TILE_SIZE.min(width - tile_x);
+            encode_hextile_tile(
+                frame,
+                pixel,
+                left + tile_x,
+                top + tile_y,
+                tile_width,
+                tile_height,
+                &mut state,
+                &mut scratch,
+                out,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Background and foreground colours persisted across the tiles of one
+/// rectangle. RFC 6143 leaves their initial values undefined, so the encoder
+/// tracks whether a client could have learned them yet and specifies them
+/// explicitly until it has.
+#[derive(Default)]
+struct HextileState {
+    background: u32,
+    foreground: u32,
+    background_defined: bool,
+    foreground_defined: bool,
+}
+
+#[derive(Default)]
+struct HextileTileScratch {
+    values: Vec<u32>,
+    counts: HashMap<u32, usize>,
+    covered: Vec<bool>,
+    subrects: Vec<(u32, u8, u8, u8, u8)>,
+    bytes: Vec<u8>,
+}
+
+/// Encode one 16x16-or-smaller Hextile tile. The background is the most
+/// frequent colour (keeping the previous background on a tie); the remaining
+/// pixels become maximal same-colour subrects. Subrects share the foreground
+/// colour when possible, otherwise every subrect carries its own PIXEL.
+#[allow(clippy::too_many_arguments)]
+fn encode_hextile_tile(
+    frame: &FrameSnapshot,
+    pixel: ClientPixelFormat,
+    left: usize,
+    top: usize,
+    width: usize,
+    height: usize,
+    state: &mut HextileState,
+    scratch: &mut HextileTileScratch,
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
+    let HextileTileScratch {
+        values,
+        counts,
+        covered,
+        subrects,
+        bytes,
+    } = scratch;
+    values.clear();
+    counts.clear();
+    covered.clear();
+    subrects.clear();
+    bytes.clear();
+
+    let count = width * height;
+    for row in 0..height {
+        for column in 0..width {
+            let (red, green, blue) = source_rgb(frame, left + column, top + row)?;
+            values.push(pixel.pixel_value(red, green, blue));
+        }
+    }
+    for &value in values.iter() {
+        *counts.entry(value).or_insert(0) += 1;
+    }
+    let max_count = counts.values().copied().max().unwrap_or(0);
+    let background = if state.background_defined
+        && counts.get(&state.background).copied().unwrap_or(0) == max_count
+    {
+        state.background
+    } else {
+        values
+            .iter()
+            .copied()
+            .find(|value| counts.get(value).copied() == Some(max_count))
+            .expect("a tile always has at least one pixel")
+    };
+
+    // A solid tile is either the current background (no payload at all) or a
+    // new background PIXEL.
+    if max_count == count {
+        if !state.background_defined || background != state.background {
+            out.push(HEXTILE_BACKGROUND_SPECIFIED);
+            pixel.push_pixel(background, out);
+            state.background = background;
+            state.background_defined = true;
+        } else {
+            out.push(0);
+        }
+        return Ok(());
+    }
+
+    covered.resize(count, false);
+    for y in 0..height {
+        for x in 0..width {
+            let index = y * width + x;
+            if covered[index] || values[index] == background {
+                continue;
+            }
+            let value = values[index];
+            // Maximal horizontal run of this colour, then extend that width
+            // downward while every cell still matches and is uncovered.
+            let mut rect_width = 1;
+            while x + rect_width < width {
+                let next = index + rect_width;
+                if covered[next] || values[next] != value {
+                    break;
+                }
+                rect_width += 1;
+            }
+            let mut rect_height = 1;
+            while y + rect_height < height {
+                let row = (y + rect_height) * width;
+                let matches = (0..rect_width).all(|dx| {
+                    let next = row + x + dx;
+                    !covered[next] && values[next] == value
+                });
+                if !matches {
+                    break;
+                }
+                rect_height += 1;
+            }
+            for dy in 0..rect_height {
+                for dx in 0..rect_width {
+                    covered[(y + dy) * width + x + dx] = true;
+                }
+            }
+            subrects.push((value, x as u8, y as u8, rect_width as u8, rect_height as u8));
+        }
+    }
+
+    // The background is the most frequent colour, so at most 255 pixels are
+    // non-background and the subrect count always fits one byte. Keep the
+    // guard so a future change to the background heuristic cannot truncate it.
+    if subrects.len() > usize::from(u8::MAX) {
+        emit_hextile_raw(values, pixel, out);
+        return Ok(());
+    }
+
+    let first = subrects
+        .first()
+        .map(|subrect| subrect.0)
+        .expect("a non-solid tile has a subrect");
+    let coloured = subrects.iter().any(|subrect| subrect.0 != first);
+    let background_changed = !state.background_defined || background != state.background;
+    let foreground_changed = !coloured && (!state.foreground_defined || first != state.foreground);
+
+    let mut flags = HEXTILE_ANY_SUBRECTS;
+    if background_changed {
+        flags |= HEXTILE_BACKGROUND_SPECIFIED;
+    }
+    if foreground_changed {
+        flags |= HEXTILE_FOREGROUND_SPECIFIED;
+    }
+    if coloured {
+        flags |= HEXTILE_SUBRECTS_COLOURED;
+    }
+
+    bytes.push(flags);
+    if background_changed {
+        pixel.push_pixel(background, bytes);
+    }
+    if foreground_changed {
+        pixel.push_pixel(first, bytes);
+    }
+    bytes.push(subrects.len() as u8);
+    for &(value, x, y, subrect_width, subrect_height) in subrects.iter() {
+        if coloured {
+            pixel.push_pixel(value, bytes);
+        }
+        bytes.push((x << 4) | y);
+        bytes.push(((subrect_width - 1) << 4) | (subrect_height - 1));
+    }
+
+    if bytes.len() >= 1 + count * pixel.pixel_len() {
+        emit_hextile_raw(values, pixel, out);
+        return Ok(());
+    }
+
+    out.extend_from_slice(bytes);
+    state.background = background;
+    state.background_defined = true;
+    if !coloured {
+        state.foreground = first;
+        state.foreground_defined = true;
+    }
+    Ok(())
+}
+
+fn emit_hextile_raw(values: &[u32], pixel: ClientPixelFormat, out: &mut Vec<u8>) {
+    out.push(HEXTILE_RAW);
+    for &value in values {
+        pixel.push_pixel(value, out);
+    }
+}
+
+/// Encode one ZLib rectangle (RFC 6143 section 7.7.7).
+///
+/// The rectangle payload is exactly the Raw encoding's pixels, compressed
+/// through the client's persistent ZLib zlib stream and sync-flushed after each
+/// rectangle. ZRLE has a separate stream, so switching between the two never
+/// corrupts either one. On any error the caller must disable ZLib for the
+/// connection because the stream state may be partially written.
+fn encode_zlib_rect(
+    frame: &FrameSnapshot,
+    pixel: ClientPixelFormat,
+    rect: Rect,
+    encoder: &mut ZlibEncoder<Vec<u8>>,
+) -> io::Result<Vec<u8>> {
+    let width = usize::from(rect.width);
+    let height = usize::from(rect.height);
+    if width == 0 || height == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ZLib rectangle is empty",
+        ));
+    }
+    let left = usize::from(rect.x);
+    let top = usize::from(rect.y);
+    if left + width > frame.format.width as usize || top + height > frame.format.height as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ZLib rectangle exceeds the captured frame",
+        ));
+    }
+
+    let mut row = Vec::with_capacity(width * pixel.pixel_len());
+    for y in 0..height {
+        row.clear();
+        for x in 0..width {
+            let (red, green, blue) = source_rgb(frame, left + x, top + y)?;
+            pixel.push_pixel(pixel.pixel_value(red, green, blue), &mut row);
+        }
+        encoder.write_all(&row)?;
+        if encoder.get_ref().len() > MAX_ZLIB_RECT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ZLib rectangle exceeded the compressed-size bound",
+            ));
+        }
+    }
+    encoder.flush()?;
+    let data = std::mem::take(encoder.get_mut());
+    if data.len() > MAX_ZLIB_RECT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ZLib rectangle exceeded the compressed-size bound",
+        ));
+    }
+    Ok(data)
 }
 
 /// Encode one ZRLE rectangle into the client's persistent zlib stream.
@@ -2953,6 +3397,119 @@ mod tests {
         }
     }
 
+    /// A fixed RGB24 frame built from a caller-supplied pixel list. It lets a
+    /// test control the exact tile shapes an encoder sees.
+    struct FixedPixelSource {
+        format: FrameFormat,
+        pixels: Arc<Vec<(u8, u8, u8)>>,
+        sent: bool,
+    }
+
+    impl FixedPixelSource {
+        fn new(width: u32, height: u32, pixels: Vec<(u8, u8, u8)>) -> Self {
+            assert_eq!(pixels.len(), width as usize * height as usize);
+            Self {
+                format: FrameFormat::rgb24(width, height),
+                pixels: Arc::new(pixels),
+                sent: false,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CaptureSource for FixedPixelSource {
+        fn id(&self) -> &str {
+            "test-vnc-fixed-source"
+        }
+
+        fn format(&self) -> FrameFormat {
+            self.format
+        }
+
+        async fn next_frame(&mut self) -> Result<Frame, MediaError> {
+            if self.sent {
+                std::future::pending::<()>().await;
+            }
+            tokio::task::yield_now().await;
+            self.sent = true;
+            let mut data = Vec::with_capacity(self.pixels.len() * 3);
+            for (red, green, blue) in self.pixels.iter() {
+                data.extend_from_slice(&[*red, *green, *blue]);
+            }
+            Frame::with_data(self.format, 0, 0, true, data)
+        }
+
+        async fn stop(&mut self) -> Result<(), MediaError> {
+            Ok(())
+        }
+    }
+
+    /// 64x32 pixels chosen to make consecutive Hextile tiles exercise the
+    /// solid-reuse, new-background, foreground-subrect, coloured-subrect, and
+    /// raw subencodings.
+    fn hextile_pixels() -> Vec<(u8, u8, u8)> {
+        const A: (u8, u8, u8) = (10, 20, 30);
+        const B: (u8, u8, u8) = (200, 30, 40);
+        const C: (u8, u8, u8) = (30, 200, 60);
+        let mut pixels = Vec::with_capacity(64 * 32);
+        for y in 0..32 {
+            for x in 0..64 {
+                let tile_x = x / 16;
+                let tile_y = y / 16;
+                let local_x = x % 16;
+                let local_y = y % 16;
+                let colour = match (tile_x, tile_y) {
+                    (0, 0) | (1, 0) => A,
+                    (2, 0) => {
+                        if (local_x + local_y) % 2 == 0 {
+                            A
+                        } else {
+                            B
+                        }
+                    }
+                    (3, 0) => {
+                        if local_x < 8 {
+                            if local_y < 8 {
+                                B
+                            } else {
+                                C
+                            }
+                        } else {
+                            A
+                        }
+                    }
+                    (0, 1) => {
+                        let index = (local_y * 16 + local_x) as u8;
+                        (index, index.wrapping_mul(2), index.wrapping_mul(3))
+                    }
+                    (1, 1) => {
+                        if (local_x + local_y) % 2 == 0 {
+                            A
+                        } else {
+                            B
+                        }
+                    }
+                    (2, 1) | (3, 1) => B,
+                    _ => unreachable!("64x32 is exactly a 4x2 tile grid"),
+                };
+                pixels.push(colour);
+            }
+        }
+        pixels
+    }
+
+    fn frame_from_pixels(width: usize, height: usize, pixels: &[(u8, u8, u8)]) -> FrameSnapshot {
+        let mut data = Vec::with_capacity(width * height * 3);
+        for &(red, green, blue) in pixels {
+            data.extend_from_slice(&[red, green, blue]);
+        }
+        FrameSnapshot {
+            generation: 1,
+            format: FrameFormat::rgb24(width as u32, height as u32),
+            data: Bytes::from(data),
+        }
+    }
+
     async fn read_exact(stream: &mut TcpStream, buf: &mut [u8]) {
         tokio::time::timeout(Duration::from_secs(2), stream.read_exact(buf))
             .await
@@ -3160,6 +3717,16 @@ mod tests {
                     read_exact(stream, &mut data).await;
                     data
                 }
+                ENCODING_ZLIB => {
+                    let mut length = [0u8; 4];
+                    read_exact(stream, &mut length).await;
+                    let length = u32::from_be_bytes(length) as usize;
+                    assert!(length <= MAX_ZLIB_RECT_BYTES);
+                    let mut data = vec![0u8; length];
+                    read_exact(stream, &mut data).await;
+                    data
+                }
+                ENCODING_HEXTILE => read_hextile_payload(stream, width, height).await,
                 ENCODING_CURSOR => Vec::new(),
                 other => panic!("unexpected encoding {other}"),
             };
@@ -3175,12 +3742,60 @@ mod tests {
         rects
     }
 
-    /// Test-side decoder for the client's single persistent ZRLE zlib stream.
-    struct TestZrleDecoder {
+    async fn read_hextile_payload(stream: &mut TcpStream, width: u16, height: u16) -> Vec<u8> {
+        let tile_width = usize::from(width);
+        let tile_height = usize::from(height);
+        let mut data = Vec::new();
+        for tile_y in (0..tile_height).step_by(HEXTILE_TILE_SIZE) {
+            let current_height = HEXTILE_TILE_SIZE.min(tile_height - tile_y);
+            for tile_x in (0..tile_width).step_by(HEXTILE_TILE_SIZE) {
+                let current_width = HEXTILE_TILE_SIZE.min(tile_width - tile_x);
+                let mut byte = [0u8; 1];
+                read_exact(stream, &mut byte).await;
+                let flags = byte[0];
+                data.push(flags);
+                let mut pixel = [0u8; 4];
+                if flags & HEXTILE_RAW != 0 {
+                    let mut raw = vec![0u8; current_width * current_height * 4];
+                    read_exact(stream, &mut raw).await;
+                    data.extend_from_slice(&raw);
+                    continue;
+                }
+                if flags & HEXTILE_BACKGROUND_SPECIFIED != 0 {
+                    read_exact(stream, &mut pixel).await;
+                    data.extend_from_slice(&pixel);
+                }
+                if flags & HEXTILE_FOREGROUND_SPECIFIED != 0 {
+                    read_exact(stream, &mut pixel).await;
+                    data.extend_from_slice(&pixel);
+                }
+                if flags & HEXTILE_ANY_SUBRECTS != 0 {
+                    read_exact(stream, &mut byte).await;
+                    data.push(byte[0]);
+                    let coloured = flags & HEXTILE_SUBRECTS_COLOURED != 0;
+                    for _ in 0..byte[0] {
+                        if coloured {
+                            read_exact(stream, &mut pixel).await;
+                            data.extend_from_slice(&pixel);
+                        }
+                        let mut xywh = [0u8; 2];
+                        read_exact(stream, &mut xywh).await;
+                        data.extend_from_slice(&xywh);
+                    }
+                }
+            }
+        }
+        data
+    }
+
+    /// Test-side decoder for a client's persistent zlib stream. The same
+    /// wrapper is usable for both ZRLE and ZLib; they must be separate decoder
+    /// instances just as the server keeps separate encoder streams.
+    struct TestZlibDecoder {
         decompress: flate2::Decompress,
     }
 
-    impl TestZrleDecoder {
+    impl TestZlibDecoder {
         fn new() -> Self {
             Self {
                 decompress: flate2::Decompress::new(true),
@@ -3220,7 +3835,7 @@ mod tests {
     }
 
     fn decode_zrle(
-        decoder: &mut TestZrleDecoder,
+        decoder: &mut TestZlibDecoder,
         compressed: &[u8],
         width: usize,
         height: usize,
@@ -3350,6 +3965,122 @@ mod tests {
         }
         assert_eq!(position, bytes.len(), "trailing ZRLE tile bytes");
         (pixels, subencodings)
+    }
+
+    fn decode_zlib_rect(
+        decoder: &mut TestZlibDecoder,
+        compressed: &[u8],
+        width: usize,
+        height: usize,
+        pixel: ClientPixelFormat,
+    ) -> Vec<(u8, u8, u8)> {
+        let bytes = decoder.inflate(compressed);
+        assert_eq!(
+            bytes.len(),
+            width * height * pixel.pixel_len(),
+            "ZLib rectangle payload must be uncompressed Raw pixels"
+        );
+        let mut position = 0usize;
+        let mut pixels = Vec::with_capacity(width * height);
+        for _ in 0..width * height {
+            pixels.push(decode_rgb(
+                decode_pixel(&bytes, &mut position, pixel.big_endian),
+                pixel,
+            ));
+        }
+        assert_eq!(position, bytes.len(), "trailing ZLib pixel bytes");
+        pixels
+    }
+
+    fn decode_hextile(
+        data: &[u8],
+        width: usize,
+        height: usize,
+        pixel: ClientPixelFormat,
+    ) -> (Vec<(u8, u8, u8)>, Vec<u8>) {
+        let mut position = 0usize;
+        let mut pixels = vec![(0u8, 0u8, 0u8); width * height];
+        let mut subencodings = Vec::new();
+        let mut background = 0u32;
+        let mut foreground = 0u32;
+
+        for tile_y in (0..height).step_by(HEXTILE_TILE_SIZE) {
+            let tile_height = HEXTILE_TILE_SIZE.min(height - tile_y);
+            for tile_x in (0..width).step_by(HEXTILE_TILE_SIZE) {
+                let tile_width = HEXTILE_TILE_SIZE.min(width - tile_x);
+                let subencoding = data[position];
+                position += 1;
+                subencodings.push(subencoding);
+                if subencoding & HEXTILE_RAW != 0 {
+                    assert_eq!(
+                        subencoding & !HEXTILE_RAW,
+                        0,
+                        "a raw Hextile subencoding must not set other bits"
+                    );
+                    for row in 0..tile_height {
+                        for column in 0..tile_width {
+                            let value = decode_pixel(data, &mut position, pixel.big_endian);
+                            pixels[(tile_y + row) * width + tile_x + column] =
+                                decode_rgb(value, pixel);
+                        }
+                    }
+                    continue;
+                }
+                if subencoding & HEXTILE_BACKGROUND_SPECIFIED != 0 {
+                    background = decode_pixel(data, &mut position, pixel.big_endian);
+                }
+                if subencoding & HEXTILE_FOREGROUND_SPECIFIED != 0 {
+                    foreground = decode_pixel(data, &mut position, pixel.big_endian);
+                }
+                let background_rgb = decode_rgb(background, pixel);
+                for row in 0..tile_height {
+                    for column in 0..tile_width {
+                        pixels[(tile_y + row) * width + tile_x + column] = background_rgb;
+                    }
+                }
+                if subencoding & HEXTILE_ANY_SUBRECTS != 0 {
+                    let count = data[position];
+                    position += 1;
+                    let coloured = subencoding & HEXTILE_SUBRECTS_COLOURED != 0;
+                    for _ in 0..count {
+                        let colour = if coloured {
+                            decode_rgb(decode_pixel(data, &mut position, pixel.big_endian), pixel)
+                        } else {
+                            decode_rgb(foreground, pixel)
+                        };
+                        let x_and_y = data[position];
+                        let width_and_height = data[position + 1];
+                        position += 2;
+                        let x = usize::from(x_and_y >> 4);
+                        let y = usize::from(x_and_y & 0x0f);
+                        let subrect_width = usize::from(width_and_height >> 4) + 1;
+                        let subrect_height = usize::from(width_and_height & 0x0f) + 1;
+                        assert!(
+                            x + subrect_width <= tile_width && y + subrect_height <= tile_height,
+                            "Hextile subrect crosses its tile"
+                        );
+                        for row in 0..subrect_height {
+                            for column in 0..subrect_width {
+                                pixels[(tile_y + y + row) * width + tile_x + x + column] = colour;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(position, data.len(), "trailing Hextile tile bytes");
+        (pixels, subencodings)
+    }
+
+    fn decode_pixel(bytes: &[u8], position: &mut usize, big_endian: bool) -> u32 {
+        let end = *position + 4;
+        let array: [u8; 4] = bytes[*position..end].try_into().unwrap();
+        *position = end;
+        if big_endian {
+            u32::from_be_bytes(array)
+        } else {
+            u32::from_le_bytes(array)
+        }
     }
 
     fn decode_cpixel(
@@ -3538,7 +4269,7 @@ mod tests {
         set_format.extend_from_slice(&[16, 8, 0, 0, 0, 0]);
         write_all(&mut client, &set_format).await;
 
-        // Raw plus an unsupported encoding: the server ignores Hextile.
+        // Raw listed before Hextile: the client's order keeps Raw selected.
         write_all(&mut client, &[2, 0, 0, 2]).await;
         write_all(&mut client, &0i32.to_be_bytes()).await;
         write_all(&mut client, &5i32.to_be_bytes()).await;
@@ -4166,14 +4897,6 @@ mod tests {
         );
     }
 
-    fn solid_frame(width: u32, height: u32) -> FrameSnapshot {
-        FrameSnapshot {
-            generation: 1,
-            format: FrameFormat::rgb24(width, height),
-            data: Bytes::from(vec![7u8; width as usize * height as usize * 3]),
-        }
-    }
-
     #[tokio::test]
     async fn zrle_decodes_the_known_framebuffer_in_rgb_and_bgr_formats() {
         let sink: SharedSink = Arc::new(FakeInputSink::new());
@@ -4185,7 +4908,7 @@ mod tests {
         // One connection, one persistent zlib stream, three pixel formats.
         // Decoding each rectangle through the same decoder also proves the
         // server did not silently reset the stream between updates.
-        let mut decoder = TestZrleDecoder::new();
+        let mut decoder = TestZlibDecoder::new();
         for (depth, big_endian, red_shift, green_shift, blue_shift) in [
             (24, false, 16, 8, 0), // RGB order, little-endian, 3-byte CPIXEL
             (24, false, 0, 8, 16), // BGR order, little-endian, 3-byte CPIXEL
@@ -4226,41 +4949,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn encoding_preference_selects_zrle_or_raw_without_claiming_extra_codecs() {
+    async fn encoding_preference_honours_all_supported_codecs_in_client_order() {
         let sink: SharedSink = Arc::new(FakeInputSink::new());
         let server = start_server(Box::new(TestSource::new(4, 2).solid(10, 20, 30)), sink, 1).await;
         let mut client = TcpStream::connect(server.bound_addr()).await.unwrap();
         handshake_client(&mut client).await;
 
-        // Advertised ZRLE is used.
-        set_encodings(&mut client, &[ENCODING_ZRLE]).await;
-        request_update(&mut client, false, 4, 2).await;
-        assert_eq!(read_update(&mut client).await[0].encoding, ENCODING_ZRLE);
-
-        // Raw is honoured when it is the only advertised encoding.
-        set_encodings(&mut client, &[ENCODING_RAW]).await;
-        request_update(&mut client, false, 4, 2).await;
-        assert_eq!(read_update(&mut client).await[0].encoding, ENCODING_RAW);
-
-        // Preference order matters: Raw listed first wins over ZRLE.
-        set_encodings(&mut client, &[ENCODING_RAW, ENCODING_ZRLE]).await;
-        request_update(&mut client, false, 4, 2).await;
-        assert_eq!(read_update(&mut client).await[0].encoding, ENCODING_RAW);
-
-        // ZRLE listed first wins over Raw.
-        set_encodings(&mut client, &[ENCODING_ZRLE, ENCODING_RAW]).await;
-        request_update(&mut client, false, 4, 2).await;
-        assert_eq!(read_update(&mut client).await[0].encoding, ENCODING_ZRLE);
-
-        // An unsupported codec (Hextile) never becomes ZRLE or Hextile.
-        set_encodings(&mut client, &[5]).await;
-        request_update(&mut client, false, 4, 2).await;
-        assert_eq!(read_update(&mut client).await[0].encoding, ENCODING_RAW);
-
-        // An empty list also falls back to Raw.
-        set_encodings(&mut client, &[]).await;
-        request_update(&mut client, false, 4, 2).await;
-        assert_eq!(read_update(&mut client).await[0].encoding, ENCODING_RAW);
+        let cases: &[(&[i32], i32)] = &[
+            // A single advertised encoding is used as-is.
+            (&[ENCODING_ZRLE], ENCODING_ZRLE),
+            (&[ENCODING_RAW], ENCODING_RAW),
+            (&[ENCODING_HEXTILE], ENCODING_HEXTILE),
+            (&[ENCODING_ZLIB], ENCODING_ZLIB),
+            // The client's order decides between every supported pair.
+            (&[ENCODING_RAW, ENCODING_ZRLE], ENCODING_RAW),
+            (&[ENCODING_ZRLE, ENCODING_RAW], ENCODING_ZRLE),
+            (&[ENCODING_HEXTILE, ENCODING_ZLIB], ENCODING_HEXTILE),
+            (&[ENCODING_ZLIB, ENCODING_HEXTILE], ENCODING_ZLIB),
+            (&[ENCODING_HEXTILE, ENCODING_ZRLE], ENCODING_HEXTILE),
+            (&[ENCODING_ZLIB, ENCODING_ZRLE], ENCODING_ZLIB),
+            (
+                &[ENCODING_ZRLE, ENCODING_HEXTILE, ENCODING_ZLIB, ENCODING_RAW],
+                ENCODING_ZRLE,
+            ),
+            // An unsupported encoding (Tight, 7) is ignored without disturbing
+            // the supported entries around it.
+            (&[7, ENCODING_ZLIB], ENCODING_ZLIB),
+            (&[ENCODING_HEXTILE, 7, ENCODING_RAW], ENCODING_HEXTILE),
+            // An all-unsupported or empty list falls back to Raw.
+            (&[7], ENCODING_RAW),
+            (&[], ENCODING_RAW),
+        ];
+        for (encodings, expected) in cases {
+            set_encodings(&mut client, encodings).await;
+            request_update(&mut client, false, 4, 2).await;
+            let rects = read_update(&mut client).await;
+            assert_eq!(
+                rects[0].encoding, *expected,
+                "encodings {encodings:?} selected the wrong codec"
+            );
+        }
 
         server.shutdown().await;
     }
@@ -4305,52 +5033,356 @@ mod tests {
         server.shutdown().await;
     }
 
-    #[test]
-    fn zrle_bounds_and_unavailable_stream_fall_back_to_raw() {
-        let frame = solid_frame(4, 2);
-        let pixel = ClientPixelFormat::default();
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    fn first_rect_encoding(bytes: &[u8]) -> i32 {
+        i32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]])
+    }
 
-        // A rectangle outside the captured frame is rejected before any bytes
-        // are appended to the zlib stream.
-        let error = encode_zrle_rect(
-            &frame,
-            pixel,
+    fn assert_all_hextile_variants(subencodings: &[u8]) {
+        assert!(
+            subencodings.contains(&HEXTILE_RAW),
+            "a raw tile should be present: {subencodings:?}"
+        );
+        assert!(
+            subencodings.iter().any(|sub| *sub == 0),
+            "a solid tile reusing the background should be present: {subencodings:?}"
+        );
+        assert!(
+            subencodings
+                .iter()
+                .any(|sub| sub & HEXTILE_BACKGROUND_SPECIFIED != 0 && sub & HEXTILE_RAW == 0),
+            "a new background should be specified: {subencodings:?}"
+        );
+        assert!(
+            subencodings.iter().any(|sub| {
+                sub & HEXTILE_ANY_SUBRECTS != 0
+                    && sub & HEXTILE_FOREGROUND_SPECIFIED != 0
+                    && sub & HEXTILE_SUBRECTS_COLOURED == 0
+            }),
+            "a non-coloured foreground subrect tile should be present: {subencodings:?}"
+        );
+        assert!(
+            subencodings
+                .iter()
+                .any(|sub| sub & HEXTILE_SUBRECTS_COLOURED != 0),
+            "a coloured subrect tile should be present: {subencodings:?}"
+        );
+    }
+
+    #[test]
+    fn hextile_all_subencodings_decode_in_rgb_and_bgr() {
+        let (width, height) = (64, 32);
+        let expected = hextile_pixels();
+        let frame = frame_from_pixels(width, height, &expected);
+
+        for pixel in [
+            client_pixel_format(24, false, 16, 8, 0),
+            client_pixel_format(24, true, 0, 8, 16),
+        ] {
+            let mut encoded = Vec::new();
+            encode_hextile_rect(
+                &frame,
+                pixel,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: width as u16,
+                    height: height as u16,
+                },
+                &mut encoded,
+            )
+            .expect("Hextile encode");
+            let (decoded, subencodings) = decode_hextile(&encoded, width, height, pixel);
+            assert_eq!(decoded, expected);
+            assert_all_hextile_variants(&subencodings);
+        }
+    }
+
+    #[test]
+    fn hextile_handles_edge_tiles_and_rectangle_offsets() {
+        let (frame_width, frame_height) = (40usize, 40usize);
+        let pixels: Vec<(u8, u8, u8)> = (0..frame_width * frame_height)
+            .map(|index| {
+                (
+                    (index % 251) as u8,
+                    ((index * 3) % 253) as u8,
+                    ((index * 7) % 255) as u8,
+                )
+            })
+            .collect();
+        let frame = frame_from_pixels(frame_width, frame_height, &pixels);
+        let rect = Rect {
+            x: 3,
+            y: 5,
+            width: 20,
+            height: 17,
+        };
+        let pixel = client_pixel_format(24, false, 0, 8, 16);
+
+        let mut encoded = Vec::new();
+        encode_hextile_rect(&frame, pixel, rect, &mut encoded).expect("Hextile encode");
+        let (decoded, _) = decode_hextile(&encoded, 20, 17, pixel);
+
+        let mut expected = Vec::with_capacity(20 * 17);
+        for y in 5..5 + 17 {
+            for x in 3..3 + 20 {
+                expected.push(pixels[y * frame_width + x]);
+            }
+        }
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn hextile_and_zlib_bounds_are_rejected_before_writing() {
+        let pixels = vec![(1u8, 2u8, 3u8); 4 * 2];
+        let frame = frame_from_pixels(4, 2, &pixels);
+        let pixel = ClientPixelFormat::default();
+
+        for rect in [
+            Rect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 2,
+            },
             Rect {
                 x: 2,
                 y: 0,
                 width: 4,
                 height: 2,
             },
-            &mut encoder,
-        )
-        .expect_err("out-of-bounds ZRLE rectangle must fail");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        ] {
+            let mut hextile = Vec::new();
+            let error = encode_hextile_rect(&frame, pixel, rect, &mut hextile)
+                .expect_err("invalid Hextile rectangle must fail");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(hextile.is_empty(), "invalid Hextile geometry wrote bytes");
 
-        // If the stream is unavailable (an earlier encode failed and ZRLE was
-        // disabled), the same selection still produces a valid Raw rectangle.
+            let mut zlib = ZlibEncoder::new(Vec::new(), Compression::default());
+            let error = encode_zlib_rect(&frame, pixel, rect, &mut zlib)
+                .expect_err("invalid ZLib rectangle must fail");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(
+                zlib.get_ref().is_empty(),
+                "invalid ZLib geometry touched the stream"
+            );
+        }
+    }
+
+    #[test]
+    fn zlib_stream_encodes_multiple_rectangles_in_rgb_and_bgr() {
+        let (width, height) = (37usize, 21usize);
+        let pixels: Vec<(u8, u8, u8)> = (0..width * height)
+            .map(|index| {
+                (
+                    (index % 255) as u8,
+                    ((index * 5) % 255) as u8,
+                    ((index * 11) % 255) as u8,
+                )
+            })
+            .collect();
+        let frame = frame_from_pixels(width, height, &pixels);
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: width as u16,
+            height: height as u16,
+        };
+
+        for pixel in [
+            client_pixel_format(24, false, 16, 8, 0),
+            client_pixel_format(24, false, 0, 8, 16),
+            client_pixel_format(32, true, 16, 8, 0),
+        ] {
+            // One encoder and one decoder for three successive rectangles.
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+            let mut decoder = TestZlibDecoder::new();
+            for _ in 0..3 {
+                let data =
+                    encode_zlib_rect(&frame, pixel, rect, &mut encoder).expect("ZLib encode");
+                let decoded = decode_zlib_rect(&mut decoder, &data, width, height, pixel);
+                assert_eq!(decoded, pixels);
+            }
+        }
+    }
+
+    #[test]
+    fn compressed_encoding_failure_falls_back_to_raw_and_disables_only_that_encoding() {
+        // YUYV is rejected at startup in production, but it gives this unit
+        // test a frame whose pixels the encoders cannot read, forcing the
+        // per-rectangle error path without a synthetic stream failure.
+        let frame = FrameSnapshot {
+            generation: 1,
+            format: FrameFormat::new(PixelFormat::Yuyv, 4, 2),
+            data: Bytes::from(vec![0u8; 16]),
+        };
+        let pixel = ClientPixelFormat::default();
+        let rects = [Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 2,
+        }];
+
+        let mut zrle = ZlibEncoder::new(Vec::new(), Compression::default());
         let built = build_update(
             &frame,
             pixel,
-            &[Rect {
-                x: 0,
-                y: 0,
-                width: 4,
-                height: 2,
-            }],
+            &rects,
             UpdateEncoding::Zrle,
+            Some(&mut zrle),
             None,
             false,
         );
-        assert!(!built.zrle_failed);
-        let encoding = i32::from_be_bytes([
-            built.bytes[12],
-            built.bytes[13],
-            built.bytes[14],
-            built.bytes[15],
-        ]);
-        assert_eq!(encoding, ENCODING_RAW);
+        assert_eq!(built.failed_encoding, Some(UpdateEncoding::Zrle));
+        assert_eq!(first_rect_encoding(&built.bytes), ENCODING_RAW);
         assert_eq!(built.payload_bytes, 4 * 2 * 4);
+
+        let built = build_update(
+            &frame,
+            pixel,
+            &rects,
+            UpdateEncoding::Hextile,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(built.failed_encoding, Some(UpdateEncoding::Hextile));
+        assert_eq!(first_rect_encoding(&built.bytes), ENCODING_RAW);
+
+        let mut zlib = ZlibEncoder::new(Vec::new(), Compression::default());
+        let built = build_update(
+            &frame,
+            pixel,
+            &rects,
+            UpdateEncoding::ZLib,
+            None,
+            Some(&mut zlib),
+            false,
+        );
+        assert_eq!(built.failed_encoding, Some(UpdateEncoding::ZLib));
+        assert_eq!(first_rect_encoding(&built.bytes), ENCODING_RAW);
+
+        // A selection with no usable stream (the encoder was already disabled)
+        // produces Raw without claiming a new failure.
+        let built = build_update(
+            &frame,
+            pixel,
+            &rects,
+            UpdateEncoding::Zrle,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(built.failed_encoding, None);
+        assert_eq!(first_rect_encoding(&built.bytes), ENCODING_RAW);
+    }
+
+    #[test]
+    fn encoding_selection_skips_only_disabled_encodings() {
+        let mut state = ClientEncodingState::default();
+        assert_eq!(
+            state.select(DisabledEncodings::default()),
+            UpdateEncoding::Raw
+        );
+
+        state.push(UpdateEncoding::Hextile);
+        state.push(UpdateEncoding::ZLib);
+        state.push(UpdateEncoding::Zrle);
+        // Duplicates and extra entries do not change or overflow the order.
+        state.push(UpdateEncoding::Hextile);
+        assert_eq!(state.count, 3);
+
+        let mut disabled = DisabledEncodings::default();
+        assert_eq!(state.select(disabled), UpdateEncoding::Hextile);
+        disabled.disable(UpdateEncoding::Hextile);
+        assert_eq!(state.select(disabled), UpdateEncoding::ZLib);
+        assert!(!disabled.is_disabled(UpdateEncoding::Zrle));
+        disabled.disable(UpdateEncoding::ZLib);
+        assert_eq!(state.select(disabled), UpdateEncoding::Zrle);
+        disabled.disable(UpdateEncoding::Zrle);
+        assert_eq!(state.select(disabled), UpdateEncoding::Raw);
+    }
+
+    #[tokio::test]
+    async fn hextile_frames_decode_over_the_wire_in_rgb_and_bgr() {
+        let expected = hextile_pixels();
+        let server = start_server(
+            Box::new(FixedPixelSource::new(64, 32, expected.clone())),
+            Arc::new(FakeInputSink::new()),
+            1,
+        )
+        .await;
+        let mut client = TcpStream::connect(server.bound_addr()).await.unwrap();
+        handshake_client(&mut client).await;
+
+        for pixel in [
+            client_pixel_format(24, false, 16, 8, 0),
+            client_pixel_format(24, false, 0, 8, 16),
+            client_pixel_format(24, true, 0, 8, 16),
+        ] {
+            set_pixel_format(&mut client, pixel).await;
+            set_encodings(&mut client, &[ENCODING_HEXTILE]).await;
+            request_update(&mut client, false, 64, 32).await;
+            let rects = read_update(&mut client).await;
+            assert_eq!(rects.len(), 1);
+            assert_eq!(rects[0].encoding, ENCODING_HEXTILE);
+            let (decoded, subencodings) = decode_hextile(&rects[0].data, 64, 32, pixel);
+            assert_eq!(decoded, expected);
+            assert_all_hextile_variants(&subencodings);
+        }
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn zlib_and_zrle_use_independent_persistent_streams() {
+        let expected = pattern_pixels(64, 32);
+        let server = start_server(
+            Box::new(PatternSource::new(64, 32)),
+            Arc::new(FakeInputSink::new()),
+            1,
+        )
+        .await;
+        let mut client = TcpStream::connect(server.bound_addr()).await.unwrap();
+        handshake_client(&mut client).await;
+        let mut zlib_decoder = TestZlibDecoder::new();
+        let mut zrle_decoder = TestZlibDecoder::new();
+
+        for pixel in [
+            client_pixel_format(24, false, 16, 8, 0),
+            client_pixel_format(24, false, 0, 8, 16),
+            client_pixel_format(24, true, 0, 8, 16),
+        ] {
+            set_pixel_format(&mut client, pixel).await;
+
+            // Two ZLib rectangles on the same persistent zlib stream.
+            set_encodings(&mut client, &[ENCODING_ZLIB]).await;
+            for _ in 0..2 {
+                request_update(&mut client, false, 64, 32).await;
+                let rects = read_update(&mut client).await;
+                assert_eq!(rects.len(), 1);
+                assert_eq!(rects[0].encoding, ENCODING_ZLIB);
+                let decoded = decode_zlib_rect(&mut zlib_decoder, &rects[0].data, 64, 32, pixel);
+                assert_eq!(decoded, expected);
+            }
+
+            // ZRLE has its own stream and must decode independently.
+            set_encodings(&mut client, &[ENCODING_ZRLE]).await;
+            request_update(&mut client, false, 64, 32).await;
+            let rects = read_update(&mut client).await;
+            assert_eq!(rects[0].encoding, ENCODING_ZRLE);
+            let (decoded, _) = decode_zrle(&mut zrle_decoder, &rects[0].data, 64, 32, pixel);
+            assert_eq!(decoded, expected);
+
+            // Returning to ZLib continues the original stream rather than
+            // restarting it.
+            set_encodings(&mut client, &[ENCODING_ZLIB]).await;
+            request_update(&mut client, false, 64, 32).await;
+            let rects = read_update(&mut client).await;
+            assert_eq!(rects[0].encoding, ENCODING_ZLIB);
+            let decoded = decode_zlib_rect(&mut zlib_decoder, &rects[0].data, 64, 32, pixel);
+            assert_eq!(decoded, expected);
+        }
+        server.shutdown().await;
     }
 
     #[tokio::test]

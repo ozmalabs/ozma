@@ -10,7 +10,9 @@ This change wires the existing `ozma-mesh` crate into `ozma-node` as an
   handles live behind a `Mutex`) so node async traits can call it. It also owns
   a typed, injectable Linux dataplane (TUN link, routes, IPv4 forwarding,
   opt-in NAT, and a bounded TUN/WireGuard packet pump) in
-  [`dataplane`](phase4-mesh-dataplane-report.md).
+  [`dataplane`](phase4-mesh-dataplane-report.md), plus opt-in mDNS peer
+  discovery and route reconciliation in
+  [`phase4-mesh-discovery-report.md`](phase4-mesh-discovery-report.md).
 * `ozma-node`: new `mesh_service` module, `--mesh*` CLI/env flags, guarded
   `/api/v1/connect/{status,peers,events}` routes, startup/shutdown wiring, and
   optional `--mesh-dataplane` lifecycle wiring.
@@ -49,7 +51,11 @@ the controller only adds new node-scoped routes and returns the node's plain
 | `--mesh-port` | `OZMA_MESH_PORT` | WireGuard UDP port (default `51820`, must be non-zero). |
 | `--mesh-key-file` | `OZMA_MESH_KEY_FILE` | Base64 X25519 WireGuard private-key file. |
 | `--mesh-kernel` | `OZMA_MESH_KERNEL` | Request kernel WireGuard (root + `wg`). Kernel mode is **not implemented** and reports a typed unsupported state. |
-| `--mesh-peer` | `OZMA_MESH_PEER` | Repeatable JSON `MeshNode` peer object. |
+| `--mesh-peer` | `OZMA_MESH_PEER` | Repeatable JSON `MeshNode` peer object. Static and authoritative. |
+| `--mesh-discover` | `OZMA_MESH_DISCOVER` | Opt in to mDNS browsing on `_ozma-mesh._udp.local`. Requires `--mesh`. |
+| `--mesh-discover-ttl` | `OZMA_MESH_DISCOVER_TTL` | Seconds an absent discovered peer is retained (default `60`). |
+| `--mesh-discover-max-peers` | `OZMA_MESH_DISCOVER_MAX_PEERS` | Discovered-peer bound (default `32`, hard limit `256`). |
+| `--mesh-trust` | `OZMA_MESH_TRUST` | Repeatable discovery authorization: JSON `TrustedPeer` or `ID=BASE64_KEY`. |
 | `--mesh-dataplane` | `OZMA_MESH_DATAPLANE` | Opt in to the kernel TUN/routing/forwarding dataplane. Requires root, `/dev/net/tun`, and `ip`. |
 | `--mesh-tun` | `OZMA_MESH_TUN` | TUN interface name (default `ozma0`). |
 | `--mesh-mtu` | `OZMA_MESH_MTU` | TUN MTU (default `1420`). |
@@ -74,6 +80,9 @@ Peer/tunnel model:
   (`Tunn::stats()` time-since-handshake is `Some`).
 * Counter fields (`tx_bytes`, `rx_bytes`, `loss`, `rtt_ms`, handshake age) are
   boringtun's real values; a newly added peer reports zeroes and idle.
+* Static peers report `origin:"static"`; discovered peers report
+  `origin:"discovered"`, their advertised capabilities, and the actual
+  `endpoint` used for WireGuard UDP transport.
 * `peer_count` and `peers` are omitted unless the service is running. A running
   service with no peers reports a real `peer_count: 0` and `peers: []`.
 
@@ -117,6 +126,47 @@ programming its route never marks that peer `established`; only a real
 boringtun handshake does. See
 [`phase4-mesh-dataplane-report.md`](phase4-mesh-dataplane-report.md).
 
+### Discovery lifecycle (opt-in)
+
+With `--mesh-discover`, the service browses `_ozma-mesh._udp.local` every five
+seconds. An advertisement is only accepted when its node id + WireGuard public
+key match a static `--mesh-peer` entry or a `--mesh-trust` entry. Static peers
+are authoritative, so a conflicting advertisement is reported and ignored.
+Accepted peers are added to the backend, get a `/32` route through the existing
+dataplane seam, and have a WireGuard handshake initiated. When a peer is not
+seen for `--mesh-discover-ttl` seconds its tunnel and route are removed. A
+changed mesh IP replaces the one tunnel for that id (no duplicate tunnel), adds
+the new route, and removes the old one.
+
+Discovered peers use the observed mDNS underlay address as their WireGuard UDP
+endpoint while keeping their mesh IP as the overlay identity. This keeps
+encrypted UDP off the mesh TUN and avoids the static-peer endpoint recursion
+noted in the live reports.
+
+Discovery status appears next to the dataplane/pump documents:
+
+```json
+"discovery": {
+  "enabled": true,
+  "local_id": "ozma-disc-a",
+  "max_peers": 8,
+  "ttl_secs": 10,
+  "static_peer_count": 0,
+  "trusted_key_count": 1,
+  "discovered_count": 1,
+  "peers": [{"id":"ozma-disc-b","mesh_ip":"10.200.1.2","wg_port":51820,
+             "wg_pubkey":"...","capabilities":["audio","video"],
+             "underlay_ip":"10.10.20.1","age_secs":0,"expires_in_secs":9}],
+  "counters": {"advertisements":4,"authorized":2,"added":1,"updated":0,
+               "removed":0,"duplicates":1,"expired":0,"conflicts":0,
+               "unauthorized":0,"invalid":0,"limit_dropped":0,
+               "self_ignored":2,"static_matched":0}
+}
+```
+
+Discovery events use the bounded event log: `peer-discovered`, `peer-removed`,
+`route`, and `conflict` (refusals), plus `error` for programming failures.
+
 Typed prerequisites (`MeshServiceError.code`):
 
 | Code | Meaning |
@@ -130,6 +180,9 @@ Typed prerequisites (`MeshServiceError.code`):
 | `mesh.wireguard-unavailable` | No usable userspace or kernel backend. |
 | `mesh.kernel-unsupported` | Root/`wg` are present but kernel mode is not implemented. |
 | `mesh.peer-invalid` | Configured peer JSON/address is invalid. |
+| `mesh.discovery-invalid` | Discovery bounds or a `--mesh-trust` entry is invalid. |
+| `mesh.peer-conflict` | A discovered advertisement conflicts with a static/other peer. |
+| `mesh.peer-unauthorized` | An advertisement lacks a matching key/host authorization. |
 | `mesh.peer-already-exists` / `mesh.peer-not-found` | Typed peer-table errors. |
 | `mesh.dataplane-unavailable` | `/dev/net/tun`, `ip`, or (for NAT) `nft` is unavailable. |
 | `mesh.dataplane-invalid` | TUN name, address/prefix, MTU, peer route, or NAT table/interface is invalid. |
@@ -161,8 +214,8 @@ Status includes:
   disabled);
 * `enabled`, `state`, `available`, `wireguard` (`userspace-boringtun`,
   `not-configured`, or `unavailable`);
-* optional `identity`, `dataplane`, `peer_count`, `peers`, `event_count`,
-  `event_capacity`;
+* optional `identity`, `dataplane`, `pump`, `discovery`, `peer_count`, `peers`,
+  `event_count`, `event_capacity`;
 * typed `code`/`reason` when unavailable.
 
 Typed 501 body:
@@ -203,12 +256,12 @@ proxied; a test asserts it still returns the Connect account/tier document.
 
 Run for this change:
 
-* `cargo test -p ozma-mesh -p ozma-node --lib` — **543 passed, 5 ignored**
-  (`ozma-mesh`: 22 passed, 2 ignored; `ozma-node`: 521 passed, 3 ignored).
+* `cargo test -p ozma-mesh -p ozma-node --lib` — **611 passed, 6 ignored**
+  (`ozma-mesh`: 48 passed, 2 ignored; `ozma-node`: 563 passed, 4 ignored).
+* `cargo test -p ozma-node --bin ozma-node mesh_` — **2 passed** (CLI defaults
+  and trust parsing).
 * `cargo check -p ozma-mesh -p ozma-node --all-targets` — passes (pre-existing
   warnings only).
-* `python3 -m pytest tests/unit/controller/test_mesh_connect_proxy.py -q` —
-  **10 passed**.
 * `rustfmt --edition 2021 --check` on every touched Rust file — passes.
 
 Coverage includes:
@@ -225,6 +278,14 @@ Coverage includes:
 * packet-pump status absent without a dataplane, stopped before start,
   starting while the TUN opens, running with real zero counters, and failed
   with typed `mesh.tun-open`/`mesh.pump-*` errors that roll back the runtime;
+* fake discovery stream: authorized add, untrusted key rejected before any
+  peer/route/handshake, duplicate dedupe, TTL removal, mesh-IP change with one
+  tunnel and two route changes, static-vs-discovered conflict, max-peer bound,
+  malformed records, and mDNS wire parsing/assembly;
+* manager origin safety: invalid advertised key installs nothing, discovered
+  endpoint updates replace the tunnel, static peers cannot be overwritten or
+  removed by discovery, and two ids cannot share a mesh IP;
+* node discovery status/events and restart without stale deduplication;
 * controller token forwarding, status/capability discovery, typed 501
   passthrough, Python-node 404, auth-failure mapping, and unchanged global
   Connect status.
@@ -241,13 +302,14 @@ are `#[ignore]`d and additionally gated by `OZMA_MESH_LIVE=1`.
 * **No root/wg requirement for the default WireGuard backend.** Userspace
   boringtun needs neither. Root/TUN/`ip` are required only when
   `--mesh-dataplane` is explicitly enabled; NAT additionally requires `nft`.
-* **No mDNS browsing in the node service.** `MeshManager` advertises
-  `_ozma._udp.local`, but peer discovery is not consumed: peers must be supplied
-  with `--mesh-peer` or runtime peer management. The existing
-  `mdns::browse_peers` helper is not wired.
-* **No automatic handshake/peer promotion.** Adding a peer starts idle; there is
-  no node route to initiate a handshake or authenticate/authorize peers. A real
-  established state requires an external peer to complete a handshake.
+* **mDNS advertisements are unauthenticated.** Discovery is opt-in and every
+  advertisement must match a static peer or a `--mesh-trust` key, but mDNS
+  itself provides no signature or replay protection. Trust entries are the
+  authorization boundary; there is no controller-issued mesh CA yet.
+* **No automatic handshake/peer promotion for static peers.** Discovered peers
+  get an initiated handshake; a static peer still becomes established through
+  its own traffic or an external call. A real established state always
+  requires a boringtun handshake, never configuration.
 * **Packet-pump live-network coverage is partial.** The pump now owns the TUN
   fd and moves IPv4 plaintext to/from boringtun, but default tests use
   in-memory seams. There is no live multi-node encrypted packet-flow test, and

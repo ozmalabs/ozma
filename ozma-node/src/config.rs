@@ -1268,8 +1268,10 @@ pub struct NodeConfig {
     pub usb_vendor: bool,
     /// Optional absolute FunctionFS daemon path (`--usb-vendor-daemon`).
     pub usb_vendor_daemon: Option<PathBuf>,
-    /// Explicit mounted FunctionFS directory for the background media daemon
-    /// (`--usb-functionfs-mount`). The node never mounts it itself.
+    /// Explicit FunctionFS mountpoint for the background media daemon
+    /// (`--usb-functionfs-mount`). In the supported auto-start path the node
+    /// creates the `ffs.<instance>` function, mounts FunctionFS here (root),
+    /// starts the daemon, and binds the UDC after the daemon writes `ep0`.
     pub usb_functionfs_mount: Option<PathBuf>,
     /// Start the bounded USB/IP control/data listener (`--usbip`).
     pub usbip: bool,

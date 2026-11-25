@@ -5,8 +5,8 @@
 //! Each `MeshManager` instance represents one node in the ozma mesh.  It:
 //!
 //! 1. Owns a userspace WireGuard tunnel per peer (via `boringtun`).
-//! 2. Advertises itself over mDNS (`_ozma._udp.local`) so other nodes on the
-//!    same LAN segment discover each other without a central registry.
+//! 2. Advertises itself over mDNS (`_ozma-mesh._udp.local`) so other nodes on
+//!    the same LAN segment discover each other without a central registry.
 //! 3. Maintains a peer table — add/remove peers at runtime.
 //! 4. Runs an async receive loop (started by [`MeshManager::start`]) that
 //!    decapsulates incoming WireGuard packets and auto-replies to handshakes.
@@ -45,6 +45,7 @@ use tokio::sync::{Notify, RwLock};
 use tracing::{debug, info, warn};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
+use crate::discovery::{normalize_capabilities, validate_peer_node, MDNS_SERVICE_TYPE};
 use crate::error::{MeshError, Result};
 use crate::node::{MeshNode, WgPrivateKey};
 
@@ -116,8 +117,28 @@ impl PeerTunnel for Tunn {
 
 pub(crate) struct PeerState {
     node: MeshNode,
+    /// WireGuard UDP endpoint actually used for this peer. Static peers use
+    /// `mesh_ip:wg_port`; discovered peers use the observed underlay address
+    /// when one was advertised, keeping transport separate from the overlay.
+    endpoint: SocketAddr,
     /// boringtun userspace WireGuard tunnel for this peer.
     tunnel: Box<dyn PeerTunnel>,
+    /// Whether this peer came from static configuration or discovery.
+    origin: PeerOrigin,
+    /// Capabilities advertised by a discovered peer.
+    capabilities: Vec<String>,
+}
+
+/// Where a peer entry came from.
+///
+/// Static peers (`--mesh-peer`) are authoritative. Discovered peers are
+/// additive and can only be added/updated/removed by the discovery reconciler.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PeerOrigin {
+    #[default]
+    Static,
+    Discovered,
 }
 
 /// Read-only snapshot of one peer's tunnel, returned by
@@ -129,6 +150,15 @@ pub(crate) struct PeerState {
 pub struct PeerStatus {
     /// Peer identity as registered.
     pub node: MeshNode,
+    /// Whether the peer was statically configured or discovered.
+    #[serde(default)]
+    pub origin: PeerOrigin,
+    /// Capabilities advertised by a discovered peer.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// UDP endpoint used for this peer's WireGuard transport.
+    #[serde(default)]
+    pub endpoint: String,
     /// Whether a WireGuard handshake has completed.
     pub established: bool,
     /// Seconds since the last handshake (`None` before the first one).
@@ -146,10 +176,22 @@ pub struct PeerStatus {
 /// Bound on decapsulated packets waiting for a packet pump.
 pub const DEFAULT_PACKET_QUEUE: usize = 256;
 
+/// Result of adding a discovered peer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PeerChange {
+    /// A new discovered peer and tunnel were created.
+    Added,
+    /// The advertisement was identical; nothing changed.
+    Unchanged,
+    /// The same authorized peer changed endpoint; its tunnel was replaced.
+    Updated { previous: MeshNode },
+}
+
 // ── Lock-protected inner state ────────────────────────────────────────────────
 
 pub(crate) struct Inner {
     pub(crate) peers: HashMap<String, PeerState>,
+    pub(crate) next_peer_index: u32,
 }
 
 // ── MeshManager ───────────────────────────────────────────────────────────────
@@ -201,8 +243,19 @@ impl MeshManager {
     ///
     /// Binds a non-blocking UDP socket on `node.wg_port` (use `0` for an
     /// OS-assigned ephemeral port) and registers an mDNS service
-    /// `_ozma._udp.local` advertising the node's id, mesh IP, and public key.
+    /// `_ozma-mesh._udp.local` advertising the node's id, mesh IP, public key,
+    /// and WireGuard endpoint.
     pub async fn new(node: MeshNode, private_key: WgPrivateKey) -> Result<Self> {
+        Self::new_with_capabilities(node, private_key, Vec::new()).await
+    }
+
+    /// Like [`MeshManager::new`], with node capabilities included in the mDNS
+    /// TXT record.
+    pub async fn new_with_capabilities(
+        node: MeshNode,
+        private_key: WgPrivateKey,
+        capabilities: Vec<String>,
+    ) -> Result<Self> {
         // Bind the WireGuard UDP socket on all interfaces.
         // Use port 0 to let the OS pick an ephemeral port when wg_port == 0.
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), node.wg_port);
@@ -222,19 +275,33 @@ impl MeshManager {
             "MeshManager: WireGuard socket bound"
         );
 
-        // Advertise over mDNS so peers on the same LAN can discover us.
+        // Advertise over a dedicated mesh service type so the node's
+        // controller-facing `_ozma._udp` record (HTTP port/TXT) is untouched.
         let responder = Responder::new().map_err(|e| MeshError::Mdns(e.to_string()))?;
+        let instance = mdns_instance_name(&node.id);
+        let capability_text = mdns_capability_text(&capabilities);
+        let mut properties = vec![
+            format!("id={}", node.id),
+            format!("mesh_ip={}", node.mesh_ip),
+            format!("pubkey={}", node.wg_pubkey),
+            format!("wg_port={actual_port}"),
+            "proto=1".to_owned(),
+        ];
+        if !capability_text.is_empty() {
+            properties.push(format!("cap={capability_text}"));
+        }
+        let property_refs: Vec<&str> = properties.iter().map(String::as_str).collect();
         let svc = responder.register(
-            "_ozma._udp".into(),
-            node.id.clone(),
+            MDNS_SERVICE_TYPE.to_owned(),
+            instance,
             actual_port,
-            &[
-                &format!("mesh_ip={}", node.mesh_ip),
-                &format!("pubkey={}", node.wg_pubkey),
-            ],
+            &property_refs,
         );
 
-        info!(node_id = %node.id, "MeshManager: mDNS service registered (_ozma._udp.local)");
+        info!(
+            node_id = %node.id,
+            "MeshManager: mDNS service registered (_ozma-mesh._udp.local)"
+        );
 
         let (packet_tx, packet_rx) = mpsc::channel(DEFAULT_PACKET_QUEUE);
 
@@ -242,6 +309,7 @@ impl MeshManager {
             node,
             inner: Arc::new(RwLock::new(Inner {
                 peers: HashMap::new(),
+                next_peer_index: 0,
             })),
             socket: Arc::new(socket),
             _mdns: std::sync::Mutex::new(Some((responder, svc))),
@@ -325,14 +393,10 @@ impl MeshManager {
                         let pkt = &buf[..n];
                         let mut guard = inner.write().await;
 
-                        // Find the peer whose endpoint matches `src`.
-                        let peer = guard.peers.values_mut().find(|p| {
-                            p.node
-                                .mesh_ip
-                                .parse::<Ipv4Addr>()
-                                .map(|ip| SocketAddr::new(IpAddr::V4(ip), p.node.wg_port) == src)
-                                .unwrap_or(false)
-                        });
+                        // Find the peer whose configured UDP endpoint matches
+                        // `src`. Discovered peers may use an underlay address
+                        // distinct from their overlay mesh IP.
+                        let peer = guard.peers.values_mut().find(|p| p.endpoint == src);
 
                         if let Some(peer) = peer {
                             match peer.tunnel.decapsulate(None, pkt, &mut out) {
@@ -389,7 +453,8 @@ impl MeshManager {
     /// Add a remote peer and create a WireGuard tunnel to it.
     ///
     /// `peer_node.mesh_ip` and `peer_node.wg_port` are used as the UDP
-    /// endpoint for outgoing packets.
+    /// endpoint for outgoing packets. The peer is tagged [`PeerOrigin::Static`]
+    /// and cannot be replaced by discovery.
     ///
     /// Returns [`MeshError::PeerAlreadyExists`] if a peer with the same id is
     /// already registered.
@@ -400,10 +465,164 @@ impl MeshManager {
             return Err(MeshError::PeerAlreadyExists(peer_node.id.clone()));
         }
 
-        // Decode keys for boringtun.
+        let endpoint = peer_endpoint(&peer_node, None)?;
+        let tunnel = self.create_tunnel(&peer_node, &mut guard)?;
+
+        info!(
+            peer_id    = %peer_node.id,
+            peer_ip    = %peer_node.mesh_ip,
+            peer_port  = peer_node.wg_port,
+            peer_pubkey = %peer_node.wg_pubkey,
+            "MeshManager: static peer added"
+        );
+
+        guard.peers.insert(
+            peer_node.id.clone(),
+            PeerState {
+                node: peer_node,
+                endpoint,
+                tunnel,
+                origin: PeerOrigin::Static,
+                capabilities: Vec::new(),
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Add or update a peer learned through authorized mDNS discovery.
+    ///
+    /// The node fields are validated again here, so a caller cannot bypass
+    /// discovery validation and install an unauthenticated key/IP. Static peers
+    /// are authoritative: a discovered id that collides with one is a typed
+    /// [`MeshError::DiscoveryConflict`] and the existing tunnel is untouched.
+    /// Re-advertising an unchanged peer is a no-op; changing the mesh IP or
+    /// WireGuard endpoint replaces the single tunnel for that id (never
+    /// creates a duplicate).
+    pub async fn add_discovered_peer(
+        &self,
+        peer_node: MeshNode,
+        capabilities: Vec<String>,
+    ) -> Result<PeerChange> {
+        self.add_discovered_peer_with_endpoint(peer_node, capabilities, None)
+            .await
+    }
+
+    /// Like [`MeshManager::add_discovered_peer`], with the observed underlay
+    /// address used as the WireGuard UDP endpoint.
+    pub async fn add_discovered_peer_with_endpoint(
+        &self,
+        peer_node: MeshNode,
+        capabilities: Vec<String>,
+        underlay_ip: Option<Ipv4Addr>,
+    ) -> Result<PeerChange> {
+        validate_peer_node(&peer_node)?;
+        let capabilities = normalize_capabilities(&capabilities)?;
+        let endpoint = peer_endpoint(&peer_node, underlay_ip)?;
+        let mut guard = self.inner.write().await;
+
+        if let Some(existing) = guard.peers.get(&peer_node.id) {
+            if existing.origin == PeerOrigin::Static {
+                return Err(MeshError::DiscoveryConflict(format!(
+                    "discovered peer {} conflicts with a static --mesh-peer entry; \
+                     static configuration is authoritative",
+                    peer_node.id
+                )));
+            }
+            if existing.node.wg_pubkey != peer_node.wg_pubkey {
+                return Err(MeshError::DiscoveryConflict(format!(
+                    "discovered peer {} changed WireGuard public key while registered",
+                    peer_node.id
+                )));
+            }
+            if existing.node == peer_node
+                && existing.capabilities == capabilities
+                && existing.endpoint == endpoint
+            {
+                return Ok(PeerChange::Unchanged);
+            }
+        }
+        if guard.peers.contains_key(&peer_node.id) {
+            self.reject_other_owner(&guard, &peer_node)?;
+            let previous = guard
+                .peers
+                .get(&peer_node.id)
+                .expect("peer was present")
+                .node
+                .clone();
+            let tunnel = self.create_tunnel(&peer_node, &mut guard)?;
+            info!(
+                peer_id = %peer_node.id,
+                old_ip = %previous.mesh_ip,
+                new_ip = %peer_node.mesh_ip,
+                %endpoint,
+                "MeshManager: discovered peer endpoint updated"
+            );
+            guard.peers.insert(
+                peer_node.id.clone(),
+                PeerState {
+                    node: peer_node,
+                    endpoint,
+                    tunnel,
+                    origin: PeerOrigin::Discovered,
+                    capabilities,
+                },
+            );
+            return Ok(PeerChange::Updated { previous });
+        }
+
+        self.reject_other_owner(&guard, &peer_node)?;
+        let tunnel = self.create_tunnel(&peer_node, &mut guard)?;
+        info!(
+            peer_id = %peer_node.id,
+            peer_ip = %peer_node.mesh_ip,
+            peer_port = peer_node.wg_port,
+            %endpoint,
+            "MeshManager: discovered peer added"
+        );
+        guard.peers.insert(
+            peer_node.id.clone(),
+            PeerState {
+                node: peer_node,
+                endpoint,
+                tunnel,
+                origin: PeerOrigin::Discovered,
+                capabilities,
+            },
+        );
+        Ok(PeerChange::Added)
+    }
+
+    /// Remove a discovered peer and its tunnel.
+    ///
+    /// `Ok(None)` means the peer was already absent (idempotent expiry).
+    /// Static peers are never removed by discovery and return a typed conflict.
+    pub async fn remove_discovered_peer(&self, peer_id: &str) -> Result<Option<MeshNode>> {
+        let mut guard = self.inner.write().await;
+        let Some(peer) = guard.peers.get(peer_id) else {
+            return Ok(None);
+        };
+        if peer.origin == PeerOrigin::Static {
+            return Err(MeshError::DiscoveryConflict(format!(
+                "static peer {peer_id} cannot be removed by discovery"
+            )));
+        }
+        let removed = guard.peers.remove(peer_id).expect("peer was present").node;
+        info!(peer_id = %peer_id, "MeshManager: discovered peer removed");
+        Ok(Some(removed))
+    }
+
+    /// Create a boringtun tunnel for `peer_node` with a fresh local index.
+    fn create_tunnel(
+        &self,
+        peer_node: &MeshNode,
+        guard: &mut Inner,
+    ) -> Result<Box<dyn PeerTunnel>> {
         let local_sk = StaticSecret::from(self.private_key.to_bytes());
         let peer_pk_bytes = peer_node.wg_pubkey.to_bytes()?;
         let peer_pk = X25519PublicKey::from(peer_pk_bytes);
+        let index = guard.next_peer_index;
+        guard.next_peer_index = guard.next_peer_index.wrapping_add(1);
 
         // Tunn::new(static_private, peer_public, preshared_key, keepalive, index, rate_limiter)
         let tunnel = Tunn::new(
@@ -411,27 +630,42 @@ impl MeshManager {
             peer_pk,
             None,     // no preshared key
             Some(25), // persistent keepalive every 25 s
-            guard.peers.len() as u32,
+            index,
             None,
         )
         .map_err(|e| MeshError::TunnelError(format!("Tunn::new for {}: {e}", peer_node.id)))?;
+        Ok(Box::new(tunnel))
+    }
 
-        info!(
-            peer_id    = %peer_node.id,
-            peer_ip    = %peer_node.mesh_ip,
-            peer_port  = peer_node.wg_port,
-            peer_pubkey = %peer_node.wg_pubkey,
-            "MeshManager: peer added"
-        );
-
-        guard.peers.insert(
-            peer_node.id.clone(),
-            PeerState {
-                node: peer_node,
-                tunnel: Box::new(tunnel),
-            },
-        );
-
+    /// Reject a discovered peer reusing another peer's mesh IP or public key.
+    fn reject_other_owner(&self, guard: &Inner, candidate: &MeshNode) -> Result<()> {
+        if candidate.mesh_ip == self.node.mesh_ip {
+            return Err(MeshError::DiscoveryConflict(format!(
+                "advertised mesh IP {} is this node's own address",
+                candidate.mesh_ip
+            )));
+        }
+        if candidate.wg_pubkey == self.node.wg_pubkey {
+            return Err(MeshError::DiscoveryConflict(
+                "advertised public key is this node's own key".to_owned(),
+            ));
+        }
+        for (id, peer) in &guard.peers {
+            if id == &candidate.id {
+                continue;
+            }
+            if peer.node.mesh_ip == candidate.mesh_ip {
+                return Err(MeshError::DiscoveryConflict(format!(
+                    "advertised mesh IP {} is already owned by peer {id}",
+                    candidate.mesh_ip
+                )));
+            }
+            if peer.node.wg_pubkey == candidate.wg_pubkey {
+                return Err(MeshError::DiscoveryConflict(format!(
+                    "advertised public key is already owned by peer {id}"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -468,6 +702,9 @@ impl MeshManager {
                 let (age, tx_bytes, rx_bytes, loss, rtt_ms) = peer.tunnel.stats();
                 PeerStatus {
                     node: peer.node.clone(),
+                    origin: peer.origin,
+                    capabilities: peer.capabilities.clone(),
+                    endpoint: peer.endpoint.to_string(),
                     // A stale handshake beyond WireGuard's reject time must not
                     // be reported as established, even if boringtun has not been
                     // polled yet.
@@ -550,12 +787,7 @@ impl MeshManager {
                 .peers
                 .get(peer_id)
                 .ok_or_else(|| MeshError::PeerNotFound(peer_id.to_owned()))?;
-            let ip: Ipv4Addr = peer
-                .node
-                .mesh_ip
-                .parse()
-                .map_err(|_| MeshError::InvalidIp(peer.node.mesh_ip.clone()))?;
-            SocketAddr::new(IpAddr::V4(ip), peer.node.wg_port)
+            peer.endpoint
         };
 
         // Generate the handshake initiation packet (148 bytes).
@@ -604,12 +836,7 @@ impl MeshManager {
                 .peers
                 .get(peer_id)
                 .ok_or_else(|| MeshError::PeerNotFound(peer_id.to_owned()))?;
-            let ip: Ipv4Addr = peer
-                .node
-                .mesh_ip
-                .parse()
-                .map_err(|_| MeshError::InvalidIp(peer.node.mesh_ip.clone()))?;
-            SocketAddr::new(IpAddr::V4(ip), peer.node.wg_port)
+            peer.endpoint
         };
 
         // WireGuard overhead is at most 148 bytes (header + auth tag).
@@ -655,14 +882,7 @@ async fn drive_timers(inner: &Arc<RwLock<Inner>>, socket: &TokioUdpSocket, out: 
     {
         let mut guard = inner.write().await;
         for peer in guard.peers.values_mut() {
-            let endpoint = peer
-                .node
-                .mesh_ip
-                .parse::<Ipv4Addr>()
-                .map(|ip| SocketAddr::new(IpAddr::V4(ip), peer.node.wg_port));
-            let Ok(endpoint) = endpoint else {
-                continue;
-            };
+            let endpoint = peer.endpoint;
             match peer.tunnel.update_timers(out) {
                 TunnResult::WriteToNetwork(packet) => {
                     pending.push((peer.node.id.clone(), endpoint, packet.to_vec()));
@@ -693,6 +913,63 @@ async fn drive_timers(inner: &Arc<RwLock<Inner>>, socket: &TokioUdpSocket, out: 
     }
 }
 
+/// Resolve the WireGuard UDP endpoint for a peer.
+///
+/// Static peers use their mesh IP (existing behavior). Discovered peers use
+/// the observed underlay address when the mDNS advertisement provided one,
+/// keeping encrypted UDP off the overlay TUN.
+fn peer_endpoint(node: &MeshNode, underlay_ip: Option<Ipv4Addr>) -> Result<SocketAddr> {
+    let address = match underlay_ip {
+        Some(address) => address,
+        None => node
+            .mesh_ip
+            .parse::<Ipv4Addr>()
+            .map_err(|_| MeshError::InvalidIp(node.mesh_ip.clone()))?,
+    };
+    Ok(SocketAddr::new(IpAddr::V4(address), node.wg_port))
+}
+
+/// Sanitize a node id into a DNS-SD instance label.
+///
+/// The TXT `id` field remains the authoritative identity; this only keeps the
+/// SRV/PTR instance name a valid single DNS label.
+fn mdns_instance_name(id: &str) -> String {
+    let mut name: String = id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .take(63)
+        .collect();
+    if name.is_empty() {
+        name.push_str("mesh-node");
+    }
+    name
+}
+
+/// Join capabilities into one bounded TXT value.
+fn mdns_capability_text(capabilities: &[String]) -> String {
+    let mut seen = std::collections::BTreeSet::new();
+    for capability in capabilities {
+        for entry in capability.split(',') {
+            let entry = entry.trim();
+            if !entry.is_empty() && !entry.chars().any(char::is_control) {
+                seen.insert(entry.to_owned());
+            }
+        }
+    }
+    seen.into_iter()
+        .collect::<Vec<_>>()
+        .join(",")
+        .chars()
+        .take(240)
+        .collect()
+}
+
 /// Validate the IPv4 header enough to trust the destination address.
 fn ipv4_destination(packet: &[u8]) -> Option<Ipv4Addr> {
     if packet.len() < 20 || packet[0] >> 4 != 4 {
@@ -717,6 +994,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64};
 
     use boringtun::noise::errors::WireGuardError;
+
+    use crate::node::WgPublicKey;
 
     struct FakeState {
         update_calls: AtomicU64,
@@ -819,6 +1098,7 @@ mod tests {
             node,
             inner: Arc::new(RwLock::new(Inner {
                 peers: HashMap::new(),
+                next_peer_index: 0,
             })),
             socket: Arc::new(socket),
             _mdns: StdMutex::new(None),
@@ -834,13 +1114,17 @@ mod tests {
     }
 
     async fn insert_fake_peer(manager: &MeshManager, peer: MeshNode, tunnel: &Arc<FakeTunnel>) {
+        let endpoint = peer_endpoint(&peer, None).expect("test peer endpoint");
         manager.inner.write().await.peers.insert(
             peer.id.clone(),
             PeerState {
                 node: peer,
+                endpoint,
                 tunnel: Box::new(FakeTunnel {
                     state: Arc::clone(&tunnel.state),
                 }),
+                origin: PeerOrigin::Static,
+                capabilities: Vec::new(),
             },
         );
     }
@@ -954,6 +1238,112 @@ mod tests {
         assert!(
             matches!(error, MeshError::NoRoute(_)),
             "no peer must be a routable drop, not a malformed-packet error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovered_peer_requires_a_valid_wireguard_key() {
+        let manager = test_manager();
+        let mut peer = MeshNode::generate("discovered", "10.200.9.2", 51_820).0;
+        peer.wg_pubkey = WgPublicKey("not-base64".to_owned());
+
+        let error = manager
+            .add_discovered_peer(peer, vec!["video".to_owned()])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, MeshError::KeyError(_) | MeshError::Base64(_)),
+            "an invalid advertised key must be a typed validation error: {error:?}"
+        );
+        assert!(
+            manager.list_peers().await.is_empty(),
+            "no peer/tunnel may be installed before key validation"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovered_peer_updates_endpoint_without_a_duplicate_tunnel() {
+        let manager = test_manager();
+        let peer = MeshNode::generate("peer", "10.200.9.2", 51_820).0;
+        assert_eq!(
+            manager
+                .add_discovered_peer(peer.clone(), vec!["video".to_owned()])
+                .await
+                .unwrap(),
+            PeerChange::Added
+        );
+        assert_eq!(
+            manager
+                .add_discovered_peer(peer.clone(), vec!["video".to_owned()])
+                .await
+                .unwrap(),
+            PeerChange::Unchanged
+        );
+
+        let mut moved = peer.clone();
+        moved.mesh_ip = "10.200.9.3".to_owned();
+        let change = manager
+            .add_discovered_peer(moved.clone(), vec!["video".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(change, PeerChange::Updated { previous: peer });
+        let peers = manager.list_peers().await;
+        assert_eq!(peers.len(), 1, "one id must own exactly one tunnel");
+        assert_eq!(peers[0].mesh_ip, "10.200.9.3");
+        let statuses = manager.peer_statuses().await;
+        assert_eq!(statuses[0].origin, PeerOrigin::Discovered);
+        assert_eq!(statuses[0].capabilities, vec!["video"]);
+    }
+
+    #[tokio::test]
+    async fn static_peer_is_never_overwritten_or_removed_by_discovery() {
+        let manager = test_manager();
+        let static_peer = MeshNode::generate("static", "10.200.9.2", 51_820).0;
+        manager.add_peer(static_peer.clone()).await.unwrap();
+
+        let mut conflict = static_peer.clone();
+        conflict.mesh_ip = "10.200.9.99".to_owned();
+        let error = manager
+            .add_discovered_peer(conflict, Vec::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, MeshError::DiscoveryConflict(_)),
+            "a static peer must win the conflict: {error:?}"
+        );
+        assert_eq!(manager.list_peers().await, vec![static_peer.clone()]);
+
+        let error = manager.remove_discovered_peer("static").await.unwrap_err();
+        assert!(matches!(error, MeshError::DiscoveryConflict(_)));
+        assert_eq!(manager.list_peers().await, vec![static_peer]);
+    }
+
+    #[tokio::test]
+    async fn discovered_mesh_ip_cannot_collide_with_another_peer() {
+        let manager = test_manager();
+        let first = MeshNode::generate("first", "10.200.9.2", 51_820).0;
+        let second = MeshNode::generate("second", "10.200.9.2", 51_821).0;
+        manager
+            .add_discovered_peer(first, Vec::new())
+            .await
+            .unwrap();
+        let error = manager
+            .add_discovered_peer(second, Vec::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, MeshError::DiscoveryConflict(_)),
+            "two peer ids must not share one mesh IP: {error:?}"
+        );
+
+        let own_ip = MeshNode::generate("intruder", "10.200.9.1", 51_822).0;
+        let error = manager
+            .add_discovered_peer(own_ip, Vec::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, MeshError::DiscoveryConflict(_)),
+            "a discovered peer must not take this node's own mesh IP: {error:?}"
         );
     }
 }

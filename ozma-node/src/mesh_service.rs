@@ -22,8 +22,9 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axum::extract::{Query, State};
@@ -43,7 +44,10 @@ use ozma_mesh::pump::{
 };
 #[cfg(test)]
 use ozma_mesh::pump::{PumpStats, TunIo};
-use ozma_mesh::{MeshManager, MeshNode, WgPrivateKey};
+use ozma_mesh::{
+    DiscoveryAction, DiscoveryConfig, DiscoveryEngine, DiscoveryStatus, MdnsBrowser, MeshManager,
+    MeshNode, PeerChange, PeerOrigin, RawAdvertisement, WgPrivateKey,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -99,6 +103,7 @@ impl MeshServiceError {
                 | "mesh.dataplane-invalid"
                 | "mesh.dataplane-not-configured"
                 | "mesh.tun-unsupported"
+                | "mesh.discovery-invalid"
         )
     }
 }
@@ -160,6 +165,15 @@ pub struct MeshPeerView {
     pub mesh_ip: String,
     pub wg_port: u16,
     pub wg_pubkey: String,
+    /// `static` or `discovered`.
+    #[serde(default)]
+    pub origin: PeerOrigin,
+    /// Capabilities advertised by a discovered peer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    /// WireGuard UDP endpoint actually used for transport.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
     pub tunnel: MeshTunnelState,
     pub established: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -190,8 +204,11 @@ pub enum MeshEventKind {
     Stopped,
     PeerAdded,
     PeerRemoved,
+    PeerDiscovered,
     TunnelState,
     Dataplane,
+    Route,
+    Conflict,
     Error,
     Surface,
 }
@@ -303,6 +320,10 @@ pub struct MeshServiceConfig {
     pub requires_wg: bool,
     /// Configured peers.
     pub peers: Vec<MeshNode>,
+    /// Capabilities advertised in this node's mesh mDNS record.
+    pub capabilities: Vec<String>,
+    /// Opt-in mDNS peer discovery policy. `None` keeps discovery disabled.
+    pub discovery: Option<DiscoveryConfig>,
     /// Optional kernel dataplane (TUN, routes, forwarding, NAT). `None` keeps
     /// the service at the userspace WireGuard layer only.
     pub dataplane: Option<DataplaneConfig>,
@@ -320,6 +341,8 @@ impl Default for MeshServiceConfig {
             requires_root: false,
             requires_wg: false,
             peers: Vec::new(),
+            capabilities: Vec::new(),
+            discovery: None,
             dataplane: None,
             event_capacity: None,
         }
@@ -455,6 +478,11 @@ impl MeshServiceConfig {
                 ));
             }
         }
+        if let Some(discovery) = &self.discovery {
+            discovery.validate().map_err(|error| {
+                MeshServiceError::new("mesh.discovery-invalid", error.to_string())
+            })?;
+        }
         Ok(())
     }
 }
@@ -467,6 +495,28 @@ pub trait MeshBackend: Send + Sync {
     async fn stop(&self) -> Result<(), MeshServiceError>;
     async fn add_peer(&self, node: MeshNode) -> Result<(), MeshServiceError>;
     async fn remove_peer(&self, peer_id: &str) -> Result<(), MeshServiceError>;
+    /// Add/update a peer learned from an authorized advertisement. Return the
+    /// change so the service can program the matching `/32` route.
+    async fn add_discovered_peer(
+        &self,
+        node: MeshNode,
+        capabilities: Vec<String>,
+        underlay_ip: Option<Ipv4Addr>,
+    ) -> Result<PeerChange, MeshServiceError> {
+        let _ = (capabilities, underlay_ip);
+        self.add_peer(node).await.map(|_| PeerChange::Added)
+    }
+    /// Remove a discovered peer, returning its identity when it existed.
+    async fn remove_discovered_peer(
+        &self,
+        peer_id: &str,
+    ) -> Result<Option<MeshNode>, MeshServiceError> {
+        self.remove_peer(peer_id).await.map(|_| None)
+    }
+    /// Start a WireGuard handshake. Discovery calls this only after validation.
+    async fn initiate_handshake(&self, _peer_id: &str) -> Result<(), MeshServiceError> {
+        Ok(())
+    }
     async fn peers(&self) -> Vec<MeshPeerView>;
     fn identity(&self) -> Option<MeshIdentity>;
     fn state(&self) -> MeshState;
@@ -525,6 +575,7 @@ pub struct BoringtunMeshBackend {
     identity: MeshNode,
     private_key: WgPrivateKey,
     configured_peers: Vec<MeshNode>,
+    capabilities: Vec<String>,
     /// `MeshManager` is `Send` but not `Sync` (libmdns uses an internal
     /// `RefCell`), so it lives behind a Tokio mutex. The mutex is shared with
     /// the packet-pump adapter so outbound packets use the same peer tunnels.
@@ -542,12 +593,14 @@ impl BoringtunMeshBackend {
         identity: MeshNode,
         private_key: WgPrivateKey,
         configured_peers: Vec<MeshNode>,
+        capabilities: Vec<String>,
         log: MeshEventLog,
     ) -> Self {
         Self {
             identity,
             private_key,
             configured_peers,
+            capabilities,
             manager: Arc::new(tokio::sync::Mutex::new(None)),
             tunnel_io: Mutex::new(None),
             state: Mutex::new(MeshState::Stopped),
@@ -606,7 +659,13 @@ impl MeshBackend for BoringtunMeshBackend {
 
         let mut manager = self.manager.lock().await;
         if manager.is_none() {
-            match MeshManager::new(self.identity.clone(), self.private_key.clone()).await {
+            match MeshManager::new_with_capabilities(
+                self.identity.clone(),
+                self.private_key.clone(),
+                self.capabilities.clone(),
+            )
+            .await
+            {
                 Ok(created) => *manager = Some(created),
                 Err(error) => {
                     let typed = MeshServiceError::new(
@@ -714,6 +773,56 @@ impl MeshBackend for BoringtunMeshBackend {
         })
     }
 
+    async fn add_discovered_peer(
+        &self,
+        node: MeshNode,
+        capabilities: Vec<String>,
+        underlay_ip: Option<Ipv4Addr>,
+    ) -> Result<PeerChange, MeshServiceError> {
+        let manager = self.manager.lock().await;
+        let Some(manager) = manager.as_ref() else {
+            return Err(MeshServiceError::new(
+                "mesh.not-running",
+                "mesh service is not running; there is no peer table to change",
+            ));
+        };
+        manager
+            .add_discovered_peer_with_endpoint(node, capabilities, underlay_ip)
+            .await
+            .map_err(map_mesh_peer_error)
+    }
+
+    async fn remove_discovered_peer(
+        &self,
+        peer_id: &str,
+    ) -> Result<Option<MeshNode>, MeshServiceError> {
+        let manager = self.manager.lock().await;
+        let Some(manager) = manager.as_ref() else {
+            return Err(MeshServiceError::new(
+                "mesh.not-running",
+                "mesh service is not running; there is no peer table to change",
+            ));
+        };
+        manager
+            .remove_discovered_peer(peer_id)
+            .await
+            .map_err(map_mesh_peer_error)
+    }
+
+    async fn initiate_handshake(&self, peer_id: &str) -> Result<(), MeshServiceError> {
+        let manager = self.manager.lock().await;
+        let Some(manager) = manager.as_ref() else {
+            return Err(MeshServiceError::new(
+                "mesh.not-running",
+                "mesh service is not running; cannot initiate a handshake",
+            ));
+        };
+        manager
+            .initiate_handshake(peer_id)
+            .await
+            .map_err(map_mesh_peer_error)
+    }
+
     async fn peers(&self) -> Vec<MeshPeerView> {
         let manager = self.manager.lock().await;
         let Some(manager) = manager.as_ref() else {
@@ -730,6 +839,9 @@ impl MeshBackend for BoringtunMeshBackend {
                     mesh_ip: peer.node.mesh_ip.clone(),
                     wg_port: peer.node.wg_port,
                     wg_pubkey: peer.node.wg_pubkey.0.clone(),
+                    origin: peer.origin,
+                    capabilities: peer.capabilities.clone(),
+                    endpoint: Some(peer.endpoint.clone()),
                     tunnel,
                     established: peer.established,
                     last_handshake_age_secs: peer.last_handshake_age_secs,
@@ -780,6 +892,7 @@ pub struct FakeMeshBackend {
     error: Mutex<Option<MeshServiceError>>,
     start_error: Mutex<Option<MeshServiceError>>,
     tunnel_io: Mutex<Option<Arc<dyn TunnelIo>>>,
+    handshakes: Mutex<Vec<String>>,
     log: MeshEventLog,
 }
 
@@ -792,8 +905,17 @@ impl FakeMeshBackend {
             error: Mutex::new(None),
             start_error: Mutex::new(None),
             tunnel_io: Mutex::new(None),
+            handshakes: Mutex::new(Vec::new()),
             log,
         }
+    }
+
+    /// Handshake initiations requested by the discovery reconciler (tests).
+    pub fn handshakes(&self) -> Vec<String> {
+        self.handshakes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
     }
 
     /// Force the next `start()` to fail with a typed runtime error.
@@ -888,9 +1010,12 @@ impl MeshBackend for FakeMeshBackend {
             node.id.clone(),
             MeshPeerView {
                 id: node.id.clone(),
-                mesh_ip: node.mesh_ip,
+                mesh_ip: node.mesh_ip.clone(),
                 wg_port: node.wg_port,
                 wg_pubkey: node.wg_pubkey.0,
+                origin: PeerOrigin::Static,
+                capabilities: Vec::new(),
+                endpoint: Some(format!("{}:{}", node.mesh_ip, node.wg_port)),
                 tunnel: MeshTunnelState::Idle,
                 established: false,
                 last_handshake_age_secs: None,
@@ -900,6 +1025,125 @@ impl MeshBackend for FakeMeshBackend {
                 rtt_ms: None,
             },
         );
+        Ok(())
+    }
+
+    async fn add_discovered_peer(
+        &self,
+        node: MeshNode,
+        capabilities: Vec<String>,
+        underlay_ip: Option<Ipv4Addr>,
+    ) -> Result<PeerChange, MeshServiceError> {
+        if self.state() != MeshState::Running {
+            return Err(MeshServiceError::new(
+                "mesh.not-running",
+                "mesh service is not running; start it before adding peers",
+            ));
+        }
+        let mut peers = self.peers.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(existing) = peers.get(&node.id) {
+            if existing.origin == PeerOrigin::Static {
+                return Err(MeshServiceError::new(
+                    "mesh.peer-conflict",
+                    format!("static peer {} is authoritative", node.id),
+                ));
+            }
+            if existing.wg_pubkey != node.wg_pubkey.0 {
+                return Err(MeshServiceError::new(
+                    "mesh.peer-conflict",
+                    format!("discovered peer {} changed public key", node.id),
+                ));
+            }
+            let endpoint = underlay_ip
+                .map(|ip| format!("{ip}:{}", node.wg_port))
+                .or_else(|| Some(format!("{}:{}", node.mesh_ip, node.wg_port)));
+            if existing.mesh_ip == node.mesh_ip
+                && existing.wg_port == node.wg_port
+                && existing.capabilities == capabilities
+                && existing.endpoint == endpoint
+            {
+                return Ok(PeerChange::Unchanged);
+            }
+            let previous = MeshNode {
+                id: existing.id.clone(),
+                mesh_ip: existing.mesh_ip.clone(),
+                wg_port: existing.wg_port,
+                wg_pubkey: ozma_mesh::WgPublicKey(existing.wg_pubkey.clone()),
+            };
+            let view = peers.get_mut(&node.id).expect("peer was present");
+            view.mesh_ip = node.mesh_ip;
+            view.wg_port = node.wg_port;
+            view.capabilities = capabilities;
+            view.endpoint = endpoint;
+            view.tunnel = MeshTunnelState::Idle;
+            view.established = false;
+            view.last_handshake_age_secs = None;
+            view.rtt_ms = None;
+            return Ok(PeerChange::Updated { previous });
+        }
+        peers.insert(
+            node.id.clone(),
+            MeshPeerView {
+                id: node.id.clone(),
+                mesh_ip: node.mesh_ip.clone(),
+                wg_port: node.wg_port,
+                wg_pubkey: node.wg_pubkey.0,
+                origin: PeerOrigin::Discovered,
+                capabilities,
+                endpoint: underlay_ip
+                    .map(|ip| format!("{ip}:{}", node.wg_port))
+                    .or_else(|| Some(format!("{}:{}", node.mesh_ip, node.wg_port))),
+                tunnel: MeshTunnelState::Idle,
+                established: false,
+                last_handshake_age_secs: None,
+                tx_bytes: 0,
+                rx_bytes: 0,
+                loss: 0.0,
+                rtt_ms: None,
+            },
+        );
+        Ok(PeerChange::Added)
+    }
+
+    async fn remove_discovered_peer(
+        &self,
+        peer_id: &str,
+    ) -> Result<Option<MeshNode>, MeshServiceError> {
+        let mut peers = self.peers.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(peer) = peers.get(peer_id) else {
+            return Ok(None);
+        };
+        if peer.origin == PeerOrigin::Static {
+            return Err(MeshServiceError::new(
+                "mesh.peer-conflict",
+                format!("static peer {peer_id} cannot be removed by discovery"),
+            ));
+        }
+        let peer = peers.remove(peer_id).expect("peer was present");
+        Ok(Some(MeshNode {
+            id: peer.id,
+            mesh_ip: peer.mesh_ip,
+            wg_port: peer.wg_port,
+            wg_pubkey: ozma_mesh::WgPublicKey(peer.wg_pubkey),
+        }))
+    }
+
+    async fn initiate_handshake(&self, peer_id: &str) -> Result<(), MeshServiceError> {
+        if !self
+            .peers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(peer_id)
+        {
+            return Err(MeshServiceError::new(
+                "mesh.peer-not-found",
+                format!("peer {peer_id} is unknown"),
+            ));
+        }
+        self.handshakes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(peer_id.to_owned());
         Ok(())
     }
 
@@ -955,6 +1199,12 @@ impl MeshBackend for FakeMeshBackend {
     }
 }
 
+/// Background discovery task handles.
+struct DiscoveryRunner {
+    stop: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
 /// Bounded, cloneable node-side mesh service.
 #[derive(Clone)]
 pub struct MeshService {
@@ -967,6 +1217,13 @@ pub struct MeshService {
     pump: Arc<Mutex<Option<PacketPump>>>,
     pump_error: Arc<Mutex<Option<PumpError>>>,
     pump_monitor: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Deterministic discovery state machine, present only when configured.
+    discovery: Option<Arc<Mutex<DiscoveryEngine>>>,
+    discovery_started: Arc<AtomicBool>,
+    discovery_task: Arc<Mutex<Option<DiscoveryRunner>>>,
+    /// Whether `start()` should spawn the real mDNS browser. Tests inject
+    /// advertisements directly and never open a network socket.
+    discovery_browse: bool,
     log: MeshEventLog,
 }
 
@@ -1026,6 +1283,26 @@ impl MeshService {
             return Self::unsupported(error, log);
         }
 
+        let discovery = match &config.discovery {
+            None => None,
+            Some(discovery) => {
+                let mut discovery = discovery.clone();
+                // The static peer list is the authoritative source; never let a
+                // caller build a discovery policy that disagrees with it.
+                discovery.local_id = config.node_id.clone();
+                discovery.static_peers = config.peers.clone();
+                match DiscoveryEngine::new(discovery) {
+                    Ok(engine) => Some(Arc::new(Mutex::new(engine))),
+                    Err(error) => {
+                        return Self::unsupported(
+                            MeshServiceError::new("mesh.discovery-invalid", error.to_string()),
+                            log,
+                        )
+                    }
+                }
+            }
+        };
+
         let (private_key, identity) = match load_identity(&config) {
             Ok(value) => value,
             Err(error) => return Self::unsupported(error, log),
@@ -1035,17 +1312,21 @@ impl MeshService {
             .dataplane
             .clone()
             .map(|dataplane| Arc::new(MeshDataplane::new(dataplane, runner, sysfs)));
-        let backend =
-            BoringtunMeshBackend::new(identity, private_key, config.peers.clone(), log.clone());
-        Self {
-            backend: Arc::new(backend),
+        let backend = BoringtunMeshBackend::new(
+            identity,
+            private_key,
+            config.peers.clone(),
+            config.capabilities.clone(),
+            log.clone(),
+        );
+        Self::with_backend_dataplane_and_discovery(
+            Arc::new(backend),
             dataplane,
-            tun_provider: tun_provider.filter(|_| config.dataplane.is_some()),
-            pump: Arc::new(Mutex::new(None)),
-            pump_error: Arc::new(Mutex::new(None)),
-            pump_monitor: Arc::new(Mutex::new(None)),
             log,
-        }
+            tun_provider.filter(|_| config.dataplane.is_some()),
+            discovery,
+            true,
+        )
     }
 
     /// Explicit unsupported service for a preflight failure.
@@ -1060,6 +1341,10 @@ impl MeshService {
             pump: Arc::new(Mutex::new(None)),
             pump_error: Arc::new(Mutex::new(None)),
             pump_monitor: Arc::new(Mutex::new(None)),
+            discovery: None,
+            discovery_started: Arc::new(AtomicBool::new(false)),
+            discovery_task: Arc::new(Mutex::new(None)),
+            discovery_browse: false,
             log,
         }
     }
@@ -1086,6 +1371,29 @@ impl MeshService {
         log: MeshEventLog,
         tun_provider: Option<Arc<dyn TunProvider>>,
     ) -> Self {
+        Self::with_backend_dataplane_and_discovery(
+            backend,
+            dataplane,
+            log,
+            tun_provider,
+            None,
+            false,
+        )
+    }
+
+    /// Build a service with an injected discovery engine.
+    ///
+    /// `auto_browse = false` (used by tests) lets callers feed synthetic
+    /// [`RawAdvertisement`]s through [`MeshService::apply_discovery_advertisement`]
+    /// without opening a network socket.
+    pub fn with_backend_dataplane_and_discovery(
+        backend: Arc<dyn MeshBackend>,
+        dataplane: Option<Arc<MeshDataplane>>,
+        log: MeshEventLog,
+        tun_provider: Option<Arc<dyn TunProvider>>,
+        discovery: Option<Arc<Mutex<DiscoveryEngine>>>,
+        auto_browse: bool,
+    ) -> Self {
         let has_dataplane = dataplane.is_some();
         Self {
             backend,
@@ -1094,6 +1402,10 @@ impl MeshService {
             pump: Arc::new(Mutex::new(None)),
             pump_error: Arc::new(Mutex::new(None)),
             pump_monitor: Arc::new(Mutex::new(None)),
+            discovery,
+            discovery_started: Arc::new(AtomicBool::new(false)),
+            discovery_task: Arc::new(Mutex::new(None)),
+            discovery_browse: auto_browse,
             log,
         }
     }
@@ -1363,6 +1675,7 @@ impl MeshService {
             }
         }
 
+        self.start_discovery();
         self.log
             .record(MeshEventKind::Started, "mesh service started", None);
         Ok(())
@@ -1371,6 +1684,7 @@ impl MeshService {
     /// Stop the packet pump, the WireGuard manager, and the dataplane in
     /// reverse start order.
     pub async fn stop(&self) -> Result<(), MeshServiceError> {
+        self.stop_discovery();
         let pump_stopped = self.stop_packet_pump();
         let dataplane_result = match &self.dataplane {
             Some(dataplane) => dataplane.stop().map_err(MeshServiceError::from),
@@ -1499,6 +1813,394 @@ impl MeshService {
         self.log.snapshot(limit)
     }
 
+    /// Discovery status, present only when discovery is configured.
+    pub fn discovery_status(&self) -> Option<DiscoveryStatus> {
+        let engine = self.discovery.as_ref()?;
+        let mut status = engine
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .status(Instant::now());
+        status.enabled = self.discovery_started.load(Ordering::SeqCst);
+        Some(status)
+    }
+
+    /// Feed one synthetic or browsed advertisement through validation,
+    /// reconciliation, and route programming. Returns the state-machine
+    /// actions for tests/diagnostics.
+    pub async fn apply_discovery_advertisement(
+        &self,
+        raw: RawAdvertisement,
+    ) -> Vec<DiscoveryAction> {
+        let Some(engine) = &self.discovery else {
+            return Vec::new();
+        };
+        let actions = engine
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .observe(raw, Instant::now());
+        for action in &actions {
+            self.reconcile_discovery_action(action).await;
+        }
+        actions
+    }
+
+    /// Expire discovered peers past their TTL.
+    pub async fn expire_discovery(&self) -> Vec<DiscoveryAction> {
+        let Some(engine) = &self.discovery else {
+            return Vec::new();
+        };
+        let actions = engine
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .expire(Instant::now());
+        for action in &actions {
+            self.reconcile_discovery_action(action).await;
+        }
+        actions
+    }
+
+    async fn reconcile_discovery_action(&self, action: &DiscoveryAction) {
+        match action {
+            DiscoveryAction::Add(peer) => {
+                match self
+                    .backend
+                    .add_discovered_peer(
+                        peer.node.clone(),
+                        peer.capabilities.clone(),
+                        peer.underlay_ip,
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        if let Err(error) = self.add_discovered_route(&peer.node) {
+                            let _ = self.backend.remove_discovered_peer(&peer.node.id).await;
+                            self.forget_discovered(&peer.node.id);
+                            self.log.record(
+                                MeshEventKind::Error,
+                                error.reason,
+                                Some(peer.node.id.clone()),
+                            );
+                            return;
+                        }
+                        self.log.record(
+                            MeshEventKind::PeerDiscovered,
+                            format!(
+                                "discovered peer {} at {}:{} (key authorized)",
+                                peer.node.id, peer.node.mesh_ip, peer.node.wg_port
+                            ),
+                            Some(peer.node.id.clone()),
+                        );
+                        self.log_route_change(
+                            &peer.node,
+                            format!(
+                                "route added for discovered peer {} ({}/32)",
+                                peer.node.id, peer.node.mesh_ip
+                            ),
+                        );
+                        self.initiate_discovered_handshake(&peer.node.id).await;
+                    }
+                    Err(error) => {
+                        self.forget_discovered(&peer.node.id);
+                        self.record_discovery_refusal(Some(peer.node.id.clone()), &error);
+                    }
+                }
+            }
+            DiscoveryAction::Update { peer, previous } => {
+                let previous_route = previous.mesh_ip.parse::<Ipv4Addr>().ok();
+                match self
+                    .backend
+                    .add_discovered_peer(
+                        peer.node.clone(),
+                        peer.capabilities.clone(),
+                        peer.underlay_ip,
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        let new_route = peer.node.mesh_ip.parse::<Ipv4Addr>().ok();
+                        if previous_route != new_route {
+                            if let Err(error) = self.add_discovered_route(&peer.node) {
+                                // Restore the previous peer so the manager and
+                                // route table stay consistent, then retry on the
+                                // next advertisement.
+                                let _ = self
+                                    .backend
+                                    .add_discovered_peer(
+                                        previous.clone(),
+                                        peer.capabilities.clone(),
+                                        peer.underlay_ip,
+                                    )
+                                    .await;
+                                self.forget_discovered(&peer.node.id);
+                                self.log.record(
+                                    MeshEventKind::Error,
+                                    error.reason,
+                                    Some(peer.node.id.clone()),
+                                );
+                                return;
+                            }
+                            if let Some(route) = previous_route {
+                                self.remove_discovered_route(route, &peer.node.id);
+                            }
+                        }
+                        self.log.record(
+                            MeshEventKind::PeerDiscovered,
+                            format!(
+                                "discovered peer {} updated to {}:{}",
+                                peer.node.id, peer.node.mesh_ip, peer.node.wg_port
+                            ),
+                            Some(peer.node.id.clone()),
+                        );
+                        self.log_route_change(
+                            &peer.node,
+                            format!(
+                                "route reconciled for discovered peer {} ({}/32)",
+                                peer.node.id, peer.node.mesh_ip
+                            ),
+                        );
+                        self.initiate_discovered_handshake(&peer.node.id).await;
+                    }
+                    Err(error) => {
+                        self.forget_discovered(&peer.node.id);
+                        self.record_discovery_refusal(Some(peer.node.id.clone()), &error);
+                    }
+                }
+            }
+            DiscoveryAction::Remove(peer) => {
+                let _ = self.backend.remove_discovered_peer(&peer.node.id).await;
+                if let Ok(route) = peer.node.mesh_ip.parse::<Ipv4Addr>() {
+                    self.remove_discovered_route(route, &peer.node.id);
+                }
+                self.log.record(
+                    MeshEventKind::PeerRemoved,
+                    format!(
+                        "discovered peer {} expired after the discovery TTL",
+                        peer.node.id
+                    ),
+                    Some(peer.node.id.clone()),
+                );
+            }
+            DiscoveryAction::Conflict { id, reason }
+            | DiscoveryAction::Unauthorized { id, reason }
+            | DiscoveryAction::Ignored { id, reason } => {
+                self.log.record(
+                    MeshEventKind::Conflict,
+                    format!("discovery refused: {reason}"),
+                    id.clone(),
+                );
+            }
+            DiscoveryAction::LimitReached { id, max_peers } => {
+                self.log.record(
+                    MeshEventKind::Conflict,
+                    format!(
+                        "discovery refused peer {id}: the configured bound of {max_peers} \
+                         discovered peers is full"
+                    ),
+                    Some(id.clone()),
+                );
+            }
+            DiscoveryAction::Unchanged { .. }
+            | DiscoveryAction::StaticMatched { .. }
+            | DiscoveryAction::IgnoredSelf { .. } => {
+                // Deduplicated / static-authoritative / self: no state change.
+            }
+        }
+    }
+
+    fn add_discovered_route(&self, peer: &MeshNode) -> Result<(), MeshServiceError> {
+        let Some(dataplane) = &self.dataplane else {
+            return Ok(());
+        };
+        let route = peer.mesh_ip.parse::<Ipv4Addr>().map_err(|_| {
+            MeshServiceError::new(
+                "mesh.peer-invalid",
+                format!("peer {} has an invalid IPv4 mesh address", peer.id),
+            )
+        })?;
+        dataplane.add_route(route).map_err(MeshServiceError::from)
+    }
+
+    fn remove_discovered_route(&self, route: Ipv4Addr, peer_id: &str) {
+        let Some(dataplane) = &self.dataplane else {
+            return;
+        };
+        match dataplane.remove_route(route) {
+            Ok(()) => {
+                self.log.record(
+                    MeshEventKind::Route,
+                    format!("route removed for discovered peer {peer_id} ({route}/32)"),
+                    Some(peer_id.to_owned()),
+                );
+            }
+            Err(error) => {
+                self.log
+                    .record(MeshEventKind::Error, error.reason, Some(peer_id.to_owned()));
+            }
+        }
+    }
+
+    fn log_route_change(&self, peer: &MeshNode, message: String) {
+        if self.dataplane.is_some() {
+            self.log
+                .record(MeshEventKind::Route, message, Some(peer.id.clone()));
+        }
+    }
+
+    fn forget_discovered(&self, peer_id: &str) {
+        if let Some(engine) = &self.discovery {
+            engine
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .forget(peer_id);
+        }
+    }
+
+    async fn initiate_discovered_handshake(&self, peer_id: &str) {
+        if let Err(error) = self.backend.initiate_handshake(peer_id).await {
+            self.log.record(
+                MeshEventKind::Error,
+                format!(
+                    "discovered peer {peer_id} handshake could not start: {}",
+                    error.reason
+                ),
+                Some(peer_id.to_owned()),
+            );
+        }
+    }
+
+    fn record_discovery_refusal(&self, peer_id: Option<String>, error: &MeshServiceError) {
+        let kind = if error.code == "mesh.peer-conflict" {
+            MeshEventKind::Conflict
+        } else {
+            MeshEventKind::Error
+        };
+        self.log.record(
+            kind,
+            format!("discovery refused: {}", error.reason),
+            peer_id,
+        );
+    }
+
+    fn start_discovery(&self) {
+        let Some(engine) = &self.discovery else {
+            return;
+        };
+        if self.discovery_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        {
+            let mut engine = engine.lock().unwrap_or_else(|error| error.into_inner());
+            engine.clear();
+        }
+        if !self.discovery_browse {
+            return;
+        }
+
+        let config = engine
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .config()
+            .clone();
+        let browser = match MdnsBrowser::new(config.query_interval) {
+            Ok(browser) => browser,
+            Err(error) => {
+                self.discovery_started.store(false, Ordering::SeqCst);
+                self.log.record(
+                    MeshEventKind::Error,
+                    format!("mDNS discovery browser could not start: {error}"),
+                    None,
+                );
+                return;
+            }
+        };
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<RawAdvertisement>(64);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let spawned = std::thread::Builder::new()
+            .name("mesh-mdns-browse".to_owned())
+            .spawn(move || {
+                let mut browser = browser;
+                while !stop_thread.load(Ordering::SeqCst) {
+                    match browser.poll() {
+                        Ok(advertisements) => {
+                            for advertisement in advertisements {
+                                if sender.blocking_send(advertisement).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            tracing::debug!(%error, "mDNS discovery browse error");
+                        }
+                    }
+                }
+            });
+        if let Err(error) = spawned {
+            self.discovery_started.store(false, Ordering::SeqCst);
+            self.log.record(
+                MeshEventKind::Error,
+                format!("mDNS discovery thread could not start: {error}"),
+                None,
+            );
+            return;
+        }
+
+        let service = self.clone();
+        let task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    advertisement = receiver.recv() => {
+                        match advertisement {
+                            Some(advertisement) => {
+                                service.apply_discovery_advertisement(advertisement).await;
+                            }
+                            None => break,
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        service.expire_discovery().await;
+                    }
+                }
+            }
+        });
+        *self
+            .discovery_task
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(DiscoveryRunner { stop, task });
+        self.log.record(
+            MeshEventKind::Started,
+            format!(
+                "mesh discovery browsing {} every {}s (ttl {}s, max {} peers)",
+                ozma_mesh::MDNS_FQDN,
+                config.query_interval.as_secs(),
+                config.ttl.as_secs(),
+                config.max_peers
+            ),
+            None,
+        );
+    }
+
+    fn stop_discovery(&self) {
+        if let Some(runner) = self
+            .discovery_task
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            runner.stop.store(true, Ordering::SeqCst);
+            runner.task.abort();
+        }
+        self.discovery_started.store(false, Ordering::SeqCst);
+        if let Some(engine) = &self.discovery {
+            engine
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clear();
+        }
+    }
+
     pub async fn status(&self) -> MeshStatus {
         let state = self.state();
         let error = self.error();
@@ -1525,6 +2227,7 @@ impl MeshService {
             identity: self.backend.identity(),
             dataplane: self.dataplane.as_ref().map(|dataplane| dataplane.status()),
             pump: self.pump_status(),
+            discovery: self.discovery_status(),
             peer_count: peers.as_ref().map(Vec::len),
             peers,
             event_count: Some(self.log.len()),
@@ -1577,6 +2280,22 @@ fn tunnel_label(state: MeshTunnelState) -> &'static str {
     }
 }
 
+/// Map a library peer error to a stable node-service code.
+fn map_mesh_peer_error(error: ozma_mesh::MeshError) -> MeshServiceError {
+    let code = match &error {
+        ozma_mesh::MeshError::PeerAlreadyExists(_) => "mesh.peer-already-exists",
+        ozma_mesh::MeshError::PeerNotFound(_) => "mesh.peer-not-found",
+        ozma_mesh::MeshError::DiscoveryConflict(_) => "mesh.peer-conflict",
+        ozma_mesh::MeshError::DiscoveryUnauthorized(_) => "mesh.peer-unauthorized",
+        ozma_mesh::MeshError::DiscoveryInvalid(_)
+        | ozma_mesh::MeshError::KeyError(_)
+        | ozma_mesh::MeshError::Base64(_)
+        | ozma_mesh::MeshError::InvalidIp(_) => "mesh.peer-invalid",
+        _ => "mesh.peer-invalid",
+    };
+    MeshServiceError::new(code, error.to_string())
+}
+
 /// Honest status document for `/api/v1/connect/status`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MeshStatus {
@@ -1601,6 +2320,9 @@ pub struct MeshStatus {
     /// when the dataplane and a TUN provider are configured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pump: Option<PumpStatus>,
+    /// Opt-in mDNS discovery policy, counters, and discovered peers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<DiscoveryStatus>,
     /// Omitted unless the service is running; `Some(0)` is a real empty table.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_count: Option<usize>,
@@ -1629,6 +2351,7 @@ impl MeshStatus {
             identity: None,
             dataplane: None,
             pump: None,
+            discovery: None,
             peer_count: None,
             peers: None,
             event_count: None,
@@ -2890,6 +3613,264 @@ mod tests {
             status.dataplane.as_ref().map(|dataplane| dataplane.state),
             Some(DataplaneState::Stopped)
         );
+    }
+
+    fn discovery_service(
+        static_peers: Vec<MeshNode>,
+        trusted: Vec<ozma_mesh::TrustedPeer>,
+        ttl: Duration,
+    ) -> (Arc<FakeMeshBackend>, MeshService, Arc<NodeRunner>) {
+        let log = MeshEventLog::new(32);
+        let backend = Arc::new(FakeMeshBackend::new(
+            fake_node("self", "10.200.9.1"),
+            log.clone(),
+        ));
+        let runner = Arc::new(NodeRunner::default());
+        let dataplane = Arc::new(MeshDataplane::new(
+            DataplaneConfig::new("ozma0", Ipv4Addr::new(10, 200, 9, 1), 24, 1420),
+            runner.clone(),
+            Arc::new(NodeSysfs::rooted()),
+        ));
+        let engine =
+            DiscoveryEngine::new(DiscoveryConfig::new("self", static_peers, trusted).with_ttl(ttl))
+                .expect("discovery engine");
+        let service = MeshService::with_backend_dataplane_and_discovery(
+            backend.clone(),
+            Some(dataplane),
+            log,
+            None,
+            Some(Arc::new(Mutex::new(engine))),
+            false,
+        );
+        (backend, service, runner)
+    }
+
+    fn advertisement(peer: &MeshNode, capabilities: &[&str]) -> RawAdvertisement {
+        RawAdvertisement {
+            id: Some(peer.id.clone()),
+            wg_pubkey: Some(peer.wg_pubkey.0.clone()),
+            mesh_ip: Some(peer.mesh_ip.clone()),
+            wg_port: Some(peer.wg_port),
+            capabilities: capabilities.iter().map(|value| value.to_string()).collect(),
+            ..RawAdvertisement::default()
+        }
+    }
+
+    fn route_command(runner: &NodeRunner, verb: &str, route: &str) -> bool {
+        runner.calls().iter().any(|command| {
+            command.program == "ip"
+                && command.args.iter().any(|arg| arg == verb)
+                && command.args.iter().any(|arg| arg == route)
+        })
+    }
+
+    #[tokio::test]
+    async fn discovery_authorizes_then_adds_peer_route_and_handshake() {
+        let authorized = peer("peer-a", "10.200.9.2");
+        let (backend, service, runner) = discovery_service(
+            Vec::new(),
+            vec![ozma_mesh::TrustedPeer::new(
+                &authorized.id,
+                &authorized.wg_pubkey.0,
+            )],
+            Duration::from_secs(30),
+        );
+        service.start().await.unwrap();
+
+        let unauthorized = peer("peer-b", "10.200.9.3");
+        let actions = service
+            .apply_discovery_advertisement(advertisement(&unauthorized, &["video"]))
+            .await;
+        assert!(matches!(
+            actions.as_slice(),
+            [DiscoveryAction::Unauthorized { .. }]
+        ));
+        assert!(
+            service.peers().await.is_empty(),
+            "an unauthenticated advertisement must not become a peer"
+        );
+        assert!(
+            backend.handshakes().is_empty(),
+            "no handshake may start before key authorization"
+        );
+        assert!(
+            !route_command(&runner, "replace", "10.200.9.3/32"),
+            "no route may be programmed for an unauthorized peer"
+        );
+
+        let mut authorized_advertisement = advertisement(&authorized, &["video", "audio"]);
+        authorized_advertisement.underlay_ip = Some(Ipv4Addr::new(10, 10, 10, 2));
+        let actions = service
+            .apply_discovery_advertisement(authorized_advertisement)
+            .await;
+        assert!(matches!(actions.as_slice(), [DiscoveryAction::Add(_)]));
+        let peers = service.peers().await;
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].origin, PeerOrigin::Discovered);
+        assert_eq!(peers[0].capabilities, vec!["audio", "video"]);
+        assert_eq!(
+            peers[0].endpoint.as_deref(),
+            Some("10.10.10.2:59200"),
+            "the observed underlay address, not the overlay mesh IP, is the WireGuard endpoint"
+        );
+        assert_eq!(backend.handshakes(), vec!["peer-a".to_owned()]);
+        assert!(route_command(&runner, "replace", "10.200.9.2/32"));
+
+        let status = service.status().await;
+        let discovery = status.discovery.expect("discovery status");
+        assert!(discovery.enabled);
+        assert_eq!(discovery.discovered_count, 1);
+        assert_eq!(discovery.counters.added, 1);
+        assert_eq!(discovery.counters.unauthorized, 1);
+        assert_eq!(discovery.peers[0].id, "peer-a");
+        assert_eq!(
+            status.dataplane.unwrap().routes,
+            vec!["10.200.9.2/32".to_owned()]
+        );
+
+        let kinds: Vec<_> = service
+            .events(32)
+            .into_iter()
+            .map(|event| event.kind)
+            .collect();
+        assert!(kinds.contains(&MeshEventKind::PeerDiscovered));
+        assert!(kinds.contains(&MeshEventKind::Route));
+        assert!(kinds.contains(&MeshEventKind::Conflict));
+    }
+
+    #[tokio::test]
+    async fn discovery_expiry_removes_the_tunnel_and_route() {
+        let peer = peer("peer-a", "10.200.9.2");
+        let (_backend, service, runner) = discovery_service(
+            Vec::new(),
+            vec![ozma_mesh::TrustedPeer::new(&peer.id, &peer.wg_pubkey.0)],
+            Duration::from_millis(30),
+        );
+        service.start().await.unwrap();
+        service
+            .apply_discovery_advertisement(advertisement(&peer, &["video"]))
+            .await;
+        assert_eq!(service.peers().await.len(), 1);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let actions = service.expire_discovery().await;
+        assert!(matches!(actions.as_slice(), [DiscoveryAction::Remove(_)]));
+        assert!(service.peers().await.is_empty());
+        assert!(route_command(&runner, "del", "10.200.9.2/32"));
+        assert_eq!(service.status().await.peer_count, Some(0));
+        assert_eq!(
+            service.status().await.discovery.unwrap().counters.expired,
+            1
+        );
+        assert!(service
+            .events(32)
+            .iter()
+            .any(|event| event.kind == MeshEventKind::PeerRemoved));
+    }
+
+    #[tokio::test]
+    async fn discovery_conflict_never_overwrites_a_static_peer() {
+        let mut static_peer = peer("static", "10.200.9.2");
+        static_peer.wg_port = 51_820;
+        let (_backend, service, runner) = discovery_service(
+            vec![static_peer.clone()],
+            vec![ozma_mesh::TrustedPeer::new(
+                &static_peer.id,
+                &static_peer.wg_pubkey.0,
+            )],
+            Duration::from_secs(30),
+        );
+        service.start().await.unwrap();
+
+        // Exact static advertisement is observed but not duplicated.
+        let actions = service
+            .apply_discovery_advertisement(advertisement(&static_peer, &[]))
+            .await;
+        assert!(matches!(
+            actions.as_slice(),
+            [DiscoveryAction::StaticMatched { .. }]
+        ));
+        assert!(service.peers().await.is_empty());
+
+        let mut conflict = static_peer.clone();
+        conflict.mesh_ip = "10.200.9.99".to_owned();
+        let actions = service
+            .apply_discovery_advertisement(advertisement(&conflict, &[]))
+            .await;
+        assert!(matches!(
+            actions.as_slice(),
+            [DiscoveryAction::Conflict { .. }]
+        ));
+        assert!(service.peers().await.is_empty());
+        assert!(
+            !route_command(&runner, "replace", "10.200.9.99/32"),
+            "a conflict must not program a discovered route"
+        );
+        let discovery = service.status().await.discovery.unwrap();
+        assert_eq!(discovery.counters.conflicts, 1);
+        assert_eq!(discovery.counters.static_matched, 1);
+    }
+
+    #[tokio::test]
+    async fn discovery_mesh_ip_change_reconciles_one_peer_and_two_routes() {
+        let peer = peer("peer-a", "10.200.9.2");
+        let (backend, service, runner) = discovery_service(
+            Vec::new(),
+            vec![ozma_mesh::TrustedPeer::new(&peer.id, &peer.wg_pubkey.0)],
+            Duration::from_secs(30),
+        );
+        service.start().await.unwrap();
+        service
+            .apply_discovery_advertisement(advertisement(&peer, &["video"]))
+            .await;
+
+        let mut moved = peer.clone();
+        moved.mesh_ip = "10.200.9.3".to_owned();
+        let actions = service
+            .apply_discovery_advertisement(advertisement(&moved, &["video"]))
+            .await;
+        assert!(matches!(
+            actions.as_slice(),
+            [DiscoveryAction::Update { .. }]
+        ));
+        let peers = service.peers().await;
+        assert_eq!(peers.len(), 1, "one id must own one tunnel");
+        assert_eq!(peers[0].mesh_ip, "10.200.9.3");
+        assert!(route_command(&runner, "replace", "10.200.9.3/32"));
+        assert!(route_command(&runner, "del", "10.200.9.2/32"));
+        assert_eq!(
+            backend.handshakes(),
+            vec!["peer-a".to_owned(), "peer-a".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_survives_restart_without_stale_deduplication() {
+        let peer = peer("peer-a", "10.200.9.2");
+        let (_backend, service, _runner) = discovery_service(
+            Vec::new(),
+            vec![ozma_mesh::TrustedPeer::new(&peer.id, &peer.wg_pubkey.0)],
+            Duration::from_secs(30),
+        );
+        service.start().await.unwrap();
+        service
+            .apply_discovery_advertisement(advertisement(&peer, &[]))
+            .await;
+        service.stop().await.unwrap();
+        assert_eq!(
+            service.status().await.discovery.unwrap().discovered_count,
+            0
+        );
+
+        service.start().await.unwrap();
+        let actions = service
+            .apply_discovery_advertisement(advertisement(&peer, &[]))
+            .await;
+        assert!(
+            matches!(actions.as_slice(), [DiscoveryAction::Add(_)]),
+            "a restarted service must re-add the peer, not deduplicate a stale entry"
+        );
+        assert_eq!(service.peers().await.len(), 1);
     }
 
     async fn body_json(response: Response) -> serde_json::Value {

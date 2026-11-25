@@ -780,6 +780,43 @@ pub struct Args {
     #[arg(long = "mesh-peer", env = "OZMA_MESH_PEER", value_name = "JSON")]
     pub mesh_peer: Vec<String>,
 
+    /// Opt in to mDNS peer discovery on `_ozma-mesh._udp.local`.
+    ///
+    /// Discovered peers are only accepted when their node id and WireGuard
+    /// public key match a `--mesh-peer` entry or a `--mesh-trust` entry. Static
+    /// peers always win conflicts. Requires `--mesh`.
+    #[arg(long, env = "OZMA_MESH_DISCOVER", requires = "mesh")]
+    pub mesh_discover: bool,
+
+    /// Seconds a discovered peer may be absent before its route and tunnel are
+    /// removed (default 60).
+    #[arg(
+        long,
+        env = "OZMA_MESH_DISCOVER_TTL",
+        default_value_t = 60,
+        value_name = "SECS"
+    )]
+    pub mesh_discover_ttl: u64,
+
+    /// Maximum number of discovered peers (default 32, hard limit 256).
+    #[arg(
+        long,
+        env = "OZMA_MESH_DISCOVER_MAX_PEERS",
+        default_value_t = 32,
+        value_name = "N"
+    )]
+    pub mesh_discover_max_peers: usize,
+
+    /// Authorize a discovered peer: JSON `{"id":...,"wg_pubkey":...}` or
+    /// `ID=BASE64_KEY`. Repeatable. Static `--mesh-peer` entries are already
+    /// authorized.
+    #[arg(
+        long = "mesh-trust",
+        env = "OZMA_MESH_TRUST",
+        value_name = "JSON|ID=KEY"
+    )]
+    pub mesh_trust: Vec<String>,
+
     /// Program a kernel mesh dataplane (TUN link, peer routes, IPv4 forwarding).
     ///
     /// Off by default. Requires root, `/dev/net/tun`, and `ip`; failure is a
@@ -3850,6 +3887,39 @@ fn build_dataplane_config(
     Some(config)
 }
 
+/// Parse one `--mesh-trust` authorization entry.
+///
+/// Accepts JSON (`{"id":"...","wg_pubkey":"...","mesh_ip":"..."}`) or the
+/// compact `ID=BASE64_KEY` form. Key material is validated before it can
+/// authorize anything.
+fn parse_mesh_trust(spec: &str) -> Result<ozma_mesh::TrustedPeer, String> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Err("--mesh-trust must not be empty".to_owned());
+    }
+    let trusted = if spec.starts_with('{') {
+        serde_json::from_str::<ozma_mesh::TrustedPeer>(spec)
+            .map_err(|error| format!("--mesh-trust is not valid TrustedPeer JSON: {error}"))?
+    } else {
+        let (id, key) = spec.split_once('=').ok_or_else(|| {
+            "--mesh-trust must be JSON or ID=BASE64_KEY (no '=' separator found)".to_owned()
+        })?;
+        ozma_mesh::TrustedPeer::new(id.trim(), key.trim())
+    };
+    if trusted.id.trim().is_empty() {
+        return Err("--mesh-trust node id must not be empty".to_owned());
+    }
+    ozma_mesh::WgPublicKey(trusted.wg_pubkey.clone())
+        .to_bytes()
+        .map_err(|error| format!("--mesh-trust public key is invalid: {error}"))?;
+    if let Some(mesh_ip) = &trusted.mesh_ip {
+        mesh_ip
+            .parse::<Ipv4Addr>()
+            .map_err(|_| format!("--mesh-trust mesh_ip {mesh_ip:?} is not IPv4"))?;
+    }
+    Ok(trusted)
+}
+
 fn build_mesh_service(args: &Args) -> Option<mesh_service::MeshService> {
     if !args.mesh {
         return None;
@@ -3872,6 +3942,32 @@ fn build_mesh_service(args: &Args) -> Option<mesh_service::MeshService> {
         }
     }
 
+    let mut trusted = Vec::new();
+    for spec in &args.mesh_trust {
+        match parse_mesh_trust(spec) {
+            Ok(peer) => trusted.push(peer),
+            Err(reason) => {
+                return Some(mesh_service::MeshService::unsupported(
+                    mesh_service::MeshServiceError::new("mesh.discovery-invalid", reason),
+                    log(),
+                ));
+            }
+        }
+    }
+
+    let capabilities: Vec<String> = args
+        .cap
+        .split(',')
+        .map(str::trim)
+        .filter(|capability| !capability.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let discovery = args.mesh_discover.then(|| {
+        ozma_mesh::DiscoveryConfig::new(args.name.clone(), peers.clone(), trusted.clone())
+            .with_max_peers(args.mesh_discover_max_peers)
+            .with_ttl(Duration::from_secs(args.mesh_discover_ttl))
+    });
+
     let config = mesh_service::MeshServiceConfig {
         node_id: args.name.clone(),
         mesh_ip: args.mesh_ip.clone().unwrap_or_default(),
@@ -3880,6 +3976,8 @@ fn build_mesh_service(args: &Args) -> Option<mesh_service::MeshService> {
         requires_root: args.mesh_kernel,
         requires_wg: args.mesh_kernel,
         peers: peers.clone(),
+        capabilities,
+        discovery,
         dataplane: build_dataplane_config(args, &peers),
         event_capacity: None,
     };
@@ -4611,6 +4709,43 @@ mod tests {
     fn multiseat_requires_a_seats_file() {
         assert!(Args::try_parse_from(["ozma-node", "--multiseat"]).is_err());
         assert!(Args::try_parse_from(["ozma-node", "--multiseat-plan"]).is_err());
+    }
+
+    #[test]
+    fn mesh_discovery_is_off_by_default_and_trust_parsing_is_typed() {
+        let defaults = Args::parse_from(["ozma-node"]);
+        assert!(!defaults.mesh_discover);
+        assert_eq!(defaults.mesh_discover_ttl, 60);
+        assert_eq!(defaults.mesh_discover_max_peers, 32);
+        assert!(defaults.mesh_trust.is_empty());
+
+        let args = Args::parse_from([
+            "ozma-node",
+            "--mesh",
+            "--mesh-discover",
+            "--mesh-discover-ttl",
+            "15",
+            "--mesh-discover-max-peers",
+            "8",
+        ]);
+        assert!(args.mesh_discover);
+        assert_eq!(args.mesh_discover_ttl, 15);
+        assert_eq!(args.mesh_discover_max_peers, 8);
+
+        let (node, _key) = ozma_mesh::MeshNode::generate("node-a", "10.200.9.1", 51_820);
+        let compact = parse_mesh_trust(&format!("node-a={}", node.wg_pubkey.0)).unwrap();
+        assert_eq!(compact.id, "node-a");
+        assert_eq!(compact.wg_pubkey, node.wg_pubkey.0);
+
+        let json = parse_mesh_trust(&format!(
+            r#"{{"id":"node-a","wg_pubkey":"{}","mesh_ip":"10.200.9.1"}}"#,
+            node.wg_pubkey.0
+        ))
+        .unwrap();
+        assert_eq!(json.mesh_ip.as_deref(), Some("10.200.9.1"));
+        assert!(parse_mesh_trust("missing-separator").is_err());
+        assert!(parse_mesh_trust("node-a=not-a-key").is_err());
+        assert!(parse_mesh_trust("=abc").is_err());
     }
 
     #[test]

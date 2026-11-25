@@ -441,3 +441,66 @@ args start the detector), so it was not run under `systemd-run`.
 Full evidence, deviations, leftover state, and remaining privileged gaps:
 [`phase4-release-install-report.md`](phase4-release-install-report.md).
 
+## Systemd runtime and udev smoke (2026-11-25 20:53–20:56)
+
+This follow-up applied the host integration that earlier gates left dormant and
+ran the packaged `ozma-node@vm.service` as `ozma-node` with the dev/test fake
+source. It did **not** capture the desktop, open QMP/VNC, register with a
+controller, or leave a unit enabled/running. Full evidence is in
+[`phase4-systemd-runtime-report.md`](phase4-systemd-runtime-report.md).
+
+Commands run as root (nothing enabled/started except the smoke unit, stopped
+before cleanup):
+
+```bash
+sudo systemd-tmpfiles --create --dry-run /etc/tmpfiles.d/ozma-node.conf  # "Would create" x3, rc 0
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/ozma-node.conf             # rc 0
+sudo modprobe uinput                 # already loaded
+sudo modprobe libcomposite           # now loaded (listed by modules-load)
+sudo udevadm control --reload-rules  # rc 0
+sudo udevadm trigger --action=change --subsystem-match=misc --sysname-match=uinput
+sudo udevadm trigger --action=change --subsystem-match=hidg
+sudo udevadm trigger --action=change --subsystem-match=video4linux --sysname-match='video*'
+sudo udevadm trigger --action=change --subsystem-match=drm --sysname-match='renderD*'
+```
+
+Applied effects:
+
+| Device | Before | After | Note |
+|---|---|---|---|
+| `/dev/uinput` | `0660 root:input` + ACL `matt`, `brltty` | `0660 root:ozma-node` + same ACLs | Intended rule; `matt` still opens it |
+| `/dev/dri/renderD128-130` | `0666 root:render` | `0660 root:render` | Intended rule; `matt` is not in `render`, so direct render access is now denied (see report) |
+| `/dev/dri/card0-3` | `0660 root:video` + ACL `matt` on card0 | unchanged | Open test as `matt` passed |
+| `/dev/input/event0` | `0660 root:input` + ACL `matt` | unchanged | Input subsystem was deliberately **not** triggered; open test as `matt` passed |
+| `/dev/video0-*` | `0660 root:video` | unchanged | Same rule/mode |
+| `/dev/hidg*` | absent | absent | No ConfigFS gadget/UDC; rule parses and trigger is a no-op |
+
+`systemd-tmpfiles` left `/run/ozma` `0755`, `/run/ozma-node` `0750`, and
+`/run/ozma/qmp` `0770 root:kvm` owned as installed. No AppArmor profile was
+loaded (`apparmor.service` not found, `apparmor_parser` absent), and
+`/etc/libvirt/qemu.conf` remained byte-identical
+(`sha256 2c7a8e5f…3e55`); neither step is required for this fake-source runtime
+and both would affect unrelated host services.
+
+Runtime smoke (packaged unit + temporary `/etc/ozma/ozma-node-vm.env`, mode
+`0600 root:ozma-node`):
+
+```bash
+sudo systemctl start ozma-node@vm.service
+# OZMA_NODE_ARGS=--name ozma-smoke --capture-provider fake --fake-width 96 \
+#   --fake-height 64 --fake-fps 2 --input-provider recording \
+#   --audio-provider none --display-provider none --power-provider none \
+#   --http-port 34383 --hid-udp-port 43789 --api-token <temporary> \
+#   --hls --hls-dir /var/lib/ozma-node/hls/ozma-smoke ...
+# /health -> {"ok":true,...}; /api/v1/connection -> capture fake, HLS running,
+# input fake-recording, power/audio/display not-configured
+# /snapshot -> HTTP 200 image/jpeg, 96x64, 771 bytes
+# unauthenticated /api/v1/connection -> HTTP 401
+sudo systemctl stop ozma-node@vm.service
+# journal: signal="SIGTERM"; "Ozma node shutting down"; Deactivated successfully
+```
+
+After stop: `inactive (dead)`, still `disabled`; no `ozma-node` process, no
+listener on 34383/43789, and no socket under `/run/ozma*`. The temporary env
+file and `/var/lib/ozma-node/hls/ozma-smoke` were removed; the tmpfiles
+directories remain intact. No service is enabled or running.
