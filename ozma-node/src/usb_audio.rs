@@ -94,9 +94,24 @@ pub fn find_uac2_playback_device() -> Option<String> {
 }
 
 /// Return the ALSA device string for the UAC2 gadget's **capture** interface
-/// (host → device direction), e.g. `"hw:2,1"`, or `None` if not found.
+/// (host → device direction), or `None` if not found.
+///
+/// `u_audio` registers both directions on PCM device 0 of the gadget card, so
+/// the capture stream normally shares `hw:N,0` with playback. A dedicated
+/// capture node at `hw:N,1` is used only if the kernel actually created it.
 pub fn find_uac2_capture_device() -> Option<String> {
-    find_uac2_playback_device().map(|d| d.replace(",0", ",1"))
+    let playback = find_uac2_playback_device()?;
+    let card = playback.strip_prefix("hw:")?.split(',').next()?;
+    let dedicated = std::path::Path::new(&format!("/dev/snd/pcmC{card}D1c")).exists();
+    Some(uac2_capture_device(card, dedicated))
+}
+
+fn uac2_capture_device(card: &str, dedicated_capture: bool) -> String {
+    if dedicated_capture {
+        format!("hw:{card},1")
+    } else {
+        format!("hw:{card},0")
+    }
 }
 
 /// Return `true` if the UAC2 function is present in the Ozma gadget.
@@ -404,9 +419,10 @@ fn spawn_watcher(config: UsbAudioConfig, stop: Arc<AtomicBool>) -> JoinHandle<()
 
             // host → device bridge (UAC2 capture → speaker output)
             //
-            // The UAC2 gadget's capture interface (hw:N,1) is opened as
-            // Direction::Capture because the USB host writes audio into it
-            // (speaker/playback from the host's perspective) and we read it.
+            // The UAC2 gadget's capture stream is opened as Direction::Capture
+            // because the USB host writes audio into it (speaker/playback from
+            // the host's perspective) and we read it. `u_audio` normally puts
+            // that stream on the gadget card's PCM device 0.
             let cap_stop = bridge_stop.clone();
             let cap_src = cap_dev.clone();
             let spk_dst = config.speaker_output_device.clone();
@@ -522,12 +538,13 @@ mod tests {
         assert_eq!(result, Some("hw:1,0".to_string()));
     }
 
-    /// Verify that the capture device is derived correctly from the playback device.
+    /// Verify that the capture device follows the gadget card's real PCM
+    /// layout: `u_audio` normally shares PCM device 0, but a dedicated
+    /// capture node is honoured when the kernel exposes one.
     #[test]
     fn capture_device_from_playback() {
-        let pb = "hw:2,0".to_string();
-        let cap = pb.replace(",0", ",1");
-        assert_eq!(cap, "hw:2,1");
+        assert_eq!(uac2_capture_device("2", false), "hw:2,0");
+        assert_eq!(uac2_capture_device("2", true), "hw:2,1");
     }
 
     /// `uac2_active()` must return false in a normal test / CI environment

@@ -111,7 +111,7 @@ impl Uac2BridgeShared {
     pub fn from_report_with_error(report: Uac2BridgeReport, error: Uac2BridgeError) -> Self {
         Self {
             state: Arc::new(Mutex::new(SharedState {
-                report: normalize_report(report),
+                report: report_after_error(report),
                 last_error: Some(error),
             })),
         }
@@ -133,9 +133,23 @@ impl Uac2BridgeShared {
 
     fn set_with_error(&self, report: Uac2BridgeReport, error: Uac2BridgeError) {
         let mut state = lock(&self.state);
-        state.report = report;
+        state.report = report_after_error(report);
         state.last_error = Some(error);
     }
+}
+
+/// Downgrade a `running` snapshot when the last pump failed.
+///
+/// Counters can move on the ALSA side even when the USB endpoint rejects the
+/// transfer (for example a virtual UDC that does not implement isochronous
+/// URBs). The typed error is the honest state; `configured` keeps `/usb` from
+/// claiming live bridge audio until a pump actually succeeds again.
+fn report_after_error(report: Uac2BridgeReport) -> Uac2BridgeReport {
+    let mut report = normalize_report(report);
+    if report.status == Uac2BridgeStatus::Running {
+        report.status = Uac2BridgeStatus::Configured;
+    }
+    report
 }
 
 /// Devices and plans the factory must open inside the pump thread.
@@ -376,7 +390,11 @@ pub fn start_real(config: &NodeConfig) -> Result<Uac2BridgeRuntime, UsbError> {
             instance: "audio".to_owned(),
             path: "gadget ALSA card",
         })?;
-    let gadget_capture = gadget_playback.replace(",0", ",1");
+    let gadget_capture =
+        crate::usb_audio::find_uac2_capture_device().ok_or_else(|| UsbError::Uac2MissingPath {
+            instance: "audio".to_owned(),
+            path: "gadget ALSA capture device",
+        })?;
 
     let uac2 = Uac2Config::new(2, 1, 48_000, 16);
     let bridge = Uac2BridgeConfig::from_uac2("audio", &uac2)?
@@ -548,10 +566,17 @@ impl AlsaUac2EndpointIo {
                 .map_err(|error| endpoint_param(address, device, "buffer size", error))?;
             pcm.hw_params(&hwp)
                 .map_err(|error| endpoint_param(address, device, "hardware parameters", error))?;
+            // Start lazily on the first packet read/write. `snd-aloop` and some
+            // UAC2 gadget PCMs reject starting an empty buffer with EPIPE.
+            let swp = pcm
+                .sw_params_current()
+                .map_err(|error| endpoint_param(address, device, "software parameters", error))?;
+            swp.set_start_threshold(1)
+                .map_err(|error| endpoint_param(address, device, "start threshold", error))?;
+            pcm.sw_params(&swp)
+                .map_err(|error| endpoint_param(address, device, "software parameters", error))?;
             pcm.prepare()
                 .map_err(|error| endpoint_param(address, device, "prepare", error))?;
-            pcm.start()
-                .map_err(|error| endpoint_param(address, device, "start", error))?;
         }
         let current = pcm
             .hw_params_current()
@@ -929,6 +954,32 @@ mod tests {
         let shared = Uac2BridgeShared::from_report(report);
         assert_eq!(shared.report().status, Uac2BridgeStatus::Configured);
         assert!(!shared.report().is_live());
+    }
+
+    #[test]
+    fn running_report_with_counters_is_downgraded_when_the_pump_failed() {
+        let report = Uac2BridgeReport {
+            status: Uac2BridgeStatus::Running,
+            playback: None,
+            capture: None,
+            counters: Uac2BridgeCounters {
+                capture_bytes_out: 96,
+                capture_frames_out: 48,
+                ..Uac2BridgeCounters::default()
+            },
+            missing_paths: Vec::new(),
+            reason: None,
+        };
+        let shared = Uac2BridgeShared::from_report_with_error(
+            report,
+            Uac2BridgeError {
+                kind: "uac2-endpoint".to_owned(),
+                message: "usb transfer failed".to_owned(),
+            },
+        );
+        assert_eq!(shared.report().status, Uac2BridgeStatus::Configured);
+        assert!(!shared.report().is_live());
+        assert_eq!(shared.last_error().unwrap().kind, "uac2-endpoint");
     }
 
     #[test]

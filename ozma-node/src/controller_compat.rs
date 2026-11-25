@@ -24,6 +24,7 @@
 //! be removed once clients speak the native session input channel.
 
 use std::collections::BTreeSet;
+use std::convert::Infallible;
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
@@ -39,6 +40,7 @@ use axum::http::{header, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use bytes::Bytes;
 use futures_util::stream;
 use ozma_audio::{
     next_eq_sink_name, validate_profile, AudioError, AudioPlaybackSpec, AudioProfile, AudioRouter,
@@ -91,7 +93,8 @@ use crate::multi_webrtc::{MultiConsoleWebrtc, MultiConsoleWebrtcStatus};
 use crate::rpa::{key_events, modifier_bit, named_key_usage, OcrControl, OcrError};
 use crate::usb_uac2::{Uac2BridgeError, Uac2BridgeShared};
 use crate::video::{
-    VideoParams, VideoStatus, VideoStreams, ALIAS as VIDEO_ALIAS, ROUTE as VIDEO_ROUTE,
+    VideoCodec, VideoEncoding, VideoParams, VideoStatus, VideoStreams, ALIAS as VIDEO_ALIAS,
+    ROUTE as VIDEO_ROUTE,
 };
 use crate::webrtc::{WebRtcControl, WebRtcError, WebRtcGeometryStatus};
 
@@ -3840,6 +3843,10 @@ pub struct ConnectionState {
     /// Bounded `/video` MJPEG stream accounting. Always present; the route
     /// itself reports a typed 503 when no snapshot control/source exists.
     pub video_streams: VideoStreams,
+    /// H.264/HEVC encoder configuration for `/video?codec=h264|hevc`.
+    /// `None` advertises MJPEG only and returns a typed 503 for encoded
+    /// requests.
+    pub video_encoding: Option<VideoEncoding>,
     /// Bounded host sampler for the public `/agent/metrics` document.
     pub metrics: crate::agent_metrics::AgentMetricsSampler,
     /// Optional deep hardware sampler used to enrich `/agent/metrics` with
@@ -3956,6 +3963,7 @@ impl ConnectionState {
             snapshot: None,
             ocr: OcrControl::detect(),
             video_streams: VideoStreams::default(),
+            video_encoding: None,
             metrics: crate::agent_metrics::AgentMetricsSampler::default(),
             hardware: None,
             host_surfaces,
@@ -4221,6 +4229,16 @@ impl ConnectionState {
     /// clamped to one.
     pub fn with_video_streams(mut self, streams: VideoStreams) -> Self {
         self.video_streams = streams;
+        self
+    }
+
+    /// Attach the H.264/HEVC encoder used by `/video?codec=h264|hevc`.
+    ///
+    /// `None` keeps the route MJPEG-only and makes an encoded request a typed
+    /// `503 video.encoder_unavailable`. This is independent of `--hls`: the
+    /// live stream writes MPEG-TS directly and does not need an HLS directory.
+    pub fn with_video_encoding(mut self, encoding: Option<VideoEncoding>) -> Self {
+        self.video_encoding = encoding;
         self
     }
 
@@ -4663,7 +4681,11 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
         None => state.codecs.clone(),
     };
     let display = state.display_status();
-    let video = VideoStatus::new(state.snapshot.is_some(), &state.video_streams);
+    let video = VideoStatus::new(
+        state.snapshot.is_some(),
+        state.video_encoding.is_some(),
+        &state.video_streams,
+    );
     let mut controller_surfaces: Vec<ControllerSurface> = RPA_IMPLEMENTED_SURFACES
         .iter()
         .chain(CONTROLLER_ONLY_SURFACES)
@@ -4909,13 +4931,12 @@ fn unavailable_display_info(last_error: Option<String>) -> DisplayInfo {
     }
 }
 
-/// `GET /video` and `GET /display/mjpeg` — bounded multipart MJPEG stream.
+/// `GET /video` and `GET /display/mjpeg` — bounded MJPEG or MPEG-TS stream.
 ///
-/// The first frame is captured before the response is committed, so a missing
-/// source, unknown console, or single-head conflict is a typed status instead
-/// of a 200 with an empty stream. Subsequent frames come from the same cached
-/// capture source and are dropped (not queued without bound) when the client
-/// stops reading. Disconnecting releases the source and the stream slot.
+/// `?codec=mjpeg` (the default) keeps the historical multipart JPEG response.
+/// `?codec=h264|hevc` feeds the same selected capture source to ffmpeg and
+/// returns MPEG-TS. In both cases a real frame/keyframe is produced before the
+/// response is committed, and disconnecting releases the source and slot.
 async fn video_stream(
     State(state): State<ConnectionState>,
     Query(params): Query<VideoParams>,
@@ -4928,12 +4949,17 @@ async fn video_stream(
                 "video.invalid_query",
                 error.message,
                 Some(
-                    "Use ?fps=1..30&quality=1..100&console=<N|label|Console_N|source-id>; \
-                     numeric values outside those bounds are clamped.",
+                    "Use ?codec=mjpeg|h264|hevc&fps=1..30&quality=1..100&bitrate=100..50000\
+                     &console=<N|label|Console_N|source-id>; numeric values outside those bounds \
+                     are clamped.",
                 ),
             )
         }
     };
+
+    if options.codec.is_encoded() {
+        return encoded_video_stream(&state, &params, options).await;
+    }
 
     let control = match video_control(&state, params.console.as_deref(), options.quality).await {
         Ok(control) => control,
@@ -4970,6 +4996,10 @@ async fn video_stream(
         HeaderValue::from_static("no"),
     );
     headers.insert(
+        axum::http::HeaderName::from_static("x-ozma-codec"),
+        HeaderValue::from_static(VideoCodec::Mjpeg.as_str()),
+    );
+    headers.insert(
         axum::http::HeaderName::from_static("x-ozma-fps"),
         HeaderValue::from_str(&options.fps.to_string()).expect("fps is numeric"),
     );
@@ -4978,6 +5008,156 @@ async fn video_stream(
         HeaderValue::from_str(&options.quality.to_string()).expect("quality is numeric"),
     );
     response
+}
+
+/// H.264/HEVC MPEG-TS branch of `/video`.
+async fn encoded_video_stream(
+    state: &ConnectionState,
+    params: &VideoParams,
+    options: crate::video::VideoOptions,
+) -> Response {
+    let Some(encoding) = state.video_encoding.as_ref() else {
+        return video_encoder_unavailable_response(
+            "This node has no H.264/HEVC encoder configuration; only ?codec=mjpeg is available.",
+        );
+    };
+
+    let control = match video_control(state, params.console.as_deref(), options.quality).await {
+        Ok(control) => control,
+        Err(error) => return snapshot_error_response(error),
+    };
+
+    let Some(guard) = state.video_streams.try_start_encoded() else {
+        return video_stream_limit_response(state);
+    };
+
+    let source = match control.open_stream_source().await {
+        Ok((_capability, source)) => source,
+        Err(error) => {
+            drop(guard);
+            return snapshot_error_response(error);
+        }
+    };
+
+    let started = match encoding
+        .start_encoded(options.codec, &options, source)
+        .await
+    {
+        Ok(started) => started,
+        Err(error) => {
+            drop(guard);
+            return video_encode_error_response(error);
+        }
+    };
+
+    let crate::video::StartedVideoStream {
+        stream: mpegts,
+        encoder,
+        stream_copy,
+    } = started;
+    let first = Some(mpegts.first);
+    let receiver = mpegts.receiver;
+    // The task is detached deliberately: it owns ffmpeg/source and exits when
+    // the receiver below is dropped. `guard` travels with the body state so a
+    // disconnect returns the slot only after the body really ends.
+    drop(mpegts.task);
+    let body = Body::from_stream(stream::unfold(
+        (first, receiver, guard),
+        |(first, mut receiver, guard)| async move {
+            if let Some(first) = first {
+                return Some((Ok::<Bytes, Infallible>(first), (None, receiver, guard)));
+            }
+            receiver
+                .recv()
+                .await
+                .map(|chunk| (Ok(chunk), (None, receiver, guard)))
+        },
+    ));
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(crate::video::MPEGTS_CONTENT_TYPE),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.insert(
+        axum::http::HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("x-ozma-codec"),
+        HeaderValue::from_static(options.codec.as_str()),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("x-ozma-encoder"),
+        HeaderValue::from_str(if stream_copy {
+            "copy"
+        } else {
+            encoder.ffmpeg_name()
+        })
+        .expect("encoder names are valid header values"),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("x-ozma-stream-copy"),
+        HeaderValue::from_static(if stream_copy { "true" } else { "false" }),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("x-ozma-fps"),
+        HeaderValue::from_str(&options.fps.to_string()).expect("fps is numeric"),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("x-ozma-bitrate"),
+        HeaderValue::from_str(&options.bitrate_kbps.to_string()).expect("bitrate is numeric"),
+    );
+    response
+}
+
+/// Typed 503 when an encoded stream was requested without an encoder.
+fn video_encoder_unavailable_response(message: impl Into<String>) -> Response {
+    compat_error_with_remediation(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "video.encoder_unavailable",
+        message,
+        Some(
+            "Enable the video capability and run the node with an ffmpeg that advertises \
+             libx264/libx265 (or the selected VAAPI/NVENC/QSV/V4L2M2M encoder), or request \
+             ?codec=mjpeg for the MJPEG stream.",
+        ),
+    )
+}
+
+/// Map an early MPEG-TS failure to the documented typed response.
+fn video_encode_error_response(error: HlsError) -> Response {
+    use crate::hls::HlsError;
+    let (status, code, remediation) = match &error {
+        HlsError::KeyframeTimeout { .. } => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "video.keyframe_timeout",
+            "The capture source produced no decodable keyframe before the stream setup bound. \
+             Check the source/encoder and retry; no replacement frame is fabricated.",
+        ),
+        HlsError::EncoderUnavailable { .. }
+        | HlsError::VaapiDevice { .. }
+        | HlsError::UnsupportedEncoder { .. }
+        | HlsError::UnsupportedPixelFormat { .. }
+        | HlsError::UnsupportedStreamCodec { .. }
+        | HlsError::Spawn { .. }
+        | HlsError::StdinUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "video.encoder_unavailable",
+            "Install/enable the selected ffmpeg encoder or request another codec; see \
+             GET /api/v1/connection.video.codecs for what this node advertises.",
+        ),
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "video.stream_failed",
+            "The capture source or ffmpeg encoder failed before the first keyframe. No MJPEG or \
+             synthetic frame is substituted; retry with a working source.",
+        ),
+    };
+    compat_error_with_remediation(status, code, error.to_string(), Some(remediation))
 }
 
 /// Select the snapshot control for a `/video` request.
@@ -5025,7 +5205,7 @@ fn video_stream_limit_response(state: &ConnectionState) -> Response {
     compat_error_with_remediation(
         StatusCode::SERVICE_UNAVAILABLE,
         "video.stream_limit",
-        format!("This node is already serving its limit of {max} MJPEG stream(s)."),
+        format!("This node is already serving its limit of {max} /video stream(s)."),
         Some(
             "Close an existing /video or /display/mjpeg stream, or use GET /display/snapshot \
              for a single JPEG frame. No frame is fabricated for a rejected stream.",
@@ -8595,6 +8775,7 @@ fn webrtc_bitrate_failure(error: WebRtcError) -> Response {
 mod tests {
     use super::*;
     use crate::display_control::ConsoleSourceFactory;
+    use crate::hls::mpegts_test_support::{mpegts_repeated, RecordingMpegTsSpawner};
     use crate::hls::{
         ffmpeg_argv, EncoderAvailability, EncoderProbe, FfmpegSpawner, FrameSink, HlsConfig,
         HlsController, HlsEncoder, HlsError, HlsSourceFactory, SpawnedFfmpeg, StaticEncoderProbe,
@@ -10435,6 +10616,47 @@ mod tests {
         }
     }
 
+    fn encoded_video_state(
+        format: Option<FrameFormat>,
+        streams: Option<VideoStreams>,
+        spawner: Arc<RecordingMpegTsSpawner>,
+        probe: Arc<dyn EncoderProbe>,
+        encoder: HlsEncoder,
+    ) -> ConnectionState {
+        let provider = match format {
+            Some(format) => FakeCaptureProvider::new().with_format(format),
+            None => FakeCaptureProvider::new(),
+        };
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_snapshot(Some(SnapshotControl::new(
+            CaptureRegistry::new().with(provider),
+        )))
+        .with_video_encoding(Some(VideoEncoding::with_components(
+            HlsConfig {
+                fps: 10,
+                bitrate_kbps: 2_000,
+                video_encoder: encoder,
+                ..HlsConfig::default()
+            },
+            probe,
+            spawner,
+        )));
+        match streams {
+            Some(streams) => state.with_video_streams(streams),
+            None => state,
+        }
+    }
+
     #[tokio::test]
     async fn video_stream_has_multipart_headers_and_real_changing_frames() {
         let app = public_router(video_state(None));
@@ -10572,6 +10794,213 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["code"], "video.invalid_query");
         assert!(body["error"].as_str().unwrap().contains("fps"));
+    }
+
+    #[tokio::test]
+    async fn video_h264_and_hevc_are_mpegts_with_a_real_first_keyframe() {
+        for (codec, encoder, fixture, expected_encoder) in [
+            ("h264", HlsEncoder::H264, HlsEncoder::H264, "libx264"),
+            ("hevc", HlsEncoder::Hevc, HlsEncoder::Hevc, "libx265"),
+        ] {
+            let spawner = Arc::new(RecordingMpegTsSpawner::new(fixture, true));
+            let state = encoded_video_state(
+                None,
+                None,
+                spawner.clone(),
+                Arc::new(StaticEncoderProbe::software()),
+                encoder,
+            );
+            let response = public_router(state)
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/video?codec={codec}&fps=10&bitrate=2000"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{codec}");
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "video/mp2t",
+                "{codec}"
+            );
+            assert_eq!(response.headers()["x-ozma-codec"], codec);
+            assert_eq!(response.headers()["x-ozma-encoder"], expected_encoder);
+            assert_eq!(response.headers()["x-ozma-stream-copy"], "false");
+            assert_eq!(response.headers()["x-ozma-fps"], "10");
+            assert_eq!(response.headers()["x-ozma-bitrate"], "2000");
+
+            let body = tokio::time::timeout(Duration::from_secs(3), response.into_body().collect())
+                .await
+                .expect("body ends when the fake ffmpeg stream ends")
+                .expect("body")
+                .to_bytes();
+            assert_eq!(body[0], 0x47, "{codec} MPEG-TS sync byte");
+            assert_eq!(body.len() % 188, 0, "{codec} whole TS packets");
+            assert!(
+                spawner
+                    .argv()
+                    .windows(2)
+                    .any(|pair| pair == ["-f", "mpegts"]),
+                "{codec} argv must use the mpegts muxer"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn video_encoded_selection_uses_compressed_passthrough_or_reencode() {
+        let h264_format = FrameFormat::new(PixelFormat::H264, 320, 240);
+
+        let copy_spawner = Arc::new(RecordingMpegTsSpawner::new(HlsEncoder::H264, true));
+        let copy_state = encoded_video_state(
+            Some(h264_format),
+            None,
+            copy_spawner.clone(),
+            Arc::new(StaticEncoderProbe::software()),
+            HlsEncoder::H264,
+        );
+        let response = public_router(copy_state)
+            .oneshot(
+                Request::builder()
+                    .uri("/video?codec=h264")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-ozma-stream-copy"], "true");
+        assert_eq!(response.headers()["x-ozma-encoder"], "copy");
+        assert_eq!(response.headers()["x-ozma-codec"], "h264");
+        let argv = copy_spawner.argv();
+        assert!(argv.windows(2).any(|pair| pair == ["-c:v", "copy"]));
+        assert!(argv.windows(2).any(|pair| pair == ["-f", "h264"]));
+        let _ = tokio::time::timeout(Duration::from_secs(3), response.into_body().collect()).await;
+
+        let reencode_spawner = Arc::new(RecordingMpegTsSpawner::new(HlsEncoder::Hevc, true));
+        let reencode_state = encoded_video_state(
+            Some(h264_format),
+            None,
+            reencode_spawner.clone(),
+            Arc::new(StaticEncoderProbe::software()),
+            HlsEncoder::Hevc,
+        );
+        let response = public_router(reencode_state)
+            .oneshot(
+                Request::builder()
+                    .uri("/video?codec=hevc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-ozma-stream-copy"], "false");
+        assert_eq!(response.headers()["x-ozma-encoder"], "libx265");
+        assert_eq!(response.headers()["x-ozma-codec"], "hevc");
+        let argv = reencode_spawner.argv();
+        assert!(argv.windows(2).any(|pair| pair == ["-f", "h264"]));
+        assert!(argv.windows(2).any(|pair| pair == ["-c:v", "libx265"]));
+        assert!(!argv.windows(2).any(|pair| pair == ["-c:v", "copy"]));
+        let _ = tokio::time::timeout(Duration::from_secs(3), response.into_body().collect()).await;
+    }
+
+    #[tokio::test]
+    async fn video_encoded_unavailable_and_bad_codecs_are_typed() {
+        let (status, body) = get_json(&public_router(video_state(None)), "/video?codec=h264").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["code"], "video.encoder_unavailable");
+
+        let spawner = Arc::new(RecordingMpegTsSpawner::new(HlsEncoder::H264, true));
+        let state = encoded_video_state(
+            None,
+            None,
+            spawner.clone(),
+            Arc::new(StaticEncoderProbe::new(EncoderAvailability::default())),
+            HlsEncoder::H264,
+        );
+        let (status, body) = get_json(&public_router(state), "/video?codec=h264").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "video.encoder_unavailable");
+        assert_eq!(
+            spawner.spawns.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no ffmpeg should start when the encoder is unavailable"
+        );
+
+        let (status, body) = get_json(&public_router(video_state(None)), "/video?codec=vp9").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "video.invalid_query");
+        assert!(body["error"].as_str().unwrap().contains("vp9"));
+    }
+
+    #[tokio::test]
+    async fn video_encoded_disconnect_releases_slot_and_stops_ffmpeg() {
+        let streams = VideoStreams::new(1);
+        let spawner = Arc::new(
+            RecordingMpegTsSpawner::with_data(mpegts_repeated(HlsEncoder::H264, true, 200))
+                .with_chunk(188),
+        );
+        let state = encoded_video_state(
+            None,
+            Some(streams.clone()),
+            spawner.clone(),
+            Arc::new(StaticEncoderProbe::software()),
+            HlsEncoder::H264,
+        );
+        let response = public_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/video?codec=h264")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(streams.active(), 1);
+        assert_eq!(streams.active_encoded(), 1);
+
+        let mut body = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(Duration::from_secs(3), body.next())
+            .await
+            .expect("first chunk before timeout")
+            .expect("chunk")
+            .expect("infallible");
+        assert_eq!(first[0], 0x47);
+        drop(body);
+        wait_for_video_idle(&streams).await;
+        assert_eq!(streams.active_encoded(), 0);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !spawner.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ffmpeg stdin was not closed after disconnect"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn video_mjpeg_default_reports_its_codec_and_leaves_the_stream_unchanged() {
+        let response = public_router(video_state(None))
+            .oneshot(
+                Request::builder()
+                    .uri("/video?fps=10&quality=60")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-ozma-codec"], "mjpeg");
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "multipart/x-mixed-replace; boundary=ozma-frame"
+        );
     }
 
     struct VideoConsoleFactory;

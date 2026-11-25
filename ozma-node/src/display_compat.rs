@@ -431,6 +431,19 @@ impl SnapshotControl {
         }
     }
 
+    /// Open the selected capture source for a long-lived encoded stream.
+    ///
+    /// This follows the same registry/source selection as [`Self::capture`]
+    /// but returns the source itself instead of a JPEG, so `/video?codec=h264`
+    /// can feed the original layout (including compressed H.264/HEVC access
+    /// units) to ffmpeg. The caller owns the source and must call
+    /// [`CaptureSource::stop`] when the stream ends.
+    pub async fn open_stream_source(
+        &self,
+    ) -> Result<(CaptureCapability, Box<dyn CaptureSource>), SnapshotError> {
+        self.open_source().await
+    }
+
     /// Prefer a specific source id instead of the first enumerated source.
     pub fn with_source_id(mut self, id: impl Into<String>) -> Self {
         self.requested_source = Some(id.into());

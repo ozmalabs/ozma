@@ -927,10 +927,18 @@ fn open_alsa_pcm(config: &AlsaUac2Config, direction: Direction) -> Result<PCM, U
             .map_err(|error| parameter_error(address, device, "buffer size", error))?;
         pcm.hw_params(&hwp)
             .map_err(|error| parameter_error(address, device, "hardware parameters", error))?;
+        // Let the first read/write start the stream. Starting an empty
+        // playback buffer is rejected with EPIPE by some drivers (snd-aloop),
+        // and the bridge is a steady 1 ms pump rather than a one-shot player.
+        let swp = pcm
+            .sw_params_current()
+            .map_err(|error| parameter_error(address, device, "software parameters", error))?;
+        swp.set_start_threshold(1)
+            .map_err(|error| parameter_error(address, device, "start threshold", error))?;
+        pcm.sw_params(&swp)
+            .map_err(|error| parameter_error(address, device, "software parameters", error))?;
         pcm.prepare()
             .map_err(|error| parameter_error(address, device, "prepare", error))?;
-        pcm.start()
-            .map_err(|error| parameter_error(address, device, "start", error))?;
         Ok(())
     };
     configure()?;

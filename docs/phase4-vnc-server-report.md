@@ -11,7 +11,10 @@ covers **JpegCompression** (honouring the -32..-23 quality pseudo-encoding),
 the **GradientFilter**, and the -256..-247 compression-level hint in addition
 to Fill/Palette/Copy. **The transport is still plain TCP: VNC authentication
 is not encryption and there is no TLS. ZRLE, ZLib, and Tight are compression,
-not encryption.** No commit was made.
+not encryption.** The node also has an **opt-in, bounded clipboard bridge**
+(`--vnc-clipboard`) that uses the desktop-profile X11 clipboard; it is off by
+default and never claims a sync when the backend is unavailable. No commit was
+made.
 
 ## Scope
 
@@ -20,15 +23,15 @@ Added:
 - `ozma-node/src/vnc_server.rs` — a bound RFB listener, handshake, optional
   RFB security type 2 (DES challenge/response), Raw, Hextile, ZLib, Tight, and
   ZRLE framebuffer encoders, Cursor pseudo-encoding, client-message parser,
-  input adapter, and per-listener counters.
+  input adapter, opt-in bounded clipboard bridge, and per-listener counters.
 - `ozma-node/Cargo.toml` — the `flate2` dependency for the per-client ZRLE,
   ZLib, and Tight zlib streams (already present in `Cargo.lock` through the
   image stack) and the `jpeg-encoder` dependency for Tight JPEG (the same
   crate `ozma-encode` already uses; no new crate was downloaded).
 - `ozma-node/src/main.rs` — `--vnc-server`, `--vnc-bind`,
   `--vnc-server-port`, `--vnc-password-file`, `--vnc-allow-unauthenticated`,
-  `--vnc-max-clients`, and `--vnc-idle-timeout-seconds`, startup/shutdown
-  wiring, and endpoint logging.
+  `--vnc-max-clients`, `--vnc-idle-timeout-seconds`, `--vnc-clipboard`, and
+  `--vnc-clipboard-max-bytes`, startup/shutdown wiring, and endpoint logging.
 - `ozma-node/src/config.rs` — validation and storage for the new flags,
   including refusal of unauthenticated non-loopback binds.
 - `ozma-node/src/registration.rs` — served-endpoint precedence over an external
@@ -56,6 +59,8 @@ updated to describe password authentication and the still-plaintext transport.
 | `--vnc-allow-unauthenticated` / `OZMA_VNC_ALLOW_UNAUTHENTICATED` | off | Explicit opt-in for a non-loopback bind **without** a password. |
 | `--vnc-max-clients` / `OZMA_VNC_MAX_CLIENTS` | `4` | Bounded 1..=32 concurrent viewers. |
 | `--vnc-idle-timeout-seconds` / `OZMA_VNC_IDLE_TIMEOUT_SECONDS` | `0` | `0` disables it; otherwise 1..=86400 seconds without a client message closes the viewer. |
+| `--vnc-clipboard` / `OZMA_VNC_CLIPBOARD` | off | Opt-in bridge between RFB cut text and the desktop-profile X11 clipboard. Requires `--vnc-server`. |
+| `--vnc-clipboard-max-bytes` / `OZMA_VNC_CLIPBOARD_MAX_BYTES` | `65536` | Bounded 1..=65536 bytes in either direction. Larger `ClientCutText` payloads are consumed and ignored. |
 
 ### Security and bind policy
 
@@ -136,7 +141,7 @@ The server advertises **RFB 003.008** and accepts clients that negotiate 3.3,
 | `3` | `FramebufferUpdateRequest` | Full (`incremental=0`) or incremental (`incremental=1`), with bounded rectangle clipping. Multiple pending requests are merged into at most eight rectangles. |
 | `4` | `KeyEvent` | Keysym → USB HID usage, forwarded to the shared `InputSink`. Unknown keysyms are counted and dropped rather than guessed. |
 | `5` | `PointerEvent` | Absolute pointer position (scaled to the sink's 0..=32767 report space) plus button/wheel transitions. |
-| `6` | `ClientCutText` | Parsed up to 1 MiB and ignored; clipboard is not exposed by any input sink. A larger length closes the connection instead of trusting the field. |
+| `6` | `ClientCutText` | Parsed up to 1 MiB. With `--vnc-clipboard` on a desktop/X11 node, the ISO-8859-1 text is sanitised (NUL/C0/C1 controls removed except tab/CR/LF) and written through the desktop clipboard path when it fits `--vnc-clipboard-max-bytes`; otherwise it is consumed and counted as rejected. With the bridge off it is parsed and ignored. A length above 1 MiB closes the connection instead of trusting the field. |
 | other | unknown | The connection is closed with a typed protocol diagnostic; the RFB framing cannot be recovered safely. |
 
 ### Framebuffer updates
@@ -361,6 +366,46 @@ sessions:
   still one shared keyboard/pointer, so a disconnect releases the shared state
   for all viewers; this is documented as a limitation below.
 
+## Clipboard bridging (opt-in)
+
+The bridge is off unless `--vnc-clipboard` is set. It uses the same
+`DesktopControls` X11 clipboard path as
+`GET/POST /clipboard` (`xclip` or `xsel`), so it adds no second process boundary
+and inherits the desktop layer's 64 KiB UTF-8/NUL checks. It is only installed
+when the node runs `--profile desktop` with an X11 display; on any other profile
+the flag is accepted as a warned no-op and status reports the clipboard as
+unavailable.
+
+- **Viewer → node:** `ClientCutText` bytes are decoded as **ISO-8859-1**
+  (RFB 6143), not UTF-8. C0/C1 controls are stripped except tab, CR, and LF, so a
+  viewer cannot inject NUL or terminal-style escapes into the desktop clipboard.
+  The text is written only when it fits `--vnc-clipboard-max-bytes`; a larger
+  payload is still consumed so later messages stay in sync, then counted as
+  rejected. A length above the 1 MiB protocol cap closes the connection.
+- **Node → viewer:** once per connection, after `ServerInit`, the server reads
+  the node clipboard and sends one `ServerCutText` when the backend is available,
+  the text is representable in ISO-8859-1, and it fits the configured bound.
+  Characters outside Latin-1 cause no message rather than a silent `?`
+  substitution. An empty clipboard is sent as a zero-length `ServerCutText`.
+- **No echo:** cut text from a viewer is written to the node clipboard but is
+  never broadcast back to that viewer (or any viewer). The only `ServerCutText`
+  is the connect-time snapshot.
+- **Unavailable or failed:** a missing display/tool, command failure, oversize
+  text, or non-Latin-1 text is ignored safely. The framebuffer session continues,
+  the viewer is not disconnected, and no sync time/direction is recorded.
+- **Status without contents:** `VncServerStats` and
+  `VncServerHandle::clipboard_status()` expose `enabled`, `available`,
+  `last_direction` (`none`/`viewer-to-node`/`node-to-viewer`),
+  `last_sync_unix_ms`, per-direction success counts, and a rejection count. The
+  clipboard text never appears in logs, `Debug`, counters, or the status
+  structure. Startup logs only `clipboard = disabled|available|unavailable` and
+  the configured bound.
+- **Not a continuous sync:** the node does not poll the desktop clipboard or
+  push later node-side changes to an already connected viewer. Reconnect to pick
+  up a new node clipboard value. Clipboard traffic remains inside the same
+  plaintext RFB transport described above, so enable this only on a trusted
+  link.
+
 ## Registration and `/api/v1/connection`
 
 - The internal listener's **actual bound** host/port is resolved before mDNS and
@@ -387,16 +432,20 @@ sessions:
 
 ### Automated
 
-`cargo test -p ozma-node --lib vnc` — **62 passed, 0 failed** for the RFB,
-config, and registration coverage. The wider `ozma-node` lib suite was not
-re-run for this Tight pass; the previous full run was **552 passed, 0 failed,
-4 ignored**, and the ignored tests are pre-existing opt-in WebRTC/GStreamer
-live tests.
+`cargo test -p ozma-node --lib vnc` — **70 passed, 0 failed** for the RFB,
+clipboard-bridge, config, and registration coverage. Because the main working
+tree also contained unrelated in-progress HLS/video edits, this pass was
+validated in a clean `HEAD` worktree with only the VNC clipboard files applied;
+`cargo check -p ozma-node --all-targets` passed there. The wider full-suite
+number from the previous pass was **552 passed, 0 failed, 4 ignored**; the
+ignored tests are pre-existing opt-in WebRTC/GStreamer live tests.
 
-This pass ran in the main working tree: `cargo check -p ozma-node
---all-targets` completed successfully despite the unrelated in-progress
-changes in other crates. No product change was made outside
-`ozma-node/src/vnc_server.rs` and this report.
+This clipboard pass changed only `ozma-node/src/vnc_server.rs`, the VNC flag
+wiring/validation in `ozma-node/src/main.rs` and `ozma-node/src/config.rs`, the
+test-config fields in `ozma-node/src/platform.rs`, and this report. It did not
+change `docs/parity-matrix.md` or `docs/plan-execution-status.md`. The main
+working tree also had unrelated in-progress HLS/video edits; those were not
+touched.
 
 New encoding tests in `ozma-node/src/vnc_server.rs`:
 
@@ -515,11 +564,19 @@ Existing tests retained and passing include:
 - `version_parsing_rejects_malformed_or_unsupported_strings_without_overflow`
 - `pixel_format_validation_is_typed`
 - `geometry_and_frame_bounds_are_enforced`
+- `client_cut_text_decodes_latin1_sanitizes_controls_and_writes_clipboard`
+- `client_cut_text_over_the_configured_bound_is_ignored_without_desync`
+- `unavailable_clipboard_ignores_cut_text_and_reports_no_sync`
+- `server_cut_text_is_sent_on_connect_as_latin1`
+- `server_cut_text_is_skipped_when_the_text_is_not_latin1`
+- `a_viewers_cut_text_is_not_echoed_back_to_the_same_viewer`
+- `client_cut_text_above_the_protocol_cap_closes_the_viewer`
 
 Registration/config tests:
 
 - `registration::tests::served_vnc_endpoint_precedes_the_external_qemu_endpoint`
 - `config::tests::vnc_server_flags_require_enable_and_validate_the_bind_address`
+- `config::tests::vnc_clipboard_flags_require_server_and_validate_the_bound`
 - `main::tests::vnc_server_flags_are_opt_in_and_auto_port_by_default`
 
 ### Live smoke (real clients, synthetic capture)
@@ -552,6 +609,28 @@ CConnection: Choosing security type None(1)
 
 The viewer decoded frames until the test's 6 s timeout stopped it. The node
 log recorded the listener and the real bound endpoint.
+
+### Live clipboard smoke (Xvfb + xclip, 2026-11-25)
+
+Environment: Xvfb `:99` (1024x768x24), `xclip`, a fake 64x48 capture source, and
+the `ozma-node` binary built from a clean `HEAD` worktree with only the VNC
+clipboard changes applied. The node used `--profile desktop` with ambient
+`DISPLAY=:99`, `--vnc-server --vnc-bind 127.0.0.1 --vnc-server-port 15999
+--vnc-clipboard`. A small raw-socket RFB 3.8 client performed the handshake and
+cut-text exchange; `xclip -selection clipboard -o` read the node side.
+
+| Check | Result | Evidence |
+|---|---|---|
+| Node starts with a usable backend | **PASS** | log `clipboard="available" clipboard_max_bytes=65536`; `bind=127.0.0.1:15999` |
+| `ServerCutText` on connect is Latin-1 | **PASS** | node clipboard `from-node-é`; viewer received `b'from-node-\xe9'` |
+| `ClientCutText` writes the node clipboard | **PASS** | viewer sent Latin-1 `from-viewer-é\tX`; `xclip -o` returned the same UTF-8 text |
+| Control characters are stripped | **PASS** | viewer sent `b'safe\x00\x01text'`; `xclip -o` returned `safetext` |
+| No echo to the same viewer | **PASS** | no `ServerCutText` arrived within 0.5 s after the viewer's cut text |
+| Cleanup | **PASS** | node, Xvfb, and xclip selection owner were terminated; no listener remained |
+
+This is a smoke test, not a full clipboard-matrix run: it did not exercise
+multiple simultaneous viewers, a clipboard owner changing after connect, or a
+non-Latin-1 node clipboard.
 
 ### Live ZRLE/Cursor smoke (2026-11-25)
 
@@ -749,6 +828,13 @@ changes that do not compile (`kernel_is_none` is missing). The wider
 - **One shared input sink.** Multiple viewers share keyboard/pointer state, and
   any disconnect releases all held input. This is conservative (no stuck keys)
   but not true per-viewer input isolation.
+- **Clipboard bridging is opt-in and limited.** It is desktop-profile/X11 only,
+  uses one shared node clipboard (no per-viewer ownership), does not poll for
+  node-side changes after a viewer connects, and has no rich selection MIME
+  types. RFB cut text is ISO-8859-1, so text outside Latin-1 is not sent rather
+  than mangled. Clipboard contents travel in the same plaintext RFB transport.
+  Status is available through `VncServerStats`/`VncServerHandle::clipboard_status`
+  and startup logs, not as a new `/api/v1/connection` sub-document.
 - **No capture sharing.** The VNC server opens its own source. HLS, WebRTC, and
   snapshots still open their own sources; a single-open device may allow only
   one of them. A shared capture hub is later work.
@@ -760,7 +846,8 @@ changes that do not compile (`kernel_is_none` is missing). The wider
   documents and code were out of scope for this pass. A supervised child can
   use the new flags directly, but the supervisor does not yet forward
   `--vnc-password-file`, `--vnc-allow-unauthenticated`,
-  `--vnc-max-clients`, or `--vnc-idle-timeout-seconds`.
+  `--vnc-max-clients`, `--vnc-idle-timeout-seconds`, `--vnc-clipboard`, or
+  `--vnc-clipboard-max-bytes`.
 - **Optional live tooling.** The live smoke used `--capture-provider fake`; no
   hardware V4L2, QMP, D-Bus, or guest VNC source was exercised in this task.
 

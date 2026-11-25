@@ -394,8 +394,9 @@ fn uac2_and_vendor_functions_are_created() {
     let status = fixture.controller.create_gadget(&config).unwrap();
 
     let uac2 = fixture.gadget().join("functions/uac2.audio");
-    assert_eq!(fixture.read(uac2.join("p_chmask")), "3");
-    assert_eq!(fixture.read(uac2.join("c_chmask")), "1");
+    // p_* is the gadget USB IN stream (Ozma capture), c_* is USB OUT.
+    assert_eq!(fixture.read(uac2.join("p_chmask")), "1");
+    assert_eq!(fixture.read(uac2.join("c_chmask")), "3");
     assert_eq!(fixture.read(uac2.join("p_srate")), "48000");
     assert_eq!(fixture.read(uac2.join("p_ssize")), "3");
     assert_eq!(fixture.read(uac2.join("req_number")), "2");

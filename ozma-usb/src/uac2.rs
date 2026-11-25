@@ -41,11 +41,13 @@ pub const UAC2_CAPTURE_ENDPOINT: u8 = 0x82;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Uac2Mode {
-    /// Capture only (`c_chmask` non-zero, `p_chmask` zero).
+    /// Capture only (`c_chmask` zero, `p_chmask` non-zero as the gadget's
+    /// USB IN stream).
     Microphone,
     /// Playback and capture (`p_chmask` and `c_chmask` non-zero).
     Headset,
-    /// Playback only (`p_chmask` non-zero, `c_chmask` zero).
+    /// Playback only (`c_chmask` non-zero, `p_chmask` zero as the gadget's
+    /// USB OUT stream).
     Speaker,
 }
 

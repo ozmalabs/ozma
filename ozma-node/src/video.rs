@@ -32,6 +32,11 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::display_compat::{SnapshotControl, SnapshotFrame};
+use crate::hls::{
+    start_mpegts_stream, validate_stream_encoder, EncoderProbe, HlsCodec, HlsConfig, HlsEncoder,
+    HlsError, HlsPixelFormat, MpegTsSpawner, MpegTsStream, SystemEncoderProbe, SystemMpegTsSpawner,
+};
+use ozma_media::{CaptureSource, FrameFormat, PixelFormat};
 
 /// Default `/video` frame rate.
 pub const DEFAULT_FPS: u32 = 10;
@@ -45,17 +50,69 @@ pub const DEFAULT_QUALITY: u8 = 85;
 pub const MIN_QUALITY: u8 = 1;
 /// Highest accepted JPEG quality.
 pub const MAX_QUALITY: u8 = 100;
-/// Maximum number of simultaneous MJPEG streams.
+/// Default H.264/HEVC bitrate in kbps.
+pub const DEFAULT_BITRATE_KBPS: u32 = 4_000;
+/// Lowest accepted H.264/HEVC bitrate in kbps.
+pub const MIN_BITRATE_KBPS: u32 = 100;
+/// Highest accepted H.264/HEVC bitrate in kbps.
+pub const MAX_BITRATE_KBPS: u32 = 50_000;
+/// Maximum number of simultaneous `/video` streams.
 pub const DEFAULT_MAX_STREAMS: usize = 4;
 
-/// MIME boundary used by every `/video` response.
+/// MIME boundary used by every `/video` MJPEG response.
 pub const BOUNDARY: &str = "ozma-frame";
 /// `Content-Type` header value for the MJPEG response.
 pub const CONTENT_TYPE: &str = "multipart/x-mixed-replace; boundary=ozma-frame";
+/// `Content-Type` header value for an H.264/HEVC MPEG-TS response.
+pub const MPEGTS_CONTENT_TYPE: &str = "video/mp2t";
 /// Canonical stream route.
 pub const ROUTE: &str = "/video";
 /// Alias matching the Python soft node's MJPEG path.
 pub const ALIAS: &str = "/display/mjpeg";
+/// Default `/video` codec (keeps the historical MJPEG behavior).
+pub const DEFAULT_CODEC: VideoCodec = VideoCodec::Mjpeg;
+
+/// A `/video` frame/stream codec.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VideoCodec {
+    /// `multipart/x-mixed-replace` JPEG frames.
+    Mjpeg,
+    /// H.264 in MPEG-TS.
+    H264,
+    /// HEVC/H.265 in MPEG-TS.
+    Hevc,
+}
+
+impl VideoCodec {
+    /// Stable query/status name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mjpeg => "mjpeg",
+            Self::H264 => "h264",
+            Self::Hevc => "hevc",
+        }
+    }
+
+    /// Parse `?codec=`; unknown values are a typed query error.
+    pub fn parse(value: &str) -> Result<Self, VideoQueryError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "mjpeg" | "mjpg" | "jpeg" => Ok(Self::Mjpeg),
+            "h264" | "avc" | "h.264" => Ok(Self::H264),
+            "hevc" | "h265" | "h.265" => Ok(Self::Hevc),
+            other => Err(VideoQueryError {
+                field: "codec",
+                value: other.to_owned(),
+                message: format!("`codec` must be mjpeg, h264, or hevc, not `{other}`."),
+            }),
+        }
+    }
+
+    /// True for the encoded MPEG-TS codecs.
+    pub fn is_encoded(self) -> bool {
+        !matches!(self, Self::Mjpeg)
+    }
+}
 
 /// Pending frames per stream.
 ///
@@ -71,21 +128,43 @@ pub struct VideoParams {
     /// Console index, label, `Console_N`, or capture source id.
     #[serde(default)]
     pub console: Option<String>,
+    /// Requested stream codec (`mjpeg`, `h264`, or `hevc`).
+    #[serde(default)]
+    pub codec: Option<String>,
     /// Requested frame rate, clamped to [`MIN_FPS`]..=[`MAX_FPS`].
     #[serde(default)]
     pub fps: Option<String>,
     /// Requested JPEG quality, clamped to [`MIN_QUALITY`]..=[`MAX_QUALITY`].
     #[serde(default)]
     pub quality: Option<String>,
+    /// Requested H.264/HEVC bitrate in kbps, clamped to
+    /// [`MIN_BITRATE_KBPS`]..=[`MAX_BITRATE_KBPS`].
+    #[serde(default)]
+    pub bitrate: Option<String>,
 }
 
 /// Resolved stream settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VideoOptions {
+    /// Selected codec.
+    pub codec: VideoCodec,
     /// Frames per second after clamping.
     pub fps: u32,
-    /// JPEG quality after clamping.
+    /// JPEG quality after clamping (ignored by H.264/HEVC).
     pub quality: u8,
+    /// H.264/HEVC bitrate after clamping (ignored by MJPEG).
+    pub bitrate_kbps: u32,
+}
+
+impl Default for VideoOptions {
+    fn default() -> Self {
+        Self {
+            codec: DEFAULT_CODEC,
+            fps: DEFAULT_FPS,
+            quality: DEFAULT_QUALITY,
+            bitrate_kbps: DEFAULT_BITRATE_KBPS,
+        }
+    }
 }
 
 /// A non-numeric `fps`/`quality` query value.
@@ -110,6 +189,10 @@ impl std::error::Error for VideoQueryError {}
 impl VideoParams {
     /// Resolve defaults and bounds for this request.
     pub fn options(&self) -> Result<VideoOptions, VideoQueryError> {
+        let codec = match self.codec.as_deref() {
+            Some(value) => VideoCodec::parse(value)?,
+            None => DEFAULT_CODEC,
+        };
         let fps = parse_bounded(
             "fps",
             self.fps.as_deref(),
@@ -124,9 +207,18 @@ impl VideoParams {
             u64::from(MIN_QUALITY),
             u64::from(MAX_QUALITY),
         )?;
+        let bitrate = parse_bounded(
+            "bitrate",
+            self.bitrate.as_deref(),
+            u64::from(DEFAULT_BITRATE_KBPS),
+            u64::from(MIN_BITRATE_KBPS),
+            u64::from(MAX_BITRATE_KBPS),
+        )?;
         Ok(VideoOptions {
+            codec,
             fps: fps as u32,
             quality: quality as u8,
+            bitrate_kbps: bitrate as u32,
         })
     }
 }
@@ -151,6 +243,7 @@ fn parse_bounded(
 
 struct StreamsInner {
     active: AtomicUsize,
+    encoded: AtomicUsize,
     limit: usize,
 }
 
@@ -171,6 +264,7 @@ impl std::fmt::Debug for VideoStreams {
         formatter
             .debug_struct("VideoStreams")
             .field("active", &self.active())
+            .field("encoded", &self.active_encoded())
             .field("limit", &self.limit())
             .finish()
     }
@@ -182,6 +276,7 @@ impl VideoStreams {
         Self {
             inner: Arc::new(StreamsInner {
                 active: AtomicUsize::new(0),
+                encoded: AtomicUsize::new(0),
                 limit: limit.max(1),
             }),
         }
@@ -197,8 +292,25 @@ impl VideoStreams {
         self.inner.active.load(Ordering::SeqCst)
     }
 
-    /// Reserve a stream slot, or return `None` when the cap is reached.
+    /// H.264/HEVC MPEG-TS streams currently being served.
+    pub fn active_encoded(&self) -> usize {
+        self.inner.encoded.load(Ordering::SeqCst)
+    }
+
+    /// Reserve an MJPEG stream slot, or return `None` when the cap is reached.
     pub fn try_start(&self) -> Option<VideoStreamGuard> {
+        self.reserve(false)
+    }
+
+    /// Reserve an H.264/HEVC stream slot.
+    ///
+    /// The encoded-stream count is additive status; the cap is shared with
+    /// MJPEG so `/video` never exceeds [`Self::limit`] concurrent sources.
+    pub fn try_start_encoded(&self) -> Option<VideoStreamGuard> {
+        self.reserve(true)
+    }
+
+    fn reserve(&self, encoded: bool) -> Option<VideoStreamGuard> {
         let mut current = self.inner.active.load(Ordering::SeqCst);
         loop {
             if current >= self.inner.limit {
@@ -211,9 +323,13 @@ impl VideoStreams {
                 Ordering::SeqCst,
             ) {
                 Ok(_) => {
+                    if encoded {
+                        self.inner.encoded.fetch_add(1, Ordering::SeqCst);
+                    }
                     return Some(VideoStreamGuard {
                         streams: self.clone(),
-                    })
+                        encoded,
+                    });
                 }
                 Err(observed) => current = observed,
             }
@@ -228,6 +344,7 @@ impl VideoStreams {
 #[derive(Debug)]
 pub struct VideoStreamGuard {
     streams: VideoStreams,
+    encoded: bool,
 }
 
 impl VideoStreamGuard {
@@ -235,10 +352,18 @@ impl VideoStreamGuard {
     pub fn streams(&self) -> &VideoStreams {
         &self.streams
     }
+
+    /// True for an H.264/HEVC MPEG-TS reservation.
+    pub fn is_encoded(&self) -> bool {
+        self.encoded
+    }
 }
 
 impl Drop for VideoStreamGuard {
     fn drop(&mut self) {
+        if self.encoded {
+            self.streams.inner.encoded.fetch_sub(1, Ordering::SeqCst);
+        }
         self.streams.inner.active.fetch_sub(1, Ordering::SeqCst);
     }
 }
@@ -255,11 +380,18 @@ pub struct VideoStatus {
     pub route: &'static str,
     /// MJPEG alias.
     pub alias: &'static str,
-    /// Frame encoding (`jpeg`).
+    /// Default frame encoding (`jpeg`).
     pub encoding: &'static str,
-    /// Number of streams currently being served.
+    /// Accepted `?codec=` values. `h264`/`hevc` are omitted when this node has
+    /// no encoder configuration.
+    pub codecs: Vec<&'static str>,
+    /// Codec used when `?codec=` is absent.
+    pub default_codec: &'static str,
+    /// Number of streams currently being served (MJPEG + encoded).
     pub active_streams: usize,
-    /// Hard concurrent-stream cap.
+    /// H.264/HEVC MPEG-TS streams currently being served.
+    pub active_encoded_streams: usize,
+    /// Hard concurrent-stream cap shared by every codec.
     pub max_streams: usize,
     /// Default frames per second.
     pub default_fps: u32,
@@ -269,28 +401,211 @@ pub struct VideoStatus {
     pub max_fps: u32,
     /// Default JPEG quality.
     pub default_quality: u8,
+    /// Default H.264/HEVC bitrate in kbps.
+    pub default_bitrate_kbps: u32,
+    /// Lowest accepted H.264/HEVC bitrate in kbps.
+    pub min_bitrate_kbps: u32,
+    /// Highest accepted H.264/HEVC bitrate in kbps.
+    pub max_bitrate_kbps: u32,
 }
 
 impl VideoStatus {
     /// Describe the route without claiming an active stream when idle.
-    pub fn new(available: bool, streams: &VideoStreams) -> Self {
+    pub fn new(available: bool, encoding_available: bool, streams: &VideoStreams) -> Self {
+        let mut codecs = vec![VideoCodec::Mjpeg.as_str()];
+        if encoding_available {
+            codecs.push(VideoCodec::H264.as_str());
+            codecs.push(VideoCodec::Hevc.as_str());
+        }
         Self {
             supported: true,
             available,
             route: ROUTE,
             alias: ALIAS,
             encoding: "jpeg",
+            codecs,
+            default_codec: DEFAULT_CODEC.as_str(),
             active_streams: streams.active(),
+            active_encoded_streams: streams.active_encoded(),
             max_streams: streams.limit(),
             default_fps: DEFAULT_FPS,
             min_fps: MIN_FPS,
             max_fps: MAX_FPS,
             default_quality: DEFAULT_QUALITY,
+            default_bitrate_kbps: DEFAULT_BITRATE_KBPS,
+            min_bitrate_kbps: MIN_BITRATE_KBPS,
+            max_bitrate_kbps: MAX_BITRATE_KBPS,
         }
     }
 }
 
-/// One `multipart/x-mixed-replace` JPEG part.
+/// A started H.264/HEVC `/video` stream plus the encoder that is actually
+/// running (which may be a software fallback from a configured hardware
+/// backend).
+pub struct StartedVideoStream {
+    /// Live MPEG-TS stream.
+    pub stream: MpegTsStream,
+    /// ffmpeg encoder selected for this stream (or the source family for a
+    /// compressed pass-through).
+    pub encoder: HlsEncoder,
+    /// True when the source bitstream is muxed without re-encoding.
+    pub stream_copy: bool,
+}
+
+/// Encoder configuration for `GET /video?codec=h264|hevc`.
+///
+/// It inherits the node's HLS encoder/backend preference, pixel format
+/// validation, ffmpeg binary, VAAPI device, and NVENC GPU selection. MJPEG
+/// continues to use [`SnapshotControl`] and never enters this path.
+#[derive(Clone)]
+pub struct VideoEncoding {
+    template: HlsConfig,
+    probe: Arc<dyn EncoderProbe>,
+    spawner: Arc<dyn MpegTsSpawner>,
+}
+
+impl VideoEncoding {
+    /// Production configuration: system ffmpeg spawner and encoder probe.
+    pub fn system(template: HlsConfig) -> Self {
+        Self {
+            template,
+            probe: Arc::new(SystemEncoderProbe::new()),
+            spawner: Arc::new(SystemMpegTsSpawner),
+        }
+    }
+
+    /// Test/embedding constructor with an injected spawner and probe.
+    pub fn with_components(
+        template: HlsConfig,
+        probe: Arc<dyn EncoderProbe>,
+        spawner: Arc<dyn MpegTsSpawner>,
+    ) -> Self {
+        Self {
+            template,
+            probe,
+            spawner,
+        }
+    }
+
+    /// Base HLS-style configuration (fps/bitrate are overridden per request).
+    pub fn template(&self) -> &HlsConfig {
+        &self.template
+    }
+
+    /// Start an encoded MPEG-TS stream from an already-opened source.
+    ///
+    /// A compressed H.264/HEVC source whose family matches `codec` is copied
+    /// without running an encoder. Otherwise the requested codec is encoded
+    /// with the configured backend when available, falling back to the
+    /// matching software encoder. A missing encoder is returned before any
+    /// response is committed, and the source is stopped on every error path.
+    pub async fn start_encoded(
+        &self,
+        codec: VideoCodec,
+        options: &VideoOptions,
+        source: Box<dyn CaptureSource>,
+    ) -> Result<StartedVideoStream, HlsError> {
+        let mut source = source;
+        let Some(family) = codec_family(codec) else {
+            let error = HlsError::UnsupportedStreamCodec {
+                encoder: codec.as_str().to_owned(),
+            };
+            let _ = source.stop().await;
+            return Err(error);
+        };
+        let declared = source.format();
+        let stream_copy = source_stream_copy(codec, declared);
+
+        let mut config = self.template.clone();
+        config.fps = options.fps;
+        config.bitrate_kbps = options.bitrate_kbps;
+        // `/video` is the browser-compatible 8-bit SDR path; the HLS
+        // configuration may be a 10-bit/HDR target, which is not inherited
+        // here.
+        config.pixel_format = HlsPixelFormat::Yuv420p;
+        config.hdr = false;
+        config.color_primaries = None;
+        config.color_transfer = None;
+        config.color_matrix = None;
+        config.width = None;
+        config.height = None;
+
+        let preferred = preferred_encoder(self.template.video_encoder, family);
+        let encoder = if stream_copy {
+            preferred
+        } else {
+            match self.resolve_encoder(preferred, family, &config) {
+                Ok(encoder) => encoder,
+                Err(error) => {
+                    let _ = source.stop().await;
+                    return Err(error);
+                }
+            }
+        };
+        config.video_encoder = encoder;
+        let stream =
+            start_mpegts_stream(source, config, self.spawner.clone(), self.probe.clone()).await?;
+        Ok(StartedVideoStream {
+            stream,
+            encoder,
+            stream_copy,
+        })
+    }
+
+    fn resolve_encoder(
+        &self,
+        preferred: HlsEncoder,
+        family: HlsCodec,
+        config: &HlsConfig,
+    ) -> Result<HlsEncoder, HlsError> {
+        let mut candidate = config.clone();
+        candidate.video_encoder = preferred;
+        match validate_stream_encoder(&candidate, self.probe.as_ref()) {
+            Ok(()) => Ok(preferred),
+            Err(_error) if preferred.is_hardware() => {
+                let fallback = preferred
+                    .software_fallback()
+                    .unwrap_or_else(|| HlsEncoder::software_for_codec(family));
+                candidate.video_encoder = fallback;
+                validate_stream_encoder(&candidate, self.probe.as_ref())?;
+                Ok(fallback)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn codec_family(codec: VideoCodec) -> Option<HlsCodec> {
+    match codec {
+        VideoCodec::Mjpeg => None,
+        VideoCodec::H264 => Some(HlsCodec::H264),
+        VideoCodec::Hevc => Some(HlsCodec::Hevc),
+    }
+}
+
+/// Keep the configured hardware backend but switch to the requested codec
+/// family. A software/AV1/MJPEG preference falls back to the matching software
+/// encoder.
+fn preferred_encoder(preferred: HlsEncoder, family: HlsCodec) -> HlsEncoder {
+    match (preferred.backend_label(), family) {
+        ("vaapi", HlsCodec::H264) => HlsEncoder::VaapiH264,
+        ("vaapi", HlsCodec::Hevc) => HlsEncoder::VaapiHevc,
+        ("nvenc", HlsCodec::H264) => HlsEncoder::NvencH264,
+        ("nvenc", HlsCodec::Hevc) => HlsEncoder::NvencHevc,
+        ("qsv", HlsCodec::H264) => HlsEncoder::QsvH264,
+        ("qsv", HlsCodec::Hevc) => HlsEncoder::QsvHevc,
+        ("v4l2m2m", HlsCodec::H264) => HlsEncoder::V4l2m2mH264,
+        ("v4l2m2m", HlsCodec::Hevc) => HlsEncoder::V4l2m2mHevc,
+        _ => HlsEncoder::software_for_codec(family),
+    }
+}
+
+fn source_stream_copy(codec: VideoCodec, format: FrameFormat) -> bool {
+    matches!(
+        (codec, format.pixel_format),
+        (VideoCodec::H264, PixelFormat::H264) | (VideoCodec::Hevc, PixelFormat::Hevc)
+    )
+}
 pub fn part(jpeg: &[u8]) -> Bytes {
     let length = jpeg.len().to_string();
     let mut out = Vec::with_capacity(jpeg.len() + BOUNDARY.len() + length.len() + 64);
@@ -465,8 +780,10 @@ mod tests {
             control,
             first,
             VideoOptions {
+                codec: VideoCodec::Mjpeg,
                 fps: 10,
                 quality: 85,
+                bitrate_kbps: DEFAULT_BITRATE_KBPS,
             },
             guard,
         );
@@ -504,8 +821,10 @@ mod tests {
                 control,
                 first,
                 VideoOptions {
+                    codec: VideoCodec::Mjpeg,
                     fps: 10,
                     quality: 85,
+                    bitrate_kbps: DEFAULT_BITRATE_KBPS,
                 },
                 guard,
             );
@@ -531,8 +850,10 @@ mod tests {
     #[test]
     fn defaults_are_bounded() {
         let options = VideoParams::default().options().unwrap();
+        assert_eq!(options.codec, DEFAULT_CODEC);
         assert_eq!(options.fps, DEFAULT_FPS);
         assert_eq!(options.quality, DEFAULT_QUALITY);
+        assert_eq!(options.bitrate_kbps, DEFAULT_BITRATE_KBPS);
     }
 
     #[test]
@@ -540,22 +861,28 @@ mod tests {
         let low = VideoParams {
             fps: Some("0".into()),
             quality: Some("0".into()),
+            codec: None,
+            bitrate: Some("0".into()),
             console: None,
         }
         .options()
         .unwrap();
         assert_eq!(low.fps, MIN_FPS);
         assert_eq!(low.quality, MIN_QUALITY);
+        assert_eq!(low.bitrate_kbps, MIN_BITRATE_KBPS);
 
         let high = VideoParams {
             fps: Some("9999".into()),
             quality: Some("9999".into()),
+            codec: None,
+            bitrate: Some("999999".into()),
             console: None,
         }
         .options()
         .unwrap();
         assert_eq!(high.fps, MAX_FPS);
         assert_eq!(high.quality, MAX_QUALITY);
+        assert_eq!(high.bitrate_kbps, MAX_BITRATE_KBPS);
     }
 
     #[test]
@@ -563,6 +890,8 @@ mod tests {
         let error = VideoParams {
             fps: Some("fast".into()),
             quality: None,
+            codec: None,
+            bitrate: None,
             console: None,
         }
         .options()
@@ -573,11 +902,67 @@ mod tests {
         let error = VideoParams {
             fps: None,
             quality: Some("best".into()),
+            codec: None,
+            bitrate: None,
             console: None,
         }
         .options()
         .unwrap_err();
         assert_eq!(error.field, "quality");
+
+        let error = VideoParams {
+            fps: None,
+            quality: None,
+            codec: None,
+            bitrate: Some("fast".into()),
+            console: None,
+        }
+        .options()
+        .unwrap_err();
+        assert_eq!(error.field, "bitrate");
+
+        let error = VideoParams {
+            fps: None,
+            quality: None,
+            codec: Some("vp9".into()),
+            bitrate: None,
+            console: None,
+        }
+        .options()
+        .unwrap_err();
+        assert_eq!(error.field, "codec");
+    }
+
+    #[test]
+    fn encoder_selection_keeps_the_hardware_backend_and_codec_family() {
+        assert_eq!(
+            preferred_encoder(HlsEncoder::VaapiHevc, HlsCodec::H264),
+            HlsEncoder::VaapiH264
+        );
+        assert_eq!(
+            preferred_encoder(HlsEncoder::NvencH264, HlsCodec::Hevc),
+            HlsEncoder::NvencHevc
+        );
+        assert_eq!(
+            preferred_encoder(HlsEncoder::Mjpeg, HlsCodec::Hevc),
+            HlsEncoder::Hevc
+        );
+        assert!(source_stream_copy(
+            VideoCodec::H264,
+            FrameFormat::new(PixelFormat::H264, 320, 240)
+        ));
+        assert!(source_stream_copy(
+            VideoCodec::Hevc,
+            FrameFormat::new(PixelFormat::Hevc, 320, 240)
+        ));
+        assert!(!source_stream_copy(
+            VideoCodec::H264,
+            FrameFormat::new(PixelFormat::Hevc, 320, 240)
+        ));
+        assert!(!source_stream_copy(
+            VideoCodec::H264,
+            FrameFormat::rgb24(320, 240)
+        ));
     }
 
     #[test]

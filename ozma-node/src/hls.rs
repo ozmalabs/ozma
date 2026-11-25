@@ -50,10 +50,11 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axum::Router;
+use bytes::Bytes;
 use ozma_media::{CaptureSource, Frame, FrameFormat, MediaError, PixelFormat};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 use tower_http::services::ServeDir;
 use tracing::warn;
@@ -345,6 +346,15 @@ enum HwCodec {
     Hevc,
 }
 
+/// Public H.264/HEVC codec family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HlsCodec {
+    /// H.264/AVC.
+    H264,
+    /// HEVC/H.265.
+    Hevc,
+}
+
 /// A compressed capture stream that can be copied into HLS without decoding.
 ///
 /// V4L2 devices can deliver H.264/HEVC access units (and some pipelines deliver
@@ -453,6 +463,30 @@ impl HlsEncoder {
             self,
             Self::H264 | Self::Hevc | Self::Av1Svt | Self::Av1Aom | Self::Mjpeg
         )
+    }
+
+    /// Video codec family this encoder produces, when it is H.264 or HEVC.
+    ///
+    /// The live `/video` MPEG-TS path uses this to keep the requested codec
+    /// while inheriting the configured hardware/software backend.
+    pub fn codec_family(self) -> Option<HlsCodec> {
+        match self {
+            Self::H264 | Self::VaapiH264 | Self::NvencH264 | Self::QsvH264 | Self::V4l2m2mH264 => {
+                Some(HlsCodec::H264)
+            }
+            Self::Hevc | Self::VaapiHevc | Self::NvencHevc | Self::QsvHevc | Self::V4l2m2mHevc => {
+                Some(HlsCodec::Hevc)
+            }
+            Self::Av1Svt | Self::Av1Aom | Self::Mjpeg => None,
+        }
+    }
+
+    /// Software encoder for a codec family.
+    pub fn software_for_codec(codec: HlsCodec) -> Self {
+        match codec {
+            HlsCodec::H264 => Self::H264,
+            HlsCodec::Hevc => Self::Hevc,
+        }
     }
 
     /// True when this encoder requires a VAAPI render node.
@@ -1130,6 +1164,25 @@ pub enum HlsError {
         /// Underlying failure.
         message: String,
     },
+    /// A live MPEG-TS stream could not be started or ended before its first
+    /// keyframe.
+    #[error("live MPEG-TS stream failed: {message}")]
+    Stream {
+        /// What failed.
+        message: String,
+    },
+    /// No keyframe arrived within the live-stream setup bound.
+    #[error("live MPEG-TS stream produced no keyframe within {timeout:?}")]
+    KeyframeTimeout {
+        /// Setup bound that elapsed.
+        timeout: Duration,
+    },
+    /// The selected encoder cannot produce a live MPEG-TS video codec.
+    #[error("live MPEG-TS streaming requires H.264 or HEVC, not `{encoder}`")]
+    UnsupportedStreamCodec {
+        /// Encoder that was selected.
+        encoder: String,
+    },
 }
 
 /// Status retained for `/api/v1/connection`.
@@ -1526,7 +1579,588 @@ impl FfmpegSpawner for SystemFfmpegSpawner {
     }
 }
 
-/// Encoder names ffmpeg advertised, parsed once from `ffmpeg -encoders`.
+/// A spawned ffmpeg process whose encoded stdout is a live MPEG-TS stream.
+pub struct SpawnedMpegTs {
+    /// Encoded stdout (`-f mpegts pipe:1`).
+    pub stdout: Box<dyn AsyncRead + Send + Unpin>,
+    /// Raw frame destination.
+    pub sink: Box<dyn FrameSink>,
+    /// Child process, when the spawner created one.
+    pub child: Option<Child>,
+}
+
+/// Injectable factory for the live MPEG-TS ffmpeg process.
+///
+/// The production implementation runs [`ffmpeg_mpegts_argv`]. Tests substitute
+/// a recording spawner plus a canned/duplex stdout so no ffmpeg is needed.
+pub trait MpegTsSpawner: Send + Sync {
+    /// Spawn ffmpeg for `width`×`height` input and capture its MPEG-TS stdout.
+    fn spawn_ts(
+        &self,
+        config: &HlsConfig,
+        width: u32,
+        height: u32,
+    ) -> Result<SpawnedMpegTs, HlsError>;
+}
+
+/// Production MPEG-TS spawner.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemMpegTsSpawner;
+
+impl MpegTsSpawner for SystemMpegTsSpawner {
+    fn spawn_ts(
+        &self,
+        config: &HlsConfig,
+        width: u32,
+        height: u32,
+    ) -> Result<SpawnedMpegTs, HlsError> {
+        let argv = ffmpeg_mpegts_argv(config, width, height);
+        let mut command = Command::new(&argv[0]);
+        command
+            .args(&argv[1..])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().map_err(|error| HlsError::Spawn {
+            bin: config.ffmpeg_bin.clone(),
+            message: error.to_string(),
+        })?;
+        let stdin = child.stdin.take().ok_or(HlsError::StdinUnavailable)?;
+        let stdout = child.stdout.take().ok_or_else(|| HlsError::Stream {
+            message: "ffmpeg did not expose a readable stdout".to_owned(),
+        })?;
+        Ok(SpawnedMpegTs {
+            stdout: Box::new(stdout),
+            sink: Box::new(ChildStdinSink { stdin: Some(stdin) }),
+            child: Some(child),
+        })
+    }
+}
+
+/// Setup bound for a live stream's first real keyframe.
+pub const MPEGTS_KEYFRAME_TIMEOUT: Duration = Duration::from_secs(10);
+/// Encoded chunks queued for an HTTP body before ffmpeg is back-pressured.
+const MPEGTS_QUEUE_DEPTH: usize = 4;
+/// Refuse to buffer an unbounded amount while waiting for a first keyframe.
+const MAX_PRE_KEYFRAME_BYTES: usize = 4 * 1024 * 1024;
+/// Encoded stdout read size; also the largest chunk sent to the body.
+const MPEGTS_READ_BUF: usize = 64 * 1024;
+
+/// A started live MPEG-TS response.
+///
+/// `first` is the real MPEG-TS prefix through the first decodable keyframe, so
+/// the HTTP layer can commit `200` only after a decoder-visible frame exists.
+/// Dropping `receiver` closes the stream and stops ffmpeg/source.
+pub struct MpegTsStream {
+    /// MPEG-TS bytes through the first keyframe.
+    pub first: Bytes,
+    /// Subsequent encoded MPEG-TS chunks.
+    pub receiver: mpsc::Receiver<Bytes>,
+    /// Feeder/reader task; ends when the receiver is dropped or the source
+    /// ends.
+    pub task: JoinHandle<()>,
+}
+
+impl std::fmt::Debug for MpegTsStream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MpegTsStream")
+            .field("first_bytes", &self.first.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Start a live MPEG-TS stream from `source`.
+///
+/// The ffmpeg argv is the HLS codec/format/hardware path plus a `mpegts`
+/// stdout muxer. A same-family compressed H.264/HEVC source is stream-copied;
+/// a mismatched compressed source is decoded and re-encoded. No response is
+/// returned until ffmpeg emits a real keyframe. Setup failures and a missing
+/// keyframe are typed [`HlsError`] values and stop the source.
+pub async fn start_mpegts_stream(
+    source: Box<dyn CaptureSource>,
+    config: HlsConfig,
+    spawner: Arc<dyn MpegTsSpawner>,
+    probe: Arc<dyn EncoderProbe>,
+) -> Result<MpegTsStream, HlsError> {
+    let mut source = source;
+    let mut config = match config.validated() {
+        Ok(config) => config,
+        Err(error) => {
+            let _ = source.stop().await;
+            return Err(error);
+        }
+    };
+    let declared = source.format();
+    let Some(codec) = stream_codec(&config) else {
+        let error = HlsError::UnsupportedStreamCodec {
+            encoder: config.video_encoder.ffmpeg_name().to_owned(),
+        };
+        let _ = source.stop().await;
+        return Err(error);
+    };
+    if let Err(error) = ensure_supported(declared.pixel_format) {
+        let _ = source.stop().await;
+        return Err(error);
+    }
+    config.input_pixel_format = normalized_input_format(declared.pixel_format);
+    let compressed = compressed_input(&config);
+    let stream_copy = compressed.is_some_and(|codec| codec.matches_encoder(config.video_encoder));
+    if !stream_copy {
+        if let Err(error) = validate_stream_encoder(&config, probe.as_ref()) {
+            let _ = source.stop().await;
+            return Err(error);
+        }
+    }
+    let expected = initial_dimensions(&config, declared);
+
+    let (first_tx, first_rx) = oneshot::channel();
+    let (sender, receiver) = mpsc::channel(MPEGTS_QUEUE_DEPTH);
+    let cancel = Arc::new(Notify::new());
+    let task = tokio::spawn(run_mpegts_stream(
+        source,
+        config,
+        declared,
+        expected,
+        spawner,
+        cancel.clone(),
+        first_tx,
+        sender,
+        codec,
+    ));
+
+    match tokio::time::timeout(MPEGTS_KEYFRAME_TIMEOUT, first_rx).await {
+        Ok(Ok(Ok(first))) => Ok(MpegTsStream {
+            first,
+            receiver,
+            task,
+        }),
+        Ok(Ok(Err(error))) => {
+            cancel.notify_waiters();
+            let _ = tokio::time::timeout(CHILD_EXIT_TIMEOUT, task).await;
+            Err(error)
+        }
+        Ok(Err(_)) => {
+            cancel.notify_waiters();
+            let _ = tokio::time::timeout(CHILD_EXIT_TIMEOUT, task).await;
+            Err(HlsError::Stream {
+                message: "the MPEG-TS stream task ended before producing a keyframe".to_owned(),
+            })
+        }
+        Err(_) => {
+            cancel.notify_waiters();
+            let _ = tokio::time::timeout(CHILD_EXIT_TIMEOUT, task).await;
+            Err(HlsError::KeyframeTimeout {
+                timeout: MPEGTS_KEYFRAME_TIMEOUT,
+            })
+        }
+    }
+}
+
+/// How the capture feeder ended.
+enum MpegTsFeedEvent {
+    /// The source reached a clean end of stream. ffmpeg's remaining stdout
+    /// should still be drained and flushed.
+    Ended,
+    /// The source or frame conversion failed; end the response.
+    Failed(HlsError),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_mpegts_stream(
+    source: Box<dyn CaptureSource>,
+    config: HlsConfig,
+    declared: FrameFormat,
+    expected: Option<(u32, u32)>,
+    spawner: Arc<dyn MpegTsSpawner>,
+    cancel: Arc<Notify>,
+    first_tx: oneshot::Sender<Result<Bytes, HlsError>>,
+    sender: mpsc::Sender<Bytes>,
+    codec: CompressedCodec,
+) {
+    let (spawn_tx, spawn_rx) = oneshot::channel();
+    let (error_tx, mut error_rx) = mpsc::channel::<MpegTsFeedEvent>(1);
+    let mut feeder = tokio::spawn(feed_mpegts_frames(
+        source,
+        config,
+        declared,
+        expected,
+        spawner,
+        cancel.clone(),
+        spawn_tx,
+        error_tx,
+    ));
+
+    let (mut stdout, mut child) = match spawn_rx.await {
+        Ok(Ok(spawned)) => spawned,
+        Ok(Err(error)) => {
+            let _ = first_tx.send(Err(error));
+            if tokio::time::timeout(CHILD_EXIT_TIMEOUT, &mut feeder)
+                .await
+                .is_err()
+            {
+                feeder.abort();
+            }
+            return;
+        }
+        Err(_) => {
+            let _ = first_tx.send(Err(HlsError::Stream {
+                message: "the capture feeder stopped before starting ffmpeg".to_owned(),
+            }));
+            if tokio::time::timeout(CHILD_EXIT_TIMEOUT, &mut feeder)
+                .await
+                .is_err()
+            {
+                feeder.abort();
+            }
+            return;
+        }
+    };
+
+    let mut first_tx = Some(first_tx);
+    let mut committed = false;
+    let mut feeder_ended = false;
+    let mut pending = Vec::new();
+    let mut buffer = vec![0u8; MPEGTS_READ_BUF];
+    loop {
+        tokio::select! {
+            biased;
+            _ = sender.closed() => break,
+            _ = cancel.notified() => break,
+            event = error_rx.recv(), if !feeder_ended => {
+                match event {
+                    Some(MpegTsFeedEvent::Ended) => {
+                        // The source ended, but ffmpeg may still hold encoded
+                        // packets (including the final PES). Keep draining
+                        // stdout until EOF so the response is not truncated.
+                        feeder_ended = true;
+                    }
+                    Some(MpegTsFeedEvent::Failed(error)) => {
+                        if !committed {
+                            if let Some(tx) = first_tx.take() {
+                                let _ = tx.send(Err(error));
+                            }
+                        }
+                        break;
+                    }
+                    None => {
+                        feeder_ended = true;
+                    }
+                }
+            }
+            read = stdout.read(&mut buffer) => {
+                match read {
+                    Ok(0) => {
+                        if !committed {
+                            if let Some(tx) = first_tx.take() {
+                                let _ = tx.send(Err(HlsError::Stream {
+                                    message: "ffmpeg ended before producing a keyframe".to_owned(),
+                                }));
+                            }
+                        }
+                        break;
+                    }
+                    Ok(count) => {
+                        if !committed {
+                            pending.extend_from_slice(&buffer[..count]);
+                            if mpegts_has_keyframe(codec, &pending) {
+                                committed = true;
+                                let first = Bytes::from(std::mem::take(&mut pending));
+                                if let Some(tx) = first_tx.take() {
+                                    if tx.send(Ok(first)).is_err() {
+                                        break;
+                                    }
+                                }
+                            } else if pending.len() > MAX_PRE_KEYFRAME_BYTES {
+                                if let Some(tx) = first_tx.take() {
+                                    let _ = tx.send(Err(HlsError::Stream {
+                                        message: format!(
+                                            "ffmpeg produced {} bytes without a keyframe",
+                                            pending.len()
+                                        ),
+                                    }));
+                                }
+                                break;
+                            }
+                        } else if sender
+                            .send(Bytes::copy_from_slice(&buffer[..count]))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        if !committed {
+                            if let Some(tx) = first_tx.take() {
+                                let _ = tx.send(Err(HlsError::Stream {
+                                    message: format!("reading ffmpeg stdout failed: {error}"),
+                                }));
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    cancel.notify_waiters();
+    kill_owned_child(&mut child).await;
+    drop(sender);
+    if let Some(tx) = first_tx.take() {
+        let _ = tx.send(Err(HlsError::Stream {
+            message: "the MPEG-TS stream ended before a keyframe".to_owned(),
+        }));
+    }
+    if tokio::time::timeout(CHILD_EXIT_TIMEOUT, &mut feeder)
+        .await
+        .is_err()
+    {
+        // The feeder owns the source. A cooperative cancel should have stopped
+        // it; the timeout only records a source that ignored cancellation.
+        warn!("MPEG-TS frame feeder did not stop within its bound");
+        feeder.abort();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn feed_mpegts_frames(
+    mut source: Box<dyn CaptureSource>,
+    config: HlsConfig,
+    declared: FrameFormat,
+    mut expected: Option<(u32, u32)>,
+    spawner: Arc<dyn MpegTsSpawner>,
+    cancel: Arc<Notify>,
+    spawn_tx: oneshot::Sender<Result<(Box<dyn AsyncRead + Send + Unpin>, Option<Child>), HlsError>>,
+    error_tx: mpsc::Sender<MpegTsFeedEvent>,
+) {
+    let compressed = CompressedCodec::from_pixel_format(config.input_pixel_format);
+    let mut first_frame: Option<Frame> = None;
+
+    if expected.is_none() && compressed.is_none() {
+        let frame = tokio::select! {
+            _ = cancel.notified() => {
+                let _ = source.stop().await;
+                return;
+            }
+            frame = source.next_frame() => frame,
+        };
+        match frame {
+            Ok(frame) => {
+                if frame.format().width == 0 || frame.format().height == 0 {
+                    let _ = spawn_tx.send(Err(HlsError::Stream {
+                        message: "capture frame has zero dimensions".to_owned(),
+                    }));
+                    let _ = source.stop().await;
+                    return;
+                }
+                expected = Some((frame.format().width, frame.format().height));
+                first_frame = Some(frame);
+            }
+            Err(error) => {
+                let _ = spawn_tx.send(Err(HlsError::Stream {
+                    message: format!("capture source `{}` failed: {error}", source.id()),
+                }));
+                let _ = source.stop().await;
+                return;
+            }
+        }
+    }
+
+    let (width, height) = expected.unwrap_or((0, 0));
+    let spawned = match spawner.spawn_ts(&config, width, height) {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            let _ = spawn_tx.send(Err(error));
+            let _ = source.stop().await;
+            return;
+        }
+    };
+    let mut sink = spawned.sink;
+    if spawn_tx.send(Ok((spawned.stdout, spawned.child))).is_err() {
+        let _ = sink.close().await;
+        let _ = source.stop().await;
+        return;
+    }
+
+    let period = Duration::from_secs_f64(1.0 / f64::from(config.fps.max(1)));
+    let mut deadline = tokio::time::Instant::now();
+    let mut frame = first_frame.take();
+
+    loop {
+        if frame.is_none() {
+            if compressed.is_none() {
+                let now = tokio::time::Instant::now();
+                if deadline > now {
+                    tokio::select! {
+                        _ = cancel.notified() => break,
+                        _ = tokio::time::sleep_until(deadline) => {}
+                    }
+                }
+            }
+            let next = tokio::select! {
+                _ = cancel.notified() => break,
+                frame = source.next_frame() => frame,
+            };
+            match next {
+                Ok(next) => frame = Some(next),
+                Err(MediaError::EndOfStream) => {
+                    let _ = error_tx.send(MpegTsFeedEvent::Ended).await;
+                    break;
+                }
+                Err(error) => {
+                    let _ = error_tx
+                        .send(MpegTsFeedEvent::Failed(HlsError::Stream {
+                            message: format!("capture source `{}` stopped: {error}", source.id()),
+                        }))
+                        .await;
+                    break;
+                }
+            }
+        }
+
+        let Some(current) = frame.take() else {
+            continue;
+        };
+        if current.format().pixel_format != declared.pixel_format {
+            let _ = error_tx
+                .send(MpegTsFeedEvent::Failed(HlsError::FormatMismatch {
+                    expected: declared.pixel_format,
+                    actual: current.format().pixel_format,
+                }))
+                .await;
+            break;
+        }
+        let frame_width = current.format().width;
+        let frame_height = current.format().height;
+        if compressed.is_none() && (frame_width != width || frame_height != height) {
+            let _ = error_tx
+                .send(MpegTsFeedEvent::Failed(HlsError::FrameDimensions {
+                    width: frame_width,
+                    height: frame_height,
+                    expected_width: width,
+                    expected_height: height,
+                }))
+                .await;
+            break;
+        }
+        let bytes = match convert_frame(&current, declared.pixel_format, frame_width, frame_height)
+        {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let _ = error_tx.send(MpegTsFeedEvent::Failed(error)).await;
+                break;
+            }
+        };
+        if let Err(error) = sink.write(&bytes).await {
+            let _ = error_tx
+                .send(MpegTsFeedEvent::Failed(HlsError::Stream {
+                    message: format!("writing a frame to ffmpeg failed: {error}"),
+                }))
+                .await;
+            break;
+        }
+
+        if compressed.is_none() {
+            let now = tokio::time::Instant::now();
+            deadline += period;
+            if deadline <= now {
+                deadline = now + period;
+            }
+        }
+    }
+
+    let _ = sink.close().await;
+    let _ = source.stop().await;
+}
+
+async fn kill_owned_child(child: &mut Option<Child>) {
+    if let Some(mut child) = child.take() {
+        let pid = child.id();
+        let _ = child.start_kill();
+        if tokio::time::timeout(CHILD_EXIT_TIMEOUT, child.wait())
+            .await
+            .is_err()
+        {
+            warn!(pid = ?pid, "MPEG-TS ffmpeg did not exit after SIGKILL");
+        }
+    }
+}
+
+/// True when `bytes` contains a decodable keyframe for `codec`.
+///
+/// Only MPEG-TS packets are inspected. PES payloads with a video stream id
+/// (`0xE0..=0xEF`) are scanned for Annex-B NAL units; H.264 IDR (type 5) and
+/// HEVC IRAP (types 16..=21) count. Bytes before the first complete packet are
+/// ignored, and the caller retains the whole prefix so a keyframe split across
+/// reads is found on the next append.
+fn mpegts_has_keyframe(codec: CompressedCodec, bytes: &[u8]) -> bool {
+    const TS_PACKET: usize = 188;
+    for packet in bytes.chunks_exact(TS_PACKET) {
+        if packet[0] != 0x47 {
+            continue;
+        }
+        let payload_start = packet[1] & 0x40 != 0;
+        let adaptation = (packet[3] >> 4) & 0x03;
+        if adaptation == 0 || adaptation == 2 {
+            continue;
+        }
+        let mut offset = 4;
+        if adaptation == 3 {
+            offset += 1 + usize::from(packet[4]);
+        }
+        if offset >= TS_PACKET {
+            continue;
+        }
+        let payload = &packet[offset..];
+        let data = if payload_start && payload.len() >= 9 && payload[..3] == [0, 0, 1] {
+            let stream_id = payload[3];
+            if !(0xE0..=0xEF).contains(&stream_id) {
+                continue;
+            }
+            let header_len = usize::from(payload[8]);
+            let start = 9 + header_len;
+            if start >= payload.len() {
+                continue;
+            }
+            &payload[start..]
+        } else {
+            payload
+        };
+        if has_nal_keyframe(codec, data) {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_nal_keyframe(codec: CompressedCodec, data: &[u8]) -> bool {
+    let mut index = 0;
+    while index + 3 < data.len() {
+        if data[index] == 0 && data[index + 1] == 0 && data[index + 2] == 1 {
+            let header = data[index + 3];
+            let keyframe = match codec {
+                CompressedCodec::H264 => header & 0x1F == 5,
+                // HEVC nal_unit_type occupies bits 1..6; IRAP is 16..=21.
+                CompressedCodec::Hevc => {
+                    let nal_type = (header >> 1) & 0x3F;
+                    (16..=21).contains(&nal_type)
+                }
+                CompressedCodec::Av1 => false,
+            };
+            if keyframe {
+                return true;
+            }
+            index += 4;
+        } else {
+            index += 1;
+        }
+    }
+    false
+}
+
 ///
 /// This is evidence, not a guess: the HLS path never starts a hardware encoder
 /// just because its name was requested. Tests inject a static list through
@@ -1991,6 +2625,47 @@ fn validate_encoder_runtime(config: &HlsConfig, probe: &dyn EncoderProbe) -> Res
     Ok(())
 }
 
+/// Confirm that ffmpeg advertises `config.video_encoder` and, for hardware,
+/// that it works on this host.
+///
+/// HLS only probes hardware because a missing software encoder surfaces as a
+/// typed spawn error. A live `/video` response must give the caller a typed
+/// 503 before a 200 is committed, so this variant checks the software name
+/// too.
+pub fn validate_stream_encoder(
+    config: &HlsConfig,
+    probe: &dyn EncoderProbe,
+) -> Result<(), HlsError> {
+    let encoder = config.video_encoder;
+    let availability =
+        probe
+            .availability(&config.ffmpeg_bin)
+            .map_err(|message| HlsError::EncoderUnavailable {
+                encoder: encoder.ffmpeg_name().to_owned(),
+                backend: encoder.backend_label().to_owned(),
+                message: format!("could not probe ffmpeg encoders: {message}"),
+                remediation: format!(
+                    "Check that `{}` can run and lists encoders, or install the selected encoder.",
+                    config.ffmpeg_bin.display()
+                ),
+                available: Vec::new(),
+            })?;
+    if !availability.contains(encoder) {
+        return Err(HlsError::EncoderUnavailable {
+            encoder: encoder.ffmpeg_name().to_owned(),
+            backend: encoder.backend_label().to_owned(),
+            message: format!("ffmpeg does not advertise `{}`", encoder.ffmpeg_name()),
+            remediation: format!(
+                "Install or enable the `{}` encoder for ffmpeg, choose another codec, or use \
+                 /stream/* HLS with a configured software encoder.",
+                encoder.ffmpeg_name()
+            ),
+            available: availability.known_encoders(),
+        });
+    }
+    validate_encoder_runtime(config, probe)
+}
+
 struct ChildStdinSink {
     stdin: Option<ChildStdin>,
 }
@@ -2125,12 +2800,7 @@ impl HlsPipeline {
         // access units are written to a compressed ffmpeg input. Store the exact
         // layout so argv and the feeder cannot disagree after a `/codec` restart
         // or size change.
-        config.input_pixel_format = match declared.pixel_format {
-            PixelFormat::Bgra | PixelFormat::Mjpeg | PixelFormat::Yuyv | PixelFormat::Nv12 => {
-                PixelFormat::Rgb24
-            }
-            other => other,
-        };
+        config.input_pixel_format = normalized_input_format(declared.pixel_format);
         let expected = initial_dimensions(&config, declared);
 
         let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
@@ -3014,6 +3684,38 @@ fn compressed_input(config: &HlsConfig) -> Option<CompressedCodec> {
     CompressedCodec::from_pixel_format(config.input_pixel_format)
 }
 
+/// Capture layout that is actually fed to ffmpeg.
+///
+/// BGRA/MJPEG/YUYV/NV12 are converted to packed RGB24 in Rust; P010 passes
+/// through byte-for-byte, and compressed H.264/HEVC/AV1 access units are
+/// written to a compressed ffmpeg input.
+fn normalized_input_format(format: PixelFormat) -> PixelFormat {
+    match format {
+        PixelFormat::Bgra | PixelFormat::Mjpeg | PixelFormat::Yuyv | PixelFormat::Nv12 => {
+            PixelFormat::Rgb24
+        }
+        other => other,
+    }
+}
+
+/// Codec family produced by the selected encoder, when it is an H.264/HEVC
+/// encoder. MJPEG and AV1 have no live MPEG-TS keyframe detector here.
+fn stream_codec(config: &HlsConfig) -> Option<CompressedCodec> {
+    match config.video_encoder {
+        HlsEncoder::H264
+        | HlsEncoder::VaapiH264
+        | HlsEncoder::NvencH264
+        | HlsEncoder::QsvH264
+        | HlsEncoder::V4l2m2mH264 => Some(CompressedCodec::H264),
+        HlsEncoder::Hevc
+        | HlsEncoder::VaapiHevc
+        | HlsEncoder::NvencHevc
+        | HlsEncoder::QsvHevc
+        | HlsEncoder::V4l2m2mHevc => Some(CompressedCodec::Hevc),
+        _ => None,
+    }
+}
+
 /// True when the source bitstream can be muxed without invoking an encoder.
 fn input_is_stream_copy(config: &HlsConfig) -> bool {
     compressed_input(config).is_some_and(|codec| codec.matches_encoder(config.video_encoder))
@@ -3071,6 +3773,40 @@ pub fn ffmpeg_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String> {
 /// and `discont_start` tells players not to interpolate across the boundary.
 /// The feeder writes raw bytes only, so frame sequence/PTS order is unchanged.
 fn ffmpeg_argv_for(config: &HlsConfig, width: u32, height: u32, restart: bool) -> Vec<String> {
+    let mut argv = ffmpeg_stream_argv(config, width, height);
+    append_hls_output(
+        &mut argv,
+        config,
+        restart,
+        input_is_stream_copy(config)
+            && compressed_input(config).is_some_and(CompressedCodec::uses_fmp4),
+    );
+    argv
+}
+
+/// Build the exact ffmpeg argv for a live MPEG-TS response.
+///
+/// This is the same input conversion, codec selection, hardware upload, GOP,
+/// and color-signalling path as HLS ([`ffmpeg_argv_for`]); only the output
+/// differs. A compressed H.264/HEVC source whose family matches
+/// [`HlsConfig::video_encoder`] is muxed with `-c:v copy` instead of being
+/// decoded and re-encoded.
+pub fn ffmpeg_mpegts_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String> {
+    let mut argv = ffmpeg_stream_argv(config, width, height);
+    argv.extend([
+        // Emit one packet per flush so the HTTP response carries a real
+        // keyframe promptly instead of waiting for an internal buffer.
+        "-flush_packets".to_owned(),
+        "1".to_owned(),
+        "-f".to_owned(),
+        "mpegts".to_owned(),
+        "pipe:1".to_owned(),
+    ]);
+    argv
+}
+
+/// Format/encoder half of the argv, before the muxer/output arguments.
+fn ffmpeg_stream_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String> {
     let bitrate = format!("{}k", config.bitrate_kbps);
     let target = config.pixel_format;
     let compressed = compressed_input(config);
@@ -3132,12 +3868,6 @@ fn ffmpeg_argv_for(config: &HlsConfig, width: u32, height: u32, restart: bool) -
                 "hvc1".to_owned(),
             ]);
         }
-        append_hls_output(
-            &mut argv,
-            config,
-            restart,
-            compressed.is_some_and(CompressedCodec::uses_fmp4),
-        );
         return argv;
     }
 
@@ -3313,7 +4043,6 @@ fn ffmpeg_argv_for(config: &HlsConfig, width: u32, height: u32, restart: bool) -
         config.force_key_frames_expr(),
     ]);
 
-    append_hls_output(&mut argv, config, restart, false);
     argv
 }
 
@@ -3376,6 +4105,291 @@ fn format_seconds(value: f32) -> String {
 /// `ServeDir` rejects `..` components, so a request cannot escape `output_dir`.
 pub fn stream_router(output_dir: impl Into<PathBuf>) -> Router {
     Router::new().nest_service("/stream", ServeDir::new(output_dir.into()))
+}
+
+/// Deterministic MPEG-TS fixtures and fakes shared by the HLS unit tests and
+/// the `/video` route tests. Test-only: production never uses these bytes.
+#[cfg(test)]
+pub mod mpegts_test_support {
+    use std::collections::VecDeque;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+
+    use super::*;
+
+    /// One 188-byte MPEG-TS packet carrying `payload` (PES header included
+    /// when `pusi` is set).
+    pub fn ts_packet(pid: u16, pusi: bool, counter: u8, payload: &[u8]) -> Vec<u8> {
+        let mut packet = vec![0u8; 188];
+        packet[0] = 0x47;
+        packet[1] = (if pusi { 0x40 } else { 0 }) | ((pid >> 8) as u8 & 0x1F);
+        packet[2] = pid as u8;
+        packet[3] = 0x10 | (counter & 0x0F);
+        let length = payload.len().min(184);
+        packet[4..4 + length].copy_from_slice(&payload[..length]);
+        packet[4 + length..].fill(0xFF);
+        packet
+    }
+
+    /// A PES video packet with one Annex-B access unit.
+    pub fn ts_video_packet(codec: HlsEncoder, keyframe: bool, counter: u8) -> Vec<u8> {
+        let nal = match (codec, keyframe) {
+            (HlsEncoder::Hevc, true) => vec![0x00, 0x00, 0x00, 0x01, 0x26, 0x01, 0xAA],
+            (HlsEncoder::Hevc, false) => vec![0x00, 0x00, 0x00, 0x01, 0x02, 0x01, 0xAA],
+            (_, true) => vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84],
+            (_, false) => vec![0x00, 0x00, 0x00, 0x01, 0x41, 0x9A, 0x02],
+        };
+        let mut payload = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
+        payload.extend_from_slice(&nal);
+        ts_packet(0x100, true, counter, &payload)
+    }
+
+    /// A single-packet fixture.
+    pub fn mpegts_fixture(codec: HlsEncoder, keyframe: bool) -> Vec<u8> {
+        ts_video_packet(codec, keyframe, 0)
+    }
+
+    /// `count` repeated packets, useful for exercising back-pressure and
+    /// disconnect cleanup.
+    pub fn mpegts_repeated(codec: HlsEncoder, keyframe: bool, count: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(count * 188);
+        for index in 0..count {
+            out.extend_from_slice(&ts_video_packet(codec, keyframe, (index & 0x0F) as u8));
+        }
+        out
+    }
+
+    /// A bounded-read async reader over canned bytes.
+    pub struct CannedReader {
+        data: Vec<u8>,
+        position: usize,
+        chunk: usize,
+    }
+
+    impl CannedReader {
+        pub fn new(data: Vec<u8>, chunk: usize) -> Self {
+            Self {
+                data,
+                position: 0,
+                chunk: chunk.max(1),
+            }
+        }
+    }
+
+    impl AsyncRead for CannedReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let remaining = &self.data[self.position..];
+            let length = remaining.len().min(buffer.remaining()).min(self.chunk);
+            if length == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            buffer.put_slice(&remaining[..length]);
+            self.position += length;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Sink that records writes and close for assertions.
+    pub struct TestFrameSink {
+        pub writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        pub closed: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl FrameSink for TestFrameSink {
+        async fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.writes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(bytes.to_vec());
+            Ok(())
+        }
+
+        async fn close(&mut self) -> io::Result<()> {
+            self.closed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// Recording MPEG-TS spawner with canned output.
+    pub struct RecordingMpegTsSpawner {
+        pub argv: Arc<Mutex<Vec<Vec<String>>>>,
+        pub writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        pub closed: Arc<AtomicBool>,
+        pub spawns: Arc<AtomicUsize>,
+        pub fail: Option<String>,
+        data: Vec<u8>,
+        chunk: usize,
+    }
+
+    impl RecordingMpegTsSpawner {
+        pub fn new(codec: HlsEncoder, keyframe: bool) -> Self {
+            Self::with_data(mpegts_fixture(codec, keyframe))
+        }
+
+        pub fn with_data(data: Vec<u8>) -> Self {
+            Self {
+                argv: Arc::new(Mutex::new(Vec::new())),
+                writes: Arc::new(Mutex::new(Vec::new())),
+                closed: Arc::new(AtomicBool::new(false)),
+                spawns: Arc::new(AtomicUsize::new(0)),
+                fail: None,
+                data,
+                chunk: 188,
+            }
+        }
+
+        pub fn with_chunk(mut self, chunk: usize) -> Self {
+            self.chunk = chunk.max(1);
+            self
+        }
+
+        pub fn failing(message: impl Into<String>) -> Self {
+            Self {
+                argv: Arc::new(Mutex::new(Vec::new())),
+                writes: Arc::new(Mutex::new(Vec::new())),
+                closed: Arc::new(AtomicBool::new(false)),
+                spawns: Arc::new(AtomicUsize::new(0)),
+                fail: Some(message.into()),
+                data: Vec::new(),
+                chunk: 188,
+            }
+        }
+
+        pub fn argv(&self) -> Vec<String> {
+            self.argv
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .first()
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    impl MpegTsSpawner for RecordingMpegTsSpawner {
+        fn spawn_ts(
+            &self,
+            config: &HlsConfig,
+            width: u32,
+            height: u32,
+        ) -> Result<SpawnedMpegTs, HlsError> {
+            self.spawns.fetch_add(1, Ordering::SeqCst);
+            if let Some(message) = &self.fail {
+                return Err(HlsError::Spawn {
+                    bin: config.ffmpeg_bin.clone(),
+                    message: message.clone(),
+                });
+            }
+            self.argv
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(ffmpeg_mpegts_argv(config, width, height));
+            Ok(SpawnedMpegTs {
+                stdout: Box::new(CannedReader::new(self.data.clone(), self.chunk)),
+                sink: Box::new(TestFrameSink {
+                    writes: self.writes.clone(),
+                    closed: self.closed.clone(),
+                }),
+                child: None,
+            })
+        }
+    }
+
+    /// Finite fake source that can optionally hang after its queue empties.
+    pub struct TestTsSource {
+        pub format: FrameFormat,
+        frames: VecDeque<Result<Frame, MediaError>>,
+        pub hang_when_empty: bool,
+        pub stopped: Arc<AtomicBool>,
+    }
+
+    impl TestTsSource {
+        pub fn new(
+            format: FrameFormat,
+            frames: Vec<Result<Frame, MediaError>>,
+            hang_when_empty: bool,
+        ) -> (Self, Arc<AtomicBool>) {
+            let stopped = Arc::new(AtomicBool::new(false));
+            (
+                Self {
+                    format,
+                    frames: frames.into(),
+                    hang_when_empty,
+                    stopped: stopped.clone(),
+                },
+                stopped,
+            )
+        }
+
+        pub fn rgb(
+            width: u32,
+            height: u32,
+            count: usize,
+            hang_when_empty: bool,
+        ) -> (Self, Arc<AtomicBool>) {
+            let frames = (0..count)
+                .map(|index| {
+                    Ok(Frame::with_data(
+                        FrameFormat::rgb24(width, height),
+                        index as u64,
+                        0,
+                        true,
+                        vec![(index.wrapping_mul(37)) as u8; (width * height * 3) as usize],
+                    )
+                    .expect("valid RGB frame"))
+                })
+                .collect();
+            Self::new(FrameFormat::rgb24(width, height), frames, hang_when_empty)
+        }
+
+        pub fn compressed(
+            format: FrameFormat,
+            count: usize,
+            hang_when_empty: bool,
+        ) -> (Self, Arc<AtomicBool>) {
+            let frames = (0..count)
+                .map(|index| {
+                    Ok(
+                        Frame::with_data(format, index as u64, 0, true, vec![index as u8; 64])
+                            .expect("valid compressed frame"),
+                    )
+                })
+                .collect();
+            Self::new(format, frames, hang_when_empty)
+        }
+    }
+
+    #[async_trait]
+    impl CaptureSource for TestTsSource {
+        fn id(&self) -> &str {
+            "fake-mpegts"
+        }
+
+        fn format(&self) -> FrameFormat {
+            self.format
+        }
+
+        async fn next_frame(&mut self) -> Result<Frame, MediaError> {
+            if let Some(frame) = self.frames.pop_front() {
+                return frame;
+            }
+            if self.hang_when_empty {
+                std::future::pending::<()>().await;
+            }
+            Err(MediaError::EndOfStream)
+        }
+
+        async fn stop(&mut self) -> Result<(), MediaError> {
+            self.stopped.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -6291,5 +7305,314 @@ mod tests {
         pipeline.stop().await.expect("stop");
         assert!(pipeline.manifest_path().is_file());
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    fn mpegts_config(encoder: HlsEncoder) -> HlsConfig {
+        HlsConfig {
+            fps: 30,
+            bitrate_kbps: 2_000,
+            video_encoder: encoder,
+            ..HlsConfig::default()
+        }
+    }
+
+    #[test]
+    fn mpegts_argv_reuses_the_hls_codec_path_and_muxes_to_stdout() {
+        let h264 = ffmpeg_mpegts_argv(&mpegts_config(HlsEncoder::H264), 320, 240);
+        assert!(h264.contains(&"-f".to_owned()));
+        assert!(h264.contains(&"mpegts".to_owned()));
+        assert_eq!(h264.last(), Some(&"pipe:1".to_owned()));
+        assert!(h264.windows(2).any(|pair| pair == ["-c:v", "libx264"]));
+        assert!(!h264.contains(&"hls".to_owned()));
+        assert!(!h264.windows(2).any(|pair| pair == ["-c:v", "copy"]));
+
+        let hevc = ffmpeg_mpegts_argv(&mpegts_config(HlsEncoder::Hevc), 320, 240);
+        assert!(hevc.windows(2).any(|pair| pair == ["-c:v", "libx265"]));
+        assert!(hevc.windows(2).any(|pair| pair == ["-pix_fmt", "yuv420p"]));
+    }
+
+    #[test]
+    fn mpegts_argv_stream_copies_matching_compressed_sources_and_reencodes_mismatches() {
+        let mut copy = mpegts_config(HlsEncoder::H264);
+        copy.input_pixel_format = PixelFormat::H264;
+        let argv = ffmpeg_mpegts_argv(&copy, 320, 240);
+        assert!(argv.windows(2).any(|pair| pair == ["-c:v", "copy"]));
+        assert!(!argv.windows(2).any(|pair| pair == ["-c:v", "libx264"]));
+        assert!(argv.windows(2).any(|pair| pair == ["-f", "h264"]));
+
+        let mut reencode = mpegts_config(HlsEncoder::Hevc);
+        reencode.input_pixel_format = PixelFormat::H264;
+        let argv = ffmpeg_mpegts_argv(&reencode, 320, 240);
+        assert!(argv.windows(2).any(|pair| pair == ["-c:v", "libx265"]));
+        assert!(!argv.windows(2).any(|pair| pair == ["-c:v", "copy"]));
+        assert!(argv.windows(2).any(|pair| pair == ["-f", "h264"]));
+    }
+
+    #[test]
+    fn mpegts_keyframe_detector_recognizes_h264_idr_and_hevc_irap() {
+        use mpegts_test_support::{mpegts_fixture, ts_packet};
+
+        assert!(mpegts_has_keyframe(
+            CompressedCodec::H264,
+            &mpegts_fixture(HlsEncoder::H264, true)
+        ));
+        assert!(!mpegts_has_keyframe(
+            CompressedCodec::H264,
+            &mpegts_fixture(HlsEncoder::H264, false)
+        ));
+        assert!(mpegts_has_keyframe(
+            CompressedCodec::Hevc,
+            &mpegts_fixture(HlsEncoder::Hevc, true)
+        ));
+        assert!(!mpegts_has_keyframe(
+            CompressedCodec::Hevc,
+            &mpegts_fixture(HlsEncoder::Hevc, false)
+        ));
+        // Non-TS bytes never claim a keyframe.
+        assert!(!mpegts_has_keyframe(CompressedCodec::H264, &[0u8; 500]));
+        // A packet without the sync byte is ignored.
+        let mut broken = ts_packet(0x100, true, 0, &[0, 0, 1, 0xE0, 0, 0, 0x80, 0, 0, 0x65]);
+        broken[0] = 0;
+        assert!(!mpegts_has_keyframe(CompressedCodec::H264, &broken));
+    }
+
+    #[tokio::test]
+    async fn mpegts_stream_returns_a_real_keyframe_and_stops_on_disconnect() {
+        use mpegts_test_support::{mpegts_repeated, RecordingMpegTsSpawner, TestTsSource};
+
+        let (source, stopped) = TestTsSource::rgb(16, 16, 200, true);
+        let spawner = Arc::new(
+            RecordingMpegTsSpawner::with_data(mpegts_repeated(HlsEncoder::H264, true, 80))
+                .with_chunk(188),
+        );
+        let stream = start_mpegts_stream(
+            Box::new(source),
+            mpegts_config(HlsEncoder::H264),
+            spawner.clone(),
+            Arc::new(StaticEncoderProbe::software()),
+        )
+        .await
+        .expect("H.264 stream");
+        assert_eq!(stream.first[0], 0x47, "MPEG-TS sync byte");
+        assert!(
+            mpegts_has_keyframe(CompressedCodec::H264, &stream.first),
+            "committed prefix contains the first IDR"
+        );
+        assert_eq!(
+            spawner.argv()[..2],
+            [
+                PathBuf::from("ffmpeg").display().to_string(),
+                "-hide_banner".to_owned()
+            ]
+        );
+        assert!(spawner
+            .argv()
+            .windows(2)
+            .any(|pair| pair == ["-c:v", "libx264"]));
+
+        let MpegTsStream {
+            first: _,
+            mut receiver,
+            task,
+        } = stream;
+        let _ = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await;
+        drop(receiver);
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("stream task stops after disconnect")
+            .expect("stream task joins");
+        assert!(stopped.load(Ordering::SeqCst), "source stop() was called");
+        assert!(spawner.closed.load(Ordering::SeqCst), "ffmpeg stdin closed");
+    }
+
+    #[tokio::test]
+    async fn mpegts_stream_fails_before_commit_without_a_keyframe() {
+        use mpegts_test_support::{mpegts_repeated, RecordingMpegTsSpawner, TestTsSource};
+
+        let (source, stopped) = TestTsSource::rgb(16, 16, 20, false);
+        let spawner = Arc::new(RecordingMpegTsSpawner::with_data(mpegts_repeated(
+            HlsEncoder::H264,
+            false,
+            3,
+        )));
+        let error = start_mpegts_stream(
+            Box::new(source),
+            mpegts_config(HlsEncoder::H264),
+            spawner,
+            Arc::new(StaticEncoderProbe::software()),
+        )
+        .await
+        .expect_err("no keyframe is a setup error");
+        assert!(matches!(error, HlsError::Stream { .. }), "{error}");
+        assert!(stopped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn mpegts_stream_rejects_mjpeg_and_unavailable_encoders() {
+        use mpegts_test_support::{RecordingMpegTsSpawner, TestTsSource};
+
+        let (source, stopped) = TestTsSource::rgb(16, 16, 4, false);
+        let error = start_mpegts_stream(
+            Box::new(source),
+            mpegts_config(HlsEncoder::Mjpeg),
+            Arc::new(RecordingMpegTsSpawner::new(HlsEncoder::H264, true)),
+            Arc::new(StaticEncoderProbe::software()),
+        )
+        .await
+        .expect_err("MJPEG has no MPEG-TS keyframe detector");
+        assert!(matches!(error, HlsError::UnsupportedStreamCodec { .. }));
+        assert!(stopped.load(Ordering::SeqCst));
+
+        let (source, stopped) = TestTsSource::rgb(16, 16, 4, false);
+        let spawner = Arc::new(RecordingMpegTsSpawner::new(HlsEncoder::H264, true));
+        let error = start_mpegts_stream(
+            Box::new(source),
+            mpegts_config(HlsEncoder::H264),
+            spawner.clone(),
+            Arc::new(StaticEncoderProbe::new(EncoderAvailability::default())),
+        )
+        .await
+        .expect_err("ffmpeg advertised no H.264 encoder");
+        assert!(matches!(error, HlsError::EncoderUnavailable { .. }));
+        assert_eq!(spawner.spawns.load(Ordering::SeqCst), 0);
+        assert!(stopped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn mpegts_stream_stream_copies_a_compressed_h264_source() {
+        use mpegts_test_support::{RecordingMpegTsSpawner, TestTsSource};
+
+        let format = FrameFormat::new(PixelFormat::H264, 16, 16);
+        let (source, stopped) = TestTsSource::compressed(format, 50, true);
+        let spawner = Arc::new(RecordingMpegTsSpawner::new(HlsEncoder::H264, true));
+        let stream = start_mpegts_stream(
+            Box::new(source),
+            mpegts_config(HlsEncoder::H264),
+            spawner.clone(),
+            Arc::new(StaticEncoderProbe::new(EncoderAvailability::default())),
+        )
+        .await
+        .expect("compressed passthrough needs no encoder");
+        let argv = spawner.argv();
+        assert!(argv.windows(2).any(|pair| pair == ["-c:v", "copy"]));
+        assert!(argv.windows(2).any(|pair| pair == ["-f", "h264"]));
+        drop(stream.receiver);
+        tokio::time::timeout(Duration::from_secs(3), stream.task)
+            .await
+            .expect("passthrough task stops")
+            .expect("passthrough task joins");
+        assert!(stopped.load(Ordering::SeqCst));
+    }
+
+    /// Live end-to-end check: a fake RGB capture source → real ffmpeg →
+    /// MPEG-TS → `ffprobe`/decode. Requires `ffmpeg` and `ffprobe` on `PATH`.
+    #[tokio::test]
+    #[ignore = "requires ffmpeg/ffprobe and working software H.264/HEVC encoders"]
+    async fn live_mpegts_stream_is_ffprobe_decodable_h264_and_hevc() {
+        use mpegts_test_support::TestTsSource;
+        use std::io::Write as _;
+
+        for (encoder, expected_codec) in [(HlsEncoder::H264, "h264"), (HlsEncoder::Hevc, "hevc")] {
+            let directory = temp_dir(&format!("live-mpegts-{expected_codec}"));
+            let path = directory.join("stream.ts");
+            let (source, stopped) = TestTsSource::rgb(160, 120, 60, false);
+            let config = HlsConfig {
+                fps: 30,
+                bitrate_kbps: 900,
+                video_encoder: encoder,
+                ..HlsConfig::default()
+            };
+            let stream = start_mpegts_stream(
+                Box::new(source),
+                config,
+                Arc::new(SystemMpegTsSpawner),
+                Arc::new(SystemEncoderProbe::new()),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{expected_codec} stream: {error}"));
+            let MpegTsStream {
+                first,
+                mut receiver,
+                task,
+            } = stream;
+            let mut file = std::fs::File::create(&path).expect("stream file");
+            file.write_all(&first).expect("write first keyframe");
+            while let Ok(Some(chunk)) =
+                tokio::time::timeout(Duration::from_millis(500), receiver.recv()).await
+            {
+                file.write_all(&chunk).expect("write chunk");
+            }
+            drop(receiver);
+            let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+            file.flush().expect("flush stream");
+            assert!(
+                stopped.load(Ordering::SeqCst),
+                "{expected_codec} source stopped"
+            );
+            assert!(
+                std::fs::metadata(&path).expect("stream file").len() > 188 * 10,
+                "{expected_codec} stream is too small"
+            );
+
+            let probe = std::process::Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=codec_name,width,height",
+                    "-of",
+                    "json",
+                ])
+                .arg(&path)
+                .output()
+                .expect("run ffprobe");
+            assert!(
+                probe.status.success(),
+                "{expected_codec} ffprobe failed: {}",
+                String::from_utf8_lossy(&probe.stderr)
+            );
+            let info: serde_json::Value =
+                serde_json::from_slice(&probe.stdout).expect("ffprobe JSON");
+            assert_eq!(info["streams"][0]["codec_name"], expected_codec);
+            assert_eq!(info["streams"][0]["width"], 160);
+            assert_eq!(info["streams"][0]["height"], 120);
+
+            let decoded = std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-i"])
+                .arg(&path)
+                .args(["-map", "0:v:0", "-f", "null", "-"])
+                .output()
+                .expect("run ffmpeg decode");
+            assert!(
+                decoded.status.success(),
+                "{expected_codec} decode failed: {}",
+                String::from_utf8_lossy(&decoded.stderr)
+            );
+
+            let frames = std::process::Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-count_frames",
+                    "-show_entries",
+                    "stream=nb_read_frames",
+                    "-of",
+                    "default=nokey=1:noprint_wrappers=1",
+                ])
+                .arg(&path)
+                .output()
+                .expect("run ffprobe frame count");
+            let frames = String::from_utf8_lossy(&frames.stdout);
+            let frames: u64 = frames.trim().parse().expect("decoded frame count");
+            assert!(
+                frames >= 10,
+                "{expected_codec} decoded only {frames} frames"
+            );
+            let _ = std::fs::remove_dir_all(directory);
+        }
     }
 }

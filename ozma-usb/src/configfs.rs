@@ -247,13 +247,19 @@ impl ConfigFsUsbController {
                 }
             }
             UsbFunction::Uac2 { config, .. } => {
+                // f_uac2 names the streams from the gadget's point of view:
+                // `p_chmask` drives the USB IN endpoint (device → host), while
+                // `c_chmask` drives USB OUT (host → device). `Uac2Config`
+                // names them from the host's point of view, so the mask
+                // projection is intentionally crossed. Both directions use the
+                // same primary rate and sample size here.
                 self.write_attr(
                     &dir.join("p_chmask"),
-                    Uac2Config::channel_mask(config.playback_channels).to_string(),
+                    Uac2Config::channel_mask(config.capture_channels).to_string(),
                 )?;
                 self.write_attr(
                     &dir.join("c_chmask"),
-                    Uac2Config::channel_mask(config.capture_channels).to_string(),
+                    Uac2Config::channel_mask(config.playback_channels).to_string(),
                 )?;
                 self.write_attr(&dir.join("p_srate"), config.sample_rate_hz.to_string())?;
                 self.write_attr(&dir.join("c_srate"), config.sample_rate_hz.to_string())?;
@@ -307,18 +313,21 @@ impl ConfigFsUsbController {
     }
 
     fn read_uac2_status(&self, function_dir: &Path, instance: &str) -> Option<Uac2Status> {
-        let playback_channels = self
+        // `p_*` is the gadget's playback stream (USB IN, device → host) and
+        // `c_*` is its capture stream (USB OUT, host → device). The Ozma model
+        // names directions from the host's point of view.
+        let capture_channels = self
             .read_attr_opt(&function_dir.join("p_chmask"))
             .and_then(|value| value.parse::<u32>().ok())
             .map(|mask| mask.count_ones() as u8)?;
-        let capture_channels = self
+        let playback_channels = self
             .read_attr_opt(&function_dir.join("c_chmask"))
             .and_then(|value| value.parse::<u32>().ok())
             .map(|mask| mask.count_ones() as u8)?;
         if playback_channels == 0 && capture_channels == 0 {
             return None;
         }
-        let (rate_key, size_key) = if playback_channels > 0 {
+        let (rate_key, size_key) = if capture_channels > 0 {
             ("p_srate", "p_ssize")
         } else {
             ("c_srate", "c_ssize")

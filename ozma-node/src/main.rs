@@ -251,6 +251,22 @@ pub struct Args {
     #[arg(long, env = "OZMA_VNC_IDLE_TIMEOUT_SECONDS", default_value_t = 0)]
     pub vnc_idle_timeout_seconds: u64,
 
+    /// Bridge the RFB viewer clipboard to this node's desktop clipboard.
+    ///
+    /// Off by default. Only meaningful with `--vnc-server`. The node must run
+    /// `--profile desktop` with an X11 display and `xclip` or `xsel`; otherwise
+    /// cut text is ignored and status reports the clipboard as unavailable.
+    #[arg(long, env = "OZMA_VNC_CLIPBOARD")]
+    pub vnc_clipboard: bool,
+
+    /// Maximum clipboard text bytes accepted from a viewer or sent to one.
+    #[arg(
+        long,
+        env = "OZMA_VNC_CLIPBOARD_MAX_BYTES",
+        default_value_t = ozma_node::vnc_server::DEFAULT_VNC_CLIPBOARD_BYTES
+    )]
+    pub vnc_clipboard_max_bytes: usize,
+
     /// QEMU D-Bus console index (`Console_N`). Supplying any D-Bus display
     /// flag selects D-Bus capture on a VM node; the effective default is 0.
     #[arg(long, env = "OZMA_DBUS_CONSOLE", value_name = "INDEX")]
@@ -1539,6 +1555,8 @@ async fn run() -> std::process::ExitCode {
         vnc_allow_unauthenticated: args.vnc_allow_unauthenticated,
         vnc_max_clients: args.vnc_max_clients,
         vnc_idle_timeout_seconds: args.vnc_idle_timeout_seconds,
+        vnc_clipboard: args.vnc_clipboard,
+        vnc_clipboard_max_bytes: args.vnc_clipboard_max_bytes,
         dbus_console: args
             .capture_console
             .or(args.dbus_console)
@@ -2002,6 +2020,49 @@ async fn run() -> std::process::ExitCode {
         },
         None => None,
     };
+    // Desktop controls are built here so the opt-in VNC clipboard bridge can
+    // share the same X11 selection owner as the /clipboard route. They remain
+    // attached to /api/v1/connection below.
+    let desktop_controls = (config.profile == NodeProfile::Desktop).then(|| {
+        let x11_display = config
+            .x11_display
+            .clone()
+            .or_else(|| std::env::var("DISPLAY").ok())
+            .map(|display| display.trim().to_owned())
+            .filter(|display| !display.is_empty());
+        let wayland_display = std::env::var("WAYLAND_DISPLAY")
+            .ok()
+            .map(|display| display.trim().to_owned())
+            .filter(|display| !display.is_empty());
+        ozma_node::desktop_compat::DesktopControls::system(x11_display, wayland_display)
+    });
+    let vnc_clipboard: Option<Arc<dyn ozma_node::vnc_server::ClipboardAccess>> =
+        if args.vnc_clipboard {
+            match (config.profile, desktop_controls.as_ref()) {
+                (NodeProfile::Desktop, Some(controls)) => Some(Arc::new(
+                    ozma_node::vnc_server::DesktopClipboard::new(controls.clone()),
+                )),
+                _ => {
+                    warn!(
+                        "--vnc-clipboard requires --profile desktop with a desktop clipboard; \
+                         cut text is ignored (no-op) and status reports clipboard unavailable"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+    if args.vnc_clipboard
+        && vnc_clipboard
+            .as_ref()
+            .is_some_and(|clipboard| !clipboard.available())
+    {
+        warn!(
+            "--vnc-clipboard is enabled but the desktop clipboard is unavailable; \
+             VNC cut text will be ignored and status will report clipboard unavailable"
+        );
+    }
     let vnc_options = ozma_node::vnc_server::VncServerOptions {
         bind: args.vnc_bind.clone(),
         port: args.vnc_server_port,
@@ -2010,6 +2071,8 @@ async fn run() -> std::process::ExitCode {
         idle_timeout: (args.vnc_idle_timeout_seconds > 0)
             .then(|| Duration::from_secs(args.vnc_idle_timeout_seconds)),
         allow_unauthenticated: args.vnc_allow_unauthenticated,
+        clipboard: vnc_clipboard,
+        clipboard_max_bytes: args.vnc_clipboard_max_bytes,
     };
 
     // Opt-in RFB 3.8 server. It binds only when --vnc-server is set *and* the
@@ -2083,6 +2146,14 @@ async fn run() -> std::process::ExitCode {
             advertised_port = port,
             security = if server.auth_enabled() { "vnc-auth" } else { "none" },
             encrypted = false,
+            clipboard = if !server.clipboard_status().enabled {
+                "disabled"
+            } else if server.clipboard_status().available {
+                "available"
+            } else {
+                "unavailable"
+            },
+            clipboard_max_bytes = args.vnc_clipboard_max_bytes,
             "RFB 3.8 VNC server is serving the first capture source \
              (transport is plain TCP; VNC auth is not encryption)"
         );
@@ -2911,22 +2982,39 @@ async fn run() -> std::process::ExitCode {
         },
     };
     set_capability(&mut args, &mut config, "bluetooth", bluetooth_available);
-    let desktop_controls = (config.profile == NodeProfile::Desktop).then(|| {
-        let x11_display = config
-            .x11_display
-            .clone()
-            .or_else(|| std::env::var("DISPLAY").ok())
-            .map(|display| display.trim().to_owned())
-            .filter(|display| !display.is_empty());
-        let wayland_display = std::env::var("WAYLAND_DISPLAY")
-            .ok()
-            .map(|display| display.trim().to_owned())
-            .filter(|display| !display.is_empty());
-        ozma_node::desktop_compat::DesktopControls::system(x11_display, wayland_display)
-    });
     // Keep a handle for shutdown: a clipboard selection owner or persistent
     // wallpaper daemon must not outlive the node.
     let desktop_controls_shutdown = desktop_controls.clone();
+    // Live `/video?codec=h264|hevc` encoder configuration. It reuses the HLS
+    // encoder/backend preference and ffmpeg/device settings even when `--hls`
+    // is not enabled, because this path writes MPEG-TS directly and needs no
+    // HLS output directory.
+    let video_encoding = if config.has_capability("video") {
+        let template = match hls_config_for_capabilities.clone() {
+            Some(config) => config,
+            None => {
+                let encoder = HlsEncoder::parse(&args.hls_encoder).unwrap_or_else(|error| {
+                    warn!(
+                        error = %error,
+                        "Invalid --hls-encoder for live /video; using the software H.264 encoder"
+                    );
+                    HlsEncoder::H264
+                });
+                HlsConfig {
+                    fps: args.hls_fps,
+                    bitrate_kbps: args.hls_bitrate_kbps,
+                    video_encoder: encoder,
+                    ffmpeg_bin: args.ffmpeg_bin.clone(),
+                    vaapi_device: config.vaapi_device.clone(),
+                    nvenc_gpu: config.nvenc_gpu,
+                    ..HlsConfig::default()
+                }
+            }
+        };
+        Some(ozma_node::video::VideoEncoding::system(template))
+    } else {
+        None
+    };
     let compat_state =
         controller_compat::ConnectionState::new(connection_info, compat_stats.clone())
             .with_power(power)
@@ -2939,6 +3027,7 @@ async fn run() -> std::process::ExitCode {
             .with_audio(audio_control)
             .with_usb(usb_control)
             .with_webrtc(webrtc_control.clone())
+            .with_video_encoding(video_encoding)
             .with_snapshot(Some({
                 let control = SnapshotControl::from_shared(registry_slot.clone());
                 match capture_source_selection(&config) {

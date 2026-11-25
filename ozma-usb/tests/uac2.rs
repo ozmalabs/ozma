@@ -171,8 +171,9 @@ fn configfs_writes_primary_attributes_and_status_reports_unsupported_bridge() {
     let status = fixture.controller.create_gadget(&gadget).unwrap();
 
     let uac2 = fixture.gadget().join("functions/uac2.audio");
-    assert_eq!(fixture.read(uac2.join("p_chmask")), "3");
-    assert_eq!(fixture.read(uac2.join("c_chmask")), "1");
+    // f_uac2 p_* is USB IN (device → host = Ozma capture); c_* is USB OUT.
+    assert_eq!(fixture.read(uac2.join("p_chmask")), "1");
+    assert_eq!(fixture.read(uac2.join("c_chmask")), "3");
     assert_eq!(fixture.read(uac2.join("p_srate")), "48000");
     assert_eq!(fixture.read(uac2.join("c_srate")), "48000");
     assert_eq!(fixture.read(uac2.join("p_ssize")), "3");
@@ -214,8 +215,9 @@ fn capture_only_configfs_attributes_and_status() {
     let status = fixture.controller.create_gadget(&gadget).unwrap();
 
     let uac2 = fixture.gadget().join("functions/uac2.audio");
-    assert_eq!(fixture.read(uac2.join("p_chmask")), "0");
-    assert_eq!(fixture.read(uac2.join("c_chmask")), "1");
+    // A microphone is the gadget's USB IN (p_chmask) stream.
+    assert_eq!(fixture.read(uac2.join("p_chmask")), "1");
+    assert_eq!(fixture.read(uac2.join("c_chmask")), "0");
     assert_eq!(fixture.read(uac2.join("p_srate")), "16000");
     assert_eq!(fixture.read(uac2.join("c_srate")), "16000");
     assert_eq!(fixture.read(uac2.join("p_ssize")), "2");

@@ -697,6 +697,8 @@ mod tests {
             vnc_allow_unauthenticated: false,
             vnc_max_clients: crate::vnc_server::DEFAULT_MAX_CLIENTS,
             vnc_idle_timeout_seconds: 0,
+            vnc_clipboard: false,
+            vnc_clipboard_max_bytes: crate::vnc_server::DEFAULT_VNC_CLIPBOARD_BYTES,
             dbus_console: 0,
             dbus_width: ozma_capture::DBUS_DEFAULT_WIDTH,
             dbus_height: ozma_capture::DBUS_DEFAULT_HEIGHT,

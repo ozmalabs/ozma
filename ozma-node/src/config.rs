@@ -1123,6 +1123,10 @@ pub struct NodeConfig {
     /// Close an RFB viewer that sends no client message for this many seconds.
     /// `0` disables the idle timeout.
     pub vnc_idle_timeout_seconds: u64,
+    /// Bridge RFB viewer cut text to the desktop-profile X11 clipboard.
+    pub vnc_clipboard: bool,
+    /// Bound for clipboard text in either direction.
+    pub vnc_clipboard_max_bytes: usize,
     /// Effective D-Bus console index (`Console_N`).
     pub dbus_console: u32,
     /// Largest D-Bus scanout width accepted.
@@ -1579,11 +1583,14 @@ impl NodeConfig {
             || self.vnc_password_file.is_some()
             || self.vnc_allow_unauthenticated
             || self.vnc_max_clients != crate::vnc_server::DEFAULT_MAX_CLIENTS
-            || self.vnc_idle_timeout_seconds != 0;
+            || self.vnc_idle_timeout_seconds != 0
+            || self.vnc_clipboard
+            || self.vnc_clipboard_max_bytes != crate::vnc_server::DEFAULT_VNC_CLIPBOARD_BYTES;
         if !self.vnc_server && vnc_server_configured {
             return Err("--vnc-bind, --vnc-server-port, --vnc-password-file, \
-                 --vnc-allow-unauthenticated, --vnc-max-clients, and \
-                 --vnc-idle-timeout-seconds configure the internal RFB server and require \
+                 --vnc-allow-unauthenticated, --vnc-max-clients, \
+                 --vnc-idle-timeout-seconds, --vnc-clipboard, and \
+                 --vnc-clipboard-max-bytes configure the internal RFB server and require \
                  --vnc-server"
                 .to_owned());
         }
@@ -1619,6 +1626,15 @@ impl NodeConfig {
                     "--vnc-idle-timeout-seconds must be between 0 and {}, got {}",
                     crate::vnc_server::MAX_IDLE_TIMEOUT_SECONDS,
                     self.vnc_idle_timeout_seconds
+                ));
+            }
+            if self.vnc_clipboard_max_bytes == 0
+                || self.vnc_clipboard_max_bytes > crate::vnc_server::MAX_VNC_CLIPBOARD_BYTES
+            {
+                return Err(format!(
+                    "--vnc-clipboard-max-bytes must be between 1 and {}, got {}",
+                    crate::vnc_server::MAX_VNC_CLIPBOARD_BYTES,
+                    self.vnc_clipboard_max_bytes
                 ));
             }
             if let Some(path) = &self.vnc_password_file {
@@ -2174,6 +2190,8 @@ mod tests {
             vnc_allow_unauthenticated: false,
             vnc_max_clients: crate::vnc_server::DEFAULT_MAX_CLIENTS,
             vnc_idle_timeout_seconds: 0,
+            vnc_clipboard: false,
+            vnc_clipboard_max_bytes: crate::vnc_server::DEFAULT_VNC_CLIPBOARD_BYTES,
             dbus_console: ozma_capture::DBUS_DEFAULT_CONSOLE_INDEX,
             dbus_width: ozma_capture::DBUS_DEFAULT_WIDTH,
             dbus_height: ozma_capture::DBUS_DEFAULT_HEIGHT,
@@ -2646,6 +2664,34 @@ mod tests {
         idle.vnc_idle_timeout_seconds = crate::vnc_server::MAX_IDLE_TIMEOUT_SECONDS + 1;
         let error = idle.validate().unwrap_err();
         assert!(error.contains("--vnc-idle-timeout-seconds"), "{error}");
+    }
+
+    #[test]
+    fn vnc_clipboard_flags_require_server_and_validate_the_bound() {
+        let mut orphan = test_config(NodeProfile::Desktop);
+        orphan.vnc_clipboard = true;
+        let error = orphan.validate().unwrap_err();
+        assert!(error.contains("--vnc-server"), "{error}");
+
+        let mut max_only = test_config(NodeProfile::Desktop);
+        max_only.vnc_clipboard_max_bytes = 1024;
+        let error = max_only.validate().unwrap_err();
+        assert!(error.contains("--vnc-server"), "{error}");
+
+        let mut enabled = test_config(NodeProfile::Desktop);
+        enabled.vnc_server = true;
+        enabled.vnc_clipboard = true;
+        enabled.validate().unwrap();
+
+        let mut zero = enabled.clone();
+        zero.vnc_clipboard_max_bytes = 0;
+        let error = zero.validate().unwrap_err();
+        assert!(error.contains("--vnc-clipboard-max-bytes"), "{error}");
+
+        let mut too_large = enabled;
+        too_large.vnc_clipboard_max_bytes = crate::vnc_server::MAX_VNC_CLIPBOARD_BYTES + 1;
+        let error = too_large.validate().unwrap_err();
+        assert!(error.contains("--vnc-clipboard-max-bytes"), "{error}");
     }
 
     #[test]

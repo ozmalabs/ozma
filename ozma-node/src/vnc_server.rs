@@ -46,6 +46,12 @@
 //! * Key and pointer events go to the node's existing [`InputSink`]. Unknown
 //!   keysyms are dropped with a diagnostic. Every disconnect calls
 //!   `release_all` so a vanished viewer cannot leave a guest key or button held.
+//! * Clipboard bridging is off by default. With `--vnc-clipboard`, a
+//!   desktop-profile X11 node writes viewer `ClientCutText` through the same
+//!   bounded `xclip`/`xsel` path as `/clipboard`, and sends one `ServerCutText`
+//!   snapshot to each viewer on connect. Unavailable, oversized, or non-Latin-1
+//!   text is ignored rather than claimed as synced, and a viewer's own cut text
+//!   is never echoed back.
 //!
 //! The controller sees the real bound endpoint only while the listener is
 //! running. [`start_if_configured`] does not invent a listener: with no capture
@@ -60,7 +66,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use async_trait::async_trait;
 
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
@@ -113,6 +121,14 @@ pub const MAX_NAME_BYTES: usize = 255;
 /// Largest `ClientCutText` payload accepted (and ignored) before the connection
 /// is closed instead of trusting an unbounded length field.
 pub const MAX_CUT_TEXT_BYTES: u32 = 1024 * 1024;
+/// Default bound for clipboard text bridged between RFB and the node clipboard.
+/// This matches the desktop clipboard route's own limit so a viewer cannot
+/// push more text than `POST /clipboard` would accept.
+pub const DEFAULT_VNC_CLIPBOARD_BYTES: usize = 64 * 1024;
+/// Largest configurable clipboard bridge bound. The desktop clipboard path is
+/// itself bounded at [`DEFAULT_VNC_CLIPBOARD_BYTES`], so a larger VNC value
+/// would only produce a typed write failure.
+pub const MAX_VNC_CLIPBOARD_BYTES: usize = DEFAULT_VNC_CLIPBOARD_BYTES;
 /// Maximum entries accepted in one `SetEncodings` message.
 pub const MAX_ENCODINGS: usize = 1024;
 /// Maximum pending framebuffer rectangles merged for one client update.
@@ -205,6 +221,136 @@ pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// aborted. This is enough for `CaptureSource::stop` to run.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
+/// Clipboard backend used by the opt-in RFB clipboard bridge.
+///
+/// The server only ever sees text through this trait, so the runtime wiring can
+/// supply the desktop-profile X11 clipboard or (in tests) a fake. A backend that
+/// has no display or no `xclip`/`xsel` reports `available() == false`; the server
+/// then ignores cut text instead of claiming a sync.
+#[async_trait]
+pub trait ClipboardAccess: Send + Sync {
+    /// Whether a usable clipboard backend is currently advertised.
+    fn available(&self) -> bool;
+    /// Read the current UTF-8 clipboard text.
+    async fn read_text(&self) -> Result<String, ClipboardAccessError>;
+    /// Write UTF-8 text and return the number of bytes accepted.
+    async fn write_text(&self, text: String) -> Result<usize, ClipboardAccessError>;
+}
+
+/// Typed clipboard-backend failure. The text itself is never carried here.
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("{code}: {message}")]
+pub struct ClipboardAccessError {
+    /// Stable code from the desktop control layer (for example
+    /// `desktop.no_display`).
+    pub code: String,
+    /// Human-readable detail; never clipboard contents.
+    pub message: String,
+}
+
+impl ClipboardAccessError {
+    /// True when the failure means no clipboard backend is usable at all, as
+    /// opposed to a transient command failure.
+    fn unavailable(&self) -> bool {
+        matches!(
+            self.code.as_str(),
+            "desktop.no_display" | "desktop.tool_missing" | "desktop.not_enabled"
+        )
+    }
+}
+
+/// Adapter from the desktop-profile X11 clipboard to [`ClipboardAccess`].
+///
+/// The underlying [`crate::desktop_compat::DesktopControls`] already enforces a
+/// UTF-8-only, NUL-free, bounded payload and keeps exactly one selection owner.
+/// This adapter adds no new process boundary.
+#[derive(Clone, Debug)]
+pub struct DesktopClipboard {
+    controls: crate::desktop_compat::DesktopControls,
+}
+
+impl DesktopClipboard {
+    /// Wrap the desktop controls attached to this node.
+    pub fn new(controls: crate::desktop_compat::DesktopControls) -> Self {
+        Self { controls }
+    }
+}
+
+fn desktop_clipboard_error(error: crate::desktop_compat::DesktopError) -> ClipboardAccessError {
+    let api = error.api_error();
+    ClipboardAccessError {
+        code: api.code,
+        message: api.message,
+    }
+}
+
+#[async_trait]
+impl ClipboardAccess for DesktopClipboard {
+    fn available(&self) -> bool {
+        self.controls.status().clipboard.available
+    }
+
+    async fn read_text(&self) -> Result<String, ClipboardAccessError> {
+        self.controls
+            .clipboard()
+            .await
+            .map(|read| read.text)
+            .map_err(desktop_clipboard_error)
+    }
+
+    async fn write_text(&self, text: String) -> Result<usize, ClipboardAccessError> {
+        self.controls
+            .set_clipboard(text)
+            .await
+            .map(|write| write.bytes)
+            .map_err(desktop_clipboard_error)
+    }
+}
+
+/// Direction of the last successful clipboard transfer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ClipboardSyncDirection {
+    /// No clipboard transfer has succeeded.
+    #[default]
+    None = 0,
+    /// A viewer's `ClientCutText` was written to the node clipboard.
+    ViewerToNode = 1,
+    /// The node clipboard was sent to a viewer as `ServerCutText`.
+    NodeToViewer = 2,
+}
+
+impl ClipboardSyncDirection {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::ViewerToNode,
+            2 => Self::NodeToViewer,
+            _ => Self::None,
+        }
+    }
+}
+
+/// Controller-facing clipboard bridge status. It deliberately exposes only
+/// availability, direction, time, and counters, never the text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VncClipboardStatus {
+    /// The operator enabled the bridge (`--vnc-clipboard`).
+    pub enabled: bool,
+    /// A backend is currently usable.
+    pub available: bool,
+    /// Direction of the last successful transfer.
+    pub last_direction: ClipboardSyncDirection,
+    /// Unix time in milliseconds of the last successful transfer; `0` means
+    /// none has succeeded.
+    pub last_sync_unix_ms: u64,
+    /// Successful viewer-to-node transfers.
+    pub from_viewers: u64,
+    /// Successful node-to-viewer transfers (initial `ServerCutText`).
+    pub to_viewers: u64,
+    /// Cut-text messages or clipboard reads rejected by a bound or failure.
+    pub rejected: u64,
+}
+
 /// Configuration for the RFB listener.
 #[derive(Clone)]
 pub struct VncServerConfig {
@@ -234,6 +380,11 @@ pub struct VncServerConfig {
     pub write_timeout: Duration,
     /// Handshake timeout.
     pub handshake_timeout: Duration,
+    /// Optional clipboard bridge. `None` keeps `ClientCutText` ignored and sends
+    /// no `ServerCutText`, which is the default.
+    pub clipboard: Option<Arc<dyn ClipboardAccess>>,
+    /// Bound for clipboard text in either direction.
+    pub clipboard_max_bytes: usize,
 }
 
 impl fmt::Debug for VncServerConfig {
@@ -250,6 +401,11 @@ impl fmt::Debug for VncServerConfig {
             .field("idle_timeout", &self.idle_timeout)
             .field("write_timeout", &self.write_timeout)
             .field("handshake_timeout", &self.handshake_timeout)
+            .field(
+                "clipboard",
+                &self.clipboard.as_ref().map(|_| "<configured>"),
+            )
+            .field("clipboard_max_bytes", &self.clipboard_max_bytes)
             .finish()
     }
 }
@@ -269,6 +425,8 @@ impl Default for VncServerConfig {
             idle_timeout: None,
             write_timeout: WRITE_TIMEOUT,
             handshake_timeout: HANDSHAKE_TIMEOUT,
+            clipboard: None,
+            clipboard_max_bytes: DEFAULT_VNC_CLIPBOARD_BYTES,
         }
     }
 }
@@ -473,6 +631,12 @@ impl VncServerConfig {
                 });
             }
         }
+        if self.clipboard_max_bytes == 0 || self.clipboard_max_bytes > MAX_VNC_CLIPBOARD_BYTES {
+            return Err(VncServerError::InvalidClipboardBound {
+                requested: self.clipboard_max_bytes,
+                max: MAX_VNC_CLIPBOARD_BYTES,
+            });
+        }
         if !self.bind.is_loopback() {
             if !self.allow_non_loopback {
                 return Err(VncServerError::WiderBindRefused {
@@ -535,6 +699,9 @@ pub enum VncServerError {
     /// Client cap outside the supported range.
     #[error("VNC max_clients must be between 1 and {max}, got {requested}")]
     InvalidClientLimit { requested: usize, max: usize },
+    /// Clipboard bound outside the supported range.
+    #[error("VNC clipboard bound must be between 1 and {max} bytes, got {requested}")]
+    InvalidClipboardBound { requested: usize, max: usize },
     /// Binding the TCP port failed.
     #[error("binding VNC listener {address}: {source}")]
     Bind {
@@ -617,6 +784,11 @@ impl VncServerHandle {
         self.stats.snapshot()
     }
 
+    /// Clipboard bridge status. Never includes clipboard text.
+    pub fn clipboard_status(&self) -> VncClipboardStatus {
+        self.stats.clipboard_status()
+    }
+
     /// Stop accepting clients, abort in-flight viewers, release held input, and
     /// wait for the listener task to finish.
     pub async fn shutdown(mut self) {
@@ -657,6 +829,20 @@ pub struct VncServerStats {
     pub source_errors: u64,
     /// Viewers closed because a framebuffer write exceeded the timeout.
     pub slow_clients: u64,
+    /// The clipboard bridge is configured (`--vnc-clipboard`).
+    pub clipboard_enabled: bool,
+    /// A clipboard backend is currently usable. Always `false` when disabled.
+    pub clipboard_available: bool,
+    /// Direction of the last successful clipboard transfer.
+    pub clipboard_last_direction: ClipboardSyncDirection,
+    /// Unix time in milliseconds of the last successful transfer; `0` is never.
+    pub clipboard_last_sync_unix_ms: u64,
+    /// Successful viewer-to-node transfers.
+    pub clipboard_from_viewers: u64,
+    /// Successful node-to-viewer transfers.
+    pub clipboard_to_viewers: u64,
+    /// Cut-text messages or clipboard reads rejected by bound or failure.
+    pub clipboard_rejected: u64,
 }
 
 #[derive(Default)]
@@ -674,9 +860,24 @@ struct VncStats {
     source_errors: AtomicU64,
     slow_clients: AtomicU64,
     generation: AtomicU64,
+    clipboard_enabled: bool,
+    clipboard_available: AtomicBool,
+    clipboard_last_direction: AtomicU64,
+    clipboard_last_sync_unix_ms: AtomicU64,
+    clipboard_from_viewers: AtomicU64,
+    clipboard_to_viewers: AtomicU64,
+    clipboard_rejected: AtomicU64,
 }
 
 impl VncStats {
+    fn new(clipboard_enabled: bool, clipboard_available: bool) -> Self {
+        Self {
+            clipboard_enabled,
+            clipboard_available: AtomicBool::new(clipboard_available),
+            ..Self::default()
+        }
+    }
+
     fn snapshot(&self) -> VncServerStats {
         VncServerStats {
             clients_connected: self.clients_connected.load(Ordering::Relaxed),
@@ -691,6 +892,49 @@ impl VncStats {
             protocol_errors: self.protocol_errors.load(Ordering::Relaxed),
             source_errors: self.source_errors.load(Ordering::Relaxed),
             slow_clients: self.slow_clients.load(Ordering::Relaxed),
+            clipboard_enabled: self.clipboard_enabled,
+            clipboard_available: self.clipboard_available.load(Ordering::Relaxed),
+            clipboard_last_direction: ClipboardSyncDirection::from_u8(
+                self.clipboard_last_direction.load(Ordering::Relaxed) as u8,
+            ),
+            clipboard_last_sync_unix_ms: self.clipboard_last_sync_unix_ms.load(Ordering::Relaxed),
+            clipboard_from_viewers: self.clipboard_from_viewers.load(Ordering::Relaxed),
+            clipboard_to_viewers: self.clipboard_to_viewers.load(Ordering::Relaxed),
+            clipboard_rejected: self.clipboard_rejected.load(Ordering::Relaxed),
+        }
+    }
+
+    fn clipboard_status(&self) -> VncClipboardStatus {
+        VncClipboardStatus {
+            enabled: self.clipboard_enabled,
+            available: self.clipboard_available.load(Ordering::Relaxed),
+            last_direction: ClipboardSyncDirection::from_u8(
+                self.clipboard_last_direction.load(Ordering::Relaxed) as u8,
+            ),
+            last_sync_unix_ms: self.clipboard_last_sync_unix_ms.load(Ordering::Relaxed),
+            from_viewers: self.clipboard_from_viewers.load(Ordering::Relaxed),
+            to_viewers: self.clipboard_to_viewers.load(Ordering::Relaxed),
+            rejected: self.clipboard_rejected.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_clipboard_sync(&self, direction: ClipboardSyncDirection) {
+        self.clipboard_last_direction
+            .store(direction as u8 as u64, Ordering::Relaxed);
+        self.clipboard_last_sync_unix_ms.store(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_millis() as u64),
+            Ordering::Relaxed,
+        );
+        match direction {
+            ClipboardSyncDirection::ViewerToNode => {
+                self.clipboard_from_viewers.fetch_add(1, Ordering::Relaxed);
+            }
+            ClipboardSyncDirection::NodeToViewer => {
+                self.clipboard_to_viewers.fetch_add(1, Ordering::Relaxed);
+            }
+            ClipboardSyncDirection::None => {}
         }
     }
 
@@ -723,7 +967,7 @@ impl VncStats {
 }
 
 /// Optional listener settings supplied by `main` from the CLI.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct VncServerOptions {
     /// Explicit bind address. `Some` is the opt-in that permits a widened bind.
     pub bind: Option<String>,
@@ -737,6 +981,30 @@ pub struct VncServerOptions {
     pub idle_timeout: Option<Duration>,
     /// Explicit opt-in for an unauthenticated non-loopback bind.
     pub allow_unauthenticated: bool,
+    /// Optional clipboard backend. Only installed when `--vnc-clipboard` was
+    /// requested and the node runs the desktop profile with an X11 display.
+    pub clipboard: Option<Arc<dyn ClipboardAccess>>,
+    /// Bound for clipboard text in either direction.
+    pub clipboard_max_bytes: usize,
+}
+
+impl fmt::Debug for VncServerOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VncServerOptions")
+            .field("bind", &self.bind)
+            .field("port", &self.port)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("max_clients", &self.max_clients)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("allow_unauthenticated", &self.allow_unauthenticated)
+            .field(
+                "clipboard",
+                &self.clipboard.as_ref().map(|_| "<configured>"),
+            )
+            .field("clipboard_max_bytes", &self.clipboard_max_bytes)
+            .finish()
+    }
 }
 
 impl Default for VncServerOptions {
@@ -748,6 +1016,8 @@ impl Default for VncServerOptions {
             max_clients: DEFAULT_MAX_CLIENTS,
             idle_timeout: None,
             allow_unauthenticated: false,
+            clipboard: None,
+            clipboard_max_bytes: DEFAULT_VNC_CLIPBOARD_BYTES,
         }
     }
 }
@@ -794,6 +1064,8 @@ pub async fn start_if_configured(
     config.max_clients = options.max_clients;
     config.idle_timeout = options.idle_timeout;
     config.allow_unauthenticated = options.allow_unauthenticated;
+    config.clipboard = options.clipboard;
+    config.clipboard_max_bytes = options.clipboard_max_bytes;
 
     let source = registry
         .open(&capability)
@@ -844,8 +1116,13 @@ pub async fn start(
         })?;
 
     let auth_enabled = config.password.is_some();
+    let clipboard_enabled = config.clipboard.is_some();
+    let clipboard_available = config
+        .clipboard
+        .as_ref()
+        .is_some_and(|clipboard| clipboard.available());
     let config = Arc::new(config);
-    let stats = Arc::new(VncStats::default());
+    let stats = Arc::new(VncStats::new(clipboard_enabled, clipboard_available));
     let cancel = CancellationToken::new();
     let (frames_tx, frames_rx) = watch::channel::<Option<Arc<FrameSnapshot>>>(None);
 
@@ -859,7 +1136,7 @@ pub async fn start(
     ));
     tasks.spawn(accept_loop(
         listener,
-        config,
+        config.clone(),
         source_format,
         sink,
         frames_rx,
@@ -892,6 +1169,14 @@ pub async fn start(
         security = if auth_enabled { "vnc-auth" } else { "none" },
         encrypted = false,
         encoding = "raw,hextile,zlib,tight,zrle",
+        clipboard = if !clipboard_enabled {
+            "disabled"
+        } else if clipboard_available {
+            "available"
+        } else {
+            "unavailable"
+        },
+        clipboard_max_bytes = config.clipboard_max_bytes,
         "RFB 3.8 VNC server listening (transport is plain TCP; VNC auth is not encryption)"
     );
 
@@ -1076,6 +1361,8 @@ async fn accept_loop(
                 let write_timeout = config.write_timeout;
                 let handshake_timeout = config.handshake_timeout;
                 let idle_timeout = config.idle_timeout;
+                let clipboard = config.clipboard.clone();
+                let clipboard_max_bytes = config.clipboard_max_bytes;
                 let password = config.password.clone();
                 let name = config.name.clone();
                 let frames = frames.clone();
@@ -1103,6 +1390,8 @@ async fn accept_loop(
                         write_timeout,
                         handshake_timeout,
                         idle_timeout,
+                        clipboard,
+                        clipboard_max_bytes,
                         password,
                     )
                     .await;
@@ -1141,6 +1430,8 @@ struct ClientContext {
     sink: SharedSink,
     stats: Arc<VncStats>,
     input_active: Arc<AtomicBool>,
+    clipboard: Option<Arc<dyn ClipboardAccess>>,
+    clipboard_max_bytes: usize,
     pixel: Mutex<ClientPixelFormat>,
     encoding: Mutex<ClientEncodingState>,
 }
@@ -1451,6 +1742,8 @@ async fn handle_client(
     write_timeout: Duration,
     handshake_timeout: Duration,
     idle_timeout: Option<Duration>,
+    clipboard: Option<Arc<dyn ClipboardAccess>>,
+    clipboard_max_bytes: usize,
     password: Option<VncPassword>,
 ) {
     let handshake = tokio::time::timeout(
@@ -1486,6 +1779,8 @@ async fn handle_client(
         sink,
         stats,
         input_active,
+        clipboard,
+        clipboard_max_bytes,
         pixel: Mutex::new(ClientPixelFormat::default()),
         encoding: Mutex::new(ClientEncodingState::default()),
     });
@@ -2180,6 +2475,35 @@ fn axis_to_report(value: u16, extent: u32) -> i32 {
     ((value * 32_767) / last) as i32
 }
 
+/// Decode the ISO-8859-1 payload mandated by RFB 6143 into a Rust string.
+///
+/// Every byte maps directly to the same Unicode code point in `U+0000..=U+00FF`;
+/// this is deliberately not UTF-8 decoding, so a viewer's Latin-1 `é` (`0xE9`)
+/// becomes `é` rather than a replacement character.
+fn decode_latin1(bytes: &[u8]) -> String {
+    bytes.iter().map(|&byte| char::from(byte)).collect()
+}
+
+/// Remove C0/C1 control characters except tab, CR, and LF.
+///
+/// The result is written to the node's desktop clipboard, so this stops a viewer
+/// from injecting NUL or terminal-style control bytes there.
+fn sanitize_clipboard_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| !character.is_control() || matches!(character, '\t' | '\r' | '\n'))
+        .collect()
+}
+
+/// Encode node clipboard text as ISO-8859-1.
+///
+/// `None` means at least one character is outside Latin-1. The caller then sends
+/// nothing instead of silently replacing text with `?` and claiming a sync.
+fn encode_latin1(text: &str) -> Option<Vec<u8>> {
+    text.chars()
+        .map(|character| u8::try_from(character as u32).ok())
+        .collect()
+}
+
 async fn read_client_cut_text(
     read: &mut OwnedReadHalf,
     context: &ClientContext,
@@ -2195,15 +2519,184 @@ async fn read_client_cut_text(
             max: MAX_CUT_TEXT_BYTES,
         });
     }
-    let mut ignored = vec![0u8; length as usize];
-    read.read_exact(&mut ignored)
+    // Consume the body even when the bridge is disabled or the payload is over
+    // the configured bound; RFB has no per-message error, so leaving bytes on
+    // the wire would desynchronise every later client message.
+    let mut bytes = vec![0u8; length as usize];
+    read.read_exact(&mut bytes)
         .await
         .map_err(ProtocolError::io)?;
-    debug!(
-        client = context.id,
-        length, "ignored VNC ClientCutText (clipboard is not exposed by this node)"
-    );
+
+    let Some(clipboard) = context.clipboard.as_ref() else {
+        debug!(
+            client = context.id,
+            length, "ignored VNC ClientCutText (clipboard bridge is disabled)"
+        );
+        return Ok(());
+    };
+
+    if bytes.len() > context.clipboard_max_bytes {
+        context
+            .stats
+            .clipboard_rejected
+            .fetch_add(1, Ordering::Relaxed);
+        debug!(
+            client = context.id,
+            length,
+            max = context.clipboard_max_bytes,
+            "ignored VNC ClientCutText over the clipboard bound"
+        );
+        return Ok(());
+    }
+
+    let text = sanitize_clipboard_text(&decode_latin1(&bytes));
+    if !clipboard.available() {
+        context
+            .stats
+            .clipboard_rejected
+            .fetch_add(1, Ordering::Relaxed);
+        context
+            .stats
+            .clipboard_available
+            .store(false, Ordering::Relaxed);
+        debug!(
+            client = context.id,
+            length, "VNC ClientCutText ignored: clipboard backend is unavailable"
+        );
+        return Ok(());
+    }
+
+    match clipboard.write_text(text).await {
+        Ok(written) => {
+            context
+                .stats
+                .clipboard_available
+                .store(true, Ordering::Relaxed);
+            context
+                .stats
+                .record_clipboard_sync(ClipboardSyncDirection::ViewerToNode);
+            debug!(
+                client = context.id,
+                bytes = written,
+                "wrote VNC ClientCutText to the node clipboard"
+            );
+        }
+        Err(error) => {
+            context
+                .stats
+                .clipboard_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            if error.unavailable() {
+                context
+                    .stats
+                    .clipboard_available
+                    .store(false, Ordering::Relaxed);
+            }
+            // Log the stable code only; the text is never logged.
+            debug!(
+                client = context.id,
+                code = %error.code,
+                "VNC ClientCutText was not applied to the node clipboard"
+            );
+        }
+    }
     Ok(())
+}
+
+/// Send the node's current clipboard to a newly connected viewer as
+/// `ServerCutText`, when the bridge is enabled, the backend is available, and
+/// the text fits the configured bound and ISO-8859-1.
+///
+/// A clipboard failure is reported in the counters but never fails the viewer;
+/// the framebuffer session continues without a clipboard sync.
+async fn send_initial_clipboard(
+    write: &mut OwnedWriteHalf,
+    context: &ClientContext,
+    write_timeout: Duration,
+) -> Result<(), ProtocolError> {
+    let Some(clipboard) = context.clipboard.as_ref() else {
+        return Ok(());
+    };
+    if !clipboard.available() {
+        context
+            .stats
+            .clipboard_available
+            .store(false, Ordering::Relaxed);
+        debug!(
+            client = context.id,
+            "VNC clipboard bridge is unavailable; no ServerCutText sent"
+        );
+        return Ok(());
+    }
+    let text = match clipboard.read_text().await {
+        Ok(text) => text,
+        Err(error) => {
+            context
+                .stats
+                .clipboard_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            if error.unavailable() {
+                context
+                    .stats
+                    .clipboard_available
+                    .store(false, Ordering::Relaxed);
+            }
+            debug!(
+                client = context.id,
+                code = %error.code,
+                "VNC clipboard read failed; no ServerCutText sent"
+            );
+            return Ok(());
+        }
+    };
+    let Some(encoded) = encode_latin1(&text) else {
+        context
+            .stats
+            .clipboard_rejected
+            .fetch_add(1, Ordering::Relaxed);
+        debug!(
+            client = context.id,
+            "VNC clipboard text is outside ISO-8859-1; no ServerCutText sent"
+        );
+        return Ok(());
+    };
+    if encoded.len() > context.clipboard_max_bytes {
+        context
+            .stats
+            .clipboard_rejected
+            .fetch_add(1, Ordering::Relaxed);
+        debug!(
+            client = context.id,
+            bytes = encoded.len(),
+            max = context.clipboard_max_bytes,
+            "VNC clipboard text exceeds the bridge bound; no ServerCutText sent"
+        );
+        return Ok(());
+    }
+
+    let mut message = Vec::with_capacity(8 + encoded.len());
+    message.extend_from_slice(&[3, 0, 0, 0]);
+    message.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+    message.extend_from_slice(&encoded);
+    match tokio::time::timeout(write_timeout, write.write_all(&message)).await {
+        Ok(Ok(())) => {
+            context
+                .stats
+                .clipboard_available
+                .store(true, Ordering::Relaxed);
+            context
+                .stats
+                .record_clipboard_sync(ClipboardSyncDirection::NodeToViewer);
+            debug!(
+                client = context.id,
+                bytes = encoded.len(),
+                "sent VNC ServerCutText from the node clipboard"
+            );
+            Ok(())
+        }
+        Ok(Err(error)) => Err(ProtocolError::io(error)),
+        Err(_) => Err(ProtocolError::WriteTimeout(write_timeout)),
+    }
 }
 
 async fn client_write_loop(
@@ -2226,6 +2719,10 @@ async fn client_write_loop(
     let mut tight = TightStream::new(TIGHT_DEFAULT_COMPRESSION);
     let mut disabled = DisabledEncodings::default();
     let mut cursor_sent = false;
+
+    // A newly connected viewer gets the node clipboard once, before the first
+    // framebuffer update. A viewer's own ClientCutText is never echoed back.
+    send_initial_clipboard(&mut write, &context, write_timeout).await?;
 
     loop {
         if let Some(request) = pending.take() {
@@ -3990,6 +4487,89 @@ mod tests {
         }
     }
 
+    /// In-memory clipboard backend used by the clipboard bridge tests. It never
+    /// touches X11, so tests can assert exact text, call counts, and failures.
+    struct FakeClipboard {
+        text: Mutex<Option<String>>,
+        available: AtomicBool,
+        reads: AtomicUsize,
+        writes: AtomicUsize,
+        fail_read: AtomicBool,
+        fail_write: AtomicBool,
+        fail_code: &'static str,
+    }
+
+    impl FakeClipboard {
+        fn new(text: Option<&str>) -> Arc<Self> {
+            Arc::new(Self {
+                text: Mutex::new(text.map(str::to_owned)),
+                available: AtomicBool::new(true),
+                reads: AtomicUsize::new(0),
+                writes: AtomicUsize::new(0),
+                fail_read: AtomicBool::new(false),
+                fail_write: AtomicBool::new(false),
+                fail_code: "desktop.no_display",
+            })
+        }
+
+        fn unavailable() -> Arc<Self> {
+            let clipboard = Self::new(None);
+            clipboard.available.store(false, Ordering::Relaxed);
+            clipboard
+        }
+
+        fn text(&self) -> Option<String> {
+            self.text
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
+        fn writes(&self) -> usize {
+            self.writes.load(Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait]
+    impl ClipboardAccess for FakeClipboard {
+        fn available(&self) -> bool {
+            self.available.load(Ordering::Relaxed)
+        }
+
+        async fn read_text(&self) -> Result<String, ClipboardAccessError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            if self.fail_read.load(Ordering::Relaxed) {
+                return Err(ClipboardAccessError {
+                    code: self.fail_code.to_owned(),
+                    message: "fake read failure".to_owned(),
+                });
+            }
+            Ok(self.text().unwrap_or_default())
+        }
+
+        async fn write_text(&self, text: String) -> Result<usize, ClipboardAccessError> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            if self.fail_write.load(Ordering::Relaxed) {
+                return Err(ClipboardAccessError {
+                    code: self.fail_code.to_owned(),
+                    message: "fake write failure".to_owned(),
+                });
+            }
+            if !self.available() {
+                return Err(ClipboardAccessError {
+                    code: "desktop.no_display".to_owned(),
+                    message: "fake clipboard unavailable".to_owned(),
+                });
+            }
+            let bytes = text.len();
+            *self
+                .text
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(text);
+            Ok(bytes)
+        }
+    }
+
     /// A fixed RGB24 frame with tile shapes chosen to exercise every ZRLE
     /// sub-encoding: a packed palette, palette RLE, a solid tile, and plain
     /// RLE (128 distinct colours, which disables both palette forms).
@@ -5182,6 +5762,48 @@ mod tests {
         start(config, source, sink).await.expect("server starts")
     }
 
+    async fn start_server_with_clipboard(
+        source: Box<dyn CaptureSource>,
+        sink: SharedSink,
+        clipboard: Arc<dyn ClipboardAccess>,
+        max_bytes: usize,
+    ) -> VncServerHandle {
+        let config = VncServerConfig {
+            name: "Ozma test".to_owned(),
+            max_clients: 1,
+            clipboard: Some(clipboard),
+            clipboard_max_bytes: max_bytes,
+            ..VncServerConfig::default()
+        };
+        start(config, source, sink).await.expect("server starts")
+    }
+
+    async fn read_server_cut_text(stream: &mut TcpStream) -> Vec<u8> {
+        let mut header = [0u8; 4];
+        read_exact(stream, &mut header).await;
+        assert_eq!(header[0], 3, "expected ServerCutText");
+        let mut length = [0u8; 4];
+        read_exact(stream, &mut length).await;
+        let mut text = vec![0u8; u32::from_be_bytes(length) as usize];
+        read_exact(stream, &mut text).await;
+        text
+    }
+
+    async fn write_client_cut_text(stream: &mut TcpStream, bytes: &[u8]) {
+        let mut message = vec![6u8, 0, 0, 0];
+        message.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        message.extend_from_slice(bytes);
+        write_all(stream, &message).await;
+    }
+
+    async fn assert_no_server_cut_text(stream: &mut TcpStream) {
+        let mut byte = [0u8; 1];
+        match tokio::time::timeout(Duration::from_millis(200), stream.read(&mut byte)).await {
+            Err(_) => {}
+            Ok(other) => panic!("expected no ServerCutText, got {other:?}"),
+        }
+    }
+
     async fn wait_for<F: Fn() -> bool>(predicate: F) {
         tokio::time::timeout(Duration::from_secs(2), async {
             while !predicate() {
@@ -5415,6 +6037,193 @@ mod tests {
             sink.held().is_empty() && sink.events().last() == Some(&InputEvent::ReleaseAll)
         })
         .await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn client_cut_text_decodes_latin1_sanitizes_controls_and_writes_clipboard() {
+        let sink: SharedSink = Arc::new(FakeInputSink::new());
+        let clipboard = FakeClipboard::new(None);
+        let server = start_server_with_clipboard(
+            Box::new(TestSource::new(2, 2)),
+            sink,
+            clipboard.clone(),
+            64,
+        )
+        .await;
+        let mut client = TcpStream::connect(server.bound_addr()).await.unwrap();
+        handshake_client(&mut client).await;
+        // The empty current clipboard is still a valid sync.
+        assert!(read_server_cut_text(&mut client).await.is_empty());
+
+        // RFB 6143 uses ISO-8859-1: 0xE9 is `é`. NUL and 0x01 are control bytes
+        // and must not reach the desktop clipboard; tab/CR/LF remain.
+        write_client_cut_text(
+            &mut client,
+            &[b'A', 0xE9, 0x00, 0x01, b'\t', b'X', b'\r', b'\n'],
+        )
+        .await;
+
+        wait_for(|| clipboard.text().as_deref() == Some("Aé\tX\r\n")).await;
+        let status = server.clipboard_status();
+        assert!(status.enabled);
+        assert!(status.available);
+        assert_eq!(status.last_direction, ClipboardSyncDirection::ViewerToNode);
+        assert_eq!(status.from_viewers, 1);
+        assert!(status.last_sync_unix_ms > 0);
+        assert!(!format!("{status:?}").contains("Aé"));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn client_cut_text_over_the_configured_bound_is_ignored_without_desync() {
+        let sink: SharedSink = Arc::new(FakeInputSink::new());
+        let clipboard = FakeClipboard::new(None);
+        let server = start_server_with_clipboard(
+            Box::new(TestSource::new(2, 2)),
+            sink,
+            clipboard.clone(),
+            4,
+        )
+        .await;
+        let mut client = TcpStream::connect(server.bound_addr()).await.unwrap();
+        handshake_client(&mut client).await;
+        assert!(read_server_cut_text(&mut client).await.is_empty());
+
+        // Five bytes exceed the four-byte bound; the body is still consumed so
+        // the following four-byte message arrives intact.
+        write_client_cut_text(&mut client, b"abcde").await;
+        write_client_cut_text(&mut client, b"okay").await;
+
+        wait_for(|| clipboard.text().as_deref() == Some("okay")).await;
+        assert_eq!(clipboard.writes(), 1, "the oversized text was not written");
+        let status = server.clipboard_status();
+        assert_eq!(status.from_viewers, 1);
+        assert_eq!(status.rejected, 1);
+        assert_eq!(server.stats().clients_connected, 1);
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn unavailable_clipboard_ignores_cut_text_and_reports_no_sync() {
+        let sink: SharedSink = Arc::new(FakeInputSink::new());
+        let clipboard = FakeClipboard::unavailable();
+        let server = start_server_with_clipboard(
+            Box::new(TestSource::new(2, 2)),
+            sink,
+            clipboard.clone(),
+            64,
+        )
+        .await;
+        let mut client = TcpStream::connect(server.bound_addr()).await.unwrap();
+        handshake_client(&mut client).await;
+        // No ServerCutText when the backend is unavailable.
+        assert_no_server_cut_text(&mut client).await;
+
+        write_client_cut_text(&mut client, b"hello").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(clipboard.writes(), 0);
+        assert_eq!(clipboard.text(), None);
+        let status = server.clipboard_status();
+        assert!(status.enabled);
+        assert!(!status.available);
+        assert_eq!(status.last_direction, ClipboardSyncDirection::None);
+        assert_eq!(status.from_viewers, 0);
+        assert_eq!(status.to_viewers, 0);
+        assert!(status.rejected >= 1);
+        assert_eq!(server.stats().clients_connected, 1);
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn server_cut_text_is_sent_on_connect_as_latin1() {
+        let sink: SharedSink = Arc::new(FakeInputSink::new());
+        let clipboard = FakeClipboard::new(Some("hello é"));
+        let server = start_server_with_clipboard(
+            Box::new(TestSource::new(2, 2)),
+            sink,
+            clipboard.clone(),
+            64,
+        )
+        .await;
+        let mut client = TcpStream::connect(server.bound_addr()).await.unwrap();
+        handshake_client(&mut client).await;
+
+        let text = read_server_cut_text(&mut client).await;
+        assert_eq!(text, b"hello \xE9", "ServerCutText must be ISO-8859-1");
+        let status = server.clipboard_status();
+        assert!(status.available);
+        assert_eq!(status.last_direction, ClipboardSyncDirection::NodeToViewer);
+        assert_eq!(status.to_viewers, 1);
+        assert!(status.last_sync_unix_ms > 0);
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn server_cut_text_is_skipped_when_the_text_is_not_latin1() {
+        let sink: SharedSink = Arc::new(FakeInputSink::new());
+        let clipboard = FakeClipboard::new(Some("hello 😀"));
+        let server = start_server_with_clipboard(
+            Box::new(TestSource::new(2, 2)),
+            sink,
+            clipboard.clone(),
+            64,
+        )
+        .await;
+        let mut client = TcpStream::connect(server.bound_addr()).await.unwrap();
+        handshake_client(&mut client).await;
+
+        // The text cannot be represented in ISO-8859-1, so nothing is sent and
+        // no sync is claimed.
+        assert_no_server_cut_text(&mut client).await;
+        let status = server.clipboard_status();
+        assert_eq!(status.to_viewers, 0);
+        assert_eq!(status.last_direction, ClipboardSyncDirection::None);
+        assert!(status.rejected >= 1);
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_viewers_cut_text_is_not_echoed_back_to_the_same_viewer() {
+        let sink: SharedSink = Arc::new(FakeInputSink::new());
+        let clipboard = FakeClipboard::new(Some("seed"));
+        let server = start_server_with_clipboard(
+            Box::new(TestSource::new(2, 2)),
+            sink,
+            clipboard.clone(),
+            64,
+        )
+        .await;
+        let mut client = TcpStream::connect(server.bound_addr()).await.unwrap();
+        handshake_client(&mut client).await;
+        assert_eq!(read_server_cut_text(&mut client).await, b"seed");
+
+        write_client_cut_text(&mut client, b"new").await;
+        wait_for(|| clipboard.text().as_deref() == Some("new")).await;
+        assert_no_server_cut_text(&mut client).await;
+
+        let status = server.clipboard_status();
+        assert_eq!(status.from_viewers, 1);
+        assert_eq!(status.to_viewers, 1, "only the connect-time sync is sent");
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn client_cut_text_above_the_protocol_cap_closes_the_viewer() {
+        let sink: SharedSink = Arc::new(FakeInputSink::new());
+        let clipboard = FakeClipboard::new(None);
+        let server =
+            start_server_with_clipboard(Box::new(TestSource::new(2, 2)), sink, clipboard, 64).await;
+        let mut client = TcpStream::connect(server.bound_addr()).await.unwrap();
+        handshake_client(&mut client).await;
+        assert!(read_server_cut_text(&mut client).await.is_empty());
+
+        let mut header = vec![6u8, 0, 0, 0];
+        header.extend_from_slice(&(MAX_CUT_TEXT_BYTES + 1).to_be_bytes());
+        write_all(&mut client, &header).await;
+        assert_connection_closed(&mut client).await;
+        wait_for(|| server.stats().protocol_errors >= 1).await;
         server.shutdown().await;
     }
 
