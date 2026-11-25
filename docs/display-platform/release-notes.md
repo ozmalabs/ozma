@@ -17,7 +17,7 @@ the release-facing summary for the display platform work tracked in
 | M4 — Font subsystem | **Done** | Font metadata, shape/intent matching, TTF/OTF subsetting, BDF/LVGL export, previews, `fsType`/OFL licence checks, and a Latin/CJK/Arabic/Indic/icon golden corpus. WOFF2 writing needs optional `brotli`. |
 | M5 — Render adapters and themes | **Done** | Five original themes, SVG gauge/bar/dual/threshold, VU meters with attack/release, dB/s falloff, peak hold, clip latch, RMS and stereo, sparkline/history widgets, sandboxed third-party widgets, PNG render plans, LVGL C/JSON, Adaptive Cards export, and AIDA64 `/panel` generated from `WidgetIR`. Optional editor only. |
 | M6 — Importers | **Done** | AIDA64/SensorPanel, Rainmeter, Home Assistant, MagicMirror, Grafana, and Adaptive Cards import/export with lossless capture and private-by-default storage. |
-| M7 — Hardening and rollout | **Done (except fuzz)** | Licence/checksum/sandbox gate, Ed25519 trust store and signing CLI, browser sandbox/CSP, migration tooling, performance benchmarks, targeted CI, environment bootstrap for Connect, operator docs, and these release notes. Default-on rollout and marketplace/review UI remain product decisions. |
+| M7 — Hardening and rollout | **Done** | Licence/checksum/sandbox gate, Ed25519 trust store and signing CLI, browser sandbox/CSP, bounded fuzz regression, migration tooling, performance benchmarks, targeted CI, environment bootstrap for Connect, operator docs, and these release notes. Default-on rollout and marketplace/review UI remain product decisions. |
 
 Treat “mostly done” as usable contracts and foundations, not a finished
 end-user workflow. See the execution plan §6.1 for the live gap list.

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import re
+
 from typing import Any, Mapping
 
 from .base import (
@@ -24,6 +25,9 @@ from .base import (
     make_source_document,
     make_widget,
 )
+
+#: Hard cap before JSON parsing.
+MAX_SOURCE_BYTES = 8 * 1024 * 1024
 
 FORMAT = "grafana_json"
 KIND_DASHBOARD = "dashboard"
@@ -285,7 +289,12 @@ class GrafanaImporter(BaseImporter):
         data: bytes,
         context: ImportContext,
     ) -> ImportResult:
-        document = _load_json(data)
+        raw = bytes(data)
+        if len(raw) > MAX_SOURCE_BYTES:
+            raise ImportError(
+                f"Grafana source is {len(raw)} bytes; limit is {MAX_SOURCE_BYTES}"
+            )
+        document = _load_json(raw)
         if not isinstance(document, Mapping):
             raise ImportError("Grafana source must be a JSON object")
         dashboard, source_kind, wrapper = self._classify(document)

@@ -115,6 +115,7 @@ jobs:
             tests/unit/controller/test_display_golden.py \
             tests/unit/controller/test_display_perf.py \
             tests/unit/controller/test_migrate_display_packs.py \
+            tests/unit/controller/test_display_fuzz.py \
             tests/unit/controller/test_display_license_gate.py \
             tests/unit/connect/test_assets.py \
             tests/unit/connect/test_asset_sync.py \
@@ -160,6 +161,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Test display IR and fonts
         run: cargo test -p ozma-display-ir -p ozma-fonts
+      - name: Bounded parser fuzz regression
+        run: cargo test -p ozma-display-ir --test fuzz_extract
       - name: Clippy (no dependencies)
         run: |
           cargo clippy -p ozma-display-ir -p ozma-fonts --all-targets \

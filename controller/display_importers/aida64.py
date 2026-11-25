@@ -38,6 +38,8 @@ MAX_MEMBERS = 4096
 MAX_MEMBER_SIZE = 64 * 1024 * 1024
 MAX_TOTAL_UNCOMPRESSED = 256 * 1024 * 1024
 MAX_COMPRESSION_RATIO = 1000
+#: Hard cap for direct (non-archive) XML/JSON/HTML source payloads.
+MAX_SOURCE_BYTES = 8 * 1024 * 1024
 
 _SCRIPT_SUFFIXES = {
     ".js",
@@ -171,6 +173,10 @@ class Aida64Importer(BaseImporter):
     ) -> ImportResult:
         source_format = self._source_format(name)
         raw = bytes(data)
+        if len(raw) > MAX_SOURCE_BYTES:
+            raise ImportError(
+                f"AIDA64 source is {len(raw)} bytes; limit is {MAX_SOURCE_BYTES}"
+            )
         source_path = name or f"source{self.suffixes[0]}"
         original = ImportAsset(
             path=source_path, data=raw, kind="original", executable=False, sandbox="none"
@@ -369,9 +375,9 @@ class Aida64Importer(BaseImporter):
     def _read_zip(self, raw: bytes) -> list[ImportAsset]:
         try:
             archive = zipfile.ZipFile(io.BytesIO(raw))
-        except zipfile.BadZipFile as exc:
+            infos = archive.infolist()
+        except (zipfile.BadZipFile, OSError, ValueError) as exc:
             raise ImportError(f"invalid AIDA64 archive: {exc}") from exc
-        infos = archive.infolist()
         if len(infos) > MAX_MEMBERS:
             raise ImportError(
                 f"archive has {len(infos)} members; limit is {MAX_MEMBERS}"
@@ -397,8 +403,13 @@ class Aida64Importer(BaseImporter):
                 raise ImportError(
                     "archive expands beyond the total uncompressed size limit"
                 )
-            with archive.open(info) as handle:
-                content = handle.read(MAX_MEMBER_SIZE + 1)
+            try:
+                with archive.open(info) as handle:
+                    content = handle.read(MAX_MEMBER_SIZE + 1)
+            except (zipfile.BadZipFile, OSError, ValueError) as exc:
+                raise ImportError(
+                    f"invalid archive member {info.filename}: {exc}"
+                ) from exc
             if len(content) > MAX_MEMBER_SIZE:
                 raise ImportError(f"archive member too large: {info.filename}")
             actual_uncompressed += len(content)

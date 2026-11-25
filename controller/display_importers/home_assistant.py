@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import re
+
 from typing import Any, Mapping
 
 import yaml
@@ -24,6 +25,9 @@ from .base import (
     make_source_document,
     make_widget,
 )
+
+#: Hard cap before YAML parsing.
+MAX_SOURCE_BYTES = 4 * 1024 * 1024
 
 _CARD_KINDS = {
     "gauge": "gauge",
@@ -160,6 +164,10 @@ class HomeAssistantImporter(BaseImporter):
         context: ImportContext,
     ) -> ImportResult:
         raw = bytes(data)
+        if len(raw) > MAX_SOURCE_BYTES:
+            raise ImportError(
+                f"Home Assistant source is {len(raw)} bytes; limit is {MAX_SOURCE_BYTES}"
+            )
         text = raw.decode("utf-8-sig", errors="replace")
         source_path = name or "dashboard.yaml"
         original = ImportAsset(
@@ -178,6 +186,10 @@ class HomeAssistantImporter(BaseImporter):
             raise ImportError("unsafe or unsupported YAML tag rejected")
         try:
             document = yaml.safe_load(text)
+        except RecursionError as exc:
+            raise ImportError(
+                "Home Assistant YAML nesting exceeds the parser limit"
+            ) from exc
         except yaml.YAMLError as exc:
             raise ImportError(f"unsafe or invalid Home Assistant YAML: {exc}") from exc
         if document is None:

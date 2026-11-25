@@ -13,6 +13,7 @@ from __future__ import annotations
 import configparser
 import math
 import re
+
 from typing import Any, Mapping
 
 from .base import (
@@ -25,6 +26,9 @@ from .base import (
     make_source_document,
     make_widget,
 )
+
+#: Hard cap before decoding/parsing a skin.
+MAX_SOURCE_BYTES = 4 * 1024 * 1024
 
 _METER_KINDS = {
     "string": "text",
@@ -198,6 +202,10 @@ class RainmeterImporter(BaseImporter):
         context: ImportContext,
     ) -> ImportResult:
         raw = bytes(data)
+        if len(raw) > MAX_SOURCE_BYTES:
+            raise ImportError(
+                f"Rainmeter source is {len(raw)} bytes; limit is {MAX_SOURCE_BYTES}"
+            )
         text = raw.decode("utf-8-sig", errors="replace")
         source_path = name or "skin.ini"
         original = ImportAsset(

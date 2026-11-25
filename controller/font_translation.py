@@ -33,6 +33,8 @@ WEIGHT_ROLE = 0.07
 WEIGHT_FORMAT = 0.05
 
 SHA256_HEX_LEN = 64
+#: Hard cap for direct font metadata parsing (distinct from the API import cap).
+MAX_SOURCE_BYTES = 32 * 1024 * 1024
 
 _BITMAP_FORMATS = frozenset({"bdf", "pcf", "bitmap", "lvgl_c"})
 
@@ -411,6 +413,10 @@ class FontMetadata:
         private: bool = True,
         face_index: int = 0,
     ) -> "FontMetadata":
+        if len(data) > MAX_SOURCE_BYTES:
+            raise FontError(
+                f"font source is {len(data)} bytes; limit is {MAX_SOURCE_BYTES}"
+            )
         fmt = _detect_format(data)
         if fmt in {"woff", "woff2"}:
             raise FontUnsupportedError(
@@ -420,7 +426,7 @@ class FontMetadata:
             raise FontUnsupportedError(
                 "BDF fonts do not use SFNT metadata; provide a FontAsset directly"
             )
-        return _parse_font(
+        return _parse_font_guarded(
             data=data,
             path=None,
             id=id,
@@ -446,7 +452,11 @@ class FontMetadata:
             data = path.read_bytes()
         except OSError as exc:  # pragma: no cover - filesystem dependent
             raise FontError(f"failed to read font file {path}: {exc}") from exc
-        return _parse_font(
+        if len(data) > MAX_SOURCE_BYTES:
+            raise FontError(
+                f"font source is {len(data)} bytes; limit is {MAX_SOURCE_BYTES}"
+            )
+        return _parse_font_guarded(
             data=data,
             path=str(path),
             id=id,
@@ -1754,6 +1764,21 @@ def _detect_format(data: bytes) -> str:
 
 def _sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _parse_font_guarded(**kwargs: Any) -> FontMetadata:
+    """Run :func:`_parse_font` and translate any parser failure to ``FontError``.
+
+    fontTools raises a mixture of ``KeyError``, ``AssertionError``, and
+    ``struct.error`` for hostile/truncated SFNT inputs. Importers must see one
+    typed error, never an internal parser exception.
+    """
+    try:
+        return _parse_font(**kwargs)
+    except FontError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - parser errors vary by version
+        raise FontError(f"failed to parse font: {exc}") from exc
 
 
 def _parse_font(

@@ -125,7 +125,7 @@ M0 must land before B/C/D/E merge to avoid schema churn.
 | M4 Font subsystem | **Done** | Rust + Python metadata, PANOSE/metrics/scripts/features, `fsType` gate, deterministic matching, reports; TTF/OTF subsetting, BDF, LVGL C, previews; Latin/CJK/Arabic/Indic/icon golden corpus | WOFF2 write path requires optional `brotli`; live shaping render comparison |
 | M5 Render adapters/themes | **Done** | Five original themes + hashed pack; gauge/bar/dual/threshold, VU ballistics (attack/release, dB/s falloff, peak hold, clip latch, RMS), and sparkline/history widgets; sandboxed third-party widgets; PNG render plans; LVGL C/JSON; Adaptive Cards; AIDA64 `/panel` generated from `WidgetIR` | Optional uPlot/gridstack editor; AIDA64 native Windows shared-memory/registry emulation |
 | M6 Importers | **Done** | AIDA64/SensorPanel, Rainmeter, Home Assistant, MagicMirror, Grafana, Adaptive Cards import/export; private import store + API; lossless capture and IR validation | Native AIDA64 `.rslcd` remains best-effort/opaque (`WGT-070`) |
-| M7 Hardening | **Done (except optional)** | Feature flags/runtime, licence/checksum/sandbox gate, Ed25519 trust + signing CLI, browser sandbox/CSP, migration tooling, perf benchmarks, targeted CI, Connect bootstrap, release notes | Fuzz regression (in progress); default-on rollout decision; marketplace/review UI |
+| M7 Hardening | **Done** | Feature flags/runtime, licence/checksum/sandbox gate, Ed25519 trust + signing CLI, browser sandbox/CSP, bounded fuzz regression, migration tooling, perf benchmarks, targeted CI, Connect bootstrap, release notes | Default-on rollout decision; marketplace/review UI |
 
 Known gaps for the next slice:
 
