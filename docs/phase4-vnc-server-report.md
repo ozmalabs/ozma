@@ -265,3 +265,41 @@ All passed; rustfmt exited 0.
   endpoint. They should be updated in the separate documentation/parity pass.
 - **Optional live tooling.** The live smoke used `--capture-provider fake`; no
   hardware V4L2, QMP, D-Bus, or guest VNC source was exercised in this task.
+
+## Live re-validation with a QMP source (2026-11-25)
+
+This section records a later live check against the real demo QMP head; full
+commands and the combined WebRTC/VNC matrix are in
+`docs/phase4-live-cutover-report.md`, section
+"WebRTC scaling + VNC server re-validation (2026-11-25)".
+
+Environment: HEAD `a7586a3`, `ozma-node` 0.1.0, controller venv at
+`/tmp/opencode/webrtc-vnc-reval-venv` (system Python 3.14 + offline uv-cache
+packages). The node used the real `--qmp-socket /tmp/ozma-vm1.qmp` capture and
+QMP input sink:
+
+```bash
+RUST_LOG='info,ozma_input=debug' ./target/debug/ozma-node \
+  --name vnc1 --profile vm --qmp-socket /tmp/ozma-vm1.qmp \
+  --hid-udp-port 17331 --http-port 17382 \
+  --capture-provider qmp --input-provider qmp \
+  --vnc-server --vnc-server-port 0 --cap hid,video
+```
+
+Results:
+
+| Check | Result | Evidence |
+|---|---|---|
+| OS-assigned port is the registered port | **PASS** | bound `127.0.0.1:38185`; registration `{"state":"configured","host":"127.0.0.1","port":38185}`; `ss` matched |
+| Real RFB 3.8 client | **PASS** | controller `asyncvnc` connected, two frames `(800,1280,4)` |
+| RFB key/pointer input reaches the node | **PASS** | `QMP input events sent on shared client` x11; guest screen OCR `localhost login: ab` / `Password:` |
+| Controller discovery of served VNC | **PASS** | `/api/v1/nodes` → `vnc1._ozma._udp.local.` `vnc_host=127.0.0.1`, `vnc_port=38185` |
+| Controller screen/read consumer | **PASS (transport)** | `POST /api/v1/screen/read` 200, 27 regions; bitmap OCR text is garbage on the VGA console (screen_reader limitation, tesseract reads the same frame) |
+| Controller screen/vectors consumer | **PASS** | 200 `{"width":1280,"height":800,...}` |
+| Registration retracted when listener stops | **FAIL** | bound 45211 then source ended and listener stopped, but `/api/v1/connection.registration.vnc` still advertised 45211 with no listener |
+
+The last row is a live reproduction of the **Startup-time registration** gap
+listed above: the endpoint is correct at bind time, but a later capture-source
+failure stops the listener without retracting the advertisement. No product
+source was changed and nothing was committed. The VNC node, controller, QEMU
+VMs, sockets, temporary venv, and artifacts were cleaned up after the run.

@@ -151,6 +151,8 @@ also never touch a real UDC, ConfigFS mount, or block device.
 | RFB/VNC server | Partial | Opt-in `--vnc-server` RFB 3.8, Security None, loopback default, Raw encoding, real geometry, key/pointer into the input sink, bounded viewers/slow-client coalescing; registration advertises the bound endpoint only while listening. Live asyncvnc + TigerVNC. No auth/TLS or Tight/ZRLE. See [`phase4-vnc-server-report.md`](phase4-vnc-server-report.md). |
 | USB/IP wire protocol | Partial | Typed DEVLIST/IMPORT codec (`0x0111`), bounded server with out-of-band credentials and existing authorization, attach only from a real kernel vhci port; loopback TCP test. No URB data path or in-process TLS. See [`phase4-usbip-protocol-report.md`](phase4-usbip-protocol-report.md). |
 | Per-seat display isolation | Partial | Opt-in `--seat-display shared|xvfb|xephyr`, per-seat Xvfb with private auth, real X11 handshake, crash/restart/cleanup and nested-display typed notes. Live two-seat smoke. No DRM leasing/compositor/physical handoff. See [`phase4-multiseat-display-report.md`](phase4-multiseat-display-report.md). |
+| Multi-seat node report | Partial | Opt-in `--multiseat --seats-file`, public read-only `GET /api/v1/seats`, persisted plan/availability, `node_seat`, explicit external lifecycle; typed 503 on store failure. Controller grouping consumes it with typed `node_errors`. No node-owned start/stop. See [`phase4-multiseat-node-report.md`](phase4-multiseat-node-report.md). |
+| USB/IP bulk data path | Partial | Typed SUBMIT/RET/UNLINK codec plus bounded relay (unlink, cap, idle timeout, cleanup) with negative-status replies; payloads redacted from Debug. Not wired into the server/import path; no kernel endpoint adapter. See [`phase4-usbip-data-report.md`](phase4-usbip-data-report.md). |
 
 Verification added by this work:
 
@@ -233,7 +235,7 @@ authentication, and Xpra video are being extended in separate workstreams.
 ## Verification
 
 ```bash
-cargo test --workspace                                   # 2404 passed, 42 ignored (current)
+cargo test --workspace                                   # 2442 passed, 42 ignored (current)
 cargo test -p ozma-node --test parity                    # Python/controller parity baseline (16)
 cargo test -p ozma-node --lib                            # node API, compat, session unit tests (136, 2 ignored)
 cargo test -p ozma-qmp -p ozma-input -p ozma-power       # QMP, uinput/QMP sinks, power (166)

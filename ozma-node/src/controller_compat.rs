@@ -2549,6 +2549,9 @@ pub struct ConnectionState {
     pub snapshot: Option<SnapshotControl>,
     /// Bounded host sampler for the public `/agent/metrics` document.
     pub metrics: crate::agent_metrics::AgentMetricsSampler,
+    /// Optional deep hardware sampler used to enrich `/agent/metrics` with
+    /// the documented AIDA64 sensor IDs.
+    pub hardware: Option<crate::hardware::HardwareState>,
     /// Controller-facing display outputs (VM consoles or raw host outputs).
     pub display_outputs: serde_json::Value,
     /// Live capture console/provider and any multi-console limitation.
@@ -2568,9 +2571,62 @@ pub struct ConnectionState {
     pub multi_console_webrtc: Option<MultiConsoleWebrtc>,
     /// Live capture transport/source for `/api/v1/connection`.
     pub capture: CaptureStatus,
+    /// Optional live VNC registration state. When managed, a stopped internal
+    /// listener stops being advertised instead of leaving a dead port in the
+    /// registration document. External QEMU endpoints remain the fallback.
+    pub vnc_registration: Option<VncRegistrationState>,
+}
+
+/// Registration view of the optional internal RFB listener.
+#[derive(Clone, Debug, Default)]
+pub struct VncRegistrationState {
+    live: Arc<std::sync::RwLock<Option<(String, u16)>>>,
+    external: Option<(String, u16)>,
+}
+
+impl VncRegistrationState {
+    /// Manage a node's VNC registration: `live` is cleared when the internal
+    /// listener stops; `external` is the configured QEMU endpoint fallback.
+    pub fn new(live: Option<(String, u16)>, external: Option<(String, u16)>) -> Self {
+        Self {
+            live: Arc::new(std::sync::RwLock::new(live)),
+            external,
+        }
+    }
+
+    /// Shared slot a VNC listener watcher clears on stop.
+    pub fn live_handle(&self) -> Arc<std::sync::RwLock<Option<(String, u16)>>> {
+        self.live.clone()
+    }
+
+    /// Currently advertised endpoint: live listener first, then external.
+    pub fn resolved(&self) -> Option<(String, u16)> {
+        self.live
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .or_else(|| self.external.clone())
+    }
 }
 
 impl ConnectionState {
+    /// Registration document for `/api/v1/connection`, applying live VNC state.
+    ///
+    /// Only nodes that explicitly install [`VncRegistrationState`] are managed;
+    /// everything else keeps the startup [`crate::registration::RegistrationExtras`].
+    pub fn registration_snapshot(&self) -> crate::registration::RegistrationExtras {
+        let mut registration = self.info.registration.clone();
+        if let Some(vnc) = self.vnc_registration.as_ref() {
+            registration.vnc = match vnc.resolved() {
+                Some((host, port)) => {
+                    crate::registration::VncRegistration::Configured { host, port }
+                }
+                None => crate::registration::VncRegistration::NotConfigured,
+            };
+        }
+        registration
+    }
+
     pub fn new(info: ConnectionInfo, stats: CompatStats) -> Self {
         Self {
             info,
@@ -2587,6 +2643,7 @@ impl ConnectionState {
             webrtc: None,
             snapshot: None,
             metrics: crate::agent_metrics::AgentMetricsSampler::default(),
+            hardware: None,
             display_outputs: serde_json::json!([]),
             display_capture: DisplayCaptureStatus::default(),
             display_control: None,
@@ -2594,6 +2651,7 @@ impl ConnectionState {
             multi_console_hls: None,
             multi_console_webrtc: None,
             capture: CaptureStatus::default(),
+            vnc_registration: None,
         }
     }
 
@@ -2604,6 +2662,16 @@ impl ConnectionState {
     /// with no kind/source instead of naming a source that does not exist.
     pub fn with_capture(mut self, capture: CaptureStatus) -> Self {
         self.capture = capture;
+        self
+    }
+
+    /// Attach the deep hardware sampler used by `/agent/metrics`.
+    ///
+    /// The sampler is shared with the `/hardware` route and the opt-in AIDA64
+    /// listener, so its short cache prevents three callers from running
+    /// SMART/NVMe/nvidia-smi collection concurrently.
+    pub fn with_hardware(mut self, hardware: crate::hardware::HardwareState) -> Self {
+        self.hardware = Some(hardware);
         self
     }
 
@@ -2767,6 +2835,13 @@ impl ConnectionState {
     /// not start and reports `failed` plus `webrtc_error`.
     pub fn with_webrtc(mut self, webrtc: Option<WebRtcControl>) -> Self {
         self.webrtc = webrtc;
+        self
+    }
+
+    /// Install the live VNC registration view (internal listener + external
+    /// fallback). Without this the startup registration document is unchanged.
+    pub fn with_vnc_registration(mut self, vnc: VncRegistrationState) -> Self {
+        self.vnc_registration = Some(vnc);
         self
     }
 
@@ -3172,7 +3247,7 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
         webrtc_audio_source,
         display_outputs: display.display_outputs,
         display_capture: display.display_capture,
-        registration: info.registration.clone(),
+        registration: state.registration_snapshot(),
         multi_console_hls,
         multi_console_webrtc,
         capture: state.capture.clone(),
@@ -3433,7 +3508,8 @@ async fn node_status(State(state): State<ConnectionState>) -> Json<ConnectionRes
 /// named in `unavailable`; the route is public (merged after the bearer guard)
 /// because the controller's poller sends no node token.
 async fn agent_metrics(State(state): State<ConnectionState>) -> Response {
-    let document = state.metrics.collect(&state.info.node_id);
+    let mut document = state.metrics.collect(&state.info.node_id);
+
     (
         [
             (header::CONTENT_TYPE, "application/json"),
@@ -6608,6 +6684,69 @@ mod tests {
 
         task.abort();
         let _ = task.await;
+    }
+
+    #[test]
+    fn live_vnc_registration_retracts_and_falls_back_to_external() {
+        let extras = crate::registration::RegistrationExtras::resolve(
+            None,
+            Some("10.0.0.5"),
+            Some(5901),
+            None,
+        );
+        let info = ConnectionInfo::new(
+            "node-a._ozma._udp.local.",
+            "hardware",
+            7382,
+            7384,
+            7331,
+            SINK_FAKE_RECORDING,
+        )
+        .with_registration(extras);
+        let vnc = VncRegistrationState::new(
+            Some(("127.0.0.1".to_owned(), 40_000)),
+            Some(("10.0.0.5".to_owned(), 5901)),
+        );
+        let live = vnc.live_handle();
+        let state = ConnectionState::new(info, CompatStats::default()).with_vnc_registration(vnc);
+
+        match state.registration_snapshot().vnc {
+            crate::registration::VncRegistration::Configured { host, port } => {
+                assert_eq!((host.as_str(), port), ("127.0.0.1", 40_000));
+            }
+            other => panic!("expected the live listener, got {other:?}"),
+        }
+        *live
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        match state.registration_snapshot().vnc {
+            crate::registration::VncRegistration::Configured { host, port } => {
+                assert_eq!((host.as_str(), port), ("10.0.0.5", 5901));
+            }
+            other => panic!("expected the external fallback, got {other:?}"),
+        }
+
+        let no_external = VncRegistrationState::new(Some(("127.0.0.1".to_owned(), 1)), None);
+        let live = no_external.live_handle();
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-b._ozma._udp.local.",
+                "desktop",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_vnc_registration(no_external);
+        *live
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        assert!(matches!(
+            state.registration_snapshot().vnc,
+            crate::registration::VncRegistration::NotConfigured
+        ));
     }
 
     #[tokio::test]

@@ -50,7 +50,7 @@ except (ImportError, Exception):
     _GRAPHQL_AVAILABLE = False
 
 from state import AppState, NodeInfo
-from seats import group_seats
+import seats as seat_groups
 from node_auth import node_api_headers, node_auth_error
 from permissions import (
     check_node_permission, check_destructive_warnings, warnings_to_dict,
@@ -1133,10 +1133,19 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
 
         Grouping prefers an explicit ``seat_id``/``parent_node_id`` and falls
         back to the ``<machine>-seat-<n>`` naming convention used by
-        ``ozma-multiseat``. Unrelated nodes stay in ``unseated_node_ids`` and
-        are never reported as seats. No tokens or secrets are included.
+        ``ozma-multiseat``. When a node serves its own read-only
+        ``/api/v1/seats`` report, that explicit persisted identity is consumed;
+        older nodes and nodes without the route preserve the historical
+        grouping. A node's typed seat-store error is passed through in
+        ``node_errors`` instead of being flattened into a transport failure.
+        Unrelated nodes stay in ``unseated_node_ids`` and are never reported as
+        seats. No tokens or secrets are included.
         """
-        return group_seats(state.nodes.values())
+        return await seat_groups.group_seats_with_node_reports(
+            state.nodes.values(),
+            seat_groups.fetch_node_seat_report,
+            fallback_token=_node_api_token,
+        )
 
     # ── Per-node bearer-token store / rotation ────────────────────────────────
     # Metadata only: tokens are never included here. The one exception is the

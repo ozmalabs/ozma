@@ -223,6 +223,9 @@ pub struct VncServerHandle {
     stats: Arc<VncStats>,
     cancel: CancellationToken,
     task: Option<tokio::task::JoinHandle<()>>,
+    /// Cleared as soon as the listener task exits (including capture failure),
+    /// so registration can stop advertising a dead port without a restart.
+    listening: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl fmt::Debug for VncServerHandle {
@@ -252,7 +255,15 @@ impl VncServerHandle {
 
     /// True until [`VncServerHandle::shutdown`] is called or the listener fails.
     pub fn is_listening(&self) -> bool {
-        !self.cancel.is_cancelled() && self.task.as_ref().is_some_and(|task| !task.is_finished())
+        self.listening.load(std::sync::atomic::Ordering::SeqCst)
+            && !self.cancel.is_cancelled()
+            && self.task.as_ref().is_some_and(|task| !task.is_finished())
+    }
+
+    /// Shared liveness flag, for a registration watcher that does not own the
+    /// handle.
+    pub fn live_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.listening.clone()
     }
 
     /// Controller-facing host/port. A wildcard bind is replaced with the
@@ -275,6 +286,8 @@ impl VncServerHandle {
     /// wait for the listener task to finish.
     pub async fn shutdown(mut self) {
         self.cancel.cancel();
+        self.listening
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         if let Some(task) = self.task.take() {
             let _ = task.await;
         }
@@ -485,6 +498,8 @@ pub async fn start(
     ));
 
     let supervisor_cancel = cancel.clone();
+    let listening = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let listening_task = listening.clone();
     let task = tokio::spawn(async move {
         tokio::select! {
             _ = supervisor_cancel.cancelled() => {}
@@ -498,6 +513,7 @@ pub async fn start(
         if tokio::time::timeout(SHUTDOWN_GRACE, drain).await.is_err() {
             tasks.shutdown().await;
         }
+        listening_task.store(false, std::sync::atomic::Ordering::SeqCst);
     });
 
     info!(
@@ -513,6 +529,7 @@ pub async fn start(
         stats,
         cancel,
         task: Some(task),
+        listening,
     })
 }
 

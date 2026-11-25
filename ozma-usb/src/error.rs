@@ -144,6 +144,14 @@ pub enum UsbError {
     #[error("invalid USB/IP control frame: {0}")]
     UsbIpProtocol(#[from] crate::usbip_protocol::UsbIpProtocolError),
 
+    /// A USB/IP URB data-path frame was malformed, oversized, or unsupported.
+    #[error("invalid USB/IP URB frame: {0}")]
+    UsbIpUrb(#[from] crate::usbip_urb::UsbIpUrbError),
+
+    /// A USB/IP data-relay state-machine operation failed.
+    #[error("USB/IP data relay: {0}")]
+    UsbIpRelay(#[from] crate::usbip_relay::UsbIpRelayError),
+
     /// An IMPORT named a bus id that this daemon does not export.
     #[error("USB/IP device {bus_id:?} is not exported by this daemon")]
     UsbIpUnknownDevice {
@@ -453,6 +461,8 @@ impl UsbError {
             Self::UsbIpDaemonStopped => "usbip-daemon-stopped",
             Self::UsbIpConnectionLimit { .. } => "usbip-connection-limit",
             Self::UsbIpProtocol(_) => "usbip-protocol",
+            Self::UsbIpUrb(_) => "usbip-urb",
+            Self::UsbIpRelay(_) => "usbip-relay",
             Self::UsbIpUnknownDevice { .. } => "usbip-unknown-device",
             Self::Protocol { .. } => "protocol-error",
             Self::ConfigFs { .. } => "configfs-io",

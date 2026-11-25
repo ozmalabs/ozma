@@ -21,14 +21,24 @@ never reported as seats.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
 import time
+import urllib.error
+import urllib.request
 from typing import Any, Iterable
+
+from node_auth import node_api_headers
 
 # Nodes that miss their re-registration window stay in state briefly while
 # discovery evicts them. Report those as offline in the read-only view rather
 # than pretending the seat is healthy.
 DEFAULT_OFFLINE_AFTER = 180.0
+
+# Read-only persisted seat report served by newer `ozma-node` builds.
+NODE_SEATS_PATH = "/api/v1/seats"
+DEFAULT_NODE_SEAT_TIMEOUT = 1.5
 
 _MDNS_SUFFIXES = (
     "._ozma._udp.local.",
@@ -67,10 +77,17 @@ def _parent_machine(node: Any) -> str:
     return normalize_node_id(getattr(node, "parent_node_id", "") or "")
 
 
-def seat_identity(node: Any) -> dict[str, Any] | None:
-    """Derive a seat identity for *node*, or ``None`` for ordinary nodes."""
+def seat_identity(node: Any, *, seat_id_override: str | None = None) -> dict[str, Any] | None:
+    """Derive a seat identity for *node*, or ``None`` for ordinary nodes.
+
+    ``seat_id_override`` is an explicit identity discovered from the node's own
+    read-only ``/api/v1/seats`` document. It is used only when non-empty and has
+    the same authority as an explicit ``seat_id`` field.
+    """
     node_id = normalize_node_id(getattr(node, "id", "") or "")
-    explicit = normalize_node_id(getattr(node, "seat_id", "") or "")
+    explicit = normalize_node_id(
+        seat_id_override or getattr(node, "seat_id", "") or ""
+    )
     parent = _parent_machine(node)
 
     # An explicit seat id is authoritative membership. Parse it for the
@@ -142,7 +159,12 @@ def _is_online(node: Any, now: float, offline_after: float) -> bool:
     return (now - last_seen) <= offline_after
 
 
-def _seat_entry(node: Any, identity: dict[str, Any], online: bool) -> dict[str, Any]:
+def _seat_entry(
+    node: Any,
+    identity: dict[str, Any],
+    online: bool,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     outputs = _display_outputs(node)
     entry: dict[str, Any] = {
         "node_id": getattr(node, "id", ""),
@@ -170,6 +192,8 @@ def _seat_entry(node: Any, identity: dict[str, Any], online: bool) -> dict[str, 
     parent = getattr(node, "parent_node_id", "") or ""
     if parent:
         entry["parent_node_id"] = parent
+    if extra:
+        entry.update(extra)
     return entry
 
 
@@ -183,25 +207,39 @@ def group_seats(
     *,
     now: float | None = None,
     offline_after: float = DEFAULT_OFFLINE_AFTER,
+    seat_id_overrides: dict[str, str] | None = None,
+    node_extras: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Group already-registered nodes into read-only seat groups.
+
+    ``seat_id_overrides`` and ``node_extras`` come from a node's own read-only
+    ``/api/v1/seats`` report when one was present. Without them the result is
+    exactly the historical name/metadata-based grouping.
 
     The return value is JSON-safe and never includes node API tokens or other
     secrets: only the display/network fields needed by the dashboard.
     """
     moment = time.monotonic() if now is None else now
+    overrides = seat_id_overrides or {}
+    extras = node_extras or {}
     grouped: dict[str, dict[str, Any]] = {}
     unseated: list[str] = []
 
     for node in nodes:
-        identity = seat_identity(node)
+        node_id = getattr(node, "id", "")
+        identity = seat_identity(node, seat_id_override=overrides.get(node_id))
         if identity is None:
-            unseated.append(getattr(node, "id", ""))
+            unseated.append(node_id)
             continue
         machine = identity["machine"] or "unknown"
         group = grouped.setdefault(machine, {"machine": machine, "seats": []})
         group["seats"].append(
-            _seat_entry(node, identity, _is_online(node, moment, offline_after))
+            _seat_entry(
+                node,
+                identity,
+                _is_online(node, moment, offline_after),
+                extras.get(node_id),
+            )
         )
 
     groups: list[dict[str, Any]] = []
@@ -232,3 +270,194 @@ def group_seats(
         "offline_count": total_seats - total_online,
         "unseated_node_ids": sorted(unseated),
     }
+
+
+def _typed_node_error(payload: Any, status: int) -> dict[str, Any]:
+    """Preserve a node's typed error body instead of flattening it to 502."""
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            code = str(error.get("code") or "node_error")
+            message = str(error.get("message") or "")
+            return {"code": code, "message": message}
+        if isinstance(error, str) and error.strip():
+            return {"code": "node_error", "message": error.strip()}
+        detail = payload.get("detail")
+        if isinstance(detail, str) and detail.strip():
+            return {"code": "node_error", "message": detail.strip()}
+    if status:
+        return {"code": "node_error", "message": f"node returned HTTP {status}"}
+    return {"code": "node_unreachable", "message": "node seat report unavailable"}
+
+
+async def fetch_node_seat_report(
+    node: Any,
+    *,
+    fallback_token: str = "",
+    timeout: float = DEFAULT_NODE_SEAT_TIMEOUT,
+) -> tuple[int, Any]:
+    """Fetch a node's read-only persisted seat report.
+
+    ``(0, None)`` means the node has no HTTP API, so the caller keeps the
+    historical grouping with no error. A reachable node's typed HTTP body is
+    returned unchanged with its status. A transport failure returns
+    ``(0, {"error": ...})`` so it can be reported without dropping the node.
+    """
+    api_port = getattr(node, "api_port", None)
+    host = (getattr(node, "host", "") or "").strip()
+    if not api_port or not host:
+        return (0, None)
+    url = f"http://{host}:{api_port}{NODE_SEATS_PATH}"
+    headers = node_api_headers(node, fallback_token)
+
+    def _fetch() -> tuple[int, Any]:
+        request = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = response.read()
+                try:
+                    return response.status, json.loads(body or b"null")
+                except ValueError:
+                    return response.status, body.decode("utf-8", "replace")
+        except urllib.error.HTTPError as error:
+            body = error.read()
+            try:
+                payload = json.loads(body)
+            except ValueError:
+                payload = body.decode("utf-8", "replace")
+            return error.code, payload
+        except Exception as error:  # noqa: BLE001 - typed below, never an HTTPException
+            return 0, {
+                "ok": False,
+                "error": {"code": "node_unreachable", "message": str(error)},
+            }
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _fetch)
+
+
+def _node_seat_override(report: Any) -> tuple[str, dict[str, Any] | None]:
+    """Return ``(seat_id, seat_document)`` from a successful node report."""
+    if not isinstance(report, dict) or report.get("configured") is not True:
+        return ("", None)
+    seat = report.get("node_seat")
+    if not isinstance(seat, dict):
+        seat = None
+    seat_id = ""
+    if seat is not None:
+        seat_id = normalize_node_id(seat.get("seat_id"))
+    if not seat_id:
+        seat_id = normalize_node_id(report.get("seat_id"))
+    return (seat_id, seat)
+
+
+def _multiseat_extra(report: dict[str, Any], seat: dict[str, Any] | None) -> dict[str, Any]:
+    status = report.get("status")
+    plan_seat_count = None
+    if isinstance(status, dict) and isinstance(status.get("seat_count"), int):
+        plan_seat_count = status["seat_count"]
+    extra: dict[str, Any] = {
+        "mode": report.get("mode") if isinstance(report.get("mode"), str) else "read-only",
+        "plan_seat_count": plan_seat_count,
+    }
+    if seat is not None:
+        if isinstance(seat.get("state"), str):
+            extra["state"] = seat["state"]
+        if isinstance(seat.get("available"), bool):
+            extra["available"] = seat["available"]
+    return extra
+
+
+async def group_seats_with_node_reports(
+    nodes: Iterable[Any],
+    fetch_report: Any = fetch_node_seat_report,
+    *,
+    now: float | None = None,
+    offline_after: float = DEFAULT_OFFLINE_AFTER,
+    fallback_token: str = "",
+    timeout: float = DEFAULT_NODE_SEAT_TIMEOUT,
+) -> dict[str, Any]:
+    """Group seats, consuming each node's read-only ``/api/v1/seats`` report.
+
+    A node that does not serve the route (404), has no HTTP API, or answered
+    ``configured:false`` is grouped exactly as before. A successful report can
+    supply an explicit seat id, so a renamed node still joins its machine group.
+    A node's typed error is passed through in ``node_errors`` and that node still
+    falls back to the historical grouping; no node is dropped and no seat is
+    invented.
+    """
+    node_list = list(nodes)
+    if not node_list:
+        return group_seats(
+            node_list, now=now, offline_after=offline_after
+        )
+
+    results = await asyncio.gather(
+        *(
+            fetch_report(node, fallback_token=fallback_token, timeout=timeout)
+            for node in node_list
+        ),
+        return_exceptions=True,
+    )
+
+    overrides: dict[str, str] = {}
+    extras: dict[str, dict[str, Any]] = {}
+    errors: list[dict[str, Any]] = []
+
+    for node, result in zip(node_list, results):
+        node_id = getattr(node, "id", "")
+        if isinstance(result, Exception):
+            errors.append(
+                {
+                    "node_id": node_id,
+                    "status": 0,
+                    "error": {
+                        "code": "node_unreachable",
+                        "message": str(result),
+                    },
+                }
+            )
+            continue
+        status, payload = result
+        if status == 404:
+            continue
+        if status == 0 and payload is None:
+            continue
+        if status >= 400 or status == 0:
+            errors.append(
+                {
+                    "node_id": node_id,
+                    "status": status,
+                    "error": _typed_node_error(payload, status),
+                }
+            )
+            continue
+        if not isinstance(payload, dict):
+            errors.append(
+                {
+                    "node_id": node_id,
+                    "status": status,
+                    "error": {
+                        "code": "seat_report_invalid",
+                        "message": "node /api/v1/seats did not return an object",
+                    },
+                }
+            )
+            continue
+        if payload.get("configured") is not True:
+            continue
+        seat_id, seat = _node_seat_override(payload)
+        if seat_id:
+            overrides[node_id] = seat_id
+        extras[node_id] = {"multiseat": _multiseat_extra(payload, seat)}
+
+    result = group_seats(
+        node_list,
+        now=now,
+        offline_after=offline_after,
+        seat_id_overrides=overrides,
+        node_extras=extras,
+    )
+    if errors:
+        result["node_errors"] = sorted(errors, key=lambda item: str(item["node_id"]))
+    return result

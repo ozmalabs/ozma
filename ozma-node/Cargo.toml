@@ -59,6 +59,8 @@ ozma-display-protocol = { path = "../ozma-display-protocol" }
 ozma-client-core = { path = "../ozma-client-core" }
 # Opt-in userspace WireGuard mesh + mDNS peer identity (`--mesh`).
 ozma-mesh     = { path = "../ozma-mesh" }
+# Read-only persisted multiseat plan/status for `--multiseat`.
+ozma-multiseat = { path = "../ozma-multiseat" }
 
 # HTTP API
 axum = { version = "0.7", features = ["json", "ws"] }
@@ -100,4 +102,5 @@ tokio = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 jpeg-decoder = "0.3"
+tempfile = "3"
 ozma-client = { path = "../ozma-client" }

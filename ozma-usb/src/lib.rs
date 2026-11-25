@@ -60,6 +60,13 @@
 //!   an injectable stream or a bounded loopback/TCP listener. `OP_REQ_IMPORT`
 //!   succeeds only after the daemon's authorization **and** a real kernel
 //!   attach; otherwise it returns a typed error and no device body.
+//! * [`usbip_urb`] is the typed 48-byte URB codec
+//!   (`USBIP_CMD_SUBMIT`/`USBIP_RET_SUBMIT`/`USBIP_CMD_UNLINK`/
+//!   `USBIP_RET_UNLINK`) with bounded transfer/ISO lengths, and
+//!   [`usbip_relay`] pairs submits and completions by seqnum over an injectable
+//!   [`UsbIpDataEndpoint`], with a concurrent in-flight ceiling, unlink
+//!   cancellation, idle timeout, and disconnect cleanup. The relay is
+//!   library-level and never fabricates device data.
 //!
 //! No code in this crate uses `unsafe`, mounts a filesystem, opens a block
 //! device, writes a block device, or creates a real USB gadget. The ConfigFS
@@ -126,7 +133,9 @@ pub mod uac2_bridge;
 pub mod usbip;
 pub mod usbip_daemon;
 pub mod usbip_protocol;
+pub mod usbip_relay;
 pub mod usbip_server;
+pub mod usbip_urb;
 
 pub use config::{
     is_safe_identifier, HidProtocol, UsbFunction, UsbFunctionKind, UsbGadgetConfig,
@@ -242,9 +251,24 @@ pub use usbip_protocol::{
     USBIP_MAX_FRAME_BYTES, USBIP_MAX_INTERFACES, USBIP_OP_HEADER_BYTES, USBIP_PATH_BYTES,
     USBIP_PROTOCOL_VERSION,
 };
+pub use usbip_relay::{
+    serve_data_session as serve_usbip_data_session, UsbIpDataEndpoint, UsbIpDataError,
+    UsbIpInFlightUrb, UsbIpRelay, UsbIpRelayConfig, UsbIpRelayError, UsbIpRelaySessionOutcome,
+    UsbIpRelayStats, USBIP_RELAY_DEFAULT_IDLE_TIMEOUT_MS, USBIP_RELAY_DEFAULT_MAX_IN_FLIGHT,
+    USBIP_RELAY_MAX_IN_FLIGHT_LIMIT, USBIP_URB_STATUS_EAGAIN, USBIP_URB_STATUS_EBUSY,
+    USBIP_URB_STATUS_EINVAL, USBIP_URB_STATUS_EMSGSIZE, USBIP_URB_STATUS_EPROTO,
+};
 pub use usbip_server::{
     serve_session as serve_usbip_session, NoUsbIpCredentials, UsbIpClock, UsbIpCredentialSource,
     UsbIpManualClock, UsbIpPresentedCredentials, UsbIpServer, UsbIpServerConfig, UsbIpServerHandle,
     UsbIpServerStats, UsbIpSessionEnd, UsbIpSessionOutcome, UsbIpSystemClock, UsbIpTransport,
     USBIP_SERVER_DEFAULT_IDLE_TIMEOUT_MS, USBIP_SERVER_MAX_CONNECTIONS,
+};
+pub use usbip_urb::{
+    UsbIpCmdSubmit, UsbIpCmdUnlink, UsbIpDirection, UsbIpIsoPacketDescriptor, UsbIpRetSubmit,
+    UsbIpRetUnlink, UsbIpUrb, UsbIpUrbCommand, UsbIpUrbError, USBIP_CMD_SUBMIT, USBIP_CMD_UNLINK,
+    USBIP_DIR_IN, USBIP_DIR_OUT, USBIP_ISO_PACKET_BYTES, USBIP_MAX_ENDPOINT, USBIP_MAX_ISO_PACKETS,
+    USBIP_RET_SUBMIT, USBIP_RET_UNLINK, USBIP_URB_HEADER_BYTES, USBIP_URB_MAX_FRAME_BYTES,
+    USBIP_URB_MAX_TRANSFER_BYTES, USBIP_URB_NO_ISO_PACKETS, USBIP_URB_UNLINK_CANCELLED,
+    USBIP_URB_UNLINK_NOT_FOUND,
 };

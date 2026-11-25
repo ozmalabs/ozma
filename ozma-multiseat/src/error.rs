@@ -256,4 +256,48 @@ impl MultiseatError {
             source,
         }
     }
+
+    /// Stable machine-readable error code for status/route documents.
+    ///
+    /// The code never includes a host path or an operator message; the human
+    /// readable [`std::fmt::Display`] text remains separate. Callers that serve
+    /// plan/status over HTTP use this so a typed persistence or planning
+    /// failure is not flattened into a generic transport error.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NoDisplays => "no_displays",
+            Self::DuplicateDisplay { .. } => "duplicate_display",
+            Self::DuplicateSeat(_) => "duplicate_seat",
+            Self::InvalidDisplay { .. } => "invalid_display",
+            Self::PortOverflow { .. } => "port_overflow",
+            Self::ZeroSeats => "zero_seats",
+            Self::MissingX11Display(_) => "missing_x11_display",
+            Self::MissingPipeWireTarget(_) => "missing_pipewire_target",
+            Self::DisplayBackend(_) => "display_backend",
+            Self::InputBackend(_) => "input_backend",
+            Self::Io { .. } => "io",
+            Self::UnknownProfile(_) => "unknown_profile",
+            Self::UnknownSeat(_) => "unknown_seat",
+            Self::SeatAlreadyRunning(_) => "seat_already_running",
+            Self::Supervisor(_) => "supervisor",
+            Self::CommandUnavailable { .. } => "command_unavailable",
+            Self::CommandFailed { .. } => "command_failed",
+            Self::InputRouting(_) => "input_routing",
+            Self::DisplayOwnership(_) => "display_ownership",
+            Self::Unsupported(_) => "unsupported",
+            Self::SeatStoreRead { .. } => "seat_store_read",
+            Self::SeatStoreParse { .. } => "seat_store_parse",
+            Self::SeatStoreVersion { .. } => "seat_store_version",
+            Self::SeatStoreInvalid(_) => "seat_store_invalid",
+            Self::SeatStoreConflict(_) => "seat_store_conflict",
+            Self::Audio(_) => "audio",
+            Self::Hotplug(_) => "hotplug",
+            Self::InputIsolation(_) => "input_isolation",
+            Self::SeatDisplayTool { .. } => "seat_display_tool",
+            Self::SeatDisplayNumberExhausted { .. } => "seat_display_number_exhausted",
+            Self::SeatDisplayStartupTimeout { .. } => "seat_display_startup_timeout",
+            Self::SeatDisplayCrashed { .. } => "seat_display_crashed",
+            Self::SeatDisplay(_) => "seat_display",
+        }
+    }
 }

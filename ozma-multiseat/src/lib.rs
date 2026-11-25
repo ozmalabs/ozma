@@ -120,8 +120,8 @@ pub use ownership::{
     SINGLE_X_SERVER_LIMITATION, XRANDR_PROGRAM,
 };
 pub use persistence::{
-    default_seat_store_path, PersistedDisplay, PersistedSeat, SeatStore, DEFAULT_SEAT_STORE_NAME,
-    SEAT_STORE_VERSION,
+    default_seat_store_path, PersistedDisplay, PersistedSeat, PersistedSeatStatus, SeatStore,
+    SeatStoreStatus, DEFAULT_SEAT_STORE_NAME, SEAT_STORE_VERSION,
 };
 pub use planner::{
     allocate_ports, CapturePreference, MultiseatPlanner, PersistedPlan, PlannerOptions,

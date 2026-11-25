@@ -26,6 +26,7 @@ pub mod platform;
 pub mod registration;
 pub mod rtsp_runtime;
 pub mod scene_replay;
+pub mod seats;
 pub mod shutdown;
 pub mod software;
 pub mod thermal;

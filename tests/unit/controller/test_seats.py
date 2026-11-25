@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+import seats
 from seats import group_seats, normalize_node_id, parse_seat_id, seat_identity
 from state import AppState, NodeInfo
 
@@ -235,6 +236,21 @@ def _isolate_mesh_config(monkeypatch, tmp_path):
     monkeypatch.setattr(mesh_network, "CONFIG_PATH", tmp_path / "mesh_network.json")
 
 
+@pytest.fixture(autouse=True)
+def _old_nodes_have_no_seat_report(monkeypatch):
+    """Default every test to a node that does not serve /api/v1/seats.
+
+    Individual tests override ``seats.fetch_node_seat_report`` when they want a
+    node report. This keeps the network out of the default unit tests and
+    proves the historical grouping is preserved when the route is absent.
+    """
+
+    async def _absent(node, **kwargs):
+        return (404, None)
+
+    monkeypatch.setattr(seats, "fetch_node_seat_report", _absent)
+
+
 def _client(state: AppState, tmp_path: Path):
     from fastapi.testclient import TestClient
     from api import build_app
@@ -327,6 +343,110 @@ class TestSeatsAPI:
         seats = client.get("/api/v1/seats").json()
         assert [group["machine"] for group in seats["groups"]] == ["host"]
         assert seats["unseated_node_ids"] == ["legacy-node._ozma._udp.local."]
+
+    def test_seats_api_consumes_a_node_seat_report(self, tmp_path, monkeypatch):
+        async def _fetch(node, **kwargs):
+            if node.id == "worker-7._ozma._udp.local.":
+                return (
+                    200,
+                    {
+                        "ok": True,
+                        "configured": True,
+                        "mode": "read-only",
+                        "lifecycle": "external",
+                        "start_stop": False,
+                        "seat_id": "host-x-seat-3",
+                        "plan": {"version": 1, "seats": [{"id": "host-x-seat-3"}]},
+                        "status": {
+                            "version": 1,
+                            "seat_count": 2,
+                            "node_count": 2,
+                            "seats": [
+                                {
+                                    "seat_id": "host-x-seat-3",
+                                    "state": "planned",
+                                    "available": True,
+                                }
+                            ],
+                        },
+                        "node_seat": {
+                            "seat_id": "host-x-seat-3",
+                            "state": "planned",
+                            "available": True,
+                        },
+                    },
+                )
+            return (404, None)
+
+        monkeypatch.setattr(seats, "fetch_node_seat_report", _fetch)
+        state = _state_with(_node("worker-7._ozma._udp.local.", api_port=7382))
+
+        payload = _client(state, tmp_path).get("/api/v1/seats").json()
+
+        assert payload["seat_count"] == 1
+        assert payload["unseated_node_ids"] == []
+        group = payload["groups"][0]
+        assert group["machine"] == "host-x"
+        seat = group["seats"][0]
+        assert seat["seat_id"] == "host-x-seat-3"
+        assert seat["seat_index"] == 3
+        assert seat["multiseat"] == {
+            "mode": "read-only",
+            "plan_seat_count": 2,
+            "state": "planned",
+            "available": True,
+        }
+        # The node's local store path/plan is never passed through.
+        assert "source" not in seat
+        assert "plan" not in seat
+
+    def test_seats_api_passes_through_a_typed_node_error_and_keeps_grouping(
+        self, tmp_path, monkeypatch
+    ):
+        async def _fetch(node, **kwargs):
+            return (
+                503,
+                {
+                    "ok": False,
+                    "configured": True,
+                    "mode": "error",
+                    "error": {
+                        "code": "seat_store_parse",
+                        "message": "failed to parse seat store /secret/path/seats.json",
+                    },
+                },
+            )
+
+        monkeypatch.setattr(seats, "fetch_node_seat_report", _fetch)
+        state = _state_with(_node("host-a-seat-0._ozma._udp.local."))
+
+        response = _client(state, tmp_path).get("/api/v1/seats")
+        payload = response.json()
+
+        assert response.status_code == 200
+        assert payload["seat_count"] == 1
+        assert payload["groups"][0]["seats"][0]["seat_id"] == "host-a-seat-0"
+        assert payload["node_errors"] == [
+            {
+                "node_id": "host-a-seat-0._ozma._udp.local.",
+                "status": 503,
+                "error": {
+                    "code": "seat_store_parse",
+                    "message": "failed to parse seat store /secret/path/seats.json",
+                },
+            }
+        ]
+
+    def test_seats_api_absent_report_keeps_the_historical_shape(self, tmp_path):
+        # The autouse fixture answers 404 for every node, which is how an older
+        # node or a node without --multiseat behaves.
+        state = _state_with(_node("host-a-seat-0._ozma._udp.local."))
+
+        payload = _client(state, tmp_path).get("/api/v1/seats").json()
+
+        assert payload["seat_count"] == 1
+        assert "node_errors" not in payload
+        assert "multiseat" not in payload["groups"][0]["seats"][0]
 
 
 # ── Dashboard (static + rendered) ────────────────────────────────────────────

@@ -937,3 +937,341 @@ removed. Pre-existing untracked `controller/mesh_network.json` and
 `nodes_meta.json` were left in place, as were the parallel workstream's
 modified/untracked sources. No product source was edited and nothing was
 committed.
+
+## WebRTC scaling + VNC server re-validation (2026-11-25)
+
+Date: 2026-11-25 12:34-12:48 local (01:34-01:48 UTC).
+Checkout: `/home/matt/ozma/ozma`, HEAD
+`a7586a34295271f1676b836dcb7e75e4debfef16`
+(`feat(phase4): RFB VNC server, USB/IP control protocol, per-seat displays`).
+Node binary: `target/debug/ozma-node` 0.1.0, built at the start of the run with
+`CARGO_NET_OFFLINE=true cargo build -p ozma-node --bin ozma-node` (exit 0).
+
+Controller: system Python 3.14.10 venv at
+`/tmp/opencode/webrtc-vnc-reval-venv` created with `--system-site-packages`.
+The missing pure-Python/ABI3 packages (`pynacl`, `mido`, `toml`,
+`strawberry-graphql`, `graphql-core`, `cross-web`, `python-multipart`) were
+installed **offline from the local uv cache** with
+`uv pip install --offline --no-deps`. No network install, no system package,
+no sudo. `gi`/GStreamer, `asyncvnc`, `numpy`, and `Pillow` came from the system
+Python. TigerVNC's `vncviewer` is present, but the live client used the
+controller's own `asyncvnc` for the frame/input path.
+
+The checkout was **not frozen**. The working tree already had modified routing
+docs and untracked `controller/mesh_network.json` / `nodes_meta.json`. During
+the run a parallel workstream edited `Cargo.lock`, `controller/api.py`,
+`controller/seats.py`, `ozma-multiseat`, `ozma-usb`, `ozma-hardware`, and
+`ozma-node` sources (including new `aida64.rs`/`seats.rs`), and a parallel
+`cargo` invocation rewrote `target/debug/ozma-node` at 12:47:49 local, after
+the live WebRTC/VNC runs below. `ozma-node/src/webrtc.rs`,
+`ozma-node/src/vnc_server.rs`, and `ozma-node/src/registration.rs` were clean
+throughout. This validation does not edit product source and does not commit.
+
+### Result summary
+
+| Check | Result | Evidence |
+|---|---|---|
+| Build current `ozma-node` | **PASS** | `cargo build -p ozma-node --bin ozma-node` exit 0; `ozma-node 0.1.0` |
+| Literal `demo/run_demo.sh --webrtc`: both nodes `webrtc=running` | **PASS** | `/api/v1/connection` on 7382/7383: `"webrtc":"running"`, `webrtc_error=null` |
+| Helper argv uses the probed head geometry | **PASS** | Both helpers `--width 720 --height 400 --fps 30`; log `configured=640x480 capture=720x400` |
+| One real peer per node | **PASS** | 2 concurrent GStreamer peers, `connected` / ICE `completed`, 1,190 buffers / 514,080,000 bytes each, I420 720x400@30, exit 0 |
+| Guest modeset no longer kills the stream | **PASS** | Capture 720x400 at 01:41:02Z, 1280x800 at 01:41:04Z; both peers kept decoding at ~30 fps through 01:41:40Z with no failure and no node error. Delivered size stayed **720x400** (nearest-neighbour downscale). |
+| Controller `/api/v1/streams/<id>/webrtc` proxy | **PASS** | Peer via the 7380 proxy: `connected`, ICE `completed`, 244 buffers, I420 720x400@30, exit 0 |
+| VNC registration advertises the actual bound port while listening | **PASS** | `--vnc-server-port 0` bound `127.0.0.1:38185`; registration `{"state":"configured","host":"127.0.0.1","port":38185}`; `ss` shows the node listening on 38185 |
+| VNC registration retracted when the listener stops | **FAIL** | Source-failure probe bound 45211, listener stopped, but `/api/v1/connection.registration.vnc` still said `configured` port 45211 with no listener (documented startup-time gap) |
+| Real RFB client frame | **PASS** | `asyncvnc` connected to `127.0.0.1:38185`; two frames decoded, shape `(800, 1280, 4)`; frame saved |
+| RFB pointer/key input reaches the node input path | **PASS** | `client.keyboard.write("ab")`, `Return`, pointer move/click; node debug log `QMP input events sent on shared client` x11; guest screen OCR shows `localhost login: ab` / `Password:` |
+| Controller VNC discovery | **PASS** | Controller lists `vnc1._ozma._udp.local.` with `vnc_host=127.0.0.1`, `vnc_port=38185` |
+| Controller `POST /api/v1/screen/read` | **PASS (transport; OCR garbled)** | HTTP 200, 27 text regions, `screen_type=terminal`; bitmap OCR text is garbage on the 1280x800 VGA console (see gaps) |
+| Controller `POST /api/v1/screen/vectors` | **PASS** | HTTP 200 `{"width":1280,"height":800,...}` in 0.23 s |
+| Snapshot / HLS / input still work | **PASS** | JPEG 1280x800 direct and proxied; H.264 1280x800 segments direct and proxied; `/input/key` and `/input/type` `ok` on both nodes |
+| Console switching | **SKIP (typed)** | Single-head demo advertises `display_outputs=[]`; `POST /display/select {"index":2}` → typed 404 `not_found` `available:[]` |
+| `demo/run_demo.sh test` + cleanup | **PASS (suite drift)** | 73 passed / 3 failed (unchanged Connect assertions); stack, VMs, nodes, and controller stopped automatically; no leftovers |
+
+### WebRTC scaling detail
+
+Command (same local QEMU/controller fixture as the earlier runs):
+
+```bash
+export PATH=/tmp/opencode/nosudo:$PATH
+export PYTHON=/tmp/opencode/webrtc-vnc-reval-venv/bin/python
+export OZMA_NODE_BIN=/home/matt/ozma/ozma/target/debug/ozma-node
+setsid bash demo/run_demo.sh --webrtc \
+  > /tmp/opencode/webrtc-vnc-reval-2026-11-25/demo-webrtc-modeset.log 2>&1 &
+```
+
+Both nodes fitted the early QMP head exactly as before:
+
+```text
+01:40:59.109Z INFO ozma_node: fitting WebRTC helper to the capture frame size
+  configured=640x480 capture=720x400
+01:40:59.235Z INFO ozma_node: WebRTC helper started
+  pid=Some(2071279) socket=/tmp/ozma-webrtc-vm1-2071235.sock
+  shm=/dev/shm/ozma-webrtc-fb-2071235 width=720 height=400 fps=30
+```
+
+`ps` confirmed the argv on both nodes:
+
+```text
+python3 .../gst_webrtc_worker.py --sock /tmp/ozma-webrtc-vm1-2071235.sock \
+  --shm /dev/shm/ozma-webrtc-fb-2071235 --width 720 --height 400 --fps 30
+python3 .../gst_webrtc_worker.py --sock /tmp/ozma-webrtc-vm2-2071241.sock \
+  --shm /dev/shm/ozma-webrtc-fb-2071241 --width 720 --height 400 --fps 30
+```
+
+Two genuine peers were started as soon as both nodes reported `running`
+(01:41:00Z), one per node, with the stock `scripts/gate2/webrtc-client.py`
+plus a temporary copy that only adds a per-second `PROGRESS` line. Capture
+geometry was sampled every 2 s during the same window:
+
+```text
+01:41:02Z vm1 snapshot 720x400     01:41:02Z vm2 snapshot 720x400
+01:41:04Z vm1 snapshot 1280x800    01:41:04Z vm2 snapshot 1280x800
+...                                 ...
+01:41:40Z vm1 snapshot 1280x800    01:41:40Z vm2 snapshot 1280x800
+```
+
+The peer progress lines straddle the modeset with no gap:
+
+```text
+PROGRESS 12:41:02 conn=connected ice=completed buffers=46  720x400
+PROGRESS 12:41:03 conn=connected ice=completed buffers=76  720x400
+PROGRESS 12:41:04 conn=connected ice=completed buffers=105 720x400  <-- guest now 1280x800
+PROGRESS 12:41:05 conn=connected ice=completed buffers=135 720x400
+...
+PROGRESS 12:41:40 conn=connected ice=completed buffers=1170 720x400
+```
+
+Final peer reports:
+
+```text
+vm1: ok=true connected ice=completed, 1190 video buffers,
+     514,080,000 bytes, I420 1280x800 capture delivered as 720x400@30, exit 0
+vm2: ok=true connected ice=completed, 1190 video buffers,
+     514,080,000 bytes, I420 1280x800 capture delivered as 720x400@30, exit 0
+```
+
+This is the requested modeset proof: the helper is fitted to the transient
+720x400 boot head, the guest switches to 1280x800, and `convert_to_bgra` +
+`scale_bgra_nearest` keeps both feeders and both peers alive by scaling later
+frames down to the helper size. Neither node logged a dimension error, a feeder
+stop, or a `webrtc_error`.
+
+The controller proxy was exercised separately with the same client and the
+controller offer URL as its target:
+
+```bash
+python3 scripts/gate2/webrtc-client.py \
+  --node-url http://127.0.0.1:7382 \
+  --offer-url http://localhost:7380/api/v1/streams/vm1._ozma._udp.local./webrtc \
+  --duration 8
+```
+
+```text
+ok=true connection_state=connected ice=completed
+244 video buffers, 105,408,000 bytes, I420 720x400@30, exit 0
+```
+
+A `POST /power/reset` attempt was used first to force a guest modeset, but the
+demo QEMU fixture runs with `-no-reboot`, so QEMU exited and the node lost its
+capture source. That is a fixture property, not a WebRTC finding; the live boot
+transition above is the actual modeset evidence.
+
+### VNC server detail
+
+An isolated node served the real QMP head without HLS/WebRTC contention, with
+an OS-assigned port (`0`):
+
+```bash
+RUST_LOG='info,ozma_input=debug' ./target/debug/ozma-node \
+  --name vnc1 --profile vm \
+  --qmp-socket /tmp/ozma-vm1.qmp \
+  --hid-udp-port 17331 --http-port 17382 \
+  --capture-provider qmp --input-provider qmp \
+  --vnc-server --vnc-server-port 0 \
+  --cap hid,video
+```
+
+Listener and real endpoint:
+
+```text
+INFO ozma_node::vnc_server: RFB 3.8 VNC server listening
+  bind=127.0.0.1:38185 loopback=true security="none" encoding="raw"
+INFO ozma_node: RFB 3.8 VNC server is serving the first capture source
+  bind=127.0.0.1:38185 advertised_host=127.0.0.1 advertised_port=38185
+INFO ozma_node::vnc_server: VNC capture source published its first frame;
+  ServerInit geometry fixed width=1280 height=800
+```
+
+Registration and the kernel agree on the ephemeral port:
+
+```text
+GET /api/v1/connection.registration
+{"vnc":{"state":"configured","host":"127.0.0.1","port":38185}, ...}
+
+ss -lntp
+LISTEN 127.0.0.1:38185 users:(("ozma-node",pid=2081829,fd=10))
+```
+
+The unmodified controller discovered the same endpoint through mDNS:
+
+```text
+GET /api/v1/nodes
+[("vnc1._ozma._udp.local.", "127.0.0.1", 38185)]
+```
+
+Real client (controller's `asyncvnc`) connected, decoded two full frames, sent
+keys and pointer, decoded a third frame, and stayed connected:
+
+```text
+connected=true  frames=(800,1280,4)  changed_pixels f1->f2 = 0
+keys "ab" + Return + pointer (640,400) + left click
+changed_pixels f2->f3 = 325 (bbox x=0..150, y=626..655, the guest text line)
+still_connected_after_input=true
+```
+
+The input path is confirmed twice. The node's QMP adapter logged 11 successful
+batches during the client connection:
+
+```text
+DEBUG ozma_input::qmp: QMP input events sent on shared client count=1
+DEBUG ozma_input::qmp: QMP input events sent on shared client count=2
+... (11 lines at 01:44:58Z)
+```
+
+and the guest screen (captured through the same VNC socket) visibly reacted:
+
+```text
+localhost login: ab
+Password: _
+```
+
+(`tesseract` on the controller's own saved frame reads the same line; this is
+independent of the controller's bitmap OCR path.)
+
+Controller consumers:
+
+```text
+POST /api/v1/screen/read       → 200, 27 text_regions, screen_type=terminal
+POST /api/v1/screen/read-prompt→ 200
+POST /api/v1/screen/find-button→ 200 {"found":false}
+POST /api/v1/screen/vectors    → 200 {"width":1280,"height":800,
+                                     "rectangles":[],"lines":[]}
+```
+
+The screen/read **transport** is healthy, but the returned OCR text is garbage
+(e.g. `*Nk*Wf9MUH**'`). `screen_reader` auto-detects a terminal and uses its
+bitmap font matcher (`ocr_method=bitmap`) on the 1280x800 anti-aliased VGA
+console; the same frame read by `tesseract` correctly yields the Alpine boot
+text and login line. This is a `screen_reader` decoder limitation, not a VNC
+frame/transport failure. The testbench `_capture_results` path uses the same
+`ScreenReader.read_node_screen`, so it inherits that limitation; no benchmark
+harness was run.
+
+**Registration retraction gap (live repro).** A second probe enabled
+`--vnc-server` on an X11 source with no display. The listener bound
+`127.0.0.1:45211`, the ffmpeg source ended, and the listener stopped:
+
+```text
+01:46:23.766Z RFB 3.8 VNC server listening bind=127.0.0.1:45211
+01:46:23.766Z advertised_host=127.0.0.1 advertised_port=45211
+01:46:24.138Z VNC capture source ended; the VNC listener is stopping
+```
+
+But `/api/v1/connection.registration.vnc` still returned
+`{"state":"configured","host":"127.0.0.1","port":45211}` and `ss` had no
+listener on 45211. This is exactly the startup-time registration limitation in
+`docs/phase4-vnc-server-report.md`: the advertised endpoint is correct while
+the listener runs, but a later listener stop does not retract the mDNS/TXT or
+the `/api/v1/connection` registration object.
+
+### Snapshot, HLS, and input
+
+Measured on the same literal `--webrtc` run (after the guest settled):
+
+- `GET /display/snapshot` 200 `image/jpeg`, 96,470 / 96,488 bytes, decoded
+  **1280x800** on vm1/vm2; controller
+  `/api/v1/streams/vm1.../snapshot` also 200 `image/jpeg` 1280x800.
+- Local `GET /stream/stream.m3u8` 200; last segment 200
+  `video/vnd.dlna.mpeg-tts` 100,392 bytes, `ffprobe` `h264,1280,800` on both.
+  Controller `/api/v1/streams/vm1.../hls/stream.m3u8` 200
+  `application/vnd.apple.mpegurl`.
+- `/input/key {"keycode":30,"down":true|false}` → `{"ok":true,"sink":"qmp"}`
+  and `/input/type {"text":"ab"}` → `{"ok":true,"events":4}` on both nodes.
+- Controller activation then `POST /api/v1/paste` → 200
+  `{"chars_sent":2,"chars_skipped":0}`.
+- `POST /display/select {"index":2}` → typed 404 `not_found`,
+  `available:[]` (single-head demo, unchanged).
+
+### `demo test` cleanup
+
+```bash
+PYTHON=/tmp/opencode/webrtc-vnc-reval-venv/bin/python \
+OZMA_NODE_BIN=/home/matt/ozma/ozma/target/debug/ozma-node \
+PATH=/tmp/opencode/nosudo:$PATH \
+bash demo/run_demo.sh test
+```
+
+Exit 1 from the unchanged controller-only Connect drift:
+
+```text
+FAIL  AI setups used: 0
+FAIL  noise_cancellation blocked on free tier
+FAIL  reason mentions upgrade:
+73 passed, 3 failed, 0 skipped
+SOME TESTS FAILED
+```
+
+The harness stopped the failing stack without manual intervention:
+`Stopping Ozma demo...` killed the controller and both nodes, `Stopping VMs...`
+killed both QEMU processes, then `Done.` Post-run checks found no
+`ozma-node`, controller, QEMU, helper, or ffmpeg process; no listeners on
+7332/7333, 7380, 7382/7383, 7384, 5901, or 5922; and no demo pidfiles or QMP
+sockets. Cleanup is **PASS**.
+
+### Remaining gaps after this re-validation
+
+1. **The literal `--webrtc` demo now stays alive but is downgraded to 720x400.**
+   The fit probe still samples the transient boot head, so the guest's final
+   1280x800 head is nearest-neighbour downscaled to 720x400 for the life of the
+   node. This satisfies "modeset must not kill the stream", but native 1280x800
+   still needs a stable-size probe, a re-fit/restart on capture-format change,
+   or deferred helper start. Not applied here.
+2. **WebRTC geometry is still absent from the status API.** `/api/v1/connection`
+   reports only `webrtc: running|failed` and `webrtc_error`; width/height are
+   visible only in the node log, helper argv, and peer caps.
+3. **VNC registration is startup-time, not live.** The live repro above shows a
+   stopped listener still advertised with `state=configured`. A retraction path
+   (or a live listener probe on `/api/v1/connection`) is still missing.
+4. **Controller screen OCR is wrong for this VGA console.** The transport
+   delivers the correct 1280x800 frame, but `screen_reader` picks its bitmap
+   terminal decoder and returns garbage. Tesseract reads the same frame
+   correctly, so the fix is in screen-type/OCR selection, not in RFB.
+5. **VNC remains security None + Raw only**, no auth/TLS/compression/resize;
+   one shared input sink; one capture source. Unchanged from the VNC report.
+6. **WebRTC audio is still unconfigured**
+   (`webrtc_audio_configured=false`, `webrtc_audio_source=null`); the peers
+   negotiated video only.
+7. **The checkout and binary moved during validation.** `target/debug/ozma-node`
+   was rewritten by a parallel cargo invocation at 12:47:49 local, after the
+   live WebRTC/VNC runs; a frozen-tree rerun would remove this caveat.
+8. **Controller test drift is unchanged** (the three Connect failures above),
+   unrelated to the Rust node, WebRTC, or VNC.
+
+### Artifacts and cleanup
+
+Artifacts were written to `/tmp/opencode/webrtc-vnc-reval-2026-11-25/`:
+demo start/stop and `demo-test.log`, mode-set timeline, per-second peer progress
+logs and report JSON, connection JSON, helper process/argv captures, snapshot
+JPEGs, HLS playlist/segment files, controller screen-read/vectors JSON, VNC
+client frames and result JSON, and the VNC node/controller logs. The temporary
+controller venv was `/tmp/opencode/webrtc-vnc-reval-venv`. Both the artifact
+directory and the venv were removed during final cleanup, as were `demo/logs/`
+and the controller state created by these runs (`moonlight_data/`, `msp_data/`,
+`scan_data/`, `static/captures/`, `wg_keys.json`, `wg_state.json`,
+`connect_cache.json`). Pre-existing untracked `controller/mesh_network.json`
+and `nodes_meta.json`, plus the parallel workstream's modified/untracked
+sources, were left untouched. No product source was edited by this validation
+and nothing was committed. The only tracked files this validation wrote are
+this report and the VNC report note; the other tracked modifications in the
+working tree belong to the parallel workstream.

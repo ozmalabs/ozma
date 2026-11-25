@@ -587,6 +587,25 @@ pub struct Args {
     #[arg(long = "mesh-peer", env = "OZMA_MESH_PEER", value_name = "JSON")]
     pub mesh_peer: Vec<String>,
 
+    /// Report the persisted multiseat plan/status at `GET /api/v1/seats`.
+    ///
+    /// Opt-in and read-only. `--multiseat` (alias `--multiseat-plan`) loads the
+    /// shared `--seats-file` store once and reports persisted seat identities.
+    /// It never starts, stops, or restarts a seat process: lifecycle stays with
+    /// the standalone `ozma-multiseat` supervisor. Requires `--seats-file`.
+    #[arg(
+        long,
+        env = "OZMA_MULTISEAT",
+        visible_alias = "multiseat-plan",
+        requires = "seats_file"
+    )]
+    pub multiseat: bool,
+
+    /// Persisted seat store loaded by `--multiseat` (for example
+    /// `/etc/ozma/seats.json`). Required when `--multiseat` is set.
+    #[arg(long, env = "OZMA_SEATS_FILE", value_name = "PATH")]
+    pub seats_file: Option<std::path::PathBuf>,
+
     /// Enable the local HLS pipeline: capture → ffmpeg → `/stream/*`.
     ///
     /// Requires a video capture source and an ffmpeg binary. WebRTC is not
@@ -1537,10 +1556,35 @@ async fn run() -> std::process::ExitCode {
     let served_vnc = vnc_server
         .as_ref()
         .map(|server| server.registration_endpoint(&local_ip));
+    // Registration keeps the live listener first and the configured external
+    // QEMU endpoint as fallback. The listener task clears the live slot as soon
+    // as it stops (capture failure or shutdown), so `/api/v1/connection` never
+    // advertises a dead port until restart. mDNS TXT is advertised once at
+    // startup and is not retracted mid-run.
+    let external_vnc = match (args.vnc_host.as_deref(), args.vnc_port) {
+        (Some(host), Some(port)) => Some((host.to_owned(), port)),
+        _ => None,
+    };
+    let vnc_registration =
+        controller_compat::VncRegistrationState::new(served_vnc.clone(), external_vnc);
+    let vnc_live_handle = vnc_registration.live_handle();
     if let Some(server) = vnc_server {
         let (host, port) = served_vnc
             .clone()
             .expect("the VNC endpoint was resolved before moving the handle");
+        let vnc_live_flag = server.live_flag();
+        let vnc_live_slot = vnc_live_handle.clone();
+        background.push((
+            "vnc-registration",
+            tokio::spawn(async move {
+                while vnc_live_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                *vnc_live_slot
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            }),
+        ));
         info!(
             bind = %server.bound_addr(),
             advertised_host = %host,
@@ -2234,7 +2278,8 @@ async fn run() -> std::process::ExitCode {
             .with_console_broker(console_broker.clone())
             .with_multi_console_hls(multi_console_hls.clone())
             .with_multi_console_webrtc(multi_console_webrtc.clone())
-            .with_capture(capture_status);
+            .with_capture(capture_status)
+            .with_vnc_registration(vnc_registration);
     // Control routes stay behind the bearer guard; the controller's read-only
     // probes are mounted after it so the unmodified controller works with
     // `--api-token`. See `controller_compat::{compat_router, public_router}`.
@@ -2303,6 +2348,45 @@ async fn run() -> std::process::ExitCode {
     }
 
     let public_compat_router = controller_compat::public_router(compat_state);
+
+    // Read-only persisted multiseat report. This loads `--seats-file` once; it
+    // never starts or stops a seat. The standalone `ozma-multiseat` supervisor
+    // owns process lifecycle, so the route is merged next to the other public
+    // read-only probes and reports `lifecycle:"external"`.
+    let seat_report = if args.multiseat {
+        let path = args
+            .seats_file
+            .as_ref()
+            .expect("clap requires --seats-file with --multiseat");
+        let seat_id = registration::seat_id_from_env();
+        let discovered = multiseat_display_names(&config);
+        let report = ozma_node::seats::SeatReportState::load(path, seat_id, &discovered);
+        let summary = report.summary();
+        match &summary.code {
+            Some(code) => warn!(
+                mode = summary.mode,
+                code = %code,
+                path = %path.display(),
+                "Multiseat seat report could not load the persisted store; \
+                 /api/v1/seats will return a typed error"
+            ),
+            None => info!(
+                mode = summary.mode,
+                seats = summary.seat_count,
+                path = %path.display(),
+                "Multiseat seat report enabled (read-only; lifecycle stays external)"
+            ),
+        }
+        report
+    } else {
+        if args.seats_file.is_some() {
+            warn!(
+                "--seats-file has no effect without --multiseat; /api/v1/seats stays not-configured"
+            );
+        }
+        ozma_node::seats::SeatReportState::not_configured()
+    };
+    let public_compat_router = public_compat_router.merge(ozma_node::seats::router(seat_report));
 
     // Thermal sampling runs read-only unless a policy and --thermal-control are
     // both present. It restores the original hwmon automatic mode on shutdown.
@@ -3120,6 +3204,30 @@ fn command_on_path(name: &str) -> bool {
     })
 }
 
+/// Display outputs this node can honestly observe for the seat report.
+///
+/// Only configured display outputs and the explicit multiseat ownership
+/// environment qualify. The node does not run `xrandr` here, so an empty result
+/// means "no discovery", not "every persisted display is missing". Output names
+/// are sorted and deduplicated for a stable report.
+fn multiseat_display_names(config: &NodeConfig) -> Vec<String> {
+    let mut names: Vec<String> = config
+        .display_outputs
+        .iter()
+        .map(|output| output.name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .collect();
+    if let Ok(output) = std::env::var(ozma_multiseat::OZMA_X11_OUTPUT_ENV) {
+        let output = output.trim();
+        if !output.is_empty() {
+            names.push(output.to_owned());
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// Build the opt-in mesh service from CLI configuration.
 ///
 /// Returns `None` when `--mesh` is absent, so a node without mesh config keeps
@@ -3819,5 +3927,38 @@ mod tests {
         assert!(!txt.contains_key("vnc_host"));
         assert!(!txt.contains_key("vm_ip"));
         assert!(!txt.contains_key("vm_guest_ip"));
+    }
+
+    #[test]
+    fn multiseat_is_off_by_default_and_accepts_the_plan_alias() {
+        let defaults = Args::parse_from(["ozma-node"]);
+        assert!(!defaults.multiseat);
+        assert!(defaults.seats_file.is_none());
+
+        let plan = Args::parse_from([
+            "ozma-node",
+            "--multiseat-plan",
+            "--seats-file",
+            "/etc/ozma/seats.json",
+        ]);
+        assert!(plan.multiseat);
+        assert_eq!(
+            plan.seats_file.as_deref(),
+            Some(std::path::Path::new("/etc/ozma/seats.json"))
+        );
+
+        let multiseat = Args::parse_from([
+            "ozma-node",
+            "--multiseat",
+            "--seats-file",
+            "/etc/ozma/seats.json",
+        ]);
+        assert!(multiseat.multiseat);
+    }
+
+    #[test]
+    fn multiseat_requires_a_seats_file() {
+        assert!(Args::try_parse_from(["ozma-node", "--multiseat"]).is_err());
+        assert!(Args::try_parse_from(["ozma-node", "--multiseat-plan"]).is_err());
     }
 }

@@ -8,9 +8,11 @@ This crate is the model and controller layer of the Python
 bounded copy-on-write write overlay, models ISO/NBD media, includes a bounded
 fixed-newstyle NBD server backed by a regular file, an in-memory image, or a
 copy-on-write overlay, serves the USB mass-storage SCSI/BOT data path over that
-same overlay, and includes a bounded in-process USB/IP daemon/control plane plus
-a bounded version-`0x0111` USB/IP control-wire server (`OP_REQ_DEVLIST`/
-`OP_REQ_IMPORT`) with an injectable stream transport. It
+same overlay, and includes a bounded in-process USB/IP daemon/control plane, a
+bounded version-`0x0111` USB/IP control-wire server (`OP_REQ_DEVLIST`/
+`OP_REQ_IMPORT`) with an injectable stream transport, and a typed URB codec plus
+bounded data relay (`USBIP_CMD_SUBMIT`/`USBIP_RET_SUBMIT`/
+`USBIP_CMD_UNLINK`/`USBIP_RET_UNLINK`) with an injectable endpoint. It
 sequences FunctionFS from ConfigFS function creation through descriptor writes,
 readiness, and UDC bind/unbind. Default paths do not mount filesystems, open
 `/dev/hidg*`, or write a block device; an explicit `CommandFunctionFsMounter`
@@ -42,6 +44,8 @@ profile.
 | USB/IP daemon | `UsbIpDaemon`, `UsbIpDaemonConfig`/`UsbIpDaemonState`/`UsbIpDaemonStatus`, bounded `UsbIpConnection`s, injectable `UsbIpKernelBackend` with explicit `NoUsbIpKernel`, export/list/attach/detach/unexport state machine, typed `usbip-kernel-required`, fail-closed TLS |
 | USB/IP wire protocol | `UsbIpOpHeader`/`UsbIpOpCode`/`UsbIpStatus`, `UsbIpDeviceDescriptor`/`UsbIpInterface`, `UsbIpDevListRequest`/`UsbIpDevListReply`, `UsbIpImportRequest`/`UsbIpImportReply`, version `0x0111`, network byte order, fixed-width path/busid, bounded counts, typed truncation/oversize/version/opcode errors |
 | USB/IP control server | `UsbIpServer`/`UsbIpServerHandle`/`UsbIpServerConfig`, injectable `UsbIpTransport`/`UsbIpClock`/`UsbIpCredentialSource`, bound TCP listener or in-memory duplex, `OP_REQ_DEVLIST` from descriptor-registered exports, authorized `OP_REQ_IMPORT` only after a real kernel attach, bounded connections/frames/idle timeout |
+| USB/IP URB codec | `UsbIpCmdSubmit`/`UsbIpRetSubmit`/`UsbIpCmdUnlink`/`UsbIpRetUnlink`, `UsbIpUrb`/`UsbIpUrbCommand`, `UsbIpDirection`/`UsbIpIsoPacketDescriptor`, 48-byte header at kernel offsets, network byte order, transfer/ISO/count bounds, typed truncation/oversize/direction/endpoint errors, payload-redacted `Debug` |
+| USB/IP data relay | `UsbIpRelay` (seqnum pairing, in-flight ceiling, unlink, drain), `UsbIpDataEndpoint` (submit → completion, unlink), `serve_data_session` (concurrent bounded workers, out-of-order completions, idle timeout, disconnect cleanup), `UsbIpRelayConfig`/`UsbIpRelayStats`/`UsbIpRelaySessionOutcome` |
 | SCSI mass storage | `MassStorageDevice`, `ScsiCommandBlock`, `ScsiReply`/`ScsiSense`/`ScsiStatus`, `MassStoragePersistPolicy`, `MassStorageOverlayStatus`; BBB dispatch, read-only/CD-ROM rejection, copy-on-write writes through `WriteOverlay`, FLUSH/stop persistence |
 | FAT32 builder | `Fat32ImageBuilder`, `Fat32Node`, `build_fat32_image`, `fat32_image_from_directory`, `parse_fat32_image`, `Fat32Info`/`Fat32Layout` |
 | ISO media | `IsoImage::inspect`, `parse_iso_volume_descriptors`, read-only `MediaFormat::Iso9660` |
@@ -745,10 +749,63 @@ and is never written to a reply, status, or log. The default
 `NoUsbIpCredentials` presents nothing, so a configured token/fingerprint
 requirement fails closed.
 
-This listener is plaintext and control-plane only. It does not implement the
-USB/IP bulk data path; a successful IMPORT records a local `vhci` port only
+This listener is plaintext. A successful IMPORT records a local `vhci` port only
 when the injected kernel backend actually returned one. TLS remains external as
 described above.
+
+### USB/IP URB data relay
+
+`usbip_urb` is the typed codec for the four messages that follow a successful
+`OP_REP_IMPORT` on the same connection:
+
+| Message | Raw value | Direction | Body |
+|---|---|---|---|
+| `USBIP_CMD_SUBMIT` | `0x00000001` | client → server | 48-byte header + OUT payload + ISO descriptors |
+| `USBIP_CMD_UNLINK` | `0x00000002` | client → server | 48-byte header with target `seqnum` |
+| `USBIP_RET_SUBMIT` | `0x00000003` | server → client | 48-byte header + IN payload + ISO descriptors |
+| `USBIP_RET_UNLINK` | `0x00000004` | server → client | 48-byte header with status |
+
+The common 20-byte basic header is `command`, `seqnum`, `devid`, `direction`,
+`ep`; the 28-byte union holds the submit flags/length/start-frame/
+packet-count/interval/setup, completion status/actual-length/start-frame/
+packet-count/error-count, or unlink target/status. All values are network byte
+order and every field is encoded at the kernel `usbip_header` offsets. Transfer
+lengths reuse the control frame ceiling (`USBIP_URB_MAX_TRANSFER_BYTES`), ISO
+descriptors are capped at `USBIP_MAX_ISO_PACKETS`, and each descriptor's
+`offset + length` plus `actual_length <= length` is checked. Non-ISO transfers
+use the kernel `0xffffffff` sentinel (`0` is also accepted); a submit with the
+wrong payload direction, an endpoint above 15, an unknown command, an
+unsupported direction, a negative signed length, truncation, trailing bytes, or
+an oversized count/length is a distinct `UsbIpUrbError` (kind `usbip-urb`).
+`Debug` prints `data_len`, never payload bytes, so URB data cannot leak through
+a log line. Kernel-style server replies that write `direction = 0` even for an
+IN payload can be decoded with `UsbIpRetSubmit::decode_with_direction`.
+
+`usbip_relay` adds the bounded data path:
+
+* `UsbIpDataEndpoint` is the injectable device boundary. `submit` receives a
+  `UsbIpCmdSubmit` and returns a `UsbIpRetSubmit` carrying real device bytes (or
+  a typed `UsbIpDataError` status); `unlink` cancels by `devid`/`seqnum`.
+* `UsbIpRelay` is the deterministic core. It pairs SUBMIT/RET by `seqnum`,
+  records only metadata while in flight, enforces `max_in_flight`, drops a
+  completion that arrives after a successful unlink, restores a target when the
+  endpoint could not cancel it, and drains every outstanding URB on cleanup.
+* `serve_data_session` runs the URB stream over any `UsbIpTransport`. Each
+  accepted submit runs on its own bounded worker thread, so completions may be
+  written out of order; a submit above the ceiling is answered with
+  `USBIP_RET_SUBMIT` status `-EBUSY` and never silently dropped. Endpoint
+  errors become negative-status completions with zero bytes. Peer close, stop,
+  protocol error, and the idle deadline all unlink outstanding URBs and record
+  `cancelled_on_disconnect`.
+
+`UsbIpRelayConfig` bounds in-flight URBs (`1..=256`, default 32), transfer bytes
+(default the codec ceiling), ISO descriptors, and an optional idle deadline
+(default 30 s). The relay does **not** invent device data, and it is not a
+kernel `usbip-host`/`vhci_hcd` stub: attach/import success still requires the
+injected `UsbIpKernelBackend` to return a real local port, and the default
+`NoUsbIpKernel` still fails with `usbip-kernel-required`. A real endpoint adapter
+would bridge these URBs to a kernel USB device or a userspace device backend;
+tests use in-memory endpoints only.
 
 `SubprocessUsbIpController` implements `UsbIpController` with an injected
 `CommandRunner`:
@@ -942,6 +999,8 @@ Relevant suites:
 | `tests/usbip_daemon.rs` | authorized/denied attach never reaches the kernel on denial, token/fingerprint enforcement, bounded connections, start/stop, export/detach/unexport cleanup, bounded hotplug log, typed `usbip-kernel-required`, fail-closed TLS, no secrets in status/Debug |
 | `tests/usbip_protocol.rs` | version-`0x0111` header/opcode/status golden bytes, device-record network byte order at kernel offsets, DEVLIST/IMPORT round trips, fixed-width strings, truncated/trailing/oversized/unknown-version/opcode errors, import-reply body rules |
 | `tests/usbip_server.rs` | in-memory duplex DEVLIST empty/populated, descriptor-only advertising, authorized/denied IMPORT, kernel-required and unknown-device error replies with no device body, version/opcode/truncation/frame-ceiling errors, idle timeout, concurrent connection ceiling, hotplug events, loopback TCP with the same codec |
+| `tests/usbip_urb.rs` | 48-byte URB header offsets and network byte order for submit/completion/unlink, OUT/IN payload rules, kernel `number_of_packets` sentinel, ISO descriptor round trips and offset/length/count bounds, truncation/trailing/unknown-command/direction/endpoint/oversize errors, bounded decode, payload-redacted `Debug`, typed `usbip-urb` kind |
+| `tests/usbip_relay.rs` | one/many in-flight URBs, out-of-order completions, unlink before and after completion, endpoint errors without invented bytes, disconnect cleanup, in-flight ceiling `-EBUSY`, idle timeout cleanup, no payload in relay outcome `Debug` |
 | `tests/fat32_overlay.rs` | FAT32/raw writes and reads, base immutability, per-block copy-on-write, allocation ceiling and preflight atomicity, commit/reload, checksummed persistence corruption, discard/materialise |
 | `tests/uac2.rs` | UAC2 descriptor/channel/rate/size consistency, microphone/speaker/headset modes, invalid rates/channels/modes, ConfigFS attribute writes, descriptor-only unsupported bridge status |
 | `tests/uac2_bridge.rs` | sample-accurate 44.1/48 kHz packetization, 16/24/32-bit and mono/stereo conversion, no implicit resampling, playback ring drops/backpressure, partial/padded capture packets, flush/stop/restart, typed missing path/endpoint/overflow errors, status never live without data |
@@ -1009,18 +1068,21 @@ existing VM; the disposable QEMU is quit over QMP or killed on timeout.
 - Real gadget validation on `dummy_hcd` and hardware UDCs; currently only the
   ignored round trip exists, and node tests use a temp root/fake controller.
 - USB/IP now has a typed version-`0x0111` control codec, a bounded plaintext
-  control listener (`UsbIpServer`), and the in-process daemon
-  (`UsbIpDaemon`) with start/stop, export/list/attach/detach/unexport, peer
-  connections, peer authorization, and a bounded hotplug log. It is still a
-  **control-plane** implementation: there is no USB/IP bulk data path (URB
-  submit/retrieve), no server-side `usbip-host` stub, and no kernel hotplug
-  monitor. `OP_REQ_IMPORT` reaches a successful reply only through an injected
-  `UsbIpKernelBackend` that returns a real local `vhci` port; the default
-  `NoUsbIpKernel` (and every fake used in tests) returns typed
+  control listener (`UsbIpServer`), the in-process daemon (`UsbIpDaemon`) with
+  start/stop, export/list/attach/detach/unexport, peer connections, peer
+  authorization, and a bounded hotplug log, plus a typed URB codec and bounded
+  data relay (`usbip_urb`/`usbip_relay`) with injectable endpoints. The relay is
+  library-level: there is no in-tree kernel `usbip-host`/`vhci_hcd` stub, no
+  adapter from `UsbIpDataEndpoint` to a real kernel USB device, and no kernel
+  hotplug monitor. `OP_REQ_IMPORT` reaches a successful reply only through an
+  injected `UsbIpKernelBackend` that returns a real local `vhci` port; the
+  default `NoUsbIpKernel` (and every fake used in tests) returns typed
   `usbip-kernel-required` instead of faking a `vhci_hcd`/`usbip-host` device.
-  The optional listener is plaintext and has no in-process TLS; an external
-  TLS terminator/tunnel must protect it, and `Required` TLS fails closed. A
-  node route exposing the daemon/server and the client-side import
+  ISO descriptor arrays are bounded and round-trip, but ISO wire-padding
+  compaction into a real URB buffer is left to the endpoint adapter. The
+  optional listener is plaintext and has no in-process TLS; an external TLS
+  terminator/tunnel must protect it, and `Required` TLS fails closed. A node
+  route exposing the daemon/server/relay and the client-side import
   orchestration remain open.
 - The FAT32 builder is a static snapshot, not the Python live `FATSynthesiser`
   (no sector-on-demand reads, inotify rescan, or long-name rescan stability).

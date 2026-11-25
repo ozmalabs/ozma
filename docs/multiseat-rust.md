@@ -22,11 +22,15 @@ remains `shared` (one X root); `xvfb`/`xephyr` start a real private server only
 when requested. A versioned `seats.json` store (`--seats-file`) preserves seat
 ids, display outputs, input hubs, ports, and audio sinks across replans; a sysfs
 hotplug model (`--hotplug`) reconciles add/remove display and input-hub events
-into seat start/stop with debounce. It is **not wired into `ozma-node` or
-`ozma-softnode`**. The helper grabs physical devices only when explicitly
-requested and confirmed; it is not invoked by the default plan, tests, or dry
-runs. The controller can group the independent per-seat node registrations for
-display, without merging them or taking over seat lifecycle.
+into seat start/stop with debounce. `ozma-node` can load that same store with
+`--multiseat --seats-file` and expose the persisted plan/status read-only at
+`GET /api/v1/seats`; it **does not** own seat lifecycle (start/stop/restart stay
+with this standalone supervisor). `ozma-softnode` has no seat integration. The
+helper grabs physical devices only when explicitly requested and confirmed; it
+is not invoked by the default plan, tests, or dry runs. The controller can
+consume each node's seat report when present, group the independent per-seat
+node registrations for display, and fall back to the historical name/metadata
+grouping for older nodes without merging them or taking over seat lifecycle.
 
 The Python baseline in [`agent/multiseat`](../agent/multiseat) remains the
 runnable multi-seat implementation. The plan and phase status are in
@@ -139,14 +143,29 @@ Implemented:
 - Read-only controller seat grouping (`GET /api/v1/seats`, dashboard Seats
   panel) that recognises the `<machine>-seat-<n>` names the planner produces,
   or explicit `seat_id`/`parent_node_id` metadata, and reports online state,
-  seat indexes, node ids, displays, and HID/HTTP ports. It never merges nodes,
-  controls seats, or exposes tokens.
+  seat indexes, node ids, displays, and HID/HTTP ports. When a node serves its
+  own read-only `GET /api/v1/seats`, the controller consumes the explicit
+  persisted seat identity and plan/state metadata; older nodes and nodes without
+  the route preserve the historical grouping. A node's typed seat-store error is
+  passed through in `node_errors`; no node is dropped. It never merges nodes,
+  controls seats, or exposes tokens or local store paths.
+- **Read-only node seat report** (`ozma-node --multiseat --seats-file PATH`):
+  opt-in and off by default. The node loads the versioned seat store once and
+  serves the persisted plan plus per-seat status at public `GET /api/v1/seats`.
+  `seat_id` is only the explicit `OZMA_SEAT_ID` value. The report marks a
+  persisted seat whose display this node cannot observe as `available:false`
+  with a typed `persisted_seat_missing_display` diagnostic; it never reports it
+  running. A store read/parse/version failure is a typed 503 document. The route
+  has no start/stop surface (`lifecycle:"external"`, `start_stop:false`) and
+  spawns no process, including in plan-only use.
 
 Deliberately not implemented yet:
 
-- Node integration inside `ozma-node`/`ozma-softnode`, controller registration,
-  or a Python-agent-compatible manager API. The CLI is the external supervisor.
-  The controller grouping above is read-only and does not change this.
+- **Node-owned seat lifecycle.** `ozma-node` exposes only the read-only report
+  above. Starting, restarting, and stopping seat children remains with the
+  standalone `ozma-multiseat` supervisor; `ozma-softnode` has no seat
+  integration. There is no manager API that lets a node or controller start a
+  seat, and no process-group/namespace isolation for seat children.
 - **True per-seat screen ownership.** The default X11 path positions one xrandr
   output on a single X server. All outputs share one root window and one
   keyboard focus, so `xrandr` ownership is not screen isolation. The opt-in
@@ -208,7 +227,7 @@ Deliberately not implemented yet:
 | Input | `InputDevice`, `InputDeviceKind`, `InputGroup`, `InputBackend`, `SysfsInputBackend`, `group_inputs`, `classify_capabilities`, `usb_hub_path_from_sysfs` |
 | Host | `HostTopology` |
 | Planning | `PlannerOptions`, `CapturePreference`, `MultiseatPlanner`, `PersistedPlan`, `allocate_ports` |
-| Persistence | `SeatStore`, `PersistedSeat`, `PersistedDisplay`, `SEAT_STORE_VERSION`, `DEFAULT_SEAT_STORE_NAME`, `default_seat_store_path` |
+| Persistence | `SeatStore`, `PersistedSeat`, `PersistedSeatStatus`, `SeatStoreStatus`, `PersistedDisplay`, `SEAT_STORE_VERSION`, `DEFAULT_SEAT_STORE_NAME`, `default_seat_store_path` |
 | Hotplug | `HotplugMonitor`, `HotplugEvent`, `HotplugDebounce`, `HotplugOptions`, `SeatReconciler`, `ReconcileReport`, `SysfsHotplugMonitor` |
 | Audio | `SeatAudioRouter`, `SeatAudioSpec`, `SeatAudioState`, `OzmaAudioRouter` |
 | Seat | `SeatProfile`, `ProfileDefaults`, `SeatConfig`, `SeatPlan`, `CapturePlan`, `NodeCommand`, `SeatPorts`, `SeatState`, `SeatStatus`, `SeatRuntimeStatus` |
@@ -688,6 +707,73 @@ Metrics labels are seat ids and fixed state/port kinds only. Node argv,
 environment, input paths, audio sink names, and error strings stay out of the
 metrics surface.
 
+## Node read-only seat report (`ozma-node --multiseat`)
+
+Seat lifecycle stays with the `ozma-multiseat` supervisor. A node launched by
+that supervisor can additionally expose the persisted plan it came from:
+
+```bash
+ozma-node --profile desktop --name host-seat-0 \
+  --multiseat --seats-file /etc/ozma/seats.json
+```
+
+`--multiseat` (visible alias `--multiseat-plan`) is opt-in and requires
+`--seats-file`. Without the flag the public route is present but reports
+`configured:false`, so a controller can distinguish "no multiseat" from an
+error. The store is loaded once at startup; the node does not enumerate
+displays, run `xrandr`, or re-plan seats.
+
+`GET /api/v1/seats` returns:
+
+```json
+{
+  "ok": true,
+  "configured": true,
+  "mode": "read-only",
+  "lifecycle": "external",
+  "start_stop": false,
+  "source": "/etc/ozma/seats.json",
+  "seat_id": "host-seat-0",
+  "plan": {"version": 1, "seats": [{"id": "host-seat-0", "...": "..."}]},
+  "status": {
+    "version": 1,
+    "seat_count": 1,
+    "node_count": 1,
+    "seats": [
+      {
+        "seat_id": "host-seat-0",
+        "display_output": "HDMI-1",
+        "state": "planned",
+        "available": true,
+        "...": "persisted ports/profile/input fields"
+      }
+    ],
+    "diagnostics": []
+  },
+  "node_seat": {"seat_id": "host-seat-0", "state": "planned", "available": true}
+}
+```
+
+* `seat_id` is the explicit `OZMA_SEAT_ID` environment value only; the node
+  never derives one from `--name`. `node_seat` is present only when that id
+  names a persisted seat.
+* Runtime lifecycle fields (`pid`, `restarts`, resource state) are absent: the
+  node does not own the seat process. `lifecycle` is always `"external"` and
+  `start_stop` is always `false`.
+* `available:false` plus a `persisted_seat_missing_display` diagnostic means the
+  node did not observe that persisted output (from configured display outputs or
+  the explicit `OZMA_X11_OUTPUT`). The seat stays retained and `planned`; it is
+  never resurrected as running.
+* An unreadable, malformed, newer-version, or invalid store is a typed 503:
+  `{"ok":false,"configured":true,"mode":"error","error":{"code":"seat_store_parse","message":"..."}}`.
+  It contains no fabricated seats. Codes are stable (`seat_store_read`,
+  `seat_store_parse`, `seat_store_version`, `seat_store_invalid`,
+  `seat_store_conflict`).
+
+This is the complete node-owned surface. There is no `POST /api/v1/seats`,
+start, stop, or restart route; the supervisor remains the only component that
+mutates seat lifecycle.
+
 ## Controller seat grouping (read-only)
 
 The controller still sees one independent node per seat. `controller/seats.py`
@@ -708,6 +794,18 @@ derives a display-only grouping at read time and exposes it as
   `stream_port`, `display_outputs`/`displays`, and display/role fields when set.
 - Online state uses the node's `last_seen` freshness (`offline_after`, default
   180 s). No tokens, node argv, environment, or audio sink names are exposed.
+- Each node is asked for its own read-only `GET /api/v1/seats` (bounded timeout,
+  bearer token when configured). A `configured:true` report supplies the
+  explicit persisted `seat_id` and a bounded `multiseat` object
+  (`mode`, `plan_seat_count`, `state`, `available`) on the seat entry. This
+  lets a renamed node still join its machine group. The node's local store path,
+  plan, argv, and environment are never passed through.
+- A node that does not serve the route (404), has no HTTP API, or answered
+  `configured:false` keeps the historical name/metadata grouping exactly.
+- A reachable node's typed failure (for example `seat_store_parse`) is preserved
+  in a top-level `node_errors` list as `{node_id, status, error:{code,message}}`;
+  the node still appears through the fallback grouping. `node_errors` is omitted
+  when every node is absent/healthy, preserving the earlier response shape.
 - The dashboard has a read-only Seats panel that groups seat rows under their
   machine; individual node cards remain unchanged. The panel has no start,
   stop, or destructive controls.
@@ -747,6 +845,15 @@ ozma-multiseat --display :0 --seat-display xvfb --seat-display-size 1280x800
 ozma-multiseat --display :0 \
   --seats-file ~/.config/ozma/seats.json \
   --hotplug --audio-router pipewire
+```
+
+A node launched by that supervisor can report the same persisted plan without
+owning lifecycle:
+
+```bash
+# Read-only GET /api/v1/seats. Requires the store; never starts/stops a seat.
+ozma-node --profile desktop --name host-seat-0 \
+  --multiseat --seats-file /etc/ozma/seats.json
 ```
 
 Configuration:
@@ -922,8 +1029,17 @@ python3 -m pytest tests/unit/controller/test_seats.py
 
 They cover name/`seat_id`/`parent_node_id` grouping, multi-host separation,
 online/offline state, unrelated-node exclusion, the API shape and token
-redaction, optional `seat_id` registration compatibility, and dashboard group
-rendering.
+redaction, optional `seat_id` registration compatibility, consuming a node's
+explicit persisted seat report, typed node-error passthrough while keeping the
+fallback group, the unchanged response shape when the route is absent, and
+dashboard group rendering. The default fixture answers 404 for every node, so
+no unit test opens a socket.
+
+Node-side route tests use only in-memory/temp files and `tower::oneshot`; they
+never spawn a seat process. They cover not-configured, a persisted plan with an
+explicit `OZMA_SEAT_ID`, a retained missing display that stays `planned`, a
+parse error as a typed 503, a newer-version error, and the always-external
+read-only lifecycle (`start_stop:false`).
 
 Real host checks are opt-in and `#[ignore]`d:
 
@@ -1038,12 +1154,12 @@ listeners, registration, capture processes, audio sinks, input assignment, and
 hotplug. The Rust crate now covers planning, subprocess supervision, and a
 local status surface. Still required for parity:
 
-1. **Node/controller integration.** Wire the supervisor into `ozma-node`,
-   `ozma-softnode`, or a manager that registers each seat as an independent
-   node with the controller. The controller groups those registrations
-   read-only, but it does not start/stop seats, merge them into a super-node,
-   or surface supervisor state. The CLI status document is local and
-   read-only.
+1. **Seat lifecycle integration.** `ozma-node` now reports the persisted plan
+   read-only at `GET /api/v1/seats`, and the controller consumes it when
+   present. Still missing: a manager that lets the node or controller start,
+   stop, or restart seats, register supervisor runtime state, merge seats into a
+   super-node, or isolate seat children (process groups/namespaces). The
+   standalone CLI remains the lifecycle owner.
 2. **True display ownership.** xrandr output positioning exists as a command
    model/controller, but the shared backend still has one root window and
    keyboard focus. The opt-in `--seat-display xvfb`/`xephyr` path now provides a

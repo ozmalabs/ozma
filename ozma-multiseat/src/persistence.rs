@@ -45,7 +45,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::display::DisplayOutput;
 use crate::error::MultiseatError;
-use crate::seat::{MultiseatPlan, SeatPlan, SeatProfile};
+use crate::seat::{
+    DiagnosticCode, MultiseatPlan, PlanDiagnostic, SeatPlan, SeatProfile, SeatState,
+};
 
 /// Highest seat-store format version this build understands.
 pub const SEAT_STORE_VERSION: u32 = 1;
@@ -138,6 +140,121 @@ impl PersistedSeat {
             udp_port: seat.config.udp_port,
             http_port: seat.config.http_port,
             profile: seat.config.profile,
+        }
+    }
+}
+
+/// Read-only status for one persisted seat.
+///
+/// A single-seat node can load the shared `seats.json` store and report its
+/// seat without re-enumerating displays or claiming a launch plan it did not
+/// resolve. The fields are exactly the persisted identity; capture transport,
+/// ownership, and routing intent are deliberately absent because the store does
+/// not record them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedSeatStatus {
+    /// Stable seat id.
+    pub seat_id: String,
+    /// Persisted display output/connector name.
+    pub display_output: String,
+    /// Persisted display index.
+    pub display_index: u32,
+    /// Persisted display width.
+    pub display_width: u32,
+    /// Persisted display height.
+    pub display_height: u32,
+    /// Persisted input hub key, when one was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_hub: Option<String>,
+    /// Persisted input device paths.
+    #[serde(default)]
+    pub input_devices: Vec<String>,
+    /// Persisted audio sink name.
+    pub audio_sink: String,
+    /// Persisted UDP HID port.
+    pub udp_port: u16,
+    /// Persisted HTTP API port.
+    pub http_port: u16,
+    /// Persisted seat profile.
+    pub profile: SeatProfile,
+    /// Lifecycle state. A persisted-only report is always [`SeatState::Planned`];
+    /// process lifecycle stays with the external supervisor.
+    pub state: SeatState,
+    /// Whether the seat's display was among the caller-supplied discovered
+    /// outputs. When the caller supplies no discovered outputs, availability is
+    /// unknown and this is `true` rather than a fabricated "missing".
+    pub available: bool,
+}
+
+/// Read-only status document for a persisted seat store.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeatStoreStatus {
+    /// Store format version.
+    pub version: u32,
+    /// Number of persisted seats.
+    pub seat_count: usize,
+    /// Controller-visible nodes. One seat is one node.
+    pub node_count: usize,
+    /// Per-seat persisted status.
+    pub seats: Vec<PersistedSeatStatus>,
+    /// Non-fatal diagnostics (for example a retained missing display).
+    #[serde(default)]
+    pub diagnostics: Vec<PlanDiagnostic>,
+}
+
+impl SeatStore {
+    /// Build a read-only status document from persisted identities.
+    ///
+    /// `discovered_displays` is the set of display outputs the caller actually
+    /// observed. When it is empty the caller is not claiming discovery, so every
+    /// persisted seat is reported as available and no missing-display diagnostic
+    /// is invented. When it is non-empty, a persisted seat whose output is absent
+    /// stays in the document with `available:false`, `state:"planned"`, and a
+    /// [`DiagnosticCode::PersistedSeatMissingDisplay`] diagnostic. It is never
+    /// resurrected as running/starting.
+    pub fn status(&self, discovered_displays: &[String]) -> SeatStoreStatus {
+        let check_displays = !discovered_displays.is_empty();
+        let mut diagnostics = Vec::new();
+        let mut seats = Vec::with_capacity(self.seats.len());
+
+        for seat in &self.seats {
+            let available = !check_displays
+                || discovered_displays
+                    .iter()
+                    .any(|output| output == &seat.display.output);
+            if !available {
+                diagnostics.push(PlanDiagnostic::for_seat(
+                    DiagnosticCode::PersistedSeatMissingDisplay,
+                    &seat.id,
+                    format!(
+                        "persisted display {:?} is not currently discovered; seat {:?} stays retained but is not running",
+                        seat.display.output, seat.id
+                    ),
+                ));
+            }
+            seats.push(PersistedSeatStatus {
+                seat_id: seat.id.clone(),
+                display_output: seat.display.output.clone(),
+                display_index: seat.display.index,
+                display_width: seat.display.width,
+                display_height: seat.display.height,
+                input_hub: seat.input_hub.clone(),
+                input_devices: seat.input_devices.clone(),
+                audio_sink: seat.audio_sink.clone(),
+                udp_port: seat.udp_port,
+                http_port: seat.http_port,
+                profile: seat.profile,
+                state: SeatState::Planned,
+                available,
+            });
+        }
+
+        SeatStoreStatus {
+            version: self.version,
+            seat_count: seats.len(),
+            node_count: seats.len(),
+            seats,
+            diagnostics,
         }
     }
 }
@@ -466,4 +583,73 @@ fn sort_seats(seats: &mut [PersistedSeat]) {
 /// Conventional path for a seat store under a configuration directory.
 pub fn default_seat_store_path(config_dir: impl AsRef<Path>) -> PathBuf {
     config_dir.as_ref().join(DEFAULT_SEAT_STORE_NAME)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seat(id: &str, output: &str, index: u32) -> PersistedSeat {
+        PersistedSeat {
+            id: id.to_owned(),
+            display: PersistedDisplay {
+                output: output.to_owned(),
+                index,
+                width: 1920,
+                height: 1080,
+                x: index as i32 * 1920,
+                y: 0,
+                x_screen: ":0".to_owned(),
+            },
+            input_hub: Some("1-1".to_owned()),
+            input_devices: vec!["/dev/input/event0".to_owned()],
+            audio_sink: format!("ozma-seat-{index}"),
+            udp_port: 7331 + index as u16,
+            http_port: 7382 + index as u16,
+            profile: SeatProfile::Desktop,
+        }
+    }
+
+    #[test]
+    fn status_does_not_invent_missing_displays_without_discovery() {
+        let store = SeatStore {
+            version: SEAT_STORE_VERSION,
+            seats: vec![seat("host-seat-0", "HDMI-1", 0)],
+        };
+
+        let status = store.status(&[]);
+
+        assert_eq!(status.seat_count, 1);
+        assert_eq!(status.node_count, 1);
+        assert!(status.seats[0].available);
+        assert_eq!(status.seats[0].state, SeatState::Planned);
+        assert!(status.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn status_retains_a_missing_display_without_resurrecting_it() {
+        let store = SeatStore {
+            version: SEAT_STORE_VERSION,
+            seats: vec![
+                seat("host-seat-0", "HDMI-1", 0),
+                seat("host-seat-1", "DP-2", 1),
+            ],
+        };
+
+        let status = store.status(&["HDMI-1".to_owned()]);
+
+        assert_eq!(status.seat_count, 2);
+        assert!(status.seats[0].available);
+        assert!(!status.seats[1].available);
+        assert_eq!(status.seats[1].state, SeatState::Planned);
+        assert_eq!(status.diagnostics.len(), 1);
+        assert_eq!(
+            status.diagnostics[0].code,
+            DiagnosticCode::PersistedSeatMissingDisplay
+        );
+        assert_eq!(
+            status.diagnostics[0].seat_id.as_deref(),
+            Some("host-seat-1")
+        );
+    }
 }
