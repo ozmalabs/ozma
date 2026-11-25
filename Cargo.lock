@@ -348,6 +348,7 @@ dependencies = [
  "axum-core",
  "base64 0.22.1",
  "bytes 1.11.1",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",
@@ -3490,6 +3491,7 @@ dependencies = [
  "hostname 0.4.2",
  "serde",
  "serde_json",
+ "sysinfo 0.29.11",
  "tracing",
 ]
 
@@ -3576,7 +3578,6 @@ dependencies = [
  "base64 0.22.1",
  "bytes 1.11.1",
  "clap",
- "futures-util",
  "hostname 0.4.2",
  "http-body-util",
  "jpeg-decoder",
@@ -3611,7 +3612,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "sysinfo 0.29.11",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
