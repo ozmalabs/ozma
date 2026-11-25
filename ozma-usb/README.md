@@ -376,6 +376,47 @@ marker file alone never sets it. The `FunctionFsDaemon` trait
 `unsupported-functionfs` failure when no daemon is ready. No daemon is spawned
 and no vendor protocol is implemented.
 
+#### FunctionFS SCSI bulk transport loop
+
+`MassStorageLoop` connects the SCSI model to injectable bulk endpoints. The
+transport trait is deliberately small:
+
+```rust
+use ozma_usb::{
+    MassStorageDevice, MassStorageLoop, MassStorageLoopConfig, MemoryBulkTransport,
+};
+
+let mut transport = MemoryBulkTransport::new();
+transport.push_host_data(&read10_cbw)?; // a 31-byte CBW
+let device = MassStorageDevice::read_only_bytes(image_bytes, 256 * 1024 * 1024)?;
+let mut loop_ = MassStorageLoop::new(device, transport, MassStorageLoopConfig::default())?;
+let outcome = loop_.step()?; // reads CBW/data, dispatches SCSI, writes data + CSW
+assert!(loop_.is_running()); // only after a completed command cycle
+# Ok::<(), ozma_usb::UsbError>(())
+```
+
+`MassStorageBulkTransport` has `read_out`, `write_in`, and `flush_in`; each call
+receives the configured deadline and must return
+`UsbError::MassStorageEndpointTimeout` for a stalled endpoint. The loop assembles
+short CBW/data transfers, rejects declared data phases above
+`MassStorageLoopConfig::max_transfer_bytes` (sector aligned, default 1 MiB,
+hard ceiling `SCSI_MAX_TRANSFER_BYTES`), counts typed timeout/bound/transport
+failures, and never claims `running` before a CSW was written. Malformed CBWs
+and transport failures are typed errors; SCSI failures are normal check
+conditions with a CSW. `SYNCHRONIZE CACHE(10)` and `stop()` apply the configured
+`MassStoragePersistPolicy` to the overlay.
+
+`FunctionFsBulkTransport` adapts an enabled `FunctionFsDaemonCore`; it clamps
+reads and chunks writes to the FunctionFS 64 KiB per-transfer limit, so a 1 MiB
+SCSI data phase is assembled across several endpoint calls. `FileBulkTransport`
+owns two explicitly supplied endpoint files for a caller-managed mount, so it
+can be boxed into a long-lived export. Default tests drive
+the loop through `MemoryBulkTransport`, owned temporary endpoint files, and
+FunctionFS loopback endpoints only.
+No test mounts FunctionFS, opens a real UDC endpoint, or claims a live host
+transfer. The node uses `IdleBulkTransport` for a configured-but-not-attached
+export, and only attaches a transport after the daemon enables its endpoints.
+
 ### UAC2 audio functions
 
 `Uac2Config` expands the previous flat channel/rate/depth tuple with multiple
@@ -679,8 +720,11 @@ remains available for the existing node wiring.
   commits the checksummed persistence file according to
   `MassStoragePersistPolicy`; `load_writable_file` reloads it. Requests are
   bounded to 1 MiB (2048 sectors), and `ScsiReply` returns the IN data,
-  residue, CSW status, and sense. No block device, mount, or USB transfer is
-  performed by this module.
+  residue, CSW status, and sense. `MassStorageLoop` drives the same device over
+  injectable bulk endpoints (`FunctionFsBulkTransport`, `MemoryBulkTransport`),
+  assembles short transfers, enforces a configured data-phase bound and typed
+  endpoint timeouts, and only reports `running` after a CSW was written. No
+  block device, mount, or real USB transfer is performed by these modules.
 - **ISO** (`iso`): `IsoImage::inspect` reads at most 32 volume descriptors from
   an existing file, verifies `CD001`, the primary descriptor, both-endian
   size/block fields, and root-directory bounds. `MediaFormat::Iso9660` always
@@ -794,6 +838,7 @@ Relevant suites:
 | `tests/functionfs_lifecycle.rs` | function/link creation, mountpoint validation, fake-mounter mount/unmount, `ep0` descriptor write, readiness success/timeout, bind failure rollback, unbind/cleanup, caller-supplied mount preservation, missing mount tool, config validation |
 | `tests/functionfs_state.rs` | typed `FunctionFsStateMachine` ordering, out-of-order typed errors, explicit UDC bind/unbind readiness, daemon status never `running` before endpoint traffic, bind/unbind events, lifecycle helper readiness gate, ignored real-UDC run |
 | `tests/mass_storage_scsi.rs` | SCSI CBW parse/dispatch, write/read-back through the overlay, base immutability, FLUSH/stop persistence + reload, read-only media and SCSI `DATA PROTECT`, typed bounds, malformed/phase errors, overlay exhaustion without partial allocation, read-only FAT32 image byte identity |
+| `tests/mass_storage_loop.rs` | CBW→data→CSW round trips over fake endpoints, write/read/flush, read-only rejection with sense, overlay persistence/reload, transfer bounds, short-transfer assembly, typed stall/I/O failures, stop cleanup, owned file endpoints, FunctionFS loopback endpoint adapter |
 | `tests/usbip_daemon.rs` | authorized/denied attach never reaches the kernel on denial, token/fingerprint enforcement, bounded connections, start/stop, export/detach/unexport cleanup, bounded hotplug log, typed `usbip-kernel-required`, fail-closed TLS, no secrets in status/Debug |
 | `tests/fat32_overlay.rs` | FAT32/raw writes and reads, base immutability, per-block copy-on-write, allocation ceiling and preflight atomicity, commit/reload, checksummed persistence corruption, discard/materialise |
 | `tests/uac2.rs` | UAC2 descriptor/channel/rate/size consistency, microphone/speaker/headset modes, invalid rates/channels/modes, ConfigFS attribute writes, descriptor-only unsupported bridge status |
@@ -896,12 +941,17 @@ existing VM; the disposable QEMU is quit over QMP or killed on timeout.
   unbind/cleanup), but mounting in the default path still requires an injected
   mounter and caller privileges. The command mounter is untested against a real
   FunctionFS mount/UDC in the default suite; there is no persistent daemon
-  process, restart supervision, real UDC event loop, node route that starts the
-  lifecycle, or vendor protocol. `running` is deliberately only reachable after
-  a real endpoint transfer; a mount, marker, UDC bind, or enable event never
-  suffices. Class/vendor control requests are rejected with typed errors until a
-  protocol handler exists. Suspend and resume events are accepted but not acted
-  on. UAC2 models descriptors/capabilities, writes
+  process, restart supervision, real UDC event loop, or vendor protocol. The
+  SCSI `MassStorageLoop` and node `/usb/media*` routes exist, but a live
+  FunctionFS transport is attached only by explicit code; the default node path
+  starts a configured export with `IdleBulkTransport` and never auto-attaches a
+  UDC endpoint. Blocking file-endpoint reads do not enforce the loop deadline
+  themselves, so the typed timeout contract is proven with fakes until a real
+  UDC test is added. `running` is deliberately only reachable after a real
+  command cycle; a mount, marker, UDC bind, or enable event never suffices.
+  Class/vendor control requests are rejected with typed errors until a protocol
+  handler exists. Suspend and resume events are accepted but not acted on.
+  UAC2 models descriptors/capabilities, writes
   the primary ConfigFS attributes, and now includes a testable isochronous
   bridge core (`Uac2Bridge`) with injectable endpoints and audio paths. It does
   **not** yet service a real UDC/FunctionFS isochronous endpoint, open ALSA or
@@ -910,6 +960,11 @@ existing VM; the disposable QEMU is quit over QMP or killed on timeout.
   report. Node flags exist (`--usb-uac2`, `--usb-vendor`,
   `--usb-vendor-daemon`), but `/usb` surfaces readiness/absence rather than
   starting either backend; the lifecycle status is library-only for now.
+- Node media export routes (`GET/POST /usb/media`, `/usb/hotplug`) are backed by
+  the userspace SCSI/overlay path and are independent of the ConfigFS
+  mass-storage LUN. They do not auto-start on boot, do not drive a real
+  FunctionFS endpoint, and record only transitions the node caused or observed;
+  there is no SSE stream or kernel hotplug monitor.
 - Node-side gadget teardown/recovery across restart, and hardware-profile
   validation. Mounting, block-device I/O, and real USB/IP transport remain
   deliberately outside this crate.

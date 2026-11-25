@@ -32,12 +32,14 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use boringtun::noise::{Tunn, TunnResult};
 use libmdns::{Responder, Service};
+use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket as TokioUdpSocket;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tracing::{debug, info, warn};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
@@ -50,6 +52,29 @@ struct PeerState {
     node: MeshNode,
     /// boringtun userspace WireGuard tunnel for this peer.
     tunnel: Box<Tunn>,
+}
+
+/// Read-only snapshot of one peer's tunnel, returned by
+/// [`MeshManager::peer_statuses`].
+///
+/// `established` is only true after boringtun reports a completed handshake;
+/// merely adding a peer never claims an active tunnel.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PeerStatus {
+    /// Peer identity as registered.
+    pub node: MeshNode,
+    /// Whether a WireGuard handshake has completed.
+    pub established: bool,
+    /// Seconds since the last handshake (`None` before the first one).
+    pub last_handshake_age_secs: Option<u64>,
+    /// Data bytes sent through the tunnel.
+    pub tx_bytes: usize,
+    /// Data bytes received through the tunnel.
+    pub rx_bytes: usize,
+    /// boringtun's estimated packet loss in `0.0..=1.0`.
+    pub loss: f32,
+    /// Last handshake RTT in milliseconds, when known.
+    pub rtt_ms: Option<u32>,
 }
 
 // ── Lock-protected inner state ────────────────────────────────────────────────
@@ -70,14 +95,22 @@ pub struct MeshManager {
     /// UDP socket used to send/receive WireGuard-encapsulated packets.
     pub socket: Arc<UdpSocket>,
 
-    /// mDNS responder — kept alive for the lifetime of the manager.
-    _mdns_responder: Responder,
-
-    /// mDNS service registration handle.
-    _mdns_service: Service,
+    /// mDNS responder + service registration handles, kept alive for the
+    /// lifetime of the manager.
+    ///
+    /// `libmdns::Responder` contains a `RefCell` and is therefore `Send` but
+    /// not `Sync`. Wrapping the handles in a `Mutex` keeps `MeshManager`
+    /// `Sync`, so node services can call it from `Send` async trait methods.
+    _mdns: std::sync::Mutex<Option<(Responder, Service)>>,
 
     /// This node's private key (needed to create per-peer boringtun tunnels).
     private_key: WgPrivateKey,
+
+    /// Whether the receive loop is currently running.
+    started: Arc<AtomicBool>,
+
+    /// Wakes the receive loop so [`MeshManager::stop`] can end it.
+    stop_notify: Arc<Notify>,
 }
 
 impl MeshManager {
@@ -127,9 +160,10 @@ impl MeshManager {
                 peers: HashMap::new(),
             })),
             socket: Arc::new(socket),
-            _mdns_responder: responder,
-            _mdns_service: svc,
+            _mdns: std::sync::Mutex::new(Some((responder, svc))),
             private_key,
+            started: Arc::new(AtomicBool::new(false)),
+            stop_notify: Arc::new(Notify::new()),
         })
     }
 
@@ -147,21 +181,44 @@ impl MeshManager {
     /// to the matching peer tunnel for decapsulation, and automatically replies
     /// to WireGuard handshake messages.
     pub async fn start(&self) -> Result<()> {
-        let socket_clone = self
-            .socket
-            .try_clone()
-            .map_err(|e| MeshError::TunnelError(format!("socket clone for recv loop: {e}")))?;
+        // Starting twice must not spawn a second reader on the same socket.
+        if self.started.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        let socket_clone = match self.socket.try_clone() {
+            Ok(socket) => socket,
+            Err(e) => {
+                self.started.store(false, Ordering::SeqCst);
+                return Err(MeshError::TunnelError(format!(
+                    "socket clone for recv loop: {e}"
+                )));
+            }
+        };
         // from_std requires the socket to already be non-blocking (set in new())
-        let async_sock = TokioUdpSocket::from_std(socket_clone)
-            .map_err(|e| MeshError::TunnelError(format!("tokio UdpSocket::from_std: {e}")))?;
+        let async_sock = match TokioUdpSocket::from_std(socket_clone) {
+            Ok(socket) => socket,
+            Err(e) => {
+                self.started.store(false, Ordering::SeqCst);
+                return Err(MeshError::TunnelError(format!(
+                    "tokio UdpSocket::from_std: {e}"
+                )));
+            }
+        };
         let inner = Arc::clone(&self.inner);
+        let started = Arc::clone(&self.started);
+        let stop_notify = Arc::clone(&self.stop_notify);
 
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             let mut out = vec![0u8; 65535];
 
             loop {
-                match async_sock.recv_from(&mut buf).await {
+                let received = tokio::select! {
+                    _ = stop_notify.notified() => break,
+                    received = async_sock.recv_from(&mut buf) => received,
+                };
+                match received {
                     Err(e) => {
                         warn!("WireGuard recv loop error: {e}");
                         break;
@@ -207,9 +264,20 @@ impl MeshManager {
                     }
                 }
             }
+            started.store(false, Ordering::SeqCst);
         });
 
         Ok(())
+    }
+
+    /// Stop the background receive loop.
+    ///
+    /// This does not remove peers or drop the mDNS registration; callers that
+    /// want the manager fully gone should drop it. It exists so a node service
+    /// can report an honest stopped state without abandoning a running task.
+    pub fn stop(&self) {
+        self.started.store(false, Ordering::SeqCst);
+        self.stop_notify.notify_waiters();
     }
 
     // ── Peer management ───────────────────────────────────────────────────────
@@ -279,6 +347,31 @@ impl MeshManager {
     pub async fn list_peers(&self) -> Vec<MeshNode> {
         let guard = self.inner.read().await;
         guard.peers.values().map(|p| p.node.clone()).collect()
+    }
+
+    /// Return a snapshot of each peer with boringtun's tunnel statistics.
+    ///
+    /// `established` reflects a completed WireGuard handshake only. A peer that
+    /// was added but has not completed a handshake is reported as not
+    /// established, never as a fabricated connected tunnel.
+    pub async fn peer_statuses(&self) -> Vec<PeerStatus> {
+        let guard = self.inner.read().await;
+        guard
+            .peers
+            .values()
+            .map(|peer| {
+                let (age, tx_bytes, rx_bytes, loss, rtt_ms) = peer.tunnel.stats();
+                PeerStatus {
+                    node: peer.node.clone(),
+                    established: age.is_some(),
+                    last_handshake_age_secs: age.map(|duration| duration.as_secs()),
+                    tx_bytes,
+                    rx_bytes,
+                    loss,
+                    rtt_ms,
+                }
+            })
+            .collect()
     }
 
     // ── Packet I/O ────────────────────────────────────────────────────────────

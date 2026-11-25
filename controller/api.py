@@ -1730,6 +1730,51 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             )
         return payload
 
+    async def _proxy_node_connect(node_id: str, surface: str) -> Any:
+        """Proxy a mesh/Connect surface to a node, preserving typed limits.
+
+        The Rust node serves `/api/v1/connect/{status,peers,events}` and answers
+        a missing key/root/`wg` prerequisite with a typed 501 document. Python
+        soft nodes do not serve these paths; their 404 is returned as a plain
+        404 instead of being flattened into a transport failure or inventing a
+        mesh state. All other controller behavior (including the global
+        ``/api/v1/connect/status`` cloud client) is unchanged.
+        """
+        status, payload = await _proxy_node_response(
+            node_id, f"/api/v1/connect/{surface}"
+        )
+        if status == 404:
+            raise HTTPException(
+                status_code=404,
+                detail="Node does not provide the mesh/Connect surface",
+            )
+        if status in (401, 403):
+            raise HTTPException(status_code=502, detail=_node_auth_error(status))
+        if status >= 400:
+            if _is_typed_unsupported(payload):
+                return JSONResponse(status_code=status, content=payload)
+            detail = payload.get("error") if isinstance(payload, dict) else None
+            raise HTTPException(
+                status_code=502,
+                detail=detail or f"Node returned HTTP {status}",
+            )
+        return payload
+
+    @app.get("/api/v1/nodes/{node_id}/connect/status")
+    async def node_connect_status(node_id: str) -> Any:
+        """Read the node's own mesh identity, state, and capabilities."""
+        return await _proxy_node_connect(node_id, "status")
+
+    @app.get("/api/v1/nodes/{node_id}/connect/peers")
+    async def node_connect_peers(node_id: str) -> Any:
+        """Read the node's known mesh peers without inventing a count."""
+        return await _proxy_node_connect(node_id, "peers")
+
+    @app.get("/api/v1/nodes/{node_id}/connect/events")
+    async def node_connect_events(node_id: str) -> Any:
+        """Read the node's bounded mesh event log."""
+        return await _proxy_node_connect(node_id, "events")
+
     async def _proxy_node_raw(
         node_id: str, path: str, timeout: float = 10.0
     ) -> tuple[int, str, bytes]:

@@ -44,7 +44,11 @@
 //! * [`MassStorageDevice`] decodes USB Mass Storage BBB CBWs and serves the
 //!   SCSI block commands for read-only FAT32/ISO/raw media or overlay-backed
 //!   writable media, with typed bounds, read-only rejection, and FLUSH/stop
-//!   persistence.
+//!   persistence. [`MassStorageLoop`] drives the same device over injectable
+//!   bulk endpoints, assembles short transfers, enforces a configured
+//!   data-phase bound and typed endpoint timeouts, and only reports `running`
+//!   after a CSW was written. [`UsbMediaHotplugLog`] is a bounded
+//!   export/attach/detach/unbind event log for the node poll route.
 //! * [`UsbIpDaemon`] is a bounded in-process USB/IP control-plane state machine
 //!   (start/stop, export/list/attach/detach/unexport, peer connections,
 //!   authorization, hotplug log) with an injectable kernel backend. The default
@@ -103,7 +107,9 @@ pub mod functionfs_daemon;
 pub mod functionfs_lifecycle;
 pub mod iso;
 pub mod mass_storage;
+pub mod mass_storage_loop;
 pub mod media;
+pub mod media_hotplug;
 pub mod nbd;
 pub mod nbd_server;
 pub mod overlay;
@@ -164,7 +170,16 @@ pub use mass_storage::{
     SCSI_MAX_TRANSFER_BYTES, SCSI_SECTOR_BYTES, SENSE_DATA_PROTECT, SENSE_ILLEGAL_REQUEST,
     SENSE_MEDIUM_ERROR, SENSE_NO_SENSE,
 };
+pub use mass_storage_loop::{
+    BoxedMassStorageTransport, BulkTransportFault, FileBulkTransport, FunctionFsBulkTransport,
+    IdleBulkTransport, MassStorageBulkTransport, MassStorageCommandOutcome, MassStorageLoop,
+    MassStorageLoopConfig, MassStorageLoopStats, MemoryBulkTransport,
+    MASS_STORAGE_DEFAULT_TIMEOUT_MS, MASS_STORAGE_MAX_TIMEOUT_MS,
+};
 pub use media::{MassStorageImage, MediaFormat, MediaMode, MediaState, VirtualMedia};
+pub use media_hotplug::{
+    UsbMediaHotplugEvent, UsbMediaHotplugKind, UsbMediaHotplugLog, MAX_USB_MEDIA_HOTPLUG_EVENTS,
+};
 pub use nbd::{
     validate_nbd_descriptor, NbdCommand, NbdExport, NbdExportDescriptor, NbdHandshake, NbdReply,
     NbdRequest, NbdRequestHeader, NBD_DEFAULT_PORT, NBD_HANDSHAKE_LEN, NBD_MAX_REQUEST_BYTES,

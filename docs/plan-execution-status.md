@@ -146,6 +146,8 @@ also never touch a real UDC, ConfigFS mount, or block device.
 | UAC2 bridge → audio/node | Partial | ALSA/PipeWire adapters + dedicated pump; `/usb` reports `configured/running/stopped` with counters and typed errors, and `running` requires PCM. Real UDC/host-enumeration unproven. See [`phase4-uac2-node-report.md`](phase4-uac2-node-report.md). |
 | USB FunctionFS/SCSI/USB-IP | Partial | Typed FunctionFS lifecycle, SCSI BBB overlay-backed writable media with persistence, bounded USB/IP daemon with authorization and fail-closed TLS. No real UDC, wire protocol, or `vhci_hcd`. See [`phase4-usb-completeness-report.md`](phase4-usb-completeness-report.md). |
 | Multi-seat input isolation | Partial | `ozma-seat-input` helper (`EVIOCGRAB` + uinput) with typed protocol, validation, rollback, idempotent release, and SIGTERM cleanup; supervisor `--input-isolation helper`. Node/compositor does not consume the uinput devices yet. See [`phase4-multiseat-input-report.md`](phase4-multiseat-input-report.md). |
+| FunctionFS SCSI media | Partial | `MassStorageLoop` CBW/data/CSW over injectable bulk transports with deadlines, bounds, and counters; `/usb/media` start/stop/status plus `/usb/hotplug`, overlay-backed writable media and persistence. No real UDC/kernel mount or persistent daemon. See [`phase4-functionfs-media-report.md`](phase4-functionfs-media-report.md). |
+| Mesh / Ozma Connect | Partial | Opt-in `--mesh` service (real `ozma-mesh` + fake backend), honest states, handshake-confirmed peers, typed key/root/`wg` errors, `/api/v1/connect/{status,peers,events}`, controller passthrough. No TUN/routing dataplane, mDNS browsing, or Connect cloud/CA registration. See [`phase4-mesh-node-report.md`](phase4-mesh-node-report.md). |
 
 Verification added by this work:
 
@@ -228,7 +230,7 @@ authentication, and Xpra video are being extended in separate workstreams.
 ## Verification
 
 ```bash
-cargo test --workspace                                   # 2314 passed, 41 ignored (current)
+cargo test --workspace                                   # 2341 passed, 41 ignored (current)
 cargo test -p ozma-node --test parity                    # Python/controller parity baseline (16)
 cargo test -p ozma-node --lib                            # node API, compat, session unit tests (136, 2 ignored)
 cargo test -p ozma-qmp -p ozma-input -p ozma-power       # QMP, uinput/QMP sinks, power (166)

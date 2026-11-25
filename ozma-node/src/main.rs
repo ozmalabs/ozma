@@ -48,7 +48,7 @@ use ozma_node::{
     },
     input_select,
     keyboard_layout::KeyboardLayout,
-    mdns,
+    mdns, mesh_service,
     multi_hls::{MultiConsoleHls, MultiConsoleHlsConfig},
     multi_webrtc::{MultiConsoleWebrtc, MultiConsoleWebrtcConfig},
     platform, registration, shutdown,
@@ -541,6 +541,34 @@ pub struct Args {
     /// Require this bearer token for the node's HTTP API.
     #[arg(long, env = "OZMA_API_TOKEN")]
     pub api_token: Option<String>,
+
+    /// Opt in to the userspace WireGuard mesh service (`/api/v1/connect/*`).
+    ///
+    /// Off by default: without this flag the node binds no mesh socket and the
+    /// Connect routes report `state:"disabled"` without peers or tunnels.
+    #[arg(long, env = "OZMA_MESH")]
+    pub mesh: bool,
+
+    /// IPv4 address assigned to this node on the mesh (required by --mesh).
+    #[arg(long, env = "OZMA_MESH_IP")]
+    pub mesh_ip: Option<String>,
+
+    /// WireGuard UDP port for mesh traffic.
+    #[arg(long, env = "OZMA_MESH_PORT", default_value_t = 51820)]
+    pub mesh_port: u16,
+
+    /// Path to a base64-encoded WireGuard private key file (required by --mesh).
+    #[arg(long, env = "OZMA_MESH_KEY_FILE", value_name = "PATH")]
+    pub mesh_key_file: Option<std::path::PathBuf>,
+
+    /// Request kernel WireGuard (root + `wg` binary). Kernel mode is not
+    /// implemented; this is reported as a typed unsupported state.
+    #[arg(long, env = "OZMA_MESH_KERNEL")]
+    pub mesh_kernel: bool,
+
+    /// Additional mesh peer as a JSON `MeshNode` object. Repeatable.
+    #[arg(long = "mesh-peer", env = "OZMA_MESH_PEER", value_name = "JSON")]
+    pub mesh_peer: Vec<String>,
 
     /// Enable the local HLS pipeline: capture → ffmpeg → `/stream/*`.
     ///
@@ -1667,60 +1695,92 @@ async fn run() -> std::process::ExitCode {
                 );
                 None
             } else {
-                match open_first_capture_source(&capture_registry).and_then(|source| {
-                    let mut start_config = webrtc_config.clone();
-                    if args.webrtc_fit_capture {
-                        let format = source.format();
-                        if format.width > 0 && format.height > 0 {
-                            if format.width != start_config.width
-                                || format.height != start_config.height
-                            {
-                                info!(
-                                    configured = %format!(
-                                        "{}x{}",
-                                        start_config.width, start_config.height
-                                    ),
-                                    capture = %format!("{}x{}", format.width, format.height),
-                                    "fitting WebRTC helper to the capture frame size"
-                                );
-                            }
-                            start_config.width = format.width;
-                            start_config.height = format.height;
-                        }
-                    }
-                    WebRtcHelper::start(source, start_config).map_err(|error| error.to_string())
-                }) {
-                    Ok(helper) => {
-                        // Keep the geometry actually used, so a later console
-                        // switch restarts the helper at the same size.
-                        let used = helper.config();
-                        webrtc_switch_config = Some(used.clone());
-                        info!(
-                            pid = ?helper.status().helper_pid(),
-                            socket = %used.socket_path.display(),
-                            shm = %used.shm_path.display(),
-                            width = used.width,
-                            height = used.height,
-                            fps = used.fps,
-                            audio = ?used.audio_source,
-                            audio_backend = used.audio_backend.as_arg(),
-                            stun = ?used.stun_server,
-                            turn = ?used.turn_server,
-                            turn_auth = used.turn_user.is_some()
-                                && used.turn_password.is_some(),
-                            "WebRTC helper started"
-                        );
-                        Some(WebRtcControl::from_helper(helper))
-                    }
+                match open_first_capture_source(&capture_registry) {
                     Err(error) => {
                         warn!(
                             error = %error,
-                            "WebRTC unavailable: the external helper did not start"
+                            "WebRTC unavailable: no capture source could be opened"
                         );
                         Some(WebRtcControl::failed_with_audio(
                             format!("WebRTC unavailable: {error}"),
                             audio_source,
                         ))
+                    }
+                    Ok(mut source) => {
+                        let mut start_config = webrtc_config.clone();
+                        if args.webrtc_fit_capture {
+                            // Discovery-time formats may be zero (QMP/VNC learn
+                            // geometry from the first frame), so probe one
+                            // bounded frame before choosing the helper size.
+                            let mut format = source.format();
+                            if format.width == 0 || format.height == 0 {
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_secs(3),
+                                    source.next_frame(),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(frame)) => format = frame.format(),
+                                    Ok(Err(error)) => warn!(
+                                        error = %error,
+                                        "WebRTC fit: the first capture frame failed; keeping the configured size"
+                                    ),
+                                    Err(_) => warn!(
+                                        "WebRTC fit: the first capture frame timed out; keeping the configured size"
+                                    ),
+                                }
+                            }
+                            if format.width > 0 && format.height > 0 {
+                                if format.width != start_config.width
+                                    || format.height != start_config.height
+                                {
+                                    info!(
+                                        configured = %format!(
+                                            "{}x{}",
+                                            start_config.width, start_config.height
+                                        ),
+                                        capture = %format!("{}x{}", format.width, format.height),
+                                        "fitting WebRTC helper to the capture frame size"
+                                    );
+                                }
+                                start_config.width = format.width;
+                                start_config.height = format.height;
+                            }
+                        }
+                        match WebRtcHelper::start(source, start_config) {
+                            Ok(helper) => {
+                                // Keep the geometry actually used, so a later
+                                // console switch restarts at the same size.
+                                let used = helper.config();
+                                webrtc_switch_config = Some(used.clone());
+                                info!(
+                                    pid = ?helper.status().helper_pid(),
+                                    socket = %used.socket_path.display(),
+                                    shm = %used.shm_path.display(),
+                                    width = used.width,
+                                    height = used.height,
+                                    fps = used.fps,
+                                    audio = ?used.audio_source,
+                                    audio_backend = used.audio_backend.as_arg(),
+                                    stun = ?used.stun_server,
+                                    turn = ?used.turn_server,
+                                    turn_auth = used.turn_user.is_some()
+                                        && used.turn_password.is_some(),
+                                    "WebRTC helper started"
+                                );
+                                Some(WebRtcControl::from_helper(helper))
+                            }
+                            Err(error) => {
+                                warn!(
+                                    error = %error,
+                                    "WebRTC unavailable: the external helper did not start"
+                                );
+                                Some(WebRtcControl::failed_with_audio(
+                                    format!("WebRTC unavailable: {error}"),
+                                    audio_source,
+                                ))
+                            }
+                        }
                     }
                 }
             }
@@ -2114,6 +2174,49 @@ async fn run() -> std::process::ExitCode {
     let compat_router = controller_compat::compat_router(compat_state.clone())
         .merge(thermal_router)
         .merge(hardware_router);
+
+    // Opt-in mesh service. It is merged into the guarded compatibility router,
+    // so `/api/v1/connect/*` uses the same bearer-token guard as the other
+    // control routes. Without `--mesh` no service exists and no socket is bound.
+    let mesh_service = build_mesh_service(&args);
+    let compat_router = compat_router.merge(mesh_service::router(mesh_service.clone()));
+    if let Some(service) = mesh_service.clone() {
+        match service.state() {
+            mesh_service::MeshState::Unsupported => {
+                if let Some(error) = service.error() {
+                    warn!(
+                        code = %error.code,
+                        reason = %error.reason,
+                        "Mesh service is configured but unsupported; /api/v1/connect/* \
+                         will return a typed unsupported document"
+                    );
+                }
+            }
+            _ => match service.start().await {
+                Ok(()) => info!("Mesh service started (userspace WireGuard)"),
+                Err(error) => warn!(
+                    code = %error.code,
+                    reason = %error.reason,
+                    "Mesh service failed to start; /api/v1/connect/* reports the runtime state"
+                ),
+            },
+        }
+        let mesh_shutdown = shutdown.clone();
+        background.push((
+            "mesh-service",
+            tokio::spawn(async move {
+                mesh_shutdown.cancelled().await;
+                if let Err(error) = service.stop().await {
+                    warn!(
+                        code = %error.code,
+                        reason = %error.reason,
+                        "Mesh service shutdown was not clean"
+                    );
+                }
+            }),
+        ));
+    }
+
     let public_compat_router = controller_compat::public_router(compat_state);
 
     // Thermal sampling runs read-only unless a policy and --thermal-control are
@@ -2933,6 +3036,63 @@ fn command_on_path(name: &str) -> bool {
             .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
             .unwrap_or(false)
     })
+}
+
+/// Build the opt-in mesh service from CLI configuration.
+///
+/// Returns `None` when `--mesh` is absent, so a node without mesh config keeps
+/// its previous behavior. A configured-but-unsupported node gets an explicit
+/// typed service instead of an error that would hide the reason.
+fn build_mesh_service(args: &Args) -> Option<mesh_service::MeshService> {
+    if !args.mesh {
+        return None;
+    }
+
+    let log = || mesh_service::MeshEventLog::new(mesh_service::MESH_EVENT_CAPACITY);
+    let mut peers = Vec::new();
+    for spec in &args.mesh_peer {
+        match serde_json::from_str::<ozma_mesh::MeshNode>(spec) {
+            Ok(peer) => peers.push(peer),
+            Err(error) => {
+                return Some(mesh_service::MeshService::unsupported(
+                    mesh_service::MeshServiceError::new(
+                        "mesh.peer-invalid",
+                        format!("--mesh-peer is not a valid MeshNode JSON object: {error}"),
+                    ),
+                    log(),
+                ));
+            }
+        }
+    }
+
+    let config = mesh_service::MeshServiceConfig {
+        node_id: args.name.clone(),
+        mesh_ip: args.mesh_ip.clone().unwrap_or_default(),
+        wg_port: args.mesh_port,
+        key_file: args.mesh_key_file.clone(),
+        requires_root: args.mesh_kernel,
+        requires_wg: args.mesh_kernel,
+        peers,
+        event_capacity: None,
+    };
+    let environment = mesh_service::MeshEnvironment::detect();
+
+    if args.mesh_kernel {
+        // Surface a missing key/root/wg first, then the honest backend limit.
+        return match config.preflight(&environment) {
+            Err(error) => Some(mesh_service::MeshService::unsupported(error, log())),
+            Ok(()) => Some(mesh_service::MeshService::unsupported(
+                mesh_service::MeshServiceError::new(
+                    "mesh.kernel-unsupported",
+                    "kernel WireGuard is not implemented on this node; only the userspace \
+                     boringtun backend is available",
+                ),
+                log(),
+            )),
+        };
+    }
+
+    Some(mesh_service::MeshService::from_config(config, &environment))
 }
 
 /// Controller-facing name for a selected input sink kind.

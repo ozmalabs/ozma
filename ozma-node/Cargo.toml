@@ -57,6 +57,8 @@ ozma-hardware = { path = "../ozma-hardware" }
 ozma-display-protocol = { path = "../ozma-display-protocol" }
 # Browser camera/microphone reassembly is shared with the client side.
 ozma-client-core = { path = "../ozma-client-core" }
+# Opt-in userspace WireGuard mesh + mDNS peer identity (`--mesh`).
+ozma-mesh     = { path = "../ozma-mesh" }
 
 # HTTP API
 axum = { version = "0.7", features = ["json", "ws"] }

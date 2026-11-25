@@ -19,6 +19,7 @@ pub mod hls;
 pub mod input_select;
 pub mod keyboard_layout;
 pub mod mdns;
+pub mod mesh_service;
 pub mod multi_hls;
 pub mod multi_webrtc;
 pub mod platform;

@@ -277,6 +277,39 @@ pub enum UsbError {
         reason: String,
     },
 
+    /// A bulk data phase is not attached to a media export.
+    #[error("mass-storage export has no bulk endpoint transport attached")]
+    MassStorageNotAttached,
+
+    /// A mass-storage bulk endpoint transfer timed out.
+    #[error("mass-storage endpoint {operation} timed out after {timeout_ms} ms")]
+    MassStorageEndpointTimeout {
+        /// Operation that timed out (`read`, `write`, `flush`, ...).
+        operation: &'static str,
+        /// Deadline in milliseconds.
+        timeout_ms: u64,
+    },
+
+    /// A mass-storage bulk transport failed outside a normal endpoint timeout.
+    #[error("mass-storage {operation} transport failed: {reason}")]
+    MassStorageTransport {
+        /// Operation that failed.
+        operation: &'static str,
+        /// Human-readable reason.
+        reason: String,
+    },
+
+    /// A mass-storage transfer would exceed the configured loop bound.
+    #[error("mass-storage {context} exceeds {limit} bytes (requested {requested})")]
+    MassStorageBuffer {
+        /// Buffer purpose (`CBW data phase`, `CSW`, ...).
+        context: &'static str,
+        /// Configured maximum in bytes.
+        limit: usize,
+        /// Requested bytes.
+        requested: usize,
+    },
+
     /// A write-overlay operation would exceed image or allocation bounds.
     #[error("write overlay bounds exceeded: {reason}")]
     OverlayBounds {
@@ -415,6 +448,10 @@ impl UsbError {
             Self::Spawn { .. } => "spawn",
             Self::CommandFailed { .. } => "command-failed",
             Self::UnsupportedFunctionFs { .. } => "unsupported-functionfs",
+            Self::MassStorageNotAttached => "mass-storage-not-attached",
+            Self::MassStorageEndpointTimeout { .. } => "mass-storage-endpoint-timeout",
+            Self::MassStorageTransport { .. } => "mass-storage-transport",
+            Self::MassStorageBuffer { .. } => "mass-storage-buffer-too-large",
             Self::OverlayBounds { .. } => "overlay-bounds",
             Self::OverlayCorrupt { .. } => "overlay-corrupt",
             Self::MissingFunctionFsMount(_) => "missing-functionfs-mount",
