@@ -33,8 +33,9 @@ use tokio::task::JoinHandle;
 
 use crate::display_compat::{SnapshotControl, SnapshotFrame};
 use crate::hls::{
-    start_mpegts_stream, validate_stream_encoder, EncoderProbe, HlsCodec, HlsConfig, HlsEncoder,
-    HlsError, HlsPixelFormat, MpegTsSpawner, MpegTsStream, SystemEncoderProbe, SystemMpegTsSpawner,
+    start_fmp4_stream, start_mpegts_stream, validate_stream_encoder, EncoderProbe, HlsCodec,
+    HlsConfig, HlsEncoder, HlsError, HlsPixelFormat, MpegTsSpawner, MpegTsStream,
+    SystemEncoderProbe, SystemMpegTsSpawner,
 };
 use ozma_media::{CaptureSource, FrameFormat, PixelFormat};
 
@@ -65,6 +66,8 @@ pub const BOUNDARY: &str = "ozma-frame";
 pub const CONTENT_TYPE: &str = "multipart/x-mixed-replace; boundary=ozma-frame";
 /// `Content-Type` header value for an H.264/HEVC MPEG-TS response.
 pub const MPEGTS_CONTENT_TYPE: &str = "video/mp2t";
+/// `Content-Type` header value for an AV1 fragmented-MP4 response.
+pub const FMP4_CONTENT_TYPE: &str = "video/mp4";
 /// Canonical stream route.
 pub const ROUTE: &str = "/video";
 /// Alias matching the Python soft node's MJPEG path.
@@ -82,6 +85,8 @@ pub enum VideoCodec {
     H264,
     /// HEVC/H.265 in MPEG-TS.
     Hevc,
+    /// AV1 in fragmented MP4.
+    Av1,
 }
 
 impl VideoCodec {
@@ -91,6 +96,7 @@ impl VideoCodec {
             Self::Mjpeg => "mjpeg",
             Self::H264 => "h264",
             Self::Hevc => "hevc",
+            Self::Av1 => "av1",
         }
     }
 
@@ -100,17 +106,54 @@ impl VideoCodec {
             "mjpeg" | "mjpg" | "jpeg" => Ok(Self::Mjpeg),
             "h264" | "avc" | "h.264" => Ok(Self::H264),
             "hevc" | "h265" | "h.265" => Ok(Self::Hevc),
+            "av1" | "av01" => Ok(Self::Av1),
             other => Err(VideoQueryError {
                 field: "codec",
                 value: other.to_owned(),
-                message: format!("`codec` must be mjpeg, h264, or hevc, not `{other}`."),
+                message: format!("`codec` must be mjpeg, h264, hevc, or av1, not `{other}`."),
             }),
         }
     }
 
-    /// True for the encoded MPEG-TS codecs.
+    /// True for the encoded stream codecs.
     pub fn is_encoded(self) -> bool {
         !matches!(self, Self::Mjpeg)
+    }
+
+    /// Transport container used by this encoded codec.
+    pub fn container(self) -> VideoContainer {
+        match self {
+            Self::Mjpeg | Self::H264 | Self::Hevc => VideoContainer::MpegTs,
+            Self::Av1 => VideoContainer::Fmp4,
+        }
+    }
+}
+
+/// Wire container for an encoded `/video` response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VideoContainer {
+    /// MPEG-TS for H.264/HEVC.
+    MpegTs,
+    /// Fragmented MP4 for AV1.
+    Fmp4,
+}
+
+impl VideoContainer {
+    /// Stable status/header name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MpegTs => "mpegts",
+            Self::Fmp4 => "fmp4",
+        }
+    }
+
+    /// HTTP content type for this container.
+    pub fn content_type(self) -> &'static str {
+        match self {
+            Self::MpegTs => MPEGTS_CONTENT_TYPE,
+            Self::Fmp4 => FMP4_CONTENT_TYPE,
+        }
     }
 }
 
@@ -128,7 +171,7 @@ pub struct VideoParams {
     /// Console index, label, `Console_N`, or capture source id.
     #[serde(default)]
     pub console: Option<String>,
-    /// Requested stream codec (`mjpeg`, `h264`, or `hevc`).
+    /// Requested stream codec (`mjpeg`, `h264`, `hevc`, or `av1`).
     #[serde(default)]
     pub codec: Option<String>,
     /// Requested frame rate, clamped to [`MIN_FPS`]..=[`MAX_FPS`].
@@ -150,9 +193,9 @@ pub struct VideoOptions {
     pub codec: VideoCodec,
     /// Frames per second after clamping.
     pub fps: u32,
-    /// JPEG quality after clamping (ignored by H.264/HEVC).
+    /// JPEG quality after clamping (ignored by H.264/HEVC/AV1).
     pub quality: u8,
-    /// H.264/HEVC bitrate after clamping (ignored by MJPEG).
+    /// H.264/HEVC/AV1 bitrate after clamping (ignored by MJPEG).
     pub bitrate_kbps: u32,
 }
 
@@ -383,13 +426,14 @@ pub struct VideoStatus {
     /// Default frame encoding (`jpeg`).
     pub encoding: &'static str,
     /// Accepted `?codec=` values. `h264`/`hevc` are omitted when this node has
-    /// no encoder configuration.
+    /// no encoder configuration; `av1` is omitted unless an AV1 encoder was
+    /// probed available.
     pub codecs: Vec<&'static str>,
     /// Codec used when `?codec=` is absent.
     pub default_codec: &'static str,
     /// Number of streams currently being served (MJPEG + encoded).
     pub active_streams: usize,
-    /// H.264/HEVC MPEG-TS streams currently being served.
+    /// H.264/HEVC/AV1 streams currently being served.
     pub active_encoded_streams: usize,
     /// Hard concurrent-stream cap shared by every codec.
     pub max_streams: usize,
@@ -401,21 +445,32 @@ pub struct VideoStatus {
     pub max_fps: u32,
     /// Default JPEG quality.
     pub default_quality: u8,
-    /// Default H.264/HEVC bitrate in kbps.
+    /// Default H.264/HEVC/AV1 bitrate in kbps.
     pub default_bitrate_kbps: u32,
-    /// Lowest accepted H.264/HEVC bitrate in kbps.
+    /// Lowest accepted H.264/HEVC/AV1 bitrate in kbps.
     pub min_bitrate_kbps: u32,
-    /// Highest accepted H.264/HEVC bitrate in kbps.
+    /// Highest accepted H.264/HEVC/AV1 bitrate in kbps.
     pub max_bitrate_kbps: u32,
 }
 
 impl VideoStatus {
     /// Describe the route without claiming an active stream when idle.
-    pub fn new(available: bool, encoding_available: bool, streams: &VideoStreams) -> Self {
+    ///
+    /// `av1_available` is probe evidence, not just configuration: it is true
+    /// only when ffmpeg advertised an AV1 encoder this pipeline can run.
+    pub fn new(
+        available: bool,
+        encoding_available: bool,
+        av1_available: bool,
+        streams: &VideoStreams,
+    ) -> Self {
         let mut codecs = vec![VideoCodec::Mjpeg.as_str()];
         if encoding_available {
             codecs.push(VideoCodec::H264.as_str());
             codecs.push(VideoCodec::Hevc.as_str());
+        }
+        if encoding_available && av1_available {
+            codecs.push(VideoCodec::Av1.as_str());
         }
         Self {
             supported: true,
@@ -439,17 +494,20 @@ impl VideoStatus {
     }
 }
 
-/// A started H.264/HEVC `/video` stream plus the encoder that is actually
+/// A started encoded `/video` stream plus the encoder that is actually
 /// running (which may be a software fallback from a configured hardware
 /// backend).
+#[derive(Debug)]
 pub struct StartedVideoStream {
-    /// Live MPEG-TS stream.
+    /// Live encoded stream (MPEG-TS for H.264/HEVC, fMP4 for AV1).
     pub stream: MpegTsStream,
     /// ffmpeg encoder selected for this stream (or the source family for a
     /// compressed pass-through).
     pub encoder: HlsEncoder,
     /// True when the source bitstream is muxed without re-encoding.
     pub stream_copy: bool,
+    /// Wire container the response body uses.
+    pub container: VideoContainer,
 }
 
 /// Encoder configuration for `GET /video?codec=h264|hevc`.
@@ -492,13 +550,29 @@ impl VideoEncoding {
         &self.template
     }
 
-    /// Start an encoded MPEG-TS stream from an already-opened source.
+    /// True when ffmpeg advertised an AV1 encoder this path can run.
     ///
-    /// A compressed H.264/HEVC source whose family matches `codec` is copied
-    /// without running an encoder. Otherwise the requested codec is encoded
-    /// with the configured backend when available, falling back to the
-    /// matching software encoder. A missing encoder is returned before any
-    /// response is committed, and the source is stopped on every error path.
+    /// This is probe evidence, not a configuration claim: a node without
+    /// `libsvtav1`, `libaom-av1`, or `librav1e` must not advertise `av1`.
+    pub fn av1_available(&self) -> bool {
+        self.probe
+            .availability(&self.template.ffmpeg_bin)
+            .map(|availability| {
+                [HlsEncoder::Av1Svt, HlsEncoder::Av1Aom, HlsEncoder::Av1Rav1e]
+                    .iter()
+                    .any(|encoder| availability.contains(*encoder))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Start an encoded stream from an already-opened source.
+    ///
+    /// A compressed source whose family matches `codec` is copied without
+    /// running an encoder. Otherwise the requested codec is encoded with the
+    /// configured backend when available, falling back to the matching
+    /// software encoder (for AV1, each of libsvtav1/libaom-av1/librav1e is
+    /// tried in order). A missing encoder is returned before any response is
+    /// committed, and the source is stopped on every error path.
     pub async fn start_encoded(
         &self,
         codec: VideoCodec,
@@ -543,12 +617,21 @@ impl VideoEncoding {
             }
         };
         config.video_encoder = encoder;
-        let stream =
-            start_mpegts_stream(source, config, self.spawner.clone(), self.probe.clone()).await?;
+        let container = codec.container();
+        let stream = match container {
+            VideoContainer::MpegTs => {
+                start_mpegts_stream(source, config, self.spawner.clone(), self.probe.clone())
+                    .await?
+            }
+            VideoContainer::Fmp4 => {
+                start_fmp4_stream(source, config, self.spawner.clone(), self.probe.clone()).await?
+            }
+        };
         Ok(StartedVideoStream {
             stream,
             encoder,
             stream_copy,
+            container,
         })
     }
 
@@ -558,6 +641,9 @@ impl VideoEncoding {
         family: HlsCodec,
         config: &HlsConfig,
     ) -> Result<HlsEncoder, HlsError> {
+        if family == HlsCodec::Av1 {
+            return self.resolve_av1_encoder(preferred, config);
+        }
         let mut candidate = config.clone();
         candidate.video_encoder = preferred;
         match validate_stream_encoder(&candidate, self.probe.as_ref()) {
@@ -573,6 +659,43 @@ impl VideoEncoding {
             Err(error) => Err(error),
         }
     }
+
+    /// Try the configured AV1 encoder first, then the other software
+    /// implementations. The selected encoder is the first one ffmpeg
+    /// advertises (and that passes the runtime probe).
+    fn resolve_av1_encoder(
+        &self,
+        preferred: HlsEncoder,
+        config: &HlsConfig,
+    ) -> Result<HlsEncoder, HlsError> {
+        let mut candidates = Vec::with_capacity(4);
+        if matches!(
+            preferred,
+            HlsEncoder::Av1Svt | HlsEncoder::Av1Aom | HlsEncoder::Av1Rav1e
+        ) {
+            candidates.push(preferred);
+        }
+        for encoder in [HlsEncoder::Av1Svt, HlsEncoder::Av1Aom, HlsEncoder::Av1Rav1e] {
+            if !candidates.contains(&encoder) {
+                candidates.push(encoder);
+            }
+        }
+
+        let mut last_error = None;
+        for encoder in candidates {
+            let mut candidate = config.clone();
+            candidate.video_encoder = encoder;
+            match validate_stream_encoder(&candidate, self.probe.as_ref()) {
+                Ok(()) => return Ok(encoder),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(
+            last_error.unwrap_or_else(|| HlsError::UnsupportedStreamCodec {
+                encoder: "av1".to_owned(),
+            }),
+        )
+    }
 }
 
 fn codec_family(codec: VideoCodec) -> Option<HlsCodec> {
@@ -580,12 +703,14 @@ fn codec_family(codec: VideoCodec) -> Option<HlsCodec> {
         VideoCodec::Mjpeg => None,
         VideoCodec::H264 => Some(HlsCodec::H264),
         VideoCodec::Hevc => Some(HlsCodec::Hevc),
+        VideoCodec::Av1 => Some(HlsCodec::Av1),
     }
 }
 
 /// Keep the configured hardware backend but switch to the requested codec
 /// family. A software/AV1/MJPEG preference falls back to the matching software
-/// encoder.
+/// encoder. The AV1 software candidates are validated in preference order by
+/// [`VideoEncoding::resolve_av1_encoder`].
 fn preferred_encoder(preferred: HlsEncoder, family: HlsCodec) -> HlsEncoder {
     match (preferred.backend_label(), family) {
         ("vaapi", HlsCodec::H264) => HlsEncoder::VaapiH264,
@@ -596,6 +721,10 @@ fn preferred_encoder(preferred: HlsEncoder, family: HlsCodec) -> HlsEncoder {
         ("qsv", HlsCodec::Hevc) => HlsEncoder::QsvHevc,
         ("v4l2m2m", HlsCodec::H264) => HlsEncoder::V4l2m2mH264,
         ("v4l2m2m", HlsCodec::Hevc) => HlsEncoder::V4l2m2mHevc,
+        (_, HlsCodec::Av1) => match preferred {
+            HlsEncoder::Av1Svt | HlsEncoder::Av1Aom | HlsEncoder::Av1Rav1e => preferred,
+            _ => HlsEncoder::software_for_codec(HlsCodec::Av1),
+        },
         _ => HlsEncoder::software_for_codec(family),
     }
 }
@@ -603,7 +732,9 @@ fn preferred_encoder(preferred: HlsEncoder, family: HlsCodec) -> HlsEncoder {
 fn source_stream_copy(codec: VideoCodec, format: FrameFormat) -> bool {
     matches!(
         (codec, format.pixel_format),
-        (VideoCodec::H264, PixelFormat::H264) | (VideoCodec::Hevc, PixelFormat::Hevc)
+        (VideoCodec::H264, PixelFormat::H264)
+            | (VideoCodec::Hevc, PixelFormat::Hevc)
+            | (VideoCodec::Av1, PixelFormat::Av1)
     )
 }
 pub fn part(jpeg: &[u8]) -> Bytes {
@@ -707,6 +838,7 @@ mod tests {
         id: String,
         format: FrameFormat,
         payload: Vec<u8>,
+        frames: usize,
     }
 
     impl CaptureProvider for StaticFrameProvider {
@@ -737,6 +869,7 @@ mod tests {
                 id: self.id.clone(),
                 format: self.format,
                 payload: self.payload.clone(),
+                remaining: self.frames,
             }))
         }
     }
@@ -745,6 +878,10 @@ mod tests {
         id: String,
         format: FrameFormat,
         payload: Vec<u8>,
+        /// Frames still to hand out before a clean end of stream. A finite
+        /// source keeps a feeder loop from spinning forever against a fake
+        /// sink, which would grow without bound.
+        remaining: usize,
     }
 
     #[async_trait]
@@ -758,6 +895,10 @@ mod tests {
         }
 
         async fn next_frame(&mut self) -> Result<Frame, MediaError> {
+            if self.remaining == 0 {
+                return Err(MediaError::EndOfStream);
+            }
+            self.remaining -= 1;
             Frame::with_data(self.format, 0, 0, true, self.payload.clone())
         }
     }
@@ -769,6 +910,7 @@ mod tests {
             id: "mjpeg0".to_owned(),
             format: FrameFormat::new(PixelFormat::Mjpeg, 2, 1),
             payload: jpeg.clone(),
+            frames: 1,
         });
         let control = SnapshotControl::new(registry).streaming(None);
         let first = control.capture().await.expect("MJPEG first frame");
@@ -988,5 +1130,222 @@ mod tests {
         assert!(text.contains("Content-Length: 4\r\n"));
         assert!(part.ends_with(b"\r\n"));
         assert!(part.windows(4).any(|window| window == jpeg));
+    }
+
+    #[test]
+    fn av1_maps_to_av1_software_encoders_and_fmp4() {
+        assert_eq!(VideoCodec::parse("av1").unwrap(), VideoCodec::Av1);
+        assert_eq!(VideoCodec::parse("AV01").unwrap(), VideoCodec::Av1);
+        assert_eq!(VideoCodec::Av1.as_str(), "av1");
+        assert_eq!(VideoCodec::Av1.container(), VideoContainer::Fmp4);
+        assert_eq!(
+            VideoCodec::Av1.container().content_type(),
+            FMP4_CONTENT_TYPE
+        );
+        assert_eq!(codec_family(VideoCodec::Av1), Some(HlsCodec::Av1));
+        assert_eq!(
+            preferred_encoder(HlsEncoder::VaapiHevc, HlsCodec::Av1),
+            HlsEncoder::Av1Svt
+        );
+        assert_eq!(
+            preferred_encoder(HlsEncoder::Av1Aom, HlsCodec::Av1),
+            HlsEncoder::Av1Aom
+        );
+        assert_eq!(
+            preferred_encoder(HlsEncoder::Av1Rav1e, HlsCodec::Av1),
+            HlsEncoder::Av1Rav1e
+        );
+        assert!(source_stream_copy(
+            VideoCodec::Av1,
+            FrameFormat::new(PixelFormat::Av1, 320, 240)
+        ));
+        assert!(!source_stream_copy(
+            VideoCodec::Av1,
+            FrameFormat::new(PixelFormat::H264, 320, 240)
+        ));
+    }
+
+    #[test]
+    fn video_status_advertises_av1_only_with_probe_evidence() {
+        let streams = VideoStreams::new(2);
+        let no_av1 = VideoStatus::new(true, true, false, &streams);
+        assert_eq!(no_av1.codecs, vec!["mjpeg", "h264", "hevc"]);
+        let with_av1 = VideoStatus::new(true, true, true, &streams);
+        assert_eq!(with_av1.codecs, vec!["mjpeg", "h264", "hevc", "av1"]);
+        let no_encoding = VideoStatus::new(true, false, true, &streams);
+        assert_eq!(no_encoding.codecs, vec!["mjpeg"]);
+    }
+
+    #[test]
+    fn av1_availability_is_the_encoder_probe_not_configuration() {
+        use crate::hls::{mpegts_test_support::RecordingMpegTsSpawner, StaticEncoderProbe};
+        use std::sync::Arc;
+
+        let spawner = Arc::new(RecordingMpegTsSpawner::fmp4(true));
+        let encoding = |probe: StaticEncoderProbe| {
+            VideoEncoding::with_components(HlsConfig::default(), Arc::new(probe), spawner.clone())
+        };
+        assert!(encoding(StaticEncoderProbe::with_encoders([HlsEncoder::Av1Svt])).av1_available());
+        assert!(encoding(StaticEncoderProbe::with_encoders([HlsEncoder::Av1Aom])).av1_available());
+        assert!(
+            encoding(StaticEncoderProbe::with_encoders([HlsEncoder::Av1Rav1e])).av1_available()
+        );
+        assert!(!encoding(StaticEncoderProbe::with_encoders([HlsEncoder::H264])).av1_available());
+        assert!(!encoding(StaticEncoderProbe::new(Default::default())).av1_available());
+    }
+
+    #[tokio::test]
+    async fn start_encoded_av1_uses_fmp4_and_the_first_available_av1_encoder() {
+        use crate::hls::{
+            mpegts_test_support::{fmp4_fixture, RecordingMpegTsSpawner},
+            EncoderAvailability, StaticEncoderProbe,
+        };
+        use std::sync::Arc;
+
+        // Re-encode an RGB source; the configured H.264 backend is irrelevant
+        // to the AV1 request, and libaom is the only advertised AV1 encoder.
+        let registry = CaptureRegistry::new().with(FakeCaptureProvider::new());
+        let control = SnapshotControl::new(registry).streaming(None);
+        let source = control
+            .open_stream_source()
+            .await
+            .expect("fake RGB source")
+            .1;
+        let spawner = Arc::new(RecordingMpegTsSpawner::with_data(fmp4_fixture(true)));
+        let encoding = VideoEncoding::with_components(
+            HlsConfig {
+                video_encoder: HlsEncoder::VaapiH264,
+                ..HlsConfig::default()
+            },
+            Arc::new(StaticEncoderProbe::with_encoders([HlsEncoder::Av1Aom])),
+            spawner.clone(),
+        );
+        let options = VideoParams {
+            codec: Some("av1".into()),
+            ..VideoParams::default()
+        }
+        .options()
+        .unwrap();
+        let started = encoding
+            .start_encoded(VideoCodec::Av1, &options, source)
+            .await
+            .expect("AV1 fMP4 start");
+        assert_eq!(started.container, VideoContainer::Fmp4);
+        assert!(!started.stream_copy);
+        assert_eq!(started.encoder, HlsEncoder::Av1Aom);
+        assert_eq!(&started.stream.first[4..8], b"ftyp");
+        let argv = spawner.argv();
+        assert!(argv.windows(2).any(|pair| pair == ["-c:v", "libaom-av1"]));
+        assert!(argv.windows(2).any(|pair| pair == ["-f", "mp4"]));
+        assert!(!argv.windows(2).any(|pair| pair == ["-c:v", "copy"]));
+
+        // An AV1 source with no advertised encoder is still copied.
+        let copy_source = StaticFrameSource {
+            id: "av1".to_owned(),
+            format: FrameFormat::new(PixelFormat::Av1, 16, 16),
+            payload: vec![0x0A, 0x0B, 0x0C],
+            remaining: 1,
+        };
+        let copy_encoding = VideoEncoding::with_components(
+            HlsConfig {
+                video_encoder: HlsEncoder::Av1Svt,
+                ..HlsConfig::default()
+            },
+            Arc::new(StaticEncoderProbe::new(EncoderAvailability::default())),
+            spawner.clone(),
+        );
+        let copied = copy_encoding
+            .start_encoded(VideoCodec::Av1, &options, Box::new(copy_source))
+            .await
+            .expect("AV1 passthrough start");
+        assert!(copied.stream_copy);
+        assert_eq!(copied.encoder, HlsEncoder::Av1Svt);
+        let last_argv = spawner
+            .argv
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("second spawn argv");
+        assert!(last_argv.windows(2).any(|pair| pair == ["-f", "obu"]));
+        assert!(last_argv.windows(2).any(|pair| pair == ["-c:v", "copy"]));
+        drop(started.stream.receiver);
+        drop(copied.stream.receiver);
+    }
+
+    #[tokio::test]
+    async fn start_encoded_av1_without_an_encoder_is_a_typed_refusal() {
+        use crate::hls::{
+            mpegts_test_support::RecordingMpegTsSpawner, EncoderAvailability, StaticEncoderProbe,
+        };
+        use std::sync::Arc;
+
+        let registry = CaptureRegistry::new().with(FakeCaptureProvider::new());
+        let control = SnapshotControl::new(registry).streaming(None);
+        let source = control
+            .open_stream_source()
+            .await
+            .expect("fake RGB source")
+            .1;
+        let spawner = Arc::new(RecordingMpegTsSpawner::fmp4(true));
+        let encoding = VideoEncoding::with_components(
+            HlsConfig::default(),
+            Arc::new(StaticEncoderProbe::new(EncoderAvailability::default())),
+            spawner.clone(),
+        );
+        let options = VideoParams {
+            codec: Some("av1".into()),
+            ..VideoParams::default()
+        }
+        .options()
+        .unwrap();
+        let error = encoding
+            .start_encoded(VideoCodec::Av1, &options, source)
+            .await
+            .expect_err("no AV1 encoder");
+        assert!(
+            matches!(error, HlsError::EncoderUnavailable { .. }),
+            "{error}"
+        );
+        assert_eq!(spawner.spawns.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn start_encoded_av1_reencodes_a_compressed_h264_source() {
+        use crate::hls::{
+            mpegts_test_support::{fmp4_fixture, RecordingMpegTsSpawner},
+            StaticEncoderProbe,
+        };
+        use std::sync::Arc;
+
+        let source = StaticFrameSource {
+            id: "h264".to_owned(),
+            format: FrameFormat::new(PixelFormat::H264, 16, 16),
+            payload: vec![0, 0, 0, 1, 0x65, 0x88, 0x84],
+            remaining: 1,
+        };
+        let spawner = Arc::new(RecordingMpegTsSpawner::with_data(fmp4_fixture(true)));
+        let encoding = VideoEncoding::with_components(
+            HlsConfig::default(),
+            Arc::new(StaticEncoderProbe::with_encoders([HlsEncoder::Av1Svt])),
+            spawner.clone(),
+        );
+        let options = VideoParams {
+            codec: Some("av1".into()),
+            ..VideoParams::default()
+        }
+        .options()
+        .unwrap();
+        let started = encoding
+            .start_encoded(VideoCodec::Av1, &options, Box::new(source))
+            .await
+            .expect("AV1 re-encode start");
+        assert_eq!(started.container, VideoContainer::Fmp4);
+        assert!(!started.stream_copy);
+        let argv = spawner.argv();
+        assert!(argv.windows(2).any(|pair| pair == ["-f", "h264"]));
+        assert!(argv.windows(2).any(|pair| pair == ["-c:v", "libsvtav1"]));
+        assert!(!argv.windows(2).any(|pair| pair == ["-c:v", "copy"]));
+        drop(started.stream.receiver);
     }
 }

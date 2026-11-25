@@ -38,6 +38,7 @@ pub mod rpa;
 pub mod rtsp_runtime;
 pub mod scene_replay;
 pub mod seats;
+pub mod serial;
 pub mod shutdown;
 pub mod software;
 pub mod thermal;

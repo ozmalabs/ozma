@@ -1,10 +1,10 @@
-# Phase 4 — `ozma-node` `/video` MJPEG and H.264/HEVC streams
+# Phase 4 — `ozma-node` `/video` MJPEG, H.264/HEVC, and AV1 streams
 
 Status: implemented. MJPEG is unit/route tested with the deterministic fake
-capture provider. H.264/HEVC MPEG-TS is tested with fake sources and a recording
-ffmpeg spawner, plus an ignored live test that pipes a fake RGB source through
-real `ffmpeg` and validates the result with `ffprobe`. No real camera, QMP, VNC,
-or D-Bus device was used.
+capture provider. H.264/HEVC MPEG-TS and AV1 fragmented MP4 are tested with fake
+sources and a recording ffmpeg spawner, plus ignored live tests that pipe a fake
+RGB source through real `ffmpeg` and validate the result with `ffprobe`. No real
+camera, QMP, VNC, or D-Bus device was used.
 
 ## Why
 
@@ -22,17 +22,17 @@ No placeholder JPEG, synthetic frame, or success-shaped empty stream is sent.
 
 ## Endpoint contract
 
-`GET /video?codec=<mjpeg|h264|hevc>&fps=<1..30>&quality=<1..100>&bitrate=<100..50000>&console=<N|label|Console_N|source-id>`
+`GET /video?codec=<mjpeg|h264|hevc|av1>&fps=<1..30>&quality=<1..100>&bitrate=<100..50000>&console=<N|label|Console_N|source-id>`
 
 `GET /display/mjpeg` accepts the same query. Without `codec`, the response is
 the historical MJPEG multipart stream.
 
 | Query | Default | Accepted / clamping |
 |---|---|---|
-| `codec` | `mjpeg` | `mjpeg`, `h264`, `hevc` (aliases `jpeg`, `avc`, `h265`). An unknown value is a typed `400`. |
+| `codec` | `mjpeg` | `mjpeg`, `h264`, `hevc`, `av1` (aliases `jpeg`, `avc`, `h265`, `av01`). An unknown value is a typed `400`. |
 | `fps` | `10` | `1..=30`; numeric values outside the range are clamped. |
 | `quality` | `85` | `1..=100`; numeric values outside the range are clamped. MJPEG only. |
-| `bitrate` | `4000` | `100..=50000` kbps; numeric values outside the range are clamped. H.264/HEVC only. |
+| `bitrate` | `4000` | `100..=50000` kbps; numeric values outside the range are clamped. Encoded codecs only. |
 | `console` | active console | Same resolver as `/display/snapshot?console=`: an advertised index, label, `Console_N`, or capture source id. |
 
 A non-numeric `fps`/`quality`/`bitrate` or an unknown `codec` is a typed `400`
@@ -67,7 +67,8 @@ failures end the body; no error/filler frame is injected.
 - `Content-Type: video/mp2t`.
 - `Cache-Control: no-store`, `Pragma: no-cache`,
   `X-Accel-Buffering: no`.
-- `X-Ozma-Codec: h264|hevc`, `X-Ozma-Encoder: libx264|libx265|<hw encoder>|copy`,
+- `X-Ozma-Codec: h264|hevc`, `X-Ozma-Container: mpegts`,
+  `X-Ozma-Encoder: libx264|libx265|<hw encoder>|copy`,
   `X-Ozma-Stream-Copy: true|false`, `X-Ozma-Fps`, and `X-Ozma-Bitrate`.
 - The body is a continuous MPEG-TS byte stream (`-f mpegts pipe:1`).
 
@@ -79,13 +80,14 @@ retained and sent as the first chunk. If the encoder exits, writes no keyframe,
 or exceeds the pre-keyframe buffer bound, the route returns a typed error and
 stops the source.
 
-The MPEG-TS path reuses the HLS encoder construction:
+The encoded paths reuse the HLS encoder construction:
 
 - the same `HlsConfig` fps/bitrate/ffmpeg/VAAPI/NVENC fields;
 - the same raw-input conversion (`bgra`, `mjpeg`, `yuyv`, `nv12` → `rgb24`,
   `p010` passed through);
-- the same H.264/HEVC software encoders (`libx264`/`libx265`), hardware
-  variants (`*_vaapi`, `*_nvenc`, `*_qsv`, `*_v4l2m2m`), profiles, pixel format
+- the same H.264/HEVC/AV1 software encoders (`libx264`/`libx265`/
+  `libsvtav1`/`libaom-av1`/`librav1e`), H.264/HEVC hardware variants
+  (`*_vaapi`, `*_nvenc`, `*_qsv`, `*_v4l2m2m`), profiles, pixel format
   pinning, GOP/keyframe forcing, and color signalling;
 - the same encoder availability probe. A configured hardware backend is used
   when ffmpeg advertises it and it passes the runtime encode probe; otherwise
@@ -93,24 +95,57 @@ The MPEG-TS path reuses the HLS encoder construction:
   route returns `503 video.encoder_unavailable` before spawning ffmpeg.
 
 Compressed capture pass-through is selected automatically. When the source's
-declared layout is H.264 and `codec=h264` (or HEVC/HEVC), ffmpeg receives the
-capture access units with `-c:v copy` and only muxes them. A compressed source
-of the other family is decoded and re-encoded through the same input path
-(`-f h264`/`-f hevc`). AV1 and MJPEG are not live MPEG-TS codecs on this route.
+declared layout is H.264 and `codec=h264` (or HEVC/HEVC, AV1/AV1), ffmpeg
+receives the capture access units with `-c:v copy` and only muxes them. A
+compressed source of another family is decoded and re-encoded through the same
+input path (`-f h264`/`-f hevc`/`-f obu`). MJPEG is not a live encoded codec on
+this route.
+
+### AV1 success
+
+- Status `200`.
+- `Content-Type: video/mp4`.
+- `Cache-Control: no-store`, `Pragma: no-cache`,
+  `X-Accel-Buffering: no`.
+- `X-Ozma-Codec: av1`, `X-Ozma-Container: fmp4`,
+  `X-Ozma-Encoder: libsvtav1|libaom-av1|librav1e|copy`,
+  `X-Ozma-Stream-Copy: true|false`, `X-Ozma-Fps`, and `X-Ozma-Bitrate`.
+- The body is a fragmented MP4 byte stream (`-f mp4 pipe:1` with
+  `-movflags +frag_keyframe+empty_moov+default_base_moof`): an `ftyp`/`moov`
+  init segment followed by `moof`/`mdat` fragments. There is no `.m4s` playlist;
+  this is a single live fMP4 response.
+
+The response is not committed until the parser has a complete init segment and
+a fragment whose first sample is a sync sample. The parser reads ISO-BMFF box
+sizes and the `trun`/`tfhd` sample flags rather than guessing from AV1 OBU
+bytes. `sample_is_non_sync_sample` must be clear. If a copied AV1 source starts
+mid-GOP, leading non-sync fragments are dropped and streaming begins at the
+first real keyframe; the init segment is retained. Bytes after the committed
+fragment are forwarded unchanged. If ffmpeg exits, writes no sync fragment, or
+exceeds the pre-keyframe buffer bound, the route returns a typed error and stops
+the source.
+
+AV1 uses the same software encoder probe and argv construction as HLS. The
+selected encoder is the first advertised implementation in the order
+`libsvtav1`, `libaom-av1`, `librav1e` (a configured AV1 choice is tried first).
+There are no AV1 hardware wrappers in this pipeline. If none is advertised the
+route returns `503 video.encoder_unavailable` before spawning ffmpeg; an AV1
+source/codec match is still stream-copied without an encoder, exactly like
+H.264/HEVC pass-through.
 
 ### Typed failures
 
 | Status | Code | When |
 |---|---|---|
-| `400` | `video.invalid_query` | `codec` is not `mjpeg|h264|hevc`, or `fps`/`quality`/`bitrate` is not an integer. |
+| `400` | `video.invalid_query` | `codec` is not `mjpeg|h264|hevc|av1`, or `fps`/`quality`/`bitrate` is not an integer. |
 | `404` | `not_found` | `?console=` names a console that is not advertised. |
 | `409` | `conflict` | A single-head QMP/VNC/Looking Glass provider was asked for a non-active console (`details.single_head:true`). |
 | `501` | `capture.unavailable` | `?console=` was requested but the node has no console selector/broker. |
 | `503` | `capture.unavailable` | No snapshot control is configured, no source is discoverable, the source cannot be opened, or the first frame/keyframe cannot be read. |
-| `503` | `video.encoder_unavailable` | `codec=h264|hevc` was requested without an encoder configuration, ffmpeg does not advertise the selected encoder, a hardware encoder/device is unusable, or the source cannot be converted for that codec. |
+| `503` | `video.encoder_unavailable` | An encoded codec was requested without an encoder configuration, ffmpeg does not advertise the selected encoder, a hardware encoder/device is unusable, or the source cannot be converted for that codec. |
 | `503` | `video.stream_failed` | ffmpeg/source failed after setup but before the first keyframe. |
 | `503` | `video.stream_limit` | All concurrent stream slots are in use. |
-| `504` | `video.keyframe_timeout` | The live MPEG-TS setup bound elapsed with no decodable keyframe. |
+| `504` | `video.keyframe_timeout` | The live encoded setup bound elapsed with no decodable keyframe/sync fragment. |
 | `504` | `display.snapshot_timeout` / `display.encode_timeout` | The existing snapshot capture/encode bound elapsed (MJPEG). |
 
 All error bodies are JSON with `ok:false`, `code`, `error`, and remediation
@@ -134,17 +169,19 @@ where applicable. They are produced by the existing snapshot error mapping, so
 ## Concurrency, backpressure, and cleanup
 
 - Default maximum: **4** simultaneous streams (`VideoStreams::default()`),
-  shared by MJPEG and H.264/HEVC. `ConnectionState::with_video_streams()`
+  shared by MJPEG, H.264/HEVC, and AV1. `ConnectionState::with_video_streams()`
   replaces the allowance for tests or constrained nodes.
 - A request over the cap receives a typed `503 video.stream_limit`; it does not
   wait indefinitely or start a fifth source.
 - MJPEG streams have a **one-slot** frame channel. `try_send` drops a newer
   frame when the client is not reading, so memory and latency stay bounded
   instead of accumulating an unbounded queue.
-- Encoded streams never drop TS bytes (that would corrupt the bitstream). They
-  use a bounded four-chunk queue and await the client; a slow reader
+- Encoded streams never drop container bytes (that would corrupt the bitstream).
+  They use a bounded four-chunk queue and await the client; a slow reader
   back-pressures ffmpeg stdout and then the source feeder. Memory remains
-  bounded instead of growing an unbounded queue.
+  bounded instead of growing an unbounded queue. While waiting for the first
+  keyframe the pre-commit buffer is bounded at 4 MiB for MPEG-TS and 16 MiB for
+  fMP4 (enough for a complete high-bitrate `moof`/`mdat` fragment).
 - Frame pacing uses the clamped `fps`. A fast fake/file source cannot spin the
   encoder; a slow source simply yields fewer frames. Compressed access units
   are never paced away because dropping one would break the reference chain.
@@ -153,9 +190,9 @@ where applicable. They are produced by the existing snapshot error mapping, so
   drops its stream guard. This releases both the provider connection and the
   concurrent-stream slot.
 - A per-frame capture/encode failure, a source end, or a disconnect ends the
-  stream; MJPEG never fabricates a replacement frame and MPEG-TS never
-  synthesizes a keyframe. A clean source end lets ffmpeg flush its remaining
-  encoded packets before the body closes.
+  stream; MJPEG never fabricates a replacement frame and the encoded paths never
+  synthesize a keyframe/sync fragment. A clean source end lets ffmpeg flush its
+  remaining encoded packets before the body closes.
 
 ## Status advertisement
 
@@ -168,7 +205,7 @@ where applicable. They are produced by the existing snapshot error mapping, so
   "route": "/video",
   "alias": "/display/mjpeg",
   "encoding": "jpeg",
-  "codecs": ["mjpeg", "h264", "hevc"],
+  "codecs": ["mjpeg", "h264", "hevc", "av1"],
   "default_codec": "mjpeg",
   "active_streams": 0,
   "active_encoded_streams": 0,
@@ -187,11 +224,13 @@ where applicable. They are produced by the existing snapshot error mapping, so
   claim that enumeration will find a source; the route still returns a typed
   `503` in that case.
 - `codecs` lists MJPEG always and adds `h264`/`hevc` when the node has a live
-  encoder configuration. Advertisement does not prove a specific encoder
-  binary exists; a missing/unusable encoder is the typed
+  encoder configuration. `av1` is added only when an AV1 encoder
+  (`libsvtav1`, `libaom-av1`, or `librav1e`) was probed available; configuration
+  alone is not enough. Advertisement of H.264/HEVC still does not prove a
+  specific encoder binary exists; a missing/unusable encoder is the typed
   `503 video.encoder_unavailable` at request time.
-- `active_streams` is the live count of reserved stream slots (both codecs) and
-  is `0` when idle. `active_encoded_streams` is the H.264/HEVC subset.
+- `active_streams` is the live count of reserved stream slots (all codecs) and
+  is `0` when idle. `active_encoded_streams` is the H.264/HEVC/AV1 subset.
 
 ## Bearer behaviour
 
@@ -205,8 +244,8 @@ controller's snapshot polling. Mutating routes (`/display/select`, `/input/*`,
 ## Tests
 
 Default coverage is fake-source/fake-ffmpeg only; no `/dev/video*`, QMP, VNC, or
-D-Bus device is touched. The one explicitly ignored live test uses real ffmpeg
-on the fake source.
+D-Bus device is touched. The explicitly ignored live tests use real ffmpeg on
+the fake source.
 
 `ozma-node/src/video.rs` unit tests:
 
@@ -215,9 +254,17 @@ on the fake source.
 - non-numeric values and unknown codecs are typed errors;
 - stream slots are capped, encoded slots are counted, and both release on guard
   drop;
-- multipart parts carry a real length and the supplied JPEG bytes.
+- multipart parts carry a real length and the supplied JPEG bytes;
+- AV1 maps to `HlsCodec::Av1`, the fMP4 container/content type, and the
+  software encoder preference order; AV1 source layouts select pass-through;
+- status lists `av1` only when the injected probe advertises an AV1 encoder,
+  and not merely because encoding is configured;
+- `start_encoded(codec=av1)` re-encodes an RGB or compressed H.264 source with
+  the first advertised AV1 encoder and returns an fMP4 prefix; an AV1 source is
+  copied without any encoder; no AV1 encoder is a typed `EncoderUnavailable`
+  with zero ffmpeg spawns.
 
-`ozma-node/src/hls.rs` MPEG-TS tests:
+`ozma-node/src/hls.rs` MPEG-TS and fMP4 tests:
 
 - `mpegts_argv_reuses_the_hls_codec_path_and_muxes_to_stdout` — H.264/HEVC argv
   keeps the HLS encoder/filters/GOP and ends with `-f mpegts pipe:1`;
@@ -234,15 +281,35 @@ on the fake source.
 - `mpegts_stream_rejects_mjpeg_and_unavailable_encoders` — typed
   `UnsupportedStreamCodec`/`EncoderUnavailable` and no ffmpeg spawn;
 - `mpegts_stream_stream_copies_a_compressed_h264_source` — pass-through works
-  without any advertised encoder.
+  without any advertised encoder;
+- `fmp4_argv_muxes_av1_or_copies_an_av1_obu_source` — AV1 argv selects
+  `libsvtav1`/`librav1e`, `-f mp4` + fragmentation flags, and `-f obu` +
+  `-c:v copy` for an AV1 source (mismatched H.264 is re-encoded);
+- `fmp4_keyframe_detector_requires_init_and_a_sync_sample` — complete
+  `ftyp`/`moov` init plus a sync `trun`/`tfhd` fragment; non-sync/truncated
+  input never commits; a mid-GOP fixture is trimmed to the first sync fragment;
+- `fmp4_stream_commits_init_and_keyframe_and_stops_on_disconnect` — the
+  committed prefix is `ftyp`/`moov`/`moof`/`mdat`, and disconnect stops the
+  source and closes ffmpeg stdin;
+- `fmp4_stream_fails_before_commit_without_a_sync_fragment` — no fake AV1
+  fragment;
+- `fmp4_stream_rejects_wrong_containers_and_unavailable_av1_encoders` — AV1 is
+  refused by the MPEG-TS starter and H.264 by the fMP4 starter; a missing AV1
+  encoder is typed with zero spawns;
+- `fmp4_stream_copies_an_av1_source_without_an_encoder` — `-f obu` +
+  `-c:v copy` + `-f mp4` without probe evidence.
 
-Ignored live test (run explicitly):
+Ignored live tests (run explicitly):
 
 - `hls::tests::live_mpegts_stream_is_ffprobe_decodable_h264_and_hevc` — a fake
   160×120 RGB capture source goes through the real system ffmpeg spawner and
   encoder probe; the MPEG-TS body is written to a temporary file and `ffprobe`
   asserts `codec_name` (`h264`/`hevc`), `width=160`, `height=120`, at least ten
   decoded frames, and a clean `ffmpeg -f null -` decode.
+- `hls::tests::live_fmp4_stream_is_ffprobe_decodable_av1` — the same source and
+  real system path produce a single fMP4 file with an `ftyp` init; `ffprobe`
+  asserts `codec_name=av1`, `160×120`, at least ten decoded frames, and a clean
+  decode.
 
 `ozma-node/src/controller_compat.rs` route tests:
 
@@ -251,6 +318,15 @@ Ignored live test (run explicitly):
 - `video_h264_and_hevc_are_mpegts_with_a_real_first_keyframe` — both codecs
   return `200 video/mp2t`, the encoder/copy/fps/bitrate headers, whole TS
   packets, and a real keyframe through the fake spawner;
+- `video_av1_is_fragmented_mp4_with_init_and_a_real_sync_fragment` — AV1 returns
+  `200 video/mp4`, `X-Ozma-Container: fmp4`, `X-Ozma-Encoder: libsvtav1`, an
+  `ftyp` prefix, and the `-f mp4` argv (never mpegts);
+- `video_av1_copies_an_av1_source_without_an_encoder` — route headers and argv
+  select `-f obu` + `-c:v copy` without probe evidence;
+- `video_av1_without_an_encoder_is_a_typed_refusal` — `503
+  video.encoder_unavailable`, no ffmpeg spawn;
+- `connection_advertises_av1_only_when_the_encoder_was_probed` — `av1` appears
+  in `video.codecs` only for a probe that advertises an AV1 encoder;
 - `video_encoded_selection_uses_compressed_passthrough_or_reencode` — route
   headers and ffmpeg argv select `copy` vs re-encode from the source layout;
 - `video_encoded_unavailable_and_bad_codecs_are_typed` — missing encoding or
@@ -275,6 +351,9 @@ cargo check -p ozma-node --all-targets
 cargo test -p ozma-node --lib \
   hls::tests::live_mpegts_stream_is_ffprobe_decodable_h264_and_hevc \
   -- --ignored --exact
+cargo test -p ozma-node --lib \
+  hls::tests::live_fmp4_stream_is_ffprobe_decodable_av1 \
+  -- --ignored --exact
 rustfmt --edition 2021 --check --config skip_children=true \
   ozma-node/src/video.rs ozma-node/src/hls.rs \
   ozma-node/src/controller_compat.rs ozma-node/src/display_compat.rs \
@@ -283,11 +362,12 @@ rustfmt --edition 2021 --check --config skip_children=true \
 
 Result on 2026-11-26:
 
-- `cargo test -p ozma-node --lib`: **733 passed, 0 failed, 6 ignored** (the
+- `cargo test -p ozma-node --lib`: **778 passed, 0 failed, 7 ignored** (the
   ignored tests are the pre-existing live GStreamer/restic/bluetooth probes plus
-  the new live MPEG-TS probe).
+  the live MPEG-TS and AV1 fMP4 probes).
 - `cargo check -p ozma-node --all-targets`: **passed** (existing warnings only).
-- The live `ffprobe` test: **passed** for H.264 and HEVC (4.6 s).
+- The live MPEG-TS `ffprobe` test: **passed** for H.264 and HEVC (4.54 s).
+- The live AV1 fMP4 `ffprobe` test: **passed** (2.38 s).
 - `rustfmt --edition 2021 --check --config skip_children=true ...`: **passed**.
 
 (`skip_children=true` keeps rustfmt from following `lib.rs`'s module tree into
@@ -300,14 +380,25 @@ unrelated files.)
   compressed access units, and long-run disconnect behaviour still need a
   hardware check. The compressed pass-through path is proven at argv/route
   level and by the HLS compressed tests, not by a live V4L2 capture.
-- Only MJPEG, H.264, and HEVC are exposed on `/video`. AV1 remains HLS-only; the
-  MPEG-TS keyframe detector has no AV1 mapping.
-- The live MPEG-TS path is 8-bit SDR (`yuv420p`); the HLS 10-bit/P010 and HDR
-  configuration is deliberately not inherited. A future `?codec=hevc&hdr=1`
-  would need its own validation and keyframe/metadata checks.
+- Only MJPEG, H.264, HEVC, and AV1 are exposed on `/video`. AV1 is software
+  only in this pipeline: `libsvtav1`, `libaom-av1`, or `librav1e`; hardware
+  AV1 wrappers (`av1_nvenc`, `av1_qsv`, ...) are not selected or advertised.
+- The AV1 path is a single live fMP4 response, not HLS `.m4s` files with a
+  playlist. A client that needs adaptive HLS should use the HLS pipeline.
+- AV1 source pass-through copies the source OBU access units. If the source
+  starts mid-GOP, the HTTP response deliberately drops leading non-sync
+  fragments and starts at the first sync fragment; this is tested with a
+  synthetic fMP4 fixture and the real encoder probe, not with a live AV1 V4L2
+  device.
+- The live encoded paths are 8-bit SDR (`yuv420p`); the HLS 10-bit/P010 and HDR
+  configuration is deliberately not inherited. A future `?hdr=1` or
+  `?codec=av1&hdr=1` would need its own validation, fMP4 color-metadata
+  checks, and HDR-capable encode/decode evidence. No `hdr`/`p010` query was
+  added because the browser-facing `/video` contract is SDR and inheriting HLS
+  HDR defaults silently would mislabel output.
 - A frame-size change on a raw source ends the encoded stream rather than
-  restarting ffmpeg mid-response. HLS restarts generations; live MPEG-TS keeps
-  one process so a decoder never sees an unannounced discontinuity.
+  restarting ffmpeg mid-response. HLS restarts generations; live MPEG-TS/fMP4
+  keeps one process so a decoder never sees an unannounced discontinuity.
 - One capture source per stream. Providers that only allow a single client (for
   example an unshared VNC server) may reject a second stream with a typed error
   or end it when the provider fails; the node does not share frames between

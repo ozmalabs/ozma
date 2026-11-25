@@ -653,6 +653,16 @@ Configuration and lifecycle:
   `--webrtc-shm`. The helper's frame geometry is taken from that console's
   advertised `width`/`height` when non-zero, so a 1280x800 and a 720x400 head
   each feed matching BGRA frames.
+- Per-console audio is opt-in through
+  `--multi-console-webrtc-audio-source TEMPLATE`
+  (`OZMA_MULTI_CONSOLE_WEBRTC_AUDIO_SOURCE`). `{console}` and `{index}` expand
+  to the console's zero-based index, so `ozma-vm{console}.monitor` gives
+  `ozma-vm0.monitor` and `ozma-vm1.monitor`. Each helper's `WebRtcConfig` and
+  `--audio-source` argv carry only its own monitor. When the template is unset
+  every helper keeps the shared base `--webrtc-audio-source`, or stays
+  video-only when that is also unset. Empty/whitespace, control-character,
+  over-long, or unknown-placeholder templates are typed startup errors; a
+  console whose helper has no source is video-only.
 - Only D-Bus consoles are capturable independently. Each advertised output
   whose `source_type` matches D-Bus gets its own helper; QMP, VNC, and Looking
   Glass keep the legacy active helper and report a typed `unsupported`
@@ -683,8 +693,11 @@ Signaling and status:
   manager owns independent consoles; the additive `multi_console_webrtc`
   object carries `enabled`, `provider`, `max_helpers`,
   `idle_timeout_seconds`, `active_console`, any `limitation`, and per-console
-  `status`/`error`/`pid`/`socket_path`/`shm_path`/`peers`/`sessions`. TURN
-  credentials and other secrets are never included.
+  `status`/`error`/`pid`/`socket_path`/`shm_path`/`peers`/`sessions` plus
+  `audio_configured`/`audio_source`. The audio fields are configuration intent
+  only (monitor names are not secret): they never claim the helper opened the
+  monitor, negotiated audio, or produced samples. TURN credentials and other
+  secrets are never included.
 - `/api/v1/nodes/{node}/display` passes `multi_console_webrtc` through. The
   controller proxies `?console=` on its WebRTC offer/candidate routes, and the
   dashboard sends the console picker value plus per-console helper status.
@@ -693,9 +706,14 @@ Tests: `multi_webrtc::tests` covers two simultaneous console offers, the max
 bound/LRU rotation, explicit versus default-active selection, session-routed
 candidates, add/remove and shutdown cleanup, single-head rejection, idle
 eviction, per-console status, and derived socket/shm paths using fake helpers
-(no GStreamer or capture device). `controller_compat::tests` covers the HTTP
-selector (`?console=` and body `console`), the per-console answer console, the
-per-console connection status, and the single-head 501.
+(no GStreamer or capture device). It also covers `{console}`/`{index}` template
+expansion, invalid-template rejection, the per-console `WebRtcConfig` and fake
+helper `--audio-source` argv, unset-template video-only fallback, and per-console
+`audio_configured`/`audio_source` status for only the configured helpers.
+`controller_compat::tests` covers the HTTP selector (`?console=` and body
+`console`), the per-console answer console, the per-console connection status
+(including audio configuration intent with no sample claim), and the
+single-head 501.
 
 **Live smoke (2026-11-25, QEMU 11.1.3, Alpine 3.21, disposable two-head
 D-Bus).** QEMU used `-device virtio-vga -device VGA -display dbus,p2p=yes`

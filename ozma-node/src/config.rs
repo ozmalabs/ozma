@@ -1224,6 +1224,10 @@ pub struct NodeConfig {
     pub webrtc_audio_source: Option<String>,
     /// Capture backend requested for the WebRTC audio source.
     pub webrtc_audio_backend: WebRtcAudioBackend,
+    /// Optional per-console WebRTC audio monitor template
+    /// (`--multi-console-webrtc-audio-source`). `{console}`/`{index}` expand to
+    /// the zero-based console index; unset keeps the shared base source.
+    pub multi_console_webrtc_audio_source: Option<String>,
     /// Guest IP advertised by VM soft nodes.
     pub vm_guest_ip: Option<String>,
     /// JSON-encoded display output list sent to the controller.
@@ -1731,6 +1735,10 @@ impl NodeConfig {
         {
             return Err("--webrtc-audio-source must not be empty or whitespace".to_owned());
         }
+        if let Some(template) = self.multi_console_webrtc_audio_source.as_deref() {
+            crate::multi_webrtc::validate_audio_source_template(template)
+                .map_err(|error| format!("--multi-console-webrtc-audio-source: {error}"))?;
+        }
         if let Some(domain) = &self.libvirt_domain {
             if domain.trim().is_empty() {
                 return Err("--libvirt-domain must not be empty".to_owned());
@@ -2234,6 +2242,7 @@ mod tests {
             audio_sink: None,
             webrtc_audio_source: None,
             webrtc_audio_backend: WebRtcAudioBackend::Auto,
+            multi_console_webrtc_audio_source: None,
             vm_guest_ip: None,
             display_outputs_json: "[]".into(),
             pci_devices_json: "[]".into(),
@@ -2971,6 +2980,33 @@ mod tests {
             WebRtcAudioBackend::PipeWire
         );
         assert!(<WebRtcAudioBackend as ValueEnum>::from_str("alsa", false).is_err());
+    }
+
+    #[test]
+    fn multi_console_webrtc_audio_template_validates() {
+        let mut config = test_config(NodeProfile::Vm);
+        assert!(config.multi_console_webrtc_audio_source.is_none());
+        assert!(config.validate().is_ok());
+
+        config.multi_console_webrtc_audio_source = Some("   ".into());
+        assert!(config.validate().is_err());
+
+        config.multi_console_webrtc_audio_source = Some("ozma-vm{console}.monitor".into());
+        assert!(config.validate().is_ok());
+
+        config.multi_console_webrtc_audio_source = Some("ozma-vm{index}.monitor".into());
+        assert!(config.validate().is_ok());
+
+        config.multi_console_webrtc_audio_source = Some("bad\nmonitor".into());
+        let error = config.validate().expect_err("control character");
+        assert!(
+            error.contains("--multi-console-webrtc-audio-source"),
+            "{error}"
+        );
+
+        config.multi_console_webrtc_audio_source = Some("ozma-vm{consol}.monitor".into());
+        let error = config.validate().expect_err("unknown placeholder");
+        assert!(error.contains("unknown placeholder"), "{error}");
     }
 
     #[test]

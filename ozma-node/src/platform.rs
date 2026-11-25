@@ -399,9 +399,9 @@ pub fn hls_encode_capability(config: &HlsConfig, envelope: EncodeEnvelope) -> En
     let (codec, backend) = match encoder {
         crate::hls::HlsEncoder::H264 => (Codec::H264, EncoderBackend::Software),
         crate::hls::HlsEncoder::Hevc => (Codec::Hevc, EncoderBackend::Software),
-        crate::hls::HlsEncoder::Av1Svt | crate::hls::HlsEncoder::Av1Aom => {
-            (Codec::Av1, EncoderBackend::Software)
-        }
+        crate::hls::HlsEncoder::Av1Svt
+        | crate::hls::HlsEncoder::Av1Aom
+        | crate::hls::HlsEncoder::Av1Rav1e => (Codec::Av1, EncoderBackend::Software),
         crate::hls::HlsEncoder::Mjpeg => (Codec::Mjpeg, EncoderBackend::Software),
         crate::hls::HlsEncoder::VaapiH264 => (Codec::H264, EncoderBackend::Vaapi),
         crate::hls::HlsEncoder::VaapiHevc => (Codec::Hevc, EncoderBackend::Vaapi),
@@ -741,6 +741,7 @@ mod tests {
             audio_sink: None,
             webrtc_audio_source: None,
             webrtc_audio_backend: crate::webrtc::WebRtcAudioBackend::Auto,
+            multi_console_webrtc_audio_source: None,
             vm_guest_ip: None,
             display_outputs_json: "[]".into(),
             pci_devices_json: "[]".into(),

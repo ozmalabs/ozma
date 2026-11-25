@@ -1843,6 +1843,60 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             )
         return payload
 
+    def _is_typed_serial_error(payload: Any) -> bool:
+        """Whether a node body is a typed serial/UART failure.
+
+        The Rust provider uses stable ``serial.*`` codes for a missing or busy
+        device, permission failures, invalid payload/cursor/limits, write/read
+        failures, and the opt-in ``serial.not-configured`` state. Preserve those
+        documents and their status instead of flattening them to a generic 502.
+        """
+        return (
+            isinstance(payload, dict)
+            and isinstance(payload.get("code"), str)
+            and payload["code"].startswith("serial.")
+            and isinstance(payload.get("error"), str)
+        )
+
+    async def _proxy_serial_surface(
+        node_id: str,
+        path: str,
+        method: str = "GET",
+        body: dict | None = None,
+        timeout: float = 10.0,
+    ) -> Any:
+        """Proxy a serial surface while preserving typed errors.
+
+        Success documents (status/read/write) are returned verbatim. A
+        ``serial.*`` error keeps the node's status, code, error, and
+        remediation. The node bearer token is forwarded only in the request
+        header and never copied into the response or error detail.
+        """
+        status, payload = await _proxy_node_response(
+            node_id, path, method, body, timeout=timeout
+        )
+        if status in (401, 403):
+            # A serial permission failure is a typed 403, not a bearer-token
+            # rejection. Preserve it; anything else keeps the existing
+            # token-free 502 explanation.
+            if not (
+                status == 403
+                and (
+                    _is_typed_unsupported(payload)
+                    or _is_typed_serial_error(payload)
+                )
+            ):
+                raise HTTPException(status_code=502, detail=_node_auth_error(status))
+        if status >= 400:
+            if _is_typed_unsupported(payload) or _is_typed_serial_error(payload):
+                return JSONResponse(status_code=status, content=payload)
+            detail = payload.get("error") if isinstance(payload, dict) else None
+            raise HTTPException(
+                status_code=502,
+                detail=detail or f"Node returned HTTP {status}",
+            )
+        return payload
+
     async def _proxy_node_connect(node_id: str, surface: str) -> Any:
         """Proxy a mesh/Connect surface to a node, preserving typed limits.
 
@@ -3807,6 +3861,123 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(400, "Bluetooth forget body must be a JSON object")
         return await _proxy_bluetooth_surface(
             node_id, "/bluetooth/forget", method="POST", body=body, timeout=25.0
+        )
+
+    # --- Node-scoped serial/UART proxies ---
+    #
+    # These forward the Rust node's opt-in /serial/* surface. Typed
+    # serial.* failures keep their node status/code/remediation and the node
+    # bearer token stays in the upstream request header only.
+
+    @app.get("/api/v1/nodes/{node_id}/serial/status")
+    async def node_serial_status(request: Request, node_id: str) -> Any:
+        """Read a node's serial device, line settings, counters, and last error."""
+        _require_scope(request, SCOPE_READ)
+        return await _proxy_serial_surface(node_id, "/serial/status")
+
+    @app.get("/api/v1/nodes/{node_id}/serial/read")
+    async def node_serial_read(request: Request, node_id: str) -> Any:
+        """Read a bounded base64 slice of the node's serial receive buffer."""
+        _require_scope(request, SCOPE_READ)
+        from urllib.parse import urlencode
+
+        params = {
+            key: request.query_params[key]
+            for key in ("max", "since")
+            if key in request.query_params
+        }
+        path = "/serial/read"
+        if params:
+            path = f"{path}?{urlencode(params)}"
+        return await _proxy_serial_surface(node_id, path)
+
+    @app.post("/api/v1/nodes/{node_id}/serial/write")
+    async def node_serial_write(request: Request, node_id: str) -> Any:
+        """Write exactly one bounded text/hex payload to a node's serial device."""
+        _require_scope(request, SCOPE_WRITE)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            raise HTTPException(400, "Serial write body must be a JSON object")
+        return await _proxy_serial_surface(
+            node_id, "/serial/write", method="POST", body=body
+        )
+
+    @app.get("/api/v1/nodes/{node_id}/serial/stream")
+    async def node_serial_stream(request: Request, node_id: str) -> Any:
+        """Stream a node's bounded serial SSE events without buffering."""
+        _require_scope(request, SCOPE_READ)
+        node = state.nodes.get(node_id)
+        if node is None:
+            raise HTTPException(status_code=404, detail="Node not found")
+        if not node.api_port:
+            raise HTTPException(status_code=503, detail="Node has no HTTP API")
+        from urllib.parse import urlencode
+        import httpx
+
+        params = {
+            key: request.query_params[key]
+            for key in ("since", "idle_ms")
+            if key in request.query_params
+        }
+        path = "/serial/stream"
+        if params:
+            path = f"{path}?{urlencode(params)}"
+        url = f"http://{node.host}:{node.api_port}{path}"
+        client = httpx.AsyncClient(
+            timeout=None, trust_env=False, follow_redirects=False
+        )
+        try:
+            upstream = client.build_request("GET", url, headers=_node_headers(node))
+            response = await client.send(upstream, stream=True)
+        except httpx.HTTPError as error:
+            await client.aclose()
+            raise HTTPException(
+                status_code=502,
+                detail=f"Node unreachable: {type(error).__name__}",
+            )
+        if response.status_code >= 400:
+            upstream_status = response.status_code
+            raw = await response.aread()
+            await response.aclose()
+            await client.aclose()
+            try:
+                payload = json.loads(raw)
+            except ValueError:
+                payload = raw.decode("utf-8", "replace")
+            typed = _is_typed_unsupported(payload) or _is_typed_serial_error(payload)
+            if upstream_status in (401, 403) and not (
+                upstream_status == 403 and typed
+            ):
+                raise HTTPException(
+                    status_code=502, detail=_node_auth_error(upstream_status)
+                )
+            if typed:
+                return JSONResponse(status_code=upstream_status, content=payload)
+            detail = payload.get("error") if isinstance(payload, dict) else None
+            raise HTTPException(
+                status_code=502,
+                detail=detail or f"Node returned HTTP {upstream_status}",
+            )
+
+        media_type = (
+            (response.headers.get("content-type") or "text/event-stream")
+            .split(";", 1)[0]
+            .strip()
+        )
+
+        async def relay():
+            try:
+                async for chunk in response.aiter_bytes():
+                    yield chunk
+            finally:
+                await response.aclose()
+                await client.aclose()
+
+        return StreamingResponse(
+            relay(), media_type=media_type, headers={"Cache-Control": "no-store"}
         )
 
     # --- Paste typing endpoints ---

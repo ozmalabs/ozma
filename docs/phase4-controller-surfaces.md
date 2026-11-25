@@ -1,9 +1,9 @@
 # Phase 4 — controller-only node surfaces
 
-Status: RPA and local Restic backup have real, honest subsets; the remaining
-controller-only surfaces stay **typed stubs**. No stub returns a fabricated
-success, empty buffer, or fake image, and no RPA route invents text or input
-results.
+Status: RPA, local Restic backup, Bluetooth, and an opt-in serial/UART console
+have real, honest subsets; the remaining controller-only surfaces stay **typed
+stubs**. No stub returns a fabricated success, empty buffer, or fake image, and
+no RPA route invents text or input results.
 
 This document covers the Rust `ozma-node` side of the controller-only proxies
 (`/rpa/*`, `/backup/*`, `/ui/windows`, `/serial/*`, `/rgb/*`, plus `/current`)
@@ -22,7 +22,8 @@ and the controller behaviour that preserves typed results.
 | remaining `/backup/*` (`config`, `apps`, `apps/restore`, `onboarding`, cloud) | `controller/api.py` backup proxy routes | **Typed stub** (501) | Python `agent/backup.py` owns app inventory, cloud/S3/SFTP/REST destinations, scheduling, macOS Time Machine, and DB hooks. A restic repository cannot supply an OS app inventory, so the Rust node advertises and returns `backup.unsupported` for those sub-surfaces. |
 | `/bluetooth/{status,devices,scan,pair,connect,disconnect,forget}` | `controller/api.py` node-scoped Bluetooth proxies | **Implemented (opt-in, guarded)** | Opt-in `--bluetooth` provider wrapping `bluetoothctl`. Explicit MAC addresses only, exact argv, no shell, no auto-trust, scan bounded to 1–15 s with `scan off` cleanup, lists bounded. Without the flag the routes return a typed 503 `bluetooth.not-configured`. See [`phase4-bluetooth-report.md`](phase4-bluetooth-report.md). |
 | `/ui/windows` | Python desktop agent (`agent/ozma_desktop_agent.py:996`); the controller consumes `/ui/hints` | **Typed stub** (501, public read-only) | Python `agent/ozma_desktop_agent.py` uses an in-guest accessibility provider. `ozma-node` has no in-guest agent and must not invent window titles or positions. `/ui/hints` keeps its existing empty-shape 200 with `available:false` for compatibility; `/ui/windows` is explicitly unsupported. |
-| `/serial/*` | `controller/serial_console.py::_poll_node_serial` and legacy panels | **Typed stub** (501) | Python `node/serial_capture.py` owns a real UART/USB-serial reader, ring buffer, SSE stream, and send path. `ozma-node` has no serialport dependency or serial session implementation. |
+| `/serial/{status,write,read,stream}` | `controller/api.py` node-scoped serial proxies; `controller/serial_console.py::_poll_node_serial` still polls the legacy `/serial/buffer` | **Implemented (opt-in, bounded)** | Opt-in `--serial-device PATH` plus `--serial-baud`, `--serial-data-bits`, `--serial-parity`, `--serial-stop-bits`, `--serial-timeout-ms`. Opens only that explicit device, keeps a fixed ring buffer, returns exact text/hex writes, and streams bounded SSE. Remaining `/serial/*` sub-surfaces stay typed 501. See [`phase4-serial-report.md`](phase4-serial-report.md). |
+| remaining `/serial/*` (`buffer`, `send`, `state`, `text`, `setup`) | `controller/serial_console.py::_poll_node_serial` and legacy panels | **Typed stub** (501) | The Python node's legacy buffer/send/state/text/setup names are not aliased. Use `/serial/read` and `/serial/write`; a controller that still polls `/serial/buffer` sees the stable `serial.unsupported` body. |
 | `/rgb/*` | `controller/api.py` RGB proxy, `controller/rgb_outputs.py::_push_node` | **Typed stub** (501) | Python `node/rgb_leds.py` drives WS2812B/SK6812 over SPI and runs effects. `ozma-usb`/`ozma-hid` are gadget/HID injectors, not SPI LED drivers; no WS2812 or SPI crate is used by the node. |
 | `/current` (and `/current/history`) | `controller/api.py::node_current` | **Typed stub** (501) | Python `node/current_sensor.py` reads an INA219-class power sensor. No Rust sensor driver or ADC source is present. |
 | `GET /storage` | `controller/api.py::node_storage` (`/api/v1/nodes/{id}/storage`) | **Implemented (read-only)** | `/proc/mounts` + `statvfs`, real `/dev` block filesystems only, at most 64 entries. No ZFS/md/multipath/SMART/admin surface. |
@@ -45,8 +46,10 @@ a real implementation backed by a node primitive or a discoverable typed result.
   routes remain typed 501s rather than pretending a script or BIOS action ran.
 - `ozma-usb` and `ozma-hid` expose ConfigFS gadget, mass-storage/NBD, and HID
   injection primitives. They do not contain an SPI/WS2812 LED output path.
-- The node has no `serialport`/`tokio-serial` dependency and no serial session
-  buffer to expose.
+- Serial is now an opt-in `serialport` provider over one explicit device path.
+  It deliberately does not auto-detect ports, alias the Python node's legacy
+  `/serial/{buffer,send,state,text,setup}` names, or expose a second device. Those
+  residual names stay typed 501s so no buffer/send result is fabricated.
 - Backup **status/init/run/snapshots/restore/delete** are implemented in
   `ozma-node/src/backup.rs` as a bounded, opt-in wrapper around the local
   `restic` CLI. Only explicitly allow-listed sources and restore roots are
@@ -215,6 +218,72 @@ hci0 status+2 s scan) and `controller_compat::tests` (advertisement and bearer
 guard), plus the controller proxy tests in
 `tests/unit/controller/test_node_api_token_proxy.py`.
 
+## Opt-in serial/UART behaviour
+
+The Rust node exposes a bounded serial console only with `--serial-device PATH`.
+The path must be absolute, with no `.`/`..` components; there is no
+auto-detection and no other device is probed. Line settings are fixed at startup:
+
+| Flag | Default | Bound |
+|---|---|---|
+| `--serial-baud` | 115200 | 50–4,000,000 |
+| `--serial-data-bits` | 8 | 5–8 |
+| `--serial-parity` | `none` | `none`, `odd`, `even` |
+| `--serial-stop-bits` | 1 | 1–2 |
+| `--serial-timeout-ms` | 100 | 1–10,000 |
+| `--serial-buffer-bytes` | 262144 | 1024–4,194,304 |
+
+The four implemented routes stay in `controller_compat::compat_router`, behind
+the same node bearer guard as the other control surfaces:
+
+| Node route | Behaviour |
+|---|---|
+| `GET /serial/status` | `configured`, `connected`, `state`, device path, line settings, read timeout, `bytes_in`/`bytes_out`, bounded-buffer facts, advertised limits, and a typed `last_error` when the device could not be opened or later failed. |
+| `POST /serial/write` | Exactly one of `{"text":"..."}` or `{"hex":"0a 0d"}`. Writes those exact bytes (no newline added) up to 64 KiB. Returns the byte count, encoding, and `bytes_out`. |
+| `GET /serial/read?max=N&since=C` | Returns a bounded base64 slice of the fixed ring buffer. `max` is 1–65536 (default 4096). `since` is an absolute cursor; the response carries `offset`, `next`, `dropped`, `has_more`, and buffer start/end. A cursor beyond the buffer is `serial.invalid-cursor`. |
+| `GET /serial/stream?since=C&idle_ms=N` | SSE `data` events of at most 8 KiB, base64-encoded with offset/next. `idle_ms` is 100–120000. A cursor before the retained buffer emits one `gap` event. Ends with `idle` or `disconnected`; dropping the client only unsubscribes that stream. |
+
+Received bytes are pushed into a fixed ring buffer; the reader thread uses a
+4 KiB scratch buffer, and SSE consumers re-read from the ring by cursor instead
+of relying on an unbounded broadcast backlog. The device is opened once, in a
+background blocking reader thread; writes use a cloned handle with the same
+line settings. A missing path, permission denial, and busy device are reported
+as `serial.device-missing` (503), `serial.permission-denied` (403), and
+`serial.device-busy` (409). Other stable codes include
+`serial.not-configured` (503), `serial.not-connected` (503),
+`serial.invalid-payload`/`serial.invalid-hex`/`serial.invalid-limit`/
+`serial.invalid-cursor`/`serial.invalid-config` (400),
+`serial.payload-too-large` (413), and `serial.write-failed`/`serial.read-failed`
+(502). The status document keeps a typed `last_error` after a failure instead of
+pretending the console is healthy.
+
+Without `--serial-device`, the four implemented routes return 503
+`serial.not-configured`; `buffer`, `send`, `state`, `text`, and `setup` keep the
+stable 501 `serial.unsupported` body. With the flag,
+`GET /api/v1/connection.controller_surfaces` adds the four `serial.*`
+capabilities as `supported:true` alongside the residual `/serial/*` entry. The
+registration `cap` string gains `serial` only when the device opened
+successfully.
+
+Controller proxies:
+
+- `GET /api/v1/nodes/{node_id}/serial/status` and `.../serial/read` forward with
+  the node bearer token and preserve success JSON.
+- `POST /api/v1/nodes/{node_id}/serial/write` forwards the exact text/hex body.
+- `GET /api/v1/nodes/{node_id}/serial/stream` streams the node SSE response
+  without buffering; `since`/`idle_ms` are forwarded.
+- `_proxy_serial_surface` preserves `serial.*` typed errors with their node
+  status. A typed serial 403 (`serial.permission-denied`) is not confused with a
+  node bearer-token rejection; a real node 401/403 still becomes the existing
+  token-free controller 502 explanation.
+- Status/read/stream require `SCOPE_READ`; write requires `SCOPE_WRITE`.
+
+Tests: `serial::tests` (config/path validation, exact text/hex bytes, ring-buffer
+bounds and cursors, missing/permission/busy mapping, typed not-configured and
+missing-device routes, fake-backend status/read/write bounds, and a live
+`socat` PTY pair covering status/write/read/SSE plus device disconnect), plus the
+controller proxy tests in `tests/unit/controller/test_node_api_token_proxy.py`.
+
 ## Host observability surfaces
 
 `ozma-node` also serves three bounded, guarded read-only routes for the agent
@@ -285,7 +354,7 @@ Stable codes:
 | OCR absent | `rpa.ocr-unavailable` |
 | remaining backup sub-surfaces | `backup.unsupported` |
 | `ui_windows` | `ui.windows_unsupported` |
-| `serial` | `serial.unsupported` |
+| remaining serial sub-surfaces (`buffer`, `send`, `state`, `text`, `setup`) | `serial.unsupported` |
 | `rgb` | `rgb.unsupported` |
 | `current` | `power.current_unsupported` |
 
@@ -299,9 +368,13 @@ Routes:
   and `DELETE /backup/snapshots/{id}` are implemented; remaining `/backup/*`
   (`config`, `apps`, `apps/restore`, `onboarding`, cloud) keep the stable
   `backup.unsupported` body.
+- guarded implemented serial router (`serial::router`):
+  `/serial/status`, `/serial/write`, `/serial/read`, `/serial/stream`; without
+  `--serial-device` they return 503 `serial.not-configured`
 - guarded typed 501 fallback (`controller_compat::legacy_router`): remaining
-  `/api/v1/rpa/*`, `/serial/*`, `/rgb/state`, `/rgb/effect`, `/rgb/set`,
-  `/rgb/off`, `/current`, `/current/history`
+  `/api/v1/rpa/*`, remaining `/serial/*` (`buffer`, `send`, `state`, `text`,
+  `setup`), `/rgb/state`, `/rgb/effect`, `/rgb/set`, `/rgb/off`, `/current`,
+  `/current/history`
 - public read-only router (`controller_compat::public_router`): `/ui/windows`
 
 Auth is unchanged from the existing node routes: control surfaces, including all
@@ -313,7 +386,9 @@ state.
 
 `GET /api/v1/connection` carries `controller_surfaces`, generated from
 `controller_compat::RPA_IMPLEMENTED_SURFACES` (now also carrying the local
-backup core endpoints) plus `controller_compat::CONTROLLER_ONLY_SURFACES`:
+backup core endpoints) plus `controller_compat::CONTROLLER_ONLY_SURFACES`. A
+configured serial service adds `controller_compat::SERIAL_IMPLEMENTED_SURFACES`,
+and a configured Bluetooth service adds its seven surfaces:
 
 ```json
 "controller_surfaces": [
@@ -352,8 +427,14 @@ array is additive; existing connection fields are unchanged.
 - `_proxy_node_raw` fetches `/api/v1/rpa/screenshot` as bytes and checks the
   status first. A typed error JSON body is returned as JSON, never labelled
   `image/jpeg`; a real 200 JPEG streams through unchanged.
+- `_proxy_serial_surface` forwards `serial/status|read|write` success JSON and
+  preserves `serial.*` typed errors, including a typed 403
+  (`serial.permission-denied`). `/api/v1/nodes/{id}/serial/stream` relays the
+  node's SSE bytes with `StreamingResponse` and closes the upstream client when
+  the downstream consumer disconnects. The bearer token is only sent upstream.
 - Node 401/403 still maps to the existing token-free controller 502
-  explanation; non-typed node failures remain 502, not a hang or a fake 200.
+  explanation when it is not a typed serial 403; non-typed node failures remain
+  502, not a hang or a fake 200.
 - The backup proxies do not turn a typed 501 into the generic 503
   "agent unreachable" message, and `/api/v1/backup/nodes/{id}/{status,init}`
   plus `DELETE .../snapshots/{id}` use the same token-free typed-error path.
@@ -402,6 +483,11 @@ Rust (`cargo test -p ozma-node --lib`):
   typed stubs.
 - `rpa::tests::*` cover named-key mapping, modifier ordering, exact event
   construction, unavailable OCR, and oversized-frame rejection.
+- `serial::tests::*` cover absolute-path/line-setting validation, exact
+  text/hex bytes and size bounds, fixed-ring eviction/cursor reads, missing/
+  permission/busy error mapping, typed `serial.not-configured` and missing-device
+  status, fake-backend status/read/write limits, and a live `socat` PTY pair
+  (status, write→peer, peer→read, live SSE data, disconnect SSE cleanup).
 
 Controller (`python3 -m pytest tests/unit/controller/test_node_api_token_proxy.py`):
 
@@ -420,6 +506,11 @@ Controller (`python3 -m pytest tests/unit/controller/test_node_api_token_proxy.p
   bearer token into a response.
 - `test_rpa_screenshot_still_returns_real_jpeg_bytes` proves a real node
   screenshot is not broken by the typed-error path.
+- `test_serial_proxies_forward_bounds_body_and_token_without_leak`,
+  `test_serial_proxy_preserves_typed_errors` (including typed 403),
+  `test_serial_stream_proxy_forwards_sse_and_token`, and the serial entries in
+  `PROXY_CASES` prove status/read/write/stream forwarding, bounds, and
+  token-free responses.
 
 ## Remaining gaps
 
@@ -430,14 +521,20 @@ Controller (`python3 -m pytest tests/unit/controller/test_node_api_token_proxy.p
   without it reports `rpa.ocr-unavailable` instead of returning empty/guessed
   text.
 - The Python providers remain the only implementations of app inventory,
-  cloud/S3/SFTP/REST destinations, backup scheduling, serial capture, RGB
-  output, current sensing, and in-guest window hints. The Rust local provider
-  covers local init/run/snapshots/restore/exact-snapshot delete plus bounded
+  cloud/S3/SFTP/REST destinations, backup scheduling, RGB output, current
+  sensing, and in-guest window hints. The Rust local backup provider covers
+  local init/run/snapshots/restore/exact-snapshot delete plus bounded
   stats/verify/estimate, but cannot derive an app inventory from the repository.
-- The node registration capability list (`capabilities` TXT/registration field)
-  is owned by `main.rs` and is not changed here; discovery uses the connection
-  document. A later registration change can mirror the same capability names.
-- `controller/serial_console.py` only polls nodes that advertise `cap:serial`
-  and `controller/rgb_outputs.py` only pushes to explicitly configured node
-  zones, so neither currently probes a Rust node that lacks these capabilities.
-  Their existing failure paths log and do not fabricate success.
+- Serial is a one-device provider: it does not auto-detect `/dev/ttyS*`,
+  `/dev/ttyUSB*`, `/dev/ttyACM*`, or `/dev/ttyGS*`, does not manage modem
+  control lines/flow control, and does not reconnect after a device is removed.
+  Reconnect is an explicit node restart. Flow control is fixed to the platform
+  default (`serialport::new` without a flow-control override).
+- `controller/serial_console.py` still polls the legacy `/serial/buffer` name
+  for nodes advertising `cap:serial`; it does not consume the new
+  `/serial/status` or `/serial/read` cursors yet. The new controller proxies are
+  available for callers that use them, while the legacy poller receives the
+  typed `serial.unsupported` 501 instead of a fabricated buffer.
+- `controller/rgb_outputs.py` only pushes to explicitly configured node zones,
+  so it does not probe a Rust node that lacks the RGB capability. Its existing
+  failure path logs and does not fabricate success.

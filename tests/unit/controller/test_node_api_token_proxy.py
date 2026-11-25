@@ -159,7 +159,7 @@ PROXY_CASES = [
         "post",
         "/api/v1/audio/room-correction/apply",
         {"node_id": NODE_ID, "profile_id": "p1"},
-        "/audio/apply",
+        "/audio/room-correction/apply",
     ),
     (
         "post",
@@ -255,6 +255,19 @@ PROXY_CASES = [
         f"/api/v1/nodes/{NODE_ID}/bluetooth/forget",
         {"address": "AA:BB:CC:DD:EE:FF"},
         "/bluetooth/forget",
+    ),
+    ("get", f"/api/v1/nodes/{NODE_ID}/serial/status", None, "/serial/status"),
+    (
+        "get",
+        f"/api/v1/nodes/{NODE_ID}/serial/read?max=64&since=0",
+        None,
+        "/serial/read",
+    ),
+    (
+        "post",
+        f"/api/v1/nodes/{NODE_ID}/serial/write",
+        {"hex": "0a0d"},
+        "/serial/write",
     ),
     ("get", f"/api/v1/audio/nodes?node_id={NODE_ID}", None, "/audio/nodes"),
     (
@@ -1080,6 +1093,151 @@ def test_backup_delete_proxy_uses_delete_and_preserves_policy(fake_node, tmp_pat
     assert record["method"] == "DELETE"
     assert record["path"] == f"/backup/snapshots/{snapshot_id}"
     assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_serial_proxies_forward_bounds_body_and_token_without_leak(fake_node, tmp_path):
+    status_document = {
+        "ok": True,
+        "supported": True,
+        "configured": True,
+        "connected": True,
+        "state": "connected",
+        "device": "/dev/ttyUSB0",
+        "line": {
+            "baud_rate": 115200,
+            "data_bits": 8,
+            "parity": "none",
+            "stop_bits": 1,
+        },
+        "bytes_in": 8,
+        "bytes_out": 5,
+        "buffer": {"start": 0, "end": 8, "bytes": 8, "capacity": 262144},
+        "limits": {
+            "max_read_bytes": 65536,
+            "max_write_bytes": 65536,
+            "default_stream_idle_ms": 15000,
+            "max_stream_idle_ms": 120000,
+        },
+        "last_error": None,
+    }
+    read_document = {
+        "ok": True,
+        "supported": True,
+        "configured": True,
+        "connected": True,
+        "offset": 0,
+        "next": 4,
+        "bytes": 4,
+        "data": "Ym9vdA==",
+        "encoding": "base64",
+        "dropped": False,
+        "has_more": False,
+        "buffer": {"start": 0, "end": 4, "bytes": 4, "capacity": 262144},
+    }
+    write_document = {
+        "ok": True,
+        "supported": True,
+        "configured": True,
+        "connected": True,
+        "bytes": 2,
+        "encoding": "hex",
+        "bytes_out": 7,
+        "buffer": {"start": 0, "end": 0, "bytes": 0, "capacity": 262144},
+    }
+
+    def responder(method, record):
+        if record["path"].startswith("/serial/status"):
+            return 200, status_document, "application/json"
+        if record["path"].startswith("/serial/read"):
+            return 200, read_document, "application/json"
+        if record["path"].startswith("/serial/write"):
+            return 200, write_document, "application/json"
+        return 200, {"ok": True}, "application/json"
+
+    fake_node.responder = responder
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+    client = _client(app)
+
+    status = client.get(f"/api/v1/nodes/{NODE_ID}/serial/status")
+    assert status.status_code == 200, status.text
+    assert status.json() == status_document
+
+    read = client.get(
+        f"/api/v1/nodes/{NODE_ID}/serial/read", params={"max": 4, "since": 0}
+    )
+    assert read.status_code == 200, read.text
+    assert read.json() == read_document
+    assert fake_node.requests[-1]["path"] == "/serial/read?max=4&since=0"
+
+    write = client.post(
+        f"/api/v1/nodes/{NODE_ID}/serial/write", json={"hex": "0a0d"}
+    )
+    assert write.status_code == 200, write.text
+    assert write.json() == write_document
+    assert fake_node.requests[-1]["body"] == {"hex": "0a0d"}
+    assert fake_node.requests[-1]["headers"]["authorization"] == f"Bearer {TOKEN}"
+    assert TOKEN not in status.text + read.text + write.text
+
+
+@pytest.mark.parametrize(
+    "node_status,code",
+    [
+        (503, "serial.not-configured"),
+        (503, "serial.device-missing"),
+        (403, "serial.permission-denied"),
+        (409, "serial.device-busy"),
+        (400, "serial.invalid-hex"),
+        (413, "serial.payload-too-large"),
+    ],
+)
+def test_serial_proxy_preserves_typed_errors(fake_node, tmp_path, node_status, code):
+    expected = {
+        "ok": False,
+        "supported": True,
+        "configured": True,
+        "code": code,
+        "error": f"typed failure for {code}",
+        "remediation": "fix the serial device",
+    }
+    fake_node.responder = lambda _method, _record: (
+        node_status,
+        expected,
+        "application/json",
+    )
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).post(
+        f"/api/v1/nodes/{NODE_ID}/serial/write", json={"hex": "zz"}
+    )
+
+    assert response.status_code == node_status, response.text
+    assert response.json() == expected
+    assert TOKEN not in response.text
+    assert fake_node.requests[-1]["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_serial_stream_proxy_forwards_sse_and_token(fake_node, tmp_path):
+    sse = b"event: data\ndata: {\"offset\":0,\"bytes\":4,\"data\":\"Ym9vdA==\"}\n\n"
+
+    def responder(method, record):
+        assert record["path"].startswith("/serial/stream?")
+        return 200, sse, "text/event-stream"
+
+    fake_node.responder = responder
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).get(
+        f"/api/v1/nodes/{NODE_ID}/serial/stream",
+        params={"since": 0, "idle_ms": 150},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert b"event: data" in response.content
+    record = fake_node.requests[-1]
+    assert record["path"] == "/serial/stream?since=0&idle_ms=150"
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+    assert TOKEN not in response.text
 
 
 def test_backup_init_proxy_preserves_typed_missing_binary(fake_node, tmp_path):

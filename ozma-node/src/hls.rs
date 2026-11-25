@@ -285,7 +285,9 @@ fn color_bitstream_filter(config: &HlsConfig) -> Option<String> {
         HlsEncoder::Hevc | HlsEncoder::VaapiHevc | HlsEncoder::NvencHevc => {
             ("hevc_metadata", "colour_primaries")
         }
-        HlsEncoder::Av1Svt | HlsEncoder::Av1Aom => ("av1_metadata", "color_primaries"),
+        HlsEncoder::Av1Svt | HlsEncoder::Av1Aom | HlsEncoder::Av1Rav1e => {
+            ("av1_metadata", "color_primaries")
+        }
         _ => return None,
     };
     let mut options = Vec::new();
@@ -319,6 +321,8 @@ pub enum HlsEncoder {
     Av1Svt,
     /// Software AV1 through `libaom-av1`.
     Av1Aom,
+    /// Software AV1 through `librav1e`.
+    Av1Rav1e,
     /// Motion JPEG through `mjpeg`.
     Mjpeg,
     /// VAAPI H.264 through `h264_vaapi` (uploads nv12 frames).
@@ -346,13 +350,15 @@ enum HwCodec {
     Hevc,
 }
 
-/// Public H.264/HEVC codec family.
+/// Public encoded video codec family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HlsCodec {
     /// H.264/AVC.
     H264,
     /// HEVC/H.265.
     Hevc,
+    /// AV1.
+    Av1,
 }
 
 /// A compressed capture stream that can be copied into HLS without decoding.
@@ -409,7 +415,10 @@ impl CompressedCodec {
                     | HlsEncoder::QsvHevc
                     | HlsEncoder::V4l2m2mHevc
             ),
-            Self::Av1 => matches!(encoder, HlsEncoder::Av1Svt | HlsEncoder::Av1Aom),
+            Self::Av1 => matches!(
+                encoder,
+                HlsEncoder::Av1Svt | HlsEncoder::Av1Aom | HlsEncoder::Av1Rav1e
+            ),
         }
     }
 
@@ -422,11 +431,12 @@ impl CompressedCodec {
 
 impl HlsEncoder {
     /// Every encoder this pipeline supports, in preference order.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::H264,
         Self::Hevc,
         Self::Av1Svt,
         Self::Av1Aom,
+        Self::Av1Rav1e,
         Self::Mjpeg,
         Self::VaapiH264,
         Self::VaapiHevc,
@@ -445,6 +455,7 @@ impl HlsEncoder {
             Self::Hevc => "libx265",
             Self::Av1Svt => "libsvtav1",
             Self::Av1Aom => "libaom-av1",
+            Self::Av1Rav1e => "librav1e",
             Self::Mjpeg => "mjpeg",
             Self::VaapiH264 => "h264_vaapi",
             Self::VaapiHevc => "hevc_vaapi",
@@ -461,14 +472,14 @@ impl HlsEncoder {
     pub fn is_hardware(self) -> bool {
         !matches!(
             self,
-            Self::H264 | Self::Hevc | Self::Av1Svt | Self::Av1Aom | Self::Mjpeg
+            Self::H264 | Self::Hevc | Self::Av1Svt | Self::Av1Aom | Self::Av1Rav1e | Self::Mjpeg
         )
     }
 
-    /// Video codec family this encoder produces, when it is H.264 or HEVC.
+    /// Encoded video codec family this encoder produces.
     ///
-    /// The live `/video` MPEG-TS path uses this to keep the requested codec
-    /// while inheriting the configured hardware/software backend.
+    /// The live `/video` path uses this to keep the requested codec while
+    /// inheriting the configured hardware/software backend.
     pub fn codec_family(self) -> Option<HlsCodec> {
         match self {
             Self::H264 | Self::VaapiH264 | Self::NvencH264 | Self::QsvH264 | Self::V4l2m2mH264 => {
@@ -477,15 +488,21 @@ impl HlsEncoder {
             Self::Hevc | Self::VaapiHevc | Self::NvencHevc | Self::QsvHevc | Self::V4l2m2mHevc => {
                 Some(HlsCodec::Hevc)
             }
-            Self::Av1Svt | Self::Av1Aom | Self::Mjpeg => None,
+            Self::Av1Svt | Self::Av1Aom | Self::Av1Rav1e => Some(HlsCodec::Av1),
+            Self::Mjpeg => None,
         }
     }
 
     /// Software encoder for a codec family.
+    ///
+    /// AV1 has three software implementations. [`Self::Av1Svt`] is the
+    /// preferred name; callers that must prove availability should try
+    /// [`Self::Av1Svt`], [`Self::Av1Aom`], then [`Self::Av1Rav1e`].
     pub fn software_for_codec(codec: HlsCodec) -> Self {
         match codec {
             HlsCodec::H264 => Self::H264,
             HlsCodec::Hevc => Self::Hevc,
+            HlsCodec::Av1 => Self::Av1Svt,
         }
     }
 
@@ -550,7 +567,12 @@ impl HlsEncoder {
             HlsPixelFormat::Yuv420p => true,
             HlsPixelFormat::P010 => matches!(
                 self,
-                Self::Hevc | Self::Av1Svt | Self::Av1Aom | Self::VaapiHevc | Self::NvencHevc
+                Self::Hevc
+                    | Self::Av1Svt
+                    | Self::Av1Aom
+                    | Self::Av1Rav1e
+                    | Self::VaapiHevc
+                    | Self::NvencHevc
             ),
         }
     }
@@ -562,7 +584,9 @@ impl HlsEncoder {
     pub fn hls_pixel_format_for(self, target: HlsPixelFormat) -> Option<&'static str> {
         match (self, target) {
             (_, HlsPixelFormat::Yuv420p) => match self {
-                Self::H264 | Self::Hevc | Self::Av1Svt | Self::Av1Aom => Some("yuv420p"),
+                Self::H264 | Self::Hevc | Self::Av1Svt | Self::Av1Aom | Self::Av1Rav1e => {
+                    Some("yuv420p")
+                }
                 Self::VaapiH264 | Self::VaapiHevc => None,
                 Self::NvencH264 | Self::NvencHevc | Self::V4l2m2mH264 | Self::V4l2m2mHevc => {
                     Some("yuv420p")
@@ -570,7 +594,9 @@ impl HlsEncoder {
                 Self::QsvH264 | Self::QsvHevc => Some("nv12"),
                 Self::Mjpeg => None,
             },
-            (Self::Hevc | Self::Av1Svt | Self::Av1Aom, HlsPixelFormat::P010) => Some("yuv420p10le"),
+            (Self::Hevc | Self::Av1Svt | Self::Av1Aom | Self::Av1Rav1e, HlsPixelFormat::P010) => {
+                Some("yuv420p10le")
+            }
             (Self::NvencHevc, HlsPixelFormat::P010) => Some("p010le"),
             (Self::VaapiHevc, HlsPixelFormat::P010) => None,
             (_, HlsPixelFormat::P010) => None,
@@ -585,7 +611,7 @@ impl HlsEncoder {
             }
             // AV1 Main covers both 8-bit and 10-bit; naming it is harmless and
             // makes the requested profile explicit.
-            (Self::Av1Svt | Self::Av1Aom, HlsPixelFormat::P010) => Some("main"),
+            (Self::Av1Svt | Self::Av1Aom | Self::Av1Rav1e, HlsPixelFormat::P010) => Some("main"),
             _ => None,
         }
     }
@@ -646,6 +672,7 @@ impl HlsEncoder {
             "libx265" | "x265" | "h265" | "hevc" | "h.265" => Ok(Self::Hevc),
             "libsvtav1" | "svtav1" | "av1" => Ok(Self::Av1Svt),
             "libaom-av1" | "aom-av1" | "libaom" => Ok(Self::Av1Aom),
+            "librav1e" | "rav1e" => Ok(Self::Av1Rav1e),
             "mjpeg" | "mjpg" | "jpeg" => Ok(Self::Mjpeg),
             "h264_vaapi" | "vaapi_h264" => Ok(Self::VaapiH264),
             "hevc_vaapi" | "h265_vaapi" | "vaapi_hevc" => Ok(Self::VaapiHevc),
@@ -1579,9 +1606,9 @@ impl FfmpegSpawner for SystemFfmpegSpawner {
     }
 }
 
-/// A spawned ffmpeg process whose encoded stdout is a live MPEG-TS stream.
+/// A spawned ffmpeg process whose encoded stdout is a live stream.
 pub struct SpawnedMpegTs {
-    /// Encoded stdout (`-f mpegts pipe:1`).
+    /// Encoded stdout (`-f mpegts pipe:1` or `-f mp4 pipe:1`).
     pub stdout: Box<dyn AsyncRead + Send + Unpin>,
     /// Raw frame destination.
     pub sink: Box<dyn FrameSink>,
@@ -1589,10 +1616,11 @@ pub struct SpawnedMpegTs {
     pub child: Option<Child>,
 }
 
-/// Injectable factory for the live MPEG-TS ffmpeg process.
+/// Injectable factory for a live encoded ffmpeg process.
 ///
-/// The production implementation runs [`ffmpeg_mpegts_argv`]. Tests substitute
-/// a recording spawner plus a canned/duplex stdout so no ffmpeg is needed.
+/// The production implementation runs [`ffmpeg_mpegts_argv`] or
+/// [`ffmpeg_fmp4_argv`]. Tests substitute a recording spawner plus a
+/// canned/duplex stdout so no ffmpeg is needed.
 pub trait MpegTsSpawner: Send + Sync {
     /// Spawn ffmpeg for `width`×`height` input and capture its MPEG-TS stdout.
     fn spawn_ts(
@@ -1601,20 +1629,29 @@ pub trait MpegTsSpawner: Send + Sync {
         width: u32,
         height: u32,
     ) -> Result<SpawnedMpegTs, HlsError>;
-}
 
-/// Production MPEG-TS spawner.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct SystemMpegTsSpawner;
-
-impl MpegTsSpawner for SystemMpegTsSpawner {
-    fn spawn_ts(
+    /// Spawn ffmpeg for fragmented-MP4 stdout.
+    ///
+    /// The default delegates to [`Self::spawn_ts`] so existing injected
+    /// spawners keep compiling. A caller that requests fMP4 with such a
+    /// spawner receives whatever that spawner produces, which is why the
+    /// production spawner and the recording test spawner override this.
+    fn spawn_fmp4(
         &self,
         config: &HlsConfig,
         width: u32,
         height: u32,
     ) -> Result<SpawnedMpegTs, HlsError> {
-        let argv = ffmpeg_mpegts_argv(config, width, height);
+        self.spawn_ts(config, width, height)
+    }
+}
+
+/// Production live-stream spawner.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemMpegTsSpawner;
+
+impl SystemMpegTsSpawner {
+    fn spawn_argv(&self, config: &HlsConfig, argv: Vec<String>) -> Result<SpawnedMpegTs, HlsError> {
         let mut command = Command::new(&argv[0]);
         command
             .args(&argv[1..])
@@ -1638,36 +1675,104 @@ impl MpegTsSpawner for SystemMpegTsSpawner {
     }
 }
 
+impl MpegTsSpawner for SystemMpegTsSpawner {
+    fn spawn_ts(
+        &self,
+        config: &HlsConfig,
+        width: u32,
+        height: u32,
+    ) -> Result<SpawnedMpegTs, HlsError> {
+        self.spawn_argv(config, ffmpeg_mpegts_argv(config, width, height))
+    }
+
+    fn spawn_fmp4(
+        &self,
+        config: &HlsConfig,
+        width: u32,
+        height: u32,
+    ) -> Result<SpawnedMpegTs, HlsError> {
+        self.spawn_argv(config, ffmpeg_fmp4_argv(config, width, height))
+    }
+}
+
 /// Setup bound for a live stream's first real keyframe.
 pub const MPEGTS_KEYFRAME_TIMEOUT: Duration = Duration::from_secs(10);
 /// Encoded chunks queued for an HTTP body before ffmpeg is back-pressured.
 const MPEGTS_QUEUE_DEPTH: usize = 4;
 /// Refuse to buffer an unbounded amount while waiting for a first keyframe.
 const MAX_PRE_KEYFRAME_BYTES: usize = 4 * 1024 * 1024;
+/// fMP4 needs one complete `moof`/`mdat` (init + keyframe) before it can
+/// commit. At the maximum 50 Mbps and a 1-second GOP that fragment is larger
+/// than the MPEG-TS slack, so the fMP4 bound is still finite but larger.
+const MAX_PRE_KEYFRAME_BYTES_FMP4: usize = 16 * 1024 * 1024;
 /// Encoded stdout read size; also the largest chunk sent to the body.
 const MPEGTS_READ_BUF: usize = 64 * 1024;
 
-/// A started live MPEG-TS response.
+/// A started live encoded response.
 ///
-/// `first` is the real MPEG-TS prefix through the first decodable keyframe, so
+/// `first` is the real encoded prefix through the first decodable keyframe, so
 /// the HTTP layer can commit `200` only after a decoder-visible frame exists.
 /// Dropping `receiver` closes the stream and stops ffmpeg/source.
-pub struct MpegTsStream {
-    /// MPEG-TS bytes through the first keyframe.
+pub struct EncodedLiveStream {
+    /// Encoded bytes through the first keyframe (and the fMP4 init segment for
+    /// AV1).
     pub first: Bytes,
-    /// Subsequent encoded MPEG-TS chunks.
+    /// Subsequent encoded chunks.
     pub receiver: mpsc::Receiver<Bytes>,
     /// Feeder/reader task; ends when the receiver is dropped or the source
     /// ends.
     pub task: JoinHandle<()>,
 }
 
-impl std::fmt::Debug for MpegTsStream {
+/// MPEG-TS live stream returned by [`start_mpegts_stream`].
+pub type MpegTsStream = EncodedLiveStream;
+/// Fragmented-MP4 live stream returned by [`start_fmp4_stream`].
+pub type Fmp4Stream = EncodedLiveStream;
+
+impl std::fmt::Debug for EncodedLiveStream {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("MpegTsStream")
+            .debug_struct("EncodedLiveStream")
             .field("first_bytes", &self.first.len())
             .finish_non_exhaustive()
+    }
+}
+
+/// Live output container.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveContainer {
+    /// MPEG-TS for H.264/HEVC.
+    MpegTs,
+    /// Fragmented MP4 for AV1.
+    Fmp4,
+}
+
+impl LiveContainer {
+    fn name(self) -> &'static str {
+        match self {
+            Self::MpegTs => "MPEG-TS",
+            Self::Fmp4 => "fragmented MP4",
+        }
+    }
+
+    fn supports(self, codec: CompressedCodec) -> bool {
+        match self {
+            Self::MpegTs => !codec.uses_fmp4(),
+            Self::Fmp4 => codec.uses_fmp4(),
+        }
+    }
+
+    fn spawn(
+        self,
+        spawner: &dyn MpegTsSpawner,
+        config: &HlsConfig,
+        width: u32,
+        height: u32,
+    ) -> Result<SpawnedMpegTs, HlsError> {
+        match self {
+            Self::MpegTs => spawner.spawn_ts(config, width, height),
+            Self::Fmp4 => spawner.spawn_fmp4(config, width, height),
+        }
     }
 }
 
@@ -1684,6 +1789,32 @@ pub async fn start_mpegts_stream(
     spawner: Arc<dyn MpegTsSpawner>,
     probe: Arc<dyn EncoderProbe>,
 ) -> Result<MpegTsStream, HlsError> {
+    start_live_stream(source, config, spawner, probe, LiveContainer::MpegTs).await
+}
+
+/// Start a live fragmented-MP4 stream from `source`.
+///
+/// AV1 is carried in fMP4: mpegts muxes it as opaque private data. The first
+/// bytes returned are the `ftyp`/`moov` init segment plus a fragment whose
+/// first sample is a sync sample. A same-family AV1 source is stream-copied as
+/// `-f obu`; any other source is decoded and re-encoded with the selected AV1
+/// encoder.
+pub async fn start_fmp4_stream(
+    source: Box<dyn CaptureSource>,
+    config: HlsConfig,
+    spawner: Arc<dyn MpegTsSpawner>,
+    probe: Arc<dyn EncoderProbe>,
+) -> Result<Fmp4Stream, HlsError> {
+    start_live_stream(source, config, spawner, probe, LiveContainer::Fmp4).await
+}
+
+async fn start_live_stream(
+    source: Box<dyn CaptureSource>,
+    config: HlsConfig,
+    spawner: Arc<dyn MpegTsSpawner>,
+    probe: Arc<dyn EncoderProbe>,
+    container: LiveContainer,
+) -> Result<EncodedLiveStream, HlsError> {
     let mut source = source;
     let mut config = match config.validated() {
         Ok(config) => config,
@@ -1700,6 +1831,13 @@ pub async fn start_mpegts_stream(
         let _ = source.stop().await;
         return Err(error);
     };
+    if !container.supports(codec) {
+        let error = HlsError::UnsupportedStreamCodec {
+            encoder: config.video_encoder.ffmpeg_name().to_owned(),
+        };
+        let _ = source.stop().await;
+        return Err(error);
+    }
     if let Err(error) = ensure_supported(declared.pixel_format) {
         let _ = source.stop().await;
         return Err(error);
@@ -1718,7 +1856,7 @@ pub async fn start_mpegts_stream(
     let (first_tx, first_rx) = oneshot::channel();
     let (sender, receiver) = mpsc::channel(MPEGTS_QUEUE_DEPTH);
     let cancel = Arc::new(Notify::new());
-    let task = tokio::spawn(run_mpegts_stream(
+    let task = tokio::spawn(run_live_stream(
         source,
         config,
         declared,
@@ -1728,10 +1866,12 @@ pub async fn start_mpegts_stream(
         first_tx,
         sender,
         codec,
+        container,
     ));
 
+    let label = container.name();
     match tokio::time::timeout(MPEGTS_KEYFRAME_TIMEOUT, first_rx).await {
-        Ok(Ok(Ok(first))) => Ok(MpegTsStream {
+        Ok(Ok(Ok(first))) => Ok(EncodedLiveStream {
             first,
             receiver,
             task,
@@ -1745,7 +1885,7 @@ pub async fn start_mpegts_stream(
             cancel.notify_waiters();
             let _ = tokio::time::timeout(CHILD_EXIT_TIMEOUT, task).await;
             Err(HlsError::Stream {
-                message: "the MPEG-TS stream task ended before producing a keyframe".to_owned(),
+                message: format!("the {label} stream task ended before producing a keyframe"),
             })
         }
         Err(_) => {
@@ -1768,7 +1908,7 @@ enum MpegTsFeedEvent {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_mpegts_stream(
+async fn run_live_stream(
     source: Box<dyn CaptureSource>,
     config: HlsConfig,
     declared: FrameFormat,
@@ -1778,10 +1918,11 @@ async fn run_mpegts_stream(
     first_tx: oneshot::Sender<Result<Bytes, HlsError>>,
     sender: mpsc::Sender<Bytes>,
     codec: CompressedCodec,
+    container: LiveContainer,
 ) {
     let (spawn_tx, spawn_rx) = oneshot::channel();
     let (error_tx, mut error_rx) = mpsc::channel::<MpegTsFeedEvent>(1);
-    let mut feeder = tokio::spawn(feed_mpegts_frames(
+    let mut feeder = tokio::spawn(feed_live_frames(
         source,
         config,
         declared,
@@ -1790,6 +1931,7 @@ async fn run_mpegts_stream(
         cancel.clone(),
         spawn_tx,
         error_tx,
+        container,
     ));
 
     let (mut stdout, mut child) = match spawn_rx.await {
@@ -1855,7 +1997,13 @@ async fn run_mpegts_stream(
                         if !committed {
                             if let Some(tx) = first_tx.take() {
                                 let _ = tx.send(Err(HlsError::Stream {
-                                    message: "ffmpeg ended before producing a keyframe".to_owned(),
+                                    message: format!(
+                                        "ffmpeg ended before producing a {}",
+                                        match container {
+                                            LiveContainer::MpegTs => "keyframe",
+                                            LiveContainer::Fmp4 => "sync fMP4 fragment",
+                                        }
+                                    ),
                                 }));
                             }
                         }
@@ -1864,20 +2012,34 @@ async fn run_mpegts_stream(
                     Ok(count) => {
                         if !committed {
                             pending.extend_from_slice(&buffer[..count]);
-                            if mpegts_has_keyframe(codec, &pending) {
+                            let first = match container {
+                                LiveContainer::MpegTs => {
+                                    mpegts_has_keyframe(codec, &pending)
+                                        .then(|| Bytes::from(std::mem::take(&mut pending)))
+                                }
+                                LiveContainer::Fmp4 => {
+                                    fmp4_init_and_keyframe(&pending).map(Bytes::from)
+                                }
+                            };
+                            if let Some(first) = first {
                                 committed = true;
-                                let first = Bytes::from(std::mem::take(&mut pending));
                                 if let Some(tx) = first_tx.take() {
                                     if tx.send(Ok(first)).is_err() {
                                         break;
                                     }
                                 }
-                            } else if pending.len() > MAX_PRE_KEYFRAME_BYTES {
+                            } else if pending.len()
+                                > match container {
+                                    LiveContainer::MpegTs => MAX_PRE_KEYFRAME_BYTES,
+                                    LiveContainer::Fmp4 => MAX_PRE_KEYFRAME_BYTES_FMP4,
+                                }
+                            {
                                 if let Some(tx) = first_tx.take() {
                                     let _ = tx.send(Err(HlsError::Stream {
                                         message: format!(
-                                            "ffmpeg produced {} bytes without a keyframe",
-                                            pending.len()
+                                            "ffmpeg produced {} bytes of {} without a keyframe",
+                                            pending.len(),
+                                            container.name()
                                         ),
                                     }));
                                 }
@@ -1911,7 +2073,7 @@ async fn run_mpegts_stream(
     drop(sender);
     if let Some(tx) = first_tx.take() {
         let _ = tx.send(Err(HlsError::Stream {
-            message: "the MPEG-TS stream ended before a keyframe".to_owned(),
+            message: format!("the {} stream ended before a keyframe", container.name()),
         }));
     }
     if tokio::time::timeout(CHILD_EXIT_TIMEOUT, &mut feeder)
@@ -1920,13 +2082,16 @@ async fn run_mpegts_stream(
     {
         // The feeder owns the source. A cooperative cancel should have stopped
         // it; the timeout only records a source that ignored cancellation.
-        warn!("MPEG-TS frame feeder did not stop within its bound");
+        warn!(
+            container = container.name(),
+            "encoded frame feeder did not stop within its bound"
+        );
         feeder.abort();
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn feed_mpegts_frames(
+async fn feed_live_frames(
     mut source: Box<dyn CaptureSource>,
     config: HlsConfig,
     declared: FrameFormat,
@@ -1935,6 +2100,7 @@ async fn feed_mpegts_frames(
     cancel: Arc<Notify>,
     spawn_tx: oneshot::Sender<Result<(Box<dyn AsyncRead + Send + Unpin>, Option<Child>), HlsError>>,
     error_tx: mpsc::Sender<MpegTsFeedEvent>,
+    container: LiveContainer,
 ) {
     let compressed = CompressedCodec::from_pixel_format(config.input_pixel_format);
     let mut first_frame: Option<Frame> = None;
@@ -1970,7 +2136,7 @@ async fn feed_mpegts_frames(
     }
 
     let (width, height) = expected.unwrap_or((0, 0));
-    let spawned = match spawner.spawn_ts(&config, width, height) {
+    let spawned = match container.spawn(spawner.as_ref(), &config, width, height) {
         Ok(spawned) => spawned,
         Err(error) => {
             let _ = spawn_tx.send(Err(error));
@@ -2161,6 +2327,184 @@ fn has_nal_keyframe(codec: CompressedCodec, data: &[u8]) -> bool {
     false
 }
 
+/// Top-level/child ISO-BMFF box header.
+struct Mp4Box<'a> {
+    kind: [u8; 4],
+    payload: &'a [u8],
+    size: usize,
+}
+
+/// Parse one complete box at `offset`, or `None` when it is truncated.
+fn mp4_box_at(bytes: &[u8], offset: usize) -> Option<Mp4Box<'_>> {
+    let head = bytes.get(offset..offset + 8)?;
+    let size32 = u32::from_be_bytes([head[0], head[1], head[2], head[3]]);
+    let kind = [head[4], head[5], head[6], head[7]];
+    let (size, header) = if size32 == 1 {
+        let extended = bytes.get(offset + 8..offset + 16)?;
+        let size = u64::from_be_bytes([
+            extended[0],
+            extended[1],
+            extended[2],
+            extended[3],
+            extended[4],
+            extended[5],
+            extended[6],
+            extended[7],
+        ]);
+        (usize::try_from(size).ok()?, 16)
+    } else if size32 == 0 {
+        // "To end of file" is meaningless for a live pipe and would let a
+        // malformed stream claim a complete box. Require a bounded size.
+        return None;
+    } else {
+        (size32 as usize, 8)
+    };
+    if size < header || offset.checked_add(size)? > bytes.len() {
+        return None;
+    }
+    Some(Mp4Box {
+        kind,
+        payload: &bytes[offset + header..offset + size],
+        size,
+    })
+}
+
+/// Iterate complete child boxes in `payload`.
+fn mp4_children<'a>(payload: &'a [u8]) -> impl Iterator<Item = Mp4Box<'a>> + 'a {
+    let mut offset = 0usize;
+    std::iter::from_fn(move || {
+        let child = mp4_box_at(payload, offset)?;
+        offset += child.size;
+        Some(child)
+    })
+}
+
+/// Read `default_sample_flags` from a `tfhd` payload, when present.
+fn tfhd_default_sample_flags(payload: &[u8]) -> Option<u32> {
+    let flags = u32::from_be_bytes(payload.get(0..4)?.try_into().ok()?) & 0x00FF_FFFF;
+    // version/flags + track_ID.
+    let mut offset = 8usize;
+    if flags & 0x000001 != 0 {
+        offset += 8; // base_data_offset
+    }
+    if flags & 0x000002 != 0 {
+        offset += 4; // sample_description_index
+    }
+    if flags & 0x000008 != 0 {
+        offset += 4; // default_sample_duration
+    }
+    if flags & 0x000010 != 0 {
+        offset += 4; // default_sample_size
+    }
+    if flags & 0x000020 != 0 {
+        let bytes = payload.get(offset..offset + 4)?;
+        return Some(u32::from_be_bytes(bytes.try_into().ok()?));
+    }
+    None
+}
+
+/// First sample's flags from a `trun`, when present.
+fn trun_first_sample_flags(payload: &[u8]) -> Option<u32> {
+    let flags = u32::from_be_bytes(payload.get(0..4)?.try_into().ok()?) & 0x00FF_FFFF;
+    // version/flags + sample_count.
+    let mut offset = 8usize;
+    if flags & 0x000001 != 0 {
+        offset += 4; // data_offset
+    }
+    if flags & 0x000004 != 0 {
+        let bytes = payload.get(offset..offset + 4)?;
+        return Some(u32::from_be_bytes(bytes.try_into().ok()?));
+    }
+    if flags & 0x000100 != 0 {
+        offset += 4; // sample_duration
+    }
+    if flags & 0x000200 != 0 {
+        offset += 4; // sample_size
+    }
+    if flags & 0x000400 != 0 {
+        let bytes = payload.get(offset..offset + 4)?;
+        return Some(u32::from_be_bytes(bytes.try_into().ok()?));
+    }
+    None
+}
+
+/// True when a `moof` payload starts with a sync sample.
+///
+/// ffmpeg's mov muxer writes `first_sample_flags` in `trun` (sometimes
+/// `default_sample_flags` in `tfhd`). `sample_is_non_sync_sample` is bit
+/// `0x0001_0000`; a clear bit is the evidence that the fragment begins with a
+/// keyframe. No flags at all is unknown, not a keyframe.
+fn fmp4_moof_has_keyframe(moof: &[u8]) -> Option<bool> {
+    for traf in mp4_children(moof).filter(|child| &child.kind == b"traf") {
+        let default_flags = mp4_children(traf.payload)
+            .find(|child| &child.kind == b"tfhd")
+            .and_then(|child| tfhd_default_sample_flags(child.payload));
+        for trun in mp4_children(traf.payload).filter(|child| &child.kind == b"trun") {
+            if let Some(flags) = trun_first_sample_flags(trun.payload).or(default_flags) {
+                return Some(flags & 0x0001_0000 == 0);
+            }
+        }
+    }
+    None
+}
+
+/// Return the committable fMP4 prefix: init segment + a keyframe fragment.
+///
+/// The init segment is the complete `ftyp`/`moov` prefix. Any fragment before
+/// the first sync-sample fragment is dropped rather than sent as a decodable
+/// start, so a copied AV1 source that begins mid-GOP still yields a real
+/// keyframe. Trailing bytes after that fragment are retained so the next
+/// fragment is not truncated.
+fn fmp4_init_and_keyframe(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut offset = 0usize;
+    let mut saw_ftyp = false;
+    let mut init_end = None;
+    while let Some(container) = mp4_box_at(bytes, offset) {
+        if &container.kind == b"ftyp" {
+            saw_ftyp = true;
+        }
+        if saw_ftyp && &container.kind == b"moov" {
+            init_end = Some(offset + container.size);
+        }
+        offset += container.size;
+    }
+    let init_end = init_end?;
+
+    let mut position = init_end;
+    let mut fragment_start = None;
+    while let Some(container) = mp4_box_at(bytes, position) {
+        match &container.kind {
+            b"styp" => {
+                fragment_start.get_or_insert(position);
+            }
+            b"moof" => {
+                let start = fragment_start.take().unwrap_or(position);
+                let moof_end = position + container.size;
+                let Some(mdat) = mp4_box_at(bytes, moof_end) else {
+                    return None;
+                };
+                if &mdat.kind != b"mdat" {
+                    return None;
+                }
+                if fmp4_moof_has_keyframe(container.payload) == Some(true) {
+                    let mut prefix =
+                        Vec::with_capacity(init_end + (bytes.len().saturating_sub(start)));
+                    prefix.extend_from_slice(&bytes[..init_end]);
+                    prefix.extend_from_slice(&bytes[start..]);
+                    return Some(prefix);
+                }
+                // Skip the whole non-keyframe fragment (and any styp before
+                // it) and keep looking for a sync sample.
+                position = moof_end + mdat.size;
+                continue;
+            }
+            _ => {}
+        }
+        position += container.size;
+    }
+    None
+}
+
 ///
 /// This is evidence, not a guess: the HLS path never starts a hardware encoder
 /// just because its name was requested. Tests inject a static list through
@@ -2186,6 +2530,7 @@ impl EncoderAvailability {
                 HlsEncoder::Hevc,
                 HlsEncoder::Av1Svt,
                 HlsEncoder::Av1Aom,
+                HlsEncoder::Av1Rav1e,
                 HlsEncoder::Mjpeg,
             ]
             .map(HlsEncoder::ffmpeg_name),
@@ -3712,6 +4057,9 @@ fn stream_codec(config: &HlsConfig) -> Option<CompressedCodec> {
         | HlsEncoder::NvencHevc
         | HlsEncoder::QsvHevc
         | HlsEncoder::V4l2m2mHevc => Some(CompressedCodec::Hevc),
+        HlsEncoder::Av1Svt | HlsEncoder::Av1Aom | HlsEncoder::Av1Rav1e => {
+            Some(CompressedCodec::Av1)
+        }
         _ => None,
     }
 }
@@ -3805,6 +4153,27 @@ pub fn ffmpeg_mpegts_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<St
     argv
 }
 
+/// Build the exact ffmpeg argv for a live fragmented-MP4 (fMP4) response.
+///
+/// AV1 is carried in fMP4 because mpegts muxes it as private data. The
+/// `empty_moov` + `frag_keyframe` flags write a standalone `ftyp`/`moov` init
+/// segment first and start a new fragment at each keyframe; the HTTP layer
+/// commits only after it has both the init segment and a fragment whose first
+/// sample is a sync sample.
+pub fn ffmpeg_fmp4_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String> {
+    let mut argv = ffmpeg_stream_argv(config, width, height);
+    argv.extend([
+        "-flush_packets".to_owned(),
+        "1".to_owned(),
+        "-movflags".to_owned(),
+        "+frag_keyframe+empty_moov+default_base_moof".to_owned(),
+        "-f".to_owned(),
+        "mp4".to_owned(),
+        "pipe:1".to_owned(),
+    ]);
+    argv
+}
+
 /// Format/encoder half of the argv, before the muxer/output arguments.
 fn ffmpeg_stream_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String> {
     let bitrate = format!("{}k", config.bitrate_kbps);
@@ -3878,7 +4247,7 @@ fn ffmpeg_stream_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String
     let software_10bit_filter = target.is_10bit()
         && matches!(
             config.video_encoder,
-            HlsEncoder::Hevc | HlsEncoder::Av1Svt | HlsEncoder::Av1Aom
+            HlsEncoder::Hevc | HlsEncoder::Av1Svt | HlsEncoder::Av1Aom | HlsEncoder::Av1Rav1e
         );
     if software_10bit_filter {
         argv.extend(["-vf".to_owned(), "format=yuv420p10le".to_owned()]);
@@ -3920,6 +4289,14 @@ fn ffmpeg_stream_argv(config: &HlsConfig, width: u32, height: u32) -> Vec<String
             "8".to_owned(),
             "-row-mt".to_owned(),
             "1".to_owned(),
+            "-b:v".to_owned(),
+            bitrate,
+        ]),
+        HlsEncoder::Av1Rav1e => argv.extend([
+            "-c:v".to_owned(),
+            "librav1e".to_owned(),
+            "-speed".to_owned(),
+            "10".to_owned(),
             "-b:v".to_owned(),
             bitrate,
         ]),
@@ -4161,6 +4538,58 @@ pub mod mpegts_test_support {
         out
     }
 
+    /// One ISO-BMFF box with a 32-bit size and no extended header.
+    pub fn mp4_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + payload.len());
+        out.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// A `moof`/`mdat` fragment whose first sample is (non-)sync.
+    fn fmp4_fragment(keyframe: bool) -> Vec<u8> {
+        let mut trun = Vec::new();
+        trun.extend_from_slice(&0x0000_0205u32.to_be_bytes()); // data offset + first flags + size
+        trun.extend_from_slice(&1u32.to_be_bytes()); // sample_count
+        trun.extend_from_slice(&0i32.to_be_bytes()); // data_offset
+        let sample_flags = if keyframe {
+            0x0200_0000u32
+        } else {
+            0x0101_0000
+        };
+        trun.extend_from_slice(&sample_flags.to_be_bytes());
+        trun.extend_from_slice(&4u32.to_be_bytes()); // sample_size
+        let traf = mp4_box(b"traf", &mp4_box(b"trun", &trun));
+        let mut out = mp4_box(b"moof", &traf);
+        out.extend_from_slice(&mp4_box(b"mdat", &[0x0A, 0x0B, 0x0C, 0x0D]));
+        out
+    }
+
+    /// A minimal fMP4 init segment + one (non-)keyframe fragment.
+    pub fn fmp4_fixture(keyframe: bool) -> Vec<u8> {
+        let ftyp = mp4_box(b"ftyp", b"av01\0\0\0\0");
+        let moov = mp4_box(b"moov", b"ozma-test-init");
+        let mut out = Vec::new();
+        out.extend_from_slice(&ftyp);
+        out.extend_from_slice(&moov);
+        out.extend_from_slice(&fmp4_fragment(keyframe));
+        out
+    }
+
+    /// An init segment followed by a non-keyframe fragment and then a keyframe
+    /// fragment, so a live fMP4 reader must not commit mid-GOP.
+    pub fn fmp4_with_leading_non_keyframe() -> Vec<u8> {
+        let ftyp = mp4_box(b"ftyp", b"av01\0\0\0\0");
+        let moov = mp4_box(b"moov", b"ozma-test-init");
+        let mut out = Vec::new();
+        out.extend_from_slice(&ftyp);
+        out.extend_from_slice(&moov);
+        out.extend_from_slice(&fmp4_fragment(false));
+        out.extend_from_slice(&fmp4_fragment(true));
+        out
+    }
+
     /// A bounded-read async reader over canned bytes.
     pub struct CannedReader {
         data: Vec<u8>,
@@ -4233,6 +4662,11 @@ pub mod mpegts_test_support {
             Self::with_data(mpegts_fixture(codec, keyframe))
         }
 
+        /// A spawner that returns a minimal fMP4 stream.
+        pub fn fmp4(keyframe: bool) -> Self {
+            Self::with_data(fmp4_fixture(keyframe))
+        }
+
         pub fn with_data(data: Vec<u8>) -> Self {
             Self {
                 argv: Arc::new(Mutex::new(Vec::new())),
@@ -4279,6 +4713,25 @@ pub mod mpegts_test_support {
             width: u32,
             height: u32,
         ) -> Result<SpawnedMpegTs, HlsError> {
+            self.spawn_argv(config, ffmpeg_mpegts_argv(config, width, height))
+        }
+
+        fn spawn_fmp4(
+            &self,
+            config: &HlsConfig,
+            width: u32,
+            height: u32,
+        ) -> Result<SpawnedMpegTs, HlsError> {
+            self.spawn_argv(config, ffmpeg_fmp4_argv(config, width, height))
+        }
+    }
+
+    impl RecordingMpegTsSpawner {
+        fn spawn_argv(
+            &self,
+            config: &HlsConfig,
+            argv: Vec<String>,
+        ) -> Result<SpawnedMpegTs, HlsError> {
             self.spawns.fetch_add(1, Ordering::SeqCst);
             if let Some(message) = &self.fail {
                 return Err(HlsError::Spawn {
@@ -4289,7 +4742,7 @@ pub mod mpegts_test_support {
             self.argv
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(ffmpeg_mpegts_argv(config, width, height));
+                .push(argv);
             Ok(SpawnedMpegTs {
                 stdout: Box::new(CannedReader::new(self.data.clone(), self.chunk)),
                 sink: Box::new(TestFrameSink {
@@ -7504,6 +7957,205 @@ mod tests {
         assert!(stopped.load(Ordering::SeqCst));
     }
 
+    fn fmp4_config(encoder: HlsEncoder) -> HlsConfig {
+        HlsConfig {
+            fps: 10,
+            bitrate_kbps: 2_000,
+            video_encoder: encoder,
+            ..HlsConfig::default()
+        }
+    }
+
+    fn top_level_box_types(bytes: &[u8]) -> Vec<[u8; 4]> {
+        let mut types = Vec::new();
+        let mut offset = 0;
+        while let Some(container) = mp4_box_at(bytes, offset) {
+            types.push(container.kind);
+            offset += container.size;
+        }
+        types
+    }
+
+    #[test]
+    fn fmp4_argv_muxes_av1_or_copies_an_av1_obu_source() {
+        let encode = ffmpeg_fmp4_argv(&fmp4_config(HlsEncoder::Av1Svt), 320, 240);
+        assert_eq!(encode.last(), Some(&"pipe:1".to_owned()));
+        assert!(encode.windows(2).any(|pair| pair == ["-f", "mp4"]));
+        assert!(!encode.windows(2).any(|pair| pair == ["-f", "mpegts"]));
+        assert!(encode.windows(2).any(|pair| pair == ["-c:v", "libsvtav1"]));
+        assert!(encode
+            .windows(2)
+            .any(|pair| pair == ["-pix_fmt", "yuv420p"]));
+        assert!(encode.windows(2).any(|pair| {
+            pair[0] == "-movflags"
+                && pair[1].contains("frag_keyframe")
+                && pair[1].contains("empty_moov")
+        }));
+
+        let rav1e = ffmpeg_fmp4_argv(&fmp4_config(HlsEncoder::Av1Rav1e), 320, 240);
+        assert!(rav1e.windows(2).any(|pair| pair == ["-c:v", "librav1e"]));
+        assert!(rav1e.windows(2).any(|pair| pair == ["-speed", "10"]));
+
+        let mut copy = fmp4_config(HlsEncoder::Av1Aom);
+        copy.input_pixel_format = PixelFormat::Av1;
+        let argv = ffmpeg_fmp4_argv(&copy, 320, 240);
+        assert!(argv.windows(2).any(|pair| pair == ["-f", "obu"]));
+        assert!(argv.windows(2).any(|pair| pair == ["-c:v", "copy"]));
+        assert!(!argv.windows(2).any(|pair| pair == ["-c:v", "libaom-av1"]));
+
+        let mut reencode = fmp4_config(HlsEncoder::Av1Svt);
+        reencode.input_pixel_format = PixelFormat::H264;
+        let argv = ffmpeg_fmp4_argv(&reencode, 320, 240);
+        assert!(argv.windows(2).any(|pair| pair == ["-f", "h264"]));
+        assert!(argv.windows(2).any(|pair| pair == ["-c:v", "libsvtav1"]));
+        assert!(!argv.windows(2).any(|pair| pair == ["-c:v", "copy"]));
+    }
+
+    #[test]
+    fn fmp4_keyframe_detector_requires_init_and_a_sync_sample() {
+        use mpegts_test_support::{fmp4_fixture, fmp4_with_leading_non_keyframe};
+
+        let keyframe = fmp4_fixture(true);
+        let prefix = fmp4_init_and_keyframe(&keyframe).expect("init + sync fragment");
+        assert_eq!(
+            top_level_box_types(&prefix),
+            vec![*b"ftyp", *b"moov", *b"moof", *b"mdat"]
+        );
+
+        // A non-sync fragment alone never commits.
+        assert!(fmp4_init_and_keyframe(&fmp4_fixture(false)).is_none());
+        // A truncated init segment never commits.
+        assert!(fmp4_init_and_keyframe(&keyframe[..16]).is_none());
+
+        // A mid-GOP source is trimmed to the init segment + first sync
+        // fragment; the leading non-keyframe fragment is not sent.
+        let leading = fmp4_with_leading_non_keyframe();
+        let prefix = fmp4_init_and_keyframe(&leading).expect("later sync fragment");
+        assert_eq!(
+            top_level_box_types(&prefix),
+            vec![*b"ftyp", *b"moov", *b"moof", *b"mdat"]
+        );
+        assert!(prefix.len() < leading.len());
+    }
+
+    #[tokio::test]
+    async fn fmp4_stream_commits_init_and_keyframe_and_stops_on_disconnect() {
+        use mpegts_test_support::{RecordingMpegTsSpawner, TestTsSource};
+
+        let (source, stopped) = TestTsSource::rgb(16, 16, 200, true);
+        let spawner = Arc::new(RecordingMpegTsSpawner::fmp4(true).with_chunk(64));
+        let stream = start_fmp4_stream(
+            Box::new(source),
+            fmp4_config(HlsEncoder::Av1Svt),
+            spawner.clone(),
+            Arc::new(StaticEncoderProbe::software()),
+        )
+        .await
+        .expect("AV1 fMP4 stream");
+        assert_eq!(
+            top_level_box_types(&stream.first),
+            vec![*b"ftyp", *b"moov", *b"moof", *b"mdat"]
+        );
+        let argv = spawner.argv();
+        assert!(argv.windows(2).any(|pair| pair == ["-f", "mp4"]));
+        assert!(argv.windows(2).any(|pair| pair == ["-c:v", "libsvtav1"]));
+
+        drop(stream.receiver);
+        tokio::time::timeout(Duration::from_secs(3), stream.task)
+            .await
+            .expect("stream task stops after disconnect")
+            .expect("stream task joins");
+        assert!(stopped.load(Ordering::SeqCst), "source stop() was called");
+        assert!(spawner.closed.load(Ordering::SeqCst), "ffmpeg stdin closed");
+    }
+
+    #[tokio::test]
+    async fn fmp4_stream_fails_before_commit_without_a_sync_fragment() {
+        use mpegts_test_support::{RecordingMpegTsSpawner, TestTsSource};
+
+        let (source, stopped) = TestTsSource::rgb(16, 16, 20, false);
+        let error = start_fmp4_stream(
+            Box::new(source),
+            fmp4_config(HlsEncoder::Av1Svt),
+            Arc::new(RecordingMpegTsSpawner::fmp4(false)),
+            Arc::new(StaticEncoderProbe::software()),
+        )
+        .await
+        .expect_err("no sync fragment is a setup error");
+        assert!(matches!(error, HlsError::Stream { .. }), "{error}");
+        assert!(stopped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn fmp4_stream_rejects_wrong_containers_and_unavailable_av1_encoders() {
+        use mpegts_test_support::{RecordingMpegTsSpawner, TestTsSource};
+
+        let (source, stopped) = TestTsSource::rgb(16, 16, 4, false);
+        let error = start_fmp4_stream(
+            Box::new(source),
+            fmp4_config(HlsEncoder::H264),
+            Arc::new(RecordingMpegTsSpawner::fmp4(true)),
+            Arc::new(StaticEncoderProbe::software()),
+        )
+        .await
+        .expect_err("H.264 belongs in MPEG-TS");
+        assert!(matches!(error, HlsError::UnsupportedStreamCodec { .. }));
+        assert!(stopped.load(Ordering::SeqCst));
+
+        let (source, stopped) = TestTsSource::rgb(16, 16, 4, false);
+        let error = start_mpegts_stream(
+            Box::new(source),
+            fmp4_config(HlsEncoder::Av1Svt),
+            Arc::new(RecordingMpegTsSpawner::fmp4(true)),
+            Arc::new(StaticEncoderProbe::software()),
+        )
+        .await
+        .expect_err("AV1 belongs in fMP4");
+        assert!(matches!(error, HlsError::UnsupportedStreamCodec { .. }));
+        assert!(stopped.load(Ordering::SeqCst));
+
+        let (source, stopped) = TestTsSource::rgb(16, 16, 4, false);
+        let spawner = Arc::new(RecordingMpegTsSpawner::fmp4(true));
+        let error = start_fmp4_stream(
+            Box::new(source),
+            fmp4_config(HlsEncoder::Av1Svt),
+            spawner.clone(),
+            Arc::new(StaticEncoderProbe::new(EncoderAvailability::default())),
+        )
+        .await
+        .expect_err("ffmpeg advertised no AV1 encoder");
+        assert!(matches!(error, HlsError::EncoderUnavailable { .. }));
+        assert_eq!(spawner.spawns.load(Ordering::SeqCst), 0);
+        assert!(stopped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn fmp4_stream_copies_an_av1_source_without_an_encoder() {
+        use mpegts_test_support::{RecordingMpegTsSpawner, TestTsSource};
+
+        let format = FrameFormat::new(PixelFormat::Av1, 16, 16);
+        let (source, stopped) = TestTsSource::compressed(format, 50, true);
+        let spawner = Arc::new(RecordingMpegTsSpawner::fmp4(true));
+        let stream = start_fmp4_stream(
+            Box::new(source),
+            fmp4_config(HlsEncoder::Av1Svt),
+            spawner.clone(),
+            Arc::new(StaticEncoderProbe::new(EncoderAvailability::default())),
+        )
+        .await
+        .expect("AV1 passthrough needs no encoder");
+        let argv = spawner.argv();
+        assert!(argv.windows(2).any(|pair| pair == ["-f", "obu"]));
+        assert!(argv.windows(2).any(|pair| pair == ["-c:v", "copy"]));
+        assert!(argv.windows(2).any(|pair| pair == ["-f", "mp4"]));
+        drop(stream.receiver);
+        tokio::time::timeout(Duration::from_secs(3), stream.task)
+            .await
+            .expect("passthrough task stops")
+            .expect("passthrough task joins");
+        assert!(stopped.load(Ordering::SeqCst));
+    }
+
     /// Live end-to-end check: a fake RGB capture source → real ffmpeg →
     /// MPEG-TS → `ffprobe`/decode. Requires `ffmpeg` and `ffprobe` on `PATH`.
     #[tokio::test]
@@ -7614,5 +8266,105 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(directory);
         }
+    }
+
+    /// Live end-to-end AV1 check: a fake RGB capture source → real ffmpeg →
+    /// fragmented MP4 → `ffprobe`/decode. Requires an AV1 encoder in ffmpeg.
+    #[tokio::test]
+    #[ignore = "requires ffmpeg/ffprobe and a working software AV1 encoder"]
+    async fn live_fmp4_stream_is_ffprobe_decodable_av1() {
+        use mpegts_test_support::TestTsSource;
+        use std::io::Write as _;
+
+        let directory = temp_dir("live-fmp4-av1");
+        let path = directory.join("stream.mp4");
+        let (source, stopped) = TestTsSource::rgb(160, 120, 60, false);
+        let config = HlsConfig {
+            fps: 30,
+            bitrate_kbps: 900,
+            video_encoder: HlsEncoder::Av1Svt,
+            ..HlsConfig::default()
+        };
+        let stream = start_fmp4_stream(
+            Box::new(source),
+            config,
+            Arc::new(SystemMpegTsSpawner),
+            Arc::new(SystemEncoderProbe::new()),
+        )
+        .await
+        .expect("AV1 fMP4 stream");
+        let Fmp4Stream {
+            first,
+            mut receiver,
+            task,
+        } = stream;
+        assert_eq!(&first[4..8], b"ftyp");
+        let mut file = std::fs::File::create(&path).expect("stream file");
+        file.write_all(&first).expect("write init + keyframe");
+        while let Ok(Some(chunk)) =
+            tokio::time::timeout(Duration::from_millis(500), receiver.recv()).await
+        {
+            file.write_all(&chunk).expect("write chunk");
+        }
+        drop(receiver);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        file.flush().expect("flush stream");
+        assert!(stopped.load(Ordering::SeqCst), "AV1 source stopped");
+
+        let probe = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name,width,height",
+                "-of",
+                "json",
+            ])
+            .arg(&path)
+            .output()
+            .expect("run ffprobe");
+        assert!(
+            probe.status.success(),
+            "ffprobe failed: {}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        let info: serde_json::Value = serde_json::from_slice(&probe.stdout).expect("ffprobe JSON");
+        assert_eq!(info["streams"][0]["codec_name"], "av1");
+        assert_eq!(info["streams"][0]["width"], 160);
+        assert_eq!(info["streams"][0]["height"], 120);
+
+        let decoded = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&path)
+            .args(["-map", "0:v:0", "-f", "null", "-"])
+            .output()
+            .expect("run ffmpeg decode");
+        assert!(
+            decoded.status.success(),
+            "AV1 decode failed: {}",
+            String::from_utf8_lossy(&decoded.stderr)
+        );
+
+        let frames = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-count_frames",
+                "-show_entries",
+                "stream=nb_read_frames",
+                "-of",
+                "default=nokey=1:noprint_wrappers=1",
+            ])
+            .arg(&path)
+            .output()
+            .expect("run ffprobe frame count");
+        let frames = String::from_utf8_lossy(&frames.stdout);
+        let frames: u64 = frames.trim().parse().expect("decoded frame count");
+        assert!(frames >= 10, "AV1 decoded only {frames} frames");
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

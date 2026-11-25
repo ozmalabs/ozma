@@ -56,6 +56,10 @@ const MAX_STATUS_ERROR_CHARS: usize = 512;
 /// Bound on remembered helper session ids per console. Old ids are dropped
 /// without touching the helper; this only bounds the routing table.
 const MAX_SESSIONS_PER_CONSOLE: usize = 64;
+/// Largest accepted `--multi-console-webrtc-audio-source` template.
+pub const MAX_AUDIO_SOURCE_TEMPLATE_CHARS: usize = 256;
+/// Largest expanded per-console audio source accepted.
+pub const MAX_AUDIO_SOURCE_CHARS: usize = 512;
 
 /// Bounds for per-console WebRTC.
 #[derive(Clone, Debug)]
@@ -67,6 +71,11 @@ pub struct MultiConsoleWebrtcConfig {
     /// that console. Zero disables idle eviction (the `max_helpers` bound still
     /// applies).
     pub idle_timeout: Duration,
+    /// Optional per-console audio monitor template (`--multi-console-webrtc-
+    /// audio-source`). `{console}` and `{index}` are replaced with the
+    /// console's zero-based index. When unset, every helper keeps the shared
+    /// base `--webrtc-audio-source` (or stays video-only when that is unset).
+    pub audio_source_template: Option<String>,
 }
 
 impl Default for MultiConsoleWebrtcConfig {
@@ -74,6 +83,7 @@ impl Default for MultiConsoleWebrtcConfig {
         Self {
             max_helpers: DEFAULT_MAX_CONSOLE_WEBRTC,
             idle_timeout: DEFAULT_CONSOLE_WEBRTC_IDLE_TIMEOUT,
+            audio_source_template: None,
         }
     }
 }
@@ -120,6 +130,18 @@ pub trait ConsoleWebRtcFactory: Send + Sync {
     /// Configured audio monitor, when the base helper uses one.
     fn audio_source(&self) -> Option<String> {
         None
+    }
+    /// True when any helper may be configured with audio.
+    fn audio_configured(&self) -> bool {
+        self.audio_source().is_some()
+    }
+    /// Configured audio monitor for one console, when that helper gets audio.
+    ///
+    /// This is configuration intent only: it does not claim the monitor was
+    /// opened or that audio samples were produced.
+    fn audio_source_for(&self, console: u32) -> Option<String> {
+        let _ = console;
+        self.audio_source()
     }
     /// Start one helper for `console`, using `geometry` when non-zero.
     async fn start(
@@ -213,6 +235,7 @@ impl ConsoleWebRtcSession for HelperSession {
 pub struct ControllerWebRtcFactory {
     console_factory: Arc<dyn ConsoleSourceFactory>,
     base: WebRtcConfig,
+    audio_source_template: Option<String>,
 }
 
 impl ControllerWebRtcFactory {
@@ -221,11 +244,25 @@ impl ControllerWebRtcFactory {
         Self {
             console_factory,
             base,
+            audio_source_template: None,
         }
     }
 
+    /// Use a per-console audio source template instead of the base monitor.
+    pub fn with_audio_source_template(mut self, template: Option<String>) -> Self {
+        self.audio_source_template = template;
+        self
+    }
+
     /// Configuration one console's helper runs with.
-    pub fn config_for(&self, console: u32, geometry: Option<(u32, u32)>) -> WebRtcConfig {
+    ///
+    /// A configured template overrides the shared base monitor; without one
+    /// the base monitor (or video-only `None`) is preserved.
+    pub fn config_for(
+        &self,
+        console: u32,
+        geometry: Option<(u32, u32)>,
+    ) -> Result<WebRtcConfig, String> {
         let mut config = self.base.clone();
         config.socket_path = console_path(&self.base.socket_path, console);
         config.shm_path = console_path(&self.base.shm_path, console);
@@ -235,7 +272,10 @@ impl ControllerWebRtcFactory {
                 config.height = height;
             }
         }
-        config
+        if let Some(template) = &self.audio_source_template {
+            config.audio_source = Some(expand_audio_source(template, console)?);
+        }
+        Ok(config)
     }
 }
 
@@ -249,6 +289,17 @@ impl ConsoleWebRtcFactory for ControllerWebRtcFactory {
         self.base.audio_source.clone()
     }
 
+    fn audio_configured(&self) -> bool {
+        self.audio_source_template.is_some() || self.base.audio_source.is_some()
+    }
+
+    fn audio_source_for(&self, console: u32) -> Option<String> {
+        match &self.audio_source_template {
+            Some(template) => expand_audio_source(template, console).ok(),
+            None => self.base.audio_source.clone(),
+        }
+    }
+
     async fn start(
         &self,
         console: u32,
@@ -256,7 +307,7 @@ impl ConsoleWebRtcFactory for ControllerWebRtcFactory {
     ) -> Result<Arc<dyn ConsoleWebRtcSession>, String> {
         let factory = self.console_factory.clone();
         let source_id = self.console_factory.source_id().map(str::to_owned);
-        let config = self.config_for(console, geometry);
+        let config = self.config_for(console, geometry)?;
         tokio::task::spawn_blocking(move || {
             let registry = factory.registry(console)?;
             let source = open_selected_source(&registry, source_id.as_deref())?;
@@ -311,6 +362,16 @@ pub struct ConsoleWebRtcStatus {
     /// Shared-memory framebuffer for this console's helper (local diagnostics).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shm_path: Option<String>,
+    /// True when this console's helper was configured with an audio monitor.
+    ///
+    /// Configuration intent only: this does not claim the monitor was opened,
+    /// that the helper negotiated an audio m-line, or that samples arrived.
+    pub audio_configured: bool,
+    /// Configured monitor source for this console, when one was supplied.
+    ///
+    /// Monitor names are not secrets; no sample or negotiation claim is made.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_source: Option<String>,
     /// Successful offers answered by this helper since it started.
     pub peers: u64,
     /// Helper session ids currently routed to this console.
@@ -381,10 +442,9 @@ impl MultiConsoleWebrtc {
         base: WebRtcConfig,
         config: MultiConsoleWebrtcConfig,
     ) -> Self {
-        Self::new(
-            Arc::new(ControllerWebRtcFactory::new(console_factory, base)),
-            config,
-        )
+        let factory = ControllerWebRtcFactory::new(console_factory, base)
+            .with_audio_source_template(config.audio_source_template.clone());
+        Self::new(Arc::new(factory), config)
     }
 
     /// True when the configured provider can expose independent consoles.
@@ -397,9 +457,12 @@ impl MultiConsoleWebrtc {
         self.inner.factory.audio_source()
     }
 
-    /// True when the base helper was configured with an audio monitor.
+    /// True when any helper may be configured with an audio monitor.
+    ///
+    /// A per-console template counts as configuration intent even when no
+    /// shared base source was supplied; per-console truth is in [`Self::status`].
     pub fn audio_configured(&self) -> bool {
-        self.audio_source().is_some()
+        self.inner.config.audio_source_template.is_some() || self.inner.factory.audio_configured()
     }
 
     /// Active console, or `0` when no outputs are advertised.
@@ -979,6 +1042,9 @@ impl MultiConsoleWebrtc {
                     0,
                 )
             };
+            let audio_source = capturable
+                .then(|| self.inner.factory.audio_source_for(output.index))
+                .flatten();
             consoles.push(ConsoleWebRtcStatus {
                 console: output.index,
                 active: output.index == active,
@@ -987,6 +1053,8 @@ impl MultiConsoleWebrtc {
                 pid,
                 socket_path,
                 shm_path,
+                audio_configured: audio_source.is_some(),
+                audio_source,
                 peers,
                 sessions,
             });
@@ -1112,6 +1180,73 @@ fn bounded(message: String) -> String {
     let mut truncated: String = message.chars().take(MAX_STATUS_ERROR_CHARS).collect();
     truncated.push('…');
     truncated
+}
+
+/// Expand one per-console audio source template.
+///
+/// `{console}` and `{index}` both become the zero-based console index, so
+/// `ozma-vm{console}.monitor` yields `ozma-vm1.monitor` for `Console_1`.
+/// Empty results, control characters, over-long values, and unknown
+/// placeholders are typed errors rather than being passed to the helper.
+pub fn expand_audio_source(template: &str, console: u32) -> Result<String, String> {
+    if template.trim().is_empty() {
+        return Err(
+            "the per-console WebRTC audio source template must not be empty or whitespace"
+                .to_owned(),
+        );
+    }
+    if template.chars().count() > MAX_AUDIO_SOURCE_TEMPLATE_CHARS {
+        return Err(format!(
+            "the per-console WebRTC audio source template must be at most \
+             {MAX_AUDIO_SOURCE_TEMPLATE_CHARS} characters"
+        ));
+    }
+    if template.chars().any(char::is_control) {
+        return Err(
+            "the per-console WebRTC audio source template must not contain control characters"
+                .to_owned(),
+        );
+    }
+    let index = console.to_string();
+    let source = template
+        .replace("{console}", &index)
+        .replace("{index}", &index);
+    if source.trim().is_empty() {
+        return Err(format!(
+            "the per-console WebRTC audio source for Console_{console} must not be empty or \
+             whitespace"
+        ));
+    }
+    if source.chars().count() > MAX_AUDIO_SOURCE_CHARS {
+        return Err(format!(
+            "the per-console WebRTC audio source for Console_{console} must be at most \
+             {MAX_AUDIO_SOURCE_CHARS} characters"
+        ));
+    }
+    if source.chars().any(char::is_control) {
+        return Err(format!(
+            "the per-console WebRTC audio source for Console_{console} must not contain control \
+             characters"
+        ));
+    }
+    if source.contains('{') || source.contains('}') {
+        return Err(format!(
+            "the per-console WebRTC audio source template for Console_{console} contains an \
+             unknown placeholder; only {{console}} and {{index}} are supported"
+        ));
+    }
+    Ok(source)
+}
+
+/// Validate a template without needing an advertised console.
+///
+/// Expands the first and last possible console indexes (the number of consoles
+/// is bounded by [`MAX_VM_CONSOLES`]) so a template that is valid for `0` but
+/// over-long for a later index is rejected at startup.
+pub fn validate_audio_source_template(template: &str) -> Result<(), String> {
+    expand_audio_source(template, 0)?;
+    expand_audio_source(template, MAX_VM_CONSOLES as u32 - 1)?;
+    Ok(())
 }
 
 /// Derive a per-console path from a base file path.
@@ -1242,6 +1377,8 @@ mod tests {
         started: StdMutex<Vec<u32>>,
         stopped: Arc<AtomicUsize>,
         fail: StdMutex<HashSet<u32>>,
+        audio_template: Option<String>,
+        audio_console: Option<u32>,
     }
 
     impl FakeFactory {
@@ -1251,6 +1388,19 @@ mod tests {
                 started: StdMutex::new(Vec::new()),
                 stopped: Arc::new(AtomicUsize::new(0)),
                 fail: StdMutex::new(HashSet::new()),
+                audio_template: None,
+                audio_console: None,
+            })
+        }
+
+        fn dbus_with_audio(template: &str, only: Option<u32>) -> Arc<Self> {
+            Arc::new(Self {
+                provider: Some(VmConsoleBackend::Dbus),
+                started: StdMutex::new(Vec::new()),
+                stopped: Arc::new(AtomicUsize::new(0)),
+                fail: StdMutex::new(HashSet::new()),
+                audio_template: Some(template.to_owned()),
+                audio_console: only,
             })
         }
 
@@ -1260,6 +1410,8 @@ mod tests {
                 started: StdMutex::new(Vec::new()),
                 stopped: Arc::new(AtomicUsize::new(0)),
                 fail: StdMutex::new(HashSet::new()),
+                audio_template: None,
+                audio_console: None,
             })
         }
 
@@ -1275,6 +1427,19 @@ mod tests {
     impl ConsoleWebRtcFactory for FakeFactory {
         fn provider(&self) -> Option<VmConsoleBackend> {
             self.provider
+        }
+
+        fn audio_configured(&self) -> bool {
+            self.audio_template.is_some()
+        }
+
+        fn audio_source_for(&self, console: u32) -> Option<String> {
+            if self.audio_console.is_some_and(|only| only != console) {
+                return None;
+            }
+            self.audio_template
+                .as_ref()
+                .map(|template| expand_audio_source(template, console).expect("valid template"))
         }
 
         async fn start(
@@ -1308,6 +1473,7 @@ mod tests {
             MultiConsoleWebrtcConfig {
                 max_helpers,
                 idle_timeout: idle,
+                audio_source_template: None,
             },
         )
     }
@@ -1517,6 +1683,161 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    #[test]
+    fn audio_source_template_expands_console_and_index() {
+        assert_eq!(
+            expand_audio_source("ozma-vm{console}.monitor", 0).unwrap(),
+            "ozma-vm0.monitor"
+        );
+        assert_eq!(
+            expand_audio_source("ozma-vm{index}.monitor", 2).unwrap(),
+            "ozma-vm2.monitor"
+        );
+        assert_eq!(expand_audio_source("{console}-{index}", 1).unwrap(), "1-1");
+        assert_eq!(
+            expand_audio_source("shared.monitor", 3).unwrap(),
+            "shared.monitor"
+        );
+    }
+
+    #[test]
+    fn invalid_audio_source_template_is_typed() {
+        for template in [
+            "",
+            "   ",
+            "bad\nmonitor",
+            "ozma-vm{consol}.monitor",
+            "ozma-vm{}.monitor",
+        ] {
+            assert!(
+                expand_audio_source(template, 0).is_err(),
+                "{template:?} must be rejected"
+            );
+        }
+        let long = "x".repeat(MAX_AUDIO_SOURCE_TEMPLATE_CHARS + 1);
+        let error = expand_audio_source(&long, 0).expect_err("over-long template");
+        assert!(error.contains("at most"), "{error}");
+        assert!(validate_audio_source_template("ozma-vm{console}.monitor").is_ok());
+        assert!(validate_audio_source_template("bad\u{7}monitor").is_err());
+    }
+
+    struct DummyConsoleFactory;
+
+    impl ConsoleSourceFactory for DummyConsoleFactory {
+        fn provider(&self) -> Option<VmConsoleBackend> {
+            None
+        }
+
+        fn default_console(&self) -> u32 {
+            0
+        }
+
+        fn supports_console_switch(&self) -> bool {
+            false
+        }
+
+        fn registry(&self, _console: u32) -> Result<ozma_capture::CaptureRegistry, String> {
+            Err("unused in this test".to_owned())
+        }
+
+        fn selection(&self, _console: u32) -> Result<DisplayOutputSelection, String> {
+            Err("unused in this test".to_owned())
+        }
+    }
+
+    fn base_webrtc_config() -> WebRtcConfig {
+        WebRtcConfig {
+            helper_program: PathBuf::from("/bin/true"),
+            helper_script: None,
+            socket_path: PathBuf::from("/tmp/base.sock"),
+            shm_path: PathBuf::from("/tmp/base.bgra"),
+            width: 640,
+            height: 480,
+            scale_to_fit: false,
+            fps: 30,
+            bitrate_kbps: 4_000,
+            audio_source: None,
+            audio_backend: crate::webrtc::WebRtcAudioBackend::Auto,
+            stun_server: None,
+            turn_server: None,
+            turn_user: None,
+            turn_password: None,
+            startup_timeout: Duration::from_secs(5),
+            offer_timeout: Duration::from_secs(10),
+        }
+    }
+
+    fn controller_factory(base: WebRtcConfig, template: Option<&str>) -> ControllerWebRtcFactory {
+        ControllerWebRtcFactory::new(Arc::new(DummyConsoleFactory), base)
+            .with_audio_source_template(template.map(str::to_owned))
+    }
+
+    #[test]
+    fn per_console_config_and_helper_argv_use_expanded_audio_source() {
+        let factory = controller_factory(base_webrtc_config(), Some("ozma-vm{console}.monitor"));
+        let zero = factory.config_for(0, None).expect("console 0 config");
+        let one = factory
+            .config_for(1, Some((1280, 800)))
+            .expect("console 1 config");
+        assert_eq!(zero.audio_source.as_deref(), Some("ozma-vm0.monitor"));
+        assert_eq!(one.audio_source.as_deref(), Some("ozma-vm1.monitor"));
+        assert_eq!(one.width, 1280);
+        assert_eq!(one.height, 800);
+
+        // The fake helper argv is what the real spawn path receives.
+        let argv = crate::webrtc::helper_argv(&one);
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair[0] == "--audio-source" && pair[1] == "ozma-vm1.monitor"),
+            "{argv:?}"
+        );
+        assert!(argv
+            .windows(2)
+            .any(|pair| pair[0] == "--audio-backend" && pair[1] == "auto"));
+    }
+
+    #[test]
+    fn unset_template_preserves_base_or_video_only_config() {
+        let mut base = base_webrtc_config();
+        base.audio_source = Some("shared-monitor".to_owned());
+        let shared = controller_factory(base, None);
+        assert_eq!(
+            shared.config_for(0, None).unwrap().audio_source.as_deref(),
+            Some("shared-monitor")
+        );
+        assert_eq!(
+            shared.config_for(1, None).unwrap().audio_source.as_deref(),
+            Some("shared-monitor")
+        );
+
+        let video_only = controller_factory(base_webrtc_config(), None);
+        assert_eq!(video_only.config_for(0, None).unwrap().audio_source, None);
+    }
+
+    #[tokio::test]
+    async fn per_console_audio_status_marks_only_configured_helpers() {
+        let factory = FakeFactory::dbus_with_audio("ozma-vm{console}.monitor", Some(0));
+        let manager = manager(factory, 2, Duration::from_secs(60));
+        manager.sync(&selection(0, &[0, 1])).await;
+
+        let status = manager.status().await;
+        let zero = status
+            .consoles
+            .iter()
+            .find(|console| console.console == 0)
+            .unwrap();
+        let one = status
+            .consoles
+            .iter()
+            .find(|console| console.console == 1)
+            .unwrap();
+        assert!(zero.audio_configured);
+        assert_eq!(zero.audio_source.as_deref(), Some("ozma-vm0.monitor"));
+        assert!(!one.audio_configured);
+        assert_eq!(one.audio_source, None);
+        assert!(manager.audio_configured());
     }
 
     #[tokio::test]

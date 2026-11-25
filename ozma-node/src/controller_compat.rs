@@ -3719,6 +3719,56 @@ pub const BLUETOOTH_UNCONFIGURED_SURFACE: ControllerSurface = ControllerSurface 
     remediation: "Restart the node with --bluetooth (and optionally --bluetooth-adapter) to enable the guarded routes.",
 };
 
+/// Serial surfaces served by the opt-in [`crate::serial`] provider.
+///
+/// These are advertised only when the node was started with `--serial-device`.
+/// The routes are always mounted behind the bearer guard, but without the
+/// service they answer a typed 503 `serial.not-configured`. The residual
+/// `/serial/*` entry in [`CONTROLLER_ONLY_SURFACES`] continues to describe the
+/// historical buffer/send/state/text/setup sub-surfaces that remain typed 501s.
+pub const SERIAL_IMPLEMENTED_SURFACES: &[ControllerSurface] = &[
+    ControllerSurface {
+        surface: "/serial/status",
+        capability: "serial.status",
+        supported: true,
+        reason: "Reports the configured device path, line settings, connection state, byte counters, bounded buffer, and typed last error.",
+        python_reference: "node/serial_capture.py::NodeSerialCapture.state_dict",
+        path_prefix: "/serial/status",
+        code: "serial.status",
+        remediation: "",
+    },
+    ControllerSurface {
+        surface: "/serial/write",
+        capability: "serial.write",
+        supported: true,
+        reason: "Writes exactly one bounded text or hex payload to the configured device; no newline is appended.",
+        python_reference: "node/serial_capture.py::NodeSerialCapture.send",
+        path_prefix: "/serial/write",
+        code: "serial.write",
+        remediation: "",
+    },
+    ControllerSurface {
+        surface: "/serial/read",
+        capability: "serial.read",
+        supported: true,
+        reason: "Returns a bounded base64 slice of the retained receive buffer with an absolute since/next cursor.",
+        python_reference: "node/serial_capture.py::NodeSerialCapture.get_buffer",
+        path_prefix: "/serial/read",
+        code: "serial.read",
+        remediation: "",
+    },
+    ControllerSurface {
+        surface: "/serial/stream",
+        capability: "serial.stream",
+        supported: true,
+        reason: "Streams bounded SSE data events from the receive buffer and ends on an idle timeout or a disconnected device.",
+        python_reference: "node/serial_capture.py::register_serial_routes.stream_sse",
+        path_prefix: "/serial/stream",
+        code: "serial.stream",
+        remediation: "",
+    },
+];
+
 /// Controller-only surfaces that this node advertises as unsupported.
 ///
 /// Each entry is backed by a typed 501 route: the controller gets a stable
@@ -3763,12 +3813,13 @@ pub const CONTROLLER_ONLY_SURFACES: &[ControllerSurface] = &[
         surface: "/serial/*",
         capability: "serial",
         supported: false,
-        reason: "This node has no serial-console reader or buffer.",
+        reason: "Serial status/write/read/stream are implemented opt-in with --serial-device; the historical buffer/send/state/text/setup sub-surfaces remain unsupported.",
         python_reference: "node/serial_capture.py",
         path_prefix: "/serial",
         code: "serial.unsupported",
-        remediation: "Attach a serial-console provider that exposes /serial/buffer; no buffer is \
-                      fabricated.",
+        remediation: "Start the node with --serial-device PATH and use /serial/status, /serial/write, \
+                      /serial/read, or /serial/stream. Other /serial/* sub-surfaces are typed 501s; \
+                      no buffer or send result is fabricated.",
     },
     ControllerSurface {
         surface: "/rgb/*",
@@ -3894,6 +3945,11 @@ pub struct ConnectionState {
     /// `--bluetooth` was configured; every `/bluetooth/*` route answers a typed
     /// 503 `bluetooth.not-configured` rather than a fake device list.
     pub bluetooth: Option<crate::bluetooth::BluetoothService>,
+    /// Opt-in bounded serial/UART provider. `None` means no `--serial-device`
+    /// was configured; the implemented routes answer a typed 503
+    /// `serial.not-configured` and every other `/serial/*` path stays a typed
+    /// 501. No device is opened unless the service is configured.
+    pub serial: Option<crate::serial::SerialService>,
 }
 
 /// Registration view of the optional internal RFB listener.
@@ -3983,6 +4039,7 @@ impl ConnectionState {
             desktop_controls: None,
             backup: None,
             bluetooth: None,
+            serial: None,
         }
     }
 
@@ -4208,6 +4265,16 @@ impl ConnectionState {
         self
     }
 
+    /// Attach the opt-in bounded serial/UART provider (`--serial-device`).
+    ///
+    /// Without it, `/serial/status|write|read|stream` answer a typed 503
+    /// `serial.not-configured` and the other `/serial/*` sub-surfaces keep their
+    /// typed 501. No serial device is opened unless this service is configured.
+    pub fn with_serial(mut self, serial: Option<crate::serial::SerialService>) -> Self {
+        self.serial = serial;
+        self
+    }
+
     /// Attach the opt-in bounded application-control surface (`--app-control`).
     ///
     /// Without it, `/apps` stays read-only and every `/apps/{pid}/*` control
@@ -4382,6 +4449,7 @@ pub fn compat_router(state: ConnectionState) -> Router {
         .merge(crate::app_control::router(state.app_control.clone()))
         .merge(crate::backup::router(state.backup.clone()))
         .merge(crate::bluetooth::router(state.bluetooth.clone()))
+        .merge(crate::serial::router(state.serial.clone()))
         .merge(legacy_router(state))
 }
 
@@ -4700,6 +4768,10 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
     let video = VideoStatus::new(
         state.snapshot.is_some(),
         state.video_encoding.is_some(),
+        state
+            .video_encoding
+            .as_ref()
+            .is_some_and(VideoEncoding::av1_available),
         &state.video_streams,
     );
     let mut controller_surfaces: Vec<ControllerSurface> = RPA_IMPLEMENTED_SURFACES
@@ -4711,6 +4783,9 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
         controller_surfaces.extend_from_slice(BLUETOOTH_IMPLEMENTED_SURFACES);
     } else {
         controller_surfaces.push(BLUETOOTH_UNCONFIGURED_SURFACE);
+    }
+    if state.serial.is_some() {
+        controller_surfaces.extend_from_slice(SERIAL_IMPLEMENTED_SURFACES);
     }
     Json(ConnectionResponse {
         ok: true,
@@ -4947,31 +5022,31 @@ fn unavailable_display_info(last_error: Option<String>) -> DisplayInfo {
     }
 }
 
-/// `GET /video` and `GET /display/mjpeg` — bounded MJPEG or MPEG-TS stream.
+/// `GET /video` and `GET /display/mjpeg` — bounded MJPEG or encoded stream.
 ///
 /// `?codec=mjpeg` (the default) keeps the historical multipart JPEG response.
-/// `?codec=h264|hevc` feeds the same selected capture source to ffmpeg and
-/// returns MPEG-TS. In both cases a real frame/keyframe is produced before the
-/// response is committed, and disconnecting releases the source and slot.
+/// `?codec=h264|hevc|av1` feeds the same selected capture source to ffmpeg and
+/// returns MPEG-TS (H.264/HEVC) or fragmented MP4 (AV1). In every case a real
+/// frame/keyframe is produced before the response is committed, and
+/// disconnecting releases the source and slot.
 async fn video_stream(
     State(state): State<ConnectionState>,
     Query(params): Query<VideoParams>,
 ) -> Response {
-    let options = match params.options() {
-        Ok(options) => options,
-        Err(error) => {
-            return compat_error_with_remediation(
+    let options =
+        match params.options() {
+            Ok(options) => options,
+            Err(error) => return compat_error_with_remediation(
                 StatusCode::BAD_REQUEST,
                 "video.invalid_query",
                 error.message,
                 Some(
-                    "Use ?codec=mjpeg|h264|hevc&fps=1..30&quality=1..100&bitrate=100..50000\
+                    "Use ?codec=mjpeg|h264|hevc|av1&fps=1..30&quality=1..100&bitrate=100..50000\
                      &console=<N|label|Console_N|source-id>; numeric values outside those bounds \
                      are clamped.",
                 ),
-            )
-        }
-    };
+            ),
+        };
 
     if options.codec.is_encoded() {
         return encoded_video_stream(&state, &params, options).await;
@@ -5026,7 +5101,7 @@ async fn video_stream(
     response
 }
 
-/// H.264/HEVC MPEG-TS branch of `/video`.
+/// Encoded H.264/HEVC/AV1 branch of `/video`.
 async fn encoded_video_stream(
     state: &ConnectionState,
     params: &VideoParams,
@@ -5034,7 +5109,7 @@ async fn encoded_video_stream(
 ) -> Response {
     let Some(encoding) = state.video_encoding.as_ref() else {
         return video_encoder_unavailable_response(
-            "This node has no H.264/HEVC encoder configuration; only ?codec=mjpeg is available.",
+            "This node has no encoded video configuration; only ?codec=mjpeg is available.",
         );
     };
 
@@ -5067,16 +5142,17 @@ async fn encoded_video_stream(
     };
 
     let crate::video::StartedVideoStream {
-        stream: mpegts,
+        stream: encoded,
         encoder,
         stream_copy,
+        container,
     } = started;
-    let first = Some(mpegts.first);
-    let receiver = mpegts.receiver;
+    let first = Some(encoded.first);
+    let receiver = encoded.receiver;
     // The task is detached deliberately: it owns ffmpeg/source and exits when
     // the receiver below is dropped. `guard` travels with the body state so a
     // disconnect returns the slot only after the body really ends.
-    drop(mpegts.task);
+    drop(encoded.task);
     let body = Body::from_stream(stream::unfold(
         (first, receiver, guard),
         |(first, mut receiver, guard)| async move {
@@ -5094,7 +5170,7 @@ async fn encoded_video_stream(
     let headers = response.headers_mut();
     headers.insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static(crate::video::MPEGTS_CONTENT_TYPE),
+        HeaderValue::from_static(container.content_type()),
     );
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
@@ -5105,6 +5181,10 @@ async fn encoded_video_stream(
     headers.insert(
         axum::http::HeaderName::from_static("x-ozma-codec"),
         HeaderValue::from_static(options.codec.as_str()),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("x-ozma-container"),
+        HeaderValue::from_static(container.as_str()),
     );
     headers.insert(
         axum::http::HeaderName::from_static("x-ozma-encoder"),
@@ -5138,8 +5218,8 @@ fn video_encoder_unavailable_response(message: impl Into<String>) -> Response {
         message,
         Some(
             "Enable the video capability and run the node with an ffmpeg that advertises \
-             libx264/libx265 (or the selected VAAPI/NVENC/QSV/V4L2M2M encoder), or request \
-             ?codec=mjpeg for the MJPEG stream.",
+             libx264/libx265/libsvtav1/libaom-av1/librav1e (or the selected VAAPI/NVENC/QSV/\
+             V4L2M2M encoder), or request ?codec=mjpeg for the MJPEG stream.",
         ),
     )
 }
@@ -10865,6 +10945,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn video_av1_is_fragmented_mp4_with_init_and_a_real_sync_fragment() {
+        let spawner = Arc::new(RecordingMpegTsSpawner::fmp4(true));
+        let state = encoded_video_state(
+            None,
+            None,
+            spawner.clone(),
+            Arc::new(StaticEncoderProbe::software()),
+            HlsEncoder::Av1Svt,
+        );
+        let response = public_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/video?codec=av1&fps=10&bitrate=2000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "video/mp4",
+            "AV1 must use fragmented MP4, not MPEG-TS"
+        );
+        assert_eq!(response.headers()["x-ozma-codec"], "av1");
+        assert_eq!(response.headers()["x-ozma-container"], "fmp4");
+        assert_eq!(response.headers()["x-ozma-encoder"], "libsvtav1");
+        assert_eq!(response.headers()["x-ozma-stream-copy"], "false");
+        let body = tokio::time::timeout(Duration::from_secs(3), response.into_body().collect())
+            .await
+            .expect("body ends when the fake fMP4 stream ends")
+            .expect("body")
+            .to_bytes();
+        assert_eq!(&body[4..8], b"ftyp", "init segment starts with ftyp");
+        for kind in [b"moov", b"moof", b"mdat"] {
+            assert!(
+                body.windows(4).any(|window| window == kind),
+                "fMP4 body is missing {}",
+                String::from_utf8_lossy(kind)
+            );
+        }
+        let argv = spawner.argv();
+        assert!(argv.windows(2).any(|pair| pair == ["-f", "mp4"]));
+        assert!(argv.windows(2).any(|pair| pair == ["-c:v", "libsvtav1"]));
+        assert!(!argv.windows(2).any(|pair| pair == ["-f", "mpegts"]));
+    }
+
+    #[tokio::test]
+    async fn video_av1_copies_an_av1_source_without_an_encoder() {
+        let spawner = Arc::new(RecordingMpegTsSpawner::fmp4(true));
+        let state = encoded_video_state(
+            Some(FrameFormat::new(PixelFormat::Av1, 320, 240)),
+            None,
+            spawner.clone(),
+            Arc::new(StaticEncoderProbe::new(EncoderAvailability::default())),
+            HlsEncoder::Av1Svt,
+        );
+        let response = public_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/video?codec=av1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-ozma-stream-copy"], "true");
+        assert_eq!(response.headers()["x-ozma-encoder"], "copy");
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "video/mp4");
+        let argv = spawner.argv();
+        assert!(argv.windows(2).any(|pair| pair == ["-f", "obu"]));
+        assert!(argv.windows(2).any(|pair| pair == ["-c:v", "copy"]));
+        let _ = tokio::time::timeout(Duration::from_secs(3), response.into_body().collect()).await;
+    }
+
+    #[tokio::test]
+    async fn video_av1_without_an_encoder_is_a_typed_refusal() {
+        let spawner = Arc::new(RecordingMpegTsSpawner::fmp4(true));
+        let state = encoded_video_state(
+            None,
+            None,
+            spawner.clone(),
+            Arc::new(StaticEncoderProbe::new(EncoderAvailability::default())),
+            HlsEncoder::Av1Svt,
+        );
+        let (status, body) = get_json(&public_router(state), "/video?codec=av1").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["code"], "video.encoder_unavailable");
+        assert_eq!(
+            spawner.spawns.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no ffmpeg should start when no AV1 encoder is advertised"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_advertises_av1_only_when_the_encoder_was_probed() {
+        let spawner = Arc::new(RecordingMpegTsSpawner::fmp4(true));
+        let with_av1 = encoded_video_state(
+            None,
+            None,
+            spawner.clone(),
+            Arc::new(StaticEncoderProbe::with_encoders([HlsEncoder::Av1Aom])),
+            HlsEncoder::Av1Svt,
+        );
+        let (status, body) = get_json(&connection_router(with_av1), "/api/v1/connection").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["video"]["codecs"],
+            serde_json::json!(["mjpeg", "h264", "hevc", "av1"])
+        );
+
+        let without_av1 = encoded_video_state(
+            None,
+            None,
+            spawner,
+            Arc::new(StaticEncoderProbe::with_encoders([HlsEncoder::H264])),
+            HlsEncoder::H264,
+        );
+        let (status, body) = get_json(&connection_router(without_av1), "/api/v1/connection").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["video"]["codecs"],
+            serde_json::json!(["mjpeg", "h264", "hevc"])
+        );
+    }
+
+    #[tokio::test]
     async fn video_encoded_selection_uses_compressed_passthrough_or_reencode() {
         let h264_format = FrameFormat::new(PixelFormat::H264, 320, 240);
 
@@ -11274,6 +11484,54 @@ mod tests {
                     && entry["surface"] == "/bluetooth/*"),
             "configured Bluetooth must not also advertise the unconfigured surface"
         );
+    }
+
+    #[tokio::test]
+    async fn connection_advertises_configured_serial_without_opening_it() {
+        let config = crate::serial::SerialConfig::new(
+            "/dev/fake-serial",
+            115_200,
+            8,
+            crate::serial::SerialParity::None,
+            1,
+            Duration::from_millis(100),
+        )
+        .expect("valid serial config");
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_serial(Some(crate::serial::SerialService::new(config)));
+        let (status, connection) = get_json(&connection_router(state), "/api/v1/connection").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let advertised = connection["controller_surfaces"]
+            .as_array()
+            .expect("controller_surfaces must be an array");
+        for capability in [
+            "serial.status",
+            "serial.write",
+            "serial.read",
+            "serial.stream",
+        ] {
+            let entry = advertised
+                .iter()
+                .find(|entry| entry["capability"] == capability)
+                .unwrap_or_else(|| panic!("missing advertised capability {capability}"));
+            assert_eq!(entry["supported"], true);
+        }
+        let residual = advertised
+            .iter()
+            .find(|entry| entry["capability"] == "serial" && entry["surface"] == "/serial/*")
+            .expect("residual serial sub-surfaces stay advertised as unsupported");
+        assert_eq!(residual["supported"], false);
     }
 
     #[tokio::test]
@@ -15904,6 +16162,14 @@ mod tests {
                 "/bluetooth/forget",
                 Some(serde_json::json!({"address": "AA:BB:CC:DD:EE:FF"})),
             ),
+            ("GET", "/serial/status", None),
+            (
+                "POST",
+                "/serial/write",
+                Some(serde_json::json!({"text": "hi"})),
+            ),
+            ("GET", "/serial/read?max=16", None),
+            ("GET", "/serial/stream?idle_ms=100", None),
             ("GET", "/api/v1/rpa/screen", None),
             (
                 "POST",
@@ -17622,12 +17888,23 @@ mod tests {
 
     struct RouteWebRtcFactory {
         provider: Option<ozma_display::vm::VmConsoleBackend>,
+        audio_template: Option<String>,
     }
 
     #[async_trait]
     impl crate::multi_webrtc::ConsoleWebRtcFactory for RouteWebRtcFactory {
         fn provider(&self) -> Option<ozma_display::vm::VmConsoleBackend> {
             self.provider
+        }
+
+        fn audio_configured(&self) -> bool {
+            self.audio_template.is_some()
+        }
+
+        fn audio_source_for(&self, console: u32) -> Option<String> {
+            self.audio_template.as_ref().and_then(|template| {
+                crate::multi_webrtc::expand_audio_source(template, console).ok()
+            })
         }
 
         async fn start(
@@ -17645,6 +17922,15 @@ mod tests {
         active: u32,
         consoles: &[u32],
     ) -> MultiConsoleWebrtc {
+        route_webrtc_manager_with_audio(provider, active, consoles, None).await
+    }
+
+    async fn route_webrtc_manager_with_audio(
+        provider: ozma_display::vm::VmConsoleBackend,
+        active: u32,
+        consoles: &[u32],
+        audio_template: Option<&str>,
+    ) -> MultiConsoleWebrtc {
         let specs: Vec<String> = consoles
             .iter()
             .map(|index| format!("{index}:Console_{index}:1280x800:dbus"))
@@ -17659,10 +17945,12 @@ mod tests {
         let manager = MultiConsoleWebrtc::new(
             Arc::new(RouteWebRtcFactory {
                 provider: Some(provider),
+                audio_template: audio_template.map(str::to_owned),
             }),
             crate::multi_webrtc::MultiConsoleWebrtcConfig {
                 max_helpers: 2,
                 idle_timeout: Duration::from_secs(60),
+                audio_source_template: audio_template.map(str::to_owned),
             },
         );
         manager.sync(&selection).await;
@@ -17724,6 +18012,46 @@ mod tests {
             "running"
         );
         assert_eq!(body["multi_console_webrtc"]["consoles"][1]["sessions"], 1);
+    }
+
+    #[tokio::test]
+    async fn per_console_webrtc_status_reports_configured_audio_without_samples() {
+        let manager = route_webrtc_manager_with_audio(
+            ozma_display::vm::VmConsoleBackend::Dbus,
+            0,
+            &[0, 1],
+            Some("ozma-vm{console}.monitor"),
+        )
+        .await;
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "vm",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_multi_console_webrtc(Some(manager));
+        let (status, body) = get_json(&connection_router(state), "/api/v1/connection").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["webrtc_audio_configured"], true);
+        assert_eq!(
+            body["multi_console_webrtc"]["consoles"][0]["audio_configured"],
+            true
+        );
+        assert_eq!(
+            body["multi_console_webrtc"]["consoles"][0]["audio_source"],
+            "ozma-vm0.monitor"
+        );
+        assert_eq!(
+            body["multi_console_webrtc"]["consoles"][1]["audio_source"],
+            "ozma-vm1.monitor"
+        );
+        // Configuration intent only: these status fields never claim samples.
+        assert!(body["multi_console_webrtc"]["consoles"][0]["audio_samples"].is_null());
     }
 
     #[tokio::test]

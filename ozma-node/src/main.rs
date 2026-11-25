@@ -57,7 +57,7 @@ use ozma_node::{
     mdns, mesh_service,
     multi_hls::{MultiConsoleHls, MultiConsoleHlsConfig},
     multi_webrtc::{MultiConsoleWebrtc, MultiConsoleWebrtcConfig},
-    platform, registration, shutdown,
+    platform, registration, serial, shutdown,
     software::report::{InventoryReporter, DEFAULT_REPORT_INTERVAL},
     usb_audio, usb_uac2,
     webrtc::{
@@ -1040,6 +1040,79 @@ pub struct Args {
     )]
     pub bluetooth_program: Option<std::path::PathBuf>,
 
+    /// Opt in to the bounded serial/UART console surface (`/serial/*`).
+    ///
+    /// Must be an explicit absolute device path (for example `/dev/ttyUSB0` or
+    /// `/dev/ttyS1`). There is no auto-detection. Without this flag the
+    /// implemented routes answer a typed 503 `serial.not-configured`; the
+    /// historical buffer/send/state/text/setup sub-surfaces stay typed 501s.
+    #[arg(long, env = "OZMA_SERIAL_DEVICE", value_name = "PATH")]
+    pub serial_device: Option<std::path::PathBuf>,
+
+    /// Serial baud rate (`--serial-device` only).
+    #[arg(
+        long,
+        env = "OZMA_SERIAL_BAUD",
+        value_name = "BAUD",
+        requires = "serial_device",
+        default_value_t = crate::serial::DEFAULT_BAUD_RATE
+    )]
+    pub serial_baud: u32,
+
+    /// Serial data bits: 5, 6, 7, or 8 (`--serial-device` only).
+    #[arg(
+        long,
+        env = "OZMA_SERIAL_DATA_BITS",
+        value_name = "BITS",
+        requires = "serial_device",
+        default_value_t = 8,
+        value_parser = clap::value_parser!(u8).range(5..=8)
+    )]
+    pub serial_data_bits: u8,
+
+    /// Serial parity: `none`, `odd`, or `even` (`--serial-device` only).
+    #[arg(
+        long,
+        env = "OZMA_SERIAL_PARITY",
+        value_name = "PARITY",
+        requires = "serial_device",
+        default_value = "none"
+    )]
+    pub serial_parity: String,
+
+    /// Serial stop bits: 1 or 2 (`--serial-device` only).
+    #[arg(
+        long,
+        env = "OZMA_SERIAL_STOP_BITS",
+        value_name = "BITS",
+        requires = "serial_device",
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u8).range(1..=2)
+    )]
+    pub serial_stop_bits: u8,
+
+    /// Serial read timeout in milliseconds (`--serial-device` only).
+    #[arg(
+        long,
+        env = "OZMA_SERIAL_TIMEOUT_MS",
+        value_name = "MS",
+        requires = "serial_device",
+        default_value_t = 100
+    )]
+    pub serial_timeout_ms: u64,
+
+    /// Received-byte buffer retained for `/serial/read` (`--serial-device` only).
+    ///
+    /// Clamped/validated to 1024..4194304 bytes by the serial provider.
+    #[arg(
+        long,
+        env = "OZMA_SERIAL_BUFFER_BYTES",
+        value_name = "BYTES",
+        requires = "serial_device",
+        default_value_t = crate::serial::DEFAULT_BUFFER_BYTES
+    )]
+    pub serial_buffer_bytes: usize,
+
     /// Opt in to bounded application control for pids listed by `/apps`
     /// (`/apps/{pid}/terminate`, `/signal`, `/suspend`, `/resume`).
     ///
@@ -1208,6 +1281,20 @@ pub struct Args {
         value_name = "SECONDS"
     )]
     pub multi_console_webrtc_idle_seconds: u64,
+
+    /// Optional per-console WebRTC audio monitor template.
+    ///
+    /// `{console}` and `{index}` are replaced with the advertised console's
+    /// zero-based index, for example `ozma-vm{console}.monitor` gives
+    /// `ozma-vm0.monitor` and `ozma-vm1.monitor`. Unset keeps the shared
+    /// `--webrtc-audio-source` for every helper (or video-only when that is
+    /// unset). Only applies with `--multi-console-webrtc`.
+    #[arg(
+        long,
+        env = "OZMA_MULTI_CONSOLE_WEBRTC_AUDIO_SOURCE",
+        value_name = "TEMPLATE"
+    )]
+    pub multi_console_webrtc_audio_source: Option<String>,
 
     /// VAAPI render node used by `h264_vaapi`/`hevc_vaapi` HLS encoders.
     ///
@@ -1645,6 +1732,7 @@ async fn run() -> std::process::ExitCode {
         audio_sink: args.audio_sink.clone(),
         webrtc_audio_source: args.webrtc_audio_source.clone(),
         webrtc_audio_backend: args.webrtc_audio_backend,
+        multi_console_webrtc_audio_source: args.multi_console_webrtc_audio_source.clone(),
         vm_guest_ip: args.vm_guest_ip.clone(),
         display_outputs_json: args.display_outputs_json.clone(),
         pci_devices_json: args.pci_devices_json.clone(),
@@ -2874,6 +2962,7 @@ async fn run() -> std::process::ExitCode {
                     MultiConsoleWebrtcConfig {
                         max_helpers: args.multi_console_webrtc_max,
                         idle_timeout: Duration::from_secs(args.multi_console_webrtc_idle_seconds),
+                        audio_source_template: args.multi_console_webrtc_audio_source.clone(),
                     },
                 );
                 let selection = display_control
@@ -3016,6 +3105,69 @@ async fn run() -> std::process::ExitCode {
         },
     };
     set_capability(&mut args, &mut config, "bluetooth", bluetooth_available);
+    // Opt-in serial/UART console. The service stays installed even when the
+    // device cannot be opened so every route can return a typed reason instead
+    // of a fabricated buffer or success. No path is opened without the flag.
+    let serial_service = match args.serial_device.clone() {
+        None => None,
+        Some(device) => {
+            let parity = match args.serial_parity.parse::<serial::SerialParity>() {
+                Ok(parity) => parity,
+                Err(detail) => {
+                    error!(error = %detail, "invalid --serial-parity");
+                    std::process::exit(2);
+                }
+            };
+            let mut serial_config = match serial::SerialConfig::new(
+                device,
+                args.serial_baud,
+                args.serial_data_bits,
+                parity,
+                args.serial_stop_bits,
+                Duration::from_millis(args.serial_timeout_ms),
+            ) {
+                Ok(config) => config,
+                Err(error) => {
+                    error!(
+                        code = error.code(),
+                        error = %error,
+                        remediation = error.remediation(),
+                        "invalid serial configuration"
+                    );
+                    std::process::exit(2);
+                }
+            };
+            serial_config.buffer_bytes = args.serial_buffer_bytes;
+            if let Err(error) = serial_config.validate() {
+                error!(
+                    code = error.code(),
+                    error = %error,
+                    remediation = error.remediation(),
+                    "invalid serial configuration"
+                );
+                std::process::exit(2);
+            }
+            let service = serial::SerialService::new(serial_config);
+            match service.start() {
+                Ok(()) => info!(
+                    device = %service.device().display(),
+                    baud = args.serial_baud,
+                    "serial provider opened; /serial/status|write|read|stream enabled"
+                ),
+                Err(error) => warn!(
+                    code = error.code(),
+                    error = %error,
+                    remediation = error.remediation(),
+                    "serial device was configured but could not be opened; /serial/* reports the typed failure"
+                ),
+            }
+            Some(service)
+        }
+    };
+    let serial_available = serial_service
+        .as_ref()
+        .is_some_and(|service| service.status().connected);
+    set_capability(&mut args, &mut config, "serial", serial_available);
     // Opt-in application control. Nothing is signalled unless this flag is
     // present; without it the routes stay mounted and return a typed 503.
     let app_control = args.app_control.then(|| {
@@ -3096,6 +3248,7 @@ async fn run() -> std::process::ExitCode {
             .with_desktop_controls(desktop_controls)
             .with_backup(backup_service)
             .with_bluetooth(bluetooth_service)
+            .with_serial(serial_service.clone())
             .with_app_control(app_control);
     // Control routes stay behind the bearer guard; the controller's read-only
     // probes are mounted after it so the unmodified controller works with
@@ -3610,6 +3763,9 @@ async fn run() -> std::process::ExitCode {
     // token, so cancellation closes its socket instead of waiting for the next
     // packet or poll timeout.
     shutdown.cancel();
+    if let Some(service) = serial_service.as_ref() {
+        service.stop();
+    }
 
     if let Some(controller) = hls_controller.as_ref() {
         if shutdown::with_timeout("hls-stop", shutdown::TASK_STOP_TIMEOUT, controller.stop())
@@ -4736,6 +4892,7 @@ mod tests {
             "WebRTC audio must stay disabled unless a monitor source is supplied"
         );
         assert_eq!(args.webrtc_audio_backend, WebRtcAudioBackend::Auto);
+        assert!(args.multi_console_webrtc_audio_source.is_none());
         assert!(args.webrtc_stun.is_none());
         assert!(args.webrtc_turn.is_none());
         assert!(args.webrtc_turn_user.is_none());
@@ -4818,6 +4975,16 @@ mod tests {
             Some("ozma-vm1.monitor")
         );
         assert_eq!(args.webrtc_audio_backend, WebRtcAudioBackend::PipeWire);
+
+        let per_console = Args::parse_from([
+            "ozma-node",
+            "--multi-console-webrtc-audio-source",
+            "ozma-vm{console}.monitor",
+        ]);
+        assert_eq!(
+            per_console.multi_console_webrtc_audio_source.as_deref(),
+            Some("ozma-vm{console}.monitor")
+        );
 
         let pulse = Args::parse_from([
             "ozma-node",
