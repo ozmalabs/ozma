@@ -21,13 +21,19 @@ bounded command loop, then exposes it through node routes:
   `--usb-media-export*`/`--usb-media-restart*` options. The startup state is
   typed `not-configured`/`configured`/`running`/`failed`; a failure never
   crashes the node.
+- `FunctionFsMediaDaemon` is the durable owner of a mounted FunctionFS
+  function: it writes `ep0` descriptors, waits for a bounded `ENABLE`, attaches
+  a `PollingFileBulkTransport`, services the SCSI loop continuously, detaches on
+  `DISABLE`/`UNBIND`, applies the restart policy, and flushes on shutdown.
+  `--usb-functionfs-mount` opts a node into this daemon.
 - `MediaRestartPolicy` bounds recovery after a bulk-transport error or an
   observed FunctionFS unbind, with capped attempts/backoff and typed last error.
   Counters stay visible across a rebuild and the persisted overlay is reloaded
   according to policy.
 - `running` is only reported after a real command cycle completed over an
-  attached transport. A configured or auto-started export is `configured`; an
-  unattached export uses `IdleBulkTransport` and cannot claim a transfer.
+  attached transport. A configured or auto-started export is `configured`
+  (or daemon `waiting-for-enable`/`enabled`); an unattached export uses
+  `IdleBulkTransport` and cannot claim a transfer.
 
 ## 1. Bulk transport and event loop
 
@@ -95,6 +101,38 @@ errors, timeouts, and bound errors.
   limit; writes are chunked to it. It is tested through FunctionFS loopback
   endpoints only.
 
+## 1a. Background media daemon
+
+New module: `ozma-usb/src/media_daemon.rs` (exported as `FunctionFsMediaDaemon`
+and related types). It owns the long-lived FunctionFS + SCSI state:
+
+| Step | Behaviour |
+|---|---|
+| Start | `write_descriptors()` writes the v2 blob and string table to `ep0`; state becomes `waiting-for-enable`. |
+| Wait | `PollingFileEp0Io` makes `ep0` nonblocking and waits with `poll(2)` up to `MediaDaemonConfig::event_timeout_ms`; `MemoryEp0` returns immediately and the worker uses `idle_poll_ms`. No busy loop. |
+| ENABLE | The core opens no data endpoints in external-endpoint mode; the daemon attaches a `PollingFileBulkTransport` and a rebuilt `MassStorageLoop`. State `enabled`, never `running` yet. |
+| Serve | One `step()` per tick; each transfer uses the SCSI loop polling deadline. `running` becomes true only after a CSW is written. |
+| Idle timeout | A timeout before the CBW counter advances is normal idleness: the transport stays attached and no restart is scheduled. |
+| Transport failure | A timeout after a CBW started (or any non-timeout transport error) marks `failed`, detaches/stops the runner, commits the overlay, and schedules the next bounded attempt. |
+| DISABLE | Detach and stop the runner (persistence policy applied); state `waiting-for-enable`. |
+| UNBIND | Detach, record an unbind, schedule the restart; the next ENABLE attaches a device rebuilt with `reload_overlay` per policy. |
+| Stop | `shutdown()` stops the runner, closes `ep0`/endpoints, applies the persistence policy, and publishes `stopped`. `MediaDaemonHandle::shutdown()` joins the worker. |
+
+`MediaDaemonStatus` exposes `state`, `live`/`enabled`/`attached`/`running`,
+preserved `MassStorageLoopStats`, `FunctionFsDaemonStats`, lifecycle counters
+(events, binds/unbinds, enables/disables, setups, attaches/detaches/restarts),
+restart attempts/exhaustion/backoff, and a path-free last error. Device and
+transport factories are injected; `FunctionFsMediaDaemon::file` is the real
+explicit-mount constructor and still never mounts FunctionFS.
+
+Node selection: `--usb-functionfs-mount PATH` requires `--usb-gadget`,
+`--usb-vendor`, and `--usb-media-export`. The node builds the same `vendor0`
+bulk-OUT-1/bulk-IN-2 FunctionFS model, the polling transport factory, and the
+daemon, then stores its shared handle. `/usb/media` reports `transport.kind =
+"polling-file"` and the daemon counters; a transfer is still required before
+`running` is true. The node does not use the blocking `FileBulkTransport` for
+this path.
+
 ## 2. Node routes
 
 `ozma-node/src/controller_compat.rs` adds:
@@ -125,6 +163,7 @@ Node startup options mirror those fields:
 | `--usb-media-restart-max-attempts` (default 3) | Bounded restart cap; `0` disables restart. |
 | `--usb-media-restart-backoff-ms` / `--usb-media-restart-max-backoff-ms` (250/4000) | Capped exponential backoff. |
 | `--usb-media-restart-no-overlay-reload` | Rebuild from the base image instead of the persisted overlay. |
+| `--usb-functionfs-mount PATH` | Opt into the background daemon over an explicitly mounted FunctionFS directory; requires `--usb-gadget --usb-vendor --usb-media-export`. |
 
 Semantics:
 
@@ -191,6 +230,29 @@ New library suite: `ozma-usb/tests/mass_storage_loop.rs` (10 tests):
 - `FunctionFsBulkTransport` drives the SCSI loop through enabled FunctionFS
   loopback endpoints and observes daemon bytes read/written.
 
+New `ozma-usb` daemon tests in `media_daemon::tests` (6 tests, in-memory
+endpoints/fakes only):
+
+- enable → attach → serve one CSW → disable → detach, with no transfer claimed
+  before a host CBW;
+- a mid-command timeout triggers a bounded restart and a later real CBW recovers
+  `running` and resets the failure streak;
+- an unbind detaches, rebuilds with overlay reload, waits for the next ENABLE,
+  and attaches with the reloaded device;
+- shutdown stops the runner, commits the persistent overlay, leaves the base
+  image untouched, and flushes the endpoint;
+- invalid event/idle bounds are typed;
+- bulk endpoint selection requires one non-zero OUT and one IN endpoint.
+
+New `ozma-node` tests (2):
+
+- `/usb` defaults `usbip` to `not-configured`, adapter `kernel-required`,
+  `kernel_required: true`, and zero data sessions;
+- media auto-start with `functionfs_mount` selects the polling daemon, reaches
+  `waiting-for-enable` without claiming `running`, reports
+  `transport.kind: "polling-file"`, and stops cleanly through
+  `POST /usb/media/stop`.
+
 New `ozma-usb` restart-policy tests in `media_restart::tests` (5 tests):
 
 - Default policy validates and keeps overlay reload enabled.
@@ -222,7 +284,7 @@ New node tests in `controller_compat::tests` (11 media tests total; 5 added):
 Verification run:
 
 ```text
-cargo test -p ozma-usb -p ozma-node --lib          # 504 passed, 3 ignored
+cargo test -p ozma-usb -p ozma-node --lib          # 548 passed, 3 ignored
 cargo check -p ozma-usb -p ozma-node --all-targets
 rustfmt --edition 2021 --check <touched rust files>
 ```
@@ -232,15 +294,14 @@ rustfmt --edition 2021 --check <touched rust files>
 - No default or CI test mounts FunctionFS, opens a real UDC, or transfers on a
   hardware endpoint. `FunctionFsBulkTransport` is proven only with loopback
   endpoints; a real FunctionFS/UDC test remains env-gated and `#[ignore]`.
-- Blocking `FileEndpointIo` reads do not themselves enforce the loop deadline.
-  The typed timeout contract is implemented and tested with fakes; a live
-  endpoint adapter needs a nonblocking/poll-based deadline (or a host/UDC
-  timeout) before hardware timeouts are guaranteed.
-- There is no persistent daemon process or live endpoint driver. Restart
-  supervision is bounded and tested through injected fake transports, but a
-  production transport error/rebind is only retried when the node observes it
-  (`/usb` snapshot, route call, or shutdown); automatic transport attach after a
-  FunctionFS `ENABLE` event remains explicit code.
+- The daemon's real endpoint path uses `PollingFileBulkTransport` and
+  `PollingFileEp0Io`; the blocking `FileEndpointIo` remains available for
+  callers that supply their own host/UDC timeout. Hardware deadlines are proven
+  only against OS pipes/FIFOs; a real UDC transfer remains env-gated.
+- The daemon requires an already-mounted FunctionFS directory. The node never
+  mounts, configures the UDC, or reconciles the `--usb-media` ConfigFS LUN with
+  the userspace FunctionFS function. `FunctionFsLifecycle` can perform the
+  privileged mount/bind when an embedder opts in.
 - `--usb-media-export` auto-starts the userspace SCSI export, but it is separate
   from the `--usb-media` ConfigFS kernel LUN; the node does not reconcile or
   switch between the two paths.

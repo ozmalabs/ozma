@@ -19,6 +19,10 @@
 //!   injected endpoints; [`FunctionFsLifecycle`] sequences ConfigFS
 //!   function/link creation, an injected mount, descriptor writes, readiness
 //!   polling, UDC bind/unbind, and cleanup without mounting by default.
+//!   [`FunctionFsMediaDaemon`] is the supervised background owner: it waits for
+//!   `ENABLE`/`UNBIND` on a polling `ep0`, attaches a
+//!   [`PollingFileBulkTransport`], services the SCSI loop, applies the bounded
+//!   restart/reload policy, and flushes on shutdown.
 //! * [`VirtualMedia`] / [`MassStorageImage`] model a backing image, disk vs
 //!   CD-ROM presentation, read-only policy, declared [`MediaFormat`], size,
 //!   and attach/detach state.
@@ -132,6 +136,7 @@ pub mod iso;
 pub mod mass_storage;
 pub mod mass_storage_loop;
 pub mod media;
+pub mod media_daemon;
 pub mod media_hotplug;
 pub mod media_restart;
 pub mod nbd;
@@ -179,11 +184,12 @@ pub use functionfs_daemon::{
     FunctionFsEndpointTransfer, FunctionFsEp0Io, FunctionFsEvent, FunctionFsEventOutcome,
     FunctionFsEventType, FunctionFsMount, FunctionFsWriteReport, LoopbackEndpoint,
     LoopbackEndpointOpener, LoopbackFunctionFsDaemon, MemoryEp0, ParsedFunctionFsDescriptors,
-    PollingFileEndpointIo, PollingFileEndpointOpener, DEFAULT_FUNCTIONFS_ENDPOINT_TIMEOUT_MS,
-    FUNCTIONFS_DESCRIPTORS_MAGIC_V2, FUNCTIONFS_EVENT_BYTES, FUNCTIONFS_HAS_FS_DESC,
-    FUNCTIONFS_HAS_HS_DESC, FUNCTIONFS_HAS_MS_OS_DESC, FUNCTIONFS_HAS_SS_DESC,
-    FUNCTIONFS_STRINGS_MAGIC, MAX_FUNCTIONFS_ENDPOINT_TIMEOUT_MS,
-    MAX_FUNCTIONFS_ENDPOINT_TRANSFER_BYTES, MAX_FUNCTIONFS_EP0_WRITE_BYTES,
+    PollingFileEndpointIo, PollingFileEndpointOpener, PollingFileEp0Io,
+    DEFAULT_FUNCTIONFS_ENDPOINT_TIMEOUT_MS, FUNCTIONFS_DESCRIPTORS_MAGIC_V2,
+    FUNCTIONFS_EVENT_BYTES, FUNCTIONFS_HAS_FS_DESC, FUNCTIONFS_HAS_HS_DESC,
+    FUNCTIONFS_HAS_MS_OS_DESC, FUNCTIONFS_HAS_SS_DESC, FUNCTIONFS_STRINGS_MAGIC,
+    MAX_FUNCTIONFS_ENDPOINT_TIMEOUT_MS, MAX_FUNCTIONFS_ENDPOINT_TRANSFER_BYTES,
+    MAX_FUNCTIONFS_EP0_WRITE_BYTES,
 };
 pub use functionfs_lifecycle::{
     CommandFunctionFsMounter, FakeFunctionFsMounter, FunctionFsDeviceState, FunctionFsDeviceStatus,
@@ -208,6 +214,14 @@ pub use mass_storage_loop::{
     MASS_STORAGE_DEFAULT_TIMEOUT_MS, MASS_STORAGE_MAX_TIMEOUT_MS,
 };
 pub use media::{MassStorageImage, MediaFormat, MediaMode, MediaState, VirtualMedia};
+pub use media_daemon::{
+    media_bulk_endpoints, media_descriptors, polling_ep0, polling_transport_factory,
+    FunctionFsMediaDaemon, MediaDaemonConfig, MediaDaemonCounters, MediaDaemonError,
+    MediaDaemonHandle, MediaDaemonState, MediaDaemonStatus, MediaDeviceFactory,
+    MediaTransportFactory, MEDIA_DAEMON_DEFAULT_EVENT_TIMEOUT_MS,
+    MEDIA_DAEMON_DEFAULT_IDLE_POLL_MS, MEDIA_DAEMON_MAX_EVENT_TIMEOUT_MS,
+    MEDIA_DAEMON_MAX_IDLE_POLL_MS,
+};
 pub use media_hotplug::{
     UsbMediaHotplugEvent, UsbMediaHotplugKind, UsbMediaHotplugLog, MAX_USB_MEDIA_HOTPLUG_EVENTS,
 };

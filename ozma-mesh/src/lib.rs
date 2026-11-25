@@ -43,6 +43,7 @@ pub mod error;
 pub mod keys;
 pub mod manager;
 pub mod node;
+pub mod pump;
 pub mod tunnel;
 
 // Convenience re-exports — `use ozma_mesh::{MeshManager, MeshNode, ...}`.
@@ -53,4 +54,8 @@ pub use dataplane::{
 pub use error::{MeshError, Result};
 pub use manager::{MeshManager, PeerStatus};
 pub use node::{MeshNode, WgPrivateKey, WgPublicKey};
+pub use pump::{
+    ManagerPacketIo, PacketPump, PumpConfig, PumpError, PumpState, PumpStats, PumpStatus,
+    SystemTunProvider, TunIo, TunProvider, TunnelIo,
+};
 pub use tunnel::WgTunnel;

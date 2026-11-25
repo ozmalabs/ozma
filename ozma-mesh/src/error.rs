@@ -26,6 +26,9 @@ pub enum MeshError {
     #[error("Mesh dataplane error: {0}")]
     Dataplane(String),
 
+    #[error("Mesh packet pump error: {0}")]
+    Pump(String),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 

@@ -105,9 +105,12 @@ pub async fn serve_with_scene_replay(
 /// `/power/*`, `/audio/{apply,remove,play,stop}`, `/codec`, and `/webrtc/*`
 /// are authenticated like the rest of the node API. `public_compat_router` is
 /// merged **after** the guard: it carries only the controller's read-only
-/// probes (`/display/snapshot`, `/display/info`, `/ui/hints`, `/node/status`,
-/// `/agent/metrics`, `/audio/nodes`) and the always-unsupported
-/// `POST /audio/sweep` stub, none of which change state or expose credentials.
+/// probes (`/display/snapshot`, `/display/info`, `/video`,
+/// `/display/mjpeg`, `/ui/hints`, `/node/status`, `/agent/metrics`,
+/// `/audio/nodes`) and the always-unsupported `POST /audio/sweep` stub, none of
+/// which change state or expose credentials. `/video` serves real MJPEG frames
+/// from the capture registry (it never fabricates a frame) and is bounded by a
+/// concurrent-stream cap.
 /// `capture_registry` replaces the default V4L2/PipeWire registry; the VM
 /// profile passes a QMP screendump registry.
 ///
@@ -945,6 +948,26 @@ mod tests {
         let jpeg = snapshot.into_body().collect().await.unwrap().to_bytes();
         assert!(jpeg.starts_with(&[0xFF, 0xD8]), "not a JPEG: {jpeg:?}");
 
+        // The MJPEG stream is public read-only media like the snapshot. The
+        // first frame is captured before the 200 response, so no body read is
+        // needed here; dropping the response disconnects the stream.
+        for uri in ["/video?fps=1&quality=50", "/display/mjpeg?fps=1"] {
+            let video = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(video.status(), StatusCode::OK, "{uri}");
+            assert!(
+                video.headers()[header::CONTENT_TYPE]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("multipart/x-mixed-replace; boundary=ozma-frame"),
+                "{uri}"
+            );
+            drop(video);
+        }
+
         // The rest of the public read-only surface answers without a token,
         // and none of it echoes the configured secret.
         for uri in [
@@ -1003,7 +1026,6 @@ mod tests {
         for (method, uri) in [
             ("GET", "/power/state"),
             ("GET", "/codec"),
-            ("GET", "/display/mjpeg"),
             ("GET", "/usb"),
             ("POST", "/usb/media/attach"),
             ("POST", "/usb/media/detach"),

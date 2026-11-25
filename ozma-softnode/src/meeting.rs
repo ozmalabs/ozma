@@ -726,6 +726,7 @@ fn now_unix_ms() -> u64 {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use tokio::io::AsyncReadExt;
 
     fn fake_detector(path: PathBuf, responses: Vec<ServerMessage>) -> tokio::task::JoinHandle<()> {
         let listener = tokio::net::UnixListener::bind(&path).expect("bind fake detector");
@@ -735,7 +736,13 @@ mod tests {
                 let Some(response) = remaining.next() else {
                     break;
                 };
-                let (_reader, mut writer) = stream.into_split();
+                let (mut reader, mut writer) = stream.into_split();
+                // Read the request before replying. Replying and dropping first
+                // can make the client's write fail with EPIPE and consume a
+                // scripted response, which made this test scheduler-dependent.
+                let mut request = [0u8; 256];
+                let _ = tokio::time::timeout(Duration::from_millis(250), reader.read(&mut request))
+                    .await;
                 let mut json = serde_json::to_string(&response).expect("serialize frame");
                 json.push('\n');
                 let _ = writer.write_all(json.as_bytes()).await;
@@ -1026,7 +1033,7 @@ mod tests {
         receiver: &watch::Receiver<MeetingDetectStatus>,
         state: MeetingDetectState,
     ) -> MeetingDetectStatus {
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let status = receiver.borrow().clone();
                 if status.state == state {
@@ -1043,7 +1050,7 @@ mod tests {
         receiver: &watch::Receiver<MeetingDetectStatus>,
         state: MeetingState,
     ) -> MeetingDetectStatus {
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let status = receiver.borrow().clone();
                 if status.meeting_state == state {

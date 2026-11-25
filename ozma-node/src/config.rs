@@ -1268,6 +1268,23 @@ pub struct NodeConfig {
     pub usb_vendor: bool,
     /// Optional absolute FunctionFS daemon path (`--usb-vendor-daemon`).
     pub usb_vendor_daemon: Option<PathBuf>,
+    /// Explicit mounted FunctionFS directory for the background media daemon
+    /// (`--usb-functionfs-mount`). The node never mounts it itself.
+    pub usb_functionfs_mount: Option<PathBuf>,
+    /// Start the bounded USB/IP control/data listener (`--usbip`).
+    pub usbip: bool,
+    /// USB/IP listener host (`--usbip-host`, default `127.0.0.1`).
+    pub usbip_host: String,
+    /// USB/IP listener port (`--usbip-port`, default 3240).
+    pub usbip_port: u16,
+    /// Select the Linux `usbip`/TCP adapters instead of the typed
+    /// kernel-required defaults (`--usbip-linux-adapters`).
+    pub usbip_linux_adapters: bool,
+    /// Sysfs root for the Linux USB/IP host adapter (`--usbip-sysfs-root`).
+    pub usbip_sysfs_root: Option<PathBuf>,
+    /// `usbip` executable for the Linux USB/IP host adapter
+    /// (`--usbip-program`, default `usbip`).
+    pub usbip_program: Option<String>,
     /// Start the UAC2 isochronous ↔ host-audio bridge (`--usb-uac2-bridge`).
     ///
     /// Requires `--usb-uac2`, a bound UAC2 gadget with its ALSA card present,
@@ -1827,6 +1844,63 @@ impl NodeConfig {
                 ));
             }
         }
+        if let Some(path) = self.usb_functionfs_mount.as_deref() {
+            if !path.is_absolute() {
+                return Err(format!(
+                    "--usb-functionfs-mount {} must be an absolute path",
+                    path.display()
+                ));
+            }
+            if !self.usb_gadget || !self.usb_vendor {
+                return Err(
+                    "--usb-functionfs-mount requires --usb-gadget and --usb-vendor".to_owned(),
+                );
+            }
+            if self.usb_media_export.is_none() {
+                return Err(
+                    "--usb-functionfs-mount requires --usb-media-export; the media daemon owns \
+                     the FunctionFS bulk endpoints"
+                        .to_owned(),
+                );
+            }
+        }
+        if self.usbip {
+            if !self.usb_gadget {
+                return Err(
+                    "--usbip requires --usb-gadget so the USB status surface can report the \
+                     listener and its counters"
+                        .to_owned(),
+                );
+            }
+            let host = self.usbip_host.trim();
+            if host.is_empty() || host.contains(char::is_whitespace) {
+                return Err("--usbip-host must be a non-empty host without whitespace".to_owned());
+            }
+            if self.usbip_port == 0 {
+                return Err("--usbip-port must be greater than zero".to_owned());
+            }
+        } else if self.usbip_linux_adapters {
+            return Err("--usbip-linux-adapters requires --usbip".to_owned());
+        }
+        if let Some(root) = self.usbip_sysfs_root.as_deref() {
+            if !root.is_absolute() {
+                return Err(format!(
+                    "--usbip-sysfs-root {} must be an absolute path",
+                    root.display()
+                ));
+            }
+            if !self.usbip {
+                return Err("--usbip-sysfs-root requires --usbip".to_owned());
+            }
+        }
+        if let Some(program) = self.usbip_program.as_deref() {
+            if program.trim().is_empty() {
+                return Err("--usbip-program must not be empty".to_owned());
+            }
+            if !self.usbip {
+                return Err("--usbip-program requires --usbip".to_owned());
+            }
+        }
         Ok(())
     }
 
@@ -2147,6 +2221,13 @@ mod tests {
             usb_uac2: false,
             usb_vendor: false,
             usb_vendor_daemon: None,
+            usb_functionfs_mount: None,
+            usbip: false,
+            usbip_host: "127.0.0.1".to_owned(),
+            usbip_port: ozma_usb::DEFAULT_USBIP_PORT,
+            usbip_linux_adapters: false,
+            usbip_sysfs_root: None,
+            usbip_program: None,
             usb_uac2_bridge: false,
             usb_uac2_sink_device: "default".to_owned(),
             usb_uac2_source_device: "default".to_owned(),
@@ -3157,6 +3238,33 @@ mod tests {
         extras.usb_vendor = false;
         extras.usb_vendor_daemon = Some(PathBuf::from("/usr/local/bin/ozma-ffs"));
         assert!(extras.validate().is_err());
+
+        let mut ffs = config.clone();
+        ffs.usb_vendor = true;
+        ffs.usb_media_export = Some(PathBuf::from("/srv/media.img"));
+        ffs.usb_functionfs_mount = Some(PathBuf::from("/dev/ffs-vendor0"));
+        assert!(ffs.validate().is_ok());
+        let mut relative_mount = ffs.clone();
+        relative_mount.usb_functionfs_mount = Some(PathBuf::from("ffs-vendor0"));
+        assert!(relative_mount.validate().is_err());
+        let mut missing_export = ffs.clone();
+        missing_export.usb_media_export = None;
+        assert!(missing_export.validate().is_err());
+
+        let mut usbip = config.clone();
+        usbip.usbip = true;
+        assert!(usbip.validate().is_ok());
+        usbip.usbip_port = 0;
+        assert!(usbip.validate().is_err());
+        usbip.usbip_port = ozma_usb::DEFAULT_USBIP_PORT;
+        usbip.usbip_linux_adapters = true;
+        usbip.usbip_sysfs_root = Some(PathBuf::from("/tmp/fake-sys"));
+        assert!(usbip.validate().is_ok());
+        usbip.usbip = false;
+        assert!(usbip.validate().is_err(), "linux adapters require --usbip");
+        usbip.usbip = true;
+        usbip.usbip_sysfs_root = Some(PathBuf::from("relative-sys"));
+        assert!(usbip.validate().is_err());
 
         // UDC names are written verbatim to ConfigFS and must stay safe.
         for bad in ["", "a/b", "dummy udc.0", "../udc", ".hidden"] {

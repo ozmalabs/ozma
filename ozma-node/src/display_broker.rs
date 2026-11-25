@@ -195,6 +195,22 @@ impl ConsoleBroker {
         result
     }
 
+    /// Build an independent cached control for one per-console MJPEG stream.
+    ///
+    /// This uses the same availability rules as [`Self::snapshot`] (advertised
+    /// console, single-head conflict), but gives the stream its own source slot
+    /// so ending the stream does not stop the broker's cached snapshot source.
+    pub async fn streaming_control(
+        &self,
+        console: u32,
+        selection: &DisplayOutputSelection,
+        quality: Option<u8>,
+    ) -> Result<SnapshotControl, SnapshotError> {
+        self.reject_if_unavailable(console, selection)?;
+        let control = self.control_for(console).await?;
+        Ok(control.streaming(quality))
+    }
+
     /// Per-console info without opening the capture device.
     pub async fn info(
         &self,

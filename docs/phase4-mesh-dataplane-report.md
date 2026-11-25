@@ -8,9 +8,10 @@ This change adds an **opt-in, typed, injectable** kernel dataplane to
 
 It creates and configures a TUN link, assigns the mesh address/prefix, sets the
 MTU, brings the link up, programs `/32` peer routes, enables IPv4 forwarding,
-and optionally installs an nftables masquerade rule. It does **not** move
-packets between the TUN device and boringtun yet; it programs the interface and
-routing/firewall state around the existing userspace WireGuard tunnels.
+and optionally installs an nftables masquerade rule. It also owns the matching
+bounded packet pump: the pump attaches to the persistent TUN fd created by the
+dataplane and moves plaintext IPv4 packets to/from the existing userspace
+WireGuard tunnels.
 
 `docs/parity-matrix.md` and `docs/plan-execution-status.md` were intentionally
 not edited.
@@ -84,6 +85,56 @@ second `stop()` issues no commands. If teardown itself fails, the state becomes
 `start()` is idempotent while running and retries any leftover teardown from a
 previous failed run before programming a new link.
 
+## Packet pump
+
+`ozma_mesh::pump::PacketPump` owns the `/dev/net/tun` fd and the two plaintext
+directions:
+
+```text
+TUN reader ──bounded queue──▶ tunnel sender ──▶ boringtun ──▶ UDP
+TUN writer ◀─bounded queue── tunnel receiver ◀── boringtun ◀── UDP
+```
+
+Two injectable seams keep default tests off the host:
+
+| Seam | Production value | Test value |
+|---|---|---|
+| `TunIo` (`read_packet` / `write_packet`) | `SystemTunProvider` attaching to the existing persistent interface via the safe `tun-rs` wrapper | in-memory channels plus scripted short reads/partial writes |
+| `TunnelIo` (`send_packet` / `recv_packet`) | `ManagerPacketIo` over the packet API on `MeshManager` | in-memory channels plus injected errors |
+
+The outbound half is the minimal documented packet API added to `ozma-mesh`:
+`MeshManager::send_ipv4` parses the IPv4 destination and looks up the peer that
+owns it; it never invents a route or peer. The inbound half publishes
+decapsulated IPv4 packets on a bounded `tokio::mpsc` channel taken once by
+`MeshManager::take_packet_receiver`. IPv6 payloads are logged and ignored (the
+pump is IPv4-only). IPv4 packets decapsulated before a subscriber takes the
+channel are counted by the manager as dropped rather than claimed as delivered.
+
+Bounds and counters:
+
+* each direction has a bounded queue (`PumpConfig::queue_capacity`, default
+  256, maximum 4096);
+* each read buffer is fixed (`PumpConfig::packet_buffer`, default 65535,
+  bounded `68..=65535`);
+* a full queue increments the matching pump drop counter; the queue never
+  grows and a slow direction cannot block the other. The manager additionally
+  counts IPv4 packets dropped before a pump subscribes;
+* `PumpStats` reports TUN read packets/bytes, tunnel send packets/bytes,
+  tunnel receive packets/bytes, TUN write packets/bytes, both queue drop
+  counters, and per-direction error counters.
+
+A worker error stops both directions, records a typed `mesh.pump-*` error, and
+leaves the pump in `failed`. The node service monitors that failure and tears
+down the WireGuard manager and dataplane instead of leaving a half-live mesh.
+`stop()` aborts in-flight worker futures and is idempotent; it preserves the
+last real counters for diagnostics (they never increase after stop);
+`start()` is idempotent while running and refuses to restart a failed pump
+until it has been stopped.
+
+Packet parsing treats a short TUN read as one complete short packet (kernel
+semantics). TUN writes are retried until the whole packet is written, so a
+short write cannot silently truncate an IPv4 packet.
+
 ## Status and typed errors
 
 `DataplaneStatus` is nested under `/api/v1/connect/status` only when the
@@ -101,6 +152,28 @@ dataplane is configured:
   "routes": ["10.200.9.2/32"],
   "nat": false,
   "last_error": null
+},
+"pump": {
+  "configured": true,
+  "state": "running",
+  "interface": "ozma0",
+  "queue_capacity": 256,
+  "stats": {
+    "tun_read_packets": 0,
+    "tun_read_bytes": 0,
+    "tun_to_tunnel_packets": 0,
+    "tun_to_tunnel_bytes": 0,
+    "tunnel_received_packets": 0,
+    "tunnel_received_bytes": 0,
+    "tunnel_to_tun_packets": 0,
+    "tunnel_to_tun_bytes": 0,
+    "dropped_tun_to_tunnel": 0,
+    "dropped_tunnel_to_tun": 0,
+    "tun_read_errors": 0,
+    "tun_write_errors": 0,
+    "tunnel_send_errors": 0,
+    "tunnel_receive_errors": 0
+  }
 }
 ```
 
@@ -108,6 +181,23 @@ dataplane is configured:
 `state:"running"`. States are `not-configured`, `stopped`, `starting`,
 `running`, and `failed`. A partially applied or rolled-back dataplane never
 reports `running`.
+
+The `pump` object is present only when a dataplane and TUN provider are
+configured. Its counters are real zeroes before traffic, never fabricated
+packets. Effectively `state:"running"` requires the dataplane, the WireGuard
+manager, and a configured pump to all be running; a stopped/failed pump makes
+the service `starting`/`failed` instead.
+
+Typed pump errors:
+
+| Code | Meaning |
+|---|---|
+| `mesh.tun-open` | The persistent TUN interface could not be attached/opened (including a missing root/permission failure). |
+| `mesh.pump-tun-read` / `mesh.pump-tun-write` | A TUN read/write failed or the link disappeared. |
+| `mesh.pump-tunnel-send` / `mesh.pump-tunnel-receive` | Encapsulation/decapsulation or queue delivery failed. |
+| `mesh.pump-unavailable` | The pump was requested but the running tunnel exposes no packet API, or the dataplane/tunnel is not running. |
+| `mesh.pump-invalid` | Queue/buffer bounds are outside the supported range. |
+| `mesh.pump-packet-too-large` | A tunnel packet exceeded the fixed bounded buffer. |
 
 Typed `DataplaneError.code` values:
 
@@ -139,27 +229,46 @@ New flags / environment:
 
 Lifecycle:
 
-* `MeshService::start` starts the dataplane first, then the WireGuard manager.
-  A manager failure tears the dataplane down; a dataplane failure never leaves
-  a WireGuard socket bound.
-* `MeshService::stop` stops both, dataplane first.
-* Effective service state is `running` only when both parts are running. A
-  dataplane failure is surfaced as `failed` with the dataplane code/reason.
+* `MeshService::start` starts the dataplane first, then the WireGuard manager,
+  and only then opens the TUN fd and starts the packet pump. A manager or pump
+  failure tears the already-started parts down; a dataplane failure never
+  leaves a WireGuard socket bound and a pump failure never leaves a half-live
+  mesh reporting `running`.
+* `MeshService::stop` stops the pump first, then the dataplane and manager.
+* Effective service state is `running` only when the dataplane, manager, and
+  configured pump are all running. A pump failure is surfaced as `failed` with
+  the typed pump code/reason and the monitor tears down the runtime parts.
 * Peer `established` remains driven exclusively by boringtun handshake state.
-  A running dataplane or a programmed route never promotes a peer.
+  A running dataplane, programmed route, or running pump never promotes a
+  peer.
 
 The Python soft node is unchanged; this is node-only.
 
 ## Tests
 
-Default tests never require root, a real TUN device, or `nft`. They use a
-recording fake runner and fake sysfs.
+Default tests never require root, a real TUN device, or `nft`. They use
+recording fake runner/sysfs seams and in-memory TUN/tunnel channels.
 
 Latest verification (private snapshot of the tree, to avoid concurrent edits):
 
-* `cargo test -p ozma-mesh -p ozma-node --lib` — **514 passed, 4 ignored**
-  (`ozma-mesh`: 12 passed, 1 ignored; `ozma-node`: 502 passed, 3 ignored).
+* `cargo test -p ozma-mesh -p ozma-node --lib` — **543 passed, 5 ignored**
+  (`ozma-mesh`: 22 passed, 2 ignored; `ozma-node`: 521 passed, 3 ignored).
 * `cargo check -p ozma-mesh -p ozma-node --all-targets` — passes.
+* `rustfmt --edition 2021 --check` on every touched Rust file — passes.
+
+`ozma-mesh` packet-pump tests cover:
+
+* TUN→tunnel and tunnel→TUN round trips through bounded in-memory channels;
+* short TUN reads treated as one packet and partial TUN writes retried;
+* queue overflow in both directions incrementing the correct drop counter;
+* per-direction packet/byte/error snapshots;
+* idempotent shutdown, no traffic after stop, and `wait_failed` returning
+  `None` on a clean stop;
+* tunnel send/receive and TUN read error propagation to a typed `failed`
+  state;
+* invalid queue/buffer bounds typed as `mesh.pump-invalid` with no start;
+* one `#[ignore]` live attach test additionally gated by `OZMA_MESH_LIVE=1`,
+  requiring root and `/dev/net/tun`.
 
 `ozma-mesh` dataplane tests cover:
 
@@ -186,7 +295,14 @@ Latest verification (private snapshot of the tree, to avoid concurrent edits):
   `running`;
 * missing root/TUN/nft typed through the service;
 * preflight root/TUN/`ip`/`nft`/invalid-config codes;
-* peer add/remove programming routes without marking the peer established.
+* peer add/remove programming routes without marking the peer established;
+* pump absent without a dataplane, stopped before start, running with real
+  zero counters, and stopped cleanly without fake packet counts;
+* pump not opened when the dataplane or tunnel is not running;
+* typed `mesh.tun-open` and `mesh.pump-unavailable` failures with rollback of
+  the dataplane/manager and a `failed` pump status;
+* asynchronous pump failure surfacing as `failed` and tearing down the
+  manager/dataplane.
 
 Live test invocation (manual, root):
 
@@ -195,11 +311,27 @@ sudo OZMA_MESH_LIVE=1 cargo test -p ozma-mesh --lib \
   dataplane::tests::live_dataplane_roundtrip -- --ignored
 ```
 
+The packet pump itself is exercised by default tests with in-memory seams. The
+optional live TUN attach path can be smoke-tested manually with root:
+
+```bash
+sudo OZMA_MESH_LIVE=1 cargo test -p ozma-mesh --lib \
+  pump::tests::live_system_tun_attaches_to_the_dataplane_link -- --ignored
+```
+
 ## Remaining kernel/dataplane gaps
 
-* **No TUN packet pump.** The interface exists and is routed, but no process
-  owns the `/dev/net/tun` fd or moves plaintext between it and boringtun. That
-  is the next dataplane step; this change is control-plane programming only.
+* **Real-network coverage is still partial.** Packet round trips are tested
+  through in-memory seams; the optional `#[ignore]` live dataplane test only
+  checks the link, not a multi-node encrypted packet flow. No default test
+  touches a real TUN, WireGuard handshake, or network namespace.
+* **IPv4 only, single queue.** The pump reads/writes one packet buffer and
+  ignores IPv6. It does not use TUN multi-queue, GSO/GRO, or vnet headers.
+* **No per-peer queues or fairness.** All peers share one tunnel outbound path;
+  a slow peer can consume the shared send budget. There is no per-peer egress
+  queue, rate limit, or backpressure signal.
+* **No PMTU/ICMP handling.** MTU is configured on the link, but the pump does
+  not synthesise ICMP frag-needed or react to path-MTU changes.
 * **No multi-node route exchange.** Peer routes come from configured
   `--mesh-peer` identities plus runtime `add_peer`; there is no routing
   protocol or mDNS-driven route reconciliation.

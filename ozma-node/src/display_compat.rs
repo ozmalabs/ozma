@@ -439,6 +439,27 @@ impl SnapshotControl {
         self
     }
 
+    /// Build an independent long-lived control for one MJPEG stream.
+    ///
+    /// The clone follows the same registry (including a runtime console switch)
+    /// and shares the last-frame cache, but gets its own source slot: it caches
+    /// the opened source between [`Self::capture`] calls, so `/video` reads
+    /// frames from one provider connection instead of reopening the device for
+    /// every JPEG. Each stream owns a separate slot, so closing one stream never
+    /// stops a concurrent snapshot or another stream. Call [`Self::shutdown`]
+    /// when the stream ends.
+    pub fn streaming(&self, quality: Option<u8>) -> Self {
+        Self {
+            registry: self.registry.clone(),
+            requested_source: self.requested_source.clone(),
+            timeout: self.timeout,
+            quality: quality.unwrap_or(self.quality),
+            cache: self.cache.clone(),
+            cache_source: true,
+            open: Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
     fn cache(&self) -> MutexGuard<'_, SnapshotCache> {
         self.cache
             .lock()

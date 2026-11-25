@@ -24,8 +24,11 @@ use ozma_protocol::NodeId;
 use ozma_qmp::SharedQmpClient;
 use ozma_thermal::ThermalStatus;
 use ozma_usb::{
-    ConfigFsUsbController, FunctionFsConfig, FunctionFsDaemonSpec, MassStorageImage, MediaFormat,
-    MediaRestartPolicy, UsbError, UsbFunction, UsbGadgetConfig, UsbGadgetController,
+    ConfigFsUsbController, FunctionFsConfig, FunctionFsDaemonSpec, LinuxUsbIpHostBackend,
+    LinuxUsbIpKernelDataEndpoint, MassStorageImage, MediaFormat, MediaRestartPolicy,
+    NoUsbIpKernelDataEndpoint, SystemCommandRunner, UsbError, UsbFunction, UsbGadgetConfig,
+    UsbGadgetController, UsbIpDaemon, UsbIpDaemonConfig, UsbIpKernelDataEndpoint, UsbIpKernelSysfs,
+    UsbIpServer, UsbIpServerConfig,
 };
 use tracing::{error, info, warn};
 
@@ -604,6 +607,61 @@ pub struct Args {
     /// Optional absolute daemon path reported as FunctionFS readiness metadata.
     #[arg(long, env = "OZMA_USB_VENDOR_DAEMON", value_name = "PATH")]
     pub usb_vendor_daemon: Option<std::path::PathBuf>,
+
+    /// Mounted FunctionFS directory the background media daemon opens.
+    ///
+    /// The node never mounts FunctionFS itself. Requires `--usb-gadget`,
+    /// `--usb-vendor`, and `--usb-media-export`; the daemon waits for the
+    /// kernel `ENABLE` event and services the SCSI loop over
+    /// `PollingFileBulkTransport`.
+    #[arg(long, env = "OZMA_USB_FUNCTIONFS_MOUNT", value_name = "PATH")]
+    pub usb_functionfs_mount: Option<std::path::PathBuf>,
+
+    /// Start the bounded USB/IP control/data listener.
+    #[arg(long, env = "OZMA_USBIP")]
+    pub usbip: bool,
+
+    /// USB/IP listener host.
+    #[arg(
+        long = "usbip-host",
+        env = "OZMA_USBIP_HOST",
+        default_value = "127.0.0.1",
+        value_name = "HOST"
+    )]
+    pub usbip_host: String,
+
+    /// USB/IP listener port.
+    #[arg(
+        long = "usbip-port",
+        env = "OZMA_USBIP_PORT",
+        default_value_t = ozma_usb::DEFAULT_USBIP_PORT,
+        value_name = "PORT"
+    )]
+    pub usbip_port: u16,
+
+    /// Select the Linux `usbip` host adapter and TCP data adapter.
+    ///
+    /// Without this flag the USB/IP daemon keeps the typed
+    /// `usbip-kernel-required` defaults and never invents an attach or data
+    /// session.
+    #[arg(long = "usbip-linux-adapters", env = "OZMA_USBIP_LINUX_ADAPTERS")]
+    pub usbip_linux_adapters: bool,
+
+    /// Sysfs root inspected by the Linux USB/IP host adapter.
+    #[arg(
+        long = "usbip-sysfs-root",
+        env = "OZMA_USBIP_SYSFS_ROOT",
+        value_name = "PATH"
+    )]
+    pub usbip_sysfs_root: Option<std::path::PathBuf>,
+
+    /// `usbip` executable used by the Linux host adapter.
+    #[arg(
+        long = "usbip-program",
+        env = "OZMA_USBIP_PROGRAM",
+        value_name = "PROGRAM"
+    )]
+    pub usbip_program: Option<String>,
 
     /// Start the UAC2 isochronous ↔ host-audio bridge.
     ///
@@ -1361,6 +1419,13 @@ async fn run() -> std::process::ExitCode {
         usb_uac2: args.usb_uac2,
         usb_vendor: args.usb_vendor,
         usb_vendor_daemon: args.usb_vendor_daemon.clone(),
+        usb_functionfs_mount: args.usb_functionfs_mount.clone(),
+        usbip: args.usbip,
+        usbip_host: args.usbip_host.clone(),
+        usbip_port: args.usbip_port,
+        usbip_linux_adapters: args.usbip_linux_adapters,
+        usbip_sysfs_root: args.usbip_sysfs_root.clone(),
+        usbip_program: args.usbip_program.clone(),
         usb_uac2_bridge: args.usb_uac2_bridge,
         usb_uac2_sink_device: args.usb_uac2_sink_device.clone(),
         usb_uac2_source_device: args.usb_uac2_source_device.clone(),
@@ -2185,8 +2250,27 @@ async fn run() -> std::process::ExitCode {
             }
         }
     }
+    if let Some(control) = usb_control
+        .as_mut()
+        .filter(|control| control.is_available())
+    {
+        match build_usbip_runtime(&config) {
+            Ok(runtime) => control.set_usbip_runtime(runtime),
+            Err(error) => {
+                warn!(
+                    kind = error.kind(),
+                    error = %error,
+                    "USB/IP listener requested but not started; /usb reports the typed failure"
+                );
+                control.set_usbip_runtime(None);
+            }
+        }
+    } else if config.usbip {
+        warn!("USB/IP listener not started because the USB gadget is unavailable");
+    }
     // Keep a cloned handle (shared `Arc`s) so shutdown can stop the media
-    // export and apply its persistence policy after the state is served.
+    // export/USB/IP listener and apply its persistence policy after the state is
+    // served.
     let usb_media_shutdown = usb_control.clone();
     let mut uac2_alsa_runtime: Option<usb_uac2::Uac2BridgeRuntime> = None;
     if let Some(control) = usb_control.as_mut() {
@@ -3098,6 +3182,13 @@ async fn run() -> std::process::ExitCode {
     // Stop the userspace media export last so its overlay is flushed according
     // to `persist_on_stop`. A failure is logged; shutdown still proceeds.
     if let Some(control) = usb_media_shutdown.as_ref() {
+        if let Some(stats) = control.shutdown_usbip() {
+            info!(
+                sessions = stats.sessions,
+                imports = stats.imports,
+                "USB/IP listener stopped"
+            );
+        }
         match control.shutdown_media_export() {
             Ok(()) => info!("userspace SCSI media export stopped; persistence policy applied"),
             Err(error) => warn!(
@@ -3266,6 +3357,67 @@ fn build_usb_control(config: &NodeConfig) -> Option<controller_compat::UsbContro
     }
 }
 
+/// Build and start the bounded USB/IP listener.
+///
+/// The default adapter set is the typed `usbip-kernel-required` pair, so a
+/// successful import is never fabricated. `--usbip-linux-adapters` explicitly
+/// selects the argv/sysfs host adapter and the TCP URB data adapter.
+fn build_usbip_runtime(
+    config: &NodeConfig,
+) -> Result<Option<controller_compat::UsbIpRuntime>, UsbError> {
+    if !config.usbip {
+        return Ok(None);
+    }
+    let daemon_config = UsbIpDaemonConfig::server(config.usbip_host.clone(), config.usbip_port);
+    let (daemon, data, adapter): (
+        Arc<UsbIpDaemon>,
+        Arc<dyn UsbIpKernelDataEndpoint>,
+        &'static str,
+    ) = if config.usbip_linux_adapters {
+        let sysfs = config
+            .usbip_sysfs_root
+            .clone()
+            .map(UsbIpKernelSysfs::with_root)
+            .unwrap_or_else(UsbIpKernelSysfs::system);
+        let program = config
+            .usbip_program
+            .clone()
+            .unwrap_or_else(|| ozma_usb::DEFAULT_USBIP_PROGRAM.to_owned());
+        let backend = LinuxUsbIpHostBackend::new(SystemCommandRunner, program, sysfs);
+        (
+            Arc::new(UsbIpDaemon::new(daemon_config)?.with_kernel(Arc::new(backend))),
+            Arc::new(LinuxUsbIpKernelDataEndpoint::system()),
+            "linux",
+        )
+    } else {
+        (
+            Arc::new(UsbIpDaemon::new(daemon_config)?),
+            Arc::new(NoUsbIpKernelDataEndpoint),
+            "kernel-required",
+        )
+    };
+    daemon.start()?;
+    let server = UsbIpServer::bind_tcp(
+        (config.usbip_host.as_str(), config.usbip_port),
+        daemon,
+        UsbIpServerConfig::default(),
+    )?
+    .with_data_endpoint(data);
+    let handle = server.start()?;
+    info!(
+        host = config.usbip_host.as_str(),
+        port = config.usbip_port,
+        adapter,
+        "USB/IP control/data listener started"
+    );
+    Ok(Some(controller_compat::UsbIpRuntime::new(
+        handle,
+        adapter,
+        config.usbip_host.clone(),
+        config.usbip_port,
+    )))
+}
+
 /// Build the opt-in userspace media auto-start configuration.
 ///
 /// `None` when `--usb-media-export` was not supplied. This is separate from
@@ -3302,6 +3454,7 @@ fn usb_media_auto_start_config(
             max_backoff_ms: config.usb_media_restart_max_backoff_ms,
             reload_overlay: config.usb_media_restart_reload_overlay,
         },
+        functionfs_mount: config.usb_functionfs_mount.clone(),
     })
 }
 

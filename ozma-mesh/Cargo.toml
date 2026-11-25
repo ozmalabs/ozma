@@ -32,6 +32,13 @@ tracing      = "0.1"
 # Root detection for the optional Linux dataplane (no other kernel access).
 libc         = { workspace = true }
 
+# Safe Linux TUN/TAP device wrapper for the optional packet pump. The crate
+# owns the TUNSETIFF ioctl; this crate contains no `unsafe` of its own.
+tun-rs       = { version = "2.8", default-features = false, features = ["async"] }
+
+# Async trait methods for the injectable packet-pump seams.
+async-trait  = { workspace = true }
+
 # Error handling
 thiserror    = "1"
 

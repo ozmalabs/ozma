@@ -482,6 +482,14 @@ impl<T: MassStorageBulkTransport> MassStorageLoop<T> {
         self.device
     }
 
+    /// Consume the loop and return both the device and its transport.
+    ///
+    /// A supervisor uses this to rebuild the device (for example to reload a
+    /// persisted overlay) without discarding a transport it still owns.
+    pub fn into_parts(self) -> (MassStorageDevice, T) {
+        (self.device, self.transport)
+    }
+
     /// Read one CBW, execute it, and write the IN data and CSW.
     ///
     /// Malformed CBWs and transport failures return a typed error. SCSI command

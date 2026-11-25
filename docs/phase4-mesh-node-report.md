@@ -8,8 +8,9 @@ This change wires the existing `ozma-mesh` crate into `ozma-node` as an
 * `ozma-mesh`: a small peer-status API (`MeshManager::peer_statuses`), an honest
   `MeshManager::stop`, and `MeshManager` is now `Sync` (the libmdns responder
   handles live behind a `Mutex`) so node async traits can call it. It also owns
-  a typed, injectable Linux dataplane (TUN link, routes, IPv4 forwarding, and
-  opt-in NAT) in [`dataplane`](phase4-mesh-dataplane-report.md).
+  a typed, injectable Linux dataplane (TUN link, routes, IPv4 forwarding,
+  opt-in NAT, and a bounded TUN/WireGuard packet pump) in
+  [`dataplane`](phase4-mesh-dataplane-report.md).
 * `ozma-node`: new `mesh_service` module, `--mesh*` CLI/env flags, guarded
   `/api/v1/connect/{status,peers,events}` routes, startup/shutdown wiring, and
   optional `--mesh-dataplane` lifecycle wiring.
@@ -89,9 +90,11 @@ Event log:
 When `--mesh-dataplane` is set, `MeshService` starts the dataplane **before**
 the WireGuard manager, so a missing TUN device, root, or `ip` never leaves a
 WireGuard socket bound. A manager start failure tears the dataplane back down.
-`state:"running"` and `available:true` require both the WireGuard manager and
-the dataplane to be running; a failed or still-starting dataplane is reported
-as `failed`/`starting`, never as `running`.
+After both are running, the service opens the persistent TUN fd and starts the
+bounded packet pump. `state:"running"` and `available:true` require the
+WireGuard manager, the dataplane, and the configured pump to all be running; a
+failed or still-starting dataplane/pump is reported as `failed`/`starting`,
+never as `running`.
 
 The dataplane status object is separate from peer handshake state:
 
@@ -132,6 +135,8 @@ Typed prerequisites (`MeshServiceError.code`):
 | `mesh.dataplane-invalid` | TUN name, address/prefix, MTU, peer route, or NAT table/interface is invalid. |
 | `mesh.dataplane-not-configured` | A dataplane operation was attempted with no configuration. |
 | `mesh.dataplane-command-failed` | `ip`/`nft` exited non-zero; the applied steps are rolled back. |
+| `mesh.tun-open` | The persistent TUN fd could not be attached for the packet pump. |
+| `mesh.pump-*` | Typed packet-pump read/write/tunnel/queue failure; the pump stops and reports `failed`. |
 | `mesh.start-failed` | Runtime bind/mDNS/start failure. |
 | `mesh.not-running` | Peer operation attempted while stopped. |
 
@@ -198,8 +203,8 @@ proxied; a test asserts it still returns the Connect account/tier document.
 
 Run for this change:
 
-* `cargo test -p ozma-mesh -p ozma-node --lib` — **514 passed, 4 ignored**
-  (`ozma-mesh`: 12 passed, 1 ignored; `ozma-node`: 502 passed, 3 ignored).
+* `cargo test -p ozma-mesh -p ozma-node --lib` — **543 passed, 5 ignored**
+  (`ozma-mesh`: 22 passed, 2 ignored; `ozma-node`: 521 passed, 3 ignored).
 * `cargo check -p ozma-mesh -p ozma-node --all-targets` — passes (pre-existing
   warnings only).
 * `python3 -m pytest tests/unit/controller/test_mesh_connect_proxy.py -q` —
@@ -217,13 +222,16 @@ Coverage includes:
   `peer_count:0`/`peers:[]`, and peers/events after a real add;
 * node dataplane status for stopped/starting/running/failed, no fake `running`,
   and peer add/remove programming routes without claiming a handshake;
+* packet-pump status absent without a dataplane, stopped before start,
+  starting while the TUN opens, running with real zero counters, and failed
+  with typed `mesh.tun-open`/`mesh.pump-*` errors that roll back the runtime;
 * controller token forwarding, status/capability discovery, typed 501
   passthrough, Python-node 404, auth-failure mapping, and unchanged global
   Connect status.
 
 No default test requires root, a real WireGuard interface, a real TUN device, a
-network namespace, or a real peer. One live dataplane test is `#[ignore]`d and
-additionally gated by `OZMA_MESH_LIVE=1`.
+network namespace, or a real peer. The live dataplane and live TUN-attach tests
+are `#[ignore]`d and additionally gated by `OZMA_MESH_LIVE=1`.
 
 ## Honest remaining gaps (modelled or unwired)
 
@@ -240,9 +248,10 @@ additionally gated by `OZMA_MESH_LIVE=1`.
 * **No automatic handshake/peer promotion.** Adding a peer starts idle; there is
   no node route to initiate a handshake or authenticate/authorize peers. A real
   established state requires an external peer to complete a handshake.
-* **No dataplane packet pump.** `MeshManager` can encapsulate/decapsulate
-  packets and the optional dataplane creates/routes a TUN link, but no process
-  owns the TUN fd or moves plaintext between the link and boringtun yet. See
+* **Packet-pump live-network coverage is partial.** The pump now owns the TUN
+  fd and moves IPv4 plaintext to/from boringtun, but default tests use
+  in-memory seams. There is no live multi-node encrypted packet-flow test, and
+  the pump is single-queue IPv4-only with no PMTU/ICMP handling. See
   [`phase4-mesh-dataplane-report.md`](phase4-mesh-dataplane-report.md).
 * **No key generation/persistence/rotation.** The operator supplies a key file;
   the node neither creates one nor persists a generated identity.

@@ -220,6 +220,34 @@ pipes/FIFOs created in temporary directories:
   writes a valid CSW;
 - ignored real endpoint test gated by `OZMA_FUNCTIONFS_MOUNT`.
 
+## Node adapter and daemon selection
+
+`ozma-node` now selects the real adapters explicitly instead of leaving them to
+an embedder:
+
+- `--usb-functionfs-mount PATH` (requires `--usb-gadget`, `--usb-vendor`, and
+  `--usb-media-export`) starts a `FunctionFsMediaDaemon` over the explicit
+  mount. The daemon uses `PollingFileBulkTransport` and `PollingFileEp0Io`, so
+  the blocking file adapter is never selected for this path. `/usb/media`
+  reports `transport.kind: "polling-file"` plus attach/detach/enable/disable/
+  unbind/restart counters; `running` still requires a completed command cycle.
+- `--usbip` starts `UsbIpServer` on `--usbip-host`/`--usbip-port`. The default
+  adapter pair is `NoUsbIpKernel` + `NoUsbIpKernelDataEndpoint`, so a successful
+  import remains a typed `usbip-kernel-required` failure.
+- `--usbip-linux-adapters` injects `LinuxUsbIpHostBackend`
+  (`--usbip-program`, `--usbip-sysfs-root`) and
+  `LinuxUsbIpKernelDataEndpoint::system()`. `/usb` reports `usbip.adapter`
+  (`linux` or `kernel-required`), `state`, active connections, and honest
+  session/import/data-session/denied/protocol/byte counters from
+  `UsbIpServerStats`. A failed listener start is logged and leaves the typed
+  unavailable state rather than inventing a listener.
+- Shutdown stops the USB/IP listener (joining its accept loop) before stopping
+  the media daemon/export and applying overlay persistence.
+
+No default test starts a real listener, invokes `usbip`, loads a module, or
+uses root. The node tests assert the default kernel-required status and that the
+FunctionFS mount path selects the polling daemon without claiming `running`.
+
 ## Verification
 
 ```bash
@@ -229,9 +257,16 @@ rustfmt --edition 2021 --check \
   ozma-usb/src/lib.rs ozma-usb/src/usbip_kernel.rs ozma-usb/src/usbip_tcp.rs \
   ozma-usb/src/usbip.rs ozma-usb/src/usbip_daemon.rs \
   ozma-usb/src/functionfs_daemon.rs ozma-usb/src/mass_storage_loop.rs \
+  ozma-usb/src/media_daemon.rs \
   ozma-usb/tests/usbip_kernel.rs ozma-usb/tests/usbip_tcp.rs \
   ozma-usb/tests/functionfs_polling.rs
 ```
+
+The node-side selection was verified with
+`cargo test -p ozma-usb -p ozma-node --lib` and
+`cargo check -p ozma-usb -p ozma-node --all-targets`. The default USB/IP status
+test asserts the typed kernel requirement, and the FunctionFS media auto-start
+test asserts the polling daemon path and no fake `running`.
 
 `cargo test -p ozma-usb` result: 290 passed, 0 failed, 8 ignored. The ignored
 tests are the pre-existing live/real-kernel cases plus the new USB/IP and
@@ -254,9 +289,10 @@ FunctionFS environment-gated cases.
   the codec's descriptor arrays as-is.
 - The data session has no TLS. The USB/IP protocol has no in-band TLS and this
   crate still does not terminate it; an external terminator/tunnel is required.
-- The node does not automatically select `PollingFileBulkTransport`, start the
-  Linux USB/IP adapters, or expose their counters through a route. Wiring is
-  left to an explicit embedder.
+- The node selects the polling transport and Linux USB/IP adapters only when
+  the explicit flags are set. It does not auto-detect a mounted FunctionFS
+  directory, mount/UDC-bind on its own, export local devices into USB/IP, or
+  provide an in-process TLS terminator.
 - No real UDC/FunctionFS data transfer in the default suite; the polling
   transport is proven against OS pipes/FIFOs, and the real endpoint test remains
   opt-in.

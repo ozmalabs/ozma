@@ -568,12 +568,28 @@ fn is_ep0_entry(metadata: &fs::Metadata) -> bool {
 }
 
 /// Injectable FunctionFS `ep0` transport.
-pub trait FunctionFsEp0Io {
+pub trait FunctionFsEp0Io: Send {
     /// Write one complete descriptor or string-table chunk.
     fn write_ep0(&mut self, data: &[u8]) -> Result<(), UsbError>;
 
     /// Read one or more encoded `usb_functionfs_event` values.
     fn read_ep0_event(&mut self, buffer: &mut [u8]) -> Result<usize, UsbError>;
+
+    /// Read one event, waiting at most `timeout_ms` for it.
+    ///
+    /// The default implementation keeps the legacy blocking behaviour and
+    /// ignores the deadline, which is correct for [`FileEp0Io`] when the caller
+    /// supplies a mount whose `ep0` already has a host/UDC timeout. The
+    /// nonblocking [`PollingFileEp0Io`] used by the background media daemon
+    /// overrides it so a shutdown/rebind is observable without a busy loop.
+    fn read_ep0_event_timeout(
+        &mut self,
+        buffer: &mut [u8],
+        timeout_ms: u64,
+    ) -> Result<usize, UsbError> {
+        let _ = timeout_ms;
+        self.read_ep0_event(buffer)
+    }
 
     /// Test/back-end downcast hook.
     fn as_any_mut(&mut self) -> &mut dyn Any;
@@ -716,8 +732,215 @@ impl FunctionFsEp0Io for FileEp0Io {
     }
 }
 
+/// Nonblocking, deadline-enforcing `ep0` transport for a daemon.
+///
+/// FunctionFS `ep0` delivers `usb_functionfs_event` records as a byte stream.
+/// A background daemon must be able to notice `ENABLE`/`DISABLE`/`UNBIND` and a
+/// shutdown request without blocking a worker forever, so this adapter sets
+/// `O_NONBLOCK` and waits with `poll(2)` for at most the supplied deadline.
+/// A timeout returns `Ok(0)` (no event yet), never an invented event.
+#[derive(Debug)]
+pub struct PollingFileEp0Io {
+    path: PathBuf,
+    file: File,
+    timeout_ms: u64,
+}
+
+impl PollingFileEp0Io {
+    /// Open `ep0` read/write and set `O_NONBLOCK`.
+    pub fn open(path: impl Into<PathBuf>, timeout_ms: u64) -> Result<Self, UsbError> {
+        let path = path.into();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|source| {
+                if source.kind() == io::ErrorKind::NotFound {
+                    UsbError::MissingFunctionFsEp0(path.clone())
+                } else {
+                    ep0_error("open", path.clone(), source)
+                }
+            })?;
+        Self::from_file(path, file, timeout_ms)
+    }
+
+    /// Wrap an already-open `ep0` descriptor.
+    pub fn from_file(
+        path: impl Into<PathBuf>,
+        file: File,
+        timeout_ms: u64,
+    ) -> Result<Self, UsbError> {
+        validate_endpoint_timeout(timeout_ms)?;
+        let flags = fcntl_getfl(&file).map_err(|error| {
+            ep0_error(
+                "configure",
+                PathBuf::from("<ep0>"),
+                io_error_from_errno(error),
+            )
+        })?;
+        fcntl_setfl(&file, flags | OFlags::NONBLOCK).map_err(|error| {
+            ep0_error(
+                "configure",
+                PathBuf::from("<ep0>"),
+                io_error_from_errno(error),
+            )
+        })?;
+        Ok(Self {
+            path: path.into(),
+            file,
+            timeout_ms,
+        })
+    }
+
+    /// Path backing this `ep0` handle.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Deadline used by the trait methods.
+    pub fn timeout_ms(&self) -> u64 {
+        self.timeout_ms
+    }
+
+    fn wait_ready(
+        &self,
+        events: PollFlags,
+        deadline: Instant,
+        operation: &'static str,
+        _timeout_ms: u64,
+    ) -> Result<(), UsbError> {
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let timeout = Timespec {
+                tv_sec: remaining.as_secs().min(i64::MAX as u64) as i64,
+                tv_nsec: remaining.subsec_nanos() as i64,
+            };
+            let mut descriptors = [PollFd::new(
+                &self.file,
+                events | PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL,
+            )];
+            match poll(&mut descriptors, Some(&timeout)) {
+                Ok(0) => return Ok(()),
+                Ok(_) => return Ok(()),
+                Err(Errno::INTR) => {}
+                Err(error) => {
+                    return Err(ep0_error(
+                        operation,
+                        self.path.clone(),
+                        io_error_from_errno(error),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn read_deadline(&mut self, buffer: &mut [u8], timeout_ms: u64) -> Result<usize, UsbError> {
+        validate_endpoint_timeout(timeout_ms)?;
+        let deadline = deadline_after(timeout_ms);
+        loop {
+            match self.file.read(buffer) {
+                Ok(count) => return Ok(count),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.wait_ready(PollFlags::IN, deadline, "read", timeout_ms)?;
+                    if Instant::now() >= deadline {
+                        return Ok(0);
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(source) => return Err(ep0_error("read", self.path.clone(), source)),
+            }
+        }
+    }
+
+    fn write_deadline(&mut self, data: &[u8], timeout_ms: u64) -> Result<(), UsbError> {
+        validate_endpoint_timeout(timeout_ms)?;
+        if data.len() > MAX_FUNCTIONFS_EP0_WRITE_BYTES {
+            return Err(UsbError::FunctionFsBuffer {
+                context: "ep0 write",
+                limit: MAX_FUNCTIONFS_EP0_WRITE_BYTES,
+                requested: data.len(),
+            });
+        }
+        let deadline = deadline_after(timeout_ms);
+        let mut written = 0usize;
+        while written < data.len() {
+            match self.file.write(&data[written..]) {
+                Ok(0) => {
+                    return Err(ep0_error(
+                        "write",
+                        self.path.clone(),
+                        io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            format!("short ep0 write: {written} of {} bytes", data.len()),
+                        ),
+                    ));
+                }
+                Ok(count) => written += count,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.wait_ready(PollFlags::OUT, deadline, "write", timeout_ms)?;
+                    if Instant::now() >= deadline {
+                        return Err(ep0_error(
+                            "write",
+                            self.path.clone(),
+                            io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                format!(
+                                    "ep0 write timed out after {timeout_ms} ms with {written} of {} bytes",
+                                    data.len()
+                                ),
+                            ),
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(source) => return Err(ep0_error("write", self.path.clone(), source)),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl FunctionFsEp0Io for PollingFileEp0Io {
+    fn write_ep0(&mut self, data: &[u8]) -> Result<(), UsbError> {
+        let timeout_ms = self.timeout_ms;
+        self.write_deadline(data, timeout_ms)
+    }
+
+    fn read_ep0_event(&mut self, buffer: &mut [u8]) -> Result<usize, UsbError> {
+        let timeout_ms = self.timeout_ms;
+        self.read_ep0_event_timeout(buffer, timeout_ms)
+    }
+
+    fn read_ep0_event_timeout(
+        &mut self,
+        buffer: &mut [u8],
+        timeout_ms: u64,
+    ) -> Result<usize, UsbError> {
+        if buffer.len() < FUNCTIONFS_EVENT_BYTES {
+            return Err(UsbError::FunctionFsBuffer {
+                context: "ep0 event buffer",
+                limit: FUNCTIONFS_EVENT_BYTES,
+                requested: buffer.len(),
+            });
+        }
+        self.read_deadline(buffer, timeout_ms)
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+}
+
 /// One FunctionFS data endpoint.
-pub trait FunctionFsEndpointIo {
+pub trait FunctionFsEndpointIo: Send {
     /// Endpoint descriptor represented by this handle.
     fn endpoint(&self) -> &FunctionFsEndpoint;
 
@@ -1187,7 +1410,7 @@ impl FunctionFsEndpointOpener for PollingFileEndpointOpener {
 }
 
 /// Opens endpoint files when FunctionFS enables the function.
-pub trait FunctionFsEndpointOpener {
+pub trait FunctionFsEndpointOpener: Send {
     /// Open endpoint `index` (one-based descriptor order).
     fn open(
         &mut self,
@@ -1684,6 +1907,7 @@ pub struct FunctionFsDaemonCore {
     state: DaemonState,
     device: FunctionFsStateMachine,
     stats: FunctionFsDaemonStats,
+    open_endpoints_on_enable: bool,
 }
 
 impl std::fmt::Debug for FunctionFsDaemonCore {
@@ -1720,7 +1944,19 @@ impl FunctionFsDaemonCore {
             state: DaemonState::default(),
             device: FunctionFsStateMachine::new(),
             stats: FunctionFsDaemonStats::default(),
+            open_endpoints_on_enable: true,
         })
+    }
+
+    /// Let a supervising daemon own the data endpoints.
+    ///
+    /// In this mode the core still consumes descriptor/string/`ENABLE`/control
+    /// events and tracks `live`, but it does not open `epN` files itself. The
+    /// background media daemon attaches a [`PollingFileBulkTransport`] so the
+    /// FunctionFS endpoint files are opened exactly once.
+    pub fn with_external_endpoints(mut self) -> Self {
+        self.open_endpoints_on_enable = false;
+        self
     }
 
     /// Function model.
@@ -1869,7 +2105,9 @@ impl FunctionFsDaemonCore {
                     });
                 }
                 if !self.state.enabled {
-                    self.open_endpoints()?;
+                    if self.open_endpoints_on_enable {
+                        self.open_endpoints()?;
+                    }
                     self.state.enabled = true;
                     self.state.configured = false;
                     if let Err(error) = self.ep0.write_ep0(&[]) {
@@ -1947,6 +2185,31 @@ impl FunctionFsDaemonCore {
     ) -> Result<Option<FunctionFsEventOutcome>, UsbError> {
         let mut buffer = [0u8; FUNCTIONFS_EVENT_BYTES];
         let read = self.ep0.read_ep0_event(&mut buffer)?;
+        self.decode_event(config, &buffer, read)
+    }
+
+    /// Read one event with a bounded wait.
+    ///
+    /// [`FunctionFsEp0Io::read_ep0_event_timeout`] returns `Ok(0)` when the
+    /// deadline expired without an event. A blocking `ep0` implementation keeps
+    /// its legacy behaviour; the background media daemon uses
+    /// [`PollingFileEp0Io`] so `DISABLE`/`UNBIND` and shutdown are observable.
+    pub fn handle_next_event_timeout(
+        &mut self,
+        config: &FunctionFsConfig,
+        timeout_ms: u64,
+    ) -> Result<Option<FunctionFsEventOutcome>, UsbError> {
+        let mut buffer = [0u8; FUNCTIONFS_EVENT_BYTES];
+        let read = self.ep0.read_ep0_event_timeout(&mut buffer, timeout_ms)?;
+        self.decode_event(config, &buffer, read)
+    }
+
+    fn decode_event(
+        &mut self,
+        config: &FunctionFsConfig,
+        buffer: &[u8; FUNCTIONFS_EVENT_BYTES],
+        read: usize,
+    ) -> Result<Option<FunctionFsEventOutcome>, UsbError> {
         if read == 0 {
             return Ok(None);
         }
@@ -1957,7 +2220,7 @@ impl FunctionFsDaemonCore {
                 ),
             });
         }
-        let event = FunctionFsEvent::decode(&buffer)?;
+        let event = FunctionFsEvent::decode(buffer)?;
         self.handle_event(config, event).map(Some)
     }
 

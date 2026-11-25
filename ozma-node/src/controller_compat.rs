@@ -32,12 +32,14 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Query, State};
-use axum::http::{header, StatusCode, Uri};
+use axum::http::{header, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::stream;
 use ozma_audio::{AudioError, AudioPlaybackSpec, AudioProfile, AudioRouter, AudioSourceProfile};
 use ozma_encode::{
     backend_name, CodecOverrideState, CodecPreference, EncoderOverride, EncoderRegistry,
@@ -50,9 +52,11 @@ use ozma_protocol::{
 };
 use ozma_usb::MediaFormat as UsbMediaFormat;
 use ozma_usb::{
-    is_safe_identifier, BoxedMassStorageTransport, FunctionFsStatus, FunctionStatus, GadgetStatus,
-    IdleBulkTransport, MassStorageDevice, MassStorageImage, MassStorageLoop, MassStorageLoopConfig,
-    MassStorageLoopStats, MassStorageOverlayStatus, MassStoragePersistPolicy, MediaRestartPolicy,
+    is_safe_identifier, polling_transport_factory, BoxedMassStorageTransport, FunctionFsConfig,
+    FunctionFsEndpoint, FunctionFsMediaDaemon, FunctionFsMount, FunctionFsStatus, FunctionStatus,
+    GadgetStatus, IdleBulkTransport, MassStorageDevice, MassStorageImage, MassStorageLoop,
+    MassStorageLoopConfig, MassStorageLoopStats, MassStorageOverlayStatus,
+    MassStoragePersistPolicy, MediaDaemonConfig, MediaDaemonHandle, MediaRestartPolicy,
     MediaRestartTracker, MediaState, NbdExportCatalog, NbdExportSource, NbdOverlayPolicy,
     NbdServer, NbdServerConfig, NbdServerHandle, NbdServerStats, OverlayConfig, Uac2Status,
     UsbError, UsbFunctionKind, UsbGadgetCapabilities, UsbGadgetController, UsbMediaHotplugKind,
@@ -80,6 +84,9 @@ use crate::multi_hls::{
 };
 use crate::multi_webrtc::{MultiConsoleWebrtc, MultiConsoleWebrtcStatus};
 use crate::usb_uac2::{Uac2BridgeError, Uac2BridgeShared};
+use crate::video::{
+    VideoParams, VideoStatus, VideoStreams, ALIAS as VIDEO_ALIAS, ROUTE as VIDEO_ROUTE,
+};
 use crate::webrtc::{WebRtcControl, WebRtcError, WebRtcGeometryStatus};
 
 /// HID packet type for an 8-byte boot keyboard report.
@@ -1622,9 +1629,11 @@ pub struct UsbControl {
     error: Option<String>,
     nbd: Arc<Mutex<Option<NbdRuntime>>>,
     media: Arc<Mutex<Option<MassStorageMediaRuntime>>>,
+    media_daemon: Arc<Mutex<Option<MediaDaemonRuntime>>>,
     media_auto: Arc<Mutex<MediaAutoStartState>>,
     hotplug: Arc<Mutex<UsbMediaHotplugState>>,
     uac2_bridge: Option<Uac2BridgeShared>,
+    usbip: Arc<Mutex<Option<UsbIpRuntime>>>,
 }
 
 struct NbdRuntime {
@@ -1913,6 +1922,12 @@ pub struct UsbMediaAutoStartConfig {
     pub max_transfer_bytes: Option<usize>,
     /// Bounded restart/backoff policy.
     pub restart: MediaRestartPolicy,
+    /// Explicit mounted FunctionFS directory for the background daemon.
+    ///
+    /// `None` keeps the node's existing configured-but-unattached export. When
+    /// set, the node starts a [`ozma_usb::FunctionFsMediaDaemon`] that owns the
+    /// bulk endpoints and uses `PollingFileBulkTransport`.
+    pub functionfs_mount: Option<PathBuf>,
 }
 
 impl UsbMediaAutoStartConfig {
@@ -1944,6 +1959,110 @@ struct MassStorageMediaRuntime {
     restart: MediaRestartTracker,
     pending_restart: Option<u64>,
     auto_start: bool,
+}
+
+/// Running USB/IP control/data listener and the adapters it selected.
+pub struct UsbIpRuntime {
+    handle: ozma_usb::UsbIpServerHandle,
+    adapter: &'static str,
+    host: String,
+    port: u16,
+}
+
+impl UsbIpRuntime {
+    /// Wrap a started server handle.
+    pub fn new(
+        handle: ozma_usb::UsbIpServerHandle,
+        adapter: &'static str,
+        host: impl Into<String>,
+        port: u16,
+    ) -> Self {
+        Self {
+            handle,
+            adapter,
+            host: host.into(),
+            port,
+        }
+    }
+
+    fn status_json(&self) -> Value {
+        let stats = self.handle.stats();
+        let local_addr = self.handle.local_addr();
+        serde_json::json!({
+            "ok": true,
+            "state": "listening",
+            "adapter": self.adapter,
+            "kernel_required": self.adapter == "kernel-required",
+            "host": self.host,
+            "port": local_addr.map_or(self.port, |address| address.port()),
+            "active_connections": self.handle.active_connections(),
+            "data_sessions": stats.imports,
+            "sessions": stats.sessions,
+            "connections_accepted": stats.connections_accepted,
+            "import_requests": stats.import_requests,
+            "import_failures": stats.import_failures,
+            "denied": stats.denied,
+            "protocol_errors": stats.protocol_errors,
+            "bytes_read": stats.bytes_read,
+            "bytes_written": stats.bytes_written,
+        })
+    }
+}
+
+/// Background FunctionFS media daemon owned by the node.
+struct MediaDaemonRuntime {
+    handle: MediaDaemonHandle,
+    function: String,
+    source: MediaExportSpec,
+    auto_start: bool,
+}
+
+impl MediaDaemonRuntime {
+    fn status_json(&self) -> Value {
+        let status = self.handle.status();
+        let capacity_bytes = std::fs::metadata(&self.source.path)
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.len());
+        serde_json::json!({
+            "ok": true,
+            "state": status.state.as_str(),
+            "running": status.running,
+            "configured": status.state.is_configured(),
+            "auto_start": self.auto_start,
+            "function": self.function,
+            "read_only": self.source.read_only,
+            "capacity": capacity_bytes.map(|bytes| serde_json::json!({
+                "sector_size": SCSI_SECTOR_BYTES,
+                "sectors": bytes / SCSI_SECTOR_BYTES as u64,
+                "bytes": bytes,
+            })),
+            "overlay": null,
+            "stats": status.stats,
+            "last_error": status.last_error,
+            "restart": {
+                "attempts": status.restart_attempts,
+                "max_attempts": self.source.restart.max_attempts,
+                "exhausted": status.restart_exhausted,
+                "pending_backoff_ms": status.pending_backoff_ms,
+                "reload_overlay": self.source.restart.reload_overlay,
+            },
+            "transport": {
+                "kind": "polling-file",
+                "attached": status.attached,
+                "enabled": status.enabled,
+                "live": status.live,
+                "events": status.counters.events,
+                "attaches": status.counters.attaches,
+                "detaches": status.counters.detaches,
+                "restarts": status.counters.restarts,
+                "enables": status.counters.enables,
+                "disables": status.counters.disables,
+                "unbinds": status.counters.unbinds,
+            },
+            "daemon_stats": status.daemon_stats,
+        })
+    }
 }
 
 /// Counters and restart visibility carried across a supervised rebuild.
@@ -2048,6 +2167,39 @@ impl UsbMediaOverlayStatus {
     }
 }
 
+/// Build the SCSI device described by `spec`.
+///
+/// Shared by the route-started export and the background FunctionFS daemon so
+/// both paths apply the same read-only policy, overlay persistence, and reload
+/// behaviour.
+fn build_media_device(spec: &MediaExportSpec, reload: bool) -> Result<MassStorageDevice, UsbError> {
+    let mut media = match spec.format {
+        UsbMediaFormat::Iso9660 => MassStorageImage::iso(&spec.path),
+        UsbMediaFormat::Fat32 => MassStorageImage::fat32(&spec.path),
+        _ => MassStorageImage::disk(&spec.path),
+    };
+    if spec.format == UsbMediaFormat::Raw {
+        media = media.with_read_only(spec.read_only)?;
+    }
+    media.validate_for_attach()?;
+
+    let policy = MassStoragePersistPolicy {
+        persist_on_flush: spec.persist_on_flush,
+        persist_on_stop: spec.persist_on_stop,
+    };
+    let persistence = spec.persist_path.as_ref().filter(|_| !spec.read_only);
+    let mut overlay_config = OverlayConfig::default();
+    if let Some(path) = persistence {
+        overlay_config = overlay_config.with_persistence(path);
+    }
+    if reload && persistence.is_some() {
+        let persist = persistence.expect("persistence was just checked");
+        MassStorageDevice::load_writable_file(&spec.path, overlay_config, policy, persist)
+    } else {
+        MassStorageDevice::from_media(&media, overlay_config, policy)
+    }
+}
+
 impl MassStorageMediaRuntime {
     fn status_json(&self) -> Value {
         let device = self.runner.device();
@@ -2105,9 +2257,11 @@ impl UsbControl {
             error: None,
             nbd: Arc::new(Mutex::new(None)),
             media: Arc::new(Mutex::new(None)),
+            media_daemon: Arc::new(Mutex::new(None)),
             media_auto: Arc::new(Mutex::new(MediaAutoStartState::default())),
             hotplug: Arc::new(Mutex::new(UsbMediaHotplugState::default())),
             uac2_bridge: None,
+            usbip: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -2120,10 +2274,23 @@ impl UsbControl {
             error: Some(reason.into()),
             nbd: Arc::new(Mutex::new(None)),
             media: Arc::new(Mutex::new(None)),
+            media_daemon: Arc::new(Mutex::new(None)),
             media_auto: Arc::new(Mutex::new(MediaAutoStartState::default())),
             hotplug: Arc::new(Mutex::new(UsbMediaHotplugState::default())),
             uac2_bridge: None,
+            usbip: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Attach a started USB/IP listener status.
+    pub fn set_usbip_runtime(&self, runtime: Option<UsbIpRuntime>) {
+        *lock(&self.usbip) = runtime;
+    }
+
+    /// Stop the USB/IP listener and return its final counters, if running.
+    pub fn shutdown_usbip(&self) -> Option<ozma_usb::UsbIpServerStats> {
+        let runtime = lock(&self.usbip).take()?;
+        Some(runtime.handle.stop())
     }
 
     /// Attach the runtime UAC2 bridge status snapshot.
@@ -2150,6 +2317,9 @@ impl UsbControl {
 
     /// Path-free status of the userspace SCSI media export.
     fn media_status_json(&self) -> Value {
+        if let Some(daemon) = lock(&self.media_daemon).as_ref() {
+            return daemon.status_json();
+        }
         let slot = lock(&self.media);
         let auto = lock(&self.media_auto);
         let auto_enabled = auto.config.is_some();
@@ -2186,31 +2356,7 @@ impl UsbControl {
         reload: bool,
         restore: Option<MediaRestore>,
     ) -> Result<MassStorageMediaRuntime, UsbError> {
-        let mut media = match spec.format {
-            UsbMediaFormat::Iso9660 => MassStorageImage::iso(&spec.path),
-            UsbMediaFormat::Fat32 => MassStorageImage::fat32(&spec.path),
-            _ => MassStorageImage::disk(&spec.path),
-        };
-        if spec.format == UsbMediaFormat::Raw {
-            media = media.with_read_only(spec.read_only)?;
-        }
-        media.validate_for_attach()?;
-
-        let policy = MassStoragePersistPolicy {
-            persist_on_flush: spec.persist_on_flush,
-            persist_on_stop: spec.persist_on_stop,
-        };
-        let persistence = spec.persist_path.as_ref().filter(|_| !spec.read_only);
-        let mut overlay_config = OverlayConfig::default();
-        if let Some(path) = persistence {
-            overlay_config = overlay_config.with_persistence(path);
-        }
-        let device = if reload && persistence.is_some() {
-            let persist = persistence.expect("persistence was just checked");
-            MassStorageDevice::load_writable_file(&spec.path, overlay_config, policy, persist)
-        } else {
-            MassStorageDevice::from_media(&media, overlay_config, policy)
-        }?;
+        let device = build_media_device(spec, reload)?;
 
         let loop_config = MassStorageLoopConfig {
             transfer_timeout_ms: spec.timeout_ms.unwrap_or(MASS_STORAGE_DEFAULT_TIMEOUT_MS),
@@ -2297,6 +2443,25 @@ impl UsbControl {
             .media_export_function(None)
             .unwrap_or_else(|_| crate::config::DEFAULT_USB_MASS_STORAGE_INSTANCE.to_owned());
         let spec = config.spec();
+        if let Some(mount) = config.functionfs_mount.clone() {
+            match self.start_media_daemon(&spec, &function, mount) {
+                Ok(()) => {
+                    info!(
+                        function = function.as_str(),
+                        restart_max_attempts = config.restart.max_attempts,
+                        "userspace SCSI media daemon started over FunctionFS polling endpoints"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        kind = error.kind(),
+                        "userspace SCSI media daemon did not start"
+                    );
+                    self.note_auto_start_failure(&error);
+                }
+            }
+            return;
+        }
         match self.build_media_runtime(&spec, &function, spec.reload, None) {
             Ok(mut runtime) => {
                 runtime.auto_start = true;
@@ -2324,6 +2489,59 @@ impl UsbControl {
                 self.note_auto_start_failure(&error);
             }
         }
+    }
+
+    /// Start the supervised FunctionFS media daemon for an explicit mount.
+    fn start_media_daemon(
+        &self,
+        spec: &MediaExportSpec,
+        function: &str,
+        mount: PathBuf,
+    ) -> Result<(), UsbError> {
+        let function_config = FunctionFsConfig::new("vendor0", 0x1d6b, 0x0106)
+            .with_interface(0xff, 0x00, 0x00)
+            .with_endpoint(FunctionFsEndpoint::bulk_out(1, 512))
+            .with_endpoint(FunctionFsEndpoint::bulk_in(2, 512));
+        let mount = FunctionFsMount::new(mount);
+        let loop_config = MassStorageLoopConfig {
+            transfer_timeout_ms: spec.timeout_ms.unwrap_or(MASS_STORAGE_DEFAULT_TIMEOUT_MS),
+            max_transfer_bytes: spec.max_transfer_bytes.unwrap_or(SCSI_MAX_TRANSFER_BYTES),
+            max_commands: None,
+        };
+        let transport = polling_transport_factory(
+            mount.clone(),
+            &function_config,
+            loop_config.transfer_timeout_ms,
+        )?;
+        let factory_spec = spec.clone();
+        let device_factory =
+            Box::new(move |reload: bool| build_media_device(&factory_spec, reload));
+        let daemon = FunctionFsMediaDaemon::file(
+            function_config,
+            mount,
+            device_factory,
+            transport,
+            MediaDaemonConfig {
+                loop_config,
+                restart: spec.restart,
+                ..MediaDaemonConfig::default()
+            },
+        )?;
+        let handle = daemon.spawn("usb-media-daemon")?;
+        let runtime = MediaDaemonRuntime {
+            handle,
+            function: function.to_owned(),
+            source: spec.clone(),
+            auto_start: true,
+        };
+        *lock(&self.media_daemon) = Some(runtime);
+        *lock(&self.media) = None;
+        self.record_media_hotplug(
+            UsbMediaHotplugKind::ExportStart,
+            Some(function.to_owned()),
+            Some("auto-start".to_owned()),
+        );
+        Ok(())
     }
 
     fn note_auto_start_failure(&self, error: &UsbError) {
@@ -2430,6 +2648,16 @@ impl UsbControl {
 
     /// Stop the export and apply its persistence policy during node shutdown.
     pub fn shutdown_media_export(&self) -> Result<(), UsbError> {
+        if let Some(daemon) = lock(&self.media_daemon).take() {
+            let function = Some(daemon.function.clone());
+            daemon.handle.shutdown();
+            self.record_media_hotplug(
+                UsbMediaHotplugKind::ExportStop,
+                function,
+                Some("shutdown".to_owned()),
+            );
+            return Ok(());
+        }
         let mut slot = lock(&self.media);
         let Some(runtime) = slot.as_mut() else {
             return Ok(());
@@ -3185,6 +3413,9 @@ pub struct ConnectionState {
     /// One-shot display snapshot control. `None` leaves `/display/snapshot`
     /// at a typed 503 rather than fabricating an image.
     pub snapshot: Option<SnapshotControl>,
+    /// Bounded `/video` MJPEG stream accounting. Always present; the route
+    /// itself reports a typed 503 when no snapshot control/source exists.
+    pub video_streams: VideoStreams,
     /// Bounded host sampler for the public `/agent/metrics` document.
     pub metrics: crate::agent_metrics::AgentMetricsSampler,
     /// Optional deep hardware sampler used to enrich `/agent/metrics` with
@@ -3280,6 +3511,7 @@ impl ConnectionState {
             usb: None,
             webrtc: None,
             snapshot: None,
+            video_streams: VideoStreams::default(),
             metrics: crate::agent_metrics::AgentMetricsSampler::default(),
             hardware: None,
             display_outputs: serde_json::json!([]),
@@ -3493,6 +3725,16 @@ impl ConnectionState {
         self
     }
 
+    /// Replace the default `/video` concurrent-stream allowance.
+    ///
+    /// The default is [`crate::video::DEFAULT_MAX_STREAMS`]; tests and
+    /// resource-constrained nodes can lower or raise it. Values below one are
+    /// clamped to one.
+    pub fn with_video_streams(mut self, streams: VideoStreams) -> Self {
+        self.video_streams = streams;
+        self
+    }
+
     /// True when the configured sink records without injecting.
     pub fn input_is_recording_only(&self) -> bool {
         matches!(
@@ -3564,6 +3806,9 @@ pub struct ConnectionResponse {
     pub multi_console_webrtc: Option<MultiConsoleWebrtcStatus>,
     /// Actual capture transport and enumerated source, or `available:false`.
     pub capture: CaptureStatus,
+    /// `/video` MJPEG route facts and live stream count. `active_streams` is
+    /// zero when idle; the document never claims a stream before one starts.
+    pub video: VideoStatus,
     /// Optional registration fields (seat, guest IP, VNC) plus typed entries for
     /// controller registration fields this node does not implement.
     pub registration: crate::registration::RegistrationExtras,
@@ -3580,13 +3825,13 @@ pub struct ConnectionResponse {
 /// layer so these endpoints are covered by the same bearer-token guard.
 ///
 /// This router deliberately excludes the controller's read-only probes
-/// (`/display/snapshot`, `/display/info`, `/node/status`, `/ui/hints`,
-/// `/agent/metrics`, `/audio/nodes`) and the always-unsupported
-/// `POST /audio/sweep` stub. Those live in [`public_router`] and must be merged
-/// **after** the guard layer so the unmodified controller can poll them without
-/// a bearer token. Control surfaces (`/input/*`, `/power/*`, `/audio/*`,
-/// `/codec`, `/webrtc/*`, `/display/mjpeg`, and the legacy mutating aliases)
-/// stay here and stay guarded.
+/// (`/display/snapshot`, `/display/info`, `/video`, `/display/mjpeg`,
+/// `/node/status`, `/ui/hints`, `/agent/metrics`, `/audio/nodes`) and the
+/// always-unsupported `POST /audio/sweep` stub. Those live in
+/// [`public_router`] and must be merged **after** the guard layer so the
+/// unmodified controller can poll them without a bearer token. Control
+/// surfaces (`/input/*`, `/power/*`, `/audio/*`, `/codec`, `/webrtc/*`, and the
+/// legacy mutating aliases) stay here and stay guarded.
 pub fn compat_router(state: ConnectionState) -> Router {
     connection_router(state.clone())
         .merge(power_router(state.clone()))
@@ -3606,6 +3851,8 @@ pub fn compat_router(state: ConnectionState) -> Router {
 ///
 /// * `GET /display/snapshot` (`controller/stream.py`,
 ///   `controller/terminal_bridge.py`, `controller/api.py`)
+/// * `GET /video` and `GET /display/mjpeg` — read-only MJPEG streams backed by
+///   the same capture registry and console broker as `/display/snapshot`
 /// * `GET /ui/hints` (`controller/agent_engine.py`, `controller/api.py`)
 /// * `GET /node/status` (`controller/mesh_intelligence.py`)
 /// * `GET /agent/metrics` (`controller/device_metrics.py`)
@@ -3618,6 +3865,8 @@ pub fn public_router(state: ConnectionState) -> Router {
     Router::new()
         .route("/display/snapshot", get(display_snapshot))
         .route("/snapshot", get(display_snapshot))
+        .route(VIDEO_ROUTE, get(video_stream))
+        .route(VIDEO_ALIAS, get(video_stream))
         .route("/display/info", get(display_info))
         .route("/node/status", get(node_status))
         .route("/status", get(node_status))
@@ -3729,14 +3978,12 @@ pub fn usb_router(state: ConnectionState) -> Router {
 
 /// Display compatibility control routes.
 ///
-/// `GET /display/snapshot` and `GET /display/info` are read-only and live in
-/// [`public_router`] so the controller's unauthenticated preview pollers work
-/// with `--api-token`. `GET /display/mjpeg` stays here as a guarded typed 501
-/// because no controller caller depends on it and it is not a media surface
-/// this node implements.
+/// `GET /display/snapshot`, `GET /display/info`, `GET /video`, and
+/// `GET /display/mjpeg` are read-only and live in [`public_router`] so the
+/// controller's unauthenticated preview pollers work with `--api-token`. This
+/// router keeps only the mutating console selector.
 pub fn display_router(state: ConnectionState) -> Router {
     Router::new()
-        .route("/display/mjpeg", get(display_mjpeg))
         .route("/display/select", post(display_select))
         .with_state(state)
 }
@@ -3868,6 +4115,7 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
         None => state.codecs.clone(),
     };
     let display = state.display_status();
+    let video = VideoStatus::new(state.snapshot.is_some(), &state.video_streams);
     Json(ConnectionResponse {
         ok: true,
         node_id: info.node_id.clone(),
@@ -3896,6 +4144,7 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
         multi_console_hls,
         multi_console_webrtc,
         capture: state.capture.clone(),
+        video,
         controller_surfaces: CONTROLLER_ONLY_SURFACES,
     })
 }
@@ -4086,14 +4335,126 @@ fn unavailable_display_info(last_error: Option<String>) -> DisplayInfo {
     }
 }
 
-async fn display_mjpeg(State(_state): State<ConnectionState>) -> Response {
+/// `GET /video` and `GET /display/mjpeg` — bounded multipart MJPEG stream.
+///
+/// The first frame is captured before the response is committed, so a missing
+/// source, unknown console, or single-head conflict is a typed status instead
+/// of a 200 with an empty stream. Subsequent frames come from the same cached
+/// capture source and are dropped (not queued without bound) when the client
+/// stops reading. Disconnecting releases the source and the stream slot.
+async fn video_stream(
+    State(state): State<ConnectionState>,
+    Query(params): Query<VideoParams>,
+) -> Response {
+    let options = match params.options() {
+        Ok(options) => options,
+        Err(error) => {
+            return compat_error_with_remediation(
+                StatusCode::BAD_REQUEST,
+                "video.invalid_query",
+                error.message,
+                Some(
+                    "Use ?fps=1..30&quality=1..100&console=<N|label|Console_N|source-id>; \
+                     numeric values outside those bounds are clamped.",
+                ),
+            )
+        }
+    };
+
+    let control = match video_control(&state, params.console.as_deref(), options.quality).await {
+        Ok(control) => control,
+        Err(error) => return snapshot_error_response(error),
+    };
+
+    let Some(guard) = state.video_streams.try_start() else {
+        return video_stream_limit_response(&state);
+    };
+
+    let first = match control.capture().await {
+        Ok(frame) => frame,
+        Err(error) => {
+            control.shutdown().await;
+            return snapshot_error_response(error);
+        }
+    };
+
+    let (receiver, _task) = crate::video::spawn_stream(control, first, options, guard);
+    let body = Body::from_stream(stream::unfold(receiver, |mut receiver| async move {
+        receiver.recv().await.map(|item| (item, receiver))
+    }));
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(crate::video::CONTENT_TYPE),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.insert(
+        axum::http::HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("x-ozma-fps"),
+        HeaderValue::from_str(&options.fps.to_string()).expect("fps is numeric"),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("x-ozma-quality"),
+        HeaderValue::from_str(&options.quality.to_string()).expect("quality is numeric"),
+    );
+    response
+}
+
+/// Select the snapshot control for a `/video` request.
+///
+/// No `?console=` uses the active one-shot control (which follows the runtime
+/// registry slot). A named active console does the same; a non-active console
+/// is resolved and opened through the bounded [`ConsoleBroker`], exactly like
+/// `/display/snapshot?console=`.
+async fn video_control(
+    state: &ConnectionState,
+    console: Option<&str>,
+    quality: u8,
+) -> Result<SnapshotControl, SnapshotError> {
+    let Some(requested) = console else {
+        return state
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.streaming(Some(quality)))
+            .ok_or(SnapshotError::NotConfigured);
+    };
+
+    let Some(display) = state.display_control.as_ref() else {
+        return Err(SnapshotError::ConsoleUnsupported);
+    };
+    let Some(broker) = state.console_broker.as_ref() else {
+        return Err(SnapshotError::ConsoleUnsupported);
+    };
+    let selection = display.selection();
+    let index = broker.resolve_console(Some(requested), &selection)?;
+    if index == selection.active_console {
+        return state
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.streaming(Some(quality)))
+            .ok_or(SnapshotError::NotConfigured);
+    }
+    broker
+        .streaming_control(index, &selection, Some(quality))
+        .await
+}
+
+/// Typed 503 when every allowed `/video` slot is already in use.
+fn video_stream_limit_response(state: &ConnectionState) -> Response {
+    let max = state.video_streams.limit();
     compat_error_with_remediation(
-        StatusCode::NOT_IMPLEMENTED,
-        "display.mjpeg_unsupported",
-        "This node does not provide a multipart MJPEG stream.",
+        StatusCode::SERVICE_UNAVAILABLE,
+        "video.stream_limit",
+        format!("This node is already serving its limit of {max} MJPEG stream(s)."),
         Some(
-            "Use GET /display/snapshot for a single JPEG frame; the controller polls that \
-             endpoint for previews. A real MJPEG stream is not implemented.",
+            "Close an existing /video or /display/mjpeg stream, or use GET /display/snapshot \
+             for a single JPEG frame. No frame is fabricated for a rejected stream.",
         ),
     )
 }
@@ -4272,6 +4633,16 @@ async fn usb_status(State(state): State<ConnectionState>) -> Response {
                 "attached_scan": false,
             });
             body["media_export"] = control.media_status_json();
+            body["usbip"] = match lock(&control.usbip).as_ref() {
+                Some(runtime) => runtime.status_json(),
+                None => serde_json::json!({
+                    "ok": true,
+                    "state": "not-configured",
+                    "adapter": "kernel-required",
+                    "kernel_required": true,
+                    "data_sessions": 0,
+                }),
+            };
             if let Some(error) = control.uac2_bridge_error() {
                 body["uac2_bridge_error"] = serde_json::json!({
                     "kind": error.kind,
@@ -4360,9 +4731,10 @@ async fn usb_media_start(
     if let Err(response) = control.controller() {
         return response;
     }
-    if lock(&control.media)
-        .as_ref()
-        .is_some_and(|runtime| runtime.state != MassStorageMediaState::Stopped)
+    if lock(&control.media_daemon).is_some()
+        || lock(&control.media)
+            .as_ref()
+            .is_some_and(|runtime| runtime.state != MassStorageMediaState::Stopped)
     {
         return media_export_conflict();
     }
@@ -4390,6 +4762,17 @@ async fn usb_media_stop(State(state): State<ConnectionState>) -> Response {
     let Some(control) = state.usb.as_ref() else {
         return usb_not_configured();
     };
+    if let Some(daemon) = lock(&control.media_daemon).as_ref() {
+        let function = Some(daemon.function.clone());
+        daemon.handle.shutdown();
+        let body = daemon.status_json();
+        control.record_media_hotplug(
+            UsbMediaHotplugKind::ExportStop,
+            function,
+            Some("stopped".to_owned()),
+        );
+        return Json(body).into_response();
+    }
     let mut slot = lock(&control.media);
     let Some(runtime) = slot.as_mut() else {
         return media_export_not_running();
@@ -6540,6 +6923,7 @@ fn webrtc_bitrate_failure(error: WebRtcError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::display_control::ConsoleSourceFactory;
     use crate::hls::{
         ffmpeg_argv, EncoderAvailability, EncoderProbe, FfmpegSpawner, FrameSink, HlsConfig,
         HlsController, HlsEncoder, HlsError, HlsSourceFactory, SpawnedFfmpeg, StaticEncoderProbe,
@@ -6548,6 +6932,7 @@ mod tests {
     use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use futures_util::StreamExt;
     use http_body_util::BodyExt;
     use ozma_capture::{CaptureRegistry, FakeCaptureProvider};
     use ozma_input::{FakeInputSink, InputSink, RecordingSink};
@@ -8111,8 +8496,7 @@ mod tests {
         assert!(body["remediation"].as_str().unwrap().contains("rgb24"));
     }
 
-    #[tokio::test]
-    async fn display_mjpeg_is_a_typed_501_not_a_fake_stream() {
+    fn video_state(streams: Option<VideoStreams>) -> ConnectionState {
         let state = ConnectionState::new(
             ConnectionInfo::new(
                 "node-a._ozma._udp.local.",
@@ -8123,12 +8507,306 @@ mod tests {
                 SINK_FAKE_RECORDING,
             ),
             CompatStats::default(),
+        )
+        .with_snapshot(Some(SnapshotControl::new(
+            CaptureRegistry::new().with(FakeCaptureProvider::new()),
+        )));
+        match streams {
+            Some(streams) => state.with_video_streams(streams),
+            None => state,
+        }
+    }
+
+    async fn wait_for_video_idle(streams: &VideoStreams) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while streams.active() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stream slot was not released after disconnect"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn video_stream_has_multipart_headers_and_real_changing_frames() {
+        let app = public_router(video_state(None));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/video?fps=30&quality=60")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "multipart/x-mixed-replace; boundary=ozma-frame"
         );
-        let (status, body) = get_json(&display_router(state), "/display/mjpeg").await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(response.headers()["x-ozma-fps"], "30");
+        assert_eq!(response.headers()["x-ozma-quality"], "60");
+
+        let (frames, _) = read_mjpeg_frames(response, 3).await;
+        assert!(frames.len() >= 3, "expected at least three frames");
+        for frame in &frames {
+            assert!(frame.starts_with(&[0xFF, 0xD8]), "not a JPEG frame");
+            assert_eq!(jpeg_size(frame), (320, 240));
+        }
+        assert_ne!(frames[0], frames[1], "frames must change over time");
+    }
+
+    #[tokio::test]
+    async fn video_stream_honours_fps_bound_and_stops_on_disconnect() {
+        let streams = VideoStreams::new(1);
+        let state = video_state(Some(streams.clone()));
+        let app = public_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/video?fps=2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(streams.active(), 1);
+
+        let (frames, elapsed) = read_mjpeg_frames(response, 3).await;
+        assert!(frames.len() >= 3);
+        // First frame is immediate; the next two are at 500 ms intervals.
+        assert!(
+            elapsed >= Duration::from_millis(700),
+            "fps=2 stream produced frames too quickly: {elapsed:?}"
+        );
+        wait_for_video_idle(&streams).await;
+    }
+
+    #[tokio::test]
+    async fn video_stream_caps_concurrent_clients_and_recovers_after_disconnect() {
+        let streams = VideoStreams::new(1);
+        let state = video_state(Some(streams.clone()));
+        let app = public_router(state);
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/video?fps=30")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(streams.active(), 1);
+
+        let (status, body) = get_json(&app, "/video?fps=30").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["ok"], false);
-        assert_eq!(body["code"], "display.mjpeg_unsupported");
-        assert!(body["remediation"].is_string());
+        assert_eq!(body["code"], "video.stream_limit");
+        assert!(body["remediation"]
+            .as_str()
+            .unwrap()
+            .contains("/display/snapshot"));
+
+        drop(first);
+        wait_for_video_idle(&streams).await;
+
+        let after = app
+            .oneshot(
+                Request::builder()
+                    .uri("/video?fps=30")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(after.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn video_stream_reports_unavailable_sources_and_bad_queries_typed() {
+        let no_source = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_snapshot(Some(SnapshotControl::new(CaptureRegistry::new())));
+        let (status, body) = get_json(&public_router(no_source), "/video").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "capture.unavailable");
+
+        let not_configured = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        );
+        let (status, body) = get_json(&public_router(not_configured), "/video").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "capture.unavailable");
+
+        let (status, body) = get_json(&public_router(video_state(None)), "/video?fps=fast").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "video.invalid_query");
+        assert!(body["error"].as_str().unwrap().contains("fps"));
+    }
+
+    struct VideoConsoleFactory;
+
+    impl crate::display_control::ConsoleSourceFactory for VideoConsoleFactory {
+        fn provider(&self) -> Option<ozma_display::vm::VmConsoleBackend> {
+            Some(ozma_display::vm::VmConsoleBackend::Dbus)
+        }
+
+        fn default_console(&self) -> u32 {
+            0
+        }
+
+        fn supports_console_switch(&self) -> bool {
+            true
+        }
+
+        fn registry(&self, console: u32) -> Result<CaptureRegistry, String> {
+            let (width, height) = if console == 0 { (32, 24) } else { (64, 48) };
+            Ok(CaptureRegistry::new().with(
+                FakeCaptureProvider::new()
+                    .with_identity(format!("console-{console}"), format!("Console_{console}"))
+                    .with_format(FrameFormat::rgb24(width, height)),
+            ))
+        }
+
+        fn selection(
+            &self,
+            console: u32,
+        ) -> Result<crate::display_outputs::DisplayOutputSelection, String> {
+            crate::display_outputs::outputs_from_specs(
+                &[
+                    "0:Console_0:1920x1080:primary:dbus".to_owned(),
+                    "1:Console_1:1280x1024:dbus".to_owned(),
+                ],
+                ozma_display::vm::VmConsoleBackend::Dbus,
+                Some("dbus0"),
+                Some(console),
+            )
+        }
+    }
+
+    fn video_console_state() -> ConnectionState {
+        let factory = Arc::new(VideoConsoleFactory);
+        let slot = Arc::new(std::sync::RwLock::new(
+            factory.registry(0).expect("active registry"),
+        ));
+        let control =
+            DisplayControl::new(factory.clone(), slot, Vec::new()).expect("display control");
+        let broker = crate::display_broker::ConsoleBroker::new(
+            factory.clone(),
+            crate::display_broker::ConsoleBrokerConfig::default(),
+        );
+        ConnectionState::new(
+            ConnectionInfo::new(
+                "vm-a._ozma._udp.local.",
+                "vm",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_snapshot(Some(SnapshotControl::new(
+            factory.registry(0).expect("active registry"),
+        )))
+        .with_display_control(Some(control))
+        .with_console_broker(Some(broker))
+    }
+
+    #[tokio::test]
+    async fn video_stream_honours_console_selection() {
+        let state = video_console_state();
+        let app = public_router(state);
+
+        let non_active = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/video?console=Console_1&fps=30")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(non_active.status(), StatusCode::OK);
+        let (frames, _) = read_mjpeg_frames(non_active, 2).await;
+        assert!(frames.len() >= 2);
+        assert_eq!(jpeg_size(&frames[0]), (64, 48));
+
+        let active = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/video?console=0&fps=30")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(active.status(), StatusCode::OK);
+        let (frames, _) = read_mjpeg_frames(active, 2).await;
+        assert!(frames.len() >= 2);
+        assert_eq!(jpeg_size(&frames[0]), (32, 24));
+
+        let (status, body) = get_json(&app, "/video?console=Console_9").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn connection_reports_video_availability_without_claiming_a_stream() {
+        let streams = VideoStreams::new(2);
+        let state = video_state(Some(streams.clone()));
+        let connection_app = connection_router(state.clone());
+        let public_app = public_router(state);
+
+        let (status, idle) = get_json(&connection_app, "/api/v1/connection").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(idle["video"]["supported"], true);
+        assert_eq!(idle["video"]["available"], true);
+        assert_eq!(idle["video"]["route"], "/video");
+        assert_eq!(idle["video"]["alias"], "/display/mjpeg");
+        assert_eq!(idle["video"]["active_streams"], 0);
+        assert_eq!(idle["video"]["max_streams"], 2);
+        assert_eq!(idle["video"]["encoding"], "jpeg");
+
+        let response = public_app
+            .oneshot(
+                Request::builder()
+                    .uri("/display/mjpeg?fps=30")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let (_, live) = get_json(&connection_app, "/api/v1/connection").await;
+        assert_eq!(live["video"]["active_streams"], 1);
+        drop(response);
+        wait_for_video_idle(&streams).await;
     }
 
     #[tokio::test]
@@ -8761,6 +9439,84 @@ mod tests {
         let status = response.status();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        if needle.is_empty() {
+            return Some(0);
+        }
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    fn mjpeg_parts(body: &[u8]) -> Vec<Vec<u8>> {
+        let marker = b"--ozma-frame";
+        let mut frames = Vec::new();
+        let mut rest = body;
+        while let Some(position) = find_bytes(rest, marker) {
+            rest = &rest[position + marker.len()..];
+            if rest.starts_with(b"\r\n") {
+                rest = &rest[2..];
+            }
+            let Some(headers_end) = find_bytes(rest, b"\r\n\r\n") else {
+                break;
+            };
+            let headers = rest[..headers_end].to_ascii_lowercase();
+            let Some(length_at) = find_bytes(&headers, b"content-length:") else {
+                break;
+            };
+            let length_text = &headers[length_at + "content-length:".len()..];
+            let length_end = find_bytes(length_text, b"\r\n").unwrap_or(length_text.len());
+            let Ok(length) = std::str::from_utf8(&length_text[..length_end])
+                .unwrap_or("")
+                .trim()
+                .parse::<usize>()
+            else {
+                break;
+            };
+            let body_start = headers_end + 4;
+            let Some(body_end) = body_start.checked_add(length) else {
+                break;
+            };
+            if rest.len() < body_end {
+                break;
+            }
+            frames.push(rest[body_start..body_end].to_vec());
+            rest = &rest[body_end..];
+        }
+        frames
+    }
+
+    /// Read multipart parts until `minimum` real JPEGs have arrived.
+    async fn read_mjpeg_frames(
+        response: axum::response::Response,
+        minimum: usize,
+    ) -> (Vec<Vec<u8>>, Duration) {
+        let started = std::time::Instant::now();
+        let limit = Duration::from_secs(5);
+        let mut chunks = response.into_body().into_data_stream();
+        let mut buffer = Vec::new();
+        while started.elapsed() < limit {
+            let remaining = limit.saturating_sub(started.elapsed());
+            let next = tokio::time::timeout(remaining, chunks.next()).await;
+            let Ok(Some(Ok(chunk))) = next else {
+                break;
+            };
+            buffer.extend_from_slice(&chunk);
+            let frames = mjpeg_parts(&buffer);
+            if frames.len() >= minimum {
+                return (frames, started.elapsed());
+            }
+        }
+        (mjpeg_parts(&buffer), started.elapsed())
+    }
+
+    fn jpeg_size(jpeg: &[u8]) -> (u16, u16) {
+        let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(jpeg));
+        decoder.decode().expect("valid JPEG frame");
+        let info = decoder.info().expect("JPEG info");
+        (info.width, info.height)
     }
 
     #[test]
@@ -11905,6 +12661,7 @@ mod tests {
             timeout_ms: None,
             max_transfer_bytes: None,
             restart,
+            functionfs_mount: None,
         }
     }
 
@@ -11971,6 +12728,71 @@ mod tests {
         assert_eq!(vendor["requires_userspace"], true);
         assert_eq!(vendor["function_fs"]["ready"], false);
         assert_eq!(vendor["function_fs"]["readiness"], "daemon_not_configured");
+    }
+
+    #[tokio::test]
+    async fn usb_status_defaults_usbip_to_kernel_required_without_counters() {
+        let (state, _) = usb_fake_state();
+        let (status, body) = get_json(&usb_router(state), "/usb").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["usbip"]["state"], "not-configured");
+        assert_eq!(body["usbip"]["adapter"], "kernel-required");
+        assert_eq!(body["usbip"]["kernel_required"], true);
+        assert_eq!(body["usbip"]["data_sessions"], 0);
+    }
+
+    #[tokio::test]
+    async fn media_auto_start_selects_the_polling_functionfs_daemon() {
+        let (state, _) = usb_fake_state();
+        let control = state.usb.as_ref().unwrap().clone();
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base.img");
+        std::fs::write(&base, vec![0u8; SCSI_SECTOR_BYTES * 4]).unwrap();
+        std::fs::write(temp.path().join("ep0"), b"").unwrap();
+
+        let auto = UsbMediaAutoStartConfig {
+            path: base,
+            format: UsbMediaFormat::Raw,
+            read_only: true,
+            persist_path: None,
+            persist_on_flush: true,
+            persist_on_stop: true,
+            reload: false,
+            timeout_ms: Some(50),
+            max_transfer_bytes: None,
+            restart: MediaRestartPolicy::default(),
+            functionfs_mount: Some(temp.path().to_path_buf()),
+        };
+        control.auto_start_media_export(&auto);
+
+        // The worker writes descriptors and waits for ENABLE; no fake transport
+        // may report `running` before a real command cycle.
+        let mut body = Value::Null;
+        for _ in 0..100 {
+            let (status, candidate) = get_json(&usb_router(state.clone()), "/usb/media").await;
+            assert_eq!(status, StatusCode::OK);
+            body = candidate;
+            if body["state"] == "waiting-for-enable" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(body["state"], "waiting-for-enable");
+        assert_eq!(body["running"], false);
+        assert_eq!(body["stats"]["commands"], 0);
+        assert_eq!(body["transport"]["kind"], "polling-file");
+        assert_eq!(body["transport"]["attached"], false);
+        assert_eq!(body["transport"]["live"], false);
+
+        let router = usb_router(state.clone());
+        let (status, body) = post_json(&router, "/usb/media/stop", Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["state"], "stopped");
+        assert_eq!(body["running"], false);
+        let (_, body) = get_json(&usb_router(state), "/usb/media").await;
+        assert_eq!(body["state"], "stopped");
+        assert_eq!(body["running"], false);
+        control.shutdown_media_export().unwrap();
     }
 
     #[tokio::test]

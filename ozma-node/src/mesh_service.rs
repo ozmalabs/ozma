@@ -37,6 +37,12 @@ use ozma_mesh::dataplane::{
 };
 #[cfg(test)]
 use ozma_mesh::dataplane::{CommandSpec, FileOpener, NatConfig};
+use ozma_mesh::pump::{
+    ManagerPacketIo, PacketPump, PumpConfig, PumpError, PumpState, PumpStatus, SystemTunProvider,
+    TunProvider, TunnelIo,
+};
+#[cfg(test)]
+use ozma_mesh::pump::{PumpStats, TunIo};
 use ozma_mesh::{MeshManager, MeshNode, WgPrivateKey};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -98,6 +104,15 @@ impl MeshServiceError {
 
 impl From<DataplaneError> for MeshServiceError {
     fn from(error: DataplaneError) -> Self {
+        Self {
+            code: error.code,
+            reason: error.reason,
+        }
+    }
+}
+
+impl From<PumpError> for MeshServiceError {
+    fn from(error: PumpError) -> Self {
         Self {
             code: error.code,
             reason: error.reason,
@@ -455,6 +470,12 @@ pub trait MeshBackend: Send + Sync {
     fn identity(&self) -> Option<MeshIdentity>;
     fn state(&self) -> MeshState;
     fn error(&self) -> Option<MeshServiceError>;
+
+    /// Packet API exposed by the running tunnel, if it has one. `None` means no
+    /// pump can be started; the service never fabricates a tunnel packet path.
+    fn tunnel_io(&self) -> Option<Arc<dyn TunnelIo>> {
+        None
+    }
 }
 
 /// Explicit unsupported backend used when preflight fails.
@@ -504,8 +525,11 @@ pub struct BoringtunMeshBackend {
     private_key: WgPrivateKey,
     configured_peers: Vec<MeshNode>,
     /// `MeshManager` is `Send` but not `Sync` (libmdns uses an internal
-    /// `RefCell`), so it lives behind a Tokio mutex instead of an `Arc`.
-    manager: tokio::sync::Mutex<Option<MeshManager>>,
+    /// `RefCell`), so it lives behind a Tokio mutex. The mutex is shared with
+    /// the packet-pump adapter so outbound packets use the same peer tunnels.
+    manager: Arc<tokio::sync::Mutex<Option<MeshManager>>>,
+    /// Packet API exposed to the pump while the tunnel is running.
+    tunnel_io: Mutex<Option<Arc<dyn TunnelIo>>>,
     state: Mutex<MeshState>,
     error: Mutex<Option<MeshServiceError>>,
     peer_states: Mutex<BTreeMap<String, MeshTunnelState>>,
@@ -523,7 +547,8 @@ impl BoringtunMeshBackend {
             identity,
             private_key,
             configured_peers,
-            manager: tokio::sync::Mutex::new(None),
+            manager: Arc::new(tokio::sync::Mutex::new(None)),
+            tunnel_io: Mutex::new(None),
             state: Mutex::new(MeshState::Stopped),
             error: Mutex::new(None),
             peer_states: Mutex::new(BTreeMap::new()),
@@ -573,6 +598,10 @@ impl MeshBackend for BoringtunMeshBackend {
         }
         self.set_state(MeshState::Starting);
         self.set_error(None);
+        *self
+            .tunnel_io
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
 
         let mut manager = self.manager.lock().await;
         if manager.is_none() {
@@ -621,12 +650,25 @@ impl MeshBackend for BoringtunMeshBackend {
             return Err(typed);
         }
 
+        if let Some(receiver) = manager.take_packet_receiver() {
+            let io: Arc<dyn TunnelIo> =
+                Arc::new(ManagerPacketIo::new(Arc::clone(&self.manager), receiver));
+            *self
+                .tunnel_io
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(io);
+        }
+
         self.set_state(MeshState::Running);
         self.set_error(None);
         Ok(())
     }
 
     async fn stop(&self) -> Result<(), MeshServiceError> {
+        *self
+            .tunnel_io
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
         let manager = self.manager.lock().await.take();
         if let Some(manager) = manager {
             manager.stop();
@@ -719,6 +761,13 @@ impl MeshBackend for BoringtunMeshBackend {
             .unwrap_or_else(|error| error.into_inner())
             .clone()
     }
+
+    fn tunnel_io(&self) -> Option<Arc<dyn TunnelIo>> {
+        self.tunnel_io
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
 }
 
 /// In-memory backend used by tests. It never binds a socket, touches root, or
@@ -729,6 +778,7 @@ pub struct FakeMeshBackend {
     peers: Mutex<BTreeMap<String, MeshPeerView>>,
     error: Mutex<Option<MeshServiceError>>,
     start_error: Mutex<Option<MeshServiceError>>,
+    tunnel_io: Mutex<Option<Arc<dyn TunnelIo>>>,
     log: MeshEventLog,
 }
 
@@ -740,6 +790,7 @@ impl FakeMeshBackend {
             peers: Mutex::new(BTreeMap::new()),
             error: Mutex::new(None),
             start_error: Mutex::new(None),
+            tunnel_io: Mutex::new(None),
             log,
         }
     }
@@ -750,6 +801,14 @@ impl FakeMeshBackend {
             .start_error
             .lock()
             .unwrap_or_else(|value| value.into_inner()) = Some(error);
+    }
+
+    /// Expose a fake tunnel packet API while the backend is running (tests).
+    pub fn set_tunnel_io(&self, io: Arc<dyn TunnelIo>) {
+        *self
+            .tunnel_io
+            .lock()
+            .unwrap_or_else(|value| value.into_inner()) = Some(io);
     }
 
     fn set_state(&self, state: MeshState) {
@@ -883,6 +942,16 @@ impl MeshBackend for FakeMeshBackend {
             .unwrap_or_else(|error| error.into_inner())
             .clone()
     }
+
+    fn tunnel_io(&self) -> Option<Arc<dyn TunnelIo>> {
+        if self.state() != MeshState::Running {
+            return None;
+        }
+        self.tunnel_io
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
 }
 
 /// Bounded, cloneable node-side mesh service.
@@ -891,6 +960,12 @@ pub struct MeshService {
     backend: Arc<dyn MeshBackend>,
     /// Optional kernel dataplane. `None` leaves the service userspace-only.
     dataplane: Option<Arc<MeshDataplane>>,
+    /// Optional TUN provider. Only set when both the dataplane and packet pump
+    /// are requested; the pump itself starts after both runtime parts are up.
+    tun_provider: Option<Arc<dyn TunProvider>>,
+    pump: Arc<Mutex<Option<PacketPump>>>,
+    pump_error: Arc<Mutex<Option<PumpError>>>,
+    pump_monitor: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     log: MeshEventLog,
 }
 
@@ -903,20 +978,42 @@ impl MeshService {
     /// produce an explicit unsupported service rather than an error the node
     /// would have to fabricate around.
     pub fn from_config(config: MeshServiceConfig, environment: &MeshEnvironment) -> Self {
-        Self::from_config_with_seams(
+        let tun_provider: Option<Arc<dyn TunProvider>> = config
+            .dataplane
+            .as_ref()
+            .map(|_| Arc::new(SystemTunProvider::new()) as Arc<dyn TunProvider>);
+        Self::from_config_with_seams_and_tun(
             config,
             environment,
             Arc::new(SystemCommandRunner::new()),
             Arc::new(SystemSysfs::new()),
+            tun_provider,
         )
     }
 
     /// Build a service with injectable dataplane seams (tests/embedding).
+    ///
+    /// This constructor deliberately does not attach a real TUN; callers that
+    /// want the packet pump must use
+    /// [`MeshService::from_config_with_seams_and_tun`].
     pub fn from_config_with_seams(
         config: MeshServiceConfig,
         environment: &MeshEnvironment,
         runner: Arc<dyn CommandRunner>,
         sysfs: Arc<dyn Sysfs>,
+    ) -> Self {
+        Self::from_config_with_seams_and_tun(config, environment, runner, sysfs, None)
+    }
+
+    /// Build a service with injectable dataplane seams and an optional TUN
+    /// provider. Providing a provider enables the packet pump after both the
+    /// dataplane and tunnel are running.
+    pub fn from_config_with_seams_and_tun(
+        config: MeshServiceConfig,
+        environment: &MeshEnvironment,
+        runner: Arc<dyn CommandRunner>,
+        sysfs: Arc<dyn Sysfs>,
+        tun_provider: Option<Arc<dyn TunProvider>>,
     ) -> Self {
         let capacity = config
             .event_capacity
@@ -942,6 +1039,10 @@ impl MeshService {
         Self {
             backend: Arc::new(backend),
             dataplane,
+            tun_provider: tun_provider.filter(|_| config.dataplane.is_some()),
+            pump: Arc::new(Mutex::new(None)),
+            pump_error: Arc::new(Mutex::new(None)),
+            pump_monitor: Arc::new(Mutex::new(None)),
             log,
         }
     }
@@ -954,6 +1055,10 @@ impl MeshService {
                 identity: None,
             }),
             dataplane: None,
+            tun_provider: None,
+            pump: Arc::new(Mutex::new(None)),
+            pump_error: Arc::new(Mutex::new(None)),
+            pump_monitor: Arc::new(Mutex::new(None)),
             log,
         }
     }
@@ -969,9 +1074,25 @@ impl MeshService {
         dataplane: Option<Arc<MeshDataplane>>,
         log: MeshEventLog,
     ) -> Self {
+        Self::with_backend_dataplane_and_tun(backend, dataplane, log, None)
+    }
+
+    /// Build a service with caller-supplied backend, dataplane, and TUN provider
+    /// (tests/embedding). The provider is only used when a dataplane exists.
+    pub fn with_backend_dataplane_and_tun(
+        backend: Arc<dyn MeshBackend>,
+        dataplane: Option<Arc<MeshDataplane>>,
+        log: MeshEventLog,
+        tun_provider: Option<Arc<dyn TunProvider>>,
+    ) -> Self {
+        let has_dataplane = dataplane.is_some();
         Self {
             backend,
             dataplane,
+            tun_provider: tun_provider.filter(|_| has_dataplane),
+            pump: Arc::new(Mutex::new(None)),
+            pump_error: Arc::new(Mutex::new(None)),
+            pump_monitor: Arc::new(Mutex::new(None)),
             log,
         }
     }
@@ -980,45 +1101,161 @@ impl MeshService {
         self.log.clone()
     }
 
+    /// Status of the packet pump, present only when both a dataplane and TUN
+    /// provider are configured. A configured but not-yet-started pump reports
+    /// `stopped` with zero counters, never fabricated traffic.
+    pub fn pump_status(&self) -> Option<PumpStatus> {
+        self.tun_provider.as_ref()?;
+        let dataplane = self.dataplane.as_ref()?;
+        let interface = Some(dataplane.config().interface.clone());
+        let pump = self
+            .pump
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        Some(match pump {
+            Some(pump) => pump.status(interface),
+            None => {
+                let mut status =
+                    PumpStatus::stopped(interface, PumpConfig::default().queue_capacity);
+                if let Some(error) = self
+                    .pump_error
+                    .lock()
+                    .unwrap_or_else(|value| value.into_inner())
+                    .clone()
+                {
+                    status.state = PumpState::Failed;
+                    status.last_error = Some(error);
+                }
+                status
+            }
+        })
+    }
+
+    fn set_pump_error(&self, error: Option<PumpError>) {
+        *self
+            .pump_error
+            .lock()
+            .unwrap_or_else(|value| value.into_inner()) = error;
+    }
+
+    /// Handle to the running packet pump, if any (tests/diagnostics).
+    pub fn packet_pump(&self) -> Option<PacketPump> {
+        self.pump
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
     /// Effective service state. When a dataplane is configured it must be
     /// running too; a failed or still-starting dataplane is never reported as
-    /// `running`.
+    /// `running`. A configured pump must also be running, so the service never
+    /// claims `running` while the TUN packet path is down.
     pub fn state(&self) -> MeshState {
         let backend = self.backend.state();
-        let Some(dataplane) = &self.dataplane else {
-            return backend;
+        let base = match &self.dataplane {
+            None => backend,
+            Some(dataplane) => match dataplane.status().state {
+                DataplaneState::Failed => MeshState::Failed,
+                DataplaneState::Starting => MeshState::Starting,
+                DataplaneState::Running => backend,
+                DataplaneState::Stopped | DataplaneState::NotConfigured => {
+                    if backend == MeshState::Running {
+                        MeshState::Starting
+                    } else {
+                        backend
+                    }
+                }
+            },
         };
-        match dataplane.status().state {
-            DataplaneState::Failed => MeshState::Failed,
-            DataplaneState::Starting => MeshState::Starting,
-            DataplaneState::Running => backend,
-            DataplaneState::Stopped | DataplaneState::NotConfigured => {
-                if backend == MeshState::Running {
-                    MeshState::Starting
-                } else {
-                    backend
+        if let Some(pump) = self.pump_status() {
+            match pump.state {
+                PumpState::Failed => return MeshState::Failed,
+                PumpState::Starting => return MeshState::Starting,
+                PumpState::Running => {}
+                PumpState::Stopped | PumpState::NotConfigured => {
+                    if base == MeshState::Running {
+                        return MeshState::Starting;
+                    }
                 }
             }
         }
+        base
     }
 
     pub fn error(&self) -> Option<MeshServiceError> {
-        self.backend.error().or_else(|| {
-            self.dataplane
-                .as_ref()
-                .and_then(|dataplane| dataplane.status().last_error)
-                .map(MeshServiceError::from)
-        })
+        self.backend
+            .error()
+            .or_else(|| {
+                self.pump_status()
+                    .and_then(|pump| pump.last_error)
+                    .map(MeshServiceError::from)
+            })
+            .or_else(|| {
+                self.dataplane
+                    .as_ref()
+                    .and_then(|dataplane| dataplane.status().last_error)
+                    .map(MeshServiceError::from)
+            })
     }
 
     pub fn identity(&self) -> Option<MeshIdentity> {
         self.backend.identity()
     }
 
+    fn stop_packet_pump(&self) -> bool {
+        self.set_pump_error(None);
+        if let Some(monitor) = self
+            .pump_monitor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            monitor.abort();
+        }
+        let pump = self
+            .pump
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        match pump {
+            Some(pump) => {
+                pump.stop();
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn spawn_pump_monitor(&self, pump: PacketPump) {
+        let service = self.clone();
+        let handle = tokio::spawn(async move {
+            if let Some(error) = pump.wait_failed().await {
+                service.log.record(
+                    MeshEventKind::Error,
+                    format!("mesh packet pump failed: {}", error.reason),
+                    None,
+                );
+                // A failed pump means the data path is gone. Tear down the
+                // tunnel and dataplane instead of leaving a half-live mesh.
+                if let Some(dataplane) = &service.dataplane {
+                    let _ = dataplane.stop();
+                }
+                let _ = service.backend.stop().await;
+            }
+        });
+        *self
+            .pump_monitor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(handle);
+    }
+
     /// Start the dataplane first (so an unavailable TUN/root never leaves a
-    /// WireGuard socket bound), then the WireGuard manager. A manager start
-    /// failure rolls the dataplane back.
+    /// WireGuard socket bound), then the WireGuard manager, and finally the
+    /// packet pump only when both are running. Any failure rolls back the
+    /// already-started parts in reverse order.
     pub async fn start(&self) -> Result<(), MeshServiceError> {
+        self.set_pump_error(None);
         let mut dataplane_started = false;
         if let Some(dataplane) = &self.dataplane {
             dataplane.start().map_err(MeshServiceError::from)?;
@@ -1047,13 +1284,93 @@ impl MeshService {
             return result;
         }
 
+        if let Some(provider) = &self.tun_provider {
+            let dataplane_running = self
+                .dataplane
+                .as_ref()
+                .is_some_and(|dataplane| dataplane.status().state == DataplaneState::Running);
+            let tunnel_running = self.backend.state() == MeshState::Running;
+            let pump_running = self
+                .pump
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+                .is_some_and(|pump| pump.state() == PumpState::Running);
+
+            if !pump_running {
+                // A previous stop/failure may have left a handle behind.
+                let _ = self.stop_packet_pump();
+                let failure = if !dataplane_running {
+                    Some(MeshServiceError::new(
+                        "mesh.pump-unavailable",
+                        "packet pump not started: the mesh dataplane is not running",
+                    ))
+                } else if !tunnel_running {
+                    Some(MeshServiceError::new(
+                        "mesh.pump-unavailable",
+                        "packet pump not started: the WireGuard tunnel is not running",
+                    ))
+                } else if let Some(dataplane) = &self.dataplane {
+                    let interface = dataplane.config().interface.clone();
+                    match self.backend.tunnel_io() {
+                        None => Some(MeshServiceError::from(PumpError::unavailable(
+                            "the running tunnel exposes no packet API",
+                        ))),
+                        Some(tunnel) => match provider.open(&interface).await {
+                            Err(error) => Some(MeshServiceError::from(error)),
+                            Ok(tun) => {
+                                let pump = PacketPump::new(tun, tunnel, PumpConfig::default());
+                                match pump.start() {
+                                    Err(error) => Some(MeshServiceError::from(error)),
+                                    Ok(()) => {
+                                        self.set_pump_error(None);
+                                        *self
+                                            .pump
+                                            .lock()
+                                            .unwrap_or_else(|error| error.into_inner()) =
+                                            Some(pump.clone());
+                                        self.log.record(
+                                            MeshEventKind::Dataplane,
+                                            format!("mesh packet pump is running on {interface}"),
+                                            None,
+                                        );
+                                        self.spawn_pump_monitor(pump);
+                                        None
+                                    }
+                                }
+                            }
+                        },
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(error) = failure {
+                    let _ = self.stop_packet_pump();
+                    self.set_pump_error(Some(PumpError::new(
+                        error.code.clone(),
+                        error.reason.clone(),
+                    )));
+                    if let Some(dataplane) = &self.dataplane {
+                        let _ = dataplane.stop();
+                    }
+                    let _ = self.backend.stop().await;
+                    self.log
+                        .record(MeshEventKind::Error, error.reason.clone(), None);
+                    return Err(error);
+                }
+            }
+        }
+
         self.log
             .record(MeshEventKind::Started, "mesh service started", None);
         Ok(())
     }
 
-    /// Stop the WireGuard manager and tear the dataplane down in reverse order.
+    /// Stop the packet pump, the WireGuard manager, and the dataplane in
+    /// reverse start order.
     pub async fn stop(&self) -> Result<(), MeshServiceError> {
+        let pump_stopped = self.stop_packet_pump();
         let dataplane_result = match &self.dataplane {
             Some(dataplane) => dataplane.stop().map_err(MeshServiceError::from),
             None => Ok(()),
@@ -1065,6 +1382,10 @@ impl MeshService {
         };
         match &result {
             Ok(()) => {
+                if pump_stopped {
+                    self.log
+                        .record(MeshEventKind::Dataplane, "mesh packet pump stopped", None);
+                }
                 if self.dataplane.is_some() {
                     self.log
                         .record(MeshEventKind::Dataplane, "mesh dataplane stopped", None);
@@ -1202,6 +1523,7 @@ impl MeshService {
             reason: error.as_ref().map(|value| value.reason.clone()),
             identity: self.backend.identity(),
             dataplane: self.dataplane.as_ref().map(|dataplane| dataplane.status()),
+            pump: self.pump_status(),
             peer_count: peers.as_ref().map(Vec::len),
             peers,
             event_count: Some(self.log.len()),
@@ -1274,6 +1596,10 @@ pub struct MeshStatus {
     /// `--mesh-dataplane` was configured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dataplane: Option<DataplaneStatus>,
+    /// Bounded TUN/WireGuard packet-pump state and real counters, present only
+    /// when the dataplane and a TUN provider are configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pump: Option<PumpStatus>,
     /// Omitted unless the service is running; `Some(0)` is a real empty table.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_count: Option<usize>,
@@ -1301,6 +1627,7 @@ impl MeshStatus {
             reason: Some("mesh service is not enabled (--mesh / OZMA_MESH)".to_owned()),
             identity: None,
             dataplane: None,
+            pump: None,
             peer_count: None,
             peers: None,
             event_count: None,
@@ -2184,6 +2511,384 @@ mod tests {
                 _ => false,
             }
         }
+    }
+
+    #[derive(Default)]
+    struct FakeTunProvider {
+        calls: Mutex<Vec<String>>,
+        error: Mutex<Option<PumpError>>,
+        probe: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    }
+
+    impl FakeTunProvider {
+        fn calls(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+        }
+
+        fn set_error(&self, error: PumpError) {
+            *self.error.lock().unwrap_or_else(|value| value.into_inner()) = Some(error);
+        }
+
+        fn set_probe(&self, probe: impl Fn() + Send + Sync + 'static) {
+            *self.probe.lock().unwrap_or_else(|value| value.into_inner()) = Some(Box::new(probe));
+        }
+    }
+
+    #[async_trait]
+    impl TunProvider for FakeTunProvider {
+        async fn open(&self, interface: &str) -> Result<Arc<dyn TunIo>, PumpError> {
+            if let Some(probe) = self
+                .probe
+                .lock()
+                .unwrap_or_else(|value| value.into_inner())
+                .take()
+            {
+                probe();
+            }
+            self.calls
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(interface.to_owned());
+            if let Some(error) = self
+                .error
+                .lock()
+                .unwrap_or_else(|value| value.into_inner())
+                .clone()
+            {
+                return Err(error);
+            }
+            Ok(Arc::new(IdleTun))
+        }
+    }
+
+    struct IdleTun;
+
+    #[async_trait]
+    impl TunIo for IdleTun {
+        async fn read_packet(&self, _buffer: &mut [u8]) -> Result<usize, PumpError> {
+            std::future::pending().await
+        }
+
+        async fn write_packet(&self, packet: &[u8]) -> Result<usize, PumpError> {
+            Ok(packet.len())
+        }
+    }
+
+    struct IdleTunnel;
+
+    #[async_trait]
+    impl TunnelIo for IdleTunnel {
+        async fn send_packet(&self, _packet: &[u8]) -> Result<(), PumpError> {
+            Ok(())
+        }
+
+        async fn recv_packet(&self, _buffer: &mut [u8]) -> Result<usize, PumpError> {
+            std::future::pending().await
+        }
+    }
+
+    struct FailingTunnel;
+
+    #[async_trait]
+    impl TunnelIo for FailingTunnel {
+        async fn send_packet(&self, _packet: &[u8]) -> Result<(), PumpError> {
+            Ok(())
+        }
+
+        async fn recv_packet(&self, _buffer: &mut [u8]) -> Result<usize, PumpError> {
+            Err(PumpError::tunnel_receive("simulated decapsulation failure"))
+        }
+    }
+
+    fn pump_service(
+        sysfs: NodeSysfs,
+        provider: Arc<FakeTunProvider>,
+        tunnel: Option<Arc<dyn TunnelIo>>,
+    ) -> (MeshService, Arc<FakeMeshBackend>, Arc<NodeRunner>) {
+        let log = MeshEventLog::new(16);
+        let backend = Arc::new(FakeMeshBackend::new(
+            fake_node("self", "10.200.9.1"),
+            log.clone(),
+        ));
+        if let Some(tunnel) = tunnel {
+            backend.set_tunnel_io(tunnel);
+        }
+        let runner = Arc::new(NodeRunner::default());
+        let dataplane = Arc::new(MeshDataplane::new(
+            dataplane_config(),
+            runner.clone(),
+            Arc::new(sysfs),
+        ));
+        let service = MeshService::with_backend_dataplane_and_tun(
+            backend.clone(),
+            Some(dataplane),
+            log,
+            Some(provider),
+        );
+        (service, backend, runner)
+    }
+
+    #[tokio::test]
+    async fn pump_is_absent_without_a_dataplane() {
+        let log = MeshEventLog::new(8);
+        let backend = Arc::new(FakeMeshBackend::new(
+            fake_node("self", "10.200.9.1"),
+            log.clone(),
+        ));
+        backend.set_tunnel_io(Arc::new(IdleTunnel));
+        let provider = Arc::new(FakeTunProvider::default());
+        let service =
+            MeshService::with_backend_dataplane_and_tun(backend, None, log, Some(provider.clone()));
+        service.start().await.unwrap();
+        assert!(service.pump_status().is_none());
+        assert!(service.status().await.pump.is_none());
+        assert!(
+            provider.calls().is_empty(),
+            "no TUN may be opened without a dataplane"
+        );
+        service.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pump_waits_for_a_running_tunnel_and_dataplane() {
+        let provider = Arc::new(FakeTunProvider::default());
+        let (service, backend, _runner) = pump_service(
+            NodeSysfs::rooted(),
+            provider.clone(),
+            Some(Arc::new(IdleTunnel)),
+        );
+        backend.set_start_error(MeshServiceError::new("mesh.start-failed", "bind failed"));
+
+        let error = service.start().await.unwrap_err();
+        assert_eq!(error.code, "mesh.start-failed");
+        assert!(provider.calls().is_empty());
+        let status = service.status().await;
+        assert_eq!(status.state, MeshState::Failed);
+        let pump = status.pump.unwrap();
+        assert_eq!(pump.state, PumpState::Stopped);
+        assert_eq!(pump.stats, PumpStats::default());
+
+        let provider = Arc::new(FakeTunProvider::default());
+        let (not_root, _backend, _runner) = pump_service(
+            NodeSysfs::rooted().not_root(),
+            provider.clone(),
+            Some(Arc::new(IdleTunnel)),
+        );
+        let error = not_root.start().await.unwrap_err();
+        assert_eq!(error.code, "mesh.root-required");
+        assert!(
+            provider.calls().is_empty(),
+            "pump must not open TUN before the dataplane is running"
+        );
+    }
+
+    #[tokio::test]
+    async fn pump_reports_starting_while_opening_the_tun() {
+        let provider = Arc::new(FakeTunProvider::default());
+        let (service, _backend, _runner) = pump_service(
+            NodeSysfs::rooted(),
+            provider.clone(),
+            Some(Arc::new(IdleTunnel)),
+        );
+        let observed = Arc::new(Mutex::new(None));
+        let slot: Arc<Mutex<Option<MeshService>>> = Arc::new(Mutex::new(None));
+        {
+            let observed = observed.clone();
+            let slot = slot.clone();
+            provider.set_probe(move || {
+                if let Some(service) = slot
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .as_ref()
+                {
+                    *observed.lock().unwrap_or_else(|error| error.into_inner()) =
+                        Some(service.state());
+                }
+            });
+        }
+        *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(service.clone());
+
+        service.start().await.unwrap();
+        assert_eq!(
+            *observed.lock().unwrap_or_else(|error| error.into_inner()),
+            Some(MeshState::Starting),
+            "the pump is visible as starting while the TUN fd is opened"
+        );
+        assert_eq!(service.state(), MeshState::Running);
+        assert_eq!(
+            service.status().await.pump.unwrap().state,
+            PumpState::Running
+        );
+        service.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pump_tun_open_failure_is_typed_and_rolls_back() {
+        let provider = Arc::new(FakeTunProvider::default());
+        provider.set_error(PumpError::tun_open("cannot attach ozma0"));
+        let (service, backend, runner) = pump_service(
+            NodeSysfs::rooted(),
+            provider.clone(),
+            Some(Arc::new(IdleTunnel)),
+        );
+
+        let before = service.status().await.pump.unwrap();
+        assert_eq!(before.state, PumpState::Stopped);
+        assert_eq!(before.stats, PumpStats::default());
+
+        let error = service.start().await.unwrap_err();
+        assert_eq!(error.code, "mesh.tun-open");
+        assert_eq!(provider.calls(), vec!["ozma0".to_owned()]);
+        assert!(!runner.calls().is_empty(), "the dataplane had started");
+
+        let status = service.status().await;
+        assert_eq!(status.state, MeshState::Failed);
+        assert!(!status.available);
+        assert!(status.peer_count.is_none());
+        let pump = status.pump.unwrap();
+        assert_eq!(pump.state, PumpState::Failed);
+        assert_eq!(
+            pump.last_error.as_ref().map(|error| error.code.as_str()),
+            Some("mesh.tun-open")
+        );
+        assert_eq!(pump.stats, PumpStats::default(), "no fake packet counts");
+        assert_eq!(
+            status.dataplane.as_ref().map(|dataplane| dataplane.state),
+            Some(DataplaneState::Stopped),
+            "start failure tears the dataplane down"
+        );
+        assert_eq!(backend.state(), MeshState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn pump_requires_the_tunnel_packet_api() {
+        let provider = Arc::new(FakeTunProvider::default());
+        let (service, _backend, _runner) =
+            pump_service(NodeSysfs::rooted(), provider.clone(), None);
+
+        let error = service.start().await.unwrap_err();
+        assert_eq!(error.code, "mesh.pump-unavailable");
+        assert!(
+            provider.calls().is_empty(),
+            "no TUN is opened for a tunnel without a packet API"
+        );
+        let status = service.status().await;
+        assert_eq!(status.state, MeshState::Failed);
+        let pump = status.pump.unwrap();
+        assert_eq!(pump.state, PumpState::Failed);
+        assert_eq!(
+            pump.last_error.as_ref().map(|error| error.code.as_str()),
+            Some("mesh.pump-unavailable")
+        );
+        assert_eq!(pump.stats, PumpStats::default());
+    }
+
+    #[tokio::test]
+    async fn pump_running_status_has_real_zero_counters_and_stops_cleanly() {
+        let provider = Arc::new(FakeTunProvider::default());
+        let (service, _backend, _runner) = pump_service(
+            NodeSysfs::rooted(),
+            provider.clone(),
+            Some(Arc::new(IdleTunnel)),
+        );
+
+        let stopped = service.status().await.pump.unwrap();
+        assert_eq!(stopped.state, PumpState::Stopped);
+        assert_eq!(stopped.stats, PumpStats::default());
+
+        service.start().await.unwrap();
+        assert_eq!(service.state(), MeshState::Running);
+        let status = service.status().await;
+        assert!(status.available);
+        let pump = status.pump.unwrap();
+        assert_eq!(pump.state, PumpState::Running);
+        assert_eq!(pump.interface.as_deref(), Some("ozma0"));
+        assert_eq!(pump.queue_capacity, PumpConfig::default().queue_capacity);
+        assert_eq!(
+            pump.stats,
+            PumpStats::default(),
+            "a running pump with no traffic reports real zeroes"
+        );
+        assert!(service.packet_pump().is_some());
+        assert_eq!(provider.calls(), vec!["ozma0".to_owned()]);
+
+        let app = router(Some(service.clone()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/connect/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_json(response).await;
+        assert_eq!(body["pump"]["state"], "running");
+        assert_eq!(body["pump"]["stats"]["tun_to_tunnel_packets"], 0);
+        assert_eq!(body["pump"]["stats"]["tunnel_to_tun_packets"], 0);
+
+        service.stop().await.unwrap();
+        assert_eq!(service.state(), MeshState::Stopped);
+        let status = service.status().await;
+        assert!(!status.available);
+        let pump = status.pump.unwrap();
+        assert_eq!(pump.state, PumpState::Stopped);
+        assert_eq!(pump.stats, PumpStats::default());
+    }
+
+    #[tokio::test]
+    async fn asynchronous_pump_failure_tears_down_runtime_parts() {
+        let provider = Arc::new(FakeTunProvider::default());
+        let (service, backend, _runner) =
+            pump_service(NodeSysfs::rooted(), provider, Some(Arc::new(FailingTunnel)));
+        service.start().await.unwrap();
+
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let dataplane_stopped = service
+                    .status()
+                    .await
+                    .dataplane
+                    .as_ref()
+                    .is_some_and(|dataplane| dataplane.state == DataplaneState::Stopped);
+                if service.state() == MeshState::Failed
+                    && backend.state() == MeshState::Stopped
+                    && dataplane_stopped
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if observed.is_err() {
+            let status = service.status().await;
+            panic!(
+                "pump failure did not tear down runtime: state={:?} backend={:?} \
+                 dataplane={:?} pump={:?} error={:?}",
+                service.state(),
+                backend.state(),
+                status.dataplane,
+                status.pump,
+                service.error()
+            );
+        }
+
+        let status = service.status().await;
+        let pump = status.pump.unwrap();
+        assert_eq!(pump.state, PumpState::Failed);
+        assert_eq!(
+            pump.last_error.as_ref().map(|error| error.code.as_str()),
+            Some("mesh.pump-tunnel-receive")
+        );
+        assert_eq!(backend.state(), MeshState::Stopped);
+        assert_eq!(
+            status.dataplane.as_ref().map(|dataplane| dataplane.state),
+            Some(DataplaneState::Stopped)
+        );
     }
 
     async fn body_json(response: Response) -> serde_json::Value {

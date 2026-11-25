@@ -32,13 +32,14 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use boringtun::noise::{Tunn, TunnResult};
 use libmdns::{Responder, Service};
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket as TokioUdpSocket;
+use tokio::sync::mpsc;
 use tokio::sync::{Notify, RwLock};
 use tracing::{debug, info, warn};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
@@ -77,6 +78,9 @@ pub struct PeerStatus {
     pub rtt_ms: Option<u32>,
 }
 
+/// Bound on decapsulated packets waiting for a packet pump.
+pub const DEFAULT_PACKET_QUEUE: usize = 256;
+
 // ── Lock-protected inner state ────────────────────────────────────────────────
 
 pub(crate) struct Inner {
@@ -111,6 +115,13 @@ pub struct MeshManager {
 
     /// Wakes the receive loop so [`MeshManager::stop`] can end it.
     stop_notify: Arc<Notify>,
+
+    /// Bounded channel of decapsulated IPv4 packets for the packet pump.
+    packet_tx: mpsc::Sender<Vec<u8>>,
+    /// Taken once by [`MeshManager::take_packet_receiver`].
+    packet_rx: StdMutex<Option<mpsc::Receiver<Vec<u8>>>>,
+    /// Packets dropped because the packet queue was full or no pump subscribed.
+    packet_drops: Arc<AtomicU64>,
 }
 
 impl MeshManager {
@@ -154,6 +165,8 @@ impl MeshManager {
 
         info!(node_id = %node.id, "MeshManager: mDNS service registered (_ozma._udp.local)");
 
+        let (packet_tx, packet_rx) = mpsc::channel(DEFAULT_PACKET_QUEUE);
+
         Ok(Self {
             node,
             inner: Arc::new(RwLock::new(Inner {
@@ -164,6 +177,9 @@ impl MeshManager {
             private_key,
             started: Arc::new(AtomicBool::new(false)),
             stop_notify: Arc::new(Notify::new()),
+            packet_tx,
+            packet_rx: StdMutex::new(Some(packet_rx)),
+            packet_drops: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -208,6 +224,8 @@ impl MeshManager {
         let inner = Arc::clone(&self.inner);
         let started = Arc::clone(&self.started);
         let stop_notify = Arc::clone(&self.stop_notify);
+        let packet_tx = self.packet_tx.clone();
+        let packet_drops = Arc::clone(&self.packet_drops);
 
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
@@ -241,10 +259,17 @@ impl MeshManager {
                                 TunnResult::WriteToTunnelV4(data, _) => {
                                     debug!(src = %src, bytes = data.len(),
                                            "WireGuard: decapsulated IPv4 packet");
+                                    match packet_tx.try_send(data.to_vec()) {
+                                        Ok(()) => {}
+                                        Err(mpsc::error::TrySendError::Full(_)) => {
+                                            packet_drops.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        Err(mpsc::error::TrySendError::Closed(_)) => {}
+                                    }
                                 }
                                 TunnResult::WriteToTunnelV6(data, _) => {
                                     debug!(src = %src, bytes = data.len(),
-                                           "WireGuard: decapsulated IPv6 packet");
+                                           "WireGuard: decapsulated IPv6 packet (pump is IPv4-only)");
                                 }
                                 TunnResult::WriteToNetwork(data) => {
                                     // Handshake response — send it back.
@@ -256,7 +281,6 @@ impl MeshManager {
                                     warn!(src = %src, "WireGuard tunnel error: {e:?}");
                                 }
                                 TunnResult::Done => {}
-                                _ => {}
                             }
                         } else {
                             debug!(src = %src, "WireGuard: packet from unknown peer, ignoring");
@@ -374,6 +398,57 @@ impl MeshManager {
             .collect()
     }
 
+    // ── Packet API (used by the optional TUN packet pump) ─────────────────────
+
+    /// Take the bounded channel of decapsulated IPv4 packets.
+    ///
+    /// The channel is created with the manager and can be taken once, normally
+    /// by [`crate::pump::ManagerPacketIo`]. Until it is taken, decapsulated
+    /// packets are counted in [`MeshManager::dropped_packets`] instead of being
+    /// silently reported as delivered.
+    pub fn take_packet_receiver(&self) -> Option<mpsc::Receiver<Vec<u8>>> {
+        self.packet_rx
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
+
+    /// Number of decapsulated packets dropped because no pump was subscribed or
+    /// the bounded packet queue was full.
+    pub fn dropped_packets(&self) -> u64 {
+        self.packet_drops.load(Ordering::Relaxed)
+    }
+
+    /// Encapsulate an IPv4 packet and send it to the peer owning its destination
+    /// address.
+    ///
+    /// This is the outbound half of the minimal packet API used by the TUN pump;
+    /// it never invents a peer. A malformed packet or an unknown destination is
+    /// a typed error.
+    pub async fn send_ipv4(&self, packet: &[u8]) -> Result<usize> {
+        let destination = ipv4_destination(packet).ok_or_else(|| {
+            MeshError::InvalidIp("packet is not a well-formed IPv4 packet".to_owned())
+        })?;
+        let peer_id = {
+            let guard = self.inner.read().await;
+            guard
+                .peers
+                .iter()
+                .find(|(_, peer)| {
+                    peer.node
+                        .mesh_ip
+                        .parse::<Ipv4Addr>()
+                        .map(|ip| ip == destination)
+                        .unwrap_or(false)
+                })
+                .map(|(id, _)| id.clone())
+        }
+        .ok_or_else(|| {
+            MeshError::InvalidIp(format!("no mesh peer owns IPv4 destination {destination}"))
+        })?;
+        self.send_to_peer(&peer_id, packet).await
+    }
+
     // ── Packet I/O ────────────────────────────────────────────────────────────
 
     /// Initiate a WireGuard handshake with `peer_id`.
@@ -483,4 +558,22 @@ impl MeshManager {
             }
         }
     }
+}
+
+/// Validate the IPv4 header enough to trust the destination address.
+fn ipv4_destination(packet: &[u8]) -> Option<Ipv4Addr> {
+    if packet.len() < 20 || packet[0] >> 4 != 4 {
+        return None;
+    }
+    let header_len = usize::from(packet[0] & 0x0f) * 4;
+    if header_len < 20 || packet.len() < header_len {
+        return None;
+    }
+    let total_len = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+    if total_len < header_len || total_len > packet.len() {
+        return None;
+    }
+    Some(Ipv4Addr::new(
+        packet[16], packet[17], packet[18], packet[19],
+    ))
 }

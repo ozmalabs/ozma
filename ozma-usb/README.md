@@ -62,6 +62,7 @@ automatic gadget creation on a hardware profile.
 | NBD server | `NbdServer`/`NbdServerHandle` over TCP or Unix sockets, `NbdExportCatalog`, `NbdExportSource` (`overlay_file`/`overlay_media`/`overlay_bytes`), `NbdMemoryImage`, `NbdFileImage`, `NbdOverlayBackend`/`NbdOverlayPolicy`/`NbdOverlayStatus`, injected `NbdTransport`/`NbdClock`, bounded read/write/flush/trim/disc, read-only exports, copy-on-write writable exports |
 | Write overlay | `WriteOverlay`, `OverlayConfig`, `OverlayWriteReport`; bounded copy-on-write over FAT32/raw base bytes, per-block allocation accounting, checksummed atomic persistence, typed `overlay-bounds`/`overlay-corrupt` failures; wired into writable NBD exports |
 | Media restart | `MediaRestartPolicy`, `MediaRestartTracker`, `MediaRestartAttempt`; capped attempts, capped exponential backoff, overlay-reload policy, and a success reset for the userspace SCSI export |
+| Background media daemon | `FunctionFsMediaDaemon`, `MediaDaemonConfig`, `MediaDaemonStatus`/`MediaDaemonState`/`MediaDaemonCounters`, `MediaDaemonHandle`, `PollingFileEp0Io`, `polling_transport_factory`, `media_bulk_endpoints`; supervised `ep0` event loop, `ENABLE` auto-attach, `DISABLE`/`UNBIND` detach, bounded restart/reload, polling bulk transport, and shutdown flush |
 | Capabilities/status | `UsbGadgetCapabilities`, `GadgetStatus`, `FunctionStatus` (`media`, `uac2`, `function_fs` details); `protocol_capability()` projects onto `ozma_protocol::UsbCapability` |
 
 ## Quick start
@@ -119,13 +120,32 @@ attempts with 250 ms→4 s capped exponential backoff; override it with
 `--usb-media-restart-max-attempts`, `--usb-media-restart-backoff-ms`, and
 `--usb-media-restart-max-backoff-ms`.
 
+Add `--usb-functionfs-mount /dev/ffs-vendor0` (with `--usb-gadget`,
+`--usb-vendor`, and `--usb-media-export`) to let a supervised
+`FunctionFsMediaDaemon` own the mounted FunctionFS endpoints. The node only
+opens the explicit mount; it never mounts FunctionFS. The daemon writes the
+descriptors, waits for `ENABLE`, attaches a `PollingFileBulkTransport`, services
+the SCSI loop with the configured per-transfer deadline, detaches on
+`DISABLE`/`UNBIND`, reloads the overlay per the restart policy, and stops/flushes
+on shutdown.
+
+`--usbip` starts the bounded USB/IP control/data listener on
+`--usbip-host`/`--usbip-port` (default `127.0.0.1:3240`). The default adapter set
+is the typed `usbip-kernel-required` pair; add `--usbip-linux-adapters` to select
+`LinuxUsbIpHostBackend` (argv/sysfs; optional `--usbip-program`,
+`--usbip-sysfs-root`) and `LinuxUsbIpKernelDataEndpoint` (TCP URB stream).
+`GET /usb` reports `usbip.state`, the selected adapter, and honest
+session/import/data counters.
+
 Equivalent environment variables are `OZMA_USB_GADGET`, `OZMA_USB_CONFIGFS_ROOT`,
 `OZMA_USB_UDC`, `OZMA_USB_MEDIA`, `OZMA_USB_MEDIA_RO`,
 `OZMA_USB_MEDIA_CDROM`, `OZMA_USB_MEDIA_EXPORT`,
 `OZMA_USB_MEDIA_EXPORT_FORMAT`, `OZMA_USB_MEDIA_EXPORT_READ_WRITE`,
 `OZMA_USB_MEDIA_EXPORT_PERSIST`, `OZMA_USB_UAC2`, `OZMA_USB_UAC2_BRIDGE`,
 `OZMA_USB_UAC2_SINK_DEVICE`, `OZMA_USB_UAC2_SOURCE_DEVICE`,
-`OZMA_USB_VENDOR`, and `OZMA_USB_VENDOR_DAEMON`. The node builds a HID
+`OZMA_USB_VENDOR`, `OZMA_USB_VENDOR_DAEMON`, `OZMA_USB_FUNCTIONFS_MOUNT`,
+`OZMA_USBIP`, `OZMA_USBIP_HOST`, `OZMA_USBIP_PORT`, `OZMA_USBIP_LINUX_ADAPTERS`,
+`OZMA_USBIP_SYSFS_ROOT`, and `OZMA_USBIP_PROGRAM`. The node builds a HID
 keyboard + mouse gadget, optionally a ConfigFS mass-storage LUN, an opt-in
 userspace SCSI export, and opt-in UAC2/FunctionFS vendor functions, then
 creates and binds it only when a UDC is supplied and the root exists. A missing
@@ -139,8 +159,8 @@ When bound, `ozma-node` advertises `usb` in capabilities, TXT/registration, and
 
 | Route | Behaviour |
 |---|---|
-| `GET /usb` | Bearer-guarded read-only gadget status, function list, capabilities, LUN media state, UAC2 descriptor/bridge status, and FunctionFS daemon readiness (no backing paths). Nested `media_export` reports `not-configured`/`configured`/`running`/`failed`, `auto_start`, overlay state, counters, and bounded restart state. |
-| `GET /usb/media` | Userspace SCSI export state, capacity, overlay/persistence summary, counters, and typed `last_error`. |
+| `GET /usb` | Bearer-guarded read-only gadget status, function list, capabilities, LUN media state, UAC2 descriptor/bridge status, and FunctionFS daemon readiness (no backing paths). Nested `media_export` reports `not-configured`/`waiting-for-enable`/`enabled`/`running`/`restarting`/`failed`/`stopped`; `usbip` reports the selected adapter and honest session/import/data counters. |
+| `GET /usb/media` | Userspace SCSI export state, capacity, overlay/persistence summary, counters, and typed `last_error`. A FunctionFS daemon adds `transport` (polling file, attached/enabled/live, enable/disable/attach/detach/restart counts) and `daemon_stats`. |
 | `POST /usb/media/start` | Configure a userspace SCSI export from an existing image (`path`, `function`, `format`, `read_only`, `persist_path`, `persist_on_flush`, `persist_on_stop`, `reload`, `max_transfer_bytes`, `timeout_ms`). Never claims `running` before a transfer. |
 | `POST /usb/media/stop` | Stop the export and apply its overlay persistence policy. |
 | `GET /usb/hotplug` | Bounded poll view of `export_start`, `export_stop`, `attach`, `detach`, `unbind`, `restart`, and `rebind` events. Auto-start is recorded as `export_start` with state `auto-start`. |
@@ -150,12 +170,15 @@ When bound, `ozma-node` advertises `usb` in capabilities, TXT/registration, and
 | `POST /usb/nbd/start` | Serve one existing absolute FAT32/ISO/raw file over loopback NBD (`path`, optional `export`, `format`, `read_only`, `persist_path`, `persist_on_flush`, `persist_on_stop`). ISO/FAT32 are forced read-only; raw defaults to read-only; a second start is a typed 409. A writable raw export is copy-on-write. |
 | `POST /usb/nbd/stop` | Stop the opt-in NBD listener, persist any configured overlay, and return its final counters. |
 
-The userspace export auto-starts only when `--usb-media-export` is set. It is
-reported as `configured` (not `running`) and uses `IdleBulkTransport`; only a
-real command cycle over an attached transport can mark it running. A configured
-auto-start failure keeps the typed reason in `/usb` and `/usb/media` instead of
-failing node startup. On SIGINT/SIGTERM the export is stopped and its overlay is
-flushed according to `persist_on_stop`.
+The userspace export auto-starts only when `--usb-media-export` is set. Without
+`--usb-functionfs-mount` it is reported as `configured` (not `running`) and uses
+`IdleBulkTransport`; only a real command cycle over an attached transport can
+mark it running. With an explicit mount the background daemon reports
+`waiting-for-enable`/`enabled` until the kernel sends `ENABLE`, then attaches the
+polling transport; `running` still requires a completed command cycle. A
+configured auto-start failure keeps the typed reason in `/usb` and `/usb/media`
+instead of failing node startup. On SIGINT/SIGTERM the daemon stops, joins its
+worker, and flushes the overlay according to `persist_on_stop`.
 
 Attach/detach write only ConfigFS `file`/`ro`/`cdrom` attributes. The NBD
 routes only bind a loopback TCP socket and read the backing file; they do not
@@ -480,6 +503,32 @@ FIFOs. `PollingFileEndpointOpener` does the same for a caller-supplied
 timeout, partial write prefix, EOF, a stalled `MassStorageLoop` that later
 recovers after a CBW arrives); there is still no live UDC transfer in the
 default suite.
+
+#### Background FunctionFS media daemon
+
+`FunctionFsMediaDaemon` owns the missing long-lived lifecycle:
+
+```text
+write ep0 descriptors -> wait for ENABLE -> attach PollingFileBulkTransport
+  -> MassStorageLoop::step() until DISABLE/UNBIND/stop
+  -> detach -> bounded MediaRestartPolicy -> reload overlay -> wait for ENABLE
+```
+
+`MediaDaemonConfig` bounds the SCSI loop and restart policy plus an `ep0` event
+deadline and an idle poll interval. `PollingFileEp0Io` switches `ep0` to
+`O_NONBLOCK` and waits with `poll(2)`, so a disabled/unbound function and a
+shutdown request are observed without a busy loop. An idle stall while waiting
+for the next CBW is counted as a timeout but keeps the same transport attached;
+a timeout after a CBW started is a transport failure and follows the restart
+policy. `MediaDaemonStatus` publishes the state, `live`/`enabled`/`attached`/
+`running`, the preserved `MassStorageLoopStats`, FunctionFS `ep0` counters, and
+enable/disable/attach/detach/restart/unbind counts.
+
+Device and transport factories are injected. `FunctionFsMediaDaemon::file`
+builds the real daemon for an explicit `FunctionFsMount`; it still does not
+mount anything. `spawn` starts the worker and returns a `MediaDaemonHandle`
+whose `shutdown()` requests stop, joins the thread, and returns after the
+persistence policy was applied.
 
 #### Bounded media restart supervision
 
