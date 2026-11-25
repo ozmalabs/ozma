@@ -78,6 +78,7 @@ from network_health import NetworkHealthMonitor
 from wol import send_wol, get_mac_from_arp
 from ocr_triggers import OCRTriggerManager, TriggerPattern
 from automation import AutomationEngine
+from meeting_status import normalise_meeting_status
 from device_metrics import MetricsCollector
 from screen_manager import ScreenManager
 from codec_manager import CodecManager, CodecConfig
@@ -1901,18 +1902,20 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         return {
             **state.snapshot(),
             "active_scenario_id": scenarios.active_id,
+            # Discovery only: never fetches the supervisor from this hot path.
+            "meeting_detect": {
+                "configured": bool((supervisor_status_url or "").strip()),
+                "status_url": "/api/v1/meeting/status",
+            },
         }
 
-    @app.get("/api/v1/supervisor/status")
-    async def supervisor_status(request: Request) -> dict[str, Any]:
-        """Read-only proxy for a configured supervisor's `/status` document.
+    async def _fetch_supervisor_document() -> dict[str, Any]:
+        """Fetch the configured supervisor `/status` document.
 
         The URL comes only from ``OZMA_SUPERVISOR_STATUS_URL``; callers cannot
-        supply a URL. The controller does not parse per-VM internals, append
-        routes, or poll children itself. The optional supervisor token is sent
-        upstream and never returned.
+        supply a URL. The optional bearer token is sent upstream and never
+        returned. The response is size-bounded and must be a JSON object.
         """
-        _require_scope(request, SCOPE_READ)
         url = (supervisor_status_url or "").strip()
         if not url:
             raise HTTPException(
@@ -1935,9 +1938,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
         except httpx.TimeoutException:
             raise HTTPException(504, "Supervisor status request timed out")
         except httpx.HTTPError as error:
-            raise HTTPException(
-                502, f"Supervisor unreachable: {type(error).__name__}"
-            )
+            raise HTTPException(502, f"Supervisor unreachable: {type(error).__name__}")
 
         if response.status_code != 200:
             raise HTTPException(
@@ -1956,7 +1957,39 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(
                 502, "Supervisor status document has an unexpected profile"
             )
+        return document
+
+    @app.get("/api/v1/supervisor/status")
+    async def supervisor_status(request: Request) -> dict[str, Any]:
+        """Read-only proxy for a configured supervisor's `/status` document.
+
+        The controller does not parse per-VM internals, append routes, or poll
+        children itself. The optional supervisor token is sent upstream and
+        never returned.
+        """
+        _require_scope(request, SCOPE_READ)
+        document = await _fetch_supervisor_document()
         return {"ok": True, "configured": True, "status": document}
+
+    @app.get("/api/v1/meeting/status")
+    async def meeting_status(request: Request) -> dict[str, Any]:
+        """Typed meeting-detection report aggregated by the supervisor.
+
+        Consumes the supervisor's existing ``meeting`` field. A supervisor that
+        predates the report still yields 200 with ``available:false`` and
+        ``state:"disabled"``; only a missing ``OZMA_SUPERVISOR_STATUS_URL`` is a
+        503. The response contains no socket/binary paths, tokens, attendee
+        addresses or calendar identifiers.
+        """
+        _require_scope(request, SCOPE_READ)
+        document = await _fetch_supervisor_document()
+        meeting = normalise_meeting_status(document.get("meeting"))
+        return {
+            "ok": True,
+            "configured": True,
+            "available": meeting["available"],
+            "meeting": meeting,
+        }
 
     @app.get("/api/v1/webrtc/ice")
     async def get_webrtc_ice() -> dict[str, Any]:
@@ -11818,6 +11851,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     from software_inventory import SoftwareInventoryManager, build_router as _software_router
     software_inventory = SoftwareInventoryManager()
     app.include_router(_software_router(software_inventory))
+
+    # Display asset repository (widgets/themes/fonts; local cache + sync)
+    from asset_repository import AssetRepository, build_router as _asset_router
+    asset_repository = AssetRepository()
+    app.include_router(_asset_router(asset_repository))
 
     # GraphQL API (optional — requires strawberry-graphql)
     if _GRAPHQL_AVAILABLE and _gql_create_router is not None:

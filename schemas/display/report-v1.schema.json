@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ozma.io/schemas/display/report-v1.schema.json",
+  "title": "Ozma translation report v1",
+  "description": "Mandatory report emitted by every export adapter. Imports use SourceCaptureReport instead.",
+  "type": "object",
+  "required": [
+    "direction",
+    "source_format",
+    "target_format",
+    "translator",
+    "translator_version",
+    "fidelity"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "direction": {"const": "export"},
+    "source_format": {"type": "string", "minLength": 1},
+    "target_format": {"type": "string", "minLength": 1},
+    "translator": {"type": "string", "minLength": 1},
+    "translator_version": {"type": "string", "minLength": 1},
+    "fidelity": {
+      "type": "string",
+      "enum": ["exact", "semantic", "approximate", "visual_only"]
+    },
+    "converted": {"type": "array", "items": {"type": "string"}},
+    "approximated": {"type": "array", "items": {"type": "string"}},
+    "dropped": {"type": "array", "items": {"type": "string"}},
+    "warnings": {"type": "array", "items": {"type": "string"}}
+  }
+}

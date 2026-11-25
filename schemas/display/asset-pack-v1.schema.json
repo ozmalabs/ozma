@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ozma.io/schemas/display/asset-pack-v1.schema.json",
+  "title": "Ozma asset pack entry and sync policy v1",
+  "description": "Searchable manifest metadata for widget, theme, description, and private import packs.",
+  "anyOf": [
+    {"$ref": "#/$defs/AssetPackEntry"},
+    {"$ref": "#/$defs/AssetSyncPolicy"}
+  ],
+  "$defs": {
+    "AssetRef": {
+      "type": "object",
+      "required": ["id", "path", "mime", "sha256", "kind"],
+      "additionalProperties": true,
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "path": {"type": "string", "minLength": 1},
+        "mime": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+        "size": {"type": "integer", "minimum": 0},
+        "kind": {"type": "string", "enum": ["original", "image", "font", "script", "theme", "preview", "other"]},
+        "executable": {"type": "boolean"},
+        "sandbox": {"type": "string", "enum": ["iframe", "wasm", "none"]}
+      }
+    },
+    "Provenance": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": true,
+      "properties": {
+        "type": {"type": "string", "enum": ["original", "imported", "adapted", "community"]},
+        "source": {"type": "string"},
+        "author": {"type": "string"},
+        "method": {"type": "string"},
+        "notes": {"type": "string"}
+      }
+    },
+    "SourceCaptureReport": {
+      "type": "object",
+      "required": ["source_format", "source_hash", "lossless"],
+      "additionalProperties": true,
+      "properties": {
+        "source_format": {"type": "string", "minLength": 1},
+        "source_version": {"type": "string"},
+        "source_hash": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+        "captured": {"type": "array", "items": {"type": "string"}},
+        "opaque": {"type": "array", "items": {"type": "string"}},
+        "assets": {"type": "array", "items": {"type": "string"}},
+        "lossless": {"const": true}
+      }
+    },
+    "TranslationReport": {
+      "type": "object",
+      "required": ["direction", "source_format", "target_format", "translator", "translator_version", "fidelity"],
+      "additionalProperties": true,
+      "properties": {
+        "direction": {"const": "export"},
+        "source_format": {"type": "string", "minLength": 1},
+        "target_format": {"type": "string", "minLength": 1},
+        "translator": {"type": "string", "minLength": 1},
+        "translator_version": {"type": "string", "minLength": 1},
+        "fidelity": {"type": "string", "enum": ["exact", "semantic", "approximate", "visual_only"]},
+        "converted": {"type": "array", "items": {"type": "string"}},
+        "approximated": {"type": "array", "items": {"type": "string"}},
+        "dropped": {"type": "array", "items": {"type": "string"}},
+        "warnings": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "VibeProfile": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "taxonomy": {"type": "string", "minLength": 1},
+        "keywords": {"type": "array", "items": {"type": "string"}},
+        "mood": {"type": "array", "items": {"type": "string"}},
+        "era": {"type": "string"},
+        "form": {"type": "array", "items": {"type": "string"}},
+        "material": {"type": "array", "items": {"type": "string"}},
+        "density": {"type": "string"},
+        "color": {"type": "array", "items": {"type": "string"}},
+        "typography": {"type": "array", "items": {"type": "string"}},
+        "motion": {"type": "array", "items": {"type": "string"}},
+        "references": {"type": "array", "items": {"type": "string"}},
+        "ornament": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "provenance": {"type": "object", "additionalProperties": true}
+      }
+    },
+    "ShapeSignature": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "widget_kind": {"type": "string"},
+        "aspect_ratio": {"type": "number", "minimum": 0},
+        "corner_radius_ratio": {"type": "number", "minimum": 0},
+        "stroke_width_ratio": {"type": "number", "minimum": 0},
+        "fill_ratio": {"type": "number", "minimum": 0},
+        "symmetry": {"type": "string"},
+        "arc_start_deg": {"type": "number"},
+        "arc_end_deg": {"type": "number"},
+        "tick_count": {"type": "integer", "minimum": 0},
+        "segment_count": {"type": "integer", "minimum": 0},
+        "needle_style": {"type": "string"},
+        "chart_mark": {"type": "string"},
+        "texture": {"type": "string"},
+        "elevation": {"type": "string"},
+        "glow": {"type": "boolean"},
+        "animation": {"type": "string"}
+      }
+    },
+    "CoherenceReport": {
+      "type": "object",
+      "required": ["score"],
+      "additionalProperties": true,
+      "properties": {
+        "score": {"type": "number", "minimum": 0, "maximum": 1},
+        "dimensions": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "mood": {"type": "number", "minimum": 0, "maximum": 1},
+            "era": {"type": "number", "minimum": 0, "maximum": 1},
+            "form": {"type": "number", "minimum": 0, "maximum": 1},
+            "material": {"type": "number", "minimum": 0, "maximum": 1},
+            "color": {"type": "number", "minimum": 0, "maximum": 1},
+            "typography": {"type": "number", "minimum": 0, "maximum": 1},
+            "density": {"type": "number", "minimum": 0, "maximum": 1},
+            "motion": {"type": "number", "minimum": 0, "maximum": 1}
+          }
+        },
+        "outliers": {"type": "array", "items": {"type": "string"}},
+        "conflicts": {"type": "array", "items": {"type": "string"}},
+        "suggestions": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "AssetPackEntry": {
+      "type": "object",
+      "required": ["id", "type", "name", "version", "schema", "license"],
+      "additionalProperties": true,
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "type": {"type": "string", "enum": ["widget_pack", "theme_pack", "description_pack", "import_pack"]},
+        "name": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "minLength": 1},
+        "schema": {"type": "string", "minLength": 1},
+        "author": {"type": "string"},
+        "description": {"type": "string"},
+        "license": {"type": "string", "minLength": 1},
+        "source_url": {"type": "string"},
+        "tags": {"type": "array", "items": {"type": "string"}},
+        "capabilities": {"type": "array", "items": {"type": "string"}},
+        "permissions": {"type": "array", "items": {"type": "string"}},
+        "min_ozma_version": {"type": "string"},
+        "min_display_schema": {"type": "string"},
+        "assets": {"type": "array", "items": {"$ref": "#/$defs/AssetRef"}},
+        "preview": {"type": "string"},
+        "provenance": {"$ref": "#/$defs/Provenance"},
+        "confidence": {"type": "string", "enum": ["exact", "approximate", "community", "template"]},
+        "vibe": {"$ref": "#/$defs/VibeProfile"},
+        "shape": {"$ref": "#/$defs/ShapeSignature"},
+        "coherence": {"$ref": "#/$defs/CoherenceReport"},
+        "signature": {"type": "string"},
+        "published_at": {"type": "string"},
+        "yanked": {"type": "boolean"},
+        "source_capture": {"$ref": "#/$defs/SourceCaptureReport"},
+        "translation_reports": {"type": "array", "items": {"$ref": "#/$defs/TranslationReport"}}
+      }
+    },
+    "AssetSyncPolicy": {
+      "type": "object",
+      "required": ["mode"],
+      "additionalProperties": true,
+      "properties": {
+        "mode": {"type": "string", "enum": ["full", "installed", "manual", "offline"]},
+        "sync_interval_hours": {"type": "integer", "minimum": 1, "default": 24},
+        "cache_size_mb": {"type": "integer", "minimum": 1},
+        "include_previews": {"type": "boolean", "default": true},
+        "include_external_imports": {"type": "boolean", "default": false},
+        "verify_signatures": {"type": "boolean", "default": false}
+      }
+    }
+  }
+}

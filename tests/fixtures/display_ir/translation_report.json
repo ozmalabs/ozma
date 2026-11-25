@@ -1,0 +1,12 @@
+{
+  "direction": "export",
+  "source_format": "org.ozma.widget-ir/1",
+  "target_format": "browser_svg",
+  "translator": "ozma-display-ir",
+  "translator_version": "0.1.0",
+  "fidelity": "semantic",
+  "converted": ["widget.gauge", "widget.binding", "widget.domain"],
+  "approximated": ["widget.typography"],
+  "dropped": ["widget.history"],
+  "warnings": ["needle animation is rendered as a static SVG"]
+}

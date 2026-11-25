@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ozma.io/schemas/display/vibe-v1.schema.json",
+  "title": "Ozma vibe profile, shape signature, and coherence v1",
+  "description": "Design-language intent with provenance. Keywords outside the versioned taxonomy are retained, never dropped.",
+  "anyOf": [
+    {"$ref": "#/$defs/VibeProfile"},
+    {"$ref": "#/$defs/ShapeSignature"},
+    {"$ref": "#/$defs/CoherenceReport"}
+  ],
+  "$defs": {
+    "VibeProvenance": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "source_keywords": {"type": "array", "items": {"type": "string"}},
+        "derived_keywords": {"type": "array", "items": {"type": "string"}},
+        "user_keywords": {"type": "array", "items": {"type": "string"}},
+        "methods": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "VibeProfile": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "taxonomy": {"type": "string", "minLength": 1},
+        "keywords": {"type": "array", "items": {"type": "string"}},
+        "mood": {"type": "array", "items": {"type": "string"}},
+        "era": {"type": "string"},
+        "form": {"type": "array", "items": {"type": "string"}},
+        "material": {"type": "array", "items": {"type": "string"}},
+        "density": {"type": "string"},
+        "color": {"type": "array", "items": {"type": "string"}},
+        "typography": {"type": "array", "items": {"type": "string"}},
+        "motion": {"type": "array", "items": {"type": "string"}},
+        "references": {"type": "array", "items": {"type": "string"}},
+        "ornament": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "provenance": {"$ref": "#/$defs/VibeProvenance"}
+      }
+    },
+    "ShapeSignature": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "widget_kind": {"type": "string"},
+        "aspect_ratio": {"type": "number", "minimum": 0},
+        "corner_radius_ratio": {"type": "number", "minimum": 0},
+        "stroke_width_ratio": {"type": "number", "minimum": 0},
+        "fill_ratio": {"type": "number", "minimum": 0},
+        "symmetry": {"type": "string"},
+        "arc_start_deg": {"type": "number"},
+        "arc_end_deg": {"type": "number"},
+        "tick_count": {"type": "integer", "minimum": 0},
+        "segment_count": {"type": "integer", "minimum": 0},
+        "needle_style": {"type": "string"},
+        "chart_mark": {"type": "string"},
+        "texture": {"type": "string"},
+        "elevation": {"type": "string"},
+        "glow": {"type": "boolean"},
+        "animation": {"type": "string"}
+      }
+    },
+    "CoherenceDimensions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mood": {"type": "number", "minimum": 0, "maximum": 1},
+        "era": {"type": "number", "minimum": 0, "maximum": 1},
+        "form": {"type": "number", "minimum": 0, "maximum": 1},
+        "material": {"type": "number", "minimum": 0, "maximum": 1},
+        "color": {"type": "number", "minimum": 0, "maximum": 1},
+        "typography": {"type": "number", "minimum": 0, "maximum": 1},
+        "density": {"type": "number", "minimum": 0, "maximum": 1},
+        "motion": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "CoherenceReport": {
+      "type": "object",
+      "required": ["score"],
+      "additionalProperties": true,
+      "properties": {
+        "score": {"type": "number", "minimum": 0, "maximum": 1},
+        "dimensions": {"$ref": "#/$defs/CoherenceDimensions"},
+        "outliers": {"type": "array", "items": {"type": "string"}},
+        "conflicts": {"type": "array", "items": {"type": "string"}},
+        "suggestions": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    }
+  }
+}

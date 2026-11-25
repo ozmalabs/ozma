@@ -1,0 +1,17 @@
+[package]
+name = "ozma-display-ir"
+version = "0.1.0"
+edition = "2021"
+description = "Lossless display Widget IR, translation reports, vibe/shape/coherence, and asset-pack contracts."
+license = "AGPL-3.0-only"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+blake3 = "1.8"
+ozma-display-definition = { path = "../ozma-display-definition" }
+ozma-protocol = { path = "../ozma-protocol" }
+
+[dev-dependencies]
+serde_json = { workspace = true }

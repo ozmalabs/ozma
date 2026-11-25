@@ -1,0 +1,16 @@
+{
+  "id": "font.jetbrains_mono",
+  "path": "fonts/JetBrainsMono-Regular.ttf",
+  "mime": "font/ttf",
+  "sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+  "size": 150000,
+  "kind": "font",
+  "executable": false,
+  "sandbox": "none",
+  "family": "JetBrains Mono",
+  "style": "Regular",
+  "format": "ttf",
+  "license": "OFL-1.1",
+  "embedding_allowed": true,
+  "private": false
+}

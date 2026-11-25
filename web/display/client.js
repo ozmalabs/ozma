@@ -51,23 +51,29 @@ const WIDGET_TYPES = new Set([
   'switch',
 ]);
 
-const els = {
-  form: document.getElementById('connect-form'),
-  server: document.getElementById('server'),
-  connect: document.getElementById('connect-button'),
-  status: document.getElementById('status'),
-  statusText: document.getElementById('status-text'),
-  connectionDetail: document.getElementById('connection-detail'),
-  screen: document.getElementById('screen'),
-  empty: document.getElementById('empty-state'),
-  definitionMeta: document.getElementById('definition-meta'),
-  stats: document.getElementById('stats'),
-  fieldsEmpty: document.getElementById('fields-empty'),
-  fieldsTable: document.getElementById('fields-table'),
-  fieldsBody: document.getElementById('fields-body'),
-  log: document.getElementById('log'),
-  clearLog: document.getElementById('clear-log'),
-};
+const DEFAULT_THEME = 'core-dark';
+const GAUGE_MODULE_URL = './widgets/gauge.js';
+const THEME_MODULE_URL = './theme.js';
+
+const els = typeof document !== 'undefined'
+  ? {
+    form: document.getElementById('connect-form'),
+    server: document.getElementById('server'),
+    connect: document.getElementById('connect-button'),
+    status: document.getElementById('status'),
+    statusText: document.getElementById('status-text'),
+    connectionDetail: document.getElementById('connection-detail'),
+    screen: document.getElementById('screen'),
+    empty: document.getElementById('empty-state'),
+    definitionMeta: document.getElementById('definition-meta'),
+    stats: document.getElementById('stats'),
+    fieldsEmpty: document.getElementById('fields-empty'),
+    fieldsTable: document.getElementById('fields-table'),
+    fieldsBody: document.getElementById('fields-body'),
+    log: document.getElementById('log'),
+    clearLog: document.getElementById('clear-log'),
+  }
+  : {};
 
 const state = {
   ws: null,
@@ -90,15 +96,24 @@ const state = {
   fieldRows: new Map(),
   actionsById: new Map(),
   actionsByKey: new Map(),
+  gaugeModule: null,
+  themeModule: null,
+  theme: null,
+  themeTokens: {},
+  themeCanvas: null,
 };
 
 let actionSequence = 0n;
+let gaugeSequence = 0;
 
 /* ------------------------------------------------------------------------- */
 /* Small utilities                                                            */
 /* ------------------------------------------------------------------------- */
 
 function getOrCreateDeviceId() {
+  if (typeof window === 'undefined') {
+    return `browser-${Math.random().toString(36).slice(2, 10)}`;
+  }
   try {
     const existing = localStorage.getItem(DEVICE_STORAGE_KEY);
     if (existing) return existing;
@@ -111,6 +126,7 @@ function getOrCreateDeviceId() {
 }
 
 function storageGet(key) {
+  if (typeof window === 'undefined') return null;
   try {
     return localStorage.getItem(key);
   } catch {
@@ -119,6 +135,7 @@ function storageGet(key) {
 }
 
 function storageSet(key, value) {
+  if (typeof window === 'undefined') return;
   try {
     localStorage.setItem(key, value);
   } catch {
@@ -216,6 +233,54 @@ function clampPercent(value, min, max) {
 
 function hasPlaceholders(text) {
   return /\{[^{}]+\}/.test(String(text || ''));
+}
+
+/* ------------------------------------------------------------------------- */
+/* Optional theme and gauge module selection (pure helpers)                   */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * Pick the theme requested at startup. The query string wins, then a
+ * `data-theme` attribute, then the default theme when the theme module exists.
+ * Returns null when no theme should be loaded.
+ */
+export function selectThemeSelection({
+  search = '',
+  dataTheme = '',
+  hasThemeModule = false,
+  defaultTheme = DEFAULT_THEME,
+} = {}) {
+  if (!hasThemeModule) return null;
+
+  const params = new URLSearchParams(String(search || '').replace(/^\?/, ''));
+  const requested = String(params.get('theme') || '').trim();
+  if (requested) return { origin: 'query', value: requested };
+
+  const attribute = String(dataTheme || '').trim();
+  if (attribute) return { origin: 'data-theme', value: attribute };
+
+  if (defaultTheme) return { origin: 'default', value: defaultTheme };
+  return null;
+}
+
+/**
+ * Map a widget type to a gauge rendering mode, or null when it should use the
+ * adapter's existing card/meter renderer.
+ */
+export function gaugeModeForType(type) {
+  const name = String(type || '').toLowerCase();
+  if (name === 'gauge') return 'arc';
+  if (name === 'bar' || name === 'vu_meter') return 'bar';
+  return null;
+}
+
+/**
+ * Choose between the SVG gauge renderer and the legacy fallback.
+ */
+export function widgetRenderKind(node, { hasGaugeModule = false } = {}) {
+  const type = typeof node === 'string' ? node : node?.type;
+  if (hasGaugeModule && gaugeModeForType(type)) return 'gauge';
+  return 'fallback';
 }
 
 /* ------------------------------------------------------------------------- */
@@ -614,6 +679,9 @@ function renderWidget(node) {
   const type = String(node.type || 'widget').toLowerCase();
   const field = resolveField(node);
   const action = resolveAction(node);
+  const gaugeMode = widgetRenderKind(node, { hasGaugeModule: Boolean(state.gaugeModule) }) === 'gauge'
+    ? gaugeModeForType(type)
+    : null;
 
   const card = document.createElement('article');
   card.className = `widget widget-${cssToken(type)}`;
@@ -625,6 +693,21 @@ function renderWidget(node) {
     heading.className = 'widget-label';
     heading.textContent = headingText;
     card.append(heading);
+  }
+
+  if (gaugeMode) {
+    const host = document.createElement('div');
+    host.className = 'gauge-host';
+    host.dataset.gauge = gaugeMode;
+    try {
+      mountGauge(host, node, field, gaugeMode, headingText);
+      card.classList.add('widget-meter', 'widget-gauge-svg');
+      card.append(host);
+      if (action) attachAction(card, action, node);
+      return card;
+    } catch {
+      // Fall through to the existing card/meter renderer.
+    }
   }
 
   const value = document.createElement('div');
@@ -673,6 +756,98 @@ function renderWidget(node) {
 
   if (action) attachAction(card, action, node);
   return card;
+}
+
+function gaugeConfigForNode(node, field, mode, label) {
+  return {
+    mode,
+    min: node.min,
+    max: node.max,
+    warn: node.warn ?? node.warn_at ?? node.warnAt,
+    crit: node.crit ?? node.critical ?? node.crit_at ?? node.critAt,
+    value: node.value,
+    unit: node.unit ?? field?.unit,
+    decimals: node.decimals,
+    label: label || node.label || node.title || node.name || '',
+    showLabel: false,
+    width: node.width,
+    height: node.height,
+    thickness: node.thickness,
+    tickCount: node.tickCount ?? node.tick_count,
+    animate: node.animate,
+  };
+}
+
+function mountGauge(host, node, field, mode, label) {
+  const gauge = state.gaugeModule;
+  if (!gauge || typeof gauge.renderGauge !== 'function') {
+    throw new Error('gauge module unavailable');
+  }
+
+  const config = gaugeConfigForNode(node, field, mode, label);
+  const tokens = state.themeTokens || {};
+  gaugeSequence += 1;
+  const options = { id: node.id || node.key || `${mode}-${gaugeSequence}` };
+  const initial = field ? state.values.get(field.id) : node.value;
+  gauge.renderGauge(host, config, initial, tokens, options);
+
+  if (!field || field.id === undefined || field.id === null) return;
+
+  const apply = (value) => updateGauge(host, config, value, tokens, options);
+  state.bindings.push({ fieldId: field.id, apply });
+  apply(initial);
+}
+
+function updateGauge(host, config, value, tokens, options) {
+  const gauge = state.gaugeModule;
+  const svg = host.querySelector('svg.ozma-gauge');
+  if (!gauge) return;
+  if (!svg) {
+    gauge.renderGauge(host, config, value, tokens, options);
+    return;
+  }
+
+  const geometry = config.mode === 'bar'
+    ? gauge.barGeometry(config, value, tokens)
+    : gauge.gaugeGeometry(config, value, tokens);
+  const formatted = gauge.formatGaugeValue(geometry.value, geometry);
+  const unit = geometry.unit;
+  const severity = geometry.severity;
+  const reading = `${formatted}${unit ? ` ${unit}` : ''}`;
+  const valueElement = svg.querySelector('.ozma-gauge-value');
+
+  if (valueElement) {
+    if (config.mode === 'bar') {
+      valueElement.setAttribute('width', String(geometry.fillWidth));
+      valueElement.setAttribute('fill', geometry.colors[severity]);
+    } else {
+      valueElement.setAttribute('d', gauge.arcPath({
+        cx: geometry.cx,
+        cy: geometry.cy,
+        radius: geometry.radius,
+        startAngle: geometry.startAngle,
+        endAngle: geometry.valueAngle,
+      }));
+      valueElement.setAttribute('stroke', geometry.colors[severity]);
+    }
+    valueElement.setAttribute('data-severity', severity);
+  }
+
+  const texts = svg.querySelectorAll('text');
+  if (texts.length && geometry.showValue !== false) {
+    texts[texts.length - 1].textContent = reading;
+  }
+
+  let aria = [geometry.label, reading].filter(Boolean).join(' ').trim() || `Gauge ${reading}`;
+  if (severity === 'crit') aria = `${aria}, critical`;
+  else if (severity === 'warn') aria = `${aria}, warning`;
+  svg.setAttribute('aria-label', aria);
+
+  const desc = svg.querySelector('desc');
+  if (desc) {
+    const severityWord = severity === 'crit' ? 'critical' : severity === 'warn' ? 'warning' : 'normal';
+    desc.textContent = `${geometry.label || 'Gauge'} reading ${reading}; range ${gauge.formatGaugeValue(geometry.min, geometry)} to ${gauge.formatGaugeValue(geometry.max, geometry)}${unit ? ` ${unit}` : ''}; ${severityWord}.`;
+  }
 }
 
 function widgetHeading(node, type, field) {
@@ -960,40 +1135,115 @@ function formatFieldTableValue(value, field) {
 }
 
 /* ------------------------------------------------------------------------- */
+/* Optional module bootstrap                                                  */
+/* ------------------------------------------------------------------------- */
+
+async function importOptional(url) {
+  try {
+    return await import(url);
+  } catch {
+    return null;
+  }
+}
+
+function loadThemeModule() {
+  if (typeof window !== 'undefined') {
+    // client.js owns startup bootstrapping, so stop theme.js from fetching the
+    // selected theme a second time through its automatic entry point.
+    window.__ozmaThemeBooted = true;
+  }
+  return importOptional(THEME_MODULE_URL);
+}
+
+async function applySelectedTheme(themeModule) {
+  const doc = typeof document !== 'undefined' ? document : null;
+  if (!doc || !themeModule || typeof themeModule.resolveThemeUrl !== 'function') return null;
+
+  const selection = selectThemeSelection({
+    search: typeof window !== 'undefined' ? window.location?.search || '' : '',
+    dataTheme: doc.documentElement?.dataset?.theme || doc.body?.dataset?.theme || '',
+    hasThemeModule: true,
+  });
+  if (!selection) return null;
+
+  try {
+    const baseUrl = doc.baseURI || (typeof window !== 'undefined' ? window.location?.href : undefined);
+    const source = themeModule.resolveThemeUrl(selection.value, { baseUrl });
+    const theme = await themeModule.loadTheme(source);
+    themeModule.applyTheme(theme, doc);
+    state.theme = theme;
+    state.themeTokens = typeof themeModule.resolveThemeTokens === 'function'
+      ? themeModule.resolveThemeTokens(theme)
+      : {};
+    state.themeCanvas = theme.canvas || null;
+    log(`Theme loaded: ${theme.name || theme.id || selection.value}`, 'ok');
+    return theme;
+  } catch (error) {
+    const code = error?.code || 'THEME_BOOT';
+    if (doc.documentElement?.dataset) {
+      doc.documentElement.dataset.ozmaThemeError = code;
+    }
+    log(`Theme not applied (${code}): ${error?.message || error}`, 'warn');
+    return null;
+  }
+}
+
+async function bootstrapOptionalModules() {
+  const [themeModule, gaugeModule] = await Promise.all([
+    loadThemeModule(),
+    importOptional(GAUGE_MODULE_URL),
+  ]);
+  if (gaugeModule) state.gaugeModule = gaugeModule;
+  if (themeModule) {
+    state.themeModule = themeModule;
+    await applySelectedTheme(themeModule);
+  }
+}
+
+/* ------------------------------------------------------------------------- */
 /* Boot                                                                       */
 /* ------------------------------------------------------------------------- */
 
-const initialServer =
-  new URLSearchParams(window.location.search).get('server') ||
-  storageGet(SERVER_STORAGE_KEY) ||
-  DEFAULT_SERVER;
+function bootAdapter() {
+  const initialServer =
+    new URLSearchParams(window.location.search).get('server') ||
+    storageGet(SERVER_STORAGE_KEY) ||
+    DEFAULT_SERVER;
 
-els.server.value = initialServer;
-els.form.addEventListener('submit', (event) => {
-  event.preventDefault();
-  if (connectionActive()) disconnect();
-  else connect();
-});
-els.clearLog.addEventListener('click', () => {
-  els.log.innerHTML = '';
-  log('Log cleared');
-});
-window.addEventListener('beforeunload', () => {
-  state.manualClose = true;
-  clearReconnect();
-  if (state.ws) {
-    try {
-      state.ws.close(1000, 'page unload');
-    } catch {
-      // Ignore.
+  els.server.value = initialServer;
+  els.form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    if (connectionActive()) disconnect();
+    else connect();
+  });
+  els.clearLog.addEventListener('click', () => {
+    els.log.innerHTML = '';
+    log('Log cleared');
+  });
+  window.addEventListener('beforeunload', () => {
+    state.manualClose = true;
+    clearReconnect();
+    if (state.ws) {
+      try {
+        state.ws.close(1000, 'page unload');
+      } catch {
+        // Ignore.
+      }
     }
-  }
-});
+  });
 
-updateStats();
-updateConnectButton();
-log('Browser Display adapter ready');
-log(`Using device id ${state.deviceId}`);
-if (new URLSearchParams(window.location.search).get('autoconnect') !== '0') {
-  connect();
+  updateStats();
+  updateConnectButton();
+  log('Browser Display adapter ready');
+  log(`Using device id ${state.deviceId}`);
+  bootstrapOptionalModules().catch((error) => {
+    log(`Optional modules unavailable: ${error?.message || error}`, 'warn');
+  });
+  if (new URLSearchParams(window.location.search).get('autoconnect') !== '0') {
+    connect();
+  }
+}
+
+if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+  bootAdapter();
 }

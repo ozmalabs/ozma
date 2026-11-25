@@ -1,0 +1,114 @@
+{
+  "schema": "org.ozma.theme/1",
+  "id": "org.ozma.theme.core-dark",
+  "name": "Core Dark",
+  "author": "Ozma Labs",
+  "license": "AGPL-3.0-only WITH OzmaPluginException",
+  "provenance": {
+    "source": "original",
+    "inspired_by": ["aida64-sensorpanel", "home-assistant"]
+  },
+  "vibe": {
+    "taxonomy": "org.ozma.vibe/1",
+    "keywords": ["minimal", "dark", "technical", "calm"],
+    "mood": ["calm", "technical"],
+    "era": "flat_2010s",
+    "form": ["rounded", "segmented"],
+    "material": ["matte"],
+    "density": "dashboard",
+    "color": ["high_contrast", "cool"],
+    "typography": ["geometric_sans", "monospace"],
+    "ornament": ["minimal"],
+    "confidence": 0.9
+  },
+  "canvas": {
+    "width": 680,
+    "height": 480,
+    "background": "{color.bg}"
+  },
+  "tokens": {
+    "color": {
+      "bg": { "$type": "color", "$value": "#0a0a0f" },
+      "fg": { "$type": "color", "$value": "#e5e7eb" },
+      "muted": { "$type": "color", "$value": "#8d9bb3" },
+      "dim": { "$type": "color", "$value": "#64728a" },
+      "accent": { "$type": "color", "$value": "#5b6fff" },
+      "ok": { "$type": "color", "$value": "#42d392" },
+      "warn": { "$type": "color", "$value": "#f0b94a" },
+      "crit": { "$type": "color", "$value": "#f26464" },
+      "track": { "$type": "color", "$value": "rgba(255, 255, 255, 0.12)" }
+    },
+    "radius": { "$type": "dimension", "$value": "12px" },
+    "radius.sm": { "$type": "dimension", "$value": "8px" },
+    "font": {
+      "family": {
+        "$type": "fontFamily",
+        "$value": ["Inter", "system-ui", "sans-serif"]
+      },
+      "mono": {
+        "$type": "fontFamily",
+        "$value": ["JetBrains Mono", "ui-monospace", "monospace"]
+      }
+    },
+    "gauge": {
+      "fill": { "$type": "color", "$value": "{color.accent}" },
+      "track": { "$type": "color", "$value": "{color.track}" },
+      "warn": { "$type": "color", "$value": "{color.warn}" },
+      "crit": { "$type": "color", "$value": "{color.crit}" },
+      "thickness": { "$type": "dimension", "$value": "14px" }
+    },
+    "shadow.card": {
+      "$type": "shadow",
+      "$value": "0 12px 36px rgba(0, 0, 0, 0.28)"
+    }
+  },
+  "widgets": [
+    {
+      "type": "gauge",
+      "x": 20,
+      "y": 20,
+      "w": 180,
+      "h": 180,
+      "metric": "@active.TCPU",
+      "min": 0,
+      "max": 100,
+      "label": "CPU",
+      "unit": "°C",
+      "warn": 70,
+      "crit": 90,
+      "style": "arc",
+      "tickCount": 5,
+      "rounded": true,
+      "decimals": 0
+    },
+    {
+      "type": "bar",
+      "x": 20,
+      "y": 220,
+      "w": 320,
+      "h": 56,
+      "metric": "@active.MEM",
+      "min": 0,
+      "max": 100,
+      "label": "Memory",
+      "unit": "%",
+      "warn": 80,
+      "crit": 95,
+      "style": "bar"
+    },
+    {
+      "type": "dual-bar",
+      "x": 20,
+      "y": 300,
+      "w": 320,
+      "h": 96,
+      "metric": "@active.RX",
+      "secondMetric": "@active.TX",
+      "min": 0,
+      "max": 1000,
+      "labels": ["RX", "TX"],
+      "units": ["Mb/s", "Mb/s"],
+      "style": "dual-bar"
+    }
+  ]
+}

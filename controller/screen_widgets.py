@@ -295,6 +295,20 @@ class WidgetPack:
     tags: list[str] = field(default_factory=list)
     installed: bool = True
     path: str = ""  # filesystem path
+    # Repository / provenance / design-language fields. Older manifests leave
+    # these empty; the local asset repository parses the same fields directly.
+    license: str = ""
+    source_url: str = ""
+    capabilities: list[str] = field(default_factory=list)
+    permissions: list[str] = field(default_factory=list)
+    min_ozma_version: str = ""
+    min_display_schema: str = ""
+    provenance: dict[str, Any] = field(default_factory=dict)
+    confidence: str = ""
+    vibe: dict[str, Any] = field(default_factory=dict)
+    shape: dict[str, Any] = field(default_factory=dict)
+    coherence: dict[str, Any] = field(default_factory=dict)
+    assets: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -305,6 +319,18 @@ class WidgetPack:
             "option_values": self.option_values,
             "themes": self.themes, "active_theme": self.active_theme,
             "tags": self.tags, "installed": self.installed,
+            "license": self.license,
+            "source_url": self.source_url,
+            "capabilities": list(self.capabilities),
+            "permissions": list(self.permissions),
+            "min_ozma_version": self.min_ozma_version,
+            "min_display_schema": self.min_display_schema,
+            "provenance": dict(self.provenance),
+            "confidence": self.confidence,
+            "vibe": dict(self.vibe),
+            "shape": dict(self.shape),
+            "coherence": dict(self.coherence),
+            "assets": list(self.assets),
         }
 
     @classmethod
@@ -321,6 +347,18 @@ class WidgetPack:
             themes=manifest.get("themes", []),
             tags=manifest.get("tags", []),
             path=path,
+            license=manifest.get("license", ""),
+            source_url=manifest.get("source_url", ""),
+            capabilities=list(manifest.get("capabilities", []) or []),
+            permissions=list(manifest.get("permissions", []) or []),
+            min_ozma_version=manifest.get("min_ozma_version", ""),
+            min_display_schema=manifest.get("min_display_schema", ""),
+            provenance=dict(manifest.get("provenance", {}) or {}),
+            confidence=manifest.get("confidence", ""),
+            vibe=dict(manifest.get("vibe", {}) or {}),
+            shape=dict(manifest.get("shape", {}) or {}),
+            coherence=dict(manifest.get("coherence", {}) or {}),
+            assets=list(manifest.get("assets", []) or []),
         )
 
 

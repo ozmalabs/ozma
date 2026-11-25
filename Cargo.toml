@@ -40,6 +40,8 @@ members = [
     "ozma-multiseat",
     "ozma-thermal",
     "ozma-hardware",
+    "ozma-display-ir",
+    "ozma-fonts",
 ]
 
 [workspace.dependencies]

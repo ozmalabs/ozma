@@ -1,0 +1,159 @@
+{
+  "id": "org.ozma.widget.cpu_temp",
+  "kind": "gauge",
+  "role": "cpu_temp",
+  "binding": {
+    "metric": "org.ozma/node.cpu_temp",
+    "source": "node",
+    "unit": "celsius",
+    "scale": 100,
+    "format": "fixed(1)",
+    "field_id": 1,
+    "value_type": "real",
+    "property": "value"
+  },
+  "domain": {
+    "min": 0,
+    "max": 100,
+    "nominal": 40,
+    "thresholds": [
+      {"at": 75, "severity": "warning", "label": "Warm", "color": "#f0b94a"},
+      {"at": 90, "severity": "critical", "label": "Hot", "color": "#f26464"}
+    ],
+    "severity_bands": [
+      {"min": 0, "max": 74, "severity": "info", "label": "Nominal"}
+    ]
+  },
+  "history": {
+    "window_seconds": 60,
+    "sample_rate_hz": 1,
+    "aggregation": "mean",
+    "retention_points": 60
+  },
+  "label": "CPU Temperature",
+  "icon": {"name": "cpu", "set": "lucide"},
+  "actions": [
+    {
+      "key": "org.ozma.scenario.activate",
+      "action_id": 1,
+      "label": "Activate",
+      "params": {"scenario": "gaming"},
+      "permissions": ["scenario.control"]
+    }
+  ],
+  "accessibility": {
+    "label": "CPU temperature",
+    "description": "Current processor temperature",
+    "role": "meter",
+    "keyboard_shortcut": "c",
+    "reduced_motion": true
+  },
+  "layout": {
+    "x": 10,
+    "y": 10,
+    "width": 120,
+    "height": 120,
+    "zone": "main",
+    "responsive_priority": 10,
+    "aspect_ratio": 1
+  },
+  "style": {
+    "theme": "core-dark",
+    "tokens": {"accent": "#5b6fff", "surface": "surface.raised"},
+    "classes": ["stat", "gauge"]
+  },
+  "typography": {
+    "intent": "numeric",
+    "size_px": 24,
+    "line_height": 1.2,
+    "tracking": 0.1,
+    "weight": 600,
+    "features": ["tabular_nums"]
+  },
+  "fonts": [
+    {
+      "id": "font.inter",
+      "path": "fonts/Inter.woff2",
+      "mime": "font/woff2",
+      "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "size": 12345,
+      "kind": "font",
+      "executable": false,
+      "sandbox": "none",
+      "family": "Inter",
+      "style": "Regular",
+      "format": "woff2",
+      "license": "OFL-1.1",
+      "embedding_allowed": true,
+      "private": false
+    }
+  ],
+  "vibe": {
+    "taxonomy": "org.ozma.vibe/1",
+    "keywords": ["precise", "instrumentation", "haunted"],
+    "mood": ["calm"],
+    "era": "aviation_1950s",
+    "form": ["circular", "needle"],
+    "material": ["brushed_metal"],
+    "density": "balanced",
+    "color": ["high_contrast"],
+    "typography": ["geometric_sans"],
+    "motion": ["needle"],
+    "references": ["aviation", "noc"],
+    "ornament": ["minimal"],
+    "confidence": 0.82,
+    "provenance": {
+      "source_keywords": ["precise"],
+      "derived_keywords": ["instrumentation"],
+      "user_keywords": ["haunted"],
+      "methods": ["manifest", "geometry", "human"]
+    },
+    "custom_axis": ["retro"]
+  },
+  "shape": {
+    "widget_kind": "gauge",
+    "aspect_ratio": 1,
+    "corner_radius_ratio": 0.5,
+    "stroke_width_ratio": 0.04,
+    "fill_ratio": 0.3,
+    "symmetry": "radial",
+    "arc_start_deg": 135,
+    "arc_end_deg": 405,
+    "tick_count": 11,
+    "segment_count": 20,
+    "needle_style": "classic",
+    "chart_mark": "line",
+    "texture": "matte",
+    "elevation": "raised",
+    "glow": false,
+    "animation": "needle"
+  },
+  "source": {
+    "format": "ozma_display_definition",
+    "version": "1",
+    "source_hash": "3333333333333333333333333333333333333333333333333333333333333333",
+    "parsed": {
+      "type": "gauge",
+      "metric": "org.ozma/node.cpu_temp",
+      "min": 0,
+      "max": 100
+    },
+    "unknown": {"legacy_vendor_field": true}
+  },
+  "extensions": {
+    "org.example.widget": {"vendor": "example"},
+    "screen_layout": {"widget": {"custom_badge": "new"}}
+  },
+  "assets": [
+    {
+      "id": "asset.raw_source",
+      "path": "source/widget.json",
+      "mime": "application/json",
+      "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "size": 456,
+      "kind": "original",
+      "executable": false,
+      "sandbox": "none"
+    }
+  ]
+}

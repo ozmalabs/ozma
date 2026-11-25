@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ozma.io/schemas/display/source-v1.schema.json",
+  "title": "Ozma display source documents and capture reports",
+  "description": "SourceDocument retains the complete import payload; SourceCaptureReport must be lossless.",
+  "oneOf": [
+    {"$ref": "#/$defs/SourceDocument"},
+    {"$ref": "#/$defs/SourceCaptureReport"}
+  ],
+  "$defs": {
+    "AssetRef": {
+      "type": "object",
+      "required": ["id", "path", "mime", "sha256", "kind"],
+      "additionalProperties": true,
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "path": {"type": "string", "minLength": 1},
+        "mime": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+        "size": {"type": "integer", "minimum": 0},
+        "kind": {"type": "string", "enum": ["original", "image", "font", "script", "theme", "preview", "other"]},
+        "executable": {"type": "boolean"},
+        "sandbox": {"type": "string", "enum": ["iframe", "wasm", "none"]}
+      }
+    },
+    "SourceDocument": {
+      "type": "object",
+      "required": ["format", "source_hash"],
+      "additionalProperties": true,
+      "properties": {
+        "format": {"type": "string", "minLength": 1},
+        "version": {"type": "string"},
+        "source_hash": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+        "original": {"$ref": "#/$defs/AssetRef"},
+        "parsed": {},
+        "unknown": {}
+      }
+    },
+    "SourceCaptureReport": {
+      "type": "object",
+      "required": ["source_format", "source_hash", "lossless"],
+      "additionalProperties": true,
+      "properties": {
+        "source_format": {"type": "string", "minLength": 1},
+        "source_version": {"type": "string"},
+        "source_hash": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+        "captured": {"type": "array", "items": {"type": "string"}},
+        "opaque": {"type": "array", "items": {"type": "string"}},
+        "assets": {"type": "array", "items": {"type": "string"}},
+        "lossless": {"const": true}
+      }
+    }
+  }
+}

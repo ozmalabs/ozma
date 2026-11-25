@@ -1,0 +1,79 @@
+{
+  "id": "org.ozma.widgets.core-dark",
+  "type": "theme_pack",
+  "name": "Core Dark",
+  "version": "1.0.0",
+  "schema": "org.ozma.asset-pack/1",
+  "author": "Ozma Labs",
+  "description": "Original dark instrumentation theme",
+  "license": "AGPL-3.0-only WITH OzmaPluginException",
+  "source_url": "https://example.invalid/ozma/core-dark",
+  "tags": ["dark", "instrumentation", "noc"],
+  "capabilities": ["rendered_widget"],
+  "permissions": [],
+  "min_ozma_version": "1.0.0",
+  "min_display_schema": "org.ozma.widget-ir/1",
+  "assets": [
+    {
+      "id": "asset.preview",
+      "path": "preview.png",
+      "mime": "image/png",
+      "sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+      "size": 9876,
+      "kind": "preview",
+      "executable": false,
+      "sandbox": "none"
+    }
+  ],
+  "preview": "preview.png",
+  "provenance": {
+    "type": "original",
+    "author": "Ozma Labs",
+    "method": "authored"
+  },
+  "confidence": "exact",
+  "vibe": {
+    "taxonomy": "org.ozma.vibe/1",
+    "keywords": ["instrumentation", "calm"],
+    "confidence": 0.9
+  },
+  "shape": {
+    "widget_kind": "gauge",
+    "aspect_ratio": 1,
+    "favicon": false
+  },
+  "coherence": {
+    "score": 0.93,
+    "dimensions": {"mood": 0.9, "color": 0.95},
+    "outliers": [],
+    "conflicts": [],
+    "suggestions": [],
+    "confidence": 0.8
+  },
+  "signature": "ed25519:example",
+  "published_at": "2026-11-25T00:00:00Z",
+  "yanked": false,
+  "source_capture": {
+    "source_format": "ozma_display_definition",
+    "source_version": "1",
+    "source_hash": "3333333333333333333333333333333333333333333333333333333333333333",
+    "captured": ["widgets", "theme"],
+    "opaque": [],
+    "assets": ["asset.preview"],
+    "lossless": true
+  },
+  "translation_reports": [
+    {
+      "direction": "export",
+      "source_format": "org.ozma.widget-ir/1",
+      "target_format": "browser_svg",
+      "translator": "ozma-display-ir",
+      "translator_version": "0.1.0",
+      "fidelity": "exact",
+      "converted": ["widgets"],
+      "approximated": [],
+      "dropped": [],
+      "warnings": []
+    }
+  ]
+}

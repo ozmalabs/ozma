@@ -1,0 +1,16 @@
+[package]
+name = "ozma-fonts"
+version = "0.1.0"
+edition = "2021"
+description = "Font metadata, shape/intent matching, and target export planning for Ozma displays."
+license = "AGPL-3.0-only"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+ttf-parser = "0.25"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

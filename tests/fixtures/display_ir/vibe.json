@@ -1,0 +1,22 @@
+{
+  "taxonomy": "org.ozma.vibe/1",
+  "keywords": ["precise", "haunted", "not_in_taxonomy"],
+  "mood": ["calm", "mysterious"],
+  "era": "synth_1980s",
+  "form": ["segmented", "dot_matrix"],
+  "material": ["crt", "glass"],
+  "density": "dense",
+  "color": ["phosphor_green"],
+  "typography": ["dot_matrix"],
+  "motion": ["sweep", "glow"],
+  "references": ["sci_fi"],
+  "ornament": ["skeuomorphic"],
+  "confidence": 0.76,
+  "provenance": {
+    "source_keywords": ["precise"],
+    "derived_keywords": ["phosphor_green", "dot_matrix"],
+    "user_keywords": ["haunted", "not_in_taxonomy"],
+    "methods": ["palette", "geometry", "human"]
+  },
+  "custom_axis": ["retro"]
+}

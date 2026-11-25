@@ -1,0 +1,9 @@
+{
+  "source_format": "ozma_display_definition",
+  "source_version": "1",
+  "source_hash": "3333333333333333333333333333333333333333333333333333333333333333",
+  "captured": ["widget.kind", "widget.binding", "widget.layout", "widget.styles"],
+  "opaque": ["legacy_vendor_field"],
+  "assets": ["asset.raw_source", "font.inter"],
+  "lossless": true
+}

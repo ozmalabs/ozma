@@ -1,0 +1,272 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ozma.io/schemas/display/ir-v1.schema.json",
+  "title": "Ozma Widget IR v1",
+  "description": "Lossless semantic widget projection plus its complete source record.",
+  "type": "object",
+  "required": ["id", "kind", "binding", "source"],
+  "additionalProperties": true,
+  "properties": {
+    "id": {"type": "string", "minLength": 1},
+    "kind": {
+      "type": "string",
+      "enum": ["gauge", "bar", "number", "text", "sparkline", "chart", "status", "icon", "table", "card", "custom"]
+    },
+    "role": {"type": "string"},
+    "binding": {"$ref": "#/$defs/DataBinding"},
+    "domain": {"$ref": "#/$defs/ValueDomain"},
+    "history": {"$ref": "#/$defs/HistoryPolicy"},
+    "label": {"type": "string"},
+    "icon": {"$ref": "#/$defs/IconRef"},
+    "actions": {"type": "array", "items": {"$ref": "#/$defs/ActionRef"}},
+    "accessibility": {"$ref": "#/$defs/Accessibility"},
+    "layout": {"$ref": "#/$defs/LayoutHint"},
+    "style": {"$ref": "#/$defs/StyleRef"},
+    "typography": {"$ref": "#/$defs/TypographyRef"},
+    "fonts": {"type": "array", "items": {"$ref": "#/$defs/FontAssetRef"}},
+    "vibe": {"$ref": "#/$defs/VibeProfile"},
+    "shape": {"$ref": "#/$defs/ShapeSignature"},
+    "source": {"$ref": "#/$defs/SourceDocument"},
+    "extensions": {"type": "object", "additionalProperties": true},
+    "assets": {"type": "array", "items": {"$ref": "#/$defs/AssetRef"}}
+  },
+  "$defs": {
+    "DataBinding": {
+      "type": "object",
+      "required": ["metric"],
+      "additionalProperties": true,
+      "properties": {
+        "metric": {"type": "string", "minLength": 1},
+        "source": {"type": "string"},
+        "unit": {"type": "string"},
+        "scale": {"type": "number"},
+        "format": {"type": "string"},
+        "field_id": {"type": "integer", "minimum": 0},
+        "value_type": {"type": "string", "enum": ["sint", "uint", "real", "bool", "string", "enum", "bytes", "timestamp"]},
+        "property": {"type": "string"}
+      }
+    },
+    "ValueDomain": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "min": {"type": "number"},
+        "max": {"type": "number"},
+        "nominal": {"type": "number"},
+        "thresholds": {"type": "array", "items": {"$ref": "#/$defs/Threshold"}},
+        "severity_bands": {"type": "array", "items": {"$ref": "#/$defs/SeverityBand"}}
+      }
+    },
+    "Threshold": {
+      "type": "object",
+      "required": ["at", "severity"],
+      "additionalProperties": true,
+      "properties": {
+        "at": {"type": "number"},
+        "severity": {"type": "string", "minLength": 1},
+        "label": {"type": "string"},
+        "color": {"type": "string"}
+      }
+    },
+    "SeverityBand": {
+      "type": "object",
+      "required": ["severity"],
+      "additionalProperties": true,
+      "properties": {
+        "min": {"type": "number"},
+        "max": {"type": "number"},
+        "severity": {"type": "string", "minLength": 1},
+        "label": {"type": "string"}
+      }
+    },
+    "HistoryPolicy": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "window_seconds": {"type": "number", "minimum": 0},
+        "sample_rate_hz": {"type": "number", "exclusiveMinimum": 0},
+        "aggregation": {"type": "string"},
+        "retention_points": {"type": "integer", "minimum": 0}
+      }
+    },
+    "IconRef": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "name": {"type": "string"},
+        "asset_id": {"type": "string"},
+        "set": {"type": "string"}
+      }
+    },
+    "ActionRef": {
+      "type": "object",
+      "required": ["key"],
+      "additionalProperties": true,
+      "properties": {
+        "key": {"type": "string", "minLength": 1},
+        "action_id": {"type": "integer", "minimum": 0},
+        "label": {"type": "string"},
+        "params": {},
+        "permissions": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "Accessibility": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "label": {"type": "string"},
+        "description": {"type": "string"},
+        "role": {"type": "string"},
+        "keyboard_shortcut": {"type": "string"},
+        "reduced_motion": {"type": "boolean"}
+      }
+    },
+    "LayoutHint": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "x": {"type": "number"},
+        "y": {"type": "number"},
+        "width": {"type": "number", "exclusiveMinimum": 0},
+        "height": {"type": "number", "exclusiveMinimum": 0},
+        "zone": {"type": "string"},
+        "responsive_priority": {"type": "integer"},
+        "aspect_ratio": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
+    "StyleRef": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "theme": {"type": "string"},
+        "tokens": {"type": "object", "additionalProperties": true},
+        "classes": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "TypographyRef": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "intent": {"type": "string"},
+        "size_px": {"type": "number", "exclusiveMinimum": 0},
+        "size_pt": {"type": "number", "exclusiveMinimum": 0},
+        "line_height": {"type": "number"},
+        "tracking": {"type": "number"},
+        "weight": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "features": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "AssetRef": {
+      "type": "object",
+      "required": ["id", "path", "mime", "sha256", "kind"],
+      "additionalProperties": true,
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "path": {"type": "string", "minLength": 1},
+        "mime": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+        "size": {"type": "integer", "minimum": 0},
+        "kind": {"type": "string", "enum": ["original", "image", "font", "script", "theme", "preview", "other"]},
+        "executable": {"type": "boolean"},
+        "sandbox": {"type": "string", "enum": ["iframe", "wasm", "none"]}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"executable": {"const": true}}},
+          "then": {"properties": {"sandbox": {"enum": ["iframe", "wasm"]}}, "required": ["sandbox"]}
+        }
+      ]
+    },
+    "FontAssetRef": {
+      "type": "object",
+      "required": ["id", "path", "mime", "sha256", "kind"],
+      "additionalProperties": true,
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "path": {"type": "string", "minLength": 1},
+        "mime": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+        "size": {"type": "integer", "minimum": 0},
+        "kind": {"type": "string", "enum": ["original", "image", "font", "script", "theme", "preview", "other"]},
+        "executable": {"type": "boolean"},
+        "sandbox": {"type": "string", "enum": ["iframe", "wasm", "none"]},
+        "family": {"type": "string"},
+        "style": {"type": "string"},
+        "format": {"type": "string"},
+        "license": {"type": "string"},
+        "embedding_allowed": {"type": "boolean"},
+        "private": {"type": "boolean"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"executable": {"const": true}}},
+          "then": {"properties": {"sandbox": {"enum": ["iframe", "wasm"]}}, "required": ["sandbox"]}
+        }
+      ]
+    },
+    "SourceDocument": {
+      "type": "object",
+      "required": ["format", "source_hash"],
+      "additionalProperties": true,
+      "properties": {
+        "format": {"type": "string", "minLength": 1},
+        "version": {"type": "string"},
+        "source_hash": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+        "original": {"$ref": "#/$defs/AssetRef"},
+        "parsed": {},
+        "unknown": {}
+      }
+    },
+    "VibeProfile": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "taxonomy": {"type": "string", "minLength": 1},
+        "keywords": {"type": "array", "items": {"type": "string"}},
+        "mood": {"type": "array", "items": {"type": "string"}},
+        "era": {"type": "string"},
+        "form": {"type": "array", "items": {"type": "string"}},
+        "material": {"type": "array", "items": {"type": "string"}},
+        "density": {"type": "string"},
+        "color": {"type": "array", "items": {"type": "string"}},
+        "typography": {"type": "array", "items": {"type": "string"}},
+        "motion": {"type": "array", "items": {"type": "string"}},
+        "references": {"type": "array", "items": {"type": "string"}},
+        "ornament": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "provenance": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "source_keywords": {"type": "array", "items": {"type": "string"}},
+            "derived_keywords": {"type": "array", "items": {"type": "string"}},
+            "user_keywords": {"type": "array", "items": {"type": "string"}},
+            "methods": {"type": "array", "items": {"type": "string"}}
+          }
+        }
+      }
+    },
+    "ShapeSignature": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "widget_kind": {"type": "string"},
+        "aspect_ratio": {"type": "number", "minimum": 0},
+        "corner_radius_ratio": {"type": "number", "minimum": 0},
+        "stroke_width_ratio": {"type": "number", "minimum": 0},
+        "fill_ratio": {"type": "number", "minimum": 0},
+        "symmetry": {"type": "string"},
+        "arc_start_deg": {"type": "number"},
+        "arc_end_deg": {"type": "number"},
+        "tick_count": {"type": "integer", "minimum": 0},
+        "segment_count": {"type": "integer", "minimum": 0},
+        "needle_style": {"type": "string"},
+        "chart_mark": {"type": "string"},
+        "texture": {"type": "string"},
+        "elevation": {"type": "string"},
+        "glow": {"type": "boolean"},
+        "animation": {"type": "string"}
+      }
+    }
+  }
+}

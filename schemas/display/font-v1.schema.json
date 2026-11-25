@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ozma.io/schemas/display/font-v1.schema.json",
+  "title": "Ozma font assets, intents, device profiles, and translation reports v1",
+  "description": "Fonts are assets matched by shape and intent, not family name. Translation is an export decision and must be reported.",
+  "oneOf": [
+    {"$ref": "#/$defs/FontAssetRef"},
+    {"$ref": "#/$defs/FontIntent"},
+    {"$ref": "#/$defs/TargetFontProfile"},
+    {"$ref": "#/$defs/FontTranslationReport"}
+  ],
+  "$defs": {
+    "FontAssetRef": {
+      "type": "object",
+      "required": ["id", "path", "mime", "sha256", "kind"],
+      "additionalProperties": true,
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "path": {"type": "string", "minLength": 1},
+        "mime": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+        "size": {"type": "integer", "minimum": 0},
+        "kind": {"type": "string", "enum": ["original", "image", "font", "script", "theme", "preview", "other"]},
+        "executable": {"type": "boolean"},
+        "sandbox": {"type": "string", "enum": ["iframe", "wasm", "none"]},
+        "family": {"type": "string"},
+        "style": {"type": "string"},
+        "format": {"type": "string", "enum": ["ttf", "otf", "woff2", "bitmap", "lvgl_c", "bdf", "pcf"]},
+        "license": {"type": "string"},
+        "embedding_allowed": {"type": "boolean"},
+        "private": {"type": "boolean"}
+      }
+    },
+    "FontIntent": {
+      "type": "object",
+      "required": ["role", "classification"],
+      "additionalProperties": true,
+      "properties": {
+        "role": {"type": "string", "enum": ["body", "label", "numeric", "display", "caption", "icon", "brand", "code"]},
+        "classification": {"type": "string", "enum": ["sans", "serif", "mono", "display", "script", "icon"]},
+        "traits": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "weight": {"type": "integer", "minimum": 100, "maximum": 900},
+            "width": {"type": "string", "enum": ["condensed", "normal", "expanded"]},
+            "slant": {"type": "string", "enum": ["upright", "italic", "oblique"]},
+            "x_height": {"type": "number"},
+            "cap_height": {"type": "number"},
+            "contrast": {"type": "string", "enum": ["low", "medium", "high"]},
+            "roundness": {"type": "string", "enum": ["geometric", "humanist", "grotesque"]},
+            "aperture": {"type": "string", "enum": ["open", "closed"]}
+          }
+        },
+        "scripts": {"type": "array", "items": {"type": "string"}},
+        "features": {"type": "array", "items": {"type": "string"}},
+        "target": {"$ref": "#/$defs/TargetFontProfile"},
+        "fallbacks": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "TargetFontProfile": {
+      "type": "object",
+      "required": ["target", "formats"],
+      "additionalProperties": true,
+      "properties": {
+        "target": {"type": "string"},
+        "formats": {"type": "array", "items": {"type": "string"}},
+        "dpi": {"type": "integer"},
+        "color_depth": {"type": "integer"},
+        "bpp": {"type": "integer", "enum": [1, 2, 4, 8]},
+        "cell_width": {"type": "integer"},
+        "cell_height": {"type": "integer"},
+        "antialias": {"type": "boolean"},
+        "hinting": {"type": "boolean"},
+        "max_bytes": {"type": "integer"},
+        "scripts": {"type": "array", "items": {"type": "string"}},
+        "fallback_family": {"type": "string"}
+      }
+    },
+    "TypographyRef": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "intent": {"type": "string"},
+        "size_px": {"type": "number", "exclusiveMinimum": 0},
+        "size_pt": {"type": "number", "exclusiveMinimum": 0},
+        "line_height": {"type": "number"},
+        "tracking": {"type": "number"},
+        "weight": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "features": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "FontTranslationReport": {
+      "type": "object",
+      "required": ["source_font", "target_font", "action", "license_ok"],
+      "additionalProperties": true,
+      "properties": {
+        "source_font": {"type": "string", "minLength": 1},
+        "target_font": {"type": "string", "minLength": 1},
+        "action": {"type": "string", "enum": ["exact", "subset", "substituted", "rasterized", "unavailable"]},
+        "shape_score": {"type": "number", "minimum": 0, "maximum": 1},
+        "metrics": {"type": "object", "additionalProperties": true},
+        "dropped_glyphs": {"type": "array", "items": {"type": "string"}},
+        "dropped_features": {"type": "array", "items": {"type": "string"}},
+        "license_ok": {"type": "boolean"},
+        "warnings": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  }
+}
