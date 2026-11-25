@@ -28,7 +28,8 @@ use crate::routing::{
 };
 use crate::seat::{SeatPlan, SeatRuntimeStatus, SeatState};
 use crate::seat_display::{
-    DisplayExit, SeatDisplayBackend, SeatDisplayHandle, SeatDisplayLauncher, SeatDisplayRequest,
+    wayland_display_name, DisplayExit, SeatDisplayBackend, SeatDisplayHandle, SeatDisplayLauncher,
+    SeatDisplayRequest, SeatWaylandEnv,
 };
 use crate::supervisor::{
     ChildExit, ChildHandle, NodeLaunchSpec, NodeLauncher, ReadinessProbe, SeatSupervisor,
@@ -721,7 +722,14 @@ impl SeatDisplayLauncher for FakeSeatDisplayLauncher {
                 number
             }
         };
-        let display = format!(":{number}");
+        let (display, wayland) = if request.backend == SeatDisplayBackend::Weston {
+            let display = wayland_display_name(number);
+            let runtime = std::env::temp_dir()
+                .join(format!("ozma-fake-weston-{}-{number}", std::process::id()));
+            (display.clone(), Some(SeatWaylandEnv::new(display, runtime)))
+        } else {
+            (format!(":{number}"), None)
+        };
         state.next_pid = state.next_pid.saturating_add(1);
         let pid = state.next_pid;
         state.spawns.push(request.clone());
@@ -739,6 +747,7 @@ impl SeatDisplayLauncher for FakeSeatDisplayLauncher {
             pid,
             number,
             display,
+            wayland,
             seat_id: request.seat_id.clone(),
             backend: request.backend,
             auth_disabled,
@@ -751,6 +760,7 @@ struct FakeDisplayHandle {
     pid: u32,
     number: u32,
     display: String,
+    wayland: Option<SeatWaylandEnv>,
     seat_id: String,
     backend: SeatDisplayBackend,
     auth_disabled: bool,
@@ -780,6 +790,10 @@ impl SeatDisplayHandle for FakeDisplayHandle {
 
     fn auth_disabled(&self) -> bool {
         self.auth_disabled
+    }
+
+    fn wayland(&self) -> Option<&SeatWaylandEnv> {
+        self.wayland.as_ref()
     }
 
     fn is_ready(&self) -> Result<bool, MultiseatError> {

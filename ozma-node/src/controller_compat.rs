@@ -4814,6 +4814,33 @@ async fn node_status(State(state): State<ConnectionState>) -> Json<ConnectionRes
 async fn agent_metrics(State(state): State<ConnectionState>) -> Response {
     let mut document = state.metrics.collect(&state.info.node_id);
 
+    // AIDA64's documented IDs are also a convenient stable vocabulary for
+    // widget panels. Merge their numeric values into the flat host document so
+    // the existing controller metric bus can resolve `@active.TCPU` etc.
+    if let Some(hardware) = &state.hardware {
+        if let Ok(snapshot) = hardware.snapshot(false).await {
+            let aida = crate::aida64::build_snapshot(&snapshot);
+            let metrics = aida.numeric_metrics();
+            if let Some(object) = document.as_object_mut() {
+                for (key, value) in &metrics {
+                    object.insert(key.clone(), serde_json::json!(value));
+                }
+                object.insert("aida64".to_string(), serde_json::json!(true));
+                if let Some(unavailable) = object
+                    .get_mut("unavailable")
+                    .and_then(|value| value.as_array_mut())
+                {
+                    unavailable.retain(|value| {
+                        value
+                            .as_str()
+                            .map(|key| !metrics.contains_key(key))
+                            .unwrap_or(true)
+                    });
+                }
+            }
+        }
+    }
+
     (
         [
             (header::CONTENT_TYPE, "application/json"),

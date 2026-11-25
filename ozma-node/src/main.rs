@@ -788,14 +788,28 @@ pub struct Args {
     #[arg(long, env = "OZMA_MESH_KEY_FILE", value_name = "PATH")]
     pub mesh_key_file: Option<std::path::PathBuf>,
 
-    /// Request kernel WireGuard (root + `wg` binary). Kernel mode is not
-    /// implemented; this is reported as a typed unsupported state.
+    /// Use Linux kernel WireGuard instead of userspace boringtun. Requires
+    /// root, the `wireguard` kernel module, `ip`, and `wg` (wireguard-tools).
+    /// The interface from `--mesh-tun` is created as a kernel `wireguard` link;
+    /// no TUN device or userspace packet pump is used.
     #[arg(long, env = "OZMA_MESH_KERNEL")]
     pub mesh_kernel: bool,
 
     /// Additional mesh peer as a JSON `MeshNode` object. Repeatable.
     #[arg(long = "mesh-peer", env = "OZMA_MESH_PEER", value_name = "JSON")]
     pub mesh_peer: Vec<String>,
+
+    /// Underlay UDP endpoint for a static peer: `ID=ADDRESS:PORT`. Repeatable.
+    ///
+    /// The peer's mesh IP stays its overlay identity and `/32` route. Set this
+    /// in kernel WireGuard mode when the peer's mesh IP is itself routed via
+    /// the WireGuard link, so encrypted UDP does not recurse into `wg`.
+    #[arg(
+        long = "mesh-peer-endpoint",
+        env = "OZMA_MESH_PEER_ENDPOINT",
+        value_name = "ID=ADDR:PORT"
+    )]
+    pub mesh_peer_endpoint: Vec<String>,
 
     /// Opt in to mDNS peer discovery on `_ozma-mesh._udp.local`.
     ///
@@ -2771,7 +2785,13 @@ async fn run() -> std::process::ExitCode {
                 }
             }
             _ => match service.start().await {
-                Ok(()) => info!("Mesh service started (userspace WireGuard)"),
+                Ok(()) => {
+                    let wireguard = service
+                        .identity()
+                        .map(|identity| identity.wireguard)
+                        .unwrap_or_else(|| "unavailable".to_owned());
+                    info!(%wireguard, "Mesh service started");
+                }
                 Err(error) => warn!(
                     code = %error.code,
                     reason = %error.reason,
@@ -3970,12 +3990,52 @@ fn parse_mesh_trust(spec: &str) -> Result<ozma_mesh::TrustedPeer, String> {
     Ok(trusted)
 }
 
+/// Parse one `--mesh-peer-endpoint` entry (`ID=ADDRESS:PORT`).
+fn parse_mesh_peer_endpoint(spec: &str) -> Result<(String, std::net::SocketAddr), String> {
+    let (id, endpoint) = spec.split_once('=').ok_or_else(|| {
+        "--mesh-peer-endpoint must be ID=ADDRESS:PORT (no '=' separator found)".to_owned()
+    })?;
+    let id = id.trim();
+    if id.is_empty() {
+        return Err("--mesh-peer-endpoint node id must not be empty".to_owned());
+    }
+    let endpoint = endpoint
+        .trim()
+        .parse::<std::net::SocketAddr>()
+        .map_err(|error| {
+            format!("--mesh-peer-endpoint {id:?} is not a valid ADDRESS:PORT endpoint: {error}")
+        })?;
+    if !endpoint.is_ipv4() {
+        return Err("--mesh-peer-endpoint must be an IPv4 address:port".to_owned());
+    }
+    if endpoint.port() == 0 {
+        return Err("--mesh-peer-endpoint port must be non-zero".to_owned());
+    }
+    Ok((id.to_owned(), endpoint))
+}
+
 fn build_mesh_service(args: &Args) -> Option<mesh_service::MeshService> {
     if !args.mesh {
         return None;
     }
 
     let log = || mesh_service::MeshEventLog::new(mesh_service::MESH_EVENT_CAPACITY);
+    if args.mesh_kernel && args.mesh_dataplane_nat {
+        return Some(mesh_service::MeshService::unsupported(
+            mesh_service::MeshServiceError::new(
+                "mesh.dataplane-invalid",
+                "NAT is not implemented for kernel WireGuard mode; remove \
+                 --mesh-dataplane-nat",
+            ),
+            log(),
+        ));
+    }
+    if args.mesh_kernel && args.mesh_dataplane {
+        warn!(
+            "--mesh-kernel owns the wg link; --mesh-dataplane does not create a TUN/pump \
+             (its tun/mtu/prefix flags only size the kernel link)"
+        );
+    }
     let mut peers = Vec::new();
     for spec in &args.mesh_peer {
         match serde_json::from_str::<ozma_mesh::MeshNode>(spec) {
@@ -3986,6 +4046,30 @@ fn build_mesh_service(args: &Args) -> Option<mesh_service::MeshService> {
                         "mesh.peer-invalid",
                         format!("--mesh-peer is not a valid MeshNode JSON object: {error}"),
                     ),
+                    log(),
+                ));
+            }
+        }
+    }
+
+    let mut peer_endpoints = std::collections::BTreeMap::new();
+    for spec in &args.mesh_peer_endpoint {
+        match parse_mesh_peer_endpoint(spec) {
+            Ok((id, endpoint)) => {
+                if !peers.iter().any(|peer| peer.id == id) {
+                    return Some(mesh_service::MeshService::unsupported(
+                        mesh_service::MeshServiceError::new(
+                            "mesh.peer-invalid",
+                            format!("--mesh-peer-endpoint {id} has no matching --mesh-peer entry"),
+                        ),
+                        log(),
+                    ));
+                }
+                peer_endpoints.insert(id, endpoint);
+            }
+            Err(reason) => {
+                return Some(mesh_service::MeshService::unsupported(
+                    mesh_service::MeshServiceError::new("mesh.peer-invalid", reason),
                     log(),
                 ));
             }
@@ -4018,35 +4102,45 @@ fn build_mesh_service(args: &Args) -> Option<mesh_service::MeshService> {
             .with_ttl(Duration::from_secs(args.mesh_discover_ttl))
     });
 
+    let kernel = args.mesh_kernel.then(|| {
+        let address = args
+            .mesh_ip
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .and_then(|value| value.parse::<Ipv4Addr>().ok())
+            .unwrap_or(Ipv4Addr::UNSPECIFIED);
+        ozma_mesh::KernelWgSettings::new(
+            args.mesh_tun.clone(),
+            address,
+            args.mesh_prefix_len,
+            args.mesh_mtu,
+            args.mesh_port,
+        )
+    });
+
     let config = mesh_service::MeshServiceConfig {
         node_id: args.name.clone(),
         mesh_ip: args.mesh_ip.clone().unwrap_or_default(),
         wg_port: args.mesh_port,
         key_file: args.mesh_key_file.clone(),
-        requires_root: args.mesh_kernel,
-        requires_wg: args.mesh_kernel,
+        requires_root: false,
+        requires_wg: false,
+        kernel,
         peers: peers.clone(),
+        peer_endpoints,
         capabilities,
         discovery,
-        dataplane: build_dataplane_config(args, &peers),
+        // Kernel mode owns its link and routes; a TUN dataplane/pump would be
+        // a competing second interface, so it is not built.
+        dataplane: if args.mesh_kernel {
+            None
+        } else {
+            build_dataplane_config(args, &peers)
+        },
         event_capacity: None,
     };
     let environment = mesh_service::MeshEnvironment::detect();
-
-    if args.mesh_kernel {
-        // Surface a missing key/root/wg first, then the honest backend limit.
-        return match config.preflight(&environment) {
-            Err(error) => Some(mesh_service::MeshService::unsupported(error, log())),
-            Ok(()) => Some(mesh_service::MeshService::unsupported(
-                mesh_service::MeshServiceError::new(
-                    "mesh.kernel-unsupported",
-                    "kernel WireGuard is not implemented on this node; only the userspace \
-                     boringtun backend is available",
-                ),
-                log(),
-            )),
-        };
-    }
 
     Some(mesh_service::MeshService::from_config(config, &environment))
 }
@@ -4784,6 +4878,16 @@ mod tests {
         assert_eq!(defaults.mesh_discover_ttl, 60);
         assert_eq!(defaults.mesh_discover_max_peers, 32);
         assert!(defaults.mesh_trust.is_empty());
+        assert!(defaults.mesh_peer_endpoint.is_empty());
+        assert!(!defaults.mesh_kernel);
+
+        let (id, endpoint) = parse_mesh_peer_endpoint("node-b=10.10.30.2:51820").unwrap();
+        assert_eq!(id, "node-b");
+        assert_eq!(endpoint.to_string(), "10.10.30.2:51820");
+        assert!(parse_mesh_peer_endpoint("missing-separator").is_err());
+        assert!(parse_mesh_peer_endpoint("node-b=not-an-endpoint").is_err());
+        assert!(parse_mesh_peer_endpoint("node-b=10.10.30.2:0").is_err());
+        assert!(parse_mesh_peer_endpoint("=10.10.30.2:51820").is_err());
 
         let args = Args::parse_from([
             "ozma-node",

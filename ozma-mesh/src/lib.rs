@@ -1,6 +1,7 @@
 //! # ozma-mesh
 //!
-//! Userspace WireGuard mesh networking + mDNS peer discovery for ozma nodes.
+//! WireGuard mesh networking (userspace boringtun or Linux kernel) + mDNS peer
+//! discovery for ozma nodes.
 //!
 //! ## Crate layout
 //!
@@ -9,7 +10,8 @@
 //! | [`error`] | [`MeshError`] enum and `Result<T>` alias |
 //! | [`node`]  | [`MeshNode`], [`WgPublicKey`], [`WgPrivateKey`] |
 //! | [`discovery`] | mDNS browse, advertisement validation, dedupe/expiry |
-//! | [`manager`] | [`MeshManager`] — lifecycle, peer table, tunnels, mDNS |
+//! | [`manager`] | [`MeshManager`] — userspace lifecycle, peer table, mDNS |
+//! | [`kernel`] | [`KernelWireguard`] — Linux `wireguard` link, peers, routes, `wg` status |
 //!
 //! ## Quick start
 //!
@@ -42,6 +44,7 @@
 pub mod dataplane;
 pub mod discovery;
 pub mod error;
+pub mod kernel;
 pub mod keys;
 pub mod manager;
 pub mod node;
@@ -58,7 +61,12 @@ pub use discovery::{
     DiscoveryStatus, MdnsBrowser, RawAdvertisement, TrustedPeer, MDNS_FQDN, MDNS_SERVICE_TYPE,
 };
 pub use error::{MeshError, Result};
-pub use manager::{MeshManager, PeerChange, PeerOrigin, PeerStatus};
+pub use kernel::{
+    parse_wg_dump, redact_keys, KernelWgSettings, KernelWgStatus, KernelWireguard, WgDump,
+    WgDumpPeer, DEFAULT_KERNEL_INTERFACE, DEFAULT_KERNEL_KEEPALIVE, DEFAULT_KERNEL_MTU,
+    HANDSHAKE_REJECT_AFTER_SECS, WIREGUARD_MODULE_PATH,
+};
+pub use manager::{MeshAdvertiser, MeshManager, PeerChange, PeerOrigin, PeerStatus};
 pub use node::{MeshNode, WgPrivateKey, WgPublicKey};
 pub use pump::{
     ManagerPacketIo, PacketPump, PumpConfig, PumpError, PumpState, PumpStats, PumpStatus,

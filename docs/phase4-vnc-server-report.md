@@ -6,10 +6,12 @@ registering an external QEMU VNC endpoint. Standard RFB VNC password
 authentication (security type 2) is now available. The server offers **ZRLE**
 (encoding 16), **Tight** (7), **Hextile** (5), and **ZLib** (6) when the
 client advertises them, keeping **Raw** as the always-valid fallback, and
-answers the **Cursor** pseudo-encoding with a typed empty cursor. **The
-transport is still plain TCP: VNC authentication is not encryption and there
-is no TLS. ZRLE, ZLib, and Tight are compression, not encryption.** No commit
-was made.
+answers the **Cursor** pseudo-encoding with a typed empty cursor. Tight now
+covers **JpegCompression** (honouring the -32..-23 quality pseudo-encoding),
+the **GradientFilter**, and the -256..-247 compression-level hint in addition
+to Fill/Palette/Copy. **The transport is still plain TCP: VNC authentication
+is not encryption and there is no TLS. ZRLE, ZLib, and Tight are compression,
+not encryption.** No commit was made.
 
 ## Scope
 
@@ -21,7 +23,8 @@ Added:
   input adapter, and per-listener counters.
 - `ozma-node/Cargo.toml` — the `flate2` dependency for the per-client ZRLE,
   ZLib, and Tight zlib streams (already present in `Cargo.lock` through the
-  image stack).
+  image stack) and the `jpeg-encoder` dependency for Tight JPEG (the same
+  crate `ozma-encode` already uses; no new crate was downloaded).
 - `ozma-node/src/main.rs` — `--vnc-server`, `--vnc-bind`,
   `--vnc-server-port`, `--vnc-password-file`, `--vnc-allow-unauthenticated`,
   `--vnc-max-clients`, and `--vnc-idle-timeout-seconds`, startup/shutdown
@@ -129,7 +132,7 @@ The server advertises **RFB 003.008** and accepts clients that negotiate 3.3,
 | Type | Message | Behavior |
 |---|---|---|
 | `0` | `SetPixelFormat` | Accepts 32-bit true-colour with 8 bits per channel and either RGB (r16/g8/b0) or BGR (r0/g8/b16) shifts, little- or big-endian. Any other format closes the connection; RFB has no per-message error, and continuing would send pixels in a format the client did not request. |
-| `2` | `SetEncodings` | Parsed with a 1024-entry bound. Every supported entry is kept in the client's stated order: Raw (0), Hextile (5), ZLib (6), Tight (7), and ZRLE (16). The first usable entry is used; if it fails during encoding only that encoding is disabled and the next listed encoding (or Raw) is used. Unsupported entries (JPEG, H.264, ...) are ignored, and an empty or all-unsupported list falls back to Raw. The Cursor pseudo-encoding (-239) is remembered. |
+| `2` | `SetEncodings` | Parsed with a 1024-entry bound. Every supported entry is kept in the client's stated order: Raw (0), Hextile (5), ZLib (6), Tight (7), and ZRLE (16). The first usable entry is used; if it fails during encoding only that encoding is disabled and the next listed encoding (or Raw) is used. Tight pseudo-encodings are remembered per client: JPEG quality `-32..-23` (0..9, later entries win) and compression level `-256..-247` (0..9). Other pseudo-encodings are ignored, and an empty or all-unsupported list falls back to Raw. The Cursor pseudo-encoding (-239) is remembered. |
 | `3` | `FramebufferUpdateRequest` | Full (`incremental=0`) or incremental (`incremental=1`), with bounded rectangle clipping. Multiple pending requests are merged into at most eight rectangles. |
 | `4` | `KeyEvent` | Keysym → USB HID usage, forwarded to the shared `InputSink`. Unknown keysyms are counted and dropped rather than guessed. |
 | `5` | `PointerEvent` | Absolute pointer position (scaled to the sink's 0..=32767 report space) plus button/wheel transitions. |
@@ -165,7 +168,11 @@ The server advertises **RFB 003.008** and accepts clients that negotiate 3.3,
   updates use it; otherwise they stay on Raw.
 - ZRLE, ZLib, and Tight keep **separate** per-client zlib streams. A failure
   in one does not reset or disable the others, and switching between them never
-  mixes stream state.
+  mixes stream state. Within Tight, a JPEG failure disables only the JPEG
+  sub-path; lossless Tight keeps using the same zlib stream. A change to the
+  negotiated compression level starts a new Tight zlib stream and sets the
+  stream-0 reset bit on the next Tight rectangle, so the decoder discards its
+  old inflate state instead of misreading the new stream.
 - Raw is always legal in RFB, so a client that advertised only a compressed
   encoding still receives a valid Raw rectangle when compression fails.
 
@@ -248,6 +255,10 @@ sessions:
   updates and sync-flushed after every rectangle. Each compressed payload uses
   Tight's one-, two-, or three-byte compact length (22 bits); a filtered
   payload smaller than 12 bytes is sent uncompressed, as the format requires.
+  The zlib level comes from the client's compression-level pseudo-encoding
+  (`-256` → level 0, `-247` → level 9) or defaults to 6. A level change starts
+  a fresh zlib stream and sets control-bit 0 (reset stream 0) on the next
+  Tight rectangle.
 - **FillCompression** for a rectangle whose pixels are one colour: a single
   `TPIXEL` after the `0x80` control byte and no zlib data.
 - **PaletteFilter** for rectangles with at most 256 colours. The palette size
@@ -255,27 +266,45 @@ sessions:
   one bit per pixel, MSB first and row-aligned, and three or more use one byte
   per pixel. The palette header is uncompressed and only the index data goes
   through the zlib stream. The encoder chooses the filter whose pre-compression
-  size is smaller; otherwise it uses the **CopyFilter**.
+  size is smaller; otherwise it considers the copy and gradient filters.
+- **GradientFilter** (filter id 2) for high-colour rectangles. Each RGB
+  component is replaced by the difference from
+  `V[i-1,j] + V[i,j-1] - V[i-1,j-1]`, clamped to 0..255, with pixels outside
+  the rectangle treated as zero. The encoder compresses both the copy and
+  gradient representations and selects gradient only when it is at least 5%
+  smaller, so noise stays on the cheaper copy path. Gradient output keeps the
+  same `TPIXEL` length (three RGB bytes for depth 24, a full four-byte PIXEL
+  for depth 32).
+- **JpegCompression** (`0x90`) for high-colour rectangles, but **only when the
+  client advertised a JPEG quality level** with `-32..-23`. The level maps to a
+  conservative 20..92 percent JPEG quality (level 0 → 20, level 9 → 92). The
+  encoder compares the JPEG payload plus its compact length against the
+  lossless payload plus compact length and uses JPEG only when it is smaller;
+  ties stay lossless. JPEG data is always a JFIF RGB stream and is never sent
+  for Fill/Palette rectangles or for a client without the quality hint. A
+  JPEG encode error or oversized payload disables only JPEG for the rest of the
+  connection and the same rectangle falls back to lossless Tight.
 - `TPIXEL` is three bytes in R, G, B order when the client chose 32-bit
   true-colour with depth 24 and 8-bit channels — independent of the shift order
   and endianness — and a full four-byte `PIXEL` for depth 32. Both RGB and BGR
-  client formats are encoded from the same source pixels.
+  client formats are encoded from the same source pixels; JPEG always extracts
+  RGB regardless of wire order.
 - **Bounds:** TightVNC decoders cap a rectangle at 2048 pixels wide, so a wider
   request is split into multiple rectangles. Each wire rectangle is also capped
   at 1,000,000 pixels, which keeps the uncompressed payload at 4,000,000 bytes
   and the compressed payload inside the 4,194,303-byte compact-length limit even
-  for incompressible data. Rectangle buffers, the palette lookup, and the
-  per-client stream are all bounded by those limits; nothing grows with frame
-  count.
-- If a Tight encode fails (invalid geometry, compact-length bound, or zlib
-  error), the whole requested rectangle is emitted as Raw and Tight is disabled
-  for the rest of the connection, because the partially written zlib stream
-  cannot be trusted. The ZRLE and ZLib streams remain usable. Raw is always
-  legal in RFB, so the client stream stays valid.
-- **Not implemented:** JPEG sub-encoding (no JPEG encoder in the node), the
-  gradient filter, `BasicCompression Without Zlib`, and the extra zlib streams
-  1–3. Those are not advertised or emitted. JPEG quality-level and compression-
-  level pseudo-encodings in `SetEncodings` are ignored rather than misread.
+  for incompressible data. The same compact-length bound is enforced for JPEG
+  before it is selected. Rectangle buffers (palette, copy, gradient, RGB, JPEG,
+  and predictor rows), the palette lookup, and the per-client stream are all
+  bounded by those limits; nothing grows with frame count.
+- If a lossless Tight encode fails (invalid geometry, compact-length bound, or
+  zlib error), the whole requested rectangle is emitted as Raw and Tight is
+  disabled for the rest of the connection, because the partially written zlib
+  stream cannot be trusted. A JPEG-only failure does not disable Tight. The
+  ZRLE and ZLib streams remain usable. Raw is always legal in RFB, so the
+  client stream stays valid.
+- **Not implemented:** `BasicCompression Without Zlib` and the extra zlib
+  streams 1–3. Those are not advertised or emitted.
 
 ### Cursor pseudo-encoding
 
@@ -358,7 +387,7 @@ sessions:
 
 ### Automated
 
-`cargo test -p ozma-node --lib vnc` — **54 passed, 0 failed** for the RFB,
+`cargo test -p ozma-node --lib vnc` — **62 passed, 0 failed** for the RFB,
 config, and registration coverage. The wider `ozma-node` lib suite was not
 re-run for this Tight pass; the previous full run was **552 passed, 0 failed,
 4 ignored**, and the ignored tests are pre-existing opt-in WebRTC/GStreamer
@@ -401,6 +430,32 @@ New encoding tests in `ozma-node/src/vnc_server.rs`:
 - `tight_and_zlib_use_independent_persistent_streams` — a live connection
   alternates Tight and ZLib rectangles; each decoder keeps its own stream and
   every rectangle decodes to the expected framebuffer.
+- `tight_quality_and_compression_pseudo_encodings_are_recorded` — `-32`/`-23`
+  and `-256`/`-247` set and update the per-client JPEG quality and zlib level
+  (0..9), later entries win, and unrelated pseudo-encodings do not disturb
+  them.
+- `tight_gradient_filter_wins_on_a_smooth_ramp_and_decodes` — a 64x64 smooth
+  colour ramp is encoded with filter id 2 in RGB, BGR, and depth-32 formats and
+  decodes exactly through the test-side gradient predictor.
+- `tight_copy_filter_stays_selected_for_noise` — high-entropy noise keeps the
+  copy filter, proving the gradient choice is not unconditional.
+- `tight_jpeg_subencoding_decodes_at_the_requested_quality` — high-colour
+  rectangles with quality levels 0 and 9 produce `0x90` JpegCompression
+  payloads whose compact length covers the body exactly, decode at 64x64, and
+  grow with quality; the same rectangle with no quality hint stays lossless
+  and never emits `0x90`.
+- `tight_compression_level_controls_the_zlib_payload_size` — levels 0 and 9
+  produce different payload sizes and both decode to the same framebuffer.
+- `tight_compression_level_change_resets_the_zlib_stream` — after a level
+  change the next rectangle sets control-bit 0 and the test decoder resets
+  before inflating; unchanged levels do not set it.
+- `tight_jpeg_subpath_failure_keeps_lossless_tight` — a disabled JPEG sub-path
+  still emits decodable lossless Tight for the same high-colour rectangle.
+- `tight_jpeg_frames_decode_over_the_wire_and_follow_quality_hints` — a real
+  RFB connection sends lossless Tight without a quality hint, then `0x90`
+  JPEG with quality -23 and -32; both JPEG rectangles decode with the
+  `jpeg-decoder` crate at the expected dimensions and the high-quality payload
+  is larger.
 - `tight_sub_rects_respect_the_width_and_area_bounds` — widths 1, 2048, 2049,
   4096, and 65535 split into pieces that all stay within 2048 pixels wide and
   1,000,000 pixels, and the pieces cover exactly the requested area.
@@ -546,8 +601,8 @@ The external probe connected twice:
   4-byte length prefix, sync flush, and raw-pixel payload all matched.
 
 This is live wire evidence for Hextile and ZLib selection and decoding, not
-just the in-process decoders. It does not claim a live run for JPEG or H.264,
-which remain unimplemented.
+just the in-process decoders. It does not claim a live run for H.264, which
+remains unimplemented.
 
 Earlier in this pass, the `asyncvnc` client advertised only ZLib before ZLib
 support existed and therefore received Raw. That historical result is no longer
@@ -591,6 +646,41 @@ evidence for Tight basic compression, the compact length, the per-client zlib
 stream, and the copy filter. Fill and palette filters are covered by the
 in-process decoder tests.
 
+### Live Tight JPEG/gradient smoke (2026-11-25)
+
+The same `--capture-provider fake` node was rebuilt from this change and run
+at `127.0.0.1:15999` with a 640x480 synthetic block source. `RUST_LOG`
+kept the encoding debug line visible.
+
+TigerVNC 1.16.2 under Xvfb with `-AutoSelect=0 -PreferredEncoding=Tight`
+advertised 27 encodings and the two new Tight hints:
+
+```text
+VNC client encoding preferences applied client=1 count=27 order=[Tight, Zrle, Hextile, Raw] cursor=true jpeg_quality=8 compression_level=2
+```
+
+The server chose the gradient filter for that source because lossless Tight
+was smaller than JPEG at level 8. The viewer decoded frames for the full 8 s
+window with no protocol or decode error.
+
+An external Python RFB probe then exercised the sub-encoding choice directly
+on the same live server:
+
+```text
+tight-only:       control=0x40 filter=2 zlib_bytes=2491 (uncompressed 921600)
+jpeg-quality-9:   control=0x40 filter=2 zlib_bytes=2529 (uncompressed 921600)
+jpeg-quality-0:   control=0x90 JpegCompression reset=0 jpeg_bytes=6528
+jpeg-quality-0:   JPEG decoded size=(640, 480) mode=RGB first_pixel=(222, 39, 165)
+```
+
+`0x40 filter=2` is BasicCompression with the GradientFilter. At quality level
+0 (pseudo-encoding `-32`) the JPEG payload won and `0x90` JpegCompression
+decoded to the exact 640x480 dimensions with PIL. The high-quality run shows
+the selection is conditional: when lossless gradient is smaller, JPEG is not
+sent even though the client advertised it. This is live wire evidence for the
+gradient filter, JPEG sub-encoding, quality-level negotiation (including the
+TigerVNC `jpeg_quality=8` hint), and the compression-level hint.
+
 ### Commands
 
 ```sh
@@ -599,10 +689,14 @@ cargo check -p ozma-node --all-targets
 rustfmt --edition 2021 --check ozma-node/src/vnc_server.rs
 ```
 
-All passed: **54 vnc tests**, check clean (only pre-existing warnings from
-other crates such as unused imports in `ozma-pipewire` and `unused_mut` in
-`controller_compat.rs`), rustfmt exit 0. The commands ran in the main working
-tree. The wider `ozma-node` lib suite was not re-run for this Tight pass.
+All passed: **62 vnc tests**, check clean apart from pre-existing warnings in
+other crates (`unused_mut` in `controller_compat.rs`, unused imports in
+`ozma-pipewire`), rustfmt exit 0. The commands and live run used a clean
+worktree at `487c396` with only `ozma-node/src/vnc_server.rs`,
+`ozma-node/Cargo.toml`, and `Cargo.lock` copied from this change, because the
+main working tree currently carries unrelated uncommitted `mesh_service`
+changes that do not compile (`kernel_is_none` is missing). The wider
+`ozma-node` lib suite was not re-run for this Tight pass.
 
 ## Remaining VNC gaps
 
@@ -621,15 +715,16 @@ tree. The wider `ozma-node` lib suite was not re-run for this Tight pass.
 - **No password rotation while running.** The file is read once at startup; a
   changed password requires a node restart.
 - **Tight is a subset.** Raw (0), Hextile (5), ZLib (6), Tight (7), and ZRLE
-  (16) are implemented. Tight supports basic zlib compression with the fill,
-  copy, and 2..=256-colour palette filters on one per-client stream. It does
-  **not** implement JPEG sub-encoding, the gradient filter,
-  BasicCompression Without Zlib, extra zlib streams 1–3, or JPEG quality /
-  compression-level pseudo-encodings. A client that advertises only an
-  unimplemented encoding still gets Raw, as RFB permits, and the server honours
-  the client's order across all five supported encodings. An encode failure
-  disables only the failing encoding for that connection and falls back to Raw
-  for that update.
+  (16) are implemented. Tight supports Fill, Palette, Copy, Gradient, and
+  JPEG sub-encodings on one per-client zlib stream, plus the JPEG quality
+  (`-32..-23`) and compression-level (`-256..-247`) pseudo-encodings. It does
+  **not** implement BasicCompression Without Zlib or extra zlib streams 1–3.
+  JPEG is lossy and is used only for high-colour rectangles where its payload
+  is smaller and the client advertised a quality level. A client that
+  advertises only an unimplemented encoding still gets Raw, as RFB permits, and
+  the server honours the client's order across all five supported encodings.
+  A lossless encode failure disables only the failing encoding and falls back
+  to Raw for that update; a JPEG failure disables only JPEG.
 - **Cursor is always the empty shape.** There is no cursor-shape source in the
   capture pipeline, so the node tells a requesting client that there is no
   local cursor. It does not inspect QMP/QEMU cursor state or synthesize a
@@ -641,7 +736,9 @@ tree. The wider `ozma-node` lib suite was not re-run for this Tight pass.
 - **Only packed RGB24/BGRA capture sources.** YUYV, NV12, P010, and compressed
   sources are refused at startup; this server does not convert pixel layouts.
   Raw, Hextile, ZLib, Tight, and ZRLE still send only 32-bit true-colour client
-  formats (depth 24/32). Tight uses its 3-byte TPIXEL form at depth 24.
+  formats (depth 24/32). Tight uses its 3-byte TPIXEL form at depth 24 and a
+  four-byte PIXEL at depth 32; the gradient filter predicts RGB components in
+  both cases.
 - **No frame-rate pacing in the server.** The capture pump runs at the source's
   own pace even when no viewer is connected; the snapshot is overwritten rather
   than queued.

@@ -27,12 +27,16 @@
 //!   per-client zlib stream; Hextile uses the standard 16x16 tiles and its
 //!   Raw, BackgroundColour, ForegroundColour, AnySubrects, and
 //!   SubrectsColoured sub-encodings. Tight sends basic zlib compression with
-//!   the Fill sub-encoding for solid rectangles and the Palette filter for
-//!   rectangles with at most 256 colours; it does not claim JPEG or gradient
-//!   compression. The server never sends an encoding the client did not
-//!   advertise, falls back to Raw if an encode fails, disables only the
-//!   failing encoding for the rest of the connection, and never claims a codec
-//!   it does not implement.
+//!   the Fill sub-encoding for solid rectangles, the Palette filter for
+//!   rectangles with at most 256 colours, and the Gradient predictor for
+//!   high-colour rectangles when it beats the copy filter. When the client
+//!   advertises a Tight JPEG quality-level pseudo-encoding, high-colour
+//!   rectangles may instead use the JpegCompression sub-encoding when the JPEG
+//!   payload is smaller than the lossless one. The server never sends an
+//!   encoding or sub-encoding the client did not advertise, falls back to Raw
+//!   if an encode fails, disables only the failing encoding or JPEG sub-path
+//!   for the rest of the connection, and never claims a codec it does not
+//!   implement.
 //! * A client may request the Cursor pseudo-encoding (-239). Because this
 //!   server has no cursor-shape source, it sends a typed 0x0 empty cursor
 //!   once per connection; it never fabricates a visible pointer shape.
@@ -60,6 +64,7 @@ use std::time::Duration;
 
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
+use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder};
 use rand::rngs::OsRng;
 use rand::RngCore;
 
@@ -126,6 +131,16 @@ pub const ENCODING_TIGHT: i32 = 7;
 pub const ENCODING_ZRLE: i32 = 16;
 /// RFB Cursor pseudo-encoding number (RFC 6143 section 7.8.1).
 pub const ENCODING_CURSOR: i32 = -239;
+/// Tight JPEG quality-level pseudo-encoding range. `-32` is the lowest
+/// (fastest/smallest) quality and `-23` the highest.
+pub const ENCODING_JPEG_QUALITY_LOW: i32 = -32;
+/// Highest Tight JPEG quality-level pseudo-encoding.
+pub const ENCODING_JPEG_QUALITY_HIGH: i32 = -23;
+/// Tight compression-level pseudo-encoding range. `-256` is the lowest
+/// (fastest) compression level and `-247` the highest.
+pub const ENCODING_COMPRESSION_LEVEL_LOW: i32 = -256;
+/// Highest Tight compression-level pseudo-encoding.
+pub const ENCODING_COMPRESSION_LEVEL_HIGH: i32 = -247;
 /// ZRLE tile edge in pixels.
 const ZRLE_TILE_SIZE: usize = 64;
 /// Hextile tile edge in pixels.
@@ -164,14 +179,24 @@ const TIGHT_MAX_PIXELS: usize = 1_000_000;
 const TIGHT_MAX_RECT_BYTES: usize = 0x003f_ffff;
 /// Tight compression-control byte: FillCompression (all pixels one colour).
 const TIGHT_FILL: u8 = 0x80;
+/// Tight compression-control byte: JpegCompression.
+const TIGHT_JPEG: u8 = 0x90;
 /// Tight compression-control bit: an explicit filter-id byte follows.
 const TIGHT_EXPLICIT_FILTER: u8 = 0x40;
 /// Tight filter id: palette (indexed colour) filter.
 const TIGHT_FILTER_PALETTE: u8 = 1;
+/// Tight filter id: gradient predictor filter.
+const TIGHT_FILTER_GRADIENT: u8 = 2;
 /// Tight sends filtered data below this size without zlib compression.
 const TIGHT_MIN_TO_COMPRESS: usize = 12;
 /// Largest palette Tight emits; the palette size byte stores `len - 1`.
 const TIGHT_MAX_PALETTE: usize = 256;
+/// Default zlib level for Tight when the client does not request one.
+const TIGHT_DEFAULT_COMPRESSION: u8 = 6;
+/// The gradient filter must beat the copy filter by this percentage of the
+/// copy payload's compressed size. Choosing only clear wins keeps near-ties on
+/// noisy rectangles on the cheaper copy path.
+const TIGHT_GRADIENT_WIN_PERCENT: usize = 95;
 /// How long a viewer may take to complete the handshake.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long one framebuffer update write may block before the viewer is closed.
@@ -1184,13 +1209,19 @@ impl DisabledEncodings {
 }
 
 /// Per-client encoding preferences: the supported encodings in the order the
-/// client listed them, plus whether the Cursor pseudo-encoding was requested.
+/// client listed them, plus whether the Cursor pseudo-encoding was requested
+/// and the Tight JPEG-quality/compression-level hints.
 /// An empty list (or a list with no supported entry) selects Raw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ClientEncodingState {
     order: [UpdateEncoding; 5],
     count: usize,
     cursor: bool,
+    /// Tight JPEG quality level 0..=9. `None` means the client did not
+    /// advertise a JPEG quality pseudo-encoding, so JPEG must never be sent.
+    jpeg_quality: Option<u8>,
+    /// Tight zlib compression level 0..=9. `None` uses the server default.
+    compression_level: Option<u8>,
 }
 
 impl Default for ClientEncodingState {
@@ -1199,6 +1230,8 @@ impl Default for ClientEncodingState {
             order: [UpdateEncoding::Raw; 5],
             count: 0,
             cursor: false,
+            jpeg_quality: None,
+            compression_level: None,
         }
     }
 }
@@ -1214,6 +1247,29 @@ impl ClientEncodingState {
         if self.count < self.order.len() {
             self.order[self.count] = encoding;
             self.count += 1;
+        }
+    }
+
+    /// Apply one `SetEncodings` entry: a real encoding, a supported
+    /// pseudo-encoding, or an ignored extension.
+    fn apply(&mut self, encoding: i32) {
+        match encoding {
+            ENCODING_RAW => self.push(UpdateEncoding::Raw),
+            ENCODING_HEXTILE => self.push(UpdateEncoding::Hextile),
+            ENCODING_ZLIB => self.push(UpdateEncoding::ZLib),
+            ENCODING_TIGHT => self.push(UpdateEncoding::Tight),
+            ENCODING_ZRLE => self.push(UpdateEncoding::Zrle),
+            ENCODING_CURSOR => self.cursor = true,
+            // -32 (low) .. -23 (high). Later entries win, matching the usual
+            // RFB "last hint received" interpretation.
+            ENCODING_JPEG_QUALITY_LOW..=ENCODING_JPEG_QUALITY_HIGH => {
+                self.jpeg_quality = Some((encoding - ENCODING_JPEG_QUALITY_LOW) as u8);
+            }
+            // -256 (low) .. -247 (high).
+            ENCODING_COMPRESSION_LEVEL_LOW..=ENCODING_COMPRESSION_LEVEL_HIGH => {
+                self.compression_level = Some((encoding - ENCODING_COMPRESSION_LEVEL_LOW) as u8);
+            }
+            _ => {}
         }
     }
 
@@ -1297,6 +1353,15 @@ impl ClientPixelFormat {
         } else {
             self.push_pixel(value, out);
         }
+    }
+
+    /// Extract the red, green, and blue components from a packed pixel value.
+    fn rgb_components(&self, value: u32) -> [u8; 3] {
+        [
+            ((value >> self.red_shift) & 0xff) as u8,
+            ((value >> self.green_shift) & 0xff) as u8,
+            ((value >> self.blue_shift) & 0xff) as u8,
+        ]
     }
 }
 
@@ -1952,20 +2017,13 @@ async fn read_set_encodings(
         .map_err(ProtocolError::io)?;
 
     // Supported encodings keep the client's stated order; unsupported entries
-    // and pseudo-encodings do not disturb it. Raw is always acceptable in RFB,
-    // so an all-unsupported or empty list falls back to Raw.
+    // do not disturb it. Tight quality/compression pseudo-encodings are
+    // remembered per client. Raw is always acceptable in RFB, so an
+    // all-unsupported or empty list falls back to Raw.
     let mut state = ClientEncodingState::default();
     for chunk in encodings.chunks_exact(4) {
         let encoding = i32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        match encoding {
-            ENCODING_RAW => state.push(UpdateEncoding::Raw),
-            ENCODING_HEXTILE => state.push(UpdateEncoding::Hextile),
-            ENCODING_ZLIB => state.push(UpdateEncoding::ZLib),
-            ENCODING_TIGHT => state.push(UpdateEncoding::Tight),
-            ENCODING_ZRLE => state.push(UpdateEncoding::Zrle),
-            ENCODING_CURSOR => state.cursor = true,
-            _ => {}
-        }
+        state.apply(encoding);
     }
     *lock(&context.encoding) = state;
     debug!(
@@ -1973,6 +2031,8 @@ async fn read_set_encodings(
         count,
         order = ?&state.order[..state.count],
         cursor = state.cursor,
+        jpeg_quality = state.jpeg_quality,
+        compression_level = state.compression_level,
         "VNC client encoding preferences applied"
     );
     Ok(())
@@ -2159,10 +2219,11 @@ async fn client_write_loop(
     // rectangles and updates. ZRLE, ZLib, and Tight are independent streams.
     // If an encode fails its stream state is untrustworthy, so only that
     // encoding is disabled for the rest of the connection and the next
-    // preference is used.
+    // preference is used. Tight also keeps its negotiated zlib level and the
+    // JPEG sub-path's failure state, which is disabled independently.
     let mut zrle = ZlibEncoder::new(Vec::new(), Compression::default());
     let mut zlib = ZlibEncoder::new(Vec::new(), Compression::default());
-    let mut tight = ZlibEncoder::new(Vec::new(), Compression::default());
+    let mut tight = TightStream::new(TIGHT_DEFAULT_COMPRESSION);
     let mut disabled = DisabledEncodings::default();
     let mut cursor_sent = false;
 
@@ -2170,6 +2231,13 @@ async fn client_write_loop(
         if let Some(request) = pending.take() {
             let snapshot = { frames.borrow().clone() };
             let encoding = *lock(&context.encoding);
+            // A changed compression-level hint starts a fresh zlib stream; the
+            // next Tight rectangle carries the stream-0 reset bit.
+            tight.set_level(
+                encoding
+                    .compression_level
+                    .unwrap_or(TIGHT_DEFAULT_COMPRESSION),
+            );
             let preferred = encoding.select(disabled);
             let cursor_pending = encoding.cursor && !cursor_sent;
             let should_send = snapshot.as_ref().is_some_and(|frame| {
@@ -2206,6 +2274,7 @@ async fn client_write_loop(
                     zrle_stream,
                     zlib_stream,
                     tight_stream,
+                    encoding.jpeg_quality,
                     cursor_pending,
                 );
                 if let Some(failed) = built.failed_encoding {
@@ -2217,7 +2286,7 @@ async fn client_write_loop(
                     } else if failed == UpdateEncoding::ZLib {
                         zlib = ZlibEncoder::new(Vec::new(), Compression::default());
                     } else if failed == UpdateEncoding::Tight {
-                        tight = ZlibEncoder::new(Vec::new(), Compression::default());
+                        tight = TightStream::new(tight.level);
                     }
                 }
                 match tokio::time::timeout(write_timeout, write.write_all(&built.bytes)).await {
@@ -2302,7 +2371,8 @@ fn build_update(
     preferred: UpdateEncoding,
     mut zrle: Option<&mut ZlibEncoder<Vec<u8>>>,
     mut zlib: Option<&mut ZlibEncoder<Vec<u8>>>,
-    mut tight: Option<&mut ZlibEncoder<Vec<u8>>>,
+    mut tight: Option<&mut TightStream>,
+    jpeg_quality: Option<u8>,
     send_cursor: bool,
 ) -> BuiltUpdate {
     let non_empty = clip_rects(rects, frame.format.width, frame.format.height);
@@ -2385,7 +2455,14 @@ fn build_update(
                 UpdateEncoding::Tight => {
                     if let Some(stream) = tight.as_deref_mut() {
                         let mark = body.len();
-                        match encode_tight_rect(frame, pixel, *rect, stream, &mut body) {
+                        match encode_tight_rect(
+                            frame,
+                            pixel,
+                            *rect,
+                            stream,
+                            jpeg_quality,
+                            &mut body,
+                        ) {
                             Ok(count) => {
                                 payload_bytes += body.len() - mark;
                                 wire_rects += count;
@@ -2790,6 +2867,48 @@ fn encode_zlib_rect(
     Ok(data)
 }
 
+/// Per-client Tight encoder state.
+///
+/// The zlib stream continues across rectangles and updates. A changed
+/// compression-level hint starts a new zlib stream and marks a pending
+/// stream-0 reset, which the next Tight rectangle advertises in its
+/// compression-control byte. JPEG is a separate sub-path: if JPEG encoding
+/// fails, only JPEG is disabled and lossless Tight continues on the same
+/// connection.
+struct TightStream {
+    encoder: ZlibEncoder<Vec<u8>>,
+    level: u8,
+    used: bool,
+    reset_pending: bool,
+    jpeg_disabled: bool,
+}
+
+impl TightStream {
+    fn new(level: u8) -> Self {
+        Self {
+            encoder: ZlibEncoder::new(Vec::new(), Compression::new(u32::from(level))),
+            level,
+            used: false,
+            reset_pending: false,
+            jpeg_disabled: false,
+        }
+    }
+
+    fn set_level(&mut self, level: u8) {
+        if self.level == level {
+            return;
+        }
+        // A decoder that has already seen this stream must be told to reset
+        // stream 0 before it reads the replacement stream.
+        if self.used {
+            self.reset_pending = true;
+        }
+        self.encoder = ZlibEncoder::new(Vec::new(), Compression::new(u32::from(level)));
+        self.level = level;
+        self.used = false;
+    }
+}
+
 /// Encode one requested rectangle as Tight encoding (encoding 7).
 ///
 /// A requested rectangle can become several wire rectangles: TightVNC decoders
@@ -2802,7 +2921,8 @@ fn encode_tight_rect(
     frame: &FrameSnapshot,
     pixel: ClientPixelFormat,
     rect: Rect,
-    encoder: &mut ZlibEncoder<Vec<u8>>,
+    stream: &mut TightStream,
+    jpeg_quality: Option<u8>,
     out: &mut Vec<u8>,
 ) -> io::Result<usize> {
     let width = usize::from(rect.width);
@@ -2826,10 +2946,19 @@ fn encode_tight_rect(
     let mut scratch = TightScratch::default();
     let mut payload = Vec::new();
     let mut count = 0usize;
-    for sub_rect in tight_sub_rects(rect) {
-        if let Err(error) =
-            encode_tight_sub_rect(frame, pixel, sub_rect, encoder, &mut scratch, &mut payload)
-        {
+    let reset = stream.reset_pending;
+    for (index, sub_rect) in tight_sub_rects(rect).into_iter().enumerate() {
+        let reset_bit = if index == 0 && reset { 0x01 } else { 0 };
+        if let Err(error) = encode_tight_sub_rect(
+            frame,
+            pixel,
+            sub_rect,
+            stream,
+            jpeg_quality,
+            reset_bit,
+            &mut scratch,
+            &mut payload,
+        ) {
             out.truncate(start);
             return Err(error);
         }
@@ -2837,6 +2966,9 @@ fn encode_tight_rect(
         out.extend_from_slice(&payload);
         count += 1;
     }
+    // The reset bit and the new zlib stream are now committed.
+    stream.reset_pending = false;
+    stream.used = true;
     Ok(count)
 }
 
@@ -2876,15 +3008,24 @@ struct TightScratch {
     palette: Vec<u32>,
     lookup: HashMap<u32, u8>,
     filtered: Vec<u8>,
+    gradient: Vec<u8>,
+    gradient_prev: Vec<[u8; 3]>,
+    gradient_row: Vec<[u8; 3]>,
+    jpeg_rgb: Vec<u8>,
+    jpeg: Vec<u8>,
 }
 
-/// Encode one Tight wire rectangle (control byte plus optional palette plus
-/// filtered pixel data). The caller has already bounded width and area.
+/// Encode one Tight wire rectangle (control byte plus optional filter data).
+/// The caller has already bounded width and area. `reset_bit` is 1 only for the
+/// first rectangle after a zlib stream restart.
+#[allow(clippy::too_many_arguments)]
 fn encode_tight_sub_rect(
     frame: &FrameSnapshot,
     pixel: ClientPixelFormat,
     rect: Rect,
-    encoder: &mut ZlibEncoder<Vec<u8>>,
+    stream: &mut TightStream,
+    jpeg_quality: Option<u8>,
+    reset_bit: u8,
     scratch: &mut TightScratch,
     out: &mut Vec<u8>,
 ) -> io::Result<()> {
@@ -2906,12 +3047,20 @@ fn encode_tight_sub_rect(
         palette,
         lookup,
         filtered,
+        gradient,
+        gradient_prev,
+        gradient_row,
+        jpeg_rgb,
+        jpeg,
     } = scratch;
     values.clear();
     values.reserve(area);
     palette.clear();
     lookup.clear();
     filtered.clear();
+    gradient.clear();
+    jpeg_rgb.clear();
+    jpeg.clear();
 
     for row in 0..height {
         for column in 0..width {
@@ -2923,13 +3072,14 @@ fn encode_tight_sub_rect(
     // FillCompression: a single TPIXEL applies to the whole rectangle.
     let first = values[0];
     if values.iter().all(|value| *value == first) {
-        out.push(TIGHT_FILL);
+        out.push(TIGHT_FILL | reset_bit);
         pixel.push_tight_pixel(first, out);
         return Ok(());
     }
 
     // Collect at most 256 colours in first-seen order. More than 256 disables
-    // the palette filter; copy filtering remains available.
+    // the palette filter and marks the rectangle as high-colour, where the
+    // gradient filter and JPEG are worth considering.
     let mut too_many_colours = false;
     for &value in values.iter() {
         if lookup.contains_key(&value) {
@@ -2983,21 +3133,95 @@ fn encode_tight_sub_rect(
                 filtered.push(lookup[&value]);
             }
         }
-        out.push(TIGHT_EXPLICIT_FILTER);
+        out.push(TIGHT_EXPLICIT_FILTER | reset_bit);
         out.push(TIGHT_FILTER_PALETTE);
         out.push((palette.len() - 1) as u8);
         for &value in palette.iter() {
             pixel.push_tight_pixel(value, out);
         }
-    } else {
-        // BasicCompression, zlib stream 0, CopyFilter (no filter-id byte).
-        out.push(0);
-        filtered.reserve(copy_size);
-        for &value in values.iter() {
-            pixel.push_tight_pixel(value, filtered);
+        write_tight_filtered(stream, filtered, out)?;
+        return Ok(());
+    }
+
+    // BasicCompression path. Build the copy-filter representation first, then
+    // compare it against the gradient predictor and (when the client advertised
+    // a JPEG quality level) JPEG. Ties prefer lossless data.
+    filtered.reserve(copy_size);
+    for &value in values.iter() {
+        pixel.push_tight_pixel(value, filtered);
+    }
+    let mut filter_id = 0u8; // CopyFilter
+
+    if too_many_colours {
+        encode_gradient_filter(
+            pixel,
+            values,
+            width,
+            height,
+            gradient_prev,
+            gradient_row,
+            gradient,
+        );
+        let copy_estimate = tight_zlib_estimate(filtered, stream.level)?;
+        let gradient_estimate = tight_zlib_estimate(gradient, stream.level)?;
+        if gradient_estimate.saturating_mul(100)
+            < copy_estimate.saturating_mul(TIGHT_GRADIENT_WIN_PERCENT)
+        {
+            std::mem::swap(filtered, gradient);
+            filter_id = TIGHT_FILTER_GRADIENT;
         }
     }
 
+    if too_many_colours {
+        if let Some(level) = jpeg_quality {
+            if !stream.jpeg_disabled {
+                match encode_tight_jpeg(pixel, values, width, height, level, jpeg_rgb, jpeg) {
+                    Ok(()) if jpeg.len() <= TIGHT_MAX_RECT_BYTES => {
+                        let jpeg_estimate = jpeg.len() + tight_compact_len_bytes(jpeg.len());
+                        let lossless_estimate = tight_zlib_estimate(filtered, stream.level)?;
+                        if jpeg_estimate < lossless_estimate {
+                            out.push(TIGHT_JPEG | reset_bit);
+                            push_tight_length(jpeg.len(), out)?;
+                            out.extend_from_slice(jpeg);
+                            return Ok(());
+                        }
+                    }
+                    Ok(()) => {
+                        debug!(
+                            bytes = jpeg.len(),
+                            "Tight JPEG payload exceeds the compact-length bound; using lossless Tight"
+                        );
+                        stream.jpeg_disabled = true;
+                    }
+                    Err(error) => {
+                        debug!(
+                            error = %error,
+                            "Tight JPEG encode failed; disabling only the JPEG sub-path"
+                        );
+                        stream.jpeg_disabled = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if filter_id == 0 {
+        // BasicCompression, zlib stream 0, CopyFilter (no filter-id byte).
+        out.push(reset_bit);
+    } else {
+        out.push(TIGHT_EXPLICIT_FILTER | reset_bit);
+        out.push(filter_id);
+    }
+    write_tight_filtered(stream, filtered, out)
+}
+
+/// Append filtered Tight pixels, compressing them through the per-client zlib
+/// stream unless the payload is below [`TIGHT_MIN_TO_COMPRESS`].
+fn write_tight_filtered(
+    stream: &mut TightStream,
+    filtered: &[u8],
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
     // Tiny filtered payloads are sent verbatim; TightVNC decoders switch on
     // the uncompressed size and expect no compact length in that case.
     if filtered.len() < TIGHT_MIN_TO_COMPRESS {
@@ -3005,9 +3229,9 @@ fn encode_tight_sub_rect(
         return Ok(());
     }
 
-    encoder.write_all(filtered)?;
-    encoder.flush()?;
-    let compressed = std::mem::take(encoder.get_mut());
+    stream.encoder.write_all(filtered)?;
+    stream.encoder.flush()?;
+    let compressed = std::mem::take(stream.encoder.get_mut());
     if compressed.len() > TIGHT_MAX_RECT_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -3017,6 +3241,121 @@ fn encode_tight_sub_rect(
     push_tight_length(compressed.len(), out)?;
     out.extend_from_slice(&compressed);
     Ok(())
+}
+
+fn tight_compact_len_bytes(length: usize) -> usize {
+    if length < 0x80 {
+        1
+    } else if length < 0x4000 {
+        2
+    } else {
+        3
+    }
+}
+
+/// Estimate the wire size of a lossless Tight payload at `level`, including the
+/// compact-length prefix. Used only to choose between the copy/gradient/JPEG
+/// representations; the chosen representation is then compressed once into the
+/// per-client stream.
+fn tight_zlib_estimate(data: &[u8], level: u8) -> io::Result<usize> {
+    if data.len() < TIGHT_MIN_TO_COMPRESS {
+        return Ok(data.len());
+    }
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(u32::from(level)));
+    encoder.write_all(data)?;
+    encoder.flush()?;
+    let length = encoder.get_ref().len();
+    Ok(length + tight_compact_len_bytes(length))
+}
+
+/// Encode the Tight gradient predictor over RGB components.
+///
+/// Prediction is `V[i-1,j] + V[i,j-1] - V[i-1,j-1]` clamped to 0..=255, with
+/// pixels outside the rectangle treated as zero. The emitted byte stream is
+/// the per-component difference in TPIXEL layout, which the decoder adds back
+/// to the same predictor.
+fn encode_gradient_filter(
+    pixel: ClientPixelFormat,
+    values: &[u32],
+    width: usize,
+    height: usize,
+    previous: &mut Vec<[u8; 3]>,
+    row: &mut Vec<[u8; 3]>,
+    out: &mut Vec<u8>,
+) {
+    previous.clear();
+    previous.resize(width, [0, 0, 0]);
+    row.clear();
+    row.resize(width, [0, 0, 0]);
+    out.reserve(width * height * pixel.tight_pixel_len());
+
+    for y in 0..height {
+        for x in 0..width {
+            let actual = pixel.rgb_components(values[y * width + x]);
+            let predicted = if x == 0 {
+                previous[0]
+            } else {
+                [
+                    gradient_predict(previous[x][0], row[x - 1][0], previous[x - 1][0]),
+                    gradient_predict(previous[x][1], row[x - 1][1], previous[x - 1][1]),
+                    gradient_predict(previous[x][2], row[x - 1][2], previous[x - 1][2]),
+                ]
+            };
+            let delta = [
+                actual[0].wrapping_sub(predicted[0]),
+                actual[1].wrapping_sub(predicted[1]),
+                actual[2].wrapping_sub(predicted[2]),
+            ];
+            if pixel.tight_pixel_len() == 3 {
+                out.extend_from_slice(&delta);
+            } else {
+                pixel.push_pixel(pixel.pixel_value(delta[0], delta[1], delta[2]), out);
+            }
+            row[x] = actual;
+        }
+        std::mem::swap(previous, row);
+    }
+}
+
+fn gradient_predict(upper: u8, left: u8, upper_left: u8) -> u8 {
+    (i32::from(upper) + i32::from(left) - i32::from(upper_left)).clamp(0, 255) as u8
+}
+
+/// Encode an RGB buffer as a JFIF JPEG for Tight's JpegCompression. Quality
+/// levels 0..=9 map to a conservative 20..=92 percent range; level 0 is still a
+/// valid lossy JPEG because advertising the pseudo-encoding asks for JPEG use.
+fn encode_tight_jpeg(
+    pixel: ClientPixelFormat,
+    values: &[u32],
+    width: usize,
+    height: usize,
+    level: u8,
+    rgb: &mut Vec<u8>,
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
+    rgb.clear();
+    rgb.reserve(width * height * 3);
+    // JPEG always uses red, green, blue regardless of the client's wire order.
+    for &value in values {
+        rgb.extend_from_slice(&pixel.rgb_components(value));
+    }
+    let quality = 20u8.saturating_add(level.min(9).saturating_mul(8));
+    out.clear();
+    JpegEncoder::new(&mut *out, quality)
+        .encode(
+            rgb,
+            u16::try_from(width).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "Tight JPEG width is too large")
+            })?,
+            u16::try_from(height).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Tight JPEG height is too large",
+                )
+            })?,
+            JpegColorType::Rgb,
+        )
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
 }
 
 /// Append a Tight compact length: one byte for 0..=127, two for 128..=16383,
@@ -3837,15 +4176,30 @@ mod tests {
         pixels
     }
 
-    /// More than 256 distinct colours, so Tight falls back to the copy filter
-    /// and its payload goes through the per-client zlib stream.
+    /// More than 256 colours with high per-pixel entropy, so Tight keeps the
+    /// copy filter (the gradient predictor cannot beat uncorrelated noise) and
+    /// its payload goes through the per-client zlib stream.
     fn tight_copy_pixels(width: usize, height: usize) -> Vec<(u8, u8, u8)> {
+        let mut state = 0x1234_5678u32;
+        (0..width * height)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((state >> 24) as u8, (state >> 16) as u8, (state >> 8) as u8)
+            })
+            .collect()
+    }
+
+    /// A smooth two-dimensional colour ramp with more than 256 colours, where
+    /// the gradient predictor beats the copy filter after zlib.
+    fn tight_gradient_pixels(width: usize, height: usize) -> Vec<(u8, u8, u8)> {
         (0..width * height)
             .map(|index| {
+                let x = index % width;
+                let y = index / width;
                 (
-                    (index % 251) as u8,
-                    ((index * 3) % 253) as u8,
-                    ((index * 7) % 255) as u8,
+                    ((x * 2 + y) % 256) as u8,
+                    ((x + y * 3) % 256) as u8,
+                    ((x / 2 + y * 2) % 256) as u8,
                 )
             })
             .collect()
@@ -4184,13 +4538,20 @@ mod tests {
         read_exact(stream, &mut byte).await;
         let control = byte[0];
         data.push(control);
-        assert_eq!(control & 0x0f, 0, "server must not set zlib reset bits");
-        let high = control >> 4;
+        let high = (control & 0xf0) >> 4;
 
         if high == 8 {
             let mut fill = vec![0u8; tpixel];
             read_exact(stream, &mut fill).await;
             data.extend_from_slice(&fill);
+            return data;
+        }
+        if high == 9 {
+            let length = read_tight_compact_length(stream, &mut data).await;
+            assert!(length <= TIGHT_MAX_RECT_BYTES);
+            let mut jpeg = vec![0u8; length];
+            read_exact(stream, &mut jpeg).await;
+            data.extend_from_slice(&jpeg);
             return data;
         }
         assert!(
@@ -4203,15 +4564,18 @@ mod tests {
             read_exact(stream, &mut byte).await;
             let filter = byte[0];
             data.push(filter);
-            if filter == TIGHT_FILTER_PALETTE {
-                read_exact(stream, &mut byte).await;
-                palette_size = usize::from(byte[0]) + 1;
-                data.push(byte[0]);
-                let mut palette = vec![0u8; palette_size * tpixel];
-                read_exact(stream, &mut palette).await;
-                data.extend_from_slice(&palette);
-            } else {
-                assert_eq!(filter, 0, "unexpected Tight filter {filter}");
+            match filter {
+                TIGHT_FILTER_PALETTE => {
+                    read_exact(stream, &mut byte).await;
+                    palette_size = usize::from(byte[0]) + 1;
+                    data.push(byte[0]);
+                    let mut palette = vec![0u8; palette_size * tpixel];
+                    read_exact(stream, &mut palette).await;
+                    data.extend_from_slice(&palette);
+                }
+                TIGHT_FILTER_GRADIENT => {}
+                0 => {}
+                other => panic!("unexpected Tight filter {other}"),
             }
         }
 
@@ -4230,32 +4594,38 @@ mod tests {
             read_exact(stream, &mut raw).await;
             data.extend_from_slice(&raw);
         } else {
-            let mut length_bytes = Vec::new();
-            loop {
-                read_exact(stream, &mut byte).await;
-                length_bytes.push(byte[0]);
-                if byte[0] & 0x80 == 0 {
-                    break;
-                }
-                assert!(length_bytes.len() < 3, "Tight compact length is too long");
-            }
-            let length = match length_bytes.len() {
-                1 => usize::from(length_bytes[0] & 0x7f),
-                2 => {
-                    usize::from(length_bytes[0] & 0x7f) | (usize::from(length_bytes[1] & 0x7f) << 7)
-                }
-                _ => {
-                    usize::from(length_bytes[0] & 0x7f)
-                        | (usize::from(length_bytes[1] & 0x7f) << 7)
-                        | (usize::from(length_bytes[2]) << 14)
-                }
-            };
-            data.extend_from_slice(&length_bytes);
+            let length = read_tight_compact_length(stream, &mut data).await;
+            assert!(length <= TIGHT_MAX_RECT_BYTES);
             let mut compressed = vec![0u8; length];
             read_exact(stream, &mut compressed).await;
             data.extend_from_slice(&compressed);
         }
         data
+    }
+
+    /// Read one Tight compact length from the wire, appending its encoded bytes
+    /// to `data` so a test decoder can consume the same byte slice.
+    async fn read_tight_compact_length(stream: &mut TcpStream, data: &mut Vec<u8>) -> usize {
+        let mut byte = [0u8; 1];
+        let mut length_bytes = Vec::new();
+        loop {
+            read_exact(stream, &mut byte).await;
+            length_bytes.push(byte[0]);
+            if byte[0] & 0x80 == 0 {
+                break;
+            }
+            assert!(length_bytes.len() < 3, "Tight compact length is too long");
+        }
+        data.extend_from_slice(&length_bytes);
+        match length_bytes.len() {
+            1 => usize::from(length_bytes[0] & 0x7f),
+            2 => usize::from(length_bytes[0] & 0x7f) | (usize::from(length_bytes[1] & 0x7f) << 7),
+            _ => {
+                usize::from(length_bytes[0] & 0x7f)
+                    | (usize::from(length_bytes[1] & 0x7f) << 7)
+                    | (usize::from(length_bytes[2]) << 14)
+            }
+        }
     }
 
     /// Test-side decoder for a client's persistent zlib stream. The same
@@ -4270,6 +4640,12 @@ mod tests {
             Self {
                 decompress: flate2::Decompress::new(true),
             }
+        }
+
+        /// The server sets a control-byte reset bit when it starts a new zlib
+        /// stream (for example after a compression-level change).
+        fn reset(&mut self) {
+            self.decompress = flate2::Decompress::new(true);
         }
 
         fn inflate(&mut self, compressed: &[u8]) -> Vec<u8> {
@@ -4491,9 +4867,10 @@ mod tests {
         length
     }
 
-    /// Test-side decoder for one Tight rectangle (FillCompression, basic
-    /// CopyFilter, and PaletteFilter). `decoder` is the client's persistent
-    /// Tight zlib stream and must be shared across successive rectangles.
+    /// Test-side decoder for one Tight rectangle: FillCompression,
+    /// JpegCompression, and BasicCompression with the copy, palette, or gradient
+    /// filter. `decoder` is the client's persistent Tight zlib stream and must
+    /// be shared across successive rectangles.
     fn decode_tight(
         decoder: &mut TestZlibDecoder,
         data: &[u8],
@@ -4505,27 +4882,47 @@ mod tests {
         let mut position = 0usize;
         let control = data[position];
         position += 1;
-        assert_eq!(control & 0x0f, 0, "server must not set zlib reset bits");
+        if control & 0x01 != 0 {
+            decoder.reset();
+        }
+        let kind = control & 0xf0;
         let mut pixels = vec![(0u8, 0u8, 0u8); width * height];
 
-        if control == TIGHT_FILL {
+        if kind == TIGHT_FILL {
             let value = decode_tight_pixel(data, &mut position, pixel);
             pixels.fill(decode_rgb(value, pixel));
             assert_eq!(position, data.len(), "trailing Tight fill bytes");
             return (pixels, control);
         }
+        if kind == TIGHT_JPEG {
+            let length = decode_tight_compact_length(data, &mut position);
+            let jpeg = &data[position..position + length];
+            position += length;
+            assert_eq!(position, data.len(), "trailing Tight JPEG bytes");
+            return (decode_jpeg(jpeg, width, height), control);
+        }
 
-        assert_eq!(control & 0x80, 0, "expected basic Tight compression");
+        assert!(
+            kind == 0 || kind == TIGHT_EXPLICIT_FILTER,
+            "expected basic Tight compression, got {control:#04x}"
+        );
         let mut palette = Vec::new();
+        let mut gradient = false;
         if control & TIGHT_EXPLICIT_FILTER != 0 {
             let filter = data[position];
             position += 1;
-            assert_eq!(filter, TIGHT_FILTER_PALETTE, "unexpected Tight filter");
-            let palette_size = usize::from(data[position]) + 1;
-            position += 1;
-            palette.reserve(palette_size);
-            for _ in 0..palette_size {
-                palette.push(decode_tight_pixel(data, &mut position, pixel));
+            match filter {
+                TIGHT_FILTER_PALETTE => {
+                    let palette_size = usize::from(data[position]) + 1;
+                    position += 1;
+                    palette.reserve(palette_size);
+                    for _ in 0..palette_size {
+                        palette.push(decode_tight_pixel(data, &mut position, pixel));
+                    }
+                }
+                TIGHT_FILTER_GRADIENT => gradient = true,
+                0 => {}
+                other => panic!("unexpected Tight filter {other}"),
             }
         }
 
@@ -4551,7 +4948,35 @@ mod tests {
         assert_eq!(position, data.len(), "trailing Tight rectangle bytes");
         assert_eq!(filtered.len(), data_size, "wrong Tight filtered data size");
 
-        if palette.is_empty() {
+        if palette.is_empty() && gradient {
+            let mut previous = vec![[0u8; 3]; width];
+            let mut row = vec![[0u8; 3]; width];
+            let mut source = 0usize;
+            for y in 0..height {
+                for x in 0..width {
+                    let value = decode_tight_pixel(&filtered, &mut source, pixel);
+                    let (red, green, blue) = decode_rgb(value, pixel);
+                    let predicted = if x == 0 {
+                        previous[0]
+                    } else {
+                        [
+                            gradient_predict(previous[x][0], row[x - 1][0], previous[x - 1][0]),
+                            gradient_predict(previous[x][1], row[x - 1][1], previous[x - 1][1]),
+                            gradient_predict(previous[x][2], row[x - 1][2], previous[x - 1][2]),
+                        ]
+                    };
+                    let actual = [
+                        red.wrapping_add(predicted[0]),
+                        green.wrapping_add(predicted[1]),
+                        blue.wrapping_add(predicted[2]),
+                    ];
+                    row[x] = actual;
+                    pixels[y * width + x] = (actual[0], actual[1], actual[2]);
+                }
+                std::mem::swap(&mut previous, &mut row);
+            }
+            assert_eq!(source, filtered.len(), "trailing Tight gradient bytes");
+        } else if palette.is_empty() {
             let mut source = 0usize;
             for slot in pixels.iter_mut() {
                 *slot = decode_rgb(decode_tight_pixel(&filtered, &mut source, pixel), pixel);
@@ -4574,6 +4999,23 @@ mod tests {
             }
         }
         (pixels, control)
+    }
+
+    fn decode_jpeg(data: &[u8], width: usize, height: usize) -> Vec<(u8, u8, u8)> {
+        let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(data));
+        let decoded = decoder.decode().expect("Tight JPEG payload must decode");
+        let info = decoder.info().expect("Tight JPEG must carry image info");
+        assert_eq!(usize::from(info.width), width, "wrong Tight JPEG width");
+        assert_eq!(usize::from(info.height), height, "wrong Tight JPEG height");
+        assert_eq!(
+            decoded.len(),
+            width * height * 3,
+            "wrong Tight JPEG data size"
+        );
+        decoded
+            .chunks_exact(3)
+            .map(|rgb| (rgb[0], rgb[1], rgb[2]))
+            .collect()
     }
 
     fn decode_hextile(
@@ -5767,14 +6209,14 @@ mod tests {
                 "invalid ZLib geometry touched the stream"
             );
 
-            let mut tight = ZlibEncoder::new(Vec::new(), Compression::default());
+            let mut tight = TightStream::new(TIGHT_DEFAULT_COMPRESSION);
             let mut tight_out = Vec::new();
-            let error = encode_tight_rect(&frame, pixel, rect, &mut tight, &mut tight_out)
+            let error = encode_tight_rect(&frame, pixel, rect, &mut tight, None, &mut tight_out)
                 .expect_err("invalid Tight rectangle must fail");
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
             assert!(tight_out.is_empty(), "invalid Tight geometry wrote bytes");
             assert!(
-                tight.get_ref().is_empty(),
+                tight.encoder.get_ref().is_empty(),
                 "invalid Tight geometry touched the stream"
             );
         }
@@ -5850,7 +6292,7 @@ mod tests {
         let pixels = vec![(12u8, 34u8, 56u8); width * height];
         let frame = frame_from_pixels(width, height, &pixels);
         let pixel = client_pixel_format(24, false, 16, 8, 0);
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        let mut encoder = TightStream::new(TIGHT_DEFAULT_COMPRESSION);
         let mut out = Vec::new();
         let count = encode_tight_rect(
             &frame,
@@ -5862,6 +6304,7 @@ mod tests {
                 height: height as u16,
             },
             &mut encoder,
+            None,
             &mut out,
         )
         .expect("Tight encode");
@@ -5930,12 +6373,13 @@ mod tests {
                     width: 64,
                     height: 32,
                 };
-                let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+                let mut encoder = TightStream::new(TIGHT_DEFAULT_COMPRESSION);
                 let mut decoder = TestZlibDecoder::new();
                 for round in 0..3 {
                     let mut encoded = Vec::new();
-                    let count = encode_tight_rect(&frame, pixel, rect, &mut encoder, &mut encoded)
-                        .expect("Tight encode");
+                    let count =
+                        encode_tight_rect(&frame, pixel, rect, &mut encoder, None, &mut encoded)
+                            .expect("Tight encode");
                     assert_eq!(count, 1);
                     // encode_tight_rect writes a 12-byte rectangle header too;
                     // the decoder consumes only the encoding payload.
@@ -5949,6 +6393,261 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Encode one Tight wire rectangle and return its payload (without the
+    /// 12-byte rectangle header).
+    fn encode_tight_test_payload(
+        frame: &FrameSnapshot,
+        pixel: ClientPixelFormat,
+        rect: Rect,
+        level: u8,
+        jpeg_quality: Option<u8>,
+    ) -> Vec<u8> {
+        let mut stream = TightStream::new(level);
+        let mut encoded = Vec::new();
+        let count = encode_tight_rect(frame, pixel, rect, &mut stream, jpeg_quality, &mut encoded)
+            .expect("Tight encode");
+        assert_eq!(count, 1);
+        assert_eq!(
+            i32::from_be_bytes([encoded[8], encoded[9], encoded[10], encoded[11]]),
+            ENCODING_TIGHT
+        );
+        encoded[12..].to_vec()
+    }
+
+    #[test]
+    fn tight_quality_and_compression_pseudo_encodings_are_recorded() {
+        let mut state = ClientEncodingState::default();
+        state.apply(ENCODING_TIGHT);
+        state.apply(ENCODING_JPEG_QUALITY_LOW);
+        state.apply(ENCODING_COMPRESSION_LEVEL_LOW);
+        assert_eq!(state.jpeg_quality, Some(0));
+        assert_eq!(state.compression_level, Some(0));
+
+        state.apply(ENCODING_JPEG_QUALITY_HIGH);
+        state.apply(ENCODING_COMPRESSION_LEVEL_HIGH);
+        assert_eq!(state.jpeg_quality, Some(9));
+        assert_eq!(state.compression_level, Some(9));
+
+        // An intermediate level and a later duplicate both update the hint.
+        state.apply(-25); // JPEG level 7
+        state.apply(-250); // compression level 6
+        assert_eq!(state.jpeg_quality, Some(7));
+        assert_eq!(state.compression_level, Some(6));
+
+        // Unrelated pseudo-encodings do not disturb the hints.
+        state.apply(ENCODING_CURSOR);
+        state.apply(-512);
+        assert!(state.cursor);
+        assert_eq!(state.jpeg_quality, Some(7));
+        assert_eq!(state.compression_level, Some(6));
+        assert_eq!(
+            state.select(DisabledEncodings::default()),
+            UpdateEncoding::Tight
+        );
+    }
+
+    #[test]
+    fn tight_gradient_filter_wins_on_a_smooth_ramp_and_decodes() {
+        let (width, height) = (64usize, 64usize);
+        let expected = tight_gradient_pixels(width, height);
+        let frame = frame_from_pixels(width, height, &expected);
+        for pixel in [
+            client_pixel_format(24, false, 16, 8, 0),
+            client_pixel_format(24, false, 0, 8, 16),
+            client_pixel_format(32, true, 16, 8, 0),
+        ] {
+            let payload = encode_tight_test_payload(
+                &frame,
+                pixel,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: width as u16,
+                    height: height as u16,
+                },
+                TIGHT_DEFAULT_COMPRESSION,
+                None,
+            );
+            assert_eq!(payload[0] & 0xf0, TIGHT_EXPLICIT_FILTER);
+            assert_eq!(payload[1], TIGHT_FILTER_GRADIENT);
+
+            let mut decoder = TestZlibDecoder::new();
+            let (decoded, control) = decode_tight(&mut decoder, &payload, width, height, pixel);
+            assert_eq!(decoded, expected);
+            assert_eq!(control & 0xf0, TIGHT_EXPLICIT_FILTER);
+        }
+    }
+
+    #[test]
+    fn tight_copy_filter_stays_selected_for_noise() {
+        let (width, height) = (64usize, 64usize);
+        let expected = tight_copy_pixels(width, height);
+        let frame = frame_from_pixels(width, height, &expected);
+        let pixel = client_pixel_format(24, false, 16, 8, 0);
+        let payload = encode_tight_test_payload(
+            &frame,
+            pixel,
+            Rect {
+                x: 0,
+                y: 0,
+                width: width as u16,
+                height: height as u16,
+            },
+            TIGHT_DEFAULT_COMPRESSION,
+            None,
+        );
+        assert_eq!(
+            payload[0] & 0xf0,
+            0,
+            "uncorrelated noise must keep the copy filter"
+        );
+
+        let mut decoder = TestZlibDecoder::new();
+        let (decoded, _) = decode_tight(&mut decoder, &payload, width, height, pixel);
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn tight_jpeg_subencoding_decodes_at_the_requested_quality() {
+        let (width, height) = (64usize, 64usize);
+        let pixels = tight_copy_pixels(width, height);
+        let frame = frame_from_pixels(width, height, &pixels);
+        let pixel = client_pixel_format(24, false, 16, 8, 0);
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: width as u16,
+            height: height as u16,
+        };
+
+        let mut lengths = Vec::new();
+        for level in [0u8, 9u8] {
+            let payload = encode_tight_test_payload(
+                &frame,
+                pixel,
+                rect,
+                TIGHT_DEFAULT_COMPRESSION,
+                Some(level),
+            );
+            assert_eq!(payload[0] & 0xf0, TIGHT_JPEG);
+            let mut position = 1usize;
+            let length = decode_tight_compact_length(&payload, &mut position);
+            assert!(length <= TIGHT_MAX_RECT_BYTES);
+            assert_eq!(
+                position + length,
+                payload.len(),
+                "Tight JPEG compact length must cover the payload exactly"
+            );
+            let decoded = decode_jpeg(&payload[position..position + length], width, height);
+            assert_eq!(decoded.len(), width * height);
+            lengths.push(length);
+        }
+        assert!(
+            lengths[1] > lengths[0],
+            "JPEG quality level 9 ({}) must be larger than level 0 ({})",
+            lengths[1],
+            lengths[0]
+        );
+
+        // Without an advertised quality level the same high-colour rectangle
+        // must stay lossless and must never carry a JPEG control byte.
+        let payload =
+            encode_tight_test_payload(&frame, pixel, rect, TIGHT_DEFAULT_COMPRESSION, None);
+        assert_ne!(payload[0] & 0xf0, TIGHT_JPEG);
+        let mut decoder = TestZlibDecoder::new();
+        let (decoded, _) = decode_tight(&mut decoder, &payload, width, height, pixel);
+        assert_eq!(decoded, pixels);
+    }
+
+    #[test]
+    fn tight_compression_level_controls_the_zlib_payload_size() {
+        let (width, height) = (64usize, 64usize);
+        let expected = tight_gradient_pixels(width, height);
+        let frame = frame_from_pixels(width, height, &expected);
+        let pixel = client_pixel_format(24, false, 16, 8, 0);
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: width as u16,
+            height: height as u16,
+        };
+
+        let low = encode_tight_test_payload(&frame, pixel, rect, 0, None);
+        let high = encode_tight_test_payload(&frame, pixel, rect, 9, None);
+        assert!(
+            high.len() < low.len(),
+            "level 9 ({}) must be smaller than level 0 ({})",
+            high.len(),
+            low.len()
+        );
+
+        for (level, payload) in [(0u8, low), (9u8, high)] {
+            let mut decoder = TestZlibDecoder::new();
+            let (decoded, _) = decode_tight(&mut decoder, &payload, width, height, pixel);
+            assert_eq!(decoded, expected, "level {level} decoded wrong");
+        }
+    }
+
+    #[test]
+    fn tight_compression_level_change_resets_the_zlib_stream() {
+        let (width, height) = (32usize, 32usize);
+        let pixels = tight_gradient_pixels(width, height);
+        let frame = frame_from_pixels(width, height, &pixels);
+        let pixel = client_pixel_format(24, false, 16, 8, 0);
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: width as u16,
+            height: height as u16,
+        };
+
+        let mut stream = TightStream::new(6);
+        let mut decoder = TestZlibDecoder::new();
+        for (level, expect_reset) in [(6u8, false), (9u8, true), (9u8, false)] {
+            stream.set_level(level);
+            let mut encoded = Vec::new();
+            encode_tight_rect(&frame, pixel, rect, &mut stream, None, &mut encoded)
+                .expect("Tight encode");
+            let payload = &encoded[12..];
+            assert_eq!(
+                payload[0] & 0x01 != 0,
+                expect_reset,
+                "level {level} reset bit"
+            );
+            let (decoded, _) = decode_tight(&mut decoder, payload, width, height, pixel);
+            assert_eq!(decoded, pixels, "level {level} decoded wrong after reset");
+        }
+    }
+
+    #[test]
+    fn tight_jpeg_subpath_failure_keeps_lossless_tight() {
+        let (width, height) = (64usize, 64usize);
+        let expected = tight_copy_pixels(width, height);
+        let frame = frame_from_pixels(width, height, &expected);
+        let pixel = client_pixel_format(24, false, 16, 8, 0);
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: width as u16,
+            height: height as u16,
+        };
+
+        let mut stream = TightStream::new(TIGHT_DEFAULT_COMPRESSION);
+        stream.jpeg_disabled = true;
+        let mut encoded = Vec::new();
+        encode_tight_rect(&frame, pixel, rect, &mut stream, Some(9), &mut encoded)
+            .expect("lossless Tight must survive a disabled JPEG sub-path");
+        assert_ne!(encoded[12] & 0xf0, TIGHT_JPEG);
+        assert!(
+            stream.jpeg_disabled,
+            "JPEG stays disabled for the connection"
+        );
+
+        let mut decoder = TestZlibDecoder::new();
+        let (decoded, _) = decode_tight(&mut decoder, &encoded[12..], width, height, pixel);
+        assert_eq!(decoded, expected);
     }
 
     #[test]
@@ -6015,6 +6714,7 @@ mod tests {
             Some(&mut zrle),
             None,
             None,
+            None,
             false,
         );
         assert_eq!(built.failed_encoding, Some(UpdateEncoding::Zrle));
@@ -6026,6 +6726,7 @@ mod tests {
             pixel,
             &rects,
             UpdateEncoding::Hextile,
+            None,
             None,
             None,
             None,
@@ -6043,12 +6744,13 @@ mod tests {
             None,
             Some(&mut zlib),
             None,
+            None,
             false,
         );
         assert_eq!(built.failed_encoding, Some(UpdateEncoding::ZLib));
         assert_eq!(first_rect_encoding(&built.bytes), ENCODING_RAW);
 
-        let mut tight = ZlibEncoder::new(Vec::new(), Compression::default());
+        let mut tight = TightStream::new(TIGHT_DEFAULT_COMPRESSION);
         let built = build_update(
             &frame,
             pixel,
@@ -6057,6 +6759,7 @@ mod tests {
             None,
             None,
             Some(&mut tight),
+            None,
             false,
         );
         assert_eq!(built.failed_encoding, Some(UpdateEncoding::Tight));
@@ -6069,6 +6772,7 @@ mod tests {
             pixel,
             &rects,
             UpdateEncoding::Zrle,
+            None,
             None,
             None,
             None,
@@ -6286,6 +6990,66 @@ mod tests {
             let (decoded, _) = decode_tight(&mut tight_decoder, &rects[0].data, 64, 32, pixel);
             assert_eq!(decoded, expected);
         }
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tight_jpeg_frames_decode_over_the_wire_and_follow_quality_hints() {
+        let (width, height) = (64usize, 32usize);
+        let expected = tight_copy_pixels(width, height);
+        let server = start_server(
+            Box::new(FixedPixelSource::new(
+                width as u32,
+                height as u32,
+                expected.clone(),
+            )),
+            Arc::new(FakeInputSink::new()),
+            1,
+        )
+        .await;
+        let mut client = TcpStream::connect(server.bound_addr()).await.unwrap();
+        handshake_client(&mut client).await;
+        let pixel = client_pixel_format(24, false, 16, 8, 0);
+        set_pixel_format(&mut client, pixel).await;
+
+        // Tight without a JPEG quality hint must stay lossless.
+        set_encodings(&mut client, &[ENCODING_TIGHT]).await;
+        request_update(&mut client, false, width as u16, height as u16).await;
+        let rects = read_update(&mut client).await;
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].encoding, ENCODING_TIGHT);
+        assert_ne!(rects[0].data[0] & 0xf0, TIGHT_JPEG);
+        let mut decoder = TestZlibDecoder::new();
+        let (decoded, _) = decode_tight(&mut decoder, &rects[0].data, width, height, pixel);
+        assert_eq!(decoded, expected);
+
+        let jpeg_length = |rect: &WireRect| -> usize {
+            assert_eq!(rect.encoding, ENCODING_TIGHT);
+            assert_eq!(rect.data[0] & 0xf0, TIGHT_JPEG);
+            let mut position = 1usize;
+            let length = decode_tight_compact_length(&rect.data, &mut position);
+            assert!(length <= TIGHT_MAX_RECT_BYTES);
+            assert_eq!(position + length, rect.data.len());
+            decode_jpeg(&rect.data[position..position + length], width, height);
+            length
+        };
+
+        set_encodings(&mut client, &[ENCODING_TIGHT, ENCODING_JPEG_QUALITY_HIGH]).await;
+        request_update(&mut client, false, width as u16, height as u16).await;
+        let rects = read_update(&mut client).await;
+        assert_eq!(rects.len(), 1);
+        let high_length = jpeg_length(&rects[0]);
+
+        set_encodings(&mut client, &[ENCODING_TIGHT, ENCODING_JPEG_QUALITY_LOW]).await;
+        request_update(&mut client, false, width as u16, height as u16).await;
+        let rects = read_update(&mut client).await;
+        assert_eq!(rects.len(), 1);
+        let low_length = jpeg_length(&rects[0]);
+
+        assert!(
+            high_length > low_length,
+            "quality -23 ({high_length}) must produce more JPEG bytes than -32 ({low_length})"
+        );
         server.shutdown().await;
     }
 

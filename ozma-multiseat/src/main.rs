@@ -58,7 +58,7 @@ use ozma_multiseat::{
                   default off, a failed apply stops that spawn, and earlier seats are released. \
                   `--input-isolation helper` instead asks the privileged `ozma-seat-input` \
                   helper to EVIOCGRAB each seat's devices and create per-seat uinput devices; \
-                  with `--seat-display xvfb|xephyr|xorg`, `--input-targeting off|warn|strict` then uses \
+                  with `--seat-display xvfb|xephyr|xorg|weston`, `--input-targeting off|warn|strict` then uses \
                   `xinput` to restrict the private display to those devices. A missing helper \
                   or failed grab stops that spawn; a targeting failure warns and continues by \
                   default, or stops the spawn with `--input-targeting strict`. `--seats-file` \
@@ -136,12 +136,17 @@ struct Args {
 
     /// Per-seat display: `shared` (default, one X root), `xvfb` (private Xvfb
     /// server per seat), `xephyr` (private Xephyr nested in the shared
-    /// display), or `xorg` (real Xorg with a config file and libinput). Nested
-    /// backends are opt-in and stopped with the seat.
-    #[arg(long, default_value = "shared", value_name = "shared|xvfb|xephyr|xorg")]
+    /// display), `xorg` (real Xorg with a config file and libinput), or
+    /// `weston` (throwaway headless Weston compositor with a private
+    /// `WAYLAND_DISPLAY`). Nested backends are opt-in and stopped with the seat.
+    #[arg(
+        long,
+        default_value = "shared",
+        value_name = "shared|xvfb|xephyr|xorg|weston"
+    )]
     seat_display: String,
 
-    /// Private X screen size for `--seat-display xvfb|xephyr`, for example
+    /// Private screen size for `--seat-display xvfb|xephyr|weston`, for example
     /// `1280x800`. `xorg` takes geometry from its config file.
     #[arg(long, default_value = "1280x800", value_name = "WxH")]
     seat_display_size: String,
@@ -661,10 +666,10 @@ fn validate(args: &Args) -> Result<(), ozma_multiseat::MultiseatError> {
     }
     if !matches!(
         args.seat_display.as_str(),
-        "shared" | "xvfb" | "xephyr" | "xorg"
+        "shared" | "xvfb" | "xephyr" | "xorg" | "weston" | "wayland"
     ) {
         return Err(ozma_multiseat::MultiseatError::SeatDisplay(format!(
-            "unknown seat display {:?}; expected shared, xvfb, xephyr, or xorg",
+            "unknown seat display {:?}; expected shared, xvfb, xephyr, xorg, or weston",
             args.seat_display
         )));
     }

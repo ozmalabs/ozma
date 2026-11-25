@@ -7,17 +7,23 @@
 //! and exports its `DISPLAY` (plus an `XAUTHORITY` cookie when `xauth` is
 //! installed). [`SeatDisplayBackend::Xephyr`] is the nested-window variant: a
 //! private X server whose root is a window inside the shared display.
+//! [`SeatDisplayBackend::Weston`] starts a private headless Weston compositor
+//! with its own runtime directory and `WAYLAND_DISPLAY` socket.
 //!
-//! Readiness is a real X11 connection setup handshake against the server's Unix
-//! socket. A display is never reported ready because a process was spawned; the
-//! server must answer the protocol handshake. Missing binaries, an exhausted
+//! Readiness is a real protocol/client handshake, never "the process exists".
+//! X backends complete an X11 connection setup request against the server's
+//! Unix socket; Weston is probed by connecting to its Wayland socket and, when
+//! `wayland-info` is installed, by running that client with the seat's private
+//! `XDG_RUNTIME_DIR`/`WAYLAND_DISPLAY`. Missing binaries, an exhausted
 //! display-number range, startup timeouts, and crashes have typed errors.
 //!
 //! Nothing here touches the operator's desktop. `Xvfb` listens only on its
 //! Unix socket (`-nolisten tcp`); the cookie is scoped to that display. When
 //! `xauth` is unavailable the server falls back to `-ac` on the same
 //! Unix-socket-only listener, and the handle reports `auth_disabled()` so the
-//! supervisor can record an honest note.
+//! supervisor can record an honest note. Weston's headless backend renders to
+//! memory with the software renderer inside a throwaway runtime directory; it
+//! does not open DRM or an existing Wayland/X display.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -69,6 +75,15 @@ pub enum SeatDisplayBackend {
     /// console user). Without a config it is a typed unsupported error rather
     /// than an implicit GPU probe.
     Xorg,
+    /// One private headless Weston compositor per seat.
+    ///
+    /// The compositor uses the `headless` backend with the software renderer,
+    /// a throwaway `XDG_RUNTIME_DIR`, a generated `weston.ini`, and a unique
+    /// `WAYLAND_DISPLAY` socket. It renders to memory: no DRM device, GPU
+    /// mode-setting, physical output, or existing X/Wayland session is used.
+    /// The headless backend has no libinput seat, so physical input isolation
+    /// is never claimed for this backend.
+    Weston,
 }
 
 impl SeatDisplayBackend {
@@ -79,12 +94,18 @@ impl SeatDisplayBackend {
             Self::Xvfb => "xvfb",
             Self::Xephyr => "xephyr",
             Self::Xorg => "xorg",
+            Self::Weston => "weston",
         }
     }
 
-    /// Whether this backend starts a private X server.
+    /// Whether this backend starts a private display/compositor.
     pub fn is_nested(self) -> bool {
         !matches!(self, Self::Shared)
+    }
+
+    /// Whether this backend exposes a Wayland socket instead of an X display.
+    pub fn is_wayland(self) -> bool {
+        matches!(self, Self::Weston)
     }
 }
 
@@ -103,8 +124,10 @@ impl FromStr for SeatDisplayBackend {
             "xvfb" => Ok(Self::Xvfb),
             "xephyr" => Ok(Self::Xephyr),
             "xorg" => Ok(Self::Xorg),
+            "weston" | "wayland" => Ok(Self::Weston),
             other => Err(MultiseatError::SeatDisplay(format!(
-                "unknown seat display backend {other:?}; expected shared, xvfb, xephyr, or xorg"
+                "unknown seat display backend {other:?}; expected shared, xvfb, xephyr, xorg, or \
+                 weston"
             ))),
         }
     }
@@ -261,17 +284,18 @@ pub struct SeatDisplayStatus {
         skip_serializing_if = "is_shared_backend"
     )]
     pub display_backend: SeatDisplayBackend,
-    /// Private X display string, for example `:90`.
+    /// Private display name. For X backends this is an X display such as
+    /// `:90`; for the Weston backend it is the `WAYLAND_DISPLAY` socket name.
     #[serde(rename = "display", default, skip_serializing_if = "Option::is_none")]
     pub display: Option<String>,
-    /// Private X server pid.
+    /// Private display server/compositor pid.
     #[serde(
         rename = "display_pid",
         default,
         skip_serializing_if = "Option::is_none"
     )]
     pub display_pid: Option<u32>,
-    /// Whether the X11 handshake succeeded and the server is still alive.
+    /// Whether the protocol handshake succeeded and the server is still alive.
     #[serde(rename = "display_ready", default, skip_serializing_if = "is_false")]
     pub display_ready: bool,
     /// Typed limitations for this display.
@@ -410,16 +434,17 @@ impl fmt::Display for DisplayExit {
     }
 }
 
-/// A started private X server.
+/// A started private display server or compositor.
 ///
-/// `is_ready` performs a real X11 connection setup handshake. `terminate` is
-/// idempotent, waits for the server to exit, and releases the display number.
+/// `is_ready` performs a real protocol handshake (X11 connection setup or a
+/// Wayland client connection). `terminate` is idempotent, waits for the server
+/// to exit, and releases the display number and any private runtime files.
 pub trait SeatDisplayHandle: Send {
     /// Backend that was started.
     fn backend(&self) -> SeatDisplayBackend;
-    /// X display string, for example `:90`.
+    /// Display name: an X display such as `:90`, or a `WAYLAND_DISPLAY` name.
     fn display(&self) -> &str;
-    /// Numeric display number.
+    /// Numeric display/socket number.
     fn display_number(&self) -> u32;
     /// Server process id.
     fn pid(&self) -> Option<u32>;
@@ -428,11 +453,15 @@ pub trait SeatDisplayHandle: Send {
     /// Whether the server was started with `-ac` because `xauth` was absent or
     /// failed. The listener is still Unix-socket-only.
     fn auth_disabled(&self) -> bool;
-    /// Perform one X11 setup probe.
+    /// Wayland environment for a compositor backend, otherwise `None`.
+    fn wayland(&self) -> Option<&SeatWaylandEnv> {
+        None
+    }
+    /// Perform one readiness probe.
     fn is_ready(&self) -> Result<bool, MultiseatError>;
     /// Non-blocking exit check.
     fn try_wait(&mut self) -> std::io::Result<Option<DisplayExit>>;
-    /// Stop the server, wait for it, and release its display number.
+    /// Stop the server, wait for it, and release its display number/files.
     fn terminate(&mut self) -> Result<(), MultiseatError>;
 }
 
@@ -455,6 +484,8 @@ pub struct SeatDisplayPrograms {
     /// `Xorg` binary name or path. The distro wrapper may restrict non-console
     /// users, so a deployment can point this at a privileged wrapper.
     pub xorg: PathBuf,
+    /// `weston` binary name or path for the headless Wayland backend.
+    pub weston: PathBuf,
     /// `xauth` binary name or path.
     pub xauth: PathBuf,
 }
@@ -465,6 +496,7 @@ impl Default for SeatDisplayPrograms {
             xvfb: PathBuf::from("Xvfb"),
             xephyr: PathBuf::from("Xephyr"),
             xorg: PathBuf::from("Xorg"),
+            weston: PathBuf::from("weston"),
             xauth: PathBuf::from("xauth"),
         }
     }
@@ -560,6 +592,43 @@ pub fn display_name(number: u32) -> String {
     format!(":{number}")
 }
 
+/// Unique `WAYLAND_DISPLAY` name for a seat number.
+///
+/// The name is scoped by the seat's private `XDG_RUNTIME_DIR`, so it cannot
+/// collide with the operator's compositor even if it uses the same socket name.
+pub fn wayland_display_name(number: u32) -> String {
+    format!("ozma-weston-{number}")
+}
+
+/// Environment that points a seat child at a private Wayland compositor.
+///
+/// The compositor socket is `XDG_RUNTIME_DIR/WAYLAND_DISPLAY`. The runtime
+/// directory is created and owned by the display handle, so it can only reach
+/// this seat's compositor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeatWaylandEnv {
+    /// Value exported as `WAYLAND_DISPLAY`.
+    pub wayland_display: String,
+    /// Value exported as `XDG_RUNTIME_DIR`.
+    pub xdg_runtime_dir: PathBuf,
+    /// Absolute socket path (`XDG_RUNTIME_DIR/WAYLAND_DISPLAY`).
+    pub socket: PathBuf,
+}
+
+impl SeatWaylandEnv {
+    /// Build the environment for a display name and private runtime directory.
+    pub fn new(wayland_display: impl Into<String>, xdg_runtime_dir: impl Into<PathBuf>) -> Self {
+        let wayland_display = wayland_display.into();
+        let xdg_runtime_dir = xdg_runtime_dir.into();
+        let socket = xdg_runtime_dir.join(&wayland_display);
+        Self {
+            wayland_display,
+            xdg_runtime_dir,
+            socket,
+        }
+    }
+}
+
 /// Parse the numeric part of a local X display string.
 pub fn parse_display_number(display: &str) -> Option<u32> {
     display
@@ -609,6 +678,100 @@ impl ProcessSeatDisplayLauncher {
             .expect("display allocator lock")
             .in_use()
     }
+
+    fn spawn_weston(
+        &self,
+        request: &SeatDisplayRequest,
+    ) -> Result<Box<dyn SeatDisplayHandle>, MultiseatError> {
+        let program = match resolve_program(&self.programs.weston) {
+            Some(program) => program,
+            None => {
+                return Err(MultiseatError::SeatDisplayTool {
+                    backend: "weston".to_owned(),
+                    program: self.programs.weston.display().to_string(),
+                    reason: "not found on PATH or not executable".to_owned(),
+                })
+            }
+        };
+
+        let number = self
+            .allocator
+            .lock()
+            .expect("display allocator lock")
+            .allocate()?;
+        let display = wayland_display_name(number);
+
+        let sequence = AUTH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "ozma-seat-weston-{}-{sequence}",
+            std::process::id()
+        ));
+        let runtime = dir.join("runtime");
+        let setup = fs::create_dir_all(&runtime)
+            .map_err(|error| {
+                MultiseatError::SeatDisplay(format!(
+                    "creating Weston runtime directory {}: {error}",
+                    runtime.display()
+                ))
+            })
+            .and_then(|()| {
+                restrict_directory(&dir);
+                restrict_directory(&runtime);
+                let config = dir.join("weston.ini");
+                fs::write(&config, weston_config(request.size)).map_err(|error| {
+                    MultiseatError::SeatDisplay(format!(
+                        "writing Weston config {}: {error}",
+                        config.display()
+                    ))
+                })?;
+                Ok(config)
+            });
+        let config = match setup {
+            Ok(config) => config,
+            Err(error) => {
+                release_number(&self.allocator, number);
+                let _ = fs::remove_dir_all(&dir);
+                return Err(error);
+            }
+        };
+
+        let args = weston_server_args(&display, request.size, &config);
+        let mut command = Command::new(&program);
+        command
+            .args(&args)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env_remove("WAYLAND_DISPLAY")
+            .env_remove("DISPLAY")
+            .env_remove("XAUTHORITY")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                release_number(&self.allocator, number);
+                let _ = fs::remove_dir_all(&dir);
+                return Err(map_spawn_error(
+                    SeatDisplayBackend::Weston,
+                    &program,
+                    &display,
+                    error,
+                ));
+            }
+        };
+
+        let wayland = SeatWaylandEnv::new(display, runtime);
+        Ok(Box::new(WestonDisplayHandle {
+            child,
+            number,
+            wayland,
+            dir,
+            allocator: Arc::clone(&self.allocator),
+            terminated: false,
+            released: false,
+        }))
+    }
 }
 
 impl SeatDisplayLauncher for ProcessSeatDisplayLauncher {
@@ -616,6 +779,9 @@ impl SeatDisplayLauncher for ProcessSeatDisplayLauncher {
         &self,
         request: &SeatDisplayRequest,
     ) -> Result<Box<dyn SeatDisplayHandle>, MultiseatError> {
+        if request.backend == SeatDisplayBackend::Weston {
+            return self.spawn_weston(request);
+        }
         let (program, backend_name) = match request.backend {
             SeatDisplayBackend::Shared => {
                 return Err(MultiseatError::Unsupported(
@@ -625,6 +791,7 @@ impl SeatDisplayLauncher for ProcessSeatDisplayLauncher {
             SeatDisplayBackend::Xvfb => (self.programs.xvfb.clone(), "xvfb"),
             SeatDisplayBackend::Xephyr => (self.programs.xephyr.clone(), "xephyr"),
             SeatDisplayBackend::Xorg => (self.programs.xorg.clone(), "xorg"),
+            SeatDisplayBackend::Weston => unreachable!("Wayland handled above"),
         };
 
         let program = match resolve_program(&program) {
@@ -892,6 +1059,168 @@ fn release_number(allocator: &Arc<Mutex<DisplayNumberAllocator>>, number: u32) {
         .release(number);
 }
 
+struct WestonDisplayHandle {
+    child: Child,
+    number: u32,
+    wayland: SeatWaylandEnv,
+    dir: PathBuf,
+    allocator: Arc<Mutex<DisplayNumberAllocator>>,
+    terminated: bool,
+    released: bool,
+}
+
+impl SeatDisplayHandle for WestonDisplayHandle {
+    fn backend(&self) -> SeatDisplayBackend {
+        SeatDisplayBackend::Weston
+    }
+
+    fn display(&self) -> &str {
+        &self.wayland.wayland_display
+    }
+
+    fn display_number(&self) -> u32 {
+        self.number
+    }
+
+    fn pid(&self) -> Option<u32> {
+        Some(self.child.id())
+    }
+
+    fn xauthority(&self) -> Option<&Path> {
+        None
+    }
+
+    fn auth_disabled(&self) -> bool {
+        false
+    }
+
+    fn wayland(&self) -> Option<&SeatWaylandEnv> {
+        Some(&self.wayland)
+    }
+
+    fn is_ready(&self) -> Result<bool, MultiseatError> {
+        probe_wayland_display(&self.wayland)
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<DisplayExit>> {
+        self.child.try_wait().map(|status| {
+            status.map(|status| DisplayExit {
+                success: status.success(),
+                code: status.code(),
+            })
+        })
+    }
+
+    fn terminate(&mut self) -> Result<(), MultiseatError> {
+        if !self.terminated {
+            self.terminated = true;
+            if self
+                .child
+                .try_wait()
+                .map_err(|error| {
+                    MultiseatError::SeatDisplay(format!("polling Weston compositor: {error}"))
+                })?
+                .is_none()
+            {
+                #[cfg(unix)]
+                {
+                    let pid = self.child.id();
+                    let _ = nix::sys::signal::kill(
+                        nix::unistd::Pid::from_raw(pid as i32),
+                        nix::sys::signal::Signal::SIGTERM,
+                    );
+                    let deadline = Instant::now() + DISPLAY_TERMINATE_GRACE;
+                    loop {
+                        match self.child.try_wait() {
+                            Ok(Some(_)) => break,
+                            Ok(None) => {}
+                            Err(error) => {
+                                return Err(MultiseatError::SeatDisplay(format!(
+                                    "polling Weston compositor for shutdown: {error}"
+                                )))
+                            }
+                        }
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                }
+                if self
+                    .child
+                    .try_wait()
+                    .map_err(|error| {
+                        MultiseatError::SeatDisplay(format!("polling Weston compositor: {error}"))
+                    })?
+                    .is_none()
+                {
+                    self.child.kill().map_err(|error| {
+                        MultiseatError::SeatDisplay(format!("killing Weston compositor: {error}"))
+                    })?;
+                    self.child.wait().map_err(|error| {
+                        MultiseatError::SeatDisplay(format!("reaping Weston compositor: {error}"))
+                    })?;
+                }
+            }
+        }
+        self.release_resources();
+        Ok(())
+    }
+}
+
+impl WestonDisplayHandle {
+    fn release_resources(&mut self) {
+        if !self.released {
+            self.released = true;
+            release_number(&self.allocator, self.number);
+        }
+        // The runtime directory contains the compositor socket, its lock file,
+        // and the generated config. Removing it is the last cleanup step.
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+impl Drop for WestonDisplayHandle {
+    fn drop(&mut self) {
+        let _ = self.terminate();
+    }
+}
+
+/// Generate the per-seat `weston.ini`.
+///
+/// The output geometry is passed on the command line; the config disables
+/// idle blanking and the desktop-shell panel so the compositor is a plain
+/// headless surface rather than an interactive desktop.
+pub fn weston_config(size: SeatDisplaySize) -> String {
+    format!(
+        "# Generated by ozma-multiseat for a throwaway {}x{} headless seat.\n\
+         [core]\n\
+         idle-time=0\n\
+         \n\
+         [shell]\n\
+         panel-position=none\n\
+         background-color=0x000000\n",
+        size.width, size.height
+    )
+}
+
+/// Build the argv for a per-seat headless Weston compositor.
+///
+/// The software renderer is explicit so a seat never depends on a GPU or opens
+/// DRM. `--socket` and `XDG_RUNTIME_DIR` together define the private
+/// `WAYLAND_DISPLAY` socket.
+pub fn weston_server_args(display: &str, size: SeatDisplaySize, config: &Path) -> Vec<String> {
+    vec![
+        "--backend=headless".to_owned(),
+        "--renderer=pixman".to_owned(),
+        format!("--socket={display}"),
+        "--idle-time=0".to_owned(),
+        format!("--config={}", config.display()),
+        format!("--width={}", size.width),
+        format!("--height={}", size.height),
+    ]
+}
+
 struct Xauthority {
     dir: PathBuf,
     file: PathBuf,
@@ -1116,6 +1445,69 @@ pub fn probe_x11_display(
     )))
 }
 
+/// Probe a private Wayland compositor.
+///
+/// A missing socket or refused connection is `Ok(false)`. A successful Unix
+/// connection is followed, when `wayland-info` is installed, by a real client
+/// round-trip using this seat's private `XDG_RUNTIME_DIR` and
+/// `WAYLAND_DISPLAY`. That proves the socket speaks Wayland, not merely that a
+/// listener exists. Without `wayland-info`, the successful connection is the
+/// readiness evidence.
+#[cfg(unix)]
+pub fn probe_wayland_display(env: &SeatWaylandEnv) -> Result<bool, MultiseatError> {
+    use std::os::unix::net::UnixStream;
+
+    if !env.socket.exists() {
+        return Ok(false);
+    }
+    let stream = match UnixStream::connect(&env.socket) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(false)
+        }
+        Err(error) => {
+            return Err(MultiseatError::SeatDisplay(format!(
+                "connecting to Wayland socket {}: {error}",
+                env.socket.display()
+            )))
+        }
+    };
+    // Drop the probe connection before starting an external client.
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    drop(stream);
+
+    let Some(program) = resolve_program(Path::new("wayland-info")) else {
+        return Ok(true);
+    };
+    let output = Command::new(program)
+        .env("XDG_RUNTIME_DIR", &env.xdg_runtime_dir)
+        .env("WAYLAND_DISPLAY", &env.wayland_display)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    match output {
+        Ok(output) => Ok(output.status.success()),
+        Err(error) => Err(MultiseatError::SeatDisplay(format!(
+            "running wayland-info against {}: {error}",
+            env.socket.display()
+        ))),
+    }
+}
+
+/// Non-Unix hosts have no Wayland Unix socket.
+#[cfg(not(unix))]
+pub fn probe_wayland_display(_env: &SeatWaylandEnv) -> Result<bool, MultiseatError> {
+    Err(MultiseatError::Unsupported(
+        "per-seat Wayland compositors require a Unix host".to_owned(),
+    ))
+}
+
 fn read_exact_with_timeout(stream: &mut impl Read, buffer: &mut [u8]) -> std::io::Result<()> {
     let mut filled = 0;
     while filled < buffer.len() {
@@ -1179,7 +1571,8 @@ pub fn probe_x11_display(
 /// video, and input configuration from `xorg_config`; it is started with
 /// `-novtswitch -sharevts` so a throwaway seat does not steal a VT, and with
 /// `-noreset` so the server survives its last client exactly like a supervised
-/// seat server. `-nolisten tcp` is unconditional for every backend.
+/// seat server. `-nolisten tcp` is unconditional for every backend. The Weston
+/// backend does not use this function; see [`weston_server_args`].
 pub fn display_server_args(
     backend: SeatDisplayBackend,
     display: &str,
@@ -1375,5 +1768,95 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(error.to_string().contains("config file"));
+    }
+
+    #[test]
+    fn weston_backend_is_wayland_and_has_a_stable_name() {
+        assert_eq!(SeatDisplayBackend::Weston.as_str(), "weston");
+        assert_eq!(
+            "weston"
+                .parse::<SeatDisplayBackend>()
+                .expect("parse weston"),
+            SeatDisplayBackend::Weston
+        );
+        assert_eq!(
+            "wayland"
+                .parse::<SeatDisplayBackend>()
+                .expect("parse wayland alias"),
+            SeatDisplayBackend::Weston
+        );
+        assert!(SeatDisplayBackend::Weston.is_nested());
+        assert!(SeatDisplayBackend::Weston.is_wayland());
+        assert!(!SeatDisplayBackend::Xvfb.is_wayland());
+    }
+
+    #[test]
+    fn weston_args_are_headless_software_and_use_the_private_socket_and_config() {
+        let args = weston_server_args(
+            "ozma-weston-90",
+            size(),
+            Path::new("/tmp/ozma-seat-weston-1/weston.ini"),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--backend=headless",
+                "--renderer=pixman",
+                "--socket=ozma-weston-90",
+                "--idle-time=0",
+                "--config=/tmp/ozma-seat-weston-1/weston.ini",
+                "--width=1280",
+                "--height=800",
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg.contains("drm")));
+        assert!(!args.iter().any(|arg| arg.contains("x11")));
+        assert!(!args.iter().any(|arg| arg.contains("wayland")));
+    }
+
+    #[test]
+    fn weston_config_is_generated_without_a_desktop_panel_or_idle_blank() {
+        let config = weston_config(size());
+        assert!(config.contains("[core]"));
+        assert!(config.contains("idle-time=0"));
+        assert!(config.contains("[shell]"));
+        assert!(config.contains("panel-position=none"));
+    }
+
+    #[test]
+    fn wayland_env_joins_the_private_runtime_dir_and_socket_name() {
+        let env = SeatWaylandEnv::new("ozma-weston-90", "/tmp/ozma-seat-weston-1/runtime");
+        assert_eq!(env.wayland_display, "ozma-weston-90");
+        assert_eq!(
+            env.socket,
+            PathBuf::from("/tmp/ozma-seat-weston-1/runtime/ozma-weston-90")
+        );
+        assert_eq!(wayland_display_name(90), "ozma-weston-90");
+    }
+
+    #[test]
+    fn missing_weston_binary_is_a_typed_missing_binary_error() {
+        let options = SeatDisplayOptions {
+            backend: SeatDisplayBackend::Weston,
+            ..SeatDisplayOptions::default()
+        };
+        let programs = SeatDisplayPrograms {
+            weston: PathBuf::from("/nonexistent/ozma-weston"),
+            ..SeatDisplayPrograms::default()
+        };
+        let launcher = ProcessSeatDisplayLauncher::new(options).with_programs(programs);
+        let request = SeatDisplayRequest {
+            seat_id: "seat-a".to_owned(),
+            backend: SeatDisplayBackend::Weston,
+            size: size(),
+            parent_display: None,
+        };
+        let error = match launcher.spawn(&request) {
+            Ok(_) => panic!("spawning without weston must fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, MultiseatError::SeatDisplayTool { .. }));
+        assert_eq!(display_error_kind(&error), "missing_binary");
+        assert!(launcher.in_use().is_empty());
     }
 }

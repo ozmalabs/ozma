@@ -40,7 +40,7 @@ use crate::seat::{
 };
 use crate::seat_display::{
     SeatDisplayError, SeatDisplayHandle, SeatDisplayLauncher, SeatDisplayNote, SeatDisplayNoteKind,
-    SeatDisplayOptions, SeatDisplayRequest, SeatDisplayStatus,
+    SeatDisplayOptions, SeatDisplayRequest, SeatDisplayStatus, SeatWaylandEnv,
 };
 
 /// Default node binary used by the planner and the process launcher.
@@ -766,6 +766,7 @@ impl ProcessSeatSupervisor {
         let display = handle.display().to_owned();
         let pid = handle.pid();
         let auth_disabled = handle.auth_disabled();
+        let wayland = handle.wayland().cloned();
         match self.wait_display_ready(handle.as_mut()) {
             Ok(()) => {}
             Err(error) => {
@@ -786,11 +787,26 @@ impl ProcessSeatSupervisor {
                  -nolisten tcp",
             ));
         }
+        if backend.is_wayland() {
+            status.push_note(SeatDisplayNote::new(
+                SeatDisplayNoteKind::InputTargetingUnavailable,
+                format!(
+                    "seat {seat_id} uses a headless Weston compositor with no libinput seat; \
+                     physical inputs and helper uinput devices cannot be targeted at this \
+                     compositor, so display input isolation is not claimed"
+                ),
+            ));
+        }
 
         let size = self.options.seat_display.size;
         let xauthority = handle.xauthority().map(std::path::Path::to_path_buf);
         let seat = self.seats.get_mut(seat_id).expect("tracked seat");
-        apply_display_to_launch(&mut seat.launch, &display, xauthority.as_deref(), size);
+        match wayland.as_ref() {
+            Some(wayland) => apply_wayland_to_launch(&mut seat.launch, wayland),
+            None => {
+                apply_display_to_launch(&mut seat.launch, &display, xauthority.as_deref(), size)
+            }
+        }
         seat.display = Some(handle);
         seat.display_status = status;
         Ok(())
@@ -942,7 +958,11 @@ impl ProcessSeatSupervisor {
         let timeout = self.options.seat_display.ready_timeout;
         let poll = self.options.seat_display.ready_poll;
         let deadline = Instant::now() + timeout;
-        let mut detail = "server did not answer the X11 setup handshake".to_owned();
+        let mut detail = if backend.is_wayland() {
+            "compositor did not accept a Wayland client connection".to_owned()
+        } else {
+            "server did not answer the X11 setup handshake".to_owned()
+        };
 
         loop {
             match handle.try_wait() {
@@ -1080,6 +1100,19 @@ impl ProcessSeatSupervisor {
         own_devices: &[String],
     ) -> Result<(), MultiseatError> {
         if own_devices.is_empty() || !self.display_is_nested(seat_id) {
+            return Ok(());
+        }
+        // The headless Weston backend has no libinput seat. There is no X
+        // display to run `xinput` against and no compositor seat to attach the
+        // helper's uinput nodes to, so never claim targeting. The typed
+        // `input_targeting_unavailable` note is recorded when the display is
+        // created.
+        if self
+            .seats
+            .get(seat_id)
+            .is_some_and(|seat| seat.display_status.display_backend.is_wayland())
+        {
+            self.clear_input_targeting(seat_id);
             return Ok(());
         }
         let mode = self.options.input_targeting;
@@ -1365,12 +1398,22 @@ impl ProcessSeatSupervisor {
             return Ok(());
         };
         if self.display_is_nested(seat_id) {
+            let kind = if self
+                .seats
+                .get(seat_id)
+                .is_some_and(|seat| seat.display_status.display_backend.is_wayland())
+            {
+                "a private headless Wayland compositor with no physical output"
+            } else {
+                "a private X root with no physical output"
+            };
             self.push_display_note(
                 seat_id,
                 SeatDisplayNote::new(
                     SeatDisplayNoteKind::OwnershipUnsupported,
                     format!(
-                        "xrandr ownership of output {} is not applied: seat {seat_id} draws on a private X root with no physical output",
+                        "xrandr ownership of output {} is not applied: seat {seat_id} draws on \
+                         {kind}",
                         ownership.output
                     ),
                 ),
@@ -1433,12 +1476,23 @@ impl ProcessSeatSupervisor {
         if route.strategy == InputRoutingStrategy::XInputMapToOutput
             && self.display_is_nested(seat_id)
         {
+            let kind = if self
+                .seats
+                .get(seat_id)
+                .is_some_and(|seat| seat.display_status.display_backend.is_wayland())
+            {
+                "the private Wayland compositor has no X pointer; use --input-isolation helper \
+                 for exclusive input"
+            } else {
+                "the private X server has no physical pointer; use --input-isolation helper for \
+                 exclusive input"
+            };
             self.push_display_note(
                 seat_id,
                 SeatDisplayNote::new(
                     SeatDisplayNoteKind::XinputRoutingUnsupported,
                     format!(
-                        "xinput map-to-output for {} is not applied: the private X server has no physical pointer; use --input-isolation helper for exclusive input",
+                        "xinput map-to-output for {} is not applied: {kind}",
                         route.display_output
                     ),
                 ),
@@ -2525,6 +2579,26 @@ fn plan_parent_display(plan: &SeatPlan) -> Option<String> {
         }
         crate::seat::CapturePlan::PipeWire { .. } => None,
     }
+}
+
+/// Point the node launch specification at the private Wayland compositor.
+///
+/// `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR` are exported to the child. The host
+/// `DISPLAY`/`XAUTHORITY` are removed so a headless Weston seat cannot fall back
+/// to the operator's X session. A PipeWire capture target is left unchanged;
+/// the planned X11 capture target is not rewritten to a Wayland name (the node
+/// capture integration for Wayland remains a documented gap).
+fn apply_wayland_to_launch(launch: &mut NodeLaunchSpec, wayland: &SeatWaylandEnv) {
+    launch.env.insert(
+        "WAYLAND_DISPLAY".to_owned(),
+        wayland.wayland_display.clone(),
+    );
+    launch.env.insert(
+        "XDG_RUNTIME_DIR".to_owned(),
+        wayland.xdg_runtime_dir.display().to_string(),
+    );
+    launch.env.remove("DISPLAY");
+    launch.env.remove("XAUTHORITY");
 }
 
 /// Point the node launch specification at the private display.

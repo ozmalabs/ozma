@@ -15,12 +15,15 @@
 //! constructed, no socket is bound, and `/api/v1/connect/*` reports
 //! `state:"not-configured"` without fabricated peers or tunnel counts.
 //!
-//! The real backend uses the existing userspace boringtun implementation in
-//! [`ozma_mesh::MeshManager`]. Kernel WireGuard is not implemented; requesting
-//! it is an explicit typed unsupported state even when root and `wg` exist.
+//! `--mesh-kernel` selects the kernel WireGuard backend
+//! ([`ozma_mesh::KernelWireguard`]): it creates a kernel `wireguard` link,
+//! configures keys/peers/routes through `ip`/`wg`, and exposes the kernel's own
+//! handshake and byte counters. The default remains the userspace boringtun
+//! backend in [`ozma_mesh::MeshManager`]. A missing root, module, or tool is a
+//! typed prerequisite failure, never a fabricated tunnel.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -45,8 +48,9 @@ use ozma_mesh::pump::{
 #[cfg(test)]
 use ozma_mesh::pump::{PumpStats, TunIo};
 use ozma_mesh::{
-    DiscoveryAction, DiscoveryConfig, DiscoveryEngine, DiscoveryStatus, MdnsBrowser, MeshManager,
-    MeshNode, PeerChange, PeerOrigin, RawAdvertisement, WgPrivateKey,
+    DiscoveryAction, DiscoveryConfig, DiscoveryEngine, DiscoveryStatus, KernelWgSettings,
+    KernelWgStatus, KernelWireguard, MdnsBrowser, MeshManager, MeshNode, PeerChange, PeerOrigin,
+    RawAdvertisement, WgPrivateKey,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -95,7 +99,6 @@ impl MeshServiceError {
                 | "mesh.root-required"
                 | "mesh.wg-missing"
                 | "mesh.wireguard-unavailable"
-                | "mesh.kernel-unsupported"
                 | "mesh.not-configured"
                 | "mesh.ip-invalid"
                 | "mesh.peer-invalid"
@@ -192,7 +195,7 @@ pub struct MeshIdentity {
     pub mesh_ip: String,
     pub wg_port: u16,
     pub wg_pubkey: String,
-    /// `userspace-boringtun` or `kernel` (not implemented).
+    /// `userspace-boringtun`, `kernel`, `fake`, or `unavailable`.
     pub wireguard: String,
 }
 
@@ -318,8 +321,15 @@ pub struct MeshServiceConfig {
     pub requires_root: bool,
     /// Kernel WireGuard mode requires the `wg` binary.
     pub requires_wg: bool,
+    /// Select and configure the kernel WireGuard backend. `None` keeps the
+    /// default userspace boringtun backend. In kernel mode the link itself is
+    /// the data transport, so no TUN/packet pump is created.
+    pub kernel: Option<KernelWgSettings>,
     /// Configured peers.
     pub peers: Vec<MeshNode>,
+    /// Optional underlay UDP endpoints for static peers, keyed by node id.
+    /// The peer's mesh IP remains its overlay identity and route.
+    pub peer_endpoints: BTreeMap<String, SocketAddr>,
     /// Capabilities advertised in this node's mesh mDNS record.
     pub capabilities: Vec<String>,
     /// Opt-in mDNS peer discovery policy. `None` keeps discovery disabled.
@@ -340,7 +350,9 @@ impl Default for MeshServiceConfig {
             key_file: None,
             requires_root: false,
             requires_wg: false,
+            kernel: None,
             peers: Vec::new(),
+            peer_endpoints: BTreeMap::new(),
             capabilities: Vec::new(),
             discovery: None,
             dataplane: None,
@@ -362,6 +374,8 @@ pub struct MeshEnvironment {
     pub ip_binary: bool,
     /// `nft` is on `PATH` (only required for opt-in NAT).
     pub nft_binary: bool,
+    /// `/sys/module/wireguard` exists (kernel WireGuard backend).
+    pub wireguard_module: bool,
 }
 
 impl Default for MeshEnvironment {
@@ -379,6 +393,7 @@ impl MeshEnvironment {
             tun_available: std::path::Path::new(ozma_mesh::dataplane::TUN_DEVICE).exists(),
             ip_binary: binary_on_path("ip"),
             nft_binary: binary_on_path("nft"),
+            wireguard_module: std::path::Path::new(ozma_mesh::WIREGUARD_MODULE_PATH).exists(),
         }
     }
 }
@@ -449,6 +464,61 @@ impl MeshServiceConfig {
                 "mesh.wg-missing",
                 "kernel WireGuard requires the wg binary, which is not on PATH",
             ));
+        }
+        if let Some(kernel) = &self.kernel {
+            kernel.validate().map_err(MeshServiceError::from)?;
+            if kernel.address.to_string() != self.mesh_ip.trim() {
+                return Err(MeshServiceError::new(
+                    "mesh.dataplane-invalid",
+                    "kernel WireGuard address does not match --mesh-ip",
+                ));
+            }
+            if kernel.listen_port != self.wg_port {
+                return Err(MeshServiceError::new(
+                    "mesh.dataplane-invalid",
+                    "kernel WireGuard listen port does not match --mesh-port",
+                ));
+            }
+            if !environment.is_root {
+                return Err(MeshServiceError::new(
+                    "mesh.root-required",
+                    "kernel WireGuard requires root to create/config its link, addresses, \
+                     peers, and routes",
+                ));
+            }
+            if !environment.wireguard_module {
+                return Err(MeshServiceError::new(
+                    "mesh.dataplane-unavailable",
+                    "the wireguard kernel module is not loaded; load it with \
+                     `modprobe wireguard`",
+                ));
+            }
+            if !environment.ip_binary {
+                return Err(MeshServiceError::new(
+                    "mesh.dataplane-unavailable",
+                    "kernel WireGuard requires the ip binary on PATH",
+                ));
+            }
+            if !environment.wg_binary {
+                return Err(MeshServiceError::new(
+                    "mesh.dataplane-unavailable",
+                    "kernel WireGuard requires the wg binary; install wireguard-tools",
+                ));
+            }
+            for (id, endpoint) in &self.peer_endpoints {
+                if !self.peers.iter().any(|peer| &peer.id == id) {
+                    return Err(MeshServiceError::new(
+                        "mesh.peer-invalid",
+                        format!("peer endpoint {id} has no matching configured peer"),
+                    ));
+                }
+                if !endpoint.is_ipv4() || endpoint.port() == 0 {
+                    return Err(MeshServiceError::new(
+                        "mesh.peer-invalid",
+                        format!("peer endpoint for {id} must be IPv4 with a non-zero port"),
+                    ));
+                }
+            }
         }
         if let Some(dataplane) = &self.dataplane {
             dataplane.validate().map_err(MeshServiceError::from)?;
@@ -525,6 +595,11 @@ pub trait MeshBackend: Send + Sync {
     /// Packet API exposed by the running tunnel, if it has one. `None` means no
     /// pump can be started; the service never fabricates a tunnel packet path.
     fn tunnel_io(&self) -> Option<Arc<dyn TunnelIo>> {
+        None
+    }
+
+    /// Kernel WireGuard link status, present only for the kernel backend.
+    fn kernel_status(&self) -> Option<KernelWgStatus> {
         None
     }
 }
@@ -880,6 +955,242 @@ impl MeshBackend for BoringtunMeshBackend {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone()
+    }
+}
+
+/// Real backend around [`ozma_mesh::KernelWireguard`] (Linux kernel module).
+pub struct KernelMeshBackend {
+    identity: MeshNode,
+    capabilities: Vec<String>,
+    kernel: KernelWireguard,
+    advertiser: Mutex<Option<ozma_mesh::MeshAdvertiser>>,
+    state: Mutex<MeshState>,
+    error: Mutex<Option<MeshServiceError>>,
+    peer_states: Mutex<BTreeMap<String, MeshTunnelState>>,
+    log: MeshEventLog,
+}
+
+impl KernelMeshBackend {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        identity: MeshNode,
+        private_key: WgPrivateKey,
+        settings: KernelWgSettings,
+        configured_peers: Vec<MeshNode>,
+        peer_endpoints: BTreeMap<String, SocketAddr>,
+        capabilities: Vec<String>,
+        runner: Arc<dyn CommandRunner>,
+        sysfs: Arc<dyn Sysfs>,
+        log: MeshEventLog,
+    ) -> Self {
+        Self {
+            identity,
+            capabilities,
+            kernel: KernelWireguard::new_with_peer_endpoints(
+                settings,
+                private_key,
+                configured_peers,
+                peer_endpoints,
+                runner,
+                sysfs,
+            ),
+            advertiser: Mutex::new(None),
+            state: Mutex::new(MeshState::Stopped),
+            error: Mutex::new(None),
+            peer_states: Mutex::new(BTreeMap::new()),
+            log,
+        }
+    }
+
+    fn set_state(&self, state: MeshState) {
+        *self.state.lock().unwrap_or_else(|error| error.into_inner()) = state;
+    }
+
+    fn set_error(&self, error: Option<MeshServiceError>) {
+        *self.error.lock().unwrap_or_else(|value| value.into_inner()) = error;
+    }
+
+    fn map_peer_state(&self, peer: &ozma_mesh::PeerStatus) -> MeshTunnelState {
+        let advertised = if peer.established {
+            MeshTunnelState::Established
+        } else {
+            MeshTunnelState::Idle
+        };
+        let mut states = self
+            .peer_states
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = states.insert(peer.node.id.clone(), advertised);
+        if previous != Some(advertised) {
+            self.log.record(
+                MeshEventKind::TunnelState,
+                format!(
+                    "peer {} tunnel is {}",
+                    peer.node.id,
+                    tunnel_label(advertised)
+                ),
+                Some(peer.node.id.clone()),
+            );
+        }
+        advertised
+    }
+}
+
+#[async_trait]
+impl MeshBackend for KernelMeshBackend {
+    async fn start(&self) -> Result<(), MeshServiceError> {
+        if self.state() == MeshState::Running {
+            return Ok(());
+        }
+        self.set_state(MeshState::Starting);
+        self.set_error(None);
+
+        let status = match self.kernel.start() {
+            Ok(status) => status,
+            Err(error) => {
+                let typed = MeshServiceError::from(error);
+                self.set_state(MeshState::Failed);
+                self.set_error(Some(typed.clone()));
+                self.log
+                    .record(MeshEventKind::Error, typed.reason.clone(), None);
+                return Err(typed);
+            }
+        };
+
+        let port = status.listen_port;
+        match ozma_mesh::MeshAdvertiser::new(&self.identity, port, &self.capabilities) {
+            Ok(advertiser) => {
+                *self
+                    .advertiser
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(advertiser);
+            }
+            Err(error) => {
+                let _ = self.kernel.stop();
+                let typed = MeshServiceError::new(
+                    "mesh.start-failed",
+                    format!("kernel WireGuard mDNS advertisement could not start: {error}"),
+                );
+                self.set_state(MeshState::Failed);
+                self.set_error(Some(typed.clone()));
+                self.log
+                    .record(MeshEventKind::Error, typed.reason.clone(), None);
+                return Err(typed);
+            }
+        }
+
+        self.set_state(MeshState::Running);
+        self.set_error(None);
+        Ok(())
+    }
+
+    async fn stop(&self) -> Result<(), MeshServiceError> {
+        self.advertiser
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        match self.kernel.stop() {
+            Ok(()) => {
+                self.set_state(MeshState::Stopped);
+                self.set_error(None);
+                Ok(())
+            }
+            Err(error) => {
+                let typed = MeshServiceError::from(error);
+                self.set_state(MeshState::Failed);
+                self.set_error(Some(typed.clone()));
+                self.log
+                    .record(MeshEventKind::Error, typed.reason.clone(), None);
+                Err(typed)
+            }
+        }
+    }
+
+    async fn add_peer(&self, node: MeshNode) -> Result<(), MeshServiceError> {
+        self.kernel.add_peer(node).map_err(MeshServiceError::from)
+    }
+
+    async fn remove_peer(&self, peer_id: &str) -> Result<(), MeshServiceError> {
+        self.kernel
+            .remove_peer(peer_id)
+            .map_err(MeshServiceError::from)
+    }
+
+    async fn add_discovered_peer(
+        &self,
+        node: MeshNode,
+        capabilities: Vec<String>,
+        underlay_ip: Option<Ipv4Addr>,
+    ) -> Result<PeerChange, MeshServiceError> {
+        self.kernel
+            .add_discovered_peer(node, capabilities, underlay_ip)
+            .map_err(MeshServiceError::from)
+    }
+
+    async fn remove_discovered_peer(
+        &self,
+        peer_id: &str,
+    ) -> Result<Option<MeshNode>, MeshServiceError> {
+        self.kernel
+            .remove_discovered_peer(peer_id)
+            .map_err(MeshServiceError::from)
+    }
+
+    async fn initiate_handshake(&self, peer_id: &str) -> Result<(), MeshServiceError> {
+        self.kernel
+            .initiate_handshake(peer_id)
+            .map_err(MeshServiceError::from)
+    }
+
+    async fn peers(&self) -> Vec<MeshPeerView> {
+        self.kernel
+            .peer_statuses()
+            .into_iter()
+            .map(|peer| {
+                let tunnel = self.map_peer_state(&peer);
+                MeshPeerView {
+                    id: peer.node.id.clone(),
+                    mesh_ip: peer.node.mesh_ip.clone(),
+                    wg_port: peer.node.wg_port,
+                    wg_pubkey: peer.node.wg_pubkey.0.clone(),
+                    origin: peer.origin,
+                    capabilities: peer.capabilities.clone(),
+                    endpoint: Some(peer.endpoint.clone()),
+                    tunnel,
+                    established: peer.established,
+                    last_handshake_age_secs: peer.last_handshake_age_secs,
+                    tx_bytes: peer.tx_bytes,
+                    rx_bytes: peer.rx_bytes,
+                    loss: peer.loss,
+                    rtt_ms: peer.rtt_ms,
+                }
+            })
+            .collect()
+    }
+
+    fn identity(&self) -> Option<MeshIdentity> {
+        Some(MeshIdentity {
+            id: self.identity.id.clone(),
+            mesh_ip: self.identity.mesh_ip.clone(),
+            wg_port: self.identity.wg_port,
+            wg_pubkey: self.identity.wg_pubkey.0.clone(),
+            wireguard: "kernel".to_owned(),
+        })
+    }
+
+    fn state(&self) -> MeshState {
+        *self.state.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn error(&self) -> Option<MeshServiceError> {
+        self.error
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    fn kernel_status(&self) -> Option<KernelWgStatus> {
+        Some(self.kernel.status())
     }
 }
 
@@ -1308,22 +1619,43 @@ impl MeshService {
             Err(error) => return Self::unsupported(error, log),
         };
 
-        let dataplane = config
-            .dataplane
-            .clone()
-            .map(|dataplane| Arc::new(MeshDataplane::new(dataplane, runner, sysfs)));
-        let backend = BoringtunMeshBackend::new(
-            identity,
-            private_key,
-            config.peers.clone(),
-            config.capabilities.clone(),
-            log.clone(),
-        );
+        // Kernel WireGuard owns its link; a TUN dataplane/pump would create a
+        // second, competing interface. Kernel mode therefore takes precedence
+        // and programs the `wg` link's own addresses and routes.
+        let kernel_requested = config.kernel.is_some();
+        let kernel = config.kernel.clone();
+        let dataplane = if kernel_requested {
+            None
+        } else {
+            config.dataplane.clone().map(|dataplane| {
+                Arc::new(MeshDataplane::new(dataplane, runner.clone(), sysfs.clone()))
+            })
+        };
+        let backend: Arc<dyn MeshBackend> = match kernel {
+            Some(settings) => Arc::new(KernelMeshBackend::new(
+                identity,
+                private_key,
+                settings,
+                config.peers.clone(),
+                config.peer_endpoints.clone(),
+                config.capabilities.clone(),
+                runner,
+                sysfs,
+                log.clone(),
+            )),
+            None => Arc::new(BoringtunMeshBackend::new(
+                identity,
+                private_key,
+                config.peers.clone(),
+                config.capabilities.clone(),
+                log.clone(),
+            )),
+        };
         Self::with_backend_dataplane_and_discovery(
-            Arc::new(backend),
+            backend,
             dataplane,
             log,
-            tun_provider.filter(|_| config.dataplane.is_some()),
+            tun_provider.filter(|_| config.dataplane.is_some() && !kernel_requested),
             discovery,
             true,
         )
@@ -2226,6 +2558,7 @@ impl MeshService {
             reason: error.as_ref().map(|value| value.reason.clone()),
             identity: self.backend.identity(),
             dataplane: self.dataplane.as_ref().map(|dataplane| dataplane.status()),
+            kernel: self.backend.kernel_status(),
             pump: self.pump_status(),
             discovery: self.discovery_status(),
             peer_count: peers.as_ref().map(Vec::len),
@@ -2316,6 +2649,10 @@ pub struct MeshStatus {
     /// `--mesh-dataplane` was configured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dataplane: Option<DataplaneStatus>,
+    /// Kernel WireGuard link state and real `wg show dump` peers, present only
+    /// when `--mesh-kernel` selected the kernel backend.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<KernelWgStatus>,
     /// Bounded TUN/WireGuard packet-pump state and real counters, present only
     /// when the dataplane and a TUN provider are configured.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2350,6 +2687,7 @@ impl MeshStatus {
             reason: Some("mesh service is not enabled (--mesh / OZMA_MESH)".to_owned()),
             identity: None,
             dataplane: None,
+            kernel: None,
             pump: None,
             discovery: None,
             peer_count: None,
@@ -2663,6 +3001,7 @@ mod tests {
             tun_available: true,
             ip_binary: true,
             nft_binary: true,
+            wireguard_module: true,
         };
         assert_eq!(
             base.preflight_with(false, &env).unwrap_err().code,
@@ -2684,6 +3023,7 @@ mod tests {
             tun_available: true,
             ip_binary: true,
             nft_binary: true,
+            wireguard_module: true,
         };
         let error = kernel.preflight_with(true, &root_env).unwrap_err();
         assert_eq!(error.code, "mesh.wg-missing");
@@ -2695,8 +3035,136 @@ mod tests {
             tun_available: true,
             ip_binary: true,
             nft_binary: true,
+            wireguard_module: true,
         };
         kernel.preflight_with(true, &complete).unwrap();
+    }
+
+    #[test]
+    fn preflight_reports_kernel_module_and_tool_errors() {
+        let base = MeshServiceConfig {
+            node_id: "node".into(),
+            mesh_ip: "10.200.9.1".into(),
+            wg_port: 51_820,
+            kernel: Some(KernelWgSettings::new(
+                "ozma0",
+                Ipv4Addr::new(10, 200, 9, 1),
+                24,
+                1420,
+                51_820,
+            )),
+            ..MeshServiceConfig::default()
+        };
+        let complete = MeshEnvironment {
+            is_root: true,
+            wg_binary: true,
+            userspace_wireguard: true,
+            tun_available: true,
+            ip_binary: true,
+            nft_binary: true,
+            wireguard_module: true,
+        };
+        base.preflight_with(true, &complete).unwrap();
+
+        let not_root = MeshEnvironment {
+            is_root: false,
+            ..complete
+        };
+        assert_eq!(
+            base.preflight_with(true, &not_root).unwrap_err().code,
+            "mesh.root-required"
+        );
+
+        let no_module = MeshEnvironment {
+            wireguard_module: false,
+            ..complete
+        };
+        let error = base.preflight_with(true, &no_module).unwrap_err();
+        assert_eq!(error.code, "mesh.dataplane-unavailable");
+        assert!(error.reason.contains("wireguard kernel module"));
+
+        let no_wg = MeshEnvironment {
+            wg_binary: false,
+            ..complete
+        };
+        assert_eq!(
+            base.preflight_with(true, &no_wg).unwrap_err().code,
+            "mesh.dataplane-unavailable"
+        );
+
+        let no_ip = MeshEnvironment {
+            ip_binary: false,
+            ..complete
+        };
+        assert_eq!(
+            base.preflight_with(true, &no_ip).unwrap_err().code,
+            "mesh.dataplane-unavailable"
+        );
+
+        let mut ghost = base.clone();
+        ghost.peer_endpoints.insert(
+            "ghost".to_owned(),
+            SocketAddr::from((Ipv4Addr::new(10, 10, 30, 9), 51_820)),
+        );
+        assert_eq!(
+            ghost.preflight_with(true, &complete).unwrap_err().code,
+            "mesh.peer-invalid"
+        );
+    }
+
+    fn write_test_key() -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "ozma-mesh-node-key-{}-{sequence}.key",
+            std::process::id()
+        ));
+        std::fs::write(&path, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn kernel_configuration_selects_the_kernel_backend() {
+        let key_path = write_test_key();
+        let config = MeshServiceConfig {
+            node_id: "kernel-node".into(),
+            mesh_ip: "10.200.9.1".into(),
+            wg_port: 51_820,
+            kernel: Some(KernelWgSettings::new(
+                "ozma0",
+                Ipv4Addr::new(10, 200, 9, 1),
+                24,
+                1420,
+                51_820,
+            )),
+            key_file: Some(key_path.clone()),
+            ..MeshServiceConfig::default()
+        };
+        let environment = MeshEnvironment {
+            is_root: true,
+            wg_binary: true,
+            userspace_wireguard: true,
+            tun_available: true,
+            ip_binary: true,
+            nft_binary: true,
+            wireguard_module: true,
+        };
+        let service = MeshService::from_config_with_seams(
+            config,
+            &environment,
+            Arc::new(NodeRunner::default()),
+            Arc::new(NodeSysfs::rooted()),
+        );
+        let _ = std::fs::remove_file(&key_path);
+        assert_eq!(service.state(), MeshState::Stopped);
+        assert_eq!(service.identity().unwrap().wireguard.as_str(), "kernel");
+        assert!(service.log().is_empty());
+        let status = service.status().await;
+        assert!(status.kernel.is_some());
+        assert_eq!(status.kernel.unwrap().interface, "ozma0");
+        assert!(status.dataplane.is_none());
+        assert!(status.pump.is_none());
+        assert_eq!(status.wireguard, "kernel");
     }
 
     #[test]
@@ -2708,6 +3176,7 @@ mod tests {
             tun_available: true,
             ip_binary: true,
             nft_binary: true,
+            wireguard_module: true,
         };
         let empty = MeshServiceConfig::default();
         assert_eq!(
@@ -3027,6 +3496,7 @@ mod tests {
             tun_available: true,
             ip_binary: true,
             nft_binary: true,
+            wireguard_module: true,
         };
         config.preflight_with(true, &base).unwrap();
 

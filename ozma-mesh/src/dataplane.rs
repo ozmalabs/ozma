@@ -16,8 +16,10 @@
 //! [`MeshDataplane::start`].
 
 use std::fmt;
+use std::fs::OpenOptions;
 use std::io;
 use std::net::Ipv4Addr;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
@@ -121,6 +123,26 @@ pub trait FileOpener: Send + Sync {
     fn exists(&self, path: &Path) -> bool;
     fn read_to_string(&self, path: &Path) -> io::Result<String>;
     fn write(&self, path: &Path, contents: &str) -> io::Result<()>;
+
+    /// Write key material with owner-only permissions.
+    ///
+    /// Implementations that can set a mode should override this; the default
+    /// keeps simple test doubles working. Kernel WireGuard uses it for a
+    /// short-lived private-key file so the key never appears in an argv or a
+    /// log line.
+    fn write_secret(&self, path: &Path, contents: &str) -> io::Result<()> {
+        self.write(path, contents)
+    }
+
+    /// Remove a file written by [`FileOpener::write_secret`]. Missing files are
+    /// already clean.
+    fn remove(&self, path: &Path) -> io::Result<()> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 /// Host environment seam: root detection and PATH tool discovery on top of
@@ -174,6 +196,24 @@ impl FileOpener for SystemSysfs {
 
     fn write(&self, path: &Path, contents: &str) -> io::Result<()> {
         std::fs::write(path, contents)
+    }
+
+    fn write_secret(&self, path: &Path, contents: &str) -> io::Result<()> {
+        use std::io::Write as _;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(contents.as_bytes())
+    }
+
+    fn remove(&self, path: &Path) -> io::Result<()> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -1029,7 +1069,7 @@ fn prefix_mask(prefix_len: u8) -> u32 {
     }
 }
 
-fn valid_interface_name(name: &str) -> bool {
+pub(crate) fn valid_interface_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 15
         && name != "."
@@ -1049,14 +1089,14 @@ fn valid_nft_name(name: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
-fn valid_mesh_address(address: Ipv4Addr) -> bool {
+pub(crate) fn valid_mesh_address(address: Ipv4Addr) -> bool {
     !address.is_unspecified()
         && !address.is_loopback()
         && !address.is_multicast()
         && address != Ipv4Addr::BROADCAST
 }
 
-fn short_reason(reason: &str) -> String {
+pub(crate) fn short_reason(reason: &str) -> String {
     if reason.len() <= MAX_REASON_BYTES {
         return reason.to_owned();
     }
@@ -1072,7 +1112,7 @@ fn command_detail(output: &CommandOutput) -> &str {
     }
 }
 
-fn command_failure(command: &CommandSpec, output: &CommandOutput) -> DataplaneError {
+pub(crate) fn command_failure(command: &CommandSpec, output: &CommandOutput) -> DataplaneError {
     DataplaneError::command_failed(format!(
         "`{command}` exited with status {}: {}",
         output.status,
@@ -1099,7 +1139,7 @@ fn persist_keyword_rejected(output: &CommandOutput) -> bool {
     mentions_persist && is_parse_error
 }
 
-fn is_already_absent(reason: &str) -> bool {
+pub(crate) fn is_already_absent(reason: &str) -> bool {
     [
         "Cannot find device",
         "No such file or directory",

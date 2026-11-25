@@ -165,11 +165,12 @@ pub use seat::{
     SeatResourceStatus, SeatRuntimeStatus, SeatState, SeatStatus,
 };
 pub use seat_display::{
-    display_error_kind, display_name, display_server_args, parse_display_number, probe_x11_display,
-    resolve_program, x11_setup_request, DisplayExit, DisplayNumberAllocator,
+    display_error_kind, display_name, display_server_args, parse_display_number,
+    probe_wayland_display, probe_x11_display, resolve_program, wayland_display_name, weston_config,
+    weston_server_args, x11_setup_request, DisplayExit, DisplayNumberAllocator,
     ProcessSeatDisplayLauncher, SeatDisplayBackend, SeatDisplayError, SeatDisplayHandle,
     SeatDisplayLauncher, SeatDisplayNote, SeatDisplayNoteKind, SeatDisplayOptions,
-    SeatDisplayPrograms, SeatDisplayRequest, SeatDisplaySize, SeatDisplayStatus,
+    SeatDisplayPrograms, SeatDisplayRequest, SeatDisplaySize, SeatDisplayStatus, SeatWaylandEnv,
     DEFAULT_DISPLAY_NUMBER_END, DEFAULT_DISPLAY_NUMBER_START, DEFAULT_DISPLAY_READY_POLL,
     DEFAULT_DISPLAY_READY_TIMEOUT, DEFAULT_SEAT_DISPLAY_HEIGHT, DEFAULT_SEAT_DISPLAY_WIDTH,
     DISPLAY_TERMINATE_GRACE,

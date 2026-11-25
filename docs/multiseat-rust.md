@@ -4,7 +4,8 @@ Status: **library + real subprocess supervisor + CLI + controller read-only
 grouping + persisted seats/hotplug reconciliation + opt-in
 input-routing/display-ownership/audio execution + opt-in privileged input
 isolation + private-display input targeting + opt-in per-seat X servers +
-opt-in DRM lease-only handoff + packaged systemd unit (2026-11-25).**
+opt-in headless Weston Wayland compositor + opt-in DRM lease-only handoff +
+packaged systemd unit (2026-11-25).**
 The crate enumerates display/input topology, plans one desktop seat per output,
 can spawn, health-check, restart, stop, and report one `ozma-node --profile
 desktop` child per seat, and models the opt-in resource layers: `xinput
@@ -12,19 +13,22 @@ map-to-output` input routing with rollback, per-seat `xrandr`
 output/mode/position ownership, per-seat PipeWire/PulseAudio null sinks, a
 privileged `ozma-seat-input` helper that performs real `EVIOCGRAB` and per-seat
 uinput creation, `xinput` targeting that restricts a private display to one
-seat's helper devices, and opt-in `Xvfb`/`Xephyr`/`Xorg` private X servers per
-seat. The real-Xorg path was validated with dummy video, libinput, per-seat
-`Xauthority`, two throwaway displays, and XInput event routing; see
-`phase4-xorg-seat-report.md`. The supervisor **applies those resources before
-spawning and releases them on stop/remove/shutdown** when the explicit
+seat's helper devices, and opt-in `Xvfb`/`Xephyr`/`Xorg` private X servers or a
+headless Weston compositor per seat. The real-Xorg path was validated with
+dummy video, libinput, per-seat `Xauthority`, two throwaway displays, and XInput
+event routing; see `phase4-xorg-seat-report.md`. The Weston path was validated
+with two throwaway headless compositors, private runtime dirs/sockets, and real
+`wayland-info` clients; see `phase4-wayland-seat-report.md`. The supervisor
+**applies those resources before spawning and releases them on
+stop/remove/shutdown** when the explicit
 `--apply-ownership`/`--apply-routing`/`--audio-router`/`--input-isolation
 helper`/`--input-targeting`/`--seat-display` CLI flags (or the matching
 `SupervisorOptions`/builder calls) are enabled; all default to off, and dry-run
 still performs no action. The default input path remains the xinput strategy;
 the helper path is never selected implicitly. The default display backend
-remains `shared` (one X root); `xvfb`/`xephyr`/`xorg` start a real private
-server only when requested. A versioned `seats.json` store (`--seats-file`)
-preserves seat
+remains `shared` (one X root); `xvfb`/`xephyr`/`xorg`/`weston` start a real
+private server/compositor only when requested. A versioned `seats.json` store
+(`--seats-file`) preserves seat
 ids, display outputs, input hubs, ports, and audio sinks across replans; a sysfs
 hotplug model (`--hotplug`) reconciles add/remove display and input-hub events
 into seat start/stop with debounce. `ozma-node` can load that same store with
@@ -113,7 +117,9 @@ Implemented:
   never runs `xinput`. Targeting is only claimed after every own device was
   found and enabled, and the disabled devices are exposed in status. A real
   Xorg seat with libinput exposes the helper's uinput nodes and passes this
-  check; `Xvfb` exposes only core/XTEST devices and fails honestly.
+  check; `Xvfb` exposes only core/XTEST devices and fails honestly. Headless
+  `weston` has no libinput seat, so it records `input_targeting_unavailable`
+  and never claims targeting.
 - `ownership`: `DisplayOwnership` and `XrandrOwnershipController` model
   per-seat output ownership as
   `xrandr --output <output> --mode <mode> --pos <x>x<y>`, with apply/release
@@ -135,16 +141,21 @@ Implemented:
   omitted when no resource action happened, so default status is unchanged.
 - **Opt-in per-seat displays** (`seat_display`): `shared` (default, one X root),
   `xvfb` (private `Xvfb :N -screen 0 WxHx24 -nolisten tcp` per seat),
-  `xephyr` (private X server nested as a window in the shared display), and
+  `xephyr` (private X server nested as a window in the shared display),
   `xorg` (a real Xorg server with a caller-supplied config and libinput; it needs
-  the host's Xorg privilege rules and refuses to start without a config). The
-  supervisor allocates a free display number, creates a per-display `xauth`
-  cookie (or falls back to `-ac` on the Unix-socket-only listener), completes a
-  real X11 connection setup handshake before exporting `DISPLAY`/`XAUTHORITY`
-  to the child, rewrites X11 capture flags to the private screen, and stops the
-  server after the node on stop/rollback/shutdown. Display state is reported as
-  `display_backend`, `display`, `display_pid`, `display_ready`, typed
-  `display_error`, and typed `display_notes`.
+  the host's Xorg privilege rules and refuses to start without a config), and
+  `weston` (a throwaway headless Weston compositor with a private
+  `XDG_RUNTIME_DIR`, generated config, and `WAYLAND_DISPLAY` socket). The
+  supervisor allocates a free display number; X backends create a per-display
+  `xauth` cookie (or fall back to `-ac` on the Unix-socket-only listener) and
+  complete a real X11 connection setup handshake before exporting
+  `DISPLAY`/`XAUTHORITY` to the child. Weston is probed by a real Wayland client
+  connection and exports `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`. X11 capture flags
+  are rewritten to a private X screen; a Weston seat keeps its planned capture
+  target (node Wayland capture remains a gap). The display is stopped after the
+  node on stop/rollback/shutdown, and Weston's runtime directory is removed.
+  Display state is reported as `display_backend`, `display`, `display_pid`,
+  `display_ready`, typed `display_error`, and typed `display_notes`.
 - **Seat persistence** (`persistence`): a versioned `SeatStore`/`seats.json`
   with explicit seat id, display output, input hub, device paths, UDP/HTTP
   ports, audio sink, and profile. Loads validate ids/displays/ports/sinks and
@@ -198,11 +209,12 @@ Deliberately not implemented yet:
 - **True per-seat screen ownership.** The default X11 path positions one xrandr
   output on a single X server. All outputs share one root window and one
   keyboard focus, so `xrandr` ownership is not screen isolation. The opt-in
-  `--seat-display xvfb` (and nested `xephyr`) backend now provides a private X
-  root per seat, but it uses a virtual X server, not a physical output owner:
-  xrandr output ownership is not applied on that root and is reported as a typed
+  `--seat-display xvfb` (and nested `xephyr`) backend provides a private X root
+  per seat, and `--seat-display weston` provides a private headless Wayland
+  compositor. Neither claims a physical output: xrandr output ownership is not
+  applied on a private display and is reported as a typed
   `ownership_unsupported` note. DRM leasing, one compositor per physical output,
-  and Wayland compositor seats are still not implemented.
+  and physical-output handoff are still not implemented.
 - **Real exclusive evdev grabs by default.** `EvdevGrabRouter` still models
   `EVIOCGRAB` with an unsupported default backend. The real path is the
   separate opt-in `ozma-seat-input` helper (`--input-isolation helper`);
@@ -220,13 +232,16 @@ Deliberately not implemented yet:
   physical pointer to map and is reported as a typed
   `xinput_routing_unsupported` note instead of a fake success.
 - **Compositor integration for private displays.** `Xvfb`/`Xephyr` prove real
-  per-seat display isolation for X11 applications, and a real `Xorg` with dummy
-  video + libinput proves per-display uinput enumeration and event routing, but
-  no window manager, compositor, DRM scanout, physical-output handoff, or
-  per-node compositor launch is managed. `xinput` targeting restricts a private
-  display to the seat's helper uinput devices; `Xvfb` exposes only core/XTEST
-  devices, so a live `Xvfb` targeting attempt honestly fails with
-  `input_targeting_failed`, while the validated Xorg path passes. Kernel evdev
+  per-seat display isolation for X11 applications, a real `Xorg` with dummy
+  video + libinput proves per-display uinput enumeration and event routing, and
+  the headless `weston` backend proves a per-seat Wayland compositor instance
+  with a private runtime dir/socket. No window manager, physical-output
+  compositor launch, DRM scanout, or physical-output handoff is managed.
+  `xinput` targeting restricts a private X display to the seat's helper uinput
+  devices; `Xvfb` exposes only core/XTEST devices, so a live `Xvfb` targeting
+  attempt honestly fails with `input_targeting_failed`, while the validated
+  Xorg path passes. The headless Weston compositor has no libinput seat, so it
+  records `input_targeting_unavailable` and never claims targeting. Kernel evdev
   ownership (`EVIOCGRAB`) remains with the helper, not a DRM-lease/compositor
   seat.
 - **Kernel/compositor seat targeting for the helper's uinput devices.** The
@@ -526,7 +541,7 @@ below starts a private X server per seat, which does isolate the root/focus for
 X11 applications. It is still not DRM leasing or a physical-output/compositor
 seat, and it claims no Wayland or Windows ownership.
 
-## Per-seat X servers (`--seat-display`)
+## Per-seat displays (`--seat-display`)
 
 The display backend is selected per supervisor run, not per seat:
 
@@ -536,14 +551,15 @@ The display backend is selected per supervisor run, not per seat:
 | `xvfb` | Start `Xvfb :N -screen 0 WxHx24 -nolisten tcp` per seat, on a free display number. |
 | `xephyr` | Start `Xephyr :N -screen WxHx24` with `DISPLAY` set to the shared display, so the private X root is a window inside the operator's desktop. If `Xephyr` is unavailable the start fails with a typed `Unsupported` error. |
 | `xorg` | Start a real `Xorg :N -config <file> -logfile <file> -nolisten tcp -noreset -novtswitch -sharevts -keeptty -auth <Xauthority>` per seat. Geometry, dummy/video, and libinput devices come from the config. Without `xorg_config` the start is a typed `Unsupported` error instead of a host GPU probe. |
+| `weston` | Start a throwaway headless Weston compositor per seat: `weston --backend=headless --renderer=pixman --socket=ozma-weston-N --idle-time=0 --config=<generated> --width=W --height=H`, with a private `XDG_RUNTIME_DIR`. Export `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR` instead of `DISPLAY`. No DRM device, GPU mode-setting, or existing X/Wayland session is used. |
 
 `SeatDisplayOptions` carries `backend`, `size` (default `1280x800`), the display
 number range (default `90..=199`), readiness timeout/poll, an optional shared
 parent for Xephyr, and `xorg_config` for the Xorg backend. `SeatDisplaySize` is
-command-line geometry for Xvfb/Xephyr; Xorg takes geometry from its config.
-`ProcessSeatDisplayLauncher` is the production
-spawner; it is installed automatically by `ProcessSeatSupervisor::new` when the
-backend is nested. `with_parts` (used by tests and the CLI) requires an explicit
+command-line geometry for Xvfb/Xephyr/Weston; Xorg takes geometry from its
+config. `ProcessSeatDisplayLauncher` is the production spawner; it is installed
+automatically by `ProcessSeatSupervisor::new` when the backend is nested.
+`with_parts` (used by tests and the CLI) requires an explicit
 `with_display_launcher(...)`.
 
 Lifecycle and honesty rules:
@@ -551,48 +567,66 @@ Lifecycle and honesty rules:
 - **Allocation.** The allocator walks the configured range and skips numbers
   whose `/tmp/.X11-unix/XN` socket or `/tmp/.XN-lock` file already exists. A
   released number is reused by the next start. Exhaustion is
-  `SeatDisplayNumberExhausted` (`number_exhausted` in status).
+  `SeatDisplayNumberExhausted` (`number_exhausted` in status). Weston uses the
+  same number for its socket name (`ozma-weston-N`), but the socket lives in the
+  seat's private runtime dir, so it cannot collide with a real compositor.
 - **Auth.** When `xauth` is available, the launcher creates a private temporary
   `Xauthority` with a random `MIT-MAGIC-COOKIE-1` for `:N`, starts the server
   with `-auth <file>`, and exports `XAUTHORITY` to the child. If `xauth` is
   missing or fails, the server uses `-ac` and a typed `auth_disabled` note is
   recorded; the listener is still Unix-socket-only because `-nolisten tcp` is
-  always passed.
-- **Readiness.** A spawned process is not a ready display. The supervisor
-  completes an X11 connection setup handshake against `/tmp/.X11-unix/XN`
-  (with the cookie) and only then stores the handle and reports
-  `display_ready=true`. A server that exits first is `SeatDisplayCrashed`; one
-  that never answers is `SeatDisplayStartupTimeout`. Both terminate and release
-  the number before returning.
-- **Child environment.** `DISPLAY` and (when present) `XAUTHORITY` are exported.
-  X11 capture flags are rewritten to the private display at offset `0,0` with
-  the configured `--seat-display-size`. A PipeWire capture seat keeps its
-  configured target; only the application display changes.
-- **Start order.** Private X server → ownership/routing/helper/audio resources →
-  private-display input targeting → node child. **Stop order** is node child →
-  targeting/resource release → private X server. A failed resource apply or node
-  readiness releases the server, and rollback releases servers that have no
-  child.
+  always passed. Weston has no X auth; its isolation is the private runtime dir
+  and socket.
+- **Readiness.** A spawned process is not a ready display. X backends complete
+  an X11 connection setup handshake against `/tmp/.X11-unix/XN` (with the
+  cookie); Weston is probed by connecting to its private Wayland socket and,
+  when `wayland-info` is installed, by running that client with the seat's
+  `XDG_RUNTIME_DIR`/`WAYLAND_DISPLAY`. Only then does the supervisor store the
+  handle and report `display_ready=true`. A server that exits first is
+  `SeatDisplayCrashed`; one that never answers is
+  `SeatDisplayStartupTimeout`. Both terminate, delete the Weston runtime
+  directory, and release the number before returning.
+- **Child environment.** X backends export `DISPLAY` and (when present)
+  `XAUTHORITY`, and rewrite X11 capture flags to the private display at offset
+  `0,0` with the configured `--seat-display-size`. A PipeWire capture seat keeps
+  its configured target; only the application display changes. Weston exports
+  `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR` and removes inherited
+  `DISPLAY`/`XAUTHORITY`, so the seat cannot silently attach to the operator's X
+  session. The planned capture target is not rewritten to a Wayland name; node
+  Wayland capture integration remains a gap.
+- **Start order.** Private display/compositor →
+  ownership/routing/helper/audio resources → private-display input targeting →
+  node child. **Stop order** is node child → targeting/resource release →
+  private display. A failed resource apply or node readiness releases the
+  server/compositor, and rollback releases displays that have no child.
 - **Crash.** `tick` polls each private server. If it exits while the seat is
-  running, the node is terminated, targeting state is cleared, the server is
+  running, the node is terminated, targeting state is cleared, the display is
   released, and the seat is scheduled for a bounded restart. The next attempt
-  starts a fresh server, reuses the display number, and re-applies targeting.
+  starts a fresh server/compositor, reuses the display number, and re-applies
+  targeting.
 - **Ownership/routing on a private root.** xrandr output ownership and xinput
   `map-to-output` assume a physical output/pointer in the shared X server.
   With a nested display they are **not executed**; the seat reports typed
   `ownership_unsupported` / `xinput_routing_unsupported` notes instead of a
   fake applied flag. `--input-isolation helper` still runs before the node and
   is not regressed: the helper grabs the devices, creates the per-seat uinput
-  devices, and `--input-targeting warn|strict` restricts the private display to
-  those names with `xinput`. A display that does not expose those uinput nodes
-  (for example `Xvfb`) reports `input_targeting_failed` rather than claiming
-  isolation; a real Xorg/libinput display exposes them and passes. On the live
-  Xorg smoke, disabling seat B's devices on `:90` and seat A's on `:91` also
-  stopped injected events from crossing displays.
+  devices, and `--input-targeting warn|strict` restricts the private X display
+  to those names with `xinput`. A display that does not expose those uinput
+  nodes (for example `Xvfb`) reports `input_targeting_failed` rather than
+  claiming isolation; a real Xorg/libinput display exposes them and passes. On
+  the live Xorg smoke, disabling seat B's devices on `:90` and seat A's on `:91`
+  also stopped injected events from crossing displays.
+- **Weston input caveat.** The headless Weston backend has no libinput seat, so
+  it cannot receive a targeting request. It records a typed
+  `input_targeting_unavailable` note, leaves `input_targeting_applied=false`,
+  and never runs `xinput` or claims display input isolation. The privileged
+  helper may still own the physical devices, but its uinput nodes are not
+  attached to this compositor.
 - **Status.** Each seat carries `display_backend`, `display`, `display_pid`,
   `display_ready`, `display_notes`, and a typed `display_error`
   (`missing_binary`, `number_exhausted`, `startup_timeout`, `crashed`,
-  `unsupported`). All display fields are omitted for the default `shared`
+  `unsupported`). For Weston, `display` is the `WAYLAND_DISPLAY` name rather
+  than an X display. All display fields are omitted for the default `shared`
   backend, so existing status JSON is unchanged.
 
 ## DRM leases (`--seat-drm-lease`)
@@ -718,13 +752,15 @@ fn status(&self) -> Vec<SeatRuntimeStatus>;
   the child. Stop/rollback/release re-enables the other seats' devices while the
   private display still exists. `InputTargetingMode` is `Warn` by default;
   `Strict` aborts the seat, `Off` skips it. The shared display backend is always
-  a targeting no-op.
+  a targeting no-op. Headless Weston has no libinput seat, so it always records
+  `input_targeting_unavailable` and leaves targeting unapplied.
 - **Private displays (opt-in).** With `seat_display.backend = Xvfb`, `Xephyr`,
-  or `Xorg`, start spawns and handshakes the server before resource reservation
-  and rewrites the launch spec. Stop releases resources and then stops the server.
-  A failed display start never spawns a node; a display crash stops the node and
-  restarts both. Dry-run reports the would-be server without allocating or
-  spawning it. Tests inject `FakeSeatDisplayLauncher`.
+  `Xorg`, or `Weston`, start spawns and handshakes the server/compositor before
+  resource reservation and rewrites the launch spec. Stop releases resources and
+  then stops the server. A failed display start never spawns a node; a display
+  crash stops the node and restarts both. Dry-run reports the would-be
+  server/compositor without allocating or spawning it. Tests inject
+  `FakeSeatDisplayLauncher`.
 - **Audio (opt-in).** With a `SeatAudioRouter` installed, start ensures the
   seat's `ozma-seat-N` null sink and records the `<sink>.monitor` target before
   spawning; stop/remove/rollback/shutdown unload it. An ensure failure is
@@ -1092,8 +1128,8 @@ Configuration:
 | `--input-isolation xinput\|helper` | Input path. `xinput` is the default; `helper` uses privileged `EVIOCGRAB`/uinput isolation. |
 | `--input-helper PATH` | Helper binary for `--input-isolation helper` (default `ozma-seat-input`). |
 | `--input-targeting off\|warn\|strict` | Restrict a private display to the seat's helper uinput devices. `warn` is the default; `strict` prevents the spawn on failure; `off` skips `xinput`. |
-| `--seat-display shared\|xvfb\|xephyr` | Per-seat display backend. `shared` is the default; `xvfb`/`xephyr` start and stop a private X server per seat. |
-| `--seat-display-size WxH` | Private X screen geometry (default `1280x800`). |
+| `--seat-display shared\|xvfb\|xephyr\|xorg\|weston` | Per-seat display backend. `shared` is the default; `xvfb`/`xephyr`/`xorg` start and stop a private X server per seat; `weston` starts a throwaway headless Wayland compositor with a private runtime dir/socket. |
+| `--seat-display-size WxH` | Private screen size for Xvfb/Xephyr/Weston (default `1280x800`). |
 | `--seat-drm-lease [SEAT=]CARD:CONNECTOR[@CRTC]` | Opt-in lease-only handoff. Repeat once per seat, or prefix every value with a seat id/index. `auto`/`vkms` selects only a virtual vkms card; real outputs must be named explicitly. |
 | `--seats-file PATH` | Load/reuse and atomically update persisted seat identities. Never written by `--print-plan`/`--dry-run`. |
 | `--hotplug` | Poll read-only sysfs DRM/input snapshots, debounce, and start/stop/restart seats. |
@@ -1131,7 +1167,7 @@ helper result is visible in `resources.grabbed_device_count` and
 `resources.uinput_devices`. The default `xinput` path does not start the helper
 or open a device.
 
-With a private `--seat-display xvfb|xephyr` and `--input-isolation helper`,
+With a private `--seat-display xvfb|xephyr|xorg` and `--input-isolation helper`,
 `--input-targeting` restricts that display after the helper grab and before the
 node: the seat's own `ozma-seat-...` uinput devices are enabled, other seats'
 helper devices are disabled, and core/XTEST devices are left alone. `warn`
@@ -1139,17 +1175,22 @@ helper devices are disabled, and core/XTEST devices are left alone. `warn`
 refuses to spawn and releases the helper/display, and `off` skips `xinput`.
 `resources.input_targeting_applied`, `targeted_devices`, and
 `disabled_devices` only claim what the real `xinput` commands confirmed.
-Targeting is never applied on the default shared display.
+Targeting is never applied on the default shared display. The headless
+`weston` backend has no libinput seat, so it records a typed
+`input_targeting_unavailable` note and leaves targeting unapplied regardless of
+this flag.
 
-With `--seat-display xvfb` or `xephyr`, the supervisor starts a private X
-server before each seat. A missing `Xvfb` (or `Xephyr` for the nested backend) is
-a typed `display_error`; a server that never completes the X11 handshake is a
-typed `startup_timeout` and is never claimed; an exhausted `:90..=199` range is
-`number_exhausted`; a server that exits is `crashed`. Display numbers are
-reused after stop or rollback. Output lists `display(<backend> <display>
-pid=... ready=...)`; JSON carries the same fields. On shutdown all child
-processes are stopped before their servers, and the sockets/processes are gone
-when `stop_all` returns.
+With `--seat-display xvfb`, `xephyr`, `xorg`, or `weston`, the supervisor starts
+a private display before each seat. A missing `Xvfb`/`Xephyr`/`Xorg`/`weston` is
+a typed `display_error`; a server/compositor that never completes its handshake
+is a typed `startup_timeout` and is never claimed; an exhausted `:90..=199`
+range is `number_exhausted`; a server that exits is `crashed`. Display numbers
+are reused after stop or rollback. For X backends the child receives `DISPLAY`
+(and `XAUTHORITY`); for `weston` it receives `WAYLAND_DISPLAY` and
+`XDG_RUNTIME_DIR` and inherited `DISPLAY`/`XAUTHORITY` are removed. Output lists
+`display(<backend> <display> pid=... ready=...)`; JSON carries the same fields.
+On shutdown all child processes are stopped before their servers, and the
+sockets/processes/runtime directories are gone when `stop_all` returns.
 
 `--seat-drm-lease [SEAT=]CARD:CONNECTOR[@CRTC]` adds a lease-only handoff before
 the node spawn. Without a seat prefix the flag must be repeated exactly once per
@@ -1466,8 +1507,24 @@ the sockets and X server pids are gone. It never uses the operator's display.
 Live smoke (2026-11-25): the private-display test passed with
 `displays=[90, 91]`, recorded `DISPLAY` values `[":90", ":91"]`, both seats
 `running` with `display_ready=true`, and both stopped cleanly; `/tmp/.X11-unix`
-had no `X90`/`X91` sockets and no `Xvfb` process remained. The host had
-`Xvfb`, `Xephyr` absent, `weston` absent, and `xauth`/`xdpyinfo` present.
+had no `X90`/`X91` sockets and no `Xvfb` process remained. At that time the host
+had `Xvfb`, `Xephyr` absent, `weston` absent, and `xauth`/`xdpyinfo` present.
+`weston` was installed later for the Wayland backend (version 15.0.1).
+
+The headless-Wayland smoke is separately gated and needs `weston` and
+`wayland-info`:
+
+```bash
+OZMA_MULTISEAT_REAL_WAYLAND=1 \
+  cargo test -p ozma-multiseat --test live_weston_smoke -- --ignored --nocapture
+```
+
+It starts two throwaway headless Weston compositors on distinct private runtime
+dirs and sockets (`ozma-weston-N`), runs the real `wayland-info` client against
+each, proves a client using seat A's runtime cannot reach seat B's socket, then
+stops both and checks the sockets, runtime dirs, and pids are gone. It never
+opens DRM or touches the operator's real Wayland/X session. Live evidence is in
+`phase4-wayland-seat-report.md`.
 
 The real `xinput` targeting path has its own throwaway-display smoke:
 

@@ -421,7 +421,7 @@ impl Default for MotherboardInfo {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FanReading {
     pub name: String,
     pub rpm: u32,
@@ -430,7 +430,7 @@ pub struct FanReading {
     pub controllable: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VoltageReading {
     pub name: String,
     pub voltage_v: f32,

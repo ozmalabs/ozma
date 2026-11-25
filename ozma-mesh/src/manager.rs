@@ -194,6 +194,51 @@ pub(crate) struct Inner {
     pub(crate) next_peer_index: u32,
 }
 
+// ── mDNS advertising ─────────────────────────────────────────────────────────
+
+/// A registered `_ozma-mesh._udp.local` advertisement for one node.
+///
+/// Keeping the responder and service handles together lets both the userspace
+/// manager and the kernel backend advertise the same identity without owning a
+/// userspace WireGuard socket.
+pub struct MeshAdvertiser {
+    _responder: Responder,
+    _service: Service,
+    port: u16,
+}
+
+impl MeshAdvertiser {
+    /// Register this node's mesh identity on the local network.
+    pub fn new(node: &MeshNode, port: u16, capabilities: &[String]) -> Result<Self> {
+        let responder = Responder::new().map_err(|e| MeshError::Mdns(e.to_string()))?;
+        let instance = mdns_instance_name(&node.id);
+        let capability_text = mdns_capability_text(capabilities);
+        let mut properties = vec![
+            format!("id={}", node.id),
+            format!("mesh_ip={}", node.mesh_ip),
+            format!("pubkey={}", node.wg_pubkey),
+            format!("wg_port={port}"),
+            "proto=1".to_owned(),
+        ];
+        if !capability_text.is_empty() {
+            properties.push(format!("cap={capability_text}"));
+        }
+        let property_refs: Vec<&str> = properties.iter().map(String::as_str).collect();
+        let service =
+            responder.register(MDNS_SERVICE_TYPE.to_owned(), instance, port, &property_refs);
+        Ok(Self {
+            _responder: responder,
+            _service: service,
+            port,
+        })
+    }
+
+    /// UDP port advertised for this node.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+}
+
 // ── MeshManager ───────────────────────────────────────────────────────────────
 
 /// Manages WireGuard peers and mDNS advertising for one ozma mesh node.
@@ -212,7 +257,7 @@ pub struct MeshManager {
     /// `libmdns::Responder` contains a `RefCell` and is therefore `Send` but
     /// not `Sync`. Wrapping the handles in a `Mutex` keeps `MeshManager`
     /// `Sync`, so node services can call it from `Send` async trait methods.
-    _mdns: std::sync::Mutex<Option<(Responder, Service)>>,
+    _mdns: std::sync::Mutex<Option<MeshAdvertiser>>,
 
     /// This node's private key (needed to create per-peer boringtun tunnels).
     private_key: WgPrivateKey,
@@ -277,26 +322,7 @@ impl MeshManager {
 
         // Advertise over a dedicated mesh service type so the node's
         // controller-facing `_ozma._udp` record (HTTP port/TXT) is untouched.
-        let responder = Responder::new().map_err(|e| MeshError::Mdns(e.to_string()))?;
-        let instance = mdns_instance_name(&node.id);
-        let capability_text = mdns_capability_text(&capabilities);
-        let mut properties = vec![
-            format!("id={}", node.id),
-            format!("mesh_ip={}", node.mesh_ip),
-            format!("pubkey={}", node.wg_pubkey),
-            format!("wg_port={actual_port}"),
-            "proto=1".to_owned(),
-        ];
-        if !capability_text.is_empty() {
-            properties.push(format!("cap={capability_text}"));
-        }
-        let property_refs: Vec<&str> = properties.iter().map(String::as_str).collect();
-        let svc = responder.register(
-            MDNS_SERVICE_TYPE.to_owned(),
-            instance,
-            actual_port,
-            &property_refs,
-        );
+        let advertiser = MeshAdvertiser::new(&node, actual_port, &capabilities)?;
 
         info!(
             node_id = %node.id,
@@ -312,7 +338,7 @@ impl MeshManager {
                 next_peer_index: 0,
             })),
             socket: Arc::new(socket),
-            _mdns: std::sync::Mutex::new(Some((responder, svc))),
+            _mdns: std::sync::Mutex::new(Some(advertiser)),
             private_key,
             started: Arc::new(AtomicBool::new(false)),
             stop_notify: Arc::new(Notify::new()),

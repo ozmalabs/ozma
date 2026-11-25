@@ -14,8 +14,13 @@ This change wires the existing `ozma-mesh` crate into `ozma-node` as an
   discovery and route reconciliation in
   [`phase4-mesh-discovery-report.md`](phase4-mesh-discovery-report.md).
 * `ozma-node`: new `mesh_service` module, `--mesh*` CLI/env flags, guarded
-  `/api/v1/connect/{status,peers,events}` routes, startup/shutdown wiring, and
-  optional `--mesh-dataplane` lifecycle wiring.
+  `/api/v1/connect/{status,peers,events}` routes, startup/shutdown wiring,
+  optional `--mesh-dataplane` lifecycle wiring, and a selectable kernel
+  WireGuard backend behind `--mesh-kernel`.
+* `ozma-mesh`: a real Linux kernel WireGuard backend (`KernelWireguard`) with
+  exact `ip`/`wg` argv, redacted key handling, `wg show dump` status parsing,
+  peer add/remove, rollback, and typed root/module/tool failures. See
+  [`phase4-mesh-kernel-report.md`](phase4-mesh-kernel-report.md).
 * `controller/api.py`: node-scoped mesh/Connect passthrough routes that send the
   node bearer token and preserve typed `supported:false` responses.
 * Tests: in-memory fake mesh backend, fake dataplane command/sysfs seams, node
@@ -50,8 +55,9 @@ the controller only adds new node-scoped routes and returns the node's plain
 | `--mesh-ip` | `OZMA_MESH_IP` | IPv4 address assigned to this node on the mesh. |
 | `--mesh-port` | `OZMA_MESH_PORT` | WireGuard UDP port (default `51820`, must be non-zero). |
 | `--mesh-key-file` | `OZMA_MESH_KEY_FILE` | Base64 X25519 WireGuard private-key file. |
-| `--mesh-kernel` | `OZMA_MESH_KERNEL` | Request kernel WireGuard (root + `wg`). Kernel mode is **not implemented** and reports a typed unsupported state. |
+| `--mesh-kernel` | `OZMA_MESH_KERNEL` | Select the Linux kernel `wireguard` backend. Requires root, the `wireguard` module, `ip`, and `wg`; the `--mesh-tun` name becomes the kernel link and no TUN/pump is created. |
 | `--mesh-peer` | `OZMA_MESH_PEER` | Repeatable JSON `MeshNode` peer object. Static and authoritative. |
+| `--mesh-peer-endpoint` | `OZMA_MESH_PEER_ENDPOINT` | Repeatable `ID=ADDRESS:PORT` underlay endpoint for a static peer. The peer's mesh IP remains its overlay identity and `/32` route. Useful in kernel mode when that mesh IP routes through the WireGuard link. |
 | `--mesh-discover` | `OZMA_MESH_DISCOVER` | Opt in to mDNS browsing on `_ozma-mesh._udp.local`. Requires `--mesh`. |
 | `--mesh-discover-ttl` | `OZMA_MESH_DISCOVER_TTL` | Seconds an absent discovered peer is retained (default `60`). |
 | `--mesh-discover-max-peers` | `OZMA_MESH_DISCOVER_MAX_PEERS` | Discovered-peer bound (default `32`, hard limit `256`). |
@@ -126,6 +132,36 @@ programming its route never marks that peer `established`; only a real
 boringtun handshake does. See
 [`phase4-mesh-dataplane-report.md`](phase4-mesh-dataplane-report.md).
 
+### Kernel WireGuard lifecycle (`--mesh-kernel`)
+
+With `--mesh-kernel`, the service selects `KernelMeshBackend` instead of the
+userspace boringtun manager. The kernel link is the data transport; no TUN
+device is created and no packet pump is started, even if `--mesh-dataplane`
+flags are also present (`--mesh-tun`/`--mesh-mtu`/`--mesh-prefix-len` supply the
+kernel link name and dimensions).
+
+Start order is: validate settings and host prerequisites, create the link,
+write the private key to a short-lived mode-0600 file, `wg set` the key and
+listen port, set MTU/address/up, then add each peer and its `/32` route. Any
+failure rolls back the applied steps in reverse. Stop removes routes, peers, and
+the link in reverse and is idempotent. Peer add/remove and discovery both update
+`wg set` plus the route table; a route failure rolls the peer change back.
+
+Kernel identity and status are honest:
+
+* `identity.wireguard` is `"kernel"`;
+* `kernel` is a separate status document with `interface`, `public_key` (never
+  the private key), `listen_port`, `address`, `mtu`, `up`, `routes`, and peers
+  parsed from `wg show <if> dump` (handshake age, tx/rx, allowed IPs, endpoint,
+  keepalive);
+* a peer is `established` only when the kernel reports a non-zero handshake
+  within WireGuard's 180 s reject time. Configuration alone stays `idle`.
+
+Typed kernel prerequisites are returned as 501 documents: `mesh.root-required`
+for a non-root process, and `mesh.dataplane-unavailable` for a missing
+`wireguard` module, `ip`, or `wg`. `wg show dump` output contains a private-key
+column; it is parsed and discarded internally and is never logged or serialized.
+
 ### Discovery lifecycle (opt-in)
 
 With `--mesh-discover`, the service browses `_ozma-mesh._udp.local` every five
@@ -176,18 +212,17 @@ Typed prerequisites (`MeshServiceError.code`):
 | `mesh.key-missing` | No readable key file. |
 | `mesh.key-invalid` | Key file is not valid base64 X25519 material. |
 | `mesh.root-required` | Kernel mode requested, node is not root. |
-| `mesh.wg-missing` | Kernel mode requested, `wg` is not on `PATH`. |
+| `mesh.wg-missing` | An explicit `requires_wg` config requested kernel mode and `wg` is not on `PATH`. |
 | `mesh.wireguard-unavailable` | No usable userspace or kernel backend. |
-| `mesh.kernel-unsupported` | Root/`wg` are present but kernel mode is not implemented. |
-| `mesh.peer-invalid` | Configured peer JSON/address is invalid. |
+| `mesh.peer-invalid` | Configured peer JSON/address or `--mesh-peer-endpoint` entry is invalid. |
 | `mesh.discovery-invalid` | Discovery bounds or a `--mesh-trust` entry is invalid. |
 | `mesh.peer-conflict` | A discovered advertisement conflicts with a static/other peer. |
 | `mesh.peer-unauthorized` | An advertisement lacks a matching key/host authorization. |
 | `mesh.peer-already-exists` / `mesh.peer-not-found` | Typed peer-table errors. |
-| `mesh.dataplane-unavailable` | `/dev/net/tun`, `ip`, or (for NAT) `nft` is unavailable. |
-| `mesh.dataplane-invalid` | TUN name, address/prefix, MTU, peer route, or NAT table/interface is invalid. |
+| `mesh.dataplane-unavailable` | The kernel `wireguard` module, `ip`, `wg`, `/dev/net/tun`, or (for NAT) `nft` is unavailable. |
+| `mesh.dataplane-invalid` | TUN/kernel interface name, address/prefix, MTU, peer route, NAT table/interface, or a kernel/mesh identity mismatch is invalid. |
 | `mesh.dataplane-not-configured` | A dataplane operation was attempted with no configuration. |
-| `mesh.dataplane-command-failed` | `ip`/`nft` exited non-zero; the applied steps are rolled back. |
+| `mesh.dataplane-command-failed` | `ip`, `wg`, or `nft` exited non-zero; the applied steps are rolled back. |
 | `mesh.tun-open` | The persistent TUN fd could not be attached for the packet pump. |
 | `mesh.pump-*` | Typed packet-pump read/write/tunnel/queue failure; the pump stops and reports `failed`. |
 | `mesh.start-failed` | Runtime bind/mDNS/start failure. |
@@ -212,10 +247,10 @@ Status includes:
 * `capability:"mesh"`, `capabilities:["/api/v1/connect/status",
   "/api/v1/connect/peers","/api/v1/connect/events"]` (discoverable even while
   disabled);
-* `enabled`, `state`, `available`, `wireguard` (`userspace-boringtun`,
-  `not-configured`, or `unavailable`);
-* optional `identity`, `dataplane`, `pump`, `discovery`, `peer_count`, `peers`,
-  `event_count`, `event_capacity`;
+* `enabled`, `state`, `available`, `wireguard` (`userspace-boringtun`, `kernel`,
+  `not-configured`, `fake`, or `unavailable`);
+* optional `identity`, `dataplane`, `kernel`, `pump`, `discovery`, `peer_count`,
+  `peers`, `event_count`, `event_capacity`;
 * typed `code`/`reason` when unavailable.
 
 Typed 501 body:
@@ -256,8 +291,8 @@ proxied; a test asserts it still returns the Connect account/tier document.
 
 Run for this change:
 
-* `cargo test -p ozma-mesh -p ozma-node --lib` — **611 passed, 6 ignored**
-  (`ozma-mesh`: 48 passed, 2 ignored; `ozma-node`: 563 passed, 4 ignored).
+* `cargo test -p ozma-mesh -p ozma-node --lib` — **645 passed, 6 ignored**
+  (`ozma-mesh`: 61 passed, 2 ignored; `ozma-node`: 584 passed, 4 ignored).
 * `cargo test -p ozma-node --bin ozma-node mesh_` — **2 passed** (CLI defaults
   and trust parsing).
 * `cargo check -p ozma-mesh -p ozma-node --all-targets` — passes (pre-existing
@@ -286,19 +321,35 @@ Coverage includes:
   endpoint updates replace the tunnel, static peers cannot be overwritten or
   removed by discovery, and two ids cannot share a mesh IP;
 * node discovery status/events and restart without stale deduplication;
+* kernel backend argv/order, key redaction, typed root/module/tool errors,
+  peer add/remove and route rollback, `wg show dump` status parsing, static
+  underlay endpoint override, and node kernel-backend selection/preflight;
 * controller token forwarding, status/capability discovery, typed 501
   passthrough, Python-node 404, auth-failure mapping, and unchanged global
   Connect status.
 
 No default test requires root, a real WireGuard interface, a real TUN device, a
 network namespace, or a real peer. The live dataplane and live TUN-attach tests
-are `#[ignore]`d and additionally gated by `OZMA_MESH_LIVE=1`.
+are `#[ignore]`d and additionally gated by `OZMA_MESH_LIVE=1`. The kernel
+two-namespace live runs are external harnesses recorded in
+[`phase4-mesh-kernel-report.md`](phase4-mesh-kernel-report.md); they are not part
+of the default suite.
 
 ## Honest remaining gaps (modelled or unwired)
 
-* **Kernel WireGuard is not implemented.** `--mesh-kernel` only produces typed
-  `mesh.root-required`, `mesh.wg-missing`, or `mesh.kernel-unsupported`; all
-  traffic uses userspace boringtun.
+* **Kernel mode requires an operator-provisioned host.** The module is never
+  loaded automatically; a missing module/`ip`/`wg`/root is a typed 501. There
+  is no capability probe beyond `/sys/module/wireguard`, `PATH`, and geteuid.
+* **Kernel static peers need an underlay endpoint when the mesh IP is routed
+  through `wg`.** The transport endpoint cannot be the overlay address in that
+  topology (kernel WireGuard would recurse into its own link, and policy routes
+  did not redirect its transport on the live kernel). Use
+  `--mesh-peer-endpoint ID=ADDRESS:PORT`; discovered peers already use the
+  observed mDNS underlay address. Without an override the peer is still
+  configured and its `/32` route is programmed, but transport may not pass.
+* **Kernel mode does not program forwarding or NAT.** It creates one `wg` link
+  with addresses and peer `/32` routes only. `--mesh-dataplane-nat` is not
+  applied in kernel mode.
 * **No root/wg requirement for the default WireGuard backend.** Userspace
   boringtun needs neither. Root/TUN/`ip` are required only when
   `--mesh-dataplane` is explicitly enabled; NAT additionally requires `nft`.
