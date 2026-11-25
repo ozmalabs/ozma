@@ -2547,10 +2547,23 @@ pub enum FakeDrmScanoutFailure {
     MissingAtomicProperty,
 }
 
+/// Injected one-shot frame-loop failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FakeDrmScanoutFlipFailure {
+    /// The flip was queued but its completion event never arrived.
+    Timeout,
+    /// The flip commit itself failed.
+    Failed,
+    /// The commit path cannot deliver flip events.
+    Unsupported,
+}
+
 #[derive(Debug, Default)]
 struct FakeDrmScanoutState {
     cards: Vec<FakeDrmScanoutCard>,
     failure: Option<FakeDrmScanoutFailure>,
+    flip_failures: VecDeque<FakeDrmScanoutFlipFailure>,
+    flip_fail_at: BTreeMap<u32, FakeDrmScanoutFlipFailure>,
     events: Vec<String>,
     active: bool,
     next_lessee: u32,
@@ -2672,6 +2685,24 @@ impl FakeDrmScanoutBackend {
         self.state.lock().expect("fake scanout lock").failure = Some(failure);
     }
 
+    /// Inject one typed failure into the next frame-loop flip.
+    pub fn fail_next_flip(&self, failure: FakeDrmScanoutFlipFailure) {
+        self.state
+            .lock()
+            .expect("fake scanout lock")
+            .flip_failures
+            .push_back(failure);
+    }
+
+    /// Inject a typed failure for one specific zero-based frame index.
+    pub fn fail_flip_at(&self, frame: u32, failure: FakeDrmScanoutFlipFailure) {
+        self.state
+            .lock()
+            .expect("fake scanout lock")
+            .flip_fail_at
+            .insert(frame, failure);
+    }
+
     /// Events recorded so far, in order.
     pub fn events(&self) -> Vec<String> {
         self.state.lock().expect("fake scanout lock").events.clone()
@@ -2694,6 +2725,7 @@ impl crate::drm_scanout::DrmScanoutBackend for FakeDrmScanoutBackend {
             DrmScanoutCommit, DrmScanoutError, DrmScanoutNote, DrmScanoutNoteKind,
             DrmScanoutStatus, SCANOUT_PATTERN,
         };
+        request.validate()?;
         let mut state = self.state.lock().expect("fake scanout lock");
         state.events.push(format!(
             "start {}:{}",
@@ -2858,8 +2890,6 @@ impl crate::drm_scanout::DrmScanoutBackend for FakeDrmScanoutBackend {
                 reason: "fake mode name is not WIDTHxHEIGHT".to_owned(),
             })?;
         let pitch = width * 4;
-        let mut bytes = vec![0u8; (pitch * height) as usize];
-        let checksum = crate::drm_scanout::fill_pattern(&mut bytes, width, height, pitch);
 
         let requested_plane = request.lease.plane_id();
         if let Some(id) = requested_plane {
@@ -2890,18 +2920,32 @@ impl crate::drm_scanout::DrmScanoutBackend for FakeDrmScanoutBackend {
             requested_plane
         };
 
+        let buffer_count = crate::drm_scanout::frame_buffer_count(request.frames);
+        let mut buffers: Vec<Vec<u8>> = Vec::with_capacity(buffer_count);
+        let mut buffer_handles: Vec<u32> = Vec::with_capacity(buffer_count);
+        let mut framebuffer_ids: Vec<u32> = Vec::with_capacity(buffer_count);
+
         state.next_lessee = state.next_lessee.saturating_add(1);
-        state.next_framebuffer = state.next_framebuffer.saturating_add(1);
-        state.next_buffer = state.next_buffer.saturating_add(1);
         let lessee_id = state.next_lessee;
-        let framebuffer_id = state.next_framebuffer;
-        let buffer_handle = state.next_buffer;
         state.events.push(format!("lease {lessee_id}"));
-        state
-            .events
-            .push(format!("buffer {buffer_handle} {width}x{height}"));
-        state.events.push(format!("fill {checksum}"));
-        state.events.push(format!("framebuffer {framebuffer_id}"));
+        for _ in 0..buffer_count {
+            state.next_framebuffer = state.next_framebuffer.saturating_add(1);
+            state.next_buffer = state.next_buffer.saturating_add(1);
+            let mut bytes = vec![0u8; (pitch * height) as usize];
+            let checksum = crate::drm_scanout::fill_pattern(&mut bytes, width, height, pitch);
+            let framebuffer_id = state.next_framebuffer;
+            let buffer_handle = state.next_buffer;
+            state
+                .events
+                .push(format!("buffer {buffer_handle} {width}x{height}"));
+            state.events.push(format!("fill {checksum}"));
+            state.events.push(format!("framebuffer {framebuffer_id}"));
+            buffers.push(bytes);
+            buffer_handles.push(buffer_handle);
+            framebuffer_ids.push(framebuffer_id);
+        }
+        let framebuffer_id = framebuffer_ids[0];
+        let checksum = status_checksum(&buffers[0]);
         match commit {
             DrmScanoutCommit::Atomic => {
                 let plane = plane_id.unwrap_or(0);
@@ -2946,6 +2990,11 @@ impl crate::drm_scanout::DrmScanoutBackend for FakeDrmScanoutBackend {
         }
         state.active = true;
 
+        let initial_stats = crate::drm_scanout::DrmScanoutFrameStats::initial(
+            request.frames,
+            buffer_count,
+            checksum,
+        );
         let mut status = DrmScanoutStatus {
             card: card.path.display().to_string(),
             connector: card.connector.clone(),
@@ -2960,9 +3009,10 @@ impl crate::drm_scanout::DrmScanoutBackend for FakeDrmScanoutBackend {
             height,
             pitch,
             framebuffer_id: Some(framebuffer_id),
-            buffer_handle: Some(buffer_handle),
+            buffer_handle: Some(buffer_handles[0]),
             pattern: SCANOUT_PATTERN.to_owned(),
             pattern_checksum: Some(checksum),
+            frames: Some(initial_stats),
             page_flipped: !page_flip_unavailable,
             verification: None,
             applied: true,
@@ -2981,6 +3031,19 @@ impl crate::drm_scanout::DrmScanoutBackend for FakeDrmScanoutBackend {
                 format!(
                     "fake plane {plane_id} was committed through {} KMS",
                     commit.as_str()
+                ),
+            ));
+        }
+        if request.frames > 1 {
+            status.push_note(DrmScanoutNote::new(
+                DrmScanoutNoteKind::FrameLoop,
+                format!(
+                    "fake bounded frame loop: {} frames across {} rotating buffers, \
+                     damage pattern {}, interval={:?}ms",
+                    request.frames,
+                    buffer_count,
+                    crate::drm_scanout::SCANOUT_DAMAGE_PATTERN,
+                    request.interval_ms
                 ),
             ));
         }
@@ -3021,16 +3084,21 @@ impl crate::drm_scanout::DrmScanoutBackend for FakeDrmScanoutBackend {
                 width,
                 height,
                 pitch,
-                framebuffer_id,
-                buffer_handle,
+                framebuffer_ids,
+                buffer_handles,
                 lessee_id,
-                checksum,
             },
+            buffers,
+            current: 0,
             verification_fails,
             active: true,
             state: Arc::clone(&self.state),
         }))
     }
+}
+
+fn status_checksum(bytes: &[u8]) -> u32 {
+    crate::drm_scanout::pattern_checksum(bytes)
 }
 
 #[derive(Clone, Debug)]
@@ -3044,15 +3112,16 @@ struct FakeScanoutRecord {
     width: u32,
     height: u32,
     pitch: u32,
-    framebuffer_id: u32,
-    buffer_handle: u32,
+    framebuffer_ids: Vec<u32>,
+    buffer_handles: Vec<u32>,
     lessee_id: u32,
-    checksum: u32,
 }
 
 struct FakeDrmScanoutHandle {
     status: crate::drm_scanout::DrmScanoutStatus,
     record: FakeScanoutRecord,
+    buffers: Vec<Vec<u8>>,
+    current: usize,
     verification_fails: bool,
     active: bool,
     state: Arc<Mutex<FakeDrmScanoutState>>,
@@ -3061,6 +3130,158 @@ struct FakeDrmScanoutHandle {
 impl crate::drm_scanout::DrmScanoutHandle for FakeDrmScanoutHandle {
     fn status(&self) -> &crate::drm_scanout::DrmScanoutStatus {
         &self.status
+    }
+
+    fn run_frames(
+        &mut self,
+        plan: crate::drm_scanout::DrmScanoutFramePlan,
+    ) -> Result<crate::drm_scanout::DrmScanoutFrameStats, crate::drm_scanout::DrmScanoutError> {
+        use crate::drm_scanout::{
+            apply_frame_damage, frame_damage_rect, DrmScanoutError, DrmScanoutFrameStats,
+            SCANOUT_MAX_FRAMES,
+        };
+        if !self.active {
+            return Err(DrmScanoutError::Released(
+                self.record.card.display().to_string(),
+            ));
+        }
+        if plan.frames == 0 || plan.frames > SCANOUT_MAX_FRAMES {
+            return Err(DrmScanoutError::InvalidFrameCount {
+                frames: plan.frames,
+                min: 1,
+                max: SCANOUT_MAX_FRAMES,
+            });
+        }
+        let buffer_count = self.buffers.len().max(1);
+        let mut stats = self.status.frames.clone().unwrap_or_else(|| {
+            DrmScanoutFrameStats::initial(
+                plan.frames,
+                buffer_count,
+                self.status.pattern_checksum.unwrap_or(0),
+            )
+        });
+        stats.requested = plan.frames;
+        stats.buffer_count = buffer_count as u32;
+        stats.damage_updates = 0;
+        stats.page_flip_events = 0;
+        stats.average_interval_us = None;
+        stats.last_sequence = None;
+        if plan.frames <= 1 {
+            stats.submitted = 1;
+            stats.completed = 1;
+            stats.dropped = 0;
+            stats.missed = 0;
+            stats.final_checksum = Some(self.status.pattern_checksum.unwrap_or(0));
+            self.status.frames = Some(stats.clone());
+            return Ok(stats);
+        }
+
+        let mut completions = vec![std::time::Instant::now()];
+        let initial_failure = {
+            let mut state = self.state.lock().expect("fake scanout lock");
+            state
+                .flip_fail_at
+                .remove(&0)
+                .or_else(|| state.flip_failures.pop_front())
+        };
+        if let Some(failure) = initial_failure {
+            stats.completed = 0;
+            stats.dropped = 1;
+            if failure == FakeDrmScanoutFlipFailure::Timeout {
+                stats.missed = 1;
+            }
+            let error = fake_flip_error(&self.record.card, 0, failure);
+            self.status.frames = Some(stats.clone());
+            self.status.mark_error(&error);
+            return Err(error);
+        }
+        stats.page_flip_events += 1;
+
+        for index in 1..plan.frames {
+            if let (Some(interval), Some(last)) = (plan.interval, completions.last().copied()) {
+                let target = last + interval;
+                let now = std::time::Instant::now();
+                if target > now {
+                    std::thread::sleep(target - now);
+                }
+            }
+            let slot = index as usize % buffer_count;
+            let (rect_x, rect_y, rect_w, rect_h) =
+                frame_damage_rect(self.record.width, self.record.height, index);
+            let checksum = apply_frame_damage(
+                &mut self.buffers[slot],
+                self.record.width,
+                self.record.height,
+                self.record.pitch,
+                index,
+            );
+            let framebuffer_id = self.record.framebuffer_ids[slot];
+            stats.submitted += 1;
+            stats.damage_updates += 1;
+            {
+                let mut state = self.state.lock().expect("fake scanout lock");
+                state.events.push(format!(
+                    "frame {index} damage {rect_x} {rect_y} {rect_w} {rect_h}"
+                ));
+                match self.record.commit {
+                    crate::drm_scanout::DrmScanoutCommit::Atomic => state.events.push(format!(
+                        "atomic_page_flip {} {framebuffer_id}",
+                        self.record.crtc_id
+                    )),
+                    crate::drm_scanout::DrmScanoutCommit::Legacy => state.events.push(format!(
+                        "page_flip {} {framebuffer_id}",
+                        self.record.crtc_id
+                    )),
+                }
+            }
+
+            let failure = {
+                let mut state = self.state.lock().expect("fake scanout lock");
+                state
+                    .flip_fail_at
+                    .remove(&index)
+                    .or_else(|| state.flip_failures.pop_front())
+            };
+            if let Some(failure) = failure {
+                stats.dropped += 1;
+                if failure == FakeDrmScanoutFlipFailure::Timeout {
+                    stats.missed += 1;
+                }
+                let error = fake_flip_error(&self.record.card, index, failure);
+                self.status.frames = Some(stats.clone());
+                self.status.mark_error(&error);
+                return Err(error);
+            }
+
+            {
+                let mut state = self.state.lock().expect("fake scanout lock");
+                state.events.push(format!(
+                    "flip_complete {} {} {}",
+                    self.record.crtc_id,
+                    index,
+                    index + 1
+                ));
+            }
+            stats.completed += 1;
+            stats.page_flip_events += 1;
+            stats.last_sequence = Some(index + 1);
+            completions.push(std::time::Instant::now());
+            self.current = slot;
+            self.status.framebuffer_id = Some(framebuffer_id);
+            self.status.buffer_handle = Some(self.record.buffer_handles[slot]);
+            self.status.pattern_checksum = Some(checksum);
+        }
+
+        if completions.len() >= 2 {
+            let total = completions[completions.len() - 1] - completions[0];
+            let micros = u64::try_from(total.as_micros()).unwrap_or(u64::MAX);
+            stats.average_interval_us = Some(micros / (completions.len() as u64 - 1));
+        }
+        let final_checksum = status_checksum(&self.buffers[self.current]);
+        stats.final_checksum = Some(final_checksum);
+        self.status.pattern_checksum = Some(final_checksum);
+        self.status.frames = Some(stats.clone());
+        Ok(stats)
     }
 
     fn verify(
@@ -3082,30 +3303,34 @@ impl crate::drm_scanout::DrmScanoutHandle for FakeDrmScanoutHandle {
             self.status.mark_error(&error);
             return Err(error);
         }
+        let framebuffer_id = self.record.framebuffer_ids[self.current];
+        let buffer_handle = self.record.buffer_handles[self.current];
+        let checksum = status_checksum(&self.buffers[self.current]);
         let verification = DrmScanoutVerification {
             crtc_id: self.record.crtc_id,
             crtc_mode: Some(self.record.mode.clone()),
-            crtc_framebuffer: Some(self.record.framebuffer_id),
+            crtc_framebuffer: Some(framebuffer_id),
             crtc_position: (0, 0),
             connector_state: "connected".to_owned(),
             connector_crtc: Some(self.record.crtc_id),
             plane_id: self.record.plane_id,
             plane_crtc: self.record.plane_id.map(|_| self.record.crtc_id),
-            plane_framebuffer: self.record.plane_id.map(|_| self.record.framebuffer_id),
-            framebuffer_id: self.record.framebuffer_id,
+            plane_framebuffer: self.record.plane_id.map(|_| framebuffer_id),
+            framebuffer_id,
             framebuffer_size: (self.record.width, self.record.height),
             framebuffer_pitch: self.record.pitch,
             framebuffer_bpp: 32,
             framebuffer_depth: 24,
-            framebuffer_buffer_handle: Some(self.record.buffer_handle),
+            framebuffer_buffer_handle: Some(buffer_handle),
             buffer_size: (self.record.width, self.record.height),
             buffer_pitch: self.record.pitch,
-            buffer_handle: self.record.buffer_handle,
-            pattern_checksum: self.record.checksum,
+            buffer_handle,
+            pattern_checksum: checksum,
             ok: true,
             mismatch: None,
         };
         self.status.verification = Some(verification.clone());
+        self.status.pattern_checksum = Some(checksum);
         Ok(verification)
     }
 
@@ -3128,13 +3353,17 @@ impl crate::drm_scanout::DrmScanoutHandle for FakeDrmScanoutHandle {
                     .push(format!("clear_crtc {}", self.record.crtc_id));
             }
         }
-        state.events.push(format!(
-            "destroy_framebuffer {}",
-            self.record.framebuffer_id
-        ));
-        state
-            .events
-            .push(format!("destroy_buffer {}", self.record.buffer_handle));
+        for (framebuffer_id, buffer_handle) in self
+            .record
+            .framebuffer_ids
+            .iter()
+            .zip(self.record.buffer_handles.iter())
+        {
+            state
+                .events
+                .push(format!("destroy_framebuffer {framebuffer_id}"));
+            state.events.push(format!("destroy_buffer {buffer_handle}"));
+        }
         state
             .events
             .push(format!("revoke {}", self.record.lessee_id));
@@ -3147,6 +3376,30 @@ impl crate::drm_scanout::DrmScanoutHandle for FakeDrmScanoutHandle {
 
     fn is_active(&self) -> bool {
         self.active
+    }
+}
+
+fn fake_flip_error(
+    card: &std::path::Path,
+    frame: u32,
+    failure: FakeDrmScanoutFlipFailure,
+) -> crate::drm_scanout::DrmScanoutError {
+    use crate::drm_scanout::DrmScanoutError;
+    match failure {
+        FakeDrmScanoutFlipFailure::Timeout => DrmScanoutError::FlipTimeout {
+            card: card.display().to_string(),
+            frame,
+            timeout_ms: 1,
+        },
+        FakeDrmScanoutFlipFailure::Failed => DrmScanoutError::FlipFailed {
+            card: card.display().to_string(),
+            frame,
+            reason: "injected flip commit failure".to_owned(),
+        },
+        FakeDrmScanoutFlipFailure::Unsupported => DrmScanoutError::FlipUnsupported {
+            card: card.display().to_string(),
+            reason: "injected unsupported page flip".to_owned(),
+        },
     }
 }
 

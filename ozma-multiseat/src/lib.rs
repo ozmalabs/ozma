@@ -10,9 +10,10 @@
 //!   lease-only handoff: it validates connector/CRTC object ids and returns an
 //!   owned lessee fd, but creates no scanout or compositor isolation.
 //!   [`drm_scanout`] is the opt-in KMS proof layered on that lease: it fills one
-//!   dumb buffer, programs one connector/CRTC/plane with an atomic commit (or
-//!   legacy `set_crtc` only when atomic KMS is unsupported), verifies the
-//!   modeset, and tears it down. It is not a compositor.
+//!   or more rotating dumb buffers, programs one connector/CRTC/plane with an
+//!   atomic commit (or legacy `set_crtc` only when atomic KMS is unsupported),
+//!   verifies the modeset, and can run a bounded page-flip loop with a moving
+//!   damage rectangle before tearing it down. It is not a compositor.
 //! * [`input`] reads evdev capability bits and groups devices by USB hub.
 //! * [`planner`] assigns one seat per display, allocates sequential UDP/HTTP
 //!   ports, attaches input groups, and emits the per-seat
@@ -115,19 +116,21 @@ pub use drm_lease::{
 #[cfg(target_os = "linux")]
 pub use drm_scanout::RealDrmScanoutBackend;
 pub use drm_scanout::{
-    ensure_scanout_card, fill_pattern, pattern_checksum, DrmScanoutBackend, DrmScanoutCommit,
-    DrmScanoutError, DrmScanoutErrorStatus, DrmScanoutHandle, DrmScanoutNote, DrmScanoutNoteKind,
-    DrmScanoutRequest, DrmScanoutStatus, DrmScanoutVerification, SCANOUT_BPP, SCANOUT_DEPTH,
-    SCANOUT_FOURCC, SCANOUT_PATTERN,
+    apply_frame_damage, ensure_scanout_card, fill_pattern, frame_buffer_count, frame_damage_rect,
+    pattern_checksum, DrmScanoutBackend, DrmScanoutCommit, DrmScanoutError, DrmScanoutErrorStatus,
+    DrmScanoutFramePlan, DrmScanoutFrameStats, DrmScanoutHandle, DrmScanoutNote,
+    DrmScanoutNoteKind, DrmScanoutRequest, DrmScanoutStatus, DrmScanoutVerification, SCANOUT_BPP,
+    SCANOUT_DAMAGE_PATTERN, SCANOUT_DEFAULT_FRAMES, SCANOUT_DEPTH, SCANOUT_FLIP_TIMEOUT_MS,
+    SCANOUT_FOURCC, SCANOUT_MAX_FRAMES, SCANOUT_PATTERN,
 };
 pub use error::MultiseatError;
 pub use fake::{
     FakeCommandRunner, FakeDeviceNameResolver, FakeDisplayBackend, FakeDrmLeaseBackend,
     FakeDrmLeaseCard, FakeDrmLeaseFailure, FakeDrmScanoutBackend, FakeDrmScanoutCard,
-    FakeDrmScanoutFailure, FakeEvdevGrabBackend, FakeGrabAction, FakeGrabEvent, FakeHelperBackend,
-    FakeHotplugMonitor, FakeInputBackend, FakeLeaseRecord, FakeNodeLauncher, FakeReadinessProbe,
-    FakeSeatAudioRouter, FakeSeatDisplayLauncher, FakeSeatInputHelper, FakeSeatInputTargeter,
-    FakeSeatSupervisor,
+    FakeDrmScanoutFailure, FakeDrmScanoutFlipFailure, FakeEvdevGrabBackend, FakeGrabAction,
+    FakeGrabEvent, FakeHelperBackend, FakeHotplugMonitor, FakeInputBackend, FakeLeaseRecord,
+    FakeNodeLauncher, FakeReadinessProbe, FakeSeatAudioRouter, FakeSeatDisplayLauncher,
+    FakeSeatInputHelper, FakeSeatInputTargeter, FakeSeatSupervisor,
 };
 pub use host::HostTopology;
 pub use hotplug::{

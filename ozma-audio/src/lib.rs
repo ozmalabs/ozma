@@ -99,6 +99,7 @@ pub mod frame;
 pub mod graph;
 pub mod opus;
 pub mod pipewire;
+pub mod room;
 pub mod router;
 pub mod sweep;
 pub mod target;
@@ -121,6 +122,10 @@ pub use graph::{
 };
 pub use opus::{default_config, OpusDecoder, OpusEncoder, MAX_OPUS_PACKET_BYTES, OPUS_ENCODER_ID};
 pub use pipewire::PipeWireCapture;
+pub use room::{
+    validate_profile, RoomProfileStore, MAX_ROOM_PROFILE_BYTES, MAX_ROOM_PROFILE_TEXT,
+    ROOM_PROFILE_FILE,
+};
 pub use router::{
     AudioPlaybackSpec, AudioProfile, AudioRouter, AudioSinkSpec, AudioSinkState,
     AudioSourceProfile, AudioSourceRef, AudioSourceSpec, AudioSourceState, AudioStreamRef, ChildId,
@@ -130,10 +135,12 @@ pub use router::{
     NULL_SINK_MODULE, PACTL, PAPLAY, PW_PLAY, REMAP_SOURCE_MODULE,
 };
 pub use sweep::{
-    run_sweep, CaptureSession, PlaybackSession, SweepBand, SweepDescriptor, SweepIo,
-    SweepMeasurement, SweepOutcome, SweepProfile, SweepRequest, SystemSweepIo, MAX_SWEEP_CHANNELS,
+    run_sweep, BandAnalysis, CaptureSession, PlaybackSession, RoomBand, SweepBand, SweepDescriptor,
+    SweepIo, SweepMeasurement, SweepOutcome, SweepProfile, SweepRequest, SystemSweepIo,
+    ANALYSIS_BAND_CENTRES_HZ, MAX_SUGGESTED_GAIN_DB, MAX_SWEEP_BANDS, MAX_SWEEP_CHANNELS,
     MAX_SWEEP_DURATION_SECS, MAX_SWEEP_HZ, MAX_SWEEP_SAMPLE_RATE, MAX_SWEEP_TAIL_SECS,
-    MIN_SWEEP_DURATION_SECS, MIN_SWEEP_HZ, MIN_SWEEP_SAMPLE_RATE, MIN_SWEEP_TAIL_SECS,
+    MIN_SUGGESTED_CONFIDENCE, MIN_SWEEP_DURATION_SECS, MIN_SWEEP_HZ, MIN_SWEEP_SAMPLE_RATE,
+    MIN_SWEEP_TAIL_SECS,
 };
 pub use target::{AudioTarget, MONITOR_PREFIX, NODE_PREFIX, OBJECT_PREFIX};
 pub use traits::{AudioEncoder, AudioSource, EncodedAudio, EncoderConfig};

@@ -3,10 +3,11 @@
 //!
 //! This is intentionally a *measurement* engine, not a room-correction DSP:
 //! it generates a logarithmic sine sweep, plays it through one existing sink,
-//! captures one existing source (normally `<sink>.monitor`), and computes a
-//! basic peak/RMS/noise/impulse/RT60 summary from the captured PCM. It never
-//! returns a profile when no audio was captured, and it never derives or
-//! applies equalisation bands.
+//! captures one existing source (normally `<sink>.monitor`), and computes
+//! peak/RMS/noise/impulse/RT60 plus a deterministic band-pass octave-band
+//! response from the captured PCM. It never returns a profile when no audio was
+//! captured, and it never applies equalisation to the graph. Suggested gains
+//! are advisory and are clamped to +/-12 dB.
 //!
 //! The engine owns no global state. Playback and capture are behind the
 //! [`SweepIo`] boundary so tests can supply deterministic sessions, and the
@@ -63,6 +64,22 @@ pub const MAX_SWEEP_TAIL_SECS: f64 = 5.0;
 const MAX_CAPTURE_BYTES: u64 = 32 * 1024 * 1024;
 /// Peak below this is treated as a failed/silent capture, not a measurement.
 const SILENT_CAPTURE_DBFS: f32 = -60.0;
+
+/// Octave-band centres used for the measured room response.
+///
+/// Ten bands is the controller's `MAX_EQ_BANDS`; any centre outside the
+/// requested sweep range is reported as skipped rather than extrapolated.
+pub const ANALYSIS_BAND_CENTRES_HZ: [f64; 10] = [
+    31.5, 63.0, 125.0, 250.0, 500.0, 1_000.0, 2_000.0, 4_000.0, 8_000.0, 16_000.0,
+];
+/// Largest number of bands carried by a measured profile.
+pub const MAX_SWEEP_BANDS: usize = ANALYSIS_BAND_CENTRES_HZ.len();
+/// Largest magnitude of a suggested EQ gain, in dB.
+pub const MAX_SUGGESTED_GAIN_DB: f64 = 12.0;
+/// Minimum per-band confidence before a gain is suggested.
+pub const MIN_SUGGESTED_CONFIDENCE: f32 = 0.2;
+/// Relative measured/target levels are clamped to this range, in dB.
+const MAX_RELATIVE_DB: f64 = 40.0;
 
 static WORKSPACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -245,6 +262,63 @@ pub struct SweepDescriptor {
     pub duration_secs: f64,
 }
 
+/// One measured octave band and its target-curve comparison.
+///
+/// All levels are relative to the median of the measured bands, not to some
+/// absolute calibration: the sweep has no calibrated reference microphone.
+/// `confidence` is 0..1 and accounts for the band's signal-to-noise ratio.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RoomBand {
+    /// Octave centre frequency in Hz.
+    pub freq: f64,
+    /// Measured level relative to the median band, in dB.
+    pub measured_db: f32,
+    /// Target level relative to the median target band, in dB.
+    pub target_db: f32,
+    /// `measured_db - target_db`, in dB.
+    pub deviation_db: f32,
+    /// Suggested correction gain (`-deviation_db`), clamped to +/-12 dB.
+    pub suggested_gain_db: f32,
+    /// Confidence in this band, 0..1.
+    pub confidence: f32,
+    /// Band signal-to-noise estimate, when it could be computed.
+    pub snr_db: Option<f32>,
+    /// True when a controller-compatible EQ band was emitted for this response.
+    pub suggested: bool,
+}
+
+/// Deterministic octave-band analysis of one captured sweep.
+///
+/// The transform is a constant-Q band-pass at each octave centre over the whole
+/// captured sweep. Equal time per octave makes the band energies comparable
+/// without an inverse-filter reference. It needs no FFT dependency and is
+/// fully driven by captured PCM; an empty capture never reaches this function.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BandAnalysis {
+    /// Transform name, for example `bandpass-octave`.
+    pub method: String,
+    /// Reference signal used for the transfer estimate.
+    pub reference: String,
+    /// How the measured levels were normalised.
+    pub normalisation: String,
+    /// Level subtracted from every band, in dB.
+    pub normalisation_db: Option<f32>,
+    /// Target curve name requested by the controller.
+    pub target_curve_requested: String,
+    /// Target curve actually used (unknown names fall back to `harman`).
+    pub target_curve_used: String,
+    /// Magnitude limit applied to suggested gains, in dB.
+    pub gain_limit_db: f32,
+    /// Octave bands with a usable transfer estimate.
+    pub bands_measured: usize,
+    /// Octave centres skipped because they were out of range or unmeasurable.
+    pub bands_skipped: usize,
+    /// Mean confidence across measured bands, 0..1.
+    pub mean_confidence: f32,
+    /// The measured bands, including low-confidence ones.
+    pub bands: Vec<RoomBand>,
+}
+
 /// Basic, honest measurement derived from captured PCM.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SweepMeasurement {
@@ -280,7 +354,9 @@ pub struct SweepMeasurement {
 
 /// The controller-compatible profile subset returned by a sweep.
 ///
-/// `bands` is always empty: this engine measures, it does not fit or apply EQ.
+/// `bands` carries only confidently measured corrections. When the capture is
+/// too short or too quiet to support a band, `bands` is empty and `analysis`
+/// records what was skipped; no band is invented.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SweepProfile {
     /// Stable id derived from the measurement time.
@@ -289,7 +365,7 @@ pub struct SweepProfile {
     pub name: String,
     /// Unix timestamp in seconds.
     pub created_at: f64,
-    /// Empty: no EQ fitting is performed.
+    /// Suggested parametric EQ bands from the measured response.
     pub bands: Vec<SweepBand>,
     /// Equal to `bands.len()`.
     pub band_count: usize,
@@ -309,6 +385,10 @@ pub struct SweepProfile {
     pub active: bool,
     /// The measured response.
     pub measurement: SweepMeasurement,
+    /// Octave-band analysis and target-curve comparison, when captured audio
+    /// was available. Older stored profiles may omit it.
+    #[serde(default)]
+    pub analysis: Option<BandAnalysis>,
 }
 
 /// A successful sweep.
@@ -595,29 +675,36 @@ pub async fn run_sweep(
     }
 
     let captured = capture.finish().await?;
-    let measurement = analyse_capture(&captured, &request)?;
+    let analysis = analyse_capture(&captured, &request)?;
     Ok(SweepOutcome {
-        profile: profile_for(&request, measurement),
+        profile: profile_for(&request, analysis.measurement, Some(analysis.bands)),
     })
 }
 
-fn profile_for(request: &SweepRequest, measurement: SweepMeasurement) -> SweepProfile {
+fn profile_for(
+    request: &SweepRequest,
+    measurement: SweepMeasurement,
+    analysis: Option<BandAnalysis>,
+) -> SweepProfile {
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs_f64())
         .unwrap_or(0.0);
+    // Millisecond precision keeps the persisted JSON stable across a round trip.
+    let created_at = (created_at * 1000.0).round() / 1000.0;
     let id = format!("sweep-{}", (created_at * 1000.0) as u64);
     let name = if request.room_name.trim().is_empty() {
         format!("Room sweep {}", (created_at * 1000.0) as u64)
     } else {
         request.room_name.trim().to_owned()
     };
+    let bands = analysis.as_ref().map(suggested_bands).unwrap_or_default();
     SweepProfile {
         id,
         name,
         created_at,
-        bands: Vec::new(),
-        band_count: 0,
+        band_count: bands.len(),
+        bands,
         mic_type: request.mic_type.clone(),
         phone_model: request.phone_model.clone(),
         mic_model: request.mic_model.clone(),
@@ -626,10 +713,32 @@ fn profile_for(request: &SweepRequest, measurement: SweepMeasurement) -> SweepPr
         node_id: request.node_id.clone(),
         active: false,
         measurement,
+        analysis,
     }
 }
 
-fn analyse_capture(bytes: &[u8], request: &SweepRequest) -> Result<SweepMeasurement, AudioError> {
+/// Convert confident response bands into controller-compatible EQ suggestions.
+fn suggested_bands(analysis: &BandAnalysis) -> Vec<SweepBand> {
+    analysis
+        .bands
+        .iter()
+        .filter(|band| band.suggested)
+        .map(|band| SweepBand {
+            freq: band.freq,
+            gain: f64::from(band.suggested_gain_db)
+                .clamp(-MAX_SUGGESTED_GAIN_DB, MAX_SUGGESTED_GAIN_DB),
+            q: 1.4,
+            band_type: "peaking".to_owned(),
+        })
+        .collect()
+}
+
+struct CaptureAnalysis {
+    measurement: SweepMeasurement,
+    bands: BandAnalysis,
+}
+
+fn analyse_capture(bytes: &[u8], request: &SweepRequest) -> Result<CaptureAnalysis, AudioError> {
     let channels = usize::from(request.channels.max(1));
     let frame_bytes = channels * 2;
     let frames = bytes.len() / frame_bytes;
@@ -686,26 +795,326 @@ fn analyse_capture(bytes: &[u8], request: &SweepRequest) -> Result<SweepMeasurem
     );
 
     let captured_secs = samples.len() as f64 / f64::from(request.sample_rate);
-    Ok(SweepMeasurement {
-        sample_rate: request.sample_rate,
-        channels: request.channels,
-        captured_frames: samples.len() as u64,
-        captured_secs,
-        peak,
-        peak_dbfs,
-        rms_dbfs,
-        noise_floor_dbfs,
-        impulse_peak: peak,
-        impulse_index: peak_index as u64,
-        impulse_index_secs: peak_index as f64 / f64::from(request.sample_rate),
-        rt60_secs,
-        decay_db_per_sec,
-        sweep: SweepDescriptor {
-            start_hz: request.start_hz,
-            end_hz: request.end_hz,
-            duration_secs: request.duration_secs,
+    let bands = analyse_bands(&samples, request, noise_floor_dbfs);
+    Ok(CaptureAnalysis {
+        measurement: SweepMeasurement {
+            sample_rate: request.sample_rate,
+            channels: request.channels,
+            captured_frames: samples.len() as u64,
+            captured_secs,
+            peak,
+            peak_dbfs,
+            rms_dbfs,
+            noise_floor_dbfs,
+            impulse_peak: peak,
+            impulse_index: peak_index as u64,
+            impulse_index_secs: peak_index as f64 / f64::from(request.sample_rate),
+            rt60_secs,
+            decay_db_per_sec,
+            sweep: SweepDescriptor {
+                start_hz: request.start_hz,
+                end_hz: request.end_hz,
+                duration_secs: request.duration_secs,
+            },
         },
+        bands,
     })
+}
+
+/// Target curves copied from the controller's documented names. Levels are
+/// relative; unknown names fall back to `harman` and the fallback is reported.
+static FLAT_TARGET: [(f64, f64); 10] = [
+    (20.0, 0.0),
+    (50.0, 0.0),
+    (100.0, 0.0),
+    (200.0, 0.0),
+    (500.0, 0.0),
+    (1_000.0, 0.0),
+    (2_000.0, 0.0),
+    (5_000.0, 0.0),
+    (10_000.0, 0.0),
+    (20_000.0, 0.0),
+];
+static HARMAN_TARGET: [(f64, f64); 15] = [
+    (20.0, 4.0),
+    (40.0, 3.5),
+    (80.0, 3.0),
+    (150.0, 1.5),
+    (300.0, 0.0),
+    (500.0, 0.0),
+    (1_000.0, 0.0),
+    (2_000.0, 0.0),
+    (4_000.0, -0.5),
+    (6_000.0, -1.0),
+    (8_000.0, -1.5),
+    (10_000.0, -2.0),
+    (12_000.0, -3.0),
+    (16_000.0, -5.0),
+    (20_000.0, -7.0),
+];
+static BBC_TARGET: [(f64, f64); 14] = [
+    (20.0, 2.0),
+    (50.0, 2.0),
+    (100.0, 1.0),
+    (200.0, 0.0),
+    (500.0, 0.0),
+    (1_000.0, 0.0),
+    (2_000.0, -1.0),
+    (3_000.0, -2.0),
+    (4_000.0, -1.0),
+    (6_000.0, 0.0),
+    (8_000.0, 0.0),
+    (10_000.0, -1.0),
+    (16_000.0, -3.0),
+    (20_000.0, -5.0),
+];
+
+fn target_curve(name: &str) -> (&'static str, &'static [(f64, f64)]) {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "flat" => ("flat", &FLAT_TARGET),
+        "bbc" => ("bbc", &BBC_TARGET),
+        "harman" | "" => ("harman", &HARMAN_TARGET),
+        _ => ("harman", &HARMAN_TARGET),
+    }
+}
+
+fn target_level(curve: &[(f64, f64)], freq: f64) -> f64 {
+    if curve.is_empty() {
+        return 0.0;
+    }
+    if freq <= curve[0].0 {
+        return curve[0].1;
+    }
+    let last = curve[curve.len() - 1];
+    if freq >= last.0 {
+        return last.1;
+    }
+    for pair in curve.windows(2) {
+        let (f0, d0) = pair[0];
+        let (f1, d1) = pair[1];
+        if (f0..=f1).contains(&freq) {
+            let t = (freq / f0).ln() / (f1 / f0).ln();
+            return d0 + t * (d1 - d0);
+        }
+    }
+    0.0
+}
+
+/// RBJ constant-peak-gain band-pass, returning total output energy and the
+/// energy inside `quiet`.
+///
+/// A constant-Q octave filter is enough here: the sweep spends equal time per
+/// octave, so equal filter bandwidths and equal dwell times make the output
+/// energy directly comparable between bands. Filtering the whole capture and
+/// accumulating the quiet window separately avoids a startup transient in the
+/// noise estimate.
+fn bandpass_energies(
+    samples: &[f32],
+    freq: f64,
+    sample_rate: f64,
+    q: f64,
+    quiet: (usize, usize),
+) -> (f64, f64) {
+    if samples.is_empty() {
+        return (0.0, 0.0);
+    }
+    let w0 = 2.0 * std::f64::consts::PI * freq / sample_rate;
+    let alpha = w0.sin() / (2.0 * q);
+    let a0 = 1.0 + alpha;
+    let b0 = alpha / a0;
+    let b2 = -alpha / a0;
+    let a1 = -2.0 * w0.cos() / a0;
+    let a2 = (1.0 - alpha) / a0;
+    let (mut x1, mut x2, mut y1, mut y2) = (0.0, 0.0, 0.0, 0.0);
+    let mut energy = 0.0;
+    let mut quiet_energy = 0.0;
+    for (index, sample) in samples.iter().enumerate() {
+        let x0 = f64::from(*sample);
+        let y0 = b0 * x0 + b2 * x2 - a1 * y1 - a2 * y2;
+        energy += y0 * y0;
+        if index >= quiet.0 && index < quiet.1 {
+            quiet_energy += y0 * y0;
+        }
+        x2 = x1;
+        x1 = x0;
+        y2 = y1;
+        y1 = y0;
+    }
+    (energy, quiet_energy)
+}
+
+/// Find the least energetic 20 ms window, used for a per-band noise estimate.
+fn quietest_window(samples: &[f32], sample_rate: f64) -> (usize, usize) {
+    let length = ((sample_rate * 0.02).round() as usize).clamp(1, samples.len().max(1));
+    if samples.is_empty() {
+        return (0, 0);
+    }
+    let mut best = (0usize, length.min(samples.len()));
+    let mut best_energy = f64::INFINITY;
+    let mut start = 0usize;
+    while start < samples.len() {
+        let end = (start + length).min(samples.len());
+        let energy = samples[start..end]
+            .iter()
+            .map(|sample| f64::from(*sample) * f64::from(*sample))
+            .sum::<f64>();
+        if energy < best_energy {
+            best_energy = energy;
+            best = (start, end - start);
+        }
+        if end == samples.len() {
+            break;
+        }
+        start = end;
+    }
+    best
+}
+
+/// Octave-band response from a captured sweep.
+///
+/// Each band is a constant-Q band-pass over the whole capture. Because the
+/// generated log sweep dwells for the same time in every octave, the band
+/// energies are directly comparable and need no inverse-filter reference. A
+/// constant playback/capture latency shifts the signal in time but does not
+/// change its octave energy, so this is more stable than a full-window chirp
+/// DFT ratio. Levels remain relative: there is no calibrated microphone.
+fn analyse_bands(samples: &[f32], request: &SweepRequest, noise_floor_dbfs: f32) -> BandAnalysis {
+    let sample_rate = f64::from(request.sample_rate);
+    let nyquist = sample_rate / 2.0;
+    let (requested, target_name, target) = {
+        let (used, curve) = target_curve(&request.target_curve);
+        (request.target_curve.clone(), used, curve)
+    };
+    let noise_rms = f64::from(10f32.powf(noise_floor_dbfs / 20.0));
+    let (quiet_start, quiet_length) = quietest_window(samples, sample_rate);
+
+    let mut measured: Vec<(usize, f64, f32, Option<f32>)> = Vec::new();
+    let mut skipped = 0usize;
+    for (index, freq) in ANALYSIS_BAND_CENTRES_HZ.iter().copied().enumerate() {
+        if freq < request.start_hz || freq > request.end_hz || freq >= nyquist {
+            skipped += 1;
+            continue;
+        }
+        let (signal_energy, quiet_energy) = bandpass_energies(
+            samples,
+            freq,
+            sample_rate,
+            1.4,
+            (quiet_start, quiet_start + quiet_length),
+        );
+        if !signal_energy.is_finite() || signal_energy <= 0.0 {
+            skipped += 1;
+            continue;
+        }
+        let scaled_noise = if quiet_length == 0 {
+            0.0
+        } else {
+            quiet_energy * samples.len() as f64 / quiet_length as f64
+        };
+        // A broadband noise floor bounds the band noise conservatively; a
+        // measured quiet segment is preferred when it is higher.
+        let band_noise = (noise_rms * noise_rms)
+            * samples.len() as f64
+            * (freq / 1.4 / sample_rate).clamp(0.0, 1.0);
+        let noise_energy = scaled_noise.max(band_noise).max(1.0e-18);
+        let snr_db = 10.0 * (signal_energy / noise_energy).log10();
+        if !snr_db.is_finite() || snr_db < -20.0 {
+            // Nothing usable reached this band. Do not invent a response.
+            skipped += 1;
+            continue;
+        }
+        let level_db = 10.0 * signal_energy.log10();
+        if !level_db.is_finite() {
+            skipped += 1;
+            continue;
+        }
+        let confidence = (((snr_db - 3.0) / 20.0) as f32).clamp(0.0, 1.0);
+        measured.push((
+            index,
+            level_db.clamp(-120.0, 40.0),
+            confidence,
+            Some((snr_db * 10.0).round() as f32 / 10.0),
+        ));
+    }
+
+    if measured.is_empty() {
+        return BandAnalysis {
+            method: "bandpass-octave".to_owned(),
+            reference: "captured sweep band energy".to_owned(),
+            normalisation: "median of measured bands".to_owned(),
+            normalisation_db: None,
+            target_curve_requested: requested,
+            target_curve_used: target_name.to_owned(),
+            gain_limit_db: MAX_SUGGESTED_GAIN_DB as f32,
+            bands_measured: 0,
+            bands_skipped: skipped,
+            mean_confidence: 0.0,
+            bands: Vec::new(),
+        };
+    }
+
+    let mut levels: Vec<f64> = measured.iter().map(|entry| entry.1).collect();
+    levels.sort_by(f64::total_cmp);
+    let normalisation = median(&levels);
+    let target_levels: Vec<f64> = measured
+        .iter()
+        .map(|entry| target_level(target, ANALYSIS_BAND_CENTRES_HZ[entry.0]))
+        .collect();
+    let target_median = median(&target_levels);
+
+    let mut bands = Vec::with_capacity(measured.len());
+    let mut confidence_sum = 0.0f32;
+    for (position, (index, raw_db, confidence, snr_db)) in measured.iter().enumerate() {
+        let measured_db = (raw_db - normalisation).clamp(-MAX_RELATIVE_DB, MAX_RELATIVE_DB) as f32;
+        let target_db = (target_levels[position] - target_median)
+            .clamp(-MAX_RELATIVE_DB, MAX_RELATIVE_DB) as f32;
+        let deviation_db =
+            (measured_db - target_db).clamp(-MAX_RELATIVE_DB as f32, MAX_RELATIVE_DB as f32) as f32;
+        let suggested_gain_db =
+            (-f64::from(deviation_db)).clamp(-MAX_SUGGESTED_GAIN_DB, MAX_SUGGESTED_GAIN_DB);
+        let suggested = *confidence >= MIN_SUGGESTED_CONFIDENCE && suggested_gain_db.abs() >= 0.5;
+        confidence_sum += *confidence;
+        bands.push(RoomBand {
+            freq: ANALYSIS_BAND_CENTRES_HZ[*index],
+            measured_db: round1(measured_db),
+            target_db: round1(target_db),
+            deviation_db: round1(deviation_db),
+            suggested_gain_db: round1(suggested_gain_db as f32),
+            confidence: (confidence * 1000.0).round() / 1000.0,
+            snr_db: *snr_db,
+            suggested,
+        });
+    }
+
+    BandAnalysis {
+        method: "bandpass-octave".to_owned(),
+        reference: "captured sweep band energy".to_owned(),
+        normalisation: "median of measured bands".to_owned(),
+        normalisation_db: Some(round1(normalisation as f32)),
+        target_curve_requested: requested,
+        target_curve_used: target_name.to_owned(),
+        gain_limit_db: MAX_SUGGESTED_GAIN_DB as f32,
+        bands_measured: bands.len(),
+        bands_skipped: skipped,
+        mean_confidence: (confidence_sum / bands.len() as f32 * 1000.0).round() / 1000.0,
+        bands,
+    }
+}
+
+fn median(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let middle = values.len() / 2;
+    if values.len() % 2 == 0 {
+        (values[middle - 1] + values[middle]) / 2.0
+    } else {
+        values[middle]
+    }
+}
+
+fn round1(value: f32) -> f32 {
+    (value * 10.0).round() / 10.0
 }
 
 fn window_dbfs(samples: &[f32], window: usize) -> Vec<f32> {
@@ -793,8 +1202,6 @@ fn dbfs(value: f32) -> f32 {
 fn write_sweep_wav(path: &Path, request: &SweepRequest) -> Result<(), AudioError> {
     let sample_rate = request.sample_rate;
     let frames = (f64::from(sample_rate) * request.duration_secs).round() as u32;
-    let k = (request.end_hz / request.start_hz).ln();
-    let fade_frames = (f64::from(sample_rate) * 0.05).round() as u32;
     let bytes = frames.saturating_mul(2);
 
     let file = std::fs::File::create(path).map_err(|error| AudioError::Process {
@@ -824,16 +1231,7 @@ fn write_sweep_wav(path: &Path, request: &SweepRequest) -> Result<(), AudioError
     write(&mut writer, &bytes.to_le_bytes())?;
 
     for index in 0..frames {
-        let t = f64::from(index) / f64::from(sample_rate);
-        let phase = 2.0 * std::f64::consts::PI * request.start_hz * request.duration_secs / k
-            * ((k * t / request.duration_secs).exp() - 1.0);
-        let mut envelope = 1.0;
-        if index < fade_frames {
-            envelope = f64::from(index) / f64::from(fade_frames.max(1));
-        } else if index + fade_frames > frames {
-            envelope = f64::from(frames - index) / f64::from(fade_frames.max(1));
-        }
-        let sample = phase.sin() * request.amplitude * envelope.clamp(0.0, 1.0);
+        let sample = sweep_sample(request, index as usize);
         let value = (sample * 32_000.0).round().clamp(-32_768.0, 32_767.0) as i16;
         write(&mut writer, &value.to_le_bytes())?;
     }
@@ -842,6 +1240,31 @@ fn write_sweep_wav(path: &Path, request: &SweepRequest) -> Result<(), AudioError
         message: error.to_string(),
     })?;
     Ok(())
+}
+
+/// The generated sweep's sample at `index`, including fades.
+///
+/// This is shared by the WAV writer and the band analyser so the reference
+/// signal can never drift from the signal that was actually played. Indices
+/// outside the sweep are zero.
+fn sweep_sample(request: &SweepRequest, index: usize) -> f64 {
+    let sample_rate = request.sample_rate;
+    let frames = (f64::from(sample_rate) * request.duration_secs).round() as usize;
+    if index >= frames {
+        return 0.0;
+    }
+    let k = (request.end_hz / request.start_hz).ln();
+    let fade_frames = (f64::from(sample_rate) * 0.05).round() as usize;
+    let t = index as f64 / f64::from(sample_rate);
+    let phase = 2.0 * std::f64::consts::PI * request.start_hz * request.duration_secs / k
+        * ((k * t / request.duration_secs).exp() - 1.0);
+    let mut envelope = 1.0;
+    if index < fade_frames {
+        envelope = index as f64 / fade_frames.max(1) as f64;
+    } else if index + fade_frames > frames {
+        envelope = (frames - index) as f64 / fade_frames.max(1) as f64;
+    }
+    phase.sin() * request.amplitude * envelope.clamp(0.0, 1.0)
 }
 
 struct Workspace {
@@ -1005,6 +1428,44 @@ mod tests {
         samples
     }
 
+    /// Render the generated sweep with a known frequency-dependent gain.
+    fn sweep_capture_with_gain(
+        request: &SweepRequest,
+        tail_secs: f64,
+        gain_at: impl Fn(f64) -> f64,
+    ) -> Vec<u8> {
+        let sample_rate = f64::from(request.sample_rate);
+        let frames = (sample_rate * request.duration_secs).round() as usize;
+        let tail = (sample_rate * tail_secs).round() as usize;
+        let k = (request.end_hz / request.start_hz).ln();
+        let mut samples = Vec::with_capacity(frames + tail);
+        for index in 0..frames {
+            let t = index as f64 / sample_rate;
+            let instantaneous = request.start_hz * (k * t / request.duration_secs).exp();
+            let value = (sweep_sample(request, index) * gain_at(instantaneous) * 32_000.0).round();
+            samples.push(value.clamp(-32_768.0, 32_767.0) as i16);
+        }
+        samples.extend(std::iter::repeat(0i16).take(tail));
+        samples
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect()
+    }
+
+    fn bell_at_1k(freq: f64) -> f64 {
+        let octaves = (freq / 1_000.0).log2() / 0.35;
+        let boost = 10f64.powf(12.0 / 20.0) - 1.0;
+        1.0 + boost * (-(octaves * octaves)).exp()
+    }
+
+    fn band<'a>(analysis: &'a BandAnalysis, freq: f64) -> &'a RoomBand {
+        analysis
+            .bands
+            .iter()
+            .find(|band| (band.freq - freq).abs() < 0.1)
+            .unwrap_or_else(|| panic!("no band at {freq} Hz"))
+    }
+
     fn test_request() -> SweepRequest {
         let mut request = SweepRequest::new("speakers.monitor", "speakers");
         request.start_delay_ms = 0;
@@ -1026,10 +1487,87 @@ mod tests {
         assert!(measurement.noise_floor_dbfs < measurement.peak_dbfs);
         assert!(measurement.rt60_secs.is_some());
         assert!(outcome.profile.id.starts_with("sweep-"));
-        assert!(outcome.profile.bands.is_empty());
-        assert_eq!(outcome.profile.band_count, 0);
+        assert_eq!(outcome.profile.band_count, outcome.profile.bands.len());
+        let analysis = outcome.profile.analysis.as_ref().expect("band analysis");
+        assert!(analysis.bands_measured > 0);
+        assert_eq!(analysis.method, "bandpass-octave");
+        assert_eq!(analysis.target_curve_used, "harman");
+        assert_eq!(analysis.bands_measured + analysis.bands_skipped, 10);
         assert!(!outcome.profile.active);
         assert_eq!(io.capture_started.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn synthetic_sweep_with_a_known_band_boost_is_measured() {
+        let mut request = test_request();
+        request.amplitude = 0.2;
+        request.target_curve = "flat".to_owned();
+        let io = FakeIo::new(sweep_capture_with_gain(&request, 0.2, bell_at_1k));
+        let outcome = run_sweep(request, &io).await.expect("measured sweep");
+        let analysis = outcome.profile.analysis.as_ref().expect("band analysis");
+        assert_eq!(analysis.bands_measured, 10);
+        assert_eq!(analysis.bands_skipped, 0);
+        assert_eq!(analysis.target_curve_used, "flat");
+
+        let boosted = band(analysis, 1_000.0);
+        let neighbour = band(analysis, 500.0);
+        assert!(
+            boosted.measured_db > 6.0,
+            "1 kHz was {:.1} dB, expected roughly +12 dB",
+            boosted.measured_db
+        );
+        assert!(
+            boosted.measured_db - neighbour.measured_db > 4.0,
+            "1 kHz {:.1} dB vs 500 Hz {:.1} dB",
+            boosted.measured_db,
+            neighbour.measured_db
+        );
+        assert!(
+            boosted.suggested_gain_db < -4.0,
+            "the suggested cut was {:.1} dB",
+            boosted.suggested_gain_db
+        );
+        assert!(boosted.suggested);
+        assert!(boosted.confidence > 0.5);
+        assert!(boosted.snr_db.unwrap() > 6.0);
+        assert_eq!(boosted.target_db, 0.0);
+
+        assert_eq!(outcome.profile.band_count, outcome.profile.bands.len());
+        assert!(outcome
+            .profile
+            .bands
+            .iter()
+            .any(|band| (band.freq - 1_000.0).abs() < 0.1 && band.gain < -2.0));
+        for band in &outcome.profile.bands {
+            assert!(band.gain.is_finite());
+            assert!(band.gain.abs() <= MAX_SUGGESTED_GAIN_DB);
+            assert_eq!(band.q, 1.4);
+            assert_eq!(band.band_type, "peaking");
+        }
+        for response in &analysis.bands {
+            assert!(response.measured_db.is_finite());
+            assert!(response.deviation_db.is_finite());
+            assert!((0.0..=1.0).contains(&response.confidence));
+        }
+    }
+
+    #[test]
+    fn target_curves_are_normalised_and_unknown_names_fall_back() {
+        let mut request = test_request();
+        let bands = analyse_bands(&vec![0.0f32; 2_048], &request, -90.0);
+        assert_eq!(bands.bands_measured, 0);
+        assert_eq!(bands.bands_skipped, 10);
+        assert!(bands.bands.is_empty());
+        assert_eq!(bands.target_curve_used, "harman");
+
+        request.target_curve = "BBC".to_owned();
+        let (used, curve) = target_curve(&request.target_curve);
+        assert_eq!(used, "bbc");
+        assert!(target_level(curve, 1_000.0) > -1.0);
+        assert!(target_level(curve, 20_000.0) < 0.0);
+
+        let (used, _) = target_curve("custom");
+        assert_eq!(used, "harman");
     }
 
     #[tokio::test]

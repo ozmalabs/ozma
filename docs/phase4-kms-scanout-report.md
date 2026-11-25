@@ -2,9 +2,9 @@
 
 Date: 2026-11-26
 Scope: `ozma-multiseat` only (DRM lease plane extension, atomic KMS scanout,
-tests, and this report). No commit was made; `docs/parity-matrix.md` and
-`docs/plan-execution-status.md` were not touched. `ozma-node`, `ozma-usb`,
-`ozma-mesh`, and controller Python were not modified.
+bounded frame-flip loop, tests, and this report). No commit was made;
+`docs/parity-matrix.md` and `docs/plan-execution-status.md` were not touched.
+`ozma-node`, `ozma-usb`, `ozma-mesh`, and controller Python were not modified.
 
 ## Problem
 
@@ -20,6 +20,9 @@ actually needs:
    an `ATOMIC` request, set connector/CRTC/plane properties, or use an atomic
    page-flip commit, and it had no typed fallback for drivers without atomic
    KMS.
+3. **No frame loop.** The proof committed one static frame and never consumed
+   a page-flip completion event. It could not show buffer rotation, repeated
+   flips, damage-style updates, or flip accounting.
 
 This phase extends the same opt-in proof:
 
@@ -29,7 +32,10 @@ This phase extends the same opt-in proof:
 - legacy `set_crtc`/`page_flip` remains the fallback **only** when atomic KMS is
   unsupported, with a typed `legacy_commit_fallback` note;
 - verification reports plane, CRTC, and framebuffer state and status exposes
-  `commit: "atomic" | "legacy"`.
+  `commit: "atomic" | "legacy"`;
+- `--seat-drm-scanout-frames 2..=300` runs a bounded frame loop over two or
+  three rotating dumb buffers, draws a deterministic moving damage rectangle,
+  and waits for each flip completion with a bounded timeout.
 
 It is still deliberately **not** a compositor, window manager, client renderer,
 or host display isolation mechanism. `DrmScanoutStatus` always carries the
@@ -44,9 +50,10 @@ Module: `ozma-multiseat/src/drm_scanout.rs`, with the lease extension in
 |---|---|
 | `DrmLeaseRequest` / `DrmPlaneSelector` | Adds an optional explicit plane to the existing card/connector/CRTC selector. |
 | `DrmLeaseHandle::plane_id` | Reports the explicitly requested plane separately from the kernel-reported `plane_ids`. |
-| `DrmScanoutRequest` | Same selector plus an optional mode and a deliberate `force_legacy` baseline flag. |
+| `DrmScanoutRequest` | Same selector plus an optional mode, frame count, interval, flip timeout, and a deliberate `force_legacy` baseline flag. |
 | `DrmScanoutCommit` | Stable `atomic` / `legacy` marker in status and verification. |
-| `DrmScanoutBackend` / `DrmScanoutHandle` | Start, status, verify, teardown, active. |
+| `DrmScanoutFramePlan` / `DrmScanoutFrameStats` | Bounded loop parameters and submitted/completed/dropped/missed/flip/interval/checksum accounting. |
+| `DrmScanoutBackend` / `DrmScanoutHandle` | Start, status, verify, bounded `run_frames`, teardown, active. |
 | `RealDrmScanoutBackend` | Production path over `RealDrmLeaseBackend` and `drm = 0.15`. |
 | `DrmScanoutStatus` / `DrmScanoutVerification` | Card/connector/CRTC/plane/framebuffer/buffer ids, commit kind, pattern checksum, page-flip flag, typed notes/errors. |
 | `DrmScanoutError` | Typed atomic, plane, property, format, and verification failures with stable `code()` values. |
@@ -142,17 +149,59 @@ Legacy fallback still queues `set_crtc` and `page_flip`, and records
 `legacy_commit_forced`. A rejected page flip remains non-fatal and records
 `page_flip_unavailable`.
 
+### Bounded frame loop
+
+`start` still performs the initial modeset commit and returns an active handle.
+The original one-frame proof is unchanged: `frames` defaults to `1`, one dumb
+buffer is allocated, and no completion event is consumed. `frames > 1` switches
+to the frame-loop path:
+
+1. `start` allocates `2` buffers for two frames and `3` for three or more,
+   filling each with the base pattern and creating one framebuffer per buffer.
+2. The initial modeset is frame zero. The loop asks for
+   `PAGE_FLIP_EVENT`, so the modeset commit reports its own completion.
+3. `run_frames(plan)` waits for frame zero's flip event. Only then is it counted
+   as completed. A timeout leaves `completed = 0`, `dropped = 1`,
+   `missed = 1`.
+4. For each later frame, the next rotating buffer receives only a deterministic
+   moving rectangle (`frame_damage_rect`/`apply_frame_damage`, 3x3 position
+   cycle, frame-dependent colour). This is damage-style **updating**, not a
+   damage tracker.
+5. The frame is committed as an atomic `FB_ID`-only page flip (or a legacy
+   `page_flip(EVENT)` in the legacy path), then `wait_for_flip` polls the lessee
+   fd for `POLLIN` and drains `Event::PageFlip` for the leased CRTC. The wait is
+   bounded by `flip_timeout_ms` (default 1000 ms).
+6. `DrmScanoutFrameStats` records `requested`, `submitted`, `completed`,
+   `dropped`, `missed`, `buffer_count`, `page_flip_events`, `damage_updates`,
+   `average_interval_us` (observed completion instants), `last_sequence`, and
+   the final re-mapped buffer checksum.
+7. A failed commit or timeout is a typed error (`flip_failed`,
+   `flip_unsupported`, or `flip_timeout`). Partial stats are stored in
+   `DrmScanoutStatus::frames` before returning, and a frame is never counted as
+   completed without a flip event.
+8. Teardown clears the CRTC, destroys every framebuffer and dumb buffer in the
+   rotation, and revokes the lease. A second run on the same objects succeeds.
+
+`run_frames` is also callable explicitly. `plan.frames == 1` is a no-op that
+returns the initial single-frame stats, so callers cannot accidentally turn the
+proof into an unbounded loop.
+
 ### CLI
 
 ```text
 ozma-multiseat --seat-drm-scanout [SEAT=]CARD:CONNECTOR[@CRTC][:PLANE] \
-               [--seat-drm-scanout-mode WIDTHxHEIGHT] [--json]
+               [--seat-drm-scanout-mode WIDTHxHEIGHT] \
+               [--seat-drm-scanout-frames 1..=300] \
+               [--seat-drm-scanout-interval-ms MS] [--json]
 ```
 
-The proof runs before display/topology/plan work and exits. `--json` emits the
-request, final scanout status (including `plane_id` and `commit`), retained
-verification, notes, and typed `error`/`teardown_error`. A seat prefix is
-accepted for CLI symmetry, but the proof is one standalone output.
+`--seat-drm-scanout-frames` defaults to `1`; out-of-range values are rejected
+before a device is opened. The optional interval paces completed frames, while
+flip completion events remain the source of truth for accounting. The proof runs
+before display/topology/plan work and exits. `--json` emits the request, final
+scanout status (including `plane_id`, `commit`, and `frames`), retained
+verification, notes, and typed `frame_error`/`error`/`teardown_error`. A seat
+prefix is accepted for CLI symmetry, but the proof is one standalone output.
 
 ### Typed errors
 
@@ -172,6 +221,10 @@ accepted for CLI symmetry, but the proof is one standalone output.
 | `ModeFailed` | `mode_failed` |
 | `BufferFailed` | `buffer_failed` |
 | `FramebufferFailed` | `framebuffer_failed` |
+| `InvalidFrameCount` | `invalid_frame_count` |
+| `FlipTimeout` | `flip_timeout` |
+| `FlipUnsupported` | `flip_unsupported` |
+| `FlipFailed` | `flip_failed` |
 | `VerificationFailed` | `verification_failed` |
 | `Released`, `InvalidRequest`, `Io` | matching snake-case names |
 | `Lease(DrmLeaseError)` | underlying lease code |
@@ -192,7 +245,7 @@ CRTC.
 - fake lease plane compatibility, unknown plane, incompatible CRTC, and reported
   `plane_id`/`plane_ids`.
 
-`tests/drm_scanout.rs` (15 tests, was 12) now covers:
+`tests/drm_scanout.rs` (22 tests, was 12 before this phase) now covers:
 
 - request parsing and explicit mode;
 - auto selection refusing a real card while an explicit path is allowed;
@@ -211,7 +264,17 @@ CRTC.
 - non-fatal page-flip unavailability;
 - status JSON with plane id, `commit:"atomic"`, notes, verification, and
   `released`;
-- deterministic pattern fill with pitch padding.
+- deterministic pattern fill with pitch padding;
+- one-frame default and typed `invalid_frame_count` bounds;
+- deterministic moving damage rectangle and rotating buffer count;
+- a four-frame loop: three buffers, four submitted/completed flips, three damage
+  updates, buffer reuse, average interval, final checksum, and post-loop
+  verification of the current framebuffer;
+- a legacy frame loop using `page_flip(EVENT)` for every frame;
+- teardown after a loop destroying every framebuffer and buffer before revoke;
+- initial flip timeout accounting (`completed = 0`, `dropped = 1`,
+  `missed = 1`) and a mid-loop `flip_failed` with partial stats;
+- `flip_unsupported` accounting and frame-stat JSON fields.
 
 `tests/live_drm_scanout.rs` is `#[ignore]`d and gated by `OZMA_DRM_LIVE=1`. It
 refuses any non-vkms card. On a configfs vkms instance it discovers an
@@ -221,6 +284,14 @@ and plane through a second card fd, tears down, checks the proof framebuffer is
 no longer attached to either object, and repeats the full cycle. If vkms exposes
 no compatible plane, or the explicit plane proof fails, it records the blocker
 and runs the legacy `set_crtc` baseline instead.
+
+A second ignored test,
+`vkms_scanout_frame_loop_has_real_flip_completions_and_clean_teardown`, runs
+10–30 frames (`OZMA_DRM_FRAMES`, default 12) with a 16 ms pacing interval. It
+asserts real completion events for every submitted frame, no drops or misses,
+three rotating buffers, the damage-update count, an average interval, a final
+checksum, verified current-framebuffer state, closed lessee fd after teardown,
+and a second successful frame loop on the same connector/CRTC/plane.
 
 `tests/live_drm_lease.rs` keeps its disconnect/reconnect/revoke cycle and now
 constructs the request with the new optional plane selector.
@@ -285,6 +356,65 @@ for explicit-plane requests removed the duplicate insertion and produced the
 atomic run above. The fake test suite keeps both the fallback and forced-legacy
 paths covered without a device.
 
+### Live frame loop
+
+A dedicated configfs instance `/sys/kernel/config/vkms/ozma-frame` was created
+with one primary plane (`type=1`), one CRTC, one encoder, one connected virtual
+connector, and `enabled=1`. `systemd-logind` was frozen for the run so it could
+not take DRM master on the new card. The test leased the primary plane and ran
+the bounded loop:
+
+```text
+$ OZMA_DRM_LIVE=1 OZMA_DRM_CARD=/dev/dri/card4 OZMA_DRM_FRAMES=12 \
+    target/debug/deps/live_drm_scanout-... vkms_scanout_frame_loop --ignored --nocapture
+vkms frame loop: card=/dev/dri/card4 connector=Virtual-3 crtc=41 plane=Some(36) frames=12
+live frame stats: DrmScanoutFrameStats {
+    requested: 12,
+    submitted: 12,
+    completed: 12,
+    dropped: 0,
+    missed: 0,
+    buffer_count: 3,
+    page_flip_events: 12,
+    damage_updates: 11,
+    average_interval_us: Some(33361),
+    last_sequence: Some(28),
+    final_checksum: Some(1428349092),
+}
+verification: crtc_id=41 crtc_framebuffer=Some(48) plane_id=Some(36)
+  plane_framebuffer=Some(48) pattern_checksum=1428349092 ok=true
+second frame loop completed and released
+test result: ok. 1 passed; 0 failed; 0 ignored
+```
+
+The completion count equals the submitted count because each flip waited for a
+real vkms `PAGE_FLIP_EVENT`; `average_interval_us` comes from observed completion
+instants, not from the requested interval. The current framebuffer `48` was
+verified on both the CRTC and plane, and a second 12-frame loop on the same
+objects succeeded, proving that all three dumb buffers/framebuffers and the
+lease were released by teardown.
+
+The CLI exercised the same path at the upper bound:
+
+```text
+$ target/debug/ozma-multiseat --seat-drm-scanout /dev/dri/card4:Virtual-3 \
+      --seat-drm-scanout-frames 30
+scanout: /dev/dri/card4:Virtual-3 connector_id=Some(43) crtc=Some(41) \
+  plane=Some(36) commit=atomic lessee=Some(1) fd=None
+  mode=1024x768 1024x768 pitch=4096 framebuffer=Some(48) buffer=Some(3) ...
+  frames: requested=30 submitted=30 completed=30 dropped=0 missed=0 buffers=3 \
+    flip_events=30 damage_updates=29 avg_interval_us=Some(16663) \
+    last_sequence=Some(1108) final_checksum=Some(436787364)
+  verify: ok=true crtc_framebuffer=Some(48) plane_framebuffer=Some(48) ...
+  note[frame_loop]: bounded frame loop: 30 frames across 3 rotating dumb buffers, \
+    damage pattern moving-damage-rect-xrgb8888, flip timeout 1000ms
+  scanout applied=false released=true
+```
+
+A 16-frame run with `--seat-drm-scanout-interval-ms 10` also completed all 16
+flips (`dropped=0`, `missed=0`, `flip_events=16`), so the optional pacing
+interval does not replace event accounting.
+
 ### CLI proof (automatic plane, then explicit plane)
 
 ```text
@@ -318,24 +448,24 @@ After the runs:
 $ sudo find /sys/kernel/config/vkms -maxdepth 1
 /sys/kernel/config/vkms
 $ ls /sys/class/drm | grep -E '^card[0-9]+$'
-card0
-card1
-card2
-card3          # default vkms, not created by this run
+card0           # xe
+card1           # amdgpu
+card2           # hermes-kms
+card3           # default vkms, not created by this run
 $ ps -o stat,comm -p $(pidof systemd-logind)
 Ss systemd-logind
 ```
 
-The configfs instance and all plane/CRTC/encoder/connector links were removed,
-logind was resumed, and no temporary instance remains. The default vkms card and
-the real GPUs were not touched.
+The `ozma-frame` configfs instance and all plane/CRTC/encoder/connector links
+were removed, logind was resumed, and no temporary instance remains. The default
+vkms card and the real GPUs were not touched.
 
 ## Verification
 
 ```text
 cargo test -p ozma-multiseat
-  211 passed, 0 failed, 14 ignored (includes the 15 fake scanout tests,
-  14 lease tests, and the ignored live lease/scanout tests)
+  218 passed, 0 failed, 15 ignored (includes the 22 fake scanout tests,
+  14 lease tests, and the ignored live lease/scanout/frame-loop tests)
 
 cargo check -p ozma-multiseat --all-targets
   clean (only pre-existing ozma-pipewire warnings)
@@ -346,20 +476,23 @@ rustfmt --edition 2021 <touched files>
 
 ## Remaining compositor gaps
 
-- **No compositor.** The proof draws one generated static framebuffer. It does
-  not accept client surfaces, composite windows, manage focus, perform damage
-  tracking, or run a Wayland/X server. The `scanout_proof_only` note is always
-  present.
+- **No compositor or damage tracker.** The frame loop draws one generated
+  moving rectangle into a rotating buffer. It does not accept client surfaces,
+  composite windows, manage focus, merge dirty regions from clients, or run a
+  Wayland/X server. The `scanout_proof_only` note is always present, and the
+  damage update is a deterministic proof pattern, not tracked content.
 - **No user-space graphics handoff.** A seat child still receives only the
   lease fd/environment. `ozma-node` has no KMS/Wayland compositor, so this is a
   platform proof, not end-to-end seat graphics.
-- **One plane, one commit.** The proof uses one primary/compatible plane and one
-  static framebuffer. It does not exercise overlay/cursor plane stacks, format
-  modifiers, per-plane alpha/blend/zpos/color properties, or multi-plane atomic
-  composition.
-- **No frame event loop.** A `PAGE_FLIP_EVENT` is requested and the commit is
-  verified synchronously, but the proof does not consume vblank/flip events,
-  schedule frames, or do damage-driven repaint.
+- **One plane, one commit chain.** The proof uses one primary/compatible plane
+  and rotates framebuffers on it. It does not exercise overlay/cursor plane
+  stacks, format modifiers, per-plane alpha/blend/zpos/color properties, or
+  multi-plane atomic composition.
+- **Bounded flip loop, not a scheduler.** Frames are presented sequentially with
+  an optional fixed interval and a bounded per-flip timeout. There is no
+  vblank-driven clock, frame-drop policy, async flip, or latency target; the
+  reported average interval is observed completion spacing, and a timeout is a
+  typed error rather than a skipped frame.
 - **No capture of the pattern.** vkms writeback output was not wired into this
   proof. Verification is KMS state (CRTC/plane/connector/framebuffer/buffer ids,
   mode, size, pitch) plus a re-mapped checksum of the buffer bytes, not a

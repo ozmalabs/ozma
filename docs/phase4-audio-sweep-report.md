@@ -1,15 +1,18 @@
 # Phase 4 — audio graph enumeration and generated sweep
 
 Status: **live-validated** on the host's existing PipeWire/PulseAudio server
-(2026-11-26). `GET /audio/nodes` now returns a real bounded graph snapshot, and
+(2026-11-26). `GET /audio/nodes` now returns a real bounded graph snapshot,
 `POST /audio/sweep` generates and plays a log sweep, captures a named source,
-and returns a measured profile only when audio was captured.
+and returns a measured profile only when audio was captured, and
+`GET`/`POST`/`DELETE /audio/room-correction/profile` persist the last measured
+profile when the operator opts in with `--audio-profile-dir`.
 
 This report covers the two routes that were typed 501 in
 [`phase4-audio-live-report.md`](phase4-audio-live-report.md). Routing control
 (`/audio/apply`, `/audio/remove`, `/audio/play`, `/audio/stop`) is unchanged.
-The measurement path is deliberately basic: it does **not** fit equalisation
-bands, apply convolution, or change the graph.
+The measurement path now returns a deterministic 10-band octave response and
+suggested gains, but it still does **not** insert parametric EQ, apply
+convolution, or change the graph.
 
 ## Environment
 
@@ -124,7 +127,21 @@ Measurement (computed in pure Rust over captured S16):
 - impulse peak/index/time (maximum absolute sample);
 - a best-effort RT60 and dB/s decay slope from the post-peak window envelope,
   reported as `null` unless the envelope falls at least 35 dB after a 5 dB
-  drop.
+  drop;
+- a 10-band octave response at 31.5, 63, 125, 250, 500, 1 k, 2 k, 4 k, 8 k,
+  and 16 k Hz. Each band is a constant-Q band-pass over the whole capture, then
+  normalised to the median measured band. Because a log sweep dwells for equal
+  time in every octave, the band energies are directly comparable without an
+  inverse-filter reference. Centres outside the requested sweep range are
+  counted in `bands_skipped`, never extrapolated.
+
+`sweep::analyse_bands` is dependency-free (no FFT crate) and deterministic.
+Per-band confidence combines the band's signal-to-noise estimate from the
+quietest 20 ms window with a broadband noise-floor bound; a gain is suggested
+only when confidence is at least 0.2 and the deviation is at least 0.5 dB.
+Every suggested gain is clamped to ±12 dB, and the band list is always derived
+from captured PCM. Bands with no usable signal are skipped rather than filled
+with a default.
 
 Profile returned inside `{"ok": true, "profile": {...}}`:
 
@@ -133,8 +150,10 @@ Profile returned inside `{"ok": true, "profile": {...}}`:
   "id": "sweep-...",
   "name": "Office",
   "created_at": 1790000000.0,
-  "bands": [],
-  "band_count": 0,
+  "bands": [
+    {"freq": 1000.0, "gain": -3.2, "q": 1.4, "type": "peaking"}
+  ],
+  "band_count": 1,
   "mic_type": "phone",
   "phone_model": "generic",
   "mic_model": "",
@@ -157,15 +176,65 @@ Profile returned inside `{"ok": true, "profile": {...}}`:
     "rt60_secs": null,
     "decay_db_per_sec": null,
     "sweep": {"start_hz": 100.0, "end_hz": 8000.0, "duration_secs": 1.0}
+  },
+  "analysis": {
+    "method": "bandpass-octave",
+    "reference": "captured sweep band energy",
+    "normalisation": "median of measured bands",
+    "normalisation_db": 0.4,
+    "target_curve_requested": "harman",
+    "target_curve_used": "harman",
+    "gain_limit_db": 12.0,
+    "bands_measured": 7,
+    "bands_skipped": 3,
+    "mean_confidence": 0.94,
+    "bands": [
+      {
+        "freq": 1000.0,
+        "measured_db": 3.2,
+        "target_db": 0.0,
+        "deviation_db": 3.2,
+        "suggested_gain_db": -3.2,
+        "confidence": 0.96,
+        "snr_db": 41.2,
+        "suggested": true
+      }
+    ]
   }
 }
 ```
 
-`bands` is always empty and `active` is always false. This engine measures; it
-does not fit or apply EQ. The controller's existing
-`CorrectionProfile.to_dict()` fields are a documented subset (no
+`bands` contains only confident suggestions; `analysis.bands` keeps every
+measured band (including low-confidence ones) plus the target comparison.
+`active` is always false: nothing is applied to the graph. The controller's
+`CorrectionProfile.to_dict()` fields remain a documented subset (no
 `raw_response_db`/`corrected_response_db`), so the dashboard can accept the
 profile without claiming corrections exist.
+
+### Profile persistence
+
+Storage is opt-in and off by default:
+
+- `--audio-profile-dir <path>` (or `OZMA_AUDIO_PROFILE_DIR`) enables it;
+  without the flag all three profile routes answer a typed 501 and nothing is
+  written.
+- `GET /audio/room-correction/profile` returns
+  `{"ok":true,"stored":true,"profile":{...}}`, or `stored:false`/`profile:null`
+  when no profile exists. A corrupt or oversized file is a typed 502.
+- `POST /audio/room-correction/profile` accepts the profile directly or as
+  `{"profile": {...}}`, validates it, and atomically replaces the stored copy.
+- `DELETE /audio/room-correction/profile` removes the file and reports
+  `cleared:true|false`.
+- `POST /audio/sweep` stores the measured profile automatically when the
+  directory is configured. Storage failure does not invalidate the
+  measurement; the response carries `storage_enabled`, `stored`, and a typed
+  `storage_error`.
+
+The fixed file name is `room-correction-profile.json`; the writer uses a
+same-directory temporary file with `0600` permissions and a rename, and reads
+are bounded to 256 KiB and reject symlinks. Validation requires captured
+audio (`captured_frames > 0`), at most 10 bands, finite values, `active:false`,
+and gains within ±12 dB. No token or other secret is stored.
 
 ### Live measurement evidence
 
@@ -175,24 +244,36 @@ and captures the sink monitor:
 ```text
 OZMA_AUDIO_LIVE=1 cargo test -p ozma-audio --test router_live -- --ignored --nocapture
 running 3 tests
-live graph: 11 nodes, 0 streams,
+live graph: 15 nodes, 0 streams,
   default sink Some("alsa_output.usb-Roland_Rubix22-00.analog-stereo.99"),
   default source Some("alsa_input.pci-0000_13_00.6.analog-stereo.99")
 test graph_lists_the_live_server_read_only ... ok
 test ensure_sink_reuses_then_remove_unloads_live ... ok
-live sweep: 74400 frames, peak -19.9 dBFS, rms -31.4 dBFS, noise -44.2 dBFS, rt60 None
+live sweep: 74400 frames, peak -20.9 dBFS, rms -29.7 dBFS, noise -43.6 dBFS,
+  rt60 None, bands 7/10 (skipped 3), mean confidence 0.00
+    125.0 Hz: measured   +2.0 dB, target  +1.9 dB, suggested  -0.0 dB, confidence 0.00
+    250.0 Hz: measured   -0.4 dB, target  +0.4 dB, suggested  +0.8 dB, confidence 0.00
+    500.0 Hz: measured   -1.2 dB, target  +0.0 dB, suggested  +1.2 dB, confidence 0.00
+   1000.0 Hz: measured   -0.9 dB, target  +0.0 dB, suggested  +0.9 dB, confidence 0.00
+   2000.0 Hz: measured   +0.0 dB, target  +0.0 dB, suggested  -0.0 dB, confidence 0.00
+   4000.0 Hz: measured   +1.2 dB, target  -0.5 dB, suggested  -1.7 dB, confidence 0.00
+   8000.0 Hz: measured   +2.0 dB, target  -1.5 dB, suggested  -3.5 dB, confidence 0.00
 test sweep_measures_a_disposable_null_sink_monitor_live ... ok
 ```
 
-The graph snapshot listed 11 real nodes (the host's hardware sinks/sources
-plus the pre-existing Ozma null sinks) and no active streams at that moment.
-No command other than `list`/`info` ran, and the defaults above were unchanged.
+The graph snapshot listed real nodes (the host's hardware sinks/sources plus
+the pre-existing Ozma null sinks) and no active streams at that moment. No
+command other than `list`/`info` ran, and the defaults above were unchanged.
 
-The capture length matches `250 ms + 1 s + 300 ms` at 48 kHz. The captured peak
-is well above the silence threshold, so a profile is returned; RT60 is `null`
-because the null-sink tail has no 35 dB decay range. No microphone was opened
-and the default sink/source were untouched. Cleanup unloads the disposable
-module and removes the temporary WAV directory.
+The capture length matches `250 ms + 1 s + 300 ms` at 48 kHz. The null-sink
+loopback is flat within about ±2 dB across the seven measurable bands. Mean
+confidence is intentionally low: the null-sink monitor has no room and little
+signal above the quiet-window noise estimate, so no gain is claimed as
+"confident" (all `suggested` flags are false). RT60 is `null` because the tail
+has no 35 dB decay range. The same run stores, loads, and clears the profile
+through `RoomProfileStore` in a private temporary directory. No microphone was
+opened and the default sink/source were untouched. Cleanup unloads the
+disposable module and removes the temporary WAV and profile directories.
 
 ### Typed errors
 
@@ -206,6 +287,11 @@ module and removes the temporary WAV directory.
 | Playback spawn fails or times out | 503 `audio.process_failed` / `audio.missing_command` |
 | Captured peak below −60 dBFS | 502 `audio.capture_failed`; no profile |
 | No capture bytes | 502 `audio.capture_failed`; no profile |
+| Profile store not configured | 501 `audio-profile-store-unsupported`; nothing written |
+| Invalid posted profile | 400 `audio.invalid_spec`; nothing replaced |
+| Corrupt/oversized stored profile | 502 `audio.output_parse` |
+| Profile file I/O failure | 503 `audio.process_failed` |
+| `POST /audio/room-correction/apply` | 501 `audio-eq-application-unsupported`; no graph change |
 
 Every error body has `ok:false`, `available:false`, and `profile:null`.
 Children are killed on success, on error, and by `kill_on_drop` on shutdown;
@@ -221,6 +307,10 @@ temporary WAV directories are removed on every path.
 - `POST /api/v1/audio/room-correction/sweep` forwards `source`, `sink`, the
   bounded frequency/duration fields, and profile metadata, and returns the
   node's measured JSON or exact typed error body/status.
+- `GET`, `POST`, and `DELETE /api/v1/audio/room-correction/profile` proxy the
+  node's stored-profile routes with the same bearer token. `node_id` is a
+  query parameter for GET/DELETE and is removed from the POST body before
+  forwarding. Typed node bodies and statuses are passed through unchanged.
 - A node disconnect is a typed 502 `audio.proxy_failed`; a node 401/403 is
   passed through without leaking the token.
 
@@ -228,8 +318,8 @@ temporary WAV directories are removed on every path.
 
 ```text
 cargo test -p ozma-audio -p ozma-node --lib
-# ozma-audio: 99 passed, 1 ignored
-# ozma-node: 635 passed, 4 ignored
+# ozma-audio: 106 passed, 1 ignored
+# ozma-node: 689 passed, 5 ignored
 
 cargo check -p ozma-audio -p ozma-node --all-targets
 # Finished
@@ -238,30 +328,40 @@ OZMA_AUDIO_LIVE=1 cargo test -p ozma-audio --test router_live -- --ignored --noc
 # 3 passed
 
 python3 -m pytest tests/unit/controller/test_node_api_token_proxy.py -q
-# 87 passed
+# 111 passed
 ```
 
 Fake-runner/unit coverage includes graph classification, defaults, truncation,
 secret-free serialization, missing `pactl`, malformed JSON, bounded request
-validation, generated WAV header, measured profile, silent/empty capture
-rejection, and playback-failure cleanup.
+validation, generated WAV header, measured octave bands with a known synthetic
+boost, target-curve normalisation, silent/empty capture rejection,
+playback-failure cleanup, and profile store round-trip/corruption/validation.
 
 ## Remaining gaps
 
-1. **No EQ fitting or application.** The profile exposes raw decay/impulse
-   measurements and an empty `bands` list. Parametric EQ fitting, target-curve
-   compensation (Harman/BBC/flat), PipeWire filter-chain insertion, and profile
-   persistence remain controller-side or future work.
-2. **No graph links.** `pactl` does not list PipeWire links; `links` is empty
+1. **No EQ or filter-chain application.** The profile returns suggested
+   parametric bands and a median-normalised target comparison, but nothing is
+   inserted into PipeWire and `active` stays false. Unsupported filter-chain
+   application stays typed 501; no automatic EQ is applied.
+2. **Relative, not calibrated, levels.** Bands are normalised to their own
+   median because there is no calibrated reference microphone. Absolute SPL
+   and microphone calibration are not claimed.
+3. **No graph links.** `pactl` does not list PipeWire links; `links` is empty
    with `links_available:false`. A `pw-dump` link reader would be a separate
    parser and is not claimed here.
-3. **RT60 is basic.** It is a windowed-envelope fit, not a calibrated
+4. **RT60 is basic.** It is a windowed-envelope fit, not a calibrated
    Schroeder integration, and is `null` when the captured decay is shorter than
    the 35 dB fit range.
-4. **No microphone validation.** The live test used only a null-sink monitor.
+5. **Band analysis is an octave-energy estimate.** The constant-Q band-pass
+   assumes the generated sweep and a linear, roughly time-invariant path. It is
+   latency-insensitive at the octave level, but it is not a full
+   deconvolution/impulse-response fit and does not resolve narrow room modes.
+6. **No microphone validation.** The live test used only a null-sink monitor.
    The route accepts a named source, including a real microphone, but no
    microphone calibration or compensation was exercised.
-5. **No resampling/room DSP.** Capture uses the requested rate; there is no
+7. **Persistence is one local file.** There is no history, multi-room index, or
+   cross-node sync; a second measurement replaces the first.
+8. **No resampling/room DSP.** Capture uses the requested rate; there is no
    channel mapping, latency compensation, or convolution.
-6. **Single-host, same-user validation.** Remote PulseAudio servers,
+9. **Single-host, same-user validation.** Remote PulseAudio servers,
    authentication, and non-Linux hosts were not exercised.

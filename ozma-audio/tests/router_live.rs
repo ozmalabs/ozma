@@ -152,16 +152,57 @@ async fn sweep_measures_a_disposable_null_sink_monitor_live() {
         "sweep monitor RMS was {:.1} dBFS",
         measurement.rms_dbfs
     );
-    assert!(outcome.profile.bands.is_empty());
+    let analysis = outcome
+        .profile
+        .analysis
+        .as_ref()
+        .expect("band analysis from captured sweep");
+    assert!(
+        analysis.bands_measured >= 5,
+        "only {} of 10 bands were measurable",
+        analysis.bands_measured
+    );
+    for band in &analysis.bands {
+        assert!(band.freq.is_finite());
+        assert!(band.measured_db.is_finite());
+        assert!(band.suggested_gain_db.is_finite());
+        assert!(band.suggested_gain_db.abs() <= ozma_audio::MAX_SUGGESTED_GAIN_DB as f32);
+        assert!((0.0..=1.0).contains(&band.confidence));
+    }
+    assert_eq!(outcome.profile.band_count, outcome.profile.bands.len());
     assert!(!outcome.profile.active);
     println!(
-        "live sweep: {} frames, peak {:.1} dBFS, rms {:.1} dBFS, noise {:.1} dBFS, rt60 {:?}",
+        "live sweep: {} frames, peak {:.1} dBFS, rms {:.1} dBFS, noise {:.1} dBFS, \
+         rt60 {:?}, bands {}/10 (skipped {}), mean confidence {:.2}",
         measurement.captured_frames,
         measurement.peak_dbfs,
         measurement.rms_dbfs,
         measurement.noise_floor_dbfs,
-        measurement.rt60_secs
+        measurement.rt60_secs,
+        analysis.bands_measured,
+        analysis.bands_skipped,
+        analysis.mean_confidence
     );
+    for band in &analysis.bands {
+        println!(
+            "  {:>7.1} Hz: measured {:>+6.1} dB, target {:>+5.1} dB, \
+             suggested {:>+5.1} dB, confidence {:.2}",
+            band.freq, band.measured_db, band.target_db, band.suggested_gain_db, band.confidence
+        );
+    }
+
+    // The same measured profile must round-trip through the opt-in store.
+    let profile_root =
+        std::env::temp_dir().join(format!("ozma-live-profile-{}", std::process::id()));
+    let store = ozma_audio::RoomProfileStore::new(&profile_root);
+    store.store(&outcome.profile).expect("store live profile");
+    assert_eq!(
+        store.load().expect("load live profile").as_ref(),
+        Some(&outcome.profile),
+        "stored profile must match the measured profile"
+    );
+    assert!(store.clear().expect("clear live profile"));
+    let _ = std::fs::remove_dir_all(&profile_root);
 
     router.remove_sink(&name).await.expect("remove sweep sink");
 }

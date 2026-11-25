@@ -188,6 +188,43 @@ PROXY_CASES = [
     ("get", f"/api/v1/nodes/{NODE_ID}/storage", None, "/storage"),
     ("get", f"/api/v1/nodes/{NODE_ID}/apps", None, "/apps"),
     ("get", f"/api/v1/nodes/{NODE_ID}/self", None, "/self"),
+    ("get", f"/api/v1/nodes/{NODE_ID}/bluetooth/status", None, "/bluetooth/status"),
+    (
+        "get",
+        f"/api/v1/nodes/{NODE_ID}/bluetooth/devices?limit=5",
+        None,
+        "/bluetooth/devices",
+    ),
+    (
+        "post",
+        f"/api/v1/nodes/{NODE_ID}/bluetooth/scan",
+        {"duration_seconds": 3},
+        "/bluetooth/scan",
+    ),
+    (
+        "post",
+        f"/api/v1/nodes/{NODE_ID}/bluetooth/pair",
+        {"address": "AA:BB:CC:DD:EE:FF"},
+        "/bluetooth/pair",
+    ),
+    (
+        "post",
+        f"/api/v1/nodes/{NODE_ID}/bluetooth/connect",
+        {"address": "AA:BB:CC:DD:EE:FF"},
+        "/bluetooth/connect",
+    ),
+    (
+        "post",
+        f"/api/v1/nodes/{NODE_ID}/bluetooth/disconnect",
+        {"address": "AA:BB:CC:DD:EE:FF"},
+        "/bluetooth/disconnect",
+    ),
+    (
+        "post",
+        f"/api/v1/nodes/{NODE_ID}/bluetooth/forget",
+        {"address": "AA:BB:CC:DD:EE:FF"},
+        "/bluetooth/forget",
+    ),
     ("get", f"/api/v1/audio/nodes?node_id={NODE_ID}", None, "/audio/nodes"),
     (
         "post",
@@ -1019,6 +1056,131 @@ def test_backup_estimate_proxy_forwards_paths_and_preserves_typed_unsupported(
     assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
 
 
+def test_bluetooth_status_proxy_preserves_real_json_without_token_leak(
+    fake_node, tmp_path
+):
+    expected = {
+        "ok": True,
+        "supported": True,
+        "configured": True,
+        "available": True,
+        "program": "/usr/bin/bluetoothctl",
+        "adapter": "80:84:89:F6:E2:E8",
+        "adapters": [
+            {
+                "address": "80:84:89:F6:E2:E8",
+                "name": "SFFPC",
+                "default": True,
+                "powered": True,
+                "discoverable": False,
+                "discovering": False,
+                "pairable": True,
+            }
+        ],
+        "discovering": False,
+        "scan": {"active": False, "default_seconds": 8, "max_seconds": 15},
+    }
+    fake_node.responder = lambda _method, _record: (200, expected, "application/json")
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).get(
+        f"/api/v1/nodes/{NODE_ID}/bluetooth/status"
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
+    assert TOKEN not in response.text
+    record = fake_node.requests[-1]
+    assert record["method"] == "GET"
+    assert record["path"] == "/bluetooth/status"
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_bluetooth_scan_proxy_forwards_bounds_and_preserves_typed_timeout(
+    fake_node, tmp_path
+):
+    expected = {
+        "ok": False,
+        "supported": True,
+        "configured": True,
+        "available": False,
+        "code": "bluetooth.timeout",
+        "error": "bluetoothctl bluetoothctl timed out",
+        "remediation": "Retry with a shorter scan.",
+    }
+    fake_node.responder = lambda _method, _record: (504, expected, "application/json")
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).post(
+        f"/api/v1/nodes/{NODE_ID}/bluetooth/scan",
+        json={"duration_seconds": 15},
+    )
+
+    assert response.status_code == 504, response.text
+    assert response.json() == expected
+    assert TOKEN not in response.text
+    record = fake_node.requests[-1]
+    assert record["method"] == "POST"
+    assert record["path"] == "/bluetooth/scan"
+    assert record["body"] == {"duration_seconds": 15}
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_bluetooth_pair_proxy_preserves_typed_invalid_address(fake_node, tmp_path):
+    expected = {
+        "ok": False,
+        "supported": True,
+        "configured": True,
+        "available": False,
+        "code": "bluetooth.invalid-address",
+        "error": "the Bluetooth address is invalid; expected AA:BB:CC:DD:EE:FF",
+        "remediation": "Send exactly one six-octet MAC address.",
+    }
+    fake_node.responder = lambda _method, _record: (400, expected, "application/json")
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).post(
+        f"/api/v1/nodes/{NODE_ID}/bluetooth/pair",
+        json={"address": "not-a-mac"},
+    )
+
+    assert response.status_code == 400, response.text
+    assert response.json() == expected
+    assert TOKEN not in response.text
+    record = fake_node.requests[-1]
+    assert record["path"] == "/bluetooth/pair"
+    assert record["body"] == {"address": "not-a-mac"}
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_bluetooth_forget_proxy_preserves_typed_unavailable(fake_node, tmp_path):
+    expected = {
+        "ok": False,
+        "supported": True,
+        "configured": False,
+        "available": False,
+        "code": "bluetooth.not-configured",
+        "error": "Bluetooth is not configured on this node",
+        "remediation": "Start the node with --bluetooth.",
+    }
+    fake_node.responder = lambda _method, _record: (503, expected, "application/json")
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).post(
+        f"/api/v1/nodes/{NODE_ID}/bluetooth/forget",
+        json={"address": "AA:BB:CC:DD:EE:FF"},
+    )
+
+    assert response.status_code == 503, response.text
+    assert response.json() == expected
+    assert TOKEN not in response.text
+    record = fake_node.requests[-1]
+    assert record["method"] == "POST"
+    assert record["path"] == "/bluetooth/forget"
+    assert record["body"] == {"address": "AA:BB:CC:DD:EE:FF"}
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
 def test_audio_nodes_proxy_preserves_real_graph_json(fake_node, tmp_path):
     expected = {
         "ok": True,
@@ -1115,3 +1277,74 @@ def test_audio_sweep_proxy_surfaces_node_disconnect_as_typed_502(fake_node, tmp_
     assert body["available"] is False
     assert body["code"] == "audio.proxy_failed"
     assert TOKEN not in response.text
+
+
+def test_audio_profile_get_preserves_typed_node_error(fake_node, tmp_path):
+    expected = {
+        "ok": False,
+        "available": False,
+        "stored": False,
+        "profile": None,
+        "code": "audio-profile-store-unsupported",
+        "error": "room-correction profile storage is not enabled on this node",
+    }
+    fake_node.responder = lambda _method, _record: (501, expected, "application/json")
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).get(
+        f"/api/v1/audio/room-correction/profile?node_id={NODE_ID}"
+    )
+
+    assert response.status_code == 501, response.text
+    assert response.json() == expected
+    assert TOKEN not in response.text
+    record = fake_node.requests[-1]
+    assert record["method"] == "GET"
+    assert record["path"] == "/audio/room-correction/profile"
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_audio_profile_put_forwards_without_node_id_and_preserves_errors(fake_node, tmp_path):
+    expected = {
+        "ok": False,
+        "available": False,
+        "stored": False,
+        "profile": None,
+        "code": "audio.invalid_spec",
+        "error": "Invalid audio routing room profile id: must not be empty.",
+    }
+    fake_node.responder = lambda _method, _record: (400, expected, "application/json")
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+    profile = {"id": "", "name": "broken", "bands": [], "band_count": 0}
+
+    response = _client(app).post(
+        "/api/v1/audio/room-correction/profile",
+        json={"node_id": NODE_ID, "profile": profile},
+    )
+
+    assert response.status_code == 400, response.text
+    assert response.json() == expected
+    assert TOKEN not in response.text
+    record = fake_node.requests[-1]
+    assert record["method"] == "POST"
+    assert record["path"] == "/audio/room-correction/profile"
+    assert record["body"] == {"profile": profile}
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_audio_profile_delete_proxies_delete_and_returns_body(fake_node, tmp_path):
+    expected = {"ok": True, "available": True, "cleared": True, "backend": "pipewire"}
+    fake_node.responder = lambda _method, _record: (200, expected, "application/json")
+    app, _ = _build_app(fake_node.server_address[1], tmp_path, global_token=TOKEN)
+
+    response = _client(app).delete(
+        f"/api/v1/audio/room-correction/profile?node_id={NODE_ID}"
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
+    assert TOKEN not in response.text
+    record = fake_node.requests[-1]
+    assert record["method"] == "DELETE"
+    assert record["path"] == "/audio/room-correction/profile"
+    assert record["headers"]["authorization"] == f"Bearer {TOKEN}"

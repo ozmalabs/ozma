@@ -41,8 +41,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream;
 use ozma_audio::{
-    AudioError, AudioPlaybackSpec, AudioProfile, AudioRouter, AudioSourceProfile, SweepOutcome,
-    SweepRequest,
+    AudioError, AudioPlaybackSpec, AudioProfile, AudioRouter, AudioSourceProfile, RoomProfileStore,
+    SweepOutcome, SweepProfile, SweepRequest,
 };
 use ozma_encode::{
     backend_name, CodecOverrideState, CodecPreference, EncoderOverride, EncoderRegistry,
@@ -1531,6 +1531,9 @@ pub struct AudioControl {
     default_sink: Option<String>,
     backend: String,
     error: Option<String>,
+    /// Opt-in storage for the last measured profile. `None` keeps the profile
+    /// routes typed 501 and writes nothing.
+    profile_store: Option<Arc<RoomProfileStore>>,
     /// Last successfully applied profile, used to preserve the Python
     /// controller's empty-body `/audio/remove` call.
     last_profile: Arc<Mutex<Option<String>>>,
@@ -1548,6 +1551,7 @@ impl AudioControl {
             default_sink: default_sink.filter(|sink| !sink.trim().is_empty()),
             backend: backend.into(),
             error: None,
+            profile_store: None,
             last_profile: Arc::new(Mutex::new(None)),
         }
     }
@@ -1559,8 +1563,21 @@ impl AudioControl {
             default_sink: None,
             backend: "none".to_owned(),
             error: Some(reason.into()),
+            profile_store: None,
             last_profile: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Attach the opt-in room-profile store. Without one, profile routes stay
+    /// typed 501 and no measurement is persisted.
+    pub fn with_profile_store(mut self, store: Option<Arc<RoomProfileStore>>) -> Self {
+        self.profile_store = store;
+        self
+    }
+
+    /// The opt-in profile store, when configured.
+    pub fn profile_store(&self) -> Option<&Arc<RoomProfileStore>> {
+        self.profile_store.as_ref()
     }
 
     /// Stable backend name (`pipewire`, `pulseaudio`, or `none`).
@@ -3605,6 +3622,99 @@ pub const RPA_IMPLEMENTED_SURFACES: &[ControllerSurface] = &[
     },
 ];
 
+/// Bluetooth surfaces served by the opt-in [`crate::bluetooth`] provider.
+///
+/// These are advertised only when the node was started with `--bluetooth`. The
+/// routes are always mounted behind the bearer guard, but without the service
+/// they answer a typed 503 `bluetooth.not-configured` and this list is replaced
+/// by [`BLUETOOTH_UNCONFIGURED_SURFACE`].
+pub const BLUETOOTH_IMPLEMENTED_SURFACES: &[ControllerSurface] = &[
+    ControllerSurface {
+        surface: "/bluetooth/status",
+        capability: "bluetooth.status",
+        supported: true,
+        reason: "Reports bounded BlueZ adapter power/discoverable/discovering flags and scan limits.",
+        python_reference: "controller/bluetooth.py::BluetoothManager.start",
+        path_prefix: "/bluetooth/status",
+        code: "bluetooth.status",
+        remediation: "",
+    },
+    ControllerSurface {
+        surface: "/bluetooth/devices",
+        capability: "bluetooth.devices",
+        supported: true,
+        reason: "Lists bounded known devices with paired/bonded/trusted/connected flags and optional RSSI.",
+        python_reference: "controller/bluetooth.py::BluetoothManager.list_devices",
+        path_prefix: "/bluetooth/devices",
+        code: "bluetooth.devices",
+        remediation: "",
+    },
+    ControllerSurface {
+        surface: "/bluetooth/scan",
+        capability: "bluetooth.scan",
+        supported: true,
+        reason: "Runs a bounded scan (1-15 s) and always attempts scan off; it never pairs or trusts.",
+        python_reference: "controller/bluetooth.py::BluetoothManager.discover",
+        path_prefix: "/bluetooth/scan",
+        code: "bluetooth.scan",
+        remediation: "",
+    },
+    ControllerSurface {
+        surface: "/bluetooth/pair",
+        capability: "bluetooth.pair",
+        supported: true,
+        reason: "Pairs one explicit MAC address with bluetoothctl pair; it never calls trust.",
+        python_reference: "controller/bluetooth.py::BluetoothManager.pair",
+        path_prefix: "/bluetooth/pair",
+        code: "bluetooth.pair",
+        remediation: "",
+    },
+    ControllerSurface {
+        surface: "/bluetooth/connect",
+        capability: "bluetooth.connect",
+        supported: true,
+        reason: "Connects one explicit MAC address with a bounded bluetoothctl connect.",
+        python_reference: "controller/bluetooth.py::BluetoothManager.connect",
+        path_prefix: "/bluetooth/connect",
+        code: "bluetooth.connect",
+        remediation: "",
+    },
+    ControllerSurface {
+        surface: "/bluetooth/disconnect",
+        capability: "bluetooth.disconnect",
+        supported: true,
+        reason: "Disconnects one explicit MAC address with a bounded bluetoothctl disconnect.",
+        python_reference: "controller/bluetooth.py::BluetoothManager.disconnect",
+        path_prefix: "/bluetooth/disconnect",
+        code: "bluetooth.disconnect",
+        remediation: "",
+    },
+    ControllerSurface {
+        surface: "/bluetooth/forget",
+        capability: "bluetooth.forget",
+        supported: true,
+        reason: "Removes (forgets) exactly one explicit MAC address with bluetoothctl remove.",
+        python_reference: "controller/bluetooth.py::BluetoothManager.remove",
+        path_prefix: "/bluetooth/forget",
+        code: "bluetooth.forget",
+        remediation: "",
+    },
+];
+
+/// Advertisement used when `--bluetooth` was not supplied. It is not backed by
+/// a 501 stub: every route is mounted and returns a typed 503
+/// `bluetooth.not-configured`, which is more accurate than "unsupported".
+pub const BLUETOOTH_UNCONFIGURED_SURFACE: ControllerSurface = ControllerSurface {
+    surface: "/bluetooth/*",
+    capability: "bluetooth",
+    supported: false,
+    reason: "Bluetooth is opt-in; start the node with --bluetooth to enable bounded BlueZ status, scan, pair, connect, disconnect, and forget.",
+    python_reference: "controller/bluetooth.py::BluetoothManager",
+    path_prefix: "/bluetooth",
+    code: "bluetooth.not-configured",
+    remediation: "Restart the node with --bluetooth (and optionally --bluetooth-adapter) to enable the guarded routes.",
+};
+
 /// Controller-only surfaces that this node advertises as unsupported.
 ///
 /// Each entry is backed by a typed 501 route: the controller gets a stable
@@ -3768,6 +3878,10 @@ pub struct ConnectionState {
     /// was configured; core `/backup/*` routes then answer a typed 503 and
     /// unsupported sub-surfaces stay typed 501.
     pub backup: Option<crate::backup::BackupService>,
+    /// Opt-in bounded BlueZ/`bluetoothctl` provider. `None` means no
+    /// `--bluetooth` was configured; every `/bluetooth/*` route answers a typed
+    /// 503 `bluetooth.not-configured` rather than a fake device list.
+    pub bluetooth: Option<crate::bluetooth::BluetoothService>,
 }
 
 /// Registration view of the optional internal RFB listener.
@@ -3854,6 +3968,7 @@ impl ConnectionState {
             vnc_registration: None,
             desktop_controls: None,
             backup: None,
+            bluetooth: None,
         }
     }
 
@@ -4069,6 +4184,16 @@ impl ConnectionState {
         self
     }
 
+    /// Attach the opt-in bounded Bluetooth provider.
+    ///
+    /// Without it, `/bluetooth/*` stays mounted behind the bearer guard and
+    /// returns a typed 503 `bluetooth.not-configured`; no device list or adapter
+    /// state is invented.
+    pub fn with_bluetooth(mut self, bluetooth: Option<crate::bluetooth::BluetoothService>) -> Self {
+        self.bluetooth = bluetooth;
+        self
+    }
+
     /// Attach the one-shot display snapshot control.
     ///
     /// `None` keeps `GET /display/snapshot` at a typed 503; attaching an empty
@@ -4191,6 +4316,10 @@ pub struct ConnectionResponse {
     /// other profiles. Availability is a `PATH` lookup, not a probe command.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub desktop_controls: Option<crate::desktop_compat::DesktopControlsStatus>,
+    /// Opt-in Bluetooth provider facts (configured adapter and scan bound).
+    /// Omitted entirely without `--bluetooth`; no adapter is probed here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bluetooth: Option<crate::bluetooth::BluetoothAdvertisement>,
 }
 
 /// Build the control compatibility router. Mount it before the node API auth
@@ -4199,11 +4328,11 @@ pub struct ConnectionResponse {
 /// This router deliberately excludes the controller's read-only probes
 /// (`/display/snapshot`, `/display/info`, `/video`, `/display/mjpeg`,
 /// `/node/status`, `/ui/hints`, `/agent/metrics`, `/audio/nodes`) and the
-/// always-unsupported `POST /audio/sweep` stub. Those live in
-/// [`public_router`] and must be merged **after** the guard layer so the
-/// unmodified controller can poll them without a bearer token. Control
-/// surfaces (`/input/*`, `/power/*`, `/audio/*`, `/codec`, `/webrtc/*`, and the
-/// legacy mutating aliases) stay here and stay guarded.
+/// generated-sweep `POST /audio/sweep`. Those live in [`public_router`] and must
+/// be merged **after** the guard layer so the unmodified controller can poll
+/// them without a bearer token. Control surfaces (`/input/*`, `/power/*`,
+/// `/audio/*`, `/codec`, `/webrtc/*`, and the legacy mutating aliases) stay
+/// here and stay guarded.
 pub fn compat_router(state: ConnectionState) -> Router {
     connection_router(state.clone())
         .merge(power_router(state.clone()))
@@ -4217,6 +4346,7 @@ pub fn compat_router(state: ConnectionState) -> Router {
         .merge(crate::desktop_compat::router(state.clone()))
         .merge(crate::host_surfaces::router(state.host_surfaces.clone()))
         .merge(crate::backup::router(state.backup.clone()))
+        .merge(crate::bluetooth::router(state.bluetooth.clone()))
         .merge(legacy_router(state))
 }
 
@@ -4234,9 +4364,9 @@ pub fn compat_router(state: ConnectionState) -> Router {
 /// * `GET /agent/metrics` (`controller/device_metrics.py`)
 ///
 /// `GET /display/info`, `GET /audio/nodes`, and `POST /audio/sweep` are mounted
-/// here as well: the first is read-only metadata, and the audio routes are
-/// typed 501 stubs that never change state. Merge this router **after** the
-/// bearer layer; see [`crate::api::serve_with_scene_replay_and_sink`].
+/// here as well. All are read-only metadata except the sweep, which plays a
+/// generated signal and captures it; none changes the graph. Merge this router
+/// **after** the bearer layer; see [`crate::api::serve_with_scene_replay_and_sink`].
 pub fn public_router(state: ConnectionState) -> Router {
     Router::new()
         .route("/display/snapshot", get(display_snapshot))
@@ -4314,14 +4444,26 @@ pub fn codec_router(state: ConnectionState) -> Router {
 ///
 /// With `--audio-router pipewire|pulseaudio` these drive a real
 /// [`AudioRouter`] (`pactl` graph control plus `pw-play`/`paplay`) and return
-/// typed 200/400/502/503 results. Without a router every route answers a typed
-/// 501 rather than a success-shaped no-op.
+/// typed 200/400/502/503 results. The profile routes additionally require
+/// `--audio-profile-dir`; without it they are typed 501. Filter-chain
+/// application is always a typed 501. Without a router every route answers a
+/// typed 501 rather than a success-shaped no-op.
 pub fn audio_router(state: ConnectionState) -> Router {
     Router::new()
         .route("/audio/apply", post(audio_apply))
         .route("/audio/remove", post(audio_remove))
         .route("/audio/play", post(audio_play))
         .route("/audio/stop", post(audio_stop))
+        .route(
+            "/audio/room-correction/profile",
+            get(audio_profile_get)
+                .post(audio_profile_put)
+                .delete(audio_profile_delete),
+        )
+        .route(
+            "/audio/room-correction/apply",
+            post(audio_room_correction_apply),
+        )
         .with_state(state)
 }
 
@@ -4521,6 +4663,16 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
     };
     let display = state.display_status();
     let video = VideoStatus::new(state.snapshot.is_some(), &state.video_streams);
+    let mut controller_surfaces: Vec<ControllerSurface> = RPA_IMPLEMENTED_SURFACES
+        .iter()
+        .chain(CONTROLLER_ONLY_SURFACES)
+        .copied()
+        .collect();
+    if state.bluetooth.is_some() {
+        controller_surfaces.extend_from_slice(BLUETOOTH_IMPLEMENTED_SURFACES);
+    } else {
+        controller_surfaces.push(BLUETOOTH_UNCONFIGURED_SURFACE);
+    }
     Json(ConnectionResponse {
         ok: true,
         node_id: info.node_id.clone(),
@@ -4550,16 +4702,16 @@ async fn connection(State(state): State<ConnectionState>) -> Json<ConnectionResp
         multi_console_webrtc,
         capture: state.capture.clone(),
         video,
-        controller_surfaces: RPA_IMPLEMENTED_SURFACES
-            .iter()
-            .chain(CONTROLLER_ONLY_SURFACES)
-            .copied()
-            .collect(),
+        controller_surfaces,
         host_surfaces: state.host_surfaces.advertisement(),
         desktop_controls: state
             .desktop_controls
             .as_ref()
             .map(|controls| controls.status()),
+        bluetooth: state
+            .bluetooth
+            .as_ref()
+            .map(|bluetooth| bluetooth.advertisement()),
     })
 }
 
@@ -7142,6 +7294,165 @@ async fn audio_stop(State(state): State<ConnectionState>) -> Response {
     }
 }
 
+/// `GET /audio/room-correction/profile` — read the stored profile.
+async fn audio_profile_get(State(state): State<ConnectionState>) -> Response {
+    let Some(control) = state.audio.as_ref() else {
+        return audio_profile_store_unsupported();
+    };
+    let Some(store) = control.profile_store() else {
+        return audio_profile_store_unsupported();
+    };
+    match store.load() {
+        Ok(Some(profile)) => Json(serde_json::json!({
+            "ok": true,
+            "available": true,
+            "stored": true,
+            "backend": control.backend(),
+            "profile": profile,
+        }))
+        .into_response(),
+        Ok(None) => Json(serde_json::json!({
+            "ok": true,
+            "available": true,
+            "stored": false,
+            "backend": control.backend(),
+            "profile": Value::Null,
+        }))
+        .into_response(),
+        Err(error) => audio_profile_error_response(error),
+    }
+}
+
+/// `POST /audio/room-correction/profile` — validate and store a profile.
+///
+/// The body may be the profile itself or `{"profile": {...}}`. Only the
+/// measurement fields are stored; no EQ is applied.
+async fn audio_profile_put(
+    State(state): State<ConnectionState>,
+    payload: Result<Json<Value>, JsonRejection>,
+) -> Response {
+    let Some(control) = state.audio.as_ref() else {
+        return audio_profile_store_unsupported();
+    };
+    let Some(store) = control.profile_store() else {
+        return audio_profile_store_unsupported();
+    };
+    let Json(body) = match payload {
+        Ok(payload) => payload,
+        Err(error) => return json_rejection(error),
+    };
+    let value = match body.get("profile") {
+        Some(profile) if !profile.is_null() => profile.clone(),
+        Some(_) => {
+            return audio_profile_error_response(AudioError::InvalidSpec {
+                field: "room profile".to_owned(),
+                reason: "`profile` must be an object, not null".to_owned(),
+            })
+        }
+        None => body,
+    };
+    let profile: SweepProfile = match serde_json::from_value(value) {
+        Ok(profile) => profile,
+        Err(error) => {
+            return audio_profile_error_response(AudioError::InvalidSpec {
+                field: "room profile".to_owned(),
+                reason: format!("invalid profile JSON: {error}"),
+            })
+        }
+    };
+    match store.store(&profile) {
+        Ok(()) => Json(serde_json::json!({
+            "ok": true,
+            "available": true,
+            "stored": true,
+            "backend": control.backend(),
+            "profile": profile,
+        }))
+        .into_response(),
+        Err(error) => audio_profile_error_response(error),
+    }
+}
+
+/// `DELETE /audio/room-correction/profile` — clear the stored profile.
+async fn audio_profile_delete(State(state): State<ConnectionState>) -> Response {
+    let Some(control) = state.audio.as_ref() else {
+        return audio_profile_store_unsupported();
+    };
+    let Some(store) = control.profile_store() else {
+        return audio_profile_store_unsupported();
+    };
+    match store.clear() {
+        Ok(cleared) => Json(serde_json::json!({
+            "ok": true,
+            "available": true,
+            "cleared": cleared,
+            "backend": control.backend(),
+        }))
+        .into_response(),
+        Err(error) => audio_profile_error_response(error),
+    }
+}
+
+/// `POST /audio/room-correction/apply` — explicitly unsupported.
+///
+/// Measurement and persistence are implemented, but inserting a parametric EQ
+/// or PipeWire filter-chain would change the graph. Nothing is applied and the
+/// response is a typed 501.
+async fn audio_room_correction_apply() -> Response {
+    compat_error_with_remediation(
+        StatusCode::NOT_IMPLEMENTED,
+        "audio-eq-application-unsupported",
+        "parametric EQ and filter-chain application are not implemented on this node",
+        Some(
+            "Measure with POST /audio/sweep and persist the measured profile with \
+             /audio/room-correction/profile. No filter node is inserted and no graph \
+             change is made; an unsupported EQ request must not report success.",
+        ),
+    )
+}
+
+fn audio_profile_store_unsupported() -> Response {
+    compat_error_with_remediation(
+        StatusCode::NOT_IMPLEMENTED,
+        "audio-profile-store-unsupported",
+        "room-correction profile storage is not enabled on this node",
+        Some(
+            "Start ozma-node with --audio-router pipewire|pulseaudio and \
+             --audio-profile-dir <path> (or OZMA_AUDIO_PROFILE_DIR) to opt in. \
+             Without a directory nothing is written; no profile is invented.",
+        ),
+    )
+}
+
+fn audio_profile_error_response(error: AudioError) -> Response {
+    let status = match &error {
+        AudioError::InvalidSpec { .. } | AudioError::InvalidTarget(_) => StatusCode::BAD_REQUEST,
+        AudioError::Unsupported { .. } => StatusCode::NOT_IMPLEMENTED,
+        AudioError::OutputParse { .. } => StatusCode::BAD_GATEWAY,
+        AudioError::MissingCommand { .. } | AudioError::Unavailable { .. } => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        AudioError::Process { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    let api = error.to_api_error();
+    let mut body = serde_json::json!({
+        "ok": false,
+        "available": false,
+        "stored": false,
+        "profile": Value::Null,
+        "code": api.code,
+        "error": api.message,
+    });
+    if let Some(remediation) = api.remediation {
+        body["remediation"] = Value::String(remediation);
+    }
+    if !api.details.is_null() {
+        body["details"] = api.details;
+    }
+    (status, Json(body)).into_response()
+}
+
 fn required_profile_id(value: Option<&str>) -> Result<String, Response> {
     value
         .map(str::trim)
@@ -7339,7 +7650,12 @@ async fn audio_sweep(
     }
 
     match router.sweep(request).await {
-        Ok(outcome) => sweep_success_response(control.backend(), outcome),
+        Ok(outcome) => {
+            let storage = control
+                .profile_store()
+                .map(|store| store.store(&outcome.profile));
+            sweep_success_response(control.backend(), outcome, storage)
+        }
         Err(error) => audio_sweep_error_response(error),
     }
 }
@@ -7400,7 +7716,11 @@ impl AudioSweepRequest {
     }
 }
 
-fn sweep_success_response(backend: &str, outcome: SweepOutcome) -> Response {
+fn sweep_success_response(
+    backend: &str,
+    outcome: SweepOutcome,
+    storage: Option<Result<(), AudioError>>,
+) -> Response {
     let mut profile = match serde_json::to_value(&outcome.profile) {
         Ok(profile) => profile,
         Err(error) => {
@@ -7416,12 +7736,27 @@ fn sweep_success_response(backend: &str, outcome: SweepOutcome) -> Response {
         object.insert("available".to_owned(), Value::Bool(true));
         object.insert("backend".to_owned(), Value::String(backend.to_owned()));
     }
+    let (storage_enabled, stored, storage_error) = match storage {
+        None => (false, false, Value::Null),
+        Some(Ok(())) => (true, true, Value::Null),
+        Some(Err(error)) => {
+            let api = error.to_api_error();
+            (
+                true,
+                false,
+                serde_json::json!({"code": api.code, "error": api.message}),
+            )
+        }
+    };
     Json(serde_json::json!({
         "ok": true,
         "available": true,
         "backend": backend,
         "profile": profile,
         "measurement": measurement,
+        "storage_enabled": storage_enabled,
+        "stored": stored,
+        "storage_error": storage_error,
     }))
     .into_response()
 }
@@ -8323,6 +8658,7 @@ mod tests {
                     room_name: request.room_name,
                     node_id: request.node_id,
                     active: false,
+                    analysis: None,
                     measurement: SweepMeasurement {
                         sample_rate: request.sample_rate,
                         channels: request.channels,
@@ -10145,6 +10481,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connection_advertises_configured_bluetooth_without_probing() {
+        let state = ConnectionState::new(
+            ConnectionInfo::new(
+                "node-a._ozma._udp.local.",
+                "hardware",
+                7382,
+                7384,
+                7331,
+                SINK_FAKE_RECORDING,
+            ),
+            CompatStats::default(),
+        )
+        .with_bluetooth(Some(crate::bluetooth::BluetoothService::new(
+            crate::bluetooth::BluetoothConfig {
+                adapter: Some("80:84:89:F6:E2:E8".to_owned()),
+                ..crate::bluetooth::BluetoothConfig::default()
+            },
+        )));
+        let (status, connection) = get_json(&connection_router(state), "/api/v1/connection").await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert_eq!(connection["bluetooth"]["configured"], true);
+        assert_eq!(connection["bluetooth"]["adapter"], "80:84:89:F6:E2:E8");
+        assert_eq!(
+            connection["bluetooth"]["max_scan_seconds"],
+            crate::bluetooth::MAX_SCAN_SECONDS
+        );
+
+        let advertised = connection["controller_surfaces"]
+            .as_array()
+            .expect("controller_surfaces must be an array");
+        for capability in [
+            "bluetooth.status",
+            "bluetooth.devices",
+            "bluetooth.scan",
+            "bluetooth.pair",
+            "bluetooth.connect",
+            "bluetooth.disconnect",
+            "bluetooth.forget",
+        ] {
+            let entry = advertised
+                .iter()
+                .find(|entry| entry["capability"] == capability)
+                .unwrap_or_else(|| panic!("missing advertised capability {capability}"));
+            assert_eq!(entry["supported"], true);
+        }
+        assert!(
+            !advertised
+                .iter()
+                .any(|entry| entry["capability"] == "bluetooth"
+                    && entry["surface"] == "/bluetooth/*"),
+            "configured Bluetooth must not also advertise the unconfigured surface"
+        );
+    }
+
+    #[tokio::test]
     async fn legacy_routes_are_typed_501s_with_remediation() {
         let state = ConnectionState::new(
             ConnectionInfo::new(
@@ -10298,6 +10690,7 @@ mod tests {
             ("/serial/*", "serial"),
             ("/rgb/*", "rgb"),
             ("/current", "current"),
+            ("/bluetooth/*", "bluetooth"),
         ];
         assert_eq!(advertised.len(), implemented.len() + unsupported.len());
         for (surface, capability) in implemented {
@@ -10311,7 +10704,11 @@ mod tests {
             let reference = entry["python_reference"]
                 .as_str()
                 .expect("python_reference is a string");
-            assert!(reference.contains("node/") || reference.contains("agent/"));
+            assert!(
+                reference.contains("node/")
+                    || reference.contains("agent/")
+                    || reference.contains("controller/")
+            );
         }
         for (surface, capability) in unsupported {
             let entry = advertised
@@ -10324,7 +10721,11 @@ mod tests {
             let reference = entry["python_reference"]
                 .as_str()
                 .expect("python_reference is a string");
-            assert!(reference.contains("node/") || reference.contains("agent/"));
+            assert!(
+                reference.contains("node/")
+                    || reference.contains("agent/")
+                    || reference.contains("controller/")
+            );
         }
 
         let app = compat_router(state.clone()).merge(public_router(state));
@@ -11144,6 +11545,23 @@ mod tests {
                     .uri(uri)
                     .header("content-type", "application/json")
                     .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn delete_json(app: &Router, uri: &str) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(uri)
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await
@@ -13967,6 +14385,144 @@ mod tests {
         state.with_audio(audio)
     }
 
+    fn audio_state_with_store(
+        router: Option<Arc<FakeAudioRouter>>,
+        default_sink: Option<&str>,
+        directory: std::path::PathBuf,
+    ) -> ConnectionState {
+        let (state, _) = input_state(SINK_FAKE_RECORDING);
+        let audio = router.map(|router| {
+            AudioControl::configured(router, default_sink.map(str::to_owned), "pipewire")
+                .with_profile_store(Some(Arc::new(RoomProfileStore::new(directory))))
+        });
+        state.with_audio(audio)
+    }
+
+    fn profile_directory(label: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "ozma-audio-profile-{label}-{}-{unique}",
+            std::process::id()
+        ))
+    }
+
+    #[tokio::test]
+    async fn audio_profile_routes_are_typed_501_without_an_opt_in_directory() {
+        let router = Arc::new(FakeAudioRouter::new());
+        let app = audio_router(audio_state(Some(router), Some("ozma-vm1")));
+
+        let (status, body) = get_json(&app, "/audio/room-correction/profile").await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["code"], "audio-profile-store-unsupported");
+        assert_eq!(body["profile"], Value::Null);
+        assert!(body["remediation"].is_string());
+
+        let (status, body) = delete_json(&app, "/audio/room-correction/profile").await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+        assert_eq!(body["code"], "audio-profile-store-unsupported");
+
+        let (status, body) = post_json(
+            &app,
+            "/audio/room-correction/apply",
+            serde_json::json!({"profile_id": "sweep-test"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["code"], "audio-eq-application-unsupported");
+        assert!(body["remediation"].is_string());
+    }
+
+    #[tokio::test]
+    async fn audio_profile_round_trips_through_the_opt_in_store() {
+        let directory = profile_directory("round-trip");
+        let router = Arc::new(FakeAudioRouter::new());
+        let state =
+            audio_state_with_store(Some(router.clone()), Some("ozma-vm1"), directory.clone());
+        let app = public_router(state.clone()).merge(audio_router(state));
+
+        let (status, body) = get_json(&app, "/audio/room-correction/profile").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["stored"], false);
+        assert_eq!(body["profile"], Value::Null);
+
+        let (status, body) = post_json(
+            &app,
+            "/audio/sweep",
+            serde_json::json!({
+                "source": "ozma-vm1.monitor",
+                "sink": "ozma-vm1",
+                "start_hz": 30,
+                "end_hz": 16000,
+                "duration": 3,
+                "room_name": "Office",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["stored"], true);
+        assert_eq!(body["storage_enabled"], true);
+        assert!(body["storage_error"].is_null());
+
+        let (status, body) = get_json(&app, "/audio/room-correction/profile").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["stored"], true);
+        assert_eq!(body["profile"]["id"], "sweep-test");
+        assert_eq!(body["backend"], "pipewire");
+
+        // The POST route accepts either the profile directly or a wrapper.
+        let (status, body) = post_json(
+            &app,
+            "/audio/room-correction/profile",
+            serde_json::json!({"profile": body["profile"].clone()}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["stored"], true);
+        assert_eq!(body["profile"]["room_name"], "Office");
+
+        let (status, body) = delete_json(&app, "/audio/room-correction/profile").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["cleared"], true);
+        let (status, body) = get_json(&app, "/audio/room-correction/profile").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["stored"], false);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn audio_profile_store_rejects_invalid_and_corrupt_profiles() {
+        let directory = profile_directory("invalid");
+        let router = Arc::new(FakeAudioRouter::new());
+        let app = audio_router(audio_state_with_store(
+            Some(router),
+            Some("ozma-vm1"),
+            directory.clone(),
+        ));
+
+        let (status, body) = post_json(
+            &app,
+            "/audio/room-correction/profile",
+            serde_json::json!({"profile": {"id": "broken"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], audio_codes::AUDIO_INVALID_SPEC);
+        assert_eq!(body["profile"], Value::Null);
+
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join(ozma_audio::ROOM_PROFILE_FILE), b"not json").unwrap();
+        let (status, body) = get_json(&app, "/audio/room-correction/profile").await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["code"], audio_codes::AUDIO_OUTPUT_PARSE);
+        assert_eq!(body["profile"], Value::Null);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     #[tokio::test]
     async fn audio_routes_apply_remove_play_and_stop_through_the_router() {
         let router = Arc::new(FakeAudioRouter::new());
@@ -14388,6 +14944,29 @@ mod tests {
             ("GET", "/api/v1/apps", None),
             ("GET", "/self", None),
             ("GET", "/api/v1/self", None),
+            ("GET", "/bluetooth/status", None),
+            ("GET", "/bluetooth/devices", None),
+            ("POST", "/bluetooth/scan", Some(serde_json::json!({}))),
+            (
+                "POST",
+                "/bluetooth/pair",
+                Some(serde_json::json!({"address": "AA:BB:CC:DD:EE:FF"})),
+            ),
+            (
+                "POST",
+                "/bluetooth/connect",
+                Some(serde_json::json!({"address": "AA:BB:CC:DD:EE:FF"})),
+            ),
+            (
+                "POST",
+                "/bluetooth/disconnect",
+                Some(serde_json::json!({"address": "AA:BB:CC:DD:EE:FF"})),
+            ),
+            (
+                "POST",
+                "/bluetooth/forget",
+                Some(serde_json::json!({"address": "AA:BB:CC:DD:EE:FF"})),
+            ),
             ("GET", "/api/v1/rpa/screen", None),
             (
                 "POST",

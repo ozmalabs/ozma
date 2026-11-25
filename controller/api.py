@@ -1649,7 +1649,11 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
     # --- Node power/current/RGB proxy ---
 
     async def _proxy_node_response(
-        node_id: str, path: str, method: str = "GET", body: dict | None = None
+        node_id: str,
+        path: str,
+        method: str = "GET",
+        body: dict | None = None,
+        timeout: float = 5.0,
     ) -> tuple[int, Any]:
         """Proxy a request and return the node's HTTP status plus decoded body.
 
@@ -1678,7 +1682,7 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
                     url, headers=_node_headers(node), method=method
                 )
             try:
-                with urllib.request.urlopen(req, timeout=5) as r:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
                     payload = r.read()
                     try:
                         return r.status, json.loads(payload)
@@ -1787,6 +1791,50 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             raise HTTPException(status_code=502, detail=_node_auth_error(status))
         if status >= 400:
             if _is_typed_unsupported(payload) or _is_typed_backup_error(payload):
+                return JSONResponse(status_code=status, content=payload)
+            detail = payload.get("error") if isinstance(payload, dict) else None
+            raise HTTPException(
+                status_code=502,
+                detail=detail or f"Node returned HTTP {status}",
+            )
+        return payload
+
+    def _is_typed_bluetooth_error(payload: Any) -> bool:
+        """Whether a node body is a typed Bluetooth failure.
+
+        The Rust provider uses stable ``bluetooth.*`` codes for a missing
+        ``bluetoothctl``, no adapter, invalid addresses, scans already running,
+        timeouts, and pair/connect/disconnect/forget failures. Preserve those
+        documents and their status instead of flattening them to a generic 502.
+        """
+        return (
+            isinstance(payload, dict)
+            and isinstance(payload.get("code"), str)
+            and payload["code"].startswith("bluetooth.")
+            and isinstance(payload.get("error"), str)
+        )
+
+    async def _proxy_bluetooth_surface(
+        node_id: str,
+        path: str,
+        method: str = "GET",
+        body: dict | None = None,
+        timeout: float = 20.0,
+    ) -> Any:
+        """Proxy a bounded Bluetooth surface while preserving typed errors.
+
+        Success documents (status/devices/scan/action results) are returned
+        verbatim. A ``bluetooth.*`` error keeps the node's status, code, error,
+        and remediation. The node bearer token is forwarded only in the request
+        header.
+        """
+        status, payload = await _proxy_node_response(
+            node_id, path, method, body, timeout=timeout
+        )
+        if status in (401, 403):
+            raise HTTPException(status_code=502, detail=_node_auth_error(status))
+        if status >= 400:
+            if _is_typed_unsupported(payload) or _is_typed_bluetooth_error(payload):
                 return JSONResponse(status_code=status, content=payload)
             detail = payload.get("error") if isinstance(payload, dict) else None
             raise HTTPException(
@@ -2828,6 +2876,36 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             return {"ok": False, "error": "Sweep failed — check source/sink names and PipeWire state"}
         return {"ok": True, "profile": profile.to_dict()}
 
+    @app.get("/api/v1/audio/room-correction/profile")
+    async def get_room_correction_profile(node_id: str = "") -> Any:
+        """Read the node's stored measured profile through the audio proxy."""
+        node = state.nodes.get(node_id) if node_id else None
+        if not node:
+            raise HTTPException(status_code=404, detail="Node not found")
+        return await _proxy_audio_node("GET", node, "/audio/room-correction/profile")
+
+    @app.post("/api/v1/audio/room-correction/profile")
+    async def put_room_correction_profile(body: dict) -> Any:
+        """Store a measured profile on the node, preserving typed errors."""
+        node_id = body.get("node_id", "")
+        node = state.nodes.get(node_id) if node_id else None
+        if not node:
+            raise HTTPException(status_code=404, detail="Node not found")
+        payload = {key: value for key, value in body.items() if key != "node_id"}
+        return await _proxy_audio_node(
+            "POST", node, "/audio/room-correction/profile", payload
+        )
+
+    @app.delete("/api/v1/audio/room-correction/profile")
+    async def delete_room_correction_profile(node_id: str = "") -> Any:
+        """Clear the node's stored measured profile."""
+        node = state.nodes.get(node_id) if node_id else None
+        if not node:
+            raise HTTPException(status_code=404, detail="Node not found")
+        return await _proxy_audio_node(
+            "DELETE", node, "/audio/room-correction/profile", None
+        )
+
     @app.post("/api/v1/audio/room-correction/measure")
     async def process_room_measurement(body: dict) -> dict[str, Any]:
         """
@@ -3638,6 +3716,86 @@ def build_app(state: AppState, scenarios: ScenarioManager, streams: StreamManage
             return {"ok": True, "address": addr, "node_id": node_id}
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Push to node failed: {e}")
+
+    # --- Node-scoped Bluetooth proxies ---
+    #
+    # The controller-local /api/v1/bluetooth/* routes above still manage the
+    # controller host. These proxy a Rust node's opt-in /bluetooth/* surface and
+    # preserve typed bluez/bluetooth.* failures instead of flattening them.
+
+    @app.get("/api/v1/nodes/{node_id}/bluetooth/status")
+    async def node_bluetooth_status(request: Request, node_id: str) -> Any:
+        """Read a node's bounded BlueZ adapter and scan status."""
+        _require_scope(request, SCOPE_READ)
+        return await _proxy_bluetooth_surface(node_id, "/bluetooth/status")
+
+    @app.get("/api/v1/nodes/{node_id}/bluetooth/devices")
+    async def node_bluetooth_devices(request: Request, node_id: str) -> Any:
+        """Read a node's bounded known-device list."""
+        _require_scope(request, SCOPE_READ)
+        limit = request.query_params.get("limit")
+        path = "/bluetooth/devices"
+        if limit is not None:
+            path = f"{path}?limit={limit}"
+        return await _proxy_bluetooth_surface(node_id, path)
+
+    @app.post("/api/v1/nodes/{node_id}/bluetooth/scan")
+    async def node_bluetooth_scan(request: Request, node_id: str) -> Any:
+        """Run a bounded node scan (max 15 s); never pairs or trusts."""
+        _require_scope(request, SCOPE_WRITE)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            raise HTTPException(400, "Bluetooth scan body must be a JSON object")
+        return await _proxy_bluetooth_surface(
+            node_id, "/bluetooth/scan", method="POST", body=body, timeout=30.0
+        )
+
+    @app.post("/api/v1/nodes/{node_id}/bluetooth/pair")
+    async def node_bluetooth_pair(request: Request, node_id: str) -> Any:
+        """Pair one explicit address on a node; the node never auto-trusts."""
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(400, "Bluetooth pair body must be a JSON object")
+        return await _proxy_bluetooth_surface(
+            node_id, "/bluetooth/pair", method="POST", body=body, timeout=40.0
+        )
+
+    @app.post("/api/v1/nodes/{node_id}/bluetooth/connect")
+    async def node_bluetooth_connect(request: Request, node_id: str) -> Any:
+        """Connect one explicit address on a node."""
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(400, "Bluetooth connect body must be a JSON object")
+        return await _proxy_bluetooth_surface(
+            node_id, "/bluetooth/connect", method="POST", body=body, timeout=30.0
+        )
+
+    @app.post("/api/v1/nodes/{node_id}/bluetooth/disconnect")
+    async def node_bluetooth_disconnect(request: Request, node_id: str) -> Any:
+        """Disconnect one explicit address on a node."""
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(400, "Bluetooth disconnect body must be a JSON object")
+        return await _proxy_bluetooth_surface(
+            node_id, "/bluetooth/disconnect", method="POST", body=body, timeout=25.0
+        )
+
+    @app.post("/api/v1/nodes/{node_id}/bluetooth/forget")
+    async def node_bluetooth_forget(request: Request, node_id: str) -> Any:
+        """Forget exactly one explicit address on a node."""
+        _require_scope(request, SCOPE_WRITE)
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(400, "Bluetooth forget body must be a JSON object")
+        return await _proxy_bluetooth_surface(
+            node_id, "/bluetooth/forget", method="POST", body=body, timeout=25.0
+        )
 
     # --- Paste typing endpoints ---
 

@@ -12,6 +12,7 @@ pub mod api;
 pub mod audio_runtime;
 pub mod backend;
 pub mod backup;
+pub mod bluetooth;
 pub mod browser_scene;
 pub mod client_capture;
 pub mod config;

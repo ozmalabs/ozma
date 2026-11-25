@@ -1203,6 +1203,8 @@ pub struct NodeConfig {
     pub audio_router: AudioRouterKind,
     /// Directory containing reference tracks for `POST /audio/play`.
     pub audio_track_root: Option<PathBuf>,
+    /// Opt-in directory for the last measured room-correction profile.
+    pub audio_profile_dir: Option<PathBuf>,
     /// ffmpeg executable used by VNC capture and HLS.
     pub ffmpeg_bin: PathBuf,
     /// VAAPI render node used by encoder detection and the HLS VAAPI argv.
@@ -1705,6 +1707,7 @@ impl NodeConfig {
             .validate()
             .map_err(|error| format!("--audio-capture-target: {error}"))?;
         validate_path("--audio-track-root", self.audio_track_root.as_deref())?;
+        validate_path("--audio-profile-dir", self.audio_profile_dir.as_deref())?;
         if self
             .webrtc_audio_source
             .as_deref()
@@ -2206,6 +2209,7 @@ mod tests {
             audio_capture_target: ozma_audio::AudioTarget::Default,
             audio_router: AudioRouterKind::None,
             audio_track_root: None,
+            audio_profile_dir: None,
             ffmpeg_bin: PathBuf::from("ffmpeg"),
             vaapi_device: PathBuf::from("/dev/dri/renderD128"),
             nvenc_gpu: None,

@@ -7,19 +7,24 @@
 //! 1. acquire a lease for one connector, one CRTC, and optionally one validated
 //!    plane;
 //! 2. choose one of the connector's advertised modes;
-//! 3. allocate a dumb buffer, fill a known pattern, and add a framebuffer;
+//! 3. allocate one dumb buffer (or two/three rotating buffers for a frame
+//!    loop), fill a known pattern, and add a framebuffer for each;
 //! 4. program the connector/CRTC/plane with an atomic property commit
 //!    (`set_plane` + `set_crtc` state) and a page-flip event, falling back to
 //!    legacy `set_crtc`/`page_flip` only when atomic KMS is unsupported;
-//! 5. re-read CRTC/plane/connector/framebuffer state and compare it with what
+//! 5. optionally run a bounded frame loop (`2..=300` frames) that draws a
+//!    deterministic moving damage rectangle into the next rotating buffer,
+//!    commits it, and waits for its page-flip completion event with a bounded
+//!    timeout;
+//! 6. re-read CRTC/plane/connector/framebuffer state and compare it with what
 //!    was requested;
-//! 6. clear the plane/CRTC, destroy the framebuffer and dumb buffer, and revoke
-//!    the lease.
+//! 7. clear the plane/CRTC, destroy every framebuffer and dumb buffer, and
+//!    revoke the lease.
 //!
-//! This is a **scanout proof**, not a compositor. It renders one static,
-//! generated pattern directly to one leased output. It does not accept client
-//! surfaces, composite windows, perform damage tracking, provide a Wayland/X
-//! server, or isolate the host desktop. Status always carries a
+//! This is a **scanout proof**, not a compositor. It renders generated pixels
+//! directly to one leased output. Even with a frame loop it does not accept
+//! client surfaces, composite windows, perform real damage tracking, provide a
+//! Wayland/X server, or isolate the host desktop. Status always carries a
 //! [`DrmScanoutNoteKind::ScanoutProofOnly`] note saying exactly that.
 //!
 //! Card selection is conservative: `auto`/`vkms` only picks a sysfs `vkms`
@@ -29,6 +34,7 @@
 
 use std::io;
 use std::str::FromStr;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +42,16 @@ use crate::drm_lease::{DrmCard, DrmCardSelector, DrmLeaseError, DrmLeaseRequest}
 
 /// Stable name of the generated scanout pattern.
 pub const SCANOUT_PATTERN: &str = "quadrants-border-diagonal-xrgb8888";
+/// Stable name of the deterministic moving damage rectangle used by the frame
+/// loop over the base pattern.
+pub const SCANOUT_DAMAGE_PATTERN: &str = "moving-damage-rect-xrgb8888";
+/// Default number of frames: the original single static proof frame.
+pub const SCANOUT_DEFAULT_FRAMES: u32 = 1;
+/// Upper bound on the opt-in frame loop. A larger request is a typed failure,
+/// never an unbounded loop.
+pub const SCANOUT_MAX_FRAMES: u32 = 300;
+/// Default bounded wait for one page-flip completion event.
+pub const SCANOUT_FLIP_TIMEOUT_MS: u64 = 1000;
 /// Pixel format used by the proof.
 pub const SCANOUT_FOURCC: &str = "XR24";
 /// Dumb-buffer bits per pixel.
@@ -88,15 +104,31 @@ pub struct DrmScanoutRequest {
     /// no leaseable plane.
     #[serde(default, skip_serializing_if = "is_false")]
     pub force_legacy: bool,
+    /// Total frames to present. `1` keeps the original single static proof;
+    /// `2..=300` runs a bounded page-flip loop over rotating dumb buffers.
+    #[serde(default = "default_frames", skip_serializing_if = "is_single_frame")]
+    pub frames: u32,
+    /// Optional pacing interval between completed frames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_ms: Option<u64>,
+    /// Bounded wait for one page-flip completion event.
+    #[serde(
+        default = "default_flip_timeout_ms",
+        skip_serializing_if = "is_default_flip_timeout"
+    )]
+    pub flip_timeout_ms: u64,
 }
 
 impl DrmScanoutRequest {
-    /// Build a request with automatic mode selection.
+    /// Build a request with automatic mode selection and one frame.
     pub fn new(lease: DrmLeaseRequest) -> Self {
         Self {
             lease,
             mode: None,
             force_legacy: false,
+            frames: SCANOUT_DEFAULT_FRAMES,
+            interval_ms: None,
+            flip_timeout_ms: SCANOUT_FLIP_TIMEOUT_MS,
         }
     }
 
@@ -117,6 +149,51 @@ impl DrmScanoutRequest {
         self.force_legacy = true;
         self
     }
+
+    /// Set the total number of frames (validated by [`Self::validate`]).
+    pub fn with_frames(mut self, frames: u32) -> Self {
+        self.frames = frames;
+        self
+    }
+
+    /// Pace completed frames at approximately `interval_ms` milliseconds.
+    pub fn with_interval_ms(mut self, interval_ms: u64) -> Self {
+        self.interval_ms = Some(interval_ms);
+        self
+    }
+
+    /// Bounded per-flip event wait.
+    pub fn with_flip_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.flip_timeout_ms = timeout_ms;
+        self
+    }
+
+    /// Validate frame count and timeout bounds before touching a device.
+    pub fn validate(&self) -> Result<(), DrmScanoutError> {
+        if self.frames == 0 || self.frames > SCANOUT_MAX_FRAMES {
+            return Err(DrmScanoutError::InvalidFrameCount {
+                frames: self.frames,
+                min: 1,
+                max: SCANOUT_MAX_FRAMES,
+            });
+        }
+        if self.flip_timeout_ms == 0 {
+            return Err(DrmScanoutError::InvalidRequest(
+                self.lease.connector.clone(),
+                "flip timeout must be greater than zero".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Frame-loop plan implied by this request.
+    pub fn frame_plan(&self) -> DrmScanoutFramePlan {
+        DrmScanoutFramePlan {
+            frames: self.frames,
+            interval: self.interval_ms.map(Duration::from_millis),
+            flip_timeout: Duration::from_millis(self.flip_timeout_ms),
+        }
+    }
 }
 
 impl FromStr for DrmScanoutRequest {
@@ -124,6 +201,93 @@ impl FromStr for DrmScanoutRequest {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         Ok(Self::new(value.parse::<DrmLeaseRequest>()?))
+    }
+}
+
+/// Bounded frame-loop parameters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DrmScanoutFramePlan {
+    /// Total frames including the initial modeset frame.
+    pub frames: u32,
+    /// Optional pacing interval between completed frames.
+    pub interval: Option<Duration>,
+    /// Bounded wait for one page-flip completion event.
+    pub flip_timeout: Duration,
+}
+
+/// Frame-loop accounting.
+///
+/// `submitted` counts commits sent to KMS; `completed` counts flip events that
+/// actually arrived. A frame is never counted as completed just because its
+/// commit ioctl returned. `dropped` is submitted minus completed for the frames
+/// attempted so far; `missed` is the subset that timed out waiting for an
+/// event.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrmScanoutFrameStats {
+    /// Total frames requested (including the initial modeset frame).
+    #[serde(default)]
+    pub requested: u32,
+    /// Commits issued to KMS.
+    #[serde(default)]
+    pub submitted: u32,
+    /// Page-flip completions observed.
+    #[serde(default)]
+    pub completed: u32,
+    /// Submitted frames that did not complete.
+    #[serde(default)]
+    pub dropped: u32,
+    /// Dropped frames whose flip event timed out.
+    #[serde(default)]
+    pub missed: u32,
+    /// Number of rotating dumb buffers/framebuffers.
+    #[serde(default)]
+    pub buffer_count: u32,
+    /// Page-flip events consumed from the lessee fd.
+    #[serde(default)]
+    pub page_flip_events: u32,
+    /// Moving damage rectangles drawn after the initial frame.
+    #[serde(default)]
+    pub damage_updates: u32,
+    /// Average interval between observed flip completions, in microseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub average_interval_us: Option<u64>,
+    /// Last observed vblank/flip sequence, when the driver reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sequence: Option<u32>,
+    /// FNV-1a checksum of the buffer backing the last completed frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_checksum: Option<u32>,
+}
+
+impl DrmScanoutFrameStats {
+    /// Initial single-frame stats for a request that has committed one frame.
+    pub fn initial(frames: u32, buffer_count: usize, checksum: u32) -> Self {
+        Self {
+            requested: frames,
+            submitted: 1,
+            completed: 1,
+            dropped: 0,
+            missed: 0,
+            buffer_count: buffer_count as u32,
+            page_flip_events: 0,
+            damage_updates: 0,
+            average_interval_us: None,
+            last_sequence: None,
+            final_checksum: Some(checksum),
+        }
+    }
+}
+
+/// Number of rotating dumb buffers for a frame count.
+///
+/// The original single-frame proof keeps one buffer. A real flip loop uses
+/// double buffering for two frames and triple buffering for three or more, so
+/// the previous frame can still be scanned out while the next is prepared.
+pub fn frame_buffer_count(frames: u32) -> usize {
+    match frames {
+        0 | 1 => 1,
+        2 => 2,
+        _ => 3,
     }
 }
 
@@ -145,6 +309,8 @@ pub enum DrmScanoutNoteKind {
     LegacyCommitForced,
     /// The lease includes an explicitly validated plane.
     PlaneLeased,
+    /// A bounded page-flip loop presented more than the static proof frame.
+    FrameLoop,
 }
 
 impl DrmScanoutNoteKind {
@@ -158,6 +324,7 @@ impl DrmScanoutNoteKind {
             Self::LegacyCommitFallback => "legacy_commit_fallback",
             Self::LegacyCommitForced => "legacy_commit_forced",
             Self::PlaneLeased => "plane_leased",
+            Self::FrameLoop => "frame_loop",
         }
     }
 }
@@ -306,6 +473,9 @@ pub struct DrmScanoutStatus {
     /// Pattern checksum.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pattern_checksum: Option<u32>,
+    /// Frame-loop accounting, when `frames > 1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames: Option<DrmScanoutFrameStats>,
     /// Whether a page flip was accepted after the modeset.
     #[serde(default)]
     pub page_flipped: bool,
@@ -344,6 +514,7 @@ impl DrmScanoutStatus {
             && self.buffer_handle.is_none()
             && self.pattern.is_empty()
             && self.pattern_checksum.is_none()
+            && self.frames.is_none()
             && !self.page_flipped
             && self.verification.is_none()
             && !self.applied
@@ -409,6 +580,24 @@ pub trait DrmScanoutHandle: Send {
     fn status(&self) -> &DrmScanoutStatus;
     /// Re-read KMS state and compare it with the requested mode/framebuffer.
     fn verify(&mut self) -> Result<DrmScanoutVerification, DrmScanoutError>;
+    /// Present the bounded frame loop described by `plan`, waiting for each
+    /// page-flip completion event with a bounded timeout. The initial modeset
+    /// frame already committed by [`DrmScanoutBackend::start`] counts as frame
+    /// one; `plan.frames == 1` is a no-op that returns the initial stats.
+    ///
+    /// Frame stats are recorded in [`DrmScanoutStatus::frames`] even when this
+    /// returns a typed error, so partial accounting is never lost. A frame is
+    /// only counted as completed after its flip event arrives.
+    fn run_frames(
+        &mut self,
+        plan: DrmScanoutFramePlan,
+    ) -> Result<DrmScanoutFrameStats, DrmScanoutError> {
+        let _ = plan;
+        Err(DrmScanoutError::FlipUnsupported {
+            card: self.status().card.clone(),
+            reason: "this scanout backend does not implement the frame loop".to_owned(),
+        })
+    }
     /// Clear scanout, destroy the framebuffer and dumb buffer, and revoke the
     /// lease. Idempotent.
     fn teardown(&mut self) -> Result<(), DrmScanoutError>;
@@ -576,6 +765,48 @@ pub enum DrmScanoutError {
         reason: String,
     },
 
+    /// The requested frame count is outside the bounded proof range.
+    #[error("invalid scanout frame count {frames}; expected {min}..={max}")]
+    InvalidFrameCount {
+        /// Requested frame count.
+        frames: u32,
+        /// Inclusive lower bound.
+        min: u32,
+        /// Inclusive upper bound.
+        max: u32,
+    },
+
+    /// A page-flip completion event did not arrive inside the bounded wait.
+    #[error("timed out waiting for frame {frame} flip completion on {card} after {timeout_ms}ms")]
+    FlipTimeout {
+        /// Card path or name.
+        card: String,
+        /// Zero-based frame index that timed out.
+        frame: u32,
+        /// Bounded wait.
+        timeout_ms: u64,
+    },
+
+    /// The driver or commit path cannot deliver page-flip events.
+    #[error("page flips are not supported on {card}: {reason}")]
+    FlipUnsupported {
+        /// Card path or name.
+        card: String,
+        /// Kernel detail.
+        reason: String,
+    },
+
+    /// A page-flip commit failed.
+    #[error("page flip for frame {frame} failed on {card}: {reason}")]
+    FlipFailed {
+        /// Card path or name.
+        card: String,
+        /// Zero-based frame index that failed.
+        frame: u32,
+        /// Kernel detail.
+        reason: String,
+    },
+
     /// Post-modeset verification did not match the request.
     #[error("scanout verification failed on {card}:{connector}: {message}")]
     VerificationFailed {
@@ -628,6 +859,10 @@ impl DrmScanoutError {
             Self::ModeFailed { .. } => "mode_failed",
             Self::BufferFailed { .. } => "buffer_failed",
             Self::FramebufferFailed { .. } => "framebuffer_failed",
+            Self::InvalidFrameCount { .. } => "invalid_frame_count",
+            Self::FlipTimeout { .. } => "flip_timeout",
+            Self::FlipUnsupported { .. } => "flip_unsupported",
+            Self::FlipFailed { .. } => "flip_failed",
             Self::VerificationFailed { .. } => "verification_failed",
             Self::Released(_) => "released",
             Self::InvalidRequest(_, _) => "invalid_request",
@@ -679,20 +914,25 @@ mod real {
     use std::num::NonZeroU32;
     use std::os::fd::{AsFd, BorrowedFd};
     use std::path::Path;
+    use std::time::{Duration, Instant};
 
     use drm::buffer::{Buffer, DrmFourcc};
     use drm::control::{
         atomic::AtomicModeReq, connector, crtc, framebuffer, plane, property, AtomicCommitFlags,
-        Device as ControlDevice, Mode, PageFlipFlags, RawResourceHandle, ResourceHandle,
+        Device as ControlDevice, Event, Mode, PageFlipFlags, RawResourceHandle, ResourceHandle,
     };
     use drm::ClientCapability;
     use drm::Device;
+    use nix::errno::Errno;
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 
     use super::{
-        drm_status_name, ensure_scanout_card, fill_pattern, pattern_checksum, DrmScanoutBackend,
-        DrmScanoutCommit, DrmScanoutError, DrmScanoutHandle, DrmScanoutNote, DrmScanoutNoteKind,
-        DrmScanoutRequest, DrmScanoutStatus, DrmScanoutVerification, BORDER_PX, DIAGONAL_PX,
-        MAX_ATOMIC_PROPERTIES, SCANOUT_BPP, SCANOUT_DEPTH, SCANOUT_FOURCC, SCANOUT_PATTERN,
+        apply_frame_damage, drm_status_name, ensure_scanout_card, fill_pattern, frame_buffer_count,
+        pattern_checksum, DrmScanoutBackend, DrmScanoutCommit, DrmScanoutError,
+        DrmScanoutFramePlan, DrmScanoutFrameStats, DrmScanoutHandle, DrmScanoutNote,
+        DrmScanoutNoteKind, DrmScanoutRequest, DrmScanoutStatus, DrmScanoutVerification, BORDER_PX,
+        DIAGONAL_PX, MAX_ATOMIC_PROPERTIES, SCANOUT_BPP, SCANOUT_DAMAGE_PATTERN, SCANOUT_DEPTH,
+        SCANOUT_FOURCC, SCANOUT_MAX_FRAMES, SCANOUT_PATTERN,
     };
     use crate::drm_lease::{
         DrmCard, DrmCardSelector, DrmLeaseBackend, DrmLeaseHandle, RealDrmLeaseBackend,
@@ -753,6 +993,7 @@ mod real {
             &self,
             request: &DrmScanoutRequest,
         ) -> Result<Box<dyn DrmScanoutHandle>, DrmScanoutError> {
+            request.validate()?;
             let card = self.resolve_card(&request.lease.card)?;
             ensure_scanout_card(&card, &request.lease.card)?;
 
@@ -798,35 +1039,49 @@ mod real {
             let (width, height) = mode.size();
             let (width, height) = (u32::from(width), u32::from(height));
 
-            let mut buffer = device
-                .create_dumb_buffer((width, height), DrmFourcc::Xrgb8888, SCANOUT_BPP)
-                .map_err(|error| DrmScanoutError::BufferFailed {
-                    card: card.path.display().to_string(),
-                    reason: error.to_string(),
-                })?;
-            let pitch = buffer.pitch();
-            let buffer_handle = u32::from(buffer.handle());
-            let checksum = {
-                let mut mapping = device.map_dumb_buffer(&mut buffer).map_err(|error| {
-                    DrmScanoutError::BufferFailed {
+            // The original proof keeps one buffer. A real loop uses two or
+            // three so the previous frame stays scannable while the next one is
+            // prepared and committed.
+            let buffer_count = frame_buffer_count(request.frames);
+            let mut slots: Vec<ScanoutSlot> = Vec::with_capacity(buffer_count);
+            for _ in 0..buffer_count {
+                let mut buffer = device
+                    .create_dumb_buffer((width, height), DrmFourcc::Xrgb8888, SCANOUT_BPP)
+                    .map_err(|error| DrmScanoutError::BufferFailed {
                         card: card.path.display().to_string(),
                         reason: error.to_string(),
-                    }
-                })?;
-                fill_pattern(&mut mapping, width, height, pitch)
-            };
-
-            let framebuffer = device
-                .add_framebuffer(&buffer, SCANOUT_DEPTH, SCANOUT_BPP)
-                .map_err(|error| DrmScanoutError::FramebufferFailed {
-                    card: card.path.display().to_string(),
-                    reason: error.to_string(),
-                })?;
+                    })?;
+                let pitch = buffer.pitch();
+                let checksum = {
+                    let mut mapping = device.map_dumb_buffer(&mut buffer).map_err(|error| {
+                        DrmScanoutError::BufferFailed {
+                            card: card.path.display().to_string(),
+                            reason: error.to_string(),
+                        }
+                    })?;
+                    fill_pattern(&mut mapping, width, height, pitch)
+                };
+                let framebuffer = device
+                    .add_framebuffer(&buffer, SCANOUT_DEPTH, SCANOUT_BPP)
+                    .map_err(|error| DrmScanoutError::FramebufferFailed {
+                        card: card.path.display().to_string(),
+                        reason: error.to_string(),
+                    })?;
+                slots.push(ScanoutSlot {
+                    buffer,
+                    framebuffer,
+                    checksum,
+                });
+            }
+            let pitch = slots[0].buffer.pitch();
+            let initial_checksum = slots[0].checksum;
 
             let plane_ids = lease.plane_ids().to_vec();
             let requested_plane = request.lease.plane_id();
+            let request_flip_event = request.frames > 1;
             let mut fallback_reason = None;
             let mut forced_legacy = false;
+            let initial_framebuffer = slots[0].framebuffer;
             let (commit, plane_id, page_flipped) = if request.force_legacy {
                 forced_legacy = true;
                 match legacy_commit(
@@ -835,14 +1090,25 @@ mod real {
                     &request.lease.connector,
                     crtc_handle,
                     connector_handle,
-                    framebuffer,
+                    initial_framebuffer,
                     mode,
                     &mode_name,
+                    request_flip_event,
                 ) {
-                    Ok(page_flipped) => (DrmScanoutCommit::Legacy, requested_plane, page_flipped),
+                    Ok(page_flipped) => {
+                        if request_flip_event && !page_flipped {
+                            let _ = destroy_slots(&device, &card.path, &mut slots);
+                            return Err(DrmScanoutError::FlipUnsupported {
+                                card: card.path.display().to_string(),
+                                reason: "legacy page flip was rejected; the frame loop needs \
+                                         completion events"
+                                    .to_owned(),
+                            });
+                        }
+                        (DrmScanoutCommit::Legacy, requested_plane, page_flipped)
+                    }
                     Err(error) => {
-                        let _ = device.destroy_framebuffer(framebuffer);
-                        let _ = device.destroy_dumb_buffer(buffer);
+                        let _ = destroy_slots(&device, &card.path, &mut slots);
                         return Err(error);
                     }
                 }
@@ -855,7 +1121,7 @@ mod real {
                     connector_id,
                     crtc_handle,
                     crtc_id,
-                    framebuffer,
+                    initial_framebuffer,
                     mode,
                     &mode_name,
                     width,
@@ -876,28 +1142,38 @@ mod real {
                             &request.lease.connector,
                             crtc_handle,
                             connector_handle,
-                            framebuffer,
+                            initial_framebuffer,
                             mode,
                             &mode_name,
+                            request_flip_event,
                         ) {
                             Ok(page_flipped) => {
+                                if request_flip_event && !page_flipped {
+                                    let _ = destroy_slots(&device, &card.path, &mut slots);
+                                    return Err(DrmScanoutError::FlipUnsupported {
+                                        card: card.path.display().to_string(),
+                                        reason: "legacy page flip was rejected; the frame loop \
+                                                 needs completion events"
+                                            .to_owned(),
+                                    });
+                                }
                                 (DrmScanoutCommit::Legacy, requested_plane, page_flipped)
                             }
                             Err(error) => {
-                                let _ = device.destroy_framebuffer(framebuffer);
-                                let _ = device.destroy_dumb_buffer(buffer);
+                                let _ = destroy_slots(&device, &card.path, &mut slots);
                                 return Err(error);
                             }
                         }
                     }
                     Err(AtomicAttempt::Failed(error)) => {
-                        let _ = device.destroy_framebuffer(framebuffer);
-                        let _ = device.destroy_dumb_buffer(buffer);
+                        let _ = destroy_slots(&device, &card.path, &mut slots);
                         return Err(error);
                     }
                 }
             };
 
+            let stats =
+                DrmScanoutFrameStats::initial(request.frames, buffer_count, initial_checksum);
             let mut status = DrmScanoutStatus {
                 card: card.path.display().to_string(),
                 connector: request.lease.connector.clone(),
@@ -911,10 +1187,11 @@ mod real {
                 width,
                 height,
                 pitch,
-                framebuffer_id: Some(u32::from(framebuffer)),
-                buffer_handle: Some(buffer_handle),
+                framebuffer_id: Some(slots[0].framebuffer_id()),
+                buffer_handle: Some(slots[0].buffer_handle()),
                 pattern: SCANOUT_PATTERN.to_owned(),
-                pattern_checksum: Some(checksum),
+                pattern_checksum: Some(initial_checksum),
+                frames: Some(stats),
                 page_flipped,
                 verification: None,
                 applied: true,
@@ -939,6 +1216,16 @@ mod real {
                         "plane {plane_id} was validated against CRTC {crtc_id} and committed \
                          through {} KMS",
                         commit.as_str()
+                    ),
+                ));
+            }
+            if request.frames > 1 {
+                status.push_note(DrmScanoutNote::new(
+                    DrmScanoutNoteKind::FrameLoop,
+                    format!(
+                        "bounded frame loop: {} frames across {} rotating dumb buffers, \
+                         damage pattern {SCANOUT_DAMAGE_PATTERN}, flip timeout {}ms",
+                        request.frames, buffer_count, request.flip_timeout_ms
                     ),
                 ));
             }
@@ -986,11 +1273,50 @@ mod real {
                 crtc_id,
                 plane_id,
                 status,
-                framebuffer: Some(framebuffer),
-                buffer: Some(buffer),
+                buffers: slots,
+                current: 0,
                 active: true,
             }))
         }
+    }
+
+    struct ScanoutSlot {
+        buffer: drm::control::dumbbuffer::DumbBuffer,
+        framebuffer: framebuffer::Handle,
+        checksum: u32,
+    }
+
+    impl ScanoutSlot {
+        fn buffer_handle(&self) -> u32 {
+            u32::from(self.buffer.handle())
+        }
+
+        fn framebuffer_id(&self) -> u32 {
+            u32::from(self.framebuffer)
+        }
+    }
+
+    fn destroy_slots(
+        device: &LeaseDevice<'_>,
+        card: &Path,
+        slots: &mut Vec<ScanoutSlot>,
+    ) -> Option<DrmScanoutError> {
+        let mut first_error = None;
+        while let Some(slot) = slots.pop() {
+            if let Err(error) = device.destroy_framebuffer(slot.framebuffer) {
+                first_error.get_or_insert(DrmScanoutError::FramebufferFailed {
+                    card: card.display().to_string(),
+                    reason: format!("destroying framebuffer {:?}: {error}", slot.framebuffer),
+                });
+            }
+            if let Err(error) = device.destroy_dumb_buffer(slot.buffer) {
+                first_error.get_or_insert(DrmScanoutError::BufferFailed {
+                    card: card.display().to_string(),
+                    reason: format!("destroying dumb buffer: {error}"),
+                });
+            }
+        }
+        first_error
     }
 
     struct RealDrmScanout {
@@ -1001,8 +1327,8 @@ mod real {
         crtc_id: u32,
         plane_id: Option<u32>,
         status: DrmScanoutStatus,
-        framebuffer: Option<framebuffer::Handle>,
-        buffer: Option<drm::control::dumbbuffer::DumbBuffer>,
+        buffers: Vec<ScanoutSlot>,
+        current: usize,
         active: bool,
     }
 
@@ -1017,6 +1343,178 @@ mod real {
             &self.status
         }
 
+        fn run_frames(
+            &mut self,
+            plan: DrmScanoutFramePlan,
+        ) -> Result<DrmScanoutFrameStats, DrmScanoutError> {
+            if !self.active {
+                return Err(DrmScanoutError::Released(self.card.display().to_string()));
+            }
+            if plan.frames == 0 || plan.frames > SCANOUT_MAX_FRAMES {
+                return Err(DrmScanoutError::InvalidFrameCount {
+                    frames: plan.frames,
+                    min: 1,
+                    max: SCANOUT_MAX_FRAMES,
+                });
+            }
+            let Some(lease) = self.lease.as_ref() else {
+                return Err(DrmScanoutError::Released(self.card.display().to_string()));
+            };
+            let Some(fd) = lease.as_fd() else {
+                return Err(DrmScanoutError::Released(self.card.display().to_string()));
+            };
+            let device = LeaseDevice { fd };
+            let card = self.card.clone();
+            let crtc = crtc_handle(self.crtc_id, &card)?;
+            let commit = self.status.commit;
+            let plane_id = self.plane_id;
+            let width = self.status.width;
+            let height = self.status.height;
+            let pitch = self.status.pitch;
+            let buffer_count = self.buffers.len().max(1);
+            let mut stats = self.status.frames.clone().unwrap_or_else(|| {
+                DrmScanoutFrameStats::initial(
+                    plan.frames,
+                    buffer_count,
+                    self.status.pattern_checksum.unwrap_or(0),
+                )
+            });
+            stats.requested = plan.frames;
+            stats.buffer_count = buffer_count as u32;
+            stats.damage_updates = 0;
+            stats.page_flip_events = 0;
+            stats.average_interval_us = None;
+            stats.last_sequence = None;
+
+            // A one-frame plan is the original static proof: the initial
+            // modeset commit already counts as the completed frame.
+            if plan.frames <= 1 {
+                stats.submitted = 1;
+                stats.completed = 1;
+                stats.dropped = 0;
+                stats.missed = 0;
+                stats.final_checksum = Some(self.status.pattern_checksum.unwrap_or(0));
+                self.status.frames = Some(stats.clone());
+                return Ok(stats);
+            }
+
+            let mut completions: Vec<Instant> = Vec::new();
+            // Frame zero (the modeset) requested a completion event in
+            // `start`; it is only counted as completed once that event lands.
+            match wait_for_flip(&device, crtc, &card, 0, plan.flip_timeout) {
+                Ok(sequence) => {
+                    stats.page_flip_events += 1;
+                    stats.last_sequence = Some(sequence);
+                    completions.push(Instant::now());
+                }
+                Err(error) => {
+                    stats.completed = 0;
+                    stats.dropped = 1;
+                    if matches!(error, DrmScanoutError::FlipTimeout { .. }) {
+                        stats.missed = 1;
+                    }
+                    self.status.frames = Some(stats.clone());
+                    self.status.mark_error(&error);
+                    return Err(error);
+                }
+            }
+
+            for index in 1..plan.frames {
+                if let (Some(interval), Some(last)) = (plan.interval, completions.last().copied()) {
+                    let target = last + interval;
+                    let now = Instant::now();
+                    if target > now {
+                        std::thread::sleep(target - now);
+                    }
+                }
+
+                let slot_index = index as usize % buffer_count;
+                let checksum = {
+                    let slot = &mut self.buffers[slot_index];
+                    let handle = slot.buffer_handle();
+                    let mut mapping =
+                        device.map_dumb_buffer(&mut slot.buffer).map_err(|error| {
+                            DrmScanoutError::BufferFailed {
+                                card: card.display().to_string(),
+                                reason: format!(
+                                    "mapping dumb buffer {handle} for frame {index}: {error}"
+                                ),
+                            }
+                        })?;
+                    apply_frame_damage(&mut mapping, width, height, pitch, index)
+                };
+                self.buffers[slot_index].checksum = checksum;
+                stats.damage_updates += 1;
+                let framebuffer = self.buffers[slot_index].framebuffer;
+
+                stats.submitted += 1;
+                let flip = match commit {
+                    DrmScanoutCommit::Atomic => match plane_id {
+                        Some(plane_id) => {
+                            atomic_page_flip(&device, &card, plane_id, framebuffer, index)
+                        }
+                        None => Err(DrmScanoutError::UnsupportedPlane {
+                            card: card.display().to_string(),
+                            crtc: self.crtc_id,
+                            reason: "the atomic frame loop needs a leased plane".to_owned(),
+                        }),
+                    },
+                    DrmScanoutCommit::Legacy => {
+                        legacy_page_flip(&device, &card, crtc, framebuffer, index)
+                    }
+                };
+                if let Err(error) = flip {
+                    stats.dropped += 1;
+                    self.status.frames = Some(stats.clone());
+                    self.status.mark_error(&error);
+                    return Err(error);
+                }
+
+                match wait_for_flip(&device, crtc, &card, index, plan.flip_timeout) {
+                    Ok(sequence) => {
+                        stats.completed += 1;
+                        stats.page_flip_events += 1;
+                        stats.last_sequence = Some(sequence);
+                        completions.push(Instant::now());
+                        self.current = slot_index;
+                        self.status.framebuffer_id =
+                            Some(self.buffers[slot_index].framebuffer_id());
+                        self.status.buffer_handle = Some(self.buffers[slot_index].buffer_handle());
+                        self.status.pattern_checksum = Some(checksum);
+                    }
+                    Err(error) => {
+                        stats.dropped += 1;
+                        if matches!(error, DrmScanoutError::FlipTimeout { .. }) {
+                            stats.missed += 1;
+                        }
+                        self.status.frames = Some(stats.clone());
+                        self.status.mark_error(&error);
+                        return Err(error);
+                    }
+                }
+            }
+
+            if completions.len() >= 2 {
+                let total = completions[completions.len() - 1] - completions[0];
+                let micros = u64::try_from(total.as_micros()).unwrap_or(u64::MAX);
+                stats.average_interval_us = Some(micros / (completions.len() as u64 - 1));
+            }
+            let final_checksum = {
+                let slot = &mut self.buffers[self.current];
+                let mapping = device.map_dumb_buffer(&mut slot.buffer).map_err(|error| {
+                    DrmScanoutError::BufferFailed {
+                        card: card.display().to_string(),
+                        reason: format!("mapping the final dumb buffer for checksum: {error}"),
+                    }
+                })?;
+                pattern_checksum(&mapping)
+            };
+            stats.final_checksum = Some(final_checksum);
+            self.status.pattern_checksum = Some(final_checksum);
+            self.status.frames = Some(stats.clone());
+            Ok(stats)
+        }
+
         fn verify(&mut self) -> Result<DrmScanoutVerification, DrmScanoutError> {
             if !self.active {
                 return Err(DrmScanoutError::Released(self.card.display().to_string()));
@@ -1028,15 +1526,15 @@ mod real {
                 return Err(DrmScanoutError::Released(self.card.display().to_string()));
             };
             let device = LeaseDevice { fd };
-            let Some(framebuffer) = self.framebuffer else {
+            let Some(slot) = self.buffers.get(self.current) else {
                 return Err(DrmScanoutError::Released(self.card.display().to_string()));
             };
-            let (buffer_handle, size, pitch) = {
-                let Some(buffer) = self.buffer.as_ref() else {
-                    return Err(DrmScanoutError::Released(self.card.display().to_string()));
-                };
-                (u32::from(buffer.handle()), buffer.size(), buffer.pitch())
-            };
+            let framebuffer = slot.framebuffer;
+            let (buffer_handle, size, pitch) = (
+                u32::from(slot.buffer.handle()),
+                slot.buffer.size(),
+                slot.buffer.pitch(),
+            );
             let connector_handle = connector_handle(self.connector_id, &self.card)?;
             let crtc_handle = crtc_handle(self.crtc_id, &self.card)?;
 
@@ -1074,14 +1572,14 @@ mod real {
             let crtc_framebuffer = crtc_info.framebuffer().map(u32::from);
             let framebuffer_buffer = framebuffer_info.buffer().map(u32::from);
             let expected_checksum = self.status.pattern_checksum.unwrap_or(0);
-            // Re-map the dumb buffer and checksum the bytes that are still
-            // being scanned out. This is stronger than trusting the fill-time
-            // checksum stored in status.
+            // Re-map the current dumb buffer and checksum the bytes that are
+            // still being scanned out. This is stronger than trusting the
+            // fill-time checksum stored in status.
             let actual_checksum = {
-                let Some(buffer) = self.buffer.as_mut() else {
+                let Some(slot) = self.buffers.get_mut(self.current) else {
                     return Err(DrmScanoutError::Released(self.card.display().to_string()));
                 };
-                let mapping = device.map_dumb_buffer(buffer).map_err(|error| {
+                let mapping = device.map_dumb_buffer(&mut slot.buffer).map_err(|error| {
                     DrmScanoutError::BufferFailed {
                         card: self.card.display().to_string(),
                         reason: format!("re-mapping the dumb buffer for verification: {error}"),
@@ -1242,25 +1740,8 @@ mod real {
                     if let Err(error) = clear {
                         first_error = Some(error);
                     }
-                    if let Some(framebuffer) = self.framebuffer {
-                        if let Err(error) = device.destroy_framebuffer(framebuffer) {
-                            first_error.get_or_insert(DrmScanoutError::FramebufferFailed {
-                                card: card.display().to_string(),
-                                reason: format!("destroying framebuffer {framebuffer:?}: {error}"),
-                            });
-                        } else {
-                            self.framebuffer = None;
-                        }
-                    }
-                    if let Some(buffer) = self.buffer {
-                        if let Err(error) = device.destroy_dumb_buffer(buffer) {
-                            first_error.get_or_insert(DrmScanoutError::BufferFailed {
-                                card: card.display().to_string(),
-                                reason: format!("destroying dumb buffer: {error}"),
-                            });
-                        } else {
-                            self.buffer = None;
-                        }
+                    if let Some(error) = destroy_slots(&device, &card, &mut self.buffers) {
+                        first_error.get_or_insert(error);
                     }
                 }
             }
@@ -1292,7 +1773,7 @@ mod real {
         fn is_active(&self) -> bool {
             self.active
                 && self.lease.as_ref().is_some_and(|lease| lease.is_active())
-                && self.framebuffer.is_some()
+                && !self.buffers.is_empty()
         }
     }
 
@@ -1758,6 +2239,7 @@ mod real {
         framebuffer: framebuffer::Handle,
         mode: Mode,
         mode_name: &str,
+        request_event: bool,
     ) -> Result<bool, DrmScanoutError> {
         device
             .set_crtc(
@@ -1773,8 +2255,13 @@ mod real {
                 mode: mode_name.to_owned(),
                 reason: error.to_string(),
             })?;
+        let flags = if request_event {
+            PageFlipFlags::EVENT
+        } else {
+            PageFlipFlags::empty()
+        };
         Ok(
-            match device.page_flip(crtc_handle, framebuffer, PageFlipFlags::empty(), None) {
+            match device.page_flip(crtc_handle, framebuffer, flags, None) {
                 Ok(()) => true,
                 Err(error) => {
                     // The CRTC commit above already programmed the mode. A
@@ -1789,6 +2276,126 @@ mod real {
                 }
             },
         )
+    }
+
+    /// Queue one legacy page flip that will deliver a completion event.
+    fn legacy_page_flip(
+        device: &LeaseDevice<'_>,
+        card: &Path,
+        crtc_handle: crtc::Handle,
+        framebuffer: framebuffer::Handle,
+        frame: u32,
+    ) -> Result<(), DrmScanoutError> {
+        device
+            .page_flip(crtc_handle, framebuffer, PageFlipFlags::EVENT, None)
+            .map_err(|error| match error.raw_os_error() {
+                Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) | Some(libc::ENOTTY) => {
+                    DrmScanoutError::FlipUnsupported {
+                        card: card.display().to_string(),
+                        reason: error.to_string(),
+                    }
+                }
+                _ => DrmScanoutError::FlipFailed {
+                    card: card.display().to_string(),
+                    frame,
+                    reason: error.to_string(),
+                },
+            })
+    }
+
+    /// Queue one atomic page flip (`FB_ID` only) that delivers an event.
+    fn atomic_page_flip(
+        device: &LeaseDevice<'_>,
+        card: &Path,
+        plane_id: u32,
+        framebuffer: framebuffer::Handle,
+        frame: u32,
+    ) -> Result<(), DrmScanoutError> {
+        let plane = plane_handle(plane_id, card)?;
+        let plane_props = AtomicProperties::read(device, plane, card, "plane", plane_id)?;
+        let mut request = AtomicModeReq::new();
+        request.add_raw_property(
+            RawResourceHandle::from(plane),
+            plane_props.require(card, "plane", plane_id, "FB_ID")?,
+            u64::from(u32::from(framebuffer)),
+        );
+        match device.atomic_commit(AtomicCommitFlags::PAGE_FLIP_EVENT, request) {
+            Ok(()) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) | Some(libc::ENOTTY)
+                ) =>
+            {
+                Err(DrmScanoutError::FlipUnsupported {
+                    card: card.display().to_string(),
+                    reason: error.to_string(),
+                })
+            }
+            Err(error) => Err(DrmScanoutError::FlipFailed {
+                card: card.display().to_string(),
+                frame,
+                reason: format!("atomic page flip: {error}"),
+            }),
+        }
+    }
+
+    /// Wait for one page-flip completion event for `crtc` with a bounded poll.
+    ///
+    /// Returns the kernel's vblank sequence when it reports one. Other event
+    /// kinds are drained and ignored; a timeout is a typed `flip_timeout`
+    /// rather than a silent skip.
+    fn wait_for_flip(
+        device: &LeaseDevice<'_>,
+        crtc: crtc::Handle,
+        card: &Path,
+        frame: u32,
+        timeout: Duration,
+    ) -> Result<u32, DrmScanoutError> {
+        let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(DrmScanoutError::FlipTimeout {
+                    card: card.display().to_string(),
+                    frame,
+                    timeout_ms,
+                });
+            }
+            let mut fds = [PollFd::new(device.as_fd(), PollFlags::POLLIN)];
+            let poll_timeout = PollTimeout::try_from(remaining).unwrap_or(PollTimeout::MAX);
+            match poll(&mut fds, poll_timeout) {
+                Ok(0) => {
+                    return Err(DrmScanoutError::FlipTimeout {
+                        card: card.display().to_string(),
+                        frame,
+                        timeout_ms,
+                    })
+                }
+                Ok(_) => {}
+                Err(Errno::EINTR) => continue,
+                Err(error) => {
+                    return Err(DrmScanoutError::Io {
+                        path: card.display().to_string(),
+                        source: std::io::Error::from(error),
+                    })
+                }
+            }
+            let events = device
+                .receive_events()
+                .map_err(|error| DrmScanoutError::Io {
+                    path: card.display().to_string(),
+                    source: error,
+                })?;
+            for event in events {
+                if let Event::PageFlip(flip) = event {
+                    if flip.crtc == crtc {
+                        return Ok(flip.frame);
+                    }
+                }
+            }
+        }
     }
 
     fn legacy_clear(
@@ -1849,6 +2456,85 @@ pub use real::RealDrmScanoutBackend;
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn default_frames() -> u32 {
+    SCANOUT_DEFAULT_FRAMES
+}
+
+fn is_single_frame(frames: &u32) -> bool {
+    *frames == SCANOUT_DEFAULT_FRAMES
+}
+
+fn default_flip_timeout_ms() -> u64 {
+    SCANOUT_FLIP_TIMEOUT_MS
+}
+
+fn is_default_flip_timeout(timeout: &u64) -> bool {
+    *timeout == SCANOUT_FLIP_TIMEOUT_MS
+}
+
+/// Deterministic moving damage rectangle for `frame`: `(x, y, width, height)`.
+///
+/// The rectangle visits a 3x3 grid (or a single position on very small modes)
+/// in a fixed order. It is a proof of damage-style updates, not a damage
+/// tracker: no client surface, dirty-region merge, or compositor is involved.
+pub fn frame_damage_rect(width: u32, height: u32, frame: u32) -> (u32, u32, u32, u32) {
+    if width == 0 || height == 0 {
+        return (0, 0, 0, 0);
+    }
+    let rect_w = (width / 8).max(16).min(width);
+    let rect_h = (height / 8).max(16).min(height);
+    let steps_x = if width > rect_w { 3 } else { 1 };
+    let steps_y = if height > rect_h { 3 } else { 1 };
+    let slot = frame % (steps_x * steps_y);
+    let col = slot % steps_x;
+    let row = slot / steps_x;
+    let x = if steps_x > 1 {
+        col * (width - rect_w) / (steps_x - 1)
+    } else {
+        0
+    };
+    let y = if steps_y > 1 {
+        row * (height - rect_h) / (steps_y - 1)
+    } else {
+        0
+    };
+    (x, y, rect_w, rect_h)
+}
+
+fn frame_damage_color(frame: u32) -> u32 {
+    let red = frame.wrapping_mul(53) & 0xff;
+    let green = frame.wrapping_mul(97) & 0xff;
+    let blue = frame.wrapping_mul(29) & 0xff;
+    (red << 16) | (green << 8) | blue
+}
+
+/// Draw only the deterministic damage rectangle for `frame` into `bytes` and
+/// return the whole-buffer FNV-1a checksum.
+///
+/// The buffer is expected to already contain [`fill_pattern`] (or previous
+/// damage), so this models an incremental update rather than a full repaint.
+pub fn apply_frame_damage(
+    bytes: &mut [u8],
+    width: u32,
+    height: u32,
+    pitch: u32,
+    frame: u32,
+) -> u32 {
+    let (rect_x, rect_y, rect_w, rect_h) = frame_damage_rect(width, height, frame);
+    let color = frame_damage_color(frame);
+    let pitch = pitch as usize;
+    for y in rect_y..rect_y.saturating_add(rect_h) {
+        let row_start = y as usize * pitch;
+        for x in rect_x..rect_x.saturating_add(rect_w) {
+            let offset = row_start + x as usize * 4;
+            if offset + 4 <= bytes.len() {
+                bytes[offset..offset + 4].copy_from_slice(&color.to_le_bytes());
+            }
+        }
+    }
+    pattern_checksum(bytes)
 }
 
 /// Fill `bytes` with the documented XRGB8888 pattern and return its FNV-1a

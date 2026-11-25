@@ -16,7 +16,8 @@ use std::time::Duration;
 
 use clap::Parser;
 use ozma_audio::{
-    AudioRouter, PipeWireAudioRouter, PulseAudioAudioRouter, RouterConfig, TokioCommandRunner,
+    AudioRouter, PipeWireAudioRouter, PulseAudioAudioRouter, RoomProfileStore, RouterConfig,
+    TokioCommandRunner,
 };
 use ozma_input::SinkKind;
 use ozma_power::{LibvirtPower, PowerBackend, QmpPower, UnavailablePower};
@@ -433,6 +434,15 @@ pub struct Args {
     /// Directory containing reference tracks for `POST /audio/play`.
     #[arg(long, env = "OZMA_AUDIO_TRACK_ROOT", value_name = "PATH")]
     pub audio_track_root: Option<std::path::PathBuf>,
+
+    /// Opt-in directory for the last measured room-correction profile.
+    ///
+    /// When set (and an audio router is configured), `GET`, `POST`, and
+    /// `DELETE /audio/room-correction/profile` read, validate, atomically
+    /// store, or clear one bounded JSON profile. Without it the routes answer a
+    /// typed 501 and nothing is written.
+    #[arg(long, env = "OZMA_AUDIO_PROFILE_DIR", value_name = "PATH")]
+    pub audio_profile_dir: Option<std::path::PathBuf>,
 
     /// Node role advertised to the controller.
     #[arg(long, default_value = "compute")]
@@ -953,6 +963,35 @@ pub struct Args {
         requires = "backup_repo"
     )]
     pub backup_restic: Option<std::path::PathBuf>,
+
+    /// Opt in to the bounded BlueZ/`bluetoothctl` surface (`/bluetooth/*`).
+    ///
+    /// The routes stay behind the node bearer guard. Without this flag they
+    /// answer a typed 503 `bluetooth.not-configured`. Scanning is bounded to
+    /// 15 seconds and pairing never trusts a device.
+    #[arg(long, env = "OZMA_BLUETOOTH")]
+    pub bluetooth: bool,
+
+    /// Explicit Bluetooth adapter MAC (`--bluetooth` only).
+    ///
+    /// Omit it to use the BlueZ `[default]` controller or the first adapter.
+    #[arg(
+        long,
+        env = "OZMA_BLUETOOTH_ADAPTER",
+        value_name = "MAC",
+        requires = "bluetooth"
+    )]
+    pub bluetooth_adapter: Option<String>,
+
+    /// `bluetoothctl` executable used by the Bluetooth provider (default
+    /// `bluetoothctl`).
+    #[arg(
+        long,
+        env = "OZMA_BLUETOOTH_PROGRAM",
+        value_name = "PATH",
+        requires = "bluetooth"
+    )]
+    pub bluetooth_program: Option<std::path::PathBuf>,
 
     /// Enable the local HLS pipeline: capture → ffmpeg → `/stream/*`.
     ///
@@ -1516,6 +1555,7 @@ async fn run() -> std::process::ExitCode {
         audio_capture_target,
         audio_router: args.audio_router,
         audio_track_root: args.audio_track_root.clone(),
+        audio_profile_dir: args.audio_profile_dir.clone(),
         ffmpeg_bin: args.ffmpeg_bin.clone(),
         vaapi_device: args.vaapi_device.clone(),
         nvenc_gpu: args.nvenc_gpu,
@@ -2807,6 +2847,39 @@ async fn run() -> std::process::ExitCode {
             }
         }
     };
+    // Opt-in Bluetooth provider. It is installed even when the host has no
+    // adapter or bluetoothctl, so every route can return the typed 503 instead
+    // of a fake list. The registration capability is only advertised after a
+    // real (read-only) adapter probe succeeds.
+    let bluetooth_service = args.bluetooth.then(|| {
+        ozma_node::bluetooth::BluetoothService::new(ozma_node::bluetooth::BluetoothConfig {
+            program: args
+                .bluetooth_program
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from("bluetoothctl")),
+            adapter: args.bluetooth_adapter.clone(),
+            timeouts: ozma_node::bluetooth::BluetoothTimeouts::default(),
+        })
+    });
+    let bluetooth_available = match bluetooth_service.as_ref() {
+        None => false,
+        Some(service) => match service.probe().await {
+            Ok(adapter) => {
+                info!(adapter = %adapter, "Bluetooth provider probed; bluetooth capability advertised");
+                true
+            }
+            Err(error) => {
+                warn!(
+                    code = error.code(),
+                    error = %error,
+                    remediation = error.remediation(),
+                    "Bluetooth was requested but is unavailable; /bluetooth/* reports the typed failure"
+                );
+                false
+            }
+        },
+    };
+    set_capability(&mut args, &mut config, "bluetooth", bluetooth_available);
     let desktop_controls = (config.profile == NodeProfile::Desktop).then(|| {
         let x11_display = config
             .x11_display
@@ -2851,7 +2924,8 @@ async fn run() -> std::process::ExitCode {
             .with_hardware(hardware_state.clone())
             .with_vnc_registration(vnc_registration)
             .with_desktop_controls(desktop_controls)
-            .with_backup(backup_service);
+            .with_backup(backup_service)
+            .with_bluetooth(bluetooth_service);
     // Control routes stay behind the bearer guard; the controller's read-only
     // probes are mounted after it so the unmodified controller works with
     // `--api-token`. See `controller_compat::{compat_router, public_router}`.
@@ -3946,16 +4020,25 @@ async fn build_audio_control(config: &NodeConfig) -> Option<AudioControl> {
     if !kind.is_configured() {
         return None;
     }
+    let profile_store = config
+        .audio_profile_dir
+        .clone()
+        .map(RoomProfileStore::new)
+        .map(Arc::new);
     if !command_on_path("pactl") {
-        return Some(AudioControl::failed(format!(
-            "`pactl` was not found on PATH; {kind} audio routing requires \
-             pulseaudio-utils or pipewire-pulse"
-        )));
+        return Some(
+            AudioControl::failed(format!(
+                "`pactl` was not found on PATH; {kind} audio routing requires \
+                 pulseaudio-utils or pipewire-pulse"
+            ))
+            .with_profile_store(profile_store),
+        );
     }
     if let Err(error) = probe_audio_server().await {
-        return Some(AudioControl::failed(format!(
-            "{kind} audio server is unavailable: {error}"
-        )));
+        return Some(
+            AudioControl::failed(format!("{kind} audio server is unavailable: {error}"))
+                .with_profile_store(profile_store),
+        );
     }
 
     let router_config = RouterConfig {
@@ -3971,11 +4054,10 @@ async fn build_audio_control(config: &NodeConfig) -> Option<AudioControl> {
         }
         AudioRouterKind::None => return None,
     };
-    Some(AudioControl::configured(
-        router,
-        config.audio_sink.clone(),
-        kind.as_str(),
-    ))
+    Some(
+        AudioControl::configured(router, config.audio_sink.clone(), kind.as_str())
+            .with_profile_store(profile_store),
+    )
 }
 
 /// Ask `pactl` for server information with a bounded timeout.

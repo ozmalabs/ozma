@@ -358,3 +358,165 @@ fn vkms_scanout_pattern_verify_teardown() {
     assert!(replacement.status().released);
     eprintln!("second scanout cycle completed and released");
 }
+
+#[test]
+#[ignore = "opt-in live vkms frame loop: set OZMA_DRM_LIVE=1 and load vkms"]
+fn vkms_scanout_frame_loop_has_real_flip_completions_and_clean_teardown() {
+    if std::env::var("OZMA_DRM_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipping: set OZMA_DRM_LIVE=1 to run the live vkms frame-loop test");
+        return;
+    }
+
+    let cards = enumerate_drm_cards().expect("enumerate DRM cards");
+    let requested_card = std::env::var("OZMA_DRM_CARD").ok();
+    let vkms = cards
+        .into_iter()
+        .find(|card| match requested_card.as_deref() {
+            Some(path) => card.path == Path::new(path),
+            None => card.is_vkms(),
+        })
+        .expect("no vkms card found");
+    assert!(
+        vkms.is_vkms() || matches!(vkms.driver.as_str(), "vkms" | "faux_driver"),
+        "live test refuses non-vkms card {} ({})",
+        vkms.path.display(),
+        vkms.driver
+    );
+
+    let lease_backend = RealDrmLeaseBackend::new();
+    let inspected = lease_backend
+        .inspect(&vkms)
+        .expect("open/inspect the vkms card");
+    let connector = inspected
+        .connectors
+        .iter()
+        .find(|connector| {
+            connector.object_id.is_some()
+                && !matches!(connector.status, ozma_multiseat::DrmStatus::Disconnected)
+        })
+        .expect("vkms connector with object id");
+    let crtc_id = connector
+        .crtc_id
+        .unwrap_or_else(|| *inspected.crtcs.first().expect("vkms CRTC"));
+    let plane_id = discover_primary_plane(&vkms.path, crtc_id);
+    let frames = std::env::var("OZMA_DRM_FRAMES")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|frames| (10..=30).contains(frames))
+        .unwrap_or(12);
+    eprintln!(
+        "vkms frame loop: card={} connector={} crtc={crtc_id} plane={plane_id:?} frames={frames}",
+        vkms.path.display(),
+        connector.name
+    );
+
+    let mut request = DrmScanoutRequest::new(
+        DrmLeaseRequest::new(
+            DrmCardSelector::Explicit(vkms.path.clone()),
+            connector.name.clone(),
+        )
+        .with_crtc(crtc_id),
+    )
+    .with_frames(frames)
+    .with_interval_ms(16);
+    if let Some(plane) = plane_id {
+        request = request.with_plane(plane);
+    } else {
+        eprintln!(
+            "blocker: no XRGB8888 primary plane for CRTC {crtc_id}; running the legacy \
+             page-flip loop baseline"
+        );
+        request = request.with_legacy_commit();
+    }
+    let backend = RealDrmScanoutBackend::new();
+
+    let mut handle = match backend.start(&request) {
+        Ok(handle) => handle,
+        Err(error) if plane_id.is_some() => {
+            eprintln!("atomic frame loop start failed ({error}); retrying legacy baseline");
+            request = DrmScanoutRequest::new(
+                DrmLeaseRequest::new(
+                    DrmCardSelector::Explicit(vkms.path.clone()),
+                    connector.name.clone(),
+                )
+                .with_crtc(crtc_id),
+            )
+            .with_legacy_commit()
+            .with_frames(frames)
+            .with_interval_ms(16);
+            backend
+                .start(&request)
+                .unwrap_or_else(|error| panic!("legacy frame loop start failed: {error}"))
+        }
+        Err(error) => panic!("frame loop start failed: {error}"),
+    };
+
+    let stats = handle
+        .run_frames(request.frame_plan())
+        .expect("live frame loop must complete every flip");
+    eprintln!("live frame stats: {stats:#?}");
+    assert_eq!(stats.requested, frames);
+    assert_eq!(stats.completed, frames, "every frame needs a flip event");
+    assert_eq!(stats.submitted, frames);
+    assert_eq!(stats.dropped, 0);
+    assert_eq!(stats.missed, 0);
+    assert_eq!(stats.damage_updates, frames - 1);
+    assert_eq!(stats.page_flip_events, frames);
+    assert!(stats.buffer_count >= 2);
+    assert!(stats.final_checksum.is_some());
+    assert!(
+        stats.average_interval_us.is_some(),
+        "flip completions must produce an average interval"
+    );
+    let status = handle.status().clone();
+    assert_eq!(
+        status.frames.as_ref().map(|stats| stats.completed),
+        Some(frames)
+    );
+    assert!(status
+        .frames
+        .as_ref()
+        .is_some_and(|stats| stats.missed == 0));
+
+    let verification = handle.verify().expect("verify frame-loop scanout");
+    assert!(
+        verification.ok,
+        "verification mismatch: {:?}",
+        verification.mismatch
+    );
+    assert_eq!(verification.framebuffer_id, status.framebuffer_id.unwrap());
+    assert_eq!(verification.crtc_framebuffer, status.framebuffer_id);
+    assert_eq!(
+        verification.pattern_checksum,
+        status.pattern_checksum.unwrap()
+    );
+    eprintln!("verification after frame loop: {verification:#?}");
+
+    let lessee_fd = status.lessee_fd.expect("lessee fd recorded");
+    handle.teardown().expect("teardown frame-loop scanout");
+    let released = handle.status().clone();
+    assert!(!released.applied);
+    assert!(released.released);
+    assert_eq!(released.lessee_fd, None);
+    assert!(
+        !Path::new(&format!("/proc/self/fd/{lessee_fd}")).exists(),
+        "lessee fd {lessee_fd} must be closed after teardown"
+    );
+
+    // A second run on the same connector/CRTC proves buffers, framebuffers,
+    // and the lease were released cleanly.
+    let mut replacement = backend
+        .start(&request)
+        .expect("the same vkms objects must be usable for a second frame loop");
+    let second = replacement
+        .run_frames(request.frame_plan())
+        .expect("second frame loop");
+    assert_eq!(second.completed, frames);
+    assert_eq!(second.dropped, 0);
+    replacement
+        .verify()
+        .expect("second frame-loop verification");
+    replacement.teardown().expect("second frame-loop teardown");
+    assert!(replacement.status().released);
+    eprintln!("second frame loop completed and released");
+}

@@ -732,6 +732,7 @@ mod tests {
             audio_capture_target: ozma_audio::AudioTarget::Default,
             audio_router: crate::config::AudioRouterKind::None,
             audio_track_root: None,
+            audio_profile_dir: None,
             ffmpeg_bin: std::path::PathBuf::from("ffmpeg"),
             vaapi_device: std::path::PathBuf::from("/dev/dri/renderD128"),
             nvenc_gpu: None,

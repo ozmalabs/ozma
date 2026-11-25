@@ -20,6 +20,7 @@ and the controller behaviour that preserves typed results.
 | remaining `/api/v1/rpa/*` (`screen`, `click`, `wait_for_text`, `script`, `enter_bios`, `set_boot_usb`) | `controller/api.py::_node_rpa_proxy` | **Typed stub** (501) | Python `node/rpa.py` has bitmap BIOS OCR, foreground script execution, text waits, click-by-text, and heuristic BIOS navigation. Rust has no script runner or BIOS policy; those routes keep the stable `rpa.unsupported` body. |
 | `/backup/{status,init,run,snapshots,restore,stats,verify,estimate}` and `DELETE /backup/snapshots/{id}` | `controller/api.py` backup proxy routes | **Implemented (opt-in, local only)** | Opt-in `--backup-repo` + `--backup-password-file` (0600) provider wrapping the local `restic` CLI. Sources and restore targets are explicit allow-lists; stats/verify/estimate are local restic operations; no cloud destination, app inventory, DB hooks, scheduling, or retention policy. See [`phase4-backup-report.md`](phase4-backup-report.md). |
 | remaining `/backup/*` (`config`, `apps`, `apps/restore`, `onboarding`, cloud) | `controller/api.py` backup proxy routes | **Typed stub** (501) | Python `agent/backup.py` owns app inventory, cloud/S3/SFTP/REST destinations, scheduling, macOS Time Machine, and DB hooks. A restic repository cannot supply an OS app inventory, so the Rust node advertises and returns `backup.unsupported` for those sub-surfaces. |
+| `/bluetooth/{status,devices,scan,pair,connect,disconnect,forget}` | `controller/api.py` node-scoped Bluetooth proxies | **Implemented (opt-in, guarded)** | Opt-in `--bluetooth` provider wrapping `bluetoothctl`. Explicit MAC addresses only, exact argv, no shell, no auto-trust, scan bounded to 1–15 s with `scan off` cleanup, lists bounded. Without the flag the routes return a typed 503 `bluetooth.not-configured`. See [`phase4-bluetooth-report.md`](phase4-bluetooth-report.md). |
 | `/ui/windows` | Python desktop agent (`agent/ozma_desktop_agent.py:996`); the controller consumes `/ui/hints` | **Typed stub** (501, public read-only) | Python `agent/ozma_desktop_agent.py` uses an in-guest accessibility provider. `ozma-node` has no in-guest agent and must not invent window titles or positions. `/ui/hints` keeps its existing empty-shape 200 with `available:false` for compatibility; `/ui/windows` is explicitly unsupported. |
 | `/serial/*` | `controller/serial_console.py::_poll_node_serial` and legacy panels | **Typed stub** (501) | Python `node/serial_capture.py` owns a real UART/USB-serial reader, ring buffer, SSE stream, and send path. `ozma-node` has no serialport dependency or serial session implementation. |
 | `/rgb/*` | `controller/api.py` RGB proxy, `controller/rgb_outputs.py::_push_node` | **Typed stub** (501) | Python `node/rgb_leds.py` drives WS2812B/SK6812 over SPI and runs effects. `ozma-usb`/`ozma-hid` are gadget/HID injectors, not SPI LED drivers; no WS2812 or SPI crate is used by the node. |
@@ -161,6 +162,58 @@ Typed errors (`ok:false`, `supported:true`, stable `code`, `error`,
 `backup.snapshot-invalid`/`backup.tag-invalid`/`backup.mode-unsupported` (400 or
 501), `backup.busy` (409), `backup.restic-failed` (502), and `backup.timeout`
 (504).
+
+## Opt-in Bluetooth behaviour
+
+The Rust node exposes a bounded BlueZ surface only with `--bluetooth`. The seven
+routes stay in `controller_compat::compat_router`, behind the same node bearer
+guard as the other control surfaces; they are never part of `public_router`.
+
+| Node route | Behaviour |
+|---|---|
+| `GET /bluetooth/status` | Adapter list (≤8) plus the selected adapter's `powered`, `discoverable`, `discovering`, and `pairable` flags, active scan state, and scan bounds. |
+| `GET /bluetooth/devices?limit=N` | Known devices (≤64), enriched by up to 32 `info` calls within an 8 s budget. Reports `paired`/`bonded`/`trusted`/`connected`/`blocked`, optional `rssi`, and `details_complete`. |
+| `POST /bluetooth/scan` | `{"duration_seconds": N}` (also `seconds`/`timeout`), clamped to 1–15 s (default 8). Always attempts `scan off`, including after timeout/failure. |
+| `POST /bluetooth/pair` | Explicit `{"address":"AA:BB:CC:DD:EE:FF"}` → `bluetoothctl pair <addr>`. Never calls `trust`; the response has `auto_trust:false`. |
+| `POST /bluetooth/connect` | Explicit address → `bluetoothctl connect <addr>`. |
+| `POST /bluetooth/disconnect` | Explicit address → `bluetoothctl disconnect <addr>`. |
+| `POST /bluetooth/forget` | Explicit address → `bluetoothctl remove <addr>`. |
+
+Safety is enforced before a process starts: only a six-octet colon MAC is
+accepted, the exact argv is `pair|connect|disconnect|remove <validated-address>`,
+and no route auto-selects a device. The node never powers adapters, changes
+discoverability/pairability, blocks devices, or writes `/var/lib/bluetooth`.
+
+Typed errors use the same `{ok:false,supported:true,configured,available,code,
+error,remediation}` shape: `bluetooth.not-configured` (503),
+`bluetooth.unavailable` (503; missing `bluetoothctl`, no adapter, or configured
+adapter absent), `bluetooth.invalid-address` (400), `bluetooth.invalid-limit`
+(400), `bluetooth.busy` (409), `bluetooth.timeout` (504), and
+`bluetooth.{pair,connect,disconnect,forget}-failed` / `bluetooth.command-failed`
+(502).
+
+`GET /api/v1/connection.controller_surfaces` advertises the seven
+`bluetooth.*` capabilities with `supported:true` only when the service is
+configured. With `--bluetooth` and a successful read-only startup probe,
+`main.rs` also adds `bluetooth` to the registration `cap` string. Without the
+flag, `/bluetooth/*` is advertised as `supported:false` with the opt-in reason;
+the mounted routes return 503 `bluetooth.not-configured`, not a bare 404. The
+connection document also carries an additive
+`bluetooth:{configured,adapter,max_scan_seconds}` summary when configured.
+
+Controller proxies:
+
+- `GET|POST /api/v1/nodes/{node_id}/bluetooth/{status,devices,scan,pair,connect,disconnect,forget}`
+  forward to the node route with the node bearer token.
+- `_proxy_bluetooth_surface` returns success JSON verbatim and preserves
+  `bluetooth.*` typed errors with their node status/code/error/remediation.
+- Read routes require `SCOPE_READ`; scan/pair/connect/disconnect/forget require
+  `SCOPE_WRITE`.
+
+Tests: `bluetooth::tests` (18; fake-runner parsing/argv/bounds/errors plus a live
+hci0 status+2 s scan) and `controller_compat::tests` (advertisement and bearer
+guard), plus the controller proxy tests in
+`tests/unit/controller/test_node_api_token_proxy.py`.
 
 ## Host observability surfaces
 

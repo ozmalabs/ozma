@@ -204,12 +204,14 @@ struct Args {
 
     /// Run the opt-in KMS scanout proof for
     /// `[SEAT=]CARD:CONNECTOR[@CRTC][:PLANE]` and exit. It acquires a DRM
-    /// lease (including the plane when named), allocates a dumb buffer, fills a
-    /// known pattern, performs an atomic plane/CRTC commit (falling back to
-    /// legacy `set_crtc` only if atomic KMS is unsupported), verifies the
-    /// result, prints status, and tears everything down. This proves scanout;
-    /// it does not start a compositor. `auto`/`vkms` only selects a vkms card;
-    /// a real output must be named as an explicit `/dev/dri/cardN`.
+    /// lease (including the plane when named), allocates one or more dumb
+    /// buffers, fills a known pattern, performs an atomic plane/CRTC commit
+    /// (falling back to legacy `set_crtc` only if atomic KMS is unsupported),
+    /// optionally runs a bounded page-flip loop with a moving damage rectangle,
+    /// verifies the result, prints status, and tears everything down. This
+    /// proves scanout; it does not start a compositor. `auto`/`vkms` only
+    /// selects a vkms card; a real output must be named as an explicit
+    /// `/dev/dri/cardN`.
     #[arg(long, value_name = "[SEAT=]CARD:CONNECTOR[@CRTC][:PLANE]")]
     seat_drm_scanout: Option<String>,
 
@@ -217,6 +219,21 @@ struct Args {
     /// connector's first advertised mode).
     #[arg(long, value_name = "WIDTHxHEIGHT")]
     seat_drm_scanout_mode: Option<String>,
+
+    /// Total frames for `--seat-drm-scanout` (default 1). Values above one run
+    /// a bounded page-flip loop over two or three rotating dumb buffers with a
+    /// deterministic moving damage rectangle, waiting for each flip event.
+    #[arg(
+        long,
+        default_value_t = ozma_multiseat::SCANOUT_DEFAULT_FRAMES,
+        value_name = "1..=300"
+    )]
+    seat_drm_scanout_frames: u32,
+
+    /// Optional pacing interval between completed `--seat-drm-scanout` frames,
+    /// in milliseconds.
+    #[arg(long, value_name = "MS")]
+    seat_drm_scanout_interval_ms: Option<u64>,
 
     /// Create per-seat null sinks through ozma-audio before start and remove
     /// them after stop. Optional value: pipewire (default) or pulseaudio.
@@ -665,6 +682,15 @@ fn run_scanout_proof(args: &Args, selector: &str) -> Result<(), ozma_multiseat::
     if let Some(mode) = args.seat_drm_scanout_mode.as_deref() {
         request = request.with_mode(mode);
     }
+    request = request.with_frames(args.seat_drm_scanout_frames);
+    if let Some(interval) = args.seat_drm_scanout_interval_ms {
+        request = request.with_interval_ms(interval);
+    }
+    if let Err(error) = request.validate() {
+        return Err(ozma_multiseat::MultiseatError::DrmScanout(
+            error.to_string(),
+        ));
+    }
     if let Some(seat) = seat {
         eprintln!(
             "note: --seat-drm-scanout is a standalone single-output proof; ignoring seat prefix \
@@ -700,6 +726,11 @@ fn run_scanout_proof(args: &Args, selector: &str) -> Result<(), ozma_multiseat::
         }
     };
 
+    let frame_error = if request.frames > 1 {
+        handle.run_frames(request.frame_plan()).err()
+    } else {
+        None
+    };
     let verification = handle.verify();
     let verify_error = verification.err();
     let teardown_error = handle.teardown().err();
@@ -707,12 +738,17 @@ fn run_scanout_proof(args: &Args, selector: &str) -> Result<(), ozma_multiseat::
 
     if args.json {
         let report = serde_json::json!({
-            "ok": verify_error.is_none() && teardown_error.is_none(),
+            "ok": frame_error.is_none() && verify_error.is_none() && teardown_error.is_none(),
             "seat": seat,
             "request": &request,
             "scanout": &status,
+            "frames": &status.frames,
             "notes": &status.notes,
             "verification": &status.verification,
+            "frame_error": frame_error.as_ref().map(|error| serde_json::json!({
+                "kind": error.code(),
+                "message": error.to_string(),
+            })),
             "error": verify_error.as_ref().map(|error| serde_json::json!({
                 "kind": error.code(),
                 "message": error.to_string(),
@@ -730,10 +766,11 @@ fn run_scanout_proof(args: &Args, selector: &str) -> Result<(), ozma_multiseat::
         print_scanout_status(&status);
     }
 
-    match (verify_error, teardown_error) {
-        (None, None) => Ok(()),
-        (verify, teardown) => {
+    match (frame_error, verify_error, teardown_error) {
+        (None, None, None) => Ok(()),
+        (frame, verify, teardown) => {
             let message = [
+                frame.map(|error| error.to_string()),
                 verify.map(|error| error.to_string()),
                 teardown.map(|error| error.to_string()),
             ]
@@ -771,6 +808,24 @@ fn print_scanout_status(status: &DrmScanoutStatus) {
         status.pattern_checksum,
         status.page_flipped
     );
+    if let Some(frames) = &status.frames {
+        println!(
+            "  frames: requested={} submitted={} completed={} dropped={} missed={} \
+             buffers={} flip_events={} damage_updates={} avg_interval_us={:?} \
+             last_sequence={:?} final_checksum={:?}",
+            frames.requested,
+            frames.submitted,
+            frames.completed,
+            frames.dropped,
+            frames.missed,
+            frames.buffer_count,
+            frames.page_flip_events,
+            frames.damage_updates,
+            frames.average_interval_us,
+            frames.last_sequence,
+            frames.final_checksum
+        );
+    }
     if let Some(verification) = &status.verification {
         println!(
             "  verify: ok={} crtc_mode={:?} crtc_framebuffer={:?} connector={} \
@@ -866,6 +921,19 @@ fn validate(args: &Args) -> Result<(), ozma_multiseat::MultiseatError> {
     if args.seat_drm_scanout.is_none() && args.seat_drm_scanout_mode.is_some() {
         return Err(ozma_multiseat::MultiseatError::DrmScanout(
             "--seat-drm-scanout-mode is only valid with --seat-drm-scanout".to_owned(),
+        ));
+    }
+    if args.seat_drm_scanout_frames == 0
+        || args.seat_drm_scanout_frames > ozma_multiseat::SCANOUT_MAX_FRAMES
+    {
+        return Err(ozma_multiseat::MultiseatError::DrmScanout(format!(
+            "--seat-drm-scanout-frames must be 1..={}",
+            ozma_multiseat::SCANOUT_MAX_FRAMES
+        )));
+    }
+    if args.seat_drm_scanout.is_none() && args.seat_drm_scanout_interval_ms.is_some() {
+        return Err(ozma_multiseat::MultiseatError::DrmScanout(
+            "--seat-drm-scanout-interval-ms is only valid with --seat-drm-scanout".to_owned(),
         ));
     }
     let _: SeatDisplaySize = args.seat_display_size.parse()?;

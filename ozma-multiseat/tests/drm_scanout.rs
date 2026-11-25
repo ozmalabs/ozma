@@ -7,10 +7,11 @@
 use std::path::PathBuf;
 
 use ozma_multiseat::{
-    ensure_scanout_card, fill_pattern, pattern_checksum, DrmCard, DrmCardSelector, DrmCrtcSelector,
-    DrmLeaseRequest, DrmScanoutBackend, DrmScanoutCommit, DrmScanoutError, DrmScanoutNoteKind,
-    DrmScanoutRequest, DrmScanoutStatus, FakeDrmScanoutBackend, FakeDrmScanoutFailure,
-    SCANOUT_PATTERN,
+    apply_frame_damage, ensure_scanout_card, fill_pattern, frame_buffer_count, frame_damage_rect,
+    pattern_checksum, DrmCard, DrmCardSelector, DrmCrtcSelector, DrmLeaseRequest,
+    DrmScanoutBackend, DrmScanoutCommit, DrmScanoutError, DrmScanoutNoteKind, DrmScanoutRequest,
+    DrmScanoutStatus, FakeDrmScanoutBackend, FakeDrmScanoutFailure, FakeDrmScanoutFlipFailure,
+    SCANOUT_MAX_FRAMES, SCANOUT_PATTERN,
 };
 
 fn request() -> DrmScanoutRequest {
@@ -382,4 +383,267 @@ fn pattern_fill_is_deterministic_and_respects_pitch() {
     assert_eq!(padded[16..32], [0xAA; 16]);
     assert_eq!(padded[32..48], tight[16..32]);
     assert_ne!(padded_checksum, pattern_checksum(&tight));
+}
+
+#[test]
+fn default_request_is_one_frame_and_frame_bounds_are_typed() {
+    let request = request();
+    assert_eq!(request.frames, 1);
+    assert_eq!(
+        request.flip_timeout_ms,
+        ozma_multiseat::SCANOUT_FLIP_TIMEOUT_MS
+    );
+    assert!(request.validate().is_ok());
+    assert_eq!(request.frame_plan().frames, 1);
+
+    let error = request
+        .clone()
+        .with_frames(0)
+        .validate()
+        .expect_err("zero frames");
+    assert!(matches!(error, DrmScanoutError::InvalidFrameCount { .. }));
+    assert_eq!(error.code(), "invalid_frame_count");
+
+    let error = request
+        .with_frames(SCANOUT_MAX_FRAMES + 1)
+        .validate()
+        .expect_err("too many frames");
+    assert!(matches!(error, DrmScanoutError::InvalidFrameCount { .. }));
+}
+
+#[test]
+fn damage_rect_is_deterministic_and_moves_across_frames() {
+    assert_eq!(frame_buffer_count(1), 1);
+    assert_eq!(frame_buffer_count(2), 2);
+    assert_eq!(frame_buffer_count(3), 3);
+    assert_eq!(frame_buffer_count(SCANOUT_MAX_FRAMES), 3);
+
+    let first = frame_damage_rect(1024, 768, 0);
+    assert_eq!(first, frame_damage_rect(1024, 768, 0));
+    assert_ne!(first, frame_damage_rect(1024, 768, 1));
+    assert_eq!(first, frame_damage_rect(1024, 768, 9));
+    let (x, y, w, h) = first;
+    assert!(x + w <= 1024 && y + h <= 768);
+
+    let width = 64;
+    let height = 48;
+    let pitch = width * 4;
+    let mut base = vec![0u8; (pitch * height) as usize];
+    fill_pattern(&mut base, width, height, pitch);
+    let mut a = base.clone();
+    let mut b = base.clone();
+    let checksum_a = apply_frame_damage(&mut a, width, height, pitch, 2);
+    let checksum_b = apply_frame_damage(&mut b, width, height, pitch, 2);
+    assert_eq!(checksum_a, checksum_b);
+    assert_eq!(a, b);
+    let mut c = base;
+    let checksum_c = apply_frame_damage(&mut c, width, height, pitch, 3);
+    assert_ne!(checksum_a, checksum_c);
+}
+
+#[test]
+fn frame_loop_rotates_buffers_and_accounts_every_completion() {
+    let backend = FakeDrmScanoutBackend::new();
+    let request = request().with_frames(4);
+    let mut handle = backend.start(&request).expect("frame-loop start");
+    let initial = handle.status().frames.clone().expect("initial stats");
+    assert_eq!(initial.requested, 4);
+    assert_eq!(initial.submitted, 1);
+    assert_eq!(initial.completed, 1);
+    assert_eq!(initial.buffer_count, 3);
+    assert!(handle
+        .status()
+        .notes
+        .iter()
+        .any(|note| note.kind == DrmScanoutNoteKind::FrameLoop));
+
+    let stats = handle
+        .run_frames(request.frame_plan())
+        .expect("bounded frame loop");
+    assert_eq!(stats.requested, 4);
+    assert_eq!(stats.submitted, 4);
+    assert_eq!(stats.completed, 4);
+    assert_eq!(stats.dropped, 0);
+    assert_eq!(stats.missed, 0);
+    assert_eq!(stats.buffer_count, 3);
+    assert_eq!(stats.page_flip_events, 4);
+    assert_eq!(stats.damage_updates, 3);
+    assert!(stats.average_interval_us.is_some());
+    assert_eq!(stats.last_sequence, Some(4));
+    let final_checksum = stats.final_checksum.expect("final checksum");
+    assert_eq!(handle.status().pattern_checksum, Some(final_checksum));
+    assert_eq!(
+        handle.status().frames.as_ref().map(|stats| stats.completed),
+        Some(4)
+    );
+
+    let events = backend.events();
+    let flips: Vec<&String> = events
+        .iter()
+        .filter(|event| event.starts_with("atomic_page_flip "))
+        .collect();
+    assert_eq!(flips.len(), 4, "{events:?}");
+    // Three buffers rotate: frame 3 reuses the initial buffer.
+    assert_eq!(flips[0], flips[3], "{flips:?}");
+    assert_ne!(flips[0], flips[1], "{flips:?}");
+    assert_ne!(flips[1], flips[2], "{flips:?}");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.starts_with("frame ") && event.contains(" damage "))
+            .count(),
+        3,
+        "{events:?}"
+    );
+
+    let verification = handle.verify().expect("verify final frame");
+    assert!(verification.ok);
+    assert_eq!(
+        verification.framebuffer_id,
+        handle.status().framebuffer_id.unwrap()
+    );
+    assert_eq!(verification.pattern_checksum, final_checksum);
+    assert_eq!(
+        verification.crtc_framebuffer,
+        handle.status().framebuffer_id
+    );
+
+    handle.teardown().expect("teardown frame loop");
+    let events = backend.events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.starts_with("destroy_framebuffer "))
+            .count(),
+        3,
+        "{events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.starts_with("destroy_buffer "))
+            .count(),
+        3,
+        "{events:?}"
+    );
+    let tail = &events[events.len() - 3..];
+    assert!(tail[0].starts_with("destroy_framebuffer "), "{tail:?}");
+    assert!(tail[1].starts_with("destroy_buffer "), "{tail:?}");
+    assert!(tail[2].starts_with("revoke "), "{tail:?}");
+    assert!(events
+        .last()
+        .is_some_and(|event| event.starts_with("revoke ")));
+    assert!(!backend.active());
+}
+
+#[test]
+fn flip_timeout_is_counted_and_never_claimed_as_completed() {
+    let backend = FakeDrmScanoutBackend::new();
+    let request = request().with_frames(3);
+    let mut handle = backend.start(&request).expect("frame-loop start");
+    backend.fail_flip_at(0, FakeDrmScanoutFlipFailure::Timeout);
+
+    let error = handle
+        .run_frames(request.frame_plan())
+        .expect_err("initial flip timeout");
+    assert!(matches!(error, DrmScanoutError::FlipTimeout { .. }));
+    assert_eq!(error.code(), "flip_timeout");
+    let stats = handle.status().frames.clone().expect("partial stats");
+    assert_eq!(stats.submitted, 1);
+    assert_eq!(stats.completed, 0, "a timed-out flip is never completed");
+    assert_eq!(stats.dropped, 1);
+    assert_eq!(stats.missed, 1);
+    assert_eq!(stats.damage_updates, 0);
+    assert_eq!(
+        handle
+            .status()
+            .error
+            .as_ref()
+            .map(|error| error.kind.as_str()),
+        Some("flip_timeout")
+    );
+
+    handle.teardown().expect("teardown after timeout");
+    assert!(!backend.active());
+}
+
+#[test]
+fn mid_loop_flip_failure_keeps_partial_accounting_and_typed_error() {
+    let backend = FakeDrmScanoutBackend::new();
+    let request = request().with_frames(4);
+    let mut handle = backend.start(&request).expect("frame-loop start");
+    backend.fail_flip_at(2, FakeDrmScanoutFlipFailure::Failed);
+
+    let error = handle
+        .run_frames(request.frame_plan())
+        .expect_err("mid-loop flip failure");
+    assert!(matches!(error, DrmScanoutError::FlipFailed { .. }));
+    assert_eq!(error.code(), "flip_failed");
+    let stats = handle.status().frames.clone().expect("partial stats");
+    assert_eq!(stats.submitted, 3);
+    assert_eq!(stats.completed, 2);
+    assert_eq!(stats.dropped, 1);
+    assert_eq!(stats.missed, 0);
+    assert_eq!(stats.damage_updates, 2);
+    assert!(handle.is_active(), "a failed frame does not fake teardown");
+    handle.teardown().expect("teardown");
+
+    let unsupported = FakeDrmScanoutBackend::new();
+    let mut handle = unsupported.start(&request).expect("start");
+    unsupported.fail_flip_at(1, FakeDrmScanoutFlipFailure::Unsupported);
+    let error = handle
+        .run_frames(request.frame_plan())
+        .expect_err("unsupported");
+    assert!(matches!(error, DrmScanoutError::FlipUnsupported { .. }));
+    assert_eq!(error.code(), "flip_unsupported");
+}
+
+#[test]
+fn legacy_frame_loop_uses_page_flip_events() {
+    let backend = FakeDrmScanoutBackend::new();
+    let request = request().with_legacy_commit().with_frames(3);
+    let mut handle = backend.start(&request).expect("legacy frame-loop start");
+    assert_eq!(handle.status().commit, DrmScanoutCommit::Legacy);
+    let stats = handle
+        .run_frames(request.frame_plan())
+        .expect("legacy frame loop");
+    assert_eq!(stats.submitted, 3);
+    assert_eq!(stats.completed, 3);
+    assert_eq!(stats.dropped, 0);
+    assert_eq!(stats.page_flip_events, 3);
+    let events = backend.events().join("\n");
+    assert!(
+        !events.contains("atomic_page_flip "),
+        "legacy loop must not use atomic flips: {events}"
+    );
+    assert_eq!(events.matches("page_flip ").count(), 3, "{events}");
+    assert_eq!(events.matches("flip_complete ").count(), 2, "{events}");
+    handle.teardown().expect("legacy teardown");
+}
+
+#[test]
+fn frame_loop_status_serializes_accounting_fields() {
+    let backend = FakeDrmScanoutBackend::new();
+    let request = request().with_frames(3);
+    let mut handle = backend.start(&request).expect("start");
+    handle.run_frames(request.frame_plan()).expect("frame loop");
+    handle.teardown().expect("teardown");
+    let encoded = serde_json::to_string(handle.status()).expect("serialize");
+    for expected in [
+        "\"requested\":3",
+        "\"submitted\":3",
+        "\"completed\":3",
+        "\"dropped\":0",
+        "\"missed\":0",
+        "\"buffer_count\":3",
+        "\"average_interval_us\"",
+        "\"final_checksum\"",
+        "\"kind\":\"frame_loop\"",
+        "\"released\":true",
+    ] {
+        assert!(
+            encoded.contains(expected),
+            "missing {expected} in {encoded}"
+        );
+    }
 }
